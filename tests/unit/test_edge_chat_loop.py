@@ -403,9 +403,10 @@ class TestEdgeChatLoop:
         """Loop stops at MAX_TURNS and reports error. No flush call."""
         turns = []
         for i in range(30):
+            # Use different arguments each turn to avoid triggering stall detection
             turns.append([
                 {"type": "tool_call", "id": f"tc_{i}", "name": "read_file",
-                 "arguments": {"path": "hello.txt"}},
+                 "arguments": {"path": f"file_{i}.txt"}},
                 {"type": "turn_complete", "has_tool_calls": True},
             ])
 
@@ -878,3 +879,145 @@ class TestCloudSkillInjection:
         assert "GitHub skills share ONE token" in source, (
             "Must inject GitHub token namespace rule"
         )
+
+
+# ============================================================================
+# Tests: Edge stall detection
+# ============================================================================
+
+class TestEdgeStallDetection:
+    """Verify the edge chat loop detects and breaks out of tool call loops."""
+
+    @pytest.mark.asyncio
+    async def test_stall_breaks_loop(self, project, router, perms, renderer):
+        """Same tool+args for 3 consecutive turns → stall detected on 3rd turn,
+        tools NOT executed on that turn, nudge sent on turn 3, final answer on turn 3."""
+        api = MockAPIClient([
+            # Turn 0: read_file → executed normally
+            [
+                {"type": "tool_call", "id": "tc_1", "name": "read_file",
+                 "arguments": {"path": "hello.txt"}},
+                {"type": "turn_complete", "has_tool_calls": True},
+            ],
+            # Turn 1: same tool+args → executed normally
+            [
+                {"type": "tool_call", "id": "tc_2", "name": "read_file",
+                 "arguments": {"path": "hello.txt"}},
+                {"type": "turn_complete", "has_tool_calls": True},
+            ],
+            # Turn 2: same tool+args → stall detected BEFORE execution,
+            # tool NOT executed, nudge injected via continue
+            [
+                {"type": "tool_call", "id": "tc_3", "name": "read_file",
+                 "arguments": {"path": "hello.txt"}},
+                {"type": "turn_complete", "has_tool_calls": True},
+            ],
+            # Turn 3: cloud receives nudge, gives final answer
+            [
+                {"type": "text_delta", "content": "Based on what I have, the file says Hello."},
+                {"type": "turn_complete", "has_tool_calls": False},
+            ],
+        ])
+        result = await edge_chat_loop(
+            "Read hello.txt repeatedly", api, router, perms,
+            project_root=str(project), renderer=renderer,
+        )
+        assert len(api.calls) == 4
+        # The 4th call should contain the nudge message
+        nudge_call = api.calls[3]
+        nudge_msgs = nudge_call.get("messages", [])
+        assert any("[SYSTEM]" in (m.get("content", "")) for m in nudge_msgs), \
+            "Nudge message should contain [SYSTEM] prefix"
+        assert any("stop" in (m.get("content", "")).lower() for m in nudge_msgs), \
+            "Nudge message should tell LLM to stop calling tools"
+        # No tool_results in the nudge turn
+        assert not nudge_call.get("tool_results")
+        # Stall detected on turn 2 — tool should NOT have been executed on that turn.
+        # Turns 0 and 1 execute tools (2 tool_start calls), turn 2 does not.
+        tool_starts = [t for t in renderer.tool_starts if t == "read_file"]
+        assert len(tool_starts) == 2, \
+            f"Tool should execute on turns 0,1 only (not turn 2); got {len(tool_starts)} executions"
+
+    @pytest.mark.asyncio
+    async def test_no_stall_with_different_args(self, project, router, perms, renderer):
+        """Different arguments each turn → no stall detected."""
+        api = MockAPIClient([
+            [
+                {"type": "tool_call", "id": "tc_1", "name": "read_file",
+                 "arguments": {"path": "hello.txt"}},
+                {"type": "turn_complete", "has_tool_calls": True},
+            ],
+            [
+                {"type": "tool_call", "id": "tc_2", "name": "read_file",
+                 "arguments": {"path": "src/main.py"}},
+                {"type": "turn_complete", "has_tool_calls": True},
+            ],
+            [
+                {"type": "tool_call", "id": "tc_3", "name": "list_dir",
+                 "arguments": {"path": "."}},
+                {"type": "turn_complete", "has_tool_calls": True},
+            ],
+            [
+                {"type": "text_delta", "content": "Done."},
+                {"type": "turn_complete", "has_tool_calls": False},
+            ],
+        ])
+        result = await edge_chat_loop(
+            "Explore the project", api, router, perms,
+            project_root=str(project), renderer=renderer,
+        )
+        assert len(api.calls) == 4
+        # No nudge — the 4th call should have tool_results from turn 2
+        assert api.calls[3].get("tool_results") is not None
+        # All 3 tools should have been executed
+        assert len(renderer.tool_starts) == 3
+
+    @pytest.mark.asyncio
+    async def test_server_stall_signal_stops_loop(self, project, router, perms, renderer):
+        """Server sends stall_detected=True in turn_complete → edge stops."""
+        api = MockAPIClient([
+            [
+                {"type": "tool_call", "id": "tc_1", "name": "read_file",
+                 "arguments": {"path": "hello.txt"}},
+                {"type": "turn_complete", "has_tool_calls": True, "stall_detected": True},
+            ],
+        ])
+        result = await edge_chat_loop(
+            "Read hello.txt", api, router, perms,
+            project_root=str(project), renderer=renderer,
+        )
+        # Loop should stop after 1 turn because server signaled stall
+        assert len(api.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_max_nudges_force_breaks(self, project, router, perms, renderer):
+        """After _MAX_NUDGES nudges the edge gives up and force-breaks.
+
+        Timeline (_turn_sigs resets after each nudge):
+          Turn 0: api#1 → tool executed, sigs=[s]
+          Turn 1: api#2 → tool executed, sigs=[s,s]
+          Turn 2: api#3 → stall! nudge#1, sigs reset to []
+          Turn 3: api#4 (nudge) → same tool, sigs=[s]
+          Turn 4: api#5 → tool executed, sigs=[s,s]
+          Turn 5: api#6 → stall! nudge#2, sigs reset to []
+          Turn 6: api#7 (nudge) → same tool, sigs=[s]
+          Turn 7: api#8 → tool executed, sigs=[s,s]
+          Turn 8: api#9 → nudge_count=3 > 2 → force break
+        Total: 9 API calls, tools executed on turns 0,1,4,7 (4 times).
+        """
+        identical_turn = [
+            {"type": "tool_call", "id": "tc", "name": "read_file",
+             "arguments": {"path": "hello.txt"}},
+            {"type": "turn_complete", "has_tool_calls": True},
+        ]
+        api = MockAPIClient([identical_turn] * 20)  # enough to keep looping
+        result = await edge_chat_loop(
+            "Read hello.txt", api, router, perms,
+            project_root=str(project), renderer=renderer,
+        )
+        assert len(api.calls) == 9, (
+            f"Expected 9 API calls (3 per stall cycle × 3 cycles), "
+            f"got {len(api.calls)}"
+        )
+        assert any("giving up" in msg.lower() for msg in renderer.infos), \
+            "Should show force-break info message"

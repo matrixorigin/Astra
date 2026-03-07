@@ -208,6 +208,139 @@ class TestSessionAnalyzer:
         assert "←" in SessionAnalyzer._summarize_event(
             "tool_result", json.dumps({"name": "bash", "result": "ok"}), "bash")
 
+    def test_stall_detection_in_analyzer(self):
+        """Analyzer detects repeated identical tool calls as a stall pattern.
+
+        Simulates realistic event ordering with llm_response between each
+        tool-call round (as happens in production):
+          user_query → llm_response → tc,tr → llm_response → tc,tr → …
+        The analyzer must still detect the stall across llm_response boundaries.
+        """
+        from core.agent.session_analyzer import SessionAnalyzer
+
+        t0 = datetime(2026, 1, 1, 0, 0, 0)
+        # Build realistic ordering: llm_response → tool_call → tool_result per round
+        events = []
+        for i in range(5):
+            base = i * 3 + 1
+            events.append(
+                (f"r{i}", "llm_response", "Checking...", None,
+                 t0 + timedelta(seconds=base), None, {}, None, None))
+            events.append(
+                (f"tc{i}", "tool_call",
+                 json.dumps({"name": "git_status", "arguments": "{}"}),
+                 None, t0 + timedelta(seconds=base + 1), None, {}, None, None))
+            events.append(
+                (f"tr{i}", "tool_result",
+                 json.dumps({"name": "git_status", "result": "M file.py"}),
+                 None, t0 + timedelta(seconds=base + 2), None, {}, None, None))
+        rows = [
+            ("e0", "user_query", "check status", None, t0, None, {}, None, None),
+            *events,
+            ("e_final", "llm_response", "Here is the answer", None,
+             t0 + timedelta(seconds=20), None, {}, None, None),
+        ]
+
+        mock_db = MagicMock()
+        mock_db.__enter__ = MagicMock(return_value=mock_db)
+        mock_db.__exit__ = MagicMock(return_value=False)
+        mock_result = MagicMock()
+        mock_result.fetchall.return_value = rows
+        mock_db.execute.return_value = mock_result
+
+        analyzer = SessionAnalyzer(db_factory=lambda: mock_db)
+        report = analyzer.analyze("stall-session")
+
+        stall_issues = [i for i in report.issues if i["type"] == "tool_call_stall"]
+        assert len(stall_issues) == 1
+        assert stall_issues[0]["repeat_count"] == 5
+        assert "git_status" in stall_issues[0]["description"]
+
+        stall_recs = [r for r in report.recommendations if "stall" in r.lower()]
+        assert len(stall_recs) == 1
+
+    def test_no_stall_with_different_args(self):
+        """Different arguments each call → no stall detected."""
+        from core.agent.session_analyzer import SessionAnalyzer
+
+        t0 = datetime(2026, 1, 1, 0, 0, 0)
+        rows = [
+            ("e0", "user_query", "explore", None, t0, None, {}, None, None),
+            ("tc1", "tool_call",
+             json.dumps({"name": "read_file", "arguments": '{"path":"a.py"}'}),
+             None, t0 + timedelta(seconds=1), None, {}, None, None),
+            ("tc2", "tool_call",
+             json.dumps({"name": "read_file", "arguments": '{"path":"b.py"}'}),
+             None, t0 + timedelta(seconds=2), None, {}, None, None),
+            ("tc3", "tool_call",
+             json.dumps({"name": "read_file", "arguments": '{"path":"c.py"}'}),
+             None, t0 + timedelta(seconds=3), None, {}, None, None),
+            ("e_final", "llm_response", "Done", None,
+             t0 + timedelta(seconds=4), None, {}, None, None),
+        ]
+
+        mock_db = MagicMock()
+        mock_db.__enter__ = MagicMock(return_value=mock_db)
+        mock_db.__exit__ = MagicMock(return_value=False)
+        mock_result = MagicMock()
+        mock_result.fetchall.return_value = rows
+        mock_db.execute.return_value = mock_result
+
+        analyzer = SessionAnalyzer(db_factory=lambda: mock_db)
+        report = analyzer.analyze("no-stall-session")
+
+        stall_issues = [i for i in report.issues if i["type"] == "tool_call_stall"]
+        assert len(stall_issues) == 0
+
+    def test_stall_spans_llm_response_boundary(self):
+        """Identical tool calls across llm_response boundary → stall detected.
+
+        llm_response does NOT reset stall tracking (only user_query does).
+        In a real stall the sequence is: llm_response → tc → tr → llm_response → tc → …
+        so resetting on llm_response would prevent detection entirely.
+        Here 4 identical calls (2 before + 2 after llm_response) exceed threshold=3.
+        """
+        from core.agent.session_analyzer import SessionAnalyzer
+
+        t0 = datetime(2026, 1, 1, 0, 0, 0)
+        tc = json.dumps({"name": "git_status", "arguments": "{}"})
+        tr = json.dumps({"name": "git_status", "result": "M file.py"})
+        rows = [
+            ("e0", "user_query", "check", None, t0, None, {}, None, None),
+            # Round 1: 2 identical calls
+            ("r0", "llm_response", "Let me check...", None, t0 + timedelta(seconds=1), None, {}, None, None),
+            ("tc1", "tool_call", tc, None, t0 + timedelta(seconds=2), None, {}, None, None),
+            ("tr1", "tool_result", tr, None, t0 + timedelta(seconds=3), None, {}, None, None),
+            ("r1", "llm_response", "Checking again...", None, t0 + timedelta(seconds=4), None, {}, None, None),
+            ("tc2", "tool_call", tc, None, t0 + timedelta(seconds=5), None, {}, None, None),
+            ("tr2", "tool_result", tr, None, t0 + timedelta(seconds=6), None, {}, None, None),
+            # llm_response between rounds — must NOT reset stall tracking
+            ("r2", "llm_response", "One more time...", None, t0 + timedelta(seconds=7), None, {}, None, None),
+            # Round 2: 2 more identical calls → total 4 ≥ threshold 3
+            ("tc3", "tool_call", tc, None, t0 + timedelta(seconds=8), None, {}, None, None),
+            ("tr3", "tool_result", tr, None, t0 + timedelta(seconds=9), None, {}, None, None),
+            ("r3", "llm_response", "And again...", None, t0 + timedelta(seconds=10), None, {}, None, None),
+            ("tc4", "tool_call", tc, None, t0 + timedelta(seconds=11), None, {}, None, None),
+            ("tr4", "tool_result", tr, None, t0 + timedelta(seconds=12), None, {}, None, None),
+            ("e_final", "llm_response", "Done", None,
+             t0 + timedelta(seconds=13), None, {}, None, None),
+        ]
+
+        mock_db = MagicMock()
+        mock_db.__enter__ = MagicMock(return_value=mock_db)
+        mock_db.__exit__ = MagicMock(return_value=False)
+        mock_result = MagicMock()
+        mock_result.fetchall.return_value = rows
+        mock_db.execute.return_value = mock_result
+
+        analyzer = SessionAnalyzer(db_factory=lambda: mock_db)
+        report = analyzer.analyze("stall-across-llm-response")
+
+        stall_issues = [i for i in report.issues if i["type"] == "tool_call_stall"]
+        assert len(stall_issues) == 1, \
+            "4 identical calls across llm_response boundary should be detected as stall"
+        assert stall_issues[0]["repeat_count"] == 4
+
 
 # ============================================================================
 # 1b. Execution tree, summary, cost, and ASCII rendering (unit tests)

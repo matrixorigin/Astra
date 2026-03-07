@@ -48,6 +48,9 @@ router = APIRouter()
 HEARTBEAT_INTERVAL_S = 15
 SERVER_TURN_TIMEOUT_S = 240
 
+# Stall detection: consecutive turns with identical tool call signatures.
+_SERVER_STALL_WINDOW = 3
+
 # ---------------------------------------------------------------------------
 # History Compaction (prevents context overflow)
 # ---------------------------------------------------------------------------
@@ -2065,6 +2068,10 @@ async def chat_turn(
             else:
                 _turn_chain_id = str(uuid7())
                 _user_query_event_id = str(uuid7())
+                # New user intent — reset stall detection so tool_sigs from the
+                # previous question don't carry over and cause false positives.
+                if _prev_entry:
+                    _prev_entry.pop("tool_sigs", None)
 
             # ── Unified Tool Registry ────────────────────────────────────
             # All tools (edge + cloud) go into one registry. Selection is
@@ -2655,6 +2662,27 @@ async def chat_turn(
                     assistant_msg["reasoning_content"] = _turn_reasoning
                 _entry.setdefault("history", []).append(assistant_msg)
                 _entry["turn_count"] = _entry.get("turn_count", 0) + 1
+                # Server-side stall detection: track tool call signatures so
+                # the turn_complete event can signal the edge to stop looping.
+                # Canonical JSON (sort_keys, compact separators) ensures
+                # consistent signatures regardless of LLM key ordering.
+                if tool_calls:
+                    def _canonical_args(raw: str) -> str:
+                        try:
+                            return json.dumps(json.loads(raw), sort_keys=True, separators=(',', ':'))
+                        except (json.JSONDecodeError, TypeError):
+                            return raw
+                    _sig = frozenset(
+                        f"{tc.get('function',{}).get('name','')}:{_canonical_args(tc.get('function',{}).get('arguments',''))}"
+                        for tc in tool_calls
+                    )
+                    _prev_sigs: list = _entry.setdefault("tool_sigs", [])
+                    _prev_sigs.append(_sig)
+                    # Keep only last _SERVER_STALL_WINDOW entries
+                    if len(_prev_sigs) > _SERVER_STALL_WINDOW:
+                        _prev_sigs[:] = _prev_sigs[-_SERVER_STALL_WINDOW:]
+                else:
+                    _entry.pop("tool_sigs", None)
                 # Store chain IDs so continuation turns (tool_results) reuse them
                 _entry["turn_chain_id"] = _turn_chain_id
                 _entry["user_query_event_id"] = _user_query_event_id
@@ -2746,6 +2774,18 @@ async def chat_turn(
             # capped at 20, unknown status → FAILURE). Future: cloud-side breaker
             # state could be merged here if the cloud tracks its own tool failures.
             _turn_complete_data: dict = {'type': 'turn_complete', 'has_tool_calls': len(tool_calls) > 0}
+            # Server-side stall detection: if the same tool signatures repeated
+            # for _SERVER_STALL_WINDOW turns, signal the edge to stop looping.
+            # NOTE: We use _peek_session_entry() instead of _entry because _entry
+            # is defined in a deeper nesting level that may not always execute
+            # (e.g. when the cloud loop path is skipped).  _peek is a safe
+            # read-only lookup that returns the same dict reference from cache.
+            _entry_for_stall = _peek_session_entry(session_id)
+            if _entry_for_stall:
+                _sigs = _entry_for_stall.get("tool_sigs", [])
+                if len(_sigs) >= _SERVER_STALL_WINDOW and all(s == _sigs[-1] for s in _sigs[-_SERVER_STALL_WINDOW:]):
+                    _turn_complete_data['stall_detected'] = True
+                    _turn_complete_data['has_tool_calls'] = False  # force edge to stop
             if hasattr(request, 'execution_state') and request.execution_state:
                 from core.agent.turn_state import TurnState
                 _ts = TurnState.from_wire(request.execution_state, messages=[], tools_schema=[])

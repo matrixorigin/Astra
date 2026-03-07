@@ -21,6 +21,7 @@ SLOW_NODE_THRESHOLD_S = 10  # Flag individual nodes slower than this
 HIGH_TOKEN_THRESHOLD = 5000
 EXPENSIVE_THRESHOLD_USD = 0.01
 LARGE_CONTEXT_THRESHOLD = 2000
+_STALL_THRESHOLD = 3  # Minimum consecutive identical tool calls to flag as stall
 
 # Model pricing (USD per 1M tokens).
 # Keyed by prefix — lookup tries exact match first, then longest prefix match.
@@ -383,6 +384,63 @@ class SessionAnalyzer(DbConsumer):
 
         # Total duration
         total_s = (rows[-1][4] - rows[0][4]).total_seconds() if len(rows) > 1 else 0
+
+        # Detect tool call stall patterns: same tool+args repeated consecutively.
+        # Only tool_call events contribute to the signature sequence — all other
+        # event types (tool_result, llm_response, etc.) are ignored.  Only
+        # user_query resets the sequence because it marks a new user intent.
+        # llm_response does NOT reset: in a real stall the event order is
+        # llm_response → tool_call → tool_result → llm_response → tool_call …
+        # so resetting on llm_response would prevent detection entirely.
+        _consecutive_sigs: list[str] = []
+        _stall_sequences: list[dict[str, Any]] = []
+
+        def _flush_stall() -> None:
+            if len(_consecutive_sigs) >= _STALL_THRESHOLD:
+                _stall_sequences.append({
+                    "tool_signature": _consecutive_sigs[0],
+                    "repeat_count": len(_consecutive_sigs),
+                })
+
+        for r in rows:
+            event_type = r[1]
+            content = r[2]
+            if event_type == "tool_call":
+                try:
+                    data = json.loads(content) if content else {}
+                    # Canonical JSON for arguments so key order doesn't matter.
+                    raw_args = data.get('arguments', '')
+                    try:
+                        canon_args = json.dumps(json.loads(raw_args), sort_keys=True, separators=(',', ':'))
+                    except (json.JSONDecodeError, TypeError):
+                        canon_args = raw_args
+                    sig = f"{data.get('name', '')}:{canon_args}"
+                except (json.JSONDecodeError, TypeError):
+                    sig = "?"
+                if _consecutive_sigs and _consecutive_sigs[-1] == sig:
+                    _consecutive_sigs.append(sig)
+                else:
+                    _flush_stall()
+                    _consecutive_sigs = [sig]
+            elif event_type == "user_query":
+                _flush_stall()
+                _consecutive_sigs = []
+        _flush_stall()
+
+        for seq in _stall_sequences:
+            issues.append({
+                "type": "tool_call_stall",
+                "description": (
+                    f"Tool call loop detected: {seq['tool_signature'].split(':')[0]} "
+                    f"called {seq['repeat_count']}x with identical arguments"
+                ),
+                "repeat_count": seq["repeat_count"],
+            })
+            recommendations.append(
+                f"Stall detected: {seq['tool_signature'].split(':')[0]} was called "
+                f"{seq['repeat_count']} times with the same arguments. "
+                f"The stall detector should have broken this loop after {_STALL_THRESHOLD} repeats."
+            )
 
         # Generate recommendations
         if cloud_loop_count >= 3:

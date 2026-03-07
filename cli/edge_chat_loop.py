@@ -4,6 +4,7 @@ Edge sends user message + tool results → cloud returns text + tool_calls → e
 """
 
 import asyncio
+import json
 import sys
 from dataclasses import dataclass, field
 from itertools import islice
@@ -19,6 +20,11 @@ from cli.tools.router import ToolCall, ToolRouter
 
 MAX_TURNS = 25
 MAX_TURN_WALL_CLOCK_S = 300
+
+# Stall detection: if the same tool+args signature repeats for this many
+# consecutive turns, inject a nudge message telling the cloud to stop looping.
+_STALL_WINDOW = 3
+_MAX_NUDGES = 2  # give up after this many nudges — cloud is not listening
 
 
 class Renderer(Protocol):
@@ -228,6 +234,8 @@ async def _consume_turn(
                             result.usage[k] = result.usage.get(k, 0) + v
                 elif etype == "turn_complete":
                     result.has_tool_calls = event.get("has_tool_calls", False)
+                    if event.get("stall_detected"):
+                        result.has_tool_calls = False  # server detected stall — stop looping
                 elif etype == "explain":
                     result.explain = event
                 elif etype == "error":
@@ -445,6 +453,8 @@ async def edge_chat_loop(
     prev_turn_text = ""  # text from previous turn — used to suppress LLM repeats
     total_usage: dict[str, int] = {}
     _explain_turns: list[dict[str, Any]] = []
+    _turn_sigs: list[frozenset[str]] = []  # per-turn tool call signatures for stall detection
+    _nudge_count = 0  # how many stall nudges we've sent this session
 
     for turn in range(MAX_TURNS):
         if session_info is not None:
@@ -518,8 +528,42 @@ async def edge_chat_loop(
         # Remember this turn's text so the next turn can suppress if LLM repeats it.
         prev_turn_text = result.text
 
-        # Execute tool calls locally
+        # Parse tool calls and check for stall BEFORE executing tools.
+        # This avoids wasting time re-executing the same tools when we
+        # already know the agent is stuck in a loop.
         parsed = ToolRouter.parse_tool_calls(result.tool_calls)
+
+        # Stall detection: track tool-call signatures per turn and nudge the
+        # cloud to stop if the same calls repeat for _STALL_WINDOW consecutive
+        # turns.  Canonical JSON (sort_keys, compact separators) ensures
+        # consistent signatures regardless of dict ordering.
+        sig = frozenset(
+            f"{tc.name}:{json.dumps(tc.arguments, sort_keys=True, separators=(',', ':'))}"
+            for tc in parsed
+        )
+        _turn_sigs.append(sig)
+        if len(_turn_sigs) >= _STALL_WINDOW:
+            recent = _turn_sigs[-_STALL_WINDOW:]
+            if all(s == recent[0] for s in recent[1:]):
+                _nudge_count += 1
+                if _nudge_count > _MAX_NUDGES:
+                    # Already nudged twice and cloud keeps looping — force stop.
+                    renderer.info("Stall detected: giving up after repeated nudges.")
+                    break
+                # Reset so the next window starts fresh after the nudge.
+                _turn_sigs = []
+                # Inject a nudge as a user message so the cloud stops looping.
+                # The `continue` deliberately skips `messages = []` below so
+                # the nudge is sent as the sole message on the next turn.
+                messages = [{"role": "user", "content": (
+                    "[SYSTEM] You have called the same tools with the same arguments "
+                    f"{_STALL_WINDOW} times in a row without making progress. "
+                    "Stop calling tools and give your best answer based on what you have so far."
+                )}]
+                tool_results = []
+                continue
+
+        # Execute tool calls locally
         approved: list[ToolCall] = []
         tool_results = []
 
