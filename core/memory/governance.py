@@ -143,7 +143,7 @@ class GovernanceScheduler(DbConsumer):
         return combined
 
     def run_daily(self, user_id: str) -> GovernanceCycleResult:
-        """Daily: stale cleanup + quarantine low effective_confidence."""
+        """Daily: stale cleanup + quarantine low effective_confidence + orphaned incremental summaries."""
         result = GovernanceCycleResult()
         try:
             result.cleaned_stale = self._cleanup_stale(user_id)
@@ -161,6 +161,11 @@ class GovernanceScheduler(DbConsumer):
         except Exception as e:
             logger.error("Pollution detection failed: %s", e)
             result.errors.append(f"pollution: {e}")
+        try:
+            self._cleanup_orphaned_incrementals(user_id)
+        except Exception as e:
+            logger.error("Orphaned incremental cleanup failed: %s", e)
+            result.errors.append(f"orphaned_incrementals: {e}")
         return result
 
     # ── Weekly ────────────────────────────────────────────────────────
@@ -253,3 +258,38 @@ class GovernanceScheduler(DbConsumer):
         if quarantined > 0:
             logger.info("Quarantined %d memories below threshold %.2f", quarantined, threshold)
         return quarantined
+
+    def _cleanup_orphaned_incrementals(self, user_id: str, older_than_hours: int = 24) -> int:
+        """Deactivate session-scoped incremental summaries from sessions that were never closed.
+
+        A session is considered abnormally terminated if:
+        - It has incremental summaries (content LIKE '[session_summary:incremental]%')
+        - Those summaries are older than `older_than_hours`
+        - No full summary (session_id IS NULL) was created after them for the same user
+
+        Called from run_daily() so it runs once per day per user.
+        """
+        with self._db() as db:
+            result = db.execute(text("""
+                UPDATE mem_memories AS inc
+                SET inc.is_active = 0, inc.updated_at = NOW()
+                WHERE inc.user_id = :uid
+                  AND inc.is_active = 1
+                  AND inc.content LIKE '[session_summary:incremental]%'
+                  AND inc.session_id IS NOT NULL
+                  AND TIMESTAMPDIFF(HOUR, inc.observed_at, NOW()) > :hours
+                  AND NOT EXISTS (
+                      SELECT 1 FROM mem_memories AS full_s
+                      WHERE full_s.user_id = :uid
+                        AND full_s.is_active = 1
+                        AND full_s.session_id IS NULL
+                        AND full_s.content LIKE '[session_summary]%'
+                        AND full_s.observed_at > inc.observed_at
+                  )
+            """), {"uid": user_id, "hours": older_than_hours})
+            db.commit()
+            count = result.rowcount
+
+        if count:
+            logger.info("Cleaned %d orphaned incremental summaries for user %s", count, user_id)
+        return count

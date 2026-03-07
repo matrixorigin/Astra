@@ -497,7 +497,7 @@ class TestSensitivityFilterRealDB:
     """Sensitivity filter blocks PII from reaching the database."""
 
     def test_pii_blocked_before_persist(self, db_factory, memory_cleanup):
-        """Observer rejects content containing PII — nothing stored."""
+        """HIGH tier PII (AWS key) is blocked — nothing stored."""
         user_id = _uid()
         store = MemoryStore(db_factory)
         observer = TypedObserver(store=store, llm_client=None, embed_fn=_embed)
@@ -505,7 +505,7 @@ class TestSensitivityFilterRealDB:
         with pytest.raises(ValueError, match="sensitivity filter"):
             observer.observe_explicit(
                 user_id=user_id,
-                content="Contact me at alice@example.com for details",
+                content="key is AKIAIOSFODNN7EXAMPLE",
                 memory_type=MemoryType.SEMANTIC,
                 initial_confidence=0.9,
             )
@@ -513,9 +513,9 @@ class TestSensitivityFilterRealDB:
         # Verify nothing leaked to DB
         results, _ = MemoryRetriever(db_factory).retrieve(
             user_id=user_id,
-            query_text="alice email",
+            query_text="aws key",
             session_id=_sid(),
-            query_embedding=_embed("alice email"),
+            query_embedding=_embed("aws key"),
             limit=10,
         )
         assert len(results) == 0

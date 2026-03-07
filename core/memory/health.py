@@ -156,6 +156,79 @@ class MemoryHealth(DbConsumer):
 
         return cleaned
 
+    def estimate_capacity(self, user_id: str) -> dict:
+        """Estimate memory capacity and IVF index performance headroom.
+
+        Provides data-driven answers to:
+        - How many memories does this user have?
+        - At what scale does IVF-flat degrade? (rule of thumb: >100K vectors)
+        - Is partitioning needed?
+
+        IVF-flat performance notes (MatrixOne):
+        - Optimal: <50K vectors per index partition
+        - Acceptable: 50K–200K (query time grows ~linearly)
+        - Degraded: >200K (consider partitioning by user_id or time bucket)
+
+        Returns a dict with current counts, growth projection, and recommendations.
+        """
+        _IVF_OPTIMAL = 50_000
+        _IVF_DEGRADED = 200_000
+
+        with self._db() as db:
+            # Per-user active vector count
+            user_row = db.execute(text("""
+                SELECT
+                    COUNT(*) as total_active,
+                    COUNT(CASE WHEN embedding IS NOT NULL THEN 1 END) as with_embedding,
+                    MIN(observed_at) as oldest_active,
+                    MAX(observed_at) as newest_active
+                FROM mem_memories
+                WHERE user_id = :uid AND is_active = 1
+            """), {"uid": user_id}).fetchone()
+
+            # Global vector count (for index-level assessment)
+            global_row = db.execute(text("""
+                SELECT COUNT(*) as global_total
+                FROM mem_memories
+                WHERE is_active = 1 AND embedding IS NOT NULL
+            """)).fetchone()
+
+            # 30-day growth rate for this user
+            growth_row = db.execute(text("""
+                SELECT COUNT(*) as added_30d
+                FROM mem_memories
+                WHERE user_id = :uid
+                  AND observed_at >= NOW() - INTERVAL 30 DAY
+            """), {"uid": user_id}).fetchone()
+
+        total_active = user_row.total_active or 0
+        with_embedding = user_row.with_embedding or 0
+        global_total = global_row.global_total or 0
+        added_30d = growth_row.added_30d or 0
+        monthly_rate = added_30d
+        days_to_ivf_optimal = (
+            int((_IVF_OPTIMAL - global_total) / (monthly_rate / 30))
+            if monthly_rate > 0 and global_total < _IVF_OPTIMAL
+            else None
+        )
+
+        recommendation = "ok"
+        if global_total > _IVF_DEGRADED:
+            recommendation = "partition_required"
+        elif global_total > _IVF_OPTIMAL:
+            recommendation = "monitor_query_latency"
+
+        return {
+            "user_active_memories": total_active,
+            "user_with_embedding": with_embedding,
+            "global_vector_count": global_total,
+            "monthly_growth_rate": monthly_rate,
+            "days_to_ivf_optimal_threshold": days_to_ivf_optimal,
+            "ivf_thresholds": {"optimal": _IVF_OPTIMAL, "degraded": _IVF_DEGRADED},
+            "recommendation": recommendation,
+            "partition_hint": "user_id_hash" if global_total > _IVF_DEGRADED else None,
+        }
+
     def get_storage_stats(self, user_id: str) -> dict:
         """Get storage statistics for monitoring."""
         with self._db() as db:

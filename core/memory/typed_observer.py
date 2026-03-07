@@ -109,12 +109,16 @@ class TypedObserver:
             if not mem:
                 continue
 
-            # Sensitivity filter — block PII/credentials
+            # Sensitivity filter — block HIGH-risk, redact MEDIUM-risk
             sensitivity = check_sensitivity(mem.content)
             if sensitivity.blocked:
                 logger.info("Sensitivity filter blocked memory: %s", sensitivity.matched_labels)
                 self._metrics.increment("sensitivity_blocked")
                 continue
+            if sensitivity.redacted_content is not None:
+                logger.info("Sensitivity filter redacted memory: %s", sensitivity.matched_labels)
+                self._metrics.increment("sensitivity_redacted")
+                mem.content = sensitivity.redacted_content
 
             if self.embed_fn:
                 try:
@@ -148,6 +152,10 @@ class TypedObserver:
             logger.warning("Sensitivity filter blocked explicit memory: %s", sensitivity.matched_labels)
             self._metrics.increment("sensitivity_blocked")
             raise ValueError(f"Content blocked by sensitivity filter: {sensitivity.matched_labels}")
+        if sensitivity.redacted_content is not None:
+            logger.info("Sensitivity filter redacted explicit memory: %s", sensitivity.matched_labels)
+            self._metrics.increment("sensitivity_redacted")
+            content = sensitivity.redacted_content
 
         mem = Memory(
             memory_id=uuid.uuid4().hex,

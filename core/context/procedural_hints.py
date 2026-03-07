@@ -1,7 +1,14 @@
-"""Procedural memory conflict resolution.
+"""Procedural memory conflict resolution and tool description injection.
 
 P0 Critical: Zero-cost helpers to detect when user instructions contradict
 procedural memory patterns, ensuring user intent always wins.
+
+Tool injection design:
+  - Matching: keyword overlap between memory content and tool name/description
+    (no embedding cost at injection time; embeddings are pre-computed at store time)
+  - Safety: injected hints are appended as a separate "Learned hints:" section,
+    never modifying the original tool schema fields (name, parameters, etc.)
+  - Cache safety: original tool schema is never mutated; a shallow copy is returned
 
 Design ref: context-window-management.md §1 Priority Resolution Mechanism
 """
@@ -9,6 +16,7 @@ Design ref: context-window-management.md §1 Priority Resolution Mechanism
 from __future__ import annotations
 
 import re
+from typing import Any
 
 
 def extract_parameter_values(pattern: str) -> dict[str, str]:
@@ -116,3 +124,77 @@ def contradicts_user_intent(pattern: str, user_message: str) -> bool:
             return True
     
     return False
+
+
+# ── Tool description injection ────────────────────────────────────────────────
+
+_STOPWORDS = frozenset({"use", "the", "a", "an", "and", "or", "to", "for", "with", "in", "of", "is"})
+_MIN_KEYWORD_LEN = 3
+
+
+def _keywords(text: str) -> set[str]:
+    """Extract meaningful lowercase keywords from text."""
+    return {
+        w.lower() for w in re.findall(r"\w+", text)
+        if len(w) >= _MIN_KEYWORD_LEN and w.lower() not in _STOPWORDS
+    }
+
+
+def _tool_matches_memory(tool: dict[str, Any], memory_content: str) -> bool:
+    """Return True if the memory content is relevant to this tool.
+
+    Matching strategy: keyword overlap between memory text and tool name +
+    description. No embedding cost — embeddings are used at retrieval time,
+    not at injection time.
+
+    Rules:
+    - At least 2 overlapping keywords.
+    - At least one of those keywords must be longer than 4 chars, to prevent
+      short generic words ("api", "get", "run") from triggering false matches.
+    """
+    tool_text = f"{tool.get('name', '')} {tool.get('description', '')}"
+    tool_kw = _keywords(tool_text)
+    mem_kw = _keywords(memory_content)
+    overlap = tool_kw & mem_kw
+    return len(overlap) >= 2 and any(len(w) > 4 for w in overlap)
+
+
+def inject_procedural_hints(
+    tools: list[dict[str, Any]],
+    procedural_memories: list[str],
+) -> list[dict[str, Any]]:
+    """Append learned hints to matching tool descriptions.
+
+    Safety guarantees:
+    - Returns shallow copies; original tool dicts are never mutated.
+    - Hints are appended as "Learned hints: ..." — never replacing existing fields.
+    - Provider tool schema caches are unaffected (original objects unchanged).
+    - If no memories match a tool, the original dict is returned as-is (no copy).
+
+    Args:
+        tools: List of tool schema dicts (name, description, parameters, ...).
+        procedural_memories: List of procedural memory content strings.
+
+    Returns:
+        List of tool dicts, some with augmented descriptions.
+    """
+    if not procedural_memories:
+        return tools
+
+    result = []
+    for tool in tools:
+        matching_hints = [
+            mem for mem in procedural_memories
+            if _tool_matches_memory(tool, mem)
+        ]
+        if not matching_hints:
+            result.append(tool)
+        else:
+            augmented = dict(tool)  # shallow copy — schema fields preserved
+            hints_text = "; ".join(matching_hints[:3])  # cap at 3 hints per tool
+            existing_desc = augmented.get("description", "")
+            augmented["description"] = f"{existing_desc}\nLearned hints: {hints_text}"
+            result.append(augmented)
+
+    return result
+

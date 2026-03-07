@@ -43,7 +43,7 @@ class HybridRetriever(DbConsumer):
         Then rerank in Python combining both scores.
         """
         if weights is None:
-            weights = {"semantic": 0.35, "keyword": 0.25, "temporal": 0.20, "causal": 0.20}
+            weights = self._current_weights()
 
         from matrixone.sqlalchemy_ext import l2_distance
 
@@ -146,6 +146,67 @@ class HybridRetriever(DbConsumer):
         if events:
             logger.info("Hybrid retrieval: %d events, top score: %.3f", len(events), events[0]["relevance_score"])
         return events
+
+    def update_weights_from_feedback(
+        self,
+        session_id: str,
+        quality_score: float,
+        retrieval_metadata: dict[str, float],
+        learning_rate: float = 0.05,
+    ) -> dict[str, float]:
+        """Adjust retrieval weights based on quality feedback.
+
+        Called after a session ends with a quality_score (0-1) from the
+        evaluation gate or implicit feedback. Uses the retrieval_metadata
+        recorded at retrieval time (vector_fraction, keyword_fraction) to
+        nudge weights toward the mix that correlated with high quality.
+
+        Args:
+            session_id: Session that produced the feedback signal.
+            quality_score: 0-1 quality rating (higher = better).
+            retrieval_metadata: Dict with keys "vector_fraction" and
+                "keyword_fraction" — the actual mix used during retrieval.
+            learning_rate: Step size for weight update (default 0.05).
+
+        Returns:
+            Updated weights dict (also stored in-memory for next retrieval).
+        """
+        if not (0.0 <= quality_score <= 1.0):
+            logger.warning("Invalid quality_score %.3f for session %s, skipping weight update", quality_score, session_id)
+            return self._current_weights()
+
+        vector_frac = retrieval_metadata.get("vector_fraction", 0.5)
+        keyword_frac = retrieval_metadata.get("keyword_fraction", 0.5)
+
+        # Reward signal: positive when quality > 0.5, negative otherwise
+        reward = quality_score - 0.5
+
+        # Nudge semantic/keyword weights proportional to their usage fraction
+        w = self._current_weights()
+        w["semantic"] = max(0.05, min(0.80, w["semantic"] + learning_rate * reward * vector_frac))
+        w["keyword"]  = max(0.05, min(0.80, w["keyword"]  + learning_rate * reward * keyword_frac))
+
+        # Renormalize all four weights so they sum to 1.
+        # temporal and causal are included in the denominator so the total stays
+        # at 1.0, but they are not directly nudged — their share changes only as
+        # a side-effect of semantic/keyword moving.  This is intentional: we have
+        # no direct signal for temporal/causal quality, so we let them scale
+        # proportionally rather than holding them fixed.
+        total = w["semantic"] + w["keyword"] + w["temporal"] + w["causal"]
+        w = {k: v / total for k, v in w.items()}
+
+        self._weights = w
+        logger.info(
+            "Weight update for session %s (quality=%.2f): semantic=%.3f keyword=%.3f temporal=%.3f causal=%.3f",
+            session_id, quality_score, w["semantic"], w["keyword"], w["temporal"], w["causal"],
+        )
+        return w
+
+    def _current_weights(self) -> dict[str, float]:
+        """Return current weights (instance-level override or defaults)."""
+        return dict(getattr(self, "_weights", {
+            "semantic": 0.35, "keyword": 0.25, "temporal": 0.20, "causal": 0.20,
+        }))
 
     def retrieve_knowledge(
         self,

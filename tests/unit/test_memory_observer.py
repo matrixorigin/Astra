@@ -98,14 +98,18 @@ class TestTypedExtraction:
 
 
 class TestSensitivityFilter:
-    def test_blocks_email(self, observer, mock_llm):
+    def test_redacts_email(self, observer, mock_llm):
+        """MEDIUM tier: email is redacted in-place, memory is kept."""
         mock_llm.chat_with_tools.return_value = {"content": json.dumps([
             {"type": "profile", "content": "email is user@example.com", "confidence": 0.9},
         ])}
         results, _ = observer.observe("u1", [{"role": "user", "content": "test"}])
-        assert len(results) == 0
+        assert len(results) == 1
+        assert "[email]" in results[0].content
+        assert "user@example.com" not in results[0].content
 
     def test_blocks_aws_key(self, observer, mock_llm):
+        """HIGH tier: AWS key blocks the entire memory."""
         mock_llm.chat_with_tools.return_value = {"content": json.dumps([
             {"type": "semantic", "content": "key is AKIAIOSFODNN7EXAMPLE", "confidence": 0.8},
         ])}
@@ -120,14 +124,17 @@ class TestSensitivityFilter:
         assert len(results) == 1
 
     def test_audit_log_emitted(self, observer, mock_llm, caplog):
-        """Sensitivity block emits structured audit log with content_hash."""
+        """MEDIUM tier redaction emits structured audit log."""
         mock_llm.chat_with_tools.return_value = {"content": json.dumps([
             {"type": "profile", "content": "email is user@example.com", "confidence": 0.9},
         ])}
         import logging
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.INFO):
             observer.observe("u1", [{"role": "user", "content": "test"}])
-        assert any("sensitivity_blocked" in r.message or "Sensitivity filter" in r.message for r in caplog.records)
+        assert any(
+            "sensitivity_redacted" in r.message or "redacted memory" in r.message.lower()
+            for r in caplog.records
+        )
 
 
 class TestContradictionDetection:

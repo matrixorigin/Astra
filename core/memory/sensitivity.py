@@ -1,10 +1,11 @@
-"""Sensitivity filter — block PII and credentials from long-term memory.
+"""Sensitivity filter — tiered PII/credential handling for long-term memory.
 
-Design decision: block-only, no redaction. If content contains PII/credentials,
-the entire memory is rejected. This is safer than partial redaction which risks
-incomplete removal.
+Three tiers:
+  HIGH   (passwords, API keys, private keys) → block entire memory
+  MEDIUM (email, phone, SSN, credit card)    → redact in-place, keep memory structure
+  LOW    (usernames)                          → allow through unchanged
 
-Audit: blocked content is logged with content_hash (no raw content in logs).
+Audit: blocked/redacted content is logged with content_hash (no raw content in logs).
 """
 
 from __future__ import annotations
@@ -12,37 +13,75 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
-# Patterns that should never be persisted into mem_memories.
-_PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("email", re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}")),
-    ("phone", re.compile(r"\b\d{3}[-.]?\d{3,4}[-.]?\d{4}\b")),
-    ("ssn", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
-    ("credit_card", re.compile(r"\b(?:\d[ -]*?){13,19}\b")),
-    ("aws_key", re.compile(r"(?:AKIA|ABIA|ACCA|ASIA)[0-9A-Z]{16}")),
-    ("private_key", re.compile(r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----")),
-    ("bearer_token", re.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*", re.IGNORECASE)),
-    ("password_assignment", re.compile(r"(?:password|passwd|secret)\s*[:=]\s*\S+", re.IGNORECASE)),
+
+class SensitivityTier(str, Enum):
+    HIGH = "high"      # block
+    MEDIUM = "medium"  # redact
+    LOW = "low"        # allow
+
+
+# (label, tier, pattern, redact_replacement)
+_PATTERNS: list[tuple[str, SensitivityTier, re.Pattern, str]] = [
+    # HIGH — block
+    ("aws_key",            SensitivityTier.HIGH,   re.compile(r"(?:AKIA|ABIA|ACCA|ASIA)[0-9A-Z]{16}"), ""),
+    ("private_key",        SensitivityTier.HIGH,   re.compile(r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----"), ""),
+    ("bearer_token",       SensitivityTier.HIGH,   re.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*", re.IGNORECASE), ""),
+    ("password_assignment",SensitivityTier.HIGH,   re.compile(r"(?:password|passwd|secret)\s*[:=]\s*\S+", re.IGNORECASE), ""),
+    # MEDIUM — redact
+    ("email",              SensitivityTier.MEDIUM, re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}"), "[email]"),
+    ("phone",              SensitivityTier.MEDIUM, re.compile(r"\b\d{3}[-.]?\d{3,4}[-.]?\d{4}\b"), "[phone]"),
+    ("ssn",                SensitivityTier.MEDIUM, re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[ssn]"),
+    ("credit_card",        SensitivityTier.MEDIUM, re.compile(r"\b(?:\d[ -]*?){13,19}\b"), "[card]"),
 ]
 
 
 @dataclass
 class SensitivityResult:
     blocked: bool
-    matched_labels: list[str]
+    redacted_content: str | None  # None if not redacted; set to cleaned text if MEDIUM hits
+    matched_labels: list[str] = field(default_factory=list)
 
 
-def check_sensitivity(text: str) -> SensitivityResult:
-    """Return which sensitivity patterns matched. Empty = safe to persist."""
-    matched = [label for label, pat in _PATTERNS if pat.search(text)]
-    result = SensitivityResult(blocked=bool(matched), matched_labels=matched)
-    if result.blocked:
-        content_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
-        logger.warning(
-            "sensitivity_blocked",
-            extra={"labels": matched, "content_hash": content_hash},
+def check_sensitivity(text_: str) -> SensitivityResult:
+    """Classify and handle PII/credentials.
+
+    Returns:
+        SensitivityResult with:
+          blocked=True           → caller must discard the memory
+          redacted_content=str   → caller should use this cleaned text instead
+          redacted_content=None  → content is safe as-is
+    """
+    content_hash = hashlib.sha256(text_.encode()).hexdigest()[:16]
+
+    # Check HIGH tier first — any match blocks immediately
+    for label, tier, pat, _ in _PATTERNS:
+        if tier == SensitivityTier.HIGH and pat.search(text_):
+            logger.warning(
+                "sensitivity_blocked",
+                extra={"label": label, "content_hash": content_hash},
+            )
+            return SensitivityResult(blocked=True, redacted_content=None, matched_labels=[label])
+
+    # Check MEDIUM tier — redact all matches, keep memory
+    redacted = text_
+    medium_hits: list[str] = []
+    for label, tier, pat, replacement in _PATTERNS:
+        if tier == SensitivityTier.MEDIUM:
+            new_text, n = pat.subn(replacement, redacted)
+            if n:
+                medium_hits.append(label)
+                redacted = new_text
+
+    if medium_hits:
+        logger.info(
+            "sensitivity_redacted",
+            extra={"labels": medium_hits, "content_hash": content_hash},
         )
-    return result
+        return SensitivityResult(blocked=False, redacted_content=redacted, matched_labels=medium_hits)
+
+    return SensitivityResult(blocked=False, redacted_content=None, matched_labels=[])
