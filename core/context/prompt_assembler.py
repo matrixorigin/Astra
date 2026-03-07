@@ -912,6 +912,7 @@ class PromptAssembler(DbConsumer):
                     "count": tiered_stats.l1_count,
                     "tokens": tiered_stats.l1_tokens,
                     "ms": round(tiered_stats.l1_ms, 1),
+                    "error": tiered_stats.l1_error,
                 }
                 if tiered_stats.retrieval:
                     stats["retrieval"] = asdict(tiered_stats.retrieval)

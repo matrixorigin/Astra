@@ -35,6 +35,7 @@ class TieredLoaderStats:
     l1_count: int = 0
     l1_tokens: int = 0
     l1_ms: float = 0.0
+    l1_error: bool = False
     retrieval: RetrievalStats | None = None
     total_ms: float = 0.0
 
@@ -120,6 +121,7 @@ class TieredMemoryLoader:
             stats.l1_count = len(l1.split("\n")) - 1 if l1 else 0
             stats.l1_tokens = len(l1.split()) if l1 else 0
             stats.l1_ms = (time.time() - l1_start) * 1000
+            stats.l1_error = not l1 and retrieval_stats is None
             stats.retrieval = retrieval_stats
             stats.total_ms = (time.time() - start) * 1000
 

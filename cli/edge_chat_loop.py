@@ -359,11 +359,16 @@ def _print_explain(turns: list[dict[str, Any]], file: Any = None, verbose: bool 
                             w(f"{dim}  │    {preview[:100]}{reset}\n")
             elif ret and ret.get("error"):
                 w(f"{dim}  ├─ L1 retrieval  error: {ret.get('error')}{reset}\n")
+            elif l1 and l1.get("error"):
+                l1_ms = l1.get("ms", 0)
+                w(f"{dim}  ├─ L1 retrieval  {l1_ms:.0f}ms  error (no stats){reset}\n")
             elif l1 and l1.get("loaded"):
                 l1_tok = l1.get("tokens", 0)
                 l1_cnt = l1.get("count", 0)
                 l1_ms = l1.get("ms", 0)
                 w(f"{dim}  ├─ L1 retrieval  {l1_ms:.0f}ms  {l1_cnt} memories  {l1_tok} tokens{reset}\n")
+            elif l1 or ret:
+                w(f"{dim}  ├─ L1 retrieval  no results{reset}\n")
             elif mem.get("error"):
                 w(f"{dim}  ├─ memory  error: {mem['error']}{reset}\n")
 
