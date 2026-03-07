@@ -384,6 +384,23 @@ class TestGit:
         assert "modified content" in result or "diff" in result.lower()
 
     @pytest.mark.asyncio
+    async def test_git_diff_staged(self, git_project: Path):
+        """staged=True shows only cached changes, not unstaged ones."""
+        main_py = git_project / "src" / "main.py"
+        # Stage a change
+        main_py.write_text("staged line\n")
+        os.system(f"cd {git_project} && git add src/main.py")
+        # Make an unstaged change on a different file so we can distinguish
+        (git_project / "src" / "other.py").write_text("unstaged line\n")
+
+        tool = GitDiffTool(str(git_project))
+        staged_result = await tool.execute(staged=True)
+        unstaged_result = await tool.execute(staged=False)
+
+        assert "staged line" in staged_result
+        assert "unstaged line" not in staged_result
+
+    @pytest.mark.asyncio
     async def test_git_log(self, git_project: Path):
         tool = GitLogTool(str(git_project))
         result = await tool.execute(n=5)

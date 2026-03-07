@@ -17,6 +17,7 @@ def _make_chain(rows=None):
     chain = MagicMock()
     chain.join.return_value = chain
     chain.filter.return_value = chain
+    chain.add_columns.return_value = chain
     chain.order_by.return_value = chain
     chain.limit.return_value = chain
     chain.all.return_value = rows or []
@@ -40,8 +41,12 @@ def _make_event_row(event_id, sem=0.3, temp=0.05, chain_id=None):
     return r
 
 
-def _make_ft_row(event_id):
-    """Simulate an ORM row from the fulltext query."""
+def _make_ft_row(event_id, ft_score=999.0):
+    """Simulate an ORM row from the fulltext query.
+
+    ft_score=999.0 normalizes to ~1.0 via score/(score+1), so
+    keyword_score ≈ weights["keyword"] (default 0.25).
+    """
     r = MagicMock()
     r.event_id = event_id
     r.session_id = "sess_1"
@@ -51,6 +56,7 @@ def _make_ft_row(event_id):
     r.causal_chain_id = None
     r.parent_event_id = None
     r.event_metadata = {}
+    r.ft_score = ft_score
     return r
 
 

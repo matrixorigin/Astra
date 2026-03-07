@@ -16,11 +16,24 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
 from core.db_consumer import DbFactory
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
+
+
+class ToolFilter(str, Enum):
+    """Tool filtering mode derived from intent classification."""
+    NONE = "none"                # DEFAULT — no filtering
+    LOCAL_BLOCKED = "local_blocked"  # EXTERNAL_FETCH — block local tools
+    ALL_BLOCKED = "all_blocked"      # CONVERSATIONAL — block all tools
+
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -52,13 +65,26 @@ class Tier1Result:
     pruned_tools: list[str] | None = None
 
 
+MAX_TOOL_ROUNDS = 10  # Default max tool rounds (imported by chat_loop)
+
+
 @dataclass
 class RoutingDecision:
-    """Final routing decision passed to PromptAssembler."""
+    """Single source of truth for all intent-derived decisions.
+
+    All fields are guaranteed to be populated after IntentRouter.route() —
+    callers never need None-checks or fallback defaults.
+    """
     plan: ContextLoadingPlan
     routing_result: RoutingResult
     tier1_result: Tier1Result | None = None
     threshold_used: float = 0.85
+    # Tool filtering (absorbed from classify_intent / IntentClassification)
+    tool_filter: ToolFilter = ToolFilter.NONE
+    max_tool_rounds: int = MAX_TOOL_ROUNDS
+    # Task type + topic shift (absorbed from ContextManager.classify_task)
+    task_type: str = "general"  # code_review / debugging / planning / general
+    topic_shift_score: float = 0.0
 
 
 # Intent → ContextLoadingPlan (from doc "Context Loading by Intent" table)

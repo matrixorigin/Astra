@@ -1,14 +1,13 @@
 """MemoryRetriever — MO-native hybrid retrieval for the memories table.
 
 Scoring strategy (3 phases):
-  Phase 1: SQL-side — keyword filter (MATCH in WHERE) + temporal/confidence scoring
+  Phase 1: SQL-side — keyword filter (MATCH in WHERE) + BM25 scoring (MATCH in SELECT)
+           + temporal/confidence scoring
   Phase 2: SQL-side — vector candidates via L2_DISTANCE (when embedding provided)
   Phase 3: App-side — merge + re-rank using all 4 dimensions (vector, keyword, temporal, confidence)
 
-TODO: MO *does* support MATCH() AGAINST() in SELECT for continuous BM25 scoring
-(see FulltextSearchBuilder.with_score()). The current binary keyword signal
-(1.0 if matched, 0.0 if not) should be replaced with the actual fulltext score.
-Tracked in docs/design/intent-unification.md Phase 0.
+Keyword scoring uses MATCH() AGAINST() in SELECT to get continuous BM25 relevance,
+normalized to 0-1 via score/(score+1) saturating transform.
 
 Supports EXPLAIN ANALYZE mode: pass explain=True to get execution stats.
 """
@@ -21,7 +20,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from sqlalchemy import text
+from sqlalchemy import literal_column, text
 from sqlalchemy.sql import func
 
 from core.db_consumer import DbConsumer, DbFactory
@@ -65,7 +64,7 @@ class _Candidate:
     observed_at: object
     session_id: Optional[str]
     trust_tier: str = "T3"
-    keyword_matched: bool = False
+    keyword_score: float = 0.0  # Continuous BM25 score from MATCH AGAINST
     l2_dist: Optional[float] = None
 
 
@@ -207,13 +206,30 @@ class MemoryRetriever(DbConsumer):
             try:
                 from matrixone.sqlalchemy_ext import boolean_match
                 ft = boolean_match("content").must(query_text)
-                rows = _base_query().filter(ft).order_by(rel.desc()).limit(limit).all()
+                # SELECT the MATCH score as a continuous BM25 relevance value.
+                # compile() returns a complete SQL literal (e.g.
+                # "MATCH(content) AGAINST('+term' IN BOOLEAN MODE)") with the
+                # query text inlined by the SDK — no bind-parameter placeholders.
+                # We intentionally delegate escaping to the SDK rather than
+                # hand-rolling format()+replace("'","''"), which would be the
+                # classic SQL-injection anti-pattern.
+                ft_sql = ft.compile()
+                assert ft_sql.startswith("MATCH("), f"Unexpected ft.compile() output: {ft_sql!r}"
+                ft_score = literal_column(ft_sql).label("ft_score")
+                rows = (
+                    _base_query()
+                    .add_columns(ft_score)
+                    .filter(ft)
+                    .order_by(rel.desc())
+                    .limit(limit)
+                    .all()
+                )
                 if rows:
                     self._metrics.increment("retrieval_keyword_hits")
                     stats.keyword_hit = True
                     return [_Candidate(r.memory_id, r.content, r.memory_type, r.initial_confidence,
                                        r.observed_at, r.session_id, trust_tier=r.trust_tier or "T3",
-                                       keyword_matched=True) for r in rows], stats
+                                       keyword_score=float(r.ft_score or 0.0)) for r in rows], stats
             except Exception as e:
                 logger.debug("Keyword search failed: %s", e)
                 self._metrics.increment("retrieval_keyword_errors")
@@ -266,7 +282,9 @@ class MemoryRetriever(DbConsumer):
     def _score_candidate(self, c: _Candidate, weights: RetrievalWeights, now_ts: float) -> tuple[float, float, float, float, float]:
         """Compute 4-dimension scores + weighted final score for a candidate."""
         vec_score = 1.0 / (1.0 + c.l2_dist) if c.l2_dist is not None else 0.0
-        kw_score = 1.0 if c.keyword_matched else 0.0
+        # Normalize BM25 score to 0-1 via saturating transform: score/(score+1)
+        # BM25 scores are non-negative by definition; clamp to 0 defensively.
+        kw_score = max(0.0, c.keyword_score) / (max(0.0, c.keyword_score) + 1.0) if c.keyword_score > 0 else 0.0
 
         if c.observed_at:
             age_hours = (now_ts - c.observed_at.timestamp()) / 3600.0

@@ -59,17 +59,20 @@ class GitDiffTool(EdgeTool):
         self._root = project_root
 
     name = "git_diff"
-    description = "Show git diff. Optionally diff against a ref."
+    description = "Show git diff. Use staged=true to see changes staged for commit."
     parameters = {
         "type": "object",
         "properties": {
             "ref": {"type": "string", "description": "Git ref to diff against (e.g. HEAD~1, main)"},
+            "staged": {"type": "boolean", "description": "If true, show staged (cached) changes instead of unstaged"},
         },
     }
     side_effect = SideEffect.READ
 
-    async def execute(self, ref: str | None = None, **_: Any) -> str:
+    async def execute(self, ref: str | None = None, staged: bool = False, **_: Any) -> str:
         args = ["diff"]
+        if staged:
+            args.append("--cached")
         if ref:
             args.append(ref)
         return await _git(self._root, *args)

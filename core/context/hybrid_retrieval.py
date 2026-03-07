@@ -11,7 +11,7 @@ Each path runs as a separate ORM query; results are merged and reranked in Pytho
 
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import literal_column, text
 from sqlalchemy.sql import func
 
 from core.db_consumer import DbConsumer, DbFactory
@@ -95,19 +95,31 @@ class HybridRetriever(DbConsumer):
             try:
                 from matrixone.sqlalchemy_ext import boolean_match
                 ft = boolean_match("content", "session_id").must(query_text)
+                # compile() returns a complete SQL literal with the query text
+                # inlined by the SDK — no bind-parameter placeholders.  Escaping
+                # is the SDK's responsibility; manual format()+replace() would be
+                # the classic SQL-injection anti-pattern.
+                ft_sql = ft.compile()
+                assert ft_sql.startswith("MATCH("), f"Unexpected ft.compile() output: {ft_sql!r}"
+                ft_score_col = literal_column(ft_sql).label("ft_score")
                 rows = (
                     db.query(
                         Event.event_id, Event.session_id, Event.event_type,
                         Event.content, Event.created_at, Event.causal_chain_id,
                         Event.parent_event_id, Event.event_metadata,
+                        ft_score_col,
                     )
                     .filter(ft, Event.session_id == session_id)
                     .limit(limit)
                     .all()
                 )
                 for r in rows:
+                    # Normalize BM25 to 0-1, then scale by keyword weight
+                    raw_score = float(r.ft_score) if r.ft_score else 0.0
+                    norm_score = raw_score / (raw_score + 1.0) if raw_score > 0 else 0.0
+                    kw_score = weights["keyword"] * norm_score
                     if r.event_id in events_by_id:
-                        events_by_id[r.event_id]["keyword_score"] = weights["keyword"]
+                        events_by_id[r.event_id]["keyword_score"] = kw_score
                     else:
                         events_by_id[r.event_id] = {
                             "event_id": r.event_id,
@@ -119,7 +131,7 @@ class HybridRetriever(DbConsumer):
                             "parent_event_id": r.parent_event_id,
                             "metadata": r.event_metadata,
                             "vector_score": 0.0,
-                            "keyword_score": weights["keyword"],
+                            "keyword_score": kw_score,
                         }
             except Exception as e:
                 logger.warning("Fulltext search failed: %s", e)
@@ -190,31 +202,42 @@ class HybridRetriever(DbConsumer):
                         "relevance_score": float(r.sem) + float(r.conf),
                     }
 
-                # Fulltext boost — add keyword weight to matching entries
+                # Fulltext boost — add BM25-weighted keyword score to matching entries
                 try:
                     from matrixone.sqlalchemy_ext import boolean_match
                     ft = boolean_match("value").must(query_text)
+                    # compile() returns a complete SQL literal — see events
+                    # retrieval comment above for rationale.
+                    ft_sql = ft.compile()
+                    assert ft_sql.startswith("MATCH("), f"Unexpected ft.compile() output: {ft_sql!r}"
+                    ft_score_col = literal_column(ft_sql).label("ft_score")
                     ft_rows = (
-                        db.query(K.entry_id)
+                        db.query(K.entry_id, ft_score_col)
                         .filter(ft, K.user_id == user_id, K.confidence > confidence_threshold)
                         .limit(limit)
                         .all()
                     )
                     for r in ft_rows:
+                        raw = float(r.ft_score) if r.ft_score else 0.0
+                        norm = raw / (raw + 1.0) if raw > 0 else 0.0
+                        kw_boost = weights["keyword"] * norm
                         if r.entry_id in entries_by_id:
-                            entries_by_id[r.entry_id]["relevance_score"] += weights["keyword"]
+                            entries_by_id[r.entry_id]["relevance_score"] += kw_boost
                     # Batch-fetch fulltext-only hits
                     new_ids = [r.entry_id for r in ft_rows if r.entry_id not in entries_by_id]
+                    ft_scores = {r.entry_id: float(r.ft_score) for r in ft_rows}
                     if new_ids:
                         full_rows = db.query(K).filter(K.entry_id.in_(new_ids)).all()
                         for full in full_rows:
+                            raw = ft_scores.get(full.entry_id, 0.0)
+                            norm = raw / (raw + 1.0) if raw > 0 else 0.0
                             entries_by_id[full.entry_id] = {
                                 "entry_id": full.entry_id, "category": full.category,
                                 "key_name": full.key_name, "value": full.value,
                                 "confidence": float(full.confidence), "trust_tier": full.trust_tier,
                                 "created_at": full.created_at.isoformat() if full.created_at else None,
                                 "last_validated_at": full.last_validated_at.isoformat() if full.last_validated_at else None,
-                                "relevance_score": weights["keyword"] + weights["confidence"] * float(full.confidence),
+                                "relevance_score": weights["keyword"] * norm + weights["confidence"] * float(full.confidence),
                             }
                 except Exception as e:
                     logger.warning("Knowledge fulltext search failed (non-fatal): %s", e)

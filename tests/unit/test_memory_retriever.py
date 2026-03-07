@@ -13,6 +13,7 @@ def _make_chain(rows=None):
     """Chainable ORM query mock."""
     chain = MagicMock()
     chain.filter.return_value = chain
+    chain.add_columns.return_value = chain
     chain.order_by.return_value = chain
     chain.limit.return_value = chain
     chain.all.return_value = rows or []
@@ -21,7 +22,7 @@ def _make_chain(rows=None):
 
 def _mem_row(memory_id, content="text", memory_type="semantic",
              confidence=0.8, observed_at=None, session_id=None,
-             trust_tier="T3", relevance=1.0):
+             trust_tier="T3", relevance=1.0, ft_score=1.0):
     """Simulate an ORM result row from _phase1."""
     r = MagicMock()
     r.memory_id = memory_id
@@ -32,6 +33,7 @@ def _mem_row(memory_id, content="text", memory_type="semantic",
     r.session_id = session_id
     r.trust_tier = trust_tier
     r.relevance = relevance
+    r.ft_score = ft_score
     return r
 
 
@@ -190,3 +192,38 @@ class TestRetrieveExplain:
 
         _, stats = retriever.retrieve("u1", "test", session_id="s1", explain=False)
         assert stats is None
+
+
+# ---------------------------------------------------------------------------
+# BM25 normalization: score/(score+1) saturating transform
+# ---------------------------------------------------------------------------
+
+class TestBM25Normalization:
+    """Verify the saturating transform used for keyword_score."""
+
+    @pytest.fixture
+    def retriever(self):
+        return MemoryRetriever(db_factory=MagicMock(), metrics=MagicMock())
+
+    def _make_candidate(self, keyword_score: float):
+        from core.memory.retriever import _Candidate
+        return _Candidate(
+            memory_id="m1", content="x", memory_type="preference",
+            initial_confidence=0.9, observed_at=datetime.now(timezone.utc),
+            session_id="s1", keyword_score=keyword_score,
+        )
+
+    @pytest.mark.parametrize("raw,expected_approx", [
+        (0.0, 0.0),
+        (1.0, 0.5),
+        (9.0, 0.9),
+        (999.0, 0.999),
+        (-1.0, 0.0),   # negative clamped to 0
+    ])
+    def test_bm25_score_normalization(self, retriever, raw, expected_approx):
+        from core.memory.retriever import RetrievalWeights
+        w = RetrievalWeights(vector=0, keyword=1, temporal=0, confidence=0)
+        c = self._make_candidate(raw)
+        final, _, kw, _, _ = retriever._score_candidate(c, w, datetime.now(timezone.utc).timestamp())
+        assert abs(kw - expected_approx) < 0.01, f"raw={raw} → kw={kw}, expected≈{expected_approx}"
+        assert final == pytest.approx(kw)  # keyword weight=1, others=0

@@ -49,13 +49,14 @@ class TestVectorRetrieval:
     def _make_chain(rows=None):
         chain = MagicMock()
         chain.filter.return_value = chain
+        chain.add_columns.return_value = chain
         chain.order_by.return_value = chain
         chain.limit.return_value = chain
         chain.all.return_value = rows or []
         return chain
 
     @staticmethod
-    def _orm_row(mid, content, mtype, conf, observed_at, session_id, trust_tier, relevance=1.0, l2_dist=None):
+    def _orm_row(mid, content, mtype, conf, observed_at, session_id, trust_tier, relevance=1.0, l2_dist=None, ft_score=1.0):
         r = MagicMock()
         r.memory_id = mid
         r.content = content
@@ -65,6 +66,7 @@ class TestVectorRetrieval:
         r.session_id = session_id
         r.trust_tier = trust_tier
         r.relevance = relevance
+        r.ft_score = ft_score
         if l2_dist is not None:
             r.l2_dist = l2_dist
         return r
@@ -589,6 +591,7 @@ class TestExplainAnalyze:
     def _make_chain(rows=None):
         chain = MagicMock()
         chain.filter.return_value = chain
+        chain.add_columns.return_value = chain
         chain.order_by.return_value = chain
         chain.limit.return_value = chain
         chain.all.return_value = rows or []
