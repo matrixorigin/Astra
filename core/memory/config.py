@@ -32,6 +32,9 @@ class MemoryGovernanceConfig:
     session_summary_turn_threshold: int = 10
     session_summary_time_threshold_hours: float = 10 / 60  # 10 minutes
 
+    # Backend selector: "tabular" or "graph"
+    memory_backend: str = "tabular"
+
 
 # Default config instance
 DEFAULT_CONFIG = MemoryGovernanceConfig()

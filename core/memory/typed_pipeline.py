@@ -17,12 +17,12 @@ from typing import Any, Optional
 
 from core.db_consumer import DbFactory
 from core.memory.config import MemoryGovernanceConfig, DEFAULT_CONFIG
-from core.memory.explain import ObserverStats, SandboxStats, PipelineStats
-from core.memory.metrics import MemoryMetrics
-from core.memory.store import MemoryStore
-from core.memory.typed_observer import TypedObserver
-from core.memory.sandbox import MemorySandbox
-from core.memory.profile import ProfileManager
+from core.memory.tabular.explain import ObserverStats, SandboxStats, PipelineStats
+from core.memory.tabular.metrics import MemoryMetrics
+from core.memory.tabular.store import MemoryStore
+from core.memory.tabular.typed_observer import TypedObserver
+from core.memory.tabular.sandbox import MemorySandbox
+from core.memory.tabular.profile import ProfileManager
 from core.memory.types import Memory
 
 logger = logging.getLogger(__name__)
