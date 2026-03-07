@@ -825,3 +825,83 @@ def get_retrieval_quality(
         "mean_relevance": overall_mean,
         "recommendation": "consider context reset or re-retrieval" if overall_quality in ("degrading", "poor") else "retrieval healthy",
     }
+
+
+@router.get("/introspection/memory/recall")
+def get_memory_recall(
+    session_id: str = Query(..., description="Session to query memories for"),
+    query: str = Query(..., description="The recall query to explain"),
+    task_hint: str = Query("default", description="Task type: code, reasoning, recall, default"),
+    limit: int = Query(10, ge=1, le=50),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+) -> dict:
+    """Run a memory recall with full scoring breakdown.
+
+    Returns per-candidate scores across all 4 dimensions (vector, keyword,
+    temporal, confidence) so AI/humans can answer "why was this memory
+    ranked here?" without guessing.
+    """
+    user_id = current_user["user_id"]
+    _verify_session_owner(db, session_id, user_id)
+
+    from api.database import SessionLocal
+    from core.memory.retriever import MemoryRetriever
+
+    # SessionLocal (not lambda: db) because DbConsumer._db() closes the session
+    # on block exit — passing the request-scoped db would break subsequent usage.
+    retriever = MemoryRetriever(db_factory=SessionLocal)
+    memories, stats = retriever.retrieve(
+        user_id=user_id,
+        query_text=query,
+        session_id=session_id,
+        limit=limit,
+        task_hint=task_hint,
+        explain=True,
+    )
+
+    result: dict = {
+        "query": query,
+        "task_hint": task_hint,
+        "retrieved_count": len(memories),
+        "phases": {
+            "keyword": {
+                "attempted": stats.keyword_attempted,
+                "hit": stats.keyword_hit,
+                "candidates": stats.phase1_candidates,
+                "error": stats.keyword_error,
+                "ms": round(stats.phase1_ms, 1),
+            },
+            "vector": {
+                "attempted": stats.vector_attempted,
+                "hit": stats.vector_hit,
+                "candidates": stats.phase2_candidates,
+                "error": stats.vector_error,
+                "ms": round(stats.phase2_ms, 1),
+            },
+            "merge": {
+                "input_candidates": stats.merged_candidates,
+                "output_count": stats.final_count,
+                "ms": round(stats.merge_ms, 1),
+            },
+        },
+        "total_ms": round(stats.total_ms, 1),
+    }
+
+    if stats.candidate_scores:
+        result["ranking"] = [
+            {
+                "rank": cs.rank,
+                "memory_id": cs.memory_id,
+                "final_score": cs.final_score,
+                "scores": {
+                    "vector": cs.vector_score,
+                    "keyword": cs.keyword_score,
+                    "temporal": cs.temporal_score,
+                    "confidence": cs.confidence_score,
+                },
+            }
+            for cs in stats.candidate_scores
+        ]
+
+    return result

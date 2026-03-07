@@ -1114,3 +1114,157 @@ class TestRetrievalQuality:
     def test_requires_auth(self, client):
         resp = client.get("/introspection/context/retrieval_quality", params={"session_id": "any"})
         assert resp.status_code in (401, 403)
+
+
+# ============================================================================
+# /introspection/memory/recall
+# ============================================================================
+
+class TestMemoryRecallExplain:
+    """Test GET /introspection/memory/recall — per-candidate scoring breakdown."""
+
+    def _seed_memories(self, db, user_id: str, session_id: str):
+        """Insert test memories with varying confidence and timestamps."""
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        memories = []
+        for i, (content, conf, age_days) in enumerate([
+            ("Python async patterns", 0.9, 1),
+            ("Go concurrency model", 0.7, 10),
+            ("Rust ownership rules", 0.5, 30),
+        ]):
+            mid = str(uuid4())
+            observed = now - timedelta(days=age_days)
+            db.execute(text(
+                "INSERT INTO mem_memories "
+                "(memory_id, user_id, memory_type, content, initial_confidence, "
+                " trust_tier, is_active, session_id, source_event_ids, observed_at, created_at) "
+                "VALUES (:mid, :uid, 'semantic', :content, :conf, "
+                " 'T3', 1, :sid, '[]', :obs, :obs)"
+            ), {
+                "mid": mid, "uid": user_id, "content": content,
+                "conf": conf, "sid": session_id, "obs": observed,
+            })
+            memories.append(mid)
+        db.commit()
+        return memories
+
+    def test_recall_returns_ranking_with_scores(self, client, auth_headers, db, test_user):
+        """Recall endpoint returns per-candidate 4-dimension score breakdown."""
+        from api.models.agent import Session as SessionModel
+        session = SessionModel(
+            session_id=str(uuid4()), user_id=test_user.user_id,
+            status="active", event_count=0,
+        )
+        db.add(session)
+        db.commit()
+        mem_ids = self._seed_memories(db, test_user.user_id, session.session_id)
+        try:
+            resp = client.get(
+                "/introspection/memory/recall",
+                headers=auth_headers,
+                params={
+                    "session_id": session.session_id,
+                    "query": "Python async",
+                    "task_hint": "code",
+                    "limit": 10,
+                },
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+
+            # Top-level fields
+            assert data["query"] == "Python async"
+            assert data["task_hint"] == "code"
+            assert data["retrieved_count"] >= 1
+            assert data["total_ms"] >= 0
+
+            # Phase stats present
+            assert "phases" in data
+            assert "keyword" in data["phases"]
+            assert "vector" in data["phases"]
+            assert "merge" in data["phases"]
+
+            # Ranking with per-candidate scores
+            assert "ranking" in data
+            ranking = data["ranking"]
+            assert len(ranking) >= 1
+
+            for entry in ranking:
+                assert "rank" in entry
+                assert "memory_id" in entry
+                assert entry["memory_id"] in set(mem_ids)  # must be from seeded data
+                assert "final_score" in entry
+                assert "scores" in entry
+                scores = entry["scores"]
+                assert "vector" in scores
+                assert "keyword" in scores
+                assert "temporal" in scores
+                assert "confidence" in scores
+                # All scores non-negative
+                for dim in ("vector", "keyword", "temporal", "confidence"):
+                    assert scores[dim] >= 0
+
+            # Ranks are sequential
+            ranks = [e["rank"] for e in ranking]
+            assert ranks == list(range(1, len(ranking) + 1))
+
+            # Final scores are non-increasing (pairwise, tolerates ties)
+            final_scores = [e["final_score"] for e in ranking]
+            for a, b in zip(final_scores, final_scores[1:]):
+                assert a >= b
+
+        finally:
+            db.execute(text("DELETE FROM mem_memories WHERE user_id = :uid"),
+                       {"uid": test_user.user_id})
+            db.delete(session)
+            db.commit()
+
+    def test_recall_empty_session(self, client, auth_headers, db, test_user):
+        """Recall on session with no memories returns empty ranking."""
+        from api.models.agent import Session as SessionModel
+        session = SessionModel(
+            session_id=str(uuid4()), user_id=test_user.user_id,
+            status="active", event_count=0,
+        )
+        db.add(session)
+        db.commit()
+        try:
+            resp = client.get(
+                "/introspection/memory/recall",
+                headers=auth_headers,
+                params={"session_id": session.session_id, "query": "anything"},
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["retrieved_count"] == 0
+            # No ranking key when no candidates scored
+            assert "ranking" not in data or len(data.get("ranking", [])) == 0
+        finally:
+            db.delete(session)
+            db.commit()
+
+    def test_recall_requires_auth(self, client):
+        resp = client.get("/introspection/memory/recall",
+                          params={"session_id": "any", "query": "test"})
+        assert resp.status_code in (401, 403)
+
+    def test_recall_other_user_denied(self, client, auth_headers, db, test_user):
+        """Cannot explain recall for another user's session."""
+        from api.models.agent import Session as SessionModel
+        other_session = SessionModel(
+            session_id=str(uuid4()), user_id="other-user-id",
+            status="active", event_count=0,
+        )
+        db.add(other_session)
+        db.commit()
+        try:
+            resp = client.get(
+                "/introspection/memory/recall",
+                headers=auth_headers,
+                params={"session_id": other_session.session_id, "query": "test"},
+            )
+            assert resp.status_code == 404
+        finally:
+            db.delete(other_session)
+            db.commit()

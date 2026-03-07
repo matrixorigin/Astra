@@ -19,6 +19,19 @@ from typing import Optional
 
 
 @dataclass
+class CandidateScore:
+    """Per-candidate scoring breakdown — answers 'why is this memory ranked here?'"""
+
+    memory_id: str
+    final_score: float
+    vector_score: float
+    keyword_score: float
+    temporal_score: float
+    confidence_score: float
+    rank: int  # 1-based position in final ranking
+
+
+@dataclass
 class RetrievalStats:
     """Phase-level stats for hybrid retrieval."""
     
@@ -37,6 +50,7 @@ class RetrievalStats:
     # Phase 3: merge
     merged_candidates: int = 0
     final_count: int = 0
+    candidate_scores: list[CandidateScore] = field(default_factory=list)
     
     # Timing (ms)
     phase1_ms: float = 0.0

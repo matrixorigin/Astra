@@ -66,3 +66,45 @@ class TestGetAgentInfo:
         assert "state" in data
         assert "memory" in data
         assert "capability" in data
+
+    @pytest.mark.asyncio
+    async def test_memory_recall_calls_api(self):
+        """dimension=memory_recall calls get_introspection_recall with query."""
+        from unittest.mock import AsyncMock
+
+        from cli.tools.introspection import GetAgentInfoTool
+
+        mock_api = AsyncMock()
+        mock_api.get_introspection_recall.return_value = {
+            "query": "Python async",
+            "retrieved_count": 2,
+            "ranking": [
+                {"rank": 1, "memory_id": "m1", "final_score": 0.8,
+                 "scores": {"vector": 0.0, "keyword": 1.0, "temporal": 0.9, "confidence": 0.7}},
+            ],
+        }
+
+        tool = GetAgentInfoTool(
+            api_client=mock_api,
+            session_info={"session_id": "s1"},
+        )
+        result = await tool.execute(dimension="memory_recall", query="Python async")
+        data = json.loads(result)
+
+        assert "memory_recall" in data
+        assert data["memory_recall"]["retrieved_count"] == 2
+        assert data["memory_recall"]["ranking"][0]["memory_id"] == "m1"
+        mock_api.get_introspection_recall.assert_called_once_with(
+            "s1", query="Python async",
+        )
+
+    @pytest.mark.asyncio
+    async def test_memory_recall_requires_query(self):
+        """dimension=memory_recall without query returns error."""
+        from cli.tools.introspection import GetAgentInfoTool
+
+        tool = GetAgentInfoTool(session_info={"session_id": "s1"})
+        result = await tool.execute(dimension="memory_recall")
+        data = json.loads(result)
+
+        assert data["memory_recall"]["error"] == "query parameter is required for memory_recall"

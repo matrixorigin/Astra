@@ -144,3 +144,49 @@ class TestRetrieveExplain:
     def test_no_explain_returns_none(self, retriever, mock_db):
         _, stats = retriever.retrieve("u1", "test", session_id="s1", explain=False)
         assert stats is None
+
+    def test_explain_candidate_scores_populated(self, retriever, mock_db):
+        """explain=True with hybrid merge should populate per-candidate score breakdown."""
+        rows_p1 = [_mem_row("m1", "Go testing"), _mem_row("m2", "Python flask")]
+        rows_p2 = [_vec_row("m1", l2_dist=0.3), _vec_row("m3", l2_dist=0.8)]
+
+        call_count = 0
+
+        def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 1:
+                return _make_chain(rows_p1)
+            return _make_chain(rows_p2)
+
+        mock_db.query.side_effect = side_effect
+
+        memories, stats = retriever.retrieve(
+            "u1", "Go testing", session_id="s1",
+            query_embedding=[0.1] * 384, explain=True,
+        )
+        assert stats is not None
+        assert len(stats.candidate_scores) == len(memories)
+
+        # Verify score breakdown fields are present and ordered by rank
+        for i, cs in enumerate(stats.candidate_scores):
+            assert cs.rank == i + 1
+            assert cs.memory_id in {"m1", "m2", "m3"}
+            assert cs.final_score > 0
+            # All 4 dimension scores should be non-negative
+            assert cs.vector_score >= 0
+            assert cs.keyword_score >= 0
+            assert cs.temporal_score >= 0
+            assert cs.confidence_score >= 0
+
+        # Scores should be descending
+        scores = [cs.final_score for cs in stats.candidate_scores]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_explain_no_candidate_scores_without_explain(self, retriever, mock_db):
+        """explain=False should not populate candidate_scores."""
+        rows = [_mem_row("m1")]
+        mock_db.query.return_value = _make_chain(rows)
+
+        _, stats = retriever.retrieve("u1", "test", session_id="s1", explain=False)
+        assert stats is None

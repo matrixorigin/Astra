@@ -24,7 +24,7 @@ from sqlalchemy import text
 from sqlalchemy.sql import func
 
 from core.db_consumer import DbConsumer, DbFactory
-from core.memory.explain import RetrievalStats
+from core.memory.explain import CandidateScore, RetrievalStats
 from core.memory.metrics import MemoryMetrics, Timer
 from core.memory.types import TRUST_TIER_HALF_LIVES, Memory, MemoryType, RetrievalWeights, TrustTier
 
@@ -141,6 +141,11 @@ class MemoryRetriever(DbConsumer):
             if not query_embedding:
                 memories = [self._to_memory(c, user_id) for c in phase1[:limit]]
                 if stats:
+                    # Annotate scores for explain without re-ranking — preserve
+                    # SQL-side ordering which uses DB-native temporal/confidence
+                    # scoring (timestampdiff + exp).  App-side _merge uses
+                    # Python time.time() + math.exp which can differ slightly.
+                    self._annotate_scores(phase1[:limit], weights, stats)
                     stats.final_count = len(memories)
                     stats.total_ms = (time.time() - start) * 1000
                 return memories, stats
@@ -157,7 +162,7 @@ class MemoryRetriever(DbConsumer):
 
             # Phase 3: merge
             merge_start = time.time() if explain else 0
-            memories = self._merge(phase1, phase2, user_id, weights, limit)
+            memories = self._merge(phase1, phase2, user_id, weights, limit, stats=stats)
             if stats:
                 stats.merged_candidates = len({c.memory_id for c in phase1} | {c.memory_id for c in phase2})
                 stats.final_count = len(memories)
@@ -257,9 +262,51 @@ class MemoryRetriever(DbConsumer):
             stats.vector_error = str(e)
             return [], stats
 
+    def _score_candidate(self, c: _Candidate, weights: RetrievalWeights, now_ts: float) -> tuple[float, float, float, float, float]:
+        """Compute 4-dimension scores + weighted final score for a candidate."""
+        vec_score = 1.0 / (1.0 + c.l2_dist) if c.l2_dist is not None else 0.0
+        kw_score = 1.0 if c.keyword_matched else 0.0
+
+        if c.observed_at:
+            age_hours = (now_ts - c.observed_at.timestamp()) / 3600.0
+            time_score = _safe_exp(-age_hours / self.decay_hours)
+            age_days = age_hours / 24.0
+            tier_half_life = TRUST_TIER_HALF_LIVES.get(TrustTier(c.trust_tier), self.half_life_days)
+            conf_score = c.initial_confidence * _safe_exp(-age_days / tier_half_life)
+        else:
+            time_score, conf_score = 0.0, c.initial_confidence
+
+        final = (weights.vector * vec_score + weights.keyword * kw_score +
+                 weights.temporal * time_score + weights.confidence * conf_score)
+        return final, vec_score, kw_score, time_score, conf_score
+
+    def _annotate_scores(
+        self, candidates: list[_Candidate], weights: RetrievalWeights,
+        stats: RetrievalStats,
+    ) -> None:
+        """Compute per-candidate scores for explain mode without re-ranking.
+
+        Used by the keyword-only path where SQL-side ordering must be preserved.
+        """
+        now_ts = time.time()
+        scores = []
+        for i, c in enumerate(candidates):
+            sc = self._score_candidate(c, weights, now_ts)
+            scores.append(CandidateScore(
+                memory_id=c.memory_id,
+                final_score=round(sc[0], 4),
+                vector_score=round(sc[1], 4),
+                keyword_score=round(sc[2], 4),
+                temporal_score=round(sc[3], 4),
+                confidence_score=round(sc[4], 4),
+                rank=i + 1,
+            ))
+        stats.candidate_scores = scores
+
     def _merge(
         self, phase1: list[_Candidate], phase2: list[_Candidate],
         user_id: str, weights: RetrievalWeights, limit: int,
+        stats: Optional[RetrievalStats] = None,
     ) -> list[Memory]:
         merged: dict[str, _Candidate] = {}
         for c in phase1:
@@ -274,25 +321,34 @@ class MemoryRetriever(DbConsumer):
             return []
 
         now_ts = time.time()
-        scored: list[tuple[float, _Candidate]] = []
 
-        for c in merged.values():
-            vec_score = 1.0 / (1.0 + c.l2_dist) if c.l2_dist is not None else 0.0
-            kw_score = 1.0 if c.keyword_matched else 0.0
+        if stats:
+            # Compute full breakdown once, sort by final, then extract scores
+            scored_full = [
+                (self._score_candidate(c, weights, now_ts), c)
+                for c in merged.values()
+            ]
+            scored_full.sort(key=lambda x: x[0][0], reverse=True)
+            selected = scored_full[:limit]
+            stats.candidate_scores = [
+                CandidateScore(
+                    memory_id=c.memory_id,
+                    final_score=round(sc[0], 4),
+                    vector_score=round(sc[1], 4),
+                    keyword_score=round(sc[2], 4),
+                    temporal_score=round(sc[3], 4),
+                    confidence_score=round(sc[4], 4),
+                    rank=i + 1,
+                )
+                for i, (sc, c) in enumerate(selected)
+            ]
+            return [self._to_memory(c, user_id) for _, c in selected]
 
-            if c.observed_at:
-                age_hours = (now_ts - c.observed_at.timestamp()) / 3600.0
-                time_score = _safe_exp(-age_hours / self.decay_hours)
-                age_days = age_hours / 24.0
-                tier_half_life = TRUST_TIER_HALF_LIVES.get(TrustTier(c.trust_tier), self.half_life_days)
-                conf_score = c.initial_confidence * _safe_exp(-age_days / tier_half_life)
-            else:
-                time_score, conf_score = 0.0, c.initial_confidence
-
-            final = (weights.vector * vec_score + weights.keyword * kw_score +
-                     weights.temporal * time_score + weights.confidence * conf_score)
-            scored.append((final, c))
-
+        # Hot path: only compute final score, skip per-dimension breakdown
+        scored = [
+            (self._score_candidate(c, weights, now_ts)[0], c)
+            for c in merged.values()
+        ]
         scored.sort(key=lambda x: x[0], reverse=True)
         return [self._to_memory(c, user_id) for _, c in scored[:limit]]
 

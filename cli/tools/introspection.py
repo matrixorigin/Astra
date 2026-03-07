@@ -53,9 +53,11 @@ class GetAgentInfoTool(EdgeTool):
             "properties": {
                 "dimension": {
                     "type": "string",
-                    "enum": ["capability", "state", "memory", "identity", "context_snapshot", "context_trend", "retrieval_quality", "all"],
+                    "enum": ["capability", "state", "memory", "memory_recall", "identity", "context_snapshot", "context_trend", "retrieval_quality", "all"],
                     "description": (
                         "Which dimension to query. "
+                        "'memory_recall': explain why specific memories were retrieved for a query — "
+                        "shows per-candidate scores across vector/keyword/temporal/confidence. "
                         "'context_snapshot': token usage, zone balance, relevance for a specific turn. "
                         "'context_trend': token growth across recent turns. "
                         "'retrieval_quality': memory retrieval effectiveness. "
@@ -66,6 +68,10 @@ class GetAgentInfoTool(EdgeTool):
                     "type": "integer",
                     "description": "For context_snapshot: which turn to inspect (1-based). Omit for latest turn.",
                 },
+                "query": {
+                    "type": "string",
+                    "description": "For memory_recall: the query to explain recall for.",
+                },
             },
             "required": ["dimension"],
         }
@@ -74,7 +80,7 @@ class GetAgentInfoTool(EdgeTool):
     def side_effect(self) -> SideEffect:
         return SideEffect.READ
 
-    _VALID_DIMENSIONS = {"capability", "state", "memory", "identity", "context_snapshot", "context_trend", "retrieval_quality", "all"}
+    _VALID_DIMENSIONS = {"capability", "state", "memory", "memory_recall", "identity", "context_snapshot", "context_trend", "retrieval_quality", "all"}
 
     async def execute(self, dimension: str = "all", **kwargs: Any) -> str:
         if dimension not in self._VALID_DIMENSIONS:
@@ -168,5 +174,19 @@ class GetAgentInfoTool(EdgeTool):
                     info["retrieval_quality"] = {"error": str(exc)}
             else:
                 info["retrieval_quality"] = {"error": "no session or api_client"}
+
+        if dimension in ("memory_recall",):
+            query = kwargs.get("query", "")
+            if not query:
+                info["memory_recall"] = {"error": "query parameter is required for memory_recall"}
+            elif self._api_client and session_id:
+                try:
+                    info["memory_recall"] = await self._api_client.get_introspection_recall(
+                        session_id, query=query,
+                    )
+                except Exception as exc:
+                    info["memory_recall"] = {"error": str(exc)}
+            else:
+                info["memory_recall"] = {"error": "no session or api_client"}
 
         return json.dumps(info, indent=2)

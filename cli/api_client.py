@@ -999,6 +999,16 @@ class APIClient:
         response = await self._request("GET", "/introspection/skills")
         return response.json()
 
+    async def get_introspection_recall(
+        self, session_id: str, query: str, task_hint: str = "default", limit: int = 10
+    ) -> dict[str, Any]:
+        """Explain a memory recall — per-candidate scoring breakdown."""
+        response = await self._request(
+            "GET", "/introspection/memory/recall",
+            params={"session_id": session_id, "query": query, "task_hint": task_hint, "limit": limit},
+        )
+        return response.json()
+
     async def get_introspection_context_snapshot(
         self, session_id: str, turn_index: int | None = None, detail: bool = False
     ) -> dict[str, Any]:

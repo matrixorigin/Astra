@@ -294,7 +294,7 @@ class TestToolRegistration:
         params = info_schema["function"]["parameters"]
         assert "dimension" in params["properties"]
         assert set(params["properties"]["dimension"]["enum"]) == {
-            "capability", "state", "memory", "identity", "all",
+            "capability", "state", "memory", "memory_recall", "identity", "all",
             "context_snapshot", "context_trend", "retrieval_quality",
         }
 
@@ -635,10 +635,11 @@ class TestIntrospectionMemoryEndpoint:
         assert user_row, "Test user should exist"
         user_id = user_row[0]
 
-        # Create session
+        # Create session (updated_at must be explicit — MatrixOne does not
+        # support the ON UPDATE default that SQLAlchemy emits in DDL)
         db_session.execute(sql_text("""
-            INSERT INTO agent_sessions (session_id, user_id, agent_id, status, event_count, created_at, last_active_at)
-            VALUES (:sid, :uid, 'test', 'active', 0, NOW(), NOW())
+            INSERT INTO agent_sessions (session_id, user_id, agent_id, status, event_count, created_at, last_active_at, updated_at)
+            VALUES (:sid, :uid, 'test', 'active', 0, NOW(), NOW(), NOW())
         """), {"sid": session_id, "uid": user_id})
         db_session.commit()
 
