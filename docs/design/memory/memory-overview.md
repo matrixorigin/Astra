@@ -748,31 +748,35 @@ This treats internal implementation as public API — any refactoring of memory 
 ### Interface Definition
 
 ```python
-# core/memory/interfaces.py
+# core/memory/interfaces.py — canonical signatures (see source file for full docstrings)
 
 class MemoryReader(Protocol):
     def retrieve(self, user_id: str, query: str, *,
+                 session_id: str = "",
+                 query_embedding: list[float] | None = None,
+                 memory_types: list[MemoryType] | None = None,
                  top_k: int = 10,
+                 task_hint: str | None = None,
                  weights: RetrievalWeights | None = None,
+                 include_cross_session: bool = True,
                  ) -> list[Memory]: ...
     def get_profile(self, user_id: str) -> str | None: ...
 
 class MemoryWriter(Protocol):
     def store(self, user_id: str, content: str, *,
-              memory_type: MemoryType, source: str,
+              memory_type: MemoryType,
+              source_event_ids: list[str] | None = None,
+              initial_confidence: float = 0.75,
+              trust_tier: TrustTier | None = None,
+              session_id: str | None = None,
               ) -> Memory: ...
-    def observe_turn(self, user_id: str, messages: list[dict],
+    def observe_turn(self, user_id: str, messages: list[dict[str, Any]], *,
+                     source_event_ids: list[str] | None = None,
                      ) -> list[Memory]: ...
 
 class MemoryAdmin(Protocol):
     def run_governance(self, user_id: str) -> GovernanceReport: ...
     def health_check(self, user_id: str) -> HealthReport: ...
-
-class MemoryService:
-    """Single entry point. All external consumers use this."""
-    reader: MemoryReader
-    writer: MemoryWriter
-    admin: MemoryAdmin
 ```
 
 ### Migration: TieredMemoryLoader → Context Module
