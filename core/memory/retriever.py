@@ -5,9 +5,10 @@ Scoring strategy (3 phases):
   Phase 2: SQL-side — vector candidates via L2_DISTANCE (when embedding provided)
   Phase 3: App-side — merge + re-rank using all 4 dimensions (vector, keyword, temporal, confidence)
 
-MO Fulltext Limitation: MATCH() AGAINST() can only be used in WHERE clause
-for filtering, not in SELECT for arithmetic scoring. So keyword presence is
-a binary signal (1.0 if matched, 0.0 if not) rather than a continuous score.
+TODO: MO *does* support MATCH() AGAINST() in SELECT for continuous BM25 scoring
+(see FulltextSearchBuilder.with_score()). The current binary keyword signal
+(1.0 if matched, 0.0 if not) should be replaced with the actual fulltext score.
+Tracked in docs/design/intent-unification.md Phase 0.
 
 Supports EXPLAIN ANALYZE mode: pass explain=True to get execution stats.
 """
