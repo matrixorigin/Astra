@@ -19,11 +19,13 @@ The codebase has three disconnected intent classification systems that independe
 
 1. **Redundant classification**: Three keyword-matching passes over the same query. System 1 checks "search online" / "hello". System 2 checks "remember" / "run" / "wrong". System 3 checks "review" / "debug" / "plan". None shares results.
 
-2. **Inconsistent signals**: System 1 runs in `chat_loop.py` *after* tool selection. System 2 runs in `prompt_assembler.py` *during* prompt assembly. System 3 runs in `manager.py` *during* context building. The order is: 3 → 2 → 1, but they don't communicate.
+2. **Inconsistent call sites**: System 2 runs in `api/routers/chat.py` (the `/chat/turn` endpoint) and passes `routing_decision` to `PromptAssembler.assemble()`. System 1 runs in `chat_loop.py` (the streaming loop) *after* tool selection. System 3 runs in `manager.py` *during* `build_context()`. These are two separate code paths (`/chat/turn` vs `chat_loop.stream_chat`) that don't share routing results.
 
-3. **No unified event**: `chat_loop.py` logs `stream_intent_classification` for System 1 only. Systems 2 and 3 produce no auditable event. We can't reconstruct what the agent "thought" about intent.
+3. **No unified event**: `chat_loop.py` logs `stream_intent_classification` for System 1. `api/routers/chat.py` logs a `routing_decision` event for System 2. System 3 produces no auditable event. The two events use different schemas and are not cross-referenced.
 
 4. **Conflicting taxonomies**: "command" in System 2 (run/execute/delete) overlaps with DEFAULT in System 1. "CONVERSATIONAL" in System 1 (hello/thanks) has no equivalent in System 2. `TaskType.DEBUGGING` in System 3 has no mapping to either.
+
+5. **Two entry points, two routing paths**: `/chat/turn` (cloud) uses `IntentRouter.route()` → `PromptAssembler`. `chat_loop.stream_chat()` (edge) uses `classify_intent()` + `ContextManager.build_context()`. The unification must handle both paths.
 
 ---
 
@@ -66,34 +68,46 @@ class ToolFilter(str, Enum):
 
 How existing intents map into the unified decision:
 
-| System 2 intent | System 1 equivalent | System 3 equivalent | tool_filter | max_rounds |
-|-----------------|---------------------|---------------------|-------------|------------|
-| preference | CONVERSATIONAL | GENERAL | ALL_BLOCKED | 0 |
-| command | DEFAULT | auto-detect | NONE | MAX |
-| feedback | DEFAULT | auto-detect | NONE | MAX |
-| question | DEFAULT | auto-detect | NONE | MAX |
-| *(any)* + EXTERNAL_FETCH keywords | EXTERNAL_FETCH | GENERAL | LOCAL_BLOCKED | 3 |
-| *(any)* + CONVERSATIONAL keywords | CONVERSATIONAL | GENERAL | ALL_BLOCKED | 0 |
+| System 2 intent | System 1 equivalent | System 3 equivalent | tool_filter | max_rounds | Notes |
+|-----------------|---------------------|---------------------|-------------|------------|-------|
+| preference | *(no equivalent)* | GENERAL | ALL_BLOCKED | 0 | "remember I use vim" — no tools needed, just store preference |
+| command | DEFAULT | auto-detect | NONE | MAX | "run pytest" — needs tools |
+| feedback | DEFAULT | auto-detect | NONE | MAX | "不对" — may need tools to re-execute |
+| question | DEFAULT | auto-detect | NONE | MAX | General questions |
+| *(no equivalent)* | CONVERSATIONAL | GENERAL | ALL_BLOCKED | 0 | "hello", "thanks" — greetings/chitchat, distinct from preference |
+| *(any)* + EXTERNAL_FETCH keywords | EXTERNAL_FETCH | GENERAL | LOCAL_BLOCKED | 3 | "search online" — block local tools |
+
+Note: System 1's CONVERSATIONAL (greetings: "hello", "thanks", "bye") and System 2's "preference" ("remember", "I prefer") are **not** the same. CONVERSATIONAL is pure chitchat with no state change; preference triggers a memory write. In the unified model, both get `tool_filter=ALL_BLOCKED` but for different reasons — CONVERSATIONAL needs no tools at all, preference only needs the memory-write side-effect (handled outside the tool loop).
 
 `task_type` is orthogonal to intent — a "question" can be CODE_REVIEW or DEBUGGING. The existing `classify_task()` keyword matching moves into Tier 0 alongside the other keyword engines.
 
 ### Execution Order (Before → After)
 
-**Before** (three independent passes):
+**Before** — two separate code paths, three independent systems:
+
 ```
-user_query
-  ├─ manager.classify_task(query)           → TaskType          (System 3, in build_context)
-  ├─ prompt_assembler.assemble(routing_decision=...)  → sections (System 2, in assemble)
-  └─ classify_intent(query)                 → IntentClassification (System 1, in chat_loop)
+/chat/turn (cloud path — api/routers/chat.py):
+  user_query
+    ├─ IntentRouter.route(query)                    → RoutingDecision  (System 2)
+    ├─ PromptAssembler.assemble(routing_decision=...) → sections       (uses System 2)
+    └─ classify_intent() is NOT called here
+
+chat_loop.stream_chat (edge path — core/agent/chat_loop.py):
+  user_query
+    ├─ context_manager.build_context(query)         → Context          (System 3: classify_task + topic_shift)
+    ├─ classify_intent(user_input)                  → IntentClassification (System 1)
+    └─ IntentRouter is NOT called here
 ```
 
-**After** (single pass, result flows everywhere):
+System 2 and System 1 never run in the same path. System 3 only runs in the edge path.
+
+**After** (single pass in both paths):
 ```
 user_query
-  └─ IntentRouter.route(query)  → RoutingDecision
+  └─ IntentRouter.route(query)  → RoutingDecision (unified)
        ├─ .plan                 → PromptAssembler (which sections to build)
-       ├─ .tool_filter          → chat_loop (which tools to keep)
-       ├─ .max_tool_rounds      → chat_loop (round limit)
+       ├─ .tool_filter          → chat_loop / chat.py (which tools to keep)
+       ├─ .max_tool_rounds      → chat_loop / chat.py (round limit)
        ├─ .task_type            → ContextManager (budget ratios, scoring weights)
        └─ .topic_shift_score    → Context (stale-context feedback)
 ```
@@ -122,16 +136,17 @@ Refactor `Tier0Engine` to use separate `KeywordRegistry` instances for each dime
 
 **Files**: `core/context/intent_routing.py`, `core/skills/intent_router.py` (extract keyword sets)
 
-### Phase 3: Wire RoutingDecision through the call chain
+### Phase 3: Wire RoutingDecision through both code paths
 
-`chat_loop.py` calls `IntentRouter.route()` once, then passes the result to:
+**Cloud path** (`api/routers/chat.py`): Already calls `IntentRouter.route()` and passes `routing_decision` to `PromptAssembler`. Add: read `.tool_filter` and `.max_tool_rounds` for tool filtering (currently done by a separate `classify_intent()` call that doesn't exist in this path — tool filtering is only in the edge path today).
+
+**Edge path** (`core/agent/chat_loop.py`): Currently calls `classify_intent()` (System 1) and `build_context()` (System 3) separately. Replace with a single `IntentRouter.route()` call, then pass the result to:
 - `context_manager.build_context(routing_decision=...)` — uses `.task_type`
-- `prompt_assembler.assemble(routing_decision=...)` — already wired
-- Tool filtering loop — uses `.tool_filter` and `.max_tool_rounds`
+- Tool filtering loop — uses `.tool_filter` and `.max_tool_rounds` (replaces `classify_intent()`)
 
-Also fix: `detect_correction()` should force intent to "feedback" (last 2 turns), not "question" (full context).
+Also fix: `detect_correction()` should force intent to "feedback" (last 2 turns), not "question" (full context). This affects `api/routers/chat.py` line ~2199.
 
-**Files**: `core/agent/chat_loop.py`, `core/context/manager.py`, `core/context/intent_routing.py`
+**Files**: `core/agent/chat_loop.py`, `api/routers/chat.py`, `core/context/manager.py`, `core/context/intent_routing.py`
 
 ### Phase 4: Remove dead code
 
@@ -334,7 +349,7 @@ Each `KeywordRegistry` gets its own test class:
 
 | # | Query | Expected intent | Expected tool_filter | Expected task_type |
 |---|-------|----------------|---------------------|-------------------|
-| 1 | "hello" | preference | ALL_BLOCKED | GENERAL |
+| 1 | "hello" | *(conversational)* | ALL_BLOCKED | GENERAL |
 | 2 | "run pytest" | command | NONE | GENERAL |
 | 3 | "不对，应该用 LEFT JOIN" | feedback | NONE | DEBUGGING |
 | 4 | "review this PR" | question | NONE | CODE_REVIEW |
