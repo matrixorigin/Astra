@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -48,6 +49,64 @@ _PROVIDER_DEFAULT_MODELS = {
 
 def _default_model_for_provider(provider: str) -> str:
     return _PROVIDER_DEFAULT_MODELS.get(provider, "gpt-4o")
+
+
+_STANDARD_TC_ID = re.compile(r"^call_[a-zA-Z0-9]+$")
+
+# HTTP 4xx status codes that are client errors (our fault, not server's).
+# These should NOT trigger circuit breaker — retrying won't help.
+# 429 is excluded: it's rate limiting, which IS retryable.
+_CLIENT_ERROR_CODES = {400, 401, 403, 404, 405, 409, 413, 415, 422}
+_CLIENT_ERROR_PATTERN = re.compile(r"Error code: (4\d{2})\b")
+
+
+def _is_client_error(error: Exception) -> bool:
+    """Return True if error is a client-side 4xx error (not retryable).
+
+    Client errors (bad parameters, auth failures) are our fault — the circuit
+    breaker should not penalize the provider for them.  429 (rate limit) is
+    excluded because it IS retryable after backoff.
+    """
+    status = getattr(error, "status_code", None)
+    if isinstance(status, int) and status in _CLIENT_ERROR_CODES:
+        return True
+    # Some SDKs embed status in the error message
+    m = _CLIENT_ERROR_PATTERN.search(str(error))
+    if m and int(m.group(1)) in _CLIENT_ERROR_CODES:
+        return True
+    return False
+
+
+def _rewrite_tool_call_ids(messages: list[dict]) -> list[dict]:
+    """Rewrite non-standard tool_call_ids to OpenAI-compatible format.
+
+    Models with strict_tool_call_ids quirk (e.g. kimi-k2.5) reject ids like
+    "read_file:1". This rewrites any id not matching "call_xxx" to a
+    deterministic "call_<uuid>" and keeps assistant/tool messages consistent.
+    """
+    id_map: dict[str, str] = {}
+
+    def _map(old_id: str) -> str:
+        if not old_id or _STANDARD_TC_ID.match(old_id):
+            return old_id
+        if old_id not in id_map:
+            id_map[old_id] = f"call_{str(uuid7()).replace('-', '')[:24]}"
+        return id_map[old_id]
+
+    out: list[dict] = []
+    for msg in messages:
+        role = msg.get("role")
+        if role == "assistant" and msg.get("tool_calls"):
+            msg = dict(msg)
+            msg["tool_calls"] = [
+                {**tc, "id": _map(tc.get("id", ""))} for tc in msg["tool_calls"]
+            ]
+        elif role == "tool" and msg.get("tool_call_id"):
+            new_id = _map(msg["tool_call_id"])
+            if new_id != msg["tool_call_id"]:
+                msg = {**msg, "tool_call_id": new_id}
+        out.append(msg)
+    return out
 
 
 class LLMClient(DbConsumer):
@@ -519,12 +578,23 @@ class LLMClient(DbConsumer):
                 # Pass cache config to Anthropic provider
                 if hasattr(provider, 'cache_enabled'):
                     provider.cache_enabled = model_cfg.enable_cache
+                # Some models require a fixed temperature (e.g. kimi-k2.5 only allows 1.0)
+                if model_cfg.fixed_temperature is not None and "temperature" in kwargs:
+                    kwargs = {**kwargs, "temperature": model_cfg.fixed_temperature}
+                # Rewrite non-standard tool_call_ids for strict models (e.g. kimi-k2.5)
+                if model_cfg.quirks.strict_tool_call_ids and "messages" in kwargs:
+                    kwargs = {**kwargs, "messages": _rewrite_tool_call_ids(kwargs["messages"])}
                 result = getattr(provider, fn_name)(model=model_cfg.model_name, **kwargs)
                 breaker.record_success()
                 return result, model_cfg
             except (BudgetExceededError, PermissionError):
                 raise  # Non-retryable — propagate immediately
             except Exception as e:
+                if _is_client_error(e):
+                    # 4xx errors are our fault (bad params), not server failures.
+                    # Don't poison the circuit breaker — just propagate.
+                    logger.warning(f"{model_cfg.model_name} client error (not retryable): {e}")
+                    raise
                 breaker.record_failure()
                 last_error = e
                 logger.warning(f"{model_cfg.model_name} failed: {e}, trying next")
@@ -662,9 +732,10 @@ class LLMClient(DbConsumer):
                 self.rate_limiter.wait_and_acquire(model_cfg.model_name, estimated_tokens=500)
                 provider = self._get_provider(model_cfg.provider, model_cfg.model_name)
                 usage = {"prompt": 0, "completion": 0, "cache_read": 0, "cache_creation": 0}
+                _temp = model_cfg.fixed_temperature if model_cfg.fixed_temperature is not None else temp
 
                 sync_iter = provider.complete_stream(
-                    messages, model_cfg.model_name, temp, max_tok
+                    messages, model_cfg.model_name, _temp, max_tok
                 )
                 while True:
                     chunk = await asyncio.to_thread(next, sync_iter, _END)
@@ -713,6 +784,9 @@ class LLMClient(DbConsumer):
             except (BudgetExceededError, ContextOverflowError, PermissionError):
                 raise
             except Exception as e:
+                if _is_client_error(e):
+                    logger.warning(f"Stream {model_cfg.model_name} client error (not retryable): {e}")
+                    raise
                 breaker.record_failure()
                 last_error = e
                 logger.warning(f"Stream {model_cfg.model_name} failed: {e}")
@@ -752,8 +826,10 @@ class LLMClient(DbConsumer):
                 if hasattr(provider, 'cache_enabled'):
                     provider.cache_enabled = model_cfg.enable_cache
                 usage = {"prompt": 0, "completion": 0, "cache_read": 0, "cache_creation": 0}
+                _temp = model_cfg.fixed_temperature if model_cfg.fixed_temperature is not None else temp
+                _messages = _rewrite_tool_call_ids(messages) if model_cfg.quirks.strict_tool_call_ids else messages
                 sync_iter = provider.complete_with_tools_stream(
-                    messages, tools, model_cfg.model_name, tool_choice, temp, max_tok
+                    _messages, tools, model_cfg.model_name, tool_choice, _temp, max_tok
                 )
                 while True:
                     chunk = await asyncio.to_thread(next, sync_iter, _END)
@@ -796,6 +872,9 @@ class LLMClient(DbConsumer):
             except (BudgetExceededError, ContextOverflowError, PermissionError):
                 raise
             except Exception as e:
+                if _is_client_error(e):
+                    logger.warning(f"Stream+tools {model_cfg.model_name} client error (not retryable): {e}")
+                    raise
                 breaker.record_failure()
                 last_error = e
                 logger.warning(f"Stream+tools {model_cfg.model_name} failed: {e}")

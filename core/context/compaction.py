@@ -189,9 +189,15 @@ def _summarize_old_turns(
         return messages
 
     # Split: system (first msg) | old turns | recent turns
+    # Use tool-call-safe split to avoid orphaning tool messages.
     system_msg = messages[0] if messages[0].get("role") == "system" else None
     start = 1 if system_msg else 0
-    cutoff = len(messages) - preserve_recent
+
+    from core.history_utils import find_tool_call_safe_split
+    cutoff = find_tool_call_safe_split(messages, preserve_recent)
+    # Ensure cutoff is at least past the system message
+    if cutoff < start:
+        cutoff = start
 
     old_turns = messages[start:cutoff]
     recent = messages[cutoff:]

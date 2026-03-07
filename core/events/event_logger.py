@@ -122,6 +122,7 @@ class EventLogger(DbConsumer):
             run_id=run_id,
             parent_run_id=parent_run_id,
             waiting_for=waiting_for,
+            reasoning_content=event.reasoning_content or None,
         )
         
         with self._db() as db:
@@ -206,6 +207,7 @@ class EventLogger(DbConsumer):
         metadata: dict | None = None,
         skill_name: str | None = None,
         skill_version: str | None = None,
+        reasoning_content: str | None = None,
     ) -> ConversationEvent:
         """Create and log a stream event to the database.
 
@@ -242,6 +244,7 @@ class EventLogger(DbConsumer):
             metadata=metadata,
             skill_name=skill_name,
             skill_version=skill_version,
+            reasoning_content=reasoning_content or None,
         )
         self.log_event(event)
         return event
@@ -302,6 +305,7 @@ class EventLogger(DbConsumer):
         llm_params: dict | None = None,
         llm_request_id: str | None = None,
         llm_response_id: str | None = None,
+        reasoning_content: str | None = None,
     ) -> ConversationEvent:
         """Create and log an LLM response event.
 
@@ -318,6 +322,7 @@ class EventLogger(DbConsumer):
             llm_params: LLM parameters
             llm_request_id: LLM provider request ID
             llm_response_id: LLM provider response ID
+            reasoning_content: Thinking-model chain-of-thought (e.g. kimi-k2.5)
 
         Returns:
             ConversationEvent: Created event
@@ -345,6 +350,7 @@ class EventLogger(DbConsumer):
             llm_model_used=llm_model_used,
             token_usage=TokenUsage(**token_usage) if token_usage else None,
             llm_params=llm_params,
+            reasoning_content=reasoning_content or None,
         )
         self.log_event(event)
         return event

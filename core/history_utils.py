@@ -10,6 +10,36 @@ import json
 from typing import Any
 
 
+def find_tool_call_safe_split(messages: list[dict[str, Any]], target_tail: int) -> int:
+    """Find a split index that never breaks an assistant(tool_calls)↔tool group.
+
+    Returns an index *i* such that ``messages[i:]`` has at least *target_tail*
+    items **and** the split does not land between an ``assistant`` message with
+    ``tool_calls`` and its corresponding ``tool`` messages.
+
+    The returned index is moved **earlier** (toward 0) when the naïve split
+    would orphan tool messages from their parent assistant message.
+
+    If the entire list is one big tool-call group, returns 0 (keep everything).
+    """
+    if target_tail <= 0 or target_tail >= len(messages):
+        return 0
+
+    idx = len(messages) - target_tail
+
+    # Walk backward: if messages[idx] is a tool message, its parent assistant
+    # (with tool_calls) must also be included.  Keep moving idx earlier until
+    # we land on a message that is NOT a tool message.
+    while idx > 0 and messages[idx].get("role") == "tool":
+        idx -= 1
+
+    # idx might now point at the assistant(tool_calls) itself — that's fine,
+    # it will be included in the tail.  But if it somehow points at a
+    # non-assistant message that precedes a tool block, we're already safe.
+
+    return idx
+
+
 def merge_tool_results_into_history(
     history: list[dict[str, Any]],
     tool_results: list[dict[str, Any]] | None,
@@ -127,11 +157,15 @@ def append_recovered_events(
 ) -> list[dict[str, Any]]:
     """Append DB event rows to an existing history list (OpenAI message format).
 
+    Row tuple: (event_type, content, metadata, reasoning_content)
+    reasoning_content is a dedicated DB column (not metadata) for thinking models.
+
     Used by both snapshot post-fill and full event-by-event reconstruction.
     Handles tool_call batching: accumulates tool_call events, flushes them as
     one assistant message when the first tool_result arrives.
     """
     pending_tool_calls: list[dict[str, Any]] = []
+    pending_reasoning: str = ""
     in_tool_batch = False
 
     for row in rows:
@@ -143,6 +177,8 @@ def append_recovered_events(
             except (json.JSONDecodeError, TypeError):
                 meta = {}
         meta = meta or {}
+        # reasoning_content is now a dedicated column (row[3]), not stored in metadata
+        row_reasoning: str = (row[3] or "") if len(row) > 3 else ""
 
         if etype == "user_query":
             in_tool_batch = False
@@ -152,6 +188,9 @@ def append_recovered_events(
                 tc_data = json.loads(content) if isinstance(content, str) else {}
             except (json.JSONDecodeError, TypeError):
                 tc_data = {}
+            # Restore reasoning_content from dedicated column (first tool_call in batch)
+            if not pending_tool_calls and row_reasoning:
+                pending_reasoning = row_reasoning
             pending_tool_calls.append({
                 "id": tc_data.get("tool_call_id", meta.get("tool_call_id", "")),
                 "type": "function",
@@ -164,8 +203,12 @@ def append_recovered_events(
             tool_call_id = meta.get("tool_call_id", "")
             tool_name = meta.get("name", "")
             if pending_tool_calls:
-                history.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
+                asst: dict[str, Any] = {"role": "assistant", "content": "", "tool_calls": pending_tool_calls}
+                if pending_reasoning:
+                    asst["reasoning_content"] = pending_reasoning
+                history.append(asst)
                 pending_tool_calls = []
+                pending_reasoning = ""
                 in_tool_batch = True
             elif not in_tool_batch:
                 if not tool_call_id:
@@ -189,12 +232,17 @@ def append_recovered_events(
             if pending_tool_calls:
                 history.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
                 pending_tool_calls = []
-            history.append({"role": "assistant", "content": content})
+            # Text-only thinking response: reasoning_content stored on llm_response event
+            asst_resp: dict[str, Any] = {"role": "assistant", "content": content}
+            if row_reasoning:
+                asst_resp["reasoning_content"] = row_reasoning
+            history.append(asst_resp)
 
     # Flush any trailing tool_calls that had no tool_result in DB
-    # (e.g. API crashed mid-execution). merge_tool_results_into_history will
-    # add placeholder tool messages later.
     if pending_tool_calls:
-        history.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
+        asst = {"role": "assistant", "content": "", "tool_calls": pending_tool_calls}
+        if pending_reasoning:
+            asst["reasoning_content"] = pending_reasoning
+        history.append(asst)
 
     return history

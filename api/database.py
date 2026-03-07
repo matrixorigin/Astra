@@ -1,5 +1,6 @@
 """Database connection and session management with SQLAlchemy."""
 
+import json
 import logging
 from contextlib import contextmanager
 from decimal import Decimal
@@ -116,6 +117,22 @@ def get_db_context():
         db.close()
 
 
+def _get_column_names(inspector, table_name: str, schema: str | None) -> set[str]:
+    """Get column names, suppressing SAWarning from FULLTEXT WITH PARSER ngram.
+
+    MatrixOne's ``FULLTEXT ... WITH PARSER ngram`` DDL triggers an SAWarning
+    in SQLAlchemy's MySQL reflection parser (``Unknown schema content``).
+    This is a known gap in the MatrixOne SDK's dialect — its ``get_columns``
+    delegates to ``super().get_columns()`` which parses ``SHOW CREATE TABLE``
+    and chokes on the ngram parser clause.  Harmless — we only need column names.
+    """
+    import warnings
+    from sqlalchemy.exc import SAWarning
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SAWarning)
+        return {c["name"] for c in inspector.get_columns(table_name, schema=schema)}
+
+
 def init_db():
     """Initialize database - create tables and indexes if not exist."""
     from sqlalchemy import inspect, text
@@ -133,7 +150,7 @@ def init_db():
 
     # Migrate: add columns merged from skill_definitions into skills_registry
     if "skills_registry" in existing:
-        cols = {c["name"] for c in inspector.get_columns("skills_registry", schema=engine.url.database)}
+        cols = _get_column_names(inspector, "skills_registry", engine.url.database)
         with engine.begin() as conn:
             for col, ddl in [
                 ("source", "VARCHAR(20) DEFAULT 'builtin'"),
@@ -146,6 +163,44 @@ def init_db():
                         conn.execute(text(f"ALTER TABLE skills_registry ADD COLUMN {col} {ddl}"))
                     except Exception as e:
                         logger.warning("Migration: failed to add column %s: %s", col, e)
+
+    # Migrate: add quirks column to infra_llm_models + sync seed quirks
+    if "infra_llm_models" in existing:
+        cols = _get_column_names(inspector, "infra_llm_models", engine.url.database)
+        if "quirks" not in cols:
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE infra_llm_models ADD COLUMN quirks JSON NULL COMMENT 'ModelQuirks — model-specific behavioral overrides'"))
+            except Exception as e:
+                logger.warning("Migration: failed to add infra_llm_models.quirks: %s", e)
+
+        # Backfill seed quirks for models that have NULL or empty quirks in DB.
+        # Only overwrites when the DB value is missing — admin-customized quirks
+        # are preserved.  This ensures new seed quirk fields (e.g. fixed_temperature
+        # added after initial registration) propagate to existing installations.
+        # NOTE: MatrixOne panics on `json_col = '{}'` (direct JSON-to-string comparison).
+        # Use CAST(quirks AS CHAR) for safe string comparison.
+        try:
+            from core.llm.seed_models import SEED_MODELS
+            with engine.begin() as conn:
+                for sm in SEED_MODELS:
+                    if sm.get("quirks"):
+                        conn.execute(text(
+                            "UPDATE infra_llm_models SET quirks = :q "
+                            "WHERE model_name = :m AND (quirks IS NULL OR CAST(quirks AS CHAR) = '{}')"
+                        ), {"q": json.dumps(sm["quirks"]), "m": sm["model_name"]})
+        except Exception as e:
+            logger.warning("Migration: failed to sync seed quirks: %s", e)
+
+    # Migrate: add reasoning_content column to agent_events
+    if "agent_events" in existing:
+        cols = _get_column_names(inspector, "agent_events", engine.url.database)
+        if "reasoning_content" not in cols:
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE agent_events ADD COLUMN reasoning_content TEXT NULL COMMENT 'thinking-model chain-of-thought (e.g. kimi-k2.5)'"))
+            except Exception as e:
+                logger.warning("Migration: failed to add agent_events.reasoning_content: %s", e)
 
     # Migrate: upgrade DATETIME(0) → DATETIME(6) on existing tables.
     # Earlier code used SQLAlchemy's generic DateTime(timezone=6) which silently

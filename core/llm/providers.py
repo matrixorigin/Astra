@@ -91,6 +91,19 @@ def _extract_openai_cached_tokens(usage) -> int:
     return 0
 
 
+def _get_reasoning_content(delta) -> str | None:
+    """Extract reasoning_content from a streaming delta.
+
+    Some providers (e.g. Moonshot/Kimi) return reasoning_content as an
+    extension field not in the OpenAI schema. The OpenAI SDK stores unknown
+    fields in model_extra, so we check both places.
+    """
+    rc = getattr(delta, "reasoning_content", None)
+    if rc is None:
+        rc = (getattr(delta, "model_extra", None) or {}).get("reasoning_content")
+    return rc or None
+
+
 def _accumulate_tool_calls(response_iter) -> Iterator[dict]:
     """Shared tool call accumulation for OpenAI-compatible streaming.
 
@@ -112,7 +125,7 @@ def _accumulate_tool_calls(response_iter) -> Iterator[dict]:
             if choice.finish_reason == "length":
                 truncated = True
             delta = choice.delta
-            reasoning = getattr(delta, "reasoning_content", None)
+            reasoning = _get_reasoning_content(delta)
             if reasoning:
                 yield {"type": "reasoning", "content": reasoning}
             if delta.content:
@@ -235,7 +248,7 @@ class OpenAIProvider(BaseProvider):
             elif chunk.choices and chunk.choices[0].delta:
                 delta = chunk.choices[0].delta
                 # OpenAI o-series reasoning tokens
-                reasoning = getattr(delta, "reasoning_content", None)
+                reasoning = _get_reasoning_content(delta)
                 if reasoning:
                     yield {"type": "reasoning", "content": reasoning}
                 if delta.content:
@@ -256,6 +269,7 @@ class OpenAIProvider(BaseProvider):
             "content": resp.choices[0].message.content or "",
             "tool_calls": _extract_tool_calls(resp.choices[0].message),
             "usage": _extract_usage(resp),
+            "reasoning_content": _get_reasoning_content(resp.choices[0].message),
         }
 
     def complete_with_tools_stream(

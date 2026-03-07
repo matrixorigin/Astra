@@ -29,6 +29,7 @@ class LLMModel(Base):
     architecture = Column(String(50), nullable=True)
     description = Column(Text, nullable=True)
     tags = Column(JSON, default=list)
+    quirks = Column(JSON, nullable=True)  # ModelQuirks — model-specific behavioral overrides
     created_by = Column(String(36), nullable=True)
     created_at = Column(DateTime6, default=func.now())
     updated_at = Column(DateTime6, default=func.now(), onupdate=func.now())

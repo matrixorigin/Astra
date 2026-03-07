@@ -24,6 +24,36 @@ class ModelPricing(BaseModel):
     request: float | None = None      # flat per-request fee
 
 
+class ModelQuirks(BaseModel):
+    """Model-specific behavioral quirks that require special handling.
+
+    Add a new field here when a model deviates from the OpenAI standard.
+    Each field is False/None by default so existing models are unaffected.
+    """
+    # Temperature
+    fixed_temperature: float | None = None      # Model only accepts one temperature value (e.g. kimi-k2.5 → 1.0)
+
+    # Reasoning / thinking models
+    # When True, reasoning_content from the LLM response is preserved in
+    # assistant messages sent back to the model on subsequent turns.  Models
+    # like kimi-k2.5 REQUIRE this — they reject tool-call continuations that
+    # omit the reasoning_content they emitted.  For other models it is harmless
+    # (they ignore the extra field), so the code always preserves it when
+    # present rather than gating on this flag.  The flag exists to document
+    # which models depend on this behavior and to enable future optimizations
+    # (e.g. stripping reasoning_content to save tokens on models that ignore it).
+    preserve_reasoning_content: bool = False
+
+    # Tool calling
+    no_parallel_tool_calls: bool = False        # Model doesn't support parallel tool calls
+    tool_choice_required: bool = False          # Must always pass tool_choice (some models reject omitting it)
+    strict_tool_call_ids: bool = False          # Model rejects non-standard tool_call_ids (e.g. "read_file:1"); rewrite to "call_xxx"
+
+    # Context
+    no_system_message: bool = False             # Model rejects system role (use first user message instead)
+    system_as_user_prefix: bool = False         # Prepend system prompt to first user message
+
+
 class ModelConfig(BaseModel):
     """Model configuration — one entry per deployable model.
 
@@ -57,6 +87,28 @@ class ModelConfig(BaseModel):
     fallback_to: str | None = None
     is_active: bool = True
     tags: list[str] = []  # e.g. ["code", "fast", "cheap", "reasoning"]
+
+    # ── Quirks (model-specific deviations from OpenAI standard) ──
+    quirks: ModelQuirks = ModelQuirks()
+
+    # ── Backward compat: fixed_temperature as top-level alias ──
+    @property
+    def fixed_temperature(self) -> float | None:
+        return self.quirks.fixed_temperature
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_quirks(cls, data: dict) -> dict:
+        """Migrate flat quirk fields into nested ModelQuirks."""
+        if not isinstance(data, dict):
+            return data
+        quirks = dict(data.get("quirks") or {})
+        # Migrate fixed_temperature from top-level
+        if "fixed_temperature" in data and "fixed_temperature" not in quirks:
+            quirks["fixed_temperature"] = data.pop("fixed_temperature")
+        if quirks:
+            data["quirks"] = quirks
+        return data
 
     # ── Backward compat properties ──
     @property
@@ -183,11 +235,17 @@ class ModelRegistry:
                 text(
                     "SELECT model_name, provider, context_window, max_completion_tokens, "
                     "input_modalities, output_modalities, supported_parameters, "
-                    "pricing, architecture, tags, is_active, base_url, description "
+                    "pricing, architecture, tags, is_active, base_url, description, quirks "
                     "FROM infra_llm_models WHERE is_active = 1"
                 )
             ).fetchall()
             for row in rows:
+                quirks_raw = row.quirks
+                if isinstance(quirks_raw, str):
+                    try:
+                        quirks_raw = json.loads(quirks_raw)
+                    except (json.JSONDecodeError, TypeError):
+                        quirks_raw = {}
                 mc = ModelConfig(
                     model_name=row.model_name,
                     provider=row.provider,
@@ -201,6 +259,7 @@ class ModelRegistry:
                     architecture=row.architecture,
                     tags=json.loads(row.tags) if isinstance(row.tags, str) else (row.tags or []),
                     is_active=bool(row.is_active),
+                    quirks=ModelQuirks(**(quirks_raw or {})),
                 )
                 self._models[mc.model_name] = mc
         except Exception as e:

@@ -86,8 +86,8 @@ class TestAtomicIncrementDB:
         uid = str(uuid7())
         db.execute(text(
             "INSERT INTO agent_sessions "
-            "(session_id, user_id, status, event_count, created_at, last_active_at) "
-            "VALUES (:sid, :uid, 'active', 0, NOW(), NOW())"
+            "(session_id, user_id, status, event_count, created_at, last_active_at, updated_at) "
+            "VALUES (:sid, :uid, 'active', 0, NOW(), NOW(), NOW())"
         ), {"sid": sid, "uid": uid})
         db.commit()
 

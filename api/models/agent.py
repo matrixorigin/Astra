@@ -90,6 +90,7 @@ class Event(Base):
     parent_run_id = Column(String(36), index=True)
     waiting_for = Column(String(255), index=True)
     dedup_key = Column(String(255), index=True)
+    reasoning_content = Column(Text, nullable=True)  # thinking-model chain-of-thought (e.g. kimi-k2.5)
 
 
 class AgentScratchpad(Base):

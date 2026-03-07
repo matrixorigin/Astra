@@ -238,5 +238,8 @@ class ConversationEvent(BaseModel):
     skill_result: Any | None = Field(
         default=None, description="Skill execution result"
     )
+    reasoning_content: str | None = Field(
+        default=None, description="Thinking-model chain-of-thought (e.g. kimi-k2.5 reasoning_content)"
+    )
 
     model_config = {"use_enum_values": True}

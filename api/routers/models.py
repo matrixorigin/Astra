@@ -29,13 +29,28 @@ class PricingSchema(BaseModel):
     cache_write: float | None = None
 
 
+class QuirksSchema(BaseModel):
+    """Mirrors ModelQuirks — stored as JSON in infra_llm_models.quirks.
+
+    IMPORTANT: Every field in core.llm.router.ModelQuirks MUST have a
+    corresponding field here.  TestQuirksSchemaParity enforces this at CI.
+    """
+    fixed_temperature: float | None = None
+    preserve_reasoning_content: bool = False
+    no_parallel_tool_calls: bool = False
+    tool_choice_required: bool = False
+    strict_tool_call_ids: bool = False
+    no_system_message: bool = False
+    system_as_user_prefix: bool = False
+
+
 class ModelCreateRequest(BaseModel):
     name: str
     provider: str
     api_key: str  # required — the whole point
     base_url: str | None = None  # override provider default
     description: str | None = None
-    context_window: int = 128000
+    context_window: int | None = None  # None = use seed default or 128000
     max_completion_tokens: int | None = None
     input_modalities: list[str] = ["text"]
     output_modalities: list[str] = ["text"]
@@ -43,6 +58,7 @@ class ModelCreateRequest(BaseModel):
     pricing: PricingSchema = PricingSchema()
     architecture: str | None = None
     tags: list[str] = []
+    quirks: QuirksSchema | None = None  # None = use seed defaults for known models
 
 
 class ModelUpdateRequest(BaseModel):
@@ -58,6 +74,7 @@ class ModelUpdateRequest(BaseModel):
     architecture: str | None = None
     tags: list[str] | None = None
     is_active: bool | None = None
+    quirks: QuirksSchema | None = None
 
 
 class ModelResponse(BaseModel):
@@ -75,6 +92,7 @@ class ModelResponse(BaseModel):
     pricing: PricingSchema = PricingSchema()
     architecture: str | None = None
     tags: list[str] = []
+    quirks: QuirksSchema = QuirksSchema()
     connectivity: str | None = None  # "ok" or error message, only on create/update
 
 
@@ -97,6 +115,18 @@ def _sanitize_error(msg: str) -> str:
     msg = re.sub(r'(sk-[a-zA-Z0-9-]{0,6})[a-zA-Z0-9-]+', r'\1...', msg)
     msg = re.sub(r'(?<![a-zA-Z0-9])[a-zA-Z0-9]{32,}(?![a-zA-Z0-9])', '<redacted>', msg)
     return msg[:200]
+
+
+def _get_seed_defaults(model_name: str) -> dict:
+    """Return preset defaults from seed_models for a known model name, or {}."""
+    try:
+        from core.llm.seed_models import SEED_MODELS
+        for m in SEED_MODELS:
+            if m["model_name"] == model_name:
+                return m
+    except Exception:
+        pass
+    return {}
 
 
 def _validate_connectivity(provider: str, model_name: str, api_key: str, base_url: str | None) -> str | None:
@@ -149,6 +179,7 @@ def _to_response(m: LLMModel, connectivity: str | None = None) -> ModelResponse:
         supported_parameters=m.supported_parameters or [],
         pricing=PricingSchema(**(m.pricing or {})),
         architecture=m.architecture, tags=m.tags or [],
+        quirks=QuirksSchema(**(m.quirks or {})),
         connectivity=connectivity,
     )
 
@@ -174,16 +205,27 @@ def create_model(
         base_url = _resolve_base_url(request.provider, request.base_url)
         conn_err = _validate_connectivity(request.provider, request.name, request.api_key, base_url)
 
+        # Merge seed defaults: if caller didn't supply a field (None), fall back
+        # to the preset from seed_models (e.g. kimi-k2.5 needs fixed_temperature=1.0).
+        # Explicit caller values always win — even if they match the default.
+        seed = _get_seed_defaults(request.name)
+        _caller_supplied_quirks = request.quirks is not None
+        _quirks = request.quirks.model_dump(exclude_none=True) if _caller_supplied_quirks else seed.get("quirks", {})
+
         model = LLMModel(
             model_id=str(uuid4()), model_name=request.name, provider=request.provider,
             api_key_encrypted=encrypt_token(request.api_key), base_url=base_url,
-            description=request.description,
+            description=request.description or seed.get("description"),
             is_active=1 if conn_err is None else 0,
-            context_window=request.context_window, max_completion_tokens=request.max_completion_tokens,
-            input_modalities=request.input_modalities, output_modalities=request.output_modalities,
-            supported_parameters=request.supported_parameters,
-            pricing=request.pricing.model_dump(exclude_none=True),
-            architecture=request.architecture, tags=request.tags,
+            context_window=request.context_window if request.context_window is not None else seed.get("context_window", 128000),
+            max_completion_tokens=request.max_completion_tokens or seed.get("max_completion_tokens"),
+            input_modalities=request.input_modalities if request.input_modalities != ["text"] else seed.get("input_modalities", request.input_modalities),
+            output_modalities=request.output_modalities if request.output_modalities != ["text"] else seed.get("output_modalities", request.output_modalities),
+            supported_parameters=request.supported_parameters or seed.get("supported_parameters", []),
+            pricing=request.pricing.model_dump(exclude_none=True) or seed.get("pricing", {}),
+            architecture=request.architecture or seed.get("architecture"),
+            tags=request.tags or seed.get("tags", []),
+            quirks=_quirks,
             created_by=current_user["user_id"],
         )
         db.add(model)
@@ -193,7 +235,26 @@ def create_model(
         connectivity = "ok" if conn_err is None else conn_err
         if conn_err:
             logger.warning(f"Model '{request.name}' registered as inactive: {conn_err}")
-        return _to_response(model, connectivity=connectivity)
+        # Build response directly from request values (not from db.refresh)
+        # because MatrixOne may not re-populate JSON columns after refresh.
+        return ModelResponse(
+            model_id=model.model_id,
+            name=request.name,
+            provider=request.provider,
+            base_url=base_url,
+            description=request.description or seed.get("description"),
+            is_active=conn_err is None,
+            context_window=model.context_window or 128000,
+            max_completion_tokens=model.max_completion_tokens,
+            input_modalities=model.input_modalities or ["text"],
+            output_modalities=model.output_modalities or ["text"],
+            supported_parameters=model.supported_parameters or [],
+            pricing=PricingSchema(**(model.pricing or {})),
+            architecture=model.architecture,
+            tags=model.tags or [],
+            quirks=QuirksSchema(**_quirks) if _quirks else QuirksSchema(),
+            connectivity=connectivity,
+        )
     finally:
         db.close()
 
@@ -273,6 +334,8 @@ def update_model(
             model.architecture = request.architecture
         if request.tags is not None:
             model.tags = request.tags
+        if request.quirks is not None:
+            model.quirks = request.quirks.model_dump(exclude_none=True)
         if request.is_active is not None:
             model.is_active = 1 if request.is_active else 0
 

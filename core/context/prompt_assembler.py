@@ -662,6 +662,10 @@ class PromptAssembler(DbConsumer):
             if skill_count:
                 parts.append(f"+{skill_count} cloud skills (use `find_skills` or `get_agent_info` to discover)")
 
+            # Memory hint — always present so the LLM knows it can recall user
+            # context via get_agent_info, even on first interaction (~15 tokens).
+            parts.append("Memory: use `get_agent_info(dimension='memory')` to recall what you know about the user")
+
             # Delegation
             if agent_id:
                 try:

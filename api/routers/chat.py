@@ -25,6 +25,9 @@ from core.history_utils import (
     append_recovered_events as _append_recovered_events,
 )
 from core.history_utils import (
+    find_tool_call_safe_split as _find_tool_call_safe_split,
+)
+from core.history_utils import (
     merge_tool_results_into_history as _merge_tool_results_into_history,
 )
 from core.logging_config import get_logger
@@ -1024,7 +1027,8 @@ def _build_retrieval_view(
         return history, None
 
     system_msg = history[0] if history[0].get("role") == "system" else None
-    recent = history[-_RECENT_MESSAGES_KEEP:]
+    split_idx = _find_tool_call_safe_split(history, _RECENT_MESSAGES_KEEP)
+    recent = history[split_idx:]
     # Ensure we don't include system in recent (it's added separately)
     if recent and recent[0].get("role") == "system":
         recent = recent[1:]
@@ -1424,7 +1428,7 @@ def _recover_history_from_db(
                 if snap_ts:
                     _event_types = ('user_query', 'llm_response', 'tool_call', 'tool_result')
                     post_rows = (
-                        db.query(EventModel.event_type, EventModel.content, EventModel.event_metadata)
+                        db.query(EventModel.event_type, EventModel.content, EventModel.event_metadata, EventModel.reasoning_content)
                         .filter(
                             EventModel.session_id == session_id,
                             EventModel.event_type.in_(_event_types),
@@ -1446,7 +1450,7 @@ def _recover_history_from_db(
         from api.models.agent import Event as EventModel
         _event_types = ('user_query', 'llm_response', 'tool_call', 'tool_result')
         rows = (
-            db.query(EventModel.event_type, EventModel.content, EventModel.event_metadata)
+            db.query(EventModel.event_type, EventModel.content, EventModel.event_metadata, EventModel.reasoning_content)
             .filter(
                 EventModel.session_id == session_id,
                 EventModel.event_type.in_(_event_types),
@@ -1486,6 +1490,7 @@ def _persist_turn_events(
     tool_results: list[dict[str, Any]] | None,
     full_text: str,
     tool_calls: list[dict[str, Any]],
+    reasoning_content: str = "",
     context_capture_id: str | None = None,
     model_used: str | None = None,
     token_usage: dict[str, int] | None = None,
@@ -1613,7 +1618,7 @@ def _persist_turn_events(
     # Phase 3: persist tool calls + LLM response + history snapshot
     try:
         if tool_calls:
-            for tc in tool_calls:
+            for i, tc in enumerate(tool_calls):
                 tc_id = tc.get("id", "")
                 tc_func = tc.get("function", {})
                 tc_name = tc_func.get("name", "")
@@ -1624,15 +1629,18 @@ def _persist_turn_events(
                 tc_content: dict[str, Any] = {"tool_call_id": tc_id, "name": tc_name, "arguments": tc_func.get("arguments", "{}")}
                 if tc_source == "cloud":
                     tc_content["source"] = "cloud"
+                tc_meta: dict[str, Any] = {"tool_call_id": tc_id, "name": tc_name, "source": tc_source}
                 el.create_stream_event(
                     user_id=user_id, session_id=session_id,
                     event_type="tool_call",
                     content=json.dumps(tc_content),
                     parent_event_id=parent_event_id,
                     causal_chain_id=causal_chain_id,
-                    metadata={"tool_call_id": tc_id, "name": tc_name, "source": tc_source},
+                    metadata=tc_meta,
                     skill_name=tc_name,
                     skill_version=skill_versions.get(tc_name),
+                    # Store reasoning_content on the first tool_call as a dedicated column
+                    reasoning_content=reasoning_content if (reasoning_content and i == 0) else None,
                 )
 
         # Track LLM response event_id for snapshot linking
@@ -1666,6 +1674,11 @@ def _persist_turn_events(
         #   3. audit trail requires a response event per LLM call
         _content = full_text.strip() if full_text else ""
         if _content or tool_calls:
+            # Store reasoning_content on llm_response when there are NO tool_calls
+            # (text-only thinking response). When tool_calls exist, reasoning_content
+            # is already stored on the first tool_call event (see above), so we
+            # avoid duplicating it on the llm_response event.
+            _rc_for_llm_resp = reasoning_content if (reasoning_content and not tool_calls) else None
             llm_resp_ev = el.create_llm_response(
                 user_id=user_id, session_id=session_id,
                 content=_content,
@@ -1675,6 +1688,7 @@ def _persist_turn_events(
                 llm_model_used=model_used,
                 token_usage=token_usage,
                 llm_params=llm_params,
+                reasoning_content=_rc_for_llm_resp,
             )
             llm_response_event_id = llm_resp_ev.event_id
 
@@ -2275,6 +2289,7 @@ async def chat_turn(
 
                 full_text = ""
                 tool_calls: list[dict[str, Any]] = []
+                _turn_reasoning: str = ""  # accumulated reasoning_content for this turn
                 usage: dict[str, int] = {}
                 llm_params: dict[str, Any] = {
                     k: v for k, v in {
@@ -2314,6 +2329,7 @@ async def chat_turn(
                 for _cloud_loop in range(_MAX_CLOUD_LOOPS + 1):
                     _loop_text = ""
                     _loop_tool_calls: list[dict[str, Any]] = []
+                    _loop_reasoning: str = ""
                     _llm_start = time.monotonic()
 
                     # Compact old tool results in _current_llm_messages when
@@ -2350,6 +2366,9 @@ async def chat_turn(
                             if chunk["type"] == "text":
                                 _loop_text += chunk["content"]
                                 yield f"data: {json.dumps({'type': 'text_delta', 'content': chunk['content']})}\n\n"
+                            elif chunk["type"] == "reasoning":
+                                _loop_reasoning += chunk["content"]
+                                yield f"data: {json.dumps({'type': 'reasoning_delta', 'content': chunk['content']})}\n\n"
                             elif chunk["type"] == "tool_call":
                                 _loop_tool_calls.append(chunk["data"])
                             elif chunk["type"] == "tool_call_start":
@@ -2395,6 +2414,8 @@ async def chat_turn(
                         })
 
                     full_text += _loop_text
+                    if _loop_reasoning:
+                        _turn_reasoning += _loop_reasoning
 
                     if _timed_out:
                         return
@@ -2452,12 +2473,16 @@ async def chat_turn(
                     if _loop_text:
                         assistant_msg_loop["content"] = _loop_text
                     assistant_msg_loop["tool_calls"] = _tc_entries
+                    if _loop_reasoning:
+                        assistant_msg_loop["reasoning_content"] = _loop_reasoning
                     _current_llm_messages = _current_llm_messages + [assistant_msg_loop]
                     # History copy: tool_calls only, no text (avoids duplication).
                     # _loop_text is already accumulated into full_text (line above)
                     # which goes into the final assistant_msg at session cache persist
                     # time, so omitting content here is safe and intentional.
                     _history_msg_loop: dict[str, Any] = {"role": "assistant", "content": None, "tool_calls": _tc_entries}
+                    if _loop_reasoning:
+                        _history_msg_loop["reasoning_content"] = _loop_reasoning
                     _cloud_loop_history.append(_history_msg_loop)
 
                     yield f"data: {json.dumps({'type': 'cloud_loop_progress', 'loop': _cloud_loop, 'cloud_skills': len(cloud_tcs), 'edge_skills': len(edge_tcs)})}\n\n"
@@ -2626,6 +2651,8 @@ async def chat_turn(
                 assistant_msg: dict[str, Any] = {"role": "assistant", "content": full_text}
                 if tool_calls:
                     assistant_msg["tool_calls"] = tool_calls
+                if _turn_reasoning:
+                    assistant_msg["reasoning_content"] = _turn_reasoning
                 _entry.setdefault("history", []).append(assistant_msg)
                 _entry["turn_count"] = _entry.get("turn_count", 0) + 1
                 # Store chain IDs so continuation turns (tool_results) reuse them
@@ -2646,6 +2673,7 @@ async def chat_turn(
                 tool_results=copy.deepcopy(request.tool_results or []),
                 full_text=full_text,
                 tool_calls=copy.deepcopy(_cloud_tool_calls_for_persist + tool_calls),
+                reasoning_content=_turn_reasoning,
                 cloud_tool_results=copy.deepcopy(_cloud_tool_results_for_persist) or None,
                 context_capture_id=snapshot_id, model_used=resolved_model,
                 token_usage=usage if usage else None,

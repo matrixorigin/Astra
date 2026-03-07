@@ -15,6 +15,7 @@ class LLMProvider(str, Enum):
     GROQ = "groq"
     ANTHROPIC = "anthropic"
     SELF_HOSTED = "self_hosted"
+    MOONSHOT = "moonshot"
     MOCK = "mock"
 
 

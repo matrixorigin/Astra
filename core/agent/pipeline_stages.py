@@ -142,11 +142,16 @@ class CallLLMStage:
             yield TurnEvent(event_type="llm_final", data={"content": content})
         else:
             # Append assistant message with tool_calls
-            state.messages.append({
+            asst_msg: dict = {
                 "role": "assistant",
                 "content": content,
                 "tool_calls": tool_calls,
-            })
+            }
+            # Kimi K2.5 (and other thinking models) require reasoning_content
+            # to be preserved in the assistant message when tool calls are made
+            if result.get("reasoning_content"):
+                asst_msg["reasoning_content"] = result["reasoning_content"]
+            state.messages.append(asst_msg)
             yield TurnEvent(event_type="llm_tool_calls", data={"tool_calls": tool_calls})
 
         yield TurnEvent(event_type="stage_complete", data={"stage": "call_llm"})

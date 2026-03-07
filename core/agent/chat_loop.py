@@ -761,6 +761,7 @@ class ChatLoop:
 
             full_text = ""
             tool_calls: list[dict] = []
+            reasoning_content_parts: list[str] = []
 
             # Use model from context if provided, otherwise use SLO escalation
             from core.llm.model_resolver import resolve_model
@@ -773,6 +774,7 @@ class ChatLoop:
                 messages, tools_schema, model=model,
             ):
                 if chunk["type"] == "reasoning":
+                    reasoning_content_parts.append(chunk["content"])
                     yield StreamEvent(
                         event_type=StreamEventType.REASONING_MESSAGE_CONTENT,
                         data={"content": chunk["content"]},
@@ -854,7 +856,10 @@ class ChatLoop:
                 return
 
             # Execute tools
-            messages.append({"role": "assistant", "content": full_text, "tool_calls": tool_calls})
+            asst_msg: dict = {"role": "assistant", "content": full_text, "tool_calls": tool_calls}
+            if reasoning_content_parts:
+                asst_msg["reasoning_content"] = "".join(reasoning_content_parts)
+            messages.append(asst_msg)
 
             # Check for parallel delegation (multiple delegate_task calls)
             delegation_calls = [tc for tc in tool_calls if tc["function"]["name"] == "delegate_task"]
