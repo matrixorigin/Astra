@@ -1,6 +1,6 @@
 # Intent Unification: Three Systems → One RoutingDecision
 
-> **Status**: Draft  
+> **Status**: Implemented  
 > **Created**: 2026-03-06  
 > **Updated**: 2026-03-07 — addressed fulltext scoring, feedback nuance, topic_shift interaction, Tier 0 maintainability, conflict resolution  
 > **Related**: [token-efficient-llm-routing.md](token-efficient-llm-routing.md), [context-window-management.md](context-window-management.md), [skills-and-tools.md](skills-and-tools.md)
