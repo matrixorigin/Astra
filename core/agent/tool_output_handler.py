@@ -334,7 +334,7 @@ def find_similar_result(
             query_parts.append(str(params[key]))
     query = ' '.join(query_parts)
 
-    results = memory_service.retrieve(
+    results, _ = memory_service.retrieve(
         user_id=user_id,
         query=query,
         session_id=session_id if not cross_session else "global",

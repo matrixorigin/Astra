@@ -68,7 +68,7 @@ class TieredMemoryLoader:
         explain: bool = False,
     ) -> tuple[str, RetrievalStats | None]:
         try:
-            memories = self._svc.retrieve(
+            memories, stats = self._svc.retrieve(
                 user_id=user_id,
                 query=query,
                 session_id=session_id,
@@ -76,13 +76,14 @@ class TieredMemoryLoader:
                 memory_types=[MemoryType.SEMANTIC, MemoryType.PROCEDURAL],
                 top_k=limit,
                 task_hint=task_hint,
+                explain=explain,
             )
             if not memories:
-                return "", None
+                return "", stats
             lines = ["Relevant Memories:"]
             for m in memories:
                 lines.append(f"- [{m.memory_type.value}] {m.content}")
-            return "\n".join(lines), None
+            return "\n".join(lines), stats
         except Exception as e:
             logger.debug("L1 load failed: %s", e)
             self._metrics.increment("tiered_loader_l1_errors")

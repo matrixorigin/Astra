@@ -113,12 +113,12 @@ class TestFindSimilarResult:
 
     def test_no_results_returns_none(self, mock_service):
         """No similar results returns None."""
-        mock_service.retrieve.return_value = []
-        
+        mock_service.retrieve.return_value = ([], None)
+
         result = find_similar_result(
             "grep", {"pattern": "test"}, "sess1", "user1", mock_service
         )
-        
+
         assert result is None
 
     def test_matching_result_returns_reference(self, mock_service):
@@ -129,12 +129,12 @@ class TestFindSimilarResult:
         mock_memory.content = "test pattern found in file.py"
         mock_memory.observed_at = datetime.now(timezone.utc) - timedelta(seconds=60)
         mock_memory.created_at = datetime.now(timezone.utc) - timedelta(seconds=60)
-        mock_service.retrieve.return_value = [mock_memory]
-        
+        mock_service.retrieve.return_value = ([mock_memory], None)
+
         result = find_similar_result(
             "grep", {"pattern": "test"}, "sess1", "user1", mock_service
         )
-        
+
         assert "memory:mem_old" in result
         assert "Reusing" in result
 
@@ -146,24 +146,24 @@ class TestFindSimilarResult:
         mock_memory.content = "test pattern found"
         mock_memory.observed_at = datetime.now(timezone.utc) - timedelta(seconds=600)
         mock_memory.created_at = datetime.now(timezone.utc) - timedelta(seconds=600)
-        mock_service.retrieve.return_value = [mock_memory]
-        
+        mock_service.retrieve.return_value = ([mock_memory], None)
+
         result = find_similar_result(
             "grep", {"pattern": "test"}, "sess1", "user1", mock_service,
             max_age_seconds=300,
         )
-        
+
         assert result is None
 
     def test_cross_session_search(self, mock_service):
         """Cross-session search passes global session_id."""
-        mock_service.retrieve.return_value = []
-        
+        mock_service.retrieve.return_value = ([], None)
+
         find_similar_result(
             "grep", {"pattern": "test"}, "sess1", "user1", mock_service,
             cross_session=True
         )
-        
+
         call_kwargs = mock_service.retrieve.call_args[1]
         assert call_kwargs["session_id"] == "global"
 
@@ -307,14 +307,14 @@ class TestStalenessCheck:
     def test_old_result_rejected(self):
         """Results older than max_age are rejected."""
         from datetime import datetime, timedelta, timezone
-        
+
         mock_service = MagicMock()
         mock_memory = MagicMock()
         mock_memory.content = "test pattern"
         mock_memory.observed_at = datetime.now(timezone.utc) - timedelta(seconds=600)  # 10 min old
         mock_memory.created_at = datetime.now(timezone.utc) - timedelta(seconds=600)
-        mock_service.retrieve.return_value = [mock_memory]
-        
+        mock_service.retrieve.return_value = ([mock_memory], None)
+
         result = find_similar_result(
             "grep", {"pattern": "test"}, "sess1", "user1", mock_service,
             max_age_seconds=300  # 5 min max
@@ -324,15 +324,15 @@ class TestStalenessCheck:
     def test_fresh_result_accepted(self):
         """Fresh results are accepted."""
         from datetime import datetime, timedelta, timezone
-        
+
         mock_service = MagicMock()
         mock_memory = MagicMock()
         mock_memory.memory_id = "mem_fresh"
         mock_memory.content = "test pattern found"
         mock_memory.observed_at = datetime.now(timezone.utc) - timedelta(seconds=60)  # 1 min old
         mock_memory.created_at = datetime.now(timezone.utc) - timedelta(seconds=60)
-        mock_service.retrieve.return_value = [mock_memory]
-        
+        mock_service.retrieve.return_value = ([mock_memory], None)
+
         result = find_similar_result(
             "grep", {"pattern": "test"}, "sess1", "user1", mock_service,
             max_age_seconds=300

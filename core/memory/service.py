@@ -31,7 +31,7 @@ class MemoryService:
 
     Usage:
         svc = MemoryService(db_factory)
-        memories = svc.retrieve(user_id, query, session_id=sid)
+        memories, stats = svc.retrieve(user_id, query, session_id=sid)
         profile = svc.get_profile(user_id)
         svc.observe_turn(user_id, messages)
         report = svc.run_governance(user_id)
@@ -148,9 +148,10 @@ class MemoryService:
         task_hint: str | None = None,
         weights: RetrievalWeights | None = None,
         include_cross_session: bool = True,
-    ) -> list[Memory]:
+        explain: bool = False,
+    ) -> tuple[list[Memory], Any]:
         """Retrieve memories ranked by hybrid relevance."""
-        memories, _ = self._retriever_lazy.retrieve(
+        return self._retriever_lazy.retrieve(
             user_id=user_id,
             query_text=query,
             session_id=session_id,
@@ -160,8 +161,8 @@ class MemoryService:
             task_hint=task_hint,
             weights=weights,
             include_cross_session=include_cross_session,
+            explain=explain,
         )
-        return memories
 
     def get_profile(self, user_id: str) -> str | None:
         """Get synthesized user profile string."""
