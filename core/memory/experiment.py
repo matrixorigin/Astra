@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime as dt
 from datetime import timedelta, timezone
@@ -180,8 +179,10 @@ class MemoryExperimentManager(DbConsumer):
             strategy_key or "vector:v1", params,
         )
 
-        exp_id = uuid.uuid4().hex[:12]
-        branch_db = f"mem_exp_{user_id[:16]}_{exp_id}"
+        from core.utils.id_generator import generate_id
+
+        exp_id = generate_id()
+        branch_db = f"mem_exp_{exp_id}"
         snapshot_name = f"base_{exp_id}"
 
         snapshot_ok = self._create_snapshot(snapshot_name)

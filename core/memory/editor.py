@@ -57,10 +57,12 @@ class MemoryEditor:
         storage: CanonicalStorage,
         db_factory: DbFactory,
         index_manager: IndexManager | None = None,
+        embed_client: Any | None = None,
     ) -> None:
         self._storage = storage
         self._db_factory = db_factory
         self._index_manager = index_manager
+        self._embed_client = embed_client
 
     def inject(
         self,
@@ -105,6 +107,74 @@ class MemoryEditor:
 
         self._log_edit(user_id, "inject", target_ids=[mem.memory_id], reason=source)
         return mem
+
+    def batch_inject(
+        self,
+        user_id: str,
+        specs: list[dict[str, Any]],
+        *,
+        source: str = "batch_inject",
+        session_id: str | None = None,
+    ) -> list[Memory]:
+        """Batch-inject memories: 1 embedding call, 1 DB transaction, 1 index update.
+
+        Args:
+            user_id: Target user.
+            specs: List of dicts with 'content', optional 'type' and 'trust'.
+            source: Source identifier for audit.
+            session_id: Optional session context.
+
+        Returns:
+            List of created Memory objects.
+        """
+        import uuid as _uuid
+
+        from core.memory.types import Memory as MemoryObj
+        from core.memory.types import MemoryType, TrustTier, _utcnow
+
+        if not specs:
+            return []
+
+        now = _utcnow()
+        memories: list[MemoryObj] = []
+        for spec in specs:
+            mem = MemoryObj(
+                memory_id=_uuid.uuid4().hex,
+                user_id=user_id,
+                memory_type=MemoryType(spec.get("type", "semantic")),
+                content=spec["content"],
+                initial_confidence=1.0,
+                trust_tier=TrustTier(spec.get("trust", "T2")),
+                source_event_ids=[f"inject:{source}"],
+                session_id=session_id,
+                observed_at=now,
+            )
+            memories.append(mem)
+
+        # Batch embed — 1 API call instead of N
+        if self._embed_client is not None:
+            try:
+                texts = [m.content for m in memories]
+                embeddings = self._embed_client.embed_batch(texts)
+                for mem, emb in zip(memories, embeddings, strict=True):
+                    mem.embedding = emb
+            except Exception:
+                logger.warning("Batch embedding failed, continuing without embeddings", exc_info=True)
+
+        # Batch store — 1 transaction
+        stored = self._storage.batch_store(memories)
+
+        # Batch index update — 1 call
+        if self._index_manager and stored:
+            self._index_manager.on_memories_stored(user_id, stored, session_id=session_id)
+
+        # Single audit entry
+        self._log_edit(
+            user_id, "inject",
+            target_ids=[m.memory_id for m in stored],
+            reason=source,
+        )
+        return stored
 
     def correct(
         self,

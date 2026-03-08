@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 class MemoryProgramTool(EdgeTool):
     """Execute memory programs (inject/correct/purge/tune) with explain."""
 
+    def __init__(self, session_info: dict[str, Any] | None = None) -> None:
+        self._session = session_info or {}
+
     @property
     def name(self) -> str:
         return "memory_program"
@@ -52,10 +55,6 @@ class MemoryProgramTool(EdgeTool):
                     ),
                     "items": {"type": "object"},
                 },
-                "sandbox": {
-                    "type": "boolean",
-                    "description": "If true, execute in isolated branch (default: true). Use false for direct writes.",
-                },
                 "dry_run": {
                     "type": "boolean",
                     "description": "If true, validate only without executing.",
@@ -79,7 +78,7 @@ class MemoryProgramTool(EdgeTool):
     async def execute(self, **kwargs: Any) -> str:
         user_id: str = kwargs["user_id"]
         actions: list[dict] = kwargs["actions"]
-        sandbox: bool = kwargs.get("sandbox", True)
+        sandbox: bool = kwargs.get("sandbox", True)  # Default true; not exposed in schema
         dry_run: bool = kwargs.get("dry_run", False)
         explain: bool = kwargs.get("explain", False)
         commit_id: str | None = kwargs.get("commit")
@@ -100,6 +99,7 @@ class MemoryProgramTool(EdgeTool):
                 sandbox=sandbox,
                 dry_run=dry_run,
                 program_name="cli",
+                session_id=self._session.get("session_id"),
             )
         except Exception as e:
             return json.dumps({"error": str(e)})
@@ -149,14 +149,12 @@ class MemoryProgramTool(EdgeTool):
 def _get_programmer():
     """Lazy-init MemoryProgrammer from production DB."""
     from api.database import SessionLocal
-    from core.memory.canonical_storage import CanonicalStorage
-    from core.memory.editor import MemoryEditor
     from core.memory.experiment import MemoryExperimentManager
+    from core.memory.factory import create_editor
     from core.memory.programmer import MemoryProgrammer
 
     db_factory = SessionLocal
-    storage = CanonicalStorage(db_factory)
-    editor = MemoryEditor(storage, db_factory)
+    editor = create_editor(db_factory)
     db_name = SessionLocal.kw["bind"].url.database
     experiments = MemoryExperimentManager(db_factory, source_db=db_name)
     return MemoryProgrammer(editor, experiments, db_factory)

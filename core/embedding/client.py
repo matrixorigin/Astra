@@ -33,6 +33,10 @@ class EmbeddingClient:
     def embed(self, text: str) -> list[float]:
         return self._provider.embed(text)
 
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Embed multiple texts in one call (native batch if provider supports it)."""
+        return self._provider.embed_batch(texts)
+
     @property
     def dimension(self) -> int:
         return self._provider.dimension()

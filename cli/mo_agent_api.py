@@ -1280,7 +1280,7 @@ async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, au
 
     # Memory programming tool (inject/correct/purge/tune + explain)
     from cli.tools.memory_program import MemoryProgramTool
-    router.register(MemoryProgramTool())
+    router.register(MemoryProgramTool(session_info=session_info))
 
     # Skill discovery tool for large catalogs
     from cli.tools.skill_discovery import FindSkillsTool
@@ -2057,9 +2057,8 @@ def memory_program(ctx, instruction, user_id, sandbox, dry_run, explain, model):
 
     from api.database import SessionLocal
     from core.llm.client import LLMClient
-    from core.memory.canonical_storage import CanonicalStorage
-    from core.memory.editor import MemoryEditor
     from core.memory.experiment import MemoryExperimentManager
+    from core.memory.factory import create_editor
     from core.memory.programmer import MemoryProgrammer, nl_to_script
 
     db_factory = SessionLocal
@@ -2075,8 +2074,13 @@ def memory_program(ctx, instruction, user_id, sandbox, dry_run, explain, model):
     if explain:
         click.echo(json.dumps(actions, indent=2))
 
-    storage = CanonicalStorage(db_factory)
-    editor = MemoryEditor(storage, db_factory)
+    if not sandbox and not dry_run:
+        click.echo("⚠️  --no-sandbox: changes will be written directly to production.")
+        if not click.confirm("Continue?"):
+            click.echo("Aborted.")
+            return
+
+    editor = create_editor(db_factory, user_id=user_id)
     db_name = SessionLocal.kw["bind"].url.database
     experiments = MemoryExperimentManager(db_factory, source_db=db_name)
     programmer = MemoryProgrammer(editor, experiments, db_factory)
@@ -2114,9 +2118,8 @@ def memory_run(script_file, user_id, sandbox, dry_run, explain):
     from pathlib import Path
 
     from api.database import SessionLocal
-    from core.memory.canonical_storage import CanonicalStorage
-    from core.memory.editor import MemoryEditor
     from core.memory.experiment import MemoryExperimentManager
+    from core.memory.factory import create_editor
     from core.memory.programmer import MemoryProgrammer, parse_script
 
     raw = Path(script_file).read_text()
@@ -2129,8 +2132,7 @@ def memory_run(script_file, user_id, sandbox, dry_run, explain):
     click.echo(f"📝 Loaded {len(actions)} action(s) from {script_file}")
 
     db_factory = SessionLocal
-    storage = CanonicalStorage(db_factory)
-    editor = MemoryEditor(storage, db_factory)
+    editor = create_editor(db_factory, user_id=user_id)
     db_name = SessionLocal.kw["bind"].url.database
     experiments = MemoryExperimentManager(db_factory, source_db=db_name)
     programmer = MemoryProgrammer(editor, experiments, db_factory)
@@ -2197,7 +2199,7 @@ def memory_review(user_id):
     db_name = SessionLocal.kw["bind"].url.database
     mgr = MemoryExperimentManager(db_factory, source_db=db_name)
 
-    experiments = mgr.list_experiments(user_id, status="active")
+    experiments = mgr.list_active(user_id)
     if not experiments:
         click.echo("No pending experiments.")
         return

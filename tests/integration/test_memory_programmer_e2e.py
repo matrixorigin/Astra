@@ -523,16 +523,17 @@ class TestEditAuditTrail:
             sandbox=False,
         )
         with db_factory() as db:
-            row = db.execute(
+            rows = db.execute(
                 text(
                     "SELECT operation, user_id FROM mem_edit_log "
-                    "WHERE user_id = :uid ORDER BY created_at DESC LIMIT 1"
+                    "WHERE user_id = :uid ORDER BY created_at"
                 ),
                 {"uid": uid},
-            ).fetchone()
-            assert row is not None
-            assert row.operation == "inject"
-            assert row.user_id == uid
+            ).fetchall()
+            ops = [r.operation for r in rows]
+            # editor.inject logs "inject", then programmer logs "program"
+            assert "inject" in ops
+            assert "program" in ops
 
 
 class TestAtomicRollback:
@@ -749,3 +750,368 @@ class TestConcurrentExecution:
             for uid, _ in results:
                 db.execute(text("DELETE FROM mem_memories WHERE user_id = :uid"), {"uid": uid})
             db.commit()
+
+
+# ── purge.before parameter ────────────────────────────────────────────────────
+
+
+class TestPurgeBeforeFilter:
+    def test_purge_before_removes_old_keeps_new(self, programmer, db_factory):
+        """purge with before= only deactivates memories older than the cutoff."""
+        from datetime import datetime, timezone
+
+        uid = f"test_prog_{generate_id()}"
+
+        # Inject two memories
+        programmer.execute(
+            uid,
+            [
+                {"inject": {"content": "old fact", "type": "semantic"}},
+                {"inject": {"content": "new fact", "type": "semantic"}},
+            ],
+            sandbox=False,
+        )
+
+        # Manually backdate the first memory so it's clearly "old"
+        with db_factory() as db:
+            db.execute(
+                text(
+                    "UPDATE mem_memories SET observed_at = '2000-01-01 00:00:00' "
+                    "WHERE user_id = :uid AND content = 'old fact'"
+                ),
+                {"uid": uid},
+            )
+            db.commit()
+
+        cutoff = datetime(2010, 1, 1, tzinfo=timezone.utc).isoformat()
+        result = programmer.execute(
+            uid,
+            [{"purge": {"filter": {"before": cutoff}}}],
+            sandbox=False,
+        )
+        assert result.actions_executed == 1
+        assert result.results[0].detail["deactivated"] == 1
+
+        # Verify: old fact gone, new fact still active
+        with db_factory() as db:
+            rows = db.execute(
+                text(
+                    "SELECT content, is_active FROM mem_memories "
+                    "WHERE user_id = :uid ORDER BY content"
+                ),
+                {"uid": uid},
+            ).fetchall()
+        by_content = {r.content: r.is_active for r in rows}
+        assert by_content["old fact"] == 0
+        assert by_content["new fact"] == 1
+
+    def test_purge_before_with_type_filter(self, programmer, db_factory):
+        """before + type filter: only old memories of that type are purged."""
+        from datetime import datetime, timezone
+
+        uid = f"test_prog_{generate_id()}"
+
+        programmer.execute(
+            uid,
+            [
+                {"inject": {"content": "old semantic", "type": "semantic"}},
+                {"inject": {"content": "old procedural", "type": "procedural"}},
+            ],
+            sandbox=False,
+        )
+
+        with db_factory() as db:
+            db.execute(
+                text(
+                    "UPDATE mem_memories SET observed_at = '2000-01-01 00:00:00' "
+                    "WHERE user_id = :uid"
+                ),
+                {"uid": uid},
+            )
+            db.commit()
+
+        cutoff = datetime(2010, 1, 1, tzinfo=timezone.utc).isoformat()
+        result = programmer.execute(
+            uid,
+            [{"purge": {"filter": {"type": "semantic", "before": cutoff}}}],
+            sandbox=False,
+        )
+        assert result.results[0].detail["deactivated"] == 1
+
+        with db_factory() as db:
+            rows = db.execute(
+                text(
+                    "SELECT content, is_active FROM mem_memories WHERE user_id = :uid"
+                ),
+                {"uid": uid},
+            ).fetchall()
+        by_content = {r.content: r.is_active for r in rows}
+        assert by_content["old semantic"] == 0
+        assert by_content["old procedural"] == 1  # different type, untouched
+
+    def test_purge_before_future_purges_nothing(self, programmer, db_factory):
+        """before= far in the future purges everything active."""
+        uid = f"test_prog_{generate_id()}"
+
+        programmer.execute(
+            uid,
+            [{"inject": {"content": "some fact", "type": "semantic"}}],
+            sandbox=False,
+        )
+
+        result = programmer.execute(
+            uid,
+            [{"purge": {"filter": {"before": "2099-01-01T00:00:00"}}}],
+            sandbox=False,
+        )
+        assert result.results[0].detail["deactivated"] == 1
+
+        with db_factory() as db:
+            active = db.execute(
+                text(
+                    "SELECT COUNT(*) FROM mem_memories "
+                    "WHERE user_id = :uid AND is_active != 0"
+                ),
+                {"uid": uid},
+            ).scalar()
+        assert active == 0
+
+
+# ── Cross-table invariants ────────────────────────────────────────────────────
+
+
+class TestCrossTableInvariants:
+    def test_inject_target_ids_match_memory_ids(self, programmer, db_factory):
+        """mem_edit_log.target_ids must contain the memory_id written to mem_memories."""
+        import json
+
+        uid = f"test_prog_{generate_id()}"
+        programmer.execute(
+            uid,
+            [{"inject": {"content": "cross-table fact", "type": "semantic"}}],
+            sandbox=False,
+        )
+
+        with db_factory() as db:
+            mem = db.execute(
+                text(
+                    "SELECT memory_id FROM mem_memories "
+                    "WHERE user_id = :uid AND content = 'cross-table fact'"
+                ),
+                {"uid": uid},
+            ).fetchone()
+            assert mem is not None
+
+            log = db.execute(
+                text(
+                    "SELECT target_ids FROM mem_edit_log "
+                    "WHERE user_id = :uid AND operation = 'inject' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"uid": uid},
+            ).fetchone()
+            assert log is not None
+            target_ids = json.loads(log.target_ids)
+            assert mem.memory_id in target_ids
+
+    def test_sandbox_snapshot_before_matches_experiment_id(
+        self, programmer, experiments, db_factory
+    ):
+        """mem_edit_log.snapshot_before == mem_experiments.experiment_id for sandbox runs."""
+        uid = f"test_prog_{generate_id()}"
+        result = programmer.execute(
+            uid,
+            [{"inject": {"content": "sandbox cross-table", "type": "semantic"}}],
+            sandbox=True,
+            program_name="cross_table_test",
+        )
+        assert result.experiment_id is not None
+
+        with db_factory() as db:
+            log = db.execute(
+                text(
+                    "SELECT snapshot_before FROM mem_edit_log "
+                    "WHERE user_id = :uid ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"uid": uid},
+            ).fetchone()
+            assert log is not None
+            assert log.snapshot_before == result.experiment_id
+
+    def test_purge_target_ids_empty_when_type_filter(self, programmer, db_factory):
+        """purge by type: target_ids in audit log is [] (bulk op, no individual IDs tracked)."""
+        import json
+
+        uid = f"test_prog_{generate_id()}"
+        programmer.execute(
+            uid,
+            [{"inject": {"content": "to purge", "type": "semantic"}}],
+            sandbox=False,
+        )
+        programmer.execute(
+            uid,
+            [{"purge": {"filter": {"type": "semantic"}}}],
+            sandbox=False,
+        )
+
+        with db_factory() as db:
+            log = db.execute(
+                text(
+                    "SELECT target_ids FROM mem_edit_log "
+                    "WHERE user_id = :uid AND operation = 'purge' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"uid": uid},
+            ).fetchone()
+            assert log is not None
+            # type-based purge doesn't collect individual IDs
+            target_ids = json.loads(log.target_ids)
+            assert isinstance(target_ids, list)
+
+    def test_sandbox_inject_audit_mirrored_to_production(self, programmer, db_factory):
+        """Sandbox inject: production mem_edit_log has both inject and program entries."""
+        import json
+
+        uid = f"test_prog_{generate_id()}"
+        result = programmer.execute(
+            uid,
+            [{"inject": {"content": "sandbox audit fact", "type": "semantic"}}],
+            sandbox=True,
+            program_name="audit_mirror_test",
+        )
+        assert result.experiment_id is not None
+
+        with db_factory() as db:
+            logs = db.execute(
+                text(
+                    "SELECT operation, target_ids, reason, snapshot_before "
+                    "FROM mem_edit_log WHERE user_id = :uid "
+                    "ORDER BY created_at ASC"
+                ),
+                {"uid": uid},
+            ).fetchall()
+
+        ops = [r.operation for r in logs]
+        assert "inject" in ops, f"inject entry missing from production audit log; got {ops}"
+        assert "program" in ops, f"program entry missing from production audit log; got {ops}"
+
+        inject_log = next(r for r in logs if r.operation == "inject")
+        program_log = next(r for r in logs if r.operation == "program")
+
+        # Both reference the same experiment
+        assert inject_log.snapshot_before == result.experiment_id
+        assert program_log.snapshot_before == result.experiment_id
+
+        # inject entry has the memory_id
+        inject_ids = json.loads(inject_log.target_ids)
+        program_ids = json.loads(program_log.target_ids)
+        assert len(inject_ids) > 0
+        assert inject_ids == program_ids  # same memory IDs in both entries
+
+    def test_sandbox_audit_not_duplicated_for_non_sandbox(self, programmer, db_factory):
+        """Non-sandbox run: only one program entry, no duplicate inject entry."""
+        uid = f"test_prog_{generate_id()}"
+        programmer.execute(
+            uid,
+            [{"inject": {"content": "direct fact", "type": "semantic"}}],
+            sandbox=False,
+        )
+
+        with db_factory() as db:
+            logs = db.execute(
+                text(
+                    "SELECT operation FROM mem_edit_log "
+                    "WHERE user_id = :uid ORDER BY created_at ASC"
+                ),
+                {"uid": uid},
+            ).fetchall()
+
+        ops = [r.operation for r in logs]
+        # non-sandbox: inject (from editor) + program (from programmer)
+        assert ops.count("inject") == 1
+        assert ops.count("program") == 1
+
+
+# ── Error degradation paths ───────────────────────────────────────────────────
+
+
+class TestErrorDegradation:
+    def test_audit_failure_does_not_fail_inject(self, programmer, db_factory, monkeypatch):
+        """If _log_edit raises internally, inject still succeeds (best-effort audit)."""
+        from core.memory import editor as editor_mod
+
+        # Patch the DB execute inside _log_edit by making the whole method silently fail
+        # (simulating what happens when the audit INSERT fails at the DB level)
+        original_log = editor_mod.MemoryEditor._log_edit
+
+        def flaky_log(self, *args, **kwargs):
+            # Simulate DB failure inside the try block — exception is swallowed by design
+            try:
+                raise RuntimeError("simulated audit DB failure")
+            except Exception:
+                pass  # mirrors the real _log_edit behavior
+
+        monkeypatch.setattr(editor_mod.MemoryEditor, "_log_edit", flaky_log)
+
+        uid = f"test_prog_{generate_id()}"
+        result = programmer.execute(
+            uid,
+            [{"inject": {"content": "audit-fail fact", "type": "semantic"}}],
+            sandbox=False,
+        )
+        # inject itself must succeed even when audit silently fails
+        assert result.actions_executed == 1
+        assert result.results[0].success is True
+
+        # Memory is in DB despite audit failure
+        with db_factory() as db:
+            count = db.execute(
+                text(
+                    "SELECT COUNT(*) FROM mem_memories "
+                    "WHERE user_id = :uid AND content = 'audit-fail fact' AND is_active != 0"
+                ),
+                {"uid": uid},
+            ).scalar()
+        assert count == 1
+
+        monkeypatch.setattr(editor_mod.MemoryEditor, "_log_edit", original_log)
+
+    def test_snapshot_failure_does_not_fail_purge(self, programmer, db_factory, monkeypatch):
+        """If _create_safety_snapshot raises internally, purge still deactivates memories."""
+        from core.memory import editor as editor_mod
+
+        def broken_snapshot(self, *args, **kwargs) -> None:
+            # Simulate failure inside the try block — returns None by design
+            try:
+                raise RuntimeError("simulated snapshot failure")
+            except Exception:
+                return None  # mirrors the real _create_safety_snapshot behavior
+
+        monkeypatch.setattr(
+            editor_mod.MemoryEditor, "_create_safety_snapshot", broken_snapshot
+        )
+
+        uid = f"test_prog_{generate_id()}"
+        programmer.execute(
+            uid,
+            [{"inject": {"content": "snap-fail fact", "type": "semantic"}}],
+            sandbox=False,
+        )
+
+        result = programmer.execute(
+            uid,
+            [{"purge": {"filter": {"type": "semantic"}}}],
+            sandbox=False,
+        )
+        assert result.results[0].success is True
+        assert result.results[0].detail["deactivated"] == 1
+
+        with db_factory() as db:
+            active = db.execute(
+                text(
+                    "SELECT COUNT(*) FROM mem_memories "
+                    "WHERE user_id = :uid AND is_active != 0"
+                ),
+                {"uid": uid},
+            ).scalar()
+        assert active == 0

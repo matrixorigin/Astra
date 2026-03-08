@@ -144,6 +144,17 @@ class CanonicalStorage:
         )
         return mem
 
+    def batch_store(
+        self,
+        memories: list[Memory],
+    ) -> list[Memory]:
+        """Batch-store pre-built Memory objects. Single transaction, no contradiction check.
+
+        Caller is responsible for building Memory objects (with embeddings if needed).
+        Skips contradiction detection — appropriate for admin/curated batch inject.
+        """
+        return self._store_lazy.batch_create(memories)
+
     def observe_turn(
         self,
         user_id: str,

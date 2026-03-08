@@ -86,6 +86,41 @@ class MemoryStore(DbConsumer):
         self._metrics.increment("memories_created")
         return memory
 
+    def batch_create(self, memories: list[Memory]) -> list[Memory]:
+        """Insert multiple memories in a single transaction."""
+        if not memories:
+            return []
+        now = _utcnow()
+        for mem in memories:
+            if not mem.memory_id:
+                mem.memory_id = uuid.uuid4().hex
+            if not mem.observed_at:
+                mem.observed_at = now
+
+        with Timer("store_batch_create", self._metrics), self._db() as db:
+            rows = [
+                MemoryRecord(
+                    memory_id=mem.memory_id,
+                    user_id=mem.user_id,
+                    session_id=mem.session_id,
+                    memory_type=mem.memory_type.value,
+                    content=mem.content,
+                    initial_confidence=mem.initial_confidence,
+                    trust_tier=mem.trust_tier.value,
+                    embedding=mem.embedding,
+                    source_event_ids=mem.source_event_ids,
+                    is_active=1,
+                    observed_at=mem.observed_at,
+                )
+                for mem in memories
+            ]
+            db.add_all(rows)
+            db.commit()
+            for mem, row in zip(memories, rows, strict=True):
+                mem.created_at = row.created_at
+        self._metrics.increment("memories_created", len(memories))
+        return memories
+
     def get(self, memory_id: str) -> Memory | None:
         with Timer("store_get", self._metrics), self._db() as db:
             row = db.query(MemoryRecord).filter_by(memory_id=memory_id).first()

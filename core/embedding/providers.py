@@ -10,6 +10,10 @@ class BaseEmbeddingProvider(ABC):
     @abstractmethod
     def embed(self, text: str) -> list[float]: ...
 
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Embed multiple texts. Default: sequential fallback."""
+        return [self.embed(t) for t in texts]
+
     @abstractmethod
     def dimension(self) -> int: ...
 
@@ -90,6 +94,15 @@ class OpenAIProvider(BaseEmbeddingProvider):
             model=self._model_name, input=text, dimensions=self._dim,
         )
         return resp.data[0].embedding
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        resp = self._client.embeddings.create(
+            model=self._model_name, input=texts, dimensions=self._dim,
+        )
+        # API returns embeddings in same order as input
+        return [d.embedding for d in resp.data]
 
     def dimension(self) -> int:
         return self._dim

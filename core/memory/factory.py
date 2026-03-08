@@ -186,6 +186,43 @@ def create_memory_service(
     )
 
 
+def create_editor(
+    db_factory: DbFactory,
+    user_id: str | None = None,
+) -> Any:
+    """Create a MemoryEditor with the appropriate index_manager for the user's strategy.
+
+    Args:
+        db_factory: Database session factory.
+        user_id: If provided, resolves user's strategy to get the right index_manager.
+
+    Returns:
+        MemoryEditor with index_manager wired up.
+    """
+    from core.memory.editor import MemoryEditor
+
+    _register_builtins()
+    storage = CanonicalStorage(db_factory)
+
+    index_manager = None
+    if user_id:
+        strategy_key = _resolve_strategy(db_factory, user_id, backend=None, strategy=None)
+        descriptor = StrategyDescriptor.parse(strategy_key)
+        index_manager = _registry.create_index_manager(
+            descriptor, db_factory=db_factory,
+        )
+
+    # Resolve embed client (best-effort — None if not configured)
+    embed_client = None
+    try:
+        from core.context.embeddings import get_embedding_client
+        embed_client = get_embedding_client()
+    except Exception:
+        logger.debug("Embedding client not available for editor", exc_info=True)
+
+    return MemoryEditor(storage, db_factory, index_manager=index_manager, embed_client=embed_client)
+
+
 # ── Per-user strategy binding ─────────────────────────────────────────
 
 

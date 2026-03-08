@@ -19,7 +19,6 @@ if TYPE_CHECKING:
     from core.memory.editor import MemoryEditor
     from core.memory.experiment import ExperimentInfo, MemoryExperimentManager
 
-from core.memory.types import TRUST_TIER_INITIAL_CONFIDENCE
 
 logger = logging.getLogger(__name__)
 
@@ -296,6 +295,7 @@ class MemoryProgrammer:
         atomic: bool = True,
         timeout_seconds: float | None = None,
         program_name: str = "unnamed",
+        session_id: str | None = None,
     ) -> ProgramResult:
         """Parse and execute a memory program.
 
@@ -353,7 +353,7 @@ class MemoryProgrammer:
             if deadline and time.monotonic() >= deadline:
                 timed_out = True
                 break
-            result = self._execute_action(user_id, action, editor=editor)
+            result = self._execute_action(user_id, action, editor=editor, session_id=session_id)
             results.append(result)
             if not result.success:
                 failed_any = True
@@ -364,7 +364,7 @@ class MemoryProgrammer:
         # Atomic rollback: discard experiment on any failure or timeout
         if atomic and (failed_any or timed_out) and sandbox and exp_info:
             self._experiments.discard(exp_info.experiment_id)
-            return ProgramResult(
+            pr = ProgramResult(
                 experiment_id=exp_info.experiment_id,
                 actions_executed=executed,
                 actions_failed=failed,
@@ -372,6 +372,8 @@ class MemoryProgrammer:
                 rolled_back=True,
                 timed_out=timed_out,
             )
+            self._log_program_audit(user_id, program_name, pr)
+            return pr
 
         if timed_out:
             raise ProgramTimeoutError(
@@ -379,12 +381,86 @@ class MemoryProgrammer:
                 f"({len(results)}/{len(actions)} actions completed)"
             )
 
-        return ProgramResult(
+        pr = ProgramResult(
             experiment_id=exp_info.experiment_id if exp_info else None,
             actions_executed=executed,
             actions_failed=failed,
             results=results,
         )
+        self._log_program_audit(user_id, program_name, pr)
+        return pr
+
+    def _log_program_audit(
+        self, user_id: str, program_name: str, result: ProgramResult,
+    ) -> None:
+        """Write a program-level entry to mem_edit_log.
+
+        For sandbox runs, also writes per-action inject/correct/purge entries to
+        production DB so the audit trail is complete after commit.
+        """
+        import json
+
+        from sqlalchemy import text
+
+        from core.utils.id_generator import generate_id
+
+        memory_ids = []
+        for r in result.results:
+            if r.success and r.detail:
+                if "memory_id" in r.detail:
+                    memory_ids.append(r.detail["memory_id"])
+                elif "memory_ids" in r.detail:
+                    memory_ids.extend(r.detail["memory_ids"])
+        try:
+            with self._db_factory() as db:
+                # For sandbox runs: mirror per-action audit entries to production DB.
+                # Branch editor writes them to branch DB only; they're lost after commit.
+                if result.experiment_id:
+                    for r in result.results:
+                        if not r.success or r.action_type not in ("inject", "correct", "purge"):
+                            continue
+                        action_ids: list[str] = []
+                        if r.detail:
+                            if "memory_id" in r.detail:
+                                action_ids = [r.detail["memory_id"]]
+                            elif "memory_ids" in r.detail:
+                                action_ids = list(r.detail["memory_ids"])
+                        db.execute(
+                            text(
+                                "INSERT INTO mem_edit_log "
+                                "(edit_id, user_id, operation, target_ids, reason, "
+                                " snapshot_before, created_by) "
+                                "VALUES (:eid, :uid, :op, :tids, :reason, :snap, :uid)"
+                            ),
+                            {
+                                "eid": generate_id(),
+                                "uid": user_id,
+                                "op": r.action_type,
+                                "tids": json.dumps(action_ids),
+                                "reason": f"sandbox:{program_name}",
+                                "snap": result.experiment_id,
+                            },
+                        )
+
+                db.execute(
+                    text(
+                        "INSERT INTO mem_edit_log "
+                        "(edit_id, user_id, operation, target_ids, reason, "
+                        " snapshot_before, created_by) "
+                        "VALUES (:eid, :uid, :op, :tids, :reason, :snap, :uid)"
+                    ),
+                    {
+                        "eid": generate_id(),
+                        "uid": user_id,
+                        "op": "program",
+                        "tids": json.dumps(memory_ids),
+                        "reason": program_name,
+                        "snap": result.experiment_id,
+                    },
+                )
+                db.commit()
+        except Exception:
+            logger.debug("Failed to log program audit for %s", user_id, exc_info=True)
 
     def _make_branch_editor(self, exp_info: ExperimentInfo) -> MemoryEditor:
         """Create a MemoryEditor that operates on the experiment's branch DB."""
@@ -397,15 +473,15 @@ class MemoryProgrammer:
         storage = CanonicalStorage(branch_factory)
         return EditorCls(storage, branch_factory)
 
-    def _execute_action(self, user_id: str, action: dict, *, editor: MemoryEditor) -> ActionResult:
+    def _execute_action(self, user_id: str, action: dict, *, editor: MemoryEditor, session_id: str | None = None) -> ActionResult:
         """Execute a single action via MemoryEditor."""
         raw_type = _get_action_type(action)
         display_type = "inject" if raw_type == _BATCH_INJECT_KEY else raw_type
         try:
             if raw_type == "inject":
-                return self._do_inject(user_id, action["inject"], editor=editor)
+                return self._do_inject(user_id, action["inject"], editor=editor, session_id=session_id)
             if raw_type == _BATCH_INJECT_KEY:
-                return self._do_batch_inject(user_id, action[_BATCH_INJECT_KEY], editor=editor)
+                return self._do_batch_inject(user_id, action[_BATCH_INJECT_KEY], editor=editor, session_id=session_id)
             if raw_type == "correct":
                 return self._do_correct(user_id, action["correct"], editor=editor)
             if raw_type == "purge":
@@ -418,58 +494,24 @@ class MemoryProgrammer:
             return ActionResult(action_type=display_type, success=False, error=str(e))
 
     def _do_batch_inject(
-        self, user_id: str, specs: list[dict], *, editor: MemoryEditor,
+        self, user_id: str, specs: list[dict], *, editor: MemoryEditor, session_id: str | None = None,
     ) -> ActionResult:
-        """Batch-insert multiple memories in a single transaction."""
-        import uuid as _uuid
-
-        from sqlalchemy import text
-
-        from core.memory.types import MemoryType, TrustTier
-
-        rows_data = []
+        """Batch-insert multiple memories via editor.batch_inject (single transaction)."""
+        # Validate all specs before calling editor
         for spec in specs:
-            content = spec.get("content")
-            if not content:
+            if not spec.get("content"):
                 return ActionResult(
                     action_type="inject", success=False,
                     error="inject requires 'content'",
                 )
-            mem_type = MemoryType(spec.get("type", "semantic"))
-            trust = TrustTier(spec.get("trust", "T2"))
-            rows_data.append({
-                "mid": _uuid.uuid4().hex,
-                "uid": user_id,
-                "mt": mem_type.value,
-                "content": content,
-                "conf": TRUST_TIER_INITIAL_CONFIDENCE.get(trust, 0.75),
-                "trust": trust.value,
-            })
 
-        # Single bulk INSERT
-        db_factory = editor._db_factory
-        with db_factory() as db:
-            for rd in rows_data:
-                db.execute(
-                    text(
-                        "INSERT INTO mem_memories "
-                        "(memory_id, user_id, memory_type, content, "
-                        " initial_confidence, trust_tier, is_active, "
-                        " source_event_ids, observed_at, created_at) "
-                        "VALUES (:mid, :uid, :mt, :content, :conf, :trust, "
-                        " 1, '[]', NOW(), NOW())"
-                    ),
-                    rd,
-                )
-            db.commit()
-
-        ids = [rd["mid"] for rd in rows_data]
+        stored = editor.batch_inject(user_id, specs, source="batch_inject", session_id=session_id)
         return ActionResult(
             action_type="inject", success=True,
-            detail={"memory_ids": ids, "count": len(ids)},
+            detail={"memory_ids": [m.memory_id for m in stored], "count": len(stored)},
         )
 
-    def _do_inject(self, user_id: str, spec: dict, *, editor: MemoryEditor) -> ActionResult:
+    def _do_inject(self, user_id: str, spec: dict, *, editor: MemoryEditor, session_id: str | None = None) -> ActionResult:
         from core.memory.types import MemoryType, TrustTier
 
         content = spec.get("content")
@@ -484,6 +526,7 @@ class MemoryProgrammer:
             user_id, content,
             memory_type=mem_type,
             trust_tier=trust,
+            session_id=session_id,
         )
         return ActionResult(
             action_type="inject", success=True,
@@ -507,6 +550,8 @@ class MemoryProgrammer:
         )
 
     def _do_purge(self, user_id: str, spec: dict, *, editor: MemoryEditor) -> ActionResult:
+        from datetime import datetime, timezone
+
         from core.memory.types import MemoryType
 
         filter_spec = spec.get("filter", {})
@@ -514,10 +559,17 @@ class MemoryProgrammer:
         type_val = filter_spec.get("type")
         memory_types = [MemoryType(type_val)] if type_val else None
 
+        before: datetime | None = None
+        if before_str := filter_spec.get("before"):
+            before = datetime.fromisoformat(before_str).replace(tzinfo=timezone.utc) \
+                if datetime.fromisoformat(before_str).tzinfo is None \
+                else datetime.fromisoformat(before_str)
+
         result = editor.purge(
             user_id,
             memory_ids=memory_ids,
             memory_types=memory_types,
+            before=before,
             reason=spec.get("reason", ""),
         )
         return ActionResult(
