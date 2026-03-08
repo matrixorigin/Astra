@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
-from typing import Optional
+from typing import TYPE_CHECKING
 
 from sqlalchemy import text
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 from core.db_consumer import DbConsumer, DbFactory
 
@@ -54,7 +56,6 @@ class MemoryHealth(DbConsumer):
 
     def detect_pollution(self, user_id: str, since_timestamp: datetime) -> dict:
         """Detect pollution by checking supersede/delete ratio since timestamp."""
-        ts_str = since_timestamp.strftime("%Y-%m-%d %H:%M:%S")
         try:
             with self._db() as db:
                 # Count changes since timestamp
@@ -82,7 +83,7 @@ class MemoryHealth(DbConsumer):
             logger.warning("Pollution detection failed: %s", e)
             return {"is_polluted": False, "error": str(e)}
 
-    def suggest_rollback_target(self, user_id: str) -> Optional[str]:
+    def suggest_rollback_target(self, user_id: str) -> str | None:
         """Find the most likely bad memory (low confidence, recent, caused supersedes)."""
         with self._db() as db:
             row = db.execute(text("""
@@ -166,13 +167,13 @@ class MemoryHealth(DbConsumer):
 
         IVF-flat performance notes (MatrixOne):
         - Optimal: <50K vectors per index partition
-        - Acceptable: 50K–200K (query time grows ~linearly)
+        - Acceptable: 50K-200K (query time grows ~linearly)
         - Degraded: >200K (consider partitioning by user_id or time bucket)
 
         Returns a dict with current counts, growth projection, and recommendations.
         """
-        _IVF_OPTIMAL = 50_000
-        _IVF_DEGRADED = 200_000
+        _ivf_optimal = 50_000
+        _ivf_degraded = 200_000
 
         with self._db() as db:
             # Per-user active vector count
@@ -207,15 +208,15 @@ class MemoryHealth(DbConsumer):
         added_30d = growth_row.added_30d or 0
         monthly_rate = added_30d
         days_to_ivf_optimal = (
-            int((_IVF_OPTIMAL - global_total) / (monthly_rate / 30))
-            if monthly_rate > 0 and global_total < _IVF_OPTIMAL
+            int((_ivf_optimal - global_total) / (monthly_rate / 30))
+            if monthly_rate > 0 and global_total < _ivf_optimal
             else None
         )
 
         recommendation = "ok"
-        if global_total > _IVF_DEGRADED:
+        if global_total > _ivf_degraded:
             recommendation = "partition_required"
-        elif global_total > _IVF_OPTIMAL:
+        elif global_total > _ivf_optimal:
             recommendation = "monitor_query_latency"
 
         return {
@@ -224,9 +225,9 @@ class MemoryHealth(DbConsumer):
             "global_vector_count": global_total,
             "monthly_growth_rate": monthly_rate,
             "days_to_ivf_optimal_threshold": days_to_ivf_optimal,
-            "ivf_thresholds": {"optimal": _IVF_OPTIMAL, "degraded": _IVF_DEGRADED},
+            "ivf_thresholds": {"optimal": _ivf_optimal, "degraded": _ivf_degraded},
             "recommendation": recommendation,
-            "partition_hint": "user_id_hash" if global_total > _IVF_DEGRADED else None,
+            "partition_hint": "user_id_hash" if global_total > _ivf_degraded else None,
         }
 
     def get_storage_stats(self, user_id: str) -> dict:

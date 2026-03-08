@@ -33,24 +33,21 @@ from core.memory.types import (
 )
 
 __all__ = [
-    # Public API
-    "create_memory_service",
-    "MemoryService",
-    # Protocols
+    "DEFAULT_CONFIG",
+    "TRUST_TIER_INITIAL_CONFIDENCE",
     "CandidateProvider",
-    "MemoryReader",
-    "MemoryWriter",
-    "MemoryAdmin",
     "GovernanceReport",
     "HealthReport",
-    "ReflectionCandidate",
-    # Shared types
-    "DEFAULT_CONFIG",
     "Memory",
+    "MemoryAdmin",
     "MemoryGovernanceConfig",
+    "MemoryReader",
+    "MemoryService",
     "MemoryType",
+    "MemoryWriter",
+    "ReflectionCandidate",
     "RetrievalWeights",
     "TrustTier",
-    "TRUST_TIER_INITIAL_CONFIDENCE",
+    "create_memory_service",
     "trust_tier_defaults",
 ]

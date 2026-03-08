@@ -5,7 +5,7 @@ Phase 0 verification: CanonicalStorage + RetrievalStrategy + IndexManager.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -106,7 +106,7 @@ class TestFactoryStrategyResolution:
 class TestMemoryServiceFacade:
     def test_store_notifies_index_manager(self):
         from core.memory.service import MemoryService
-        from core.memory.types import Memory, MemoryType, TrustTier
+        from core.memory.types import Memory, MemoryType
 
         storage = MagicMock()
         retrieval = MagicMock()

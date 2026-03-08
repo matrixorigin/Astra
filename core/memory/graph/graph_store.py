@@ -4,14 +4,10 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import TYPE_CHECKING
 
 from api.models.graph import GraphEdge, GraphNode
 from core.db_consumer import DbConsumer
 from core.memory.graph.types import Edge, GraphNodeData, NodeType
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 

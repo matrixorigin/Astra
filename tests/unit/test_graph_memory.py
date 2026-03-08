@@ -4,8 +4,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from core.memory.graph.types import Edge, EdgeType, GraphNodeData, NodeType
 from core.memory.graph.graph_builder import _compute_ingest_importance
+from core.memory.graph.types import Edge, EdgeType, GraphNodeData, NodeType
 
 
 class TestEdge:
