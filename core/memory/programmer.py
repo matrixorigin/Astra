@@ -136,7 +136,12 @@ def parse_script(raw: str | dict | list) -> list[dict]:
         InvalidScriptError: If script is malformed.
     """
     if isinstance(raw, str):
+        import re
+
         import yaml
+        # Strip markdown code fences (```yaml ... ``` or ``` ... ```)
+        raw = re.sub(r"^```(?:ya?ml)?\s*\n", "", raw.strip())
+        raw = re.sub(r"\n```\s*$", "", raw)
         try:
             raw = yaml.safe_load(raw)
         except Exception as e:
@@ -145,7 +150,7 @@ def parse_script(raw: str | dict | list) -> list[dict]:
     if isinstance(raw, dict):
         if "actions" in raw:
             version = raw.get("version", 1)
-            if version != SCRIPT_VERSION:
+            if int(version) != SCRIPT_VERSION:
                 raise InvalidScriptError(
                     f"Unsupported script version {version} (expected {SCRIPT_VERSION})"
                 )
@@ -165,6 +170,11 @@ def parse_script(raw: str | dict | list) -> list[dict]:
     for i, action in enumerate(actions):
         if not isinstance(action, dict):
             raise InvalidScriptError(f"Action {i} is not a dict")
+        # Normalize flat format: {action: "inject", content: ...} → {inject: {content: ...}}
+        if "action" in action and action["action"] in _ACTION_KEYS:
+            action_type = action.pop("action")
+            actions[i] = {action_type: action}
+            action = actions[i]
         keys = set(action.keys()) & _ACTION_KEYS
         if len(keys) == 0:
             raise InvalidScriptError(
@@ -173,7 +183,52 @@ def parse_script(raw: str | dict | list) -> list[dict]:
         if len(keys) > 1:
             raise InvalidScriptError(f"Action {i} has multiple action keys: {keys}")
 
-    return actions
+    return [_normalize_action_fields(a) for a in actions]
+
+
+# ── Field name normalization ─────────────────────────────────────────
+# LLMs output varying field names. Map all known variants to canonical names
+# so the executor only deals with one vocabulary.
+
+_FIELD_ALIASES: dict[str, str] = {
+    # inject / correct fields
+    "memory_type": "type",
+    "kind": "type",
+    "trust_tier": "trust",
+    "confidence_level": "trust",
+    "tier": "trust",
+    "text": "content",
+    "message": "content",
+    "body": "content",
+    "new_text": "new_content",
+    "new_message": "new_content",
+    "updated_content": "new_content",
+    # tune fields
+    "strategy_key": "strategy",
+    "strategy_name": "strategy",
+    # purge fields — "filter" is already canonical
+}
+
+
+def _normalize_action_fields(action: dict) -> dict:
+    """Normalize field names inside each action's spec dict."""
+    normalized = {}
+    for key, spec in action.items():
+        if key in _ACTION_KEYS and isinstance(spec, dict):
+            normalized[key] = _remap_fields(spec)
+        else:
+            normalized[key] = spec
+    return normalized
+
+
+def _remap_fields(spec: dict) -> dict:
+    """Remap alias field names to canonical names, recursing into nested dicts."""
+    out: dict = {}
+    for k, v in spec.items():
+        canonical = _FIELD_ALIASES.get(k, k)
+        if canonical not in out:
+            out[canonical] = _remap_fields(v) if isinstance(v, dict) else v
+    return out
 
 
 def _get_action_type(action: dict) -> str:
@@ -502,3 +557,32 @@ class MemoryProgrammer:
             action_type="tune", success=True,
             detail={"strategy": strategy, "params": validated},
         )
+
+
+def nl_to_script(user_input: str, user_id: str, llm_client: Any, *, model: str | None = None) -> list[dict]:
+    """Convert natural language instruction to structured actions via LLM.
+
+    Args:
+        user_input: Natural language memory instruction.
+        user_id: Target user.
+        llm_client: LLMClient instance with .chat() method.
+        model: LLM model to use (default: caller's default).
+
+    Returns:
+        Parsed list of action dicts.
+
+    Raises:
+        InvalidScriptError: If LLM output is not valid YAML/script.
+    """
+    from core.memory.programmer_prompts import NL_TO_SCRIPT_PROMPT
+
+    prompt = NL_TO_SCRIPT_PROMPT.format(user_input=user_input, user_id=user_id)
+    kwargs: dict = {
+        "messages": [{"role": "user", "content": prompt}],
+        "user_id": user_id,
+        "task_hint": "memory_program_nl_convert",
+        "temperature": 0.0,
+        "model": model or "cheapest",
+    }
+    response = llm_client.chat(**kwargs)
+    return parse_script(response.content)

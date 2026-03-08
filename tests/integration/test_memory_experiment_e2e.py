@@ -268,7 +268,10 @@ class TestExperimentEvaluate:
         user_id = f"test_exp_{uuid.uuid4().hex[:8]}"
         info = mgr.create(user_id, "eval-no-golden")
 
-        result = mgr.evaluate(info.experiment_id)
+        result = mgr.evaluate(
+            info.experiment_id,
+            golden_session_ids=["nonexistent_session_for_isolation"],
+        )
 
         assert result.sessions_tested == 0
         assert result.metrics.get("note") == "no_golden_sessions"

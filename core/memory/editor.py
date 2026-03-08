@@ -249,8 +249,9 @@ class MemoryEditor:
 
     def _create_safety_snapshot(self, user_id: str, operation: str) -> str | None:
         """Create a snapshot before destructive operations. Best-effort."""
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        name = f"pre_{operation}_{user_id[:16]}_{ts}"
+        from core.utils.id_generator import generate_id
+
+        name = f"pre_{operation}_{generate_id()}"
         try:
             from core.git_for_data import GitForData
 

@@ -1278,6 +1278,10 @@ async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, au
     router.register(ReflectTool(api_client=api_client, session_info=session_info))
     register_skill_config_tools(router, api_client)
 
+    # Memory programming tool (inject/correct/purge/tune + explain)
+    from cli.tools.memory_program import MemoryProgramTool
+    router.register(MemoryProgramTool())
+
     # Skill discovery tool for large catalogs
     from cli.tools.skill_discovery import FindSkillsTool
     router.register(FindSkillsTool())
@@ -2028,6 +2032,178 @@ def profile_delete(profile_name):
     except ValueError as e:
         click.echo(f"❌ {e}")
         sys.exit(1)
+
+
+@cli.group()
+def memory():
+    """Memory programming commands."""
+
+
+@memory.command("program")
+@click.argument("instruction")
+@click.option("--user-id", required=True, help="Target user ID")
+@click.option("--sandbox/--no-sandbox", default=True, help="Execute in sandbox (default: yes)")
+@click.option("--dry-run", is_flag=True, help="Validate only, don't execute")
+@click.option("--explain", is_flag=True, help="Show per-action execution details")
+@click.option("--model", default=None, help="LLM model name (default: auto)")
+@click.pass_context
+def memory_program(ctx, instruction, user_id, sandbox, dry_run, explain, model):
+    """Execute a memory program from natural language.
+
+    INSTRUCTION is a natural language description like:
+    "Remember that I prefer Python for data science"
+    """
+    import json
+
+    from api.database import SessionLocal
+    from core.llm.client import LLMClient
+    from core.memory.canonical_storage import CanonicalStorage
+    from core.memory.editor import MemoryEditor
+    from core.memory.experiment import MemoryExperimentManager
+    from core.memory.programmer import MemoryProgrammer, nl_to_script
+
+    db_factory = SessionLocal
+    llm = LLMClient(db_factory)
+
+    try:
+        actions = nl_to_script(instruction, user_id, llm, model=model)
+    except Exception as e:
+        click.echo(f"❌ Failed to parse instruction: {e}")
+        return
+
+    click.echo(f"📝 Generated {len(actions)} action(s)")
+    if explain:
+        click.echo(json.dumps(actions, indent=2))
+
+    storage = CanonicalStorage(db_factory)
+    editor = MemoryEditor(storage, db_factory)
+    db_name = SessionLocal.kw["bind"].url.database
+    experiments = MemoryExperimentManager(db_factory, source_db=db_name)
+    programmer = MemoryProgrammer(editor, experiments, db_factory)
+
+    result = programmer.execute(
+        user_id, actions, sandbox=sandbox, dry_run=dry_run, program_name="cli",
+    )
+
+    if result.dry_run:
+        click.echo("🔍 Dry-run complete (no changes made)")
+    elif result.rolled_back:
+        click.echo("⚠️  Rolled back due to failure")
+    elif result.experiment_id and sandbox:
+        click.echo(f"✅ Sandbox run: {result.actions_executed} executed, {result.actions_failed} failed")
+        click.echo(f"   Experiment: {result.experiment_id}")
+        click.echo("   Run `mo-agent memory commit <id>` to apply, or `mo-agent memory discard <id>`")
+    else:
+        click.echo(f"✅ {result.actions_executed} executed, {result.actions_failed} failed")
+
+    if explain:
+        for r in result.results:
+            status = "✓" if r.success else "✗"
+            click.echo(f"  {status} {r.action_type}: {r.detail or r.error}")
+
+
+@memory.command("run")
+@click.argument("script_file", type=click.Path(exists=True))
+@click.option("--user-id", required=True, help="Target user ID")
+@click.option("--sandbox/--no-sandbox", default=True)
+@click.option("--dry-run", is_flag=True)
+@click.option("--explain", is_flag=True)
+def memory_run(script_file, user_id, sandbox, dry_run, explain):
+    """Execute a memory program from a YAML file."""
+    import json
+    from pathlib import Path
+
+    from api.database import SessionLocal
+    from core.memory.canonical_storage import CanonicalStorage
+    from core.memory.editor import MemoryEditor
+    from core.memory.experiment import MemoryExperimentManager
+    from core.memory.programmer import MemoryProgrammer, parse_script
+
+    raw = Path(script_file).read_text()
+    try:
+        actions = parse_script(raw)
+    except Exception as e:
+        click.echo(f"❌ Invalid script: {e}")
+        return
+
+    click.echo(f"📝 Loaded {len(actions)} action(s) from {script_file}")
+
+    db_factory = SessionLocal
+    storage = CanonicalStorage(db_factory)
+    editor = MemoryEditor(storage, db_factory)
+    db_name = SessionLocal.kw["bind"].url.database
+    experiments = MemoryExperimentManager(db_factory, source_db=db_name)
+    programmer = MemoryProgrammer(editor, experiments, db_factory)
+
+    result = programmer.execute(
+        user_id, actions, sandbox=sandbox, dry_run=dry_run, program_name=script_file,
+    )
+
+    click.echo(f"✅ {result.actions_executed} executed, {result.actions_failed} failed")
+    if result.experiment_id and sandbox:
+        click.echo(f"   Experiment: {result.experiment_id}")
+        click.echo("   Run `mo-agent memory commit <id>` to apply")
+
+    if explain:
+        for r in result.results:
+            status = "✓" if r.success else "✗"
+            click.echo(f"  {status} {r.action_type}: {json.dumps(r.detail) if r.detail else r.error}")
+
+
+@memory.command("commit")
+@click.argument("experiment_id")
+def memory_commit(experiment_id):
+    """Commit a sandboxed experiment to production."""
+    from api.database import SessionLocal
+    from core.memory.experiment import MemoryExperimentManager
+
+    db_factory = SessionLocal
+    db_name = SessionLocal.kw["bind"].url.database
+    mgr = MemoryExperimentManager(db_factory, source_db=db_name)
+
+    try:
+        mgr.commit(experiment_id)
+        click.echo(f"✅ Committed {experiment_id}")
+    except Exception as e:
+        click.echo(f"❌ Commit failed: {e}")
+
+
+@memory.command("discard")
+@click.argument("experiment_id")
+def memory_discard(experiment_id):
+    """Discard a sandboxed experiment."""
+    from api.database import SessionLocal
+    from core.memory.experiment import MemoryExperimentManager
+
+    db_factory = SessionLocal
+    db_name = SessionLocal.kw["bind"].url.database
+    mgr = MemoryExperimentManager(db_factory, source_db=db_name)
+
+    try:
+        mgr.discard(experiment_id)
+        click.echo(f"✅ Discarded {experiment_id}")
+    except Exception as e:
+        click.echo(f"❌ Discard failed: {e}")
+
+
+@memory.command("review")
+@click.option("--user-id", required=True, help="User ID to review pending experiments")
+def memory_review(user_id):
+    """List pending (active) experiments for review."""
+    from api.database import SessionLocal
+    from core.memory.experiment import MemoryExperimentManager
+
+    db_factory = SessionLocal
+    db_name = SessionLocal.kw["bind"].url.database
+    mgr = MemoryExperimentManager(db_factory, source_db=db_name)
+
+    experiments = mgr.list_experiments(user_id, status="active")
+    if not experiments:
+        click.echo("No pending experiments.")
+        return
+
+    for exp in experiments:
+        click.echo(f"  {exp.experiment_id}  {exp.name}  created={exp.created_at}")
 
 
 if __name__ == "__main__":

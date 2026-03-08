@@ -79,16 +79,23 @@ _mo_client = _MoClient(
 )
 engine = _mo_client._engine
 
-# Mark "Packet sequence number wrong" as a disconnect so pool_pre_ping
+# Mark broken-connection errors as disconnects so pool_pre_ping
 # (and normal error handling) invalidates the connection instead of raising.
 from sqlalchemy import event as _sa_event
 
+_DISCONNECT_PATTERNS = (
+    "Packet sequence number wrong",
+    "Bad file descriptor",
+    "Connection reset by peer",
+    "Broken pipe",
+)
+
 @_sa_event.listens_for(engine, "handle_error")
-def _handle_packet_error(context):
-    if context.original_exception and "Packet sequence number wrong" in str(
-        context.original_exception
-    ):
-        context.is_disconnect = True
+def _handle_disconnect_errors(context):
+    if context.original_exception:
+        msg = str(context.original_exception)
+        if any(p in msg for p in _DISCONNECT_PATTERNS):
+            context.is_disconnect = True
 
 # Session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

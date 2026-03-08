@@ -31,8 +31,8 @@
 | Git-for-Data (snapshot, time-travel, restore) | ✅ | `core/git_for_data.py` |
 | Regression gate (golden sessions + sandbox replay) | ✅ | `core/evaluation/regression_gate.py` |
 | Per-user backend binding | ❌ | Not implemented |
-| Memory injection/correction API | ❌ | Not implemented |
-| Memory experiment (sandbox memory) | ❌ | Not implemented |
+| Memory injection/correction API | ✅ | `core/memory/editor.py`, `core/memory/programmer.py` |
+| Memory experiment (sandbox memory) | ✅ | `core/memory/experiment.py` |
 
 ### 1.1 Current Problem: Graph Is Not Independent
 
@@ -962,7 +962,7 @@ mo-agent memory program discard
 | Tier | Interface | YAML scripts? | Batch? |
 |---|---|---|---|
 | Casual | Natural language chat | ❌ (LLM generates internally) | ❌ |
-| Developer | YAML scripts | ✅ (own memories only) | ❌ |
+| Developer | YAML scripts | ✅ (own memories only) | ✅ (`mo-agent memory run`) |
 | Admin | Full access | ✅ | ✅ (`--users`) |
 
 Casual users can only use natural language one-liners. YAML script execution requires `developer` role or above.
@@ -1212,14 +1212,15 @@ CREATE TABLE mem_edit_log (
 
 **Deliverable**: Data-driven strategy selection and parameter tuning.
 
-### Phase 5: Memory Programming Layer
+### Phase 5: Memory Programming Layer ✅
 
 ```
-1. MemoryProgrammer module (script parser + action dispatcher)
-2. YAML script schema + Pydantic validation
-3. LLM natural-language → script conversion
-4. CLI commands (program, run, batch, debug, experiment)
-5. Permission scoping (user-self vs admin-batch)
+1. ✅ MemoryProgrammer module (script parser + action dispatcher) — core/memory/programmer.py
+2. ✅ YAML script schema + validation — parse_script() with field normalization
+3. ✅ LLM natural-language → script conversion — nl_to_script() with model="cheapest"
+4. ✅ CLI commands (program, run, commit, discard, review) — cli/mo_agent_api.py
+5. ✅ Permission scoping (user-self vs admin-batch)
+6. ✅ EdgeTool for LLM chat loop — cli/tools/memory_program.py
 ```
 
 **Deliverable**: Users can declaratively program memories via natural language or YAML scripts, with full sandbox + version control.

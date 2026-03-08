@@ -56,6 +56,13 @@ def test_engine():
     from api.database import init_db
 
     engine = database.engine
+
+    # Tighten pool for test: fewer connections, faster recycle.
+    # Prevents stale file descriptors when xdist workers dispose/recreate pools.
+    engine.pool._recycle = 60
+    engine.pool._size = 2
+    engine.pool._max_overflow = 3
+
     for attempt in range(5):
         try:
             init_db()
