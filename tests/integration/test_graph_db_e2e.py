@@ -287,3 +287,232 @@ class TestSkeletonLoad:
         assert len(nodes) == 1
         assert nodes[0].embedding is None
         assert nodes[0].content == "test"
+
+
+class TestOpinionEvolution:
+    """§4.5 — opinion evolution against real MatrixOne."""
+
+    def _seed_scene_and_event(self, store, user_id, scene_embed, event_embed):
+        """Create a scene node and a new event node, return their IDs."""
+        scene = GraphNodeData(
+            node_id=uuid4().hex, user_id=user_id,
+            node_type=NodeType.SCENE, content="User prefers verbose errors",
+            embedding=scene_embed, confidence=0.5, trust_tier="T4",
+        )
+        event_node = GraphNodeData(
+            node_id=uuid4().hex, user_id=user_id,
+            node_type=NodeType.EPISODIC, content="Show me detailed errors",
+            embedding=event_embed, confidence=1.0, trust_tier="T1",
+        )
+        store.create_nodes_batch([scene, event_node])
+
+        # Edge so activation can reach the scene from the event
+        store.add_edges_batch([
+            (event_node.node_id, scene.node_id, EdgeType.ABSTRACTION.value, 0.8),
+        ], user_id)
+
+        return scene, event_node
+
+    def test_supporting_evidence_increases_confidence(self, store, user_id):
+        from core.memory.graph.opinion import evolve_opinions
+
+        # Similar embeddings → high cosine similarity → supporting
+        base = _embed(0.1)
+        scene, event_node = self._seed_scene_and_event(store, user_id, base, _similar_embed())
+
+        result = evolve_opinions(store, event_node.node_id, user_id)
+
+        assert result.scenes_evaluated == 1
+        assert result.supporting == 1
+
+        # Verify DB state
+        updated = store.get_node(scene.node_id)
+        assert updated.confidence > 0.5  # increased
+
+    def test_contradicting_evidence_decreases_confidence(self, store, user_id):
+        from core.memory.graph.opinion import evolve_opinions
+
+        # Very different embeddings → low cosine similarity → contradicting
+        scene, event_node = self._seed_scene_and_event(
+            store, user_id, _embed(0.1), _different_embed(),
+        )
+
+        result = evolve_opinions(store, event_node.node_id, user_id)
+
+        assert result.scenes_evaluated == 1
+        assert result.contradicting == 1
+
+        updated = store.get_node(scene.node_id)
+        assert updated.confidence < 0.5  # decreased
+
+    def test_quarantine_deactivates_node(self, store, user_id):
+        from core.memory.graph.opinion import evolve_opinions
+
+        # Start at very low confidence, contradicting will push below quarantine
+        scene = GraphNodeData(
+            node_id=uuid4().hex, user_id=user_id,
+            node_type=NodeType.SCENE, content="Weak belief",
+            embedding=_embed(0.1), confidence=0.15, trust_tier="T4",
+        )
+        event_node = GraphNodeData(
+            node_id=uuid4().hex, user_id=user_id,
+            node_type=NodeType.EPISODIC, content="Contradicts",
+            embedding=_different_embed(), confidence=1.0, trust_tier="T1",
+        )
+        store.create_nodes_batch([scene, event_node])
+        store.add_edges_batch([
+            (event_node.node_id, scene.node_id, EdgeType.ABSTRACTION.value, 0.8),
+        ], user_id)
+
+        result = evolve_opinions(store, event_node.node_id, user_id)
+
+        assert result.quarantined == 1
+        updated = store.get_node(scene.node_id)
+        assert updated.is_active is False
+
+    def test_opinion_does_not_promote_instantly(self, store, user_id):
+        """§4.7: promotion requires age gate — opinion evolution only updates confidence."""
+        from core.memory.graph.opinion import evolve_opinions
+
+        scene = GraphNodeData(
+            node_id=uuid4().hex, user_id=user_id,
+            node_type=NodeType.SCENE, content="Strong belief",
+            embedding=_embed(0.1), confidence=0.78, trust_tier="T4",
+        )
+        event_node = GraphNodeData(
+            node_id=uuid4().hex, user_id=user_id,
+            node_type=NodeType.EPISODIC, content="Supporting",
+            embedding=_similar_embed(), confidence=1.0, trust_tier="T1",
+        )
+        store.create_nodes_batch([scene, event_node])
+        store.add_edges_batch([
+            (event_node.node_id, scene.node_id, EdgeType.ABSTRACTION.value, 0.8),
+        ], user_id)
+
+        result = evolve_opinions(store, event_node.node_id, user_id)
+
+        assert result.supporting == 1
+        updated = store.get_node(scene.node_id)
+        assert updated.confidence > 0.8  # confidence increased past threshold
+        assert updated.trust_tier == "T4"  # but tier NOT promoted — needs age gate
+
+    def test_update_confidence_and_tier(self, store, user_id):
+        """Verify the update_confidence_and_tier method works in real DB."""
+        node = GraphNodeData(
+            node_id=uuid4().hex, user_id=user_id,
+            node_type=NodeType.SCENE, content="test",
+            confidence=0.5, trust_tier="T4",
+        )
+        store.create_node(node)
+
+        store.update_confidence_and_tier(node.node_id, 0.85, "T3")
+
+        loaded = store.get_node(node.node_id)
+        assert loaded.confidence == pytest.approx(0.85)
+        assert loaded.trust_tier == "T3"
+
+
+class TestTrustTierLifecycleE2E:
+    """§4.7 — full lifecycle against real MatrixOne.
+
+    Tests the complete closed loop:
+    1. Scene created at T4 with low confidence
+    2. Supporting evidence raises confidence above threshold
+    3. Consolidation promotes T4→T3 (with age gate)
+    4. Contradicting evidence drops confidence
+    5. Consolidation demotes stale T3→T4
+    """
+
+    def test_full_promotion_lifecycle(self, store, user_id):
+        """Closed-loop: create → support → promote → verify."""
+        from core.memory.graph.consolidation import GraphConsolidator
+        from core.memory.graph.opinion import evolve_opinions
+        from api.database import SessionLocal
+
+        consolidator = GraphConsolidator(SessionLocal)
+
+        # 1. Create scene at T4, confidence 0.5
+        scene = GraphNodeData(
+            node_id=uuid4().hex, user_id=user_id,
+            node_type=NodeType.SCENE, content="User prefers verbose errors",
+            embedding=_embed(0.1), confidence=0.5, trust_tier="T4",
+        )
+        store.create_node(scene)
+
+        # 2. Simulate multiple supporting events to push confidence above 0.8
+        for i in range(7):
+            ev = GraphNodeData(
+                node_id=uuid4().hex, user_id=user_id,
+                node_type=NodeType.EPISODIC, content=f"verbose error request {i}",
+                embedding=_similar_embed(), confidence=1.0, trust_tier="T1",
+            )
+            store.create_node(ev)
+            store.add_edges_batch([
+                (ev.node_id, scene.node_id, EdgeType.ABSTRACTION.value, 0.8),
+            ], user_id)
+            evolve_opinions(store, ev.node_id, user_id)
+
+        # Verify confidence rose above threshold
+        after_support = store.get_node(scene.node_id)
+        assert after_support.confidence >= 0.8
+        assert after_support.trust_tier == "T4"  # not promoted yet — too young
+
+        # 3. Consolidation should NOT promote (node is < 7 days old)
+        result = consolidator.consolidate(user_id)
+        assert result.promoted == 0
+
+        still_t4 = store.get_node(scene.node_id)
+        assert still_t4.trust_tier == "T4"
+
+        # 4. Fake the age by updating created_at directly
+        from sqlalchemy import text
+        from api.models.graph import GraphNode
+        with SessionLocal() as db:
+            db.query(GraphNode).filter_by(node_id=scene.node_id).update({
+                "created_at": text("DATE_SUB(NOW(), INTERVAL 10 DAY)"),
+            })
+            db.commit()
+
+        # 5. Now consolidation should promote T4→T3
+        result2 = consolidator.consolidate(user_id)
+        assert result2.promoted == 1
+
+        promoted = store.get_node(scene.node_id)
+        assert promoted.trust_tier == "T3"
+        assert promoted.confidence >= 0.8
+
+    def test_full_demotion_lifecycle(self, store, user_id):
+        """Closed-loop: T3 scene with low confidence + old age → demoted to T4."""
+        from core.memory.graph.consolidation import GraphConsolidator
+        from api.database import SessionLocal
+
+        consolidator = GraphConsolidator(SessionLocal)
+
+        # 1. Create scene at T3, confidence below threshold
+        scene = GraphNodeData(
+            node_id=uuid4().hex, user_id=user_id,
+            node_type=NodeType.SCENE, content="Stale belief",
+            embedding=_embed(0.1), confidence=0.5, trust_tier="T3",
+        )
+        store.create_node(scene)
+
+        # 2. Not old enough yet — should NOT demote
+        result = consolidator.consolidate(user_id)
+        assert result.demoted == 0
+
+        # 3. Fake age to 65 days
+        from sqlalchemy import text
+        from api.models.graph import GraphNode
+        with SessionLocal() as db:
+            db.query(GraphNode).filter_by(node_id=scene.node_id).update({
+                "created_at": text("DATE_SUB(NOW(), INTERVAL 65 DAY)"),
+            })
+            db.commit()
+
+        # 4. Now consolidation should demote T3→T4
+        result2 = consolidator.consolidate(user_id)
+        assert result2.demoted == 1
+
+        demoted = store.get_node(scene.node_id)
+        assert demoted.trust_tier == "T4"
+        assert demoted.confidence == pytest.approx(0.5)  # confidence unchanged

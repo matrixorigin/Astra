@@ -108,13 +108,12 @@ class SpreadingActivation:
                 spread += SPREADING_FACTOR * _edge_weight(edge) * neighbor_act / fan
             raw[nid] = retention + spread
 
-        # Also activate newly reached neighbors
+        # Also activate newly reached neighbors (single batch query)
+        all_outgoing = self._store.get_edges_for_nodes(active_ids)
         for nid in active_ids:
-            out_edges = self._store.get_edges_for_nodes({nid}).get(nid, [])
-            for edge in out_edges:
+            for edge in all_outgoing.get(nid, []):
                 tid = edge.target_id
                 if tid not in raw:
-                    # New node reached by spreading
                     neighbor_act = self._activation.get(nid, 0.0)
                     if neighbor_act > 0:
                         fan = self._out_degree.get(nid, 1)

@@ -360,6 +360,15 @@ class GraphStore(DbConsumer):
             db.query(GraphNode).filter_by(node_id=node_id).update({"confidence": confidence})
             db.commit()
 
+    def update_confidence_and_tier(
+        self, node_id: str, confidence: float, trust_tier: str,
+    ) -> None:
+        with self._db() as db:
+            db.query(GraphNode).filter_by(node_id=node_id).update({
+                "confidence": confidence, "trust_tier": trust_tier,
+            })
+            db.commit()
+
     def mark_conflict(
         self, older_id: str, newer_id: str,
         *, confidence_factor: float = 0.5, old_confidence: float = 0.75,

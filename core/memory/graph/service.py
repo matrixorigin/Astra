@@ -90,7 +90,7 @@ class GraphMemoryService:
     @property
     def _consolidator(self) -> GraphConsolidator:
         if self._graph_consolidator is None:
-            self._graph_consolidator = GraphConsolidator(self._db_factory)
+            self._graph_consolidator = GraphConsolidator(self._db_factory, config=self._config)
         return self._graph_consolidator
 
     @property
@@ -191,7 +191,8 @@ class GraphMemoryService:
             session_id=session_id,
         )
         try:
-            self._builder.ingest(user_id, [mem], [], session_id=session_id)
+            created = self._builder.ingest(user_id, [mem], [], session_id=session_id)
+            self._run_opinion_evolution(user_id, created)
         except Exception:
             logger.warning("Graph ingest failed for memory %s", mem.memory_id, exc_info=True)
         return mem
@@ -210,10 +211,31 @@ class GraphMemoryService:
         events = [{"event_id": eid, "event_type": "unknown"} for eid in (source_event_ids or [])]
         try:
             session_id = memories[0].session_id if memories else None
-            self._builder.ingest(user_id, memories, events, session_id=session_id)
+            created = self._builder.ingest(user_id, memories, events, session_id=session_id)
+            self._run_opinion_evolution(user_id, created)
         except Exception:
             logger.warning("Graph ingest failed for turn", exc_info=True)
         return memories
+
+    def _run_opinion_evolution(
+        self, user_id: str, created_nodes: list[Any],
+    ) -> None:
+        """Run opinion evolution for newly created nodes with embeddings."""
+        from core.memory.graph.opinion import evolve_opinions
+
+        for node in created_nodes:
+            if not node.embedding:
+                continue
+            try:
+                result = evolve_opinions(self._store, node.node_id, user_id, self._config)
+                if result.scenes_evaluated:
+                    logger.debug(
+                        "Opinion evolution for %s: %d scenes, %d supporting, %d contradicting, %d quarantined",
+                        node.node_id, result.scenes_evaluated,
+                        result.supporting, result.contradicting, result.quarantined,
+                    )
+            except Exception:
+                logger.warning("Opinion evolution failed for node %s", node.node_id, exc_info=True)
 
     # ── MemoryAdmin ───────────────────────────────────────────────────
 

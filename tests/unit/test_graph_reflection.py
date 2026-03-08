@@ -146,6 +146,93 @@ class TestGraphConsolidator:
         assert args[1] == pytest.approx(0.72)
 
 
+
+class TestTrustTierLifecycle:
+    """§4.7 — T4→T3 promotion (age-gated) and T3→T4 demotion."""
+
+    def _make_consolidator(self):
+        from core.memory.graph.consolidation import GraphConsolidator
+        c = GraphConsolidator(lambda: MagicMock())
+        c._store = MagicMock()
+        c._store.get_association_edges.return_value = []
+        return c
+
+    def _scene(self, node_id="s1", confidence=0.85, trust_tier="T4", age_days=10):
+        from datetime import datetime, timedelta, timezone
+        created = datetime.now(timezone.utc) - timedelta(days=age_days)
+        return GraphNodeData(
+            node_id=node_id, user_id="u1", node_type=NodeType.SCENE,
+            content="insight", confidence=confidence, trust_tier=trust_tier,
+            created_at=created.isoformat(),
+        )
+
+    def test_t4_promoted_when_confident_and_old_enough(self):
+        c = self._make_consolidator()
+        scene = self._scene(confidence=0.85, trust_tier="T4", age_days=10)
+        c._store.get_user_nodes.return_value = [scene]
+
+        result = c.consolidate("u1")
+
+        assert result.promoted == 1
+        c._store.update_confidence_and_tier.assert_called_once_with("s1", 0.85, "T3")
+
+    def test_t4_not_promoted_when_too_young(self):
+        c = self._make_consolidator()
+        scene = self._scene(confidence=0.85, trust_tier="T4", age_days=3)
+        c._store.get_user_nodes.return_value = [scene]
+
+        result = c.consolidate("u1")
+
+        assert result.promoted == 0
+        c._store.update_confidence_and_tier.assert_not_called()
+
+    def test_t4_not_promoted_when_low_confidence(self):
+        c = self._make_consolidator()
+        scene = self._scene(confidence=0.6, trust_tier="T4", age_days=30)
+        c._store.get_user_nodes.return_value = [scene]
+
+        result = c.consolidate("u1")
+
+        assert result.promoted == 0
+
+    def test_t3_demoted_when_stale_and_low_confidence(self):
+        c = self._make_consolidator()
+        scene = self._scene(confidence=0.5, trust_tier="T3", age_days=65)
+        c._store.get_user_nodes.return_value = [scene]
+
+        result = c.consolidate("u1")
+
+        assert result.demoted == 1
+        c._store.update_confidence_and_tier.assert_called_once_with("s1", 0.5, "T4")
+
+    def test_t3_not_demoted_when_confident(self):
+        c = self._make_consolidator()
+        scene = self._scene(confidence=0.85, trust_tier="T3", age_days=90)
+        c._store.get_user_nodes.return_value = [scene]
+
+        result = c.consolidate("u1")
+
+        assert result.demoted == 0
+
+    def test_t3_not_demoted_when_young(self):
+        c = self._make_consolidator()
+        scene = self._scene(confidence=0.5, trust_tier="T3", age_days=30)
+        c._store.get_user_nodes.return_value = [scene]
+
+        result = c.consolidate("u1")
+
+        assert result.demoted == 0
+
+    def test_t2_not_affected(self):
+        c = self._make_consolidator()
+        scene = self._scene(confidence=0.4, trust_tier="T2", age_days=100)
+        c._store.get_user_nodes.return_value = [scene]
+
+        result = c.consolidate("u1")
+
+        assert result.promoted == 0
+        assert result.demoted == 0
+
 class TestGraphServiceReflection:
     def _make_service(self):
         from core.memory.graph.service import GraphMemoryService
