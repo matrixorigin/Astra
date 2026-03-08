@@ -162,9 +162,9 @@ class ChatLoop:
             pass
         # Initialize memory service for tool output handling
         try:
-            from core.memory.tabular.service import MemoryService
+            from core.memory import create_memory_service
             if hasattr(event_logger, '_db_factory'):
-                self._memory_service = MemoryService(event_logger._db_factory)
+                self._memory_service = create_memory_service(event_logger._db_factory)
         except Exception:
             pass
         # Initialize global context budget manager

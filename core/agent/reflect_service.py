@@ -179,10 +179,10 @@ class ReflectService(DbConsumer):
 
             # 3. Past lessons
             try:
-                from core.memory.tabular.service import MemoryService
+                from core.memory import create_memory_service
                 from core.memory.types import MemoryType
 
-                svc = MemoryService(self._db_factory)
+                svc = create_memory_service(self._db_factory)
                 # Only list_active() is called — no llm_client/embed_fn needed
                 # (those are only required for observe/pipeline paths).
                 memories = svc.list_active(user_id, MemoryType.PROCEDURAL, limit=5, load_embedding=False)

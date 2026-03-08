@@ -151,8 +151,8 @@ class TurnHooks(DbConsumer):
         embed_fn = self._embed_fn
 
         def _bg():
-            from core.memory.tabular.service import MemoryService
-            svc = MemoryService(db_factory, llm_client=llm, embed_fn=embed_fn)
+            from core.memory import create_memory_service
+            svc = create_memory_service(db_factory, llm_client=llm, embed_fn=embed_fn)
 
             try:
                 svc.run_pipeline(user_id=user_id, messages=messages)
@@ -256,9 +256,9 @@ class TurnHooks(DbConsumer):
             f"Context: {reflect_evidence[:200]}"
         )
         try:
-            from core.memory.tabular.service import MemoryService
+            from core.memory import create_memory_service
             from core.memory.types import MemoryType, TrustTier
-            svc = MemoryService(self._db_factory)
+            svc = create_memory_service(self._db_factory)
             svc.store(
                 user_id=user_id,
                 content=lesson,

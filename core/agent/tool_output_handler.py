@@ -11,12 +11,12 @@ Handles large tool outputs by:
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from core.memory.types import MemoryType
 
 if TYPE_CHECKING:
-    from core.memory.tabular.service import MemoryService
+    pass
 
 SUMMARY_THRESHOLD = 10 * 1024  # 10KB default
 MIN_THRESHOLD = 2 * 1024      # 2KB minimum (always summarize if larger)
@@ -232,7 +232,7 @@ def process_tool_output(
     tool_name: str,
     session_id: str,
     user_id: str,
-    memory_service: MemoryService | None,
+    memory_service: Any | None,
     turn_event_id: str | None = None,
     remaining_tokens: int | None = None,
     force_full: bool = False,  # Force return full content (no summarization)
@@ -244,7 +244,7 @@ def process_tool_output(
         tool_name: Name of the tool (grep, shell, etc.)
         session_id: Current session ID
         user_id: Current user ID
-        memory_service: MemoryService instance (None = truncation-only fallback)
+        memory_service: Any instance (None = truncation-only fallback)
         turn_event_id: Optional event ID for provenance tracking
         remaining_tokens: Optional remaining context budget for dynamic threshold
         force_full: Force return full content (skip summarization check)
@@ -307,7 +307,7 @@ def find_similar_result(
     params: dict,
     session_id: str,
     user_id: str,
-    memory_service: MemoryService,
+    memory_service: Any,
     cross_session: bool = False,
     max_age_seconds: int = 300,  # 5 minutes default
 ) -> str | None:
@@ -318,7 +318,7 @@ def find_similar_result(
         params: Tool parameters (pattern, path, etc.)
         session_id: Current session ID
         user_id: Current user ID
-        memory_service: MemoryService instance
+        memory_service: Any instance
         cross_session: If True, search across all sessions
         max_age_seconds: Maximum age of result to consider (staleness check)
     
@@ -367,7 +367,7 @@ def find_similar_result(
 
 def expand_memory_reference(
     memory_id: str,
-    memory_service: MemoryService,
+    memory_service: Any,
     start_line: int | None = None,
     end_line: int | None = None,
     query: str | None = None,
@@ -377,7 +377,7 @@ def expand_memory_reference(
     
     Args:
         memory_id: The memory ID to expand (from [memory:xxx] reference)
-        memory_service: MemoryService instance
+        memory_service: Any instance
         start_line: Optional start line for partial expansion
         end_line: Optional end line for partial expansion
         query: Optional query to filter content (grep-like)

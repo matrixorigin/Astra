@@ -406,8 +406,8 @@ def _build_chat_loop(db_factory):
         firewall=_shared_firewall,
     )
 
-    from core.memory.tabular.service import MemoryService
-    loop.set_observer(MemoryService(db_factory, llm_client=llm_client))
+    from core.memory import create_memory_service
+    loop.set_observer(create_memory_service(db_factory, llm_client=llm_client))
 
     return loop
 

@@ -13,12 +13,10 @@ Strategy:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
-
-    from core.memory.tabular.service import MemoryService
 
 
 @dataclass
@@ -40,7 +38,7 @@ class StreamingOutputAccumulator:
         tool_name: str,
         session_id: str,
         user_id: str,
-        memory_service: MemoryService,
+        memory_service: Any,
         threshold: int = 10 * 1024,
     ):
         self.tool_name = tool_name
@@ -157,7 +155,7 @@ async def process_streaming_output(
     tool_name: str,
     session_id: str,
     user_id: str,
-    memory_service: MemoryService,
+    memory_service: Any,
     threshold: int = 10 * 1024,
 ) -> AsyncIterator[tuple[str, str | None]]:
     """Process streaming output, yielding chunks and final result.

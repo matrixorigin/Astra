@@ -14,14 +14,13 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from core.memory.tabular.metrics import MemoryMetrics
 from core.memory.types import MemoryType
 
 if TYPE_CHECKING:
     from core.memory.tabular.explain import RetrievalStats
-    from core.memory.tabular.service import MemoryService
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +45,7 @@ class TieredMemoryLoader:
     Uses MemoryService as the sole interface to the memory module.
     """
 
-    def __init__(self, memory_service: MemoryService, metrics: MemoryMetrics | None = None):
+    def __init__(self, memory_service: Any, metrics: MemoryMetrics | None = None):
         self._svc = memory_service
         self._metrics = metrics or MemoryMetrics()
 
