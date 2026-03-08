@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-import uuid
+from core.utils.id_generator import generate_prefixed_id
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -133,7 +133,7 @@ class MemoryProvenance(DbConsumer):
     def create_milestone(self, name: Optional[str] = None) -> str:
         """Create a named snapshot for long-term anchor."""
         if not name:
-            name = f"mem_milestone_{uuid.uuid4().hex[:8]}"
+            name = generate_prefixed_id("mem_milestone")
         self._exec_ddl(f"create snapshot {name} for account sys")
         return name
 

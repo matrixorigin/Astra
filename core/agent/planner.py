@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, ValidationError
 from uuid_utils import uuid7
 
 from core.logging_config import get_logger
+from core.utils.id_generator import generate_prefixed_id
 
 logger = get_logger(__name__)
 
@@ -738,8 +739,7 @@ def execute_plan_in_sandbox(
     
     # Generate sandbox name if not provided (use timestamp + random for uniqueness)
     if sandbox_name is None:
-        import time
-        sandbox_name = f"plan_dry_run_{int(time.time() * 1000)}_{str(uuid7())[:8]}"
+        sandbox_name = generate_prefixed_id("plan_dry_run")
     
     sandbox = Sandbox(db_factory=lambda: db)
     results = {

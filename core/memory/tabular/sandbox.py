@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import time
-import uuid
+from core.utils.id_generator import generate_prefixed_id
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -65,7 +65,7 @@ class MemorySandbox(DbConsumer):
                 stats.total_ms = 0
             return True, stats
 
-        branch_name = f"memories_sandbox_{uuid.uuid4().hex[:8]}"
+        branch_name = generate_prefixed_id("memories_sandbox")
         if stats:
             stats.branch_name = branch_name
 

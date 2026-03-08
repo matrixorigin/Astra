@@ -14,7 +14,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
-from uuid import uuid4
+from core.utils.id_generator import generate_short_id
 
 from core.logging_config import get_logger
 
@@ -83,7 +83,7 @@ class InProcessBackend(ExecutionBackend):
         self._results: dict[str, ExecutionResult] = {}
 
     async def submit(self, skill_name: str, inputs: dict, req: ExecutionRequirements) -> str:
-        job_id = str(uuid4())[:12]
+        job_id = generate_short_id(12)
         self._results[job_id] = ExecutionResult(job_id=job_id, status=ExecutionStatus.PENDING)
         self._maybe_gc()
         return job_id
@@ -130,7 +130,7 @@ class SubprocessBackend(ExecutionBackend):
         self._results: dict[str, ExecutionResult] = {}
 
     async def submit(self, skill_name: str, inputs: dict, req: ExecutionRequirements) -> str:
-        job_id = str(uuid4())[:12]
+        job_id = generate_short_id(12)
         self._results[job_id] = ExecutionResult(job_id=job_id, status=ExecutionStatus.PENDING)
         self._tasks[job_id] = asyncio.create_task(self._run(job_id, skill_name, inputs, req))
         self._maybe_gc()

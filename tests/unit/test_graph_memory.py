@@ -192,7 +192,13 @@ class TestGraphServiceWiring:
         svc = GraphMemoryService(lambda: MagicMock())
         svc._tabular = MagicMock()
         mock_mem = MagicMock()
+        mock_mem.memory_id = "mem-1"
         svc._tabular.store.return_value = mock_mem
+
+        # Mock graph builder so it doesn't hit real DB
+        mock_builder = MagicMock()
+        mock_builder.ingest.return_value = []
+        svc._graph_builder = mock_builder
 
         result = svc.store(
             "u1", "test", memory_type=MemoryType.SEMANTIC,
@@ -200,3 +206,93 @@ class TestGraphServiceWiring:
         )
         assert result == mock_mem
         svc._tabular.store.assert_called_once()
+        mock_builder.ingest.assert_called_once()
+
+
+class TestGraphServiceErrorHandling:
+    """Regression: GraphMemoryService must only catch recoverable errors."""
+
+    def _make_service(self) -> "GraphMemoryService":
+        from core.memory.graph.service import GraphMemoryService
+        svc = GraphMemoryService(lambda: MagicMock())
+        svc._tabular = MagicMock()
+        return svc
+
+    def test_retrieve_propagates_programming_error(self):
+        """TypeError in activation retriever must NOT be swallowed."""
+        svc = self._make_service()
+        mock_retriever = MagicMock()
+        mock_retriever.retrieve.side_effect = TypeError("bad arg")
+        svc._activation_retriever = mock_retriever
+
+        with pytest.raises(TypeError, match="bad arg"):
+            svc.retrieve("u1", "query", query_embedding=[0.1])
+
+    def test_retrieve_catches_db_error(self):
+        """SQLAlchemy errors in retriever should fall back to tabular."""
+        from sqlalchemy.exc import OperationalError
+        svc = self._make_service()
+        mock_retriever = MagicMock()
+        mock_retriever.retrieve.side_effect = OperationalError("db", {}, Exception())
+        svc._activation_retriever = mock_retriever
+        svc._tabular.retrieve.return_value = ["fallback"]
+
+        result = svc.retrieve("u1", "query", query_embedding=[0.1])
+        assert result == ["fallback"]
+
+    def test_store_queues_pending_on_graph_failure(self):
+        """Graph ingest failure queues memory_id for retry."""
+        from sqlalchemy.exc import OperationalError
+        svc = self._make_service()
+        mock_mem = MagicMock()
+        mock_mem.memory_id = "mem-123"
+        svc._tabular.store.return_value = mock_mem
+
+        mock_builder = MagicMock()
+        mock_builder.ingest.side_effect = OperationalError("db", {}, Exception())
+        svc._graph_builder = mock_builder
+
+        result = svc.store("u1", "test", memory_type=MagicMock(), trust_tier=MagicMock())
+        assert result.memory_id == "mem-123"
+        assert svc.pending_graph_sync_count == 1
+        assert svc.drain_pending_graph_sync() == ["mem-123"]
+        assert svc.pending_graph_sync_count == 0
+
+    def test_store_propagates_programming_error_from_graph(self):
+        """TypeError in graph builder must NOT be swallowed."""
+        svc = self._make_service()
+        svc._tabular.store.return_value = MagicMock(memory_id="mem-1")
+
+        mock_builder = MagicMock()
+        mock_builder.ingest.side_effect = TypeError("wrong type")
+        svc._graph_builder = mock_builder
+
+        with pytest.raises(TypeError, match="wrong type"):
+            svc.store("u1", "test", memory_type=MagicMock(), trust_tier=MagicMock())
+
+    def test_observe_turn_queues_pending_on_graph_failure(self):
+        """Graph ingest failure during observe_turn queues for retry."""
+        from sqlalchemy.exc import OperationalError
+        svc = self._make_service()
+        mock_mem = MagicMock()
+        mock_mem.memory_id = "mem-456"
+        mock_mem.session_id = "s1"
+        svc._tabular.observe_turn.return_value = [mock_mem]
+
+        mock_builder = MagicMock()
+        mock_builder.ingest.side_effect = OperationalError("db", {}, Exception())
+        svc._graph_builder = mock_builder
+
+        result = svc.observe_turn("u1", [{"role": "user", "content": "hi"}])
+        assert len(result) == 1
+        assert svc.pending_graph_sync_count == 1
+
+    def test_candidates_propagates_programming_error(self):
+        """TypeError in graph candidates must NOT be swallowed."""
+        svc = self._make_service()
+        mock_candidates = MagicMock()
+        mock_candidates.get_reflection_candidates.side_effect = TypeError("bad")
+        svc._graph_candidates = mock_candidates
+
+        with pytest.raises(TypeError, match="bad"):
+            svc.get_reflection_candidates("u1")

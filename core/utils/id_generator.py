@@ -28,13 +28,18 @@ def generate_id(max_length: int = 36) -> str:
 def generate_short_id(length: int = 8) -> str:
     """Generate a short unique ID for temporary names and display.
     
+    Uses the random suffix of UUID7 to ensure uniqueness even when
+    called in rapid succession (the timestamp prefix would collide).
+    
     Args:
         length: Length of the ID (default 8)
         
     Returns:
         A short unique ID string
     """
-    return generate_id(length)
+    hex_str = str(uuid7()).replace("-", "")
+    # Take from the tail — the random portion of UUID7
+    return hex_str[-length:] if length < len(hex_str) else hex_str
 
 
 def generate_hash_id(data: Any, length: int = 16) -> str:
@@ -97,6 +102,21 @@ def generate_log_id() -> str:
 def generate_sandbox_name(prefix: str = "sandbox") -> str:
     """Generate a unique sandbox name."""
     return f"{prefix}_{generate_short_id(16)}".lower()
+
+
+def generate_prefixed_id(prefix: str, length: int = 8) -> str:
+    """Generate a prefixed unique ID like 'memories_sandbox_a1b2c3d4'.
+
+    Args:
+        prefix: Human-readable prefix (e.g. 'memories_sandbox', 'mem_milestone')
+        length: Length of the random suffix (default 8)
+    """
+    return f"{prefix}_{generate_short_id(length)}"
+
+
+def generate_tool_call_id() -> str:
+    """Generate a tool-call ID compatible with OpenAI's format (24-char alphanum)."""
+    return f"call_{generate_id(24)}"
 
 
 def generate_session_name(prefix: str = "session") -> str:

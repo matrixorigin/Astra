@@ -67,7 +67,7 @@ class GovernanceScheduler(DbConsumer):
         self._metrics = metrics or MemoryMetrics()
         self._llm_client = llm_client
         self._embed_fn = embed_fn
-        self.store = MemoryStore(db_factory, metrics=self._metrics)
+        self._store = MemoryStore(db_factory, metrics=self._metrics)
         self.health = MemoryHealth(
             db_factory,
             pollution_threshold=self.config.pollution_threshold,
@@ -362,7 +362,7 @@ class GovernanceScheduler(DbConsumer):
             logger.info("Cleaned %d orphaned incremental summaries for user %s", count, user_id)
         return count
 
-    def store_memory(
+    def store(
         self,
         user_id: str,
         content: str,
@@ -373,7 +373,7 @@ class GovernanceScheduler(DbConsumer):
         trust_tier: Any = None,
         session_id: str | None = None,
     ) -> Any:
-        """MemoryWriter facade — delegates to MemoryStore.create()."""
+        """MemoryWriter.store() — delegates to MemoryStore.create()."""
         from core.memory.types import Memory, TrustTier as TT
         mem = Memory(
             memory_id="",
@@ -385,4 +385,4 @@ class GovernanceScheduler(DbConsumer):
             source_event_ids=source_event_ids or [],
             session_id=session_id,
         )
-        return self.store.create(mem)
+        return self._store.create(mem)

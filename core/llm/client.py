@@ -18,6 +18,7 @@ from core.llm.models import LLMCallLog, LLMMessage, LLMProvider, LLMResponse
 from core.llm.providers import AnthropicProvider, BaseProvider, GroqProvider, OpenAIProvider
 from core.llm.rate_limiter import RateLimiter
 from core.llm.router import ModelConfig, ModelRouter
+from core.utils.id_generator import generate_tool_call_id
 from core.auth.encryption import decrypt_token
 from core.db_consumer import DbConsumer, DbFactory
 
@@ -90,7 +91,7 @@ def _rewrite_tool_call_ids(messages: list[dict]) -> list[dict]:
         if not old_id or _STANDARD_TC_ID.match(old_id):
             return old_id
         if old_id not in id_map:
-            id_map[old_id] = f"call_{str(uuid7()).replace('-', '')[:24]}"
+            id_map[old_id] = generate_tool_call_id()
         return id_map[old_id]
 
     out: list[dict] = []

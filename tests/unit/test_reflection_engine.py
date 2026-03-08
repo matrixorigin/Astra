@@ -30,6 +30,45 @@ def _candidate(
     )
 
 
+class TestMemoryWriterProtocolCompliance:
+    """Regression: ReflectionEngine must call MemoryWriter.store(), not store_memory()."""
+
+    def test_engine_calls_store_not_store_memory(self):
+        """ReflectionEngine._persist_insight must call writer.store()."""
+        from unittest.mock import sentinel
+
+        provider = MagicMock()
+        candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)
+        provider.get_reflection_candidates.return_value = [candidate]
+
+        # Writer that has store() but NOT store_memory()
+        writer = MagicMock(spec=["store"])
+        writer.store.return_value = sentinel.memory
+
+        llm = MagicMock()
+        llm.chat.return_value = json.dumps([{
+            "type": "procedural", "content": "test insight",
+            "confidence": 0.5, "evidence_summary": "e",
+        }])
+
+        engine = ReflectionEngine(
+            candidate_provider=provider, writer=writer, llm_client=llm,
+        )
+        result = engine.reflect("u1")
+
+        assert result.scenes_created == 1
+        writer.store.assert_called_once()
+        assert not hasattr(writer, "store_memory")
+
+    def test_governance_scheduler_satisfies_writer_store(self, db_factory):
+        """GovernanceScheduler must have store() matching MemoryWriter protocol."""
+        from core.memory.tabular.governance import GovernanceScheduler
+
+        gov = GovernanceScheduler(db_factory, llm_client=None)
+        assert hasattr(gov, "store"), "GovernanceScheduler must implement store()"
+        assert callable(gov.store)
+
+
 class TestReflectionEngine:
 
     def _make_engine(self, candidates, llm_response, threshold=DAILY_THRESHOLD):
@@ -57,7 +96,7 @@ class TestReflectionEngine:
         assert result.scenes_created == 0
         assert result.llm_calls == 0
         llm.chat.assert_not_called()
-        writer.store_memory.assert_not_called()
+        writer.store.assert_not_called()
 
     def test_candidates_below_threshold_filtered_out(self):
         # Single-session, small cluster → low score
@@ -91,8 +130,8 @@ class TestReflectionEngine:
         assert result.scenes_created == 1
 
         # Verify persist call
-        writer.store_memory.assert_called_once()
-        call_kwargs = writer.store_memory.call_args
+        writer.store.assert_called_once()
+        call_kwargs = writer.store.call_args
         assert call_kwargs.kwargs["user_id"] == "u1"
         assert call_kwargs.kwargs["content"] == "Always run linter before commit"
         assert call_kwargs.kwargs["memory_type"] == MemoryType.PROCEDURAL
@@ -112,7 +151,7 @@ class TestReflectionEngine:
         result = engine.reflect("u1")
 
         assert result.scenes_created == 2
-        assert writer.store_memory.call_count == 2
+        assert writer.store.call_count == 2
 
     def test_llm_returns_invalid_json_no_crash(self):
         candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)
@@ -131,7 +170,7 @@ class TestReflectionEngine:
         result = engine.reflect("u1")
 
         assert result.scenes_created == 0
-        writer.store_memory.assert_not_called()
+        writer.store.assert_not_called()
 
     def test_confidence_clamped_to_range(self):
         candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)
@@ -143,7 +182,7 @@ class TestReflectionEngine:
         result = engine.reflect("u1")
 
         # Confidence clamped to max 0.7
-        assert writer.store_memory.call_args.kwargs["initial_confidence"] == 0.7
+        assert writer.store.call_args.kwargs["initial_confidence"] == 0.7
 
     def test_confidence_clamped_min(self):
         candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)
@@ -154,7 +193,7 @@ class TestReflectionEngine:
 
         result = engine.reflect("u1")
 
-        assert writer.store_memory.call_args.kwargs["initial_confidence"] == 0.3
+        assert writer.store.call_args.kwargs["initial_confidence"] == 0.3
 
     def test_invalid_memory_type_skipped(self):
         candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)

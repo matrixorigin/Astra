@@ -17,6 +17,8 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from core.utils.id_generator import generate_short_id
+
 logger = logging.getLogger(__name__)
 
 # Type alias for async tool executors
@@ -125,11 +127,10 @@ _registry.register("submit_job", _execute_submit_job, _SUBMIT_JOB_SCHEMA)
 async def _execute_submit_workflow(params: dict[str, Any], run_id: str | None = None) -> dict:
     """Submit a workflow. Persists to wf_definitions + wf_runs tables."""
     import asyncio as _aio
-    from uuid import uuid4
 
     from core.workflow.engine import Workflow, WorkflowEngine, Step
 
-    wf_id = str(uuid4())[:12]
+    wf_id = generate_short_id(12)
     steps = [Step(**s) if isinstance(s, dict) else s for s in params["steps"]]
     workflow = Workflow(
         name=params.get("name", f"wf_{wf_id}"),

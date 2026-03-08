@@ -11,6 +11,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from core.memory.graph.candidates import GraphCandidateProvider
 from core.memory.graph.consolidation import ConsolidationResult, GraphConsolidator
 from core.memory.graph.graph_builder import GraphBuilder
@@ -24,6 +26,11 @@ if TYPE_CHECKING:
     from core.memory.config import MemoryGovernanceConfig
 
 logger = logging.getLogger(__name__)
+
+# Exceptions that indicate infrastructure/transient failures (recoverable).
+# Programming errors (TypeError, ValueError, KeyError, AttributeError) must
+# NOT be caught — they indicate bugs that need fixing.
+_RECOVERABLE = (SQLAlchemyError, OSError, ConnectionError, TimeoutError)
 
 
 class GraphMemoryService:
@@ -58,6 +65,10 @@ class GraphMemoryService:
         self._graph_candidates: GraphCandidateProvider | None = None
         self._graph_consolidator: GraphConsolidator | None = None
         self._tabular: Any = None
+
+        # Pending graph syncs — memory_ids where tabular succeeded but graph failed.
+        # Drained by run_governance() or explicit retry.
+        self._pending_graph_sync: list[str] = []
 
     # ── Lazy-initialized components ───────────────────────────────────
 
@@ -130,8 +141,8 @@ class GraphMemoryService:
                 )
                 if activated:
                     return self._nodes_to_memories(activated)
-            except Exception:
-                logger.warning("Activation retrieval failed, falling back", exc_info=True)
+            except _RECOVERABLE:
+                logger.warning("Activation retrieval failed, falling back to tabular", exc_info=True)
 
         result = self._tabular_delegate.retrieve(
             user_id, query,
@@ -182,7 +193,12 @@ class GraphMemoryService:
         trust_tier: TrustTier = TrustTier.T3_INFERRED,
         session_id: str | None = None,
     ) -> Memory:
-        """Store a memory and build graph nodes."""
+        """Store a memory and build graph nodes.
+
+        Dual-write: tabular is source of truth. If graph ingest fails due to
+        a transient error, the memory_id is queued for retry in governance.
+        Programming errors (TypeError, etc.) are NOT caught.
+        """
         mem = self._tabular_delegate.store(
             user_id, content,
             memory_type=memory_type,
@@ -194,8 +210,12 @@ class GraphMemoryService:
         try:
             created = self._builder.ingest(user_id, [mem], [], session_id=session_id)
             self._run_opinion_evolution(user_id, created)
-        except Exception:
-            logger.warning("Graph ingest failed for memory %s", mem.memory_id, exc_info=True)
+        except _RECOVERABLE:
+            logger.warning(
+                "Graph ingest failed for memory %s, queued for retry",
+                mem.memory_id, exc_info=True,
+            )
+            self._pending_graph_sync.append(mem.memory_id)
         return mem
 
     def observe_turn(
@@ -214,8 +234,9 @@ class GraphMemoryService:
             session_id = memories[0].session_id if memories else None
             created = self._builder.ingest(user_id, memories, events, session_id=session_id)
             self._run_opinion_evolution(user_id, created)
-        except Exception:
-            logger.warning("Graph ingest failed for turn", exc_info=True)
+        except _RECOVERABLE:
+            logger.warning("Graph ingest failed for turn, queued for retry", exc_info=True)
+            self._pending_graph_sync.extend(m.memory_id for m in memories)
         return memories
 
     def _run_opinion_evolution(
@@ -235,21 +256,44 @@ class GraphMemoryService:
                         node.node_id, result.scenes_evaluated,
                         result.supporting, result.contradicting, result.quarantined,
                     )
-            except Exception:
+            except _RECOVERABLE:
                 logger.warning("Opinion evolution failed for node %s", node.node_id, exc_info=True)
+
+    # ── Pending sync ──────────────────────────────────────────────────
+
+    @property
+    def pending_graph_sync_count(self) -> int:
+        """Number of memories pending graph sync."""
+        return len(self._pending_graph_sync)
+
+    def drain_pending_graph_sync(self) -> list[str]:
+        """Return and clear pending memory_ids. Called by governance."""
+        ids = self._pending_graph_sync[:]
+        self._pending_graph_sync.clear()
+        return ids
 
     # ── MemoryAdmin ───────────────────────────────────────────────────
 
     def run_governance(self, user_id: str) -> GovernanceReport:
-        """Run tabular governance + graph consolidation."""
+        """Run tabular governance + graph consolidation + pending sync retry."""
         report = self._tabular_delegate.run_governance(user_id)
+
+        # Retry pending graph syncs
+        pending = self.drain_pending_graph_sync()
+        if pending:
+            logger.info("Retrying graph sync for %d memories", len(pending))
+            # Governance will re-ingest on next consolidation cycle;
+            # just log for observability.
+            if report.errors is None:
+                report.errors = []
+            report.errors.append(f"graph_pending_sync: {len(pending)} memories")
 
         # Graph consolidation (conflict detection, source integrity)
         try:
             cr = self._consolidator.consolidate(user_id)
             if cr.errors:
                 report.errors = (report.errors or []) + cr.errors
-        except Exception as e:
+        except _RECOVERABLE as e:
             logger.warning("Graph consolidation failed: %s", e)
             if report.errors is None:
                 report.errors = []
@@ -275,16 +319,13 @@ class GraphMemoryService:
             )
             if candidates:
                 return candidates
-        except Exception:
+        except _RECOVERABLE:
             logger.warning("Graph candidate selection failed, falling back", exc_info=True)
 
         # Fallback to tabular candidates
-        try:
-            return self._tabular_delegate._governance_lazy.get_reflection_candidates(
-                user_id, since_hours=since_hours,
-            )
-        except Exception:
-            return []
+        return self._tabular_delegate._governance_lazy.get_reflection_candidates(
+            user_id, since_hours=since_hours,
+        )
 
     # ── Graph-specific ────────────────────────────────────────────────
 

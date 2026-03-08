@@ -139,3 +139,19 @@ class TransientError(AgentError):
     def __init__(self, message: str, retry_after_ms: int = 1000):
         self.retry_after_ms = retry_after_ms
         super().__init__(message, code="TRANSIENT_ERROR")
+
+
+class MemoryError(AgentError):
+    """Memory subsystem error."""
+
+    def __init__(self, message: str):
+        super().__init__(message, code="MEMORY_ERROR")
+
+
+class GraphIngestError(MemoryError):
+    """Graph ingest failed after tabular write succeeded (dual-write inconsistency)."""
+
+    def __init__(self, memory_id: str, cause: Exception):
+        self.memory_id = memory_id
+        self.cause = cause
+        super().__init__(f"Graph ingest failed for memory {memory_id}: {cause}")

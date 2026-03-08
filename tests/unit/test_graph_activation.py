@@ -177,13 +177,14 @@ class TestGraphServiceRetrieve:
         assert result[0].content == "test"
 
     def test_fallback_to_tabular_on_activation_failure(self):
+        from sqlalchemy.exc import OperationalError
         from core.memory.graph.service import GraphMemoryService
         svc = GraphMemoryService(lambda: MagicMock())
         svc._tabular = MagicMock()
         svc._tabular.retrieve.return_value = ["tabular_mem"]
 
         mock_retriever = MagicMock()
-        mock_retriever.retrieve.side_effect = RuntimeError("boom")
+        mock_retriever.retrieve.side_effect = OperationalError("db", {}, Exception("conn lost"))
         svc._activation_retriever = mock_retriever
 
         result = svc.retrieve("u1", "query", query_embedding=[0.1] * 10)

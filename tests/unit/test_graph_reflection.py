@@ -250,9 +250,10 @@ class TestGraphServiceReflection:
         assert result == ["c1"]
 
     def test_candidates_fallback_to_tabular_on_error(self):
+        from sqlalchemy.exc import OperationalError
         svc = self._make_service()
         mock_candidates = MagicMock()
-        mock_candidates.get_reflection_candidates.side_effect = RuntimeError("boom")
+        mock_candidates.get_reflection_candidates.side_effect = OperationalError("db", {}, Exception("conn lost"))
         svc._graph_candidates = mock_candidates
         svc._tabular._governance_lazy = MagicMock()
         svc._tabular._governance_lazy.get_reflection_candidates.return_value = ["fallback"]

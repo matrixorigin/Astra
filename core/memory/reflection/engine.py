@@ -220,7 +220,7 @@ class ReflectionEngine:
 
     def _persist_insight(self, user_id: str, insight: SynthesizedInsight) -> None:
         """Persist a synthesized insight as a scene-type memory."""
-        self._writer.store_memory(
+        self._writer.store(
             user_id=user_id,
             content=insight.content,
             memory_type=insight.memory_type,
