@@ -407,6 +407,13 @@ def test_grant_and_revoke_role_success(client, admin_user, db_session):
 
 def test_first_user_becomes_admin(client, db_session):
     """Test that first registered user automatically becomes admin."""
+    # Ensure admin role exists
+    db_session.execute(
+        text("""
+            INSERT IGNORE INTO auth_roles (role_id, role_name, description)
+            VALUES ('mo-agent-admin-role', 'mo_agent_admin', 'Administrator role')
+        """)
+    )
     # Clear all users
     db_session.execute(text("DELETE FROM auth_user_roles"))
     db_session.execute(text("DELETE FROM auth_users"))

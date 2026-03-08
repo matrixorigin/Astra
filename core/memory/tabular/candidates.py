@@ -59,20 +59,18 @@ class TabularCandidateProvider(DbConsumer):
         cutoff = _hours_ago(since_hours)
 
         with self._db() as db:
-            try:
-                candidates.extend(self._signal_semantic_clusters(db, user_id, cutoff))
-            except Exception as e:
-                logger.warning("Signal 1 (semantic clustering) failed: %s", e)
-
-            try:
-                candidates.extend(self._signal_contradiction_pairs(db, user_id, cutoff))
-            except Exception as e:
-                logger.warning("Signal 2 (contradiction pairs) failed: %s", e)
-
-            try:
-                candidates.extend(self._signal_summary_recurrence(db, user_id))
-            except Exception as e:
-                logger.warning("Signal 3 (summary recurrence) failed: %s", e)
+            for name, fn in [
+                ("semantic_clusters", lambda: self._signal_semantic_clusters(db, user_id, cutoff)),
+                ("contradiction_pairs", lambda: self._signal_contradiction_pairs(db, user_id, cutoff)),
+                ("summary_recurrence", lambda: self._signal_summary_recurrence(db, user_id)),
+            ]:
+                try:
+                    candidates.extend(fn())
+                except Exception as e:
+                    logger.warning(
+                        "Signal %s failed for user=%s since=%s: %s",
+                        name, user_id, cutoff, e, exc_info=True,
+                    )
 
         return candidates
 
