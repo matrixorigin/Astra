@@ -297,7 +297,7 @@ class TestContradictionSupersede:
         assert len(contras) == 1
         c = contras[0]
         assert len(c.memories) == 2
-        assert c.importance_boost == 0.3
+        assert c.importance_score > 0.3  # contradiction signal scores high
 
         by_content = {m.content: m for m in c.memories}
         old_m = by_content["Python 3.11 is best"]

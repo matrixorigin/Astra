@@ -19,6 +19,7 @@ from api.models.memory import MemoryRecord
 from core.db_consumer import DbConsumer
 from core.memory.config import DEFAULT_CONFIG, MemoryGovernanceConfig
 from core.memory.interfaces import ReflectionCandidate
+from core.memory.reflection.importance import score_candidate
 from core.memory.types import Memory, MemoryType, TrustTier, _utcnow
 
 if TYPE_CHECKING:
@@ -151,11 +152,14 @@ class TabularCandidateProvider(DbConsumer):
                     .filter(MemoryRecord.memory_id.in_(list(mids)))
                     .all()
                 )
-                candidates.append(ReflectionCandidate(
-                    memories=[_to_domain(r) for r in rows],
+                mems = [_to_domain(r) for r in rows]
+                c = ReflectionCandidate(
+                    memories=mems,
                     signal="semantic_cluster",
                     session_ids=session_ids,
-                ))
+                )
+                c.importance_score = score_candidate(c)
+                candidates.append(c)
         return candidates
 
     # ── Signal 2: Contradiction pairs ─────────────────────────────────
@@ -195,7 +199,11 @@ class TabularCandidateProvider(DbConsumer):
             candidates.append(ReflectionCandidate(
                 memories=[old_mem, new_mem],
                 signal="contradiction",
-                importance_boost=0.3,
+                importance_score=score_candidate(ReflectionCandidate(
+                    memories=[old_mem, new_mem],
+                    signal="contradiction",
+                    session_ids=session_ids,
+                )),
                 session_ids=session_ids,
             ))
         return candidates
@@ -278,7 +286,11 @@ class TabularCandidateProvider(DbConsumer):
                 candidates.append(ReflectionCandidate(
                     memories=[_to_domain(r) for r in rows],
                     signal="summary_recurrence",
-                    importance_boost=0.2,
+                    importance_score=score_candidate(ReflectionCandidate(
+                        memories=[_to_domain(r) for r in rows],
+                        signal="summary_recurrence",
+                        session_ids=[],
+                    )),
                     session_ids=[],
                 ))
         return candidates

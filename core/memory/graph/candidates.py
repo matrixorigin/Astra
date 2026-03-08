@@ -15,6 +15,7 @@ from core.memory.graph.activation import SpreadingActivation
 from core.memory.graph.graph_store import GraphStore
 from core.memory.graph.types import GraphNodeData, NodeType
 from core.memory.interfaces import ReflectionCandidate
+from core.memory.reflection.importance import score_candidate
 from core.memory.types import Memory, MemoryType, TrustTier
 
 if TYPE_CHECKING:
@@ -85,11 +86,16 @@ class GraphCandidateProvider:
                 continue
             memories = [self._node_to_memory(n) for n in cluster]
             has_conflict = any(n.conflicts_with for n in cluster)
-            candidates.append(ReflectionCandidate(
+            avg_activation = sum(
+                activated.get(n.node_id, 0.0) for n in cluster
+            ) / len(cluster)
+            c = ReflectionCandidate(
                 memories=memories,
                 signal="contradiction" if has_conflict else "semantic_cluster",
                 session_ids=session_ids,
-            ))
+            )
+            c.importance_score = score_candidate(c, activation_energy=avg_activation)
+            candidates.append(c)
         return candidates
 
     def _find_connected_components(

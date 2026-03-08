@@ -20,12 +20,12 @@ def _mem(mid: str = "m1", session_id: str = "s1", content: str = "test") -> Memo
 
 def _candidate(
     n_memories: int = 3, n_sessions: int = 3, signal: str = "semantic_cluster",
-    boost: float = 0.0,
+    importance: float = 0.6,
 ) -> ReflectionCandidate:
     return ReflectionCandidate(
         memories=[_mem(f"m{i}", f"s{i}", f"content {i}") for i in range(n_memories)],
         signal=signal,
-        importance_boost=boost,
+        importance_score=importance,
         session_ids=[f"s{i}" for i in range(n_sessions)],
     )
 
@@ -74,7 +74,7 @@ class TestReflectionEngine:
         assert result.llm_calls == 0
 
     def test_qualifying_candidate_triggers_llm_and_persist(self):
-        candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", boost=0.3)
+        candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)
         llm_response = json.dumps([{
             "type": "procedural",
             "content": "Always run linter before commit",
@@ -102,7 +102,7 @@ class TestReflectionEngine:
         assert call_kwargs.kwargs["source_event_ids"] == [f"m{i}" for i in range(5)]
 
     def test_llm_returns_two_insights(self):
-        candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", boost=0.3)
+        candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)
         llm_response = json.dumps([
             {"type": "procedural", "content": "Insight 1", "confidence": 0.5, "evidence_summary": "e1"},
             {"type": "semantic", "content": "Insight 2", "confidence": 0.4, "evidence_summary": "e2"},
@@ -115,7 +115,7 @@ class TestReflectionEngine:
         assert writer.store_memory.call_count == 2
 
     def test_llm_returns_invalid_json_no_crash(self):
-        candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", boost=0.3)
+        candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)
         engine, provider, writer, llm = self._make_engine([candidate], "not json at all")
 
         result = engine.reflect("u1")
@@ -125,7 +125,7 @@ class TestReflectionEngine:
         assert len(result.errors) == 1  # parse failure recorded as error
 
     def test_llm_returns_empty_array(self):
-        candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", boost=0.3)
+        candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)
         engine, provider, writer, llm = self._make_engine([candidate], "[]")
 
         result = engine.reflect("u1")
@@ -134,7 +134,7 @@ class TestReflectionEngine:
         writer.store_memory.assert_not_called()
 
     def test_confidence_clamped_to_range(self):
-        candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", boost=0.3)
+        candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)
         llm_response = json.dumps([
             {"type": "semantic", "content": "test", "confidence": 0.99, "evidence_summary": "e"},
         ])
@@ -146,7 +146,7 @@ class TestReflectionEngine:
         assert writer.store_memory.call_args.kwargs["initial_confidence"] == 0.7
 
     def test_confidence_clamped_min(self):
-        candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", boost=0.3)
+        candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)
         llm_response = json.dumps([
             {"type": "semantic", "content": "test", "confidence": 0.1, "evidence_summary": "e"},
         ])
@@ -157,7 +157,7 @@ class TestReflectionEngine:
         assert writer.store_memory.call_args.kwargs["initial_confidence"] == 0.3
 
     def test_invalid_memory_type_skipped(self):
-        candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", boost=0.3)
+        candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)
         llm_response = json.dumps([
             {"type": "invalid_type", "content": "test", "confidence": 0.5, "evidence_summary": "e"},
         ])
@@ -181,7 +181,7 @@ class TestReflectionEngine:
         assert "db down" in result.errors[0]
 
     def test_llm_error_captured_per_candidate(self):
-        candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", boost=0.3)
+        candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)
         provider = MagicMock()
         provider.get_reflection_candidates.return_value = [candidate]
         llm = MagicMock()
@@ -198,7 +198,7 @@ class TestReflectionEngine:
         assert "rate limited" in result.errors[0]
 
     def test_max_two_insights_per_candidate(self):
-        candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", boost=0.3)
+        candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)
         llm_response = json.dumps([
             {"type": "semantic", "content": "i1", "confidence": 0.5, "evidence_summary": "e"},
             {"type": "semantic", "content": "i2", "confidence": 0.5, "evidence_summary": "e"},

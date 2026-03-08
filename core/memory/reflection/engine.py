@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from core.memory.interfaces import CandidateProvider, MemoryWriter, ReflectionCandidate
-from core.memory.reflection.importance import DAILY_THRESHOLD, ImportanceScorer
+from core.memory.reflection.importance import DAILY_THRESHOLD
 from core.memory.reflection.prompts import REFLECTION_SYNTHESIS_PROMPT
 from core.memory.types import MemoryType, TrustTier
 
@@ -48,13 +48,15 @@ class SynthesizedInsight:
 
 
 class ReflectionEngine:
-    """Backend-agnostic reflection: candidates → importance → LLM → persist.
+    """Backend-agnostic reflection: candidates → threshold filter → LLM → persist.
+
+    Candidates arrive with pre-computed importance_score from their backend.
+    Engine only filters by threshold, synthesizes, and persists.
 
     Args:
         candidate_provider: backend-specific provider (tabular or graph).
         writer: MemoryWriter for persisting new scene memories.
         llm_client: LLM client for synthesis calls.
-        scorer: ImportanceScorer instance (default: standard 4-signal).
         threshold: minimum importance score to trigger synthesis.
     """
 
@@ -63,14 +65,12 @@ class ReflectionEngine:
         candidate_provider: CandidateProvider,
         writer: MemoryWriter,
         llm_client: Any,
-        scorer: ImportanceScorer | None = None,
         threshold: float = DAILY_THRESHOLD,
         llm_retries: int = 1,
     ):
         self._provider = candidate_provider
         self._writer = writer
         self._llm = llm_client
-        self._scorer = scorer or ImportanceScorer()
         self._threshold = threshold
         self._llm_retries = llm_retries
 
@@ -111,7 +111,7 @@ class ReflectionEngine:
 
         # 2. Score and filter
         scored = [
-            (c, self._scorer.score(c)) for c in candidates
+            (c, c.importance_score) for c in candidates
         ]
         passed = [(c, s) for c, s in scored if s >= self._threshold]
         result.candidates_passed = len(passed)

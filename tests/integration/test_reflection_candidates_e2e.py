@@ -169,7 +169,7 @@ class TestSignalContradictionPairs:
         contras = [c for c in candidates if c.signal == "contradiction"]
         assert len(contras) == 1
         assert len(contras[0].memories) == 2
-        assert contras[0].importance_boost == 0.3
+        assert contras[0].importance_score > 0.3  # contradiction signal scores high
         # Verify old and new are both present
         contents = {m.content for m in contras[0].memories}
         assert "old belief" in contents
@@ -214,7 +214,7 @@ class TestSignalSummaryRecurrence:
         recur = [c for c in candidates if c.signal == "summary_recurrence"]
         assert len(recur) == 1
         assert len(recur[0].memories) == 4
-        assert recur[0].importance_boost == 0.2
+        assert recur[0].importance_score > 0  # pre-computed by score_candidate
 
     def test_too_few_summaries_excluded(self, db, db_factory):
         """Only 2 summaries → below threshold, no candidate."""

@@ -94,7 +94,7 @@ class ReflectionCandidate:
 
     memories: list[Memory]
     signal: str  # "semantic_cluster" | "contradiction" | "summary_recurrence"
-    importance_boost: float = 0.0  # signal-specific boost
+    importance_score: float = 0.0  # pre-computed by backend-specific scorer
     session_ids: list[str] = field(default_factory=list)
 
 
