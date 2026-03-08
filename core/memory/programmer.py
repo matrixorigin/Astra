@@ -19,6 +19,8 @@ if TYPE_CHECKING:
     from core.memory.editor import MemoryEditor
     from core.memory.experiment import ExperimentInfo, MemoryExperimentManager
 
+from core.memory.types import TRUST_TIER_INITIAL_CONFIDENCE
+
 logger = logging.getLogger(__name__)
 
 SCRIPT_VERSION = 1
@@ -111,6 +113,7 @@ class ProgramResult:
     actions_failed: int = 0
     results: list[ActionResult] = field(default_factory=list)
     dry_run: bool = False
+    rolled_back: bool = False
 
 
 def parse_script(raw: str | dict | list) -> list[dict]:
@@ -170,10 +173,40 @@ def parse_script(raw: str | dict | list) -> list[dict]:
 
 def _get_action_type(action: dict) -> str:
     """Get the action type key from an action dict."""
-    for key in _ACTION_KEYS:
+    for key in _ALL_ACTION_KEYS:
         if key in action:
             return key
     raise InvalidScriptError(f"No action key found in {action}")
+
+
+_BATCH_INJECT_KEY = "_batch_inject"
+_ALL_ACTION_KEYS = _ACTION_KEYS | {_BATCH_INJECT_KEY}
+
+
+def _coalesce_injects(actions: list[dict]) -> list[dict]:
+    """Merge consecutive inject actions into batch inserts.
+
+    [inject, inject, inject, purge, inject] →
+    [_batch_inject(3), purge, inject(1)]
+    """
+    result: list[dict] = []
+    batch: list[dict] = []
+
+    def flush() -> None:
+        if len(batch) == 1:
+            result.append({"inject": batch[0]})
+        elif len(batch) > 1:
+            result.append({_BATCH_INJECT_KEY: batch[:]})
+        batch.clear()
+
+    for action in actions:
+        if "inject" in action:
+            batch.append(action["inject"])
+        else:
+            flush()
+            result.append(action)
+    flush()
+    return result
 
 
 class MemoryProgrammer:
@@ -200,6 +233,7 @@ class MemoryProgrammer:
         *,
         sandbox: bool = True,
         dry_run: bool = False,
+        atomic: bool = True,
         program_name: str = "unnamed",
     ) -> ProgramResult:
         """Parse and execute a memory program.
@@ -209,6 +243,8 @@ class MemoryProgrammer:
             script: YAML string, dict, or list of actions.
             sandbox: If True (default), execute in experiment branch.
             dry_run: If True, parse and validate only, don't execute.
+            atomic: If True (default), discard on any failure (sandbox)
+                    or stop-on-first-failure (non-sandbox).
             program_name: Name for the experiment (if sandboxed).
 
         Returns:
@@ -230,6 +266,9 @@ class MemoryProgrammer:
                 dry_run=True,
             )
 
+        # Batch consecutive injects for performance
+        actions = _coalesce_injects(actions)
+
         exp_info: ExperimentInfo | None = None
         editor = self._editor
         if sandbox:
@@ -237,16 +276,32 @@ class MemoryProgrammer:
                 user_id, f"prog_{program_name}",
                 description=f"Memory program: {program_name}",
             )
-            # Swap editor to operate on branch DB, not production
             editor = self._make_branch_editor(exp_info)
 
         results: list[ActionResult] = []
+        failed_any = False
         for action in actions:
+            if atomic and failed_any:
+                # Stop executing remaining actions
+                break
             result = self._execute_action(user_id, action, editor=editor)
             results.append(result)
+            if not result.success:
+                failed_any = True
 
         executed = sum(1 for r in results if r.success)
         failed = sum(1 for r in results if not r.success)
+
+        # Atomic rollback: discard experiment on any failure
+        if atomic and failed_any and sandbox and exp_info:
+            self._experiments.discard(exp_info.experiment_id)
+            return ProgramResult(
+                experiment_id=exp_info.experiment_id,
+                actions_executed=executed,
+                actions_failed=failed,
+                results=results,
+                rolled_back=True,
+            )
 
         return ProgramResult(
             experiment_id=exp_info.experiment_id if exp_info else None,
@@ -268,20 +323,75 @@ class MemoryProgrammer:
 
     def _execute_action(self, user_id: str, action: dict, *, editor: MemoryEditor) -> ActionResult:
         """Execute a single action via MemoryEditor."""
-        action_type = _get_action_type(action)
+        raw_type = _get_action_type(action)
+        display_type = "inject" if raw_type == _BATCH_INJECT_KEY else raw_type
         try:
-            if action_type == "inject":
+            if raw_type == "inject":
                 return self._do_inject(user_id, action["inject"], editor=editor)
-            if action_type == "correct":
+            if raw_type == _BATCH_INJECT_KEY:
+                return self._do_batch_inject(user_id, action[_BATCH_INJECT_KEY], editor=editor)
+            if raw_type == "correct":
                 return self._do_correct(user_id, action["correct"], editor=editor)
-            if action_type == "purge":
+            if raw_type == "purge":
                 return self._do_purge(user_id, action["purge"], editor=editor)
-            if action_type == "tune":
+            if raw_type == "tune":
                 return self._do_tune(user_id, action["tune"])
-            return ActionResult(action_type=action_type, success=False,
-                                error=f"Unknown action: {action_type}")
+            return ActionResult(action_type=display_type, success=False,
+                                error=f"Unknown action: {display_type}")
         except Exception as e:
-            return ActionResult(action_type=action_type, success=False, error=str(e))
+            return ActionResult(action_type=display_type, success=False, error=str(e))
+
+    def _do_batch_inject(
+        self, user_id: str, specs: list[dict], *, editor: MemoryEditor,
+    ) -> ActionResult:
+        """Batch-insert multiple memories in a single transaction."""
+        import uuid as _uuid
+
+        from sqlalchemy import text
+
+        from core.memory.types import MemoryType, TrustTier
+
+        rows_data = []
+        for spec in specs:
+            content = spec.get("content")
+            if not content:
+                return ActionResult(
+                    action_type="inject", success=False,
+                    error="inject requires 'content'",
+                )
+            mem_type = MemoryType(spec.get("type", "semantic"))
+            trust = TrustTier(spec.get("trust", "T2"))
+            rows_data.append({
+                "mid": _uuid.uuid4().hex,
+                "uid": user_id,
+                "mt": mem_type.value,
+                "content": content,
+                "conf": TRUST_TIER_INITIAL_CONFIDENCE.get(trust, 0.75),
+                "trust": trust.value,
+            })
+
+        # Single bulk INSERT
+        db_factory = editor._db_factory
+        with db_factory() as db:
+            for rd in rows_data:
+                db.execute(
+                    text(
+                        "INSERT INTO mem_memories "
+                        "(memory_id, user_id, memory_type, content, "
+                        " initial_confidence, trust_tier, is_active, "
+                        " source_event_ids, observed_at, created_at) "
+                        "VALUES (:mid, :uid, :mt, :content, :conf, :trust, "
+                        " 1, '[]', NOW(), NOW())"
+                    ),
+                    rd,
+                )
+            db.commit()
+
+        ids = [rd["mid"] for rd in rows_data]
+        return ActionResult(
+            action_type="inject", success=True,
+            detail={"memory_ids": ids, "count": len(ids)},
+        )
 
     def _do_inject(self, user_id: str, spec: dict, *, editor: MemoryEditor) -> ActionResult:
         from core.memory.types import MemoryType, TrustTier

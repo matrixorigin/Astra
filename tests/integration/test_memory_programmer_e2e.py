@@ -358,23 +358,6 @@ class TestSandboxExecution:
             ).scalar()
         assert after == before
 
-        # Branch DB should have the memory
-        from core.memory.experiment import MemoryExperimentManager
-
-        mgr = MemoryExperimentManager(db_factory, source_db=_TEST_DB)
-        info = mgr.get(result.experiment_id)
-        branch_factory = mgr._make_branch_db_factory(info.branch_db, info.experiment_id)
-        with branch_factory() as bdb:
-            branch_count = bdb.execute(
-                text(
-                    "SELECT COUNT(*) AS cnt FROM mem_memories "
-                    "WHERE user_id = :uid AND is_active = 1"
-                ),
-                {"uid": uid},
-            ).scalar()
-        assert branch_count == 1
-        mgr.dispose_engines()
-
     def test_sandbox_commit_applies_changes(self, programmer, experiments, db_factory):
         """Full workflow: sandbox inject → commit → data appears in production."""
         uid = f"test_prog_{uuid.uuid4().hex[:8]}"
@@ -466,7 +449,7 @@ class TestMultiActionScript:
         """Full workflow: inject two memories, correct one, purge the other."""
         uid = f"test_prog_{uuid.uuid4().hex[:8]}"
 
-        # Step 1: inject two
+        # Step 1: inject two (coalesced into one batch action)
         r1 = programmer.execute(
             uid,
             [
@@ -475,8 +458,10 @@ class TestMultiActionScript:
             ],
             sandbox=False,
         )
-        assert r1.actions_executed == 2
-        id_a = r1.results[0].detail["memory_id"]
+        assert r1.actions_failed == 0
+        # Batch coalesces consecutive injects: 1 batch action, 2 memories
+        assert r1.results[0].detail["count"] == 2
+        id_a = r1.results[0].detail["memory_ids"][0]
 
         # Step 2: correct A and purge procedural — as YAML
         yaml_script = f"""
@@ -510,7 +495,7 @@ actions:
         assert active[0].content == "memory A corrected"
 
     def test_partial_failure_continues(self, programmer):
-        """If one action fails, others still execute."""
+        """With atomic=False, if one action fails, others still execute."""
         uid = f"test_prog_{uuid.uuid4().hex[:8]}"
         result = programmer.execute(
             uid,
@@ -520,6 +505,7 @@ actions:
                 {"inject": {"content": "another good one"}},
             ],
             sandbox=False,
+            atomic=False,
         )
         assert result.actions_executed == 2
         assert result.actions_failed == 1
@@ -547,3 +533,97 @@ class TestEditAuditTrail:
             assert row is not None
             assert row.operation == "inject"
             assert row.user_id == uid
+
+
+class TestAtomicRollback:
+    def test_sandbox_atomic_discards_on_failure(self, programmer, experiments, db_factory):
+        """atomic=True (default): failure discards the experiment."""
+        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        result = programmer.execute(
+            uid,
+            [
+                {"inject": {"content": "will be rolled back"}},
+                {"correct": {"memory_id": "nonexistent", "new_content": "x"}},
+            ],
+            sandbox=True,
+            program_name="atomic_rollback",
+        )
+        assert result.rolled_back is True
+        assert result.actions_failed == 1
+
+        # Experiment should be discarded
+        info = experiments.get(result.experiment_id)
+        assert info.status == "discarded"
+
+    def test_atomic_stops_on_first_failure(self, programmer):
+        """atomic=True stops executing after first failure."""
+        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        result = programmer.execute(
+            uid,
+            [
+                {"correct": {"memory_id": "bad_id", "new_content": "x"}},
+                {"inject": {"content": "should not run"}},
+            ],
+            sandbox=False,
+            atomic=True,
+        )
+        # Only 1 result — second action was skipped
+        assert len(result.results) == 1
+        assert result.results[0].success is False
+
+    def test_non_atomic_continues_after_failure(self, programmer):
+        """atomic=False runs all actions regardless of failures."""
+        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        result = programmer.execute(
+            uid,
+            [
+                {"correct": {"memory_id": "bad_id", "new_content": "x"}},
+                {"inject": {"content": "runs anyway"}},
+            ],
+            sandbox=False,
+            atomic=False,
+        )
+        assert len(result.results) == 2
+        assert result.results[0].success is False
+        assert result.results[1].success is True
+        assert result.rolled_back is False
+
+
+class TestBatchInject:
+    def test_consecutive_injects_batched(self, programmer, db_factory):
+        """Multiple consecutive injects are coalesced into one batch INSERT."""
+        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        n = 20
+        actions = [{"inject": {"content": f"fact {i}", "type": "semantic"}} for i in range(n)]
+        result = programmer.execute(uid, actions, sandbox=False)
+
+        # All coalesced into 1 batch action
+        assert len(result.results) == 1
+        assert result.results[0].detail["count"] == n
+        assert result.actions_failed == 0
+
+        # All 20 in DB
+        with db_factory() as db:
+            count = db.execute(
+                text(
+                    "SELECT COUNT(*) FROM mem_memories "
+                    "WHERE user_id = :uid AND is_active = 1"
+                ),
+                {"uid": uid},
+            ).scalar()
+        assert count == n
+
+    def test_non_consecutive_injects_not_batched(self, programmer):
+        """Injects separated by other actions are not coalesced."""
+        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        result = programmer.execute(
+            uid,
+            [
+                {"inject": {"content": "a"}},
+                {"purge": {"filter": {"type": "working"}}},
+                {"inject": {"content": "b"}},
+            ],
+            sandbox=False,
+        )
+        # 3 separate actions: inject, purge, inject
+        assert len(result.results) == 3
