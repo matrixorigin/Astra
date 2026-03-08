@@ -12,7 +12,7 @@ See docs/design/memory/backend-management.md
 
 # ── Public interface ──────────────────────────────────────────────────
 from core.memory.config import DEFAULT_CONFIG, MemoryGovernanceConfig
-from core.memory.factory import create_memory_service
+from core.memory.factory import create_memory_service, set_user_strategy, switch_user_strategy
 from core.memory.interfaces import (
     CandidateProvider,
     GovernanceReport,
@@ -49,5 +49,7 @@ __all__ = [
     "RetrievalWeights",
     "TrustTier",
     "create_memory_service",
+    "set_user_strategy",
+    "switch_user_strategy",
     "trust_tier_defaults",
 ]

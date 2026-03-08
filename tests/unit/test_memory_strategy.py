@@ -95,12 +95,12 @@ class TestFactoryStrategyResolution:
     def test_env_fallback(self, monkeypatch):
         from core.memory.factory import _resolve_strategy
         monkeypatch.setenv("MEM_RETRIEVAL_STRATEGY", "activation:v1")
-        assert _resolve_strategy(None, None) == "activation:v1"
+        assert _resolve_strategy(None, None, None, None) == "activation:v1"
 
     def test_hardcoded_fallback(self, monkeypatch):
         from core.memory.factory import _resolve_strategy
         monkeypatch.delenv("MEM_RETRIEVAL_STRATEGY", raising=False)
-        assert _resolve_strategy(None, None) == "vector:v1"
+        assert _resolve_strategy(None, None, None, None) == "vector:v1"
 
 
 class TestMemoryServiceFacade:

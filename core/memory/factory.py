@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from core.memory.canonical_storage import CanonicalStorage
@@ -70,14 +71,20 @@ _BACKEND_TO_STRATEGY: dict[str, str] = {
 }
 
 
-def _resolve_strategy(backend: str | None, strategy: str | None) -> str:
-    """Resolve strategy key from backend name or explicit strategy.
+def _resolve_strategy(
+    db_factory: DbFactory | None,
+    user_id: str | None,
+    backend: str | None,
+    strategy: str | None,
+) -> str:
+    """Resolve strategy key.
 
-    Resolution order:
+    Resolution order (§4.2):
     1. Explicit strategy parameter
     2. Backend name mapped to strategy
-    3. MEM_RETRIEVAL_STRATEGY env var
-    4. "vector:v1" hardcoded fallback
+    3. Per-user DB row (mem_user_memory_config)
+    4. MEM_RETRIEVAL_STRATEGY env var
+    5. "vector:v1" hardcoded fallback
     """
     if strategy:
         return strategy
@@ -85,9 +92,37 @@ def _resolve_strategy(backend: str | None, strategy: str | None) -> str:
         mapped = _BACKEND_TO_STRATEGY.get(backend)
         if mapped:
             return mapped
-        # Treat as strategy key directly (e.g. "vector:v1")
         return backend
+    if user_id and db_factory:
+        db_key = _lookup_user_strategy(db_factory, user_id)
+        if db_key:
+            return db_key
     return os.environ.get("MEM_RETRIEVAL_STRATEGY", "vector:v1")
+
+
+def _lookup_user_strategy(db_factory: DbFactory, user_id: str) -> str | None:
+    """Look up per-user strategy from mem_user_memory_config."""
+    from sqlalchemy import text
+
+    try:
+        with db_factory() as db:
+            row = db.execute(
+                text(
+                    "SELECT strategy_key, index_status "
+                    "FROM mem_user_memory_config "
+                    "WHERE user_id = :uid"
+                ),
+                {"uid": user_id},
+            ).fetchone()
+            if row is None:
+                return None
+            # If index is still building, fall through to env/default
+            if row.index_status == "backfilling":  # type: ignore[union-attr]
+                return None
+            return row.strategy_key  # type: ignore[union-attr]
+    except Exception:
+        logger.debug("Failed to look up user strategy for %s", user_id, exc_info=True)
+        return None
 
 
 def create_memory_service(
@@ -95,6 +130,7 @@ def create_memory_service(
     *,
     backend: str | None = None,
     strategy: str | None = None,
+    user_id: str | None = None,
     llm_client: object | None = None,
     embed_fn: Callable | None = None,
     config: MemoryGovernanceConfig | None = None,
@@ -105,6 +141,7 @@ def create_memory_service(
         db_factory: Database session factory.
         backend: Legacy backend name ("tabular" or "graph"). Maps to strategy.
         strategy: Explicit strategy key ("vector:v1", "activation:v1").
+        user_id: Resolve per-user strategy from DB (§4.2).
         llm_client: LLM client for memory extraction.
         embed_fn: Embedding function.
         config: Governance configuration.
@@ -112,7 +149,7 @@ def create_memory_service(
     Returns:
         MemoryService with canonical storage + selected retrieval strategy.
     """
-    strategy_key = _resolve_strategy(backend, strategy)
+    strategy_key = _resolve_strategy(db_factory, user_id, backend, strategy)
 
     if config is None:
         from core.memory.config import DEFAULT_CONFIG
@@ -144,3 +181,127 @@ def create_memory_service(
         retrieval=retrieval,
         index_manager=index_manager,
     )
+
+
+# ── Per-user strategy binding ─────────────────────────────────────────
+
+
+@dataclass
+class SwitchResult:
+    """Result of a strategy switch request."""
+
+    status: str  # "ready" | "backfilling"
+    strategy_key: str
+    previous_key: str | None = None
+    estimated_seconds: int | None = None
+
+
+def set_user_strategy(
+    db_factory: DbFactory,
+    user_id: str,
+    strategy_key: str,
+) -> None:
+    """Set or create per-user strategy binding (no backfill check)."""
+    from sqlalchemy import text
+
+    with db_factory() as db:
+        db.execute(
+            text(
+                "INSERT INTO mem_user_memory_config (user_id, strategy_key) "
+                "VALUES (:uid, :sk) "
+                "ON DUPLICATE KEY UPDATE strategy_key = :sk, updated_at = NOW()"
+            ),
+            {"uid": user_id, "sk": strategy_key},
+        )
+        db.commit()
+
+
+def switch_user_strategy(
+    db_factory: DbFactory,
+    user_id: str,
+    new_strategy: str,
+) -> SwitchResult:
+    """Switch a user's retrieval strategy, with backfill if needed.
+
+    If the new strategy has an IndexManager that needs backfill,
+    marks status as 'backfilling' and runs backfill synchronously
+    (async job integration is Phase 4).
+
+    Returns SwitchResult with status and previous strategy.
+    """
+    from sqlalchemy import text
+
+    descriptor = StrategyDescriptor.parse(new_strategy)
+    # Validate strategy exists
+    _registry.create_strategy(descriptor, db_factory=db_factory)
+
+    # Get current strategy
+    previous_key: str | None = None
+    with db_factory() as db:
+        row = db.execute(
+            text("SELECT strategy_key FROM mem_user_memory_config WHERE user_id = :uid"),
+            {"uid": user_id},
+        ).fetchone()
+        if row:
+            previous_key = row.strategy_key  # type: ignore[union-attr]
+
+    if previous_key == new_strategy:
+        return SwitchResult(status="ready", strategy_key=new_strategy, previous_key=previous_key)
+
+    # Check if backfill is needed
+    index_mgr = _registry.create_index_manager(descriptor, db_factory=db_factory)
+    needs_backfill = index_mgr and index_mgr.backfill_needed(user_id)
+
+    if needs_backfill:
+        # Mark as backfilling
+        _upsert_user_config(
+            db_factory, user_id, new_strategy,
+            index_status="backfilling", migrated_from=previous_key,
+        )
+        # Run backfill (synchronous for now; async job in Phase 4)
+        try:
+            index_mgr.backfill(user_id)  # type: ignore[union-attr]
+            _upsert_user_config(
+                db_factory, user_id, new_strategy,
+                index_status="ready", migrated_from=previous_key,
+            )
+            return SwitchResult(
+                status="ready", strategy_key=new_strategy, previous_key=previous_key,
+            )
+        except Exception:
+            _upsert_user_config(
+                db_factory, user_id, previous_key or "vector:v1",
+                index_status="failed", migrated_from=previous_key,
+            )
+            raise
+    else:
+        set_user_strategy(db_factory, user_id, new_strategy)
+        return SwitchResult(
+            status="ready", strategy_key=new_strategy, previous_key=previous_key,
+        )
+
+
+def _upsert_user_config(
+    db_factory: DbFactory,
+    user_id: str,
+    strategy_key: str,
+    *,
+    index_status: str = "ready",
+    migrated_from: str | None = None,
+) -> None:
+    """Upsert mem_user_memory_config row (atomic)."""
+    from sqlalchemy import text
+
+    with db_factory() as db:
+        db.execute(
+            text(
+                "INSERT INTO mem_user_memory_config "
+                "(user_id, strategy_key, index_status, migrated_from) "
+                "VALUES (:uid, :sk, :st, :mf) "
+                "ON DUPLICATE KEY UPDATE "
+                "strategy_key = :sk, index_status = :st, "
+                "migrated_from = :mf, updated_at = NOW()"
+            ),
+            {"uid": user_id, "sk": strategy_key, "st": index_status, "mf": migrated_from},
+        )
+        db.commit()
