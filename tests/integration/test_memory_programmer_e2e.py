@@ -10,7 +10,6 @@ Tests:
 """
 
 import os
-import uuid
 
 import pytest
 from sqlalchemy import text
@@ -23,6 +22,7 @@ from core.memory.programmer import (  # noqa: E402
     MemoryProgrammer,
     parse_script,
 )
+from core.utils.id_generator import generate_id  # noqa: E402
 
 # ── Script Parsing (no DB needed) ────────────────────────────────────
 
@@ -187,7 +187,7 @@ def _cleanup(db_factory):
 
 class TestInjectAction:
     def test_inject_creates_memory(self, programmer, db_factory):
-        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        uid = f"test_prog_{generate_id()}"
         result = programmer.execute(
             uid,
             [{"inject": {"content": "Python prefers spaces over tabs", "type": "semantic"}}],
@@ -210,7 +210,7 @@ class TestInjectAction:
             assert row.is_active == 1
 
     def test_inject_missing_content_fails(self, programmer):
-        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        uid = f"test_prog_{generate_id()}"
         result = programmer.execute(
             uid,
             [{"inject": {"type": "semantic"}}],
@@ -223,7 +223,7 @@ class TestInjectAction:
 
 class TestCorrectAction:
     def test_correct_supersedes_memory(self, programmer, db_factory):
-        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        uid = f"test_prog_{generate_id()}"
         # First inject
         r1 = programmer.execute(
             uid,
@@ -259,7 +259,7 @@ class TestCorrectAction:
             assert new.is_active == 1
 
     def test_correct_missing_fields_fails(self, programmer):
-        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        uid = f"test_prog_{generate_id()}"
         result = programmer.execute(
             uid,
             [{"correct": {"memory_id": "nonexistent"}}],
@@ -271,7 +271,7 @@ class TestCorrectAction:
 
 class TestPurgeAction:
     def test_purge_by_type(self, programmer, db_factory):
-        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        uid = f"test_prog_{generate_id()}"
         # Inject two memories
         programmer.execute(
             uid,
@@ -296,7 +296,7 @@ class TestPurgeAction:
             active = db.execute(
                 text(
                     "SELECT COUNT(*) AS cnt FROM mem_memories "
-                    "WHERE user_id = :uid AND is_active = 1"
+                    "WHERE user_id = :uid AND is_active != 0"
                 ),
                 {"uid": uid},
             ).scalar()
@@ -305,7 +305,7 @@ class TestPurgeAction:
 
 class TestSandboxExecution:
     def test_sandbox_creates_experiment(self, programmer, db_factory):
-        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        uid = f"test_prog_{generate_id()}"
         result = programmer.execute(
             uid,
             [{"inject": {"content": "sandboxed fact"}}],
@@ -326,14 +326,14 @@ class TestSandboxExecution:
 
     def test_sandbox_inject_isolated(self, programmer, db_factory):
         """Sandbox inject writes to branch DB, not production."""
-        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        uid = f"test_prog_{generate_id()}"
 
         # Count production memories before
         with db_factory() as db:
             before = db.execute(
                 text(
                     "SELECT COUNT(*) AS cnt FROM mem_memories "
-                    "WHERE user_id = :uid AND is_active = 1"
+                    "WHERE user_id = :uid AND is_active != 0"
                 ),
                 {"uid": uid},
             ).scalar()
@@ -352,7 +352,7 @@ class TestSandboxExecution:
             after = db.execute(
                 text(
                     "SELECT COUNT(*) AS cnt FROM mem_memories "
-                    "WHERE user_id = :uid AND is_active = 1"
+                    "WHERE user_id = :uid AND is_active != 0"
                 ),
                 {"uid": uid},
             ).scalar()
@@ -360,7 +360,7 @@ class TestSandboxExecution:
 
     def test_sandbox_commit_applies_changes(self, programmer, experiments, db_factory):
         """Full workflow: sandbox inject → commit → data appears in production."""
-        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        uid = f"test_prog_{generate_id()}"
 
         # Sandbox inject
         result = programmer.execute(
@@ -406,7 +406,7 @@ class TestSandboxExecution:
 class TestTuneAction:
     def test_tune_sets_strategy_and_params(self, programmer, db_factory):
         """Tune action sets user strategy and persists validated params."""
-        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        uid = f"test_prog_{generate_id()}"
         result = programmer.execute(
             uid,
             [{"tune": {
@@ -434,7 +434,7 @@ class TestTuneAction:
             assert row.params_json["semantic_weight"] == 0.6
 
     def test_tune_missing_strategy_fails(self, programmer):
-        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        uid = f"test_prog_{generate_id()}"
         result = programmer.execute(
             uid,
             [{"tune": {"params": {"semantic_weight": 0.5}}}],
@@ -447,7 +447,7 @@ class TestTuneAction:
 class TestMultiActionScript:
     def test_multi_action_yaml_workflow(self, programmer, db_factory):
         """Full workflow: inject two memories, correct one, purge the other."""
-        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        uid = f"test_prog_{generate_id()}"
 
         # Step 1: inject two (coalesced into one batch action)
         r1 = programmer.execute(
@@ -496,7 +496,7 @@ actions:
 
     def test_partial_failure_continues(self, programmer):
         """With atomic=False, if one action fails, others still execute."""
-        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        uid = f"test_prog_{generate_id()}"
         result = programmer.execute(
             uid,
             [
@@ -516,7 +516,7 @@ actions:
 
 class TestEditAuditTrail:
     def test_inject_logged_in_edit_log(self, programmer, db_factory):
-        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        uid = f"test_prog_{generate_id()}"
         programmer.execute(
             uid,
             [{"inject": {"content": "audited fact"}}],
@@ -538,7 +538,7 @@ class TestEditAuditTrail:
 class TestAtomicRollback:
     def test_sandbox_atomic_discards_on_failure(self, programmer, experiments, db_factory):
         """atomic=True (default): failure discards the experiment."""
-        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        uid = f"test_prog_{generate_id()}"
         result = programmer.execute(
             uid,
             [
@@ -557,7 +557,7 @@ class TestAtomicRollback:
 
     def test_atomic_stops_on_first_failure(self, programmer):
         """atomic=True stops executing after first failure."""
-        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        uid = f"test_prog_{generate_id()}"
         result = programmer.execute(
             uid,
             [
@@ -573,7 +573,7 @@ class TestAtomicRollback:
 
     def test_non_atomic_continues_after_failure(self, programmer):
         """atomic=False runs all actions regardless of failures."""
-        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        uid = f"test_prog_{generate_id()}"
         result = programmer.execute(
             uid,
             [
@@ -592,7 +592,7 @@ class TestAtomicRollback:
 class TestBatchInject:
     def test_consecutive_injects_batched(self, programmer, db_factory):
         """Multiple consecutive injects are coalesced into one batch INSERT."""
-        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        uid = f"test_prog_{generate_id()}"
         n = 20
         actions = [{"inject": {"content": f"fact {i}", "type": "semantic"}} for i in range(n)]
         result = programmer.execute(uid, actions, sandbox=False)
@@ -603,11 +603,13 @@ class TestBatchInject:
         assert result.actions_failed == 0
 
         # All 20 in DB
+        # Note: use CAST to work around MatrixOne SMALLINT literal comparison bug
+        # where `is_active = 1` returns 0 rows (MatrixOne bug: integer equality in composite index scan) despite is_active being 1.
         with db_factory() as db:
             count = db.execute(
                 text(
                     "SELECT COUNT(*) FROM mem_memories "
-                    "WHERE user_id = :uid AND is_active = 1"
+                    "WHERE user_id = :uid AND is_active != 0"
                 ),
                 {"uid": uid},
             ).scalar()
@@ -615,7 +617,7 @@ class TestBatchInject:
 
     def test_non_consecutive_injects_not_batched(self, programmer):
         """Injects separated by other actions are not coalesced."""
-        uid = f"test_prog_{uuid.uuid4().hex[:8]}"
+        uid = f"test_prog_{generate_id()}"
         result = programmer.execute(
             uid,
             [
@@ -627,3 +629,123 @@ class TestBatchInject:
         )
         # 3 separate actions: inject, purge, inject
         assert len(result.results) == 3
+
+
+class TestLargeBatchPerformance:
+    def test_100_injects_under_5_seconds(self, programmer, db_factory):
+        """100 inject actions complete within 5 seconds via batch coalescing."""
+        import time
+
+        uid = f"test_prog_{generate_id()}"
+        n = 100
+        actions = [{"inject": {"content": f"perf fact {i}"}} for i in range(n)]
+
+        start = time.monotonic()
+        result = programmer.execute(uid, actions, sandbox=False)
+        elapsed = time.monotonic() - start
+
+        assert result.actions_failed == 0
+        assert result.results[0].detail["count"] == n
+        assert elapsed < 5.0, f"100 injects took {elapsed:.1f}s (expected < 5s)"
+
+        with db_factory() as db:
+            count = db.execute(
+                text("SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid"),
+                {"uid": uid},
+            ).scalar()
+        assert count == n
+
+    def test_mixed_100_actions(self, programmer, db_factory):
+        """100 mixed actions (inject + purge cycles) complete reasonably."""
+        import time
+
+        uid = f"test_prog_{generate_id()}"
+        # 10 rounds of: 9 injects + 1 purge = 100 actions
+        actions: list[dict] = []
+        for _ in range(10):
+            for j in range(9):
+                actions.append({"inject": {"content": f"item {j}", "type": "semantic"}})
+            actions.append({"purge": {"filter": {"type": "semantic"}}})
+
+        start = time.monotonic()
+        result = programmer.execute(uid, actions, sandbox=False, atomic=False)
+        elapsed = time.monotonic() - start
+
+        assert result.actions_failed == 0
+        assert elapsed < 15.0, f"100 mixed actions took {elapsed:.1f}s (expected < 15s)"
+
+
+class TestTimeout:
+    def test_timeout_raises_on_non_sandbox(self, programmer):
+        """Non-sandbox timeout raises ProgramTimeoutError."""
+        from core.memory.programmer import ProgramTimeoutError
+
+        uid = f"test_prog_{generate_id()}"
+        # Many non-coalesced actions with already-expired deadline
+        actions: list[dict] = []
+        for i in range(10):
+            actions.append({"inject": {"content": f"item {i}"}})
+            actions.append({"purge": {"filter": {"type": "working"}}})
+
+        with pytest.raises(ProgramTimeoutError, match="timed out"):
+            programmer.execute(uid, actions, sandbox=False, timeout_seconds=-1)
+
+    def test_timeout_sandbox_atomic_discards(self, programmer, experiments, db_factory):
+        """Sandbox + atomic + timeout → experiment discarded, no raise."""
+        uid = f"test_prog_{generate_id()}"
+        actions: list[dict] = []
+        for i in range(10):
+            actions.append({"inject": {"content": f"item {i}"}})
+            actions.append({"purge": {"filter": {"type": "working"}}})
+
+        result = programmer.execute(
+            uid, actions,
+            sandbox=True,
+            timeout_seconds=-1,
+            program_name="timeout_test",
+        )
+        assert result.timed_out is True
+        assert result.rolled_back is True
+        info = experiments.get(result.experiment_id)
+        assert info.status == "discarded"
+
+
+class TestConcurrentExecution:
+    def test_concurrent_programs_isolated(self, editor, db_factory):
+        """Two programs running concurrently don't interfere."""
+        import concurrent.futures
+
+        tag = generate_id()
+
+        def run_program(idx: int) -> tuple[str, int]:
+            uid = f"tpc_{tag}_{idx}"  # Short prefix outside test_prog_% pattern
+            exp = MemoryExperimentManager(db_factory, source_db=_TEST_DB)
+            prog = MemoryProgrammer(editor, exp, db_factory)
+            result = prog.execute(
+                uid,
+                [{"inject": {"content": f"fact from {idx}"}}],
+                sandbox=False,
+            )
+            return uid, result.actions_executed
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(run_program, i) for i in range(4)]
+            results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+        # All 4 succeeded
+        assert all(count == 1 for _, count in results)
+
+        # Each user has exactly 1 memory
+        for uid, _ in results:
+            with db_factory() as db:
+                count = db.execute(
+                    text("SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active != 0"),
+                    {"uid": uid},
+                ).scalar()
+                assert count == 1
+
+        # Self-cleanup
+        with db_factory() as db:
+            for uid, _ in results:
+                db.execute(text("DELETE FROM mem_memories WHERE user_id = :uid"), {"uid": uid})
+            db.commit()

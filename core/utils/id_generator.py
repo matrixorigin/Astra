@@ -2,7 +2,8 @@
 
 import hashlib
 import json
-from typing import Any, Dict
+from typing import Any
+
 from uuid_utils import uuid7
 
 
@@ -17,29 +18,12 @@ def generate_id(max_length: int = 36) -> str:
     """
     # Generate UUID7 and remove hyphens
     uuid_str = str(uuid7()).replace("-", "")
-    
+
     # Truncate if necessary to fit database constraints
     if len(uuid_str) > max_length:
         return uuid_str[:max_length]
-    
+
     return uuid_str
-
-
-def generate_short_id(length: int = 8) -> str:
-    """Generate a short unique ID for temporary names and display.
-    
-    Uses the random suffix of UUID7 to ensure uniqueness even when
-    called in rapid succession (the timestamp prefix would collide).
-    
-    Args:
-        length: Length of the ID (default 8)
-        
-    Returns:
-        A short unique ID string
-    """
-    hex_str = str(uuid7()).replace("-", "")
-    # Take from the tail — the random portion of UUID7
-    return hex_str[-length:] if length < len(hex_str) else hex_str
 
 
 def generate_hash_id(data: Any, length: int = 16) -> str:
@@ -56,7 +40,7 @@ def generate_hash_id(data: Any, length: int = 16) -> str:
         data_str = data
     else:
         data_str = json.dumps(data, sort_keys=True)
-    
+
     return hashlib.sha256(data_str.encode()).hexdigest()[:length]
 
 
@@ -101,17 +85,17 @@ def generate_log_id() -> str:
 
 def generate_sandbox_name(prefix: str = "sandbox") -> str:
     """Generate a unique sandbox name."""
-    return f"{prefix}_{generate_short_id(16)}".lower()
+    return f"{prefix}_{generate_id()}".lower()
 
 
-def generate_prefixed_id(prefix: str, length: int = 8) -> str:
-    """Generate a prefixed unique ID like 'memories_sandbox_a1b2c3d4'.
+def generate_prefixed_id(prefix: str, length: int = 0) -> str:
+    """Generate a prefixed unique ID like 'memories_sandbox_<uuid7>'.
 
     Args:
         prefix: Human-readable prefix (e.g. 'memories_sandbox', 'mem_milestone')
-        length: Length of the random suffix (default 8)
+        length: Unused, kept for backward compatibility.
     """
-    return f"{prefix}_{generate_short_id(length)}"
+    return f"{prefix}_{generate_id()}"
 
 
 def generate_tool_call_id() -> str:
@@ -121,9 +105,9 @@ def generate_tool_call_id() -> str:
 
 def generate_session_name(prefix: str = "session") -> str:
     """Generate a unique session name."""
-    return f"{prefix}_{generate_short_id(8)}"
+    return f"{prefix}_{generate_id()}"
 
 
 def generate_test_name(prefix: str = "test") -> str:
     """Generate a unique test name."""
-    return f"{prefix}_{generate_short_id(8)}"
+    return f"{prefix}_{generate_id()}"

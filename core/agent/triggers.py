@@ -13,7 +13,7 @@ from typing import Callable
 from uuid import uuid4
 
 from croniter import croniter
-from core.utils.id_generator import generate_short_id
+from core.utils.id_generator import generate_id
 from sqlalchemy.orm import Session
 
 from api.models import Trigger
@@ -45,7 +45,7 @@ def create_trigger(
         if not croniter.is_valid(cron_expr):
             raise ValueError(f"Invalid cron expression: {cron_expr}")
 
-    trigger_id = generate_short_id(12)
+    trigger_id = generate_id()
     secret = str(uuid4()) if trigger_type == "webhook" else None
     now = datetime.now(timezone.utc)
 

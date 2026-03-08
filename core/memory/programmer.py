@@ -94,6 +94,10 @@ class InvalidScriptError(ValueError):
     """Raised when a memory program script is invalid."""
 
 
+class ProgramTimeoutError(TimeoutError):
+    """Raised when a memory program exceeds its timeout."""
+
+
 @dataclass
 class ActionResult:
     """Result of a single action execution."""
@@ -114,6 +118,7 @@ class ProgramResult:
     results: list[ActionResult] = field(default_factory=list)
     dry_run: bool = False
     rolled_back: bool = False
+    timed_out: bool = False
 
 
 def parse_script(raw: str | dict | list) -> list[dict]:
@@ -234,6 +239,7 @@ class MemoryProgrammer:
         sandbox: bool = True,
         dry_run: bool = False,
         atomic: bool = True,
+        timeout_seconds: float | None = None,
         program_name: str = "unnamed",
     ) -> ProgramResult:
         """Parse and execute a memory program.
@@ -245,6 +251,7 @@ class MemoryProgrammer:
             dry_run: If True, parse and validate only, don't execute.
             atomic: If True (default), discard on any failure (sandbox)
                     or stop-on-first-failure (non-sandbox).
+            timeout_seconds: Max wall-clock seconds for execution. None = no limit.
             program_name: Name for the experiment (if sandboxed).
 
         Returns:
@@ -252,7 +259,10 @@ class MemoryProgrammer:
 
         Raises:
             InvalidScriptError: If script is malformed.
+            ProgramTimeoutError: If execution exceeds timeout_seconds.
         """
+        import time
+
         actions = parse_script(script)
 
         if dry_run:
@@ -278,11 +288,15 @@ class MemoryProgrammer:
             )
             editor = self._make_branch_editor(exp_info)
 
+        deadline = (time.monotonic() + timeout_seconds) if timeout_seconds else None
         results: list[ActionResult] = []
         failed_any = False
+        timed_out = False
         for action in actions:
             if atomic and failed_any:
-                # Stop executing remaining actions
+                break
+            if deadline and time.monotonic() >= deadline:
+                timed_out = True
                 break
             result = self._execute_action(user_id, action, editor=editor)
             results.append(result)
@@ -292,8 +306,8 @@ class MemoryProgrammer:
         executed = sum(1 for r in results if r.success)
         failed = sum(1 for r in results if not r.success)
 
-        # Atomic rollback: discard experiment on any failure
-        if atomic and failed_any and sandbox and exp_info:
+        # Atomic rollback: discard experiment on any failure or timeout
+        if atomic and (failed_any or timed_out) and sandbox and exp_info:
             self._experiments.discard(exp_info.experiment_id)
             return ProgramResult(
                 experiment_id=exp_info.experiment_id,
@@ -301,6 +315,13 @@ class MemoryProgrammer:
                 actions_failed=failed,
                 results=results,
                 rolled_back=True,
+                timed_out=timed_out,
+            )
+
+        if timed_out:
+            raise ProgramTimeoutError(
+                f"Execution timed out after {timeout_seconds}s "
+                f"({len(results)}/{len(actions)} actions completed)"
             )
 
         return ProgramResult(

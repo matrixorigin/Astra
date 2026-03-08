@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 
-from core.utils.id_generator import generate_short_id, generate_hash_id
+from core.utils.id_generator import generate_hash_id
 from core.code_executor.data_context import (
     DataAccessLevel,
     DataContext,

@@ -17,7 +17,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from core.utils.id_generator import generate_short_id
+from core.utils.id_generator import generate_id
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +130,7 @@ async def _execute_submit_workflow(params: dict[str, Any], run_id: str | None = 
 
     from core.workflow.engine import Workflow, WorkflowEngine, Step
 
-    wf_id = generate_short_id(12)
+    wf_id = generate_id()
     steps = [Step(**s) if isinstance(s, dict) else s for s in params["steps"]]
     workflow = Workflow(
         name=params.get("name", f"wf_{wf_id}"),
