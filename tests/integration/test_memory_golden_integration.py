@@ -17,12 +17,12 @@ from sqlalchemy import text
 from uuid_utils import uuid7
 
 from api.database import get_db_session
-from core.memory.store import MemoryStore
-from core.memory.retriever import MemoryRetriever
-from core.memory.typed_observer import TypedObserver, _parse_json_array
-from core.memory.profile import ProfileManager
+from core.memory.tabular.store import MemoryStore
+from core.memory.tabular.retriever import MemoryRetriever
+from core.memory.tabular.typed_observer import TypedObserver, _parse_json_array
+from core.memory.tabular.profile import ProfileManager
 from core.context.tiered_loader import TieredMemoryLoader
-from core.memory.service import MemoryService
+from core.memory.tabular.service import MemoryService
 from core.memory.types import Memory, MemoryType
 
 FIXTURE_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "golden_sessions"
@@ -209,7 +209,7 @@ class TestMemoryRetrieverRealDB:
 
     def test_vector_search_uses_ivfflat_index(self, db_factory, cleanup_memories):
         """Verify L2_DISTANCE vector search actually uses ivfflat index (not fallback)."""
-        from core.memory.metrics import MemoryMetrics
+        from core.memory.tabular.metrics import MemoryMetrics
         
         store = MemoryStore(db_factory)
         retriever = MemoryRetriever(db_factory)
@@ -403,8 +403,8 @@ class TestSandboxRealDB:
 
     def test_branch_create_and_delete(self, db_factory, cleanup_memories):
         """Branch operations work with real DB — verify NOT fallback."""
-        from core.memory.sandbox import MemorySandbox
-        from core.memory.metrics import MemoryMetrics
+        from core.memory.tabular.sandbox import MemorySandbox
+        from core.memory.tabular.metrics import MemoryMetrics
 
         store = MemoryStore(db_factory)
         sandbox = MemorySandbox(db_factory, db_name=os.environ["MATRIXONE_DATABASE"])
@@ -461,7 +461,7 @@ class TestProvenanceRealDB:
 
     def test_setup_pitr(self, db_factory):
         """PITR setup works with real DB."""
-        from core.memory.provenance import MemoryProvenance
+        from core.memory.tabular.provenance import MemoryProvenance
         import os
         import pymysql
 
@@ -488,8 +488,8 @@ class TestProvenanceRealDB:
 
     def test_create_and_cleanup_milestone(self, db_factory):
         """Snapshot creation works with real DB."""
-        from core.memory.provenance import MemoryProvenance
-        from core.memory.health import MemoryHealth
+        from core.memory.tabular.provenance import MemoryProvenance
+        from core.memory.tabular.health import MemoryHealth
         import os
         import pymysql
 
@@ -616,7 +616,7 @@ class TestHealthRealDB:
 
     def test_analyze_returns_stats(self, db_factory, cleanup_memories):
         """Health analyze returns per-type statistics."""
-        from core.memory.health import MemoryHealth
+        from core.memory.tabular.health import MemoryHealth
 
         store = MemoryStore(db_factory)
         health = MemoryHealth(db_factory)
@@ -642,7 +642,7 @@ class TestHealthRealDB:
 
     def test_detect_pollution_low_ratio(self, db_factory, cleanup_memories):
         """No pollution detected when supersede ratio is low."""
-        from core.memory.health import MemoryHealth
+        from core.memory.tabular.health import MemoryHealth
         from datetime import timedelta
 
         store = MemoryStore(db_factory)
@@ -675,7 +675,7 @@ class TestPipelineRealDB:
 
     def test_pipeline_observe_and_store(self, db_factory, cleanup_memories):
         """Pipeline extracts and stores memories."""
-        from core.memory.typed_pipeline import run_typed_memory_pipeline
+        from core.memory.tabular.typed_pipeline import run_typed_memory_pipeline
         from unittest.mock import MagicMock
 
         user_id = _uid()
@@ -713,7 +713,7 @@ class TestPipelineRealDB:
 
     def test_pipeline_full_cycle(self, db_factory, cleanup_memories):
         """Pipeline runs observe → persist cycle (no reflector)."""
-        from core.memory.typed_pipeline import run_typed_memory_pipeline
+        from core.memory.tabular.typed_pipeline import run_typed_memory_pipeline
         from core.memory.config import MemoryGovernanceConfig
         from unittest.mock import MagicMock
 
@@ -747,7 +747,7 @@ class TestGovernanceRealDB:
 
     def test_decay_reduces_old_memory_confidence(self, db_factory, cleanup_memories):
         """Decay actually reduces confidence in DB."""
-        from core.memory.governance import GovernanceScheduler
+        from core.memory.tabular.governance import GovernanceScheduler
         from core.memory.config import MemoryGovernanceConfig
 
         store = MemoryStore(db_factory)
@@ -774,7 +774,7 @@ class TestGovernanceRealDB:
 
     def test_cleanup_stale_removes_inactive_low_conf(self, db_factory, cleanup_memories):
         """Cleanup deletes inactive memories below threshold."""
-        from core.memory.governance import GovernanceScheduler
+        from core.memory.tabular.governance import GovernanceScheduler
 
         store = MemoryStore(db_factory)
         user_id = _uid()
@@ -804,7 +804,7 @@ class TestGovernanceRealDB:
 
     def test_storage_stats_accurate(self, db_factory, cleanup_memories):
         """Storage stats reflect actual DB state."""
-        from core.memory.health import MemoryHealth
+        from core.memory.tabular.health import MemoryHealth
 
         store = MemoryStore(db_factory)
         health = MemoryHealth(db_factory)

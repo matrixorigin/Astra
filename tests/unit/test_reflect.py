@@ -321,7 +321,7 @@ class TestBuildReflectEvidence:
 
     def test_past_lessons_from_memory(self, reflect_session, db_factory, reflect_svc):
         sid, uid, _ = reflect_session
-        from core.memory.store import MemoryStore
+        from core.memory.tabular.store import MemoryStore
         from core.memory.types import Memory, MemoryType, TrustTier
         MemoryStore(db_factory).create(Memory(
             memory_id="", user_id=uid,
@@ -527,7 +527,7 @@ class TestReflectionLearningRealDB:
     def test_reflect_then_retry_creates_real_memory(self, reflect_session, db_factory):
         sid, uid, _ = reflect_session
         from core.agent.turn_hooks import TurnHooks
-        from core.memory.store import MemoryStore
+        from core.memory.tabular.store import MemoryStore
         from core.memory.types import MemoryType
 
         hooks = TurnHooks(db_factory)
@@ -551,7 +551,7 @@ class TestReflectionLearningRealDB:
     def test_no_lesson_without_reflect_first(self, reflect_session, db_factory):
         sid, uid, _ = reflect_session
         from core.agent.turn_hooks import TurnHooks
-        from core.memory.store import MemoryStore
+        from core.memory.tabular.store import MemoryStore
         from core.memory.types import MemoryType
 
         hooks = TurnHooks(db_factory)

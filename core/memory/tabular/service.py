@@ -99,7 +99,7 @@ class TabularMemoryService:
     @property
     def _governance_lazy(self) -> Any:
         if self._governance is None:
-            from core.memory.governance import GovernanceScheduler
+            from core.memory.tabular.governance import GovernanceScheduler
             self._governance = GovernanceScheduler(
                 self._db_factory, config=self._config, metrics=self._metrics,
             )
@@ -214,7 +214,7 @@ class TabularMemoryService:
         Unlike observe_turn() which only extracts+persists, this runs the
         complete pipeline including sandbox validation and profile update.
         """
-        from core.memory.typed_pipeline import run_typed_memory_pipeline
+        from core.memory.tabular.typed_pipeline import run_typed_memory_pipeline
 
         return run_typed_memory_pipeline(
             db_factory=self._db_factory,
@@ -347,3 +347,7 @@ class TabularMemoryService:
             errors=r.errors,
             total_ms=r.total_ms,
         )
+
+
+# Backward-compat alias
+MemoryService = TabularMemoryService

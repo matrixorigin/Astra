@@ -1013,7 +1013,7 @@ class TestObserverExtractionE2E:
         # Patch run_observer to execute synchronously (no daemon thread)
         # so flush_persist_threads() guarantees observer completion.
         def _sync_run_observer(self, session_id, user_id, messages, turn_count=0, session_start=None):
-            from core.memory.typed_pipeline import run_typed_memory_pipeline
+            from core.memory.tabular.typed_pipeline import run_typed_memory_pipeline
             try:
                 run_typed_memory_pipeline(
                     db_factory=self._db_factory,

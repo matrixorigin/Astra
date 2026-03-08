@@ -11,7 +11,7 @@ import pytest
 from uuid_utils import uuid7
 
 from api.models.memory import MemoryRecord
-from core.memory.service import MemoryService
+from core.memory.tabular.service import MemoryService
 from core.memory.types import Memory, MemoryType, TrustTier
 
 
@@ -37,7 +37,7 @@ def cleanup(db_factory):
     """Track and cleanup memories created during test."""
     created_ids: list[str] = []
     yield created_ids
-    from core.memory.store import MemoryStore
+    from core.memory.tabular.store import MemoryStore
     store = MemoryStore(db_factory)
     for mid in created_ids:
         try:
@@ -432,7 +432,7 @@ class TestStoreUpdateContent:
     """MemoryStore.update_content: direct DB verification."""
 
     def test_update_content_field_level(self, db_factory, db_session, cleanup):
-        from core.memory.store import MemoryStore
+        from core.memory.tabular.store import MemoryStore
 
         store = MemoryStore(db_factory)
         mid = _mid()
@@ -469,7 +469,7 @@ class TestStoreUpdateContent:
         assert after.is_active == 1
 
     def test_update_nonexistent_is_noop(self, db_factory):
-        from core.memory.store import MemoryStore
+        from core.memory.tabular.store import MemoryStore
 
         store = MemoryStore(db_factory)
         store.update_content("nonexistent_xyz", "new content")

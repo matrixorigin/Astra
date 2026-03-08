@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from core.memory.retriever import TASK_WEIGHTS, MemoryRetriever
+from core.memory.tabular.retriever import TASK_WEIGHTS, MemoryRetriever
 from core.memory.types import MemoryType
 
 
@@ -206,7 +206,7 @@ class TestBM25Normalization:
         return MemoryRetriever(db_factory=MagicMock(), metrics=MagicMock())
 
     def _make_candidate(self, keyword_score: float):
-        from core.memory.retriever import _Candidate
+        from core.memory.tabular.retriever import _Candidate
         return _Candidate(
             memory_id="m1", content="x", memory_type="preference",
             initial_confidence=0.9, observed_at=datetime.now(timezone.utc),
@@ -221,7 +221,7 @@ class TestBM25Normalization:
         (-1.0, 0.0),   # negative clamped to 0
     ])
     def test_bm25_score_normalization(self, retriever, raw, expected_approx):
-        from core.memory.retriever import RetrievalWeights
+        from core.memory.tabular.retriever import RetrievalWeights
         w = RetrievalWeights(vector=0, keyword=1, temporal=0, confidence=0)
         c = self._make_candidate(raw)
         final, _, kw, _, _ = retriever._score_candidate(c, w, datetime.now(timezone.utc).timestamp())

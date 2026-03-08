@@ -235,7 +235,7 @@ async def close_session(
 
                 def _bg_summary():
                     try:
-                        from core.memory.service import MemoryService
+                        from core.memory.tabular.service import MemoryService
                         svc = MemoryService(SessionLocal)
                         svc.generate_session_summary(_uid, _sid, _hist)
                     except Exception as e:

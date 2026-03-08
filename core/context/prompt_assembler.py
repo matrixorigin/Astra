@@ -891,7 +891,7 @@ class PromptAssembler(DbConsumer):
         # Primary: tiered memory system (L0 + L1)
         try:
             from core.context.tiered_loader import TieredMemoryLoader
-            from core.memory.service import MemoryService
+            from core.memory.tabular.service import MemoryService
             svc = MemoryService(self._db_factory)
             loader = TieredMemoryLoader(svc)
             tiered_section, tiered_stats = loader.build_section(
@@ -997,7 +997,7 @@ class PromptAssembler(DbConsumer):
         stats: dict[str, Any] | None = {"source": "profile_only"} if explain else None
         try:
             from core.context.tiered_loader import TieredMemoryLoader
-            from core.memory.service import MemoryService
+            from core.memory.tabular.service import MemoryService
             svc = MemoryService(self._db_factory)
             loader = TieredMemoryLoader(svc)
             l0_text = loader.load_l0(user_id)

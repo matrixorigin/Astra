@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 from core.memory.types import MemoryType
 
 if TYPE_CHECKING:
-    from core.memory.service import MemoryService
+    from core.memory.tabular.service import MemoryService
 
 SUMMARY_THRESHOLD = 10 * 1024  # 10KB default
 MIN_THRESHOLD = 2 * 1024      # 2KB minimum (always summarize if larger)

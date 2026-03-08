@@ -16,12 +16,12 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from core.memory.metrics import MemoryMetrics
+from core.memory.tabular.metrics import MemoryMetrics
 from core.memory.types import MemoryType
 
 if TYPE_CHECKING:
-    from core.memory.explain import RetrievalStats
-    from core.memory.service import MemoryService
+    from core.memory.tabular.explain import RetrievalStats
+    from core.memory.tabular.service import MemoryService
 
 logger = logging.getLogger(__name__)
 

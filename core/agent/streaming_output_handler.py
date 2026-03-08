@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-    from core.memory.service import MemoryService
+    from core.memory.tabular.service import MemoryService
 
 
 @dataclass

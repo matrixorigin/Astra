@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from core.context.tiered_loader import TieredMemoryLoader
-from core.memory.explain import RetrievalStats
+from core.memory.tabular.explain import RetrievalStats
 from core.memory.types import Memory, MemoryType
 
 

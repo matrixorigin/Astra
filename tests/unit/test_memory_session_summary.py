@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from core.memory.session_summary import SessionSummarizer, _SESSION_SUMMARY_TAG, _INCREMENTAL_TAG
+from core.memory.tabular.session_summary import SessionSummarizer, _SESSION_SUMMARY_TAG, _INCREMENTAL_TAG
 from core.memory.config import MemoryGovernanceConfig
 from core.memory.types import MemoryType
 

@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from core.memory.typed_observer import TypedObserver, _parse_json_array
+from core.memory.tabular.typed_observer import TypedObserver, _parse_json_array
 from core.memory.types import MemoryType
 
 

@@ -9,11 +9,11 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 
-from core.memory.retriever import TASK_WEIGHTS
-from core.memory.typed_observer import TypedObserver
+from core.memory.tabular.retriever import TASK_WEIGHTS
+from core.memory.tabular.typed_observer import TypedObserver
 from core.context.tiered_loader import TieredMemoryLoader
-from core.memory.service import MemoryService
-from core.memory.health import MemoryHealth
+from core.memory.tabular.service import MemoryService
+from core.memory.tabular.health import MemoryHealth
 from core.memory.config import MemoryGovernanceConfig, DEFAULT_CONFIG
 from core.memory.types import Memory, MemoryType
 
@@ -206,7 +206,7 @@ class TestObserverExtraction:
 
     def test_parse_json_array_handles_markdown(self):
         """_parse_json_array extracts JSON from markdown code blocks."""
-        from core.memory.typed_observer import _parse_json_array
+        from core.memory.tabular.typed_observer import _parse_json_array
 
         text = '''Here are the memories:
 ```json
@@ -219,7 +219,7 @@ class TestObserverExtraction:
 
     def test_parse_json_array_handles_plain_json(self):
         """_parse_json_array handles plain JSON."""
-        from core.memory.typed_observer import _parse_json_array
+        from core.memory.tabular.typed_observer import _parse_json_array
 
         text = '[{"content": "test", "type": "semantic"}]'
         result = _parse_json_array(text)
@@ -227,7 +227,7 @@ class TestObserverExtraction:
 
     def test_parse_json_array_handles_invalid(self):
         """_parse_json_array returns empty list for invalid input."""
-        from core.memory.typed_observer import _parse_json_array
+        from core.memory.tabular.typed_observer import _parse_json_array
 
         result = _parse_json_array("not json at all")
         assert result == []

@@ -162,7 +162,7 @@ class ChatLoop:
             pass
         # Initialize memory service for tool output handling
         try:
-            from core.memory.service import MemoryService
+            from core.memory.tabular.service import MemoryService
             if hasattr(event_logger, '_db_factory'):
                 self._memory_service = MemoryService(event_logger._db_factory)
         except Exception:

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from core.memory.types import Memory, MemoryType, RetrievalWeights
-from core.memory.store import MemoryStore
+from core.memory.tabular.store import MemoryStore
 
 
 # ---------------------------------------------------------------------------

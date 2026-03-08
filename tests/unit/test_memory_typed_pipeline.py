@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from core.memory.typed_pipeline import run_typed_memory_pipeline, TypedPipelineResult
+from core.memory.tabular.typed_pipeline import run_typed_memory_pipeline, TypedPipelineResult
 from core.memory.config import MemoryGovernanceConfig
 from core.memory.types import Memory, MemoryType
 
@@ -22,7 +22,7 @@ class TestTypedPipeline:
             {"type": "profile", "content": "likes Go", "confidence": 0.9},
         ])}
 
-        with patch("core.memory.typed_pipeline.MemoryStore") as MockStore:
+        with patch("core.memory.tabular.typed_pipeline.MemoryStore") as MockStore:
             mock_store = MagicMock()
             mock_store.create.side_effect = lambda m: m
             mock_store.list_active.return_value = []
@@ -43,7 +43,7 @@ class TestTypedPipeline:
             {"type": "profile", "content": "prefers vim", "confidence": 0.9},
         ])}
 
-        with patch("core.memory.typed_pipeline.MemoryStore") as MockStore:
+        with patch("core.memory.tabular.typed_pipeline.MemoryStore") as MockStore:
             mock_store = MagicMock()
             mock_store.create.side_effect = lambda m: m
             mock_store.list_active.return_value = []
@@ -64,7 +64,7 @@ class TestTypedPipeline:
             {"type": "semantic", "content": "discussed testing", "confidence": 0.7},
         ])}
 
-        with patch("core.memory.typed_pipeline.MemoryStore") as MockStore:
+        with patch("core.memory.tabular.typed_pipeline.MemoryStore") as MockStore:
             mock_store = MagicMock()
             mock_store.create.side_effect = lambda m: m
             mock_store.list_active.return_value = []
@@ -84,7 +84,7 @@ class TestTypedPipeline:
         mock_llm = MagicMock()
         mock_llm.chat_with_tools.return_value = {"content": "[]"}
 
-        with patch("core.memory.typed_pipeline.MemoryStore"):
+        with patch("core.memory.tabular.typed_pipeline.MemoryStore"):
             result = run_typed_memory_pipeline(
                 db_factory=lambda: mock_db,
                 user_id="u1",
@@ -96,7 +96,7 @@ class TestTypedPipeline:
         assert result.memories_extracted == 0
 
     def test_handles_observer_error(self, mock_db):
-        with patch("core.memory.typed_pipeline.TypedObserver") as MockObs:
+        with patch("core.memory.tabular.typed_pipeline.TypedObserver") as MockObs:
             MockObs.side_effect = Exception("Observer failed")
 
             result = run_typed_memory_pipeline(

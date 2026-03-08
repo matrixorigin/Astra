@@ -846,7 +846,7 @@ def get_memory_recall(
     _verify_session_owner(db, session_id, user_id)
 
     from api.database import SessionLocal
-    from core.memory.retriever import MemoryRetriever
+    from core.memory.tabular.retriever import MemoryRetriever
 
     # SessionLocal (not lambda: db) because DbConsumer._db() closes the session
     # on block exit — passing the request-scoped db would break subsequent usage.

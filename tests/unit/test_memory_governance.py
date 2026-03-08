@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 
-from core.memory.governance import GovernanceScheduler, GovernanceCycleResult
+from core.memory.tabular.governance import GovernanceScheduler, GovernanceCycleResult
 from core.memory.config import MemoryGovernanceConfig
 
 

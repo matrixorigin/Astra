@@ -148,7 +148,7 @@ class GovernanceTaskRunner:
 
         # 2. Memories table governance (via MemoryService facade)
         try:
-            from core.memory.service import MemoryService
+            from core.memory.tabular.service import MemoryService
             svc = MemoryService(db_factory)
             if task_name == "hourly":
                 r = svc.run_hourly()

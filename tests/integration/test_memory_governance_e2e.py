@@ -9,8 +9,8 @@ from datetime import datetime, timezone, timedelta
 import pytest
 from uuid_utils import uuid7
 
-from core.memory.store import MemoryStore
-from core.memory.governance import GovernanceScheduler
+from core.memory.tabular.store import MemoryStore
+from core.memory.tabular.governance import GovernanceScheduler
 from core.memory.config import MemoryGovernanceConfig
 from core.memory.types import Memory, MemoryType, TrustTier
 

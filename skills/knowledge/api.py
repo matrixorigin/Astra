@@ -314,7 +314,7 @@ class KnowledgeExtractor:
         return stored
 
     def _extract_via_llm(self, events, user_id: str) -> list[dict[str, Any]]:
-        from core.memory import parse_json_array
+        from core.memory.tabular.json_utils import parse_json_array
         from core.memory.types import trust_tier_defaults
 
         conv_text = "\n".join(

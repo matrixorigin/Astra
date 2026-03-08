@@ -187,7 +187,7 @@ class SessionManager:
             # Generate full session summary (memories table) — reuse events already loaded
             try:
                 from api.database import SessionLocal
-                from core.memory.service import MemoryService
+                from core.memory.tabular.service import MemoryService
 
                 messages = [
                     {"role": "user" if e.event_type == "user_query" else "assistant",

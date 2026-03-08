@@ -793,7 +793,7 @@ def memory_health(
 @router.get("/memory-metrics")
 def memory_metrics() -> dict:
     """Memory system performance metrics."""
-    from core.memory.metrics import metrics
+    from core.memory.tabular.metrics import metrics
     return metrics.get_stats()
 
 

@@ -12,15 +12,15 @@ import pytest
 from api.models._constants import EMBEDDING_DIM
 from uuid_utils import uuid7
 
-from core.memory.store import MemoryStore
-from core.memory.retriever import MemoryRetriever
+from core.memory.tabular.store import MemoryStore
+from core.memory.tabular.retriever import MemoryRetriever
 from core.memory.types import Memory, MemoryType, TrustTier
-from core.memory.profile import ProfileManager
+from core.memory.tabular.profile import ProfileManager
 from core.context.tiered_loader import TieredMemoryLoader
-from core.memory.service import MemoryService
-from core.memory.typed_observer import TypedObserver
-from core.memory.governance import GovernanceScheduler
-from core.memory.health import MemoryHealth
+from core.memory.tabular.service import MemoryService
+from core.memory.tabular.typed_observer import TypedObserver
+from core.memory.tabular.governance import GovernanceScheduler
+from core.memory.tabular.health import MemoryHealth
 from core.memory.config import MemoryGovernanceConfig
 
 
@@ -558,7 +558,7 @@ class TestSessionSummaryRealDB:
 
     def test_incremental_summary_persists(self, db_factory, memory_cleanup):
         """Incremental summary persists to DB with session_id set."""
-        from core.memory.session_summary import SessionSummarizer, _INCREMENTAL_TAG
+        from core.memory.tabular.session_summary import SessionSummarizer, _INCREMENTAL_TAG
         from core.memory.config import MemoryGovernanceConfig
 
         store = MemoryStore(db_factory)
@@ -583,7 +583,7 @@ class TestSessionSummaryRealDB:
 
     def test_full_summary_cross_session(self, db_factory, memory_cleanup):
         """Full summary has session_id=NULL (cross-session)."""
-        from core.memory.session_summary import SessionSummarizer, _SESSION_SUMMARY_TAG
+        from core.memory.tabular.session_summary import SessionSummarizer, _SESSION_SUMMARY_TAG
 
         store = MemoryStore(db_factory)
         summarizer = SessionSummarizer(store)
@@ -606,7 +606,7 @@ class TestSessionSummaryRealDB:
 
     def test_full_supersedes_incrementals(self, db_factory, memory_cleanup):
         """Full summary deactivates incremental summaries."""
-        from core.memory.session_summary import SessionSummarizer
+        from core.memory.tabular.session_summary import SessionSummarizer
         from core.memory.config import MemoryGovernanceConfig
 
         store = MemoryStore(db_factory)
@@ -696,9 +696,9 @@ class TestSchedulerWiring:
         mock_factory = MagicMock(return_value=mock_db)
 
         with patch("core.context.lifecycle.MemoryGovernanceEngine") as MockEngine, \
-             patch("core.memory.governance.GovernanceScheduler") as MockSched:
+             patch("core.memory.tabular.governance.GovernanceScheduler") as MockSched:
             MockEngine.return_value.run_hourly_tasks.return_value = {"archived_notes": 0}
-            from core.memory.governance import GovernanceCycleResult
+            from core.memory.tabular.governance import GovernanceCycleResult
             MockSched.return_value.run_hourly.return_value = GovernanceCycleResult(
                 cleaned_tool_results=3, archived_working=1,
             )
@@ -718,9 +718,9 @@ class TestSchedulerWiring:
         mock_factory = MagicMock(return_value=mock_db)
 
         with patch("core.context.lifecycle.MemoryGovernanceEngine") as MockEngine, \
-             patch("core.memory.governance.GovernanceScheduler") as MockSched:
+             patch("core.memory.tabular.governance.GovernanceScheduler") as MockSched:
             MockEngine.return_value.run_daily_tasks.return_value = {"quarantined": 0}
-            from core.memory.governance import GovernanceCycleResult
+            from core.memory.tabular.governance import GovernanceCycleResult
             MockSched.return_value.run_daily_all.return_value = GovernanceCycleResult(
                 cleaned_stale=2, quarantined=5,
             )
@@ -812,7 +812,7 @@ class TestSessionSummaryWiring:
         hooks = TurnHooks(db_factory=MagicMock(), llm_client=MagicMock())
 
         # Should not raise — verifies the signature accepts new params
-        with patch("core.memory.typed_pipeline.run_typed_memory_pipeline"):
+        with patch("core.memory.tabular.typed_pipeline.run_typed_memory_pipeline"):
             hooks.run_observer(
                 session_id="test_sess", user_id="test_user",
                 messages=[{"role": "user", "content": "hello"}],

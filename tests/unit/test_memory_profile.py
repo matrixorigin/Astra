@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from core.memory.profile import ProfileManager, _DEFAULT_PROFILE
+from core.memory.tabular.profile import ProfileManager, _DEFAULT_PROFILE
 from core.memory.types import Memory, MemoryType
 
 

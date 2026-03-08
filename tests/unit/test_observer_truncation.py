@@ -8,7 +8,7 @@ class TestObserverTruncation:
     """Verify _extract_via_llm respects message and char limits."""
 
     def _make_observer(self, mock_llm=None):
-        from core.memory.typed_observer import TypedObserver
+        from core.memory.tabular.typed_observer import TypedObserver
         return TypedObserver(
             store=MagicMock(), llm_client=mock_llm or MagicMock(),
             embed_fn=None, db_factory=None,

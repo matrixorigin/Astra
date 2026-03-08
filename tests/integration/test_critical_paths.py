@@ -17,10 +17,10 @@ import pytest
 
 from api.models._constants import EMBEDDING_DIM
 
-from core.memory.store import MemoryStore
-from core.memory.retriever import MemoryRetriever
-from core.memory.typed_observer import TypedObserver
-from core.memory.sandbox import MemorySandbox
+from core.memory.tabular.store import MemoryStore
+from core.memory.tabular.retriever import MemoryRetriever
+from core.memory.tabular.typed_observer import TypedObserver
+from core.memory.tabular.sandbox import MemorySandbox
 from core.memory.types import Memory, MemoryType
 
 

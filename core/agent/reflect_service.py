@@ -179,7 +179,7 @@ class ReflectService(DbConsumer):
 
             # 3. Past lessons
             try:
-                from core.memory.service import MemoryService
+                from core.memory.tabular.service import MemoryService
                 from core.memory.types import MemoryType
 
                 svc = MemoryService(self._db_factory)

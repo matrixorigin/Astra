@@ -20,7 +20,7 @@ from uuid_utils import uuid7
 from api.models.auth import AuditLog, RefreshToken
 from api.models.evaluation import LLMCallLog
 from core.agent.run_engine import RunEngine, _agent_config_cache
-from core.memory.governance import GovernanceScheduler
+from core.memory.tabular.governance import GovernanceScheduler
 
 
 # ── fixtures ──────────────────────────────────────────────────────────

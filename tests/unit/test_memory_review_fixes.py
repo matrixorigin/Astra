@@ -11,15 +11,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from core.memory.retriever import MemoryRetriever, _safe_exp
-from core.memory.typed_observer import TypedObserver
-from core.memory.typed_pipeline import run_typed_memory_pipeline
-from core.memory.governance import GovernanceScheduler
-from core.memory.profile import ProfileManager
-from core.memory.store import MemoryStore
+from core.memory.tabular.retriever import MemoryRetriever, _safe_exp
+from core.memory.tabular.typed_observer import TypedObserver
+from core.memory.tabular.typed_pipeline import run_typed_memory_pipeline
+from core.memory.tabular.governance import GovernanceScheduler
+from core.memory.tabular.profile import ProfileManager
+from core.memory.tabular.store import MemoryStore
 from core.memory.config import MemoryGovernanceConfig
 from core.memory.types import Memory, MemoryType, RetrievalWeights
-from core.memory.metrics import MemoryMetrics
+from core.memory.tabular.metrics import MemoryMetrics
 
 
 # --- Helpers ---
@@ -197,8 +197,8 @@ class TestPipelineSandboxRejection:
         ])}
         mock_db = MagicMock()
 
-        with patch("core.memory.typed_pipeline.MemoryStore") as MockStore, \
-             patch("core.memory.typed_pipeline.MemorySandbox") as MockSandbox:
+        with patch("core.memory.tabular.typed_pipeline.MemoryStore") as MockStore, \
+             patch("core.memory.tabular.typed_pipeline.MemorySandbox") as MockSandbox:
             mock_store = MagicMock()
             mock_store.create.side_effect = lambda m: m
             mock_store.list_active.return_value = []
@@ -226,8 +226,8 @@ class TestPipelineSandboxRejection:
         ])}
         mock_db = MagicMock()
 
-        with patch("core.memory.typed_pipeline.MemoryStore") as MockStore, \
-             patch("core.memory.typed_pipeline.MemorySandbox") as MockSandbox:
+        with patch("core.memory.tabular.typed_pipeline.MemoryStore") as MockStore, \
+             patch("core.memory.tabular.typed_pipeline.MemorySandbox") as MockSandbox:
             mock_store = MagicMock()
             mock_store.create.side_effect = lambda m: m
             mock_store.list_active.return_value = []
@@ -255,8 +255,8 @@ class TestPipelineSandboxRejection:
         ])}
         mock_db = MagicMock()
 
-        with patch("core.memory.typed_pipeline.MemoryStore") as MockStore, \
-             patch("core.memory.typed_pipeline.MemorySandbox") as MockSandbox:
+        with patch("core.memory.tabular.typed_pipeline.MemoryStore") as MockStore, \
+             patch("core.memory.tabular.typed_pipeline.MemorySandbox") as MockSandbox:
             mock_store = MagicMock()
             mock_store.create.side_effect = lambda m: m
             mock_store.list_active.return_value = []
@@ -285,8 +285,8 @@ class TestPipelineSandboxRejection:
         ])}
         mock_db = MagicMock()
 
-        with patch("core.memory.typed_pipeline.MemoryStore") as MockStore, \
-             patch("core.memory.typed_pipeline.MemorySandbox") as MockSandbox:
+        with patch("core.memory.tabular.typed_pipeline.MemoryStore") as MockStore, \
+             patch("core.memory.tabular.typed_pipeline.MemorySandbox") as MockSandbox:
             mock_store = MagicMock()
             mock_store.create.side_effect = lambda m: m
             mock_store.list_active.return_value = []
@@ -568,7 +568,7 @@ class TestTieredLoaderFallbackMetrics:
 class TestSandboxExplainStats:
 
     def test_sandbox_exception_recorded_in_stats(self):
-        from core.memory.sandbox import MemorySandbox
+        from core.memory.tabular.sandbox import MemorySandbox
         mock_db = MagicMock()
         mock_db.execute.side_effect = Exception("Branch creation failed")
         sandbox = MemorySandbox(lambda: mock_db)

@@ -20,11 +20,9 @@ from typing import Any, Optional
 from sqlalchemy import text
 
 from core.db_consumer import DbConsumer, DbFactory
-from core.memory.config import MemoryGovernanceConfig, DEFAULT_CONFIG
+from core.memory.config import DEFAULT_CONFIG, MemoryGovernanceConfig
 from core.memory.tabular.health import MemoryHealth
 from core.memory.tabular.metrics import MemoryMetrics
-
-
 from core.memory.tabular.store import MemoryStore
 from core.memory.types import TRUST_TIER_HALF_LIVES, TrustTier, _utcnow
 

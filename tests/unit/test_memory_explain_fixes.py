@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from core.memory.prompts import OBSERVER_EXTRACTION_PROMPT
+from core.memory.tabular.prompts import OBSERVER_EXTRACTION_PROMPT
 
 
 class TestCLIExplainL1Fallback:
@@ -128,14 +128,14 @@ class TestMemoryServiceExplainPassthrough:
     """Verify MemoryService.retrieve() passes explain to MemoryRetriever."""
 
     def test_explain_true_forwarded(self):
-        from core.memory.service import MemoryService
+        from core.memory.tabular.service import MemoryService
 
         mock_db_factory = MagicMock()
         svc = MemoryService(mock_db_factory)
 
         # Mock the retriever
         mock_retriever = MagicMock()
-        from core.memory.explain import RetrievalStats
+        from core.memory.tabular.explain import RetrievalStats
         expected_stats = RetrievalStats(keyword_attempted=True, keyword_hit=True, final_count=2)
         mock_retriever.retrieve.return_value = ([], expected_stats)
         svc._retriever = mock_retriever
@@ -145,7 +145,7 @@ class TestMemoryServiceExplainPassthrough:
         assert stats is expected_stats
 
     def test_explain_false_forwarded(self):
-        from core.memory.service import MemoryService
+        from core.memory.tabular.service import MemoryService
 
         mock_db_factory = MagicMock()
         svc = MemoryService(mock_db_factory)

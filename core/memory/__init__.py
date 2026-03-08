@@ -2,9 +2,9 @@
 
 Public Interface (for external consumers):
 - create_memory_service: factory function (preferred)
-- MemoryService: backward-compat alias for TabularMemoryService
 - MemoryReader, MemoryWriter, MemoryAdmin: Protocol interfaces
 - GovernanceReport, HealthReport: result types
+- Memory, MemoryType, TrustTier, RetrievalWeights: shared types
 
 See docs/design/memory/backend-coexistence.md
 """
@@ -19,8 +19,6 @@ from core.memory.interfaces import (
     MemoryReader,
     MemoryWriter,
 )
-
-# Types — shared vocabulary
 from core.memory.types import (
     TRUST_TIER_HALF_LIVES,
     TRUST_TIER_INITIAL_CONFIDENCE,
@@ -30,25 +28,6 @@ from core.memory.types import (
     TrustTier,
     trust_tier_defaults,
 )
-
-# ── Backward-compat re-exports from tabular backend ──────────────────
-from core.memory.tabular.explain import (
-    ContradictionStats,
-    ExplainResult,
-    GovernanceStats,
-    MemoryStats,
-    ObserverStats,
-    PipelineStats,
-    RetrievalStats,
-    SandboxStats,
-)
-from core.memory.tabular.json_utils import parse_json_array
-from core.memory.tabular.profile import ProfileManager
-from core.memory.tabular.retriever import MemoryRetriever
-from core.memory.tabular.sensitivity import SensitivityResult, check_sensitivity
-from core.memory.tabular.service import TabularMemoryService as MemoryService
-from core.memory.tabular.store import MemoryStore
-from core.memory.tabular.typed_observer import TypedObserver
 
 __all__ = [
     # Public API
@@ -69,22 +48,4 @@ __all__ = [
     "TRUST_TIER_HALF_LIVES",
     "TRUST_TIER_INITIAL_CONFIDENCE",
     "trust_tier_defaults",
-    # Backward-compat aliases
-    "MemoryService",
-    "MemoryStore",
-    "MemoryRetriever",
-    "TypedObserver",
-    "ProfileManager",
-    "parse_json_array",
-    "check_sensitivity",
-    "SensitivityResult",
-    # Explain types
-    "ContradictionStats",
-    "ExplainResult",
-    "GovernanceStats",
-    "MemoryStats",
-    "ObserverStats",
-    "PipelineStats",
-    "RetrievalStats",
-    "SandboxStats",
 ]

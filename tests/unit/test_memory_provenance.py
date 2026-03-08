@@ -5,8 +5,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from core.memory.provenance import MemoryProvenance
-from core.memory.health import MemoryHealth
+from core.memory.tabular.provenance import MemoryProvenance
+from core.memory.tabular.health import MemoryHealth
 
 
 # ---------------------------------------------------------------------------

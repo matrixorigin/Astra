@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
-from core.memory.sandbox import MemorySandbox
+from core.memory.tabular.sandbox import MemorySandbox
 from core.memory.types import Memory, MemoryType
 
 
