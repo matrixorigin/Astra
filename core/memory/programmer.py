@@ -1,0 +1,373 @@
+"""MemoryProgrammer — declarative memory manipulation via structured scripts.
+
+Thin orchestrator over MemoryEditor + MemoryExperimentManager.
+Parses YAML/dict scripts, validates actions, executes in sandbox.
+
+See docs/design/memory/backend-management.md §9
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from core.db_consumer import DbFactory
+    from core.memory.editor import MemoryEditor
+    from core.memory.experiment import ExperimentInfo, MemoryExperimentManager
+
+logger = logging.getLogger(__name__)
+
+SCRIPT_VERSION = 1
+
+
+# ── Action schemas ────────────────────────────────────────────────────
+
+
+class InjectAction(BaseModel):
+    """Inject a new memory."""
+
+    inject: dict = Field(...)
+
+    # Nested fields
+    @property
+    def content(self) -> str:
+        return self.inject["content"]
+
+    @property
+    def memory_type(self) -> str:
+        return self.inject.get("type", "semantic")
+
+    @property
+    def trust_tier(self) -> str:
+        return self.inject.get("trust", "T2")
+
+
+class CorrectAction(BaseModel):
+    """Correct an existing memory."""
+
+    correct: dict = Field(...)
+
+    @property
+    def memory_id(self) -> str:
+        return self.correct["memory_id"]
+
+    @property
+    def new_content(self) -> str:
+        return self.correct["new_content"]
+
+
+class PurgeAction(BaseModel):
+    """Purge memories matching filter."""
+
+    purge: dict = Field(...)
+
+    @property
+    def filter_spec(self) -> dict:
+        return self.purge.get("filter", {})
+
+
+class TuneAction(BaseModel):
+    """Tune strategy params."""
+
+    tune: dict = Field(...)
+
+    @property
+    def strategy(self) -> str:
+        return self.tune["strategy"]
+
+    @property
+    def params(self) -> dict:
+        return self.tune.get("params", {})
+
+
+# Action type → key used in script
+_ACTION_KEYS = {"inject", "correct", "purge", "tune"}
+
+
+class InvalidScriptError(ValueError):
+    """Raised when a memory program script is invalid."""
+
+
+@dataclass
+class ActionResult:
+    """Result of a single action execution."""
+
+    action_type: str
+    success: bool
+    detail: dict[str, Any] = field(default_factory=dict)
+    error: str | None = None
+
+
+@dataclass
+class ProgramResult:
+    """Result of executing a memory program."""
+
+    experiment_id: str | None = None
+    actions_executed: int = 0
+    actions_failed: int = 0
+    results: list[ActionResult] = field(default_factory=list)
+    dry_run: bool = False
+
+
+def parse_script(raw: str | dict | list) -> list[dict]:
+    """Parse a memory program script into a list of action dicts.
+
+    Accepts:
+    - dict with 'actions' key (full script format)
+    - list of action dicts
+    - YAML string
+
+    Returns:
+        List of action dicts, each with exactly one action key.
+
+    Raises:
+        InvalidScriptError: If script is malformed.
+    """
+    if isinstance(raw, str):
+        import yaml
+        try:
+            raw = yaml.safe_load(raw)
+        except Exception as e:
+            raise InvalidScriptError(f"Invalid YAML: {e}") from e
+
+    if isinstance(raw, dict):
+        if "actions" in raw:
+            version = raw.get("version", 1)
+            if version != SCRIPT_VERSION:
+                raise InvalidScriptError(
+                    f"Unsupported script version {version} (expected {SCRIPT_VERSION})"
+                )
+            actions = raw["actions"]
+        else:
+            # Single action dict
+            actions = [raw]
+    elif isinstance(raw, list):
+        actions = raw
+    else:
+        raise InvalidScriptError(f"Expected dict, list, or YAML string, got {type(raw).__name__}")
+
+    if not actions:
+        raise InvalidScriptError("Script has no actions")
+
+    # Validate each action has exactly one known key
+    for i, action in enumerate(actions):
+        if not isinstance(action, dict):
+            raise InvalidScriptError(f"Action {i} is not a dict")
+        keys = set(action.keys()) & _ACTION_KEYS
+        if len(keys) == 0:
+            raise InvalidScriptError(
+                f"Action {i} has no recognized action key (expected one of {_ACTION_KEYS})"
+            )
+        if len(keys) > 1:
+            raise InvalidScriptError(f"Action {i} has multiple action keys: {keys}")
+
+    return actions
+
+
+def _get_action_type(action: dict) -> str:
+    """Get the action type key from an action dict."""
+    for key in _ACTION_KEYS:
+        if key in action:
+            return key
+    raise InvalidScriptError(f"No action key found in {action}")
+
+
+class MemoryProgrammer:
+    """Declarative memory manipulation via structured scripts.
+
+    Composes MemoryEditor (actions) + MemoryExperimentManager (sandbox).
+    All executions are sandboxed by default.
+    """
+
+    def __init__(
+        self,
+        editor: MemoryEditor,
+        experiments: MemoryExperimentManager,
+        db_factory: DbFactory,
+    ) -> None:
+        self._editor = editor
+        self._experiments = experiments
+        self._db_factory = db_factory
+
+    def execute(
+        self,
+        user_id: str,
+        script: str | dict | list,
+        *,
+        sandbox: bool = True,
+        dry_run: bool = False,
+        program_name: str = "unnamed",
+    ) -> ProgramResult:
+        """Parse and execute a memory program.
+
+        Args:
+            user_id: Target user.
+            script: YAML string, dict, or list of actions.
+            sandbox: If True (default), execute in experiment branch.
+            dry_run: If True, parse and validate only, don't execute.
+            program_name: Name for the experiment (if sandboxed).
+
+        Returns:
+            ProgramResult with per-action results.
+
+        Raises:
+            InvalidScriptError: If script is malformed.
+        """
+        actions = parse_script(script)
+
+        if dry_run:
+            return ProgramResult(
+                actions_executed=0,
+                results=[
+                    ActionResult(action_type=_get_action_type(a), success=True,
+                                 detail={"dry_run": True})
+                    for a in actions
+                ],
+                dry_run=True,
+            )
+
+        exp_info: ExperimentInfo | None = None
+        editor = self._editor
+        if sandbox:
+            exp_info = self._experiments.create(
+                user_id, f"prog_{program_name}",
+                description=f"Memory program: {program_name}",
+            )
+            # Swap editor to operate on branch DB, not production
+            editor = self._make_branch_editor(exp_info)
+
+        results: list[ActionResult] = []
+        for action in actions:
+            result = self._execute_action(user_id, action, editor=editor)
+            results.append(result)
+
+        executed = sum(1 for r in results if r.success)
+        failed = sum(1 for r in results if not r.success)
+
+        return ProgramResult(
+            experiment_id=exp_info.experiment_id if exp_info else None,
+            actions_executed=executed,
+            actions_failed=failed,
+            results=results,
+        )
+
+    def _make_branch_editor(self, exp_info: ExperimentInfo) -> MemoryEditor:
+        """Create a MemoryEditor that operates on the experiment's branch DB."""
+        from core.memory.canonical_storage import CanonicalStorage
+        from core.memory.editor import MemoryEditor as EditorCls
+
+        branch_factory = self._experiments._make_branch_db_factory(
+            exp_info.branch_db, exp_info.experiment_id,
+        )
+        storage = CanonicalStorage(branch_factory)
+        return EditorCls(storage, branch_factory)
+
+    def _execute_action(self, user_id: str, action: dict, *, editor: MemoryEditor) -> ActionResult:
+        """Execute a single action via MemoryEditor."""
+        action_type = _get_action_type(action)
+        try:
+            if action_type == "inject":
+                return self._do_inject(user_id, action["inject"], editor=editor)
+            if action_type == "correct":
+                return self._do_correct(user_id, action["correct"], editor=editor)
+            if action_type == "purge":
+                return self._do_purge(user_id, action["purge"], editor=editor)
+            if action_type == "tune":
+                return self._do_tune(user_id, action["tune"])
+            return ActionResult(action_type=action_type, success=False,
+                                error=f"Unknown action: {action_type}")
+        except Exception as e:
+            return ActionResult(action_type=action_type, success=False, error=str(e))
+
+    def _do_inject(self, user_id: str, spec: dict, *, editor: MemoryEditor) -> ActionResult:
+        from core.memory.types import MemoryType, TrustTier
+
+        content = spec.get("content")
+        if not content:
+            return ActionResult(action_type="inject", success=False,
+                                error="inject requires 'content'")
+
+        mem_type = MemoryType(spec.get("type", "semantic"))
+        trust = TrustTier(spec.get("trust", "T2"))
+
+        mem = editor.inject(
+            user_id, content,
+            memory_type=mem_type,
+            trust_tier=trust,
+        )
+        return ActionResult(
+            action_type="inject", success=True,
+            detail={"memory_id": mem.memory_id},
+        )
+
+    def _do_correct(self, user_id: str, spec: dict, *, editor: MemoryEditor) -> ActionResult:
+        memory_id = spec.get("memory_id")
+        new_content = spec.get("new_content")
+        if not memory_id or not new_content:
+            return ActionResult(action_type="correct", success=False,
+                                error="correct requires 'memory_id' and 'new_content'")
+
+        mem = editor.correct(
+            user_id, memory_id, new_content,
+            reason=spec.get("reason", ""),
+        )
+        return ActionResult(
+            action_type="correct", success=True,
+            detail={"old_id": memory_id, "new_id": mem.memory_id},
+        )
+
+    def _do_purge(self, user_id: str, spec: dict, *, editor: MemoryEditor) -> ActionResult:
+        from core.memory.types import MemoryType
+
+        filter_spec = spec.get("filter", {})
+        memory_ids = filter_spec.get("memory_ids")
+        type_val = filter_spec.get("type")
+        memory_types = [MemoryType(type_val)] if type_val else None
+
+        result = editor.purge(
+            user_id,
+            memory_ids=memory_ids,
+            memory_types=memory_types,
+            reason=spec.get("reason", ""),
+        )
+        return ActionResult(
+            action_type="purge", success=True,
+            detail={"deactivated": result.deactivated,
+                    "snapshot": result.snapshot_name},
+        )
+
+    def _do_tune(self, user_id: str, spec: dict) -> ActionResult:
+        from core.memory.strategy.params import validate_strategy_params
+
+        strategy = spec.get("strategy")
+        params = spec.get("params")
+        if not strategy:
+            return ActionResult(action_type="tune", success=False,
+                                error="tune requires 'strategy'")
+
+        validated = validate_strategy_params(strategy, params)
+
+        from core.memory.factory import set_user_strategy
+
+        set_user_strategy(self._db_factory, user_id, strategy)
+
+        # Update params in user config if provided
+        if validated:
+            from sqlalchemy import func as sa_func
+
+            from api.models.memory_config import MemoryUserConfig
+
+            with self._db_factory() as db:
+                db.query(MemoryUserConfig).filter_by(
+                    user_id=user_id,
+                ).update({"params_json": validated, "updated_at": sa_func.now()})
+                db.commit()
+
+        return ActionResult(
+            action_type="tune", success=True,
+            detail={"strategy": strategy, "params": validated},
+        )
