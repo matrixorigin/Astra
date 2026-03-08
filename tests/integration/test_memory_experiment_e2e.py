@@ -22,9 +22,10 @@ from sqlalchemy import text
 
 # Ensure test database
 os.environ.setdefault("MATRIXONE_DATABASE", "test_dev_agent_v3")
+_TEST_DB = os.environ.get("MATRIXONE_DATABASE", "test_dev_agent_v3")
 
-from api.database import SessionLocal
-from core.memory.experiment import (
+from api.database import SessionLocal  # noqa: E402
+from core.memory.experiment import (  # noqa: E402
     DEFAULT_MAX_EXPERIMENTS,
     DEFAULT_TTL_DAYS,
     MAX_TTL_DAYS,
@@ -41,7 +42,7 @@ def db_factory():
 
 @pytest.fixture()
 def mgr(db_factory):
-    return MemoryExperimentManager(db_factory, source_db="test_dev_agent_v3")
+    return MemoryExperimentManager(db_factory, source_db=_TEST_DB)
 
 
 @pytest.fixture(autouse=True)
@@ -134,7 +135,9 @@ class TestExperimentCreate:
             pj = row._mapping["params_json"]
             if isinstance(pj, str):
                 pj = json.loads(pj)
-            assert pj == params
+            assert pj["spreading_factor"] == 0.9
+            # Defaults filled in by validation
+            assert "num_iterations" in pj
 
     def test_create_limit_enforced(self, mgr):
         user_id = f"test_exp_{uuid.uuid4().hex[:8]}"
@@ -650,8 +653,6 @@ class TestBranchOperations:
 
     def test_commit_merges_branch_data_into_production(self, mgr, db_factory):
         """After commit, branch data appears in production."""
-        import time
-
         user_id = f"test_exp_{uuid.uuid4().hex[:8]}"
         info = mgr.create(user_id, "commit-merge-test")
 
@@ -671,27 +672,20 @@ class TestBranchOperations:
             )
             db.commit()
 
-        # Commit
+        # Commit — merge must succeed for mem_memories (raises on failure)
         mgr.commit(info.experiment_id)
 
-        # Verify data now in production.
-        # branch merge is DDL-like; under parallel execution a fresh session
-        # may not see the row immediately, so retry briefly.
-        row = None
-        for _ in range(5):
-            with db_factory() as db:
-                row = db.execute(
-                    text(
-                        "SELECT content, is_active FROM mem_memories "
-                        "WHERE memory_id = :mid"
-                    ),
-                    {"mid": mid},
-                ).fetchone()
-            if row is not None:
-                break
-            time.sleep(0.5)
+        # Verify data now in production
+        with db_factory() as db:
+            row = db.execute(
+                text(
+                    "SELECT content, is_active FROM mem_memories "
+                    "WHERE memory_id = :mid"
+                ),
+                {"mid": mid},
+            ).fetchone()
 
-        assert row is not None, f"Merged memory {mid} not visible in production"
+        assert row is not None
         assert row.content == "merged content"
         assert row.is_active == 1
 
@@ -740,7 +734,7 @@ class TestBranchOperations:
 
     def test_context_manager_disposes_engines(self, db_factory):
         """Context manager auto-disposes all engines on exit."""
-        with MemoryExperimentManager(db_factory, source_db="test_dev_agent_v3") as m:
+        with MemoryExperimentManager(db_factory, source_db=_TEST_DB) as m:
             user_id = f"test_exp_{uuid.uuid4().hex[:8]}"
             info = m.create(user_id, "ctx-mgr-test")
             _svc = m.get_service(info.experiment_id)

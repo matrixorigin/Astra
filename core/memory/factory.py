@@ -131,6 +131,7 @@ def create_memory_service(
     backend: str | None = None,
     strategy: str | None = None,
     user_id: str | None = None,
+    params: dict | None = None,
     llm_client: object | None = None,
     embed_fn: Callable | None = None,
     config: MemoryGovernanceConfig | None = None,
@@ -142,6 +143,7 @@ def create_memory_service(
         backend: Legacy backend name ("tabular" or "graph"). Maps to strategy.
         strategy: Explicit strategy key ("vector:v1", "activation:v1").
         user_id: Resolve per-user strategy from DB (§4.2).
+        params: Strategy-specific param overrides (validated against schema).
         llm_client: LLM client for memory extraction.
         embed_fn: Embedding function.
         config: Governance configuration.
@@ -168,7 +170,7 @@ def create_memory_service(
     )
 
     # Create retrieval strategy + optional index manager
-    descriptor = StrategyDescriptor.parse(strategy_key)
+    descriptor = StrategyDescriptor.parse(strategy_key, params=params)
     retrieval = _registry.create_strategy(
         descriptor, db_factory=db_factory, config=config, metrics=metrics,
     )

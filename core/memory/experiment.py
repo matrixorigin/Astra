@@ -164,6 +164,7 @@ class MemoryExperimentManager(DbConsumer):
             ExperimentLimitError: If user has too many active experiments.
         """
         from api.models.memory_experiment import MemoryExperiment
+        from core.memory.strategy.params import validate_strategy_params
 
         ttl_days = min(ttl_days, MAX_TTL_DAYS)
 
@@ -173,6 +174,11 @@ class MemoryExperimentManager(DbConsumer):
                 f"User {user_id} has {active} active experiments "
                 f"(max {max_experiments})"
             )
+
+        # Validate params against strategy schema
+        validated_params = validate_strategy_params(
+            strategy_key or "vector:v1", params,
+        )
 
         exp_id = uuid.uuid4().hex[:12]
         branch_db = f"mem_exp_{user_id[:16]}_{exp_id}"
@@ -191,7 +197,7 @@ class MemoryExperimentManager(DbConsumer):
             branch_db=branch_db,
             base_snapshot=snapshot_name if snapshot_ok else None,
             strategy_key=strategy_key,
-            params_json=params,
+            params_json=validated_params,
             expires_at=now + timedelta(days=ttl_days),
             created_by=user_id,
         )
@@ -253,6 +259,7 @@ class MemoryExperimentManager(DbConsumer):
         return create_memory_service(
             branch_db_factory,
             strategy=info.strategy_key,
+            params=info.params_json,
             llm_client=llm_client,
             embed_fn=embed_fn,
         )
@@ -347,6 +354,66 @@ class MemoryExperimentManager(DbConsumer):
             self._set_status(experiment_id, "active")
             raise
 
+    # ── A/B Comparison ─────────────────────────────────────────────────
+
+    def compare(
+        self,
+        experiment_id_a: str,
+        experiment_id_b: str,
+    ) -> dict[str, Any]:
+        """Compare metrics of two experiments side-by-side.
+
+        Both experiments must have been evaluated (metrics_json populated).
+
+        Returns:
+            Dict with metrics_a, metrics_b, and per-metric winner.
+        """
+        info_a = self.get(experiment_id_a)
+        info_b = self.get(experiment_id_b)
+        if info_a is None:
+            raise ValueError(f"Experiment {experiment_id_a} not found")
+        if info_b is None:
+            raise ValueError(f"Experiment {experiment_id_b} not found")
+        if not info_a.metrics_json:
+            raise ValueError(f"Experiment {experiment_id_a} has no metrics (run evaluate first)")
+        if not info_b.metrics_json:
+            raise ValueError(f"Experiment {experiment_id_b} has no metrics (run evaluate first)")
+
+        metrics_a = info_a.metrics_json
+        metrics_b = info_b.metrics_json
+
+        # Compare numeric metrics — higher is better for rates, lower for errors
+        higher_better = {"pass_rate", "retrieval_precision_at_k", "retrieval_recall_at_k",
+                         "response_quality_score", "profile_accuracy", "multi_hop_hit_rate"}
+        lower_better = {"error_rate", "p50_retrieve_latency_ms", "p99_retrieve_latency_ms",
+                        "avg_tokens_in_context"}
+
+        comparison: dict[str, Any] = {}
+        all_keys = set(metrics_a.keys()) | set(metrics_b.keys())
+        for key in sorted(all_keys):
+            val_a = metrics_a.get(key)
+            val_b = metrics_b.get(key)
+            if not isinstance(val_a, (int, float)) or not isinstance(val_b, (int, float)):
+                comparison[key] = {"a": val_a, "b": val_b, "winner": None}
+                continue
+            if key in higher_better:
+                winner = "a" if val_a > val_b else ("b" if val_b > val_a else "tie")
+            elif key in lower_better:
+                winner = "a" if val_a < val_b else ("b" if val_b < val_a else "tie")
+            else:
+                winner = None
+            comparison[key] = {"a": val_a, "b": val_b, "winner": winner}
+
+        return {
+            "experiment_a": experiment_id_a,
+            "experiment_b": experiment_id_b,
+            "strategy_a": info_a.strategy_key,
+            "strategy_b": info_b.strategy_key,
+            "metrics_a": metrics_a,
+            "metrics_b": metrics_b,
+            "comparison": comparison,
+        }
+
     # ── Commit with optimistic locking ────────────────────────────────
 
     def commit(self, experiment_id: str) -> None:
@@ -381,6 +448,8 @@ class MemoryExperimentManager(DbConsumer):
                     on_conflict="accept",
                 )
             except Exception as e:
+                if table == "mem_memories":
+                    raise  # core table merge must not fail silently
                 logger.debug("Merge skipped for %s: %s", table, e)
 
         with self._db() as db:
@@ -560,6 +629,8 @@ class MemoryExperimentManager(DbConsumer):
                     snapshot=snapshot,
                 )
             except Exception as e:
+                if table == "mem_memories":
+                    raise  # core table branch must not fail silently
                 logger.debug("Branch table %s failed: %s", table, e)
 
     def _drop_branch_db(self, branch_db: str) -> None:
