@@ -50,7 +50,16 @@ make dev-status
 # 7. Run tests to confirm setup
 pytest tests/unit/test_events.py -n auto
 
-# 8. Visit API docs
+# 8. E2E verification (real DB writes + assertions)
+make verify
+
+# 9. (Optional) Set up LLM for full verification
+cp config/models.example.yaml .models.yaml
+# Edit .models.yaml — fill in API keys
+mo-admin model load .models.yaml
+make verify-llm
+
+# 10. Visit API docs
 # Open http://localhost:8000/docs in browser
 ```
 

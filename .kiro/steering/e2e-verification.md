@@ -8,6 +8,49 @@ inclusion: always
 
 ---
 
+## Running Verification
+
+```bash
+# Core scenarios — no LLM needed, just DB
+make verify
+
+# Full verification — includes NL→Script via real LLM
+make verify-llm
+
+# Verbose output
+make verify VERBOSE=1
+```
+
+### First-Time LLM Setup
+
+```bash
+cp config/models.example.yaml .models.yaml
+# Edit .models.yaml — fill in API keys and endpoint IDs
+mo-admin model load .models.yaml
+make verify-llm
+```
+
+### What It Verifies
+
+| Scenario | What | LLM needed? |
+|----------|------|-------------|
+| 1. Sandbox inject | Experiment created, production unchanged | No |
+| 2. Commit | Data moves to production, experiment committed | No |
+| 3. Dry-run | Zero DB changes | No |
+| 4. Discard | Production unchanged, experiment discarded | No |
+| 5. Direct write | Data in production, dual audit entries | No |
+| 6. Multi-turn | inject → correct → verify content updated, audit chain | No |
+| 7. NL→Script | LLM generates actions, sandbox execution works | Yes |
+
+### Data Safety
+
+- Uses `__verify_<uuid>` user ID prefix — cannot collide with real users
+- Auto-cleans before and after every run
+- Lives in `scripts/e2e/`, not in any user-facing CLI
+- Invoked via `make verify` only — developers only
+
+---
+
 ## When to Do E2E Verification
 
 After implementing or modifying any feature that touches:
@@ -19,18 +62,6 @@ After implementing or modifying any feature that touches:
 - CLI commands
 
 **Do NOT skip E2E because "unit tests pass". Unit tests mock the DB. E2E proves the real path.**
-
----
-
-## Environment
-
-```bash
-export TOKEN_ENCRYPTION_KEY='<from .env>'
-export MATRIXONE_DATABASE='dev_agent'
-```
-
-Use `dev_agent` — that's where real LLM models and encrypted API keys live.
-Use a dedicated `user_id` like `e2e-<feature>-user` to isolate test data.
 
 ---
 
@@ -82,26 +113,15 @@ were not accidentally modified.
 
 ---
 
-## CLI E2E Checklist
+## Adding New Verification Scenarios
 
-Run these in sequence, verify DB after each step:
+When adding a new feature, add a corresponding scenario to `scripts/e2e/verify_cli.py`:
 
-```bash
-# 1. NL → sandbox inject (real LLM, e.g. ep-deepseek-v3-2-104138)
-# Verify: experiment created, production mem_memories has 0 new rows
-
-# 2. Review → Commit
-# Verify: mem_memories rows appear in production, mem_experiments status=committed
-
-# 3. Dry-run
-# Verify: NO new rows anywhere
-
-# 4. YAML run → Discard
-# Verify: mem_memories unchanged, mem_experiments status=discarded
-
-# 5. Direct write (--no-sandbox)
-# Verify: rows written directly, audit log has both inject+program entries
-```
+1. Create a `test_<feature>()` function
+2. Use `__verify_` user ID (already set up)
+3. Verify DB state with `query_one()` / `count()` helpers
+4. Use `check(name, condition, msg)` for assertions
+5. Register it in `main()` — before or after `--with-llm` gate as appropriate
 
 ---
 
@@ -115,14 +135,3 @@ Run these in sequence, verify DB after each step:
 | Only 1 audit entry instead of 2 | `_log_program_audit()` not called, or called before editor logs |
 | `branch_db` identifier error | Contains hyphens — must use `generate_id()`, not `user_id[:N]` |
 | Sandbox data in production | `_make_branch_editor()` using wrong `db_factory` |
-
----
-
-## Cleaning Up
-
-```python
-with db_factory() as db:
-    db.execute(text("DELETE FROM mem_edit_log WHERE user_id = :uid"), {'uid': USER_ID})
-    db.execute(text("UPDATE mem_memories SET is_active = 0 WHERE user_id = :uid"), {'uid': USER_ID})
-    db.commit()
-```

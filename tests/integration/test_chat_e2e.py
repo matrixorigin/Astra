@@ -470,28 +470,23 @@ class TestChatErrorRecovery:
             assert result.exit_code != 0
 
     def test_chat_session_cleanup_on_error(self, runner):
-        """Test that session is cleaned up even if error occurs."""
+        """Session is NOT explicitly closed on error — zombie detection handles cleanup."""
         import asyncio
 
         with patch("cli.mo_agent_api.SyncAPIClient") as mock_client_class:
             mock_client = MagicMock()
             mock_client_class.return_value = mock_client
-            
+
             mock_client.ensure_authenticated.return_value = True
             mock_client.create_session.return_value = {"session_id": "s1"}
-            mock_client.close_session.return_value = None
 
             def _run_close(coro):
                 if asyncio.iscoroutine(coro):
                     coro.close()
                 raise Exception("Chat error")
             mock_client._run.side_effect = _run_close
-            
-            result = runner.invoke(
-                agent_cli,
-                ["chat"],
-                input="hello\nexit\n"
-            )
-            
-            # close_session should still be called
-            mock_client.close_session.assert_called()
+
+            runner.invoke(agent_cli, ["chat"], input="hello\nexit\n")
+
+            # close_session must NOT be called — zombie GC handles orphaned sessions
+            mock_client.close_session.assert_not_called()

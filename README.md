@@ -388,6 +388,25 @@ make dev-test-unit      # Unit tests only
 make dev-test-integration  # Integration tests only
 ```
 
+### E2E Verification
+
+Verify the full system with real DB writes and real assertions:
+
+```bash
+make verify             # Core scenarios (no LLM needed)
+make verify-llm         # Includes NL→Script via real LLM
+make verify VERBOSE=1   # Verbose output
+```
+
+To run LLM verification, first set up model config:
+
+```bash
+cp config/models.example.yaml .models.yaml
+# Edit .models.yaml — fill in API keys
+mo-admin model load .models.yaml
+make verify-llm
+```
+
 See [Testing Guide](docs/guides/testing.md) for detailed testing documentation.
 
 ---

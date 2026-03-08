@@ -185,9 +185,6 @@ def cmd_session(console, session_id=None, username=None, state=None, **_):
 
 def cmd_clear(console, client=None, user_id=None, state=None, **_):
     try:
-        old_sid = state.get("session_id")
-        if old_sid:
-            client.close_session(old_sid)
         result = client.create_session(agent_id=user_id or "default-agent")
         state["session_id"] = result["session_id"]
         console.print(f"[green]✓[/green] New session: {state['session_id']}")
@@ -1674,11 +1671,7 @@ def chat(ctx, user_id, session_id, model, routing_strategy, resume, auto_approve
     except KeyboardInterrupt:
         console.print("\n[dim]Interrupted[/dim]")
     finally:
-        try:
-            client.close_session(state["session_id"])
-            console.print("[green]✓[/green] Session closed")
-        except Exception:
-            pass
+        pass
 
 
 @cli.command()

@@ -44,6 +44,8 @@ help:
 	@echo "  make test               - Run all tests"
 	@echo "  make test-unit          - Run unit tests only"
 	@echo "  make test-integration   - Run integration tests only"
+	@echo "  make verify             - E2E verification (real DB, no LLM)"
+	@echo "  make verify-llm         - E2E verification (real DB + real LLM)"
 	@echo ""
 	@echo "Environment Setup:"
 	@echo "  make dev-init           - Complete initialization (setup + deps + config)"
@@ -488,6 +490,19 @@ db-reset:
 	else \
 		echo "Cancelled"; \
 	fi
+
+# ============================================================================
+# E2E Verification
+# ============================================================================
+
+.PHONY: verify verify-llm
+verify:
+	@echo "Running E2E verification..."
+	@python scripts/e2e/verify_cli.py $(if $(VERBOSE),-v)
+
+verify-llm:
+	@echo "Running E2E verification (with LLM)..."
+	@python scripts/e2e/verify_cli.py --with-llm $(if $(VERBOSE),-v)
 
 # ============================================================================
 # Testing

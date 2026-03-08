@@ -92,7 +92,8 @@ class TestCmdClear:
         state = {"session_id": "ses_old"}
         cmd_clear(console=console, client=client, state=state)
         assert state["session_id"] == "ses_new"
-        client.close_session.assert_called_once_with("ses_old")
+        # old session is NOT closed — zombie detection handles cleanup
+        client.close_session.assert_not_called()
 
 
 class TestCmdVerboseCompact:
