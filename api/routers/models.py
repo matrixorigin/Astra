@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from api.database import SessionLocal
+from api.database import get_db_session
 from api.dependencies import get_current_user
 from api.models import LLMModel
 from core.auth.encryption import decrypt_token, encrypt_token
@@ -191,53 +191,52 @@ def _to_response(m: LLMModel, connectivity: str | None = None) -> ModelResponse:
 def create_model(
     request: ModelCreateRequest,
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
     """Register a new model with API key. Validates connectivity."""
-    db = SessionLocal()
-    try:
-        _require_admin(current_user, db)
-        existing = db.query(LLMModel).filter(
-            LLMModel.model_name == request.name, LLMModel.provider == request.provider,
-        ).first()
-        if existing:
-            raise HTTPException(status_code=400, detail=f"Model '{request.name}' ({request.provider}) already exists")
+    _require_admin(current_user, db)
+    existing = db.query(LLMModel).filter(
+        LLMModel.model_name == request.name, LLMModel.provider == request.provider,
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail=f"Model '{request.name}' ({request.provider}) already exists")
 
-        base_url = _resolve_base_url(request.provider, request.base_url)
-        conn_err = _validate_connectivity(request.provider, request.name, request.api_key, base_url)
+    base_url = _resolve_base_url(request.provider, request.base_url)
+    conn_err = _validate_connectivity(request.provider, request.name, request.api_key, base_url)
 
-        # Merge seed defaults: if caller didn't supply a field (None), fall back
-        # to the preset from seed_models (e.g. kimi-k2.5 needs fixed_temperature=1.0).
-        # Explicit caller values always win — even if they match the default.
-        seed = _get_seed_defaults(request.name)
-        _caller_supplied_quirks = request.quirks is not None
-        _quirks = request.quirks.model_dump(exclude_none=True) if _caller_supplied_quirks else seed.get("quirks", {})
+    # Merge seed defaults: if caller didn't supply a field (None), fall back
+    # to the preset from seed_models (e.g. kimi-k2.5 needs fixed_temperature=1.0).
+    # Explicit caller values always win — even if they match the default.
+    seed = _get_seed_defaults(request.name)
+    _caller_supplied_quirks = request.quirks is not None
+    _quirks = request.quirks.model_dump(exclude_none=True) if _caller_supplied_quirks else seed.get("quirks", {})
 
-        model = LLMModel(
-            model_id=str(uuid4()), model_name=request.name, provider=request.provider,
-            api_key_encrypted=encrypt_token(request.api_key), base_url=base_url,
-            description=request.description or seed.get("description"),
-            is_active=1 if conn_err is None else 0,
-            context_window=request.context_window if request.context_window is not None else seed.get("context_window", 128000),
-            max_completion_tokens=request.max_completion_tokens or seed.get("max_completion_tokens"),
-            input_modalities=request.input_modalities if request.input_modalities != ["text"] else seed.get("input_modalities", request.input_modalities),
-            output_modalities=request.output_modalities if request.output_modalities != ["text"] else seed.get("output_modalities", request.output_modalities),
-            supported_parameters=request.supported_parameters or seed.get("supported_parameters", []),
-            pricing=request.pricing.model_dump(exclude_none=True) or seed.get("pricing", {}),
-            architecture=request.architecture or seed.get("architecture"),
-            tags=request.tags or seed.get("tags", []),
-            quirks=_quirks,
-            created_by=current_user["user_id"],
-        )
-        db.add(model)
-        db.commit()
-        db.refresh(model)
+    model = LLMModel(
+        model_id=str(uuid4()), model_name=request.name, provider=request.provider,
+        api_key_encrypted=encrypt_token(request.api_key), base_url=base_url,
+        description=request.description or seed.get("description"),
+        is_active=1 if conn_err is None else 0,
+        context_window=request.context_window if request.context_window is not None else seed.get("context_window", 128000),
+        max_completion_tokens=request.max_completion_tokens or seed.get("max_completion_tokens"),
+        input_modalities=request.input_modalities if request.input_modalities != ["text"] else seed.get("input_modalities", request.input_modalities),
+        output_modalities=request.output_modalities if request.output_modalities != ["text"] else seed.get("output_modalities", request.output_modalities),
+        supported_parameters=request.supported_parameters or seed.get("supported_parameters", []),
+        pricing=request.pricing.model_dump(exclude_none=True) or seed.get("pricing", {}),
+        architecture=request.architecture or seed.get("architecture"),
+        tags=request.tags or seed.get("tags", []),
+        quirks=_quirks,
+        created_by=current_user["user_id"],
+    )
+    db.add(model)
+    db.commit()
+    db.refresh(model)
 
-        connectivity = "ok" if conn_err is None else conn_err
-        if conn_err:
-            logger.warning(f"Model '{request.name}' registered as inactive: {conn_err}")
-        # Build response directly from request values (not from db.refresh)
-        # because MatrixOne may not re-populate JSON columns after refresh.
-        return ModelResponse(
+    connectivity = "ok" if conn_err is None else conn_err
+    if conn_err:
+        logger.warning(f"Model '{request.name}' registered as inactive: {conn_err}")
+    # Build response directly from request values (not from db.refresh)
+    # because MatrixOne may not re-populate JSON columns after refresh.
+    return ModelResponse(
             model_id=model.model_id,
             name=request.name,
             provider=request.provider,
@@ -255,40 +254,32 @@ def create_model(
             quirks=QuirksSchema(**_quirks) if _quirks else QuirksSchema(),
             connectivity=connectivity,
         )
-    finally:
-        db.close()
 
 
 @router.get("", response_model=list[ModelResponse])
 def list_models(
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
-    db = SessionLocal()
-    try:
-        from core.auth.permission_checker import PermissionChecker
-        is_admin = PermissionChecker(lambda: db).is_admin(current_user["user_id"])
-        query = db.query(LLMModel)
-        if not is_admin:
-            query = query.filter(LLMModel.is_active == 1)
-        models = query.order_by(LLMModel.provider, LLMModel.model_name).all()
-        return [_to_response(m) for m in models]
-    finally:
-        db.close()
+    from core.auth.permission_checker import PermissionChecker
+    is_admin = PermissionChecker(lambda: db).is_admin(current_user["user_id"])
+    query = db.query(LLMModel)
+    if not is_admin:
+        query = query.filter(LLMModel.is_active == 1)
+    models = query.order_by(LLMModel.provider, LLMModel.model_name).all()
+    return [_to_response(m) for m in models]
 
 
 @router.get("/{model_name}", response_model=ModelResponse)
 def get_model(
     model_name: str,
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
-    db = SessionLocal()
-    try:
-        model = db.query(LLMModel).filter(LLMModel.model_name == model_name).first()
-        if not model:
-            raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
-        return _to_response(model)
-    finally:
-        db.close()
+    model = db.query(LLMModel).filter(LLMModel.model_name == model_name).first()
+    if not model:
+        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
+    return _to_response(model)
 
 
 @router.put("/{model_name}", response_model=ModelResponse)
@@ -296,90 +287,81 @@ def update_model(
     model_name: str,
     request: ModelUpdateRequest,
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
     """Update model config or API key. Re-validates connectivity if key changes."""
-    db = SessionLocal()
-    try:
-        _require_admin(current_user, db)
-        model = db.query(LLMModel).filter(LLMModel.model_name == model_name).first()
-        if not model:
-            raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
+    _require_admin(current_user, db)
+    model = db.query(LLMModel).filter(LLMModel.model_name == model_name).first()
+    if not model:
+        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
 
-        conn_result = None
-        if request.api_key is not None:
-            model.api_key_encrypted = encrypt_token(request.api_key)
-            base_url = request.base_url or model.base_url
-            conn_err = _validate_connectivity(model.provider, model.model_name, request.api_key, base_url)
-            conn_result = "ok" if conn_err is None else conn_err
-            if request.is_active is None:
-                model.is_active = 1 if conn_err is None else 0
+    conn_result = None
+    if request.api_key is not None:
+        model.api_key_encrypted = encrypt_token(request.api_key)
+        base_url = request.base_url or model.base_url
+        conn_err = _validate_connectivity(model.provider, model.model_name, request.api_key, base_url)
+        conn_result = "ok" if conn_err is None else conn_err
+        if request.is_active is None:
+            model.is_active = 1 if conn_err is None else 0
 
-        if request.base_url is not None:
-            model.base_url = request.base_url
-        if request.description is not None:
-            model.description = request.description
-        if request.context_window is not None:
-            model.context_window = request.context_window
-        if request.max_completion_tokens is not None:
-            model.max_completion_tokens = request.max_completion_tokens
-        if request.input_modalities is not None:
-            model.input_modalities = request.input_modalities
-        if request.output_modalities is not None:
-            model.output_modalities = request.output_modalities
-        if request.supported_parameters is not None:
-            model.supported_parameters = request.supported_parameters
-        if request.pricing is not None:
-            model.pricing = request.pricing.model_dump(exclude_none=True)
-        if request.architecture is not None:
-            model.architecture = request.architecture
-        if request.tags is not None:
-            model.tags = request.tags
-        if request.quirks is not None:
-            model.quirks = request.quirks.model_dump(exclude_none=True)
-        if request.is_active is not None:
-            model.is_active = 1 if request.is_active else 0
+    if request.base_url is not None:
+        model.base_url = request.base_url
+    if request.description is not None:
+        model.description = request.description
+    if request.context_window is not None:
+        model.context_window = request.context_window
+    if request.max_completion_tokens is not None:
+        model.max_completion_tokens = request.max_completion_tokens
+    if request.input_modalities is not None:
+        model.input_modalities = request.input_modalities
+    if request.output_modalities is not None:
+        model.output_modalities = request.output_modalities
+    if request.supported_parameters is not None:
+        model.supported_parameters = request.supported_parameters
+    if request.pricing is not None:
+        model.pricing = request.pricing.model_dump(exclude_none=True)
+    if request.architecture is not None:
+        model.architecture = request.architecture
+    if request.tags is not None:
+        model.tags = request.tags
+    if request.quirks is not None:
+        model.quirks = request.quirks.model_dump(exclude_none=True)
+    if request.is_active is not None:
+        model.is_active = 1 if request.is_active else 0
 
-        db.commit()
-        db.refresh(model)
-        return _to_response(model, connectivity=conn_result)
-    finally:
-        db.close()
+    db.commit()
+    db.refresh(model)
+    return _to_response(model, connectivity=conn_result)
 
 
 @router.delete("/{model_name}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_model(
     model_name: str,
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
-    db = SessionLocal()
-    try:
-        _require_admin(current_user, db)
-        model = db.query(LLMModel).filter(LLMModel.model_name == model_name).first()
-        if not model:
-            raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
-        db.delete(model)
-        db.commit()
-    finally:
-        db.close()
+    _require_admin(current_user, db)
+    model = db.query(LLMModel).filter(LLMModel.model_name == model_name).first()
+    if not model:
+        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
+    db.delete(model)
+    db.commit()
 
 
 @router.post("/{model_name}/check", response_model=ModelResponse)
 def check_model(
     model_name: str,
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
     """Re-check model connectivity and update active status."""
-    db = SessionLocal()
-    try:
-        _require_admin(current_user, db)
-        model = db.query(LLMModel).filter(LLMModel.model_name == model_name).first()
-        if not model:
-            raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
-        api_key = decrypt_token(model.api_key_encrypted)
-        conn_err = _validate_connectivity(model.provider, model.model_name, api_key, model.base_url)
-        model.is_active = 1 if conn_err is None else 0
-        db.commit()
-        db.refresh(model)
-        return _to_response(model, connectivity="ok" if conn_err is None else conn_err)
-    finally:
-        db.close()
+    _require_admin(current_user, db)
+    model = db.query(LLMModel).filter(LLMModel.model_name == model_name).first()
+    if not model:
+        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
+    api_key = decrypt_token(model.api_key_encrypted)
+    conn_err = _validate_connectivity(model.provider, model.model_name, api_key, model.base_url)
+    model.is_active = 1 if conn_err is None else 0
+    db.commit()
+    db.refresh(model)
+    return _to_response(model, connectivity="ok" if conn_err is None else conn_err)

@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
-from api.database import SessionLocal, get_db_session
+from api.database import get_db_session
 from api.dependencies import get_current_user
 from core.auth.permission_checker import PermissionChecker
 from core.skills.config_center import CredentialManager, SkillConfigCenter
@@ -42,6 +42,7 @@ def initialize() -> None:
     import os
     from api.models.skill import SkillRegistry
     from core.skills.config_center import init_config_center
+    from api.database import SessionLocal
 
     key = os.environ.get("TOKEN_ENCRYPTION_KEY", "dev-key")
     cred_mgr = CredentialManager(key)
@@ -100,6 +101,7 @@ def _resolve_config_namespace(skill_name: str) -> str:
     """
     from api.models.skill import SkillRegistry as SkillModel
     from core.logging_config import get_logger as _get_logger
+    from api.database import SessionLocal
     _log = _get_logger(__name__)
 
     db = SessionLocal()

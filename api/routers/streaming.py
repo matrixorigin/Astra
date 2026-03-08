@@ -4,8 +4,9 @@ import json
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
-from api.database import SessionLocal
+from api.database import get_db_session
 from api.dependencies import get_current_user
 from api.routers.chat import _build_chat_loop, _ensure_session
 from api.sse_errors import SSE_HEADERS
@@ -28,6 +29,7 @@ class StreamChatRequest(BaseModel):
 async def stream_chat(
     request: StreamChatRequest,
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
     """Deprecated — use /chat/stream from chat router instead."""
 
@@ -35,11 +37,8 @@ async def stream_chat(
         loop = None
         try:
             user_id = current_user["user_id"]
-            db = SessionLocal()
-            try:
-                session_id = _ensure_session(db, user_id, request.session_id, None)
-            finally:
-                db.close()
+            session_id = _ensure_session(db, user_id, request.session_id, None)
+            from api.database import SessionLocal
             loop = _build_chat_loop(SessionLocal)
 
             async for stream_event in loop.run_step_stream(

@@ -119,6 +119,21 @@ class GovernanceScheduler(DbConsumer):
 
     # ── Daily ─────────────────────────────────────────────────────────
 
+    def _build_reflection_engine(self) -> Any:
+        """Build a ReflectionEngine if LLM client is available, else None."""
+        if self._llm_client is None:
+            return None
+        from core.memory.reflection.engine import ReflectionEngine
+        from core.memory.tabular.candidates import TabularCandidateProvider
+
+        provider = TabularCandidateProvider(self._db_factory, config=self.config)
+        return ReflectionEngine(
+            candidate_provider=provider,
+            writer=self,
+            llm_client=self._llm_client,
+            threshold=self.config.reflection_daily_threshold,
+        )
+
     def run_daily_all(self) -> GovernanceCycleResult:
         """Daily governance for ALL users (or this worker's shard).
 
@@ -131,18 +146,7 @@ class GovernanceScheduler(DbConsumer):
         combined = GovernanceCycleResult()
 
         # Pre-build reflection engine once (if LLM available)
-        reflection_engine = None
-        if self._llm_client is not None:
-            from core.memory.reflection.engine import ReflectionEngine
-            from core.memory.tabular.candidates import TabularCandidateProvider
-
-            provider = TabularCandidateProvider(self._db_factory, config=self.config)
-            reflection_engine = ReflectionEngine(
-                candidate_provider=provider,
-                writer=self,
-                llm_client=self._llm_client,
-                threshold=self.config.reflection_daily_threshold,
-            )
+        reflection_engine = self._build_reflection_engine()
 
         batch_size = self.config.daily_batch_size
         shard_count = self.config.shard_count
@@ -187,18 +191,7 @@ class GovernanceScheduler(DbConsumer):
     def run_daily(self, user_id: str) -> GovernanceCycleResult:
         """Daily: stale cleanup + quarantine low effective_confidence + orphaned incremental summaries."""
         # Build per-call reflection engine when called standalone
-        reflection_engine = None
-        if self._llm_client is not None:
-            from core.memory.reflection.engine import ReflectionEngine
-            from core.memory.tabular.candidates import TabularCandidateProvider
-
-            provider = TabularCandidateProvider(self._db_factory, config=self.config)
-            reflection_engine = ReflectionEngine(
-                candidate_provider=provider,
-                writer=self,
-                llm_client=self._llm_client,
-                threshold=self.config.reflection_daily_threshold,
-            )
+        reflection_engine = self._build_reflection_engine()
         return self._run_daily_for_user(user_id, reflection_engine)
 
     def _run_daily_for_user(

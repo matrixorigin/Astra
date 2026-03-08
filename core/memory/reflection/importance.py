@@ -28,6 +28,20 @@ DAILY_THRESHOLD = 0.5      # queued for daily reflection
 class ImportanceScorer:
     """Score reflection candidates by importance. No DB, no LLM."""
 
+    def __init__(
+        self,
+        w_centrality: float = W_CENTRALITY,
+        w_cross_session: float = W_CROSS_SESSION,
+        w_contradiction: float = W_CONTRADICTION,
+        w_recurrence: float = W_RECURRENCE,
+    ):
+        self._w = {
+            "centrality": w_centrality,
+            "cross_session": w_cross_session,
+            "contradiction": w_contradiction,
+            "recurrence": w_recurrence,
+        }
+
     def score(self, candidate: ReflectionCandidate) -> float:
         """Score a candidate cluster. Returns 0.0-1.0."""
         centrality = self._centrality(candidate)
@@ -36,10 +50,10 @@ class ImportanceScorer:
         recurrence = self._recurrence(candidate)
 
         return (
-            W_CENTRALITY * centrality
-            + W_CROSS_SESSION * cross_session
-            + W_CONTRADICTION * contradiction
-            + W_RECURRENCE * recurrence
+            self._w["centrality"] * centrality
+            + self._w["cross_session"] * cross_session
+            + self._w["contradiction"] * contradiction
+            + self._w["recurrence"] * recurrence
         )
 
     def _centrality(self, c: ReflectionCandidate) -> float:

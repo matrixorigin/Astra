@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
-from api.database import SessionLocal
+from api.database import get_db_session
 from api.dependencies import get_current_user
 from core.logging_config import get_logger
 from core.utils.id_generator import generate_id
@@ -123,61 +124,58 @@ def get_quality_trend(
     days: int = Query(default=14, ge=1, le=90),
     model: str | None = Query(default=None),
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ) -> QualityTrendResponse:
     """Daily quality score trend from agent_events."""
-    db = SessionLocal()
+    params: dict[str, Any] = {"days": days}
+    model_filter = ""
+    if model:
+        model_filter = "AND llm_model_used = :model"
+        params["model"] = model
+
     try:
-        params: dict[str, Any] = {"days": days}
-        model_filter = ""
-        if model:
-            model_filter = "AND llm_model_used = :model"
-            params["model"] = model
+        rows = db.execute(text(f"""
+            SELECT DATE(created_at) AS d,
+                   AVG(quality_score) AS avg_score,
+                   COUNT(*) AS cnt,
+                   llm_model_used
+            FROM agent_events
+            WHERE quality_score IS NOT NULL
+              AND created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)
+              {model_filter}
+            GROUP BY d, llm_model_used
+            ORDER BY d ASC
+        """), params).fetchall()
+    except Exception:
+        logger.debug("quality/trend: table not ready, returning empty")
+        return QualityTrendResponse(points=[], overall_avg=0.0, total_events=0)
 
-        try:
-            rows = db.execute(text(f"""
-                SELECT DATE(created_at) AS d,
-                       AVG(quality_score) AS avg_score,
-                       COUNT(*) AS cnt,
-                       llm_model_used
-                FROM agent_events
-                WHERE quality_score IS NOT NULL
-                  AND created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)
-                  {model_filter}
-                GROUP BY d, llm_model_used
-                ORDER BY d ASC
-            """), params).fetchall()
-        except Exception:
-            logger.debug("quality/trend: table not ready, returning empty")
-            return QualityTrendResponse(points=[], overall_avg=0.0, total_events=0)
-
-        points = [
-            QualityTrendPoint(
-                date=str(r[0]), avg_score=round(float(r[1]), 2),
-                count=int(r[2]), model=r[3],
-            )
-            for r in rows
-        ]
-        total = sum(p.count for p in points)
-        overall = (
-            sum(p.avg_score * p.count for p in points) / total
-            if total else 0.0
+    points = [
+        QualityTrendPoint(
+            date=str(r[0]), avg_score=round(float(r[1]), 2),
+            count=int(r[2]), model=r[3],
         )
-        return QualityTrendResponse(
-            points=points, overall_avg=round(overall, 2), total_events=total,
-        )
-
-    finally:
-        db.close()
+        for r in rows
+    ]
+    total = sum(p.count for p in points)
+    overall = (
+        sum(p.avg_score * p.count for p in points) / total
+        if total else 0.0
+    )
+    return QualityTrendResponse(
+        points=points, overall_avg=round(overall, 2), total_events=total,
+    )
 
 @router.get("/drift", response_model=list[DriftSignalResponse])
 def detect_drift(
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ) -> list[DriftSignalResponse]:
     """Run drift detection and return active signals."""
     from core.evaluation.drift_detector import DriftDetector
 
     try:
-        signals = DriftDetector(SessionLocal).detect()
+        signals = DriftDetector(lambda: db).detect()
     except Exception:
         logger.debug("drift: detector not ready, returning empty")
         return []
@@ -198,45 +196,42 @@ def detect_drift(
 def get_gate_history(
     limit: int = Query(default=20, ge=1, le=100),
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ) -> list[GateResultResponse]:
     """Recent regression gate results."""
-    db = SessionLocal()
     try:
-        try:
-            rows = db.execute(text("""
-                SELECT gate_id, change_type, change_id, sessions_tested,
-                       error_rate, score_delta, passed, created_at
-                FROM eval_gate_results
-                ORDER BY created_at DESC
-                LIMIT :limit
-            """), {"limit": limit}).fetchall()
-        except Exception:
-            return []
+        rows = db.execute(text("""
+            SELECT gate_id, change_type, change_id, sessions_tested,
+                   error_rate, score_delta, passed, created_at
+            FROM eval_gate_results
+            ORDER BY created_at DESC
+            LIMIT :limit
+        """), {"limit": limit}).fetchall()
+    except Exception:
+        return []
 
-        return [
-            GateResultResponse(
-                gate_id=r[0], change_type=r[1], change_id=r[2],
-                sessions_tested=int(r[3]), error_rate=float(r[4]),
-                score_delta=float(r[5]), passed=bool(r[6]),
-                created_at=r[7].isoformat() if r[7] else None,
-            )
-            for r in rows
-        ]
-
-    finally:
-        db.close()
+    return [
+        GateResultResponse(
+            gate_id=r[0], change_type=r[1], change_id=r[2],
+            sessions_tested=int(r[3]), error_rate=float(r[4]),
+            score_delta=float(r[5]), passed=bool(r[6]),
+            created_at=r[7].isoformat() if r[7] else None,
+        )
+        for r in rows
+    ]
 
 @router.get("/calibration", response_model=CalibrationResponse)
 def get_calibration(
     agent_id: str | None = Query(default=None),
     days: int = Query(default=30, ge=1, le=90),
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ) -> CalibrationResponse:
     """Confidence calibration status — how well the system knows what it doesn't know."""
     from core.evaluation.confidence_calibrator import ConfidenceCalibrator
 
     try:
-        cal = ConfidenceCalibrator(SessionLocal)
+        cal = ConfidenceCalibrator(lambda: db)
         result = cal.measure(agent_id=agent_id, days=days)
         adj = cal.compute_adjustment(result)
     except Exception:
@@ -262,31 +257,27 @@ def get_session_scores(
     limit: int = Query(default=20, ge=1, le=100),
     min_score: float = Query(default=0.0, ge=0.0, le=5.0),
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ) -> list[SessionScoreResponse]:
     """Session-level quality scores from eval_quality_assessments."""
-    db = SessionLocal()
     try:
-        try:
-            rows = db.execute(text("""
-                SELECT target_id, score, COALESCE(step_count, 0)
-                FROM eval_quality_assessments
-                WHERE level = 'session' AND score >= :min_score
-                ORDER BY updated_at DESC
-                LIMIT :limit
-            """), {"limit": limit, "min_score": min_score}).fetchall()
-        except Exception:
-            logger.debug("sessions/scores: table not ready, returning empty")
-            return []
+        rows = db.execute(text("""
+            SELECT target_id, score, COALESCE(step_count, 0)
+            FROM eval_quality_assessments
+            WHERE level = 'session' AND score >= :min_score
+            ORDER BY updated_at DESC
+            LIMIT :limit
+        """), {"limit": limit, "min_score": min_score}).fetchall()
+    except Exception:
+        logger.debug("sessions/scores: table not ready, returning empty")
+        return []
 
-        return [
-            SessionScoreResponse(
-                session_id=r[0], score=round(float(r[1]), 2), chain_count=int(r[2]),
-            )
-            for r in rows
-        ]
-
-    finally:
-        db.close()
+    return [
+        SessionScoreResponse(
+            session_id=r[0], score=round(float(r[1]), 2), chain_count=int(r[2]),
+        )
+        for r in rows
+    ]
 
 # ---------------------------------------------------------------------------
 # Action endpoints — closed-loop evaluation
@@ -297,11 +288,12 @@ def get_session_scores(
 def validate_gate(
     req: GateValidateRequest,
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ) -> GateValidateResponse:
     """Trigger regression gate: replay golden sessions against a proposed change."""
     from core.evaluation.regression_gate import ChangeType, RegressionGate
 
-    gate = RegressionGate(db_factory=SessionLocal)
+    gate = RegressionGate(db_factory=lambda: db)
     result = gate.validate_change(
         change_type=ChangeType(req.change_type),
         change_id=req.change_id,
@@ -322,11 +314,12 @@ def validate_gate(
 @router.post("/drift/run", response_model=DriftPipelineResponse)
 def run_drift(
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ) -> DriftPipelineResponse:
     """Run full drift pipeline: detect → confirm → correct."""
     from core.evaluation.drift_pipeline import run_drift_pipeline
 
-    result = run_drift_pipeline(db_factory=SessionLocal)
+    result = run_drift_pipeline(db_factory=lambda: db)
     return DriftPipelineResponse(
         signals_detected=result.signals_detected,
         signals_confirmed=result.signals_confirmed,
@@ -341,6 +334,7 @@ def run_closed_loop(
     days: int = Query(default=7, ge=1, le=30),
     dry_run: bool = Query(default=False),
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ) -> ClosedLoopResponse:
     """Full closed loop: OBSERVE → DIAGNOSE → PROPOSE → VALIDATE → DEPLOY → RECORD.
 
@@ -359,7 +353,7 @@ def run_closed_loop(
 
     # Phase 1: Drift detection + auto-correction
     try:
-        drift_result = run_drift_pipeline(db_factory=SessionLocal)
+        drift_result = run_drift_pipeline(db_factory=lambda: db)
     except Exception as e:
         logger.error("Closed loop drift phase failed: %s", e)
         drift_result = PipelineResult(error=str(e))
@@ -374,9 +368,8 @@ def run_closed_loop(
 
     # Phase 2: Calibration
     calibration_resp: CalibrationResponse | None = None
-    db = SessionLocal()
     try:
-        cal = ConfidenceCalibrator(SessionLocal)
+        cal = ConfidenceCalibrator(lambda: db)
         cal_result = cal.measure(days=days)
         adj = cal.compute_adjustment(cal_result)
         calibration_resp = CalibrationResponse(
@@ -390,8 +383,6 @@ def run_closed_loop(
         )
     except Exception as e:
         logger.error("Closed loop calibration phase failed: %s", e)
-    finally:
-        db.close()
 
     # Phase 3: InputFaceLearner — drift-informed targeted diagnosis
     # If drift found template-level issues, focus learner on PROMPT face
@@ -400,12 +391,11 @@ def run_closed_loop(
         faces = [InputFace.PROMPT]
 
     diagnoses: list[LoopDiagnosisItem] = []
-    db = SessionLocal()
     try:
         from core.llm.client import LLMClient
 
-        llm = LLMClient(SessionLocal)
-        learner = InputFaceLearner(SessionLocal, llm)
+        llm = LLMClient(lambda: db)
+        learner = InputFaceLearner(lambda: db, llm)
         results = learner.diagnose_and_fix(days=days, dry_run=dry_run, faces=faces)
         diagnoses = [
             LoopDiagnosisItem(
@@ -423,8 +413,6 @@ def run_closed_loop(
             input_face="all", bottleneck="learner_unavailable",
             applied=False, gate_verdict="error", error=str(e),
         )]
-    finally:
-        db.close()
 
     # Phase 4: Skill selection learning (removed — SkillPipeline deleted)
     skill_learning_resp: dict[str, Any] | None = None
@@ -432,7 +420,7 @@ def run_closed_loop(
     # Record — audit trail for the loop execution itself
     _record_loop_event(
         loop_id, drift_resp, calibration_resp, diagnoses,
-        skill_learning_resp, dry_run,
+        skill_learning_resp, dry_run, db,
     )
 
     return ClosedLoopResponse(
@@ -451,9 +439,9 @@ def _record_loop_event(
     diagnoses: list[LoopDiagnosisItem],
     skill_learning: dict[str, Any] | None,
     dry_run: bool,
+    db: Session,
 ) -> None:
     """Persist closed-loop execution as an auditable conversation event."""
-    db = SessionLocal()
     try:
         # causal_chain_id = loop_id: each loop execution is its own causal chain root
         db.execute(text("""
@@ -479,8 +467,6 @@ def _record_loop_event(
     except Exception as e:
         logger.warning("Failed to record loop event: %s", e)
         db.rollback()
-    finally:
-        db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +487,7 @@ def trust_report(
     agent_id: str = Query(default="dev-agent"),
     days: int = Query(default=7, ge=1, le=90),
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ) -> TrustReportResponse:
     """Aggregated trust health report: confidence, SLO, drift, hallucination."""
     scores: list[float] = []
@@ -512,7 +499,7 @@ def trust_report(
     # 1. Confidence calibration
     try:
         from core.evaluation.confidence_calibrator import ConfidenceCalibrator
-        cal = ConfidenceCalibrator(SessionLocal)
+        cal = ConfidenceCalibrator(lambda: db)
         cal_result = cal.measure(agent_id=agent_id, days=days)
         result.confidence_calibration = {
             "calibration_error": round(cal_result.calibration_error, 4),
@@ -526,7 +513,7 @@ def trust_report(
     # 2. SLO compliance
     try:
         from core.evaluation.slo_monitor import SLOMonitor
-        monitor = SLOMonitor(SessionLocal)
+        monitor = SLOMonitor(lambda: db)
         report = monitor.check_agent(agent_id, period_days=days)
         total = len(report.statuses)
         met = sum(1 for s in report.statuses if s.met)
@@ -543,7 +530,7 @@ def trust_report(
     # 3. Drift
     try:
         from core.evaluation.drift_detector import DriftDetector
-        detector = DriftDetector(SessionLocal)
+        detector = DriftDetector(lambda: db)
         signals = detector.detect()
         critical = sum(1 for s in signals if s.severity.value == "critical")
         result.drift_summary = {
@@ -556,7 +543,6 @@ def trust_report(
         logger.debug("Trust report drift skipped: %s", e)
 
     # 4. Hallucination stats — direct SQL, needs its own short-lived session
-    db = SessionLocal()
     try:
         row = db.execute(text("""
             SELECT COUNT(*) as total,
@@ -574,8 +560,6 @@ def trust_report(
             scores.append((row[1] or 0) / row[0])
     except Exception as e:
         logger.debug("Trust report hallucination skipped: %s", e)
-    finally:
-        db.close()
 
     result.overall_trust_score = round(sum(scores) / len(scores), 4) if scores else 0.0
     return result
@@ -598,56 +582,53 @@ class SLODashboardResponse(BaseModel):
 def slo_dashboard(
     period_days: int = Query(default=30, ge=1, le=90),
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
     """SLO dashboard: check all agents and return compliance status."""
-    db = SessionLocal()
     try:
-        try:
-            rows = db.execute(text("""
-                SELECT DISTINCT agent_id FROM agent_events
-                WHERE event_type = 'llm_response'
-                  AND created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
-                  AND agent_id IS NOT NULL
-            """), {"days": period_days}).fetchall()
-            agent_ids = [r[0] for r in rows] if rows else []
+        rows = db.execute(text("""
+            SELECT DISTINCT agent_id FROM agent_events
+            WHERE event_type = 'llm_response'
+              AND created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
+              AND agent_id IS NOT NULL
+        """), {"days": period_days}).fetchall()
+        agent_ids = [r[0] for r in rows] if rows else []
 
-            from core.evaluation.slo_monitor import SLOMonitor
-            monitor = SLOMonitor(SessionLocal)
-            entries = []
-            for aid in agent_ids:
-                report = monitor.check_agent(aid, period_days=period_days)
-                entries.append(SLODashboardEntry(
-                    agent_id=aid,
-                    statuses=[
-                        {
-                            "slo": s.slo.name,
-                            "target": s.slo.target,
-                            "current": s.current_value,
-                            "met": s.met,
-                            "burn_rate": s.burn_rate,
-                            "severity": s.severity.value,
-                            "bad_days": s.bad_days,
-                        }
-                        for s in report.statuses
-                    ],
-                    period_days=period_days,
-                ))
-            return SLODashboardResponse(agents=entries)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
-        db.close()
+        from core.evaluation.slo_monitor import SLOMonitor
+        monitor = SLOMonitor(lambda: db)
+        entries = []
+        for aid in agent_ids:
+            report = monitor.check_agent(aid, period_days=period_days)
+            entries.append(SLODashboardEntry(
+                agent_id=aid,
+                statuses=[
+                    {
+                        "slo": s.slo.name,
+                        "target": s.slo.target,
+                        "current": s.current_value,
+                        "met": s.met,
+                        "burn_rate": s.burn_rate,
+                        "severity": s.severity.value,
+                        "bad_days": s.bad_days,
+                    }
+                    for s in report.statuses
+                ],
+                period_days=period_days,
+            ))
+        return SLODashboardResponse(agents=entries)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/slo/{agent_id}/history")
 def slo_history(
     agent_id: str,
     days: int = Query(default=30, ge=1, le=90),
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
     """SLO history: daily metrics for a single agent."""
     from core.evaluation.slo_monitor import SLOMonitor
-    monitor = SLOMonitor(SessionLocal)
+    monitor = SLOMonitor(lambda: db)
     metrics = monitor.get_daily_metrics(agent_id, days)
     return {"agent_id": agent_id, "days": days, "daily_metrics": metrics}
 
@@ -661,60 +642,56 @@ def observability_metrics(
     agent_id: str = Query(default="dev-agent"),
     days: int = Query(default=7, ge=1, le=90),
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
     """Aggregated observability metrics across 6 layers (trust-and-safety.md §5)."""
-    db = SessionLocal()
-    try:
-        result: dict[str, Any] = {}
+    result: dict[str, Any] = {}
 
-        # Decision layer
-        row = db.execute(text("""
-            SELECT AVG(quality_score) as avg_quality,
-                   COUNT(*) as total_responses
+    # Decision layer
+    row = db.execute(text("""
+        SELECT AVG(quality_score) as avg_quality,
+               COUNT(*) as total_responses
+        FROM agent_events
+        WHERE agent_id = :aid AND event_type = 'llm_response'
+          AND created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
+    """), {"aid": agent_id, "days": days}).fetchone()
+    result["decision"] = {
+        "avg_quality": round(float(row[0]), 4) if row and row[0] else 0,
+        "total_responses": int(row[1]) if row else 0,
+    }
+
+    # Session layer
+    row = db.execute(text("""
+        SELECT COUNT(DISTINCT session_id) as sessions,
+               AVG(turn_count) as avg_turns
+        FROM (
+            SELECT session_id, COUNT(*) as turn_count
             FROM agent_events
-            WHERE agent_id = :aid AND event_type = 'llm_response'
+            WHERE agent_id = :aid
               AND created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
-        """), {"aid": agent_id, "days": days}).fetchone()
-        result["decision"] = {
-            "avg_quality": round(float(row[0]), 4) if row and row[0] else 0,
-            "total_responses": int(row[1]) if row else 0,
-        }
+            GROUP BY session_id
+        ) sub
+    """), {"aid": agent_id, "days": days}).fetchone()
+    result["session"] = {
+        "active_sessions": int(row[0]) if row and row[0] else 0,
+        "avg_turns_per_session": round(float(row[1]), 1) if row and row[1] else 0,
+    }
 
-        # Session layer
-        row = db.execute(text("""
-            SELECT COUNT(DISTINCT session_id) as sessions,
-                   AVG(turn_count) as avg_turns
-            FROM (
-                SELECT session_id, COUNT(*) as turn_count
-                FROM agent_events
-                WHERE agent_id = :aid
-                  AND created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
-                GROUP BY session_id
-            ) sub
-        """), {"aid": agent_id, "days": days}).fetchone()
-        result["session"] = {
-            "active_sessions": int(row[0]) if row and row[0] else 0,
-            "avg_turns_per_session": round(float(row[1]), 1) if row and row[1] else 0,
-        }
+    # Skill layer
+    row = db.execute(text("""
+        SELECT COUNT(*) as total,
+               SUM(CASE WHEN execution_success = 1 THEN 1 ELSE 0 END) as ok
+        FROM skill_selection_events
+        WHERE created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
+    """), {"days": days}).fetchone()
+    total_sel = int(row[0]) if row and row[0] else 0
+    ok_sel = int(row[1]) if row and row[1] else 0
+    result["skill"] = {
+        "total_selections": total_sel,
+        "success_rate": round(ok_sel / total_sel, 4) if total_sel else 0,
+    }
 
-        # Skill layer
-        row = db.execute(text("""
-            SELECT COUNT(*) as total,
-                   SUM(CASE WHEN execution_success = 1 THEN 1 ELSE 0 END) as ok
-            FROM skill_selection_events
-            WHERE created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
-        """), {"days": days}).fetchone()
-        total_sel = int(row[0]) if row and row[0] else 0
-        ok_sel = int(row[1]) if row and row[1] else 0
-        result["skill"] = {
-            "total_selections": total_sel,
-            "success_rate": round(ok_sel / total_sel, 4) if total_sel else 0,
-        }
-
-        return {"agent_id": agent_id, "period_days": days, "metrics": result}
-
-    finally:
-        db.close()
+    return {"agent_id": agent_id, "period_days": days, "metrics": result}
 
 # ---------------------------------------------------------------------------
 # Memory Health — aggregated memory pipeline status
@@ -731,61 +708,59 @@ class MemoryHealthResponse(BaseModel):
 def memory_health(
     user_id: str | None = Query(default=None),
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ) -> MemoryHealthResponse:
     """Memory pipeline health: memories, knowledge, pollution."""
     uid = user_id or current_user.get("user_id", "system")
     result = MemoryHealthResponse()
-    db = SessionLocal()
+    
+    # Memories (new system)
     try:
-        # Memories (new system)
-        try:
-            row = db.execute(text("""
-                SELECT COUNT(*) as total,
-                       SUM(CASE WHEN memory_type = 'episodic' THEN 1 ELSE 0 END) as episodic,
-                       SUM(CASE WHEN memory_type = 'semantic' THEN 1 ELSE 0 END) as semantic,
-                       SUM(CASE WHEN memory_type = 'profile' THEN 1 ELSE 0 END) as profile
-                FROM mem_memories WHERE user_id = :uid AND is_active = 1
-            """), {"uid": uid}).fetchone()
-            if row:
-                result.memories = {
-                    "total": row[0],
-                    "episodic": row[1] or 0,
-                    "semantic": row[2] or 0,
-                    "profile": row[3] or 0,
-                }
-        except Exception:
-            pass
+        row = db.execute(text("""
+            SELECT COUNT(*) as total,
+                   SUM(CASE WHEN memory_type = 'episodic' THEN 1 ELSE 0 END) as episodic,
+                   SUM(CASE WHEN memory_type = 'semantic' THEN 1 ELSE 0 END) as semantic,
+                   SUM(CASE WHEN memory_type = 'profile' THEN 1 ELSE 0 END) as profile
+            FROM mem_memories WHERE user_id = :uid AND is_active = 1
+        """), {"uid": uid}).fetchone()
+        if row:
+            result.memories = {
+                "total": row[0],
+                "episodic": row[1] or 0,
+                "semantic": row[2] or 0,
+                "profile": row[3] or 0,
+            }
+    except Exception:
+        pass
 
-        # Knowledge entries
-        try:
-            row = db.execute(text("""
-                SELECT COUNT(*) as total,
-                       SUM(CASE WHEN confidence < 0.3 THEN 1 ELSE 0 END) as low_conf,
-                       SUM(CASE WHEN confidence = 0 THEN 1 ELSE 0 END) as quarantined
-                FROM sk_knowledge_entries WHERE user_id = :uid
-            """), {"uid": uid}).fetchone()
-            if row:
-                result.knowledge = {
-                    "total": row[0],
-                    "low_confidence": row[1] or 0,
-                    "quarantined": row[2] or 0,
-                }
-        except Exception:
-            pass
+    # Knowledge entries
+    try:
+        row = db.execute(text("""
+            SELECT COUNT(*) as total,
+                   SUM(CASE WHEN confidence < 0.3 THEN 1 ELSE 0 END) as low_conf,
+                   SUM(CASE WHEN confidence = 0 THEN 1 ELSE 0 END) as quarantined
+            FROM sk_knowledge_entries WHERE user_id = :uid
+        """), {"uid": uid}).fetchone()
+        if row:
+            result.knowledge = {
+                "total": row[0],
+                "low_confidence": row[1] or 0,
+                "quarantined": row[2] or 0,
+            }
+    except Exception:
+        pass
 
-        # Recent governance runs
-        try:
-            rows = db.execute(text("""
-                SELECT task_name, result
-                FROM governance_runs
-                ORDER BY completed_at DESC LIMIT 5
-            """)).fetchall()
-            if rows:
-                result.governance = {r[0]: r[1] for r in rows if r[1]}
-        except Exception:
-            pass
-    finally:
-        db.close()
+    # Recent governance runs
+    try:
+        rows = db.execute(text("""
+            SELECT task_name, result
+            FROM governance_runs
+            ORDER BY completed_at DESC LIMIT 5
+        """)).fetchall()
+        if rows:
+            result.governance = {r[0]: r[1] for r in rows if r[1]}
+    except Exception:
+        pass
 
     return result
 
@@ -816,11 +791,12 @@ class TrainingDatasetResponse(BaseModel):
 def extract_training_data(
     req: TrainingDataExtractRequest,
     _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
     """Extract high-quality conversation pairs as training data."""
     from core.data_versioning.training_data_pipeline import DatasetConfig, TrainingDataPipeline
     from core.utils.id_generator import generate_id
-    pipeline = TrainingDataPipeline(SessionLocal)
+    pipeline = TrainingDataPipeline(lambda: db)
     dataset_id = generate_id()
     config = DatasetConfig(
         dataset_id=dataset_id,
@@ -844,10 +820,11 @@ def export_training_data(
     dataset_id: str,
     format: str = "jsonl",
     _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
     """Export a training dataset as JSONL file."""
     from core.data_versioning.training_data_pipeline import TrainingDataPipeline
-    pipeline = TrainingDataPipeline(SessionLocal)
+    pipeline = TrainingDataPipeline(lambda: db)
     try:
         output_path = pipeline.export_dataset(dataset_id, format=format)
     except Exception as e:

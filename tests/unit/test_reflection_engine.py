@@ -122,7 +122,7 @@ class TestReflectionEngine:
 
         assert result.llm_calls == 1
         assert result.scenes_created == 0
-        assert len(result.errors) == 0  # parse failure is not an error, just empty
+        assert len(result.errors) == 1  # parse failure recorded as error
 
     def test_llm_returns_empty_array(self):
         candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", boost=0.3)

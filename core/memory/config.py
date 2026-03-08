@@ -79,6 +79,21 @@ class MemoryGovernanceConfig:
     # ── Backend selector ──
     memory_backend: str = "tabular"
 
+    def __post_init__(self) -> None:
+        """Validate parameter ranges."""
+        for name in ("half_life_t1_days", "half_life_t2_days", "half_life_t3_days", "half_life_t4_days"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
+        for name in ("quarantine_threshold", "pollution_threshold", "contradiction_similarity_threshold",
+                      "cluster_similarity_threshold", "reflection_daily_threshold", "reflection_immediate_threshold"):
+            v = getattr(self, name)
+            if not 0.0 <= v <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1], got {v}")
+        if self.shard_count < 1:
+            raise ValueError(f"shard_count must be >= 1, got {self.shard_count}")
+        if not 0 <= self.shard_index < self.shard_count:
+            raise ValueError(f"shard_index must be in [0, {self.shard_count}), got {self.shard_index}")
+
     @property
     def half_lives(self) -> dict[str, float]:
         """Return half-life mapping keyed by tier value string."""

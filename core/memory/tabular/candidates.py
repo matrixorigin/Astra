@@ -105,8 +105,9 @@ class TabularCandidateProvider(DbConsumer):
                 B.observed_at > cutoff,
                 B.embedding.isnot(None),
                 A.session_id != B.session_id,
-                text(f"cosine_similarity(a.embedding, b.embedding) >= {self._config.cluster_similarity_threshold}"),
+                text("cosine_similarity(a.embedding, b.embedding) >= :threshold").bindparams(threshold=self._config.cluster_similarity_threshold),
             )
+            .limit(5000)
             .all()
         )
 
@@ -232,8 +233,9 @@ class TabularCandidateProvider(DbConsumer):
                 B.is_active == 1,
                 B.observed_at > cutoff_7d,
                 B.embedding.isnot(None),
-                text(f"cosine_similarity(sa.embedding, sb.embedding) >= {self._config.cluster_similarity_threshold}"),
+                text("cosine_similarity(sa.embedding, sb.embedding) >= :threshold").bindparams(threshold=self._config.cluster_similarity_threshold),
             )
+            .limit(5000)
             .all()
         )
 

@@ -27,7 +27,7 @@ class TestFromEnvInt:
         assert c.shard_count == 8
 
     def test_overrides_shard_index(self):
-        with patch.dict(os.environ, {"MEM_SHARD_INDEX": "3"}):
+        with patch.dict(os.environ, {"MEM_SHARD_INDEX": "3", "MEM_SHARD_COUNT": "4"}):
             c = MemoryGovernanceConfig.from_env()
         assert c.shard_index == 3
 

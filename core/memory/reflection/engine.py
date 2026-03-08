@@ -16,7 +16,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from core.memory.interfaces import CandidateProvider, ReflectionCandidate
+from core.memory.interfaces import CandidateProvider, MemoryWriter, ReflectionCandidate
 from core.memory.reflection.importance import DAILY_THRESHOLD, ImportanceScorer
 from core.memory.reflection.prompts import REFLECTION_SYNTHESIS_PROMPT
 from core.memory.types import MemoryType, TrustTier
@@ -61,16 +61,18 @@ class ReflectionEngine:
     def __init__(
         self,
         candidate_provider: CandidateProvider,
-        writer: Any,  # MemoryWriter protocol
+        writer: MemoryWriter,
         llm_client: Any,
         scorer: ImportanceScorer | None = None,
         threshold: float = DAILY_THRESHOLD,
+        llm_retries: int = 1,
     ):
         self._provider = candidate_provider
         self._writer = writer
         self._llm = llm_client
         self._scorer = scorer or ImportanceScorer()
         self._threshold = threshold
+        self._llm_retries = llm_retries
 
     def reflect(
         self,
@@ -121,8 +123,8 @@ class ReflectionEngine:
         # 3. Synthesize each qualifying candidate
         for candidate, score in passed:
             try:
-                insights = self._synthesize(candidate, existing_knowledge)
                 result.llm_calls += 1
+                insights = self._synthesize_with_retry(candidate, existing_knowledge)
 
                 # 4. Persist all insights from this candidate
                 for insight in insights:
@@ -139,6 +141,22 @@ class ReflectionEngine:
 
         result.total_ms = (time.time() - start) * 1000
         return result
+
+    def _synthesize_with_retry(
+        self,
+        candidate: ReflectionCandidate,
+        existing_knowledge: str,
+    ) -> list[SynthesizedInsight]:
+        """Call _synthesize with retry on failure."""
+        last_err: Exception | None = None
+        for attempt in range(1 + self._llm_retries):
+            try:
+                return self._synthesize(candidate, existing_knowledge)
+            except Exception as e:
+                last_err = e
+                if attempt < self._llm_retries:
+                    logger.info("Retrying synthesis (attempt %d): %s", attempt + 1, e)
+        raise last_err  # type: ignore[misc]
 
     def _synthesize(
         self,
@@ -167,19 +185,21 @@ class ReflectionEngine:
     def _parse_insights(
         self, raw: str, candidate: ReflectionCandidate,
     ) -> list[SynthesizedInsight]:
-        """Parse LLM JSON output into SynthesizedInsight list."""
+        """Parse LLM JSON output into SynthesizedInsight list.
+
+        Raises ValueError on unparseable output so callers can record the error.
+        """
         # Extract JSON array from response
         text = raw.strip()
         start = text.find("[")
         end = text.rfind("]")
         if start == -1 or end == -1:
-            return []
+            raise ValueError(f"No JSON array in LLM output: {text[:200]}")
 
         try:
             items = json.loads(text[start:end + 1])
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse reflection output: %s", text[:200])
-            return []
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in LLM output: {e} — {text[:200]}") from e
 
         source_ids = [m.memory_id for m in candidate.memories]
         insights = []
