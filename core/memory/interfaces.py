@@ -8,7 +8,7 @@ See docs/design/memory-architecture.md §11 "Module Independence".
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -81,6 +81,30 @@ class MemoryAdmin(Protocol):
 
     def health_check(self, user_id: str) -> HealthReport:
         """Get memory health analytics."""
+        ...
+
+
+@dataclass
+class ReflectionCandidate:
+    """A candidate cluster for reflection synthesis.
+
+    Produced by backend-specific CandidateProviders, consumed by the
+    shared ReflectionEngine.
+    """
+
+    memories: list[Memory]
+    signal: str  # "semantic_cluster" | "contradiction" | "summary_recurrence"
+    importance_boost: float = 0.0  # signal-specific boost
+    session_ids: list[str] = field(default_factory=list)
+
+
+class CandidateProvider(Protocol):
+    """Each backend implements this to feed the shared ReflectionEngine."""
+
+    def get_reflection_candidates(
+        self, user_id: str, *, since_hours: int = 24,
+    ) -> list[ReflectionCandidate]:
+        """Return candidate clusters for reflection."""
         ...
 
 

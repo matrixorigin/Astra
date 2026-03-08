@@ -13,11 +13,13 @@ See docs/design/memory/backend-coexistence.md
 from core.memory.config import DEFAULT_CONFIG, MemoryGovernanceConfig
 from core.memory.factory import create_memory_service
 from core.memory.interfaces import (
+    CandidateProvider,
     GovernanceReport,
     HealthReport,
     MemoryAdmin,
     MemoryReader,
     MemoryWriter,
+    ReflectionCandidate,
 )
 from core.memory.types import (
     TRUST_TIER_HALF_LIVES,
@@ -33,11 +35,13 @@ __all__ = [
     # Public API
     "create_memory_service",
     # Protocols
+    "CandidateProvider",
     "MemoryReader",
     "MemoryWriter",
     "MemoryAdmin",
     "GovernanceReport",
     "HealthReport",
+    "ReflectionCandidate",
     # Shared types
     "DEFAULT_CONFIG",
     "Memory",
