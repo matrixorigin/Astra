@@ -184,6 +184,17 @@ class GraphStore(DbConsumer):
         with self._db() as db:
             return db.query(GraphNode).filter_by(user_id=user_id, is_active=1).count()
 
+    def has_min_nodes(self, user_id: str, minimum: int) -> bool:
+        """Check if user has at least `minimum` active nodes without full COUNT(*)."""
+        with self._db() as db:
+            rows = (
+                db.query(GraphNode.node_id)
+                .filter_by(user_id=user_id, is_active=1)
+                .limit(minimum)
+                .all()
+            )
+            return len(rows) >= minimum
+
     # ── Vector Search ─────────────────────────────────────────────────
 
     def find_similar_nodes(
@@ -292,6 +303,42 @@ class GraphStore(DbConsumer):
             for r in rows:
                 result[r.source_id].append(Edge(r.target_id, r.edge_type, r.weight))
             return result
+
+    def get_edges_bidirectional(
+        self, node_ids: set[str],
+    ) -> tuple[dict[str, list[Edge]], dict[str, list[Edge]]]:
+        """Batch: incoming AND outgoing edges for a set of nodes.
+
+        Two indexed queries (each uses its own index efficiently).
+        Returns (incoming, outgoing).
+        """
+        if not node_ids:
+            return {}, {}
+        id_list = list(node_ids)
+        with self._db() as db:
+            # Query 1: outgoing (uses PK: source_id leading column)
+            out_rows = (
+                db.query(GraphEdge)
+                .filter(GraphEdge.source_id.in_(id_list))
+                .all()
+            )
+            # Query 2: incoming (uses idx_edge_target)
+            in_rows = (
+                db.query(GraphEdge)
+                .filter(GraphEdge.target_id.in_(id_list))
+                .all()
+            )
+            incoming: dict[str, list[Edge]] = {nid: [] for nid in node_ids}
+            outgoing: dict[str, list[Edge]] = {nid: [] for nid in node_ids}
+            for r in out_rows:
+                outgoing[r.source_id].append(
+                    Edge(r.target_id, r.edge_type, r.weight)
+                )
+            for r in in_rows:
+                incoming[r.target_id].append(
+                    Edge(r.source_id, r.edge_type, r.weight)
+                )
+            return incoming, outgoing
 
     def get_incoming_for_nodes(self, node_ids: set[str]) -> dict[str, list[Edge]]:
         """Batch: all incoming edges for a set of nodes. Single query."""

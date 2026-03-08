@@ -31,6 +31,21 @@ CONFLICT_PENALTY = {"superseded": 0.5, "pending": 0.7}
 MIN_GRAPH_NODES = 50
 ANCHOR_TOP_K = 10
 
+# §13.2 Memory mode → activation parameters per task type
+_TASK_ACTIVATION_PARAMS: dict[str | None, tuple[int, int]] = {
+    # task_type: (iterations, anchor_k)
+    "code_review": (3, 10),   # FULL
+    "debugging":   (3, 10),   # FULL
+    "planning":    (2, 5),    # COMPRESSED
+    "general":     (3, 10),   # FULL (fallback)
+    None:          (3, 10),   # default
+}
+
+
+def _task_activation_params(task_type: str | None) -> tuple[int, int]:
+    """Return (iterations, anchor_k) for the given task type."""
+    return _TASK_ACTIVATION_PARAMS.get(task_type, _TASK_ACTIVATION_PARAMS[None])
+
 _HALF_LIVES = {"T1": 365.0, "T2": 180.0, "T3": 60.0, "T4": 30.0}
 
 
@@ -67,15 +82,19 @@ class ActivationRetriever:
         self, user_id: str, query: str,
         query_embedding: list[float] | None = None,
         *, top_k: int = 10,
+        task_type: str | None = None,
     ) -> list[tuple[GraphNodeData, float]]:
         if not query_embedding:
             return []
-        if self._store.count_user_nodes(user_id) < MIN_GRAPH_NODES:
+        if not self._store.has_min_nodes(user_id, MIN_GRAPH_NODES):
             return []
+
+        # §13.2 Memory mode → activation parameters
+        iterations, anchor_k = _task_activation_params(task_type)
 
         # 1. DB-side anchor selection (cosine similarity)
         anchor_results = self._store.find_similar_with_scores(
-            user_id, query_embedding, top_k=ANCHOR_TOP_K,
+            user_id, query_embedding, top_k=anchor_k,
         )
         if not anchor_results:
             return []
@@ -83,10 +102,10 @@ class ActivationRetriever:
         anchors = {n.node_id: max(s, 0.0) for n, s in anchor_results}
         anchor_semantic = dict(anchors)
 
-        # 2. Spreading activation — DB-side edge traversal
-        sa = SpreadingActivation(self._store)
+        # 2. Spreading activation — DB-side edge traversal (§13.1 task boost)
+        sa = SpreadingActivation(self._store, task_type=task_type)
         sa.set_anchors(anchors)
-        sa.propagate()
+        sa.propagate(iterations=iterations)
         activation_map = sa.get_activated(min_activation=0.01)
 
         # 3. Collect candidate IDs

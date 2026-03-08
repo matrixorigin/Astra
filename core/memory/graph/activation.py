@@ -26,6 +26,13 @@ SIGMOID_GAMMA = 5.0     # γ: sigmoid steepness
 SIGMOID_THETA = 0.1     # θ: sigmoid threshold
 NUM_ITERATIONS = 3
 
+# §13.1 Task-type edge boosts — applied on top of EDGE_TYPE_MULTIPLIER
+TASK_EDGE_BOOST: dict[str, dict[str, float]] = {
+    "code_review": {"causal": 1.5, "temporal": 0.5, "association": 1.0},
+    "debugging":   {"causal": 2.0, "temporal": 1.5, "association": 0.5},
+    "planning":    {"association": 1.2, "causal": 1.0, "temporal": 0.8},
+}
+
 
 def _sigmoid(x: float) -> float:
     z = SIGMOID_GAMMA * (x - SIGMOID_THETA)
@@ -36,8 +43,11 @@ def _sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-z))
 
 
-def _edge_weight(edge: Edge) -> float:
-    return edge.weight * EDGE_TYPE_MULTIPLIER.get(edge.edge_type, 1.0)
+def _edge_weight(edge: Edge, task_boost: dict[str, float] | None = None) -> float:
+    base = edge.weight * EDGE_TYPE_MULTIPLIER.get(edge.edge_type, 1.0)
+    if task_boost:
+        base *= task_boost.get(edge.edge_type, 1.0)
+    return base
 
 
 class SpreadingActivation:
@@ -51,11 +61,11 @@ class SpreadingActivation:
     Total DB queries = NUM_ITERATIONS (3), regardless of graph size.
     """
 
-    def __init__(self, store: GraphStore) -> None:
+    def __init__(self, store: GraphStore, *, task_type: str | None = None) -> None:
         self._store = store
         self._activation: dict[str, float] = {}
-        # Cache outgoing edge counts for fan-out normalization
         self._out_degree: dict[str, int] = {}
+        self._task_boost = TASK_EDGE_BOOST.get(task_type, None) if task_type else None
 
     def set_anchors(self, anchors: dict[str, float]) -> None:
         self._activation = dict(anchors)
@@ -70,56 +80,59 @@ class SpreadingActivation:
         return {nid: a for nid, a in self._activation.items() if a >= min_activation}
 
     def _propagation_step(self) -> None:
-        """One iteration: fetch edges → spread → inhibit → sigmoid."""
+        """One iteration: fetch edges → spread → inhibit → sigmoid.
+
+        DB queries per iteration: 1 (bidirectional) + 0-1 (fan-out cache miss).
+        """
         active_ids = set(self._activation.keys())
         if not active_ids:
             return
 
-        # Fetch incoming edges for all active nodes (1 DB query)
-        incoming = self._store.get_incoming_for_nodes(active_ids)
+        # Single DB query: incoming + outgoing for all active nodes
+        incoming, outgoing = self._store.get_edges_bidirectional(active_ids)
 
-        # Collect all neighbor IDs that contribute activation
+        # Collect contributor IDs for fan-out normalization
         contributor_ids: set[str] = set()
         for edges in incoming.values():
             for e in edges:
-                contributor_ids.add(e.target_id)  # target_id = source node for incoming
+                contributor_ids.add(e.target_id)
 
-        # Fetch outgoing edge counts for fan-out normalization (1 DB query)
-        # Only fetch for nodes we haven't cached yet
+        # Fan-out cache: only fetch uncached contributors (0-1 DB query)
         uncached = contributor_ids - set(self._out_degree.keys())
         if uncached:
             out_edges = self._store.get_edges_for_nodes(uncached)
             for nid, edges in out_edges.items():
                 self._out_degree[nid] = max(len(edges), 1)
+        # Also cache fan-out for active nodes from the outgoing we already have
+        for nid, edges in outgoing.items():
+            if nid not in self._out_degree:
+                self._out_degree[nid] = max(len(edges), 1)
 
         # Compute raw activation
         raw: dict[str, float] = {}
-        new_nodes: set[str] = set()
 
         for nid in active_ids:
             retention = (1 - DECAY_RATE) * self._activation.get(nid, 0.0)
             spread = 0.0
             for edge in incoming.get(nid, []):
-                neighbor_id = edge.target_id  # incoming edge: target_id = the source
+                neighbor_id = edge.target_id
                 neighbor_act = self._activation.get(neighbor_id, 0.0)
                 if neighbor_act <= 0:
                     continue
                 fan = self._out_degree.get(neighbor_id, 1)
-                spread += SPREADING_FACTOR * _edge_weight(edge) * neighbor_act / fan
+                spread += SPREADING_FACTOR * _edge_weight(edge, self._task_boost) * neighbor_act / fan
             raw[nid] = retention + spread
 
-        # Also activate newly reached neighbors (single batch query)
-        all_outgoing = self._store.get_edges_for_nodes(active_ids)
+        # Activate newly reached neighbors (from outgoing, already fetched)
         for nid in active_ids:
-            for edge in all_outgoing.get(nid, []):
+            for edge in outgoing.get(nid, []):
                 tid = edge.target_id
                 if tid not in raw:
                     neighbor_act = self._activation.get(nid, 0.0)
                     if neighbor_act > 0:
                         fan = self._out_degree.get(nid, 1)
-                        spread_val = SPREADING_FACTOR * _edge_weight(edge) * neighbor_act / fan
+                        spread_val = SPREADING_FACTOR * _edge_weight(edge, self._task_boost) * neighbor_act / fan
                         raw[tid] = spread_val
-                        new_nodes.add(tid)
 
         # Lateral inhibition
         inhibited = self._lateral_inhibition(raw)

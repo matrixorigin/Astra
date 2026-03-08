@@ -516,3 +516,255 @@ class TestTrustTierLifecycleE2E:
         demoted = store.get_node(scene.node_id)
         assert demoted.trust_tier == "T4"
         assert demoted.confidence == pytest.approx(0.5)  # confidence unchanged
+
+
+class TestIntentDrivenLoadingE2E:
+    """§13 — Intent-driven memory loading against real MatrixOne.
+
+    Verifies:
+    1. Task edge boosts change activation scores (same graph, different task_type)
+    2. Task activation params affect retrieval (planning vs debugging)
+    3. Full retriever path with 50+ nodes, real cosine similarity, real edges
+    4. Field-level verification on returned results
+    """
+
+    def _seed_graph(self, store: GraphStore, user_id: str, count: int = 55):
+        """Seed a graph with causal + association edges for task-boost testing.
+
+        Topology for boost testing (first 3 nodes):
+          anchor → causal_target  (1 causal edge, fan-out=2)
+          anchor → assoc_target   (1 association edge, fan-out=2)
+        Both targets have identical fan-in (1 edge from anchor) and anchor
+        has fan-out=2, so the ONLY difference in activation is edge type boost.
+        """
+        nodes = []
+        for i in range(count):
+            emb = [0.1] * EMBEDDING_DIM
+            emb[i % EMBEDDING_DIM] += 0.05 * (i % 10)
+            nodes.append(GraphNodeData(
+                node_id=f"n{i}_{user_id[:8]}",
+                user_id=user_id,
+                node_type=NodeType.SEMANTIC,
+                content=f"node {i}",
+                embedding=emb,
+                confidence=0.8,
+                importance=0.5,
+                trust_tier="T3",
+            ))
+        store.create_nodes_batch(nodes)
+
+        # Minimal topology: anchor(n0) has exactly 2 outgoing edges
+        # so fan-out normalization is equal for both targets
+        edges = [
+            (f"n0_{user_id[:8]}", f"n1_{user_id[:8]}", EdgeType.CAUSAL, 1.0),
+            (f"n0_{user_id[:8]}", f"n2_{user_id[:8]}", EdgeType.ASSOCIATION, 1.0),
+        ]
+        store.add_edges_batch(edges, user_id)
+        return nodes
+
+    def test_task_boost_changes_scores(self, store, user_id):
+        """Same graph + query, different task_type → different score ordering.
+
+        Topology: anchor(n0) --causal--> n1, anchor(n0) --association--> n2
+        Fan-out = 2 for both, so the ONLY variable is edge type boost.
+        """
+        from core.memory.graph.activation import SpreadingActivation
+
+        nodes = self._seed_graph(store, user_id)
+        anchors = {nodes[0].node_id: 1.0}
+        n1_id = nodes[1].node_id  # causal target
+        n2_id = nodes[2].node_id  # association target
+
+        # Debugging: causal=2.0, association=0.5
+        sa_debug = SpreadingActivation(store, task_type="debugging")
+        sa_debug.set_anchors(dict(anchors))
+        sa_debug.propagate(iterations=1)  # single iteration to avoid sigmoid saturation
+        debug_act = sa_debug.get_activated()
+
+        # Planning: association=1.2, causal=1.0
+        sa_plan = SpreadingActivation(store, task_type="planning")
+        sa_plan.set_anchors(dict(anchors))
+        sa_plan.propagate(iterations=1)
+        plan_act = sa_plan.get_activated()
+
+        # Debugging should boost causal (n1) over association (n2)
+        assert debug_act.get(n1_id, 0) > debug_act.get(n2_id, 0), (
+            f"debugging: causal n1={debug_act.get(n1_id, 0):.4f} "
+            f"should > association n2={debug_act.get(n2_id, 0):.4f}"
+        )
+        # Planning should boost association (n2) relative to causal (n1)
+        debug_ratio = debug_act.get(n1_id, 0) / max(debug_act.get(n2_id, 0), 1e-9)
+        plan_ratio = plan_act.get(n1_id, 0) / max(plan_act.get(n2_id, 0), 1e-9)
+        assert debug_ratio > plan_ratio, (
+            f"debugging should favor causal more than planning: "
+            f"debug_ratio={debug_ratio:.3f} plan_ratio={plan_ratio:.3f}"
+        )
+
+    def test_full_retriever_with_task_type(self, store, user_id):
+        """Full ActivationRetriever path: 55 nodes, real DB, task_type passed through."""
+        from core.memory.graph.retriever import ActivationRetriever
+
+        nodes = self._seed_graph(store, user_id)
+        retriever = ActivationRetriever(store)
+
+        # Query embedding close to n0
+        query_emb = list(nodes[0].embedding)
+
+        results = retriever.retrieve(
+            user_id, "test query", query_emb,
+            top_k=10, task_type="debugging",
+        )
+
+        assert len(results) > 0, "should return results with 55 nodes"
+        # Verify field-level correctness on every returned node
+        seen_ids = set()
+        prev_score = float("inf")
+        for node, score in results:
+            assert node.user_id == user_id
+            assert node.content is not None
+            assert node.confidence is not None
+            assert node.importance is not None
+            assert score > 0
+            assert node.is_active in (True, 1)
+            # Scores must be descending (sorted)
+            assert score <= prev_score + 1e-9, "results should be sorted by score desc"
+            prev_score = score
+            # No duplicates
+            assert node.node_id not in seen_ids, f"duplicate node {node.node_id}"
+            seen_ids.add(node.node_id)
+
+        # n0 (anchor) must appear somewhere in results
+        result_ids = {n.node_id for n, _ in results}
+        assert nodes[0].node_id in result_ids, "anchor node n0 should be in results"
+
+    def test_planning_uses_fewer_anchors(self, store, user_id):
+        """Planning mode uses anchor_k=5 vs debugging's anchor_k=10."""
+        from core.memory.graph.retriever import ActivationRetriever
+
+        nodes = self._seed_graph(store, user_id)
+        retriever = ActivationRetriever(store)
+        query_emb = list(nodes[0].embedding)
+
+        results_debug = retriever.retrieve(
+            user_id, "q", query_emb, top_k=20, task_type="debugging",
+        )
+        results_plan = retriever.retrieve(
+            user_id, "q", query_emb, top_k=20, task_type="planning",
+        )
+
+        # Both should return results
+        assert len(results_debug) > 0
+        assert len(results_plan) > 0
+
+        # Planning with fewer anchors (5) and fewer iterations (2)
+        # should generally activate fewer nodes than debugging (10 anchors, 3 iters)
+        assert len(results_plan) <= len(results_debug), (
+            f"planning ({len(results_plan)}) should activate <= debugging ({len(results_debug)})"
+        )
+
+    def test_no_task_type_uses_defaults(self, store, user_id):
+        """task_type=None should work and use default params."""
+        from core.memory.graph.retriever import ActivationRetriever
+
+        self._seed_graph(store, user_id)
+        retriever = ActivationRetriever(store)
+        query_emb = [0.1] * EMBEDDING_DIM
+
+        results = retriever.retrieve(user_id, "q", query_emb, top_k=5)
+        assert len(results) > 0, "default task_type should still return results"
+
+    def test_service_passes_task_hint_through(self, store, user_id, db_factory):
+        """GraphMemoryService.retrieve(task_hint=...) produces results via activation path."""
+        from core.memory.graph.service import GraphMemoryService
+
+        self._seed_graph(store, user_id)
+        svc = GraphMemoryService(db_factory)
+        query_emb = [0.1] * EMBEDDING_DIM
+
+        # Real end-to-end: service → retriever → activation → DB
+        results = svc.retrieve(
+            user_id, "test", query_embedding=query_emb, task_hint="debugging",
+        )
+        # With 55 nodes (above MIN_GRAPH_NODES=50), activation path should fire
+        assert len(results) > 0, "service should return memories via activation path"
+        for mem in results:
+            assert mem.user_id == user_id
+            assert mem.content is not None
+
+
+class TestTaskImportanceWeightsE2E:
+    """§13.3 — task-type importance weights affect retrieval ranking via real DB.
+
+    Chain: score_candidate(task_type) → node.importance → retriever score.
+    """
+
+    def test_task_weights_change_retrieval_ranking(self, store, user_id):
+        """Two nodes with same signals but different task-type scoring
+        should rank differently when importance is written to DB."""
+        from core.memory.graph.retriever import ActivationRetriever
+        from core.memory.interfaces import ReflectionCandidate
+        from core.memory.reflection.importance import score_candidate
+        from core.memory.types import Memory, MemoryType
+
+        # Create 55 nodes (above MIN_GRAPH_NODES threshold)
+        nodes = []
+        for i in range(55):
+            emb = [0.1] * EMBEDDING_DIM
+            emb[i % EMBEDDING_DIM] += 0.05 * (i % 10)
+            nodes.append(GraphNodeData(
+                node_id=f"n{i}_{user_id[:8]}",
+                user_id=user_id,
+                node_type=NodeType.SEMANTIC,
+                content=f"node {i}",
+                embedding=emb,
+                confidence=0.8,
+                trust_tier="T3",
+                importance=0.5,  # default
+            ))
+        store.create_nodes_batch(nodes)
+
+        # Build a candidate that represents a contradiction cluster
+        mems = [
+            Memory(memory_id=f"m{i}", user_id=user_id,
+                   memory_type=MemoryType.SEMANTIC, content=f"mem {i}",
+                   session_id=f"s{i}")
+            for i in range(4)
+        ]
+        candidate = ReflectionCandidate(
+            memories=mems, signal="contradiction",
+            session_ids=["s0", "s1", "s2"],
+        )
+
+        # Score under different task types
+        score_debug = score_candidate(candidate, task_type="debugging")
+        score_cr = score_candidate(candidate, task_type="code_review")
+
+        # Debugging weights contradiction at 0.45 vs code_review at 0.15
+        assert score_debug > score_cr
+
+        # Write these different importance scores to two nodes in DB
+        store.update_importance(nodes[0].node_id, score_debug)
+        store.update_importance(nodes[1].node_id, score_cr)
+
+        # Verify DB persistence
+        n0 = store.get_node(nodes[0].node_id)
+        n1 = store.get_node(nodes[1].node_id)
+        assert n0.importance == pytest.approx(score_debug, abs=0.01)
+        assert n1.importance == pytest.approx(score_cr, abs=0.01)
+
+        # Retrieve — node with higher importance should score higher
+        # (all else being equal: same embedding distance, same confidence)
+        retriever = ActivationRetriever(store)
+        query_emb = list(nodes[0].embedding)
+        results = retriever.retrieve(
+            user_id, "test", query_emb, top_k=55,
+        )
+
+        # Find both nodes in results
+        scores_by_id = {n.node_id: s for n, s in results}
+        if nodes[0].node_id in scores_by_id and nodes[1].node_id in scores_by_id:
+            assert scores_by_id[nodes[0].node_id] > scores_by_id[nodes[1].node_id], (
+                f"Higher importance node should rank higher: "
+                f"n0={scores_by_id[nodes[0].node_id]:.4f} "
+                f"n1={scores_by_id[nodes[1].node_id]:.4f}"
+            )

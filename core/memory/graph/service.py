@@ -126,6 +126,7 @@ class GraphMemoryService:
             try:
                 activated = self._retriever.retrieve(
                     user_id, query, query_embedding, top_k=top_k,
+                    task_type=task_hint,
                 )
                 if activated:
                     return self._nodes_to_memories(activated)

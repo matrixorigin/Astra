@@ -163,6 +163,7 @@ def init_db():
         ("ctx_ctx_event_embeddings", "idx_event_emb_vec", "embedding"),
         ("sk_knowledge_entries", "idx_knowledge_emb_vec", "embedding"),
         ("skill_selection_learningss", "idx_learning_emb_vec", "query_embedding"),
+        ("memory_graph_nodes", "idx_graph_node_embedding", "embedding"),
     ]:
         try:
             with engine.begin() as conn:

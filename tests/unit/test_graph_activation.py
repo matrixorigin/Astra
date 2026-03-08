@@ -33,7 +33,7 @@ class TestSigmoid:
 class TestSpreadingActivation:
     def _make_store(self):
         store = MagicMock()
-        store.get_incoming_for_nodes.return_value = {}
+        store.get_edges_bidirectional.return_value = ({}, {})
         store.get_edges_for_nodes.return_value = {}
         return store
 
@@ -54,14 +54,21 @@ class TestSpreadingActivation:
 
     def test_activation_spreads_to_neighbors(self):
         store = self._make_store()
-        # When propagation asks for incoming edges of "b", return edge from "a"
-        def mock_incoming(node_ids):
-            result = {nid: [] for nid in node_ids}
+
+        def mock_bidir(node_ids):
+            incoming = {nid: [] for nid in node_ids}
+            outgoing = {nid: [] for nid in node_ids}
             if "b" in node_ids:
-                result["b"] = [Edge("a", "association", 1.0)]
-            return result
-        store.get_incoming_for_nodes.side_effect = mock_incoming
-        store.get_edges_for_nodes.side_effect = lambda ids: {nid: [Edge("b", "association", 1.0)] if nid == "a" else [] for nid in ids}
+                incoming["b"] = [Edge("a", "association", 1.0)]
+            if "a" in node_ids:
+                outgoing["a"] = [Edge("b", "association", 1.0)]
+            return incoming, outgoing
+
+        store.get_edges_bidirectional.side_effect = mock_bidir
+        store.get_edges_for_nodes.side_effect = lambda ids: {
+            nid: [Edge("b", "association", 1.0)] if nid == "a" else []
+            for nid in ids
+        }
 
         sa = SpreadingActivation(store)
         sa.set_anchors({"a": 0.8})
@@ -101,18 +108,19 @@ class TestEffectiveConfidence:
 class TestActivationRetriever:
     def _make_retriever(self):
         store = MagicMock()
-        store.count_user_nodes.return_value = 100
+        store.has_min_nodes.return_value = True
         store.find_similar_with_scores.return_value = []
-        store.get_incoming_for_nodes.return_value = {}
+        store.get_edges_bidirectional.return_value = ({}, {})
         store.get_edges_for_nodes.return_value = {}
         store.get_nodes_by_ids.return_value = []
         return ActivationRetriever(store), store
 
     def test_fallback_when_graph_too_small(self):
         retriever, store = self._make_retriever()
-        store.count_user_nodes.return_value = 10
+        store.has_min_nodes.return_value = False
         result = retriever.retrieve("u1", "query", [0.1] * 10)
         assert result == []
+        store.find_similar_with_scores.assert_not_called()
 
     def test_fallback_when_no_embedding(self):
         retriever, _ = self._make_retriever()
