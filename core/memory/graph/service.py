@@ -1,0 +1,273 @@
+"""GraphMemoryService — graph backend for memory operations.
+
+Implements MemoryReader, MemoryWriter, MemoryAdmin, and CandidateProvider
+protocols using a typed directed graph with adjacency-list storage.
+
+See docs/design/memory/graph-memory.md
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Any
+
+from core.memory.graph.candidates import GraphCandidateProvider
+from core.memory.graph.consolidation import ConsolidationResult, GraphConsolidator
+from core.memory.graph.graph_builder import GraphBuilder
+from core.memory.graph.graph_store import GraphStore
+from core.memory.graph.retriever import ActivationRetriever
+from core.memory.interfaces import GovernanceReport, HealthReport, ReflectionCandidate
+from core.memory.types import Memory, MemoryType, RetrievalWeights, TrustTier
+
+if TYPE_CHECKING:
+    from core.db_consumer import DbFactory
+    from core.memory.config import MemoryGovernanceConfig
+
+logger = logging.getLogger(__name__)
+
+
+class GraphMemoryService:
+    """Graph memory backend — typed directed graph with adjacency-list storage.
+
+    Write path: tabular + graph ingest (dual-write).
+    Read path: activation retrieval with tabular fallback.
+    Governance: tabular governance + graph consolidation + graph candidates.
+    """
+
+    def __init__(
+        self,
+        db_factory: DbFactory,
+        llm_client: Any = None,
+        embed_fn: Any = None,
+        config: MemoryGovernanceConfig | None = None,
+    ) -> None:
+        self._db_factory = db_factory
+        self._llm_client = llm_client
+        self._embed_fn = embed_fn
+
+        if config is None:
+            from core.memory.config import DEFAULT_CONFIG
+            self._config = DEFAULT_CONFIG
+        else:
+            self._config = config
+
+        # Lazy-initialized components
+        self._graph_store: GraphStore | None = None
+        self._graph_builder: GraphBuilder | None = None
+        self._activation_retriever: ActivationRetriever | None = None
+        self._graph_candidates: GraphCandidateProvider | None = None
+        self._graph_consolidator: GraphConsolidator | None = None
+        self._tabular: Any = None
+
+    # ── Lazy-initialized components ───────────────────────────────────
+
+    @property
+    def _store(self) -> GraphStore:
+        if self._graph_store is None:
+            self._graph_store = GraphStore(self._db_factory)
+        return self._graph_store
+
+    @property
+    def _builder(self) -> GraphBuilder:
+        if self._graph_builder is None:
+            self._graph_builder = GraphBuilder(self._store)
+        return self._graph_builder
+
+    @property
+    def _retriever(self) -> ActivationRetriever:
+        if self._activation_retriever is None:
+            self._activation_retriever = ActivationRetriever(self._store)
+        return self._activation_retriever
+
+    @property
+    def _candidates(self) -> GraphCandidateProvider:
+        if self._graph_candidates is None:
+            self._graph_candidates = GraphCandidateProvider(
+                self._db_factory, config=self._config,
+            )
+        return self._graph_candidates
+
+    @property
+    def _consolidator(self) -> GraphConsolidator:
+        if self._graph_consolidator is None:
+            self._graph_consolidator = GraphConsolidator(self._db_factory)
+        return self._graph_consolidator
+
+    @property
+    def _tabular_delegate(self) -> Any:
+        """Tabular backend for dual-write and fallback."""
+        if self._tabular is None:
+            from core.memory.tabular.service import TabularMemoryService
+            self._tabular = TabularMemoryService(
+                self._db_factory,
+                llm_client=self._llm_client,
+                embed_fn=self._embed_fn,
+                config=self._config,
+            )
+        return self._tabular
+
+    # ── MemoryReader ──────────────────────────────────────────────────
+
+    def retrieve(
+        self,
+        user_id: str,
+        query: str,
+        *,
+        session_id: str = "",
+        query_embedding: list[float] | None = None,
+        memory_types: list[MemoryType] | None = None,
+        top_k: int = 10,
+        task_hint: str | None = None,
+        weights: RetrievalWeights | None = None,
+        include_cross_session: bool = True,
+    ) -> list[Memory]:
+        """Retrieve memories. Activation retrieval with tabular fallback."""
+        if query_embedding:
+            try:
+                activated = self._retriever.retrieve(
+                    user_id, query, query_embedding, top_k=top_k,
+                )
+                if activated:
+                    return self._nodes_to_memories(activated)
+            except Exception:
+                logger.warning("Activation retrieval failed, falling back", exc_info=True)
+
+        result = self._tabular_delegate.retrieve(
+            user_id, query,
+            session_id=session_id,
+            query_embedding=query_embedding,
+            memory_types=memory_types,
+            top_k=top_k,
+            task_hint=task_hint,
+            weights=weights,
+            include_cross_session=include_cross_session,
+        )
+        return result[0] if isinstance(result, tuple) else result
+
+    @staticmethod
+    def _nodes_to_memories(scored_nodes: list[tuple[Any, float]]) -> list[Memory]:
+        """Convert scored graph nodes to Memory domain objects."""
+        memories: list[Memory] = []
+        for node, _score in scored_nodes:
+            try:
+                tier = TrustTier(node.trust_tier)
+            except ValueError:
+                tier = TrustTier.T3_INFERRED
+            memories.append(Memory(
+                memory_id=node.memory_id or node.node_id,
+                user_id=node.user_id,
+                memory_type=MemoryType.SEMANTIC,
+                content=node.content,
+                initial_confidence=node.confidence,
+                embedding=node.embedding,
+                session_id=node.session_id,
+                trust_tier=tier,
+            ))
+        return memories
+
+    def get_profile(self, user_id: str) -> str | None:
+        return self._tabular_delegate.get_profile(user_id)
+
+    # ── MemoryWriter ──────────────────────────────────────────────────
+
+    def store(
+        self,
+        user_id: str,
+        content: str,
+        *,
+        memory_type: MemoryType,
+        source_event_ids: list[str] | None = None,
+        initial_confidence: float = 0.75,
+        trust_tier: TrustTier = TrustTier.T3_INFERRED,
+        session_id: str | None = None,
+    ) -> Memory:
+        """Store a memory and build graph nodes."""
+        mem = self._tabular_delegate.store(
+            user_id, content,
+            memory_type=memory_type,
+            source_event_ids=source_event_ids,
+            initial_confidence=initial_confidence,
+            trust_tier=trust_tier,
+            session_id=session_id,
+        )
+        try:
+            self._builder.ingest(user_id, [mem], [], session_id=session_id)
+        except Exception:
+            logger.warning("Graph ingest failed for memory %s", mem.memory_id, exc_info=True)
+        return mem
+
+    def observe_turn(
+        self,
+        user_id: str,
+        messages: list[dict[str, Any]],
+        *,
+        source_event_ids: list[str] | None = None,
+    ) -> list[Memory]:
+        """Extract memories from a turn and build graph."""
+        memories = self._tabular_delegate.observe_turn(
+            user_id, messages, source_event_ids=source_event_ids,
+        )
+        events = [{"event_id": eid, "event_type": "unknown"} for eid in (source_event_ids or [])]
+        try:
+            session_id = memories[0].session_id if memories else None
+            self._builder.ingest(user_id, memories, events, session_id=session_id)
+        except Exception:
+            logger.warning("Graph ingest failed for turn", exc_info=True)
+        return memories
+
+    # ── MemoryAdmin ───────────────────────────────────────────────────
+
+    def run_governance(self, user_id: str) -> GovernanceReport:
+        """Run tabular governance + graph consolidation."""
+        report = self._tabular_delegate.run_governance(user_id)
+
+        # Graph consolidation (conflict detection, source integrity)
+        try:
+            cr = self._consolidator.consolidate(user_id)
+            if cr.errors:
+                report.errors = (report.errors or []) + cr.errors
+        except Exception as e:
+            logger.warning("Graph consolidation failed: %s", e)
+            if report.errors is None:
+                report.errors = []
+            report.errors.append(f"graph_consolidation: {e}")
+
+        return report
+
+    def health_check(self, user_id: str) -> HealthReport:
+        return self._tabular_delegate.health_check(user_id)
+
+    # ── CandidateProvider ─────────────────────────────────────────────
+
+    def get_reflection_candidates(
+        self,
+        user_id: str,
+        *,
+        since_hours: int = 24,
+    ) -> list[ReflectionCandidate]:
+        """Get reflection candidates from graph activation patterns."""
+        try:
+            candidates = self._candidates.get_reflection_candidates(
+                user_id, since_hours=since_hours,
+            )
+            if candidates:
+                return candidates
+        except Exception:
+            logger.warning("Graph candidate selection failed, falling back", exc_info=True)
+
+        # Fallback to tabular candidates
+        try:
+            return self._tabular_delegate._governance_lazy.get_reflection_candidates(
+                user_id, since_hours=since_hours,
+            )
+        except Exception:
+            return []
+
+    # ── Graph-specific ────────────────────────────────────────────────
+
+    def get_graph_stats(self, user_id: str) -> dict[str, int]:
+        return {"total_nodes": self._store.count_user_nodes(user_id)}
+
+    def consolidate(self, user_id: str) -> ConsolidationResult:
+        """Run graph consolidation directly (for testing/admin)."""
+        return self._consolidator.consolidate(user_id)

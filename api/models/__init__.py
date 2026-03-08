@@ -16,6 +16,7 @@ from api.models.agent import (  # noqa: F401
 
 # memory
 from api.models.memory import MemoryRecord  # noqa: F401
+from api.models.graph import GraphEdge, GraphNode  # noqa: F401
 
 # skills
 from api.models.skill import (  # noqa: F401
