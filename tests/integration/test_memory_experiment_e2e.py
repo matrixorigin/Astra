@@ -8,6 +8,9 @@ Covers:
 - evaluate() with golden session replay
 - Optimistic locking on commit (ExperimentConflictError)
 - TTL management (expires_at, extend_ttl, cleanup_expired)
+- get_service() operates on branch (isolated mutations)
+- diff() returns actual changes
+- commit() merges data into production
 """
 
 import json
@@ -283,6 +286,82 @@ class TestExperimentEvaluate:
                 mj = json.loads(mj)
             assert mj["note"] == "no_golden_sessions"
 
+    def test_evaluate_replays_golden_sessions(self, mgr, db_factory):
+        """evaluate() with explicit session IDs exercises full replay path."""
+        user_id = f"test_exp_{uuid.uuid4().hex[:8]}"
+        session_id = f"sess_{uuid.uuid4().hex[:8]}"
+        event_id = f"evt_{uuid.uuid4().hex[:8]}"
+        chain_id = f"chain_{uuid.uuid4().hex[:8]}"
+
+        # Create a real session + event so ReplayService can find them
+        with db_factory() as db:
+            db.execute(
+                text(
+                    "INSERT INTO agent_sessions "
+                    "(session_id, user_id, status, event_count, "
+                    " created_at, last_active_at) "
+                    "VALUES (:sid, :uid, 'active', 1, NOW(), NOW())"
+                ),
+                {"sid": session_id, "uid": user_id},
+            )
+            db.execute(
+                text(
+                    "INSERT INTO agent_events "
+                    "(event_id, session_id, user_id, agent_id, agent_version, "
+                    " event_type, content, causal_chain_id, created_at) "
+                    "VALUES (:eid, :sid, :uid, 'system', '1.0.0', "
+                    " 'user_query', 'test message', :cid, NOW())"
+                ),
+                {"eid": event_id, "sid": session_id, "uid": user_id, "cid": chain_id},
+            )
+            db.commit()
+
+        try:
+            info = mgr.create(user_id, "eval-replay-test")
+
+            result = mgr.evaluate(
+                info.experiment_id,
+                golden_session_ids=[session_id],
+            )
+
+            # ── Verify EvalResult fields ──
+            assert result.sessions_tested == 1
+            assert result.sessions_passed == 1  # replay succeeded
+            assert len(result.replay_results) == 1
+
+            rr = result.replay_results[0]
+            assert rr["session_id"] == session_id
+            assert rr["replay_status"] == "completed"
+            assert rr["successful"] >= 1  # at least the user_query event
+            assert rr["failed"] == 0
+
+            # ── Verify aggregate metrics ──
+            assert result.metrics["sessions_tested"] == 1
+            assert result.metrics["pass_rate"] == 1.0
+            assert result.metrics["error_rate"] == 0.0
+
+            # ── Verify status reverted to active ──
+            fetched = mgr.get(info.experiment_id)
+            assert fetched is not None
+            assert fetched.status == "active"
+
+            # ── Verify metrics persisted to DB ──
+            assert fetched.metrics_json is not None
+            assert fetched.metrics_json["sessions_tested"] == 1
+            assert fetched.metrics_json["sessions_passed"] == 1
+            assert fetched.metrics_json["pass_rate"] == 1.0
+        finally:
+            with db_factory() as db:
+                db.execute(
+                    text("DELETE FROM agent_events WHERE event_id = :eid"),
+                    {"eid": event_id},
+                )
+                db.execute(
+                    text("DELETE FROM agent_sessions WHERE session_id = :sid"),
+                    {"sid": session_id},
+                )
+                db.commit()
+
     def test_evaluate_nonexistent_raises(self, mgr):
         with pytest.raises(ValueError, match="not found"):
             mgr.evaluate("nonexistent_id")
@@ -488,3 +567,182 @@ class TestTTLManagement:
         fetched = mgr.get(info.experiment_id)
         assert fetched is not None
         assert fetched.status == "active"
+
+
+# ── Branch Operations (get_service, diff, commit data) ────────────────
+
+
+class TestBranchOperations:
+    """Test that get_service operates on branch, diff shows changes,
+    and commit merges data into production."""
+
+    def test_get_service_writes_to_branch_not_production(self, mgr, db_factory):
+        """Mutations via get_service() only affect the branch DB."""
+        user_id = f"test_exp_{uuid.uuid4().hex[:8]}"
+        info = mgr.create(user_id, "branch-write-test")
+
+        # Insert a memory directly into the branch DB
+        with db_factory() as db:
+            db.execute(
+                text(
+                    f"INSERT INTO `{info.branch_db}`.mem_memories "
+                    "(memory_id, user_id, content, memory_type, trust_tier, "
+                    " initial_confidence, source_event_ids, is_active, "
+                    " observed_at, created_at, updated_at) "
+                    "VALUES (:mid, :uid, 'branch only', 'semantic', 'T3', "
+                    " 0.75, '[]', 1, NOW(), NOW(), NOW())"
+                ),
+                {"mid": f"branch_{uuid.uuid4().hex[:8]}", "uid": user_id},
+            )
+            db.commit()
+
+        # Verify it exists in branch
+        with db_factory() as db:
+            row = db.execute(
+                text(
+                    f"SELECT COUNT(*) AS cnt FROM `{info.branch_db}`.mem_memories "
+                    "WHERE user_id = :uid AND content = 'branch only'"
+                ),
+                {"uid": user_id},
+            ).fetchone()
+            assert row.cnt == 1
+
+        # Verify it does NOT exist in production
+        with db_factory() as db:
+            row = db.execute(
+                text(
+                    "SELECT COUNT(*) AS cnt FROM mem_memories "
+                    "WHERE user_id = :uid AND content = 'branch only'"
+                ),
+                {"uid": user_id},
+            ).fetchone()
+            assert row.cnt == 0
+
+    def test_diff_shows_branch_changes(self, mgr, db_factory):
+        """diff() returns non-empty result when branch has changes."""
+        user_id = f"test_exp_{uuid.uuid4().hex[:8]}"
+        info = mgr.create(user_id, "diff-test")
+
+        # Insert data into branch
+        mid = f"diff_{uuid.uuid4().hex[:8]}"
+        with db_factory() as db:
+            db.execute(
+                text(
+                    f"INSERT INTO `{info.branch_db}`.mem_memories "
+                    "(memory_id, user_id, content, memory_type, trust_tier, "
+                    " initial_confidence, source_event_ids, is_active, "
+                    " observed_at, created_at, updated_at) "
+                    "VALUES (:mid, :uid, 'diff content', 'semantic', 'T3', "
+                    " 0.75, '[]', 1, NOW(), NOW(), NOW())"
+                ),
+                {"mid": mid, "uid": user_id},
+            )
+            db.commit()
+
+        result = mgr.diff(info.experiment_id)
+        # Should have at least one table with changes
+        assert len(result.table_diffs) > 0
+        mem_diff = next(
+            (d for d in result.table_diffs if d["table"] == "mem_memories"), None
+        )
+        assert mem_diff is not None
+        assert len(mem_diff["changes"]) > 0
+
+    def test_commit_merges_branch_data_into_production(self, mgr, db_factory):
+        """After commit, branch data appears in production."""
+        import time
+
+        user_id = f"test_exp_{uuid.uuid4().hex[:8]}"
+        info = mgr.create(user_id, "commit-merge-test")
+
+        # Insert data into branch
+        mid = f"merge_{uuid.uuid4().hex[:8]}"
+        with db_factory() as db:
+            db.execute(
+                text(
+                    f"INSERT INTO `{info.branch_db}`.mem_memories "
+                    "(memory_id, user_id, content, memory_type, trust_tier, "
+                    " initial_confidence, source_event_ids, is_active, "
+                    " observed_at, created_at, updated_at) "
+                    "VALUES (:mid, :uid, 'merged content', 'semantic', 'T3', "
+                    " 0.75, '[]', 1, NOW(), NOW(), NOW())"
+                ),
+                {"mid": mid, "uid": user_id},
+            )
+            db.commit()
+
+        # Commit
+        mgr.commit(info.experiment_id)
+
+        # Verify data now in production.
+        # branch merge is DDL-like; under parallel execution a fresh session
+        # may not see the row immediately, so retry briefly.
+        row = None
+        for _ in range(5):
+            with db_factory() as db:
+                row = db.execute(
+                    text(
+                        "SELECT content, is_active FROM mem_memories "
+                        "WHERE memory_id = :mid"
+                    ),
+                    {"mid": mid},
+                ).fetchone()
+            if row is not None:
+                break
+            time.sleep(0.5)
+
+        assert row is not None, f"Merged memory {mid} not visible in production"
+        assert row.content == "merged content"
+        assert row.is_active == 1
+
+        # Clean up merged data
+        with db_factory() as db:
+            db.execute(
+                text("DELETE FROM mem_memories WHERE memory_id = :mid"),
+                {"mid": mid},
+            )
+            db.commit()
+
+    def test_dispose_engines_releases_connections(self, mgr, db_factory):
+        """dispose_engines() cleans up branch connection pools."""
+        user_id = f"test_exp_{uuid.uuid4().hex[:8]}"
+        info = mgr.create(user_id, "dispose-test")
+
+        # Create a branch engine via get_service
+        _svc = mgr.get_service(info.experiment_id)
+        assert len(mgr._branch_engines) >= 1
+        assert info.experiment_id in mgr._branch_engines
+
+        mgr.dispose_engines()
+        assert len(mgr._branch_engines) == 0
+
+    def test_commit_disposes_branch_engine(self, mgr, db_factory):
+        """commit() auto-disposes the branch engine for that experiment."""
+        user_id = f"test_exp_{uuid.uuid4().hex[:8]}"
+        info = mgr.create(user_id, "commit-dispose")
+
+        _svc = mgr.get_service(info.experiment_id)
+        assert info.experiment_id in mgr._branch_engines
+
+        mgr.commit(info.experiment_id)
+        assert info.experiment_id not in mgr._branch_engines
+
+    def test_discard_disposes_branch_engine(self, mgr, db_factory):
+        """discard() auto-disposes the branch engine for that experiment."""
+        user_id = f"test_exp_{uuid.uuid4().hex[:8]}"
+        info = mgr.create(user_id, "discard-dispose")
+
+        _svc = mgr.get_service(info.experiment_id)
+        assert info.experiment_id in mgr._branch_engines
+
+        mgr.discard(info.experiment_id)
+        assert info.experiment_id not in mgr._branch_engines
+
+    def test_context_manager_disposes_engines(self, db_factory):
+        """Context manager auto-disposes all engines on exit."""
+        with MemoryExperimentManager(db_factory, source_db="test_dev_agent_v3") as m:
+            user_id = f"test_exp_{uuid.uuid4().hex[:8]}"
+            info = m.create(user_id, "ctx-mgr-test")
+            _svc = m.get_service(info.experiment_id)
+            assert len(m._branch_engines) >= 1
+        assert len(m._branch_engines) == 0

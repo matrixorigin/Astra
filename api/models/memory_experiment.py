@@ -32,4 +32,6 @@ class MemoryExperiment(Base):
     __table_args__ = (
         Index("idx_exp_user", "user_id"),
         Index("idx_exp_status", "status"),
+        Index("idx_exp_user_status", "user_id", "status"),
+        Index("idx_exp_status_expires", "status", "expires_at"),
     )

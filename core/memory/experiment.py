@@ -16,15 +16,16 @@ import contextlib
 import logging
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime as dt
+from datetime import timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
+from sqlalchemy import func as sa_func
 from sqlalchemy import text
 
 from core.db_consumer import DbConsumer
 
 if TYPE_CHECKING:
-    from datetime import datetime
-
     from core.db_consumer import DbFactory
     from core.memory.service import MemoryService
 
@@ -59,9 +60,9 @@ class ExperimentInfo:
     strategy_key: str | None = None
     params_json: dict[str, Any] | None = None
     metrics_json: dict[str, Any] | None = None
-    created_at: datetime | None = None
-    committed_at: datetime | None = None
-    expires_at: datetime | None = None
+    created_at: dt | None = None
+    committed_at: dt | None = None
+    expires_at: dt | None = None
 
 
 @dataclass
@@ -90,6 +91,25 @@ class ExperimentConflictError(Exception):
     """Raised when production data changed since experiment branch point."""
 
 
+def _model_to_info(row: Any) -> ExperimentInfo:
+    """Convert a MemoryExperiment ORM instance to ExperimentInfo."""
+    return ExperimentInfo(
+        experiment_id=row.experiment_id,
+        user_id=row.user_id,
+        name=row.name,
+        status=row.status,
+        branch_db=row.branch_db,
+        base_snapshot=row.base_snapshot,
+        description=row.description or "",
+        strategy_key=row.strategy_key,
+        params_json=row.params_json,
+        metrics_json=row.metrics_json,
+        created_at=row.created_at,
+        committed_at=row.committed_at,
+        expires_at=row.expires_at,
+    )
+
+
 class MemoryExperimentManager(DbConsumer):
     """Manage isolated memory experiments using Git-for-Data branching.
 
@@ -107,6 +127,13 @@ class MemoryExperimentManager(DbConsumer):
             from config.settings import get_settings
             source_db = get_settings().matrixone_database
         self._source_db = source_db
+        self._branch_engines: dict[str, Any] = {}  # experiment_id → engine
+
+    def __enter__(self) -> MemoryExperimentManager:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.dispose_engines()
 
     def create(
         self,
@@ -136,11 +163,10 @@ class MemoryExperimentManager(DbConsumer):
         Raises:
             ExperimentLimitError: If user has too many active experiments.
         """
-        import json
+        from api.models.memory_experiment import MemoryExperiment
 
         ttl_days = min(ttl_days, MAX_TTL_DAYS)
 
-        # Check active experiment count
         active = self._count_active(user_id)
         if active >= max_experiments:
             raise ExperimentLimitError(
@@ -152,36 +178,25 @@ class MemoryExperimentManager(DbConsumer):
         branch_db = f"mem_exp_{user_id[:16]}_{exp_id}"
         snapshot_name = f"base_{exp_id}"
 
-        # 1. Create snapshot (safety net for rollback)
         snapshot_ok = self._create_snapshot(snapshot_name)
-
-        # 2. Create branch database + branch tables
         self._create_branch(branch_db, snapshot_name if snapshot_ok else None)
 
-        # 3. Insert experiment record with TTL
+        now = dt.now(timezone.utc)
+        record = MemoryExperiment(
+            experiment_id=exp_id,
+            user_id=user_id,
+            name=name,
+            description=description,
+            status="active",
+            branch_db=branch_db,
+            base_snapshot=snapshot_name if snapshot_ok else None,
+            strategy_key=strategy_key,
+            params_json=params,
+            expires_at=now + timedelta(days=ttl_days),
+            created_by=user_id,
+        )
         with self._db() as db:
-            db.execute(
-                text(
-                    "INSERT INTO mem_experiments "
-                    "(experiment_id, user_id, name, description, status, "
-                    " branch_db, base_snapshot, strategy_key, params_json, "
-                    " expires_at, created_by) "
-                    "VALUES (:eid, :uid, :name, :desc, 'active', "
-                    " :bdb, :snap, :sk, :pj, "
-                    " DATE_ADD(NOW(), INTERVAL :ttl DAY), :uid)"
-                ),
-                {
-                    "eid": exp_id,
-                    "uid": user_id,
-                    "name": name,
-                    "desc": description,
-                    "bdb": branch_db,
-                    "snap": snapshot_name if snapshot_ok else None,
-                    "sk": strategy_key,
-                    "pj": json.dumps(params) if params else None,
-                    "ttl": ttl_days,
-                },
-            )
+            db.add(record)
             db.commit()
 
         info = self.get(exp_id)
@@ -190,27 +205,28 @@ class MemoryExperimentManager(DbConsumer):
 
     def get(self, experiment_id: str) -> ExperimentInfo | None:
         """Get experiment info by ID."""
+        from api.models.memory_experiment import MemoryExperiment
+
         with self._db() as db:
-            row = db.execute(
-                text("SELECT * FROM mem_experiments WHERE experiment_id = :eid"),
-                {"eid": experiment_id},
-            ).fetchone()
+            row = db.query(MemoryExperiment).filter_by(
+                experiment_id=experiment_id,
+            ).first()
             if row is None:
                 return None
-            return self._row_to_info(row)
+            return _model_to_info(row)
 
     def list_active(self, user_id: str) -> list[ExperimentInfo]:
         """List active experiments for a user."""
+        from api.models.memory_experiment import MemoryExperiment
+
         with self._db() as db:
-            rows = db.execute(
-                text(
-                    "SELECT * FROM mem_experiments "
-                    "WHERE user_id = :uid AND status = 'active' "
-                    "ORDER BY created_at DESC"
-                ),
-                {"uid": user_id},
-            ).fetchall()
-            return [self._row_to_info(r) for r in rows]
+            rows = (
+                db.query(MemoryExperiment)
+                .filter_by(user_id=user_id, status="active")
+                .order_by(MemoryExperiment.created_at.desc())
+                .all()
+            )
+            return [_model_to_info(r) for r in rows]
 
     def get_service(
         self,
@@ -230,7 +246,7 @@ class MemoryExperimentManager(DbConsumer):
         if info.status != "active":
             raise ValueError(f"Experiment {experiment_id} is {info.status}, not active")
 
-        branch_db_factory = self._make_branch_db_factory(info.branch_db)
+        branch_db_factory = self._make_branch_db_factory(info.branch_db, experiment_id)
 
         from core.memory.factory import create_memory_service
 
@@ -296,19 +312,9 @@ class MemoryExperimentManager(DbConsumer):
         if info.status not in ("active", "evaluating"):
             raise ValueError(f"Experiment {experiment_id} is {info.status}")
 
-        # Mark as evaluating
-        with self._db() as db:
-            db.execute(
-                text(
-                    "UPDATE mem_experiments SET status = 'evaluating' "
-                    "WHERE experiment_id = :eid"
-                ),
-                {"eid": experiment_id},
-            )
-            db.commit()
+        self._set_status(experiment_id, "evaluating")
 
         try:
-            # Load golden sessions
             sessions = self._load_golden_sessions(
                 golden_session_ids, golden_session_count,
             )
@@ -318,10 +324,7 @@ class MemoryExperimentManager(DbConsumer):
                 self._set_status(experiment_id, "active")
                 return result
 
-            # Replay each session against experiment branch
             replay_results = self._replay_sessions(info, sessions)
-
-            # Compute aggregate metrics
             metrics = self._compute_eval_metrics(replay_results)
             result = EvalResult(
                 sessions_tested=len(sessions),
@@ -337,13 +340,10 @@ class MemoryExperimentManager(DbConsumer):
                 "sessions_passed": result.sessions_passed,
                 **metrics,
             })
-
-            # Return to active after evaluation
             self._set_status(experiment_id, "active")
             return result
 
         except Exception:
-            # On failure, revert to active so user can retry
             self._set_status(experiment_id, "active")
             raise
 
@@ -359,20 +359,20 @@ class MemoryExperimentManager(DbConsumer):
         Raises:
             ExperimentConflictError: If production changed since branch point.
         """
+        from api.models.memory_experiment import MemoryExperiment
+
         info = self.get(experiment_id)
         if info is None:
             raise ValueError(f"Experiment {experiment_id} not found")
         if info.status != "active":
             raise ValueError(f"Experiment {experiment_id} is {info.status}, not active")
 
-        # Optimistic lock: check if production changed since branch point
         if info.base_snapshot:
             self._check_production_unchanged(info)
 
         from core.sandbox.branch import Branch
 
         branch = Branch(self._db_factory, database=self._source_db)
-
         for table in _MEMORY_TABLES:
             try:
                 branch.merge(
@@ -384,20 +384,18 @@ class MemoryExperimentManager(DbConsumer):
                 logger.debug("Merge skipped for %s: %s", table, e)
 
         with self._db() as db:
-            db.execute(
-                text(
-                    "UPDATE mem_experiments "
-                    "SET status = 'committed', committed_at = NOW() "
-                    "WHERE experiment_id = :eid"
-                ),
-                {"eid": experiment_id},
-            )
+            db.query(MemoryExperiment).filter_by(
+                experiment_id=experiment_id,
+            ).update({"status": "committed", "committed_at": sa_func.now()})
             db.commit()
 
+        self._dispose_engine(experiment_id)
         self._drop_branch_db(info.branch_db)
 
     def discard(self, experiment_id: str) -> None:
         """Discard experiment: drop branch DB, keep record for audit."""
+        from api.models.memory_experiment import MemoryExperiment
+
         info = self.get(experiment_id)
         if info is None:
             raise ValueError(f"Experiment {experiment_id} not found")
@@ -405,15 +403,12 @@ class MemoryExperimentManager(DbConsumer):
             raise ValueError(f"Experiment {experiment_id} is {info.status}")
 
         with self._db() as db:
-            db.execute(
-                text(
-                    "UPDATE mem_experiments SET status = 'discarded' "
-                    "WHERE experiment_id = :eid"
-                ),
-                {"eid": experiment_id},
-            )
+            db.query(MemoryExperiment).filter_by(
+                experiment_id=experiment_id,
+            ).update({"status": "discarded"})
             db.commit()
 
+        self._dispose_engine(experiment_id)
         self._drop_branch_db(info.branch_db)
 
     # ── TTL management ────────────────────────────────────────────────
@@ -431,9 +426,9 @@ class MemoryExperimentManager(DbConsumer):
         if info.status != "active":
             raise ValueError(f"Experiment {experiment_id} is {info.status}")
 
+        # Cap: expires_at cannot exceed created_at + MAX_TTL_DAYS
+        # MatrixOne doesn't support LEAST(), use CASE WHEN
         with self._db() as db:
-            # Cap: expires_at cannot exceed created_at + MAX_TTL_DAYS
-            # MatrixOne doesn't support LEAST(), use CASE WHEN
             db.execute(
                 text(
                     "UPDATE mem_experiments SET expires_at = "
@@ -448,32 +443,48 @@ class MemoryExperimentManager(DbConsumer):
             )
             db.commit()
 
-    def cleanup_expired(self) -> int:
+    def cleanup_expired(self, *, drop_snapshots: bool = False) -> int:
         """Expire and clean up experiments past their TTL.
 
         Sets status='expired', drops branch DBs.
+        Optionally drops base snapshots (default: retained for audit per §7.6).
         Intended to be called by a daily governance job.
+
+        Args:
+            drop_snapshots: If True, also drop base_snapshot (saves storage).
 
         Returns:
             Number of experiments expired.
         """
-        # Find expired active experiments
+        from api.models.memory_experiment import MemoryExperiment
+
         with self._db() as db:
-            rows = db.execute(
-                text(
-                    "SELECT experiment_id, branch_db FROM mem_experiments "
-                    "WHERE status = 'active' "
-                    "AND expires_at IS NOT NULL AND expires_at < NOW()"
-                ),
-            ).fetchall()
+            rows = (
+                db.query(MemoryExperiment)
+                .filter(
+                    MemoryExperiment.status == "active",
+                    MemoryExperiment.expires_at.isnot(None),
+                    MemoryExperiment.expires_at < sa_func.now(),
+                )
+                .all()
+            )
+            expired = [
+                {
+                    "experiment_id": r.experiment_id,
+                    "branch_db": r.branch_db,
+                    "base_snapshot": r.base_snapshot,
+                }
+                for r in rows
+            ]
 
         count = 0
-        for row in rows:
-            exp_id = row._mapping["experiment_id"]
-            branch_db = row._mapping["branch_db"]
+        for item in expired:
+            exp_id = item["experiment_id"]
             try:
                 self._set_status(exp_id, "expired")
-                self._drop_branch_db(branch_db)
+                self._drop_branch_db(item["branch_db"])
+                if drop_snapshots and item.get("base_snapshot"):
+                    self._drop_snapshot(item["base_snapshot"])
                 count += 1
             except Exception:
                 logger.warning("Failed to expire experiment %s", exp_id, exc_info=True)
@@ -486,41 +497,35 @@ class MemoryExperimentManager(DbConsumer):
         self, experiment_id: str, metrics: dict[str, Any],
     ) -> None:
         """Store evaluation metrics on the experiment record."""
-        import json
+        from api.models.memory_experiment import MemoryExperiment
 
         with self._db() as db:
-            db.execute(
-                text(
-                    "UPDATE mem_experiments SET metrics_json = :mj "
-                    "WHERE experiment_id = :eid"
-                ),
-                {"eid": experiment_id, "mj": json.dumps(metrics)},
-            )
+            db.query(MemoryExperiment).filter_by(
+                experiment_id=experiment_id,
+            ).update({"metrics_json": metrics})
             db.commit()
 
     # ── Internal helpers ──────────────────────────────────────────────
 
     def _set_status(self, experiment_id: str, status: str) -> None:
+        from api.models.memory_experiment import MemoryExperiment
+
         with self._db() as db:
-            db.execute(
-                text(
-                    "UPDATE mem_experiments SET status = :st "
-                    "WHERE experiment_id = :eid"
-                ),
-                {"eid": experiment_id, "st": status},
-            )
+            db.query(MemoryExperiment).filter_by(
+                experiment_id=experiment_id,
+            ).update({"status": status})
             db.commit()
 
     def _count_active(self, user_id: str) -> int:
+        from api.models.memory_experiment import MemoryExperiment
+
         with self._db() as db:
-            row = db.execute(
-                text(
-                    "SELECT COUNT(*) AS cnt FROM mem_experiments "
-                    "WHERE user_id = :uid AND status = 'active'"
-                ),
-                {"uid": user_id},
-            ).fetchone()
-            return row.cnt if row else 0  # type: ignore[union-attr]
+            return (
+                db.query(sa_func.count())
+                .select_from(MemoryExperiment)
+                .filter_by(user_id=user_id, status="active")
+                .scalar()
+            ) or 0
 
     def _create_snapshot(self, name: str) -> bool:
         """Create account-level snapshot. Returns True on success."""
@@ -574,8 +579,21 @@ class MemoryExperimentManager(DbConsumer):
         except Exception:
             logger.warning("Failed to drop branch DB %s", branch_db, exc_info=True)
 
-    def _make_branch_db_factory(self, branch_db: str) -> DbFactory:
-        """Create a db_factory that connects to the branch database."""
+    def _drop_snapshot(self, name: str) -> None:
+        """Drop a snapshot. Best-effort."""
+        try:
+            from core.git_for_data import GitForData
+
+            git = GitForData(self._db_factory)
+            git.drop_snapshot(name)
+        except Exception:
+            logger.debug("Failed to drop snapshot %s", name, exc_info=True)
+
+    def _make_branch_db_factory(self, branch_db: str, experiment_id: str) -> DbFactory:
+        """Create a db_factory that connects to the branch database.
+
+        The engine is tracked and can be disposed via dispose_engines().
+        """
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
 
@@ -588,8 +606,23 @@ class MemoryExperimentManager(DbConsumer):
             "?charset=utf8mb4"
         )
         eng = create_engine(url, pool_pre_ping=True, pool_size=2)
+        self._branch_engines[experiment_id] = eng
         factory = sessionmaker(bind=eng)
         return factory  # type: ignore[return-value]
+
+    def dispose_engines(self) -> None:
+        """Dispose all branch database engines to release connections."""
+        for eng in self._branch_engines.values():
+            with contextlib.suppress(Exception):
+                eng.dispose()
+        self._branch_engines.clear()
+
+    def _dispose_engine(self, experiment_id: str) -> None:
+        """Dispose a single branch engine if tracked."""
+        eng = self._branch_engines.pop(experiment_id, None)
+        if eng is not None:
+            with contextlib.suppress(Exception):
+                eng.dispose()
 
     def _check_production_unchanged(self, info: ExperimentInfo) -> None:
         """Optimistic lock: verify production hasn't changed since branch point.
@@ -598,12 +631,12 @@ class MemoryExperimentManager(DbConsumer):
         mem_memories for this user. If production has newer writes,
         the experiment's assumptions may be stale.
         """
+        from api.models.memory import MemoryRecord
         from core.git_for_data import GitForData
 
         git = GitForData(self._db_factory)
         snap_info = git.get_snapshot_info(info.base_snapshot)  # type: ignore[arg-type]
         if snap_info is None:
-            # Snapshot gone — can't verify, allow commit with warning
             logger.warning(
                 "Base snapshot %s not found, skipping optimistic lock",
                 info.base_snapshot,
@@ -614,18 +647,19 @@ class MemoryExperimentManager(DbConsumer):
         if snap_ts is None:
             return
 
-        # Check if production mem_memories has rows updated after snapshot
         with self._db() as db:
-            row = db.execute(
-                text(
-                    "SELECT COUNT(*) AS cnt FROM mem_memories "
-                    "WHERE user_id = :uid AND updated_at > :snap_ts"
-                ),
-                {"uid": info.user_id, "snap_ts": snap_ts},
-            ).fetchone()
-            if row and row.cnt > 0:  # type: ignore[union-attr]
+            cnt = (
+                db.query(sa_func.count())
+                .select_from(MemoryRecord)
+                .filter(
+                    MemoryRecord.user_id == info.user_id,
+                    MemoryRecord.updated_at > snap_ts,
+                )
+                .scalar()
+            ) or 0
+            if cnt > 0:
                 raise ExperimentConflictError(
-                    f"Production has {row.cnt} memory changes since branch point "  # type: ignore[union-attr]
+                    f"Production has {cnt} memory changes since branch point "
                     f"({snap_ts}). Re-evaluate or discard the experiment."
                 )
 
@@ -639,31 +673,22 @@ class MemoryExperimentManager(DbConsumer):
         If session_ids provided, use those. Otherwise auto-select
         high-quality sessions via the same criteria as RegressionGate.
         """
-        from datetime import datetime as dt
-        from datetime import timedelta, timezone
-
-        from sqlalchemy import func as sa_func
-
         from api.models.agent import Event
 
         if session_ids:
             with self._db() as db:
-                rows = db.execute(
-                    text(
-                        "SELECT DISTINCT session_id, user_id "
-                        "FROM conversation_events "
-                        "WHERE session_id IN :sids"
-                    ),
-                    {"sids": tuple(session_ids)},
-                ).fetchall()
+                rows = (
+                    db.query(Event.session_id, Event.user_id)
+                    .filter(Event.session_id.in_(session_ids))
+                    .distinct()
+                    .all()
+                )
                 return [
-                    {"session_id": r._mapping["session_id"],
-                     "user_id": r._mapping["user_id"],
+                    {"session_id": r.session_id, "user_id": r.user_id,
                      "avg_score": 0.0}
                     for r in rows
                 ]
 
-        # Auto-select golden sessions (same criteria as RegressionGate)
         cutoff = dt.now(timezone.utc) - timedelta(days=30)
         with self._db() as db:
             rows = (
@@ -696,42 +721,41 @@ class MemoryExperimentManager(DbConsumer):
     ) -> list[dict[str, Any]]:
         """Replay sessions against experiment branch.
 
-        Creates a temporary sandbox pointing to the experiment's branch DB,
-        then uses ReplayService to replay each session.
+        Uses ReplayService to replay each session in the experiment's
+        branch database context.
+
+        Raises:
+            ImportError: If ReplayService is not available.
         """
+        from api.services.replay_service import ReplayService
+
         results: list[dict[str, Any]] = []
-
-        try:
-            from api.services.replay_service import ReplayService
-
-            for session in sessions:
-                try:
-                    with self._db() as db:
-                        replay_svc = ReplayService(lambda db=db: db)
-                        result = replay_svc.replay_session(
-                            session_id=session["session_id"],
-                            user_id=session["user_id"],
-                            sandbox_name=info.branch_db,
-                            mock_mode=True,
-                        )
-                        results.append({
-                            "session_id": session["session_id"],
-                            "original_score": session.get("avg_score", 0.0),
-                            "replay_status": result.get("status", "unknown"),
-                            "successful": result.get("result", {}).get("successful", 0),
-                            "failed": result.get("result", {}).get("failed", 0),
-                        })
-                except Exception as e:
+        for session in sessions:
+            try:
+                with self._db() as db:
+                    replay_svc = ReplayService(lambda db=db: db)
+                    result = replay_svc.replay_session(
+                        session_id=session["session_id"],
+                        user_id=session["user_id"],
+                        sandbox_name=info.branch_db,
+                        mock_mode=True,
+                    )
                     results.append({
                         "session_id": session["session_id"],
                         "original_score": session.get("avg_score", 0.0),
-                        "replay_status": "error",
-                        "error": str(e),
-                        "successful": 0,
-                        "failed": 1,
+                        "replay_status": result.get("status", "unknown"),
+                        "successful": result.get("result", {}).get("successful", 0),
+                        "failed": result.get("result", {}).get("failed", 0),
                     })
-        except ImportError:
-            logger.warning("ReplayService not available, skipping replay")
+            except Exception as e:
+                results.append({
+                    "session_id": session["session_id"],
+                    "original_score": session.get("avg_score", 0.0),
+                    "replay_status": "error",
+                    "error": str(e),
+                    "successful": 0,
+                    "failed": 1,
+                })
 
         return results
 
@@ -752,32 +776,3 @@ class MemoryExperimentManager(DbConsumer):
             "pass_rate": passed / total if total else 0.0,
             "error_rate": failed / total if total else 0.0,
         }
-
-    @staticmethod
-    def _row_to_info(row: Any) -> ExperimentInfo:
-        """Convert a DB row to ExperimentInfo."""
-        import json
-
-        m = row._mapping
-        params = m.get("params_json")
-        if isinstance(params, str):
-            params = json.loads(params)
-        metrics = m.get("metrics_json")
-        if isinstance(metrics, str):
-            metrics = json.loads(metrics)
-
-        return ExperimentInfo(
-            experiment_id=m["experiment_id"],
-            user_id=m["user_id"],
-            name=m["name"],
-            status=m["status"],
-            branch_db=m["branch_db"],
-            base_snapshot=m.get("base_snapshot"),
-            description=m.get("description", ""),
-            strategy_key=m.get("strategy_key"),
-            params_json=params,
-            metrics_json=metrics,
-            created_at=m.get("created_at"),
-            committed_at=m.get("committed_at"),
-            expires_at=m.get("expires_at"),
-        )
