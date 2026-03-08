@@ -180,6 +180,7 @@ def create_memory_service(
         storage=storage,
         retrieval=retrieval,
         index_manager=index_manager,
+        db_factory=db_factory,
     )
 
 

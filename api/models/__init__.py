@@ -17,6 +17,7 @@ from api.models.agent import (  # noqa: F401
 # memory
 from api.models.memory import MemoryRecord  # noqa: F401
 from api.models.memory_config import MemoryUserConfig  # noqa: F401
+from api.models.memory_edit_log import MemoryEditLog  # noqa: F401
 from api.models.graph import GraphEdge, GraphNode  # noqa: F401
 
 # skills

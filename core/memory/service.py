@@ -11,7 +11,9 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from core.db_consumer import DbFactory
     from core.memory.canonical_storage import CanonicalStorage
+    from core.memory.editor import MemoryEditor
     from core.memory.interfaces import GovernanceReport, HealthReport, ReflectionCandidate
     from core.memory.strategy.protocol import IndexManager, RetrievalStrategy
     from core.memory.types import Memory, MemoryType, RetrievalWeights
@@ -33,15 +35,29 @@ class MemoryService:
         storage: CanonicalStorage,
         retrieval: RetrievalStrategy,
         index_manager: IndexManager | None = None,
+        db_factory: DbFactory | None = None,
     ) -> None:
         self._storage = storage
         self._retrieval = retrieval
         self._index_manager = index_manager
+        self._db_factory = db_factory
+        self._editor: MemoryEditor | None = None
 
     @property
     def storage(self) -> CanonicalStorage:
         """Access canonical storage directly (for advanced use)."""
         return self._storage
+
+    @property
+    def editor(self) -> MemoryEditor:
+        """Lazy-initialized MemoryEditor for inject/correct/purge."""
+        if self._editor is None:
+            from core.memory.editor import MemoryEditor as _Editor
+
+            if self._db_factory is None:
+                raise RuntimeError("MemoryService needs db_factory for editor operations")
+            self._editor = _Editor(self._storage, self._db_factory, self._index_manager)
+        return self._editor
 
     @property
     def strategy_key(self) -> str:
