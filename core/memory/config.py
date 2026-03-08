@@ -2,7 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass, field, fields
+
+
+def _env_float(key: str, default: float) -> float:
+    v = os.environ.get(key)
+    return float(v) if v is not None else default
+
+
+def _env_int(key: str, default: int) -> int:
+    v = os.environ.get(key)
+    return int(v) if v is not None else default
 
 
 @dataclass
@@ -10,7 +21,8 @@ class MemoryGovernanceConfig:
     """Configurable parameters for memory governance.
 
     All timing, threshold, and decay parameters in one place.
-    Can be loaded from DB/env at startup for dynamic adjustment.
+    Loads overrides from environment variables at construction time.
+    Env var name: ``MEM_`` + uppercase field name, e.g. ``MEM_HALF_LIFE_T1_DAYS=400``.
     """
 
     pitr_range_value: int = 14
@@ -27,7 +39,7 @@ class MemoryGovernanceConfig:
     working_memory_stale_hours: int = 2
 
     # ── Confidence decay (per trust tier) ──
-    half_life_t1_days: float = 365.0
+    half_life_t1_days: float = 365.0  # matches TrustTier.T1_VERIFIED.default_half_life_days
     half_life_t2_days: float = 180.0
     half_life_t3_days: float = 60.0
     half_life_t4_days: float = 30.0
@@ -77,6 +89,26 @@ class MemoryGovernanceConfig:
             "T4": self.half_life_t4_days,
         }
 
+    @classmethod
+    def from_env(cls) -> MemoryGovernanceConfig:
+        """Create config with overrides from ``MEM_*`` environment variables."""
+        overrides: dict[str, object] = {}
+        for f in fields(cls):
+            env_key = f"MEM_{f.name.upper()}"
+            val = os.environ.get(env_key)
+            if val is None:
+                continue
+            if f.type == "float":
+                overrides[f.name] = float(val)
+            elif f.type == "int":
+                overrides[f.name] = int(val)
+            elif f.type == "bool":
+                overrides[f.name] = val.lower() in ("1", "true", "yes")
+            elif f.type == "str":
+                overrides[f.name] = val
+            # skip complex types (tuple, etc.) — not env-friendly
+        return cls(**overrides)
 
-# Default config instance
-DEFAULT_CONFIG = MemoryGovernanceConfig()
+
+# Default config instance — picks up MEM_* env overrides automatically
+DEFAULT_CONFIG = MemoryGovernanceConfig.from_env()

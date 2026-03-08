@@ -73,7 +73,7 @@ class TabularMemoryService:
     def _retriever_lazy(self) -> Any:
         if self._retriever is None:
             from core.memory.tabular.retriever import MemoryRetriever
-            self._retriever = MemoryRetriever(self._db_factory, metrics=self._metrics)
+            self._retriever = MemoryRetriever(self._db_factory, metrics=self._metrics, config=self._config)
         return self._retriever
 
     @property

@@ -28,14 +28,19 @@ class TrustTier(str, enum.Enum):
     T3_INFERRED = "T3"
     T4_UNVERIFIED = "T4"
 
+    @property
+    def default_half_life_days(self) -> float:
+        """Built-in default half-life per tier (days)."""
+        return _TIER_HALF_LIFE[self]
 
-# Half-life in days per trust tier
-TRUST_TIER_HALF_LIVES: dict[TrustTier, float] = {
+
+_TIER_HALF_LIFE: dict["TrustTier", float] = {
     TrustTier.T1_VERIFIED: 365.0,
     TrustTier.T2_CURATED: 180.0,
     TrustTier.T3_INFERRED: 60.0,
     TrustTier.T4_UNVERIFIED: 30.0,
 }
+
 
 # Initial confidence per trust tier (from architecture §1)
 TRUST_TIER_INITIAL_CONFIDENCE: dict[TrustTier, float] = {
@@ -54,7 +59,7 @@ def trust_tier_defaults(tier: str) -> dict[str, float]:
         t = TrustTier.T3_INFERRED
     return {
         "initial_confidence": TRUST_TIER_INITIAL_CONFIDENCE[t],
-        "half_life_days": TRUST_TIER_HALF_LIVES[t],
+        "half_life_days": t.default_half_life_days,
     }
 
 
@@ -82,7 +87,7 @@ class Memory:
         if self.observed_at is None:
             return self.initial_confidence
         if half_life_days is None:
-            half_life_days = TRUST_TIER_HALF_LIVES.get(self.trust_tier, 60.0)
+            half_life_days = self.trust_tier.default_half_life_days
         now = _utcnow()
         observed = self.observed_at
         # Handle naive datetime from DB (assume UTC)

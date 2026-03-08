@@ -5,7 +5,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from core.memory.types import Memory, MemoryType, TrustTier, TRUST_TIER_HALF_LIVES
+from core.memory.types import Memory, MemoryType, TrustTier
+from core.memory.config import DEFAULT_CONFIG
 
 
 class TestTrustTierEnum:
@@ -16,8 +17,8 @@ class TestTrustTierEnum:
         assert TrustTier.T4_UNVERIFIED.value == "T4"
 
     def test_half_lives(self):
-        assert TRUST_TIER_HALF_LIVES[TrustTier.T1_VERIFIED] == 365.0
-        assert TRUST_TIER_HALF_LIVES[TrustTier.T4_UNVERIFIED] == 30.0
+        assert DEFAULT_CONFIG.half_lives["T1"] == 365.0
+        assert DEFAULT_CONFIG.half_lives["T4"] == 30.0
 
     def test_from_string(self):
         assert TrustTier("T1") == TrustTier.T1_VERIFIED

@@ -22,7 +22,6 @@ from core.memory.interfaces import (
     ReflectionCandidate,
 )
 from core.memory.types import (
-    TRUST_TIER_HALF_LIVES,
     TRUST_TIER_INITIAL_CONFIDENCE,
     Memory,
     MemoryType,
@@ -49,7 +48,6 @@ __all__ = [
     "MemoryType",
     "RetrievalWeights",
     "TrustTier",
-    "TRUST_TIER_HALF_LIVES",
     "TRUST_TIER_INITIAL_CONFIDENCE",
     "trust_tier_defaults",
 ]

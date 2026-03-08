@@ -26,7 +26,7 @@ from sqlalchemy.sql import func
 from core.db_consumer import DbConsumer, DbFactory
 from core.memory.tabular.explain import CandidateScore, RetrievalStats
 from core.memory.tabular.metrics import MemoryMetrics, Timer
-from core.memory.types import TRUST_TIER_HALF_LIVES, Memory, MemoryType, RetrievalWeights, TrustTier
+from core.memory.types import Memory, MemoryType, RetrievalWeights, TrustTier
 
 logger = logging.getLogger(__name__)
 
@@ -90,11 +90,16 @@ class MemoryRetriever(DbConsumer):
         decay_hours: float = 720.0,
         half_life_days: float = 30.0,
         metrics: Optional[MemoryMetrics] = None,
+        config: Optional["MemoryGovernanceConfig"] = None,
     ):
         super().__init__(db_factory)
         self.decay_hours = decay_hours
         self.half_life_days = half_life_days
         self._metrics = metrics or MemoryMetrics()
+        if config is None:
+            from core.memory.config import DEFAULT_CONFIG
+            config = DEFAULT_CONFIG
+        self._config = config
 
     def retrieve(
         self,
@@ -290,7 +295,7 @@ class MemoryRetriever(DbConsumer):
             age_hours = (now_ts - c.observed_at.timestamp()) / 3600.0
             time_score = _safe_exp(-age_hours / self.decay_hours)
             age_days = age_hours / 24.0
-            tier_half_life = TRUST_TIER_HALF_LIVES.get(TrustTier(c.trust_tier), self.half_life_days)
+            tier_half_life = self._config.half_lives.get(c.trust_tier, self.half_life_days)
             conf_score = c.initial_confidence * _safe_exp(-age_days / tier_half_life)
         else:
             time_score, conf_score = 0.0, c.initial_confidence
