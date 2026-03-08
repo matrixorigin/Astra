@@ -22,6 +22,8 @@ class MemoryRecord(Base):
         Index("idx_memory_user_active", "user_id", "is_active"),
         Index("idx_memory_user_session", "user_id", "session_id"),
         Index("idx_memory_observed_at", "observed_at"),
+        Index("idx_memory_superseded_by", "superseded_by"),
+        Index("idx_memory_user_active_type_observed", "user_id", "is_active", "memory_type", "observed_at"),
     )
 
     memory_id = Column(String(64), primary_key=True)

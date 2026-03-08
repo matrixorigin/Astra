@@ -14,26 +14,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from core.memory.config import MemoryGovernanceConfig
     from core.memory.types import Memory
 
 logger = logging.getLogger(__name__)
-
-# Confidence deltas
-SUPPORTING_DELTA = 0.05
-CONTRADICTING_DELTA = -0.10
-CONFIDENCE_CAP = 0.95
-
-# Similarity thresholds for evidence alignment
-SUPPORTING_THRESHOLD = 0.8
-CONTRADICTING_THRESHOLD = 0.3
-
-# Trust tier promotion thresholds
-T4_TO_T3_CONFIDENCE = 0.8
-T4_TO_T3_MIN_AGE_DAYS = 7
-T3_TO_T2_CONFIDENCE = 0.9  # requires human confirmation
-
-# Quarantine threshold
-QUARANTINE_THRESHOLD = 0.2
 
 
 @dataclass
@@ -51,6 +35,17 @@ class OpinionUpdate:
 class OpinionEvolver:
     """Evolve confidence of reflection-produced memories based on new evidence."""
 
+    def __init__(self, config: MemoryGovernanceConfig | None = None) -> None:
+        from core.memory.config import DEFAULT_CONFIG
+        c = config or DEFAULT_CONFIG
+        self._supporting_delta = c.opinion_supporting_delta
+        self._contradicting_delta = c.opinion_contradicting_delta
+        self._confidence_cap = c.opinion_confidence_cap
+        self._supporting_threshold = c.opinion_supporting_threshold
+        self._contradicting_threshold = c.opinion_contradicting_threshold
+        self._quarantine_threshold = c.opinion_quarantine_threshold
+        self._t4_to_t3_confidence = c.opinion_t4_to_t3_confidence
+
     def evaluate_evidence(
         self,
         similarity: float,
@@ -67,12 +62,12 @@ class OpinionEvolver:
         """
         old_conf = scene.initial_confidence
 
-        if similarity >= SUPPORTING_THRESHOLD:
+        if similarity >= self._supporting_threshold:
             evidence_type = "supporting"
-            new_conf = min(old_conf + SUPPORTING_DELTA, CONFIDENCE_CAP)
-        elif similarity <= CONTRADICTING_THRESHOLD:
+            new_conf = min(old_conf + self._supporting_delta, self._confidence_cap)
+        elif similarity <= self._contradicting_threshold:
             evidence_type = "contradicting"
-            new_conf = max(old_conf + CONTRADICTING_DELTA, 0.0)
+            new_conf = max(old_conf + self._contradicting_delta, 0.0)
         else:
             return OpinionUpdate(
                 memory_id=scene.memory_id,
@@ -81,10 +76,10 @@ class OpinionEvolver:
                 evidence_type="neutral",
             )
 
-        quarantined = new_conf < QUARANTINE_THRESHOLD
+        quarantined = new_conf < self._quarantine_threshold
         promoted = (
             not quarantined
-            and new_conf >= T4_TO_T3_CONFIDENCE
+            and new_conf >= self._t4_to_t3_confidence
             and scene.trust_tier.value == "T4"
         )
 

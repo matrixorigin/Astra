@@ -116,6 +116,7 @@ class GovernanceReport:
     archived_working: int = 0
     cleaned_stale: int = 0
     quarantined: int = 0
+    scenes_created: int = 0
     cleaned_branches: int = 0
     cleaned_snapshots: int = 0
     pollution_detected: bool = False

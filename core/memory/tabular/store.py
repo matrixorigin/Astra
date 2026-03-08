@@ -99,6 +99,21 @@ class MemoryStore(DbConsumer):
                 row.content = content
                 db.commit()
 
+    def update_confidence(
+        self, memory_id: str, confidence: float,
+        trust_tier: str | None = None, is_active: bool | None = None,
+    ) -> None:
+        """Update confidence (and optionally tier/active) for opinion evolution."""
+        with self._db() as db:
+            row = db.query(MemoryRecord).filter_by(memory_id=memory_id).first()
+            if row:
+                row.initial_confidence = confidence
+                if trust_tier is not None:
+                    row.trust_tier = trust_tier
+                if is_active is not None:
+                    row.is_active = int(is_active)
+                db.commit()
+
     def list_active(
         self,
         user_id: str,

@@ -73,7 +73,7 @@ class TypedObserver:
 
         results = []
         for m in candidates:
-            mem, c_stats = self._store_with_contradiction_check(m, explain)
+            mem, c_stats = self.persist_with_contradiction_check(m, explain)
             results.append(mem)
             if stats and c_stats:
                 if c_stats.found:
@@ -131,8 +131,10 @@ class TypedObserver:
         return results
 
     def persist_with_contradiction_check(self, mem: Memory, explain: bool = False) -> tuple[Memory, Optional[ContradictionStats]]:
-        """Persist a single memory with contradiction detection. Public API for pipeline."""
-        return self._store_with_contradiction_check(mem, explain)
+        """Persist a single memory with contradiction detection + opinion evolution. Public API for pipeline."""
+        stored, stats = self._store_with_contradiction_check(mem, explain)
+        self._evolve_scene_opinions(stored)
+        return stored, stats
 
     def observe_explicit(
         self,
@@ -174,7 +176,7 @@ class TypedObserver:
             except Exception as e:
                 logger.warning("Embedding failed: %s", e)
 
-        return self._store_with_contradiction_check(mem, explain)
+        return self.persist_with_contradiction_check(mem, explain)
 
     # Only send the most recent messages to the extraction LLM.
     # Older context is already captured in prior memory entries.
@@ -299,3 +301,76 @@ class TypedObserver:
                 initial_confidence=row.initial_confidence,
             ), stats
         return None, stats
+
+    def _evolve_scene_opinions(self, new_mem: Memory) -> None:
+        """Find scene memories similar to new_mem and evolve their confidence.
+
+        Scene memories are reflection-produced (T4, session_id=None).
+        Uses DB-side cosine_similarity to find nearby scenes, then OpinionEvolver
+        to compute confidence delta. Lightweight: 1 DB query, no LLM.
+        """
+        if new_mem.embedding is None or self._db_factory is None:
+            return
+
+        from core.memory.reflection.opinion import OpinionEvolver
+
+        from api.models.memory import MemoryRecord
+        from core.memory.types import TrustTier
+
+        db = self._db_factory()
+        try:
+            # Use raw SQL with cosine_similarity for accurate similarity
+            from sqlalchemy import text as sa_text
+            emb_str = "[" + ",".join(str(v) for v in new_mem.embedding) + "]"
+            rows = db.execute(sa_text("""
+                SELECT memory_id, content, initial_confidence, trust_tier,
+                       cosine_similarity(embedding, :emb) AS cos_sim
+                FROM mem_memories
+                WHERE user_id = :uid AND is_active = 1
+                  AND session_id IS NULL
+                  AND embedding IS NOT NULL
+                  AND memory_id != :mid
+                ORDER BY cos_sim DESC
+                LIMIT 5
+            """), {"uid": new_mem.user_id, "emb": emb_str, "mid": new_mem.memory_id}).fetchall()
+
+            if not rows:
+                return
+
+            evolver = OpinionEvolver()
+            for row in rows:
+                similarity = float(row.cos_sim)
+
+                scene = Memory(
+                    memory_id=row.memory_id,
+                    user_id=new_mem.user_id,
+                    memory_type=new_mem.memory_type,
+                    content=row.content,
+                    initial_confidence=row.initial_confidence,
+                    trust_tier=TrustTier(row.trust_tier) if row.trust_tier else TrustTier.T4_UNVERIFIED,
+                )
+
+                update = evolver.evaluate_evidence(similarity, scene)
+                if update.evidence_type == "neutral":
+                    continue
+
+                new_tier = None
+                if update.promoted:
+                    new_tier = "T3"
+                is_active = None if not update.quarantined else False
+
+                self.store.update_confidence(
+                    update.memory_id, update.new_confidence,
+                    trust_tier=new_tier, is_active=is_active,
+                )
+                logger.info(
+                    "Opinion evolved: %s %s %.2f→%.2f%s%s",
+                    row.memory_id[:8], update.evidence_type,
+                    update.old_confidence, update.new_confidence,
+                    " PROMOTED" if update.promoted else "",
+                    " QUARANTINED" if update.quarantined else "",
+                )
+        except Exception as e:
+            logger.warning("Opinion evolution failed: %s", e)
+        finally:
+            db.close()

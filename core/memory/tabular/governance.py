@@ -24,7 +24,7 @@ from core.memory.config import DEFAULT_CONFIG, MemoryGovernanceConfig
 from core.memory.tabular.health import MemoryHealth
 from core.memory.tabular.metrics import MemoryMetrics
 from core.memory.tabular.store import MemoryStore
-from core.memory.types import TRUST_TIER_HALF_LIVES, TrustTier, _utcnow
+from core.memory.types import TrustTier, _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,7 @@ class GovernanceCycleResult:
     # Daily
     cleaned_stale: int = 0
     quarantined: int = 0
+    scenes_created: int = 0
     # Weekly
     cleaned_branches: int = 0
     cleaned_snapshots: int = 0
@@ -58,10 +59,14 @@ class GovernanceScheduler(DbConsumer):
         db_factory: DbFactory,
         config: Optional[MemoryGovernanceConfig] = None,
         metrics: Optional[MemoryMetrics] = None,
+        llm_client: Any = None,
+        embed_fn: Any = None,
     ):
         super().__init__(db_factory)
         self.config = config or DEFAULT_CONFIG
         self._metrics = metrics or MemoryMetrics()
+        self._llm_client = llm_client
+        self._embed_fn = embed_fn
         self.store = MemoryStore(db_factory, metrics=self._metrics)
         self.health = MemoryHealth(
             db_factory,
@@ -83,6 +88,7 @@ class GovernanceScheduler(DbConsumer):
         d = self.run_daily(user_id)
         result.cleaned_stale = d.cleaned_stale
         result.quarantined = d.quarantined
+        result.scenes_created = d.scenes_created
         result.pollution_detected = d.pollution_detected
         result.errors.extend(d.errors)
 
@@ -114,26 +120,64 @@ class GovernanceScheduler(DbConsumer):
     # ── Daily ─────────────────────────────────────────────────────────
 
     def run_daily_all(self) -> GovernanceCycleResult:
-        """Daily governance for ALL users. Used by scheduler."""
+        """Daily governance for ALL users (or this worker's shard).
+
+        Sharding: when config.shard_count > 1, each worker processes only
+        users where CRC32(user_id) % shard_count == shard_index.
+        This allows N workers to split the user space with no coordination.
+
+        Creates reflection provider/engine once and reuses across users.
+        """
         combined = GovernanceCycleResult()
-        batch_size = 2000
+
+        # Pre-build reflection engine once (if LLM available)
+        reflection_engine = None
+        if self._llm_client is not None:
+            from core.memory.reflection.engine import ReflectionEngine
+            from core.memory.tabular.candidates import TabularCandidateProvider
+
+            provider = TabularCandidateProvider(self._db_factory, config=self.config)
+            reflection_engine = ReflectionEngine(
+                candidate_provider=provider,
+                writer=self,
+                llm_client=self._llm_client,
+                threshold=self.config.reflection_daily_threshold,
+            )
+
+        batch_size = self.config.daily_batch_size
+        shard_count = self.config.shard_count
+        shard_index = self.config.shard_index
         last_uid = ""
+
         with self._db() as db:
             while True:
-                rows = db.execute(
-                    text(
-                        "SELECT DISTINCT user_id FROM mem_memories "
-                        "WHERE is_active = 1 AND user_id > :last "
-                        "ORDER BY user_id LIMIT :limit"
-                    ),
-                    {"last": last_uid, "limit": batch_size},
-                ).fetchall()
+                if shard_count > 1:
+                    rows = db.execute(
+                        text(
+                            "SELECT DISTINCT user_id FROM mem_memories "
+                            "WHERE is_active = 1 AND user_id > :last "
+                            "AND CRC32(user_id) % :shards = :shard "
+                            "ORDER BY user_id LIMIT :limit"
+                        ),
+                        {"last": last_uid, "limit": batch_size,
+                         "shards": shard_count, "shard": shard_index},
+                    ).fetchall()
+                else:
+                    rows = db.execute(
+                        text(
+                            "SELECT DISTINCT user_id FROM mem_memories "
+                            "WHERE is_active = 1 AND user_id > :last "
+                            "ORDER BY user_id LIMIT :limit"
+                        ),
+                        {"last": last_uid, "limit": batch_size},
+                    ).fetchall()
                 if not rows:
                     break
                 for (uid,) in rows:
-                    r = self.run_daily(uid)
+                    r = self._run_daily_for_user(uid, reflection_engine)
                     combined.cleaned_stale += r.cleaned_stale
                     combined.quarantined += r.quarantined
+                    combined.scenes_created += r.scenes_created
                     combined.errors.extend(r.errors)
                 last_uid = rows[-1][0]
                 if len(rows) < batch_size:
@@ -142,6 +186,25 @@ class GovernanceScheduler(DbConsumer):
 
     def run_daily(self, user_id: str) -> GovernanceCycleResult:
         """Daily: stale cleanup + quarantine low effective_confidence + orphaned incremental summaries."""
+        # Build per-call reflection engine when called standalone
+        reflection_engine = None
+        if self._llm_client is not None:
+            from core.memory.reflection.engine import ReflectionEngine
+            from core.memory.tabular.candidates import TabularCandidateProvider
+
+            provider = TabularCandidateProvider(self._db_factory, config=self.config)
+            reflection_engine = ReflectionEngine(
+                candidate_provider=provider,
+                writer=self,
+                llm_client=self._llm_client,
+                threshold=self.config.reflection_daily_threshold,
+            )
+        return self._run_daily_for_user(user_id, reflection_engine)
+
+    def _run_daily_for_user(
+        self, user_id: str, reflection_engine: Any = None,
+    ) -> GovernanceCycleResult:
+        """Daily governance for a single user. Accepts pre-built reflection engine."""
         result = GovernanceCycleResult()
         try:
             result.cleaned_stale = self._cleanup_stale(user_id)
@@ -164,6 +227,19 @@ class GovernanceScheduler(DbConsumer):
         except Exception as e:
             logger.error("Orphaned incremental cleanup failed: %s", e)
             result.errors.append(f"orphaned_incrementals: {e}")
+        # Reflection: synthesize cross-session patterns
+        if reflection_engine is not None:
+            try:
+                ref_result = reflection_engine.reflect(user_id)
+                result.scenes_created = ref_result.scenes_created
+                if ref_result.scenes_created:
+                    logger.info(
+                        "Reflection created %d scenes for user %s",
+                        ref_result.scenes_created, user_id,
+                    )
+            except Exception as e:
+                logger.error("Reflection failed: %s", e)
+                result.errors.append(f"reflection: {e}")
         return result
 
     # ── Weekly ────────────────────────────────────────────────────────
@@ -237,14 +313,15 @@ class GovernanceScheduler(DbConsumer):
     def _quarantine_low_confidence(self, user_id: str) -> int:
         """Deactivate memories whose effective_confidence is below quarantine threshold.
 
-        Uses per-tier half-life: T1=365d, T2=180d, T3=60d, T4=30d.
-        Memories with no trust_tier default to T3 (60d).
+        Uses per-tier half-life from config.
+        Memories with no trust_tier default to T3.
         """
         threshold = self.config.quarantine_threshold
+        half_lives = self.config.half_lives
         quarantined = 0
         with self._db() as db:
             for tier in TrustTier:
-                hl = TRUST_TIER_HALF_LIVES[tier]
+                hl = half_lives[tier.value]
                 result = db.execute(text("""
                     UPDATE mem_memories SET is_active = 0, updated_at = NOW()
                     WHERE user_id = :uid AND is_active = 1
@@ -291,3 +368,28 @@ class GovernanceScheduler(DbConsumer):
         if count:
             logger.info("Cleaned %d orphaned incremental summaries for user %s", count, user_id)
         return count
+
+    def store_memory(
+        self,
+        user_id: str,
+        content: str,
+        *,
+        memory_type: Any,
+        source_event_ids: list[str] | None = None,
+        initial_confidence: float = 0.75,
+        trust_tier: Any = None,
+        session_id: str | None = None,
+    ) -> Any:
+        """MemoryWriter facade — delegates to MemoryStore.create()."""
+        from core.memory.types import Memory, TrustTier as TT
+        mem = Memory(
+            memory_id="",
+            user_id=user_id,
+            memory_type=memory_type,
+            content=content,
+            initial_confidence=initial_confidence,
+            trust_tier=trust_tier or TT.T4_UNVERIFIED,
+            source_event_ids=source_event_ids or [],
+            session_id=session_id,
+        )
+        return self.store.create(mem)

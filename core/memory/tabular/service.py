@@ -102,6 +102,7 @@ class TabularMemoryService:
             from core.memory.tabular.governance import GovernanceScheduler
             self._governance = GovernanceScheduler(
                 self._db_factory, config=self._config, metrics=self._metrics,
+                llm_client=self._llm_client, embed_fn=self._embed_fn,
             )
         return self._governance
 
@@ -262,6 +263,7 @@ class TabularMemoryService:
             archived_working=result.archived_working,
             cleaned_stale=result.cleaned_stale,
             quarantined=result.quarantined,
+            scenes_created=result.scenes_created,
             cleaned_branches=result.cleaned_branches,
             cleaned_snapshots=result.cleaned_snapshots,
             pollution_detected=result.pollution_detected,

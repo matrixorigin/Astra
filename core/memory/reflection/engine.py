@@ -124,10 +124,14 @@ class ReflectionEngine:
                 insights = self._synthesize(candidate, existing_knowledge)
                 result.llm_calls += 1
 
-                # 4. Persist
+                # 4. Persist all insights from this candidate
                 for insight in insights:
-                    self._persist_insight(user_id, insight)
-                    result.scenes_created += 1
+                    try:
+                        self._persist_insight(user_id, insight)
+                        result.scenes_created += 1
+                    except Exception as e:
+                        logger.warning("Failed to persist insight: %s", e)
+                        result.errors.append(f"persist: {e}")
 
             except Exception as e:
                 logger.warning("Reflection synthesis failed: %s", e)
@@ -196,11 +200,11 @@ class ReflectionEngine:
 
     def _persist_insight(self, user_id: str, insight: SynthesizedInsight) -> None:
         """Persist a synthesized insight as a scene-type memory."""
-        self._writer.store(
+        self._writer.store_memory(
             user_id=user_id,
             content=insight.content,
             memory_type=insight.memory_type,
-            source_event_ids=None,
+            source_event_ids=insight.source_memory_ids,
             initial_confidence=insight.confidence,
             trust_tier=TrustTier.T4_UNVERIFIED,
         )

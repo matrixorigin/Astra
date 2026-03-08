@@ -352,7 +352,7 @@ class TestGovernanceRealExecution:
         """Full governance cycle runs without error."""
         user_id = _uid()
         store = MemoryStore(db_factory)
-        config = MemoryGovernanceConfig(confidence_decay_half_life_days=1.0)
+        config = MemoryGovernanceConfig(half_life_t4_days=1.0)
         scheduler = GovernanceScheduler(db_factory, config)
         
         for i in range(3):

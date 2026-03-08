@@ -766,7 +766,7 @@ class TestGovernanceRealDB:
         store.create(mem)
 
         # Decay is query-time only — DB value unchanged
-        config = MemoryGovernanceConfig(confidence_decay_half_life_days=30.0)
+        config = MemoryGovernanceConfig(half_life_t4_days=30.0)
         stored = store.get(mem.memory_id)
         assert stored.initial_confidence == 0.9
         # Query-time decay: 60 days / 30 half-life = 2 half-lives → ~0.12
