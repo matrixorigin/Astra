@@ -214,19 +214,20 @@ class TestPurge:
     def test_purge_by_type(self, editor, db_factory, user_id):
         editor.inject(user_id, "proc1", memory_type=MemoryType.PROCEDURAL)
         editor.inject(user_id, "proc2", memory_type=MemoryType.PROCEDURAL)
-        editor.inject(user_id, "sem1", memory_type=MemoryType.SEMANTIC)
+        sem = editor.inject(user_id, "sem1", memory_type=MemoryType.SEMANTIC)
 
         result = editor.purge(user_id, memory_types=[MemoryType.PROCEDURAL])
         assert result.deactivated == 2
 
         db = db_factory()
         try:
-            # Semantic still active
+            # Semantic still active — query by memory_id for determinism
             row = db.execute(text(
-                "SELECT COUNT(*) as cnt FROM mem_memories "
-                "WHERE user_id = :uid AND is_active = 1"
-            ), {"uid": user_id}).fetchone()
-            assert row.cnt == 1
+                "SELECT is_active FROM mem_memories "
+                "WHERE memory_id = :mid"
+            ), {"mid": sem.memory_id}).fetchone()
+            assert row is not None
+            assert row.is_active == 1
         finally:
             db.close()
 
@@ -250,7 +251,7 @@ class TestPurge:
         other = _uid()
         try:
             editor.inject(user_id, "my mem", memory_type=MemoryType.SEMANTIC)
-            editor.inject(other, "other mem", memory_type=MemoryType.SEMANTIC)
+            other_mem = editor.inject(other, "other mem", memory_type=MemoryType.SEMANTIC)
 
             editor.purge(user_id, memory_types=[MemoryType.SEMANTIC])
 
@@ -258,9 +259,10 @@ class TestPurge:
             try:
                 row = db.execute(text(
                     "SELECT is_active FROM mem_memories "
-                    "WHERE user_id = :uid AND is_active = 1"
-                ), {"uid": other}).fetchone()
-                assert row is not None  # other user's memory still active
+                    "WHERE memory_id = :mid"
+                ), {"mid": other_mem.memory_id}).fetchone()
+                assert row is not None
+                assert row.is_active == 1
             finally:
                 db.close()
         finally:

@@ -12,6 +12,11 @@ See docs/design/memory/backend-management.md
 
 # ── Public interface ──────────────────────────────────────────────────
 from core.memory.config import DEFAULT_CONFIG, MemoryGovernanceConfig
+from core.memory.experiment import (
+    ExperimentConflictError,
+    ExperimentLimitError,
+    MemoryExperimentManager,
+)
 from core.memory.factory import create_memory_service, set_user_strategy, switch_user_strategy
 from core.memory.interfaces import (
     CandidateProvider,
@@ -36,10 +41,13 @@ __all__ = [
     "DEFAULT_CONFIG",
     "TRUST_TIER_INITIAL_CONFIDENCE",
     "CandidateProvider",
+    "ExperimentConflictError",
+    "ExperimentLimitError",
     "GovernanceReport",
     "HealthReport",
     "Memory",
     "MemoryAdmin",
+    "MemoryExperimentManager",
     "MemoryGovernanceConfig",
     "MemoryReader",
     "MemoryService",
