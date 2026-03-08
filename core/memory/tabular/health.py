@@ -101,8 +101,8 @@ class MemoryHealth(DbConsumer):
         with self._db() as db:
             rows = db.execute(text("""
                 SELECT sname FROM mo_catalog.mo_snapshots
-                WHERE sname LIKE 'mem_milestone_%'
-                ORDER BY create_time DESC
+                WHERE prefix_eq(sname, 'mem_milestone_')
+                ORDER BY ts DESC
             """)).fetchall()
 
         if len(rows) <= keep_last_n:

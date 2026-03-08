@@ -1,9 +1,9 @@
-"""TabularMemoryService — tabular backend for memory operations.
+"""CanonicalStorage — shared storage layer for all retrieval strategies.
 
-Implements MemoryReader, MemoryWriter, and MemoryAdmin protocols using
-flat tables with vector/fulltext hybrid retrieval.
+Extracted from TabularMemoryService: store, observe_turn, profile, governance, health.
+This is the single source of truth for mem_memories.
 
-See docs/design/memory/tabular-memory.md
+See docs/design/memory/backend-management.md §2.1
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from core.memory.interfaces import GovernanceReport, HealthReport
 from core.memory.tabular.metrics import MemoryMetrics
-from core.memory.types import Memory, MemoryType, RetrievalWeights, TrustTier, _utcnow
+from core.memory.types import Memory, MemoryType, TrustTier, _utcnow
 
 if TYPE_CHECKING:
     from core.db_consumer import DbFactory
@@ -23,44 +23,42 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class TabularMemoryService:
-    """Tabular memory backend — flat table + vector/fulltext retrieval.
+class CanonicalStorage:
+    """Canonical storage on mem_memories — shared by all strategies.
 
-    Wraps internal components (MemoryStore, MemoryRetriever, ProfileManager,
-    TypedObserver, GovernanceScheduler, MemoryHealth) behind Protocol interfaces.
+    Handles: store, observe_turn, profile, governance, health, session summary.
+    Does NOT handle retrieval — that's the strategy's job.
     """
 
     def __init__(
         self,
         db_factory: DbFactory,
+        *,
         llm_client: Any = None,
         embed_fn: Any = None,
         config: MemoryGovernanceConfig | None = None,
         metrics: MemoryMetrics | None = None,
-    ):
+    ) -> None:
         self._db_factory = db_factory
         self._llm_client = llm_client
         self._embed_fn = embed_fn
         self._metrics = metrics or MemoryMetrics()
 
-        # Lazy-initialized internal components (use properties below)
-        self._store: Any = None
-        self._retriever: Any = None
-        self._profile_mgr: Any = None
-        self._observer: Any = None
-        self._governance: Any = None
-        self._health: Any = None
-        self._summarizer: Any = None
-
-        # Deferred config import
         if config is None:
             from core.memory.config import DEFAULT_CONFIG
             self._config = DEFAULT_CONFIG
         else:
             self._config = config
 
-    # ── Lazy-initialized component properties ─────────────────────────
-    # Named as nouns (what they are), not verbs (what they do).
+        # Lazy-initialized components
+        self._store: Any = None
+        self._observer: Any = None
+        self._profile_mgr: Any = None
+        self._governance: Any = None
+        self._health: Any = None
+        self._summarizer: Any = None
+
+    # ── Lazy properties ───────────────────────────────────────────────
 
     @property
     def _store_lazy(self) -> Any:
@@ -68,20 +66,6 @@ class TabularMemoryService:
             from core.memory.tabular.store import MemoryStore
             self._store = MemoryStore(self._db_factory, metrics=self._metrics)
         return self._store
-
-    @property
-    def _retriever_lazy(self) -> Any:
-        if self._retriever is None:
-            from core.memory.tabular.retriever import MemoryRetriever
-            self._retriever = MemoryRetriever(self._db_factory, metrics=self._metrics, config=self._config)
-        return self._retriever
-
-    @property
-    def _profile_mgr_lazy(self) -> Any:
-        if self._profile_mgr is None:
-            from core.memory.tabular.profile import ProfileManager
-            self._profile_mgr = ProfileManager(self._store_lazy)
-        return self._profile_mgr
 
     @property
     def _observer_lazy(self) -> Any:
@@ -95,6 +79,13 @@ class TabularMemoryService:
                 metrics=self._metrics,
             )
         return self._observer
+
+    @property
+    def _profile_mgr_lazy(self) -> Any:
+        if self._profile_mgr is None:
+            from core.memory.tabular.profile import ProfileManager
+            self._profile_mgr = ProfileManager(self._store_lazy)
+        return self._profile_mgr
 
     @property
     def _governance_lazy(self) -> Any:
@@ -128,42 +119,7 @@ class TabularMemoryService:
             )
         return self._summarizer
 
-    # ── MemoryReader ──────────────────────────────────────────────────
-
-    def retrieve(
-        self,
-        user_id: str,
-        query: str,
-        *,
-        session_id: str = "",
-        query_embedding: list[float] | None = None,
-        memory_types: list[MemoryType] | None = None,
-        top_k: int = 10,
-        task_hint: str | None = None,
-        weights: RetrievalWeights | None = None,
-        include_cross_session: bool = True,
-        explain: bool = False,
-    ) -> tuple[list[Memory], Any]:
-        """Retrieve memories ranked by hybrid relevance."""
-        return self._retriever_lazy.retrieve(
-            user_id=user_id,
-            query_text=query,
-            session_id=session_id,
-            query_embedding=query_embedding,
-            memory_types=memory_types,
-            limit=top_k,
-            task_hint=task_hint,
-            weights=weights,
-            include_cross_session=include_cross_session,
-            explain=explain,
-        )
-
-    def get_profile(self, user_id: str) -> str | None:
-        """Get synthesized user profile string."""
-        profile = self._profile_mgr_lazy.get_profile(user_id)
-        return profile or None
-
-    # ── MemoryWriter ──────────────────────────────────────────────────
+    # ── Write path ────────────────────────────────────────────────────
 
     def store(
         self,
@@ -210,11 +166,7 @@ class TabularMemoryService:
         *,
         source_event_ids: list[str] | None = None,
     ) -> Any:
-        """Run full typed memory pipeline (extract → sandbox → persist → profile).
-
-        Unlike observe_turn() which only extracts+persists, this runs the
-        complete pipeline including sandbox validation and profile update.
-        """
+        """Run full typed memory pipeline."""
         from core.memory.tabular.typed_pipeline import run_typed_memory_pipeline
 
         return run_typed_memory_pipeline(
@@ -227,9 +179,16 @@ class TabularMemoryService:
             metrics=self._metrics,
         )
 
+    # ── Profile ───────────────────────────────────────────────────────
+
+    def get_profile(self, user_id: str) -> str | None:
+        profile = self._profile_mgr_lazy.get_profile(user_id)
+        return profile or None
+
     def invalidate_profile(self, user_id: str) -> None:
-        """Invalidate cached profile after profile memory changes."""
         self._profile_mgr_lazy.invalidate(user_id)
+
+    # ── Session summary ───────────────────────────────────────────────
 
     def generate_session_summary(
         self,
@@ -237,7 +196,6 @@ class TabularMemoryService:
         session_id: str,
         messages: list[dict[str, Any]],
     ) -> Memory | None:
-        """Generate full session summary on close."""
         return self._summarizer_lazy.generate_full_summary(user_id, session_id, messages)
 
     def check_and_summarize(
@@ -248,15 +206,13 @@ class TabularMemoryService:
         turn_count: int,
         session_start: Any,
     ) -> Memory | None:
-        """Check thresholds and generate incremental summary if needed."""
         return self._summarizer_lazy.check_and_summarize(
             user_id, session_id, messages, turn_count, session_start,
         )
 
-    # ── MemoryAdmin ───────────────────────────────────────────────────
+    # ── Governance ────────────────────────────────────────────────────
 
     def run_governance(self, user_id: str) -> GovernanceReport:
-        """Run all governance cycles for a user."""
         result = self._governance_lazy.run_cycle(user_id)
         return GovernanceReport(
             cleaned_tool_results=result.cleaned_tool_results,
@@ -271,8 +227,36 @@ class TabularMemoryService:
             total_ms=result.total_ms,
         )
 
+    def run_hourly(self) -> GovernanceReport:
+        r = self._governance_lazy.run_hourly()
+        return GovernanceReport(
+            cleaned_tool_results=r.cleaned_tool_results,
+            archived_working=r.archived_working,
+            errors=r.errors,
+            total_ms=r.total_ms,
+        )
+
+    def run_daily_all(self) -> GovernanceReport:
+        r = self._governance_lazy.run_daily_all()
+        return GovernanceReport(
+            cleaned_stale=r.cleaned_stale,
+            quarantined=r.quarantined,
+            errors=r.errors,
+            total_ms=r.total_ms,
+        )
+
+    def run_weekly(self) -> GovernanceReport:
+        r = self._governance_lazy.run_weekly()
+        return GovernanceReport(
+            cleaned_branches=r.cleaned_branches,
+            cleaned_snapshots=r.cleaned_snapshots,
+            errors=r.errors,
+            total_ms=r.total_ms,
+        )
+
+    # ── Health ────────────────────────────────────────────────────────
+
     def health_check(self, user_id: str) -> HealthReport:
-        """Get memory health analytics."""
         storage = self._health_lazy.get_storage_stats(user_id)
         per_type = self._health_lazy.analyze(user_id)
         pollution = self._health_lazy.detect_pollution(
@@ -287,22 +271,16 @@ class TabularMemoryService:
             pollution=pollution,
         )
 
-    # ── Low-level CRUD (for Tool Context Engine) ──────────────────────
+    # ── Low-level CRUD ────────────────────────────────────────────────
 
     def create_memory(self, memory: Memory) -> Memory:
-        """Create a memory record directly (bypasses Observer pipeline).
-
-        Use for TOOL_RESULT and other programmatic writes that don't need
-        LLM extraction or contradiction detection.
-        """
+        """Direct create bypassing Observer pipeline."""
         return self._store_lazy.create(memory)
 
     def get_memory(self, memory_id: str) -> Memory | None:
-        """Get a single memory by ID."""
         return self._store_lazy.get(memory_id)
 
     def update_memory_content(self, memory_id: str, content: str) -> None:
-        """Update content of an existing memory (e.g. streaming accumulation)."""
         self._store_lazy.update_content(memory_id, content)
 
     def list_active(
@@ -312,45 +290,17 @@ class TabularMemoryService:
         limit: int | None = None,
         load_embedding: bool = True,
     ) -> list[Memory]:
-        """List active memories, optionally filtered by type."""
         return self._store_lazy.list_active(
             user_id, memory_type=memory_type, limit=limit,
             load_embedding=load_embedding,
         )
 
-    # ── Governance (scheduler-level) ──────────────────────────────────
+    # ── Reflection candidates ─────────────────────────────────────────
 
-    def run_hourly(self) -> GovernanceReport:
-        """Run hourly governance tasks (tool_result cleanup, working archive)."""
-        r = self._governance_lazy.run_hourly()
-        return GovernanceReport(
-            cleaned_tool_results=r.cleaned_tool_results,
-            archived_working=r.archived_working,
-            errors=r.errors,
-            total_ms=r.total_ms,
+    def get_reflection_candidates(
+        self, user_id: str, *, since_hours: int = 24,
+    ) -> Any:
+        """Get reflection candidates from governance scheduler."""
+        return self._governance_lazy.get_reflection_candidates(
+            user_id, since_hours=since_hours,
         )
-
-    def run_daily_all(self) -> GovernanceReport:
-        """Run daily governance tasks for all users (stale cleanup, quarantine)."""
-        r = self._governance_lazy.run_daily_all()
-        return GovernanceReport(
-            cleaned_stale=r.cleaned_stale,
-            quarantined=r.quarantined,
-            errors=r.errors,
-            total_ms=r.total_ms,
-        )
-
-    def run_weekly(self) -> GovernanceReport:
-        """Run weekly governance tasks (branch/snapshot cleanup)."""
-        r = self._governance_lazy.run_weekly()
-        return GovernanceReport(
-            cleaned_branches=r.cleaned_branches,
-            cleaned_snapshots=r.cleaned_snapshots,
-            errors=r.errors,
-            total_ms=r.total_ms,
-        )
-
-
-# Backward-compat aliases — new code should use core.memory.service.MemoryService
-# or core.memory.create_memory_service() instead.
-MemoryService = TabularMemoryService

@@ -2,11 +2,12 @@
 
 Public Interface (for external consumers):
 - create_memory_service: factory function (preferred)
+- MemoryService: unified facade (canonical storage + pluggable retrieval)
 - MemoryReader, MemoryWriter, MemoryAdmin: Protocol interfaces
 - GovernanceReport, HealthReport: result types
 - Memory, MemoryType, TrustTier, RetrievalWeights: shared types
 
-See docs/design/memory/backend-coexistence.md
+See docs/design/memory/backend-management.md
 """
 
 # ── Public interface ──────────────────────────────────────────────────
@@ -21,6 +22,7 @@ from core.memory.interfaces import (
     MemoryWriter,
     ReflectionCandidate,
 )
+from core.memory.service import MemoryService
 from core.memory.types import (
     TRUST_TIER_INITIAL_CONFIDENCE,
     Memory,
@@ -33,6 +35,7 @@ from core.memory.types import (
 __all__ = [
     # Public API
     "create_memory_service",
+    "MemoryService",
     # Protocols
     "CandidateProvider",
     "MemoryReader",

@@ -83,12 +83,14 @@ class TestFactory:
     def test_tabular_is_default(self):
         from core.memory.factory import create_memory_service
         svc = create_memory_service(lambda: MagicMock(), backend="tabular")
-        assert svc.__class__.__name__ == "TabularMemoryService"
+        assert svc.__class__.__name__ == "MemoryService"
+        assert svc.strategy_key == "vector:v1"
 
     def test_graph_backend(self):
         from core.memory.factory import create_memory_service
         svc = create_memory_service(lambda: MagicMock(), backend="graph")
-        assert svc.__class__.__name__ == "GraphMemoryService"
+        assert svc.__class__.__name__ == "MemoryService"
+        assert svc.strategy_key == "activation:v1"
 
 
 class TestGraphBuilder:

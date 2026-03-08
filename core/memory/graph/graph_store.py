@@ -446,3 +446,15 @@ class GraphStore(DbConsumer):
                 .first()
             )
             return _to_domain(row) if row else None
+
+    def delete_user_data(self, user_id: str) -> None:
+        """Remove all graph nodes and edges for a user."""
+        with self._db() as db:
+            from sqlalchemy import text as sa_text
+            db.execute(sa_text(
+                "DELETE FROM memory_graph_edges WHERE user_id = :uid"
+            ), {"uid": user_id})
+            db.execute(sa_text(
+                "DELETE FROM memory_graph_nodes WHERE user_id = :uid"
+            ), {"uid": user_id})
+            db.commit()
