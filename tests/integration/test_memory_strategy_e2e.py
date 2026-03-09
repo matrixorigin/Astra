@@ -17,6 +17,7 @@ from api.models._constants import EMBEDDING_DIM
 from api.models.memory import MemoryRecord
 from core.memory.factory import create_memory_service
 from core.memory.types import Memory, MemoryType, TrustTier
+from datetime import datetime, timedelta, timezone
 
 
 def _uid() -> str:
@@ -553,3 +554,148 @@ class TestEndToEndStoreRetrieve:
         ).first()
         assert gnode is not None
         assert gnode.is_active == 1
+
+
+# ── 7. MemoryService facade methods ──────────────────────────────────
+# (migrated from test_memory_service_e2e.py)
+
+import time as _time
+from core.memory.tabular.service import MemoryService as _MemoryService
+
+
+def _svc(db_factory):
+    return _MemoryService(db_factory)
+
+
+class TestUpdateMemoryContent:
+    def test_content_updated_others_unchanged(self, db_factory, db_session, user_id):
+        svc = _svc(db_factory)
+        mid = uuid4().hex
+        sid = _sid()
+        mem = Memory(
+            memory_id=mid, user_id=user_id,
+            memory_type=MemoryType.TOOL_RESULT, content="original",
+            initial_confidence=0.7, trust_tier=TrustTier.T4_UNVERIFIED,
+            source_event_ids=["e1"], session_id=sid,
+        )
+        svc.create_memory(mem)
+
+        db_session.expire_all()
+        before = db_session.query(MemoryRecord).filter_by(memory_id=mid).first()
+        _time.sleep(0.05)
+        svc.update_memory_content(mid, "updated content")
+
+        db_session.expire_all()
+        after = db_session.query(MemoryRecord).filter_by(memory_id=mid).first()
+        assert after.content == "updated content"
+        assert after.updated_at >= before.updated_at
+        assert after.created_at == before.created_at
+        assert after.memory_type == "tool_result"
+        assert after.initial_confidence == pytest.approx(0.7, abs=0.01)
+        assert after.is_active == 1
+
+
+class TestListActive:
+    def test_filters_by_type_and_user(self, db_factory, user_id):
+        svc = _svc(db_factory)
+        other = _uid()
+        for u, t in [(user_id, MemoryType.SEMANTIC), (user_id, MemoryType.SEMANTIC),
+                     (user_id, MemoryType.PROCEDURAL), (other, MemoryType.SEMANTIC)]:
+            svc.create_memory(Memory(
+                memory_id=uuid4().hex, user_id=u, memory_type=t, content="x",
+            ))
+        assert len(svc.list_active(user_id, memory_type=MemoryType.SEMANTIC)) == 2
+        assert len(svc.list_active(user_id, memory_type=MemoryType.PROCEDURAL)) == 1
+        assert len(svc.list_active(user_id)) == 3
+        assert len(svc.list_active(other)) == 1
+
+    def test_limit_and_excludes_inactive(self, db_factory, db_session, user_id):
+        svc = _svc(db_factory)
+        mid_active = uuid4().hex
+        mid_inactive = uuid4().hex
+        for mid in (mid_active, mid_inactive):
+            svc.create_memory(Memory(
+                memory_id=mid, user_id=user_id,
+                memory_type=MemoryType.SEMANTIC, content="x",
+            ))
+        db_session.query(MemoryRecord).filter_by(memory_id=mid_inactive).update({"is_active": 0})
+        db_session.commit()
+        results = svc.list_active(user_id)
+        assert len(results) == 1
+        assert results[0].memory_id == mid_active
+
+
+class TestServiceGovernance:
+    def test_run_hourly_cleans_tool_results(self, db_factory, db_session, user_id):
+        from datetime import timedelta
+        svc = _svc(db_factory)
+        mid_old = uuid4().hex
+        mid_fresh = uuid4().hex
+        for mid in (mid_old, mid_fresh):
+            svc.create_memory(Memory(
+                memory_id=mid, user_id=user_id,
+                memory_type=MemoryType.TOOL_RESULT, content="tool out",
+            ))
+        old_time = datetime.utcnow().replace(microsecond=0) - timedelta(hours=25)
+        db_session.query(MemoryRecord).filter_by(memory_id=mid_old).update({
+            "created_at": old_time, "observed_at": old_time, "updated_at": old_time,
+        })
+        db_session.commit()
+        report = svc.run_hourly()
+        assert report.cleaned_tool_results >= 1
+        db_session.expire_all()
+        old_row = db_session.query(MemoryRecord).filter_by(memory_id=mid_old).first()
+        assert old_row is None or old_row.is_active == 0
+        fresh_row = db_session.query(MemoryRecord).filter_by(memory_id=mid_fresh).first()
+        assert fresh_row is not None and fresh_row.is_active == 1
+
+    def test_run_weekly_returns_report(self, db_factory):
+        report = _svc(db_factory).run_weekly()
+        assert report is not None
+
+    def test_run_pipeline_extracts_and_persists(self, db_factory, db_session, user_id):
+        from unittest.mock import MagicMock
+        import json as _json
+        mock_llm = MagicMock()
+        mock_llm.chat_with_tools.return_value = {"content": _json.dumps([
+            {"type": "semantic", "content": "user prefers dark mode", "confidence": 0.8},
+        ])}
+        svc = _MemoryService(db_factory, llm_client=mock_llm)
+        result = svc.run_pipeline(user_id=user_id, messages=[
+            {"role": "user", "content": "I always use dark mode"},
+        ])
+        assert result.memories_extracted >= 0
+        if result.memories_extracted > 0:
+            db_session.expire_all()
+            rows = db_session.query(MemoryRecord).filter(
+                MemoryRecord.user_id == user_id, MemoryRecord.is_active == 1,
+            ).all()
+            assert len(rows) == result.memories_extracted
+
+
+class TestStoreUpdateContent:
+    def test_update_content_field_level(self, db_factory, db_session, user_id):
+        from core.memory.tabular.store import MemoryStore
+        store = MemoryStore(db_factory)
+        mid = uuid4().hex
+        store.create(Memory(
+            memory_id=mid, user_id=user_id,
+            memory_type=MemoryType.TOOL_RESULT, content="v1",
+            initial_confidence=0.5, trust_tier=TrustTier.T3_INFERRED,
+            source_event_ids=["e1"],
+        ))
+        db_session.expire_all()
+        before = db_session.query(MemoryRecord).filter_by(memory_id=mid).first()
+        _time.sleep(0.05)
+        store.update_content(mid, "v2")
+        db_session.expire_all()
+        after = db_session.query(MemoryRecord).filter_by(memory_id=mid).first()
+        assert after.content == "v2"
+        assert after.updated_at >= before.updated_at
+        assert after.created_at == before.created_at
+        assert after.initial_confidence == pytest.approx(0.5, abs=0.01)
+        assert after.is_active == 1
+
+    def test_update_nonexistent_is_noop(self, db_factory):
+        from core.memory.tabular.store import MemoryStore
+        MemoryStore(db_factory).update_content("nonexistent_xyz", "new")

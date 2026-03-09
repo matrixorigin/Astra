@@ -93,7 +93,7 @@ class MemoryProgramTool(EdgeTool):
             },
             "required": ["actions"],
         }
-
+        sandbox: bool = kwargs.get("sandbox", False)  # Default false: write directly
     @property
     def side_effect(self) -> SideEffect:
         return SideEffect.WRITE

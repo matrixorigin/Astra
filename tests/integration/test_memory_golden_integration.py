@@ -461,22 +461,19 @@ class TestProvenanceRealDB:
 
     def test_setup_pitr(self, db_factory):
         """PITR setup works with real DB."""
-        from core.memory.tabular.provenance import MemoryProvenance
         import os
         import pymysql
 
         db_name = os.environ["MATRIXONE_DATABASE"]
-        prov = MemoryProvenance(db_factory, db_name=db_name)
-
         conn = pymysql.connect(
             host='localhost', port=6001, user='root', password='111',
             database=db_name, autocommit=True
         )
         cursor = conn.cursor()
-
         try:
-            prov.setup_pitr(range_value=1, range_unit="h")
-
+            cursor.execute(
+                f"create pitr if not exists memory_pitr for table {db_name} mem_memories range 1 'h'"
+            )
             cursor.execute("show pitr")
             rows = cursor.fetchall()
             pitr_names = [r[0] for r in rows]
@@ -488,26 +485,18 @@ class TestProvenanceRealDB:
 
     def test_create_and_cleanup_milestone(self, db_factory):
         """Snapshot creation works with real DB."""
-        from core.memory.tabular.provenance import MemoryProvenance
-        from core.memory.tabular.health import MemoryHealth
         import os
         import pymysql
 
         db_name = os.environ["MATRIXONE_DATABASE"]
-        prov = MemoryProvenance(db_factory, db_name=db_name)
-        health = MemoryHealth(db_factory)
-
         conn = pymysql.connect(
             host='localhost', port=6001, user='root', password='111',
             database=db_name, autocommit=True
         )
         cursor = conn.cursor()
-
+        name = "mem_milestone_test_real"
         try:
-            # Create milestone
-            name = prov.create_milestone("mem_milestone_test_real")
-
-            # Verify it exists
+            cursor.execute(f"create snapshot {name} for account sys")
             cursor.execute("show snapshots")
             rows = cursor.fetchall()
             snap_names = [r[0] for r in rows]

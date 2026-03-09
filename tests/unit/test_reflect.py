@@ -821,7 +821,6 @@ class TestExplainSSE:
             {"type": "usage", "prompt": 10, "completion": 5},
         ])
 
-        # Use a user query that matches the tool description to ensure tool is selected
         with patch("core.llm.client.LLMClient.chat_with_tools_stream", return_value=stream):
             resp = client.post("/chat/turn", json={
                 "messages": [{"role": "user", "content": "run bash command"}],
@@ -846,7 +845,6 @@ class TestExplainSSE:
 
         stream = fake_llm_stream([{"type": "text", "content": "hi"}])
 
-        # Use a user query that matches the tool description to ensure tool is selected
         with patch("core.llm.client.LLMClient.chat_with_tools_stream", return_value=stream):
             resp = client.post("/chat/turn", json={
                 "messages": [{"role": "user", "content": "run bash command"}],

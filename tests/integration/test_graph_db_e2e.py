@@ -768,3 +768,58 @@ class TestTaskImportanceWeightsE2E:
                 f"n0={scores_by_id[nodes[0].node_id]:.4f} "
                 f"n1={scores_by_id[nodes[1].node_id]:.4f}"
             )
+
+
+# ── Graph candidates and service ──────────────────────────────────────
+
+class TestGraphCandidatesAndService:
+    """GraphCandidateProvider and ActivationIndexManager.get_reflection_candidates."""
+
+    def test_get_reflection_candidates_returns_list(self, db_factory, user_id):
+        """get_reflection_candidates runs without error and returns a list."""
+        from core.memory.strategy.activation_index import ActivationIndexManager
+        from core.memory.tabular.store import MemoryStore
+        from core.memory.types import Memory, MemoryType
+
+        store = MemoryStore(db_factory)
+        idx = ActivationIndexManager(db_factory)
+
+        # Create some memories and index them
+        for i in range(3):
+            mem = Memory(
+                memory_id=uuid4().hex, user_id=user_id,
+                memory_type=MemoryType.SEMANTIC,
+                content=f"reflection candidate {i}",
+                initial_confidence=0.7,
+                embedding=_embed(0.1 + i * 0.1),
+            )
+            store.create(mem)
+            idx.on_memories_stored(user_id, [mem])
+
+        candidates = idx.get_reflection_candidates(user_id)
+        assert isinstance(candidates, (list, type(None)))
+
+    def test_graph_candidate_provider_direct(self, db_factory, user_id):
+        """GraphCandidateProvider.get_reflection_candidates with real graph nodes."""
+        from core.memory.graph.candidates import GraphCandidateProvider
+        from core.memory.strategy.activation_index import ActivationIndexManager
+        from core.memory.tabular.store import MemoryStore
+        from core.memory.types import Memory, MemoryType
+
+        store = MemoryStore(db_factory)
+        idx = ActivationIndexManager(db_factory)
+
+        for i in range(5):
+            mem = Memory(
+                memory_id=uuid4().hex, user_id=user_id,
+                memory_type=MemoryType.SEMANTIC,
+                content=f"graph candidate {i}",
+                initial_confidence=0.6 + i * 0.05,
+                embedding=_embed(0.2 + i * 0.05),
+            )
+            store.create(mem)
+            idx.on_memories_stored(user_id, [mem])
+
+        provider = GraphCandidateProvider(db_factory)
+        candidates = provider.get_reflection_candidates(user_id)
+        assert isinstance(candidates, list)
