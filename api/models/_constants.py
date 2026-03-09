@@ -1,5 +1,2 @@
-"""Shared constants for ORM models, resolved at import time from env vars."""
-
-import os
-
-EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "384"))
+"""Backward-compat re-export — canonical location is api._model_constants."""
+from api._model_constants import EMBEDDING_DIM  # noqa: F401

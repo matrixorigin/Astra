@@ -37,6 +37,7 @@
 | [graph-memory.md](graph-memory.md) | `memory_graph_nodes`, spreading activation, 3-phase lifecycle (perceive/consolidate/reflect), tiered graph loading | Working on the graph backend (`core/memory/graph/`) |
 | [intent-driven-loading.md](intent-driven-loading.md) | Task type → memory mode mapping, Tier 0/1 classification, token reduction | Working on context-layer memory loading optimization |
 | [backend-coexistence.md](backend-coexistence.md) | Factory design, directory layout, migration path, testing strategy | Understanding how tabular/graph coexist |
+| [mo-memory-mcp.md](mo-memory-mcp.md) | MCP server, CLI (`init`/`migrate`/`status`), IDE integration, standalone deployment | Setting up or deploying mo-memory for AI tools |
 
 ## Quick Reference
 

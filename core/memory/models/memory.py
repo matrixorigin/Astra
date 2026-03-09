@@ -8,8 +8,8 @@ from sqlalchemy import (
 from sqlalchemy.sql import func
 
 from api.base import Base
-from api.models._constants import EMBEDDING_DIM
-from api.models._types import DateTime6, NullableJSON as JSON
+from core.memory.models._sa_types import EMBEDDING_DIM
+from core.memory.models._sa_types import DateTime6, NullableJSON as JSON
 
 
 class MemoryRecord(Base):

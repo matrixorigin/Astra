@@ -3,7 +3,7 @@
 from sqlalchemy import Column, Index, String, Text, func
 
 from api.base import Base
-from api.models._types import DateTime6, NullableJSON
+from core.memory.models._sa_types import DateTime6, NullableJSON
 
 
 class MemoryExperiment(Base):

@@ -6,8 +6,8 @@ from sqlalchemy import Column, Float, Index, Integer, SmallInteger, String, Text
 from sqlalchemy.sql import func
 
 from api.base import Base
-from api.models._constants import EMBEDDING_DIM
-from api.models._types import DateTime6
+from core.memory.models._sa_types import EMBEDDING_DIM
+from core.memory.models._sa_types import DateTime6
 
 
 class GraphNode(Base):

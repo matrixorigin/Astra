@@ -7,8 +7,8 @@ from sqlalchemy import Column, String
 from sqlalchemy.sql import func
 
 from api.base import Base
-from api.models._types import DateTime6
-from api.models._types import NullableJSON as JSON  # noqa: N814
+from core.memory.models._sa_types import DateTime6
+from core.memory.models._sa_types import NullableJSON as JSON
 
 
 class MemoryUserConfig(Base):

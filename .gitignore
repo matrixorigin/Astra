@@ -3,6 +3,9 @@
 
 .mo-agent/
 
+# Kiro local settings (MCP config has local paths/credentials)
+.kiro/settings/
+
 # Docker volumes (local data)
 deployment/all-in-one/data/
 

@@ -42,6 +42,7 @@ local-embedding = ["sentence-transformers"]
 [tool.poetry.scripts]
 mo-agent = "cli.mo_agent_api:cli"
 mo-admin = "cli.mo_admin_api:cli"
+mo-memory = "cli.mo_memory_cli:main"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.3"

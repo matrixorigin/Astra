@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_SENTINEL = object()  # distinguishes "not passed" from explicit None
+
 # ── Global strategy registry ──────────────────────────────────────────
 
 _registry = StrategyRegistry()
@@ -189,12 +191,14 @@ def create_memory_service(
 def create_editor(
     db_factory: DbFactory,
     user_id: str | None = None,
+    embed_client: Any | None = _SENTINEL,
 ) -> Any:
     """Create a MemoryEditor with the appropriate index_manager for the user's strategy.
 
     Args:
         db_factory: Database session factory.
         user_id: If provided, resolves user's strategy to get the right index_manager.
+        embed_client: Embedding client to use. If omitted, auto-resolved from settings.
 
     Returns:
         MemoryEditor with index_manager wired up.
@@ -212,13 +216,14 @@ def create_editor(
             descriptor, db_factory=db_factory,
         )
 
-    # Resolve embed client (best-effort — None if not configured)
-    embed_client = None
-    try:
-        from core.embedding import get_embedding_client
-        embed_client = get_embedding_client()
-    except Exception:
-        logger.debug("Embedding client not available for editor", exc_info=True)
+    # Resolve embed client: use caller-provided, or auto-resolve from settings.
+    if embed_client is _SENTINEL:
+        embed_client = None
+        try:
+            from core.embedding import get_embedding_client
+            embed_client = get_embedding_client()
+        except Exception:
+            logger.debug("Embedding client not available for editor", exc_info=True)
 
     return MemoryEditor(storage, db_factory, index_manager=index_manager, embed_client=embed_client)
 

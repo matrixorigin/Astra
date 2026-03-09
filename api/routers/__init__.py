@@ -1,15 +1,1 @@
-"""Router package."""
-
-from api.routers import (
-    agents,
-    auth,
-    context,
-    decisions,
-    events,
-    replay,
-    sessions,
-    skills,
-    streaming,
-)
-
-__all__ = ["agents", "auth", "context", "decisions", "events", "replay", "sessions", "skills", "streaming"]
+"""Router package — import individual routers directly, e.g. ``from api.routers import auth``."""
