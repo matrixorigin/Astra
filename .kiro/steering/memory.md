@@ -14,6 +14,10 @@ You have MCP tools from the `mo-memory` server. These are real, callable tools �
 - `@mo-memory/memory_purge` — Delete a memory. Params: `memory_id`, `reason`
 - `@mo-memory/memory_profile` — Get user profile summary
 - `@mo-memory/memory_search` — Semantic search. Params: `query`, `top_k`
+- `@mo-memory/memory_governance` — Run governance cycle: decay, quarantine, cleanup. Params: `user_id` (optional)
+- `@mo-memory/memory_consolidate` — Run graph consolidation: detect conflicts, fix orphans, manage trust tiers. Params: `user_id` (optional)
+- `@mo-memory/memory_reflect` — Run reflection: analyze clusters, create scene nodes (requires LLM). Params: `user_id` (optional)
+- `@mo-memory/memory_rebuild_index` — Rebuild IVF vector index with optimal centroid count. Params: `table` ('mem_memories' or 'memory_graph_nodes')
 
 ## When to use
 

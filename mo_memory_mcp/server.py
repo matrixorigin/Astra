@@ -32,6 +32,10 @@ class MemoryBackend:
     def purge(self, user_id: str, memory_id: str, reason: str) -> dict: ...
     def profile(self, user_id: str) -> dict: ...
     def search(self, user_id: str, query: str, top_k: int) -> list[dict]: ...
+    def governance(self, user_id: str, force: bool = False) -> dict: ...
+    def consolidate(self, user_id: str, force: bool = False) -> dict: ...
+    def reflect(self, user_id: str, force: bool = False) -> dict: ...
+    def rebuild_index(self, table: str) -> str: ...
 
 
 class EmbeddedBackend(MemoryBackend):
@@ -104,7 +108,7 @@ class EmbeddedBackend(MemoryBackend):
     def purge(self, user_id: str, memory_id: str, reason: str) -> dict:
         editor = self._create_editor(self._db_factory, user_id=user_id, embed_client=self._embed_client)
         result = editor.purge(user_id, memory_ids=[memory_id], reason=reason)
-        return {"purged": result.count}
+        return {"purged": result.deactivated}
 
     def profile(self, user_id: str) -> dict:
         svc = self._create_service(self._db_factory, user_id=user_id)
@@ -112,6 +116,80 @@ class EmbeddedBackend(MemoryBackend):
 
     def search(self, user_id: str, query: str, top_k: int) -> list[dict]:
         return self.retrieve(user_id, query, top_k)
+
+    # Cooldown: governance/consolidate/reflect are expensive, throttle per user.
+    # key = (user_id, op_name), value = (timestamp, result)
+    _cooldown_cache: dict[tuple[str, str], tuple[float, dict]] = {}
+    _COOLDOWN_SECONDS = {"governance": 3600, "consolidate": 1800, "reflect": 7200}
+
+    def _with_cooldown(self, user_id: str, op: str, fn: Any, force: bool = False) -> dict:
+        import time
+        key = (user_id, op)
+        now = time.time()
+        if not force:
+            cached = self._cooldown_cache.get(key)
+            if cached:
+                ts, result = cached
+                remaining = self._COOLDOWN_SECONDS[op] - (now - ts)
+                if remaining > 0:
+                    result_copy = dict(result)
+                    result_copy["skipped"] = True
+                    result_copy["cooldown_remaining_s"] = int(remaining)
+                    return result_copy
+        result = fn()
+        self._cooldown_cache[key] = (now, result)
+        return result
+
+    def governance(self, user_id: str, force: bool = False) -> dict:
+        def _run():
+            from core.memory.tabular.governance import GovernanceScheduler
+            gs = GovernanceScheduler(self._db_factory)
+            result = gs.run_cycle(user_id)
+            return {
+                "quarantined": result.quarantined,
+                "cleaned_stale": result.cleaned_stale,
+                "scenes_created": result.scenes_created,
+                "vector_index_health": result.vector_index_health,
+            }
+        return self._with_cooldown(user_id, "governance", _run, force=force)
+
+    def consolidate(self, user_id: str, force: bool = False) -> dict:
+        def _run():
+            from core.memory.graph.consolidation import GraphConsolidator
+            gc = GraphConsolidator(self._db_factory)
+            result = gc.consolidate(user_id)
+            return {
+                "merged_nodes": result.merged_nodes,
+                "conflicts_detected": result.conflicts_detected,
+                "orphaned_scenes": result.orphaned_scenes,
+                "promoted": result.promoted,
+                "demoted": result.demoted,
+            }
+        return self._with_cooldown(user_id, "consolidate", _run, force=force)
+
+    def reflect(self, user_id: str, force: bool = False) -> dict:
+        def _run():
+            from core.memory.graph.candidates import GraphCandidateProvider
+            from core.memory.reflection.engine import ReflectionEngine
+            from core.memory.graph.service import GraphMemoryService
+
+            provider = GraphCandidateProvider(self._db_factory)
+            svc = GraphMemoryService(self._db_factory)
+            try:
+                from core.llm.client import LLMClient
+                llm = LLMClient(db_factory=self._db_factory)
+            except Exception:
+                return {"error": "LLM client not available for reflection"}
+            engine = ReflectionEngine(provider, svc, llm)
+            result = engine.reflect(user_id)
+            return {"scenes_created": result.scenes_created, "candidates_found": result.candidates_found}
+        return self._with_cooldown(user_id, "reflect", _run, force=force)
+
+    def rebuild_index(self, table: str) -> str:
+        from core.memory.tabular.governance import GovernanceScheduler
+        gs = GovernanceScheduler(self._db_factory)
+        result = gs.rebuild_vector_index(table)
+        return f"Rebuilt IVF index for {table}: lists {result['old_lists']} → {result['new_lists']} (rows={result['total_rows']})"
 
 
 class HTTPBackend(MemoryBackend):
@@ -151,6 +229,26 @@ class HTTPBackend(MemoryBackend):
         r = self._client.post("/v1/memories/search", json={"query": query, "top_k": top_k})
         r.raise_for_status()
         return r.json()
+
+    def governance(self, user_id: str, force: bool = False) -> dict:
+        r = self._client.post("/v1/memories/governance", json={"user_id": user_id, "force": force})
+        r.raise_for_status()
+        return r.json()
+
+    def consolidate(self, user_id: str, force: bool = False) -> dict:
+        r = self._client.post("/v1/memories/consolidate", json={"user_id": user_id, "force": force})
+        r.raise_for_status()
+        return r.json()
+
+    def reflect(self, user_id: str, force: bool = False) -> dict:
+        r = self._client.post("/v1/memories/reflect", json={"user_id": user_id, "force": force})
+        r.raise_for_status()
+        return r.json()
+
+    def rebuild_index(self, table: str) -> str:
+        r = self._client.post("/v1/memories/rebuild-index", json={"table": table})
+        r.raise_for_status()
+        return r.json().get("message", str(r.json()))
 
 
 # ── MCP Server ────────────────────────────────────────────────────────
@@ -274,6 +372,97 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             return "No memories found."
         lines = [f"- [{r.get('type', 'fact')}] ({r['memory_id']}) {r['content']}" for r in results]
         return f"Found {len(results)} memories:\n" + "\n".join(lines)
+
+    @server.tool()
+    def memory_governance(
+        user_id: str | None = None,
+        force: bool = False,
+    ) -> str:
+        """Run memory governance: quarantine low-confidence memories, clean stale data.
+
+        Do NOT call proactively. Only call when user explicitly asks to
+        "clean up memories", "run maintenance", or "check memory health".
+        Has a 1-hour cooldown per user. Use force=True only if user insists.
+
+        Args:
+            user_id: User ID (optional).
+            force: Skip cooldown (only when user explicitly requests).
+        """
+        result = backend.governance(_user(user_id), force=force)
+        if result.get("skipped"):
+            return f"Governance skipped (cooldown, {result['cooldown_remaining_s']}s remaining). Last result: {', '.join(f'{k}={v}' for k, v in result.items() if k not in ('skipped', 'cooldown_remaining_s', 'vector_index_health'))}"
+        health = result.pop("vector_index_health", {})
+        parts = [f"{k}={v}" for k, v in result.items()]
+        msg = f"Governance done: {', '.join(parts)}"
+        for table, h in health.items():
+            if h.get("needs_rebuild") and not h.get("rebuilt"):
+                msg += f"\n⚠️  {table}: IVF index needs rebuild (rows={h.get('total_rows')}, centroids={h['centroids']}, ratio={h.get('ratio')})"
+            elif h.get("rebuilt"):
+                msg += f"\n✅ {table}: IVF index rebuilt automatically"
+            elif h.get("rebuild_error"):
+                msg += f"\n❌ {table}: IVF rebuild failed: {h['rebuild_error']}"
+        return msg
+
+    @server.tool()
+    def memory_consolidate(
+        user_id: str | None = None,
+        force: bool = False,
+    ) -> str:
+        """Run graph consolidation: detect contradicting memories, fix orphaned nodes, manage trust tiers.
+
+        Do NOT call proactively. Only call when user explicitly asks to
+        "check for conflicts", "consolidate memories", or "fix memory graph".
+        Has a 30-minute cooldown per user. Use force=True only if user insists.
+
+        Args:
+            user_id: User ID (optional).
+            force: Skip cooldown (only when user explicitly requests).
+        """
+        result = backend.consolidate(_user(user_id), force=force)
+        if result.get("skipped"):
+            return f"Consolidation skipped (cooldown, {result['cooldown_remaining_s']}s remaining)."
+        parts = [f"{k}={v}" for k, v in result.items()]
+        return f"Consolidation done: {', '.join(parts)}"
+
+    @server.tool()
+    def memory_reflect(
+        user_id: str | None = None,
+        force: bool = False,
+    ) -> str:
+        """Analyze memory clusters and synthesize high-level insights (scene nodes). Requires LLM.
+
+        Do NOT call proactively. Only call when user explicitly asks to
+        "reflect on memories", "find patterns", or "summarize what you know".
+        Has a 2-hour cooldown per user. Use force=True only if user insists.
+        This is the most expensive operation (LLM calls).
+
+        Args:
+            user_id: User ID (optional).
+            force: Skip cooldown (only when user explicitly requests).
+        """
+        result = backend.reflect(_user(user_id), force=force)
+        if result.get("skipped"):
+            return f"Reflection skipped (cooldown, {result['cooldown_remaining_s']}s remaining)."
+        if "error" in result:
+            return f"Reflection failed: {result['error']}"
+        return f"Reflection done: scenes_created={result['scenes_created']}, candidates_found={result['candidates_found']}"
+
+    @server.tool()
+    def memory_rebuild_index(
+        table: str = "mem_memories",
+        user_id: str | None = None,
+    ) -> str:
+        """Rebuild IVF vector index for a memory table with optimal centroid count.
+
+        Only call when memory_governance reports 'needs_rebuild=True' for a table,
+        or when user explicitly asks to rebuild the vector index.
+        This operation is expensive (full table scan). Do NOT call proactively.
+
+        Args:
+            table: Table to rebuild. One of: 'mem_memories', 'memory_graph_nodes'.
+            user_id: User ID (optional, unused but kept for consistency).
+        """
+        return backend.rebuild_index(table)
 
     return server
 

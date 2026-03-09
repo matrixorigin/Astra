@@ -765,6 +765,52 @@ def test_observer_pipeline_graph() -> None:
           f"before={nodes_before}, after={nodes_after}")
 
 
+# ── Scenario 16: Vector index health + rebuild ────────────────────────
+
+def test_vector_index_health_and_rebuild() -> None:
+    print("\n── 16. Vector index health + rebuild ──")
+
+    from core.memory.tabular.governance import GovernanceScheduler
+
+    gs = GovernanceScheduler(SessionLocal)
+
+    # 1. Health check returns results for both tables
+    health = gs._check_vector_index_health()
+
+    if not health:
+        ok("vector index health skip", "VectorManager not available, skipping")
+        return
+
+    for table, h in health.items():
+        if "error" in h:
+            ok(f"{table} health error", f"error: {h['error']}")
+            continue
+        check(f"{table} has centroids", h["centroids"] >= 1, f"centroids={h['centroids']}")
+        check(f"{table} has total_rows", h["total_rows"] >= 0, f"total_rows={h['total_rows']}")
+        ok(f"{table} health", f"centroids={h['centroids']}, rows={h['total_rows']}, ratio={h['ratio']}, needs_rebuild={h['needs_rebuild']}")
+
+    # 2. run_cycle includes health in result
+    result = gs.run_cycle(USER_ID)
+    check("run_cycle includes vector_index_health", isinstance(result.vector_index_health, dict),
+          f"got {type(result.vector_index_health)}")
+
+    # 3. Rebuild index for mem_memories (drop + recreate with optimal lists)
+    try:
+        rebuild_result = gs.rebuild_vector_index("mem_memories")
+        check("rebuild returns table", rebuild_result["table"] == "mem_memories",
+              f"got {rebuild_result}")
+        check("rebuild new_lists >= 1", rebuild_result["new_lists"] >= 1,
+              f"new_lists={rebuild_result['new_lists']}")
+        ok("rebuild mem_memories", f"lists {rebuild_result['old_lists']} → {rebuild_result['new_lists']} (rows={rebuild_result['total_rows']})")
+    except Exception as e:
+        fail("rebuild mem_memories", str(e))
+
+    # 4. After rebuild, health check should still work
+    health_after = gs._check_vector_index_health()
+    if "mem_memories" in health_after and "error" not in health_after["mem_memories"]:
+        ok("health after rebuild", f"needs_rebuild={health_after['mem_memories']['needs_rebuild']}")
+
+
 # ── Scenario 15: NL → Script (real LLM) ──────────────────────────────
 
 def test_nl_to_script() -> None:
@@ -874,6 +920,7 @@ def main() -> None:
         test_purge_graph()
         test_consolidation()
         test_opinion_evolution()
+        test_vector_index_health_and_rebuild()
 
         if args.with_llm:
             test_observer_pipeline_graph()

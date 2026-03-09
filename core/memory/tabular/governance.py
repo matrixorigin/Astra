@@ -19,6 +19,11 @@ from typing import Any, Optional
 
 from sqlalchemy import text
 
+try:
+    from matrixone.vector_manager import VectorManager
+except ImportError:
+    VectorManager = None  # type: ignore[assignment,misc]
+
 from core.db_consumer import DbConsumer, DbFactory
 from core.memory.config import DEFAULT_CONFIG, MemoryGovernanceConfig
 from core.memory.tabular.health import MemoryHealth
@@ -43,6 +48,7 @@ class GovernanceCycleResult:
     cleaned_snapshots: int = 0
     # Health
     pollution_detected: bool = False
+    vector_index_health: dict = field(default_factory=dict)  # table → {centroids, imbalance, needs_rebuild}
     errors: list[str] = field(default_factory=list)
     total_ms: float = 0.0
 
@@ -98,6 +104,19 @@ class GovernanceScheduler(DbConsumer):
         result.errors.extend(w.errors)
 
         result.total_ms = (time.time() - start) * 1000
+
+        # Vector index health check + auto-rebuild if needed
+        result.vector_index_health = self._check_vector_index_health()
+        for table, h in result.vector_index_health.items():
+            if h.get("needs_rebuild"):
+                try:
+                    self.rebuild_vector_index(table)
+                    result.vector_index_health[table]["rebuilt"] = True
+                    logger.info("Auto-rebuilt IVF index for %s", table)
+                except Exception as e:
+                    result.vector_index_health[table]["rebuild_error"] = str(e)
+                    result.errors.append(f"rebuild_{table}: {e}")
+
         return result
 
     # ── Hourly ────────────────────────────────────────────────────────
@@ -361,6 +380,105 @@ class GovernanceScheduler(DbConsumer):
         if count:
             logger.info("Cleaned %d orphaned incremental summaries for user %s", count, user_id)
         return count
+
+    # IVF index config per table: (index_name, column, op_type_str)
+    _IVF_INDEX_CONFIG = {
+        "mem_memories": ("idx_memory_embedding", "embedding", "vector_l2_ops"),
+        "memory_graph_nodes": ("idx_graph_node_embedding", "embedding", "vector_l2_ops"),
+    }
+
+    def rebuild_vector_index(self, table: str) -> dict:
+        """Rebuild IVF index for a table with optimal lists count.
+
+        lists = max(1, total_rows // 50), capped at 1024.
+        Returns {table, old_lists, new_lists, total_rows}.
+        """
+        if table not in self._IVF_INDEX_CONFIG:
+            raise ValueError(f"Unknown table: {table}. Known: {list(self._IVF_INDEX_CONFIG)}")
+
+        index_name, column, op_type_str = self._IVF_INDEX_CONFIG[table]
+
+        try:
+            from api.database import _mo_client
+            from matrixone.sqlalchemy_ext.vector_index import VectorOpType
+            if VectorManager is None:
+                raise RuntimeError("matrixone.vector_manager not available")
+            vm = VectorManager(_mo_client)
+        except Exception as e:
+            raise RuntimeError(f"VectorManager not available: {e}") from e
+
+        # Get current stats
+        stats = vm.get_ivf_stats(table, column)
+        counts = stats["distribution"]["centroid_count"]
+        total_rows = sum(counts) if counts else 0
+        old_lists = len(counts)
+
+        # Compute optimal lists
+        new_lists = max(1, min(total_rows // 50, 1024))
+
+        op_type = VectorOpType.VECTOR_L2_OPS  # only l2 supported for now
+
+        logger.info("Rebuilding IVF index %s on %s: lists %d → %d (rows=%d)",
+                    index_name, table, old_lists, new_lists, total_rows)
+
+        vm.drop(table, index_name)
+        vm.create_ivf(table, index_name, column, lists=new_lists, op_type=op_type)
+
+        logger.info("IVF index %s rebuilt successfully", index_name)
+        return {"table": table, "old_lists": old_lists, "new_lists": new_lists, "total_rows": total_rows}
+
+    def _check_vector_index_health(self) -> dict:
+        """Check IVF index health for memory tables.
+
+        health rules based on rows/centroids ratio:
+        - < 20k rows:   centroids in [1, rows/50], i.e. ratio >= 50
+        - 20k–1M rows:  500 < rows/centroids < 1000
+        - > 1M rows:    centroids >= 1024
+        """
+        tables = ["mem_memories", "memory_graph_nodes"]
+        health: dict = {}
+        try:
+            from api.database import _mo_client
+            if VectorManager is None:
+                logger.debug("VectorManager not available")
+                return {}
+            vm = VectorManager(_mo_client)
+        except Exception as e:
+            logger.debug("VectorManager not available: %s", e)
+            return {}
+
+        for table in tables:
+            try:
+                stats = vm.get_ivf_stats(table, "embedding")
+                counts = stats["distribution"]["centroid_count"]
+                if not counts:
+                    continue
+                n_centroids = len(counts)
+                total_rows = sum(counts)
+                ratio = total_rows / n_centroids if n_centroids > 0 else float("inf")
+
+                if total_rows < 20_000:
+                    # centroids must be in [1, total_rows/50], i.e. ratio >= 50
+                    needs_rebuild = ratio < 50
+                elif total_rows < 1_000_000:
+                    needs_rebuild = ratio < 500 or ratio >= 1000
+                else:
+                    needs_rebuild = n_centroids < 1024
+
+                health[table] = {
+                    "centroids": n_centroids,
+                    "total_rows": total_rows,
+                    "ratio": round(ratio, 1),
+                    "needs_rebuild": needs_rebuild,
+                }
+                if needs_rebuild:
+                    logger.warning(
+                        "IVF index unhealthy for %s: total_rows=%d centroids=%d ratio=%.1f",
+                        table, total_rows, n_centroids, ratio,
+                    )
+            except Exception as e:
+                health[table] = {"error": str(e)}
+        return health
 
     def store(
         self,
