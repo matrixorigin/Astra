@@ -1,8 +1,12 @@
 """Integration tests for admin API endpoints."""
+# This file modifies global auth state (DELETE FROM auth_users) and must not run in parallel
+# with other workers. Mark all tests in this file to the same xdist group.
 
 import uuid
 
 import pytest
+
+pytestmark = pytest.mark.xdist_group("admin_api")
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
@@ -11,13 +15,42 @@ from api.main import app
 
 
 @pytest.fixture(scope="module", autouse=True)
-def setup_database():
+def setup_database(test_session_factory):
     """Initialize database before tests."""
     from contextlib import suppress
 
     with suppress(Exception):
         init_db()  # Tables may already exist
+
+    with test_session_factory() as db:
+        # Ensure admin role exists
+        exists = db.execute(text("SELECT 1 FROM auth_roles WHERE role_id = 'mo-agent-admin-role'")).scalar()
+        if not exists:
+            db.execute(text("""
+                INSERT INTO auth_roles (role_id, role_name, description)
+                VALUES ('mo-agent-admin-role', 'mo_agent_admin', 'Administrator role')
+            """))
+
+        # Insert a sentinel user so regular_user is never the "first user" and won't auto-get admin
+        sentinel_id = str(uuid.uuid4())
+        db.execute(text("""
+            INSERT INTO auth_users (user_id, username, email, password_hash, is_active, created_at)
+            VALUES (:uid, '__sentinel__', '__sentinel__@test.invalid', 'x', 1, NOW())
+        """), {"uid": sentinel_id})
+        # Give sentinel admin role so subsequent registrations don't auto-become admin
+        db.execute(text("""
+            INSERT INTO auth_user_roles (user_id, role_id)
+            VALUES (:uid, 'mo-agent-admin-role')
+        """), {"uid": sentinel_id})
+        db.commit()
+
     yield
+
+    # Cleanup sentinel
+    with test_session_factory() as db:
+        db.execute(text("DELETE FROM auth_user_roles WHERE user_id IN (SELECT user_id FROM auth_users WHERE username = '__sentinel__')"))
+        db.execute(text("DELETE FROM auth_users WHERE username = '__sentinel__'"))
+        db.commit()
 
 
 @pytest.fixture
@@ -67,14 +100,6 @@ def admin_user(client, db_session):
     user_id = payload["sub"]
 
     # Grant admin role using test database session
-    # Ensure mo_agent_admin role exists
-    db_session.execute(
-        text("""
-            INSERT IGNORE INTO auth_roles (role_id, role_name, description)
-            VALUES ('mo-agent-admin-role', 'mo_agent_admin', 'Administrator role')
-        """)
-    )
-    # Assign role to user
     db_session.execute(
         text("""
             INSERT INTO auth_user_roles (user_id, role_id)
@@ -407,67 +432,66 @@ def test_grant_and_revoke_role_success(client, admin_user, db_session):
 
 def test_first_user_becomes_admin(client, db_session):
     """Test that first registered user automatically becomes admin."""
-    # Ensure admin role exists
-    db_session.execute(
-        text("""
-            INSERT IGNORE INTO auth_roles (role_id, role_name, description)
-            VALUES ('mo-agent-admin-role', 'mo_agent_admin', 'Administrator role')
-        """)
-    )
     # Clear all users
     db_session.execute(text("DELETE FROM auth_user_roles"))
     db_session.execute(text("DELETE FROM auth_users"))
     db_session.commit()
 
-    # Register first user
-    unique_id = uuid.uuid4().hex
-    username = f"firstuser_{unique_id}"
-    response = client.post(
-        "/auth/register",
-        json={
-            "username": username,
-            "password": "first12345",
-            "email": f"{username}@test.com",
-        },
-    )
-    assert response.status_code == 201
+    try:
+        # Register first user
+        unique_id = uuid.uuid4().hex
+        username = f"firstuser_{unique_id}"
+        response = client.post(
+            "/auth/register",
+            json={
+                "username": username,
+                "password": "first12345",
+                "email": f"{username}@test.com",
+            },
+        )
+        assert response.status_code == 201
 
-    # Refresh test session to see committed data from API
-    db_session.commit()
+        # Refresh test session to see committed data from API
+        db_session.commit()
 
-    # Verify user has admin role
-    result = db_session.execute(
-        text("""
-            SELECT r.role_name FROM auth_user_roles ur
-            JOIN auth_users u ON ur.user_id = u.user_id
-            JOIN auth_roles r ON ur.role_id = r.role_id
-            WHERE u.username = :username
-        """),
-        {"username": username},
-    ).fetchone()
-    assert result is not None
-    assert result[0] == "mo_agent_admin"
+        # Verify user has admin role
+        result = db_session.execute(
+            text("""
+                SELECT r.role_name FROM auth_user_roles ur
+                JOIN auth_users u ON ur.user_id = u.user_id
+                JOIN auth_roles r ON ur.role_id = r.role_id
+                WHERE u.username = :username
+            """),
+            {"username": username},
+        ).fetchone()
+        assert result is not None
+        assert result[0] == "mo_agent_admin"
 
-    # Register second user
-    username2 = f"seconduser_{unique_id}"
-    response = client.post(
-        "/auth/register",
-        json={
-            "username": username2,
-            "password": "second12345",
-            "email": f"{username2}@test.com",
-        },
-    )
-    assert response.status_code == 201
+        # Register second user
+        username2 = f"seconduser_{unique_id}"
+        response = client.post(
+            "/auth/register",
+            json={
+                "username": username2,
+                "password": "second12345",
+                "email": f"{username2}@test.com",
+            },
+        )
+        assert response.status_code == 201
 
-    # Verify second user does NOT have admin role
-    result = db_session.execute(
-        text("""
-            SELECT r.role_name FROM auth_user_roles ur
-            JOIN auth_users u ON ur.user_id = u.user_id
-            JOIN auth_roles r ON ur.role_id = r.role_id
-            WHERE u.username = :username
-        """),
-        {"username": username2},
-    ).fetchone()
-    assert result is None
+        # Verify second user does NOT have admin role
+        result = db_session.execute(
+            text("""
+                SELECT r.role_name FROM auth_user_roles ur
+                JOIN auth_users u ON ur.user_id = u.user_id
+                JOIN auth_roles r ON ur.role_id = r.role_id
+                WHERE u.username = :username
+            """),
+            {"username": username2},
+        ).fetchone()
+        assert result is None
+    finally:
+        # Restore: remove users created by this test so subsequent tests are not affected
+        db_session.execute(text("DELETE FROM auth_user_roles"))
+        db_session.execute(text("DELETE FROM auth_users"))
+        db_session.commit()

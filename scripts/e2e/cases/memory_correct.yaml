@@ -9,12 +9,18 @@ turns:
         - tool_called: memory_program
         - db:
             table: mem_memories
-            where: "user_id = :uid AND is_active = 1"
+            # workaround: MatrixOne composite index bug causes = 1 on SmallInteger to return
+            # wrong results when queried via a new connection after commit.
+            # Use != 0 instead until fixed: https://github.com/matrixorigin/matrixone/issues/23817
+            # TODO: revert to is_active = 1 after MatrixOne fixes the issue
+            where: "user_id = :uid AND is_active != 0"
             assert:
               count: ">=1"
         - db:
             table: mem_memories
-            where: "user_id = :uid AND content LIKE '%Python%' AND is_active = 1"
+            # workaround: https://github.com/matrixorigin/matrixone/issues/23817
+            # TODO: revert to is_active = 1 after MatrixOne fixes the issue
+            where: "user_id = :uid AND content LIKE '%Python%' AND is_active != 0"
             assert:
               count: ">=1"
 
@@ -24,13 +30,17 @@ turns:
         - tool_called: memory_program
         - db:
             table: mem_memories
-            where: "user_id = :uid AND is_active = 1"
+            # workaround: https://github.com/matrixorigin/matrixone/issues/23817
+            # TODO: revert to is_active = 1 after MatrixOne fixes the issue
+            where: "user_id = :uid AND is_active != 0"
             assert:
               fields:
                 content: {contains: "Rust"}
         - db:
             table: mem_memories
-            where: "user_id = :uid AND is_active = 0 AND content LIKE '%Python%'"
+            # workaround: https://github.com/matrixorigin/matrixone/issues/23817
+            # TODO: revert to is_active = 0 after MatrixOne fixes the issue
+            where: "user_id = :uid AND is_active != 1 AND content LIKE '%Python%'"
             assert:
               count: ">=1"
         - db:

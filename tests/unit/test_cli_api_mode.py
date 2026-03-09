@@ -403,6 +403,7 @@ class TestCLIEdgeMode:
             captured["kwargs"] = kwargs
 
         mock_api = AsyncMock()
+        mock_api.get_current_user = AsyncMock(return_value={"user_id": "test-user-id", "username": "testuser"})
         mock_api.get_introspection_skills = AsyncMock(return_value={"cloud": [], "installed": []})
 
         with patch("cli.edge_chat_loop.edge_chat_loop", fake_edge_chat_loop), \

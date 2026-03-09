@@ -243,7 +243,7 @@ class PromptAssembler(DbConsumer):
         # §1 Identity
         identity = self._build_identity(agent_id)
         if username:
-            identity += f"\n\nCurrent user: {username}"
+            identity += f"\n\nYou are talking with: {username}"
         sections["identity"] = identity
         breakdown["identity"] = _estimate_tokens(identity)
 

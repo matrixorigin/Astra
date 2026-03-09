@@ -64,10 +64,6 @@ class MemoryProgramTool(EdgeTool):
         return {
             "type": "object",
             "properties": {
-                "user_id": {
-                    "type": "string",
-                    "description": "Target user ID. If omitted, defaults to the current user.",
-                },
                 "actions": {
                     "type": "array",
                     "description": (
@@ -104,6 +100,7 @@ class MemoryProgramTool(EdgeTool):
 
     async def execute(self, **kwargs: Any) -> str:
         user_id: str = kwargs.get("user_id") or self._session.get("user_id") or self._session.get("agent_id", "")
+        logger.debug("memory_program.execute: user_id=%s session=%s", user_id, self._session)
         if not user_id:
             return json.dumps({"error": "user_id not available in session context"})
         actions: list[dict] = kwargs["actions"]

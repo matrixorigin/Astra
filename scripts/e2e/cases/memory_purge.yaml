@@ -27,12 +27,21 @@ turns:
               count: ">=2"
         - db:
             table: mem_memories
-            where: "user_id = :uid AND is_active = 0"
+            # workaround: https://github.com/matrixorigin/matrixone/issues/23817
+            # TODO: revert to is_active = 0 after MatrixOne fixes the issue
+            where: "user_id = :uid AND is_active != 1"
             assert:
               count: ">=1"
       llm_judge:
         criteria: "回复应表示正在或已经删除记忆，不应拒绝或忽略请求"
         pass_threshold: 0.5
+
+  # 同一 session 内：删除后立即问，不应再提 Go
+  - user: "我喜欢用什么语言做后端开发？"
+    checks:
+      llm_judge:
+        criteria: "回复应表示不知道用户的偏好，或询问用户。不应把 Go 作为用户已知的偏好陈述出来"
+        pass_threshold: 0.7
 
   # 新 session：agent 只能依赖 memory，不能依赖 conversation history
   - user: "我喜欢用什么语言做后端开发？"
@@ -41,7 +50,9 @@ turns:
       rules:
         - db:
             table: mem_memories
-            where: "user_id = :uid AND is_active = 1 AND content LIKE '%Go%'"
+            # workaround: https://github.com/matrixorigin/matrixone/issues/23817
+            # TODO: revert to is_active = 1 after MatrixOne fixes the issue
+            where: "user_id = :uid AND is_active != 0 AND content LIKE '%Go%'"
             assert:
               count: "0"
       llm_judge:

@@ -10,12 +10,14 @@ turns:
         - tool_called: memory_program
         - db:
             table: mem_memories
-            where: "user_id = :uid AND is_active = 1"
+            # workaround: https://github.com/matrixorigin/matrixone/issues/23817
+            # TODO: revert to is_active = 1 after MatrixOne fixes the issue
+            where: "user_id = :uid AND is_active != 0"
             assert:
               count: ">=1"
         - db:
             table: mem_memories
-            where: "user_id = :uid AND is_active = 1 AND content LIKE '%Alex%'"
+            where: "user_id = :uid AND is_active != 0 AND content LIKE '%Alex%'"
             assert:
               count: ">=1"
 
@@ -35,6 +37,8 @@ final_checks:
   rules:
     - db:
         table: mem_memories
-        where: "user_id = :uid AND is_active = 1"
+        # workaround: https://github.com/matrixorigin/matrixone/issues/23817
+        # TODO: revert to is_active = 1 after MatrixOne fixes the issue
+        where: "user_id = :uid AND is_active != 0"
         assert:
           count: ">=1"

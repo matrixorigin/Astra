@@ -1273,8 +1273,11 @@ async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, au
         try:
             info = await api_client.get_current_user()
             jwt_user_id = info.get("user_id") or jwt_user_id
-        except Exception:
-            pass
+            logger.debug("_run_edge_turn: jwt_user_id=%s (from get_current_user)", jwt_user_id)
+        except Exception as e:
+            logger.debug("_run_edge_turn: get_current_user failed: %s, fallback jwt_user_id=%s", e, jwt_user_id)
+        if not jwt_user_id:
+            raise RuntimeError("Cannot determine user_id: not logged in and no --user-id provided. Run 'mo-agent login' first.")
         session_info = {"session_id": session_id, "agent_id": agent_id or "default-agent", "user_id": jwt_user_id, "model": model, "turn": 0}
     perms = PermissionManager(auto_approve=auto_approve)
 
@@ -1379,7 +1382,7 @@ def logout(ctx):
 
 
 @cli.command()
-@click.option("--user-id", default="cli_user")
+@click.option("--user-id", default=None, help="User ID override (defaults to authenticated user's UUID)")
 @click.option("--session-id", default=None)
 @click.option("--message", "-m", default=None, help="Single message (non-interactive mode)")
 @click.option("--model", default=None, help="Model to use for chat")
@@ -1440,8 +1443,10 @@ def chat(ctx, user_id, session_id, message, model, routing_strategy, resume, aut
     try:
         user_info = client.get_current_user()
         username = user_info.get("username", "You")
+        jwt_user_id = user_info.get("user_id") or user_id or ""
     except Exception:
         username = "You"
+        jwt_user_id = user_id or ""
 
     selected_model = model
     try:
@@ -1505,6 +1510,7 @@ def chat(ctx, user_id, session_id, message, model, routing_strategy, resume, aut
         "session_info": {
             "session_id": session_id,
             "agent_id": user_id or "default-agent",
+            "user_id": jwt_user_id,
             "model": selected_model,
             "turn": 0,
         },
