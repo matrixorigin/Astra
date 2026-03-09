@@ -27,7 +27,7 @@ class MemoryBackend:
     """Abstract backend for memory operations."""
 
     def store(self, user_id: str, content: str, memory_type: str, session_id: str | None) -> dict: ...
-    def retrieve(self, user_id: str, query: str, top_k: int) -> list[dict]: ...
+    def retrieve(self, user_id: str, query: str, top_k: int, session_id: str | None = None) -> list[dict]: ...
     def correct(self, user_id: str, memory_id: str, new_content: str, reason: str) -> dict: ...
     def purge(self, user_id: str, memory_id: str | None, topic: str | None, reason: str) -> dict: ...
     def profile(self, user_id: str) -> dict: ...
@@ -96,9 +96,13 @@ class EmbeddedBackend(MemoryBackend):
         mem = editor.inject(user_id, content, memory_type=MemoryType(memory_type), source="mcp", session_id=session_id)
         return {"memory_id": mem.memory_id, "content": mem.content}
 
-    def retrieve(self, user_id: str, query: str, top_k: int) -> list[dict]:
+    def retrieve(self, user_id: str, query: str, top_k: int, session_id: str | None = None) -> list[dict]:
         svc = self._create_service(self._db_factory, user_id=user_id)
-        memories, _ = svc.retrieve(user_id, query, top_k=top_k)
+        # Pass session_id to the underlying retrieval service.
+        # The service's retrieve() method accepts session_id (default "") and uses it to prioritize
+        # memories from that session. If session_id is None, it's converted to "" by the service,
+        # which enables cross-session retrieval with include_cross_session=True.
+        memories, _ = svc.retrieve(user_id, query, top_k=top_k, session_id=session_id or "")
         return [{"memory_id": m.memory_id, "content": m.content, "type": str(m.memory_type)} for m in memories]
 
     # Thresholds for health_warnings — surfaced as constants for testability.
@@ -246,8 +250,14 @@ class HTTPBackend(MemoryBackend):
         r.raise_for_status()
         return r.json()
 
-    def retrieve(self, user_id: str, query: str, top_k: int) -> list[dict]:
-        r = self._client.post("/v1/memories/retrieve", json={"query": query, "top_k": top_k})
+    def retrieve(self, user_id: str, query: str, top_k: int, session_id: str | None = None) -> list[dict]:
+        payload: dict[str, Any] = {"query": query, "top_k": top_k}
+        # Only include session_id in payload if provided (not None).
+        # This allows the remote API to distinguish between "no session context" (None)
+        # and "empty session context" (""), enabling proper cross-session retrieval behavior.
+        if session_id:
+            payload["session_id"] = session_id
+        r = self._client.post("/v1/memories/retrieve", json=payload)
         r.raise_for_status()
         return r.json()
 
@@ -367,6 +377,7 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
         query: str,
         top_k: int = 5,
         user_id: str | None = None,
+        session_id: str | None = None,
     ) -> str:
         """Retrieve relevant memories for a query. Call this at conversation start or when context is needed.
 
@@ -374,9 +385,14 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             query: What to search for in memories.
             top_k: Max number of memories to return (default 5).
             user_id: User ID (optional).
+            session_id: Session context (optional). When set, prioritizes memories from this session.
+                When None, searches across all sessions (include_cross_session=True).
+                When set, the underlying retrieval strategy ranks session-scoped memories higher.
         """
         uid = _user(user_id)
-        results = backend.retrieve(uid, query, top_k)
+        # Pass session_id to backend: if set, retrieval strategy will prioritize memories from this session.
+        # If not set, retrieval searches across all sessions with cross-session inclusion enabled.
+        results = backend.retrieve(uid, query, top_k, session_id=session_id)
         parts: list[str] = []
         if not results:
             parts.append("No relevant memories found.")

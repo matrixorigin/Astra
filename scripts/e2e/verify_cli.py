@@ -887,6 +887,48 @@ def test_health_warnings() -> None:
           f"expected count >= 6 in: {warnings[0]}")
 
 
+# ── Scenario 19: Session-scoped retrieve ──────────────────────────────
+
+def test_session_retrieve() -> None:
+    print("\n── 19. Session-scoped retrieve ──")
+
+    from mo_memory_mcp.server import EmbeddedBackend
+
+    b = EmbeddedBackend()
+    sess_a = "sess_alpha"
+    sess_b = "sess_beta"
+
+    # Store memories in different sessions with highly distinctive keywords
+    # to ensure they rank high in semantic search results
+    b.store(USER_ID, "XYZABC123: Alpha session decision to use gRPC protocol", "semantic", sess_a)
+    b.store(USER_ID, "XYZDEF456: Beta session decision to use REST protocol", "semantic", sess_b)
+
+    # Test 1: Retrieve with session_id=sess_a — should return alpha session memory
+    results_a = b.retrieve(USER_ID, "XYZABC123 gRPC", top_k=5, session_id=sess_a)
+    check("session-scoped retrieve returns results", len(results_a) > 0, f"count={len(results_a)}")
+    
+    # Verify content comes from the correct session (gRPC keyword should be present)
+    has_grpc = any("gRPC" in r["content"] for r in results_a)
+    check("session-scoped retrieve contains session A content", has_grpc,
+          f"Expected gRPC in results, got: {[r['content'] for r in results_a]}")
+
+    # Test 2: Retrieve with session_id=sess_b — should return beta session memory
+    results_b = b.retrieve(USER_ID, "XYZDEF456 REST", top_k=5, session_id=sess_b)
+    check("session B retrieve returns results", len(results_b) > 0, f"count={len(results_b)}")
+    has_rest_in_b = any("REST" in r["content"] for r in results_b)
+    check("session B retrieve contains session B content", has_rest_in_b,
+          f"Expected REST in session B results, got: {[r['content'] for r in results_b]}")
+
+    # Test 3: Verify session isolation — session A query should NOT return session B memory
+    # Query specifically for session A content
+    results_a_only = b.retrieve(USER_ID, "XYZABC123", top_k=5, session_id=sess_a)
+    check("session A query returns session A memory", len(results_a_only) > 0, f"count={len(results_a_only)}")
+    has_only_grpc = any("gRPC" in r["content"] for r in results_a_only)
+    has_no_rest = not any("REST" in r["content"] for r in results_a_only)
+    check("session A query prioritizes session A content", has_only_grpc and has_no_rest,
+          f"Expected only gRPC, got: {[r['content'] for r in results_a_only]}")
+
+
 # ── Scenario 15: NL → Script (real LLM) ──────────────────────────────
 
 def test_nl_to_script() -> None:
@@ -999,6 +1041,7 @@ def main() -> None:
         test_vector_index_health_and_rebuild()
         test_topic_purge()
         test_health_warnings()
+        test_session_retrieve()
 
         if args.with_llm:
             test_observer_pipeline_graph()
