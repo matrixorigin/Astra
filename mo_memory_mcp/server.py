@@ -11,10 +11,10 @@ Two backends:
 from __future__ import annotations
 
 import argparse
-import asyncio
+import contextlib
 import logging
 import os
-from typing import Any
+from typing import Any, ClassVar
 
 from mcp.server import FastMCP
 
@@ -174,8 +174,8 @@ class EmbeddedBackend(MemoryBackend):
 
     # Cooldown: governance/consolidate/reflect are expensive, throttle per user.
     # key = (user_id, op_name), value = (timestamp, result)
-    _cooldown_cache: dict[tuple[str, str], tuple[float, dict]] = {}
-    _COOLDOWN_SECONDS = {"governance": 3600, "consolidate": 1800, "reflect": 7200}
+    _cooldown_cache: ClassVar[dict[tuple[str, str], tuple[float, dict]]] = {}
+    _COOLDOWN_SECONDS: ClassVar[dict[str, int]] = {"governance": 3600, "consolidate": 1800, "reflect": 7200}
 
     def _with_cooldown(self, user_id: str, op: str, fn: Any, force: bool = False) -> dict:
         import time
@@ -225,8 +225,8 @@ class EmbeddedBackend(MemoryBackend):
     def reflect(self, user_id: str, force: bool = False) -> dict:
         def _run():
             from core.memory.graph.candidates import GraphCandidateProvider
-            from core.memory.reflection.engine import ReflectionEngine
             from core.memory.graph.service import GraphMemoryService
+            from core.memory.reflection.engine import ReflectionEngine
 
             provider = GraphCandidateProvider(self._db_factory)
             svc = GraphMemoryService(self._db_factory)
@@ -269,7 +269,7 @@ class EmbeddedBackend(MemoryBackend):
         return SessionLocal.kw["bind"].url.database
 
     # In-memory active branch tracking per user (session-scoped, not persisted across restarts)
-    _active_branches: dict[str, str] = {}
+    _active_branches: ClassVar[dict[str, str]] = {}
 
     def _get_active_branch(self, user_id: str) -> str:
         """Get active branch for user. Stored in-memory for this session."""
@@ -340,7 +340,7 @@ class EmbeddedBackend(MemoryBackend):
 
         # Validate timestamp: within last 30 minutes
         if from_timestamp:
-            from datetime import datetime, timezone, timedelta
+            from datetime import datetime, timedelta, timezone
             try:
                 ts = datetime.strptime(from_timestamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             except ValueError:
@@ -360,10 +360,8 @@ class EmbeddedBackend(MemoryBackend):
         snap_name: str | None = None
         if snap:
             snap_name = snap
-            try:
+            with contextlib.suppress(Exception):
                 self._git().create_snapshot(snap_name)
-            except Exception:
-                pass
         elif not from_timestamp:
             snap_name = f"mem_br_base_{branch_id}"
             self._git().create_snapshot(snap_name)
@@ -484,12 +482,12 @@ class EmbeddedBackend(MemoryBackend):
 
     def _get_diff_rows(self, branch_db: str, src_db: str, limit: int):
         """Get diff rows via SDK. Returns (total, rows). limit=0 means count only.
-        
+
         Uses MatrixOne's native diff_table_branch API for efficient comparison.
         Errors are logged but don't fail the merge — we fall back to conservative merge.
         """
-        from sqlalchemy import text
         from matrixone.branch_builder import diff_table_branch
+        from sqlalchemy import text
         try:
             stmt_count = diff_table_branch(f"{branch_db}.mem_memories").against(
                 f"{src_db}.mem_memories"
@@ -537,7 +535,7 @@ class EmbeddedBackend(MemoryBackend):
         1. SDK diff count → safety check (prevent >5000 changes)
         2. Bulk INSERT...SELECT for non-conflicting new memories
         3. For replace: UPDATE via subquery for conflicts
-        
+
         Design rationale for _MAX_MERGE_CHANGES=5000:
         - Cosine similarity on 5000 memories takes ~10-30s (acceptable)
         - Prevents accidental merges of massive branches

@@ -13,6 +13,7 @@ Usage:
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import uuid
@@ -104,10 +105,8 @@ def cleanup() -> None:
                 {"uid": USER_ID},
             ).fetchall()
         for row in rows:
-            try:
+            with contextlib.suppress(Exception):
                 mgr.discard(row.experiment_id)
-            except Exception:
-                pass
     except Exception:
         pass
 
@@ -119,10 +118,8 @@ def cleanup() -> None:
                 {"uid": USER_ID},
             ).fetchall()
             for row in rows:
-                try:
+                with contextlib.suppress(Exception):
                     db.execute(text(f"DROP DATABASE IF EXISTS `{row.branch_db}`"))
-                except Exception:
-                    pass
             db.execute(text("DELETE FROM mem_branches WHERE user_id = :uid"), {"uid": USER_ID})
             db.commit()
     except Exception:
@@ -135,10 +132,8 @@ def cleanup() -> None:
         for s in git.list_snapshots():
             sname = s["snapshot_name"]
             if sname.startswith("mem_snap_test_") or sname.startswith("mem_br_base_"):
-                try:
+                with contextlib.suppress(Exception):
                     git.drop_snapshot(sname)
-                except Exception:
-                    pass
     except Exception:
         pass
 
@@ -260,7 +255,7 @@ def test_direct_write() -> None:
     mem_before = count("mem_memories")
     audit_before = count("mem_edit_log")
 
-    result = prog.execute(USER_ID, actions, sandbox=False, dry_run=False, program_name="verify")
+    result = prog.execute(USER_ID, actions, sandbox=False, dry_run=False, program_name="verify")  # noqa: F841
 
     check("memory count +1", count("mem_memories") == mem_before + 1)
     check("dual audit (>=+2)", count("mem_edit_log") >= audit_before + 2,
@@ -453,12 +448,17 @@ def test_graph_vs_vector() -> None:
     print("\n── 9. Graph > Vector (2-hop recall) ──")
 
     import numpy as np
+
+    from core.embedding import get_embedding_client
     from core.memory.factory import (
-        _register_builtins, _resolve_strategy, _registry, StrategyDescriptor, create_editor,
+        StrategyDescriptor,
+        _register_builtins,
+        _registry,
+        _resolve_strategy,
+        create_editor,
     )
     from core.memory.graph.graph_store import GraphStore
     from core.memory.strategy.vector_v1 import VectorRetrievalStrategy
-    from core.embedding import get_embedding_client
 
     ec = get_embedding_client()
     if ec is None:
@@ -556,8 +556,8 @@ def test_graph_vs_vector() -> None:
 def test_backfill() -> None:
     print("\n── 9. Backfill (memories exist, graph nodes missing) ──")
 
-    from core.memory.tabular.store import MemoryStore
     from core.memory.strategy.activation_index import ActivationIndexManager
+    from core.memory.tabular.store import MemoryStore
 
     # Use a separate user so graph is empty
     bfill_user = USER_ID + "_bf"
@@ -565,8 +565,10 @@ def test_backfill() -> None:
     try:
         # 1. Store memories directly (bypass index_manager → no graph nodes)
         store = MemoryStore(SessionLocal)
-        from core.memory.types import Memory as MemObj, MemoryType, TrustTier, _utcnow
         import uuid as _uuid
+
+        from core.memory.types import Memory as MemObj
+        from core.memory.types import MemoryType, TrustTier, _utcnow
 
         now = _utcnow()
         from core.embedding import get_embedding_client
@@ -574,7 +576,7 @@ def test_backfill() -> None:
         texts = ["backfill test memory A about Python", "backfill test memory B about Rust"]
         embeddings = ec.embed_batch(texts)
 
-        for txt, emb in zip(texts, embeddings):
+        for txt, emb in zip(texts, embeddings, strict=True):
             mem = MemObj(
                 memory_id=_uuid.uuid4().hex, user_id=bfill_user,
                 memory_type=MemoryType.SEMANTIC, content=txt,
@@ -691,7 +693,6 @@ def test_consolidation() -> None:
     print("\n── 12. Consolidation conflict detection ──")
 
     from core.memory.graph.consolidation import GraphConsolidator
-    from core.memory.graph.graph_store import GraphStore
 
     consolidator = GraphConsolidator(SessionLocal)
 
@@ -937,7 +938,7 @@ def test_session_retrieve() -> None:
     # Test 1: Retrieve with session_id=sess_a — should return alpha session memory
     results_a = b.retrieve(USER_ID, "XYZABC123 gRPC", top_k=5, session_id=sess_a)
     check("session-scoped retrieve returns results", len(results_a) > 0, f"count={len(results_a)}")
-    
+
     # Verify content comes from the correct session (gRPC keyword should be present)
     has_grpc = any("gRPC" in r["content"] for r in results_a)
     check("session-scoped retrieve contains session A content", has_grpc,
@@ -1040,8 +1041,9 @@ def test_branch_lifecycle() -> None:
 def test_branch_from_timestamp() -> None:
     print("\n── 22. Branch from timestamp ──")
 
+    from datetime import datetime, timedelta, timezone
+
     from mo_memory_mcp.server import EmbeddedBackend
-    from datetime import datetime, timezone, timedelta
     b = EmbeddedBackend()
 
     b.store(USER_ID, "Timestamp branch test data", "semantic", None)
@@ -1130,9 +1132,10 @@ def test_branch_full_workflow() -> None:
 def test_branch_diff() -> None:
     print("\n── 24. Branch diff ──")
 
-    from mo_memory_mcp.server import EmbeddedBackend
     from sqlalchemy import text as sa_text
+
     from core.utils.id_generator import generate_id
+    from mo_memory_mcp.server import EmbeddedBackend
     b = EmbeddedBackend()
 
     # 1. Store baseline with embedding
