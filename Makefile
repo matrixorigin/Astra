@@ -46,6 +46,7 @@ help:
 	@echo "  make test-integration   - Run integration tests only"
 	@echo "  make verify             - E2E verification (real DB, no LLM)"
 	@echo "  make verify-llm         - E2E verification (real DB + real LLM)"
+	@echo "  make verify-talk        - Talk verification (real CLI + API + LLM)"
 	@echo ""
 	@echo "Environment Setup:"
 	@echo "  make dev-init           - Complete initialization (setup + deps + config)"
@@ -495,14 +496,18 @@ db-reset:
 # E2E Verification
 # ============================================================================
 
-.PHONY: verify verify-llm
+.PHONY: verify verify-llm verify-talk
 verify:
 	@echo "Running E2E verification..."
-	@python scripts/e2e/verify_cli.py $(if $(VERBOSE),-v)
+	@set -a && . ./.env && set +a && http_proxy= https_proxy= python scripts/e2e/verify_cli.py $(if $(VERBOSE),-v)
 
 verify-llm:
-	@echo "Running E2E verification (with LLM)..."
-	@python scripts/e2e/verify_cli.py --with-llm $(if $(VERBOSE),-v)
+	@echo "Running E2E verification (with LLM + session state)..."
+	@set -a && . ./.env && set +a && http_proxy= https_proxy= python scripts/e2e/verify_cli.py --with-llm $(if $(VERBOSE),-v) $(if $(MODEL),--model $(MODEL))
+
+verify-talk:
+	@echo "Running talk verification (requires API server + LLM)..."
+	@set -a && . ./.env && set +a && http_proxy= https_proxy= python scripts/e2e/verify_talk.py $(if $(VERBOSE),-v) $(if $(CASE),--case $(CASE)) $(if $(MODEL),--model $(MODEL))
 
 # ============================================================================
 # Testing

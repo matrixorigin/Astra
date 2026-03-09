@@ -1,0 +1,48 @@
+name: memory_basic
+description: "记忆注入和召回：agent 应该调用 memory 工具存储偏好，然后能召回"
+requires: [llm]
+
+turns:
+  - user: "记住我喜欢用 Python 做数据分析"
+    checks:
+      rules:
+        - tool_called: memory_program
+        - db:
+            table: mem_memories
+            where: "user_id = :uid"
+            assert:
+              count: ">=1"
+        - db:
+            table: mem_memories
+            where: "user_id = :uid AND content LIKE '%Python%' AND is_active = 1"
+            assert:
+              count: ">=1"
+        - db:
+            table: mem_edit_log
+            where: "user_id = :uid"
+            assert:
+              count: ">=1"
+      llm_judge:
+        criteria: "回复应确认已记住用户偏好，语气自然，不应反问用户"
+        pass_threshold: 0.7
+
+  - user: "我刚才说我喜欢用什么语言做数据分析？"
+    checks:
+      rules:
+        - no_tool_called: true
+        - response_contains: "Python"
+      llm_judge:
+        criteria: "回复应准确引用之前存储的偏好（Python），不编造其他语言"
+        pass_threshold: 0.8
+
+final_checks:
+  rules:
+    - session_integrity: true
+    - turn_count_increases: true
+    - db:
+        table: agent_events
+        where: "session_id = :sid"
+        assert:
+          count: ">=4"
+          fields:
+            session_id: {not_null: true}

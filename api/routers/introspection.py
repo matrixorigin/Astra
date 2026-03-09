@@ -389,11 +389,27 @@ def get_introspection_memory(
 ) -> dict:
     """Return memory stats for introspection tool."""
     _verify_session_owner(db, session_id, current_user["user_id"])
-    return {
+    result = {
         "episodic": _get_episodic_stats(db, session_id),
         "semantic": _get_semantic_stats(db, session_id),
         "procedural": _get_procedural_stats(db, session_id),
     }
+    # Include actual profile memories so LLM can answer questions about the user
+    user_id = current_user["user_id"]
+    try:
+        rows = db.execute(
+            text(
+                "SELECT content FROM mem_memories "
+                "WHERE user_id = :uid AND is_active = 1 AND memory_type = 'profile' "
+                "ORDER BY updated_at DESC LIMIT 20"
+            ),
+            {"uid": user_id},
+        ).fetchall()
+        if rows:
+            result["profile"] = [r[0] for r in rows]
+    except Exception as exc:
+        logger.debug("profile memory query failed: %s", exc)
+    return result
 
 
 def _get_episodic_stats(db: Session, session_id: str) -> dict:

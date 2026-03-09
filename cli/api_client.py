@@ -45,7 +45,7 @@ class APIClient:
             _transport: Optional httpx transport (e.g. ASGITransport for testing)
         """
         self.base_url = (
-            base_url or os.getenv("MO_AGENT_API_URL", "http://localhost:8000")
+            base_url or os.getenv("MO_AGENT_API_URL", "http://127.0.0.1:8000")
         ).rstrip("/")
         self.credentials_path = credentials_path or Path.home() / ".mo-agent" / "credentials.json"
         self.profile = profile or os.getenv("MO_AGENT_PROFILE")

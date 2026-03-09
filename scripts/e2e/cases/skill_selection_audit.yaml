@@ -1,0 +1,42 @@
+name: skill_selection_audit
+description: "Skill 选择审计：每次工具调用都应写入 skill_selection_events，包含 skill_name、session_id、execution_success"
+requires: [llm]
+
+turns:
+  - user: "记住我喜欢喝咖啡"
+    checks:
+      rules:
+        - tool_called: memory_program
+        - db:
+            table: mem_memories
+            where: "user_id = :uid AND is_active = 1"
+            assert:
+              count: ">=1"
+        - db:
+            table: skill_selection_events
+            where: "session_id = :sid"
+            assert:
+              count: ">=1"
+              fields:
+                skill_name: {not_null: true}
+                execution_success: 1
+                selection_method: {not_null: true}
+      llm_judge:
+        criteria: "回复应确认已记住用户偏好"
+        pass_threshold: 0.7
+
+  - user: "我刚才说我喜欢喝什么？"
+    checks:
+      rules:
+        - no_tool_called: true
+        - response_contains: "咖啡"
+
+final_checks:
+  rules:
+    - session_integrity: true
+    - turn_count_increases: true
+    - db:
+        table: skill_selection_events
+        where: "session_id = :sid AND execution_success = 1"
+        assert:
+          count: ">=1"

@@ -781,6 +781,8 @@ class LLMClient(DbConsumer):
                     "success",
                     metadata=_meta,
                 )
+                yield {"type": "usage", "prompt": usage["prompt"], "completion": usage["completion"],
+                       "cache_read": usage["cache_read"], "cache_creation": usage["cache_creation"]}
                 return
             except (BudgetExceededError, ContextOverflowError, PermissionError):
                 raise

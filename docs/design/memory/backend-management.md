@@ -1062,7 +1062,14 @@ class MemoryProgrammer:
         self.experiments = experiments
 
     def execute(self, user_id: str, script: str | dict, sandbox: bool = True) -> ProgramResult:
-        """Parse script → create experiment → execute actions → return diff."""
+        """Parse script → create experiment → execute actions → return diff.
+
+        sandbox=True (default in core API): writes to experiment branch, requires
+        explicit commit to merge into production. Provides atomic rollback on failure.
+
+        sandbox=False (default in CLI EdgeTool): writes directly to production.
+        Used when no commit UI exists and the LLM cannot trigger the commit step.
+        """
         ...
 ```
 

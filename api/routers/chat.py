@@ -362,7 +362,7 @@ def _get_shared_components(db_factory):
         register_builtin_skills(_shared_skill_catalog, db_factory, code_executor=_shared_code_executor)
         _shared_context_manager = ContextManager(db_factory, gate_trigger=_shared_gate_trigger)
 
-        _shared_tool_registry = ToolRegistry()
+        _shared_tool_registry = ToolRegistry(embed_fn=_get_shared_embed_fn())
         for skill in _shared_skill_catalog.list_skills():
             _shared_tool_registry.register_skill(skill, source=ToolSource.CLOUD, category="builtin")
 
@@ -1877,8 +1877,11 @@ def _get_session_tool_registry(
     from core.skills.tool_registry import ToolRegistry, ToolSource
     embed_fn = _get_shared_embed_fn()
     registry = ToolRegistry(embed_fn=embed_fn)
+    # memory_program is a core edge tool — always pin it so cloud skills don't crowd it out
+    _EDGE_PINNED = frozenset({"memory_program"})
     for schema in (edge_tools or []):
-        registry.register_schema(schema, ToolSource.EDGE)
+        name = schema.get("function", {}).get("name", "")
+        registry.register_schema(schema, ToolSource.EDGE, pinned=(name in _EDGE_PINNED))
     return registry
 
 
@@ -2160,9 +2163,17 @@ async def chat_turn(
                     cloud_schemas = _get_cloud_skill_schemas(cloud_registry)
                     edge_tool_names = _tool_names(tools_schema)
 
-                    # Cheap keyword pre-filter: score each cloud skill by query token overlap
+                    # Cheap keyword pre-filter: score each cloud skill by query token overlap.
+                    # Uses bidirectional matching to handle non-English queries:
+                    # 1. query tokens in skill text (works for English queries)
+                    # 2. skill name parts in query (e.g. "issues" in "matrixone的issue")
+                    # 3. query substrings in skill name (e.g. "issue" matches "list_issues")
                     _query_lower = (user_query or "").lower()
                     _query_tokens = set(_query_lower.split()) if _query_lower else set()
+                    # Extract alphabetic words from query for reverse matching
+                    # (handles mixed-language queries like "matrixone的issue")
+                    import re as _re
+                    _query_alpha = set(_re.findall(r"[a-z]{3,}", _query_lower))
 
                     _candidates = []
                     for cs in cloud_schemas:
@@ -2170,10 +2181,16 @@ async def chat_turn(
                         if not cs_name or cs_name in edge_tool_names:
                             continue
                         cloud_skill_names.add(cs_name)
-                        # Inline relevance score — number of query tokens found in name+description
-                        _text = (cs.get("function", {}).get("name", "") + " "
+                        _text = (cs_name + " "
                                  + cs.get("function", {}).get("description", "")).lower()
-                        _score = sum(1 for t in _query_tokens if t in _text)
+                        # Forward: query tokens found in skill text
+                        _score = sum(1 for t in _query_tokens if t in _text) if _query_tokens else 0
+                        # Reverse: skill name parts ↔ query alpha words (bidirectional substring)
+                        _name_parts = set(cs_name.lower().replace("_", " ").split())
+                        for qw in _query_alpha:
+                            for np in _name_parts:
+                                if qw in np or np in qw:
+                                    _score += 2
                         _candidates.append((cs, _score))
 
                     # Take top candidates by relevance, then fill with unmatched up to limit.

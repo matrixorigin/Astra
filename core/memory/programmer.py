@@ -272,7 +272,12 @@ class MemoryProgrammer:
     """Declarative memory manipulation via structured scripts.
 
     Composes MemoryEditor (actions) + MemoryExperimentManager (sandbox).
-    All executions are sandboxed by default.
+
+    sandbox default: False in the CLI EdgeTool, True in the core API.
+    The core API defaults to sandbox=True for safety (atomic rollback on
+    failure, experiment branch isolation). The CLI EdgeTool overrides this
+    to False because no commit UI exists yet — sandbox writes would silently
+    disappear since the LLM cannot trigger the commit step.
     """
 
     def __init__(
@@ -519,8 +524,16 @@ class MemoryProgrammer:
             return ActionResult(action_type="inject", success=False,
                                 error="inject requires 'content'")
 
-        mem_type = MemoryType(spec.get("type", "semantic"))
-        trust = TrustTier(spec.get("trust", "T2"))
+        # Coerce LLM-friendly type aliases to valid MemoryType
+        _TYPE_ALIASES = {"preference": "profile", "fact": "semantic", "skill": "procedural"}
+        raw_type = spec.get("type", "semantic")
+        mem_type = MemoryType(_TYPE_ALIASES.get(raw_type, raw_type))
+
+        # Coerce numeric trust to TrustTier (LLMs often send floats)
+        raw_trust = spec.get("trust", "T2")
+        if isinstance(raw_trust, (int, float)):
+            raw_trust = "T1" if raw_trust >= 0.9 else "T2" if raw_trust >= 0.7 else "T3" if raw_trust >= 0.4 else "T4"
+        trust = TrustTier(raw_trust)
 
         mem = editor.inject(
             user_id, content,

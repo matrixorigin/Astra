@@ -586,9 +586,17 @@ class ChatLoop:
                 slo_escalation_model=self._check_slo_escalation(session_id),
             )
 
+            _llm_usage: dict[str, int] | None = None
             async for chunk_msg in self.llm.chat_stream(
                 messages, user_id, session_id, model=model,
             ):
+                if chunk_msg["type"] == "usage":
+                    _llm_usage = {
+                        "prompt": chunk_msg.get("prompt", 0),
+                        "completion": chunk_msg.get("completion", 0),
+                        "total": chunk_msg.get("prompt", 0) + chunk_msg.get("completion", 0),
+                    }
+                    continue
                 if chunk_msg["type"] == "reasoning":
                     # Emit reasoning event for CoT audit trail
                     yield StreamEvent(
@@ -678,7 +686,7 @@ class ChatLoop:
             )
             self._log_response(
                 user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id,
-                messages=messages, firewall_result=verification,
+                messages=messages, firewall_result=verification, token_usage=_llm_usage,
             )
 
             run_finished_event = self.event_logger.create_stream_event(
@@ -790,10 +798,17 @@ class ChatLoop:
                 slo_escalation_model=self._check_slo_escalation(session_id),
             )
 
+            _llm_usage_tools: dict[str, int] | None = None
             async for chunk in self.llm.chat_with_tools_stream(
                 messages, tools_schema, model=model,
             ):
-                if chunk["type"] == "reasoning":
+                if chunk["type"] == "usage":
+                    _llm_usage_tools = {
+                        "prompt": chunk.get("prompt", 0),
+                        "completion": chunk.get("completion", 0),
+                        "total": chunk.get("prompt", 0) + chunk.get("completion", 0),
+                    }
+                elif chunk["type"] == "reasoning":
                     reasoning_content_parts.append(chunk["content"])
                     yield StreamEvent(
                         event_type=StreamEventType.REASONING_MESSAGE_CONTENT,
@@ -855,7 +870,7 @@ class ChatLoop:
                 )
                 self._log_response(
                     user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id,
-                    messages=messages, firewall_result=verification,
+                    messages=messages, firewall_result=verification, token_usage=_llm_usage_tools,
                 )
 
                 run_finished_event = self.event_logger.create_stream_event(
@@ -1073,9 +1088,17 @@ class ChatLoop:
         from core.verification.streaming_verifier import StreamingVerifier
         sv = StreamingVerifier(firewall=self.firewall, context_capture_id=context_capture_id, llm_client=self.llm)
 
+        _llm_usage_final: dict[str, int] | None = None
         async for chunk_msg in self.llm.chat_stream(
             messages, user_id, session_id, model=self._check_slo_escalation(session_id),
         ):
+            if chunk_msg["type"] == "usage":
+                _llm_usage_final = {
+                    "prompt": chunk_msg.get("prompt", 0),
+                    "completion": chunk_msg.get("completion", 0),
+                    "total": chunk_msg.get("prompt", 0) + chunk_msg.get("completion", 0),
+                }
+                continue
             if chunk_msg["type"] == "reasoning":
                 yield StreamEvent(
                     event_type=StreamEventType.REASONING_MESSAGE_CONTENT,
@@ -1140,7 +1163,7 @@ class ChatLoop:
 
         self._log_response(
             user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id,
-            messages=messages, firewall_result=verification,
+            messages=messages, firewall_result=verification, token_usage=_llm_usage_final,
         )
         yield StreamEvent(
             event_type=StreamEventType.RUN_FINISHED,
@@ -1420,7 +1443,15 @@ class ChatLoop:
             slo_escalation_model=self._check_slo_escalation(session_id),
         )
         final_text = ""
+        _llm_usage_plan: dict[str, int] | None = None
         async for chunk_msg in self.llm.chat_stream(synth_messages, user_id, session_id, model=model):
+            if chunk_msg["type"] == "usage":
+                _llm_usage_plan = {
+                    "prompt": chunk_msg.get("prompt", 0),
+                    "completion": chunk_msg.get("completion", 0),
+                    "total": chunk_msg.get("prompt", 0) + chunk_msg.get("completion", 0),
+                }
+                continue
             if chunk_msg["type"] == "reasoning":
                 continue
             chunk = chunk_msg["content"]
@@ -1458,7 +1489,7 @@ class ChatLoop:
         self._log_response(
             user_id, session_id, final_text,
             user_event.event_id, user_event.causal_chain_id,
-            firewall_result=verification,
+            firewall_result=verification, token_usage=_llm_usage_plan,
         )
 
         yield StreamEvent(
@@ -1952,6 +1983,7 @@ class ChatLoop:
         causal_chain_id: str | None,
         messages: list[dict[str, Any]] | None = None,
         firewall_result: Any | None = None,
+        token_usage: dict[str, int] | None = None,
     ) -> None:
         """Log the final agent response as an event, then run Observer."""
         event = self.event_logger.create_llm_response(
@@ -1963,6 +1995,7 @@ class ChatLoop:
             parent_event_id=parent_event_id,
             causal_chain_id=causal_chain_id or "",
             llm_model_used=self.llm.config.get("model", "unknown"),
+            token_usage=token_usage,
         )
         # Auto-score: fill quality_score + training_eligible
         if firewall_result is not None:

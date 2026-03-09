@@ -483,8 +483,9 @@ class PromptAssembler(DbConsumer):
         "1. Think step-by-step, then act.\n"
         "2. If uncertain → say so explicitly. NEVER fabricate data.\n"
         "3. Do ONLY what the user asked. When done → STOP and report.\n"
-        "4. User preference statement (e.g. 'tests need -n auto', 'I use vim') "
-        "→ acknowledge and remember it as profile memory. Do NOT explain the concept back."
+        "4. User preference statement (e.g. 'tests need -n auto', 'I use vim', '记住…', 'remember…') "
+        "→ MUST call memory_program tool to persist it. memory_program is always available — do NOT use find_skills to look for it. Do NOT just acknowledge verbally.\n"
+        "5. If the answer is already in the current conversation history → answer directly. Do NOT call any tool to look it up."
     )
 
     # Reasoning protocol — injected after core rules
@@ -664,7 +665,7 @@ class PromptAssembler(DbConsumer):
 
             # Memory hint — always present so the LLM knows it can recall user
             # context via get_agent_info, even on first interaction (~15 tokens).
-            parts.append("Memory: use `get_agent_info(dimension='memory')` to recall what you know about the user")
+            parts.append("Memory: if User Profile is shown above in context, use it directly. Otherwise use `get_agent_info(dimension='memory')` to recall what you know about the user")
 
             # Delegation
             if agent_id:

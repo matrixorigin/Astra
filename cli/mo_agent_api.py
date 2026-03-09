@@ -1237,7 +1237,7 @@ SLASH_COMMANDS = {
 # Edge turn runner
 # ============================================================================
 
-async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, auto_approve, renderer=None, extra_rules=None, explain=False, session_info=None, routing_strategy=None):
+async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, auto_approve, renderer=None, extra_rules=None, explain=False, session_info=None, routing_strategy=None, user_id=None):
     """Run one edge chat loop turn using the provided APIClient."""
     import os
 
@@ -1268,7 +1268,14 @@ async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, au
     from cli.tools.reflect import ReflectTool
     from cli.tools.skill_config import register_skill_config_tools
     if session_info is None:
-        session_info = {"session_id": session_id, "agent_id": agent_id or "default-agent", "model": model, "turn": 0}
+        # Use JWT user_id (UUID) so memory writes and context loads use the same key.
+        jwt_user_id = user_id or agent_id or ""
+        try:
+            info = await api_client.get_current_user()
+            jwt_user_id = info.get("user_id") or jwt_user_id
+        except Exception:
+            pass
+        session_info = {"session_id": session_id, "agent_id": agent_id or "default-agent", "user_id": jwt_user_id, "model": model, "turn": 0}
     perms = PermissionManager(auto_approve=auto_approve)
 
     router.register(GetAgentInfoTool(tool_router=router, session_info=session_info, api_client=api_client))
@@ -1279,7 +1286,7 @@ async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, au
     from cli.tools.memory_program import MemoryProgramTool
     router.register(MemoryProgramTool(session_info=session_info))
 
-    # Skill discovery tool for large catalogs
+    # Skill discovery — fallback for skills not in current tool list
     from cli.tools.skill_discovery import FindSkillsTool
     router.register(FindSkillsTool())
 
@@ -1374,6 +1381,7 @@ def logout(ctx):
 @cli.command()
 @click.option("--user-id", default="cli_user")
 @click.option("--session-id", default=None)
+@click.option("--message", "-m", default=None, help="Single message (non-interactive mode)")
 @click.option("--model", default=None, help="Model to use for chat")
 @click.option("--router", "routing_strategy", default=None, help="Routing strategy (e.g. 'default', 'experiment_v2')")
 @click.option("--resume", is_flag=True, help="Resume last session")
@@ -1381,14 +1389,14 @@ def logout(ctx):
 @click.option("--debug", is_flag=True, help="Print full traceback on errors")
 @click.option("--explain", is_flag=True, help="Show per-turn execution trace (like EXPLAIN ANALYZE)")
 @click.pass_context
-def chat(ctx, user_id, session_id, model, routing_strategy, resume, auto_approve, debug, explain):
+def chat(ctx, user_id, session_id, message, model, routing_strategy, resume, auto_approve, debug, explain):
     """Start interactive chat with edge tool execution."""
     from rich.console import Console
     from rich.panel import Panel
 
     client = ctx.obj["client"]
     console = Console(stderr=True)
-    is_tty = sys.stdin.isatty()
+    is_tty = sys.stdin.isatty() and not message  # -m mode is always non-interactive
 
     if debug:
         from rich.traceback import install
@@ -1457,6 +1465,27 @@ def chat(ctx, user_id, session_id, model, routing_strategy, resume, auto_approve
     except Exception as e:
         console.print(f"[red]Failed to create session: {e}[/red]")
         sys.exit(1)
+
+    # --- Single message mode (-m) ---
+    if message:
+        from cli.ui.renderer import SimpleRenderer
+        try:
+            loop_result = client._run(_run_edge_turn(
+                message, client._ensure_client(), session_id,
+                selected_model, user_id, True,
+                renderer=SimpleRenderer(),
+                explain=explain,
+                routing_strategy=routing_strategy,
+                user_id=user_id,
+            ))
+            # Print response to stdout (renderer already printed streaming text)
+        except Exception as e:
+            if debug:
+                console.print_exception(show_locals=True)
+            else:
+                console.print(f"[red]{type(e).__name__}: {e}[/red]")
+            sys.exit(1)
+        return
 
     # --- Welcome banner ---
     console.print(Panel(

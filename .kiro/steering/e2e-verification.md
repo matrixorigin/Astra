@@ -17,8 +17,19 @@ make verify
 # Full verification — includes NL→Script via real LLM
 make verify-llm
 
+# Talk verification — real CLI + API + LLM, multi-turn conversations
+make verify-talk
+
+# Run one case
+make verify-talk CASE=memory_basic
+
+# Specify model explicitly (default: cheapest by pricing)
+make verify-llm MODEL=deepseek-chat
+make verify-talk MODEL=kimi-k2.5
+
 # Verbose output
 make verify VERBOSE=1
+make verify-talk VERBOSE=1
 ```
 
 ### First-Time LLM Setup
@@ -32,15 +43,39 @@ make verify-llm
 
 ### What It Verifies
 
-| Scenario | What | LLM needed? |
-|----------|------|-------------|
-| 1. Sandbox inject | Experiment created, production unchanged | No |
-| 2. Commit | Data moves to production, experiment committed | No |
-| 3. Dry-run | Zero DB changes | No |
-| 4. Discard | Production unchanged, experiment discarded | No |
-| 5. Direct write | Data in production, dual audit entries | No |
-| 6. Multi-turn | inject → correct → verify content updated, audit chain | No |
-| 7. NL→Script | LLM generates actions, sandbox execution works | Yes |
+| Command | What | Needs |
+|---------|------|-------|
+| `make verify` | Core data path (sandbox, commit, dry-run, discard, multi-turn) | MatrixOne |
+| `make verify-llm` | + NL→Script via real LLM | + LLM key |
+| `make verify-talk` | Full conversations: tool calls, DB state, response quality | + API server |
+
+### Talk Verification Cases
+
+Cases live in `scripts/e2e/cases/*.yaml`. Each case defines:
+- Multi-turn conversation (user messages in sequence)
+- Per-turn rule checks (hard pass/fail): tool called, DB state, response content
+- Per-turn LLM judge (soft scoring): response quality against criteria
+- Final checks: `session_integrity` (event chain, parent_event_id, status, event_count), `turn_count_increases`
+
+```bash
+scripts/e2e/cases/
+├── memory_basic.yaml      # 记忆注入和召回
+├── memory_correct.yaml    # 记忆纠正
+├── memory_purge.yaml      # 记忆删除，召回时不再出现
+└── multi_session.yaml     # 跨 session 记忆持久化
+```
+
+Available rule types in YAML:
+- `tool_called: <name>` — tool was invoked
+- `response_contains: <text>` — response includes text
+- `response_not_contains: <text>` — response excludes text
+- `response_contains_any: [a, b, c]` — response includes at least one
+- `db: {table, where, assert: {count, fields}}` — DB state check
+- `session_integrity: true` — verifies event chain, parent_event_id, status, event_count consistency
+- `turn_count_increases: true` — verifies event count grew since last snapshot
+- `new_session: true` on a turn — starts a fresh session (same user, new session_id)
+
+To add a new case, create a YAML file following the format in existing cases.
 
 ### Data Safety
 

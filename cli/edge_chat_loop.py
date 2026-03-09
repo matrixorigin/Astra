@@ -26,6 +26,10 @@ MAX_TURN_WALL_CLOCK_S = 300
 _STALL_WINDOW = 3
 _MAX_NUDGES = 2  # give up after this many nudges — cloud is not listening
 
+# Tool-name-only stall: if the same tool name (regardless of args) repeats
+# this many consecutive turns without progress, also nudge.
+_TOOL_NAME_STALL_WINDOW = 4
+
 
 class Renderer(Protocol):
     """Pluggable output renderer (terminal, file, test stub)."""
@@ -464,6 +468,7 @@ async def edge_chat_loop(
     total_usage: dict[str, int] = {}
     _explain_turns: list[dict[str, Any]] = []
     _turn_sigs: list[frozenset[str]] = []  # per-turn tool call signatures for stall detection
+    _turn_tool_names: list[frozenset[str]] = []  # per-turn tool names only (for name-only stall)
     _nudge_count = 0  # how many stall nudges we've sent this session
 
     for turn in range(MAX_TURNS):
@@ -551,27 +556,47 @@ async def edge_chat_loop(
             f"{tc.name}:{json.dumps(tc.arguments, sort_keys=True, separators=(',', ':'))}"
             for tc in parsed
         )
+        name_sig = frozenset(tc.name for tc in parsed)
         _turn_sigs.append(sig)
+        _turn_tool_names.append(name_sig)
+
+        stall_detected = False
+        stall_msg = ""
         if len(_turn_sigs) >= _STALL_WINDOW:
             recent = _turn_sigs[-_STALL_WINDOW:]
             if all(s == recent[0] for s in recent[1:]):
-                _nudge_count += 1
-                if _nudge_count > _MAX_NUDGES:
-                    # Already nudged twice and cloud keeps looping — force stop.
-                    renderer.info("Stall detected: giving up after repeated nudges.")
-                    break
-                # Reset so the next window starts fresh after the nudge.
-                _turn_sigs = []
-                # Inject a nudge as a user message so the cloud stops looping.
-                # The `continue` deliberately skips `messages = []` below so
-                # the nudge is sent as the sole message on the next turn.
-                messages = [{"role": "user", "content": (
+                stall_detected = True
+                stall_msg = (
                     "[SYSTEM] You have called the same tools with the same arguments "
                     f"{_STALL_WINDOW} times in a row without making progress. "
                     "Stop calling tools and give your best answer based on what you have so far."
-                )}]
-                tool_results = []
-                continue
+                )
+        if not stall_detected and len(_turn_tool_names) >= _TOOL_NAME_STALL_WINDOW:
+            recent_names = _turn_tool_names[-_TOOL_NAME_STALL_WINDOW:]
+            if all(s == recent_names[0] for s in recent_names[1:]) and len(recent_names[0]) == 1:
+                stall_detected = True
+                tool_name = next(iter(recent_names[0]))
+                stall_msg = (
+                    f"[SYSTEM] You have called '{tool_name}' {_TOOL_NAME_STALL_WINDOW} times in a row "
+                    "with different arguments but no progress. "
+                    "Stop searching and act on what you already found, or give your best answer."
+                )
+
+        if stall_detected:
+            _nudge_count += 1
+            if _nudge_count > _MAX_NUDGES:
+                # Already nudged twice and cloud keeps looping — force stop.
+                renderer.info("Stall detected: giving up after repeated nudges.")
+                break
+            # Reset so the next window starts fresh after the nudge.
+            _turn_sigs = []
+            _turn_tool_names = []
+            # Inject a nudge as a user message so the cloud stops looping.
+            # The `continue` deliberately skips `messages = []` below so
+            # the nudge is sent as the sole message on the next turn.
+            messages = [{"role": "user", "content": stall_msg}]
+            tool_results = []
+            continue
 
         # Execute tool calls locally
         approved: list[ToolCall] = []

@@ -1,0 +1,59 @@
+name: memory_purge
+description: "记忆删除：agent 应该能软删除记忆，新 session 召回时不再出现"
+requires: [llm]
+
+turns:
+  - user: "记住我喜欢用 Go 做后端开发"
+    checks:
+      rules:
+        - tool_called: memory_program
+        - db:
+            table: mem_edit_log
+            where: "user_id = :uid"
+            assert:
+              count: ">=1"
+      llm_judge:
+        criteria: "回复应确认已记住用户偏好"
+        pass_threshold: 0.7
+
+  - user: "忘掉我关于编程语言偏好的记忆"
+    checks:
+      rules:
+        - tool_called: memory_program
+        - db:
+            table: mem_edit_log
+            where: "user_id = :uid"
+            assert:
+              count: ">=2"
+        - db:
+            table: mem_memories
+            where: "user_id = :uid AND is_active = 0"
+            assert:
+              count: ">=1"
+      llm_judge:
+        criteria: "回复应表示正在或已经删除记忆，不应拒绝或忽略请求"
+        pass_threshold: 0.5
+
+  # 新 session：agent 只能依赖 memory，不能依赖 conversation history
+  - user: "我喜欢用什么语言做后端开发？"
+    new_session: true
+    checks:
+      rules:
+        - db:
+            table: mem_memories
+            where: "user_id = :uid AND is_active = 1 AND content LIKE '%Go%'"
+            assert:
+              count: "0"
+      llm_judge:
+        criteria: "回复应表示不知道用户的偏好，或询问用户。不应把 Go 作为用户已知的偏好陈述出来（列举常见语言作为选项是可以的）"
+        pass_threshold: 0.7
+
+final_checks:
+  rules:
+    - session_integrity: true
+    - turn_count_increases: true
+    - db:
+        table: mem_edit_log
+        where: "user_id = :uid"
+        assert:
+          count: ">=2"

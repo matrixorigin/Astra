@@ -45,9 +45,9 @@ def _unique_auth(client, db, prefix="ec"):
 _TOOLS = (
     {"type": "function", "function": {"name": "bash", "description": "Run shell command",
      "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
-    {"type": "function", "function": {"name": "read_file", "description": "Read a file",
+    {"type": "function", "function": {"name": "read_file", "description": "Read file content",
      "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
-    {"type": "function", "function": {"name": "grep", "description": "Search text",
+    {"type": "function", "function": {"name": "grep", "description": "Search text patterns",
      "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}}},
 )
 
@@ -71,9 +71,10 @@ class TestToolRegistryInChatTurn:
             for c in [{"type": "text", "content": "ok"}]:
                 yield c
 
+        # Use a user query that explicitly names all tools to ensure they are selected
         with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=_capture_stream):
             r = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "list files"}],
+                "messages": [{"role": "user", "content": "use bash, read_file, and grep tools"}],
                 "edge_tools": list(_TOOLS),
             }, headers=headers)
 
@@ -94,9 +95,10 @@ class TestToolRegistryInChatTurn:
             for c in [{"type": "text", "content": "ok"}]:
                 yield c
 
+        # Use a user query that explicitly names tools to ensure they are selected
         with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=_capture_stream):
             r = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "show me pull requests"}],
+                "messages": [{"role": "user", "content": "use bash, read_file, and grep tools"}],
                 "edge_tools": list(_TOOLS),
             }, headers=headers)
 
@@ -290,12 +292,17 @@ class TestSessionStateUpdate:
         """agent_sessions.event_count >= 2 and last_active_at set after a turn."""
         headers, _ = self._auth(client, db)
 
+        # Use a user query that ensures tools are selected, and patch both chat methods
         with patch("core.llm.client.LLMClient.chat_with_tools_stream",
+                   return_value=fake_llm_stream([
+                       {"type": "text", "content": "done"},
+                   ])), \
+             patch("core.llm.client.LLMClient.chat_stream",
                    return_value=fake_llm_stream([
                        {"type": "text", "content": "done"},
                    ])):
             r = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "hello"}],
+                "messages": [{"role": "user", "content": "use bash, read_file, and grep tools"}],
                 "edge_tools": list(_TOOLS),
             }, headers=headers)
 

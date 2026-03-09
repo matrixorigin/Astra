@@ -395,7 +395,17 @@ Verify the full system with real DB writes and real assertions:
 ```bash
 make verify             # Core scenarios (no LLM needed)
 make verify-llm         # Includes NL→Script via real LLM
+make verify-talk        # Talk verification (real CLI + API + LLM)
 make verify VERBOSE=1   # Verbose output
+```
+
+Talk verification runs designed multi-turn conversations against the real agent,
+checking DB state, tool calls, and response quality (via LLM judge):
+
+```bash
+make verify-talk                    # Run all cases
+make verify-talk CASE=memory_basic  # Run one case
+make verify-talk VERBOSE=1          # See responses and tool calls
 ```
 
 To run LLM verification, first set up model config:
@@ -404,7 +414,8 @@ To run LLM verification, first set up model config:
 cp config/models.example.yaml .models.yaml
 # Edit .models.yaml — fill in API keys
 mo-admin model load .models.yaml
-make verify-llm
+make verify-llm                        # auto-selects cheapest model
+make verify-llm MODEL=deepseek-chat    # or specify explicitly
 ```
 
 See [Testing Guide](docs/guides/testing.md) for detailed testing documentation.

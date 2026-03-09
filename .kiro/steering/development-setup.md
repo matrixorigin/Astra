@@ -57,7 +57,8 @@ make verify
 cp config/models.example.yaml .models.yaml
 # Edit .models.yaml — fill in API keys
 mo-admin model load .models.yaml
-make verify-llm
+make verify-llm                        # auto-selects cheapest model
+make verify-llm MODEL=deepseek-chat    # or specify explicitly
 
 # 10. Visit API docs
 # Open http://localhost:8000/docs in browser

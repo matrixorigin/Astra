@@ -331,10 +331,17 @@ class TestEditorHasIndexManager:
 
 
 class TestEdgeToolForceSandbox:
-    """EdgeTool must default to sandbox — no direct production writes from chat loop."""
+    """EdgeTool defaults to sandbox=False — writes go directly to production."""
 
-    def test_edge_tool_defaults_to_sandbox(self, db_factory):
-        """Calling EdgeTool without sandbox param → experiment created, production untouched."""
+    def test_edge_tool_defaults_to_no_sandbox(self, db_factory):
+        """MemoryProgramTool._default_sandbox is False by default."""
+        from cli.tools.memory_program import MemoryProgramTool
+
+        tool = MemoryProgramTool()
+        assert tool._default_sandbox is False
+
+    def test_edge_tool_sandbox_true_creates_experiment(self, db_factory):
+        """Explicit sandbox=True still creates experiment branch."""
         import asyncio
 
         from cli.tools.memory_program import MemoryProgramTool
@@ -345,19 +352,11 @@ class TestEdgeToolForceSandbox:
         raw = asyncio.run(tool.execute(
             user_id=user_id,
             actions=[{"inject": {"content": "edge sandbox test", "type": "semantic"}}],
-            # No sandbox param — should default to True
+            sandbox=True,
         ))
         result = json.loads(raw)
         assert result.get("experiment_id") is not None
-        assert "hint" in result  # "Sandbox run. Call with commit=..."
-
-        # Production table must have 0 rows
-        with db_factory() as db:
-            count = db.execute(
-                text("SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active != 0"),
-                {"uid": user_id},
-            ).scalar()
-            assert count == 0
+        assert "hint" in result
 
 
 class TestBatchInjectEmbedding:

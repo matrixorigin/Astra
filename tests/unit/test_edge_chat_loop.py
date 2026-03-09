@@ -402,10 +402,12 @@ class TestEdgeChatLoop:
     async def test_max_turns_limit(self, router, perms, renderer):
         """Loop stops at MAX_TURNS and reports error. No flush call."""
         turns = []
+        tool_names = ["read_file", "list_dir", "grep", "bash", "write_file"]
         for i in range(30):
-            # Use different arguments each turn to avoid triggering stall detection
+            # Rotate tool names to avoid triggering both stall detectors
+            name = tool_names[i % len(tool_names)]
             turns.append([
-                {"type": "tool_call", "id": f"tc_{i}", "name": "read_file",
+                {"type": "tool_call", "id": f"tc_{i}", "name": name,
                  "arguments": {"path": f"file_{i}.txt"}},
                 {"type": "turn_complete", "has_tool_calls": True},
             ])

@@ -41,9 +41,10 @@ if [ -f .env ]; then
     set -a; source .env; set +a
 fi
 
-# Start server
-NO_PROXY=localhost,127.0.0.1 python -m uvicorn api.main:app --port 8000 > "$LOG_FILE" 2>&1 &
-PID=$!
+# Start server in new session (setsid) so it's immune to Ctrl+C from parent
+setsid python -m uvicorn api.main:app --port 8000 >> "$LOG_FILE" 2>&1 &
+sleep 1
+PID=$(pgrep -f "uvicorn api.main:app" | head -1)
 echo $PID > "$PID_FILE"
 
 # Wait and check

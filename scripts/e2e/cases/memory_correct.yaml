@@ -1,0 +1,62 @@
+name: memory_correct
+description: "记忆纠正：agent 应该能更新已有记忆"
+requires: [llm]
+
+turns:
+  - user: "记住我喜欢用 Python 做数据分析"
+    checks:
+      rules:
+        - tool_called: memory_program
+        - db:
+            table: mem_memories
+            where: "user_id = :uid AND is_active = 1"
+            assert:
+              count: ">=1"
+        - db:
+            table: mem_memories
+            where: "user_id = :uid AND content LIKE '%Python%' AND is_active = 1"
+            assert:
+              count: ">=1"
+
+  - user: "我改主意了，现在更喜欢用 Rust 做数据分析"
+    checks:
+      rules:
+        - tool_called: memory_program
+        - db:
+            table: mem_memories
+            where: "user_id = :uid AND is_active = 1"
+            assert:
+              fields:
+                content: {contains: "Rust"}
+        - db:
+            table: mem_memories
+            where: "user_id = :uid AND is_active = 0 AND content LIKE '%Python%'"
+            assert:
+              count: ">=1"
+        - db:
+            table: mem_edit_log
+            where: "user_id = :uid"
+            assert:
+              count: ">=2"
+      llm_judge:
+        criteria: "回复应确认偏好已从 Python 更新为 Rust"
+        pass_threshold: 0.7
+
+  - user: "我现在喜欢用什么语言做数据分析？"
+    checks:
+      rules:
+        - no_tool_called: true
+        - response_contains: "Rust"
+      llm_judge:
+        criteria: "回复应明确说明当前偏好是 Rust，不应把 Python 作为当前偏好"
+        pass_threshold: 0.7
+
+final_checks:
+  rules:
+    - session_integrity: true
+    - turn_count_increases: true
+    - db:
+        table: agent_events
+        where: "session_id = :sid"
+        assert:
+          count: ">=6"

@@ -307,4 +307,5 @@ class TestChatStreamReasoningPassthrough:
 
         assert collected[0] == {"type": "reasoning", "content": "thinking..."}
         assert collected[1] == {"type": "text", "content": "answer"}
-        assert len(collected) == 2  # usage is consumed, not yielded
+        assert collected[2] == {"type": "usage", "prompt": 10, "completion": 5, "cache_read": 0, "cache_creation": 0}
+        assert len(collected) == 3  # usage is yielded as final chunk for observability

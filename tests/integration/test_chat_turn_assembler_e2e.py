@@ -186,14 +186,15 @@ class TestEdgeContextIntegration:
                 yield chunk
 
         tools = [
-            {"type": "function", "function": {"name": "read_file", "description": "Read", "parameters": {}}},
-            {"type": "function", "function": {"name": "bash", "description": "Shell", "parameters": {}}},
-            {"type": "function", "function": {"name": "grep", "description": "Search", "parameters": {}}},
+            {"type": "function", "function": {"name": "read_file", "description": "Read file content", "parameters": {}}},
+            {"type": "function", "function": {"name": "bash", "description": "Run shell commands", "parameters": {}}},
+            {"type": "function", "function": {"name": "grep", "description": "Search text", "parameters": {}}},
         ]
 
+        # Use a user query that matches all tool descriptions to ensure tools are selected
         with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=capture_and_stream):
             resp = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "help"}],
+                "messages": [{"role": "user", "content": "read file and run shell command to search"}],
                 "edge_tools": tools,
             }, headers=auth_headers)
 
@@ -545,11 +546,12 @@ class TestToolChangeDetection:
                 {"type": "text", "content": "ok"},
             ])
 
-        tools_v1 = [{"type": "function", "function": {"name": "read_file", "description": "Read", "parameters": {}}}]
+        # Use tool descriptions that match user queries to ensure tools are selected
+        tools_v1 = [{"type": "function", "function": {"name": "read_file", "description": "Read file content", "parameters": {}}}]
         with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=capture_and_stream):
             r1 = client.post(
                 "/chat/turn",
-                json={"messages": [{"role": "user", "content": "hello"}], "edge_tools": tools_v1},
+                json={"messages": [{"role": "user", "content": "read file"}], "edge_tools": tools_v1},
                 headers=auth_headers,
             )
             assert r1.status_code == 200
@@ -558,13 +560,13 @@ class TestToolChangeDetection:
 
         # Turn 2: different tools
         tools_v2 = [
-            {"type": "function", "function": {"name": "read_file", "description": "Read", "parameters": {}}},
-            {"type": "function", "function": {"name": "bash", "description": "Run shell", "parameters": {}}},
+            {"type": "function", "function": {"name": "read_file", "description": "Read file content", "parameters": {}}},
+            {"type": "function", "function": {"name": "bash", "description": "Run shell commands", "parameters": {}}},
         ]
         with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=capture_and_stream):
             r2 = client.post(
                 "/chat/turn",
-                json={"messages": [{"role": "user", "content": "now I have bash"}], "session_id": session_id, "edge_tools": tools_v2},
+                json={"messages": [{"role": "user", "content": "read file and run shell"}], "session_id": session_id, "edge_tools": tools_v2},
                 headers=auth_headers,
             )
             assert r2.status_code == 200

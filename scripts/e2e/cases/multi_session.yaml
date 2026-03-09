@@ -1,0 +1,40 @@
+name: multi_session
+description: "跨 session 记忆持久化：session A 注入，session B 能召回"
+requires: [llm]
+
+# Turn 1 在 session A（由 runner 自动创建）
+turns:
+  - user: "记住我的名字是 Alex，我是一名机器学习工程师"
+    checks:
+      rules:
+        - tool_called: memory_program
+        - db:
+            table: mem_memories
+            where: "user_id = :uid AND is_active = 1"
+            assert:
+              count: ">=1"
+        - db:
+            table: mem_memories
+            where: "user_id = :uid AND is_active = 1 AND content LIKE '%Alex%'"
+            assert:
+              count: ">=1"
+
+# new_session: true 让 runner 开一个新 session，但同一 user_id
+  - user: "我叫什么名字？我是做什么的？"
+    new_session: true
+    checks:
+      rules:
+        - no_tool_called: true
+        - response_contains: "Alex"
+        - response_contains_any: ["机器学习", "ML", "machine learning"]
+      llm_judge:
+        criteria: "回复应准确引用之前存储的姓名（Alex）和职业（机器学习工程师），即使是在新的对话中"
+        pass_threshold: 0.8
+
+final_checks:
+  rules:
+    - db:
+        table: mem_memories
+        where: "user_id = :uid AND is_active = 1"
+        assert:
+          count: ">=1"

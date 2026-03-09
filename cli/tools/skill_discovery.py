@@ -25,7 +25,8 @@ class FindSkillsTool(EdgeTool):
     name = "find_skills"
     description = (
         "Search for additional skills by task description. "
-        "Use when current tools can't handle the request."
+        "Use only when you need a capability not in your current tool list. "
+        "Once you find a matching skill, call it directly by name — do NOT call find_skills again."
     )
     parameters: ClassVar[dict[str, Any]] = {
         "type": "object",
@@ -114,7 +115,11 @@ class FindSkillsTool(EdgeTool):
 
             if not results:
                 logger.debug("No skill details found for semantic results: %s", skill_names[:limit])
-                return f"No skills found matching '{query}'"
+                return (
+                    f"No skills found matching '{query}'. "
+                    "You can use bash to accomplish this task instead "
+                    "(e.g. gh, curl, git commands)."
+                )
 
             # Format output
             lines = [f"Found {len(results)} skills matching '{query}':"]
@@ -129,7 +134,7 @@ class FindSkillsTool(EdgeTool):
                 if r.get('category'):
                     lines.append(f"  Category: {r['category']}")
 
-            lines.append("\nUse get_agent_info for full skill details and parameters.")
+            lines.append("\nCall these skills directly by name. Use get_agent_info(dimension='capability') only if you need parameter details.")
             return "\n".join(lines)
 
         except Exception as e:
@@ -159,15 +164,37 @@ class FindSkillsTool(EdgeTool):
 
                 rows = q.limit(100).all()
 
-                # Simple keyword matching: name match (2x) > description match (1x)
-                query_lower = query.lower()
+                # Word-level bidirectional matching: each alpha word (3+ chars) from
+                # query is checked against skill name parts bidirectionally.
+                # e.g. "github issues" → words ["github","issues"]
+                #      "issues" ↔ "list_issues" → match
+                import re as _re
+                query_words = _re.findall(r"[a-z]{3,}", query.lower())
+                # Also capture short (2-char) pure-alpha tokens when the whole
+                # query is short (e.g. "ci", "go") — avoids UUID fragment noise
+                # from long queries like "nonexistent_<uuid>"
+                if not query_words:
+                    query_words = _re.findall(r"[a-z]{2,}", query.lower())
+                # Also include full CJK/non-ascii tokens as single units
+                cjk_tokens = _re.findall(r"[^\x00-\x7f]+", query.lower())
+                query_tokens = query_words + cjk_tokens
+
                 matches = []
                 for name, desc, cat in rows:
                     score = 0
-                    if query_lower in name.lower():
-                        score += 2  # Name match is more relevant
-                    if desc and query_lower in desc.lower():
-                        score += 1  # Description match is secondary
+                    name_lower = name.lower()
+                    desc_lower = (desc or "").lower()
+                    for tok in query_tokens:
+                        # bidirectional: tok in name part OR name part in tok
+                        if tok in name_lower or name_lower in tok:
+                            score += 2
+                        elif desc and len(tok) >= 5 and (tok in desc_lower or desc_lower in tok):
+                            score += 1
+                    # System/meta skills matched only via description are
+                    # deprioritised — they appear in results only when the
+                    # user explicitly asks about configuration/system topics
+                    if score > 0 and cat == "system" and score < 2:
+                        score = 0
                     if score > 0:
                         matches.append((name, desc, cat, score))
 
@@ -176,7 +203,11 @@ class FindSkillsTool(EdgeTool):
 
                 if not matches:
                     logger.debug("Keyword search found no matches for query '%s'", query)
-                    return f"No skills found matching '{query}'"
+                    return (
+                        f"No skills found matching '{query}'. "
+                        "You can use bash to accomplish this task instead "
+                        "(e.g. gh, curl, git commands)."
+                    )
 
                 lines = [f"Found {len(matches)} skills matching '{query}':"]
                 for name, desc, cat, _ in matches:
@@ -188,6 +219,7 @@ class FindSkillsTool(EdgeTool):
                     if cat:
                         lines.append(f"  Category: {cat}")
 
+                lines.append("\nCall these skills directly by name. Use get_agent_info(dimension='capability') only if you need parameter details.")
                 return "\n".join(lines)
             finally:
                 db.close()

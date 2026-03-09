@@ -46,7 +46,7 @@ def setup_logging(level: str = "INFO", json_format: bool = True) -> None:
     log_level = getattr(logging, level.upper(), logging.INFO)
 
     # Create handler
-    handler = logging.StreamHandler(sys.stdout)
+    handler = logging.StreamHandler(sys.stderr)
 
     # Set formatter
     if json_format:

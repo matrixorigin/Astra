@@ -428,8 +428,10 @@ class TestChatTurnExpanded:
     def test_tool_schema_change_rebuilds_system(self, client, db):
         """Sending different edge_tools on turn 2 triggers force_rebuild_system."""
         headers, _ = _unique_auth(client, db, "toolchg")
-        tools_v1 = list(_TOOLS)
-        tools_v2 = [{"type": "function", "function": {"name": "write_file", "description": "Write",
+        # Use tool descriptions that match user queries to ensure tools are selected
+        tools_v1 = [{"type": "function", "function": {"name": "read_file", "description": "Read file content",
+                     "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
+        tools_v2 = [{"type": "function", "function": {"name": "write_file", "description": "Write file content",
                      "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
 
         captured_messages: list[list] = []
@@ -439,10 +441,10 @@ class TestChatTurnExpanded:
             async for c in fake_llm_stream([{"type": "text", "content": "ok"}]):
                 yield c
 
-        # Turn 1 with tools_v1
+        # Turn 1 with tools_v1 - use query that matches tool description
         with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=_capture):
             r1 = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "hello"}],
+                "messages": [{"role": "user", "content": "read file content"}],
                 "edge_tools": tools_v1,
             }, headers=headers)
         session_id = parse_sse_events(r1.text)[0]["session_id"]
@@ -451,7 +453,7 @@ class TestChatTurnExpanded:
         # Turn 2 with tools_v2 — different tool set triggers rebuild
         with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=_capture):
             client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "now write"}],
+                "messages": [{"role": "user", "content": "write file content"}],
                 "session_id": session_id,
                 "edge_tools": tools_v2,
             }, headers=headers)
