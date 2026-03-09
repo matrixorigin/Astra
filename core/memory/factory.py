@@ -215,7 +215,7 @@ def create_editor(
     # Resolve embed client (best-effort — None if not configured)
     embed_client = None
     try:
-        from core.context.embeddings import get_embedding_client
+        from core.embedding import get_embedding_client
         embed_client = get_embedding_client()
     except Exception:
         logger.debug("Embedding client not available for editor", exc_info=True)

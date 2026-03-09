@@ -120,6 +120,7 @@ class MemoryExperimentManager(DbConsumer):
         self,
         db_factory: DbFactory,
         source_db: str | None = None,
+        replay_factory: Any | None = None,
     ) -> None:
         super().__init__(db_factory)
         if source_db is None:
@@ -127,6 +128,9 @@ class MemoryExperimentManager(DbConsumer):
             source_db = get_settings().matrixone_database
         self._source_db = source_db
         self._branch_engines: dict[str, Any] = {}  # experiment_id → engine
+        # Optional: callable(db_factory) → object with .replay_session()
+        # When None, _replay_sessions falls back to lazy import of ReplayService.
+        self._replay_factory = replay_factory
 
     def __enter__(self) -> MemoryExperimentManager:
         return self
@@ -744,45 +748,46 @@ class MemoryExperimentManager(DbConsumer):
 
         If session_ids provided, use those. Otherwise auto-select
         high-quality sessions via the same criteria as RegressionGate.
-        """
-        from api.models.agent import Event
 
+        Uses raw SQL to avoid depending on the Event ORM model (which
+        lives in the orchestration layer).
+        """
         if session_ids:
+            placeholders = ",".join(f":s{i}" for i in range(len(session_ids)))
+            params = {f"s{i}": sid for i, sid in enumerate(session_ids)}
             with self._db() as db:
-                rows = (
-                    db.query(Event.session_id, Event.user_id)
-                    .filter(Event.session_id.in_(session_ids))
-                    .distinct()
-                    .all()
-                )
+                rows = db.execute(
+                    text(
+                        f"SELECT DISTINCT session_id, user_id"
+                        f" FROM agent_events"
+                        f" WHERE session_id IN ({placeholders})"
+                    ),
+                    params,
+                ).fetchall()
                 return [
-                    {"session_id": r.session_id, "user_id": r.user_id,
-                     "avg_score": 0.0}
+                    {"session_id": r[0], "user_id": r[1], "avg_score": 0.0}
                     for r in rows
                 ]
 
         cutoff = dt.now(timezone.utc) - timedelta(days=30)
         with self._db() as db:
-            rows = (
-                db.query(
-                    Event.session_id,
-                    Event.user_id,
-                    sa_func.avg(Event.quality_score).label("avg_score"),
-                )
-                .filter(
-                    Event.quality_score >= 4.0,
-                    Event.training_eligible == 1,
-                    Event.created_at > cutoff,
-                )
-                .group_by(Event.session_id, Event.user_id)
-                .having(sa_func.count() >= 3)
-                .order_by(sa_func.avg(Event.quality_score).desc())
-                .limit(limit)
-                .all()
-            )
+            rows = db.execute(
+                text(
+                    "SELECT session_id, user_id, AVG(quality_score) AS avg_score"
+                    " FROM agent_events"
+                    " WHERE quality_score >= 4.0"
+                    "   AND training_eligible = 1"
+                    "   AND created_at > :cutoff"
+                    " GROUP BY session_id, user_id"
+                    " HAVING COUNT(*) >= 3"
+                    " ORDER BY avg_score DESC"
+                    " LIMIT :lim"
+                ),
+                {"cutoff": cutoff, "lim": limit},
+            ).fetchall()
             return [
-                {"session_id": r.session_id, "user_id": r.user_id,
-                 "avg_score": float(r.avg_score)}
+                {"session_id": r[0], "user_id": r[1],
+                 "avg_score": float(r[2])}
                 for r in rows
             ]
 
@@ -799,13 +804,15 @@ class MemoryExperimentManager(DbConsumer):
         Raises:
             ImportError: If ReplayService is not available.
         """
-        from api.services.replay_service import ReplayService
-
         results: list[dict[str, Any]] = []
         for session in sessions:
             try:
                 with self._db() as db:
-                    replay_svc = ReplayService(lambda db=db: db)
+                    if self._replay_factory is not None:
+                        replay_svc = self._replay_factory(lambda db=db: db)
+                    else:
+                        from api.services.replay_service import ReplayService
+                        replay_svc = ReplayService(lambda db=db: db)
                     result = replay_svc.replay_session(
                         session_id=session["session_id"],
                         user_id=session["user_id"],

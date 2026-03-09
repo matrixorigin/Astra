@@ -14,21 +14,17 @@ from core.logging_config import get_logger
 logger = get_logger(__name__)
 
 # Process-wide singleton — created once, reused everywhere.
+# Delegates to canonical singleton in core.embedding (foundation layer).
 _shared_client: EmbeddingClient | None = None
 
 
 def get_embedding_client() -> EmbeddingClient:
     """Get or create the process-wide EmbeddingClient singleton.
 
-    Fails fast if the configured provider is unavailable (e.g., sentence-transformers
-    not installed for local, or API key missing for openai).
+    Delegates to :func:`core.embedding.get_embedding_client`.
     """
-    global _shared_client
-    if _shared_client is None:
-        s = get_settings()
-        _shared_client = EmbeddingClient(provider=s.embedding_provider, model=s.embedding_model, dim=s.embedding_dim)
-        logger.info("EmbeddingClient: provider=%s, model=%s, dim=%d", s.embedding_provider, s.embedding_model, s.embedding_dim)
-    return _shared_client
+    from core.embedding import get_embedding_client as _get
+    return _get()
 
 
 class EmbeddingService(DbConsumer):

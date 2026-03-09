@@ -41,3 +41,20 @@ def get_current_user(
         raise
     except Exception:
         raise HTTPException(status_code=401, detail="Could not validate credentials")
+
+
+def get_current_user_id(
+    current_user: dict = Depends(get_current_user),
+) -> str:
+    """Extract user_id from authenticated user."""
+    return current_user["user_id"]
+
+
+def get_db_factory():
+    """Return a DbFactory (callable that yields a DB session)."""
+    from api.database import SessionLocal
+
+    def _factory():
+        return SessionLocal()
+
+    return _factory
