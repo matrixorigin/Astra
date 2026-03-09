@@ -86,7 +86,7 @@ mo-memory MCP server
   ├── memory_store     → vectorize + persist
   ├── memory_retrieve  → semantic search
   ├── memory_correct   → update with audit trail
-  ├── memory_purge     → delete with reason
+  ├── memory_purge     → delete by ID or topic
   ├── memory_profile   → user profile summary
   └── memory_search    → full semantic search
   │
@@ -104,9 +104,9 @@ directly to the database — no separate service to manage.
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
 | `memory_store` | Store a memory | `content`, `memory_type` (default: semantic) |
-| `memory_retrieve` | Recall relevant memories | `query`, `top_k` (default: 5) |
+| `memory_retrieve` | Recall relevant memories; includes ⚠️ health warnings if issues detected | `query`, `top_k` (default: 5) |
 | `memory_correct` | Fix an existing memory | `memory_id`, `new_content`, `reason` |
-| `memory_purge` | Delete a memory | `memory_id`, `reason` |
+| `memory_purge` | Delete by ID or bulk-delete by topic | `memory_id` or `topic`, `reason` |
 | `memory_profile` | Get user profile summary | — |
 | `memory_search` | Semantic search | `query`, `top_k` (default: 10) |
 
