@@ -1,16 +1,13 @@
----
-inclusion: always
----
+## Memory Integration
 
-# Memory Integration
+This project uses mo-memory for shared memory across AI tools.
+MCP tools available: memory_store, memory_retrieve, memory_correct, memory_purge, memory_profile, memory_search.
 
-You have access to a shared memory service via MCP tools. Use it proactively:
-
-## 🔴 MANDATORY: Start of every conversation
-**ALWAYS call `memory_retrieve` with the user's first message before responding.**
+### MANDATORY: Start of every conversation
+**Always call `memory_retrieve` with the user's first message before responding.**
 This is not optional. Without this, you have no memory of past interactions.
 
-## 🔴 MANDATORY: End of every conversation turn
+### MANDATORY: End of every conversation turn
 After each response, check if the turn contained anything worth remembering:
 - User stated a preference, fact, constraint, or decision → `memory_store`
 - User corrected something you said → `memory_store` with the correction
@@ -18,12 +15,12 @@ After each response, check if the turn contained anything worth remembering:
 
 Do NOT store: greetings, trivial questions, things already in memory.
 
-## Other triggers
+### Other triggers
 - User says a stored memory is wrong → `memory_correct`
 - User asks to forget something → `memory_purge`
 - User asks "what do you know about me" → `memory_profile`
 
-## Memory types
+### Memory types
 - `profile`: user/agent profiles
 - `semantic`: project facts, technical decisions, architecture choices (default)
 - `procedural`: how-to knowledge, workflows, processes

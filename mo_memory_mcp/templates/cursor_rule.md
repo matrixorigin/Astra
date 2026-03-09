@@ -1,16 +1,12 @@
----
-inclusion: always
----
-
 # Memory Integration
 
-You have access to a shared memory service via MCP tools. Use it proactively:
+You have access to a shared memory service via MCP tools (mo-memory).
 
-## 🔴 MANDATORY: Start of every conversation
-**ALWAYS call `memory_retrieve` with the user's first message before responding.**
+## MANDATORY: Start of every conversation
+**Always call `memory_retrieve` with the user's first message before responding.**
 This is not optional. Without this, you have no memory of past interactions.
 
-## 🔴 MANDATORY: End of every conversation turn
+## MANDATORY: End of every conversation turn
 After each response, check if the turn contained anything worth remembering:
 - User stated a preference, fact, constraint, or decision → `memory_store`
 - User corrected something you said → `memory_store` with the correction

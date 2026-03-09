@@ -99,6 +99,8 @@ directly to the database — no separate service to manage.
 
 ## MCP Tools
 
+### CRUD Tools
+
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
 | `memory_store` | Store a memory | `content`, `memory_type` (default: semantic) |
@@ -107,6 +109,25 @@ directly to the database — no separate service to manage.
 | `memory_purge` | Delete a memory | `memory_id`, `reason` |
 | `memory_profile` | Get user profile summary | — |
 | `memory_search` | Semantic search | `query`, `top_k` (default: 10) |
+
+### Maintenance Tools
+
+These tools are **expensive** and have cooldowns. Do not call proactively — only when user explicitly requests.
+
+| Tool | Description | Cooldown | Key Parameters |
+|------|-------------|----------|----------------|
+| `memory_governance` | Quarantine low-confidence memories, clean stale data, auto-rebuild unhealthy IVF indexes | 1 hour | `user_id`, `force` |
+| `memory_consolidate` | Detect contradicting memories, fix orphaned graph nodes, manage trust tiers | 30 min | `user_id`, `force` |
+| `memory_reflect` | Analyze memory clusters and synthesize insights (scene nodes). Requires LLM | 2 hours | `user_id`, `force` |
+| `memory_rebuild_index` | Manually rebuild IVF vector index with optimal centroid count | — | `table` |
+
+**`memory_governance` auto-rebuilds** unhealthy IVF indexes during its run. Use `memory_rebuild_index` only for manual forced rebuild.
+
+**Trigger phrases:**
+- governance: "clean up memories", "run maintenance", "check memory health"
+- consolidate: "check for conflicts", "consolidate memories"
+- reflect: "reflect on memories", "find patterns", "summarize what you know"
+- rebuild_index: "rebuild vector index" (usually not needed — governance handles it)
 
 ### Memory Types
 
@@ -141,10 +162,13 @@ Files written:
 ## CLI Commands
 
 ```bash
-mo-memory init      # Configure MCP + steering rules
-mo-memory migrate   # Create memory tables in the database
-mo-memory status    # Show which tools are configured
-mo-memory health    # Check memory service health (remote mode)
+mo-memory init        # Configure MCP + steering rules
+mo-memory migrate     # Create memory tables in the database
+mo-memory status      # Show which tools are configured
+mo-memory health      # Check memory service health (remote mode)
+mo-memory governance  # Run governance cycle (quarantine, cleanup, IVF rebuild)
+mo-memory consolidate --user-id <uid>  # Run graph consolidation
+mo-memory reflect     --user-id <uid>  # Run reflection (requires LLM)
 ```
 
 ### migrate

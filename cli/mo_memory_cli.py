@@ -13,7 +13,10 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from core.db_consumer import DbFactory
 
 # ── MCP config templates ──────────────────────────────────────────────
 
@@ -39,66 +42,51 @@ def _mcp_config(mode: str = "stdio", db_url: str | None = None, **embed_opts: st
     return cfg
 
 
-# ── Steering rule content ─────────────────────────────────────────────
+# ── Steering rule content (loaded from templates/) ───────────────────
+# Templates live alongside the MCP server package so they are the single
+# source of truth for all AI-tool steering rules.  The CLI reads them at
+# runtime and writes them into each tool's config directory.
 
-_KIRO_STEERING = """\
----
-inclusion: always
----
+_TEMPLATES_DIR = Path(__file__).parent.parent / "mo_memory_mcp" / "templates"
 
-# Memory Integration
+# Required sections that every steering template must contain.
+# Prevents silently writing empty or broken rules.
+_REQUIRED_KEYWORDS = ["Memory Integration", "memory_retrieve"]
 
-You have access to a shared memory service via MCP tools. Use it proactively:
 
-## When to store memories
-- User states a preference, fact, or decision → `memory_store`
-- User corrects you → `memory_store` the correction as a fact
-- Important project context is shared → `memory_store` with type "fact"
+def _load_template(name: str) -> str:
+    """Load and validate a steering-rule template.
 
-## When to retrieve memories
-- At the START of every conversation → `memory_retrieve` with a summary of the user's first message
-- When the user references something from a past conversation → `memory_retrieve`
-- Before making assumptions about preferences → `memory_retrieve`
+    Raises:
+        FileNotFoundError: Template file does not exist.
+        ValueError: Template is empty or missing required sections.
+    """
+    path = _TEMPLATES_DIR / name
+    if not path.exists():
+        raise FileNotFoundError(f"Template not found: {path}")
 
-## When to correct/purge
-- User says a stored memory is wrong → `memory_correct`
-- User asks to forget something → `memory_purge`
+    content = path.read_text()
+    if not content.strip():
+        raise ValueError(f"Template is empty: {path}")
 
-## Memory types
-- `profile`: user/agent profiles
-- `semantic`: project facts, technical decisions, architecture choices
-- `procedural`: how-to knowledge, workflows, processes
-- `working`: temporary context for current task
-- `tool_result`: results from tool executions
-"""
+    for keyword in _REQUIRED_KEYWORDS:
+        if keyword not in content:
+            raise ValueError(
+                f"Template {path.name} missing required section '{keyword}'"
+            )
+    return content
 
-_CURSOR_RULE = """\
-# Memory Integration
 
-You have access to a shared memory service via MCP tools (mo-memory).
+def _get_kiro_steering() -> str:
+    return _load_template("kiro_steering.md")
 
-**Always retrieve memories** at the start of conversations using `memory_retrieve`.
-**Store important information** using `memory_store` when the user shares facts, preferences, or decisions.
-**Correct memories** with `memory_correct` when information is outdated.
-**Purge memories** with `memory_purge` when asked to forget something.
 
-Memory types: profile, semantic, procedural, working, tool_result.
-"""
+def _get_cursor_rule() -> str:
+    return _load_template("cursor_rule.md")
 
-_CLAUDE_RULE = """\
 
-## Memory Integration
-
-This project uses mo-memory for shared memory across AI tools.
-MCP tools available: memory_store, memory_retrieve, memory_correct, memory_purge, memory_profile, memory_search.
-
-- Retrieve memories at conversation start with `memory_retrieve`
-- Store facts/preferences/decisions with `memory_store`
-- Correct outdated info with `memory_correct`
-- Delete on request with `memory_purge`
-
-Memory types: profile, semantic, procedural, working, tool_result.
-"""
+def _get_claude_rule() -> str:
+    return _load_template("claude_rule.md")
 
 
 # ── Detection & writing ───────────────────────────────────────────────
@@ -133,7 +121,7 @@ def _write_kiro(project_dir: Path, mode: str, db_url: str | None = None, **embed
     steering_dir = project_dir / ".kiro" / "steering"
     steering_dir.mkdir(parents=True, exist_ok=True)
     rule_file = steering_dir / "memory.md"
-    rule_file.write_text(_KIRO_STEERING)
+    rule_file.write_text(_get_kiro_steering())
     actions.append(f"  ✅ {rule_file.relative_to(project_dir)}")
 
     return actions
@@ -161,7 +149,7 @@ def _write_cursor(project_dir: Path, mode: str, db_url: str | None = None, **emb
     rules_dir = cursor_dir / "rules"
     rules_dir.mkdir(parents=True, exist_ok=True)
     rule_file = rules_dir / "memory.mdc"
-    rule_file.write_text(_CURSOR_RULE)
+    rule_file.write_text(_get_cursor_rule())
     actions.append(f"  ✅ {rule_file.relative_to(project_dir)}")
 
     return actions
@@ -190,12 +178,12 @@ def _write_claude(project_dir: Path, mode: str, db_url: str | None = None, **emb
     if claude_md.exists():
         existing = claude_md.read_text()
         if "mo-memory" not in existing:
-            claude_md.write_text(existing.rstrip() + "\n" + _CLAUDE_RULE)
+            claude_md.write_text(existing.rstrip() + "\n" + _get_claude_rule())
             actions.append(f"  ✅ {claude_md.relative_to(project_dir)} (appended)")
         else:
             actions.append(f"  ⏭️  {claude_md.relative_to(project_dir)} (already configured)")
     else:
-        claude_md.write_text(_CLAUDE_RULE.lstrip())
+        claude_md.write_text(_get_claude_rule().lstrip())
         actions.append(f"  ✅ {claude_md.relative_to(project_dir)} (created)")
 
     return actions
@@ -226,6 +214,29 @@ def cmd_init(args: argparse.Namespace) -> None:
         print(f"DB URL: {db_url}")
     if embed_opts.get("provider"):
         print(f"Embedding: {embed_opts['provider']}")
+    print()
+
+    # Auto-migrate: create memory tables if not exist.
+    # This is best-effort — if it fails, the user can run 'mo-memory migrate'
+    # manually.  We warn loudly so the failure is not missed.
+    try:
+        if db_url:
+            from sqlalchemy import create_engine
+            _engine = create_engine(db_url, pool_pre_ping=True)
+        else:
+            from api.database import engine as _engine
+        import core.memory.models  # noqa: F401
+        from api.base import Base
+        memory_tables = [t for t in Base.metadata.sorted_tables
+                         if t.name.startswith("mem_") or t.name.startswith("memory_graph")]
+        Base.metadata.create_all(bind=_engine, tables=memory_tables, checkfirst=True)
+        print(f"✅ Memory tables ready ({len(memory_tables)} tables)")
+    except ImportError as e:
+        print(f"⚠️  Could not auto-migrate tables (missing dependency): {e}")
+        print("   Run 'mo-memory migrate' manually after setup.")
+    except Exception as e:
+        print(f"⚠️  Could not auto-migrate tables: {e}")
+        print("   Run 'mo-memory migrate' manually after setup.")
     print()
 
     writers = {"kiro": _write_kiro, "cursor": _write_cursor, "claude": _write_claude}
@@ -293,8 +304,8 @@ def cmd_migrate(args: argparse.Namespace) -> None:
             print("❌ --db-url required (or set MO_MEMORY_DB_URL, or run from project root)")
             sys.exit(1)
 
-    from api.base import Base
     import core.memory.models  # noqa: F401
+    from api.base import Base
 
     memory_tables = [
         t for t in Base.metadata.sorted_tables
@@ -307,6 +318,99 @@ def cmd_migrate(args: argparse.Namespace) -> None:
         print(f"  ✅ {t.name}")
 
     print(f"\n{len(memory_tables)} memory tables ready.")
+
+
+def _get_db_factory(args: argparse.Namespace) -> DbFactory:
+    """Resolve a DbFactory from CLI args, env var, or project default.
+
+    Resolution order:
+      1. --db-url argument
+      2. MO_MEMORY_DB_URL environment variable
+      3. api.database.SessionLocal (project default)
+
+    The returned factory is a short-lived CLI tool — engine disposal
+    happens at process exit.
+    """
+    db_url = getattr(args, "db_url", None) or os.environ.get("MO_MEMORY_DB_URL")
+    if db_url:
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        engine = create_engine(db_url, pool_pre_ping=True)
+        return sessionmaker(bind=engine)
+    try:
+        from api.database import SessionLocal
+        return SessionLocal
+    except ImportError:
+        print("❌ Database not available.")
+        print("   Use --db-url, set MO_MEMORY_DB_URL, or run from project root.")
+        sys.exit(1)
+
+
+def cmd_governance(args: argparse.Namespace) -> None:
+    """Run memory governance cycle."""
+    from core.memory.tabular.governance import GovernanceScheduler
+    db_factory = _get_db_factory(args)
+    gs = GovernanceScheduler(db_factory)
+    user_id = args.user_id or "all"
+    print(f"Running governance for user={user_id}...")
+    result = gs.run_cycle(user_id)
+    print(f"  quarantined={result.quarantined}")
+    print(f"  cleaned_stale={result.cleaned_stale}")
+    print(f"  scenes_created={result.scenes_created}")
+    for table, h in result.vector_index_health.items():
+        if h.get("rebuilt"):
+            print(f"  ✅ {table}: IVF index rebuilt")
+        elif h.get("needs_rebuild"):
+            print(f"  ⚠️  {table}: IVF index needs rebuild (ratio={h.get('ratio')})")
+        elif "error" not in h:
+            print(f"  ✅ {table}: IVF index healthy (ratio={h.get('ratio')})")
+    if result.errors:
+        for e in result.errors:
+            print(f"  ❌ {e}")
+
+
+def cmd_consolidate(args: argparse.Namespace) -> None:
+    """Run graph consolidation."""
+    from core.memory.graph.consolidation import GraphConsolidator
+    db_factory = _get_db_factory(args)
+    gc = GraphConsolidator(db_factory)
+    print(f"Running consolidation for user={args.user_id}...")
+    result = gc.consolidate(args.user_id)
+    print(f"  merged_nodes={result.merged_nodes}")
+    print(f"  conflicts_detected={result.conflicts_detected}")
+    print(f"  orphaned_scenes={result.orphaned_scenes}")
+    print(f"  promoted={result.promoted}, demoted={result.demoted}")
+    if result.errors:
+        for e in result.errors:
+            print(f"  ❌ {e}")
+
+
+def cmd_reflect(args: argparse.Namespace) -> None:
+    """Run reflection (requires LLM)."""
+    from core.memory.graph.candidates import GraphCandidateProvider
+    from core.memory.graph.service import GraphMemoryService
+    from core.memory.reflection.engine import ReflectionEngine
+    db_factory = _get_db_factory(args)
+    try:
+        from core.llm.client import LLMClient
+        llm = LLMClient(db_factory=db_factory)
+    except ImportError as e:
+        print(f"❌ LLM client not available (missing dependency): {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ LLM client initialization failed: {e}")
+        sys.exit(1)
+    provider = GraphCandidateProvider(db_factory)
+    svc = GraphMemoryService(db_factory)
+    engine = ReflectionEngine(provider, svc, llm)
+    print(f"Running reflection for user={args.user_id}...")
+    result = engine.reflect(args.user_id)
+    print(f"  candidates_found={result.candidates_found}")
+    print(f"  scenes_created={result.scenes_created}")
+    print(f"  llm_calls={result.llm_calls}")
+    if result.errors:
+        for e in result.errors:
+            print(f"  ❌ {e}")
 
 
 def main() -> None:
@@ -331,6 +435,18 @@ def main() -> None:
     p_health = sub.add_parser("health", help="Check memory service health")
     p_health.add_argument("--api-url", default="http://localhost:8100", help="Memory service URL")
 
+    p_gov = sub.add_parser("governance", help="Run memory governance: quarantine, cleanup, IVF index health")
+    p_gov.add_argument("--user-id", help="User ID (default: all users)")
+    p_gov.add_argument("--db-url", help="Database URL (or set MO_MEMORY_DB_URL)")
+
+    p_con = sub.add_parser("consolidate", help="Run graph consolidation: conflict detection, orphan cleanup")
+    p_con.add_argument("--user-id", required=True, help="User ID")
+    p_con.add_argument("--db-url", help="Database URL (or set MO_MEMORY_DB_URL)")
+
+    p_ref = sub.add_parser("reflect", help="Run reflection: synthesize insights from memory clusters (requires LLM)")
+    p_ref.add_argument("--user-id", required=True, help="User ID")
+    p_ref.add_argument("--db-url", help="Database URL (or set MO_MEMORY_DB_URL)")
+
     args = parser.parse_args()
     if args.command == "init":
         cmd_init(args)
@@ -340,6 +456,12 @@ def main() -> None:
         cmd_migrate(args)
     elif args.command == "health":
         cmd_health(args)
+    elif args.command == "governance":
+        cmd_governance(args)
+    elif args.command == "consolidate":
+        cmd_consolidate(args)
+    elif args.command == "reflect":
+        cmd_reflect(args)
     else:
         parser.print_help()
 

@@ -259,11 +259,16 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
     server = FastMCP(
         "mo-memory",
         instructions=(
-            "Memory service for AI coding tools. "
-            "Use memory_store to save important facts, preferences, and decisions. "
-            "Use memory_retrieve at the start of conversations to recall relevant context. "
-            "Use memory_correct to fix outdated or wrong memories. "
-            "Use memory_purge to delete sensitive or irrelevant memories."
+            "Persistent memory across conversations. "
+            "\n\n"
+            "MANDATORY RULES:\n"
+            "1. ALWAYS call memory_retrieve with the user's first message BEFORE responding.\n"
+            "2. AFTER each response, call memory_store for any new fact, preference, or decision.\n"
+            "\n"
+            "CRUD: memory_store, memory_retrieve, memory_correct, memory_purge, memory_profile, memory_search.\n"
+            "MAINTENANCE (only when user asks): memory_governance, memory_consolidate, memory_reflect, memory_rebuild_index.\n"
+            "\n"
+            "memory_store types: semantic (default), profile, procedural, working, tool_result."
         ),
     )
 
