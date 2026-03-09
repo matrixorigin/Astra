@@ -811,6 +811,82 @@ def test_vector_index_health_and_rebuild() -> None:
         ok("health after rebuild", f"needs_rebuild={health_after['mem_memories']['needs_rebuild']}")
 
 
+# ── Scenario 17: Topic-based purge via MCP backend ───────────────────
+
+def test_topic_purge() -> None:
+    print("\n── 17. Topic-based purge ──")
+
+    from mo_memory_mcp.server import EmbeddedBackend
+
+    b = EmbeddedBackend()
+
+    # Inject several memories — Alpha topic vs unrelated topic
+    b.store(USER_ID, "Project Alpha uses Redis for caching", "semantic", None)
+    b.store(USER_ID, "Project Alpha deadline is March 2026", "semantic", None)
+    b.store(USER_ID, "My favorite programming language is Rust", "semantic", None)
+
+    # Snapshot unrelated memory count before purge
+    rust_before = scalar(
+        "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1 "
+        "AND content = 'My favorite programming language is Rust'", uid=USER_ID,
+    )
+    check("Rust memory exists before purge", rust_before == 1, f"active={rust_before}")
+
+    # Purge by topic — uses SQL LIKE, so only exact keyword matches are deleted
+    result = b.purge(USER_ID, memory_id=None, topic="Project Alpha", reason="project cancelled")
+    check("topic purge found exactly 2 matches", result["purged"] == 2, f"purged={result['purged']}")
+
+    # Verify Alpha memories deactivated
+    alpha_active = scalar(
+        "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1 "
+        "AND content LIKE '%Project Alpha%'", uid=USER_ID,
+    )
+    check("Alpha memories deactivated", alpha_active == 0, f"active={alpha_active}")
+
+    # Verify unrelated memory still active
+    rust_after = scalar(
+        "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1 "
+        "AND content = 'My favorite programming language is Rust'", uid=USER_ID,
+    )
+    check("unrelated memory untouched", rust_after == 1, f"active={rust_after}")
+
+
+# ── Scenario 18: Health warnings in retrieve ─────────────────────────
+
+def test_health_warnings() -> None:
+    print("\n── 18. Health warnings ──")
+
+    import uuid
+
+    from mo_memory_mcp.server import EmbeddedBackend
+
+    b = EmbeddedBackend()
+
+    # health_warnings should return empty for normal data
+    warnings = b.health_warnings(USER_ID)
+    check("no warnings for normal data", len(warnings) == 0, f"warnings={warnings}")
+
+    # Inject low-confidence memories directly to trigger warning.
+    # Use unique IDs per run to avoid duplicate key conflicts on re-run.
+    run_tag = uuid.uuid4().hex[:8]
+    from sqlalchemy import text as sa_text
+    with SessionLocal() as db:
+        for i in range(6):
+            db.execute(sa_text(
+                "INSERT INTO mem_memories (memory_id, user_id, content, memory_type, "
+                "initial_confidence, source_event_ids, is_active, observed_at, created_at, updated_at) "
+                "VALUES (:mid, :uid, :content, 'semantic', 0.2, '[]', 1, NOW(), NOW(), NOW())"
+            ), {"mid": f"__low_conf_{run_tag}_{i}", "uid": USER_ID, "content": f"low confidence fact {i}"})
+        db.commit()
+
+    warnings = b.health_warnings(USER_ID)
+    check("warnings for low confidence", len(warnings) == 1, f"warnings={warnings}")
+    check("warning mentions low confidence", "low confidence" in warnings[0].lower(), warnings[0])
+    # Verify the count in the warning message is at least 6
+    check("warning includes count", "6 " in warnings[0] or "7 " in warnings[0] or "8 " in warnings[0],
+          f"expected count >= 6 in: {warnings[0]}")
+
+
 # ── Scenario 15: NL → Script (real LLM) ──────────────────────────────
 
 def test_nl_to_script() -> None:
@@ -921,6 +997,8 @@ def main() -> None:
         test_consolidation()
         test_opinion_evolution()
         test_vector_index_health_and_rebuild()
+        test_topic_purge()
+        test_health_warnings()
 
         if args.with_llm:
             test_observer_pipeline_graph()

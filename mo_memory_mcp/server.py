@@ -29,13 +29,14 @@ class MemoryBackend:
     def store(self, user_id: str, content: str, memory_type: str, session_id: str | None) -> dict: ...
     def retrieve(self, user_id: str, query: str, top_k: int) -> list[dict]: ...
     def correct(self, user_id: str, memory_id: str, new_content: str, reason: str) -> dict: ...
-    def purge(self, user_id: str, memory_id: str, reason: str) -> dict: ...
+    def purge(self, user_id: str, memory_id: str | None, topic: str | None, reason: str) -> dict: ...
     def profile(self, user_id: str) -> dict: ...
     def search(self, user_id: str, query: str, top_k: int) -> list[dict]: ...
     def governance(self, user_id: str, force: bool = False) -> dict: ...
     def consolidate(self, user_id: str, force: bool = False) -> dict: ...
     def reflect(self, user_id: str, force: bool = False) -> dict: ...
     def rebuild_index(self, table: str) -> str: ...
+    def health_warnings(self, user_id: str) -> list[str]: ...
 
 
 class EmbeddedBackend(MemoryBackend):
@@ -100,14 +101,54 @@ class EmbeddedBackend(MemoryBackend):
         memories, _ = svc.retrieve(user_id, query, top_k=top_k)
         return [{"memory_id": m.memory_id, "content": m.content, "type": str(m.memory_type)} for m in memories]
 
+    # Thresholds for health_warnings — surfaced as constants for testability.
+    _LOW_CONFIDENCE_THRESHOLD = 0.4
+    _LOW_CONFIDENCE_WARNING_MIN = 5
+
+    def health_warnings(self, user_id: str) -> list[str]:
+        """Lightweight check for memory quality issues."""
+        warnings: list[str] = []
+        try:
+            from sqlalchemy import text
+            with self._db_factory() as db:
+                row = db.execute(text(
+                    "SELECT COUNT(*) as cnt FROM mem_memories "
+                    "WHERE user_id = :uid AND is_active = 1 "
+                    "AND initial_confidence < :threshold"
+                ), {"uid": user_id, "threshold": self._LOW_CONFIDENCE_THRESHOLD}).fetchone()
+                if row and row.cnt >= self._LOW_CONFIDENCE_WARNING_MIN:
+                    warnings.append(f"{row.cnt} memories have low confidence — consider reviewing with memory_search.")
+        except Exception as e:
+            logger.debug("health_warnings query failed for user=%s: %s", user_id, e)
+        return warnings
+
     def correct(self, user_id: str, memory_id: str, new_content: str, reason: str) -> dict:
         editor = self._create_editor(self._db_factory, user_id=user_id, embed_client=self._embed_client)
         mem = editor.correct(user_id, memory_id, new_content, reason=reason)
         return {"memory_id": mem.memory_id, "content": mem.content}
 
-    def purge(self, user_id: str, memory_id: str, reason: str) -> dict:
+    def purge(self, user_id: str, memory_id: str | None, topic: str | None, reason: str) -> dict:
         editor = self._create_editor(self._db_factory, user_id=user_id, embed_client=self._embed_client)
-        result = editor.purge(user_id, memory_ids=[memory_id], reason=reason)
+        if topic:
+            # Use SQL LIKE for precise keyword matching.  Semantic search
+            # (self.retrieve) would return loosely related results ranked by
+            # similarity with no score threshold — too dangerous for a
+            # destructive bulk operation.
+            from sqlalchemy import text
+            with self._db_factory() as db:
+                rows = db.execute(text(
+                    "SELECT memory_id FROM mem_memories "
+                    "WHERE user_id = :uid AND is_active = 1 "
+                    "AND content LIKE :pattern"
+                ), {"uid": user_id, "pattern": f"%{topic}%"}).fetchall()
+            ids = [r.memory_id for r in rows]
+            if not ids:
+                return {"purged": 0}
+            result = editor.purge(user_id, memory_ids=ids, reason=reason or f"topic purge: {topic}")
+        elif memory_id:
+            result = editor.purge(user_id, memory_ids=[memory_id], reason=reason)
+        else:
+            return {"purged": 0}
         return {"purged": result.deactivated}
 
     def profile(self, user_id: str) -> dict:
@@ -215,10 +256,33 @@ class HTTPBackend(MemoryBackend):
         r.raise_for_status()
         return r.json()
 
-    def purge(self, user_id: str, memory_id: str, reason: str) -> dict:
-        r = self._client.delete(f"/v1/memories/{memory_id}", params={"reason": reason})
-        r.raise_for_status()
-        return r.json()
+    def purge(self, user_id: str, memory_id: str | None, topic: str | None, reason: str) -> dict:
+        if topic:
+            # Search then purge each match.  Collect partial results so a
+            # mid-batch failure doesn't lose the count of already-purged items.
+            hits = self.search(user_id, topic, top_k=50)
+            ids = [h["memory_id"] for h in hits]
+            purged = 0
+            errors: list[str] = []
+            for mid in ids:
+                try:
+                    r = self._client.delete(
+                        f"/v1/memories/{mid}",
+                        params={"reason": reason or f"topic purge: {topic}"},
+                    )
+                    r.raise_for_status()
+                    purged += r.json().get("purged", 1)
+                except Exception as e:
+                    errors.append(f"{mid}: {e}")
+            result: dict = {"purged": purged}
+            if errors:
+                result["errors"] = errors
+            return result
+        elif memory_id:
+            r = self._client.delete(f"/v1/memories/{memory_id}", params={"reason": reason})
+            r.raise_for_status()
+            return r.json()
+        return {"purged": 0}
 
     def profile(self, user_id: str) -> dict:
         r = self._client.get(f"/v1/profiles/{user_id}")
@@ -249,6 +313,9 @@ class HTTPBackend(MemoryBackend):
         r = self._client.post("/v1/memories/rebuild-index", json={"table": table})
         r.raise_for_status()
         return r.json().get("message", str(r.json()))
+
+    def health_warnings(self, user_id: str) -> list[str]:
+        return []  # Not available via HTTP yet
 
 
 # ── MCP Server ────────────────────────────────────────────────────────
@@ -306,11 +373,19 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             top_k: Max number of memories to return (default 5).
             user_id: User ID (optional).
         """
-        results = backend.retrieve(_user(user_id), query, top_k)
+        uid = _user(user_id)
+        results = backend.retrieve(uid, query, top_k)
+        parts: list[str] = []
         if not results:
-            return "No relevant memories found."
-        lines = [f"- [{r.get('type', 'fact')}] {r['content']}" for r in results]
-        return f"Found {len(results)} memories:\n" + "\n".join(lines)
+            parts.append("No relevant memories found.")
+        else:
+            lines = [f"- [{r.get('type', 'fact')}] {r['content']}" for r in results]
+            parts.append(f"Found {len(results)} memories:\n" + "\n".join(lines))
+        # Attach health warnings if any
+        warnings = backend.health_warnings(uid)
+        if warnings:
+            parts.append("\n⚠️ Memory health:\n" + "\n".join(f"- {w}" for w in warnings))
+        return "\n".join(parts)
 
     @server.tool()
     def memory_correct(
@@ -332,18 +407,22 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
 
     @server.tool()
     def memory_purge(
-        memory_id: str,
+        memory_id: str | None = None,
+        topic: str | None = None,
         reason: str = "",
         user_id: str | None = None,
     ) -> str:
-        """Delete a memory permanently.
+        """Delete memories. Use memory_id for a single memory, or topic to bulk-delete all memories matching a keyword.
 
         Args:
-            memory_id: ID of the memory to delete.
+            memory_id: ID of a specific memory to delete.
+            topic: Keyword/topic — finds and deletes all matching memories.
             reason: Why it should be deleted.
             user_id: User ID (optional).
         """
-        result = backend.purge(_user(user_id), memory_id, reason)
+        if not memory_id and not topic:
+            return "Provide either memory_id or topic."
+        result = backend.purge(_user(user_id), memory_id, topic, reason)
         return f"Purged {result['purged']} memory(ies)."
 
     @server.tool()

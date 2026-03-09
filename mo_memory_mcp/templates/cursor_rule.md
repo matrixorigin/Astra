@@ -5,6 +5,7 @@ You have access to a shared memory service via MCP tools (mo-memory).
 ## MANDATORY: Start of every conversation
 **Always call `memory_retrieve` with the user's first message before responding.**
 This is not optional. Without this, you have no memory of past interactions.
+If the response includes ⚠️ Memory health warnings, proactively inform the user and offer to help clean up.
 
 ## MANDATORY: End of every conversation turn
 After each response, check if the turn contained anything worth remembering:
@@ -16,7 +17,8 @@ Do NOT store: greetings, trivial questions, things already in memory.
 
 ## Other triggers
 - User says a stored memory is wrong → `memory_correct`
-- User asks to forget something → `memory_purge`
+- User asks to forget something → `memory_purge` (single ID or by topic)
+- User says "forget everything about X" → `memory_purge` with `topic="X"` to bulk-delete
 - User asks "what do you know about me" → `memory_profile`
 
 ## Memory types
