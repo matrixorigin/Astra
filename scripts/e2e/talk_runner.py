@@ -123,6 +123,8 @@ class TalkSession:
         env.pop("https_proxy", None)
         env.pop("HTTP_PROXY", None)
         env.pop("HTTPS_PROXY", None)
+        env["HF_HUB_OFFLINE"] = "1"
+        env["TRANSFORMERS_OFFLINE"] = "1"
         result = subprocess.run(
             cmd, capture_output=True, text=True,
             env=env, cwd=PROJECT_ROOT, timeout=180,

@@ -87,7 +87,12 @@ class ActivationRetrievalStrategy:
                 )
                 if activated:
                     memories = self._nodes_to_memories(activated)
-                    return memories, None
+                    logger.info(
+                        "activation:v1 graph path — user=%s results=%d",
+                        user_id, len(memories),
+                    )
+                    explain_info = {"path": "graph", "results": len(memories)} if explain else None
+                    return memories, explain_info
             except Exception:
                 logger.warning(
                     "Activation retrieval failed, using vector fallback",
@@ -95,7 +100,8 @@ class ActivationRetrievalStrategy:
                 )
 
         # Strategy-internal vector fallback
-        return self._get_vector_fallback().retrieve(
+        logger.debug("activation:v1 vector fallback — user=%s", user_id)
+        memories, vec_explain = self._get_vector_fallback().retrieve(
             user_id, query, query_embedding,
             top_k=top_k, task_type=task_type,
             session_id=session_id,
@@ -104,6 +110,9 @@ class ActivationRetrievalStrategy:
             include_cross_session=include_cross_session,
             explain=explain,
         )
+        if explain:
+            return memories, {"path": "vector_fallback", "vec_explain": vec_explain}
+        return memories, vec_explain
 
     def _get_vector_fallback(self) -> Any:
         """Lazy-init vector fallback (strategy-internal, not cross-strategy)."""

@@ -68,30 +68,34 @@ class GraphConsolidator:
         return result
 
     def _detect_conflicts(self, user_id: str) -> int:
-        """Detect contradictions: high association + low content similarity + cross-session.
+        """Detect contradictions: nodes whose current embedding cosine sim dropped
+        below 0.4 despite having a strong historical association edge (weight >= 0.7).
 
-        Scans edge table directly — no node loading for graph traversal.
-        Only loads the specific node pairs that are conflict candidates.
+        This catches cases where a memory was corrected (embedding changed) but the
+        old association edge still exists — the edge weight reflects historical similarity,
+        while the current embedding reflects the corrected content.
+
+        Algorithm: single DB query returns (edge_weight, current_cosine_sim) per pair.
+        No Python-side embedding loading or computation.
         """
-        # 1. Get all strong association edges (DB-side filter)
-        strong_assoc = self._store.get_association_edges(
-            user_id, min_weight=CONTRADICTION_ASSOCIATION_THRESHOLD,
+        # Single query: association edges with current cosine similarity
+        # edge_weight = historical cosine sim (at edge creation time)
+        # current_sim = cosine sim of current embeddings
+        candidates = self._store.get_association_edges_with_current_sim(
+            user_id,
+            min_edge_weight=CONTRADICTION_ASSOCIATION_THRESHOLD,
+            max_current_sim=0.4,
         )
-        if not strong_assoc:
+        if not candidates:
             return 0
 
-        # 2. Collect candidate node IDs
-        candidate_ids: set[str] = set()
-        for src, tgt, _ in strong_assoc:
-            candidate_ids.add(src)
-            candidate_ids.add(tgt)
-
-        # 3. Load only candidate nodes (not full graph)
+        # Load only the conflicting node pairs
+        candidate_ids = {nid for src, tgt, _, _ in candidates for nid in (src, tgt)}
         nodes = self._store.get_nodes_by_ids(list(candidate_ids))
         node_map = {n.node_id: n for n in nodes}
 
         conflicts_found = 0
-        for src_id, tgt_id, _weight in strong_assoc:
+        for src_id, tgt_id, _edge_w, _cur_sim in candidates:
             node = node_map.get(src_id)
             neighbor = node_map.get(tgt_id)
             if not node or not neighbor:
@@ -105,14 +109,6 @@ class GraphConsolidator:
             if node.session_id == neighbor.session_id:
                 continue
 
-            # DB-side content similarity check
-            content_sim = self._store.get_pair_similarity(node.node_id, neighbor.node_id)
-            if content_sim is None:
-                content_sim = 0.5
-            if content_sim > 0.4:
-                continue
-
-            # Confirmed contradiction
             if node.node_id < neighbor.node_id:
                 older, newer = node, neighbor
             else:

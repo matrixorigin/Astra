@@ -92,9 +92,10 @@ class TestGraphConsolidator:
             content="prefers Python", session_id="s2", confidence=0.6,
         )
 
-        c._store.get_association_edges.return_value = [("a", "b", 0.8)]
+        c._store.get_association_edges_with_current_sim.return_value = [
+            ("a", "b", 0.8, 0.2),  # edge_weight=0.8, current_cosine_sim=0.2 → conflict
+        ]
         c._store.get_nodes_by_ids.return_value = [node_a, node_b]
-        c._store.get_pair_similarity.return_value = 0.2  # low content sim = contradiction
         c._store.get_user_nodes.return_value = []  # no scenes
 
         result = c.consolidate("u1")

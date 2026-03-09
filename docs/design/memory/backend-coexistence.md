@@ -113,45 +113,35 @@ core/memory/
 
 ## 3. Factory
 
+`core/memory/factory.py` provides `create_memory_service()` with pluggable strategy resolution:
+
 ```python
-# core/memory/factory.py
-from __future__ import annotations
-
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from core.db_consumer import DbFactory
-    from core.memory.interfaces import MemoryAdmin, MemoryReader, MemoryWriter
-
-# Union type for the facade
-type MemoryFacade = MemoryReader & MemoryWriter & MemoryAdmin
-
-
-def create_memory_service(
-    db_factory: DbFactory,
-    *,
-    backend: str = "tabular",
-    llm_client: Any = None,
-    embed_fn: Any = None,
-    config: Any = None,
-) -> Any:
-    """Create memory service by backend.
-
-    Args:
-        backend: "tabular" (flat table) or "graph" (graph-based).
-                 Read from config.memory_backend if not specified.
-    """
-    if backend == "graph":
-        from core.memory.graph.service import GraphMemoryService
-        return GraphMemoryService(
-            db_factory, llm_client=llm_client, embed_fn=embed_fn, config=config,
-        )
-
-    from core.memory.tabular.service import TabularMemoryService
-    return TabularMemoryService(
-        db_factory, llm_client=llm_client, embed_fn=embed_fn, config=config,
-    )
+svc = create_memory_service(db_factory, user_id="alice")
 ```
+
+**Resolution order** (§4.2):
+1. Explicit `strategy=` parameter
+2. `backend=` mapped to strategy (`"tabular"` → `"vector:v1"`, `"graph"` → `"activation:v1"`)
+3. Per-user DB row in `mem_user_memory_config`
+4. `MEM_RETRIEVAL_STRATEGY` env var
+5. `"vector:v1"` hardcoded fallback
+
+### CLI Commands
+
+```bash
+# Check current strategy for a user
+mo-agent memory strategy get --user-id <uid>
+
+# Switch to graph-based activation retrieval (runs backfill if needed)
+mo-agent memory strategy set activation:v1 --user-id <uid>
+
+# Switch back to tabular vector retrieval
+mo-agent memory strategy set vector:v1 --user-id <uid>
+```
+
+### MCP Server
+
+The MCP server (`mo_memory_mcp/server.py`) passes `user_id` to both `create_memory_service` and `create_editor`, so per-user strategy is automatically respected. The `--user` flag (default `"default"`) sets the fallback user ID when the LLM doesn't pass one.
 
 ---
 

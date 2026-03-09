@@ -110,7 +110,7 @@ class MemoryProgramTool(EdgeTool):
         commit_id: str | None = kwargs.get("commit")
 
         try:
-            programmer = _get_programmer()
+            programmer = _get_programmer(user_id)
         except Exception as e:
             return json.dumps({"error": f"Failed to initialize: {e}"})
 
@@ -176,28 +176,15 @@ class MemoryProgramTool(EdgeTool):
             return json.dumps({"error": f"Commit failed: {e}"})
 
 
-_programmer_instance = None
-
-def _get_programmer():
-    """Lazy-init MemoryProgrammer from production DB (singleton).
-    
-    Skips embedding client init — CLI doesn't need embeddings (server handles that).
-    """
-    global _programmer_instance
-    if _programmer_instance is not None:
-        return _programmer_instance
+def _get_programmer(user_id: str | None = None):
+    """Create MemoryProgrammer with user-aware editor."""
     from api.database import SessionLocal
     from core.memory.experiment import MemoryExperimentManager
-    from core.memory.editor import MemoryEditor
-    from core.memory.canonical_storage import CanonicalStorage
+    from core.memory.factory import create_editor
     from core.memory.programmer import MemoryProgrammer
-    from core.memory.factory import _register_builtins
 
-    _register_builtins()
     db_factory = SessionLocal
-    storage = CanonicalStorage(db_factory)
-    editor = MemoryEditor(storage, db_factory, index_manager=None, embed_client=None)
+    editor = create_editor(db_factory, user_id=user_id)
     db_name = SessionLocal.kw["bind"].url.database
     experiments = MemoryExperimentManager(db_factory, source_db=db_name)
-    _programmer_instance = MemoryProgrammer(editor, experiments, db_factory)
-    return _programmer_instance
+    return MemoryProgrammer(editor, experiments, db_factory)

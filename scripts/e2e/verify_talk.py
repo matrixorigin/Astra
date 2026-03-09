@@ -20,6 +20,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+# Force HuggingFace offline mode — model is cached locally, avoid proxy hang
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+for _k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+    os.environ.pop(_k, None)
+
 import argparse
 import logging
 
@@ -69,6 +75,34 @@ def _init_prev_counts(case: dict, uid: str, sid: str, prev_counts: dict, uid_onl
                         ).scalar() or 0
 
 
+def _seed_graph_nodes(user_id: str, count: int = 50) -> None:
+    """Seed graph nodes for a user so activation:v1 threshold is met."""
+    from core.memory.factory import create_editor
+
+    editor = create_editor(SessionLocal, user_id=user_id)
+    if not editor._embed_client:
+        return  # no embedding client, skip
+
+    topics = [
+        "Python", "Rust", "Go", "TypeScript", "Java", "C++", "Ruby", "Swift",
+        "machine learning", "data analysis", "web development", "database",
+        "API design", "microservices", "DevOps", "cloud computing",
+        "algorithms", "data structures", "system design", "testing",
+    ]
+    batch: list[dict] = []
+    for i in range(count):
+        topic = topics[i % len(topics)]
+        batch.append({
+            "content": f"Background: user has experience with {topic} (seed {i})",
+            "type": "semantic", "trust": "T3",
+        })
+        if len(batch) >= 10:
+            editor.batch_inject(user_id, batch, source="verify-talk-seed")
+            batch = []
+    if batch:
+        editor.batch_inject(user_id, batch, source="verify-talk-seed")
+
+
 def run_case(case: dict, *, verbose: bool = False, model: str | None = None) -> tuple[int, int]:
     """Run one case. Returns (passed, failed)."""
     name = case["name"]
@@ -84,6 +118,17 @@ def run_case(case: dict, *, verbose: bool = False, model: str | None = None) -> 
     try:
         session.setup()
 
+        uid = session.user_uuid or session.username
+
+        # Set activation:v1 strategy for this test user so graph path is used
+        from core.memory.factory import set_user_strategy
+        set_user_strategy(SessionLocal, uid, "activation:v1")
+
+        # Pre-seed graph nodes only for cases that need graph activation check
+        check_graph = case.get("check_graph_activation", False)
+        if check_graph:
+            _seed_graph_nodes(uid, count=50)
+
         # Run first turn to establish session_id
         turns = case.get("turns", [])
         if not turns:
@@ -91,7 +136,6 @@ def run_case(case: dict, *, verbose: bool = False, model: str | None = None) -> 
             return 0, 0
 
         # Snapshot uid-based counts BEFORE first turn
-        uid = session.user_uuid or session.username
         _init_prev_counts(case, uid, "", prev_counts, uid_only=True)
 
         # First turn
@@ -135,6 +179,25 @@ def run_case(case: dict, *, verbose: bool = False, model: str | None = None) -> 
                     passed += 1
                 else:
                     failed += 1
+
+        # Verify graph activation was actually used (only for cases that opt in)
+        if check_graph:
+            from core.memory.factory import _resolve_strategy, _registry, StrategyDescriptor, _register_builtins
+            from core.embedding import get_embedding_client
+            _register_builtins()
+            sk = _resolve_strategy(SessionLocal, uid, backend=None, strategy=None)
+            desc = StrategyDescriptor.parse(sk)
+            strategy = _registry.create_strategy(desc, db_factory=SessionLocal)
+            ec = get_embedding_client()
+            q_emb = ec.embed("Python data analysis")
+            _, explain_info = strategy.retrieve(uid, "Python data analysis", q_emb, top_k=3, explain=True)
+            path = (explain_info or {}).get("path", "unknown")
+            if path == "graph":
+                print(f"    ✅ graph_activation_used — path=graph (confirmed via explain)")
+                passed += 1
+            else:
+                print(f"    ❌ graph_activation_used — path={path} (expected graph)")
+                failed += 1
 
     except Exception as e:
         print(f"  ❌ Case failed: {e}")
@@ -205,7 +268,7 @@ def _check_turn(
 def _cleanup_user(user_id: str) -> None:
     from sqlalchemy import text as sa_text
     with SessionLocal() as db:
-        for t in ("mem_edit_log", "mem_memories"):
+        for t in ("mem_edit_log", "mem_memories", "memory_graph_nodes", "memory_graph_edges"):
             db.execute(sa_text(f"DELETE FROM {t} WHERE user_id = :uid"), {"uid": user_id})
         db.commit()
 

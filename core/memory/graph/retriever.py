@@ -28,7 +28,7 @@ LAMBDA_IMPORTANCE = 0.10
 
 CONFLICT_PENALTY = {"superseded": 0.5, "pending": 0.7}
 
-MIN_GRAPH_NODES = 50
+MIN_GRAPH_NODES = 10
 ANCHOR_TOP_K = 10
 
 # §13.2 Memory mode → activation parameters per task type

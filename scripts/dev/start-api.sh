@@ -42,7 +42,11 @@ if [ -f .env ]; then
 fi
 
 # Start server in new session (setsid) so it's immune to Ctrl+C from parent
-setsid python -m uvicorn api.main:app --port 8000 >> "$LOG_FILE" 2>&1 &
+# Clear proxy env vars so LLM API calls go directly (not through corporate proxy)
+# Set HF offline mode so SentenceTransformer loads from cache without network hang
+setsid env http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= \
+    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    python -m uvicorn api.main:app --port 8000 >> "$LOG_FILE" 2>&1 &
 sleep 1
 PID=$(pgrep -f "uvicorn api.main:app" | head -1)
 echo $PID > "$PID_FILE"

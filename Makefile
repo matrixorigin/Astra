@@ -499,7 +499,15 @@ db-reset:
 .PHONY: verify verify-llm verify-talk
 verify:
 	@echo "Running E2E verification..."
-	@set -a && . ./.env && set +a && http_proxy= https_proxy= python scripts/e2e/verify_cli.py $(if $(VERBOSE),-v)
+	@set -a && . ./.env && set +a && http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python scripts/e2e/verify_cli.py $(if $(VERBOSE),-v)
+
+verify-llm:
+	@echo "Running E2E verification with LLM..."
+	@set -a && . ./.env && set +a && http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python scripts/e2e/verify_cli.py --with-llm $(if $(VERBOSE),-v) $(if $(MODEL),--model $(MODEL))
+
+verify-talk:
+	@echo "Running talk verification (requires API server + LLM)..."
+	@set -a && . ./.env && set +a && http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python scripts/e2e/verify_talk.py $(if $(VERBOSE),-v) $(if $(CASE),--case $(CASE)) $(if $(MODEL),--model $(MODEL))
 
 verify-llm:
 	@echo "Running E2E verification (with LLM + session state)..."

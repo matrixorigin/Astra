@@ -248,29 +248,65 @@ class GraphStore(DbConsumer):
             )
             return float(result.sim) if result else None
 
+    def get_pairs_similarity_batch(
+        self, pairs: list[tuple[str, str]],
+    ) -> dict[tuple[str, str], float]:
+        """Cosine similarity for multiple node pairs — DB-side computation.
+
+        Single query with self-join on the specific pair IDs.
+        Returns dict keyed by (node_a_id, node_b_id) → cosine_similarity.
+        """
+        if not pairs:
+            return {}
+        from matrixone.sqlalchemy_ext import cosine_distance
+        from sqlalchemy.orm import aliased
+
+        a_ids = [p[0] for p in pairs]
+        b_ids = [p[1] for p in pairs]
+        pair_set = set(pairs)
+
+        with self._db() as db:
+            A = aliased(GraphNode, name="a")
+            B = aliased(GraphNode, name="b")
+            rows = (
+                db.query(
+                    A.node_id.label("a_id"),
+                    B.node_id.label("b_id"),
+                    (1.0 - cosine_distance(A.embedding, B.embedding)).label("sim"),
+                )
+                .filter(A.node_id.in_(a_ids), B.node_id.in_(b_ids))
+                .filter(A.embedding.isnot(None), B.embedding.isnot(None))
+                .all()
+            )
+        return {
+            (r.a_id, r.b_id): float(r.sim)
+            for r in rows
+            if (r.a_id, r.b_id) in pair_set
+        }
+
     # ── Edge Operations (normalized table) ────────────────────────────
 
     def add_edges_batch(
         self, edges: list[tuple[str, str, str, float]], user_id: str,
     ) -> None:
-        """Insert edges, ignoring duplicates (composite PK)."""
+        """Insert edges, ignoring duplicates (composite PK).
+
+        Uses INSERT ... ON DUPLICATE KEY UPDATE — avoids N SELECT round-trips.
+        """
         if not edges:
             return
         with self._db() as db:
-            for src_id, tgt_id, etype, weight in edges:
-                existing = (
-                    db.query(GraphEdge)
-                    .filter_by(source_id=src_id, target_id=tgt_id, edge_type=etype)
-                    .first()
+            from sqlalchemy import text as sa_text
+            for src, tgt, etype, weight in edges:
+                db.execute(
+                    sa_text(
+                        "INSERT INTO memory_graph_edges "
+                        "(source_id, target_id, edge_type, weight, user_id) "
+                        "VALUES (:src, :tgt, :etype, :w, :uid) "
+                        "ON DUPLICATE KEY UPDATE weight = :w"
+                    ),
+                    {"src": src, "tgt": tgt, "etype": etype, "w": weight, "uid": user_id},
                 )
-                if existing:
-                    if existing.weight != weight:
-                        existing.weight = weight
-                else:
-                    db.add(GraphEdge(
-                        source_id=src_id, target_id=tgt_id,
-                        edge_type=etype, weight=weight, user_id=user_id,
-                    ))
             db.commit()
 
     def get_outgoing_edges(self, node_id: str) -> list[Edge]:
@@ -382,6 +418,49 @@ class GraphStore(DbConsumer):
                 .all()
             )
             return [(r.source_id, r.target_id, r.weight) for r in rows]
+
+    def get_association_edges_with_current_sim(
+        self,
+        user_id: str,
+        *,
+        min_edge_weight: float = 0.7,
+        max_current_sim: float = 0.4,
+    ) -> list[tuple[str, str, float, float]]:
+        """Association edges where historical weight is high but current cosine sim is low.
+
+        Single DB query: JOIN edges with nodes, compute cosine_distance inline.
+        Returns list of (source_id, target_id, edge_weight, current_cosine_sim).
+        """
+        from matrixone.sqlalchemy_ext import cosine_distance
+        from sqlalchemy.orm import aliased
+
+        with self._db() as db:
+            A = aliased(GraphNode, name="a")
+            B = aliased(GraphNode, name="b")
+            cur_sim = (1.0 - cosine_distance(A.embedding, B.embedding)).label("cur_sim")
+            rows = (
+                db.query(
+                    GraphEdge.source_id,
+                    GraphEdge.target_id,
+                    GraphEdge.weight,
+                    cur_sim,
+                )
+                .join(A, A.node_id == GraphEdge.source_id)
+                .join(B, B.node_id == GraphEdge.target_id)
+                .filter(
+                    GraphEdge.user_id == user_id,
+                    GraphEdge.edge_type == "association",
+                    GraphEdge.weight >= min_edge_weight,
+                    A.embedding.isnot(None),
+                    B.embedding.isnot(None),
+                )
+                .all()
+            )
+        return [
+            (r.source_id, r.target_id, float(r.weight), float(r.cur_sim))
+            for r in rows
+            if float(r.cur_sim) < max_current_sim
+        ]
 
     # ── Node Update ───────────────────────────────────────────────────
 

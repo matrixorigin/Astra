@@ -52,7 +52,8 @@ turns:
             table: mem_memories
             # workaround: https://github.com/matrixorigin/matrixone/issues/23817
             # TODO: revert to is_active = 1 after MatrixOne fixes the issue
-            where: "user_id = :uid AND is_active != 0 AND content LIKE '%Go%'"
+            # exclude seed nodes injected by verify-talk setup
+            where: "user_id = :uid AND is_active != 0 AND content LIKE '%Go%' AND content NOT LIKE '%seed%'"
             assert:
               count: "0"
       llm_judge:

@@ -282,6 +282,9 @@ def llm_judge(
         resp = llm_client.chat(messages, user_id="__verify_judge", model=model)
         raw = resp.content if hasattr(resp, "content") else str(resp)
         match = re.search(r"(\d+\.?\d*)", raw.strip())
+        if not match:
+            import logging
+            logging.getLogger(__name__).warning("llm_judge got non-numeric response: %r", raw[:200])
         score = float(match.group(1)) if match else 0.0
         score = min(1.0, max(0.0, score))
         passed = score >= pass_threshold

@@ -1,6 +1,8 @@
 """Memory SQLAlchemy model."""
 
 from matrixone import VectorPrecision, VectorType
+if not getattr(VectorType, "cache_ok", False):
+    VectorType.cache_ok = True
 from matrixone.sqlalchemy_ext import FulltextIndex, FulltextParserType
 from sqlalchemy import (
     Column, Float, Index, Integer, SmallInteger, String, Text,
