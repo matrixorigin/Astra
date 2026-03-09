@@ -46,6 +46,7 @@ class MemoryBackend:
     def branch_checkout(self, user_id: str, name: str) -> dict: ...
     def branch_delete(self, user_id: str, name: str) -> dict: ...
     def branch_merge(self, user_id: str, source: str, strategy: str) -> dict: ...
+    def branch_diff(self, user_id: str, source: str, limit: int) -> dict: ...
 
 
 class EmbeddedBackend(MemoryBackend):
@@ -481,176 +482,235 @@ class EmbeddedBackend(MemoryBackend):
             self._set_active_branch(user_id, "main")
         return {"deleted": name}
 
-    def branch_merge(self, user_id: str, source: str, strategy: str) -> dict:
-        """Merge branch memories into current branch (usually main).
+    def _get_diff_rows(self, branch_db: str, src_db: str, limit: int):
+        """Get diff rows via SDK. Returns (total, rows). limit=0 means count only.
         
-        Conflict detection: two memories conflict when they have the same memory_type
-        and high semantic similarity (cosine > 0.9) but different content.
-        
-        Strategy:
-        - 'append' (default): Add all branch memories, skip conflicts
-        - 'replace': Branch memories override conflicting main memories
-        
-        Optimized for massive datasets (100M+): SQL-level conflict detection.
+        Uses MatrixOne's native diff_table_branch API for efficient comparison.
+        Errors are logged but don't fail the merge — we fall back to conservative merge.
         """
         from sqlalchemy import text
-        from core.utils.id_generator import generate_id
-        
+        from matrixone.branch_builder import diff_table_branch
+        try:
+            stmt_count = diff_table_branch(f"{branch_db}.mem_memories").against(
+                f"{src_db}.mem_memories"
+            ).output_count()
+            with self._db_factory() as db:
+                db.commit()
+                total = db.execute(text(str(stmt_count))).scalar() or 0
+            if total == 0 or limit == 0:
+                return total, []
+            stmt_rows = diff_table_branch(f"{branch_db}.mem_memories").against(
+                f"{src_db}.mem_memories"
+            ).output_limit(limit)
+            with self._db_factory() as db:
+                db.commit()
+                rows = db.execute(text(str(stmt_rows))).fetchall()
+            return total, rows
+        except Exception as e:
+            logger.warning("diff_table_branch failed: %s. Falling back to conservative merge.", e)
+            return 0, []
+
+    def _resolve_branch(self, user_id: str, name: str):
+        """Lookup active branch. Returns (branch_db, error_dict)."""
+        from sqlalchemy import text
         with self._db_factory() as db:
             row = db.execute(text(
                 "SELECT branch_id, branch_db FROM mem_branches "
                 "WHERE user_id = :uid AND name = :name AND status = 'active'"
-            ), {"uid": user_id, "name": source}).fetchone()
+            ), {"uid": user_id, "name": name}).fetchone()
         if not row:
-            return {"error": f"Branch '{source}' not found"}
-        branch_db = row.branch_db
+            return None, {"error": f"Branch '{name}' not found"}
+        # Verify branch DB exists
+        with self._db_factory() as db:
+            exists = db.execute(text(
+                "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = :db"
+            ), {"db": row.branch_db}).scalar()
+        if not exists:
+            return None, {"error": f"Branch DB '{row.branch_db}' no longer exists"}
+        return row.branch_db, None
+
+    _MAX_MERGE_CHANGES = 5000  # Safety limit: prevent accidental large merges. 5000 memories ≈ 10-30s merge time.
+
+    def branch_merge(self, user_id: str, source: str, strategy: str) -> dict:
+        """Merge branch into main. All SQL — no rows pulled to Python.
+
+        1. SDK diff count → safety check (prevent >5000 changes)
+        2. Bulk INSERT...SELECT for non-conflicting new memories
+        3. For replace: UPDATE via subquery for conflicts
+        
+        Design rationale for _MAX_MERGE_CHANGES=5000:
+        - Cosine similarity on 5000 memories takes ~10-30s (acceptable)
+        - Prevents accidental merges of massive branches
+        - User can split large branches into smaller ones
+        """
+        from sqlalchemy import text
+
+        branch_db, err = self._resolve_branch(user_id, source)
+        if err:
+            return err
+        src_db = self._source_db_name()
+
+        # 1. Safety check — count changes first
+        total, _ = self._get_diff_rows(branch_db, src_db, limit=0)
+        if total == 0:
+            return {"merged": 0, "skipped": 0, "source": source}
+        if total > self._MAX_MERGE_CHANGES:
+            return {"error": f"Too many changes ({total}). Max {self._MAX_MERGE_CHANGES}. Reduce branch scope."}
 
         with self._db_factory() as db:
-            if strategy == "replace":
-                # Replace strategy: update existing conflicts, insert new ones
-                # 1. Update conflicts: same memory_type + cosine > 0.9 + different content
+            # Count new non-conflicting memories before insert
+            inserted = db.execute(text(f"""
+                SELECT COUNT(*) FROM `{branch_db}`.mem_memories b
+                WHERE b.user_id = :uid AND b.is_active = 1
+                AND NOT EXISTS (
+                    SELECT 1 FROM mem_memories m WHERE m.memory_id = b.memory_id AND m.is_active = 1
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM mem_memories m
+                    WHERE m.user_id = :uid AND m.is_active = 1
+                    AND m.memory_type = b.memory_type
+                    AND b.embedding IS NOT NULL AND m.embedding IS NOT NULL
+                    AND cosine_similarity(m.embedding, b.embedding) > 0.9
+                )
+            """), {"uid": user_id}).scalar() or 0
+
+            # 2. Bulk INSERT non-conflicting new memories (one SQL)
+            db.execute(text(f"""
+                INSERT INTO mem_memories (memory_id, user_id, content, memory_type,
+                    initial_confidence, trust_tier, embedding, source_event_ids,
+                    is_active, observed_at, created_at, updated_at)
+                SELECT UUID(), b.user_id, b.content, b.memory_type,
+                    b.initial_confidence, b.trust_tier, b.embedding, b.source_event_ids,
+                    1, b.observed_at, NOW(), NOW()
+                FROM `{branch_db}`.mem_memories b
+                WHERE b.user_id = :uid AND b.is_active = 1
+                AND NOT EXISTS (
+                    SELECT 1 FROM mem_memories m WHERE m.memory_id = b.memory_id AND m.is_active = 1
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM mem_memories m
+                    WHERE m.user_id = :uid AND m.is_active = 1
+                    AND m.memory_type = b.memory_type
+                    AND b.embedding IS NOT NULL AND m.embedding IS NOT NULL
+                    AND cosine_similarity(m.embedding, b.embedding) > 0.9
+                )
+            """), {"uid": user_id})
+
+            # 3. Handle conflicts
+            replaced = 0
+            skipped = 0
+            conflict_where = f"""
+                FROM `{branch_db}`.mem_memories b
+                WHERE b.user_id = :uid AND b.is_active = 1
+                AND NOT EXISTS (SELECT 1 FROM mem_memories m2 WHERE m2.memory_id = b.memory_id AND m2.is_active = 1)
+                AND EXISTS (
+                    SELECT 1 FROM mem_memories m
+                    WHERE m.user_id = :uid AND m.is_active = 1
+                    AND m.memory_type = b.memory_type
+                    AND b.embedding IS NOT NULL AND m.embedding IS NOT NULL
+                    AND cosine_similarity(m.embedding, b.embedding) > 0.9
+                )
+            """
+            conflict_count = db.execute(text(f"SELECT COUNT(*) {conflict_where}"), {"uid": user_id}).scalar() or 0
+            if strategy == "replace" and conflict_count > 0:
                 db.execute(text(f"""
                     UPDATE mem_memories m
                     SET m.content = (
                         SELECT b.content FROM `{branch_db}`.mem_memories b
-                        WHERE b.user_id = m.user_id
+                        WHERE b.user_id = :uid AND b.is_active = 1
                         AND b.memory_type = m.memory_type
+                        AND b.embedding IS NOT NULL
                         AND cosine_similarity(m.embedding, b.embedding) > 0.9
-                        AND b.content != m.content
-                        AND b.is_active = 1
+                        AND NOT EXISTS (SELECT 1 FROM mem_memories m2 WHERE m2.memory_id = b.memory_id AND m2.is_active = 1)
                         LIMIT 1
                     ),
                     m.embedding = (
                         SELECT b.embedding FROM `{branch_db}`.mem_memories b
-                        WHERE b.user_id = m.user_id
+                        WHERE b.user_id = :uid AND b.is_active = 1
                         AND b.memory_type = m.memory_type
+                        AND b.embedding IS NOT NULL
                         AND cosine_similarity(m.embedding, b.embedding) > 0.9
-                        AND b.content != m.content
-                        AND b.is_active = 1
+                        AND NOT EXISTS (SELECT 1 FROM mem_memories m2 WHERE m2.memory_id = b.memory_id AND m2.is_active = 1)
                         LIMIT 1
                     ),
                     m.updated_at = NOW()
-                    WHERE m.user_id = :uid
-                    AND m.is_active = 1
+                    WHERE m.user_id = :uid AND m.is_active = 1
                     AND EXISTS (
                         SELECT 1 FROM `{branch_db}`.mem_memories b
-                        WHERE b.user_id = m.user_id
+                        WHERE b.user_id = :uid AND b.is_active = 1
                         AND b.memory_type = m.memory_type
+                        AND b.embedding IS NOT NULL
                         AND cosine_similarity(m.embedding, b.embedding) > 0.9
-                        AND b.content != m.content
-                        AND b.is_active = 1
+                        AND NOT EXISTS (SELECT 1 FROM mem_memories m2 WHERE m2.memory_id = b.memory_id AND m2.is_active = 1)
                     )
                 """), {"uid": user_id})
-                
-                # 2. Count updates
-                updated = db.execute(text(f"""
-                    SELECT COUNT(*) FROM `{branch_db}`.mem_memories b
-                    WHERE b.user_id = :uid
-                    AND b.is_active = 1
-                    AND EXISTS (
-                        SELECT 1 FROM mem_memories m
-                        WHERE m.user_id = b.user_id
-                        AND m.memory_type = b.memory_type
-                        AND cosine_similarity(m.embedding, b.embedding) > 0.9
-                        AND m.content != b.content
-                        AND m.is_active = 1
-                    )
-                """), {"uid": user_id}).scalar() or 0
-                
-                # 3. Insert non-conflicting memories with new IDs
-                db.execute(text(f"""
-                    INSERT INTO mem_memories (memory_id, user_id, content, memory_type, 
-                        initial_confidence, trust_tier, embedding, source_event_ids, 
-                        is_active, observed_at, created_at, updated_at)
-                    SELECT 
-                        UUID(), b.user_id, b.content, b.memory_type,
-                        b.initial_confidence, b.trust_tier, b.embedding, b.source_event_ids,
-                        1, b.observed_at, NOW(), NOW()
-                    FROM `{branch_db}`.mem_memories b
-                    WHERE b.user_id = :uid
-                    AND b.is_active = 1
-                    AND NOT EXISTS (
-                        SELECT 1 FROM mem_memories m
-                        WHERE m.user_id = b.user_id
-                        AND m.memory_type = b.memory_type
-                        AND cosine_similarity(m.embedding, b.embedding) > 0.9
-                        AND m.content != b.content
-                        AND m.is_active = 1
-                    )
-                """), {"uid": user_id})
-                
-                # 4. Count inserts
-                inserted = db.execute(text(f"""
-                    SELECT COUNT(*) FROM `{branch_db}`.mem_memories b
-                    WHERE b.user_id = :uid
-                    AND b.is_active = 1
-                    AND NOT EXISTS (
-                        SELECT 1 FROM mem_memories m
-                        WHERE m.user_id = b.user_id
-                        AND m.memory_type = b.memory_type
-                        AND cosine_similarity(m.embedding, b.embedding) > 0.9
-                        AND m.content != b.content
-                        AND m.is_active = 1
-                    )
-                """), {"uid": user_id}).scalar() or 0
-                
-                db.commit()
-                merged = updated + inserted
-                skipped = 0
+                replaced = conflict_count
             else:
-                # Append strategy: insert only non-conflicting memories with new IDs
-                db.execute(text(f"""
-                    INSERT INTO mem_memories (memory_id, user_id, content, memory_type, 
-                        initial_confidence, trust_tier, embedding, source_event_ids, 
-                        is_active, observed_at, created_at, updated_at)
-                    SELECT 
-                        UUID(), b.user_id, b.content, b.memory_type,
-                        b.initial_confidence, b.trust_tier, b.embedding, b.source_event_ids,
-                        1, b.observed_at, NOW(), NOW()
-                    FROM `{branch_db}`.mem_memories b
-                    WHERE b.user_id = :uid
-                    AND b.is_active = 1
-                    AND NOT EXISTS (
-                        SELECT 1 FROM mem_memories m
-                        WHERE m.user_id = b.user_id
-                        AND m.memory_type = b.memory_type
-                        AND cosine_similarity(m.embedding, b.embedding) > 0.9
-                        AND m.content != b.content
-                        AND m.is_active = 1
-                    )
-                """), {"uid": user_id})
-                
-                merged = db.execute(text(f"""
-                    SELECT COUNT(*) FROM `{branch_db}`.mem_memories b
-                    WHERE b.user_id = :uid
-                    AND b.is_active = 1
-                    AND NOT EXISTS (
-                        SELECT 1 FROM mem_memories m
-                        WHERE m.user_id = b.user_id
-                        AND m.memory_type = b.memory_type
-                        AND cosine_similarity(m.embedding, b.embedding) > 0.9
-                        AND m.content != b.content
-                        AND m.is_active = 1
-                    )
-                """), {"uid": user_id}).scalar() or 0
-                
-                skipped = db.execute(text(f"""
-                    SELECT COUNT(*) FROM `{branch_db}`.mem_memories b
-                    WHERE b.user_id = :uid
-                    AND b.is_active = 1
-                    AND EXISTS (
-                        SELECT 1 FROM mem_memories m
-                        WHERE m.user_id = b.user_id
-                        AND m.memory_type = b.memory_type
-                        AND cosine_similarity(m.embedding, b.embedding) > 0.9
-                        AND m.content != b.content
-                        AND m.is_active = 1
-                    )
-                """), {"uid": user_id}).scalar() or 0
-                
-                db.commit()
+                skipped = conflict_count
 
-        return {"merged": merged, "skipped": skipped, "source": source}
+            db.commit()
+
+        return {"merged": inserted + replaced, "skipped": skipped, "source": source}
+
+    def branch_diff(self, user_id: str, source: str, limit: int = 200) -> dict:
+        """Diff branch against main using SDK diff + semantic conflict detection."""
+        branch_db, err = self._resolve_branch(user_id, source)
+        if err:
+            return err
+        src_db = self._source_db_name()
+
+        total, rows = self._get_diff_rows(branch_db, src_db, limit)
+        if total == 0:
+            return {"source": source, "total": 0, "changes": [], "truncated": False}
+
+        # Classify each change
+        changes: list[dict] = []
+        inserts_with_emb_ids: list[str] = []
+        inserts_with_emb_entries: list[dict] = []
+
+        for r in rows:
+            m = dict(r._mapping)
+            flag = m.get("flag", "UNKNOWN")
+            entry = {
+                "memory_id": m.get("memory_id"),
+                "content": (m.get("content") or "")[:200],
+                "memory_type": m.get("memory_type"),
+                "flag": flag,
+            }
+            if flag in ("DELETE", "UPDATE"):
+                entry["semantic"] = "removed" if flag == "DELETE" else "modified"
+                changes.append(entry)
+            elif flag == "INSERT":
+                if m.get("embedding") is None:
+                    entry["semantic"] = "new (no embedding)"
+                    changes.append(entry)
+                else:
+                    inserts_with_emb_ids.append(m["memory_id"])
+                    inserts_with_emb_entries.append(entry)
+            else:
+                entry["semantic"] = flag.lower()
+                changes.append(entry)
+
+        # Batch semantic conflict detection
+        conflict_ids: set[str] = set()
+        if inserts_with_emb_ids:
+            conflict_ids = self._detect_conflicts(branch_db, user_id, inserts_with_emb_ids)
+        for entry in inserts_with_emb_entries:
+            entry["semantic"] = "conflict" if entry["memory_id"] in conflict_ids else "new"
+            changes.append(entry)
+
+        summary: dict[str, int] = {}
+        for c in changes:
+            s = c["semantic"]
+            summary[s] = summary.get(s, 0) + 1
+
+        return {
+            "source": source,
+            "total": total,
+            "truncated": total > limit,
+            "summary": summary,
+            "changes": changes,
+        }
 
 class HTTPBackend(MemoryBackend):
     """Proxy to memory service REST API — for remote mode."""
@@ -764,6 +824,9 @@ class HTTPBackend(MemoryBackend):
         return {"error": "Not available via HTTP"}
 
     def branch_merge(self, user_id: str, source: str, strategy: str) -> dict:
+        return {"error": "Not available via HTTP"}
+
+    def branch_diff(self, user_id: str, source: str, limit: int = 200) -> dict:
         return {"error": "Not available via HTTP"}
 
 
@@ -1141,6 +1204,42 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
         if "error" in result:
             return f"Error: {result['error']}"
         return f"Merged {result['merged']} memories from '{source}' (skipped {result['skipped']})."
+
+    @server.tool()
+    def memory_diff(
+        source: str,
+        limit: int = 50,
+        user_id: str | None = None,
+    ) -> str:
+        """Show what would change if a branch were merged into main.
+
+        Uses kernel-level diff (LCA-based) then classifies each change semantically:
+        - new: memory exists only on branch, no semantic match in main
+        - conflict: branch memory is semantically similar (cosine>0.9) to a main memory but different content
+        - modified: same memory_id changed on branch
+        - removed: memory deleted on branch
+        - new (no embedding): new memory without embedding, cannot check for conflicts
+
+        Args:
+            source: Branch name to diff.
+            limit: Max changes to return (default 50).
+            user_id: User ID (optional).
+        """
+        result = backend.branch_diff(_user(user_id), source, limit)
+        if "error" in result:
+            return f"Error: {result['error']}"
+        if result["total"] == 0:
+            return f"Branch '{source}' has no changes vs main."
+        lines = [f"Branch '{source}': {result['total']} total changes"]
+        if result.get("truncated"):
+            lines[0] += f" (showing first {limit})"
+        if result.get("summary"):
+            parts = [f"{v} {k}" for k, v in result["summary"].items()]
+            lines.append(f"Summary: {', '.join(parts)}")
+        for c in result["changes"]:
+            content_preview = c["content"][:80]
+            lines.append(f"  [{c['semantic']}] {content_preview}")
+        return "\n".join(lines)
 
     return server
 

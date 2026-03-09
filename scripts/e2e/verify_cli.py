@@ -1125,6 +1125,91 @@ def test_branch_full_workflow() -> None:
           scalar("SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1 AND content LIKE '%MySQL 8.0%'", uid=USER_ID) >= 1)
 
 
+# ── Scenario 24: Branch diff (SDK diff + semantic classification) ─────
+
+def test_branch_diff() -> None:
+    print("\n── 24. Branch diff ──")
+
+    from mo_memory_mcp.server import EmbeddedBackend
+    from sqlalchemy import text as sa_text
+    from core.utils.id_generator import generate_id
+    b = EmbeddedBackend()
+
+    # 1. Store baseline with embedding
+    b.store(USER_ID, "We use Redis 7.2 for caching", "semantic", None)
+    b.store(USER_ID, "Our API uses FastAPI framework", "semantic", None)
+
+    # Check if embeddings are available
+    with SessionLocal() as db:
+        redis_row = db.execute(sa_text(
+            "SELECT memory_id, embedding FROM mem_memories "
+            "WHERE user_id = :uid AND content LIKE '%Redis%' AND is_active = 1"
+        ), {"uid": USER_ID}).fetchone()
+    has_embeddings = redis_row is not None and redis_row.embedding is not None
+    vlog(f"embeddings available: {has_embeddings}")
+
+    # 2. Snapshot + branch
+    b.snapshot_create(USER_ID, "test_diff_base", "")
+    result = b.branch_create(USER_ID, "diff_test", "test_diff_base")
+    check("diff branch created", "error" not in result, str(result))
+    branch_db = result["branch_db"]
+
+    # 3. On branch: add truly new memory (no embedding → no semantic match possible)
+    with SessionLocal() as db:
+        mid1 = generate_id()
+        db.execute(sa_text(
+            f"INSERT INTO `{branch_db}`.mem_memories "
+            f"(memory_id, user_id, content, memory_type, initial_confidence, "
+            f"source_event_ids, is_active, observed_at, created_at, updated_at) "
+            f"VALUES (:mid, :uid, 'Branch: evaluating Kubernetes 1.29', 'semantic', "
+            f"0.8, '[]', 1, NOW(), NOW(), NOW())"
+        ), {"mid": mid1, "uid": USER_ID})
+
+        # Add semantic conflict: reuse Redis embedding with different content
+        if has_embeddings:
+            mid2 = generate_id()
+            db.execute(sa_text(
+                f"INSERT INTO `{branch_db}`.mem_memories "
+                f"(memory_id, user_id, content, memory_type, initial_confidence, "
+                f"embedding, source_event_ids, is_active, observed_at, created_at, updated_at) "
+                f"VALUES (:mid, :uid, 'Switched from Redis to Valkey 8.0', 'semantic', "
+                f"0.8, :emb, '[]', 1, NOW(), NOW(), NOW())"
+            ), {"mid": mid2, "uid": USER_ID, "emb": redis_row.embedding})
+        db.commit()
+
+    # 4. Diff
+    diff = b.branch_diff(USER_ID, "diff_test")
+    check("diff no error", "error" not in diff, str(diff))
+    expected_total = 2 if has_embeddings else 1
+    check("diff total correct", diff["total"] == expected_total, f"total={diff['total']}, expected={expected_total}")
+    vlog(f"diff summary: {diff.get('summary')}")
+    vlog(f"diff changes: {[(c['semantic'], c['content'][:50]) for c in diff['changes']]}")
+
+    semantics = [c["semantic"] for c in diff["changes"]]
+
+    # Kubernetes: new (no embedding)
+    has_new = "new" in semantics or "new (no embedding)" in semantics
+    check("diff has new memory", has_new, f"semantics={semantics}")
+
+    # Valkey: conflict (same embedding as Redis in main)
+    if has_embeddings:
+        check("diff detects semantic conflict", "conflict" in semantics, f"semantics={semantics}")
+
+    # 5. Empty diff
+    b.snapshot_create(USER_ID, "test_diff_empty", "")
+    result2 = b.branch_create(USER_ID, "empty_br", "test_diff_empty")
+    check("empty branch created", "error" not in result2)
+    empty_diff = b.branch_diff(USER_ID, "empty_br")
+    check("empty diff total=0", empty_diff["total"] == 0, f"total={empty_diff['total']}")
+    b.branch_delete(USER_ID, "empty_br")
+
+    # 6. Nonexistent branch
+    check("nonexistent branch error", "error" in b.branch_diff(USER_ID, "nonexistent"))
+
+    # Cleanup
+    b.branch_delete(USER_ID, "diff_test")
+
+
 # ── Scenario 15: NL → Script (real LLM) ──────────────────────────────
 
 def test_nl_to_script() -> None:
@@ -1242,6 +1327,7 @@ def main() -> None:
         test_branch_lifecycle()
         test_branch_from_timestamp()
         test_branch_full_workflow()
+        test_branch_diff()
 
         if args.with_llm:
             test_observer_pipeline_graph()
