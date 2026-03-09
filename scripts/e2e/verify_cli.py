@@ -111,6 +111,37 @@ def cleanup() -> None:
     except Exception:
         pass
 
+    # Drop ALL user branches (active + deleted) and their DBs
+    try:
+        with SessionLocal() as db:
+            rows = db.execute(
+                text("SELECT branch_id, branch_db FROM mem_branches WHERE user_id = :uid"),
+                {"uid": USER_ID},
+            ).fetchall()
+            for row in rows:
+                try:
+                    db.execute(text(f"DROP DATABASE IF EXISTS `{row.branch_db}`"))
+                except Exception:
+                    pass
+            db.execute(text("DELETE FROM mem_branches WHERE user_id = :uid"), {"uid": USER_ID})
+            db.commit()
+    except Exception:
+        pass
+
+    # Drop test snapshots
+    try:
+        from core.git_for_data import GitForData
+        git = GitForData(SessionLocal)
+        for s in git.list_snapshots():
+            sname = s["snapshot_name"]
+            if sname.startswith("mem_snap_test_") or sname.startswith("mem_br_base_"):
+                try:
+                    git.drop_snapshot(sname)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     vlog(f"cleaned up {USER_ID}")
 
 
@@ -929,6 +960,171 @@ def test_session_retrieve() -> None:
           f"Expected only gRPC, got: {[r['content'] for r in results_a_only]}")
 
 
+# ── Scenario 20: Snapshot and rollback ────────────────────────────────
+
+def test_snapshot_and_rollback() -> None:
+    print("\n── 20. Snapshot and rollback ──")
+
+    from mo_memory_mcp.server import EmbeddedBackend
+    b = EmbeddedBackend()
+
+    b.store(USER_ID, "Important fact before snapshot", "semantic", None)
+    check("memory stored before snapshot",
+          scalar("SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1 AND content = 'Important fact before snapshot'", uid=USER_ID) == 1)
+
+    result = b.snapshot_create(USER_ID, "test_snap", "test")
+    check("snapshot created", "error" not in result, str(result))
+
+    snaps = b.snapshot_list(USER_ID)
+    check("snapshot listed", any("test_snap" in s["name"] for s in snaps), f"snaps={[s['name'] for s in snaps[:5]]}")
+
+    b.store(USER_ID, "New fact after snapshot UNIQUE_MARKER", "semantic", None)
+    check("new memory exists after snapshot",
+          scalar("SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1 AND content LIKE '%UNIQUE_MARKER%'", uid=USER_ID) == 1)
+
+    result = b.snapshot_rollback(USER_ID, "test_snap")
+    check("rollback completed", "error" not in result, str(result))
+    check("new memory gone after rollback",
+          scalar("SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1 AND content LIKE '%UNIQUE_MARKER%'", uid=USER_ID) == 0)
+
+
+# ── Scenario 21: Branch lifecycle ─────────────────────────────────────
+
+def test_branch_lifecycle() -> None:
+    print("\n── 21. Branch lifecycle ──")
+
+    from mo_memory_mcp.server import EmbeddedBackend
+    b = EmbeddedBackend()
+
+    result = b.branch_create(USER_ID, "test_branch", None)
+    check("branch created", "error" not in result, str(result))
+    branch_db = result["branch_db"]
+    branch_id = result["branch_id"]
+
+    # Verify DB record
+    row = query_one("SELECT branch_id, user_id, name, branch_db, status FROM mem_branches WHERE branch_id = :bid", bid=branch_id)
+    check("db record exists", row is not None)
+    check("db status active", row.status == "active", f"status={row.status}")
+    check("db name matches", row.name == "test_branch", f"name={row.name}")
+    check("db branch_db matches", row.branch_db == branch_db, f"db={row.branch_db}")
+
+    branches = b.branch_list(USER_ID)
+    check("branch listed", "test_branch" in [br["name"] for br in branches])
+
+    result = b.branch_checkout(USER_ID, "test_branch")
+    check("checkout ok", "error" not in result, str(result))
+    check("active branch set", b._get_active_branch(USER_ID) == "test_branch", f"active={b._get_active_branch(USER_ID)}")
+
+    result = b.branch_checkout(USER_ID, "main")
+    check("checkout main ok", "error" not in result, str(result))
+    check("back to main", b._get_active_branch(USER_ID) == "main", f"active={b._get_active_branch(USER_ID)}")
+
+    result = b.branch_delete(USER_ID, "test_branch")
+    check("branch deleted", "error" not in result, str(result))
+
+    # Verify DB: status=deleted, not physically removed
+    row_after = query_one("SELECT status FROM mem_branches WHERE branch_id = :bid", bid=branch_id)
+    check("db status deleted", row_after is not None and row_after.status == "deleted",
+          f"status={row_after.status if row_after else 'MISSING'}")
+
+    check("branch gone from list", "test_branch" not in [br["name"] for br in b.branch_list(USER_ID)])
+
+    # Verify branch DB dropped
+    check("branch db dropped",
+          scalar("SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = :db", db=branch_db) == 0,
+          f"db_exists for {branch_db}")
+
+
+# ── Scenario 22: Branch from timestamp ────────────────────────────────
+
+def test_branch_from_timestamp() -> None:
+    print("\n── 22. Branch from timestamp ──")
+
+    from mo_memory_mcp.server import EmbeddedBackend
+    from datetime import datetime, timezone, timedelta
+    b = EmbeddedBackend()
+
+    b.store(USER_ID, "Timestamp branch test data", "semantic", None)
+
+    now = datetime.now(timezone.utc)
+    ts_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    result = b.branch_create(USER_ID, "ts_branch", None, from_timestamp=ts_str)
+    check("timestamp branch created", "error" not in result, str(result))
+
+    row = query_one("SELECT base_snapshot FROM mem_branches WHERE branch_id = :bid", bid=result["branch_id"])
+    check("base_snapshot is timestamp", row is not None and row.base_snapshot == ts_str,
+          f"base_snapshot={row.base_snapshot if row else 'MISSING'}")
+
+    b.branch_delete(USER_ID, "ts_branch")
+
+    # Reject future
+    future = (now + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    check("future timestamp rejected", "error" in b.branch_create(USER_ID, "bad_future", None, from_timestamp=future))
+
+    # Reject >30 min ago
+    old = (now - timedelta(minutes=45)).strftime("%Y-%m-%d %H:%M:%S")
+    check("old timestamp rejected", "error" in b.branch_create(USER_ID, "bad_old", None, from_timestamp=old))
+
+    # Reject both
+    check("snapshot+timestamp rejected", "error" in b.branch_create(USER_ID, "bad_both", "some_snap", from_timestamp=ts_str))
+
+
+# ── Scenario 23: Full branch workflow ─────────────────────────────────
+
+def test_branch_full_workflow() -> None:
+    print("\n── 23. Full branch workflow ──")
+
+    from mo_memory_mcp.server import EmbeddedBackend
+    b = EmbeddedBackend()
+
+    b.store(USER_ID, "Baseline: we use MySQL 8.0", "semantic", None)
+    check("baseline on main",
+          scalar("SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1 AND content LIKE '%MySQL 8.0%'", uid=USER_ID) == 1)
+
+    b.snapshot_create(USER_ID, "test_before_branch", "")
+
+    result = b.branch_create(USER_ID, "eval_pg", "test_before_branch")
+    check("branch from snapshot", "error" not in result, str(result))
+    branch_db = result["branch_db"]
+
+    # Store on branch
+    from sqlalchemy import text as sa_text
+    with SessionLocal() as db:
+        from core.utils.id_generator import generate_id
+        mid = generate_id()
+        db.execute(sa_text(
+            f"INSERT INTO `{branch_db}`.mem_memories "
+            f"(memory_id, user_id, content, memory_type, initial_confidence, "
+            f"source_event_ids, is_active, observed_at, created_at, updated_at) "
+            f"VALUES (:mid, :uid, 'Branch: evaluating PostgreSQL 15', 'semantic', "
+            f"0.8, '[]', 1, NOW(), NOW(), NOW())"
+        ), {"mid": mid, "uid": USER_ID})
+        db.commit()
+
+    br_pg_count = scalar(f"SELECT COUNT(*) FROM `{branch_db}`.mem_memories WHERE user_id = :uid AND is_active = 1 AND content LIKE '%PostgreSQL%'", uid=USER_ID)
+    check("memory on branch", br_pg_count == 1, f"count={br_pg_count}")
+    check("main has no PostgreSQL",
+          scalar("SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1 AND content LIKE '%PostgreSQL%'", uid=USER_ID) == 0)
+
+    result = b.branch_merge(USER_ID, "eval_pg", "append")
+    check("merge completed", "error" not in result, str(result))
+    check("merge count", result["merged"] >= 1, f"merged={result['merged']}")
+
+    check("main has PostgreSQL after merge",
+          scalar("SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1 AND content LIKE '%PostgreSQL%'", uid=USER_ID) >= 1)
+    check("main still has MySQL",
+          scalar("SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1 AND content LIKE '%MySQL 8.0%'", uid=USER_ID) >= 1)
+
+    result = b.branch_delete(USER_ID, "eval_pg")
+    check("branch cleanup", "error" not in result, str(result))
+
+    b.snapshot_rollback(USER_ID, "test_before_branch")
+    check("rollback removes merged data",
+          scalar("SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1 AND content LIKE '%PostgreSQL%'", uid=USER_ID) == 0)
+    check("rollback restores baseline",
+          scalar("SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1 AND content LIKE '%MySQL 8.0%'", uid=USER_ID) >= 1)
+
+
 # ── Scenario 15: NL → Script (real LLM) ──────────────────────────────
 
 def test_nl_to_script() -> None:
@@ -1042,6 +1238,10 @@ def main() -> None:
         test_topic_purge()
         test_health_warnings()
         test_session_retrieve()
+        test_snapshot_and_rollback()
+        test_branch_lifecycle()
+        test_branch_from_timestamp()
+        test_branch_full_workflow()
 
         if args.with_llm:
             test_observer_pipeline_graph()

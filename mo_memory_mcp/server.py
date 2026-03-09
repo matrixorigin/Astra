@@ -37,6 +37,15 @@ class MemoryBackend:
     def reflect(self, user_id: str, force: bool = False) -> dict: ...
     def rebuild_index(self, table: str) -> str: ...
     def health_warnings(self, user_id: str) -> list[str]: ...
+    # Branching
+    def snapshot_create(self, user_id: str, name: str, description: str) -> dict: ...
+    def snapshot_list(self, user_id: str) -> list[dict]: ...
+    def snapshot_rollback(self, user_id: str, name: str) -> dict: ...
+    def branch_create(self, user_id: str, name: str, from_snapshot: str | None, from_timestamp: str | None) -> dict: ...
+    def branch_list(self, user_id: str) -> list[dict]: ...
+    def branch_checkout(self, user_id: str, name: str) -> dict: ...
+    def branch_delete(self, user_id: str, name: str) -> dict: ...
+    def branch_merge(self, user_id: str, source: str, strategy: str) -> dict: ...
 
 
 class EmbeddedBackend(MemoryBackend):
@@ -236,6 +245,412 @@ class EmbeddedBackend(MemoryBackend):
         result = gs.rebuild_vector_index(table)
         return f"Rebuilt IVF index for {table}: lists {result['old_lists']} → {result['new_lists']} (rows={result['total_rows']})"
 
+    # ── Branching ─────────────────────────────────────────────────────
+
+    MAX_USER_SNAPSHOTS = 1000
+    MAX_USER_BRANCHES = 20
+    _BRANCH_TABLES = ("mem_memories", "memory_graph_nodes", "memory_graph_edges")
+
+    @staticmethod
+    def _sanitize_name(name: str) -> str:
+        import re
+        clean = re.sub(r"[^a-zA-Z0-9_]", "_", name)[:40]
+        if not clean or not clean[0].isalpha():
+            clean = "s_" + clean
+        return clean
+
+    def _git(self):
+        from core.git_for_data import GitForData
+        return GitForData(self._db_factory)
+
+    def _source_db_name(self) -> str:
+        from api.database import SessionLocal
+        return SessionLocal.kw["bind"].url.database
+
+    # In-memory active branch tracking per user (session-scoped, not persisted across restarts)
+    _active_branches: dict[str, str] = {}
+
+    def _get_active_branch(self, user_id: str) -> str:
+        """Get active branch for user. Stored in-memory for this session."""
+        return self._active_branches.get(user_id, "main")
+
+    def _set_active_branch(self, user_id: str, name: str) -> None:
+        """Set active branch for user. Stored in-memory for this session."""
+        self._active_branches[user_id] = name
+
+    def snapshot_create(self, user_id: str, name: str, description: str) -> dict:
+        safe = self._sanitize_name(name)
+        from sqlalchemy import text
+        with self._db_factory() as db:
+            cnt = db.execute(text("SELECT COUNT(*) FROM mo_catalog.mo_snapshots")).scalar() or 0
+        if cnt >= self.MAX_USER_SNAPSHOTS:
+            return {"error": f"Snapshot limit reached ({self.MAX_USER_SNAPSHOTS}). Delete old snapshots first."}
+        snap_name = f"mem_snap_{safe}"
+        info = self._git().create_snapshot(snap_name)
+        return {"name": name, "snapshot_name": snap_name, "timestamp": str(info.get("timestamp", ""))}
+
+    def snapshot_list(self, user_id: str) -> list[dict]:
+        all_snaps = self._git().list_snapshots()
+        result = []
+        for s in all_snaps:
+            sname = s["snapshot_name"]
+            if sname.startswith("mem_snap_") or sname.startswith("mem_milestone_"):
+                display = sname.replace("mem_snap_", "").replace("mem_milestone_", "auto:")
+                result.append({"name": display, "snapshot_name": sname, "timestamp": str(s.get("timestamp", ""))})
+        return sorted(result, key=lambda x: x["timestamp"], reverse=True)
+
+    def snapshot_rollback(self, user_id: str, name: str) -> dict:
+        safe = self._sanitize_name(name)
+        snap_name = name if name.startswith("mem_snap_") or name.startswith("mem_milestone_") else f"mem_snap_{safe}"
+        git = self._git()
+        for table in ("mem_memories", "memory_graph_nodes", "memory_graph_edges", "mem_edit_log"):
+            try:
+                git.restore_table_from_snapshot(table, snap_name)
+            except Exception as e:
+                if table == "mem_memories":
+                    return {"error": f"Rollback failed: {e}"}
+                logger.debug("Rollback table %s skipped: %s", table, e)
+        return {"rolled_back_to": snap_name}
+
+    def branch_create(self, user_id: str, name: str, from_snapshot: str | None, from_timestamp: str | None = None) -> dict:
+        if from_snapshot and from_timestamp:
+            return {"error": "Specify from_snapshot or from_timestamp, not both."}
+        safe = self._sanitize_name(name)
+        from sqlalchemy import text
+
+        # Global branch limit (not per-user). Prevents resource exhaustion across all users.
+        with self._db_factory() as db:
+            active = db.execute(text("SELECT COUNT(*) FROM mem_branches WHERE status = 'active'")).scalar() or 0
+        if active >= self.MAX_USER_BRANCHES:
+            return {"error": f"Branch limit reached ({self.MAX_USER_BRANCHES}). Delete old branches first."}
+
+        # Duplicate check: reject if branch with same name already exists (active or deleted).
+        # This prevents name reuse confusion. Deleted branches are soft-deleted and can be purged later.
+        with self._db_factory() as db:
+            dup = db.execute(text(
+                "SELECT branch_id FROM mem_branches WHERE user_id = :uid AND name = :name AND status != 'purged'"
+            ), {"uid": user_id, "name": safe}).fetchone()
+        if dup:
+            return {"error": f"Branch '{safe}' already exists or was recently deleted. Use a different name."}
+
+        snap = from_snapshot
+        if snap and not snap.startswith("mem_snap_") and not snap.startswith("mem_milestone_"):
+            snap = f"mem_snap_{self._sanitize_name(snap)}"
+
+        # Validate timestamp: within last 30 minutes
+        if from_timestamp:
+            from datetime import datetime, timezone, timedelta
+            try:
+                ts = datetime.strptime(from_timestamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            except ValueError:
+                return {"error": "from_timestamp must be 'YYYY-MM-DD HH:MM:SS'"}
+            now = datetime.now(timezone.utc)
+            if ts > now:
+                return {"error": "from_timestamp cannot be in the future"}
+            if now - ts > timedelta(minutes=30):
+                return {"error": "from_timestamp must be within the last 30 minutes"}
+
+        from core.utils.id_generator import generate_id
+        branch_id = generate_id()
+        branch_db = f"mem_br_{branch_id}"
+        src_db = self._source_db_name()
+
+        # Determine branch point
+        snap_name: str | None = None
+        if snap:
+            snap_name = snap
+            try:
+                self._git().create_snapshot(snap_name)
+            except Exception:
+                pass
+        elif not from_timestamp:
+            snap_name = f"mem_br_base_{branch_id}"
+            self._git().create_snapshot(snap_name)
+
+        # CREATE DATABASE (DDL, separate commit)
+        with self._db_factory() as db:
+            db.commit()
+            db.execute(text(f"DROP DATABASE IF EXISTS `{branch_db}`"))
+            db.commit()
+            db.execute(text(f"CREATE DATABASE `{branch_db}`"))
+            db.commit()
+
+        try:
+            # Branch tables + INSERT mem_branches in one commit
+            from matrixone.branch_builder import create_table_branch
+            with self._db_factory() as db:
+                for table in self._BRANCH_TABLES:
+                    try:
+                        if snap_name:
+                            stmt = create_table_branch(f"{branch_db}.{table}").from_table(
+                                f"{src_db}.{table}", snapshot=snap_name
+                            )
+                            db.execute(text(str(stmt)))
+                        else:
+                            # timestamp mode — SDK doesn't support yet
+                            db.execute(text(
+                                f"data branch create table {branch_db}.{table} "
+                                f'from {src_db}.{table}{{timestamp="{from_timestamp}"}}'
+                            ))
+                    except Exception as e:
+                        if table == "mem_memories":
+                            raise
+                        logger.debug("Branch table %s failed: %s", table, e)
+                base_label = snap_name or from_timestamp or "current"
+                db.execute(text(
+                    "INSERT INTO mem_branches (branch_id, user_id, name, branch_db, base_snapshot, status, created_at) "
+                    "VALUES (:bid, :uid, :name, :bdb, :snap, 'active', NOW())"
+                ), {"bid": branch_id, "uid": user_id, "name": safe, "bdb": branch_db, "snap": base_label})
+                db.commit()
+        except Exception:
+            with self._db_factory() as db:
+                db.commit()
+                db.execute(text(f"DROP DATABASE IF EXISTS `{branch_db}`"))
+                db.commit()
+            raise
+
+        return {"name": safe, "branch_db": branch_db, "branch_id": branch_id}
+
+    def branch_list(self, user_id: str) -> list[dict]:
+        from sqlalchemy import text
+        with self._db_factory() as db:
+            rows = db.execute(text(
+                "SELECT branch_id, name, branch_db, created_at "
+                "FROM mem_branches WHERE user_id = :uid AND status = 'active' "
+                "ORDER BY created_at"
+            ), {"uid": user_id}).fetchall()
+        active = self._get_active_branch(user_id)  # Call once, not per row
+        result = [{"name": "main", "branch_db": self._source_db_name(), "active": active == "main"}]
+        for r in rows:
+            result.append({"name": r.name, "branch_db": r.branch_db, "active": active == r.name})
+        return result
+
+    def branch_checkout(self, user_id: str, name: str) -> dict:
+        if name == "main":
+            self._set_active_branch(user_id, "main")
+            return {"active_branch": "main"}
+        from sqlalchemy import text
+        with self._db_factory() as db:
+            row = db.execute(text(
+                "SELECT name FROM mem_branches WHERE user_id = :uid AND name = :name AND status = 'active'"
+            ), {"uid": user_id, "name": name}).fetchone()
+        if not row:
+            return {"error": f"Branch '{name}' not found"}
+        self._set_active_branch(user_id, name)
+        return {"active_branch": name}
+
+    def branch_delete(self, user_id: str, name: str) -> dict:
+        if name == "main":
+            return {"error": "Cannot delete main"}
+        from sqlalchemy import text
+        with self._db_factory() as db:
+            row = db.execute(text(
+                "SELECT branch_id, branch_db FROM mem_branches "
+                "WHERE user_id = :uid AND name = :name AND status = 'active'"
+            ), {"uid": user_id, "name": name}).fetchone()
+        if not row:
+            return {"error": f"Branch '{name}' not found"}
+
+        # delete_table_branch + mark deleted in one commit
+        try:
+            from matrixone.branch_builder import delete_table_branch
+            with self._db_factory() as db:
+                for table in self._BRANCH_TABLES:
+                    try:
+                        stmt = delete_table_branch(f"{row.branch_db}.{table}")
+                        db.execute(text(str(stmt)))
+                    except Exception:
+                        pass
+                db.execute(text(
+                    "UPDATE mem_branches SET status = 'deleted', updated_at = NOW() WHERE branch_id = :bid"
+                ), {"bid": row.branch_id})
+                db.commit()
+        except Exception:
+            logger.warning("Failed to delete branch tables %s", row.branch_db)
+
+        # DROP DATABASE is DDL, must be separate
+        try:
+            with self._db_factory() as db:
+                db.commit()
+                db.execute(text(f"DROP DATABASE IF EXISTS `{row.branch_db}`"))
+                db.commit()
+        except Exception:
+            logger.warning("Failed to drop branch DB %s", row.branch_db)
+
+        if self._get_active_branch(user_id) == name:
+            self._set_active_branch(user_id, "main")
+        return {"deleted": name}
+
+    def branch_merge(self, user_id: str, source: str, strategy: str) -> dict:
+        """Merge branch memories into current branch (usually main).
+        
+        Conflict detection: two memories conflict when they have the same memory_type
+        and high semantic similarity (cosine > 0.9) but different content.
+        
+        Strategy:
+        - 'append' (default): Add all branch memories, skip conflicts
+        - 'replace': Branch memories override conflicting main memories
+        
+        Optimized for massive datasets (100M+): SQL-level conflict detection.
+        """
+        from sqlalchemy import text
+        from core.utils.id_generator import generate_id
+        
+        with self._db_factory() as db:
+            row = db.execute(text(
+                "SELECT branch_id, branch_db FROM mem_branches "
+                "WHERE user_id = :uid AND name = :name AND status = 'active'"
+            ), {"uid": user_id, "name": source}).fetchone()
+        if not row:
+            return {"error": f"Branch '{source}' not found"}
+        branch_db = row.branch_db
+
+        with self._db_factory() as db:
+            if strategy == "replace":
+                # Replace strategy: update existing conflicts, insert new ones
+                # 1. Update conflicts: same memory_type + cosine > 0.9 + different content
+                db.execute(text(f"""
+                    UPDATE mem_memories m
+                    SET m.content = (
+                        SELECT b.content FROM `{branch_db}`.mem_memories b
+                        WHERE b.user_id = m.user_id
+                        AND b.memory_type = m.memory_type
+                        AND cosine_similarity(m.embedding, b.embedding) > 0.9
+                        AND b.content != m.content
+                        AND b.is_active = 1
+                        LIMIT 1
+                    ),
+                    m.embedding = (
+                        SELECT b.embedding FROM `{branch_db}`.mem_memories b
+                        WHERE b.user_id = m.user_id
+                        AND b.memory_type = m.memory_type
+                        AND cosine_similarity(m.embedding, b.embedding) > 0.9
+                        AND b.content != m.content
+                        AND b.is_active = 1
+                        LIMIT 1
+                    ),
+                    m.updated_at = NOW()
+                    WHERE m.user_id = :uid
+                    AND m.is_active = 1
+                    AND EXISTS (
+                        SELECT 1 FROM `{branch_db}`.mem_memories b
+                        WHERE b.user_id = m.user_id
+                        AND b.memory_type = m.memory_type
+                        AND cosine_similarity(m.embedding, b.embedding) > 0.9
+                        AND b.content != m.content
+                        AND b.is_active = 1
+                    )
+                """), {"uid": user_id})
+                
+                # 2. Count updates
+                updated = db.execute(text(f"""
+                    SELECT COUNT(*) FROM `{branch_db}`.mem_memories b
+                    WHERE b.user_id = :uid
+                    AND b.is_active = 1
+                    AND EXISTS (
+                        SELECT 1 FROM mem_memories m
+                        WHERE m.user_id = b.user_id
+                        AND m.memory_type = b.memory_type
+                        AND cosine_similarity(m.embedding, b.embedding) > 0.9
+                        AND m.content != b.content
+                        AND m.is_active = 1
+                    )
+                """), {"uid": user_id}).scalar() or 0
+                
+                # 3. Insert non-conflicting memories with new IDs
+                db.execute(text(f"""
+                    INSERT INTO mem_memories (memory_id, user_id, content, memory_type, 
+                        initial_confidence, trust_tier, embedding, source_event_ids, 
+                        is_active, observed_at, created_at, updated_at)
+                    SELECT 
+                        UUID(), b.user_id, b.content, b.memory_type,
+                        b.initial_confidence, b.trust_tier, b.embedding, b.source_event_ids,
+                        1, b.observed_at, NOW(), NOW()
+                    FROM `{branch_db}`.mem_memories b
+                    WHERE b.user_id = :uid
+                    AND b.is_active = 1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM mem_memories m
+                        WHERE m.user_id = b.user_id
+                        AND m.memory_type = b.memory_type
+                        AND cosine_similarity(m.embedding, b.embedding) > 0.9
+                        AND m.content != b.content
+                        AND m.is_active = 1
+                    )
+                """), {"uid": user_id})
+                
+                # 4. Count inserts
+                inserted = db.execute(text(f"""
+                    SELECT COUNT(*) FROM `{branch_db}`.mem_memories b
+                    WHERE b.user_id = :uid
+                    AND b.is_active = 1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM mem_memories m
+                        WHERE m.user_id = b.user_id
+                        AND m.memory_type = b.memory_type
+                        AND cosine_similarity(m.embedding, b.embedding) > 0.9
+                        AND m.content != b.content
+                        AND m.is_active = 1
+                    )
+                """), {"uid": user_id}).scalar() or 0
+                
+                db.commit()
+                merged = updated + inserted
+                skipped = 0
+            else:
+                # Append strategy: insert only non-conflicting memories with new IDs
+                db.execute(text(f"""
+                    INSERT INTO mem_memories (memory_id, user_id, content, memory_type, 
+                        initial_confidence, trust_tier, embedding, source_event_ids, 
+                        is_active, observed_at, created_at, updated_at)
+                    SELECT 
+                        UUID(), b.user_id, b.content, b.memory_type,
+                        b.initial_confidence, b.trust_tier, b.embedding, b.source_event_ids,
+                        1, b.observed_at, NOW(), NOW()
+                    FROM `{branch_db}`.mem_memories b
+                    WHERE b.user_id = :uid
+                    AND b.is_active = 1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM mem_memories m
+                        WHERE m.user_id = b.user_id
+                        AND m.memory_type = b.memory_type
+                        AND cosine_similarity(m.embedding, b.embedding) > 0.9
+                        AND m.content != b.content
+                        AND m.is_active = 1
+                    )
+                """), {"uid": user_id})
+                
+                merged = db.execute(text(f"""
+                    SELECT COUNT(*) FROM `{branch_db}`.mem_memories b
+                    WHERE b.user_id = :uid
+                    AND b.is_active = 1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM mem_memories m
+                        WHERE m.user_id = b.user_id
+                        AND m.memory_type = b.memory_type
+                        AND cosine_similarity(m.embedding, b.embedding) > 0.9
+                        AND m.content != b.content
+                        AND m.is_active = 1
+                    )
+                """), {"uid": user_id}).scalar() or 0
+                
+                skipped = db.execute(text(f"""
+                    SELECT COUNT(*) FROM `{branch_db}`.mem_memories b
+                    WHERE b.user_id = :uid
+                    AND b.is_active = 1
+                    AND EXISTS (
+                        SELECT 1 FROM mem_memories m
+                        WHERE m.user_id = b.user_id
+                        AND m.memory_type = b.memory_type
+                        AND cosine_similarity(m.embedding, b.embedding) > 0.9
+                        AND m.content != b.content
+                        AND m.is_active = 1
+                    )
+                """), {"uid": user_id}).scalar() or 0
+                
+                db.commit()
+
+        return {"merged": merged, "skipped": skipped, "source": source}
 
 class HTTPBackend(MemoryBackend):
     """Proxy to memory service REST API — for remote mode."""
@@ -326,6 +741,30 @@ class HTTPBackend(MemoryBackend):
 
     def health_warnings(self, user_id: str) -> list[str]:
         return []  # Not available via HTTP yet
+
+    def snapshot_create(self, user_id: str, name: str, description: str) -> dict:
+        return {"error": "Not available via HTTP"}
+
+    def snapshot_list(self, user_id: str) -> list[dict]:
+        return []
+
+    def snapshot_rollback(self, user_id: str, name: str) -> dict:
+        return {"error": "Not available via HTTP"}
+
+    def branch_create(self, user_id: str, name: str, from_snapshot: str | None, from_timestamp: str | None = None) -> dict:
+        return {"error": "Not available via HTTP"}
+
+    def branch_list(self, user_id: str) -> list[dict]:
+        return []
+
+    def branch_checkout(self, user_id: str, name: str) -> dict:
+        return {"error": "Not available via HTTP"}
+
+    def branch_delete(self, user_id: str, name: str) -> dict:
+        return {"error": "Not available via HTTP"}
+
+    def branch_merge(self, user_id: str, source: str, strategy: str) -> dict:
+        return {"error": "Not available via HTTP"}
 
 
 # ── MCP Server ────────────────────────────────────────────────────────
@@ -565,6 +1004,143 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             user_id: User ID (optional, unused but kept for consistency).
         """
         return backend.rebuild_index(table)
+
+    # ── Snapshot tools ────────────────────────────────────────────────
+
+    @server.tool()
+    def memory_snapshot(
+        name: str,
+        description: str = "",
+        user_id: str | None = None,
+    ) -> str:
+        """Create a named snapshot of current memory state.
+
+        Args:
+            name: Snapshot name (e.g. 'before_refactor').
+            description: Optional description.
+            user_id: User ID (optional).
+        """
+        result = backend.snapshot_create(_user(user_id), name, description)
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Snapshot '{name}' created."
+
+    @server.tool()
+    def memory_snapshots(user_id: str | None = None) -> str:
+        """List all memory snapshots.
+
+        Args:
+            user_id: User ID (optional).
+        """
+        snaps = backend.snapshot_list(_user(user_id))
+        if not snaps:
+            return "No snapshots found."
+        lines = [f"  {s['name']} ({s['timestamp']})" for s in snaps[:20]]
+        return f"Found {len(snaps)} snapshots:\n" + "\n".join(lines)
+
+    @server.tool()
+    def memory_rollback(
+        name: str,
+        user_id: str | None = None,
+    ) -> str:
+        """Restore memories to a previous snapshot. WARNING: changes after the snapshot will be lost.
+
+        Args:
+            name: Snapshot name to rollback to.
+            user_id: User ID (optional).
+        """
+        result = backend.snapshot_rollback(_user(user_id), name)
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Rolled back to snapshot '{name}'."
+
+    # ── Branch tools ──────────────────────────────────────────────────
+
+    @server.tool()
+    def memory_branch(
+        name: str,
+        from_snapshot: str | None = None,
+        from_timestamp: str | None = None,
+        user_id: str | None = None,
+    ) -> str:
+        """Create a new memory branch for isolated experimentation.
+
+        Args:
+            name: Branch name (e.g. 'eval_postgres', 'experiment_a').
+            from_snapshot: Branch from a named snapshot.
+            from_timestamp: Branch from a point in time (e.g. '2026-03-09 12:00:00'). Must be within last 30 minutes.
+            user_id: User ID (optional).
+
+        If neither from_snapshot nor from_timestamp is given, branches from current state.
+        """
+        if from_snapshot and from_timestamp:
+            return "Error: specify from_snapshot or from_timestamp, not both."
+        result = backend.branch_create(_user(user_id), name, from_snapshot, from_timestamp)
+        if "error" in result:
+            return f"Error: {result['error']}"
+        src = ""
+        if from_snapshot:
+            src = f" from snapshot '{from_snapshot}'"
+        elif from_timestamp:
+            src = f" from timestamp '{from_timestamp}'"
+        return f"Branch '{name}' created{src}. Use memory_checkout to switch to it."
+
+    @server.tool()
+    def memory_branches(user_id: str | None = None) -> str:
+        """List all memory branches.
+
+        Args:
+            user_id: User ID (optional).
+        """
+        branches = backend.branch_list(_user(user_id))
+        if not branches:
+            return "No branches."
+        lines = [f"  {'* ' if b['active'] else '  '}{b['name']}" for b in branches]
+        return "\n".join(lines)
+
+    @server.tool()
+    def memory_checkout(name: str, user_id: str | None = None) -> str:
+        """Switch to a different memory branch.
+
+        Args:
+            name: Branch name to switch to (or 'main').
+            user_id: User ID (optional).
+        """
+        result = backend.branch_checkout(_user(user_id), name)
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Switched to branch '{name}'."
+
+    @server.tool()
+    def memory_branch_delete(name: str, user_id: str | None = None) -> str:
+        """Delete a memory branch.
+
+        Args:
+            name: Branch name to delete.
+            user_id: User ID (optional).
+        """
+        result = backend.branch_delete(_user(user_id), name)
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Branch '{name}' deleted."
+
+    @server.tool()
+    def memory_merge(
+        source: str,
+        strategy: str = "append",
+        user_id: str | None = None,
+    ) -> str:
+        """Merge a branch back into main.
+
+        Args:
+            source: Branch name to merge from.
+            strategy: 'append' (skip duplicates) or 'replace' (overwrite duplicates).
+            user_id: User ID (optional).
+        """
+        result = backend.branch_merge(_user(user_id), source, strategy)
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Merged {result['merged']} memories from '{source}' (skipped {result['skipped']})."
 
     return server
 
