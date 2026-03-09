@@ -36,11 +36,11 @@ turns:
         criteria: "回复应表示正在或已经删除记忆，不应拒绝或忽略请求"
         pass_threshold: 0.5
 
-  # 同一 session 内：删除后立即问，不应再提 Go
+  # 同一 session 内：删除后立即问，不应再把 Go 当作当前有效偏好
   - user: "我喜欢用什么语言做后端开发？"
     checks:
       llm_judge:
-        criteria: "回复应表示不知道用户的偏好，或询问用户。不应把 Go 作为用户已知的偏好陈述出来"
+        criteria: "回复不应把 Go 作为用户当前有效的偏好陈述出来。可以提及 Go 已被删除/遗忘，或表示不知道当前偏好，或询问用户"
         pass_threshold: 0.7
 
   # 新 session：agent 只能依赖 memory，不能依赖 conversation history

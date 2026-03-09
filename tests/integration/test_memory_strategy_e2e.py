@@ -14,7 +14,7 @@ from uuid import uuid4
 import pytest
 
 from api.models._constants import EMBEDDING_DIM
-from api.models.memory import MemoryRecord
+from core.memory.models.memory import MemoryRecord
 from core.memory.factory import create_memory_service
 from core.memory.types import Memory, MemoryType, TrustTier
 from datetime import datetime, timedelta, timezone
@@ -146,7 +146,7 @@ class TestFactoryCreatesRealService:
         assert row.is_active == 1
 
         # Ground truth 2: graph node created
-        from api.models.graph import GraphNode
+        from core.memory.models.graph import GraphNode
         gnode = db_session.query(GraphNode).filter_by(
             memory_id=mem.memory_id,
         ).first()
@@ -364,7 +364,7 @@ class TestActivationIndexManagerDB:
         idx.on_memories_stored(user_id, [mem])
 
         # Verify graph node in DB
-        from api.models.graph import GraphNode
+        from core.memory.models.graph import GraphNode
         db_session.expire_all()
         gnode = db_session.query(GraphNode).filter_by(
             memory_id=mem.memory_id,
@@ -400,7 +400,7 @@ class TestActivationIndexManagerDB:
             mids.append(mem.memory_id)
 
         # Verify no graph nodes yet
-        from api.models.graph import GraphNode
+        from core.memory.models.graph import GraphNode
         db_session.expire_all()
         count_before = db_session.query(GraphNode).filter(
             GraphNode.memory_id.in_(mids),
@@ -444,7 +444,7 @@ class TestActivationIndexManagerDB:
         assert r2.processed == 0
         assert r2.skipped == 1
 
-        from api.models.graph import GraphNode
+        from core.memory.models.graph import GraphNode
         db_session.expire_all()
         count = db_session.query(GraphNode).filter_by(
             memory_id=mem.memory_id,
@@ -470,7 +470,7 @@ class TestActivationIndexManagerDB:
         idx.on_memories_stored(user_id, [mem])
 
         # Verify node exists
-        from api.models.graph import GraphNode
+        from core.memory.models.graph import GraphNode
         db_session.expire_all()
         assert db_session.query(GraphNode).filter_by(
             memory_id=mem.memory_id,
@@ -548,7 +548,7 @@ class TestEndToEndStoreRetrieve:
         assert row.content == "Governance safety test"
 
         # Graph data intact
-        from api.models.graph import GraphNode
+        from core.memory.models.graph import GraphNode
         gnode = db_session.query(GraphNode).filter_by(
             memory_id=mem.memory_id,
         ).first()

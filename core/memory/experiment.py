@@ -166,7 +166,7 @@ class MemoryExperimentManager(DbConsumer):
         Raises:
             ExperimentLimitError: If user has too many active experiments.
         """
-        from api.models.memory_experiment import MemoryExperiment
+        from core.memory.models.memory_experiment import MemoryExperiment
         from core.memory.strategy.params import validate_strategy_params
 
         ttl_days = min(ttl_days, MAX_TTL_DAYS)
@@ -216,7 +216,7 @@ class MemoryExperimentManager(DbConsumer):
 
     def get(self, experiment_id: str) -> ExperimentInfo | None:
         """Get experiment info by ID."""
-        from api.models.memory_experiment import MemoryExperiment
+        from core.memory.models.memory_experiment import MemoryExperiment
 
         with self._db() as db:
             row = db.query(MemoryExperiment).filter_by(
@@ -228,7 +228,7 @@ class MemoryExperimentManager(DbConsumer):
 
     def list_active(self, user_id: str) -> list[ExperimentInfo]:
         """List active experiments for a user."""
-        from api.models.memory_experiment import MemoryExperiment
+        from core.memory.models.memory_experiment import MemoryExperiment
 
         with self._db() as db:
             rows = (
@@ -431,7 +431,7 @@ class MemoryExperimentManager(DbConsumer):
         Raises:
             ExperimentConflictError: If production changed since branch point.
         """
-        from api.models.memory_experiment import MemoryExperiment
+        from core.memory.models.memory_experiment import MemoryExperiment
 
         info = self.get(experiment_id)
         if info is None:
@@ -468,7 +468,7 @@ class MemoryExperimentManager(DbConsumer):
 
     def discard(self, experiment_id: str) -> None:
         """Discard experiment: drop branch DB, keep record for audit."""
-        from api.models.memory_experiment import MemoryExperiment
+        from core.memory.models.memory_experiment import MemoryExperiment
 
         info = self.get(experiment_id)
         if info is None:
@@ -530,7 +530,7 @@ class MemoryExperimentManager(DbConsumer):
         Returns:
             Number of experiments expired.
         """
-        from api.models.memory_experiment import MemoryExperiment
+        from core.memory.models.memory_experiment import MemoryExperiment
 
         with self._db() as db:
             rows = (
@@ -571,7 +571,7 @@ class MemoryExperimentManager(DbConsumer):
         self, experiment_id: str, metrics: dict[str, Any],
     ) -> None:
         """Store evaluation metrics on the experiment record."""
-        from api.models.memory_experiment import MemoryExperiment
+        from core.memory.models.memory_experiment import MemoryExperiment
 
         with self._db() as db:
             db.query(MemoryExperiment).filter_by(
@@ -582,7 +582,7 @@ class MemoryExperimentManager(DbConsumer):
     # ── Internal helpers ──────────────────────────────────────────────
 
     def _set_status(self, experiment_id: str, status: str) -> None:
-        from api.models.memory_experiment import MemoryExperiment
+        from core.memory.models.memory_experiment import MemoryExperiment
 
         with self._db() as db:
             db.query(MemoryExperiment).filter_by(
@@ -591,7 +591,7 @@ class MemoryExperimentManager(DbConsumer):
             db.commit()
 
     def _count_active(self, user_id: str) -> int:
-        from api.models.memory_experiment import MemoryExperiment
+        from core.memory.models.memory_experiment import MemoryExperiment
 
         with self._db() as db:
             return (
@@ -707,7 +707,7 @@ class MemoryExperimentManager(DbConsumer):
         mem_memories for this user. If production has newer writes,
         the experiment's assumptions may be stale.
         """
-        from api.models.memory import MemoryRecord
+        from core.memory.models.memory import MemoryRecord
         from core.git_for_data import GitForData
 
         git = GitForData(self._db_factory)

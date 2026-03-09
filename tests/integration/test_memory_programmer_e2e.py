@@ -424,7 +424,7 @@ class TestTuneAction:
         assert validated["temporal_weight"] == 0.2
 
         # Verify strategy set in DB (use ORM to get proper JSON deserialization)
-        from api.models.memory_config import MemoryUserConfig
+        from core.memory.models.memory_config import MemoryUserConfig
 
         with db_factory() as db:
             row = db.query(MemoryUserConfig).filter_by(user_id=uid).first()

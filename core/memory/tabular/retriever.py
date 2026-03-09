@@ -41,7 +41,7 @@ TASK_WEIGHTS: dict[str, RetrievalWeights] = {
 
 def _relevance_expr(w_time: float, w_conf: float, decay_hours: float, half_life: float):
     """Build ORM expression for temporal + confidence scoring."""
-    from api.models.memory import MemoryRecord as M
+    from core.memory.models.memory import MemoryRecord as M
     age_hours = func.timestampdiff(text("HOUR"), M.observed_at, func.now())
     age_days = func.timestampdiff(text("DAY"), M.observed_at, func.now())
     return (
@@ -185,7 +185,7 @@ class MemoryRetriever(DbConsumer):
         w_conf = weights.confidence / total if total > 0 else 0.5
         stats = _PhaseStats()
 
-        from api.models.memory import MemoryRecord as M
+        from core.memory.models.memory import MemoryRecord as M
 
         rel = _relevance_expr(w_time, w_conf, self.decay_hours, self.half_life_days)
         type_values = base_params["types"]
@@ -197,7 +197,7 @@ class MemoryRetriever(DbConsumer):
             q = (
                 db.query(M.memory_id, M.content, M.memory_type, M.initial_confidence,
                          M.observed_at, M.session_id, M.trust_tier, rel)
-                .filter(M.user_id == uid, M.is_active == 1, M.memory_type.in_(type_values))
+                .filter(M.user_id == uid, M.is_active > 0, M.memory_type.in_(type_values))
             )
             if include_cross:
                 from sqlalchemy import or_
@@ -252,7 +252,7 @@ class MemoryRetriever(DbConsumer):
 
         from matrixone.sqlalchemy_ext import l2_distance
 
-        from api.models.memory import MemoryRecord as M
+        from core.memory.models.memory import MemoryRecord as M
 
         dist_expr = l2_distance(M.embedding, query_embedding).label("l2_dist")
         uid = base_params["uid"]
@@ -264,7 +264,7 @@ class MemoryRetriever(DbConsumer):
             q = (
                 db.query(M.memory_id, M.content, M.memory_type, M.initial_confidence,
                          M.observed_at, M.session_id, M.trust_tier, dist_expr)
-                .filter(M.user_id == uid, M.is_active == 1,
+                .filter(M.user_id == uid, M.is_active > 0,
                         M.memory_type.in_(type_values), M.embedding.isnot(None))
             )
             if include_cross:

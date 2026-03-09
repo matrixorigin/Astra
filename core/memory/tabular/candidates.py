@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import and_, text
 from sqlalchemy.orm import aliased
 
-from api.models.memory import MemoryRecord
+from core.memory.models.memory import MemoryRecord
 from core.db_consumer import DbConsumer
 from core.memory.config import DEFAULT_CONFIG, MemoryGovernanceConfig
 from core.memory.interfaces import ReflectionCandidate

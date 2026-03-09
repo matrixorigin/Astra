@@ -14,12 +14,15 @@ from api.models.agent import (  # noqa: F401
     Session,
 )
 
-# memory
-from api.models.memory import MemoryRecord  # noqa: F401
-from api.models.memory_config import MemoryUserConfig  # noqa: F401
-from api.models.memory_edit_log import MemoryEditLog  # noqa: F401
-from api.models.memory_experiment import MemoryExperiment  # noqa: F401
-from api.models.graph import GraphEdge, GraphNode  # noqa: F401
+# memory (canonical location: core.memory.models)
+from core.memory.models import (  # noqa: F401
+    GraphEdge,
+    GraphNode,
+    MemoryEditLog,
+    MemoryExperiment,
+    MemoryRecord,
+    MemoryUserConfig,
+)
 
 # skills
 from api.models.skill import (  # noqa: F401

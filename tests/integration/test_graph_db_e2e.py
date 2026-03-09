@@ -466,7 +466,7 @@ class TestTrustTierLifecycleE2E:
 
         # 4. Fake the age by updating created_at directly
         from sqlalchemy import text
-        from api.models.graph import GraphNode
+        from core.memory.models.graph import GraphNode
         with SessionLocal() as db:
             db.query(GraphNode).filter_by(node_id=scene.node_id).update({
                 "created_at": text("DATE_SUB(NOW(), INTERVAL 10 DAY)"),
@@ -502,7 +502,7 @@ class TestTrustTierLifecycleE2E:
 
         # 3. Fake age to 65 days
         from sqlalchemy import text
-        from api.models.graph import GraphNode
+        from core.memory.models.graph import GraphNode
         with SessionLocal() as db:
             db.query(GraphNode).filter_by(node_id=scene.node_id).update({
                 "created_at": text("DATE_SUB(NOW(), INTERVAL 65 DAY)"),

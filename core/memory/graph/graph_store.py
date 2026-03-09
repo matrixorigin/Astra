@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import uuid
 
-from api.models.graph import GraphEdge, GraphNode
+from core.memory.models.graph import GraphEdge, GraphNode
 from core.db_consumer import DbConsumer
 from core.memory.graph.types import Edge, GraphNodeData, NodeType
 

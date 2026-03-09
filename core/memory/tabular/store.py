@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import uuid
 
-from api.models.memory import MemoryRecord
+from core.memory.models.memory import MemoryRecord
 from core.db_consumer import DbConsumer, DbFactory
 from core.memory.tabular.metrics import MemoryMetrics, Timer
 from core.memory.types import Memory, MemoryType, TrustTier, _utcnow
@@ -165,7 +165,7 @@ class MemoryStore(DbConsumer):
                 q = db.query(*cols)
             q = q.filter(
                 MemoryRecord.user_id == user_id,
-                MemoryRecord.is_active == 1,
+                MemoryRecord.is_active > 0,
             )
             if memory_type:
                 q = q.filter(MemoryRecord.memory_type == memory_type.value)

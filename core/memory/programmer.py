@@ -610,7 +610,7 @@ class MemoryProgrammer:
         if validated:
             from sqlalchemy import func as sa_func
 
-            from api.models.memory_config import MemoryUserConfig
+            from core.memory.models.memory_config import MemoryUserConfig
 
             with self._db_factory() as db:
                 db.query(MemoryUserConfig).filter_by(

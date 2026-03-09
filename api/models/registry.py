@@ -31,11 +31,11 @@ _GROUP_IMPORTS: dict[ModelGroup, list[tuple[str, list[str]]]] = {
         ("api.models.agent", ["Agent", "AgentScratchpad", "Event", "RunEvent", "Session"]),
     ],
     ModelGroup.MEMORY: [
-        ("api.models.memory", ["MemoryRecord"]),
-        ("api.models.memory_config", ["MemoryUserConfig"]),
-        ("api.models.memory_edit_log", ["MemoryEditLog"]),
-        ("api.models.memory_experiment", ["MemoryExperiment"]),
-        ("api.models.graph", ["GraphEdge", "GraphNode"]),
+        ("core.memory.models.memory", ["MemoryRecord"]),
+        ("core.memory.models.memory_config", ["MemoryUserConfig"]),
+        ("core.memory.models.memory_edit_log", ["MemoryEditLog"]),
+        ("core.memory.models.memory_experiment", ["MemoryExperiment"]),
+        ("core.memory.models.graph", ["GraphEdge", "GraphNode"]),
     ],
     ModelGroup.SKILLS: [
         ("api.models.skill", [

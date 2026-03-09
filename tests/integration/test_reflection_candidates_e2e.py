@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from api.models.memory import MemoryRecord
+from core.memory.models.memory import MemoryRecord
 from core.memory.tabular.candidates import TabularCandidateProvider, _cosine_similarity
 
 

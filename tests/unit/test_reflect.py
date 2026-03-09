@@ -72,7 +72,7 @@ def reflect_session(db_factory, db_session):
             db_session.query(model).filter(model.session_id == sid).delete()
         except Exception:
             pass
-    from api.models.memory import MemoryRecord
+    from core.memory.models.memory import MemoryRecord
     try:
         db_session.query(MemoryRecord).filter(MemoryRecord.user_id == user_id).delete()
     except Exception:
@@ -517,7 +517,7 @@ class TestReflectionLearningRealDB:
     def _cleanup_lessons(self, reflect_session, db_session):
         yield
         _, uid, _ = reflect_session
-        from api.models.memory import MemoryRecord
+        from core.memory.models.memory import MemoryRecord
         db_session.query(MemoryRecord).filter(
             MemoryRecord.user_id == uid,
             MemoryRecord.content.like("%Reflection-driven%"),

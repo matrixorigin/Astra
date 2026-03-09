@@ -20,7 +20,7 @@ from unittest.mock import MagicMock
 import pytest
 from sqlalchemy import text
 
-from api.models.memory import MemoryRecord
+from core.memory.models.memory import MemoryRecord
 from core.memory.tabular.candidates import TabularCandidateProvider
 from core.memory.tabular.governance import GovernanceScheduler
 from core.memory.types import MemoryType, TrustTier

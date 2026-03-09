@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from api.models.memory import MemoryRecord
+from core.memory.models.memory import MemoryRecord
 from core.memory.config import DEFAULT_CONFIG
 from core.memory.tabular.store import MemoryStore
 from core.memory.tabular.typed_observer import TypedObserver

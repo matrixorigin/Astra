@@ -258,7 +258,7 @@ class TypedObserver:
 
         from matrixone.sqlalchemy_ext import l2_distance
 
-        from api.models.memory import MemoryRecord
+        from core.memory.models.memory import MemoryRecord
 
         dist_expr = l2_distance(MemoryRecord.embedding, new.embedding).label("l2_dist")
 
@@ -314,7 +314,7 @@ class TypedObserver:
 
         from core.memory.reflection.opinion import OpinionEvolver
 
-        from api.models.memory import MemoryRecord
+        from core.memory.models.memory import MemoryRecord
         from core.memory.types import TrustTier
 
         db = self._db_factory()
