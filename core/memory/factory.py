@@ -99,7 +99,7 @@ def _resolve_strategy(
         db_key = _lookup_user_strategy(db_factory, user_id)
         if db_key:
             return db_key
-    return os.environ.get("MEM_RETRIEVAL_STRATEGY", "vector:v1")
+    return os.environ.get("MEM_RETRIEVAL_STRATEGY", "activation:v1")
 
 
 def _lookup_user_strategy(db_factory: DbFactory, user_id: str) -> str | None:

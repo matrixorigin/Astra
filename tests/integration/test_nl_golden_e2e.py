@@ -316,10 +316,11 @@ class TestEditorHasIndexManager:
             ).fetchone()
             assert row is not None, "graph_nodes should have a row after inject with activation strategy"
 
-    def test_vector_strategy_has_no_index_manager(self, db_factory):
+    def test_vector_strategy_has_no_index_manager(self, db_factory, monkeypatch):
         """vector:v1 doesn't need graph index → index_manager is None."""
         from core.memory.factory import create_editor
 
+        monkeypatch.setenv("MEM_RETRIEVAL_STRATEGY", "vector:v1")
         editor = create_editor(db_factory, user_id="any-user")
         assert editor._index_manager is None
 

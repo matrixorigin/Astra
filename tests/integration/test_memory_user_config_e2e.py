@@ -151,7 +151,7 @@ class TestFactoryPerUserResolution:
 
     def test_no_db_row_uses_default(self, db_factory, user_id):
         svc = create_memory_service(db_factory, user_id=user_id)
-        assert svc.strategy_key == "vector:v1"
+        assert svc.strategy_key == "activation:v1"
 
     def test_explicit_strategy_overrides_db(self, db_factory, user_id):
         set_user_strategy(db_factory, user_id, "activation:v1")
@@ -172,7 +172,7 @@ class TestFactoryPerUserResolution:
             svc_bob = create_memory_service(db_factory, user_id=bob)
 
             assert svc_alice.strategy_key == "activation:v1"
-            assert svc_bob.strategy_key == "vector:v1"
+            assert svc_bob.strategy_key == "activation:v1"
         finally:
             db = db_factory()
             try:
@@ -301,9 +301,9 @@ class TestBackfillStatusTransitions:
         finally:
             db.close()
 
-        # Factory should NOT use activation:v1 — should fall through
+        # Factory should NOT use the DB row — should fall through to default
         svc = create_memory_service(db_factory, user_id=user_id)
-        assert svc.strategy_key == "vector:v1"
+        assert svc.strategy_key == "activation:v1"
 
     def test_ready_status_used_by_factory(self, db_factory, user_id):
         """If index_status='ready', factory uses the DB strategy."""

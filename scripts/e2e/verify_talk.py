@@ -120,10 +120,6 @@ def run_case(case: dict, *, verbose: bool = False, model: str | None = None) -> 
 
         uid = session.user_uuid or session.username
 
-        # Set activation:v1 strategy for this test user so graph path is used
-        from core.memory.factory import set_user_strategy
-        set_user_strategy(SessionLocal, uid, "activation:v1")
-
         # Pre-seed graph nodes only for cases that need graph activation check
         check_graph = case.get("check_graph_activation", False)
         if check_graph:

@@ -28,6 +28,10 @@ LAMBDA_IMPORTANCE = 0.10
 
 CONFLICT_PENALTY = {"superseded": 0.5, "pending": 0.7}
 
+# Node type weights: scene nodes are distilled insights (highest value),
+# semantic nodes are facts/preferences, episodic nodes are raw events.
+NODE_TYPE_WEIGHT = {"scene": 1.2, "semantic": 1.0, "episodic": 0.8}
+
 MIN_GRAPH_NODES = 10
 ANCHOR_TOP_K = 10
 
@@ -129,6 +133,9 @@ class ActivationRetriever:
                 + LAMBDA_CONFIDENCE * confidence
                 + LAMBDA_IMPORTANCE * node.importance
             )
+
+            # Type-based weighting: prefer scene > semantic > episodic
+            score *= NODE_TYPE_WEIGHT.get(node.node_type, 1.0)
 
             if node.conflicts_with:
                 resolution = node.conflict_resolution or "pending"
