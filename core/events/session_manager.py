@@ -195,7 +195,7 @@ class SessionManager:
                     for e in events
                 ]
                 if messages:
-                    svc = create_memory_service(SessionLocal)
+                    svc = create_memory_service(SessionLocal, user_id=db_session.user_id)
                     svc.generate_session_summary(db_session.user_id, session_id, messages)
             except Exception as e:
                 logger.debug("Session summary generation failed (non-fatal): %s", e)

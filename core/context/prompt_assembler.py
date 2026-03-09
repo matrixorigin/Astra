@@ -893,7 +893,7 @@ class PromptAssembler(DbConsumer):
         try:
             from core.context.tiered_loader import TieredMemoryLoader
             from core.memory import create_memory_service
-            svc = create_memory_service(self._db_factory)
+            svc = create_memory_service(self._db_factory, user_id=user_id)
             loader = TieredMemoryLoader(svc)
             tiered_section, tiered_stats = loader.build_section(
                 user_id, session_id, query, explain=explain,
@@ -999,7 +999,7 @@ class PromptAssembler(DbConsumer):
         try:
             from core.context.tiered_loader import TieredMemoryLoader
             from core.memory import create_memory_service
-            svc = create_memory_service(self._db_factory)
+            svc = create_memory_service(self._db_factory, user_id=user_id)
             loader = TieredMemoryLoader(svc)
             l0_text = loader.load_l0(user_id)
             if l0_text:

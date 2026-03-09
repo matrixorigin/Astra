@@ -121,7 +121,8 @@ def _lookup_user_strategy(db_factory: DbFactory, user_id: str) -> str | None:
             # If index is still building, fall through to env/default
             if row.index_status == "backfilling":  # type: ignore[union-attr]
                 return None
-            return row.strategy_key  # type: ignore[union-attr]
+            key = row.strategy_key  # type: ignore[union-attr]
+            return key if isinstance(key, str) else None
     except Exception:
         logger.debug("Failed to look up user strategy for %s", user_id, exc_info=True)
         return None

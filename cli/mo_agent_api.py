@@ -2236,5 +2236,39 @@ def memory_review(user_id):
         click.echo(f"  {exp.experiment_id}  {exp.name}  created={exp.created_at}")
 
 
+@memory.group("strategy")
+def memory_strategy():
+    """Get or set memory retrieval strategy for a user."""
+
+
+@memory_strategy.command("get")
+@click.option("--user-id", required=True, help="User ID")
+def memory_strategy_get(user_id):
+    """Show current retrieval strategy for a user."""
+    from api.database import SessionLocal
+    from core.memory.factory import _resolve_strategy
+
+    key = _resolve_strategy(SessionLocal, user_id, backend=None, strategy=None)
+    click.echo(f"Strategy for {user_id}: {key}")
+
+
+@memory_strategy.command("set")
+@click.argument("strategy_key")
+@click.option("--user-id", required=True, help="User ID")
+def memory_strategy_set(strategy_key, user_id):
+    """Set retrieval strategy for a user (e.g. vector:v1, activation:v1)."""
+    from api.database import SessionLocal
+    from core.memory.factory import switch_user_strategy
+
+    try:
+        result = switch_user_strategy(SessionLocal, user_id, strategy_key)
+        click.echo(f"✅ Strategy set to {result.strategy_key} (status: {result.status})")
+        if result.previous_key:
+            click.echo(f"   Previous: {result.previous_key}")
+    except Exception as e:
+        click.echo(f"❌ Failed: {e}")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     cli()

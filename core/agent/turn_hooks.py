@@ -152,7 +152,7 @@ class TurnHooks(DbConsumer):
 
         def _bg():
             from core.memory import create_memory_service
-            svc = create_memory_service(db_factory, llm_client=llm, embed_fn=embed_fn)
+            svc = create_memory_service(db_factory, llm_client=llm, embed_fn=embed_fn, user_id=user_id)
 
             try:
                 svc.run_pipeline(user_id=user_id, messages=messages)
@@ -258,7 +258,7 @@ class TurnHooks(DbConsumer):
         try:
             from core.memory import create_memory_service
             from core.memory.types import MemoryType, TrustTier
-            svc = create_memory_service(self._db_factory)
+            svc = create_memory_service(self._db_factory, user_id=user_id)
             svc.store(
                 user_id=user_id,
                 content=lesson,

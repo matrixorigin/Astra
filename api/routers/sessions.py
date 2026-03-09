@@ -236,7 +236,7 @@ async def close_session(
                 def _bg_summary():
                     try:
                         from core.memory import create_memory_service
-                        svc = create_memory_service(SessionLocal)
+                        svc = create_memory_service(SessionLocal, user_id=_uid)
                         svc.generate_session_summary(_uid, _sid, _hist)
                     except Exception as e:
                         logger.debug("Session summary generation failed (non-fatal): %s", e)
