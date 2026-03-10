@@ -15,6 +15,7 @@ import logging
 import os
 import tempfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -536,6 +537,21 @@ class TestEnsureTables:
         mock_conn = MagicMock()
         mock_engine.connect.return_value.__enter__ = Mock(return_value=mock_conn)
         mock_engine.connect.return_value.__exit__ = Mock(return_value=False)
+
+        # _fix_embedding_dim runs SHOW COLUMNS and inspects the result.
+        # Return matching dim so no ALTER is triggered.
+        show_result = MagicMock()
+        show_result.fetchone.return_value = ("embedding", "vecf32(384)", "YES", "", None, "")
+
+        original_execute = mock_conn.execute
+
+        def execute_side_effect(stmt: Any) -> Any:
+            sql = getattr(stmt, "text", str(stmt))
+            if "SHOW COLUMNS" in sql.upper():
+                return show_result
+            return original_execute(stmt)
+
+        mock_conn.execute = MagicMock(side_effect=execute_side_effect)
 
         with patch("mo_memory_mcp.schema.ensure_database") as mock_edb:
             from mo_memory_mcp.schema import ensure_tables, TABLE_NAMES
