@@ -23,7 +23,7 @@ from sqlalchemy.engine import Engine
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DIM = int(os.environ.get("EMBEDDING_DIM", "384"))
+DEFAULT_DIM = int(os.environ.get("EMBEDDING_DIM") or "384")
 
 DEFAULT_DB_URL = "mysql+pymysql://root:111@localhost:6001/trustmem"
 

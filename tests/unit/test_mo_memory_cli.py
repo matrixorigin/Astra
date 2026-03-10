@@ -88,7 +88,13 @@ class TestMCPConfig:
         cfg = _mcp_config("stdio")
         assert "command" in cfg
         assert cfg["args"] == ["-m", "mo_memory_mcp"]
-        assert "env" not in cfg  # no env when no extras
+        # All env vars are always present (empty string = not set).
+        assert cfg["env"]["TRUSTMEM_DB_URL"] == ""
+        assert cfg["env"]["EMBEDDING_PROVIDER"] == ""
+        assert cfg["env"]["EMBEDDING_MODEL"] == ""
+        assert cfg["env"]["EMBEDDING_DIM"] == ""
+        assert cfg["env"]["EMBEDDING_API_KEY"] == ""
+        assert cfg["env"]["EMBEDDING_BASE_URL"] == ""
 
     def test_remote_mode(self) -> None:
         assert _mcp_config("remote") == {"url": "http://localhost:8100/mcp"}
@@ -101,6 +107,8 @@ class TestMCPConfig:
         cfg = _mcp_config("stdio", provider="openai", model="ada-002")
         assert cfg["env"]["EMBEDDING_PROVIDER"] == "openai"
         assert cfg["env"]["EMBEDDING_MODEL"] == "ada-002"
+        # Unset opts are empty string, not absent
+        assert cfg["env"]["EMBEDDING_DIM"] == ""
 
 
 # ── Tool detection ────────────────────────────────────────────────────

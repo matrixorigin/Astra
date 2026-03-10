@@ -35,15 +35,17 @@ def _mcp_config(mode: str = "stdio", db_url: str | None = None, **embed_opts: st
         "command": sys.executable,
         "args": ["-m", "mo_memory_mcp"],
     }
-    env: dict[str, str] = {}
-    if db_url:
-        env["TRUSTMEM_DB_URL"] = db_url
-    for key in ("provider", "model", "dim", "api_key", "base_url"):
-        val = embed_opts.get(key)
-        if val:
-            env[f"EMBEDDING_{key.upper()}"] = val
-    if env:
-        cfg["env"] = env
+    # Always emit all env vars so users can see what's configurable.
+    # Empty string = not set (MCP server treats empty same as absent).
+    env: dict[str, str] = {
+        "TRUSTMEM_DB_URL": db_url or "",
+        "EMBEDDING_PROVIDER": embed_opts.get("provider", ""),
+        "EMBEDDING_MODEL": embed_opts.get("model", ""),
+        "EMBEDDING_DIM": embed_opts.get("dim", ""),
+        "EMBEDDING_API_KEY": embed_opts.get("api_key", ""),
+        "EMBEDDING_BASE_URL": embed_opts.get("base_url", ""),
+    }
+    cfg["env"] = env
     return cfg
 
 

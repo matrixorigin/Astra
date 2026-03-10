@@ -104,16 +104,16 @@ class EmbeddedBackend(MemoryBackend):
     @staticmethod
     def _make_embed_client():
         """Build EmbeddingClient from EMBEDDING_* env vars."""
-        provider = os.environ.get("EMBEDDING_PROVIDER", "local")
-        model = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+        provider = os.environ.get("EMBEDDING_PROVIDER") or "local"
+        model = os.environ.get("EMBEDDING_MODEL") or "all-MiniLM-L6-v2"
         # local provider always uses 384 (all-MiniLM-L6-v2 is fixed)
-        dim = 384 if provider == "local" else int(os.environ.get("EMBEDDING_DIM", "384"))
+        dim = 384 if provider == "local" else int(os.environ.get("EMBEDDING_DIM") or "384")
         try:
             from core.embedding.client import EmbeddingClient
             return EmbeddingClient(
                 provider=provider, model=model, dim=dim,
-                api_key=os.environ.get("EMBEDDING_API_KEY", ""),
-                base_url=os.environ.get("EMBEDDING_BASE_URL"),
+                api_key=os.environ.get("EMBEDDING_API_KEY") or "",
+                base_url=os.environ.get("EMBEDDING_BASE_URL") or None,
             )
         except Exception:
             logger.warning("Embedding client not available, memories won't be vectorized")
