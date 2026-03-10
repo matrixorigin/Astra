@@ -11,5 +11,5 @@ Quick start::
 For the full multi-user version with auth, see: trustmem (coming soon).
 """
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 PRODUCT_NAME = "TrustMem Lite"

@@ -61,12 +61,19 @@ help:
 	@echo "  make lint               - Run linters"
 	@echo "  make lint-fix           - Auto-fix linting issues"
 	@echo ""
+	@echo "TrustMem Lite (MCP Memory Server):"
+	@echo "  make bump-trustmem-version BUMP=patch  - Bump version (patch/minor/major)"
+	@echo "  make build-trustmem     - Build wheel distribution"
+	@echo "  make publish-trustmem   - Publish to PyPI"
+	@echo "  make publish-trustmem-test - Publish to TestPyPI"
+	@echo ""
 	@echo "Examples:"
 	@echo "  make dev-start                    # Daily development"
 	@echo "  make dev-api-restart              # After code changes"
 	@echo "  make test                         # Run all tests"
 	@echo "  make test-unit                    # Run unit tests only"
 	@echo "  make dev-api-docker-scale REPLICAS=4  # Test load balancing"
+	@echo "  make bump-trustmem-version BUMP=minor # Bump 0.2.3 → 0.3.0"
 
 # ============================================================================
 # Environment Setup
