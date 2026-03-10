@@ -1,0 +1,82 @@
+# TrustMem Cloud v1 — All-in-One
+#
+# Build context is the project root (TrustMem depends on core/ and api/ shared files).
+# Both invocation styles work — context: .. is always relative to this file's location.
+#
+# Usage:
+#   cd trustmem_cloud_v1 && docker compose up -d
+#   # or: docker compose -f trustmem_cloud_v1/docker-compose.yml up -d
+
+services:
+
+  matrixone:
+    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
+    hostname: matrixone
+    ports:
+      - "${MATRIXONE_PORT:-6001}:6001"
+    volumes:
+      - mo-data:/mo-data
+    environment:
+      - TZ=Asia/Shanghai
+    networks:
+      - trustmem-net
+    healthcheck:
+      test: ["CMD-SHELL", "mysql -h127.0.0.1 -P6001 -uroot -p111 -e 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.2
+    hostname: redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - trustmem-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ..
+      dockerfile: trustmem_cloud_v1/Dockerfile
+      args:
+        INSTALL_EXTRAS: ${INSTALL_EXTRAS:-}
+    hostname: trustmem-api
+    ports:
+      - "${API_PORT:-8100}:8000"
+    environment:
+      - TRUSTMEM_DB_HOST=matrixone
+      - TRUSTMEM_DB_PORT=6001
+      - TRUSTMEM_DB_USER=${TRUSTMEM_DB_USER:-root}
+      - TRUSTMEM_DB_PASSWORD=${TRUSTMEM_DB_PASSWORD:-111}
+      - TRUSTMEM_DB_NAME=${TRUSTMEM_DB_NAME:-trustmem}
+      - TRUSTMEM_MASTER_KEY=${TRUSTMEM_MASTER_KEY:?Set TRUSTMEM_MASTER_KEY in .env (min 16 chars)}
+      - TRUSTMEM_EMBEDDING_PROVIDER=${TRUSTMEM_EMBEDDING_PROVIDER:-local}
+      - TRUSTMEM_EMBEDDING_MODEL=${TRUSTMEM_EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      - TRUSTMEM_EMBEDDING_API_KEY=${TRUSTMEM_EMBEDDING_API_KEY:-}
+      - TRUSTMEM_EMBEDDING_BASE_URL=${TRUSTMEM_EMBEDDING_BASE_URL:-}
+    depends_on:
+      matrixone:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - trustmem-net
+    restart: unless-stopped
+
+volumes:
+  mo-data:
+  redis-data:
+
+networks:
+  trustmem-net:
+    driver: bridge
