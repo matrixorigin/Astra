@@ -31,8 +31,6 @@ sqlalchemy = "^2.0.0"
 matrixone-python-sdk = ">=0.1.16"
 pydantic = "^2.5.0"
 mcp = "^1.26.0"
-cryptography = "^42.0.0"
-bcrypt = "^4.1.2"
 sentence-transformers = {version = ">=2.2.0", optional = true}
 
 [tool.poetry.extras]

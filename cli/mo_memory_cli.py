@@ -52,7 +52,14 @@ def _mcp_config(mode: str = "stdio", db_url: str | None = None, **embed_opts: st
 # source of truth for all AI-tool steering rules.  The CLI reads them at
 # runtime and writes them into each tool's config directory.
 
-_TEMPLATES_DIR = Path(__file__).parent.parent / "mo_memory_mcp" / "templates"
+def _get_templates_dir() -> Path:
+    """Resolve templates dir, works both in normal Python and PyInstaller binary."""
+    # PyInstaller sets sys._MEIPASS to the temp extraction dir
+    base = Path(getattr(sys, '_MEIPASS', Path(__file__).parent.parent))
+    return base / "mo_memory_mcp" / "templates"
+
+
+_TEMPLATES_DIR = _get_templates_dir()
 
 # Required sections that every steering template must contain.
 # Prevents silently writing empty or broken rules.
