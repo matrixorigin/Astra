@@ -2,29 +2,37 @@
 
 ## Docker Compose (Recommended)
 
+A `.env` file is pre-configured for local development. Just start:
+
 ```bash
 cd trustmem_cloud_v1
-cp .env.example .env
-# Edit .env — set TRUSTMEM_MASTER_KEY (min 16 chars)
-
 docker compose up -d
 ```
 
-> The build context is the project root (`context: ..` in docker-compose.yml) because TrustMem depends on `core/` and shared files in `api/`. Both `cd trustmem_cloud_v1 && docker compose up -d` and `docker compose -f trustmem_cloud_v1/docker-compose.yml up -d` work — Docker Compose resolves `context` relative to the compose file, not the working directory.
+For a fresh environment, copy the template and fill in your values:
 
-This starts three services:
+```bash
+cp .env.example .env
+# Set TRUSTMEM_MASTER_KEY and TRUSTMEM_EMBEDDING_API_KEY
+docker compose up -d
+```
+
+> The build context is the project root (`context: ..` in docker-compose.yml) because TrustMem depends on `core/` and shared files in `api/`. Both `cd trustmem_cloud_v1 && docker compose up -d` and `docker compose -f trustmem_cloud_v1/docker-compose.yml up -d` work.
+
+This starts two services:
 
 | Service | Port | Description |
 |---------|------|-------------|
 | API | 8100 | TrustMem REST API (FastAPI + Uvicorn) |
 | MatrixOne | 6001 | HTAP database (memory storage, vector search, snapshots) |
-| Redis | 6379 | Rate limiting cache |
 
 Verify:
 ```bash
-curl http://localhost:8100/health
+curl --noproxy localhost http://localhost:8100/health
 # {"status": "ok", "database": "connected"}
 ```
+
+> If you have `http_proxy` set in your environment, add `--noproxy localhost` to curl commands.
 
 ## Environment Variables
 
@@ -39,8 +47,20 @@ curl http://localhost:8100/health
 | `TRUSTMEM_EMBEDDING_PROVIDER` | No | `local` | `local` or `openai` |
 | `TRUSTMEM_EMBEDDING_MODEL` | No | `all-MiniLM-L6-v2` | Embedding model name |
 | `TRUSTMEM_EMBEDDING_API_KEY` | No | — | Required if provider is `openai` |
-| `TRUSTMEM_EMBEDDING_BASE_URL` | No | — | Custom embedding endpoint |
+| `TRUSTMEM_EMBEDDING_BASE_URL` | No | — | Custom embedding endpoint (OpenAI-compatible) |
+| `TRUSTMEM_EMBEDDING_DIM` | No | `0` (auto) | Embedding dimension, 0 = auto-infer |
 | `API_PORT` | No | `8100` | Host-side API port |
+| `MATRIXONE_PORT` | No | `6001` | Host-side MatrixOne port |
+| `MATRIXONE_DEBUG_PORT` | No | — | Expose MatrixOne pprof port (e.g. `6060`) |
+| `MATRIXONE_DATA_DIR` | No | `./data/matrixone` | Host path for MatrixOne data (bind mount) |
+
+## Data Persistence
+
+MatrixOne data is bind-mounted to `./data/matrixone` (relative to `trustmem_cloud_v1/`). Data survives container restarts and `docker compose down`. To change the path:
+
+```bash
+MATRIXONE_DATA_DIR=/your/path docker compose up -d
+```
 
 ## External MatrixOne
 
@@ -54,36 +74,62 @@ TRUSTMEM_DB_USER=root
 TRUSTMEM_DB_PASSWORD=your-password
 ```
 
-Start without the bundled DB:
+Start only the API:
 ```bash
-docker compose up -d api redis
+docker compose up -d api
 ```
 
 Tables are auto-created on first startup.
 
 ## Embedding Options
 
-### Local (default)
+### OpenAI-compatible (recommended)
 
-No API key needed. Uses [sentence-transformers](https://www.sbert.net/) running in-process.
+No extra build step needed. Works with OpenAI, SiliconFlow, Azure OpenAI, local vLLM, etc.
+
+```bash
+TRUSTMEM_EMBEDDING_PROVIDER=openai
+TRUSTMEM_EMBEDDING_MODEL=BAAI/bge-m3
+TRUSTMEM_EMBEDDING_DIM=1024
+TRUSTMEM_EMBEDDING_API_KEY=sk-...
+TRUSTMEM_EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1
+```
+
+### Local (no API key)
+
+Requires bundling `sentence-transformers` at build time (~500MB extra):
+
+```bash
+INSTALL_EXTRAS=local-embedding docker compose build
+```
 
 ```bash
 TRUSTMEM_EMBEDDING_PROVIDER=local
 TRUSTMEM_EMBEDDING_MODEL=all-MiniLM-L6-v2
 ```
 
-Build the image with local embedding support:
-```bash
-INSTALL_EXTRAS=local-embedding docker compose build
-```
+## Debug Port
 
-### OpenAI
+To expose MatrixOne's pprof/debug HTTP port:
 
 ```bash
-TRUSTMEM_EMBEDDING_PROVIDER=openai
-TRUSTMEM_EMBEDDING_MODEL=text-embedding-3-small
-TRUSTMEM_EMBEDDING_API_KEY=sk-...
+# .env
+MATRIXONE_DEBUG_PORT=6060
 ```
+
+Then access `http://localhost:6060/debug/pprof/` for profiling.
+
+## Rate Limits
+
+All limits are configurable via env vars (format: `max_requests,window_seconds`):
+
+```bash
+TRUSTMEM_RATE_LIMIT_AUTH_KEYS=1000,60    # relaxed for testing
+TRUSTMEM_RATE_LIMIT_CONSOLIDATE=100,60
+TRUSTMEM_RATE_LIMIT_REFLECT=100,60
+```
+
+See `middleware.py` for all configurable keys and defaults.
 
 ## Automated Governance
 
@@ -95,7 +141,7 @@ A background scheduler starts automatically with the API server:
 | Daily | Clean up expired/quarantined memories |
 | Weekly | Compress redundant memories |
 
-No configuration needed. Admins can also trigger governance manually per user:
+Admins can also trigger governance manually per user:
 
 ```bash
 curl -X POST http://localhost:8100/admin/governance/alice/trigger \
@@ -108,5 +154,5 @@ curl -X POST http://localhost:8100/admin/governance/alice/trigger \
 - All queries are scoped to the authenticated user's `user_id`
 - Master key is required for all admin operations
 - Snapshot names are sanitized and regex-validated before entering SQL
-- Rate limiting is per API key (in-memory sliding window; v2 will use Redis)
+- Rate limiting is per API key (in-memory sliding window)
 - Run behind a reverse proxy (nginx/Caddy) with TLS in production

@@ -19,8 +19,13 @@ os.environ["TRUSTMEM_MASTER_KEY"] = MASTER_KEY
 @pytest.fixture(scope="module")
 def client():
     from trustmem_cloud_v1.api.main import app
+    # Save and restore global embedding client to avoid polluting other test modules
+    from core.embedding import _shared_client as _saved_client
+    import core.embedding as _emb_mod
     with TestClient(app) as c:
         yield c
+    # Restore embedding client
+    _emb_mod._shared_client = _saved_client
     # Clean up rate limit state after module
     from trustmem_cloud_v1.api.middleware import _windows
     _windows.clear()

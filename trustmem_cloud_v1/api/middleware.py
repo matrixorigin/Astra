@@ -1,39 +1,55 @@
 """Rate limiting middleware — per-API-key throttle.
 
 v1: in-memory sliding window. v2: swap to Redis for distributed.
+
+Override any limit via environment variables:
+    TRUSTMEM_RATE_LIMIT_AUTH_KEYS=100,60       # POST /auth/keys: 100 req/60s
+    TRUSTMEM_RATE_LIMIT_STORE=500,60           # POST /v1/memories
+    TRUSTMEM_RATE_LIMIT_BATCH=100,60           # POST /v1/memories/batch
+    TRUSTMEM_RATE_LIMIT_RETRIEVE=1000,60       # POST /v1/memories/retrieve
+    TRUSTMEM_RATE_LIMIT_CONSOLIDATE=10,3600    # POST /v1/consolidate
+    TRUSTMEM_RATE_LIMIT_REFLECT=5,7200         # POST /v1/reflect
+    TRUSTMEM_RATE_LIMIT_DEFAULT=2000,60        # fallback
 """
 
+import os
 import time
 from collections import defaultdict
 
-from fastapi import Request, HTTPException, status
+from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
+
+
+def _env_limit(name: str, default: tuple[int, int]) -> tuple[int, int]:
+    val = os.environ.get(f"TRUSTMEM_RATE_LIMIT_{name}")
+    if val:
+        try:
+            parts = val.split(",")
+            return int(parts[0]), int(parts[1])
+        except Exception:
+            pass
+    return default
+
 
 # Limits: (max_requests, window_seconds)
 _RATE_LIMITS: dict[str, tuple[int, int]] = {
-    # Write operations
-    "POST:/v1/memories": (300, 60),
-    "POST:/v1/memories/batch": (60, 60),
-    "PUT:/v1/memories/": (120, 60),
-    "DELETE:/v1/memories/": (120, 60),
-    "POST:/v1/memories/purge": (30, 60),
-    "POST:/v1/observe": (120, 60),
-    # Read operations
-    "POST:/v1/memories/retrieve": (600, 60),
-    "POST:/v1/memories/search": (600, 60),
-    "GET:/v1/memories": (300, 60),
-    "GET:/v1/profiles/": (120, 60),
-    # Expensive operations
-    "POST:/v1/consolidate": (3, 3600),
-    "POST:/v1/reflect": (2, 7200),
-    # Snapshots
-    "POST:/v1/snapshots": (30, 60),
-    "GET:/v1/snapshots": (120, 60),
-    "DELETE:/v1/snapshots/": (30, 60),
-    # Auth
-    "POST:/auth/keys": (20, 60),
-    # Global fallback
-    "_default": (1000, 60),
+    "POST:/v1/memories":          _env_limit("STORE",       (300, 60)),
+    "POST:/v1/memories/batch":    _env_limit("BATCH",       (60, 60)),
+    "PUT:/v1/memories/":          _env_limit("CORRECT",     (120, 60)),
+    "DELETE:/v1/memories/":       _env_limit("DELETE",      (120, 60)),
+    "POST:/v1/memories/purge":    _env_limit("PURGE",       (30, 60)),
+    "POST:/v1/observe":           _env_limit("OBSERVE",     (120, 60)),
+    "POST:/v1/memories/retrieve": _env_limit("RETRIEVE",    (600, 60)),
+    "POST:/v1/memories/search":   _env_limit("SEARCH",      (600, 60)),
+    "GET:/v1/memories":           _env_limit("LIST",        (300, 60)),
+    "GET:/v1/profiles/":          _env_limit("PROFILE",     (120, 60)),
+    "POST:/v1/consolidate":       _env_limit("CONSOLIDATE", (3, 3600)),
+    "POST:/v1/reflect":           _env_limit("REFLECT",     (2, 7200)),
+    "POST:/v1/snapshots":         _env_limit("SNAP_CREATE", (30, 60)),
+    "GET:/v1/snapshots":          _env_limit("SNAP_READ",   (120, 60)),
+    "DELETE:/v1/snapshots/":      _env_limit("SNAP_DELETE", (30, 60)),
+    "POST:/auth/keys":            _env_limit("AUTH_KEYS",   (20, 60)),
+    "_default":                   _env_limit("DEFAULT",     (1000, 60)),
 }
 
 

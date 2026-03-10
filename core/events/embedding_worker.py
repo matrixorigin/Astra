@@ -123,7 +123,19 @@ class EmbeddingWorker:
                     {"event_id": row.event_id, "embedding": vec_str, "model": svc.model},
                 )
             except Exception:
-                logger.warning("Failed to embed event %s", row.event_id, exc_info=True)
+                logger.warning("Failed to embed event %s — marking as skipped to prevent retry loop", row.event_id, exc_info=True)
+                # Insert a sentinel row so this event is not retried indefinitely
+                try:
+                    db.execute(
+                        text("""
+                            INSERT INTO ctx_event_embeddings
+                            (event_id, embedding, model_name, model_version, metadata, created_at, updated_at)
+                            VALUES (:event_id, NULL, 'error', '0', '{"error": "embed_failed"}', NOW(), NOW())
+                        """),
+                        {"event_id": row.event_id},
+                    )
+                except Exception:
+                    pass  # If sentinel insert also fails, it will retry next cycle — acceptable
 
         db.commit()
         logger.info("Embedded %d events", len(rows))

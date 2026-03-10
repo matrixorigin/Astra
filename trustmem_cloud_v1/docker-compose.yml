@@ -14,34 +14,20 @@ services:
     hostname: matrixone
     ports:
       - "${MATRIXONE_PORT:-6001}:6001"
+      # Debug HTTP port (pprof) — disabled by default, set MATRIXONE_DEBUG_PORT to enable
+      - "${MATRIXONE_DEBUG_PORT:-}:6060"
     volumes:
-      - mo-data:/mo-data
+      - ${MATRIXONE_DATA_DIR:-./data/matrixone}:/mo-data
     environment:
       - TZ=Asia/Shanghai
     networks:
       - trustmem-net
     healthcheck:
-      test: ["CMD-SHELL", "mysql -h127.0.0.1 -P6001 -uroot -p111 -e 'SELECT 1' || exit 1"]
+      test: ["CMD-SHELL", "timeout 2 bash -c 'echo > /dev/tcp/127.0.0.1/6001' 2>/dev/null"]
       interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 12
       start_period: 30s
-    restart: unless-stopped
-
-  redis:
-    image: redis:7.2
-    hostname: redis
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
-    volumes:
-      - redis-data:/data
-    networks:
-      - trustmem-net
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
     restart: unless-stopped
 
   api:
@@ -49,6 +35,8 @@ services:
       context: ..
       dockerfile: trustmem_cloud_v1/Dockerfile
       args:
+        # Set INSTALL_EXTRAS=local-embedding to bundle sentence-transformers (~500MB).
+        # Default is empty — use an external embedding provider via TRUSTMEM_EMBEDDING_* env vars.
         INSTALL_EXTRAS: ${INSTALL_EXTRAS:-}
     hostname: trustmem-api
     ports:
@@ -64,18 +52,17 @@ services:
       - TRUSTMEM_EMBEDDING_MODEL=${TRUSTMEM_EMBEDDING_MODEL:-all-MiniLM-L6-v2}
       - TRUSTMEM_EMBEDDING_API_KEY=${TRUSTMEM_EMBEDDING_API_KEY:-}
       - TRUSTMEM_EMBEDDING_BASE_URL=${TRUSTMEM_EMBEDDING_BASE_URL:-}
+      # Rate limits — override for testing: TRUSTMEM_RATE_LIMIT_AUTH_KEYS=1000,60
+      - TRUSTMEM_RATE_LIMIT_AUTH_KEYS=${TRUSTMEM_RATE_LIMIT_AUTH_KEYS:-20,60}
+      - TRUSTMEM_RATE_LIMIT_DEFAULT=${TRUSTMEM_RATE_LIMIT_DEFAULT:-1000,60}
     depends_on:
       matrixone:
-        condition: service_healthy
-      redis:
         condition: service_healthy
     networks:
       - trustmem-net
     restart: unless-stopped
 
-volumes:
-  mo-data:
-  redis-data:
+volumes: {}
 
 networks:
   trustmem-net:

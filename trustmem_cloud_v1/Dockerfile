@@ -25,6 +25,10 @@ RUN if [ -n "$INSTALL_EXTRAS" ]; then \
 COPY core/ core/
 COPY mo_memory_mcp/ mo_memory_mcp/
 COPY trustmem_cloud_v1/ trustmem_cloud_v1/
+COPY config/ config/
+# core/context/__init__.py imports skills.knowledge which is not needed by TrustMem.
+# Overwrite with an empty init to avoid the dependency.
+RUN echo '"""Context management package."""' > core/context/__init__.py
 # Shared files used by core/ and trustmem_cloud_v1/
 COPY api/__init__.py api/__init__.py
 COPY api/_model_types.py api/_model_types.py
