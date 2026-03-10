@@ -129,6 +129,7 @@ filterwarnings = [
 markers = [
     "integration: marks tests as integration tests (require database setup)",
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "benchmark: marks tests as benchmark (measure throughput/latency)",
 ]
 
 [build-system]

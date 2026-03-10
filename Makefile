@@ -441,7 +441,7 @@ test:
 		echo "❌ Error: MatrixOne is not running. Start services with 'make dev-start'"; \
 		exit 1; \
 	fi
-	@python -m pytest tests/ -n auto --dist loadscope -v
+	@python -m pytest tests/ -n auto --dist loadscope -v -m "not slow and not benchmark"
 
 .PHONY: test-unit
 test-unit:
