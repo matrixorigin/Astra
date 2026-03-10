@@ -16,7 +16,11 @@ This package exposes the existing `ContextManager` memory-selection logic from `
 
 ```bash
 python -m pytest tests/unit/test_openclaw_memory_plugin.py
+python -m pytest tests/unit/test_openclaw_plugin_package.py
 ```
+
+The package smoke test verifies the plugin entrypoint can load in an isolated
+package directory (without relying on repo-level `core.*` imports).
 
 ## Packaging
 

@@ -35,6 +35,7 @@ To package the current memory layer as a plugin, this repo now contains:
 
 - [ ] Manifest schema validated against docs
 - [ ] Entrypoint path validated by OpenClaw loader
+- [ ] Entrypoint imports cleanly from packaged artifact (no repo-only `core.*` dependency)
 - [ ] Plugin install test passes in OpenClaw runtime
 - [ ] Submission form fields completed
 - [ ] Archive uploaded successfully

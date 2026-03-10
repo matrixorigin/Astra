@@ -418,7 +418,8 @@ class ContextManager:
         # Extract file paths from event content
         import re
 
-        file_pattern = r"[\w/]+\.(py|js|go|java|rs|cpp|c|h)"
+        # Use a non-capturing group so findall returns full file paths, not only extensions.
+        file_pattern = r"[\w/]+\.(?:py|js|go|java|rs|cpp|c|h)"
 
         for event in selected_events[:5]:  # Check recent 5 events
             content = event.get("content", "")

@@ -66,3 +66,16 @@ def test_build_context_prompt_falls_back_to_general_task_type():
 
     assert prompt == "assembled prompt"
     assert manager.calls[0]["task_type"] == TaskType.GENERAL
+
+
+def test_retrieve_relevant_memory_normalizes_task_type_input():
+    manager = FakeContextManager()
+    plugin = OpenClawMemoryPlugin(manager)
+
+    plugin.retrieve_relevant_memory(
+        session_id="s-1",
+        query="plan this",
+        task_type="  PLANNING  ",
+    )
+
+    assert manager.calls[0]["task_type"] == TaskType.PLANNING

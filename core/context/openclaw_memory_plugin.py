@@ -79,7 +79,8 @@ class OpenClawMemoryPlugin:
 
     @staticmethod
     def _parse_task_type(task_type: str) -> TaskType:
+        normalized = str(task_type).strip().lower()
         try:
-            return TaskType(task_type)
-        except ValueError:
+            return TaskType(normalized)
+        except (TypeError, ValueError):
             return TaskType.GENERAL
