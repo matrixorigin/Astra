@@ -12,7 +12,7 @@ def create_server(api_url: str, api_key: str) -> FastMCP:
     client = httpx.Client(base_url=api_url, headers={"Authorization": f"Bearer {api_key}"}, timeout=30)
 
     @server.tool()
-    async def memory_store(content: str, memory_type: str = "fact", session_id: str | None = None) -> str:
+    async def memory_store(content: str, memory_type: str = "semantic", session_id: str | None = None) -> str:
         """Store a memory."""
         r = client.post("/v1/memories", json={"content": content, "memory_type": memory_type, "session_id": session_id})
         r.raise_for_status()
@@ -70,7 +70,7 @@ def create_server(api_url: str, api_key: str) -> FastMCP:
         r = client.post("/v1/snapshots", json={"name": name, "description": description})
         r.raise_for_status()
         d = r.json()
-        return f"Snapshot '{d['name']}' created ({d['memory_count']} memories)"
+        return f"Snapshot '{d['name']}' created (ts={d.get('timestamp', 'unknown')})"
 
     @server.tool()
     async def memory_snapshots() -> str:
@@ -80,7 +80,7 @@ def create_server(api_url: str, api_key: str) -> FastMCP:
         items = r.json()
         if not items:
             return "No snapshots."
-        lines = [f"- {s['name']} ({s['memory_count']} memories, {s['created_at']})" for s in items]
+        lines = [f"- {s['name']} ({s.get('timestamp', '')})" for s in items]
         return "\n".join(lines)
 
     @server.tool()
@@ -96,6 +96,20 @@ def create_server(api_url: str, api_key: str) -> FastMCP:
         r = client.post("/v1/reflect", params={"force": force})
         r.raise_for_status()
         return str(r.json())
+
+    @server.tool()
+    async def memory_snapshot_diff(name: str) -> str:
+        """Compare a snapshot with current memories. Shows added/removed since snapshot."""
+        r = client.get(f"/v1/snapshots/{name}/diff")
+        r.raise_for_status()
+        d = r.json()
+        lines = [f"Snapshot '{name}': {d['snapshot_count']} memories, Current: {d['current_count']} memories"]
+        lines.append(f"Added: {d['added_count']}, Removed: {d['removed_count']}, Unchanged: {d['unchanged_count']}")
+        for m in d.get("added", []):
+            lines.append(f"  + [{m['memory_type']}] {m['content']}")
+        for m in d.get("removed", []):
+            lines.append(f"  - [{m['memory_type']}] {m['content']}")
+        return "\n".join(lines)
 
     return server
 

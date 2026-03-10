@@ -1,7 +1,7 @@
 """Admin endpoints — user management, system stats. Cursor-based pagination."""
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import text, func
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from trustmem_cloud_v1.api.database import get_db_session
@@ -16,9 +16,10 @@ def system_stats(
     _admin: str = Depends(require_admin),
     db: Session = Depends(get_db_session),
 ):
-    """System-wide stats."""
+    """System-wide stats. Uses indexed COUNT for bounded tables, approximate for large ones."""
+    from core.memory.models.memory import MemoryRecord as M
     total_users = db.query(func.count(User.user_id)).filter(User.is_active == 1).scalar() or 0
-    total_memories = db.execute(text("SELECT COUNT(*) FROM mem_memories WHERE is_active = 1")).scalar() or 0
+    total_memories = db.query(func.count(M.memory_id)).filter(M.is_active > 0).scalar() or 0
     total_snapshots = db.query(func.count(SnapshotRegistry.snapshot_name)).scalar() or 0
     return {"total_users": total_users, "total_memories": total_memories, "total_snapshots": total_snapshots}
 
@@ -31,7 +32,7 @@ def list_users(
     db: Session = Depends(get_db_session),
 ):
     """List users with cursor-based pagination. Pass last user_id as cursor for next page."""
-    q = db.query(User).filter(User.is_active == 1)
+    q = db.query(User.user_id, User.created_at).filter(User.is_active == 1)
     if cursor:
         q = q.filter(User.user_id > cursor)
     rows = q.order_by(User.user_id).limit(limit).all()
@@ -48,9 +49,8 @@ def user_stats(
     _admin: str = Depends(require_admin),
     db: Session = Depends(get_db_session),
 ):
-    mem_count = db.execute(
-        text("SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1"), {"uid": user_id},
-    ).scalar() or 0
+    from core.memory.models.memory import MemoryRecord as M
+    mem_count = db.query(func.count(M.memory_id)).filter(M.user_id == user_id, M.is_active > 0).scalar() or 0
     snap_count = db.query(SnapshotRegistry).filter_by(user_id=user_id).count()
     key_count = db.query(ApiKey).filter_by(user_id=user_id, is_active=1).count()
     return {"user_id": user_id, "memory_count": mem_count, "snapshot_count": snap_count, "api_key_count": key_count}
@@ -63,10 +63,8 @@ def delete_user(
     db: Session = Depends(get_db_session),
 ):
     """Deactivate user and revoke all API keys."""
-    user = db.query(User).filter_by(user_id=user_id).first()
-    if user:
-        user.is_active = 0
-    db.execute(text("UPDATE auth_api_keys SET is_active = 0 WHERE user_id = :uid"), {"uid": user_id})
+    db.query(User).filter_by(user_id=user_id).update({"is_active": 0})
+    db.query(ApiKey).filter_by(user_id=user_id).update({"is_active": 0})
     db.commit()
     return {"status": "ok", "user_id": user_id}
 

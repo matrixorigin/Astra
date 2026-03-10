@@ -331,7 +331,7 @@ class TestMergeRowcountIntegration:
 
         # 3. Count main before merge
         before = db_session.execute(text(
-            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1"
+            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active"
         ), {"uid": uid}).scalar()
 
         # 4. Merge
@@ -340,7 +340,7 @@ class TestMergeRowcountIntegration:
 
         # 5. Count main after merge
         after = db_session.execute(text(
-            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1"
+            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active"
         ), {"uid": uid}).scalar()
 
         # 6. Verify: reported inserted == actual new rows

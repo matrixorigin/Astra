@@ -79,14 +79,11 @@ def _get_editor(db_factory, user_id: str):
 
 def _verify_ownership(db_factory, memory_id: str, user_id: str):
     """Verify memory belongs to user. Raises 404 if not found or not owned."""
-    from sqlalchemy import text
+    from core.memory.models.memory import MemoryRecord as M
     db = db_factory()
     try:
-        row = db.execute(
-            text("SELECT user_id FROM mem_memories WHERE memory_id = :mid AND is_active = 1"),
-            {"mid": memory_id},
-        ).first()
-        if row is None or row[0] != user_id:
+        row = db.query(M.user_id).filter_by(memory_id=memory_id).filter(M.is_active > 0).first()
+        if row is None or row.user_id != user_id:
             raise HTTPException(status_code=404, detail="Memory not found")
     finally:
         db.close()
@@ -103,28 +100,43 @@ def _get_service(db_factory, user_id: str):
 def list_memories(
     memory_type: str | None = None,
     limit: int = 100,
-    offset: int = 0,
+    cursor: str | None = None,
     user_id: str = Depends(get_current_user_id),
     db_factory=Depends(get_db_factory),
 ):
-    """List active memories for the current user."""
-    from sqlalchemy import text
+    """List active memories for the current user. Cursor-based pagination (pass last observed_at|memory_id)."""
+    from core.memory.models.memory import MemoryRecord as M
+    from sqlalchemy import or_, and_
     db = db_factory()
     try:
-        where = "user_id = :uid AND is_active = 1"
-        params: dict = {"uid": user_id, "limit": limit, "offset": offset}
+        if limit > 500:
+            limit = 500
+        q = db.query(M.memory_id, M.content, M.memory_type, M.initial_confidence, M.observed_at).filter(
+            M.user_id == user_id, M.is_active > 0,
+        )
         if memory_type:
-            where += " AND memory_type = :mt"
-            params["mt"] = memory_type
-        rows = db.execute(
-            text(f"SELECT memory_id, content, memory_type, initial_confidence, observed_at FROM mem_memories WHERE {where} ORDER BY observed_at DESC LIMIT :limit OFFSET :offset"),
-            params,
-        ).fetchall()
-        return [
-            {"memory_id": r[0], "content": r[1], "memory_type": r[2], "confidence": r[3],
-             "observed_at": r[4].isoformat() if r[4] else None}
+            q = q.filter(M.memory_type == memory_type)
+        if cursor:
+            parts = cursor.split("|", 1)
+            if len(parts) == 2:
+                q = q.filter(or_(
+                    M.observed_at < parts[0],
+                    and_(M.observed_at == parts[0], M.memory_id < parts[1]),
+                ))
+        rows = q.order_by(M.observed_at.desc(), M.memory_id.desc()).limit(limit).all()
+        _FMT = "%Y-%m-%d %H:%M:%S.%f"
+        items = [
+            {"memory_id": r.memory_id, "content": r.content, "memory_type": r.memory_type,
+             "confidence": r.initial_confidence,
+             "observed_at": r.observed_at.strftime(_FMT) if r.observed_at else None}
             for r in rows
         ]
+        next_cursor = None
+        if len(rows) == limit and rows:
+            last = rows[-1]
+            ts = last.observed_at.strftime(_FMT) if last.observed_at else ""
+            next_cursor = f"{ts}|{last.memory_id}"
+        return {"items": items, "next_cursor": next_cursor}
     finally:
         db.close()
 
@@ -247,7 +259,35 @@ def get_profile(
     resolved = user_id if target_user_id == "me" else target_user_id
     svc = _get_service(db_factory, user_id=resolved)
     profile = svc.get_profile(resolved)
-    return {"user_id": resolved, "profile": profile}
+
+    # Enrich with stats for quality assessment
+    from sqlalchemy import func as sa_func
+    from core.memory.models.memory import MemoryRecord as M
+    db = db_factory()
+    try:
+        stats: dict[str, Any] = {}
+        rows = db.query(M.memory_type, sa_func.count()).filter(
+            M.user_id == resolved, M.is_active > 0,
+        ).group_by(M.memory_type).all()
+        stats["by_type"] = {str(r[0]): r[1] for r in rows}
+        stats["total"] = sum(r[1] for r in rows)
+        stats["avg_confidence"] = db.query(
+            sa_func.round(sa_func.avg(M.initial_confidence), 2)
+        ).filter(M.user_id == resolved, M.is_active > 0).scalar()
+        stats["oldest"] = db.query(sa_func.min(M.observed_at)).filter(
+            M.user_id == resolved, M.is_active > 0,
+        ).scalar()
+        stats["newest"] = db.query(sa_func.max(M.observed_at)).filter(
+            M.user_id == resolved, M.is_active > 0,
+        ).scalar()
+        if stats["oldest"]:
+            stats["oldest"] = stats["oldest"].isoformat()
+        if stats["newest"]:
+            stats["newest"] = stats["newest"].isoformat()
+    finally:
+        db.close()
+
+    return {"user_id": resolved, "profile": profile, "stats": stats}
 
 
 @router.post("/observe")

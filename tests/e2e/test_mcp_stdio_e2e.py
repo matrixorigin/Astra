@@ -299,14 +299,14 @@ async def test_purge_by_topic(session):
     # All topic memories should be deactivated
     active = _db_fetch(
         "mem_memories",
-        f"user_id = '{user}' AND content LIKE '%{topic_kw}%' AND is_active = 1"
+        f"user_id = '{user}' AND content LIKE '%{topic_kw}%' AND is_active"
     )
     assert len(active) == 0, "All topic memories should be deactivated"
 
     # Unrelated memory should still be active
     unrelated = _db_fetch(
         "mem_memories",
-        f"user_id = '{user}' AND content = 'unrelated memory' AND is_active = 1"
+        f"user_id = '{user}' AND content = 'unrelated memory' AND is_active"
     )
     assert len(unrelated) == 1
 

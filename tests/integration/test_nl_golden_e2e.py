@@ -536,7 +536,7 @@ class TestSessionIdPropagation:
 
         with db_factory() as db:
             row = db.execute(
-                text("SELECT session_id FROM mem_memories WHERE user_id = :uid AND is_active = 1"),
+                text("SELECT session_id FROM mem_memories WHERE user_id = :uid AND is_active"),
                 {"uid": user_id},
             ).fetchone()
             assert row is not None

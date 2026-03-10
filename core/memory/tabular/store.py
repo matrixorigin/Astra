@@ -129,10 +129,8 @@ class MemoryStore(DbConsumer):
     def update_content(self, memory_id: str, content: str) -> None:
         """Update content of an existing memory (e.g. streaming accumulation)."""
         with self._db() as db:
-            row = db.query(MemoryRecord).filter_by(memory_id=memory_id).first()
-            if row:
-                row.content = content
-                db.commit()
+            db.query(MemoryRecord).filter_by(memory_id=memory_id).update({"content": content})
+            db.commit()
 
     def update_confidence(
         self, memory_id: str, confidence: float,
@@ -140,14 +138,13 @@ class MemoryStore(DbConsumer):
     ) -> None:
         """Update confidence (and optionally tier/active) for opinion evolution."""
         with self._db() as db:
-            row = db.query(MemoryRecord).filter_by(memory_id=memory_id).first()
-            if row:
-                row.initial_confidence = confidence
-                if trust_tier is not None:
-                    row.trust_tier = trust_tier
-                if is_active is not None:
-                    row.is_active = int(is_active)
-                db.commit()
+            vals: dict = {"initial_confidence": confidence}
+            if trust_tier is not None:
+                vals["trust_tier"] = trust_tier
+            if is_active is not None:
+                vals["is_active"] = int(is_active)
+            db.query(MemoryRecord).filter_by(memory_id=memory_id).update(vals)
+            db.commit()
 
     def list_active(
         self,
@@ -184,11 +181,9 @@ class MemoryStore(DbConsumer):
             new_memory.observed_at = now
 
         with self._db() as db:
-            old = db.query(MemoryRecord).filter_by(memory_id=old_id).first()
-            if old:
-                old.is_active = 0
-                old.superseded_by = new_memory.memory_id
-                old.updated_at = now
+            db.query(MemoryRecord).filter_by(memory_id=old_id).update({
+                "is_active": 0, "superseded_by": new_memory.memory_id, "updated_at": now,
+            })
 
             row = MemoryRecord(
                 memory_id=new_memory.memory_id,

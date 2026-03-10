@@ -35,7 +35,7 @@ def create_api_key(
 ):
     """Create an API key for a user. Requires master key. Auto-creates user if new."""
     # Upsert user
-    user = db.query(User).filter_by(user_id=req.user_id).first()
+    user = db.query(User.user_id).filter_by(user_id=req.user_id).first()
     if not user:
         db.add(User(user_id=req.user_id))
 
@@ -59,7 +59,7 @@ def list_api_keys(
     user_id: str = Depends(get_current_user_id),
     db: Session = Depends(get_db_session),
 ):
-    rows = db.query(ApiKey).filter_by(user_id=user_id, is_active=1).all()
+    rows = db.query(ApiKey.key_id, ApiKey.user_id, ApiKey.name, ApiKey.key_prefix, ApiKey.created_at).filter_by(user_id=user_id, is_active=1).all()
     return [
         KeyResponse(
             key_id=r.key_id, user_id=r.user_id, name=r.name,
@@ -75,10 +75,10 @@ def revoke_api_key(
     user_id: str = Depends(get_current_user_id),
     db: Session = Depends(get_db_session),
 ):
-    row = db.query(ApiKey).filter_by(key_id=key_id).first()
+    row = db.query(ApiKey.key_id, ApiKey.user_id).filter_by(key_id=key_id).first()
     if row is None:
         raise HTTPException(status_code=404, detail="Key not found")
     if user_id != "__admin__" and row.user_id != user_id:
         raise HTTPException(status_code=403, detail="Not your key")
-    row.is_active = 0
+    db.query(ApiKey).filter_by(key_id=key_id).update({"is_active": 0})
     db.commit()

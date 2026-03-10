@@ -103,6 +103,69 @@ class TestAuth:
         # HTTP: rejected
         assert client.get("/v1/memories", headers=h).status_code == 401
 
+    def test_list_keys(self, client):
+        """GET /auth/keys returns the user's active keys."""
+        uid, h, kid = _make_user(client)
+        r = client.get("/auth/keys", headers=h)
+        assert r.status_code == 200
+        keys = r.json()
+        assert isinstance(keys, list)
+        assert len(keys) >= 1
+        assert any(k["key_id"] == kid for k in keys)
+
+
+# ── Memory List ───────────────────────────────────────────────────────
+
+class TestMemoryList:
+    def test_list_memories_empty(self, client):
+        """GET /memories returns empty list for new user."""
+        _, h, _ = _make_user(client)
+        r = client.get("/v1/memories", headers=h)
+        assert r.status_code == 200
+        data = r.json()
+        assert data["items"] == []
+        assert data["next_cursor"] is None
+
+    def test_list_memories_returns_stored(self, client, db):
+        """GET /memories returns stored memories with correct fields."""
+        uid, h, _ = _make_user(client)
+        client.post("/v1/memories", json={"content": "list test 1"}, headers=h)
+        client.post("/v1/memories", json={"content": "list test 2"}, headers=h)
+
+        r = client.get("/v1/memories", headers=h)
+        assert r.status_code == 200
+        items = r.json()["items"]
+        assert len(items) >= 2
+        contents = [m["content"] for m in items]
+        assert "list test 1" in contents
+        assert "list test 2" in contents
+        for m in items:
+            assert "memory_id" in m
+            assert "content" in m
+            assert "memory_type" in m
+
+    def test_list_memories_cursor_pagination(self, client):
+        """GET /memories cursor pagination works correctly."""
+        _, h, _ = _make_user(client)
+        for i in range(5):
+            client.post("/v1/memories", json={"content": f"page test {i}"}, headers=h)
+
+        # First page
+        r = client.get("/v1/memories", params={"limit": 2}, headers=h)
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["items"]) == 2
+        assert data["next_cursor"] is not None
+
+        # Second page
+        r2 = client.get("/v1/memories", params={"limit": 2, "cursor": data["next_cursor"]}, headers=h)
+        data2 = r2.json()
+        assert len(data2["items"]) == 2
+        # No overlap
+        ids1 = {m["memory_id"] for m in data["items"]}
+        ids2 = {m["memory_id"] for m in data2["items"]}
+        assert ids1.isdisjoint(ids2)
+
 
 # ── Memory CRUD with DB verification ─────────────────────────────────
 
@@ -170,7 +233,7 @@ class TestMemory:
 
         # DB: all 3 exist and active
         count = db.execute(text(
-            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1 AND content LIKE 'batch_%'"
+            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active AND content LIKE 'batch_%'"
         ), {"uid": uid}).scalar()
         assert count == 3
 
@@ -199,12 +262,12 @@ class TestMemory:
 
         # DB: working deactivated, semantic survives
         wk = db.execute(text(
-            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND memory_type = 'working' AND is_active = 1"
+            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND memory_type = 'working' AND is_active"
         ), {"uid": uid}).scalar()
         assert wk == 0
 
         sem = db.execute(text(
-            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND memory_type = 'semantic' AND is_active = 1"
+            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND memory_type = 'semantic' AND is_active"
         ), {"uid": uid}).scalar()
         assert sem >= 1
 
@@ -222,7 +285,7 @@ class TestObserve:
         uid, h, _ = _make_user(client)
 
         before = db.execute(text(
-            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1"
+            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active"
         ), {"uid": uid}).scalar()
 
         r = client.post("/v1/observe", json={
@@ -389,7 +452,7 @@ class TestAdmin:
 
         # DB: all keys revoked
         active_keys = db.execute(text(
-            "SELECT COUNT(*) FROM auth_api_keys WHERE user_id = :uid AND is_active = 1"
+            "SELECT COUNT(*) FROM auth_api_keys WHERE user_id = :uid AND is_active"
         ), {"uid": uid}).scalar()
         assert active_keys == 0
 
@@ -475,7 +538,7 @@ class TestIsolation:
 
         # B cannot see A's memory in list
         r = client.get("/v1/memories", headers=h_b)
-        b_mids = [m["memory_id"] for m in r.json()]
+        b_mids = [m["memory_id"] for m in r.json()["items"]]
         assert mid_a not in b_mids
 
         # B cannot correct A's memory
@@ -607,7 +670,7 @@ class TestObserveDB:
         uid, h, _ = _make_user(client)
 
         before = db.execute(text(
-            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1"
+            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active"
         ), {"uid": uid}).scalar()
 
         r = client.post("/v1/observe", json={
@@ -622,7 +685,7 @@ class TestObserveDB:
         if len(extracted) > 0:
             # If extraction worked, verify DB has new rows
             after = db.execute(text(
-                "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1"
+                "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active"
             ), {"uid": uid}).scalar()
             assert after > before
 
@@ -709,13 +772,13 @@ class TestAdminStatsAccuracy:
         data = r.json()
 
         actual_mem = db.execute(text(
-            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1"
+            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active"
         ), {"uid": uid}).scalar()
         actual_snap = db.execute(text(
             "SELECT COUNT(*) FROM mem_snapshot_registry WHERE user_id = :uid"
         ), {"uid": uid}).scalar()
         actual_keys = db.execute(text(
-            "SELECT COUNT(*) FROM auth_api_keys WHERE user_id = :uid AND is_active = 1"
+            "SELECT COUNT(*) FROM auth_api_keys WHERE user_id = :uid AND is_active"
         ), {"uid": uid}).scalar()
 
         assert data["memory_count"] == actual_mem
@@ -826,7 +889,7 @@ class TestBoundaryValues:
         assert r.status_code == 201
         assert len(r.json()) == 50
         count = db.execute(text(
-            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active = 1 AND content LIKE 'bulk_%'"
+            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active AND content LIKE 'bulk_%'"
         ), {"uid": uid}).scalar()
         assert count == 50
 
@@ -999,7 +1062,7 @@ class TestGovernanceWithData:
             }, headers=h)
 
         before = db.execute(text(
-            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND memory_type = 'tool_result' AND is_active = 1"
+            "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND memory_type = 'tool_result' AND is_active"
         ), {"uid": uid}).scalar()
         assert before == 3
 
@@ -1088,3 +1151,58 @@ class TestGovernanceHeartbeat:
         )).first()
         assert row is not None
         assert row[0] >= original_exp, "Heartbeat should have extended the expiry"
+
+
+# ── Profile Stats & Snapshot Diff ─────────────────────────────────────
+
+class TestProfileStats:
+    def test_profile_includes_stats(self, client):
+        uid, h, _ = _make_user(client)
+        client.post("/v1/memories", json={"content": "semantic fact"}, headers=h)
+        client.post("/v1/memories", json={"content": "proc fact", "memory_type": "procedural"}, headers=h)
+
+        r = client.get("/v1/profiles/me", headers=h)
+        assert r.status_code == 200
+        d = r.json()
+        assert "stats" in d
+        stats = d["stats"]
+        assert stats["total"] == 2
+        assert "semantic" in str(stats["by_type"])
+        assert "procedural" in str(stats["by_type"])
+        assert stats["avg_confidence"] is not None
+        assert stats["oldest"] is not None
+        assert stats["newest"] is not None
+
+
+class TestSnapshotDiff:
+    def test_diff_shows_changes(self, client):
+        import time
+        uid, h, _ = _make_user(client)
+        client.post("/v1/memories", json={"content": "before A"}, headers=h)
+        client.post("/v1/memories", json={"content": "before B"}, headers=h)
+
+        time.sleep(0.3)
+        client.post("/v1/snapshots", json={"name": "baseline"}, headers=h)
+        time.sleep(0.3)
+
+        # Add one, delete one
+        client.post("/v1/memories", json={"content": "after C"}, headers=h)
+        items = client.get("/v1/memories", headers=h).json()["items"]
+        a_mid = next(m["memory_id"] for m in items if m["content"] == "before A")
+        client.delete(f"/v1/memories/{a_mid}", headers=h)
+
+        r = client.get("/v1/snapshots/baseline/diff", headers=h)
+        assert r.status_code == 200
+        d = r.json()
+        assert d["snapshot_count"] == 2
+        assert d["current_count"] == 2  # B + C
+        assert d["added_count"] == 1
+        assert d["removed_count"] == 1
+        assert d["unchanged_count"] == 1
+        assert any("after C" in m["content"] for m in d["added"])
+        assert any("before A" in m["content"] for m in d["removed"])
+
+    def test_diff_nonexistent_snapshot(self, client):
+        _, h, _ = _make_user(client)
+        r = client.get("/v1/snapshots/nonexistent/diff", headers=h)
+        assert r.status_code == 404
