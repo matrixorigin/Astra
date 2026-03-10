@@ -15,13 +15,15 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+from typing import Any
 
 from sqlalchemy import create_engine as _create_engine, text
 from sqlalchemy.engine import Engine
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_DIM = int(os.environ.get("EMBEDDING_DIM", "384"))
+DEFAULT_DIM = int(os.environ.get("EMBEDDING_DIM", "384"))
 
 DEFAULT_DB_URL = "mysql+pymysql://root:111@localhost:6001/trustmem"
 
@@ -213,28 +215,66 @@ def ensure_database(engine: Engine) -> None:
     root_engine.dispose()
 
 
-def ensure_tables(engine: Engine, *, dim: int | None = None) -> list[str]:
+_VECF32_RE = re.compile(r"vecf32\((\d+)\)", re.IGNORECASE)
+
+
+def _fix_embedding_dim(conn: Any, dim: int, *, force: bool = False) -> None:
+    """Warn (or ALTER) if embedding column dim doesn't match target dim.
+
+    By default only warns — ALTER is destructive when existing vector data is present.
+    Pass force=True (via ``trustmem migrate --force``) to actually ALTER.
+    """
+    for table in ("mem_memories", "memory_graph_nodes"):
+        row = conn.execute(text(
+            f"SHOW COLUMNS FROM `{table}` LIKE 'embedding'"
+        )).fetchone()
+        if row is None:
+            continue
+        col_type: str = row[1]  # e.g. "vecf32(384)"
+        m = _VECF32_RE.search(col_type)
+        if not m:
+            continue  # unrecognised column type — skip silently
+        current_dim = int(m.group(1))
+        if current_dim == dim:
+            continue
+        if force:
+            logger.info("Altering %s.embedding from %s to vecf32(%d)", table, col_type, dim)
+            conn.execute(text(
+                f"ALTER TABLE `{table}` MODIFY COLUMN `embedding` VECF32({dim}) DEFAULT NULL"
+            ))
+        else:
+            logger.warning(
+                "Embedding dim mismatch: %s.embedding is %s but EMBEDDING_DIM=%d. "
+                "Existing vector data will not be re-embedded automatically. "
+                "Run `trustmem migrate --dim %d --force` to ALTER the column "
+                "(existing embeddings will be cleared).",
+                table, col_type, dim, dim,
+            )
+
+
+def ensure_tables(engine: Engine, *, dim: int | None = None, force: bool = False) -> list[str]:
     """Create database and memory tables if they don't exist.
 
     Idempotent — uses CREATE DATABASE/TABLE IF NOT EXISTS.
+    If tables already exist but embedding dim differs, logs a warning.
+    Pass force=True to ALTER the column (existing embeddings will be cleared).
 
     Args:
         engine: SQLAlchemy engine connected to the target database.
         dim: Embedding vector dimension (default: EMBEDDING_DIM env or 384).
+        force: If True, ALTER embedding column when dim mismatches (destructive).
 
     Returns:
         List of table names that were processed (all 8 tables).
-
-    Raises:
-        Exception: If any CREATE TABLE fails (connection error, syntax error, etc.).
     """
     ensure_database(engine)
-    dim = dim or _DEFAULT_DIM
+    dim = dim or DEFAULT_DIM
     created: list[str] = []
     stmts = _ddl_statements(dim)
     with engine.connect() as conn:
         for name, ddl in zip(TABLE_NAMES, stmts):
             conn.execute(text(ddl))
             created.append(name)
+        _fix_embedding_dim(conn, dim, force=force)
         conn.commit()
     return created

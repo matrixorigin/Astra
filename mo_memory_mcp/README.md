@@ -16,13 +16,14 @@ pip install 'trust-mem-lite[local-embedding]'
 # Install from TestPyPI (pre-release testing)
 pip install --index-url https://pypi.org/simple/ --extra-index-url https://test.pypi.org/simple/ 'trust-mem-lite[local-embedding]'
 
-# Initialize (creates database, tables, MCP config, steering rules)
+# Initialize — writes MCP config and steering rules (no DB connection needed)
 trustmem init --db-url 'mysql+pymysql://root:111@localhost:6001/trustmem'
 
 # Or with default local MatrixOne (localhost:6001, database: trustmem)
 trustmem init
 
 # Restart your AI tool — done!
+# Database tables are created automatically when the MCP server starts.
 ```
 
 ## What It Does
@@ -41,15 +42,18 @@ After `trustmem init`, your AI tool will:
 ## Commands
 
 ```bash
-trustmem init           # Configure everything (tables + MCP + rules)
+trustmem init           # Write MCP config + steering rules (tables created on first MCP start)
 trustmem status         # Show configuration and rule versions
 trustmem update-rules   # Update steering rules to latest version
-trustmem migrate        # Create/update database tables only
+trustmem migrate        # Create/update database tables manually
 trustmem health         # Check remote memory service health
 trustmem governance     # Run memory cleanup and maintenance
 ```
 
 ## Embedding Options
+
+Configure embedding **before** your AI tool starts for the first time — the MCP server
+creates tables using the configured dimension, so there's no mismatch.
 
 ```bash
 # Local (default) — free, private, ~80MB model download on first use
@@ -74,3 +78,13 @@ trustmem init --embedding-provider openai \
 
 > **Note**: `--embedding-dim` must match the model's actual output dimension.
 > Common values: `all-MiniLM-L6-v2`=384, `BAAI/bge-m3`=1024, `text-embedding-ada-002`=1536.
+
+## Switching Embedding Provider
+
+If you want to switch providers after tables already exist, run `migrate --force` to
+ALTER the embedding column (this clears existing embeddings — memories are kept but
+will need to be re-embedded manually via `trustmem governance`):
+
+```bash
+trustmem migrate --dim 1536 --force
+```

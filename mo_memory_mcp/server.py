@@ -66,9 +66,10 @@ class EmbeddedBackend(MemoryBackend):
                 self._engine = create_engine(db_url, pool_pre_ping=True)
                 self._db_factory = sessionmaker(bind=self._engine)
                 # Auto-create tables on first run (idempotent).
-                from mo_memory_mcp.schema import ensure_tables
+                # Pass EMBEDDING_DIM so the dim check runs even when tables already exist.
+                from mo_memory_mcp.schema import ensure_tables, DEFAULT_DIM
                 try:
-                    ensure_tables(self._engine)
+                    ensure_tables(self._engine, dim=DEFAULT_DIM)
                 except Exception as e:
                     logger.warning("Auto-migrate failed: %s", e)
             else:

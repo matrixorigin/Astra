@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -501,8 +502,81 @@ class TestEnsureTables:
 
         mock_edb.assert_called_once_with(mock_engine)
         assert result == TABLE_NAMES
-        # 8 DDL statements executed
-        assert mock_conn.execute.call_count == 8
+        # 8 CREATE TABLE + 2 SHOW COLUMNS (mem_memories, memory_graph_nodes)
+        assert mock_conn.execute.call_count == 10
+
+
+class TestFixEmbeddingDim:
+    """Test _fix_embedding_dim: warn/ALTER when embedding column dim mismatches."""
+
+    def _make_conn(self, col_types: dict[str, str | None]) -> MagicMock:
+        """Create a mock connection where SHOW COLUMNS returns given types.
+
+        col_types maps table name → column type string (e.g. "vecf32(384)"),
+        or None if the table has no embedding column.
+        """
+        tables = ("mem_memories", "memory_graph_nodes")
+
+        def execute_side_effect(stmt: Any) -> MagicMock:
+            sql = stmt.text if hasattr(stmt, "text") else str(stmt)
+            for t in tables:
+                if f"`{t}`" in sql and "SHOW COLUMNS" in sql.upper():
+                    result = MagicMock()
+                    ct = col_types.get(t)
+                    if ct is None:
+                        result.fetchone.return_value = None
+                    else:
+                        result.fetchone.return_value = ("embedding", ct, "YES", "", None, "")
+                    return result
+            return MagicMock()  # ALTER or other statements
+
+        conn = MagicMock()
+        conn.execute.side_effect = execute_side_effect
+        return conn
+
+    def test_no_action_when_dim_matches(self) -> None:
+        from mo_memory_mcp.schema import _fix_embedding_dim
+        conn = self._make_conn({"mem_memories": "vecf32(384)", "memory_graph_nodes": "vecf32(384)"})
+        _fix_embedding_dim(conn, 384)
+        # Only 2 SHOW COLUMNS, no ALTER
+        assert conn.execute.call_count == 2
+
+    def test_skips_when_no_embedding_column(self) -> None:
+        from mo_memory_mcp.schema import _fix_embedding_dim
+        conn = self._make_conn({"mem_memories": None, "memory_graph_nodes": None})
+        _fix_embedding_dim(conn, 384)
+        assert conn.execute.call_count == 2
+
+    def test_warns_on_mismatch_without_force(self, caplog: pytest.LogCaptureFixture) -> None:
+        from mo_memory_mcp.schema import _fix_embedding_dim
+        conn = self._make_conn({"mem_memories": "vecf32(384)", "memory_graph_nodes": "vecf32(384)"})
+        with caplog.at_level(logging.WARNING, logger="mo_memory_mcp.schema"):
+            _fix_embedding_dim(conn, 1536, force=False)
+        # No ALTER executed — only SHOW COLUMNS
+        assert conn.execute.call_count == 2
+        assert "dim mismatch" in caplog.text.lower()
+        assert "trustmem migrate" in caplog.text
+
+    def test_alters_column_with_force(self) -> None:
+        from mo_memory_mcp.schema import _fix_embedding_dim
+        conn = self._make_conn({"mem_memories": "vecf32(384)", "memory_graph_nodes": "vecf32(384)"})
+        _fix_embedding_dim(conn, 1536, force=True)
+        # 2 SHOW COLUMNS + 2 ALTER TABLE
+        assert conn.execute.call_count == 4
+        alter_calls = [
+            c for c in conn.execute.call_args_list
+            if hasattr(c[0][0], "text") and "ALTER" in c[0][0].text
+        ]
+        assert len(alter_calls) == 2
+        for call in alter_calls:
+            assert "VECF32(1536)" in call[0][0].text
+
+    def test_mixed_tables_one_matches_one_mismatches(self) -> None:
+        from mo_memory_mcp.schema import _fix_embedding_dim
+        conn = self._make_conn({"mem_memories": "vecf32(1536)", "memory_graph_nodes": "vecf32(384)"})
+        _fix_embedding_dim(conn, 1536, force=True)
+        # 2 SHOW COLUMNS + 1 ALTER (only memory_graph_nodes mismatches)
+        assert conn.execute.call_count == 3
 
 
 # ── CLI: effective_db_url written to MCP config ───────────────────────

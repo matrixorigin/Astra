@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from core.db_consumer import DbFactory
 
-_VERSION = "0.2.4"
+_VERSION = "0.2.5"
 _PRODUCT = "TrustMem Lite"
 _MCP_SERVER_KEY = "trustmem-lite"
 
@@ -228,13 +228,13 @@ def _resolve_engine(db_url: str | None) -> tuple[Any, str]:
     return create_engine(DEFAULT_DB_URL, pool_pre_ping=True), f"{DEFAULT_DB_URL} (default)"
 
 
-def _create_tables(engine: Any, *, dim: int | None = None) -> list[str]:
+def _create_tables(engine: Any, *, dim: int | None = None, force: bool = False) -> list[str]:
     """Create memory tables using self-contained DDL (no core/ dependency).
 
     Returns list of table names created.
     """
     from mo_memory_mcp.schema import ensure_tables
-    return ensure_tables(engine, dim=dim)
+    return ensure_tables(engine, dim=dim, force=force)
 
 
 def _test_connection(engine: Any) -> bool:
@@ -295,30 +295,20 @@ def cmd_init(args: argparse.Namespace) -> None:
             print("   trustmem init --embedding-provider openai --embedding-api-key sk-...")
         print()
 
-    # ── Step 1: Create memory tables ──────────────────────────────
+    # ── Step 1: Write MCP configs + steering rules ────────────────
     effective_db_url = db_url
-    if mode == "remote":
-        print("⏭️  Remote mode — tables managed by the memory service.")
-    else:
-        engine, src = _resolve_engine(db_url)
+    if mode != "remote" and not db_url:
+        # Resolve the default DB URL so it gets written into MCP config explicitly.
+        # Tables are NOT created here — MCP server creates them on first start
+        # using the EMBEDDING_DIM env var set in the config, so dim is always correct.
+        engine, _src = _resolve_engine(None)
+        effective_db_url = engine.url.render_as_string(hide_password=False)
+        # Non-fatal connectivity check — warn early if DB is unreachable.
         if not _test_connection(engine):
-            sys.exit(1)
-        dim = int(embed_opts.get("dim", "384")) if embed_opts.get("dim") else None
-        try:
-            tables = _create_tables(engine, dim=dim)
-            print(f"✅ Memory tables ready ({len(tables)} tables)")
-        except Exception as e:
-            print(f"❌ Failed to create tables: {e}")
+            print("⚠️  Database not reachable — tables will be created when it becomes available.")
             print()
-            print("  You can retry with: trustmem migrate --db-url '...'")
-            sys.exit(1)
-        if not db_url:
-            # Resolved from env/project/default — write the actual URL to MCP config
-            # so the server connects to the same DB.
-            effective_db_url = engine.url.render_as_string(hide_password=False)
-    print()
+        engine.dispose()
 
-    # ── Step 2: Write MCP configs + steering rules ────────────────
     writers = {"kiro": _write_kiro, "cursor": _write_cursor, "claude": _write_claude}
     for tool_name in detected:
         print(f"Configuring {tool_name}:")
@@ -328,6 +318,11 @@ def cmd_init(args: argparse.Namespace) -> None:
         print()
 
     print("Done! Restart your AI tools to pick up the new MCP config.")
+    print()
+    print("Memory tables will be created automatically when the MCP server starts.")
+    print("To change embedding provider before first use, edit the MCP config and")
+    print("update EMBEDDING_PROVIDER / EMBEDDING_DIM, then restart your AI tool.")
+    print("Or run manually: trustmem migrate --db-url '...' --dim <dim>")
     if mode == "stdio" and not db_url:
         print("\nTip: pass --db-url to connect to a specific database:")
         print("  trustmem init --db-url 'mysql+pymysql://user:pass@host:6001/db'")
@@ -462,8 +457,9 @@ def cmd_migrate(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     dim = int(args.dim) if getattr(args, "dim", None) else None
+    force = getattr(args, "force", False)
     try:
-        tables = _create_tables(engine, dim=dim)
+        tables = _create_tables(engine, dim=dim, force=force)
     except Exception as e:
         print(f"❌ Failed to create tables: {e}")
         sys.exit(1)
@@ -580,6 +576,8 @@ def main() -> None:
     p_migrate = sub.add_parser("migrate", help="Create memory tables in the database")
     p_migrate.add_argument("--db-url", help="Database URL (or set TRUSTMEM_DB_URL)")
     p_migrate.add_argument("--dim", help="Embedding vector dimension (default: 384)")
+    p_migrate.add_argument("--force", action="store_true",
+                           help="ALTER embedding column if dim mismatches (clears existing embeddings)")
 
     p_health = sub.add_parser("health", help="Check memory service health")
     p_health.add_argument("--api-url", default="http://localhost:8100", help="Memory service URL")
