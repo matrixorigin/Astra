@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 FILES = [
     ("pyproject.trustmem.toml", r'(version\s*=\s*")([^"]+)(")'),
     ("mo_memory_mcp/__init__.py", r'(__version__\s*=\s*")([^"]+)(")'),
+    ("cli/mo_memory_cli.py", r'(_VERSION\s*=\s*")([^"]+)(")'),
     ("mo_memory_mcp/templates/kiro_steering.md", r'(trustmem-version:\s*)(\S+)()'),
     ("mo_memory_mcp/templates/claude_rule.md", r'(trustmem-version:\s*)(\S+)()'),
     ("mo_memory_mcp/templates/cursor_rule.md", r'(trustmem-version:\s*)(\S+)()'),
