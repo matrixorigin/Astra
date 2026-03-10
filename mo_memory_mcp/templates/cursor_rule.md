@@ -1,4 +1,4 @@
-<!-- trustmem-version: 0.2.1 -->
+<!-- trustmem-version: 0.2.2 -->
 # Memory Integration (TrustMem Lite)
 
 You have access to a shared memory service via MCP tools (TrustMem Lite — local single-user mode).
