@@ -407,6 +407,32 @@ class TestCmdHealth:
         assert "❌ Cannot reach memory service" in out
 
 
+class TestCmdMigrate:
+    """Test cmd_migrate passes force and dim to _create_tables."""
+
+    def test_force_passed_to_create_tables(self) -> None:
+        from cli.mo_memory_cli import cmd_migrate
+        args = argparse.Namespace(db_url=None, dim="1536", force=True)
+        with patch("cli.mo_memory_cli._resolve_engine", return_value=(MagicMock(), "d")), \
+             patch("cli.mo_memory_cli._test_connection", return_value=True), \
+             patch("cli.mo_memory_cli._create_tables", return_value=["t"] * 8) as mock_ct:
+            cmd_migrate(args)
+        mock_ct.assert_called_once()
+        _, kwargs = mock_ct.call_args
+        assert kwargs["dim"] == 1536
+        assert kwargs["force"] is True
+
+    def test_default_force_is_false(self) -> None:
+        from cli.mo_memory_cli import cmd_migrate
+        args = argparse.Namespace(db_url=None, dim=None, force=False)
+        with patch("cli.mo_memory_cli._resolve_engine", return_value=(MagicMock(), "d")), \
+             patch("cli.mo_memory_cli._test_connection", return_value=True), \
+             patch("cli.mo_memory_cli._create_tables", return_value=["t"] * 8) as mock_ct:
+            cmd_migrate(args)
+        _, kwargs = mock_ct.call_args
+        assert kwargs["force"] is False
+
+
 # ── Argument parsing via main() ───────────────────────────────────────
 
 
@@ -445,6 +471,21 @@ class TestMain:
              patch("cli.mo_memory_cli.cmd_health") as mock_cmd:
             main()
         assert mock_cmd.call_args[0][0].api_url == "http://x:9000"
+
+    def test_migrate_force_flag(self) -> None:
+        with patch("sys.argv", ["trustmem", "migrate", "--force", "--dim", "1536"]), \
+             patch("cli.mo_memory_cli.cmd_migrate") as mock_cmd:
+            main()
+        args = mock_cmd.call_args[0][0]
+        assert args.force is True
+        assert args.dim == "1536"
+
+    def test_migrate_default_no_force(self) -> None:
+        with patch("sys.argv", ["trustmem", "migrate"]), \
+             patch("cli.mo_memory_cli.cmd_migrate") as mock_cmd:
+            main()
+        args = mock_cmd.call_args[0][0]
+        assert args.force is False
 
 
 # ── Schema: ensure_database + ensure_tables ───────────────────────────
@@ -596,10 +637,12 @@ class TestCmdInitEffectiveDbUrl:
                 "mysql+pymysql://root:111@localhost:6001/trustmem"
             )
 
+            # cmd_init no longer creates tables — only resolves URL and writes config.
+            # _test_connection is called for a non-fatal warning; _create_tables must NOT be called.
             with patch("cli.mo_memory_cli._resolve_engine",
-                       return_value=(mock_engine, "default")) as mock_re, \
+                       return_value=(mock_engine, "default")), \
                  patch("cli.mo_memory_cli._test_connection", return_value=True), \
-                 patch("cli.mo_memory_cli._create_tables", return_value=["t"] * 8), \
+                 patch("cli.mo_memory_cli._create_tables") as mock_ct, \
                  patch("cli.mo_memory_cli._get_kiro_steering", return_value="# rule"):
                 from cli.mo_memory_cli import cmd_init
                 args = argparse.Namespace(
@@ -609,6 +652,7 @@ class TestCmdInitEffectiveDbUrl:
                     embedding_base_url=None,
                 )
                 cmd_init(args)
+                mock_ct.assert_not_called()
 
             mcp_file = kiro_dir / "settings" / "mcp.json"
             config = json.loads(mcp_file.read_text())
@@ -616,17 +660,15 @@ class TestCmdInitEffectiveDbUrl:
             assert env.get("TRUSTMEM_DB_URL") == "mysql+pymysql://root:111@localhost:6001/trustmem"
 
     def test_explicit_db_url_written_to_mcp_config(self) -> None:
-        """When --db-url is given, it's written directly (no render_as_string)."""
+        """When --db-url is given, it's written directly (no resolve, no connection test)."""
         with tempfile.TemporaryDirectory() as d:
             kiro_dir = Path(d) / ".kiro"
             kiro_dir.mkdir()
 
-            mock_engine = MagicMock()
-
-            with patch("cli.mo_memory_cli._resolve_engine",
-                       return_value=(mock_engine, "explicit")) as mock_re, \
-                 patch("cli.mo_memory_cli._test_connection", return_value=True), \
-                 patch("cli.mo_memory_cli._create_tables", return_value=["t"] * 8), \
+            # When db_url is explicit, _resolve_engine and _test_connection are NOT called.
+            with patch("cli.mo_memory_cli._resolve_engine") as mock_re, \
+                 patch("cli.mo_memory_cli._test_connection") as mock_tc, \
+                 patch("cli.mo_memory_cli._create_tables") as mock_ct, \
                  patch("cli.mo_memory_cli._get_kiro_steering", return_value="# rule"):
                 from cli.mo_memory_cli import cmd_init
                 args = argparse.Namespace(
@@ -637,6 +679,9 @@ class TestCmdInitEffectiveDbUrl:
                     embedding_base_url=None,
                 )
                 cmd_init(args)
+                mock_re.assert_not_called()
+                mock_tc.assert_not_called()
+                mock_ct.assert_not_called()
 
             mcp_file = kiro_dir / "settings" / "mcp.json"
             config = json.loads(mcp_file.read_text())
@@ -657,7 +702,6 @@ class TestCmdInitEffectiveDbUrl:
             with patch("cli.mo_memory_cli._resolve_engine",
                        return_value=(mock_engine, "default")), \
                  patch("cli.mo_memory_cli._test_connection", return_value=True), \
-                 patch("cli.mo_memory_cli._create_tables", return_value=["t"] * 8), \
                  patch("cli.mo_memory_cli._get_kiro_steering", return_value="# rule"):
                 from cli.mo_memory_cli import cmd_init
                 args = argparse.Namespace(
@@ -700,7 +744,6 @@ class TestCmdInitEmbeddingCheck:
 
             with patch("cli.mo_memory_cli._resolve_engine", return_value=(mock_engine, "d")), \
                  patch("cli.mo_memory_cli._test_connection", return_value=True), \
-                 patch("cli.mo_memory_cli._create_tables", return_value=["t"] * 8), \
                  patch("cli.mo_memory_cli._get_kiro_steering", return_value="# rule"):
                 from cli.mo_memory_cli import cmd_init
                 args = argparse.Namespace(
