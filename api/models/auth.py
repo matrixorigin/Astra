@@ -71,3 +71,18 @@ class Token(Base):
     created_at = Column(DateTime6, default=func.now())
     expires_at = Column(DateTime6, nullable=True)
     token_metadata = Column("metadata", JSON)
+
+
+class ApiKey(Base):
+    """API key for programmatic access (SaaS mode)."""
+
+    __tablename__ = "auth_api_keys"
+    key_id = Column(String(36), primary_key=True)
+    user_id = Column(String(36), nullable=False, index=True)
+    key_hash = Column(String(255), nullable=False, unique=True)
+    key_prefix = Column(String(12), nullable=False, index=True)
+    name = Column(String(100), nullable=False)
+    is_active = Column(SmallInteger, default=1, server_default="1", nullable=False)
+    created_at = Column(DateTime6, default=func.now(), nullable=False)
+    expires_at = Column(DateTime6, nullable=True)
+    last_used_at = Column(DateTime6, nullable=True)

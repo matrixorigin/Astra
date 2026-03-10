@@ -10,10 +10,20 @@ __all__ = [
     "MockProvider",
     "OpenAIProvider",
     "get_embedding_client",
+    "set_embedding_client",
 ]
 
 # Process-wide singleton — created once, reused everywhere.
 _shared_client: EmbeddingClient | None = None
+
+
+def set_embedding_client(client: EmbeddingClient) -> None:
+    """Pre-inject a shared EmbeddingClient (e.g. from TrustMem config).
+
+    Must be called before any get_embedding_client() call.
+    """
+    global _shared_client
+    _shared_client = client
 
 
 def get_embedding_client() -> EmbeddingClient:

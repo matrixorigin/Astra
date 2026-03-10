@@ -78,8 +78,15 @@ class GovernanceTaskRunner:
     - Multiple workers/instances safe — only one wins per cycle
     """
 
-    def __init__(self, db_context_factory: Callable):
+    def __init__(
+        self,
+        db_context_factory: Callable,
+        db_factory: Callable | None = None,
+        memory_only: bool = False,
+    ):
         self._db_ctx = db_context_factory
+        self._db_factory = db_factory
+        self._memory_only = memory_only
         self._instance_id = f"{socket.gethostname()}:{os.getpid()}"
 
     def run(self, task_name: str) -> dict[str, int] | None:
@@ -101,11 +108,11 @@ class GovernanceTaskRunner:
             hb.start()
 
             try:
-                # SessionLocal (raw factory → Session) rather than self._db_ctx
-                # (context-manager factory) because phases need db_factory() → Session
-                # with caller-managed close(), not `with db_ctx() as db:`.
-                from api.database import SessionLocal
-                result = self._dispatch(task_name, db, SessionLocal)
+                db_factory = self._db_factory
+                if db_factory is None:
+                    from api.database import SessionLocal
+                    db_factory = SessionLocal
+                result = self._dispatch(task_name, db, db_factory, self._memory_only)
                 self._persist_run(db, task_name, result)
                 logger.info(f"Governance [{task_name}]: {result}")
                 return result
@@ -121,30 +128,34 @@ class GovernanceTaskRunner:
     # ── Task dispatch ──────────────────────────────────────────
 
     @staticmethod
-    def _dispatch(task_name: str, db: Session, db_factory: Callable) -> dict[str, int]:
+    def _dispatch(task_name: str, db: Session, db_factory: Callable, memory_only: bool = False) -> dict[str, int]:
         """Route task_name to the appropriate executor.
 
-        Runs both:
+        Runs both (unless memory_only=True):
         - MemoryGovernanceEngine (sk_knowledge_entries governance)
-        - GovernanceScheduler (memories table governance)
+        - MemoryService (mem_memories table governance)
 
         Args:
             db: Lock-holding session (for MemoryGovernanceEngine tasks).
             db_factory: Factory for independent sessions.
+            memory_only: Skip knowledge/eval tasks (for standalone memory services).
         """
         if task_name == "eval_daily":
+            if memory_only:
+                return {}
             return GovernanceTaskRunner._run_eval_daily(db_factory)
 
         results: dict[str, int] = {}
 
-        # 1. Knowledge entries governance (lifecycle.py)
-        try:
-            from core.context.lifecycle import MemoryGovernanceEngine
-            engine = MemoryGovernanceEngine(db_factory)
-            ke_results = getattr(engine, f"run_{task_name}_tasks")()
-            results.update(ke_results)
-        except Exception as e:
-            logger.error("Knowledge governance [%s] failed: %s", task_name, e)
+        # 1. Knowledge entries governance (lifecycle.py) — skip in memory_only mode
+        if not memory_only:
+            try:
+                from core.context.lifecycle import MemoryGovernanceEngine
+                engine = MemoryGovernanceEngine(db_factory)
+                ke_results = getattr(engine, f"run_{task_name}_tasks")()
+                results.update(ke_results)
+            except Exception as e:
+                logger.error("Knowledge governance [%s] failed: %s", task_name, e)
 
         # 2. Memories table governance (via MemoryService facade)
         try:
