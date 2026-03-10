@@ -589,3 +589,37 @@ format-check:
 .PHONY: ci
 ci: dev-deps-up dev-deps-wait check test dev-deps-down
 	@echo "✅ All CI checks passed!"
+
+# ── TrustMem Lite publish ─────────────────────────────────────────────
+
+BUMP ?= patch
+.PHONY: bump-trustmem-version
+bump-trustmem-version:
+	@python scripts/bump_trustmem_version.py $(BUMP)
+
+TRUSTMEM_DIST = dist/trustmem
+
+.PHONY: build-trustmem
+build-trustmem:
+	@echo "Building trust-mem-lite..."
+	@rm -rf $(TRUSTMEM_DIST)
+	@mkdir -p $(TRUSTMEM_DIST)
+	@cp pyproject.toml pyproject.toml.bak
+	@cp pyproject.trustmem.toml pyproject.toml
+	@python -m build --wheel --outdir $(TRUSTMEM_DIST)
+	@mv pyproject.toml.bak pyproject.toml
+	@echo "✅ Built: $$(ls $(TRUSTMEM_DIST)/*.whl)"
+
+.PHONY: publish-trustmem
+publish-trustmem: build-trustmem
+	@echo "Publishing trust-mem-lite to PyPI..."
+	@pip install --quiet twine 2>/dev/null || true
+	@twine upload $(TRUSTMEM_DIST)/*
+	@echo "✅ Published trust-mem-lite to PyPI"
+
+.PHONY: publish-trustmem-test
+publish-trustmem-test: build-trustmem
+	@echo "Publishing trust-mem-lite to TestPyPI..."
+	@pip install --quiet twine 2>/dev/null || true
+	@twine upload --repository testpypi $(TRUSTMEM_DIST)/*
+	@echo "✅ Published trust-mem-lite to TestPyPI"

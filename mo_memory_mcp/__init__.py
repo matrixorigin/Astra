@@ -1,9 +1,15 @@
-"""mo-memory MCP server — expose memory tools to Kiro, Cursor, Claude Code.
+"""TrustMem Lite — persistent memory for AI coding tools (Kiro, Cursor, Claude Code).
 
-Two modes:
-    # Local (embedded, stdio) — talks directly to DB
-    python -m mo_memory_mcp
+Install::
 
-    # Remote (HTTP) — proxies to memory service API
-    python -m mo_memory_mcp --api-url http://localhost:8100
+    pip install trust-mem-lite
+
+Quick start::
+
+    trustmem init --db-url 'mysql+pymysql://root:111@localhost:6001/mydb'
+
+For the full multi-user version with auth, see: trustmem (coming soon).
 """
+
+__version__ = "0.2.0"
+PRODUCT_NAME = "TrustMem Lite"

@@ -1,0 +1,240 @@
+"""Self-contained DDL for TrustMem Lite memory tables.
+
+No dependency on core/ or api/ — works in standalone pip-install mode.
+The embedding dimension is configurable via ``EMBEDDING_DIM`` env var
+(default 384, matching all-MiniLM-L6-v2).
+
+Usage::
+
+    from mo_memory_mcp.schema import ensure_tables
+    ensure_tables(engine)          # idempotent, skips existing tables
+    ensure_tables(engine, dim=768) # override embedding dimension
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+
+from sqlalchemy import create_engine as _create_engine, text
+from sqlalchemy.engine import Engine
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_DIM = int(os.environ.get("EMBEDDING_DIM", "384"))
+
+DEFAULT_DB_URL = "mysql+pymysql://root:111@localhost:6001/trustmem"
+
+# Table names in dependency order (no FK between them, but order is stable).
+TABLE_NAMES = [
+    "mem_branches",
+    "mem_edit_log",
+    "mem_experiments",
+    "mem_memories",
+    "mem_user_memory_config",
+    "mem_user_state",
+    "memory_graph_edges",
+    "memory_graph_nodes",
+]
+
+
+def _ddl_statements(dim: int) -> list[str]:
+    """Return CREATE TABLE IF NOT EXISTS statements for all memory tables."""
+    return [
+        # ── mem_branches ──────────────────────────────────────────
+        """
+        CREATE TABLE IF NOT EXISTS `mem_branches` (
+          `branch_id`     VARCHAR(36)  NOT NULL,
+          `user_id`       VARCHAR(64)  NOT NULL,
+          `name`          VARCHAR(100) NOT NULL,
+          `branch_db`     VARCHAR(64)  NOT NULL,
+          `base_snapshot` VARCHAR(128) DEFAULT NULL,
+          `status`        VARCHAR(20)  NOT NULL DEFAULT 'active',
+          `created_at`    DATETIME(6)  NOT NULL DEFAULT NOW(),
+          `updated_at`    DATETIME(6)  DEFAULT NULL,
+          PRIMARY KEY (`branch_id`),
+          KEY `idx_branch_user` (`user_id`),
+          KEY `idx_branch_user_status` (`user_id`, `status`),
+          UNIQUE KEY `idx_branch_user_name` (`user_id`, `name`)
+        )
+        """,
+        # ── mem_edit_log ──────────────────────────────────────────
+        """
+        CREATE TABLE IF NOT EXISTS `mem_edit_log` (
+          `edit_id`         VARCHAR(36)  NOT NULL,
+          `user_id`         VARCHAR(64)  NOT NULL,
+          `operation`       VARCHAR(20)  NOT NULL,
+          `target_ids`      JSON         DEFAULT NULL,
+          `reason`          TEXT         DEFAULT NULL,
+          `snapshot_before` VARCHAR(64)  DEFAULT NULL,
+          `created_at`      DATETIME(6)  NOT NULL DEFAULT NOW(),
+          `created_by`      VARCHAR(64)  NOT NULL,
+          PRIMARY KEY (`edit_id`),
+          KEY `idx_edit_operation` (`operation`),
+          KEY `idx_edit_user` (`user_id`)
+        )
+        """,
+        # ── mem_experiments ───────────────────────────────────────
+        """
+        CREATE TABLE IF NOT EXISTS `mem_experiments` (
+          `experiment_id` VARCHAR(36)  NOT NULL,
+          `user_id`       VARCHAR(64)  NOT NULL,
+          `name`          VARCHAR(100) NOT NULL,
+          `description`   TEXT         DEFAULT NULL,
+          `status`        VARCHAR(20)  NOT NULL DEFAULT 'active',
+          `branch_db`     VARCHAR(64)  NOT NULL,
+          `base_snapshot` VARCHAR(64)  DEFAULT NULL,
+          `strategy_key`  VARCHAR(32)  DEFAULT NULL,
+          `params_json`   JSON         DEFAULT NULL,
+          `metrics_json`  JSON         DEFAULT NULL,
+          `created_at`    DATETIME(6)  NOT NULL DEFAULT NOW(),
+          `committed_at`  DATETIME(6)  DEFAULT NULL,
+          `expires_at`    DATETIME(6)  DEFAULT NULL,
+          `created_by`    VARCHAR(64)  NOT NULL,
+          PRIMARY KEY (`experiment_id`),
+          KEY `idx_exp_user` (`user_id`),
+          KEY `idx_exp_status` (`status`),
+          KEY `idx_exp_user_status` (`user_id`, `status`),
+          KEY `idx_exp_status_expires` (`status`, `expires_at`)
+        )
+        """,
+        # ── mem_memories ──────────────────────────────────────────
+        f"""
+        CREATE TABLE IF NOT EXISTS `mem_memories` (
+          `memory_id`          VARCHAR(64)  NOT NULL,
+          `user_id`            VARCHAR(64)  NOT NULL,
+          `session_id`         VARCHAR(64)  DEFAULT NULL,
+          `memory_type`        VARCHAR(20)  NOT NULL,
+          `content`            TEXT         NOT NULL,
+          `initial_confidence` FLOAT        NOT NULL,
+          `trust_tier`         VARCHAR(10)  DEFAULT NULL,
+          `embedding`          VECF32({dim}) DEFAULT NULL,
+          `source_event_ids`   JSON         NOT NULL,
+          `superseded_by`      VARCHAR(64)  DEFAULT NULL,
+          `is_active`          SMALLINT     NOT NULL DEFAULT 1,
+          `observed_at`        DATETIME(6)  NOT NULL,
+          `created_at`         DATETIME(6)  NOT NULL,
+          `updated_at`         DATETIME(6)  DEFAULT NULL,
+          PRIMARY KEY (`memory_id`),
+          KEY `idx_memory_user_type_active` (`user_id`, `memory_type`, `is_active`),
+          KEY `idx_memory_user_active` (`user_id`, `is_active`),
+          KEY `idx_memory_user_session` (`user_id`, `session_id`),
+          KEY `idx_memory_observed_at` (`observed_at`),
+          KEY `idx_memory_superseded_by` (`superseded_by`),
+          KEY `idx_memory_user_active_type_observed` (`user_id`, `is_active`, `memory_type`, `observed_at`),
+          FULLTEXT `ft_memory_content`(`content`) WITH PARSER ngram
+        )
+        """,
+        # ── mem_user_memory_config ────────────────────────────────
+        """
+        CREATE TABLE IF NOT EXISTS `mem_user_memory_config` (
+          `user_id`            VARCHAR(64)  NOT NULL,
+          `strategy_key`       VARCHAR(32)  NOT NULL DEFAULT 'vector:v1',
+          `params_json`        JSON         DEFAULT NULL,
+          `migrated_from`      VARCHAR(32)  DEFAULT NULL,
+          `migration_snapshot` VARCHAR(64)  DEFAULT NULL,
+          `index_status`       VARCHAR(20)  NOT NULL DEFAULT 'ready',
+          `created_at`         DATETIME(6)  NOT NULL DEFAULT NOW(),
+          `updated_at`         DATETIME(6)  DEFAULT NOW(),
+          PRIMARY KEY (`user_id`)
+        )
+        """,
+        # ── mem_user_state ────────────────────────────────────────
+        """
+        CREATE TABLE IF NOT EXISTS `mem_user_state` (
+          `user_id`       VARCHAR(64)  NOT NULL,
+          `active_branch` VARCHAR(100) NOT NULL DEFAULT 'main',
+          `updated_at`    DATETIME(6)  NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (`user_id`)
+        )
+        """,
+        # ── memory_graph_edges ────────────────────────────────────
+        """
+        CREATE TABLE IF NOT EXISTS `memory_graph_edges` (
+          `source_id`  VARCHAR(32)  NOT NULL,
+          `target_id`  VARCHAR(32)  NOT NULL,
+          `edge_type`  VARCHAR(15)  NOT NULL,
+          `weight`     FLOAT        NOT NULL,
+          `user_id`    VARCHAR(64)  NOT NULL,
+          PRIMARY KEY (`source_id`, `target_id`, `edge_type`),
+          KEY `idx_edge_user` (`user_id`),
+          KEY `idx_edge_target` (`target_id`)
+        )
+        """,
+        # ── memory_graph_nodes ────────────────────────────────────
+        f"""
+        CREATE TABLE IF NOT EXISTS `memory_graph_nodes` (
+          `node_id`             VARCHAR(32)  NOT NULL,
+          `user_id`             VARCHAR(64)  NOT NULL,
+          `node_type`           VARCHAR(10)  NOT NULL,
+          `content`             TEXT         NOT NULL,
+          `embedding`           VECF32({dim}) DEFAULT NULL,
+          `event_id`            VARCHAR(32)  DEFAULT NULL,
+          `memory_id`           VARCHAR(64)  DEFAULT NULL,
+          `session_id`          VARCHAR(64)  DEFAULT NULL,
+          `confidence`          FLOAT        DEFAULT NULL,
+          `trust_tier`          VARCHAR(4)   DEFAULT NULL,
+          `importance`          FLOAT        NOT NULL,
+          `source_nodes`        TEXT         DEFAULT NULL,
+          `conflicts_with`      VARCHAR(32)  DEFAULT NULL,
+          `conflict_resolution` VARCHAR(10)  DEFAULT NULL,
+          `access_count`        INT          DEFAULT NULL,
+          `cross_session_count` INT          DEFAULT NULL,
+          `is_active`           SMALLINT     NOT NULL DEFAULT 1,
+          `superseded_by`       VARCHAR(32)  DEFAULT NULL,
+          `created_at`          DATETIME(6)  NOT NULL,
+          PRIMARY KEY (`node_id`),
+          KEY `idx_graph_event` (`event_id`),
+          KEY `idx_graph_memory` (`memory_id`),
+          KEY `idx_graph_conflicts` (`user_id`, `conflicts_with`),
+          KEY `idx_graph_user_active` (`user_id`, `is_active`, `node_type`),
+          FULLTEXT `ft_graph_content`(`content`) WITH PARSER ngram
+        )
+        """,
+    ]
+
+
+def ensure_database(engine: Engine) -> None:
+    """Create the target database if it doesn't exist.
+
+    Connects without a database to execute CREATE DATABASE IF NOT EXISTS,
+    then verifies the original engine can connect.
+    """
+    url = engine.url
+    db_name = url.database
+    if not db_name:
+        return
+    # Connect without specifying a database.
+    root_url = url.set(database="")
+    root_engine = _create_engine(root_url, pool_pre_ping=True)
+    with root_engine.connect() as conn:
+        conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{db_name}`"))
+        conn.commit()
+    root_engine.dispose()
+
+
+def ensure_tables(engine: Engine, *, dim: int | None = None) -> list[str]:
+    """Create database and memory tables if they don't exist.
+
+    Idempotent — uses CREATE DATABASE/TABLE IF NOT EXISTS.
+
+    Args:
+        engine: SQLAlchemy engine connected to the target database.
+        dim: Embedding vector dimension (default: EMBEDDING_DIM env or 384).
+
+    Returns:
+        List of table names that were processed (all 8 tables).
+
+    Raises:
+        Exception: If any CREATE TABLE fails (connection error, syntax error, etc.).
+    """
+    ensure_database(engine)
+    dim = dim or _DEFAULT_DIM
+    created: list[str] = []
+    stmts = _ddl_statements(dim)
+    with engine.connect() as conn:
+        for name, ddl in zip(TABLE_NAMES, stmts):
+            conn.execute(text(ddl))
+            created.append(name)
+        conn.commit()
+    return created

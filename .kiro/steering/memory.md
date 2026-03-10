@@ -2,9 +2,9 @@
 inclusion: always
 ---
 
-# Memory Integration
+# Memory Integration (TrustMem Lite)
 
-You have access to a shared memory service via MCP tools. Use it proactively:
+You have access to a shared memory service via MCP tools (TrustMem Lite — local single-user mode). Use it proactively:
 
 ## 🔴 MANDATORY: Start of every conversation
 **ALWAYS call `memory_retrieve` with the user's first message before responding.**

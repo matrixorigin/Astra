@@ -1,6 +1,7 @@
-## Memory Integration
+<!-- trustmem-version: 0.2.0 -->
+## Memory Integration (TrustMem Lite)
 
-This project uses mo-memory for shared memory across AI tools.
+This project uses TrustMem Lite for shared memory across AI tools (local single-user mode).
 MCP tools available: memory_store, memory_retrieve, memory_correct, memory_purge, memory_profile, memory_search.
 
 ### MANDATORY: Start of every conversation

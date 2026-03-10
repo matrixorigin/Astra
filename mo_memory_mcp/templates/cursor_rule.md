@@ -1,6 +1,7 @@
-# Memory Integration
+<!-- trustmem-version: 0.2.0 -->
+# Memory Integration (TrustMem Lite)
 
-You have access to a shared memory service via MCP tools (mo-memory).
+You have access to a shared memory service via MCP tools (TrustMem Lite — local single-user mode).
 
 ## MANDATORY: Start of every conversation
 **Always call `memory_retrieve` with the user's first message before responding.**

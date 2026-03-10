@@ -1,7 +1,7 @@
-"""mo-memory MCP server.
+"""TrustMem Lite — MCP server.
 
-Exposes memory_store, memory_retrieve, memory_correct, memory_purge,
-memory_profile, memory_search tools via MCP protocol.
+Exposes memory tools (store, retrieve, correct, purge, profile, search,
+snapshots, branches) via MCP protocol.
 
 Two backends:
   - EmbeddedBackend: direct DB access (local / stdio mode)
@@ -16,6 +16,8 @@ import logging
 import os
 from typing import Any, ClassVar
 
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
 from mcp.server import FastMCP
 
 logger = logging.getLogger(__name__)
@@ -61,12 +63,17 @@ class EmbeddedBackend(MemoryBackend):
         sys.stdout = sys.stderr
         try:
             if db_url:
-                from sqlalchemy import create_engine
-                from sqlalchemy.orm import sessionmaker
-                engine = create_engine(db_url, pool_pre_ping=True)
-                self._db_factory = sessionmaker(bind=engine)
+                self._engine = create_engine(db_url, pool_pre_ping=True)
+                self._db_factory = sessionmaker(bind=self._engine)
+                # Auto-create tables on first run (idempotent).
+                from mo_memory_mcp.schema import ensure_tables
+                try:
+                    ensure_tables(self._engine)
+                except Exception as e:
+                    logger.warning("Auto-migrate failed: %s", e)
             else:
                 from api.database import SessionLocal
+                self._engine = None  # dev mode: engine lives inside SessionLocal
                 self._db_factory = SessionLocal
             from core.memory.factory import create_editor, create_memory_service
         finally:
@@ -78,9 +85,20 @@ class EmbeddedBackend(MemoryBackend):
         _mo.setLevel(logging.WARNING)
 
         # Configure embedding from env vars (standalone) or project settings (dev).
-        self._embed_client = self._make_embed_client() if db_url else None
+        # Lazy: don't load the model at startup — load on first store/retrieve call.
+        # This avoids the ~3-5s sentence-transformers model load blocking MCP handshake.
+        self._embed_client = None
+        self._embed_client_initialized = False
+        self._embed_client_standalone = bool(db_url)  # only auto-init in standalone mode
         self._create_service = create_memory_service
         self._create_editor = create_editor
+        # Per-instance state — class-level dicts would be shared across
+        # instances (e.g. in tests with pytest -n auto), causing state pollution.
+        self._active_branches: dict[str, str] = {}
+        # Cache (engine, sessionmaker) per (user_id, branch_name) to reuse
+        # connection pools. Engine stored so we can dispose() on eviction.
+        self._branch_factory_cache: dict[tuple[str, str], tuple[Any, Any]] = {}
+        self._cooldown_cache: dict[tuple[str, str], tuple[float, dict]] = {}
 
     @staticmethod
     def _make_embed_client():
@@ -99,20 +117,40 @@ class EmbeddedBackend(MemoryBackend):
             logger.warning("Embedding client not available, memories won't be vectorized")
             return None
 
+    def _get_embed_client(self):
+        """Return embedding client, initializing lazily on first call."""
+        if not self._embed_client_initialized:
+            self._embed_client_initialized = True
+            if self._embed_client_standalone:
+                self._embed_client = self._make_embed_client()
+        return self._embed_client
+
     def store(self, user_id: str, content: str, memory_type: str, session_id: str | None) -> dict:
         from core.memory.types import MemoryType
 
-        editor = self._create_editor(self._db_factory, user_id=user_id, embed_client=self._embed_client)
+        db_factory = self._branch_db_factory(user_id)
+        editor = self._create_editor(db_factory, user_id=user_id, embed_client=self._get_embed_client())
         mem = editor.inject(user_id, content, memory_type=MemoryType(memory_type), source="mcp", session_id=session_id)
-        return {"memory_id": mem.memory_id, "content": mem.content}
+        return {"memory_id": mem.memory_id, "content": mem.content, "branch": self._get_active_branch(user_id)}
 
     def retrieve(self, user_id: str, query: str, top_k: int, session_id: str | None = None) -> list[dict]:
-        svc = self._create_service(self._db_factory, user_id=user_id)
-        # Pass session_id to the underlying retrieval service.
-        # The service's retrieve() method accepts session_id (default "") and uses it to prioritize
-        # memories from that session. If session_id is None, it's converted to "" by the service,
-        # which enables cross-session retrieval with include_cross_session=True.
-        memories, _ = svc.retrieve(user_id, query, top_k=top_k, session_id=session_id or "")
+        db_factory = self._branch_db_factory(user_id)
+        svc = self._create_service(db_factory, user_id=user_id)
+        # Generate query embedding for vector search (phase 2).
+        # Falls back to keyword-only (phase 1) if embed client unavailable.
+        query_embedding: list[float] | None = None
+        embed = self._get_embed_client()
+        if embed is not None:
+            try:
+                query_embedding = embed.embed(query)
+            except Exception as e:
+                logger.warning("Query embedding failed, falling back to keyword search: %s", e)
+        memories, _ = svc.retrieve(
+            user_id, query,
+            query_embedding=query_embedding,
+            top_k=top_k,
+            session_id=session_id or "",
+        )
         return [{"memory_id": m.memory_id, "content": m.content, "type": str(m.memory_type)} for m in memories]
 
     # Thresholds for health_warnings — surfaced as constants for testability.
@@ -123,7 +161,6 @@ class EmbeddedBackend(MemoryBackend):
         """Lightweight check for memory quality issues."""
         warnings: list[str] = []
         try:
-            from sqlalchemy import text
             with self._db_factory() as db:
                 row = db.execute(text(
                     "SELECT COUNT(*) as cnt FROM mem_memories "
@@ -137,19 +174,20 @@ class EmbeddedBackend(MemoryBackend):
         return warnings
 
     def correct(self, user_id: str, memory_id: str, new_content: str, reason: str) -> dict:
-        editor = self._create_editor(self._db_factory, user_id=user_id, embed_client=self._embed_client)
+        db_factory = self._branch_db_factory(user_id)
+        editor = self._create_editor(db_factory, user_id=user_id, embed_client=self._get_embed_client())
         mem = editor.correct(user_id, memory_id, new_content, reason=reason)
         return {"memory_id": mem.memory_id, "content": mem.content}
 
     def purge(self, user_id: str, memory_id: str | None, topic: str | None, reason: str) -> dict:
-        editor = self._create_editor(self._db_factory, user_id=user_id, embed_client=self._embed_client)
+        db_factory = self._branch_db_factory(user_id)
+        editor = self._create_editor(db_factory, user_id=user_id, embed_client=self._get_embed_client())
         if topic:
-            # Use SQL LIKE for precise keyword matching.  Semantic search
+            # Use SQL LIKE for precise keyword matching. Semantic search
             # (self.retrieve) would return loosely related results ranked by
             # similarity with no score threshold — too dangerous for a
             # destructive bulk operation.
-            from sqlalchemy import text
-            with self._db_factory() as db:
+            with db_factory() as db:
                 rows = db.execute(text(
                     "SELECT memory_id FROM mem_memories "
                     "WHERE user_id = :uid AND is_active = 1 "
@@ -166,15 +204,16 @@ class EmbeddedBackend(MemoryBackend):
         return {"purged": result.deactivated}
 
     def profile(self, user_id: str) -> dict:
-        svc = self._create_service(self._db_factory, user_id=user_id)
+        db_factory = self._branch_db_factory(user_id)
+        svc = self._create_service(db_factory, user_id=user_id)
         return {"user_id": user_id, "profile": svc.get_profile(user_id)}
 
     def search(self, user_id: str, query: str, top_k: int) -> list[dict]:
         return self.retrieve(user_id, query, top_k)
 
     # Cooldown: governance/consolidate/reflect are expensive, throttle per user.
-    # key = (user_id, op_name), value = (timestamp, result)
-    _cooldown_cache: ClassVar[dict[tuple[str, str], tuple[float, dict]]] = {}
+    # key = (user_id, op_name), value = (timestamp, result).
+    # Instance-level to avoid state pollution across parallel test workers.
     _COOLDOWN_SECONDS: ClassVar[dict[str, int]] = {"governance": 3600, "consolidate": 1800, "reflect": 7200}
 
     def _with_cooldown(self, user_id: str, op: str, fn: Any, force: bool = False) -> dict:
@@ -196,6 +235,9 @@ class EmbeddedBackend(MemoryBackend):
         return result
 
     def governance(self, user_id: str, force: bool = False) -> dict:
+        # Intentionally operates on main DB only. Governance (decay, quarantine,
+        # compression) is a global maintenance operation — running it on a branch
+        # would be meaningless since branches are short-lived experiments.
         def _run():
             from core.memory.tabular.governance import GovernanceScheduler
             gs = GovernanceScheduler(self._db_factory)
@@ -209,6 +251,7 @@ class EmbeddedBackend(MemoryBackend):
         return self._with_cooldown(user_id, "governance", _run, force=force)
 
     def consolidate(self, user_id: str, force: bool = False) -> dict:
+        # Main-only: graph consolidation merges/promotes nodes in the canonical store.
         def _run():
             from core.memory.graph.consolidation import GraphConsolidator
             gc = GraphConsolidator(self._db_factory)
@@ -223,6 +266,7 @@ class EmbeddedBackend(MemoryBackend):
         return self._with_cooldown(user_id, "consolidate", _run, force=force)
 
     def reflect(self, user_id: str, force: bool = False) -> dict:
+        # Main-only: reflection synthesizes scene nodes from the canonical memory store.
         def _run():
             from core.memory.graph.candidates import GraphCandidateProvider
             from core.memory.graph.service import GraphMemoryService
@@ -265,23 +309,109 @@ class EmbeddedBackend(MemoryBackend):
         return GitForData(self._db_factory)
 
     def _source_db_name(self) -> str:
+        """Return the source (main) database name, regardless of init mode."""
+        if self._engine is not None:
+            # Standalone mode: db_url was given, engine is ours.
+            return str(self._engine.url.database)
+        # Dev mode: engine lives inside SessionLocal (api.database).
         from api.database import SessionLocal
         return SessionLocal.kw["bind"].url.database
 
-    # In-memory active branch tracking per user (session-scoped, not persisted across restarts)
-    _active_branches: ClassVar[dict[str, str]] = {}
-
     def _get_active_branch(self, user_id: str) -> str:
-        """Get active branch for user. Stored in-memory for this session."""
-        return self._active_branches.get(user_id, "main")
+        """Get active branch for user. Loads from DB on first access."""
+        if user_id not in self._active_branches:
+            # Restore from DB on cold start
+            try:
+                with self._db_factory() as db:
+                    row = db.execute(text(
+                        "SELECT active_branch FROM mem_user_state "
+                        "WHERE user_id = :uid"
+                    ), {"uid": user_id}).fetchone()
+                    self._active_branches[user_id] = row.active_branch if row else "main"
+            except Exception as e:
+                logger.warning("Failed to load active branch for user=%s, defaulting to main: %s", user_id, e)
+                self._active_branches[user_id] = "main"
+        return self._active_branches[user_id]
+
+    def _evict_branch_cache(self, user_id: str, branch_name: str) -> None:
+        """Remove a branch from the factory cache and dispose its engine."""
+        entry = self._branch_factory_cache.pop((user_id, branch_name), None)
+        if entry is not None:
+            eng, _ = entry
+            try:
+                eng.dispose()
+            except Exception:
+                pass
 
     def _set_active_branch(self, user_id: str, name: str) -> None:
-        """Set active branch for user. Stored in-memory for this session."""
+        """Set active branch for user. Persisted to DB.
+
+        Also invalidates the branch factory cache for this user so the next
+        _branch_db_factory call picks up the new branch.
+        """
+        old = self._active_branches.get(user_id)
         self._active_branches[user_id] = name
+        # Invalidate cached factory for the old branch (if any)
+        if old and old != "main":
+            self._evict_branch_cache(user_id, old)
+        try:
+            with self._db_factory() as db:
+                db.execute(text(
+                    "INSERT INTO mem_user_state (user_id, active_branch, updated_at) "
+                    "VALUES (:uid, :branch, NOW()) "
+                    "ON DUPLICATE KEY UPDATE active_branch = :branch, updated_at = NOW()"
+                ), {"uid": user_id, "branch": name})
+                db.commit()
+        except Exception as e:
+            # Best-effort persist; in-memory is authoritative for this session.
+            # On next cold start the branch will revert to main if this write failed.
+            logger.warning("Failed to persist active branch for user=%s: %s", user_id, e)
+
+    def _branch_db_factory(self, user_id: str) -> Any:
+        """Return db_factory for the user's active branch. Main → original factory.
+
+        Caches the (engine, sessionmaker) per (user_id, branch_name) so that
+        repeated CRUD calls reuse the same connection pool. Engine is stored
+        so we can dispose() it when the cache entry is evicted.
+        """
+        branch = self._get_active_branch(user_id)
+        if branch == "main":
+            return self._db_factory
+
+        cache_key = (user_id, branch)
+        cached = self._branch_factory_cache.get(cache_key)
+        if cached is not None:
+            return cached[1]  # return factory from (engine, factory) tuple
+
+        # Look up branch_db name
+        with self._db_factory() as db:
+            row = db.execute(text(
+                "SELECT branch_db FROM mem_branches "
+                "WHERE user_id = :uid AND name = :name AND status = 'active'"
+            ), {"uid": user_id, "name": branch}).fetchone()
+        if not row:
+            # Branch gone (deleted externally), reset to main silently.
+            self._set_active_branch(user_id, "main")
+            return self._db_factory
+        # Derive the branch URL from the source engine URL — avoids calling
+        # Session.get_bind() which was removed in SQLAlchemy 2.0.
+        src_url = self._source_engine_url()
+        branch_url = src_url.set(database=row.branch_db)
+        eng = create_engine(branch_url, pool_pre_ping=True)
+        factory = sessionmaker(bind=eng)
+        self._branch_factory_cache[cache_key] = (eng, factory)
+        return factory
+
+    def _source_engine_url(self) -> Any:
+        """Return the SQLAlchemy URL of the source (main) engine."""
+        if self._engine is not None:
+            return self._engine.url
+        # Dev mode: engine lives inside SessionLocal.
+        from api.database import SessionLocal
+        return SessionLocal.kw["bind"].url
 
     def snapshot_create(self, user_id: str, name: str, description: str) -> dict:
         safe = self._sanitize_name(name)
-        from sqlalchemy import text
         with self._db_factory() as db:
             cnt = db.execute(text("SELECT COUNT(*) FROM mo_catalog.mo_snapshots")).scalar() or 0
         if cnt >= self.MAX_USER_SNAPSHOTS:
@@ -317,7 +447,6 @@ class EmbeddedBackend(MemoryBackend):
         if from_snapshot and from_timestamp:
             return {"error": "Specify from_snapshot or from_timestamp, not both."}
         safe = self._sanitize_name(name)
-        from sqlalchemy import text
 
         # Global branch limit (not per-user). Prevents resource exhaustion across all users.
         with self._db_factory() as db:
@@ -411,7 +540,6 @@ class EmbeddedBackend(MemoryBackend):
         return {"name": safe, "branch_db": branch_db, "branch_id": branch_id}
 
     def branch_list(self, user_id: str) -> list[dict]:
-        from sqlalchemy import text
         with self._db_factory() as db:
             rows = db.execute(text(
                 "SELECT branch_id, name, branch_db, created_at "
@@ -428,7 +556,6 @@ class EmbeddedBackend(MemoryBackend):
         if name == "main":
             self._set_active_branch(user_id, "main")
             return {"active_branch": "main"}
-        from sqlalchemy import text
         with self._db_factory() as db:
             row = db.execute(text(
                 "SELECT name FROM mem_branches WHERE user_id = :uid AND name = :name AND status = 'active'"
@@ -441,7 +568,6 @@ class EmbeddedBackend(MemoryBackend):
     def branch_delete(self, user_id: str, name: str) -> dict:
         if name == "main":
             return {"error": "Cannot delete main"}
-        from sqlalchemy import text
         with self._db_factory() as db:
             row = db.execute(text(
                 "SELECT branch_id, branch_db FROM mem_branches "
@@ -478,6 +604,8 @@ class EmbeddedBackend(MemoryBackend):
 
         if self._get_active_branch(user_id) == name:
             self._set_active_branch(user_id, "main")
+        # Evict cached factory and dispose its engine (points to dropped DB).
+        self._evict_branch_cache(user_id, name)
         return {"deleted": name}
 
     def _get_diff_rows(self, branch_db: str, src_db: str, limit: int):
@@ -487,7 +615,6 @@ class EmbeddedBackend(MemoryBackend):
         Errors are logged but don't fail the merge — we fall back to conservative merge.
         """
         from matrixone.branch_builder import diff_table_branch
-        from sqlalchemy import text
         try:
             stmt_count = diff_table_branch(f"{branch_db}.mem_memories").against(
                 f"{src_db}.mem_memories"
@@ -510,7 +637,6 @@ class EmbeddedBackend(MemoryBackend):
 
     def _resolve_branch(self, user_id: str, name: str):
         """Lookup active branch. Returns (branch_db, error_dict)."""
-        from sqlalchemy import text
         with self._db_factory() as db:
             row = db.execute(text(
                 "SELECT branch_id, branch_db FROM mem_branches "
@@ -527,7 +653,8 @@ class EmbeddedBackend(MemoryBackend):
             return None, {"error": f"Branch DB '{row.branch_db}' no longer exists"}
         return row.branch_db, None
 
-    _MAX_MERGE_CHANGES = 5000  # Safety limit: prevent accidental large merges. 5000 memories ≈ 10-30s merge time.
+    _MAX_MERGE_CHANGES: ClassVar[int] = 5000  # Safety limit: prevent accidental large merges.
+    _CONFLICT_COSINE_THRESHOLD: ClassVar[float] = 0.9  # Single source of truth for conflict detection threshold.
 
     def branch_merge(self, user_id: str, source: str, strategy: str) -> dict:
         """Merge branch into main. All SQL — no rows pulled to Python.
@@ -541,43 +668,30 @@ class EmbeddedBackend(MemoryBackend):
         - Prevents accidental merges of massive branches
         - User can split large branches into smaller ones
         """
-        from sqlalchemy import text
 
         branch_db, err = self._resolve_branch(user_id, source)
         if err:
             return err
         src_db = self._source_db_name()
 
-        # 1. Safety check — count changes first
+        # 1. Safety check — count memory diff only.
+        # total==0 does NOT mean the branch is empty: it may have graph-only changes.
+        # We never short-circuit here; graph nodes/edges are always merged below.
         total, _ = self._get_diff_rows(branch_db, src_db, limit=0)
-        if total == 0:
-            return {"merged": 0, "skipped": 0, "source": source}
         if total > self._MAX_MERGE_CHANGES:
             return {"error": f"Too many changes ({total}). Max {self._MAX_MERGE_CHANGES}. Reduce branch scope."}
 
         with self._db_factory() as db:
-            # Count new non-conflicting memories before insert
-            inserted = db.execute(text(f"""
-                SELECT COUNT(*) FROM `{branch_db}`.mem_memories b
-                WHERE b.user_id = :uid AND b.is_active = 1
-                AND NOT EXISTS (
-                    SELECT 1 FROM mem_memories m WHERE m.memory_id = b.memory_id AND m.is_active = 1
-                )
-                AND NOT EXISTS (
-                    SELECT 1 FROM mem_memories m
-                    WHERE m.user_id = :uid AND m.is_active = 1
-                    AND m.memory_type = b.memory_type
-                    AND b.embedding IS NOT NULL AND m.embedding IS NOT NULL
-                    AND cosine_similarity(m.embedding, b.embedding) > 0.9
-                )
-            """), {"uid": user_id}).scalar() or 0
-
-            # 2. Bulk INSERT non-conflicting new memories (one SQL)
-            db.execute(text(f"""
+            # 2. Bulk INSERT non-conflicting new memories (one SQL).
+            # Preserve b.memory_id so the row is idempotent across repeated merges
+            # and so mem_edit_log.target_ids references remain valid.
+            # Use result.rowcount — avoids a redundant COUNT(*) that would repeat
+            # the same expensive cosine scan.
+            insert_result = db.execute(text(f"""
                 INSERT INTO mem_memories (memory_id, user_id, content, memory_type,
                     initial_confidence, trust_tier, embedding, source_event_ids,
                     is_active, observed_at, created_at, updated_at)
-                SELECT UUID(), b.user_id, b.content, b.memory_type,
+                SELECT b.memory_id, b.user_id, b.content, b.memory_type,
                     b.initial_confidence, b.trust_tier, b.embedding, b.source_event_ids,
                     1, b.observed_at, NOW(), NOW()
                 FROM `{branch_db}`.mem_memories b
@@ -590,9 +704,10 @@ class EmbeddedBackend(MemoryBackend):
                     WHERE m.user_id = :uid AND m.is_active = 1
                     AND m.memory_type = b.memory_type
                     AND b.embedding IS NOT NULL AND m.embedding IS NOT NULL
-                    AND cosine_similarity(m.embedding, b.embedding) > 0.9
+                    AND cosine_similarity(m.embedding, b.embedding) > :threshold
                 )
-            """), {"uid": user_id})
+            """), {"uid": user_id, "threshold": self._CONFLICT_COSINE_THRESHOLD})
+            inserted = insert_result.rowcount
 
             # 3. Handle conflicts
             replaced = 0
@@ -606,10 +721,13 @@ class EmbeddedBackend(MemoryBackend):
                     WHERE m.user_id = :uid AND m.is_active = 1
                     AND m.memory_type = b.memory_type
                     AND b.embedding IS NOT NULL AND m.embedding IS NOT NULL
-                    AND cosine_similarity(m.embedding, b.embedding) > 0.9
+                    AND cosine_similarity(m.embedding, b.embedding) > :threshold
                 )
             """
-            conflict_count = db.execute(text(f"SELECT COUNT(*) {conflict_where}"), {"uid": user_id}).scalar() or 0
+            conflict_count = db.execute(
+                text(f"SELECT COUNT(*) {conflict_where}"),
+                {"uid": user_id, "threshold": self._CONFLICT_COSINE_THRESHOLD}
+            ).scalar() or 0
             if strategy == "replace" and conflict_count > 0:
                 db.execute(text(f"""
                     UPDATE mem_memories m
@@ -618,7 +736,7 @@ class EmbeddedBackend(MemoryBackend):
                         WHERE b.user_id = :uid AND b.is_active = 1
                         AND b.memory_type = m.memory_type
                         AND b.embedding IS NOT NULL
-                        AND cosine_similarity(m.embedding, b.embedding) > 0.9
+                        AND cosine_similarity(m.embedding, b.embedding) > :threshold
                         AND NOT EXISTS (SELECT 1 FROM mem_memories m2 WHERE m2.memory_id = b.memory_id AND m2.is_active = 1)
                         LIMIT 1
                     ),
@@ -627,7 +745,7 @@ class EmbeddedBackend(MemoryBackend):
                         WHERE b.user_id = :uid AND b.is_active = 1
                         AND b.memory_type = m.memory_type
                         AND b.embedding IS NOT NULL
-                        AND cosine_similarity(m.embedding, b.embedding) > 0.9
+                        AND cosine_similarity(m.embedding, b.embedding) > :threshold
                         AND NOT EXISTS (SELECT 1 FROM mem_memories m2 WHERE m2.memory_id = b.memory_id AND m2.is_active = 1)
                         LIMIT 1
                     ),
@@ -638,17 +756,101 @@ class EmbeddedBackend(MemoryBackend):
                         WHERE b.user_id = :uid AND b.is_active = 1
                         AND b.memory_type = m.memory_type
                         AND b.embedding IS NOT NULL
-                        AND cosine_similarity(m.embedding, b.embedding) > 0.9
+                        AND cosine_similarity(m.embedding, b.embedding) > :threshold
                         AND NOT EXISTS (SELECT 1 FROM mem_memories m2 WHERE m2.memory_id = b.memory_id AND m2.is_active = 1)
                     )
-                """), {"uid": user_id})
+                """), {"uid": user_id, "threshold": self._CONFLICT_COSINE_THRESHOLD})
                 replaced = conflict_count
             else:
                 skipped = conflict_count
 
+            # 4. Merge graph nodes (append only — skip existing node_ids).
+            # Use INSERT+rowcount, not COUNT+INSERT, to avoid TOCTOU and double scan.
+            node_result = db.execute(text(f"""
+                INSERT INTO memory_graph_nodes (
+                    node_id, user_id, node_type, content, embedding,
+                    event_id, memory_id, session_id,
+                    confidence, trust_tier, importance,
+                    source_nodes, conflicts_with, conflict_resolution,
+                    access_count, cross_session_count,
+                    is_active, superseded_by, created_at
+                )
+                SELECT
+                    b.node_id, b.user_id, b.node_type, b.content, b.embedding,
+                    b.event_id, b.memory_id, b.session_id,
+                    b.confidence, b.trust_tier, b.importance,
+                    b.source_nodes, b.conflicts_with, b.conflict_resolution,
+                    b.access_count, b.cross_session_count,
+                    b.is_active, b.superseded_by, b.created_at
+                FROM `{branch_db}`.memory_graph_nodes b
+                WHERE b.user_id = :uid AND b.is_active = 1
+                AND NOT EXISTS (
+                    SELECT 1 FROM memory_graph_nodes m WHERE m.node_id = b.node_id
+                )
+            """), {"uid": user_id})
+            graph_nodes_merged = node_result.rowcount
+
+            # 5. Merge graph edges (append only — skip existing src+tgt+type).
+            # Same INSERT+rowcount pattern.
+            edge_result = db.execute(text(f"""
+                INSERT INTO memory_graph_edges (
+                    source_id, target_id, edge_type, weight, user_id
+                )
+                SELECT
+                    b.source_id, b.target_id, b.edge_type, b.weight, b.user_id
+                FROM `{branch_db}`.memory_graph_edges b
+                WHERE b.user_id = :uid
+                AND NOT EXISTS (
+                    SELECT 1 FROM memory_graph_edges m
+                    WHERE m.source_id = b.source_id
+                    AND m.target_id = b.target_id
+                    AND m.edge_type = b.edge_type
+                )
+            """), {"uid": user_id})
+            graph_edges_merged = edge_result.rowcount
+
             db.commit()
 
-        return {"merged": inserted + replaced, "skipped": skipped, "source": source}
+        return {
+            "inserted": inserted,
+            "replaced": replaced,
+            "merged": inserted + replaced,  # total for backward compat
+            "skipped": skipped,
+            "graph_nodes_merged": graph_nodes_merged,
+            "graph_edges_merged": graph_edges_merged,
+            "source": source,
+        }
+
+    def _detect_conflicts(self, branch_db: str, user_id: str, memory_ids: list[str]) -> set[str]:
+        """Find branch memories that semantically conflict with main (cosine > 0.9).
+
+        Uses a single SQL query with JOIN to batch-check all candidate IDs
+        against main's active memories. Returns the subset of memory_ids that
+        have a near-duplicate in main.
+        """
+        if not memory_ids:
+            return set()
+        placeholders = ", ".join(f":id{i}" for i in range(len(memory_ids)))
+        params: dict[str, Any] = {"uid": user_id}
+        for i, mid in enumerate(memory_ids):
+            params[f"id{i}"] = mid
+        try:
+            with self._db_factory() as db:
+                rows = db.execute(text(f"""
+                    SELECT DISTINCT b.memory_id
+                    FROM `{branch_db}`.mem_memories b
+                    JOIN mem_memories m
+                      ON m.user_id = :uid AND m.is_active = 1
+                      AND m.memory_type = b.memory_type
+                      AND m.embedding IS NOT NULL
+                      AND cosine_similarity(m.embedding, b.embedding) > :threshold
+                    WHERE b.memory_id IN ({placeholders})
+                      AND b.embedding IS NOT NULL
+                """), {**params, "threshold": self._CONFLICT_COSINE_THRESHOLD}).fetchall()
+            return {r.memory_id for r in rows}
+        except Exception as e:
+            logger.warning("_detect_conflicts failed: %s", e)
+            return set()
 
     def branch_diff(self, user_id: str, source: str, limit: int = 200) -> dict:
         """Diff branch against main using SDK diff + semantic conflict detection."""
@@ -834,9 +1036,9 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
     """Create MCP server with memory tools."""
 
     server = FastMCP(
-        "mo-memory",
+        "trustmem-lite",
         instructions=(
-            "Persistent memory across conversations. "
+            "TrustMem Lite — persistent memory across conversations (local single-user mode). "
             "\n\n"
             "MANDATORY RULES:\n"
             "1. ALWAYS call memory_retrieve with the user's first message BEFORE responding.\n"
@@ -1247,7 +1449,7 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
 def main():
     import sys
 
-    parser = argparse.ArgumentParser(description="mo-memory MCP server")
+    parser = argparse.ArgumentParser(description="TrustMem Lite — MCP memory server")
     parser.add_argument("--api-url", help="Memory service API URL (remote mode)")
     parser.add_argument("--db-url", help="Database URL for embedded mode (or set MO_MEMORY_DB_URL)")
     parser.add_argument("--token", help="Auth token for remote mode")
@@ -1265,6 +1467,9 @@ def main():
         backend: MemoryBackend = HTTPBackend(args.api_url, token=args.token)
     else:
         db_url = args.db_url or os.environ.get("MO_MEMORY_DB_URL")
+        if not db_url:
+            from mo_memory_mcp.schema import DEFAULT_DB_URL
+            db_url = DEFAULT_DB_URL
         backend = EmbeddedBackend(db_url=db_url)
 
     server = create_server(backend, default_user=args.user)

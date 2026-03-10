@@ -1,49 +1,49 @@
-# mo-memory — Shared Memory for AI Coding Tools
+# TrustMem Lite — Shared Memory for AI Coding Tools
 
-mo-memory gives your AI coding tools (Kiro, Cursor, Claude Code) persistent memory
+TrustMem Lite gives your AI coding tools (Kiro, Cursor, Claude Code) persistent memory
 backed by MatrixOne. Facts, preferences, and decisions survive across sessions and
-are shared between tools.
+are shared between tools. This is the local single-user edition.
 
 ## Quick Start
 
 ```bash
-pip install mo-memory
+pip install trustmem-lite
 
 # Create memory tables
-mo-memory migrate --db-url 'mysql+pymysql://root:111@localhost:6001/my_db'
+trustmem migrate --db-url 'mysql+pymysql://root:111@localhost:6001/my_db'
 
 # Configure for your project (auto-detects Kiro / Cursor / Claude Code)
 cd your-project
-mo-memory init --db-url 'mysql+pymysql://root:111@localhost:6001/my_db'
+trustmem init --db-url 'mysql+pymysql://root:111@localhost:6001/my_db'
 
 # Restart your IDE — done!
 ```
 
-## What `mo-memory init` Does
+## What `trustmem init` Does
 
 1. **Detects AI tools** — scans for `.kiro/`, `.cursor/`, `CLAUDE.md`
-2. **Writes MCP config** — registers the mo-memory MCP server with your IDE
+2. **Writes MCP config** — registers the TrustMem Lite MCP server with your IDE
 3. **Writes steering rules** — tells the AI when to store/retrieve/correct memories
 
-Does NOT create database tables — run `mo-memory migrate` first.
+Does NOT create database tables — run `trustmem migrate` first.
 
 ## Configuration
 
 ### Database (required)
 
 ```bash
-mo-memory init --db-url 'mysql+pymysql://user:pass@host:6001/database'
+trustmem init --db-url 'mysql+pymysql://user:pass@host:6001/database'
 ```
 
 ### Embedding (optional)
 
-By default, mo-memory uses a local embedding model (`all-MiniLM-L6-v2`, 384 dimensions).
+By default, TrustMem Lite uses a local embedding model (`all-MiniLM-L6-v2`, 384 dimensions).
 No API key needed.
 
 To use OpenAI embeddings:
 
 ```bash
-mo-memory init \
+trustmem init \
   --db-url 'mysql+pymysql://user:pass@host:6001/db' \
   --embedding-provider openai \
   --embedding-api-key sk-... \
@@ -54,7 +54,7 @@ mo-memory init \
 To use a local OpenAI-compatible API (Ollama, vLLM, etc.):
 
 ```bash
-mo-memory init \
+trustmem init \
   --db-url 'mysql+pymysql://user:pass@host:6001/db' \
   --embedding-provider openai \
   --embedding-base-url http://localhost:11434/v1 \
@@ -81,7 +81,7 @@ IDE (Kiro/Cursor/Claude Code)
   │
   │ stdio (JSON-RPC)
   ▼
-mo-memory MCP server
+TrustMem Lite MCP server
   │
   ├── memory_store     → vectorize + persist
   ├── memory_retrieve  → semantic search
@@ -143,7 +143,7 @@ These tools are **expensive** and have cooldowns. Do not call proactively — on
 
 ### Kiro
 
-Files written by `mo-memory init`:
+Files written by `trustmem init`:
 - `.kiro/settings/mcp.json` — MCP server config (gitignore this)
 - `.kiro/steering/memory.md` — steering rule (commit this)
 
@@ -162,13 +162,13 @@ Files written:
 ## CLI Commands
 
 ```bash
-mo-memory init        # Configure MCP + steering rules
-mo-memory migrate     # Create memory tables in the database
-mo-memory status      # Show which tools are configured
-mo-memory health      # Check memory service health (remote mode)
-mo-memory governance  # Run governance cycle (quarantine, cleanup, IVF rebuild)
-mo-memory consolidate --user-id <uid>  # Run graph consolidation
-mo-memory reflect     --user-id <uid>  # Run reflection (requires LLM)
+trustmem init        # Configure MCP + steering rules
+trustmem migrate     # Create memory tables in the database
+trustmem status      # Show which tools are configured
+trustmem health      # Check memory service health (remote mode)
+trustmem governance  # Run governance cycle (quarantine, cleanup, IVF rebuild)
+trustmem consolidate --user-id <uid>  # Run graph consolidation
+trustmem reflect     --user-id <uid>  # Run reflection (requires LLM)
 ```
 
 ### migrate
@@ -179,10 +179,10 @@ Safe to run multiple times (`checkfirst=True`).
 
 ```bash
 # Release: explicit DB URL
-mo-memory migrate --db-url 'mysql+pymysql://user:pass@host:6001/db'
+trustmem migrate --db-url 'mysql+pymysql://user:pass@host:6001/db'
 
 # Dev: auto-reads project .env config
-mo-memory migrate
+trustmem migrate
 ```
 
 Priority: `--db-url` > `MO_MEMORY_DB_URL` env var > project `config/settings.py`.
@@ -195,14 +195,14 @@ For shared/team deployments, run the memory service as an HTTP API:
 uvicorn api.memory_app:memory_app --port 8100
 
 # Configure clients to use remote mode
-mo-memory init --mode remote
+trustmem init --mode remote
 ```
 
 ## Troubleshooting
 
 **"Table mem_memories doesn't exist"**
-- Run `mo-memory migrate --db-url '...'` to create tables
-- Dev mode: just `mo-memory migrate` (reads project config)
+- Run `trustmem migrate --db-url '...'` to create tables
+- Dev mode: just `trustmem migrate` (reads project config)
 
 **MCP server won't connect**
 - Check IDE logs for error messages
@@ -215,9 +215,9 @@ mo-memory init --mode remote
 - For openai provider: verify API key is set
 
 **IDE doesn't see the tools**
-- Restart the IDE after running `mo-memory init`
+- Restart the IDE after running `trustmem init`
 - Check that `.kiro/settings/mcp.json` (or equivalent) exists and is valid JSON
 
 **"No such file or directory" on MCP start**
 - The `command` in MCP config must be an absolute path to python
-- `mo-memory init` uses `sys.executable` — re-run init from the correct conda/venv
+- `trustmem init` uses `sys.executable` — re-run init from the correct conda/venv

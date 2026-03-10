@@ -1,9 +1,10 @@
-"""mo-memory CLI — configure AI tools to use shared memory service.
+"""TrustMem Lite CLI — configure AI tools to use shared memory service.
 
 Usage:
-    mo-memory init       # Detect tools, write MCP config + steering rules
-    mo-memory status     # Show connection status
-    mo-memory health     # Health check
+    trustmem init       # Detect tools, write MCP config + steering rules
+    trustmem status     # Show connection status
+    trustmem health     # Health check
+    trustmem migrate    # Create memory tables in the database
 """
 
 from __future__ import annotations
@@ -17,6 +18,10 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from core.db_consumer import DbFactory
+
+_VERSION = "0.1.0"
+_PRODUCT = "TrustMem Lite"
+_MCP_SERVER_KEY = "trustmem-lite"
 
 # ── MCP config templates ──────────────────────────────────────────────
 
@@ -113,7 +118,7 @@ def _write_kiro(project_dir: Path, mode: str, db_url: str | None = None, **embed
         config = {"mcpServers": {}}
 
     config.setdefault("mcpServers", {})
-    config["mcpServers"]["mo-memory"] = _mcp_config(mode, db_url, **embed_opts)
+    config["mcpServers"][_MCP_SERVER_KEY] = _mcp_config(mode, db_url, **embed_opts)
     mcp_file.write_text(json.dumps(config, indent=2) + "\n")
     actions.append(f"  ✅ {mcp_file.relative_to(project_dir)}")
 
@@ -141,7 +146,7 @@ def _write_cursor(project_dir: Path, mode: str, db_url: str | None = None, **emb
         config = {"mcpServers": {}}
 
     config.setdefault("mcpServers", {})
-    config["mcpServers"]["mo-memory"] = _mcp_config(mode, db_url, **embed_opts)
+    config["mcpServers"][_MCP_SERVER_KEY] = _mcp_config(mode, db_url, **embed_opts)
     mcp_file.write_text(json.dumps(config, indent=2) + "\n")
     actions.append(f"  ✅ {mcp_file.relative_to(project_dir)}")
 
@@ -169,7 +174,7 @@ def _write_claude(project_dir: Path, mode: str, db_url: str | None = None, **emb
         config = {"mcpServers": {}}
 
     config.setdefault("mcpServers", {})
-    config["mcpServers"]["mo-memory"] = _mcp_config(mode, db_url, **embed_opts)
+    config["mcpServers"][_MCP_SERVER_KEY] = _mcp_config(mode, db_url, **embed_opts)
     mcp_file.write_text(json.dumps(config, indent=2) + "\n")
     actions.append(f"  ✅ {mcp_file.relative_to(project_dir)}")
 
@@ -177,7 +182,7 @@ def _write_claude(project_dir: Path, mode: str, db_url: str | None = None, **emb
     claude_md = project_dir / "CLAUDE.md"
     if claude_md.exists():
         existing = claude_md.read_text()
-        if "mo-memory" not in existing:
+        if _MCP_SERVER_KEY not in existing:
             claude_md.write_text(existing.rstrip() + "\n" + _get_claude_rule())
             actions.append(f"  ✅ {claude_md.relative_to(project_dir)} (appended)")
         else:
@@ -189,12 +194,65 @@ def _write_claude(project_dir: Path, mode: str, db_url: str | None = None, **emb
     return actions
 
 
+# ── Database helpers ──────────────────────────────────────────────────
+
+
+def _resolve_engine(db_url: str | None) -> tuple[Any, str]:
+    """Resolve a SQLAlchemy engine from --db-url, env var, or project default.
+
+    Returns (engine, source_description). Always succeeds — falls back to DEFAULT_DB_URL.
+    """
+    from mo_memory_mcp.schema import DEFAULT_DB_URL
+
+    url = db_url or os.environ.get("MO_MEMORY_DB_URL")
+    if url:
+        from sqlalchemy import create_engine
+        return create_engine(url, pool_pre_ping=True), url
+
+    # Fall back to project-local engine (dev mode).
+    try:
+        from api.database import engine as _engine
+        return _engine, "project default (api.database)"
+    except ImportError:
+        pass
+
+    # Last resort: local default.
+    from sqlalchemy import create_engine
+    return create_engine(DEFAULT_DB_URL, pool_pre_ping=True), f"{DEFAULT_DB_URL} (default)"
+
+
+def _create_tables(engine: Any, *, dim: int | None = None) -> list[str]:
+    """Create memory tables using self-contained DDL (no core/ dependency).
+
+    Returns list of table names created.
+    """
+    from mo_memory_mcp.schema import ensure_tables
+    return ensure_tables(engine, dim=dim)
+
+
+def _test_connection(engine: Any) -> bool:
+    """Quick connectivity check. Returns True on success."""
+    from sqlalchemy import text
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return True
+    except Exception as e:
+        print(f"❌ Cannot connect to database: {e}")
+        print()
+        print("  Check that MatrixOne is running and the URL is correct.")
+        print("  Example: mysql+pymysql://root:111@localhost:6001/mydb")
+        return False
+
+
 # ── Commands ──────────────────────────────────────────────────────────
 
 def cmd_init(args: argparse.Namespace) -> None:
+    print(f"{_PRODUCT} v{_VERSION} — local single-user mode")
+    print()
     project_dir = Path(args.dir).resolve()
     mode = args.mode
-    db_url = args.db_url
+    db_url = args.db_url or os.environ.get("MO_MEMORY_DB_URL")
     embed_opts = {}
     for key in ("provider", "model", "dim", "api_key", "base_url"):
         val = getattr(args, f"embedding_{key}", None)
@@ -216,33 +274,48 @@ def cmd_init(args: argparse.Namespace) -> None:
         print(f"Embedding: {embed_opts['provider']}")
     print()
 
-    # Auto-migrate: create memory tables if not exist.
-    # This is best-effort — if it fails, the user can run 'mo-memory migrate'
-    # manually.  We warn loudly so the failure is not missed.
-    try:
-        if db_url:
-            from sqlalchemy import create_engine
-            _engine = create_engine(db_url, pool_pre_ping=True)
-        else:
-            from api.database import engine as _engine
-        import core.memory.models  # noqa: F401
-        from api.base import Base
-        memory_tables = [t for t in Base.metadata.sorted_tables
-                         if t.name.startswith("mem_") or t.name.startswith("memory_graph")]
-        Base.metadata.create_all(bind=_engine, tables=memory_tables, checkfirst=True)
-        print(f"✅ Memory tables ready ({len(memory_tables)} tables)")
-    except ImportError as e:
-        print(f"⚠️  Could not auto-migrate tables (missing dependency): {e}")
-        print("   Run 'mo-memory migrate' manually after setup.")
-    except Exception as e:
-        print(f"⚠️  Could not auto-migrate tables: {e}")
-        print("   Run 'mo-memory migrate' manually after setup.")
+    # ── Embedding check ───────────────────────────────────────────
+    provider = embed_opts.get("provider", "local")
+    if provider == "local":
+        try:
+            import sentence_transformers  # noqa: F401
+            print("✅ sentence-transformers installed (local embedding ready)")
+        except ImportError:
+            print("⚠️  sentence-transformers not installed — memories won't be vectorized.")
+            print("   Install it for better retrieval quality:")
+            print("   pip install trust-mem-lite[local-embedding]")
+            print("   Or use OpenAI embeddings:")
+            print("   trustmem init --embedding-provider openai --embedding-api-key sk-...")
+        print()
+
+    # ── Step 1: Create memory tables ──────────────────────────────
+    effective_db_url = db_url
+    if mode == "remote":
+        print("⏭️  Remote mode — tables managed by the memory service.")
+    else:
+        engine, src = _resolve_engine(db_url)
+        if not _test_connection(engine):
+            sys.exit(1)
+        dim = int(embed_opts.get("dim", "384")) if embed_opts.get("dim") else None
+        try:
+            tables = _create_tables(engine, dim=dim)
+            print(f"✅ Memory tables ready ({len(tables)} tables)")
+        except Exception as e:
+            print(f"❌ Failed to create tables: {e}")
+            print()
+            print("  You can retry with: trustmem migrate --db-url '...'")
+            sys.exit(1)
+        if not db_url:
+            # Resolved from env/project/default — write the actual URL to MCP config
+            # so the server connects to the same DB.
+            effective_db_url = engine.url.render_as_string(hide_password=False)
     print()
 
+    # ── Step 2: Write MCP configs + steering rules ────────────────
     writers = {"kiro": _write_kiro, "cursor": _write_cursor, "claude": _write_claude}
     for tool_name in detected:
         print(f"Configuring {tool_name}:")
-        actions = writers[tool_name](project_dir, mode, db_url, **embed_opts)
+        actions = writers[tool_name](project_dir, mode, effective_db_url, **embed_opts)
         for a in actions:
             print(a)
         print()
@@ -250,16 +323,35 @@ def cmd_init(args: argparse.Namespace) -> None:
     print("Done! Restart your AI tools to pick up the new MCP config.")
     if mode == "stdio" and not db_url:
         print("\nTip: pass --db-url to connect to a specific database:")
-        print("  mo-memory init --db-url 'mysql+pymysql://user:pass@host:6001/db'")
+        print("  trustmem init --db-url 'mysql+pymysql://user:pass@host:6001/db'")
+
+
+def _rule_paths(project_dir: Path) -> dict[str, Path]:
+    """Return {tool_name: rule_file_path} for each tool's steering rule."""
+    return {
+        "kiro": project_dir / ".kiro" / "steering" / "memory.md",
+        "cursor": project_dir / ".cursor" / "rules" / "memory.mdc",
+        "claude": project_dir / "CLAUDE.md",
+    }
+
+
+def _installed_rule_version(path: Path) -> str | None:
+    """Extract trustmem-version from an installed rule file."""
+    if not path.exists():
+        return None
+    import re
+    m = re.search(r"trustmem-version:\s*([\d.]+)", path.read_text()[:500])
+    return m.group(1) if m else None
 
 
 def cmd_status(args: argparse.Namespace) -> None:
     project_dir = Path(args.dir).resolve()
     tools = _detect_tools(project_dir)
+    rules = _rule_paths(project_dir)
+    needs_update = False
 
     for name, found in tools.items():
         if found:
-            # Check if MCP config exists
             if name == "kiro":
                 cfg = project_dir / ".kiro" / "settings" / "mcp.json"
             elif name == "cursor":
@@ -269,12 +361,77 @@ def cmd_status(args: argparse.Namespace) -> None:
 
             if cfg.exists():
                 data = json.loads(cfg.read_text())
-                has_memory = "mo-memory" in data.get("mcpServers", {})
-                print(f"  {name}: {'✅ configured' if has_memory else '❌ not configured'}")
+                has_memory = _MCP_SERVER_KEY in data.get("mcpServers", {})
+                status = "✅ configured" if has_memory else "❌ not configured"
             else:
-                print(f"  {name}: ❌ no MCP config")
+                status = "❌ no MCP config"
+
+            # Check rule version
+            installed_ver = _installed_rule_version(rules[name])
+            if installed_ver is None:
+                status += " | rules: ❌ missing"
+                needs_update = True
+            elif installed_ver != _VERSION:
+                status += f" | rules: ⚠️  outdated ({installed_ver} → {_VERSION})"
+                needs_update = True
+            else:
+                status += f" | rules: ✅ v{installed_ver}"
+
+            print(f"  {name}: {status}")
         else:
             print(f"  {name}: — not detected")
+
+    if needs_update:
+        print()
+        print("  Run 'trustmem update-rules' to update steering rules.")
+
+
+def cmd_update_rules(args: argparse.Namespace) -> None:
+    """Update steering rules for all detected AI tools."""
+    project_dir = Path(args.dir).resolve()
+    tools = _detect_tools(project_dir)
+    detected = [name for name, found in tools.items() if found]
+    if not detected:
+        detected = ["kiro", "cursor", "claude"]
+
+    writers = {
+        "kiro": lambda d: _write_kiro(d, "stdio")[1:],  # skip mcp.json, only rule
+        "cursor": lambda d: _write_cursor(d, "stdio")[1:],
+        "claude": lambda d: _write_claude(d, "stdio")[1:],
+    }
+
+    # Directly write rule files (not MCP config)
+    for name in detected:
+        rules = _rule_paths(project_dir)
+        rule_file = rules[name]
+        if name == "kiro":
+            rule_file.parent.mkdir(parents=True, exist_ok=True)
+            rule_file.write_text(_get_kiro_steering())
+        elif name == "cursor":
+            rule_file.parent.mkdir(parents=True, exist_ok=True)
+            rule_file.write_text(_get_cursor_rule())
+        elif name == "claude":
+            # For Claude, rewrite the whole CLAUDE.md section
+            if rule_file.exists():
+                existing = rule_file.read_text()
+                if "trustmem-version:" in existing:
+                    # Replace existing section
+                    import re
+                    new_rule = _get_claude_rule()
+                    existing = re.sub(
+                        r"<!-- trustmem-version:.*?(?=\n<!-- |$)",
+                        new_rule.strip(),
+                        existing,
+                        flags=re.DOTALL,
+                    )
+                    rule_file.write_text(existing)
+                else:
+                    rule_file.write_text(existing.rstrip() + "\n" + _get_claude_rule())
+            else:
+                rule_file.write_text(_get_claude_rule().lstrip())
+        print(f"  ✅ {name}: rules updated to v{_VERSION}")
+
+    print(f"\nDone! {len(detected)} tools updated.")
 
 
 def cmd_health(args: argparse.Namespace) -> None:
@@ -292,45 +449,26 @@ def cmd_health(args: argparse.Namespace) -> None:
 
 def cmd_migrate(args: argparse.Namespace) -> None:
     """Create memory tables in the database."""
-    db_url = args.db_url or os.environ.get("MO_MEMORY_DB_URL")
+    engine, src = _resolve_engine(args.db_url)
 
-    if db_url:
-        from sqlalchemy import create_engine
-        engine = create_engine(db_url, pool_pre_ping=True)
-    else:
-        try:
-            from api.database import engine
-        except Exception:
-            print("❌ --db-url required (or set MO_MEMORY_DB_URL, or run from project root)")
-            sys.exit(1)
+    if not _test_connection(engine):
+        sys.exit(1)
 
-    import core.memory.models  # noqa: F401
-    from api.base import Base
+    dim = int(args.dim) if getattr(args, "dim", None) else None
+    try:
+        tables = _create_tables(engine, dim=dim)
+    except Exception as e:
+        print(f"❌ Failed to create tables: {e}")
+        sys.exit(1)
 
-    memory_tables = [
-        t for t in Base.metadata.sorted_tables
-        if t.name.startswith("mem_") or t.name.startswith("memory_graph")
-    ]
+    for t in tables:
+        print(f"  ✅ {t}")
 
-    Base.metadata.create_all(bind=engine, tables=memory_tables, checkfirst=True)
-
-    for t in memory_tables:
-        print(f"  ✅ {t.name}")
-
-    print(f"\n{len(memory_tables)} memory tables ready.")
+    print(f"\n{len(tables)} memory tables ready.")
 
 
 def _get_db_factory(args: argparse.Namespace) -> DbFactory:
-    """Resolve a DbFactory from CLI args, env var, or project default.
-
-    Resolution order:
-      1. --db-url argument
-      2. MO_MEMORY_DB_URL environment variable
-      3. api.database.SessionLocal (project default)
-
-    The returned factory is a short-lived CLI tool — engine disposal
-    happens at process exit.
-    """
+    """Resolve a DbFactory from CLI args, env var, project default, or DEFAULT_DB_URL."""
     db_url = getattr(args, "db_url", None) or os.environ.get("MO_MEMORY_DB_URL")
     if db_url:
         from sqlalchemy import create_engine
@@ -341,9 +479,11 @@ def _get_db_factory(args: argparse.Namespace) -> DbFactory:
         from api.database import SessionLocal
         return SessionLocal
     except ImportError:
-        print("❌ Database not available.")
-        print("   Use --db-url, set MO_MEMORY_DB_URL, or run from project root.")
-        sys.exit(1)
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from mo_memory_mcp.schema import DEFAULT_DB_URL
+        engine = create_engine(DEFAULT_DB_URL, pool_pre_ping=True)
+        return sessionmaker(bind=engine)
 
 
 def cmd_governance(args: argparse.Namespace) -> None:
@@ -414,11 +554,11 @@ def cmd_reflect(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="mo-memory", description="Configure AI tools for shared memory")
+    parser = argparse.ArgumentParser(prog="trustmem", description=f"{_PRODUCT} v{_VERSION} — configure AI tools for shared memory")
     parser.add_argument("--dir", default=".", help="Project directory")
     sub = parser.add_subparsers(dest="command")
 
-    p_init = sub.add_parser("init", help="Configure MCP + steering rules")
+    p_init = sub.add_parser("init", help="Configure MCP + steering rules + create tables")
     p_init.add_argument("--mode", choices=["stdio", "remote"], default="stdio", help="MCP transport mode")
     p_init.add_argument("--db-url", help="Database URL, e.g. mysql+pymysql://user:pass@host:6001/db")
     p_init.add_argument("--embedding-provider", help="Embedding provider: local (default), openai, mock")
@@ -428,9 +568,11 @@ def main() -> None:
     p_init.add_argument("--embedding-base-url", help="Custom API base URL (e.g. Ollama)")
 
     sub.add_parser("status", help="Show configuration status")
+    sub.add_parser("update-rules", help="Update steering rules to latest version")
 
     p_migrate = sub.add_parser("migrate", help="Create memory tables in the database")
     p_migrate.add_argument("--db-url", help="Database URL (or set MO_MEMORY_DB_URL)")
+    p_migrate.add_argument("--dim", help="Embedding vector dimension (default: 384)")
 
     p_health = sub.add_parser("health", help="Check memory service health")
     p_health.add_argument("--api-url", default="http://localhost:8100", help="Memory service URL")
@@ -452,6 +594,8 @@ def main() -> None:
         cmd_init(args)
     elif args.command == "status":
         cmd_status(args)
+    elif args.command == "update-rules":
+        cmd_update_rules(args)
     elif args.command == "migrate":
         cmd_migrate(args)
     elif args.command == "health":

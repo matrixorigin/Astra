@@ -26,6 +26,7 @@ from cli.mo_memory_cli import (
     _get_kiro_steering,
     _load_template,
     _mcp_config,
+    _resolve_engine,
     _write_claude,
     _write_cursor,
     _write_kiro,
@@ -143,7 +144,7 @@ class TestWriteKiro:
         with tempfile.TemporaryDirectory() as d:
             actions = _write_kiro(Path(d), "stdio")
             mcp = json.loads((Path(d) / ".kiro" / "settings" / "mcp.json").read_text())
-            assert "mo-memory" in mcp["mcpServers"]
+            assert "trustmem-lite" in mcp["mcpServers"]
             assert (Path(d) / ".kiro" / "steering" / "memory.md").read_text() == "# kiro rule"
             assert len(actions) == 2
 
@@ -156,7 +157,7 @@ class TestWriteKiro:
             _write_kiro(Path(d), "stdio")
             mcp = json.loads((mcp_dir / "mcp.json").read_text())
             assert "other" in mcp["mcpServers"]
-            assert "mo-memory" in mcp["mcpServers"]
+            assert "trustmem-lite" in mcp["mcpServers"]
 
 
 class TestWriteCursor:
@@ -188,7 +189,7 @@ class TestWriteClaude:
     @patch("cli.mo_memory_cli._get_claude_rule", return_value="\n# claude rule")
     def test_skips_if_already_configured(self, _mock: Mock) -> None:
         with tempfile.TemporaryDirectory() as d:
-            (Path(d) / "CLAUDE.md").write_text("# Has mo-memory already")
+            (Path(d) / "CLAUDE.md").write_text("# Has trustmem-lite already")
             actions = _write_claude(Path(d), "stdio")
             assert any("already configured" in a for a in actions)
 
@@ -235,19 +236,26 @@ class TestGetDbFactory:
                 result = _get_db_factory(args)
         assert result is mock_sl
 
-    def test_exits_when_no_db_available(self) -> None:
-        """sys.exit(1) when no DB URL and api.database import fails."""
+    def test_falls_back_to_default_db_url(self) -> None:
+        """Falls back to DEFAULT_DB_URL when no DB URL and api.database import fails."""
         import sys as _sys
 
         args = argparse.Namespace(db_url=None)
         saved = _sys.modules.get("api.database")
         try:
-            # Force ImportError by making the module None
             _sys.modules["api.database"] = None  # type: ignore[assignment]
             with patch.dict("os.environ", {}, clear=False), \
-                 pytest.raises(SystemExit, match="1"):
+                 patch("sqlalchemy.create_engine") as mock_ce, \
+                 patch("sqlalchemy.orm.sessionmaker") as mock_sm:
                 os.environ.pop("MO_MEMORY_DB_URL", None)
-                _get_db_factory(args)
+                mock_engine = MagicMock()
+                mock_ce.return_value = mock_engine
+                mock_factory = MagicMock()
+                mock_sm.return_value = mock_factory
+                result = _get_db_factory(args)
+            mock_ce.assert_called_once()
+            assert "trustmem" in mock_ce.call_args[0][0]
+            assert result is mock_factory
         finally:
             if saved is not None:
                 _sys.modules["api.database"] = saved
@@ -359,7 +367,7 @@ class TestCmdStatus:
             # Set up kiro as configured
             mcp_dir = Path(d) / ".kiro" / "settings"
             mcp_dir.mkdir(parents=True)
-            (mcp_dir / "mcp.json").write_text('{"mcpServers":{"mo-memory":{}}}')
+            (mcp_dir / "mcp.json").write_text('{"mcpServers":{"trustmem-lite":{}}}')
 
             args = argparse.Namespace(dir=d)
             with patch("cli.mo_memory_cli._detect_tools", return_value={
@@ -403,36 +411,247 @@ class TestCmdHealth:
 
 class TestMain:
     def test_governance_args(self) -> None:
-        with patch("sys.argv", ["mo-memory", "governance", "--user-id", "bob"]), \
+        with patch("sys.argv", ["trustmem", "governance", "--user-id", "bob"]), \
              patch("cli.mo_memory_cli.cmd_governance") as mock_cmd:
             main()
         args = mock_cmd.call_args[0][0]
         assert args.user_id == "bob"
 
     def test_consolidate_requires_user_id(self) -> None:
-        with patch("sys.argv", ["mo-memory", "consolidate"]), \
+        with patch("sys.argv", ["trustmem", "consolidate"]), \
              pytest.raises(SystemExit):
             main()
 
     def test_reflect_requires_user_id(self) -> None:
-        with patch("sys.argv", ["mo-memory", "reflect"]), \
+        with patch("sys.argv", ["trustmem", "reflect"]), \
              pytest.raises(SystemExit):
             main()
 
     def test_no_command_shows_help(self) -> None:
-        with patch("sys.argv", ["mo-memory"]), \
+        with patch("sys.argv", ["trustmem"]), \
              patch("argparse.ArgumentParser.print_help") as mock_help:
             main()
         mock_help.assert_called_once()
 
     def test_status_command(self) -> None:
-        with patch("sys.argv", ["mo-memory", "status"]), \
+        with patch("sys.argv", ["trustmem", "status"]), \
              patch("cli.mo_memory_cli.cmd_status") as mock_cmd:
             main()
         mock_cmd.assert_called_once()
 
     def test_health_command(self) -> None:
-        with patch("sys.argv", ["mo-memory", "health", "--api-url", "http://x:9000"]), \
+        with patch("sys.argv", ["trustmem", "health", "--api-url", "http://x:9000"]), \
              patch("cli.mo_memory_cli.cmd_health") as mock_cmd:
             main()
         assert mock_cmd.call_args[0][0].api_url == "http://x:9000"
+
+
+# ── Schema: ensure_database + ensure_tables ───────────────────────────
+
+
+class TestEnsureDatabase:
+    """Test that ensure_database creates the DB before tables."""
+
+    def test_creates_database_via_root_connection(self) -> None:
+        """ensure_database connects without DB name and runs CREATE DATABASE."""
+        mock_engine = MagicMock()
+        mock_engine.url.database = "trustmem"
+        mock_engine.url.set.return_value = "root_url"
+
+        mock_root_engine = MagicMock()
+        mock_conn = MagicMock()
+        mock_root_engine.connect.return_value.__enter__ = Mock(return_value=mock_conn)
+        mock_root_engine.connect.return_value.__exit__ = Mock(return_value=False)
+
+        with patch("mo_memory_mcp.schema._create_engine", return_value=mock_root_engine) as mock_ce:
+            from mo_memory_mcp.schema import ensure_database
+            ensure_database(mock_engine)
+
+        mock_engine.url.set.assert_called_once_with(database="")
+        mock_ce.assert_called_once_with("root_url", pool_pre_ping=True)
+        sql_arg = mock_conn.execute.call_args[0][0]
+        assert "CREATE DATABASE IF NOT EXISTS" in sql_arg.text
+        assert "trustmem" in sql_arg.text
+        mock_root_engine.dispose.assert_called_once()
+
+    def test_skips_when_no_database_name(self) -> None:
+        """No-op when engine URL has no database."""
+        mock_engine = MagicMock()
+        mock_engine.url.database = ""
+
+        with patch("mo_memory_mcp.schema._create_engine") as mock_ce:
+            from mo_memory_mcp.schema import ensure_database
+            ensure_database(mock_engine)
+
+        mock_ce.assert_not_called()
+
+
+class TestEnsureTables:
+    """Test that ensure_tables calls ensure_database first."""
+
+    def test_calls_ensure_database_before_ddl(self) -> None:
+        mock_engine = MagicMock()
+        mock_conn = MagicMock()
+        mock_engine.connect.return_value.__enter__ = Mock(return_value=mock_conn)
+        mock_engine.connect.return_value.__exit__ = Mock(return_value=False)
+
+        with patch("mo_memory_mcp.schema.ensure_database") as mock_edb:
+            from mo_memory_mcp.schema import ensure_tables, TABLE_NAMES
+            result = ensure_tables(mock_engine, dim=384)
+
+        mock_edb.assert_called_once_with(mock_engine)
+        assert result == TABLE_NAMES
+        # 8 DDL statements executed
+        assert mock_conn.execute.call_count == 8
+
+
+# ── CLI: effective_db_url written to MCP config ───────────────────────
+
+
+class TestCmdInitEffectiveDbUrl:
+    """Test that cmd_init writes the resolved db_url into MCP config."""
+
+    def test_resolved_url_written_to_mcp_config(self) -> None:
+        """When no --db-url, the resolved URL is still written to mcp.json."""
+        with tempfile.TemporaryDirectory() as d:
+            kiro_dir = Path(d) / ".kiro"
+            kiro_dir.mkdir()
+
+            mock_engine = MagicMock()
+            mock_engine.url.render_as_string.return_value = (
+                "mysql+pymysql://root:111@localhost:6001/trustmem"
+            )
+
+            with patch("cli.mo_memory_cli._resolve_engine",
+                       return_value=(mock_engine, "default")) as mock_re, \
+                 patch("cli.mo_memory_cli._test_connection", return_value=True), \
+                 patch("cli.mo_memory_cli._create_tables", return_value=["t"] * 8), \
+                 patch("cli.mo_memory_cli._get_kiro_steering", return_value="# rule"):
+                from cli.mo_memory_cli import cmd_init
+                args = argparse.Namespace(
+                    dir=d, mode="stdio", db_url=None,
+                    embedding_provider=None, embedding_model=None,
+                    embedding_dim=None, embedding_api_key=None,
+                    embedding_base_url=None,
+                )
+                cmd_init(args)
+
+            mcp_file = kiro_dir / "settings" / "mcp.json"
+            config = json.loads(mcp_file.read_text())
+            env = config["mcpServers"]["trustmem-lite"].get("env", {})
+            assert env.get("MO_MEMORY_DB_URL") == "mysql+pymysql://root:111@localhost:6001/trustmem"
+
+    def test_explicit_db_url_written_to_mcp_config(self) -> None:
+        """When --db-url is given, it's written directly (no render_as_string)."""
+        with tempfile.TemporaryDirectory() as d:
+            kiro_dir = Path(d) / ".kiro"
+            kiro_dir.mkdir()
+
+            mock_engine = MagicMock()
+
+            with patch("cli.mo_memory_cli._resolve_engine",
+                       return_value=(mock_engine, "explicit")) as mock_re, \
+                 patch("cli.mo_memory_cli._test_connection", return_value=True), \
+                 patch("cli.mo_memory_cli._create_tables", return_value=["t"] * 8), \
+                 patch("cli.mo_memory_cli._get_kiro_steering", return_value="# rule"):
+                from cli.mo_memory_cli import cmd_init
+                args = argparse.Namespace(
+                    dir=d, mode="stdio",
+                    db_url="mysql+pymysql://u:p@h:6001/mydb",
+                    embedding_provider=None, embedding_model=None,
+                    embedding_dim=None, embedding_api_key=None,
+                    embedding_base_url=None,
+                )
+                cmd_init(args)
+
+            mcp_file = kiro_dir / "settings" / "mcp.json"
+            config = json.loads(mcp_file.read_text())
+            env = config["mcpServers"]["trustmem-lite"].get("env", {})
+            assert env.get("MO_MEMORY_DB_URL") == "mysql+pymysql://u:p@h:6001/mydb"
+
+    def test_password_not_masked(self) -> None:
+        """render_as_string(hide_password=False) is used, not str(url)."""
+        with tempfile.TemporaryDirectory() as d:
+            kiro_dir = Path(d) / ".kiro"
+            kiro_dir.mkdir()
+
+            mock_engine = MagicMock()
+            mock_engine.url.render_as_string.return_value = (
+                "mysql+pymysql://root:s3cret@host:6001/db"
+            )
+
+            with patch("cli.mo_memory_cli._resolve_engine",
+                       return_value=(mock_engine, "default")), \
+                 patch("cli.mo_memory_cli._test_connection", return_value=True), \
+                 patch("cli.mo_memory_cli._create_tables", return_value=["t"] * 8), \
+                 patch("cli.mo_memory_cli._get_kiro_steering", return_value="# rule"):
+                from cli.mo_memory_cli import cmd_init
+                args = argparse.Namespace(
+                    dir=d, mode="stdio", db_url=None,
+                    embedding_provider=None, embedding_model=None,
+                    embedding_dim=None, embedding_api_key=None,
+                    embedding_base_url=None,
+                )
+                cmd_init(args)
+
+            mock_engine.url.render_as_string.assert_called_once_with(hide_password=False)
+            mcp_file = kiro_dir / "settings" / "mcp.json"
+            config = json.loads(mcp_file.read_text())
+            url = config["mcpServers"]["trustmem-lite"]["env"]["MO_MEMORY_DB_URL"]
+            assert "s3cret" in url
+            assert "***" not in url
+
+
+# ── CLI: embedding check in init ──────────────────────────────────────
+
+
+class TestCmdInitEmbeddingCheck:
+    """trustmem init warns when sentence-transformers is not installed."""
+
+    def _run_init(self, d: str, has_sentence_transformers: bool, capsys) -> str:
+        kiro_dir = Path(d) / ".kiro"
+        kiro_dir.mkdir(exist_ok=True)
+        mock_engine = MagicMock()
+        mock_engine.url.render_as_string.return_value = "mysql+pymysql://root:x@h:6001/db"
+
+        import sys as _sys
+        saved = _sys.modules.get("sentence_transformers")
+        try:
+            if not has_sentence_transformers:
+                _sys.modules["sentence_transformers"] = None  # type: ignore[assignment]
+            elif saved is None:
+                # Simulate installed: put a dummy module
+                import types
+                _sys.modules["sentence_transformers"] = types.ModuleType("sentence_transformers")
+
+            with patch("cli.mo_memory_cli._resolve_engine", return_value=(mock_engine, "d")), \
+                 patch("cli.mo_memory_cli._test_connection", return_value=True), \
+                 patch("cli.mo_memory_cli._create_tables", return_value=["t"] * 8), \
+                 patch("cli.mo_memory_cli._get_kiro_steering", return_value="# rule"):
+                from cli.mo_memory_cli import cmd_init
+                args = argparse.Namespace(
+                    dir=d, mode="stdio", db_url=None,
+                    embedding_provider=None, embedding_model=None,
+                    embedding_dim=None, embedding_api_key=None,
+                    embedding_base_url=None,
+                )
+                cmd_init(args)
+        finally:
+            if saved is not None:
+                _sys.modules["sentence_transformers"] = saved
+            else:
+                _sys.modules.pop("sentence_transformers", None)
+
+        return capsys.readouterr().out
+
+    def test_warns_when_not_installed(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            out = self._run_init(d, has_sentence_transformers=False, capsys=capsys)
+        assert "sentence-transformers not installed" in out
+        assert "pip install" in out
+
+    def test_no_warning_when_installed(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            out = self._run_init(d, has_sentence_transformers=True, capsys=capsys)
+        assert "sentence-transformers installed" in out
+        assert "not installed" not in out
