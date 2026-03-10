@@ -200,8 +200,10 @@ class MemoryRetriever(DbConsumer):
                 .filter(M.user_id == uid, M.is_active > 0, M.memory_type.in_(type_values))
             )
             if include_cross:
-                from sqlalchemy import or_
-                q = q.filter(or_(M.session_id == session_id, M.session_id.is_(None)))
+                if session_id:
+                    from sqlalchemy import or_
+                    q = q.filter(or_(M.session_id == session_id, M.session_id.is_(None)))
+                # else: no session filter — return memories from all sessions
             else:
                 q = q.filter(M.session_id == session_id)
             return q
@@ -268,8 +270,10 @@ class MemoryRetriever(DbConsumer):
                         M.memory_type.in_(type_values), M.embedding.isnot(None))
             )
             if include_cross:
-                from sqlalchemy import or_
-                q = q.filter(or_(M.session_id == session_id, M.session_id.is_(None)))
+                if session_id:
+                    from sqlalchemy import or_
+                    q = q.filter(or_(M.session_id == session_id, M.session_id.is_(None)))
+                # else: no session filter — return memories from all sessions
             else:
                 q = q.filter(M.session_id == session_id)
             rows = q.order_by("l2_dist").limit(limit).all()

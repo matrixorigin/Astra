@@ -8,10 +8,13 @@ Works with **Kiro**, **Cursor**, and **Claude Code**. Stores memories in [Matrix
 
 ```bash
 # Install
-pip install trust-mem-lite
+pip install 'trust-mem-lite'
 
 # For local embeddings (recommended, +80MB model download on first use)
-pip install trust-mem-lite[local-embedding]
+pip install 'trust-mem-lite[local-embedding]'
+
+# Install from TestPyPI (pre-release testing)
+pip install --index-url https://pypi.org/simple/ --extra-index-url https://test.pypi.org/simple/ 'trust-mem-lite[local-embedding]'
 
 # Initialize (creates database, tables, MCP config, steering rules)
 trustmem init --db-url 'mysql+pymysql://root:111@localhost:6001/trustmem'

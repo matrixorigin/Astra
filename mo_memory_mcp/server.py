@@ -1097,7 +1097,7 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
         results = backend.retrieve(uid, query, top_k, session_id=session_id)
         parts: list[str] = []
         if not results:
-            parts.append("No relevant memories found.")
+            parts.append("No relevant memories found. Try memory_search with a broader query to see all stored memories.")
         else:
             lines = [f"- [{r.get('type', 'fact')}] {r['content']}" for r in results]
             parts.append(f"Found {len(results)} memories:\n" + "\n".join(lines))
@@ -1155,7 +1155,7 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             user_id: User ID (optional).
         """
         result = backend.profile(_user(user_id))
-        profile = result.get("profile") or "No profile available yet."
+        profile = result.get("profile") or "No profile available yet. Use memory_search to browse all stored memories."
         return f"Profile for {result['user_id']}:\n{profile}"
 
     @server.tool()
@@ -1362,17 +1362,23 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
         return "\n".join(lines)
 
     @server.tool()
-    def memory_checkout(name: str, user_id: str | None = None) -> str:
+    def memory_checkout(name: str, top_k: int = 50, user_id: str | None = None) -> str:
         """Switch to a different memory branch.
 
         Args:
             name: Branch name to switch to (or 'main').
+            top_k: Max memories to show after switching (default 50).
             user_id: User ID (optional).
         """
-        result = backend.branch_checkout(_user(user_id), name)
+        uid = _user(user_id)
+        result = backend.branch_checkout(uid, name)
         if "error" in result:
             return f"Error: {result['error']}"
-        return f"Switched to branch '{name}'."
+        memories = backend.search(uid, "", top_k=top_k)
+        if not memories:
+            return f"Switched to branch '{name}'. No memories on this branch yet."
+        lines = [f"- [{r.get('type', 'fact')}] {r['content']}" for r in memories]
+        return f"Switched to branch '{name}'. {len(memories)} memories on this branch:\n" + "\n".join(lines)
 
     @server.tool()
     def memory_branch_delete(name: str, user_id: str | None = None) -> str:

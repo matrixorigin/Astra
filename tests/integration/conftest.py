@@ -130,3 +130,15 @@ def test_session(db_session, test_user):
         db_session.commit()
     except:
         pass
+
+
+# ── VCR + urllib3 2.x compatibility ──────────────────────────────────────────
+# urllib3 2.x added `version_string` to HTTPResponse; VCR's mock response
+# doesn't have it, causing AttributeError in connectionpool.py:551.
+try:
+    from vcr.stubs import VCRHTTPResponse
+
+    if not hasattr(VCRHTTPResponse, "version_string"):
+        VCRHTTPResponse.version_string = property(lambda self: "HTTP/1.1")
+except ImportError:
+    pass

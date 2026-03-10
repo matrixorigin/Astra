@@ -1,4 +1,4 @@
-<!-- trustmem-version: 0.2.0 -->
+<!-- trustmem-version: 0.2.1 -->
 ## Memory Integration (TrustMem Lite)
 
 This project uses TrustMem Lite for shared memory across AI tools (local single-user mode).
