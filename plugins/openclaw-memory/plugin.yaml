@@ -1,0 +1,12 @@
+name: mo-agent-memory
+slug: mo-agent-memory
+description: Exposes mo-agent-runtime memory retrieval and context assembly as an OpenClaw community plugin.
+version: 0.1.0
+author: MatrixOne Team
+entrypoint: src/openclaw_memory_plugin.py
+capabilities:
+  - memory.retrieve
+  - memory.context_prompt
+runtime:
+  language: python
+  min_version: "3.10"
