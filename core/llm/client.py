@@ -28,6 +28,22 @@ logger = logging.getLogger(__name__)
 _END = object()
 
 
+def _response_guard_fps(messages: list) -> list[str] | None:
+    """Build fingerprints from messages for response guard (lightweight)."""
+    from core.llm.response_guard import build_fingerprints
+    # Normalize LLMMessage objects to dicts before fingerprinting.
+    dicts = []
+    for m in messages:
+        if isinstance(m, dict):
+            dicts.append(m)
+        elif hasattr(m, "role"):
+            d: dict = {"role": m.role}
+            if m.content is not None:
+                d["content"] = m.content
+            dicts.append(d)
+    return build_fingerprints(dicts) or None
+
+
 class BudgetExceededError(Exception):
     """Raised when estimated cost exceeds remaining budget."""
 
@@ -657,6 +673,16 @@ class LLMClient(DbConsumer):
                     task_hint, response.tokens_prompt, response.tokens_completion,
                     response.cost_usd, response.latency_ms,
                 )
+            # Guard: detect degenerate responses before returning to callers.
+            from core.llm.response_guard import is_degenerate
+            _reason = is_degenerate(response.content, _response_guard_fps(messages))
+            if _reason:
+                logger.warning(
+                    "Response guard (%s) on non-streaming chat: model=%s preview=%r",
+                    _reason, model, (response.content or "")[:200],
+                )
+                response.content = ""
+                response.guard_blocked = _reason
             return (
                 LLMResponse(**response.model_dump())
                 if isinstance(response, LLMResponse)
@@ -701,7 +727,21 @@ class LLMClient(DbConsumer):
             temperature=temp,
             max_tokens=max_tok,
         )
-        return dict(result) if result else {}
+        rd = dict(result) if result else {}
+        # Guard non-streaming tool responses: if the LLM returned text content
+        # (no tool_calls) that looks like prompt leakage, blank it out.
+        _content = rd.get("content") or ""
+        if _content and not rd.get("tool_calls"):
+            from core.llm.response_guard import is_degenerate
+            _reason = is_degenerate(_content, _response_guard_fps(messages))
+            if _reason:
+                logger.warning(
+                    "Response guard (%s) on chat_with_tools: model=%s preview=%r",
+                    _reason, model, _content[:200],
+                )
+                rd["content"] = ""
+                rd["guard_blocked"] = _reason
+        return rd
 
     async def chat_stream(
         self,

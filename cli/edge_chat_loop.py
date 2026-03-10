@@ -245,6 +245,10 @@ async def _consume_turn(
                 elif etype == "error":
                     result.error = event
                     renderer.error(event.get("message", "Unknown cloud error"))
+                    # Discard any partial text accumulated before the error —
+                    # it may contain leaked prompt content or a truncated LLM
+                    # response that should not be shown or stored.
+                    result.text = ""
                 elif etype == "ping":
                     # Heartbeat — connection alive. Show thinking indicator
                     # so the user knows the LLM is still working.
@@ -516,7 +520,7 @@ async def edge_chat_loop(
                     renderer.info(f"  ⟳ Network error, retrying in {_BACKOFF[attempt]:.0f}s...")
                     await asyncio.sleep(_BACKOFF[attempt])
                     continue
-                renderer.error(f"Network error: {e}")
+                renderer.error("Network error: server unreachable (is the API running?)")
                 break
             except KeyboardInterrupt:
                 renderer.error("Interrupted by user")

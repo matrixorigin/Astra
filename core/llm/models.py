@@ -54,6 +54,8 @@ class LLMResponse(BaseModel):
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # Set by response_guard when the output is blocked (PROMPT_LEAK / REPETITION_LOOP).
+    guard_blocked: str | None = None
 
 
 class LLMCallLog(BaseModel):

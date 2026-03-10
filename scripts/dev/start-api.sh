@@ -47,8 +47,12 @@ fi
 setsid env http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= \
     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
     python -m uvicorn api.main:app --port 8000 >> "$LOG_FILE" 2>&1 &
+SETSID_PID=$!
 sleep 1
+# setsid forks a new session; the actual uvicorn process may have a different PID.
+# Use pgrep to find the real uvicorn PID, fall back to $! if not found yet.
 PID=$(pgrep -f "uvicorn api.main:app" | head -1)
+PID=${PID:-$SETSID_PID}
 echo $PID > "$PID_FILE"
 
 # Wait and check

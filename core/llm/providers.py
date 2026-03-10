@@ -104,6 +104,25 @@ def _get_reasoning_content(delta) -> str | None:
     return rc or None
 
 
+def _split_think_tags(content: str) -> tuple[str, str]:
+    """Split <think>...</think> inline reasoning from visible text content.
+
+    Some providers (e.g. private DeepSeek endpoints) embed reasoning inside
+    <think> tags in delta.content instead of using a separate reasoning_content
+    field.  This function separates them so reasoning goes to the reasoning
+    stream and only the visible reply goes to the text stream.
+
+    Returns (reasoning, text) — either may be empty string.
+    """
+    import re
+    # Match complete <think>...</think> blocks
+    reasoning_parts: list[str] = re.findall(r"<think>(.*?)</think>", content, re.DOTALL)
+    # Remove all <think>...</think> blocks (and any dangling </think> tags) from text
+    text = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+    text = re.sub(r"</think>", "", text)
+    return "".join(reasoning_parts), text
+
+
 def _accumulate_tool_calls(response_iter) -> Iterator[dict]:
     """Shared tool call accumulation for OpenAI-compatible streaming.
 
@@ -129,7 +148,11 @@ def _accumulate_tool_calls(response_iter) -> Iterator[dict]:
             if reasoning:
                 yield {"type": "reasoning", "content": reasoning}
             if delta.content:
-                yield {"type": "text", "content": delta.content}
+                _think_rc, _text = _split_think_tags(delta.content)
+                if _think_rc:
+                    yield {"type": "reasoning", "content": _think_rc}
+                if _text:
+                    yield {"type": "text", "content": _text}
             if delta.tool_calls:
                 for tc in delta.tool_calls:
                     idx = tc.index
@@ -252,7 +275,11 @@ class OpenAIProvider(BaseProvider):
                 if reasoning:
                     yield {"type": "reasoning", "content": reasoning}
                 if delta.content:
-                    yield {"type": "text", "content": delta.content}
+                    _think_rc, _text = _split_think_tags(delta.content)
+                    if _think_rc:
+                        yield {"type": "reasoning", "content": _think_rc}
+                    if _text:
+                        yield {"type": "text", "content": _text}
 
     def complete_with_tools(self, messages, tools, model, tool_choice, temperature, max_tokens):
         resp = self._with_retry(

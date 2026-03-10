@@ -8,10 +8,41 @@ from sqlalchemy import text
 
 from api.database import get_db_session
 from api.dependencies import get_current_user
+from pydantic import BaseModel, EmailStr, Field
+
 from api.repositories.user_repository import UserRepository
 from core.auth.jwt_manager import create_access_token, create_refresh_token, decode_token
 from core.auth.password import hash_password, verify_password
-from schemas.auth import LoginRequest, RefreshRequest, RegisterRequest, TokenResponse, UserResponse
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50, pattern="^[a-zA-Z0-9_-]+$")
+    email: EmailStr
+    password: str = Field(..., min_length=8, max_length=72)
+    display_name: str | None = Field(None, max_length=255)
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class UserResponse(BaseModel):
+    user_id: str
+    username: str
+    email: str
+    display_name: str | None = None
 
 router = APIRouter(tags=["authentication"])
 

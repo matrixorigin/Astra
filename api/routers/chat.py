@@ -852,6 +852,15 @@ def _tool_names(tools: list[dict[str, Any]]) -> set[str]:
     return {t.get("function", {}).get("name", "") for t in tools}
 
 
+# ── Response guard (prompt leak + repetition detection) ───────────────
+# Delegated to core.llm.response_guard for reuse across all LLM call paths.
+from core.llm.response_guard import (
+    build_fingerprints as _build_prompt_fingerprints,
+    is_prompt_leaked as _is_prompt_leaked,
+    is_repetition_loop as _is_repetition_loop,
+)
+
+
 def _peek_session_entry(session_id: str) -> dict[str, Any] | None:
     """Read-only lookup — returns None if not cached. No LRU side-effects."""
     return _session_cache.get(session_id)
@@ -2343,6 +2352,8 @@ async def chat_turn(
 
             model = request.model
             task_hint = _classify_task(request.messages)
+            # Build fingerprints once per turn — used later to detect prompt leakage.
+            _prompt_fingerprints = _build_prompt_fingerprints(llm_messages, effective_tools_schema)
 
             yield f"data: {json.dumps({'type': 'session_info', 'session_id': session_id})}\n\n"
 
@@ -2696,6 +2707,29 @@ async def chat_turn(
                                 parsed_args = {"_parse_error": f"Malformed arguments JSON: {args[:200]}"}
                     yield f"data: {json.dumps({'type': 'tool_call', 'id': tc.get('id', ''), 'name': tc_name, 'arguments': parsed_args})}\n\n"
 
+                # Detect prompt leakage: if the LLM echoed back system prompt or tool
+                # description content, discard the response and do NOT store it in
+                # session cache — storing it would corrupt future turns.
+                if not tool_calls and _is_prompt_leaked(full_text, _prompt_fingerprints):
+                    logger.error(
+                        "Prompt leakage detected — discarding response and aborting turn. "
+                        "session=%s model=%s text_preview=%r",
+                        session_id, model, full_text[:200],
+                    )
+                    yield f"data: {json.dumps({'type': 'error', 'message': 'Model returned invalid response (prompt leakage). Please retry.', 'code': 'PROMPT_LEAK', 'retryable': True})}\n\n"
+                    return
+
+                # Detect repetition loop: broken model endpoints output degenerate
+                # repetitions (e.g. 'it it it it...'). Discard and do NOT cache.
+                if not tool_calls and _is_repetition_loop(full_text):
+                    logger.error(
+                        "Repetition loop detected — discarding response and aborting turn. "
+                        "session=%s model=%s text_preview=%r",
+                        session_id, model, full_text[:200],
+                    )
+                    yield f"data: {json.dumps({'type': 'error', 'message': 'Model returned invalid response (repetition loop). Please retry or switch models.', 'code': 'MODEL_DEGRADED', 'retryable': False})}\n\n"
+                    return
+
                 # Update session cache
                 _entry = _get_or_create_session_entry(session_id)
                 # Inject cloud skill intermediate messages (assistant+tool_calls,
@@ -2863,6 +2897,9 @@ async def chat_turn(
             if isinstance(e, HTTPException):
                 err["message"] = e.detail
                 err.update(code=status_to_error_code(e.status_code), retryable=False)
+            elif isinstance(e, PermissionError):
+                # PermissionError subclasses OSError — must check before OSError branch.
+                err.update(code="MODEL_NOT_AVAILABLE", retryable=False)
             elif isinstance(e, BudgetExceededError):
                 err.update(code="BUDGET_EXCEEDED", retryable=False)
             elif isinstance(e, LLMRateLimitError):
@@ -2872,7 +2909,14 @@ async def chat_turn(
             elif isinstance(e, (SQLAlchemyError, ConnectionError, OSError)):
                 err.update(code="SERVER_ERROR", retryable=True, retry_after_ms=1000)
             else:
-                err.update(code="INTERNAL_ERROR", retryable=False)
+                # httpx.TransportError (RemoteProtocolError, ReadError, etc.)
+                # from LLM provider connections are transient — allow retry.
+                import httpx as _httpx
+                if isinstance(e, _httpx.TransportError):
+                    err.update(code="LLM_TRANSPORT_ERROR", retryable=True, retry_after_ms=2000,
+                               message="LLM provider connection failed. Please retry.")
+                else:
+                    err.update(code="INTERNAL_ERROR", retryable=False)
             yield f"data: {json.dumps(err)}\n\n"
 
     return StreamingResponse(

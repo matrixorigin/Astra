@@ -11,6 +11,7 @@ from core.agent.planner import Planner, PlanStatus, restore_plan_from_events
 from core.events.event_logger import EventLogger
 from core.events.models import StreamEvent, StreamEventType
 from core.llm.models import LLMMessage
+from core.llm.response_guard import is_degenerate as _is_degenerate_response
 from core.logging_config import get_logger
 from core.skills.prefilter import ConversationState
 
@@ -647,6 +648,22 @@ class ChatLoop:
 
             full_text = sv.full_text
 
+            # Response guard: detect prompt leakage / repetition before persisting.
+            _guard_reason = _is_degenerate_response(full_text)
+            if _guard_reason:
+                logger.error(
+                    "Response guard (%s) in chat_loop: session=%s preview=%r",
+                    _guard_reason, session_id, full_text[:200],
+                )
+                yield StreamEvent(
+                    event_type=StreamEventType.RUN_ERROR,
+                    data={"error": f"Model returned invalid response ({_guard_reason}). Please retry."},
+                    event_id=user_event.event_id,
+                    causal_chain_id=user_event.causal_chain_id,
+                    agent_id=self.agent_id,
+                )
+                return
+
             # Post-stream: full response-level verification for audit record
             verification = self.firewall.verify_response(full_text, context_capture_id, mode=self.firewall_mode)
             self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
@@ -839,6 +856,22 @@ class ChatLoop:
                     tool_calls = _merge_tool_call_fragments(tool_calls, [chunk["data"]])
 
             if not tool_calls:
+                # Response guard before firewall/persistence
+                _guard_reason = _is_degenerate_response(full_text)
+                if _guard_reason:
+                    logger.error(
+                        "Response guard (%s) in chat_loop tool path: session=%s preview=%r",
+                        _guard_reason, session_id, full_text[:200],
+                    )
+                    yield StreamEvent(
+                        event_type=StreamEventType.RUN_ERROR,
+                        data={"error": f"Model returned invalid response ({_guard_reason}). Please retry."},
+                        event_id=user_event.event_id,
+                        causal_chain_id=user_event.causal_chain_id,
+                        agent_id=self.agent_id,
+                    )
+                    return
+
                 # Verify with firewall (same as non-stream path)
                 verification = self.firewall.verify_response(full_text, context_capture_id, mode=self.firewall_mode, skill_name=last_skill_name)
                 self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
