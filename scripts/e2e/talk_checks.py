@@ -32,10 +32,13 @@ def check_tool_called(tool_name: str, tool_calls: list[dict]) -> CheckResult:
 
 
 def check_no_tool_called(tool_calls: list[dict]) -> CheckResult:
+    # introspection is a read-only internal tool, not a side-effecting call
+    _IGNORED = {"introspection"}
+    significant = [tc for tc in tool_calls if tc.get("name") not in _IGNORED]
     return CheckResult(
         "no_tool_called",
-        len(tool_calls) == 0,
-        f"unexpected tool calls: {[tc.get('name') for tc in tool_calls]}" if tool_calls else "",
+        len(significant) == 0,
+        f"unexpected tool calls: {[tc.get('name') for tc in significant]}" if significant else "",
     )
 
 

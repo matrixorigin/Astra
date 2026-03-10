@@ -52,12 +52,25 @@ trustmem governance     # Run memory cleanup and maintenance
 ## Embedding Options
 
 ```bash
-# Local (default) — free, private, ~80MB model
+# Local (default) — free, private, ~80MB model download on first use
 trustmem init --embedding-provider local
 
-# OpenAI — better quality, requires API key
+# OpenAI
 trustmem init --embedding-provider openai --embedding-api-key sk-...
 
-# Custom endpoint (Ollama, etc.)
-trustmem init --embedding-provider openai --embedding-base-url http://localhost:11434/v1
+# SiliconFlow (recommended for China users)
+trustmem init --embedding-provider openai \
+  --embedding-model BAAI/bge-m3 \
+  --embedding-dim 1024 \
+  --embedding-api-key sk-... \
+  --embedding-base-url https://api.siliconflow.cn/v1
+
+# Any OpenAI-compatible endpoint (Ollama, Azure, etc.)
+trustmem init --embedding-provider openai \
+  --embedding-base-url http://localhost:11434/v1 \
+  --embedding-model nomic-embed-text \
+  --embedding-dim 768
 ```
+
+> **Note**: `--embedding-dim` must match the model's actual output dimension.
+> Common values: `all-MiniLM-L6-v2`=384, `BAAI/bge-m3`=1024, `text-embedding-ada-002`=1536.

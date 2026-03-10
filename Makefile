@@ -529,7 +529,7 @@ test-api:
 .PHONY: test-e2e
 test-e2e:
 	@echo "Running end-to-end tests..."
-	@python -m pytest tests/e2e/ -v
+	@set -a && . ./.env && set +a && python -m pytest tests/e2e/ -v
 
 .PHONY: test-runtime
 test-runtime:

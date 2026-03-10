@@ -102,16 +102,17 @@ class EmbeddedBackend(MemoryBackend):
 
     @staticmethod
     def _make_embed_client():
-        """Build EmbeddingClient from MO_MEMORY_EMBEDDING_* env vars."""
-        provider = os.environ.get("MO_MEMORY_EMBEDDING_PROVIDER", "local")
-        model = os.environ.get("MO_MEMORY_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-        dim = int(os.environ.get("MO_MEMORY_EMBEDDING_DIM", "384"))
+        """Build EmbeddingClient from EMBEDDING_* env vars."""
+        provider = os.environ.get("EMBEDDING_PROVIDER", "local")
+        model = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+        # local provider always uses 384 (all-MiniLM-L6-v2 is fixed)
+        dim = 384 if provider == "local" else int(os.environ.get("EMBEDDING_DIM", "384"))
         try:
             from core.embedding.client import EmbeddingClient
             return EmbeddingClient(
                 provider=provider, model=model, dim=dim,
-                api_key=os.environ.get("MO_MEMORY_EMBEDDING_API_KEY", ""),
-                base_url=os.environ.get("MO_MEMORY_EMBEDDING_BASE_URL"),
+                api_key=os.environ.get("EMBEDDING_API_KEY", ""),
+                base_url=os.environ.get("EMBEDDING_BASE_URL"),
             )
         except Exception:
             logger.warning("Embedding client not available, memories won't be vectorized")
@@ -1457,7 +1458,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="TrustMem Lite — MCP memory server")
     parser.add_argument("--api-url", help="Memory service API URL (remote mode)")
-    parser.add_argument("--db-url", help="Database URL for embedded mode (or set MO_MEMORY_DB_URL)")
+    parser.add_argument("--db-url", help="Database URL for embedded mode (or set TRUSTMEM_DB_URL)")
     parser.add_argument("--token", help="Auth token for remote mode")
     parser.add_argument("--user", default="default", help="Default user ID")
     parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio")
@@ -1472,7 +1473,7 @@ def main():
     if args.api_url:
         backend: MemoryBackend = HTTPBackend(args.api_url, token=args.token)
     else:
-        db_url = args.db_url or os.environ.get("MO_MEMORY_DB_URL")
+        db_url = args.db_url or os.environ.get("TRUSTMEM_DB_URL")
         if not db_url:
             from mo_memory_mcp.schema import DEFAULT_DB_URL
             db_url = DEFAULT_DB_URL

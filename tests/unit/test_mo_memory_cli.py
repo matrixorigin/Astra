@@ -93,12 +93,12 @@ class TestMCPConfig:
 
     def test_db_url_in_env(self) -> None:
         cfg = _mcp_config("stdio", db_url="mysql+pymysql://u:p@h:6001/db")
-        assert cfg["env"]["MO_MEMORY_DB_URL"] == "mysql+pymysql://u:p@h:6001/db"
+        assert cfg["env"]["TRUSTMEM_DB_URL"] == "mysql+pymysql://u:p@h:6001/db"
 
     def test_embedding_opts_in_env(self) -> None:
         cfg = _mcp_config("stdio", provider="openai", model="ada-002")
-        assert cfg["env"]["MO_MEMORY_EMBEDDING_PROVIDER"] == "openai"
-        assert cfg["env"]["MO_MEMORY_EMBEDDING_MODEL"] == "ada-002"
+        assert cfg["env"]["EMBEDDING_PROVIDER"] == "openai"
+        assert cfg["env"]["EMBEDDING_MODEL"] == "ada-002"
 
 
 # ── Tool detection ────────────────────────────────────────────────────
@@ -212,12 +212,12 @@ class TestGetDbFactory:
         mock_sm.assert_called_once_with(bind=mock_engine)
 
     def test_with_env_var(self) -> None:
-        """MO_MEMORY_DB_URL env var is used when --db-url is absent."""
+        """TRUSTMEM_DB_URL env var is used when --db-url is absent."""
         args = argparse.Namespace(db_url=None)
         mock_engine = MagicMock()
         mock_sm = MagicMock(return_value=MagicMock())
 
-        with patch.dict("os.environ", {"MO_MEMORY_DB_URL": "mysql://env"}), \
+        with patch.dict("os.environ", {"TRUSTMEM_DB_URL": "mysql://env"}), \
              patch("sqlalchemy.create_engine", return_value=mock_engine) as mock_ce, \
              patch("sqlalchemy.orm.sessionmaker", mock_sm):
             _get_db_factory(args)
@@ -231,7 +231,7 @@ class TestGetDbFactory:
         mock_sl = MagicMock()
         # Remove env var if present, then patch api.database module
         with patch.dict("os.environ", {}, clear=False):
-            os.environ.pop("MO_MEMORY_DB_URL", None)
+            os.environ.pop("TRUSTMEM_DB_URL", None)
             with patch.dict("sys.modules", {"api.database": MagicMock(SessionLocal=mock_sl)}):
                 result = _get_db_factory(args)
         assert result is mock_sl
@@ -247,7 +247,7 @@ class TestGetDbFactory:
             with patch.dict("os.environ", {}, clear=False), \
                  patch("sqlalchemy.create_engine") as mock_ce, \
                  patch("sqlalchemy.orm.sessionmaker") as mock_sm:
-                os.environ.pop("MO_MEMORY_DB_URL", None)
+                os.environ.pop("TRUSTMEM_DB_URL", None)
                 mock_engine = MagicMock()
                 mock_ce.return_value = mock_engine
                 mock_factory = MagicMock()
@@ -539,7 +539,7 @@ class TestCmdInitEffectiveDbUrl:
             mcp_file = kiro_dir / "settings" / "mcp.json"
             config = json.loads(mcp_file.read_text())
             env = config["mcpServers"]["trustmem-lite"].get("env", {})
-            assert env.get("MO_MEMORY_DB_URL") == "mysql+pymysql://root:111@localhost:6001/trustmem"
+            assert env.get("TRUSTMEM_DB_URL") == "mysql+pymysql://root:111@localhost:6001/trustmem"
 
     def test_explicit_db_url_written_to_mcp_config(self) -> None:
         """When --db-url is given, it's written directly (no render_as_string)."""
@@ -567,7 +567,7 @@ class TestCmdInitEffectiveDbUrl:
             mcp_file = kiro_dir / "settings" / "mcp.json"
             config = json.loads(mcp_file.read_text())
             env = config["mcpServers"]["trustmem-lite"].get("env", {})
-            assert env.get("MO_MEMORY_DB_URL") == "mysql+pymysql://u:p@h:6001/mydb"
+            assert env.get("TRUSTMEM_DB_URL") == "mysql+pymysql://u:p@h:6001/mydb"
 
     def test_password_not_masked(self) -> None:
         """render_as_string(hide_password=False) is used, not str(url)."""
@@ -597,7 +597,7 @@ class TestCmdInitEffectiveDbUrl:
             mock_engine.url.render_as_string.assert_called_once_with(hide_password=False)
             mcp_file = kiro_dir / "settings" / "mcp.json"
             config = json.loads(mcp_file.read_text())
-            url = config["mcpServers"]["trustmem-lite"]["env"]["MO_MEMORY_DB_URL"]
+            url = config["mcpServers"]["trustmem-lite"]["env"]["TRUSTMEM_DB_URL"]
             assert "s3cret" in url
             assert "***" not in url
 

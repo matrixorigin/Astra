@@ -43,6 +43,26 @@ DB_URL = os.environ.get(
 )
 _DB_HOST = "10.222.1.57"
 _DB_PORT = 6001
+
+
+def _server_env() -> dict[str, str]:
+    """Build subprocess env for MCP server. Uses remote embedding if configured, else local."""
+    provider = os.environ.get("EMBEDDING_PROVIDER", "local")
+    if provider != "local":
+        return {
+            **os.environ,
+            "EMBEDDING_PROVIDER": provider,
+            "EMBEDDING_MODEL": os.environ.get("EMBEDDING_MODEL", ""),
+            "EMBEDDING_DIM": os.environ.get("EMBEDDING_DIM", "384"),
+        }
+    return {
+        **os.environ,
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_DATASETS_OFFLINE": "1",
+        "EMBEDDING_PROVIDER": "local",
+        "EMBEDDING_MODEL": "all-MiniLM-L6-v2",
+        "EMBEDDING_DIM": "384",
+    }
 _DB_USER = "root"
 _DB_PASS = "111"
 _DB_NAME = "trustmem_e2e_test"
@@ -104,18 +124,10 @@ def _db_cleanup(user_id_prefix: str) -> None:
 @asynccontextmanager
 async def _mcp_session(user: str) -> AsyncGenerator[ClientSession, None]:
     """Spawn a real MCP server subprocess and return a connected ClientSession."""
-    env = {
-        **os.environ,
-        "TRANSFORMERS_OFFLINE": "1",
-        "HF_DATASETS_OFFLINE": "1",
-        "MO_MEMORY_EMBEDDING_PROVIDER": "local",
-        "MO_MEMORY_EMBEDDING_MODEL": "all-MiniLM-L6-v2",
-        "MO_MEMORY_EMBEDDING_DIM": "384",
-    }
     params = StdioServerParameters(
         command=sys.executable,
         args=["-m", "mo_memory_mcp", "--db-url", DB_URL, "--user", user],
-        env=env,
+        env=_server_env(),
     )
     async with stdio_client(params) as (r, w):
         async with ClientSession(r, w) as session:
@@ -141,18 +153,10 @@ async def session():
     user = _user("main")
     # We can't yield inside an asynccontextmanager across anyio task boundaries,
     # so we manage the lifecycle manually.
-    env = {
-        **os.environ,
-        "TRANSFORMERS_OFFLINE": "1",
-        "HF_DATASETS_OFFLINE": "1",
-        "MO_MEMORY_EMBEDDING_PROVIDER": "local",
-        "MO_MEMORY_EMBEDDING_MODEL": "all-MiniLM-L6-v2",
-        "MO_MEMORY_EMBEDDING_DIM": "384",
-    }
     params = StdioServerParameters(
         command=sys.executable,
         args=["-m", "mo_memory_mcp", "--db-url", DB_URL, "--user", user],
-        env=env,
+        env=_server_env(),
     )
 
     # Use a queue to pass the session out of the background task

@@ -66,12 +66,12 @@ trustmem init \
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--db-url` | `MO_MEMORY_DB_URL` | — | Database connection URL (required) |
-| `--embedding-provider` | `MO_MEMORY_EMBEDDING_PROVIDER` | `local` | `local`, `openai`, or `mock` |
-| `--embedding-model` | `MO_MEMORY_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Model name |
-| `--embedding-dim` | `MO_MEMORY_EMBEDDING_DIM` | `384` | Vector dimension |
-| `--embedding-api-key` | `MO_MEMORY_EMBEDDING_API_KEY` | — | API key (openai provider) |
-| `--embedding-base-url` | `MO_MEMORY_EMBEDDING_BASE_URL` | — | Custom API endpoint |
+| `--db-url` | `TRUSTMEM_DB_URL` | — | Database connection URL (required) |
+| `--embedding-provider` | `EMBEDDING_PROVIDER` | `local` | `local`, `openai`, or `mock` |
+| `--embedding-model` | `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Model name |
+| `--embedding-dim` | `EMBEDDING_DIM` | `384` | Vector dimension |
+| `--embedding-api-key` | `EMBEDDING_API_KEY` | — | API key (openai provider) |
+| `--embedding-base-url` | `EMBEDDING_BASE_URL` | — | Custom API endpoint |
 | `--mode` | — | `stdio` | `stdio` (local) or `remote` (HTTP) |
 
 ## How It Works
@@ -185,7 +185,7 @@ trustmem migrate --db-url 'mysql+pymysql://user:pass@host:6001/db'
 trustmem migrate
 ```
 
-Priority: `--db-url` > `MO_MEMORY_DB_URL` env var > project `config/settings.py`.
+Priority: `--db-url` > `TRUSTMEM_DB_URL` env var > project `config/settings.py`.
 
 ## Remote Mode
 
@@ -207,7 +207,7 @@ trustmem init --mode remote
 **MCP server won't connect**
 - Check IDE logs for error messages
 - Verify database is reachable: `mysql -h host -P 6001 -u user -p`
-- Test manually: `MO_MEMORY_DB_URL='...' python -m mo_memory_mcp`
+- Test manually: `TRUSTMEM_DB_URL='...' python -m mo_memory_mcp`
 
 **Memories not vectorized**
 - Check embedding provider is configured correctly

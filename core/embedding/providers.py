@@ -82,25 +82,29 @@ class OpenAIProvider(BaseEmbeddingProvider):
         if not api_key:
             raise ValueError("OpenAI embedding provider requires api_key")
         import openai as _openai
-        kwargs = {"api_key": api_key}
+        kwargs: dict = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
         self._client = _openai.OpenAI(**kwargs)
         self._model_name = model
         self._dim = dim
+        # Only OpenAI text-embedding-3-* supports the `dimensions` param.
+        self._supports_dimensions = not base_url and "text-embedding-3" in model
+
+    def _create_kwargs(self, input: str | list[str]) -> dict:
+        kwargs: dict = {"model": self._model_name, "input": input}
+        if self._supports_dimensions:
+            kwargs["dimensions"] = self._dim
+        return kwargs
 
     def embed(self, text: str) -> list[float]:
-        resp = self._client.embeddings.create(
-            model=self._model_name, input=text, dimensions=self._dim,
-        )
+        resp = self._client.embeddings.create(**self._create_kwargs(text))
         return resp.data[0].embedding
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        resp = self._client.embeddings.create(
-            model=self._model_name, input=texts, dimensions=self._dim,
-        )
+        resp = self._client.embeddings.create(**self._create_kwargs(texts))
         # API returns embeddings in same order as input
         return [d.embedding for d in resp.data]
 

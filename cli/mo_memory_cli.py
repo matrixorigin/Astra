@@ -37,11 +37,11 @@ def _mcp_config(mode: str = "stdio", db_url: str | None = None, **embed_opts: st
     }
     env: dict[str, str] = {}
     if db_url:
-        env["MO_MEMORY_DB_URL"] = db_url
+        env["TRUSTMEM_DB_URL"] = db_url
     for key in ("provider", "model", "dim", "api_key", "base_url"):
         val = embed_opts.get(key)
         if val:
-            env[f"MO_MEMORY_EMBEDDING_{key.upper()}"] = val
+            env[f"EMBEDDING_{key.upper()}"] = val
     if env:
         cfg["env"] = env
     return cfg
@@ -211,7 +211,7 @@ def _resolve_engine(db_url: str | None) -> tuple[Any, str]:
     """
     from mo_memory_mcp.schema import DEFAULT_DB_URL
 
-    url = db_url or os.environ.get("MO_MEMORY_DB_URL")
+    url = db_url or os.environ.get("TRUSTMEM_DB_URL")
     if url:
         from sqlalchemy import create_engine
         return create_engine(url, pool_pre_ping=True), url
@@ -259,7 +259,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     print()
     project_dir = Path(args.dir).resolve()
     mode = args.mode
-    db_url = args.db_url or os.environ.get("MO_MEMORY_DB_URL")
+    db_url = args.db_url or os.environ.get("TRUSTMEM_DB_URL")
     embed_opts = {}
     for key in ("provider", "model", "dim", "api_key", "base_url"):
         val = getattr(args, f"embedding_{key}", None)
@@ -476,7 +476,7 @@ def cmd_migrate(args: argparse.Namespace) -> None:
 
 def _get_db_factory(args: argparse.Namespace) -> DbFactory:
     """Resolve a DbFactory from CLI args, env var, project default, or DEFAULT_DB_URL."""
-    db_url = getattr(args, "db_url", None) or os.environ.get("MO_MEMORY_DB_URL")
+    db_url = getattr(args, "db_url", None) or os.environ.get("TRUSTMEM_DB_URL")
     if db_url:
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
@@ -578,7 +578,7 @@ def main() -> None:
     sub.add_parser("update-rules", help="Update steering rules to latest version")
 
     p_migrate = sub.add_parser("migrate", help="Create memory tables in the database")
-    p_migrate.add_argument("--db-url", help="Database URL (or set MO_MEMORY_DB_URL)")
+    p_migrate.add_argument("--db-url", help="Database URL (or set TRUSTMEM_DB_URL)")
     p_migrate.add_argument("--dim", help="Embedding vector dimension (default: 384)")
 
     p_health = sub.add_parser("health", help="Check memory service health")
@@ -586,15 +586,15 @@ def main() -> None:
 
     p_gov = sub.add_parser("governance", help="Run memory governance: quarantine, cleanup, IVF index health")
     p_gov.add_argument("--user-id", help="User ID (default: all users)")
-    p_gov.add_argument("--db-url", help="Database URL (or set MO_MEMORY_DB_URL)")
+    p_gov.add_argument("--db-url", help="Database URL (or set TRUSTMEM_DB_URL)")
 
     p_con = sub.add_parser("consolidate", help="Run graph consolidation: conflict detection, orphan cleanup")
     p_con.add_argument("--user-id", required=True, help="User ID")
-    p_con.add_argument("--db-url", help="Database URL (or set MO_MEMORY_DB_URL)")
+    p_con.add_argument("--db-url", help="Database URL (or set TRUSTMEM_DB_URL)")
 
     p_ref = sub.add_parser("reflect", help="Run reflection: synthesize insights from memory clusters (requires LLM)")
     p_ref.add_argument("--user-id", required=True, help="User ID")
-    p_ref.add_argument("--db-url", help="Database URL (or set MO_MEMORY_DB_URL)")
+    p_ref.add_argument("--db-url", help="Database URL (or set TRUSTMEM_DB_URL)")
 
     args = parser.parse_args()
     if args.command == "init":
