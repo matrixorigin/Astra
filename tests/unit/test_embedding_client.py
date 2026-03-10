@@ -150,3 +150,59 @@ class TestStartupValidation:
         """Valid local config should work."""
         c = EmbeddingClient(provider="local", model="all-MiniLM-L6-v2", dim=384)
         assert len(c.embed("test")) == 384
+
+
+# ── KNOWN_DIMENSIONS validation ───────────────────────────────────────
+
+class TestKnownDimensions:
+    def test_known_model_wrong_dim_raises(self):
+        """Known model with wrong dim must fail at init, not at embed time."""
+        with pytest.raises(ValueError, match="fixed dimension 1024.*config says 768"):
+            EmbeddingClient(provider="mock", model="BAAI/bge-m3", dim=768)
+
+    def test_known_model_correct_dim_passes(self):
+        c = EmbeddingClient(provider="mock", model="BAAI/bge-m3", dim=1024)
+        assert c.dimension == 1024
+
+    def test_unknown_model_any_dim_passes(self):
+        """Unknown model: no check, user is responsible for dim."""
+        c = EmbeddingClient(provider="mock", model="my-custom-model", dim=512)
+        assert c.dimension == 512
+
+    def test_all_known_models_correct_dim(self):
+        """Smoke test: every entry in KNOWN_DIMENSIONS passes its own check."""
+        from core.embedding.client import KNOWN_DIMENSIONS
+        for model, dim in KNOWN_DIMENSIONS.items():
+            c = EmbeddingClient(provider="mock", model=model, dim=dim)
+            assert c.dimension == dim
+
+
+# ── Settings auto-infer ───────────────────────────────────────────────
+
+class TestSettingsInfer:
+    def test_known_model_auto_infers_dim(self, monkeypatch):
+        monkeypatch.setenv("EMBEDDING_MODEL", "BAAI/bge-m3")
+        monkeypatch.setenv("EMBEDDING_DIM", "0")
+        from importlib import reload
+        import config.settings as s
+        reload(s)
+        settings = s.Settings()
+        assert settings.embedding_dim == 1024
+
+    def test_explicit_dim_preserved(self, monkeypatch):
+        monkeypatch.setenv("EMBEDDING_MODEL", "BAAI/bge-m3")
+        monkeypatch.setenv("EMBEDDING_DIM", "1024")
+        from importlib import reload
+        import config.settings as s
+        reload(s)
+        settings = s.Settings()
+        assert settings.embedding_dim == 1024
+
+    def test_unknown_model_no_dim_raises(self, monkeypatch):
+        monkeypatch.setenv("EMBEDDING_MODEL", "my-unknown-model")
+        monkeypatch.setenv("EMBEDDING_DIM", "0")
+        from importlib import reload
+        import config.settings as s
+        reload(s)
+        with pytest.raises(Exception, match="not in KNOWN_DIMENSIONS"):
+            s.Settings()

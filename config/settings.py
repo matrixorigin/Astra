@@ -6,7 +6,7 @@ Follows 12-factor app principles for configuration management.
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -43,9 +43,23 @@ class Settings(BaseSettings):
     # Embedding
     embedding_provider: str = Field(default="local", description="Embedding provider: local, openai, mock")
     embedding_model: str = Field(default="all-MiniLM-L6-v2", description="Embedding model name")
-    embedding_dim: int = Field(default=384, description="Embedding vector dimension")
+    embedding_dim: int = Field(default=0, description="Embedding vector dimension (0 = auto-infer from model name)")
     embedding_api_key: str = Field(default="", description="API key for openai-compatible embedding")
     embedding_base_url: str | None = Field(default=None, description="Base URL for openai-compatible embedding")
+
+    @model_validator(mode="after")
+    def infer_embedding_dim(self) -> "Settings":
+        from core.embedding.client import KNOWN_DIMENSIONS
+        if self.embedding_dim == 0:
+            known = KNOWN_DIMENSIONS.get(self.embedding_model)
+            if known is not None:
+                object.__setattr__(self, "embedding_dim", known)
+            else:
+                raise ValueError(
+                    f"embedding_dim is not set and model {self.embedding_model!r} is not in KNOWN_DIMENSIONS. "
+                    "Please set EMBEDDING_DIM explicitly."
+                )
+        return self
 
     # External Services
     github_token: str | None = Field(default=None, description="GitHub API token")
