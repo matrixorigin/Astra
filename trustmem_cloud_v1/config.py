@@ -18,8 +18,8 @@ class TrustMemSettings(BaseSettings):
     db_name: str = "trustmem"
 
     # Embedding
-    embedding_provider: str = "local"
-    embedding_model: str = "all-MiniLM-L6-v2"
+    embedding_provider: str = "openai"
+    embedding_model: str = "BAAI/bge-m3"
     embedding_dim: int = Field(default=0, description="0 = auto-infer")
     embedding_api_key: str = ""
     embedding_base_url: str | None = None

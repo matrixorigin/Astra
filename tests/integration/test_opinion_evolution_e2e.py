@@ -30,18 +30,22 @@ def _mid():
     return uuid.uuid4().hex
 
 
+from tests.conftest import TEST_EMBEDDING_DIM
+
+
 def _embed_ortho():
     """Embedding orthogonal to _embed() — cosine similarity = 0.0."""
-    return [1.0 if i % 2 == 0 else -1.0 for i in range(384)]
+    return [1.0 if i % 2 == 0 else -1.0 for i in range(TEST_EMBEDDING_DIM)]
 
 
 def _embed(val: float = 0.5):
-    return [val] * 384
+    return [val] * TEST_EMBEDDING_DIM
 
 
 def _embed_neutral():
     """Embedding with ~0.47 cosine similarity to _embed() — in neutral zone (0.3~0.8)."""
-    return [0.9 if i < 192 else (1.0 if i % 2 == 0 else -1.0) for i in range(384)]
+    half = TEST_EMBEDDING_DIM // 2
+    return [0.9 if i < half else (1.0 if i % 2 == 0 else -1.0) for i in range(TEST_EMBEDDING_DIM)]
 
 
 def _insert_scene(db, user_id, content, *, embedding, confidence=0.5,

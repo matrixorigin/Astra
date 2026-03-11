@@ -225,6 +225,9 @@ class MemoryService:
     def update_memory_content(self, memory_id: str, content: str) -> None:
         self._storage.update_memory_content(memory_id, content)
 
+    def update_memory_embedding(self, memory_id: str) -> None:
+        self._storage.update_memory_embedding(memory_id)
+
     def list_active(
         self,
         user_id: str,

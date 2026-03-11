@@ -17,7 +17,7 @@ def _init_embedding() -> None:
     s = get_settings()
     dim = s.embedding_dim
     if dim == 0:
-        dim = KNOWN_DIMENSIONS.get(s.embedding_model, 384)
+        dim = KNOWN_DIMENSIONS.get(s.embedding_model, 1024)
     set_embedding_client(
         EmbeddingClient(
             provider=s.embedding_provider,

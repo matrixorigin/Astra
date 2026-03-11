@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from core.db_consumer import DbFactory
 
-_VERSION = "0.2.9"
+_VERSION = "0.2.10"
 _PRODUCT = "TrustMem Lite"
 _MCP_SERVER_KEY = "trustmem-lite"
 
@@ -36,12 +36,29 @@ def _mcp_config(mode: str = "stdio", db_url: str | None = None, **embed_opts: st
         "args": ["-m", "mo_memory_mcp"],
     }
     # Always emit all env vars so users can see what's configurable.
-    # Empty string = not set (MCP server treats empty same as absent).
+    # When user doesn't specify embedding options, write explicit defaults
+    # so the MCP server, schema DDL, and embed client all agree on dimensions.
+    provider = embed_opts.get("provider", "local")
+    model = embed_opts.get("model", "all-MiniLM-L6-v2")
+    dim = embed_opts.get("dim", "")
+    if not dim:
+        # Auto-infer from model name. Inline subset — keys use BOTH short and
+        # fully-qualified names because users may configure either form.
+        # Canonical source: core.embedding.client.KNOWN_DIMENSIONS (not imported
+        # here to keep CLI startup fast and avoid heavy transitive imports).
+        _MODEL_DIMS = {
+            "all-MiniLM-L6-v2": "384", "all-MiniLM-L12-v2": "384",
+            "sentence-transformers/all-MiniLM-L6-v2": "384",
+            "sentence-transformers/all-MiniLM-L12-v2": "384",
+            "BAAI/bge-m3": "1024", "BAAI/bge-base-en-v1.5": "768",
+            "text-embedding-3-small": "1536", "text-embedding-ada-002": "1536",
+        }
+        dim = _MODEL_DIMS.get(model, "1024")
     env: dict[str, str] = {
         "TRUSTMEM_DB_URL": db_url or "",
-        "EMBEDDING_PROVIDER": embed_opts.get("provider", ""),
-        "EMBEDDING_MODEL": embed_opts.get("model", ""),
-        "EMBEDDING_DIM": embed_opts.get("dim", ""),
+        "EMBEDDING_PROVIDER": provider,
+        "EMBEDDING_MODEL": model,
+        "EMBEDDING_DIM": dim,
         "EMBEDDING_API_KEY": embed_opts.get("api_key", ""),
         "EMBEDDING_BASE_URL": embed_opts.get("base_url", ""),
     }

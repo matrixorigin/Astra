@@ -41,8 +41,8 @@ class Settings(BaseSettings):
     )
     
     # Embedding
-    embedding_provider: str = Field(default="local", description="Embedding provider: local, openai, mock")
-    embedding_model: str = Field(default="all-MiniLM-L6-v2", description="Embedding model name")
+    embedding_provider: str = Field(default="openai", description="Embedding provider: local, openai, mock")
+    embedding_model: str = Field(default="BAAI/bge-m3", description="Embedding model name")
     embedding_dim: int = Field(default=0, description="Embedding vector dimension (0 = auto-infer from model name)")
     embedding_api_key: str = Field(default="", description="API key for openai-compatible embedding")
     embedding_base_url: str | None = Field(default=None, description="Base URL for openai-compatible embedding")

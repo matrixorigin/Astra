@@ -132,6 +132,13 @@ class MemoryStore(DbConsumer):
             db.query(MemoryRecord).filter_by(memory_id=memory_id).update({"content": content})
             db.commit()
 
+    def update_embedding(self, memory_id: str, embedding: list[float]) -> int:
+        """Update embedding of an existing memory. Returns rows affected (0 if not found)."""
+        with self._db() as db:
+            rows = db.query(MemoryRecord).filter_by(memory_id=memory_id).update({"embedding": embedding})
+            db.commit()
+            return rows
+
     def update_confidence(
         self, memory_id: str, confidence: float,
         trust_tier: str | None = None, is_active: bool | None = None,

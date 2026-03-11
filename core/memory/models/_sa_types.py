@@ -11,7 +11,7 @@ from sqlalchemy import DateTime as _SA_DateTime
 from sqlalchemy.engine import Dialect
 from sqlalchemy.types import TypeDecorator
 
-EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM") or "384")
+EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM") or "1024")
 
 
 class DateTime6(TypeDecorator):

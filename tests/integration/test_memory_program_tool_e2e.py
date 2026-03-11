@@ -66,7 +66,7 @@ class TestInjectE2E:
             explain=True,
         )
 
-        assert result["actions_executed"] == 1
+        assert result["actions_executed"] == 1, f"result={result}"
         assert result["actions_failed"] == 0
         assert len(result["explain"]) == 1
         exp = result["explain"][0]

@@ -10,8 +10,12 @@ os.environ["TOKEN_ENCRYPTION_KEY"] = "test-encryption-key-for-unit-tests-only"
 
 # Embedding: use mock provider for fast tests (no model loading)
 os.environ.setdefault("EMBEDDING_PROVIDER", "mock")
-os.environ.setdefault("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-os.environ.setdefault("EMBEDDING_DIM", "384")
+os.environ.setdefault("EMBEDDING_MODEL", "BAAI/bge-m3")
+os.environ.setdefault("EMBEDDING_DIM", "1024")
+
+# Single source of truth for test embedding dimension — use this in all tests
+# instead of hardcoding 1024 everywhere.
+TEST_EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "1024"))
 
 # Disable EventPipeline in tests to prevent background DB sessions from leaking
 os.environ["EVENT_PIPELINE_ENABLED"] = "false"

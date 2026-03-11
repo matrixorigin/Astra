@@ -216,6 +216,33 @@ class TestMemory:
         assert row is not None
         assert row[0] is not None, "embedding must not be NULL after inject"
 
+    def test_correct_embedding_not_null(self, client, db):
+        """Correct via PUT /v1/memories/{id}/correct must produce a non-NULL embedding."""
+        uid, h, _ = _make_user(client)
+        mid = client.post("/v1/memories", json={"content": "original fact about databases"}, headers=h).json()["memory_id"]
+
+        r = client.put(f"/v1/memories/{mid}/correct",
+                       json={"new_content": "corrected fact about quantum computing", "reason": "fix"},
+                       headers=h)
+        assert r.status_code == 200
+        new_mid = r.json()["memory_id"]
+
+        row = db.execute(text(
+            "SELECT embedding FROM mem_memories WHERE memory_id = :mid"
+        ), {"mid": new_mid}).first()
+        assert row is not None
+        assert row[0] is not None, "embedding must not be NULL after correct"
+
+        # Old memory embedding should still be intact (not corrupted by correct)
+        old_row = db.execute(text(
+            "SELECT embedding FROM mem_memories WHERE memory_id = :mid"
+        ), {"mid": mid}).first()
+        assert old_row is not None
+        assert old_row[0] is not None, "old memory embedding must not be corrupted"
+
+        # Content changed → embedding must differ
+        assert row[0] != old_row[0], "corrected memory should have different embedding"
+
     def test_correct_deactivates_old(self, client, db):
         uid, h, _ = _make_user(client)
         mid = client.post("/v1/memories", json={"content": "original"}, headers=h).json()["memory_id"]
@@ -261,6 +288,25 @@ class TestMemory:
             "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active AND content LIKE 'batch_%'"
         ), {"uid": uid}).scalar()
         assert count == 3
+
+    def test_batch_store_embedding_not_null(self, client, db):
+        """Batch store must produce non-NULL embeddings for all memories."""
+        uid, h, _ = _make_user(client)
+        r = client.post("/v1/memories/batch", json={
+            "memories": [
+                {"content": "The Eiffel Tower is in Paris"},
+                {"content": "Python was created by Guido van Rossum"},
+            ]
+        }, headers=h)
+        assert r.status_code == 201
+        mids = [m["memory_id"] for m in r.json()]
+
+        for mid in mids:
+            row = db.execute(text(
+                "SELECT embedding FROM mem_memories WHERE memory_id = :mid"
+            ), {"mid": mid}).first()
+            assert row is not None
+            assert row[0] is not None, f"embedding must not be NULL for batch memory {mid}"
 
     def test_search_returns_relevant(self, client, user_key):
         uid, h = user_key

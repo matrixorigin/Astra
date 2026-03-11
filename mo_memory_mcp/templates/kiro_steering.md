@@ -2,7 +2,7 @@
 inclusion: always
 ---
 
-<!-- trustmem-version: 0.2.9 -->
+<!-- trustmem-version: 0.2.10 -->
 
 # Memory Integration (TrustMem Lite)
 

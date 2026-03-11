@@ -1,8 +1,9 @@
 """Self-contained DDL for TrustMem Lite memory tables.
 
 No dependency on core/ or api/ — works in standalone pip-install mode.
-The embedding dimension is configurable via ``EMBEDDING_DIM`` env var
-(default 384, matching all-MiniLM-L6-v2).
+The embedding dimension is configurable via ``EMBEDDING_DIM`` env var.
+When unset, inferred from ``EMBEDDING_MODEL`` (384 for all-MiniLM-L6-v2,
+1024 for BAAI/bge-m3, etc.).  Final fallback: 1024.
 
 Usage::
 
@@ -23,7 +24,33 @@ from sqlalchemy.engine import Engine
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DIM = int(os.environ.get("EMBEDDING_DIM") or "384")
+
+def _infer_default_dim() -> int:
+    """Infer embedding dimension from env vars.
+
+    Priority: EMBEDDING_DIM (explicit) > model name lookup > 1024.
+    Duplicates a small subset of KNOWN_DIMENSIONS to stay self-contained
+    (no dependency on core/).
+    """
+    raw = os.environ.get("EMBEDDING_DIM") or ""
+    val = int(raw) if raw.strip() else 0
+    if val > 0:
+        return val
+    model = os.environ.get("EMBEDDING_MODEL") or ""
+    # Keys use both short and fully-qualified names (users may configure either).
+    # Canonical source: core.embedding.client.KNOWN_DIMENSIONS (not imported
+    # here — schema.py must stay self-contained with no core/ dependency).
+    _MODEL_DIMS = {
+        "all-MiniLM-L6-v2": 384, "all-MiniLM-L12-v2": 384,
+        "sentence-transformers/all-MiniLM-L6-v2": 384,
+        "sentence-transformers/all-MiniLM-L12-v2": 384,
+        "BAAI/bge-m3": 1024, "BAAI/bge-base-en-v1.5": 768,
+        "text-embedding-3-small": 1536, "text-embedding-ada-002": 1536,
+    }
+    return _MODEL_DIMS.get(model, 1024)
+
+
+DEFAULT_DIM = _infer_default_dim()
 
 DEFAULT_DB_URL = "mysql+pymysql://root:111@localhost:6001/trustmem"
 
@@ -230,7 +257,7 @@ def _fix_embedding_dim(conn: Any, dim: int, *, force: bool = False) -> None:
         )).fetchone()
         if row is None:
             continue
-        col_type: str = row[1]  # e.g. "vecf32(384)"
+        col_type: str = row[1]  # e.g. "vecf32(1024)"
         m = _VECF32_RE.search(col_type)
         if not m:
             continue  # unrecognised column type — skip silently
@@ -261,7 +288,7 @@ def ensure_tables(engine: Engine, *, dim: int | None = None, force: bool = False
 
     Args:
         engine: SQLAlchemy engine connected to the target database.
-        dim: Embedding vector dimension (default: EMBEDDING_DIM env or 384).
+        dim: Embedding vector dimension (default: EMBEDDING_DIM env or 1024).
         force: If True, ALTER embedding column when dim mismatches (destructive).
 
     Returns:

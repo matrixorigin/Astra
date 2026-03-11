@@ -285,14 +285,45 @@ class CanonicalStorage:
     # ── Low-level CRUD ────────────────────────────────────────────────
 
     def create_memory(self, memory: Memory) -> Memory:
-        """Direct create bypassing Observer pipeline."""
+        """Direct create bypassing Observer pipeline.
+
+        Auto-generates embedding if ``_embed_fn`` is configured and
+        ``memory.embedding`` is None.  Mutates the input object in-place.
+        """
+        if memory.embedding is None and self._embed_fn is not None:
+            try:
+                emb = self._embed_fn(memory.content)
+                if emb is not None:
+                    memory.embedding = emb
+            except Exception:
+                logger.warning("Embedding failed in create_memory", exc_info=True)
         return self._store_lazy.create(memory)
 
     def get_memory(self, memory_id: str) -> Memory | None:
         return self._store_lazy.get(memory_id)
 
     def update_memory_content(self, memory_id: str, content: str) -> None:
+        # Content-only update. Used by streaming accumulator for intermediate
+        # flushes — re-embedding on every flush would be wasteful and the two
+        # writes (content + embedding) would be in separate transactions.
+        # Callers that need an up-to-date embedding after a content change
+        # should call update_memory_embedding() explicitly.
         self._store_lazy.update_content(memory_id, content)
+
+    def update_memory_embedding(self, memory_id: str) -> None:
+        """Re-generate and persist embedding for an existing memory."""
+        if self._embed_fn is None:
+            return
+        mem = self._store_lazy.get(memory_id)
+        if mem is None:
+            logger.debug("update_memory_embedding: memory %s not found", memory_id)
+            return
+        try:
+            embedding = self._embed_fn(mem.content)
+            if embedding is not None:
+                self._store_lazy.update_embedding(memory_id, embedding)
+        except Exception:
+            logger.warning("Embedding failed in update_memory_embedding", exc_info=True)
 
     def list_active(
         self,

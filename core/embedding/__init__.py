@@ -42,7 +42,7 @@ def get_embedding_client() -> EmbeddingClient:
         _shared_client = EmbeddingClient(
             provider=s.embedding_provider,
             model=s.embedding_model,
-            dim=384 if s.embedding_provider == "local" else s.embedding_dim,
+            dim=s.embedding_dim,
             api_key=s.embedding_api_key,
             base_url=s.embedding_base_url,
         )

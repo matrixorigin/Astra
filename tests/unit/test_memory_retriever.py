@@ -7,6 +7,7 @@ import pytest
 
 from core.memory.tabular.retriever import TASK_WEIGHTS, MemoryRetriever
 from core.memory.types import MemoryType
+from tests.conftest import TEST_EMBEDDING_DIM
 
 
 def _make_chain(rows=None):
@@ -105,7 +106,7 @@ class TestRetrievePhase2:
 
     def test_vector_path_invoked_with_embedding(self, retriever, mock_db):
         """When query_embedding is provided, phase2 should run."""
-        retriever.retrieve("u1", "test", session_id="s1", query_embedding=[0.1] * 384)
+        retriever.retrieve("u1", "test", session_id="s1", query_embedding=[0.1] * TEST_EMBEDDING_DIM)
         # At least 2 query calls: phase1 fallback + phase2 vector
         assert mock_db.query.call_count >= 2
 
@@ -121,7 +122,7 @@ class TestRetrievePhase2:
             raise RuntimeError("vector down")
 
         mock_db.query.side_effect = side_effect
-        results, _ = retriever.retrieve("u1", "test", session_id="s1", query_embedding=[0.1] * 384)
+        results, _ = retriever.retrieve("u1", "test", session_id="s1", query_embedding=[0.1] * TEST_EMBEDDING_DIM)
         assert len(results) >= 1
 
 
@@ -165,7 +166,7 @@ class TestRetrieveExplain:
 
         memories, stats = retriever.retrieve(
             "u1", "Go testing", session_id="s1",
-            query_embedding=[0.1] * 384, explain=True,
+            query_embedding=[0.1] * TEST_EMBEDDING_DIM, explain=True,
         )
         assert stats is not None
         assert len(stats.candidate_scores) == len(memories)

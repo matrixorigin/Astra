@@ -12,8 +12,11 @@ Strategy:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -123,6 +126,14 @@ class StreamingOutputAccumulator:
             return self.state.buffer
 
         self._update_storage()
+
+        # Re-embed with final content (initial embedding was from partial buffer)
+        if self.state.memory_id:
+            try:
+                self.memory_service.update_memory_embedding(self.state.memory_id)
+            except Exception:
+                logger.warning("Re-embed failed for memory %s", self.state.memory_id, exc_info=True)
+
         summary = self._generate_summary()
 
         return f"{summary}\n\n[Full output ({self.state.total_bytes} bytes): memory:{self.state.memory_id}]"

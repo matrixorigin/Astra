@@ -103,11 +103,19 @@ class EmbeddedBackend(MemoryBackend):
 
     @staticmethod
     def _make_embed_client():
-        """Build EmbeddingClient from EMBEDDING_* env vars."""
+        """Build EmbeddingClient from EMBEDDING_* env vars.
+
+        MCP server runs locally as a dev tool. Default to "local" provider
+        (sentence-transformers) so `trustmem init` works without API keys.
+        Production deployments (TrustMem Cloud, mo-agent API) use their own
+        config files which default to "openai" + BAAI/bge-m3.
+        """
         provider = os.environ.get("EMBEDDING_PROVIDER") or "local"
         model = os.environ.get("EMBEDDING_MODEL") or "all-MiniLM-L6-v2"
-        # local provider always uses 384 (all-MiniLM-L6-v2 is fixed)
-        dim = 384 if provider == "local" else int(os.environ.get("EMBEDDING_DIM") or "384")
+        dim = int(os.environ.get("EMBEDDING_DIM") or "0")
+        if dim == 0:
+            from core.embedding.client import KNOWN_DIMENSIONS
+            dim = KNOWN_DIMENSIONS.get(model, 1024)
         try:
             from core.embedding.client import EmbeddingClient
             return EmbeddingClient(

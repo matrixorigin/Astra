@@ -47,21 +47,21 @@ _DB_PORT = 6001
 
 def _server_env() -> dict[str, str]:
     """Build subprocess env for MCP server. Uses remote embedding if configured, else local."""
-    provider = os.environ.get("EMBEDDING_PROVIDER", "local")
-    if provider != "local":
+    provider = os.environ.get("EMBEDDING_PROVIDER", "mock")
+    if provider not in ("local", "mock"):
         return {
             **os.environ,
             "EMBEDDING_PROVIDER": provider,
             "EMBEDDING_MODEL": os.environ.get("EMBEDDING_MODEL", ""),
-            "EMBEDDING_DIM": os.environ.get("EMBEDDING_DIM", "384"),
+            "EMBEDDING_DIM": os.environ.get("EMBEDDING_DIM", "1024"),
         }
     return {
         **os.environ,
         "TRANSFORMERS_OFFLINE": "1",
         "HF_DATASETS_OFFLINE": "1",
-        "EMBEDDING_PROVIDER": "local",
-        "EMBEDDING_MODEL": "all-MiniLM-L6-v2",
-        "EMBEDDING_DIM": "384",
+        "EMBEDDING_PROVIDER": provider,
+        "EMBEDDING_MODEL": os.environ.get("EMBEDDING_MODEL", "BAAI/bge-m3"),
+        "EMBEDDING_DIM": os.environ.get("EMBEDDING_DIM", "1024"),
     }
 _DB_USER = "root"
 _DB_PASS = "111"

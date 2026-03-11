@@ -2,6 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
+from tests.conftest import TEST_EMBEDDING_DIM
 from skills.knowledge.api import add_relation, expand_with_graph, get_neighbors
 
 
@@ -153,7 +154,7 @@ class TestHybridRetrievalGraphExpansion:
 
         with patch("skills.knowledge.api.update_access_tracking"):
             entries = hr.retrieve_knowledge(
-                query_text="test", query_embedding=[0.1] * 384,
+                query_text="test", query_embedding=[0.1] * TEST_EMBEDDING_DIM,
                 user_id="u1", limit=5,
             )
         assert len(entries) >= 1

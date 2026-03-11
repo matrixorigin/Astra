@@ -82,7 +82,7 @@ def init_db():
     dim = settings.embedding_dim
     if dim == 0:
         from core.embedding.client import KNOWN_DIMENSIONS
-        dim = KNOWN_DIMENSIONS.get(settings.embedding_model, 384)
+        dim = KNOWN_DIMENSIONS.get(settings.embedding_model, 1024)
     ensure_tables(engine, dim=dim)
 
     # Governance infrastructure tables (used by scheduler)

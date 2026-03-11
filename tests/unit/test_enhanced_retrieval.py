@@ -1,3 +1,4 @@
+from tests.conftest import TEST_EMBEDDING_DIM
 """Tests for enhanced hybrid retrieval.
 
 Strategy: ORM chain mocking is brittle, so we test the Python-side logic
@@ -76,7 +77,7 @@ class TestRetrieveEvents:
         mock_db.query.side_effect = [vec_chain, ft_chain]
 
         events = retriever.retrieve_events(
-            query_text="test", query_embedding=[0.1] * 384, session_id="sess_1",
+            query_text="test", query_embedding=[0.1] * TEST_EMBEDDING_DIM, session_id="sess_1",
         )
         assert len(events) == 1
         # vector_score = sem + temp + 0 causal = 0.35, keyword_score = 0.25
@@ -90,7 +91,7 @@ class TestRetrieveEvents:
         mock_db.query.side_effect = [vec_chain, ft_chain]
 
         events = retriever.retrieve_events(
-            query_text="test", query_embedding=[0.1] * 384,
+            query_text="test", query_embedding=[0.1] * TEST_EMBEDDING_DIM,
             session_id="sess_1", current_chain_id="c1",
         )
         assert len(events) == 1
@@ -104,7 +105,7 @@ class TestRetrieveEvents:
         mock_db.query.side_effect = [vec_chain, ft_chain]
 
         events = retriever.retrieve_events(
-            query_text="test", query_embedding=[0.1] * 384, session_id="sess_1",
+            query_text="test", query_embedding=[0.1] * TEST_EMBEDDING_DIM, session_id="sess_1",
         )
         assert len(events) == 1
         assert events[0]["relevance_score"] == pytest.approx(0.25, abs=0.01)
@@ -119,7 +120,7 @@ class TestRetrieveEvents:
         mock_db.query.side_effect = [vec_chain, ft_chain]
 
         events = retriever.retrieve_events(
-            query_text="test", query_embedding=[0.1] * 384, session_id="sess_1",
+            query_text="test", query_embedding=[0.1] * TEST_EMBEDDING_DIM, session_id="sess_1",
         )
         assert len(events) == 2
         # e1: 0.35 vector only; e2: 0.12 + 0.25 keyword = 0.37
@@ -139,7 +140,7 @@ class TestRetrieveEvents:
 
         mock_db.query.side_effect = side_effect
         events = retriever.retrieve_events(
-            query_text="test", query_embedding=[0.1] * 384, session_id="sess_1",
+            query_text="test", query_embedding=[0.1] * TEST_EMBEDDING_DIM, session_id="sess_1",
         )
         assert len(events) == 1
         assert events[0]["event_id"] == "e3"
@@ -148,7 +149,7 @@ class TestRetrieveEvents:
         """Both paths failing returns empty list, no exception."""
         mock_db.query.side_effect = RuntimeError("DB down")
         events = retriever.retrieve_events(
-            query_text="test", query_embedding=[0.1] * 384, session_id="sess_1",
+            query_text="test", query_embedding=[0.1] * TEST_EMBEDDING_DIM, session_id="sess_1",
         )
         assert events == []
 
@@ -159,7 +160,7 @@ class TestRetrieveEvents:
         mock_db.query.side_effect = [vec_chain, ft_chain]
 
         events = retriever.retrieve_events(
-            query_text="test", query_embedding=[0.1] * 384, session_id="sess_1",
+            query_text="test", query_embedding=[0.1] * TEST_EMBEDDING_DIM, session_id="sess_1",
         )
         assert "vector_score" not in events[0]
         assert "keyword_score" not in events[0]
@@ -178,7 +179,7 @@ class TestRetrieveKnowledge:
     def test_invalid_weights_returns_empty(self, retriever, mock_db):
         """Missing required weight keys returns empty immediately."""
         entries = retriever.retrieve_knowledge(
-            query_text="test", query_embedding=[0.1] * 384,
+            query_text="test", query_embedding=[0.1] * TEST_EMBEDDING_DIM,
             user_id="u1", weights={"semantic": 0.5},
         )
         assert entries == []
@@ -188,6 +189,6 @@ class TestRetrieveKnowledge:
         """Vector query failure returns empty list."""
         mock_db.query.side_effect = RuntimeError("DB down")
         entries = retriever.retrieve_knowledge(
-            query_text="test", query_embedding=[0.1] * 384, user_id="u1",
+            query_text="test", query_embedding=[0.1] * TEST_EMBEDDING_DIM, user_id="u1",
         )
         assert entries == []

@@ -219,7 +219,15 @@ class MemoryEditor:
             observed_at=datetime.now(timezone.utc),
         )
 
-        # Use store's supersede: deactivates old, creates new, links them
+        if self._embed_client is not None:
+            try:
+                new_mem.embedding = self._embed_client.embed(new_content)
+            except Exception:
+                logger.warning("Embedding failed for correct", exc_info=True)
+
+        # Use store's supersede: deactivates old, creates new, links them.
+        # supersede() inserts directly into MemoryStore (not through
+        # CanonicalStorage.create_memory), so we must embed here.
         from core.memory.tabular.store import MemoryStore
 
         store = MemoryStore(self._db_factory)

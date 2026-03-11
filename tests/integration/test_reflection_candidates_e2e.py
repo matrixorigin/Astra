@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from tests.conftest import TEST_EMBEDDING_DIM
 from core.memory.models.memory import MemoryRecord
 from core.memory.tabular.candidates import TabularCandidateProvider, _cosine_similarity
 
@@ -59,7 +60,7 @@ class TestSignalSemanticClusters:
     def test_cross_session_cluster_found(self, db, db_factory):
         """Two similar memories in different sessions → 1 candidate."""
         uid = f"u-{uuid.uuid4().hex[:8]}"
-        emb = [1.0] * 384
+        emb = [1.0] * TEST_EMBEDDING_DIM
         _make_memory(db, uid, "Use ruff for linting", session_id="s1", embedding=emb)
         _make_memory(db, uid, "Use ruff for linting", session_id="s2", embedding=emb)
 
@@ -74,7 +75,7 @@ class TestSignalSemanticClusters:
     def test_same_session_not_clustered(self, db, db_factory):
         """Two similar memories in same session → no candidate."""
         uid = f"u-{uuid.uuid4().hex[:8]}"
-        emb = [1.0] * 384
+        emb = [1.0] * TEST_EMBEDDING_DIM
         _make_memory(db, uid, "Use ruff", session_id="s1", embedding=emb)
         _make_memory(db, uid, "Use ruff", session_id="s1", embedding=emb)
 
@@ -87,8 +88,8 @@ class TestSignalSemanticClusters:
     def test_dissimilar_memories_not_clustered(self, db, db_factory):
         """Two orthogonal embeddings → no cluster."""
         uid = f"u-{uuid.uuid4().hex[:8]}"
-        emb_a = [1.0] + [0.0] * 383
-        emb_b = [0.0] + [1.0] + [0.0] * 382
+        emb_a = [1.0] + [0.0] * (TEST_EMBEDDING_DIM - 1)
+        emb_b = [0.0] + [1.0] + [0.0] * (TEST_EMBEDDING_DIM - 2)
         _make_memory(db, uid, "topic A", session_id="s1", embedding=emb_a)
         _make_memory(db, uid, "topic B", session_id="s2", embedding=emb_b)
 
@@ -101,7 +102,7 @@ class TestSignalSemanticClusters:
     def test_old_memories_excluded(self, db, db_factory):
         """Memories older than since_hours are excluded."""
         uid = f"u-{uuid.uuid4().hex[:8]}"
-        emb = [1.0] * 384
+        emb = [1.0] * TEST_EMBEDDING_DIM
         old_time = _utcnow() - timedelta(hours=48)
         _make_memory(db, uid, "old", session_id="s1", embedding=emb, observed_at=old_time)
         _make_memory(db, uid, "old", session_id="s2", embedding=emb, observed_at=old_time)
@@ -127,7 +128,7 @@ class TestSignalSemanticClusters:
     def test_memory_fields_populated(self, db, db_factory):
         """Verify all Memory fields are correctly populated from DB."""
         uid = f"u-{uuid.uuid4().hex[:8]}"
-        emb = [0.5] * 384
+        emb = [0.5] * TEST_EMBEDDING_DIM
         _make_memory(db, uid, "content A", session_id="s1", embedding=emb,
                      memory_type="procedural")
         _make_memory(db, uid, "content A", session_id="s2", embedding=emb,
@@ -201,7 +202,7 @@ class TestSignalSummaryRecurrence:
     def test_recurring_summaries_found(self, db, db_factory):
         """3+ similar cross-session summaries → 1 recurrence candidate."""
         uid = f"u-{uuid.uuid4().hex[:8]}"
-        emb = [0.7] * 384
+        emb = [0.7] * TEST_EMBEDDING_DIM
         for i in range(4):
             _make_memory(
                 db, uid, f"User prefers concise output v{i}",
@@ -219,7 +220,7 @@ class TestSignalSummaryRecurrence:
     def test_too_few_summaries_excluded(self, db, db_factory):
         """Only 2 summaries → below threshold, no candidate."""
         uid = f"u-{uuid.uuid4().hex[:8]}"
-        emb = [0.7] * 384
+        emb = [0.7] * TEST_EMBEDDING_DIM
         for i in range(2):
             _make_memory(
                 db, uid, f"summary {i}",
@@ -257,7 +258,7 @@ class TestUserIsolation:
         """Memories from other users must not appear in candidates."""
         uid_a = f"u-{uuid.uuid4().hex[:8]}"
         uid_b = f"u-{uuid.uuid4().hex[:8]}"
-        emb = [1.0] * 384
+        emb = [1.0] * TEST_EMBEDDING_DIM
         _make_memory(db, uid_a, "A's memory", session_id="s1", embedding=emb)
         _make_memory(db, uid_b, "B's memory", session_id="s2", embedding=emb)
 

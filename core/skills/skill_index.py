@@ -44,7 +44,7 @@ class SkillIndex(DbConsumer):
     ``db_factory`` provides short-lived sessions (via DbConsumer._db()).
     """
 
-    # L2 distance threshold — empirically tuned for 384-dim all-MiniLM-L6-v2.
+    # L2 distance threshold — empirically tuned.
     # Lower = more similar.  L2 ≈ sqrt(2 * (1 - cosine)) for unit vectors.
     MAX_L2_DISTANCE = 1.15
 

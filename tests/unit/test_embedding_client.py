@@ -6,22 +6,23 @@ from unittest.mock import MagicMock, patch
 
 from core.embedding.client import EmbeddingClient
 from core.embedding.providers import LocalProvider, MockProvider, OpenAIProvider
+from tests.conftest import TEST_EMBEDDING_DIM
 
 
 # ── MockProvider ──────────────────────────────────────────────────────
 
 class TestMockProvider:
     def test_deterministic(self):
-        c = EmbeddingClient(provider="mock", model="mock", dim=384)
+        c = EmbeddingClient(provider="mock", model="mock", dim=TEST_EMBEDDING_DIM)
         assert c.embed("hello") == c.embed("hello")
 
     def test_correct_dimension(self):
-        c = EmbeddingClient(provider="mock", model="mock", dim=384)
-        assert len(c.embed("hello")) == 384
-        assert c.dimension == 384
+        c = EmbeddingClient(provider="mock", model="mock", dim=TEST_EMBEDDING_DIM)
+        assert len(c.embed("hello")) == TEST_EMBEDDING_DIM
+        assert c.dimension == TEST_EMBEDDING_DIM
 
     def test_different_texts_differ(self):
-        c = EmbeddingClient(provider="mock", model="mock", dim=384)
+        c = EmbeddingClient(provider="mock", model="mock", dim=TEST_EMBEDDING_DIM)
         assert c.embed("hello") != c.embed("goodbye")
 
     def test_custom_dimension(self):
@@ -30,7 +31,7 @@ class TestMockProvider:
         assert c.dimension == 128
 
     def test_model_name(self):
-        c = EmbeddingClient(provider="mock", model="mock", dim=384)
+        c = EmbeddingClient(provider="mock", model="mock", dim=TEST_EMBEDDING_DIM)
         assert c.model_name == "mock"
 
 
@@ -39,7 +40,7 @@ class TestMockProvider:
 class TestFailFast:
     def test_unknown_provider_raises(self):
         with pytest.raises(ValueError, match="Unknown embedding provider"):
-            EmbeddingClient(provider="nonexistent", model="x", dim=384)
+            EmbeddingClient(provider="nonexistent", model="x", dim=TEST_EMBEDDING_DIM)
 
     def test_openai_missing_api_key_raises(self):
         with pytest.raises(ValueError, match="requires api_key"):
@@ -223,11 +224,11 @@ class TestSaTypesEmbeddingDim:
         reload(m)
         return m.EMBEDDING_DIM
 
-    def test_empty_string_falls_back_to_384(self, monkeypatch):
-        assert self._reload_dim(monkeypatch, "") == 384
+    def test_empty_string_falls_back_to_1024(self, monkeypatch):
+        assert self._reload_dim(monkeypatch, "") == 1024
 
-    def test_unset_falls_back_to_384(self, monkeypatch):
-        assert self._reload_dim(monkeypatch, None) == 384
+    def test_unset_falls_back_to_1024(self, monkeypatch):
+        assert self._reload_dim(monkeypatch, None) == 1024
 
     def test_explicit_value_used(self, monkeypatch):
         assert self._reload_dim(monkeypatch, "1024") == 1024

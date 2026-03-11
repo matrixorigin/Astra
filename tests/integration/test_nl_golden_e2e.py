@@ -16,6 +16,7 @@ _TEST_DB = os.environ.get("MATRIXONE_DATABASE", "test_dev_agent_v3")
 
 from core.memory.programmer import MemoryProgrammer, parse_script  # noqa: E402
 from core.utils.id_generator import generate_id  # noqa: E402
+from tests.conftest import TEST_EMBEDDING_DIM  # noqa: E402
 
 # ── Golden LLM outputs (deepseek-chat, 2026-03-08) ──────────────────
 
@@ -370,7 +371,7 @@ class TestBatchInjectEmbedding:
         from core.memory.canonical_storage import CanonicalStorage
         from core.memory.editor import MemoryEditor
 
-        dim = 384  # must match DB vector column dimension
+        dim = TEST_EMBEDDING_DIM
         mock_client = MagicMock()
         mock_client.embed_batch.return_value = [[0.1] * dim, [0.2] * dim]
 

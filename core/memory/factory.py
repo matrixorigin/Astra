@@ -215,7 +215,11 @@ def create_editor(
             from core.embedding import get_embedding_client
             embed_client = get_embedding_client()
         except Exception:
-            logger.debug("Embedding client not available for editor", exc_info=True)
+            logger.warning(
+                "Embedding client not available — memories will be stored without vectors. "
+                "Check EMBEDDING_PROVIDER / EMBEDDING_API_KEY configuration.",
+                exc_info=True,
+            )
 
     # Wire embed_fn into CanonicalStorage so observe_explicit generates embeddings.
     embed_fn = embed_client.embed if embed_client is not None else None

@@ -43,7 +43,8 @@ def _mid():
 
 
 def _embed(val: float = 0.5):
-    return [val] * 384
+    from tests.conftest import TEST_EMBEDDING_DIM
+    return [val] * TEST_EMBEDDING_DIM
 
 
 def _insert(db, user_id, content, *, memory_type="semantic", session_id="s1",
