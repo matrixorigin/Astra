@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from core.db_consumer import DbFactory
 
-_VERSION = "0.2.7"
+_VERSION = "0.2.8"
 _PRODUCT = "TrustMem Lite"
 _MCP_SERVER_KEY = "trustmem-lite"
 
@@ -103,6 +103,51 @@ def _get_claude_rule() -> str:
     return _load_template("claude_rule.md")
 
 
+def _safe_write_rule(rule_file: Path, new_content: str, *, force: bool, project_dir: Path) -> str:
+    """Write a steering rule file, respecting user customizations.
+
+    Returns a status string for display.
+    """
+    rel = rule_file.relative_to(project_dir)
+    if not rule_file.exists():
+        rule_file.parent.mkdir(parents=True, exist_ok=True)
+        rule_file.write_text(new_content)
+        return f"  ✅ {rel} (created)"
+
+    existing = rule_file.read_text()
+    installed_ver = _installed_rule_version(rule_file)
+    import re
+    new_ver_m = re.search(r"trustmem-version:\s*([\d.]+)", new_content[:500])
+    new_ver = new_ver_m.group(1) if new_ver_m else None
+
+    # Same version, same content — skip
+    if installed_ver == new_ver and existing.strip() == new_content.strip():
+        return f"  ⏭️  {rel} (up to date)"
+
+    # Same version but content differs — user customized
+    if installed_ver == new_ver and existing.strip() != new_content.strip():
+        if force:
+            _backup(rule_file)
+            rule_file.write_text(new_content)
+            return f"  ⚠️  {rel} (overwritten — backup saved as {rel}.bak)"
+        return f"  ⏭️  {rel} (user-customized, use --force to overwrite)"
+
+    # Older version — auto-update, backup first
+    if installed_ver != new_ver:
+        _backup(rule_file)
+        rule_file.write_text(new_content)
+        return f"  ✅ {rel} (updated {installed_ver} → {new_ver}, backup saved as {rel}.bak)"
+
+    rule_file.write_text(new_content)
+    return f"  ✅ {rel}"
+
+
+def _backup(path: Path) -> None:
+    """Save a .bak copy of a file before overwriting."""
+    bak = path.with_suffix(path.suffix + ".bak")
+    bak.write_text(path.read_text())
+
+
 # ── Detection & writing ───────────────────────────────────────────────
 
 def _detect_tools(project_dir: Path) -> dict[str, bool]:
@@ -113,7 +158,7 @@ def _detect_tools(project_dir: Path) -> dict[str, bool]:
     }
 
 
-def _write_kiro(project_dir: Path, mode: str, db_url: str | None = None, **embed_opts: str) -> list[str]:
+def _write_kiro(project_dir: Path, mode: str, db_url: str | None = None, force: bool = False, **embed_opts: str) -> list[str]:
     actions = []
 
     # MCP config
@@ -135,13 +180,12 @@ def _write_kiro(project_dir: Path, mode: str, db_url: str | None = None, **embed
     steering_dir = project_dir / ".kiro" / "steering"
     steering_dir.mkdir(parents=True, exist_ok=True)
     rule_file = steering_dir / "memory.md"
-    rule_file.write_text(_get_kiro_steering())
-    actions.append(f"  ✅ {rule_file.relative_to(project_dir)}")
+    actions.append(_safe_write_rule(rule_file, _get_kiro_steering(), force=force, project_dir=project_dir))
 
     return actions
 
 
-def _write_cursor(project_dir: Path, mode: str, db_url: str | None = None, **embed_opts: str) -> list[str]:
+def _write_cursor(project_dir: Path, mode: str, db_url: str | None = None, force: bool = False, **embed_opts: str) -> list[str]:
     actions = []
 
     # MCP config
@@ -163,13 +207,12 @@ def _write_cursor(project_dir: Path, mode: str, db_url: str | None = None, **emb
     rules_dir = cursor_dir / "rules"
     rules_dir.mkdir(parents=True, exist_ok=True)
     rule_file = rules_dir / "memory.mdc"
-    rule_file.write_text(_get_cursor_rule())
-    actions.append(f"  ✅ {rule_file.relative_to(project_dir)}")
+    actions.append(_safe_write_rule(rule_file, _get_cursor_rule(), force=force, project_dir=project_dir))
 
     return actions
 
 
-def _write_claude(project_dir: Path, mode: str, db_url: str | None = None, **embed_opts: str) -> list[str]:
+def _write_claude(project_dir: Path, mode: str, db_url: str | None = None, force: bool = False, **embed_opts: str) -> list[str]:
     actions = []
 
     # MCP config for Claude Code
@@ -270,10 +313,14 @@ def cmd_init(args: argparse.Namespace) -> None:
 
     tools = _detect_tools(project_dir)
 
-    detected = [name for name, found in tools.items() if found]
-    if not detected:
-        print("No AI tools detected. Creating configs for all tools.")
-        detected = ["kiro", "cursor", "claude"]
+    # --tool flag overrides auto-detection
+    if args.tool:
+        detected = args.tool
+    else:
+        detected = [name for name, found in tools.items() if found]
+        if not detected:
+            print("No AI tools detected. Use --tool to specify: --tool kiro, --tool cursor, --tool claude")
+            return
 
     print(f"Detected tools: {', '.join(detected)}")
     print(f"Mode: {mode}")
@@ -314,7 +361,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     writers = {"kiro": _write_kiro, "cursor": _write_cursor, "claude": _write_claude}
     for tool_name in detected:
         print(f"Configuring {tool_name}:")
-        actions = writers[tool_name](project_dir, mode, effective_db_url, **embed_opts)
+        actions = writers[tool_name](project_dir, mode, effective_db_url, force=args.force, **embed_opts)
         for a in actions:
             print(a)
         print()
@@ -566,6 +613,8 @@ def main() -> None:
     p_init = sub.add_parser("init", help="Configure MCP + steering rules + create tables")
     p_init.add_argument("--mode", choices=["stdio", "remote"], default="stdio", help="MCP transport mode")
     p_init.add_argument("--db-url", help="Database URL, e.g. mysql+pymysql://user:pass@host:6001/db")
+    p_init.add_argument("--tool", choices=["kiro", "cursor", "claude"], action="append", help="Only configure specific tool(s). Can be repeated: --tool kiro --tool cursor")
+    p_init.add_argument("--force", action="store_true", help="Overwrite steering rules even if user has customized them")
     p_init.add_argument("--embedding-provider", help="Embedding provider: local (default), openai, mock")
     p_init.add_argument("--embedding-model", help="Embedding model name (default: all-MiniLM-L6-v2)")
     p_init.add_argument("--embedding-dim", help="Embedding dimension (default: 384)")

@@ -22,10 +22,34 @@ trustmem init --db-url 'mysql+pymysql://root:111@localhost:6001/my_db'
 ## What `trustmem init` Does
 
 1. **Detects AI tools** — scans for `.kiro/`, `.cursor/`, `CLAUDE.md`
-2. **Writes MCP config** — registers the TrustMem Lite MCP server with your IDE
-3. **Writes steering rules** — tells the AI when to store/retrieve/correct memories
+2. **Writes MCP config** — registers the TrustMem Lite MCP server with your IDE (always updated)
+3. **Writes steering rules** — tells the AI when to store/retrieve/correct memories (protected, see below)
 
 Does NOT create database tables — run `trustmem migrate` first.
+
+### Steering Rule Protection
+
+`trustmem init` protects steering rules you've customized:
+
+| Situation | Behavior |
+|-----------|----------|
+| File doesn't exist | Created |
+| Same version, no changes | Skipped (up to date) |
+| Same version, user-modified | Skipped — use `--force` to overwrite |
+| Older version | Auto-updated, `.bak` backup saved first |
+| `--force` flag | Always overwrites, `.bak` backup saved first |
+
+### Selecting Tools
+
+By default, `trustmem init` auto-detects installed tools. Use `--tool` to configure specific tools only:
+
+```bash
+trustmem init --tool kiro                    # Kiro only
+trustmem init --tool cursor                  # Cursor only
+trustmem init --tool kiro --tool cursor      # Both
+```
+
+If no tools are detected and `--tool` is not specified, init will prompt you to use `--tool`.
 
 ## Configuration
 
@@ -162,9 +186,13 @@ Files written:
 ## CLI Commands
 
 ```bash
-trustmem init        # Configure MCP + steering rules
+trustmem init        # Configure MCP + steering rules (auto-detects tools)
+trustmem init --tool kiro              # Configure Kiro only
+trustmem init --tool kiro --tool cursor  # Configure specific tools
+trustmem init --force                  # Overwrite steering rules even if user-customized
 trustmem migrate     # Create memory tables in the database
 trustmem status      # Show which tools are configured
+trustmem update-rules  # Update steering rules to latest version
 trustmem health      # Check memory service health (remote mode)
 trustmem governance  # Run governance cycle (quarantine, cleanup, IVF rebuild)
 trustmem consolidate --user-id <uid>  # Run graph consolidation

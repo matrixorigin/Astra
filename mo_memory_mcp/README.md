@@ -10,8 +10,11 @@ Works with **Kiro**, **Cursor**, and **Claude Code**. Stores memories in [Matrix
 # Install
 pip install 'trust-mem-lite'
 
-# For local embeddings (recommended, +80MB model download on first use)
+# For local embeddings (sentence-transformers, +80MB model download on first use)
 pip install 'trust-mem-lite[local-embedding]'
+
+# For OpenAI-compatible embeddings (OpenAI, SiliconFlow, Ollama, etc.)
+pip install 'trust-mem-lite[openai-embedding]'
 
 # Install from TestPyPI (pre-release testing)
 pip install --index-url https://pypi.org/simple/ --extra-index-url https://test.pypi.org/simple/ 'trust-mem-lite[local-embedding]'
@@ -42,13 +45,24 @@ After `trustmem init`, your AI tool will:
 ## Commands
 
 ```bash
-trustmem init           # Write MCP config + steering rules (tables created on first MCP start)
-trustmem status         # Show configuration and rule versions
-trustmem update-rules   # Update steering rules to latest version
-trustmem migrate        # Create/update database tables manually
-trustmem health         # Check remote memory service health
-trustmem governance     # Run memory cleanup and maintenance
+trustmem init                          # Auto-detect tools, write MCP config + steering rules
+trustmem init --tool kiro              # Configure Kiro only
+trustmem init --tool kiro --tool cursor  # Configure specific tools
+trustmem init --force                  # Overwrite steering rules even if user-customized
+trustmem status                        # Show configuration and rule versions
+trustmem update-rules                  # Update steering rules to latest version
+trustmem migrate                       # Create/update database tables manually
+trustmem health                        # Check remote memory service health
+trustmem governance                    # Run memory cleanup and maintenance
 ```
+
+### Steering Rule Protection
+
+`trustmem init` protects rules you've customized:
+- **No changes** → skipped (up to date)
+- **User-modified** → skipped, use `--force` to overwrite
+- **Version upgrade** → auto-updated, original saved as `.bak`
+- **`--force`** → always overwrites, original saved as `.bak`
 
 ## Embedding Options
 
