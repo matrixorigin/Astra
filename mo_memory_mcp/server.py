@@ -123,7 +123,16 @@ class EmbeddedBackend(MemoryBackend):
                 api_key=os.environ.get("EMBEDDING_API_KEY") or "",
                 base_url=os.environ.get("EMBEDDING_BASE_URL") or None,
             )
-        except Exception:
+        except Exception as exc:
+            # If user explicitly configured a non-local provider, fail loud —
+            # silent degradation when the user expects real embeddings is a bug.
+            if provider not in ("local", "mock"):
+                logger.error(
+                    "Embedding provider %r requested but init failed: %s. "
+                    "Install the required package (e.g. `pip install openai`).",
+                    provider, exc,
+                )
+                raise
             logger.warning("Embedding client not available, memories won't be vectorized")
             return None
 
