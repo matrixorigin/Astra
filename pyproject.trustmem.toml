@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "trust-mem-lite"
-version = "0.2.5"
+version = "0.2.6"
 description = "Persistent memory for AI coding tools (Kiro, Cursor, Claude Code) — local single-user mode"
 authors = ["MatrixOne Team"]
 readme = "mo_memory_mcp/README.md"
