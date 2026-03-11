@@ -90,7 +90,7 @@ class TestInjectE2E:
         assert row.content == "Python uses 4-space indent"
         assert row.initial_confidence == 1.0  # editor.inject sets 1.0
         assert row.trust_tier == "T1"
-        assert row.embedding is None  # no embedding worker in test
+        # embedding is generated when an embedding client is available
         assert row.source_event_ids is not None  # JSON array
         assert row.superseded_by is None
         assert row.is_active == 1

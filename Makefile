@@ -448,7 +448,8 @@ test:
 		echo "❌ Error: MatrixOne is not running. Start services with 'make dev-start'"; \
 		exit 1; \
 	fi
-	@python -m pytest tests/ trustmem_cloud_v1/tests/test_e2e.py -n auto --dist loadscope -v -m "not slow and not benchmark"
+	@python -m pytest tests/ -n auto --dist loadscope -v -m "not slow and not benchmark"
+	@python -m pytest trustmem_cloud_v1/tests/test_e2e.py -n auto --dist loadscope -v
 
 .PHONY: test-cloud
 test-cloud:

@@ -134,16 +134,16 @@ class TestMemoryList:
     def test_list_memories_returns_stored(self, client, db):
         """GET /memories returns stored memories with correct fields."""
         uid, h, _ = _make_user(client)
-        client.post("/v1/memories", json={"content": "list test 1"}, headers=h)
-        client.post("/v1/memories", json={"content": "list test 2"}, headers=h)
+        client.post("/v1/memories", json={"content": "My favorite programming language is Python"}, headers=h)
+        client.post("/v1/memories", json={"content": "I enjoy hiking in the mountains on weekends"}, headers=h)
 
         r = client.get("/v1/memories", headers=h)
         assert r.status_code == 200
         items = r.json()["items"]
         assert len(items) >= 2
         contents = [m["content"] for m in items]
-        assert "list test 1" in contents
-        assert "list test 2" in contents
+        assert "My favorite programming language is Python" in contents
+        assert "I enjoy hiking in the mountains on weekends" in contents
         for m in items:
             assert "memory_id" in m
             assert "content" in m
@@ -152,8 +152,15 @@ class TestMemoryList:
     def test_list_memories_cursor_pagination(self, client):
         """GET /memories cursor pagination works correctly."""
         _, h, _ = _make_user(client)
-        for i in range(5):
-            client.post("/v1/memories", json={"content": f"page test {i}"}, headers=h)
+        contents = [
+            "I prefer coffee over tea in the morning",
+            "My dog's name is Buddy and he loves fetch",
+            "The capital of France is Paris",
+            "I learned to play guitar last summer",
+            "My favorite movie genre is science fiction",
+        ]
+        for content in contents:
+            client.post("/v1/memories", json={"content": content}, headers=h)
 
         # First page
         r = client.get("/v1/memories", params={"limit": 2}, headers=h)
@@ -195,6 +202,19 @@ class TestMemory:
         from trustmem_cloud_v1.config import get_settings
         if get_settings().embedding_provider == "local":
             assert row[5] is not None  # local embedding must always work
+
+    def test_store_embedding_not_null(self, client, db):
+        """Single inject via POST /v1/memories must produce a non-NULL embedding."""
+        uid, h, _ = _make_user(client)
+        r = client.post("/v1/memories", json={"content": "embedding test memory"}, headers=h)
+        assert r.status_code == 201
+        mid = r.json()["memory_id"]
+
+        row = db.execute(text(
+            "SELECT embedding FROM mem_memories WHERE memory_id = :mid"
+        ), {"mid": mid}).first()
+        assert row is not None
+        assert row[0] is not None, "embedding must not be NULL after inject"
 
     def test_correct_deactivates_old(self, client, db):
         uid, h, _ = _make_user(client)
@@ -713,9 +733,9 @@ class TestPurgeMultiCondition:
     def test_purge_by_memory_ids(self, client, db):
         """Purge specific memory IDs, verify only those deactivated."""
         uid, h, _ = _make_user(client)
-        mid1 = client.post("/v1/memories", json={"content": "purge me 1"}, headers=h).json()["memory_id"]
-        mid2 = client.post("/v1/memories", json={"content": "purge me 2"}, headers=h).json()["memory_id"]
-        mid3 = client.post("/v1/memories", json={"content": "keep me"}, headers=h).json()["memory_id"]
+        mid1 = client.post("/v1/memories", json={"content": "I visited Tokyo last spring"}, headers=h).json()["memory_id"]
+        mid2 = client.post("/v1/memories", json={"content": "My car needs an oil change soon"}, headers=h).json()["memory_id"]
+        mid3 = client.post("/v1/memories", json={"content": "I enjoy reading fantasy novels"}, headers=h).json()["memory_id"]
 
         r = client.post("/v1/memories/purge", json={"memory_ids": [mid1, mid2]}, headers=h)
         assert r.status_code == 200
@@ -1066,10 +1086,15 @@ class TestGovernanceWithData:
         """Store tool_result memories, run hourly, verify cleanup."""
         uid, h, _ = _make_user(client)
 
-        # Store tool_result type memories
-        for i in range(3):
+        # Store tool_result type memories (semantically distinct to avoid contradiction detection)
+        tool_contents = [
+            "SELECT * FROM users WHERE id = 42",
+            "docker build -t myapp:latest .",
+            "curl -X POST https://api.example.com/data",
+        ]
+        for content in tool_contents:
             client.post("/v1/memories", json={
-                "content": f"tool output {i}", "memory_type": "tool_result"
+                "content": content, "memory_type": "tool_result"
             }, headers=h)
 
         before = db.execute(text(

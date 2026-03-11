@@ -207,15 +207,6 @@ def create_editor(
     from core.memory.editor import MemoryEditor
 
     _register_builtins()
-    storage = CanonicalStorage(db_factory)
-
-    index_manager = None
-    if user_id:
-        strategy_key = _resolve_strategy(db_factory, user_id, backend=None, strategy=None)
-        descriptor = StrategyDescriptor.parse(strategy_key)
-        index_manager = _registry.create_index_manager(
-            descriptor, db_factory=db_factory,
-        )
 
     # Resolve embed client: use caller-provided, or auto-resolve from settings.
     if embed_client is _SENTINEL:
@@ -225,6 +216,18 @@ def create_editor(
             embed_client = get_embedding_client()
         except Exception:
             logger.debug("Embedding client not available for editor", exc_info=True)
+
+    # Wire embed_fn into CanonicalStorage so observe_explicit generates embeddings.
+    embed_fn = embed_client.embed if embed_client is not None else None
+    storage = CanonicalStorage(db_factory, embed_fn=embed_fn)
+
+    index_manager = None
+    if user_id:
+        strategy_key = _resolve_strategy(db_factory, user_id, backend=None, strategy=None)
+        descriptor = StrategyDescriptor.parse(strategy_key)
+        index_manager = _registry.create_index_manager(
+            descriptor, db_factory=db_factory,
+        )
 
     return MemoryEditor(storage, db_factory, index_manager=index_manager, embed_client=embed_client)
 
