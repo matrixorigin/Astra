@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from core.db_consumer import DbFactory
 
-_VERSION = "0.2.8"
+_VERSION = "0.2.9"
 _PRODUCT = "TrustMem Lite"
 _MCP_SERVER_KEY = "trustmem-lite"
 

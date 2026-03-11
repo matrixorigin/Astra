@@ -1,4 +1,4 @@
-<!-- trustmem-version: 0.2.8 -->
+<!-- trustmem-version: 0.2.9 -->
 
 # Memory Integration (TrustMem Lite)
 
