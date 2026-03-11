@@ -30,7 +30,7 @@ import pymysql
 import pytest
 import pytest_asyncio
 
-pytestmark = pytest.mark.slow  # all e2e tests are slow (spawn subprocess per test)
+pytestmark = [pytest.mark.slow]  # e2e tests spawn subprocess per test
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client

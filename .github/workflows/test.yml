@@ -7,6 +7,7 @@ on:
     branches: [ main, develop ]
 
 jobs:
+  # ── Job 1: Unit + Integration + TrustMem TestClient tests ──────────────
   test:
     runs-on: ubuntu-latest
 
@@ -16,64 +17,162 @@ jobs:
         ports:
           - 6001:6001
         options: >-
-          --health-cmd "mysql -h127.0.0.1 -P6001 -uroot -p111 -e 'SELECT 1'"
+          --health-cmd "bash -c 'echo > /dev/tcp/127.0.0.1/6001'"
           --health-interval 10s
           --health-timeout 5s
-          --health-retries 5
-
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+          --health-retries 12
+          --health-start-period 30s
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install Poetry
         run: pipx install poetry
 
-      - name: Cache Poetry
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
-          path: |
-            ~/.cache/pypoetry
-          key: ${{ runner.os }}-poetry-dev-${{ hashFiles('poetry.lock') }}
-          restore-keys: ${{ runner.os }}-poetry-dev-
+          path: ~/.cache/pypoetry
+          key: ${{ runner.os }}-poetry-${{ hashFiles('poetry.lock') }}
+          restore-keys: ${{ runner.os }}-poetry-
 
-      # Single source of truth for dev dependencies — see Makefile.
       - name: Install dependencies
         run: make install-dev-deps
 
-      - name: Run unit tests (parallel)
+      # Runs: tests/ + trustmem_cloud_v1/tests/ (TestClient, no Docker needed)
+      # Excludes: local_embedding, slow, benchmark
+      - name: CI test suite
         env:
           DATABASE_URL: mysql://root:111@localhost:6001/mo_agent
-          REDIS_URL: redis://localhost:6379/0
-        run: |
-          poetry run pytest tests/unit/ -n auto --dist loadscope -v --tb=short
-
-      - name: Run integration tests (parallel)
-        env:
-          DATABASE_URL: mysql://root:111@localhost:6001/mo_agent
-          REDIS_URL: redis://localhost:6379/0
-        run: |
-          poetry run pytest tests/integration/ -n auto --dist loadscope -v --tb=short
+          TRUSTMEM_MASTER_KEY: ci-master-key-trustmem-cloud
+          TRUSTMEM_DB_HOST: localhost
+          TRUSTMEM_DB_PORT: 6001
+          TRUSTMEM_DB_NAME: trustmem_ci
+          TRUSTMEM_EMBEDDING_PROVIDER: openai
+          TRUSTMEM_EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL || 'BAAI/bge-m3' }}
+          TRUSTMEM_EMBEDDING_DIM: ${{ vars.EMBEDDING_DIM || '1024' }}
+          TRUSTMEM_EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+          TRUSTMEM_EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL }}
+          TRUSTMEM_RATE_LIMIT_AUTH_KEYS: "1000,60"
+          TRUSTMEM_RATE_LIMIT_CONSOLIDATE: "100,60"
+          TRUSTMEM_RATE_LIMIT_REFLECT: "100,60"
+        run: make ci-test
 
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results
-          path: |
-            .pytest_cache/
-            test-results.xml
+          path: .pytest_cache/
+
+  # ── Job 2: TrustMem Cloud Docker regression tests ──────────────────────
+  test-cloud:
+    runs-on: ubuntu-latest
+    needs: test  # only run if job 1 passes
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Poetry
+        run: pipx install poetry
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry
+          key: ${{ runner.os }}-poetry-${{ hashFiles('poetry.lock') }}
+          restore-keys: ${{ runner.os }}-poetry-
+
+      - name: Install dependencies
+        run: make install-dev-deps
+
+      - name: Create .env for docker compose
+        run: |
+          cat > trustmem_cloud_v1/.env << EOF
+          TRUSTMEM_MASTER_KEY=ci-master-key-trustmem-cloud
+          TRUSTMEM_EMBEDDING_PROVIDER=openai
+          TRUSTMEM_EMBEDDING_MODEL=${{ vars.EMBEDDING_MODEL || 'BAAI/bge-m3' }}
+          TRUSTMEM_EMBEDDING_DIM=${{ vars.EMBEDDING_DIM || '1024' }}
+          TRUSTMEM_EMBEDDING_API_KEY=${{ secrets.EMBEDDING_API_KEY }}
+          TRUSTMEM_EMBEDDING_BASE_URL=${{ vars.EMBEDDING_BASE_URL }}
+          TRUSTMEM_RATE_LIMIT_AUTH_KEYS=1000,60
+          TRUSTMEM_RATE_LIMIT_CONSOLIDATE=100,60
+          TRUSTMEM_RATE_LIMIT_REFLECT=100,60
+          EOF
+
+      - name: Build and start TrustMem Cloud
+        run: make cloud-start
+
+      - name: Wait for API to be ready
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf --noproxy localhost http://localhost:8100/health && break
+            echo "Waiting... ($i/30)"
+            sleep 3
+          done
+
+      - name: Run Docker regression tests
+        env:
+          TRUSTMEM_URL: http://localhost:8100
+          TRUSTMEM_MASTER_KEY: ci-master-key-trustmem-cloud
+        run: make test-cloud
+
+      - name: Cloud logs on failure
+        if: failure()
+        run: make cloud-logs || true
+
+      - name: Stop TrustMem Cloud
+        if: always()
+        run: make cloud-stop
+
+  # ── Job 3: mo_memory_mcp stdio e2e regression ──────────────────────────
+  test-mcp:
+    runs-on: ubuntu-latest
+    needs: test
+
+    services:
+      matrixone:
+        image: matrixorigin/matrixone:latest
+        ports:
+          - 6001:6001
+        options: >-
+          --health-cmd "bash -c 'echo > /dev/tcp/127.0.0.1/6001'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+          --health-start-period 30s
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Poetry
+        run: pipx install poetry
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry
+          key: ${{ runner.os }}-poetry-${{ hashFiles('poetry.lock') }}
+          restore-keys: ${{ runner.os }}-poetry-
+
+      - name: Install dependencies
+        run: make install-dev-deps
+
+      - name: Run mo_memory_mcp stdio e2e tests
+        env:
+          DATABASE_URL: mysql://root:111@localhost:6001/mo_agent
+          EMBEDDING_PROVIDER: openai
+          EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL || 'BAAI/bge-m3' }}
+          EMBEDDING_DIM: ${{ vars.EMBEDDING_DIM || '1024' }}
+          EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+          EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL }}
+        run: poetry run pytest tests/e2e/test_mcp_stdio_e2e.py -v --tb=short

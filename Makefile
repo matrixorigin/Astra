@@ -453,8 +453,41 @@ test:
 .PHONY: test-cloud
 test-cloud:
 	@echo "Running TrustMem Cloud Docker regression tests..."
-	@echo "Requires: cd trustmem_cloud_v1 && docker compose up -d"
+	@echo "Requires: make cloud-start"
 	@python -m pytest trustmem_cloud_v1/tests/test_docker.py -v
+
+.PHONY: cloud-start
+cloud-start:
+	@echo "Starting TrustMem Cloud v1..."
+	@docker compose -f trustmem_cloud_v1/docker-compose.yml up -d
+	@echo "API: http://localhost:8100  Swagger: http://localhost:8100/docs"
+
+.PHONY: cloud-stop
+cloud-stop:
+	@docker compose -f trustmem_cloud_v1/docker-compose.yml down
+
+.PHONY: cloud-logs
+cloud-logs:
+	@docker compose -f trustmem_cloud_v1/docker-compose.yml logs -f api
+
+.PHONY: cloud-status
+cloud-status:
+	@docker compose -f trustmem_cloud_v1/docker-compose.yml ps
+
+.PHONY: cloud-clean
+cloud-clean:
+	@echo "Stopping and removing TrustMem Cloud v1 (including data)..."
+	@docker compose -f trustmem_cloud_v1/docker-compose.yml down
+	@rm -rf trustmem_cloud_v1/data/
+	@echo "Done."
+
+.PHONY: ci-test
+ci-test:
+	@echo "Running CI test suite (excludes local_embedding, slow, benchmark)..."
+	@set -a && [ -f trustmem_cloud_v1/.env ] && . trustmem_cloud_v1/.env; set +a; \
+	python -m pytest tests/ trustmem_cloud_v1/tests/ \
+		-n auto --dist loadgroup -v --tb=short \
+		-m "not slow and not benchmark and not local_embedding"
 
 .PHONY: test-unit
 test-unit:

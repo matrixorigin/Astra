@@ -355,6 +355,7 @@ class TestMergeRowcountIntegration:
 class TestDetectConflictsIntegration:
     """DB-level test for _detect_conflicts with real cosine_similarity."""
 
+    @pytest.mark.local_embedding
     def test_detects_similar_memories(self, backend, branch_user, db_session):
         """Semantically similar memories (cosine > 0.9) must be detected as conflicts;
         unrelated memories (cosine < 0.9) must not.

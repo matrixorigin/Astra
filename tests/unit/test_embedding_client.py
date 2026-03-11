@@ -45,6 +45,7 @@ class TestFailFast:
         with pytest.raises(ValueError, match="requires api_key"):
             EmbeddingClient(provider="openai", model="text-embedding-3-small", dim=1536, api_key="")
 
+    @pytest.mark.local_embedding
     def test_local_dimension_mismatch_raises(self):
         """If model outputs different dim than config, fail fast."""
         with pytest.raises(ValueError, match="produces 384-dim.*config says 512"):
@@ -53,6 +54,7 @@ class TestFailFast:
 
 # ── LocalProvider ─────────────────────────────────────────────────────
 
+@pytest.mark.local_embedding
 class TestLocalProvider:
     def test_correct_dimension(self):
         c = EmbeddingClient(provider="local", model="all-MiniLM-L6-v2", dim=384)

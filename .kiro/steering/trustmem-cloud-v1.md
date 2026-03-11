@@ -97,26 +97,28 @@ TRUSTMEM_RATE_LIMIT_CONSOLIDATE=100,60   # for testing
 
 Format: `max_requests,window_seconds`. See `middleware.py` for all configurable keys.
 
-## Running Tests
+## CI/CD
 
-```bash
-# Unit/integration tests (TestClient + real DB)
-python -m pytest trustmem_cloud_v1/tests/test_e2e.py -v
+Tests run on GitHub Actions on every push/PR. Three test suites:
 
-# Docker integration tests (requires running container)
-cd trustmem_cloud_v1 && docker compose up -d
-python -m pytest trustmem_cloud_v1/tests/test_docker.py -v
+| Suite | Command | Coverage |
+|-------|---------|----------|
+| Unit | `pytest tests/unit/` | Core logic, no DB |
+| Integration | `pytest tests/integration/` | Core + real MatrixOne |
+| TrustMem Cloud | `pytest trustmem_cloud_v1/tests/` | API + MCP + DB ground truth |
 
-# All tests
-python -m pytest trustmem_cloud_v1/tests/ -v
-```
+### Required GitHub Secrets / Variables
 
-For Docker tests, set relaxed rate limits in `.env`:
-```bash
-TRUSTMEM_RATE_LIMIT_AUTH_KEYS=1000,60
-TRUSTMEM_RATE_LIMIT_CONSOLIDATE=100,60
-TRUSTMEM_RATE_LIMIT_REFLECT=100,60
-```
+Go to **Settings → Secrets and variables → Actions**:
+
+| Type | Name | Value |
+|------|------|-------|
+| Secret | `EMBEDDING_API_KEY` | Your embedding API key (e.g. SiliconFlow `sk-...`) |
+| Variable | `EMBEDDING_BASE_URL` | `https://api.siliconflow.cn/v1` |
+| Variable | `EMBEDDING_MODEL` | `BAAI/bge-m3` |
+| Variable | `EMBEDDING_DIM` | `1024` |
+
+Local embedding (`sentence-transformers`) is **blocked in CI** — tests will fail fast if `TRUSTMEM_EMBEDDING_PROVIDER=local` is detected in a CI environment.
 
 ## Local Development
 
