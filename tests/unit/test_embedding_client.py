@@ -208,3 +208,26 @@ class TestSettingsInfer:
         reload(s)
         with pytest.raises(Exception, match="not in KNOWN_DIMENSIONS"):
             s.Settings()
+
+
+class TestSaTypesEmbeddingDim:
+    """Regression: EMBEDDING_DIM='' (empty string) must not raise ValueError."""
+
+    def _reload_dim(self, monkeypatch, value: str | None) -> int:
+        if value is None:
+            monkeypatch.delenv("EMBEDDING_DIM", raising=False)
+        else:
+            monkeypatch.setenv("EMBEDDING_DIM", value)
+        from importlib import reload
+        import core.memory.models._sa_types as m
+        reload(m)
+        return m.EMBEDDING_DIM
+
+    def test_empty_string_falls_back_to_384(self, monkeypatch):
+        assert self._reload_dim(monkeypatch, "") == 384
+
+    def test_unset_falls_back_to_384(self, monkeypatch):
+        assert self._reload_dim(monkeypatch, None) == 384
+
+    def test_explicit_value_used(self, monkeypatch):
+        assert self._reload_dim(monkeypatch, "1024") == 1024
