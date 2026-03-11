@@ -1,4 +1,4 @@
-"""Self-contained DDL for TrustMem Lite memory tables.
+"""Self-contained DDL for Memoria Lite memory tables.
 
 No dependency on core/ or api/ — works in standalone pip-install mode.
 The embedding dimension is configurable via ``EMBEDDING_DIM`` env var.
@@ -52,7 +52,7 @@ def _infer_default_dim() -> int:
 
 DEFAULT_DIM = _infer_default_dim()
 
-DEFAULT_DB_URL = "mysql+pymysql://root:111@localhost:6001/trustmem"
+DEFAULT_DB_URL = "mysql+pymysql://root:111@localhost:6001/memoria"
 
 # Table names in dependency order (no FK between them, but order is stable).
 TABLE_NAMES = [
@@ -249,7 +249,7 @@ def _fix_embedding_dim(conn: Any, dim: int, *, force: bool = False) -> None:
     """Warn (or ALTER) if embedding column dim doesn't match target dim.
 
     By default only warns — ALTER is destructive when existing vector data is present.
-    Pass force=True (via ``trustmem migrate --force``) to actually ALTER.
+    Pass force=True (via ``memoria migrate --force``) to actually ALTER.
     """
     for table in ("mem_memories", "memory_graph_nodes"):
         row = conn.execute(text(
@@ -273,7 +273,7 @@ def _fix_embedding_dim(conn: Any, dim: int, *, force: bool = False) -> None:
             logger.warning(
                 "Embedding dim mismatch: %s.embedding is %s but EMBEDDING_DIM=%d. "
                 "Existing vector data will not be re-embedded automatically. "
-                "Run `trustmem migrate --dim %d --force` to ALTER the column "
+                "Run `memoria migrate --dim %d --force` to ALTER the column "
                 "(existing embeddings will be cleared).",
                 table, col_type, dim, dim,
             )

@@ -1,7 +1,7 @@
-"""Tool output handler with mo-trustmem integration.
+"""Tool output handler with mo-memoria integration.
 
 Handles large tool outputs by:
-1. Storing full output in mo-trustmem (TOOL_RESULT type)
+1. Storing full output in mo-memoria (TOOL_RESULT type)
 2. Generating structured summary (rule-based, zero LLM cost)
 3. Returning summary + memory reference
 4. Reusing similar historical results via Retriever
@@ -270,7 +270,7 @@ def process_tool_output(
         record_tool_output(tool_name, len(output), len(result), was_summarized=True)
         return result
 
-    # 1. Store full output in mo-trustmem
+    # 1. Store full output in mo-memoria
     import uuid
 
     from core.memory.types import Memory
@@ -286,9 +286,9 @@ def process_tool_output(
         )
         memory = memory_service.create_memory(mem_obj)
     except Exception as e:
-        # Fallback: truncate if mo-trustmem write fails
+        # Fallback: truncate if mo-memoria write fails
         record_tool_output(tool_name, len(output), threshold, was_summarized=True)
-        return output[:threshold] + f"\n... [truncated, mo-trustmem unavailable: {e}]"
+        return output[:threshold] + f"\n... [truncated, mo-memoria unavailable: {e}]"
 
     # 2. Generate rule-based summary
     summary = generate_structured_summary(output, tool_name)
@@ -311,7 +311,7 @@ def find_similar_result(
     cross_session: bool = False,
     max_age_seconds: int = 300,  # 5 minutes default
 ) -> str | None:
-    """Find similar historical tool result via mo-trustmem Retriever.
+    """Find similar historical tool result via mo-memoria Retriever.
     
     Args:
         tool_name: Name of the tool

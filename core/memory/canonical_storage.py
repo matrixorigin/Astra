@@ -132,17 +132,41 @@ class CanonicalStorage:
         trust_tier: TrustTier = TrustTier.T3_INFERRED,
         session_id: str | None = None,
     ) -> Memory:
-        """Store a single memory with contradiction detection."""
-        mem, _ = self._observer_lazy.observe_explicit(
+        """Store a single memory directly — no contradiction detection.
+
+        Admin inject should always create a new record regardless of similarity.
+        Contradiction detection is for observe_turn (LLM-extracted memories).
+        Sensitivity filter is still applied (blocks PII/credentials).
+        """
+        import uuid
+
+        from core.memory.tabular.sensitivity import check_sensitivity
+
+        sensitivity = check_sensitivity(content)
+        if sensitivity.blocked:
+            raise ValueError(f"Content blocked by sensitivity filter: {sensitivity.matched_labels}")
+        if sensitivity.redacted_content is not None:
+            content = sensitivity.redacted_content
+
+        mem = Memory(
+            memory_id=uuid.uuid4().hex,
             user_id=user_id,
             content=content,
             memory_type=memory_type,
-            initial_confidence=initial_confidence,
-            source_event_ids=source_event_ids,
             trust_tier=trust_tier,
+            initial_confidence=initial_confidence,
+            source_event_ids=source_event_ids or [],
             session_id=session_id,
+            observed_at=_utcnow(),
         )
-        return mem
+        if self._embed_fn is not None:
+            try:
+                emb = self._embed_fn(content)
+                if emb is not None:
+                    mem.embedding = emb
+            except Exception:
+                logger.warning("Embedding failed in store()", exc_info=True)
+        return self._store_lazy.create(mem)
 
     def batch_store(
         self,

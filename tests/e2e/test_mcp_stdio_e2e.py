@@ -39,7 +39,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 DB_URL = os.environ.get(
     "MCP_E2E_DB_URL",
-    "mysql+pymysql://root:111@10.222.1.57:6001/trustmem_e2e_test",
+    "mysql+pymysql://root:111@10.222.1.57:6001/memoria_e2e_test",
 )
 _DB_HOST = "10.222.1.57"
 _DB_PORT = 6001
@@ -65,7 +65,7 @@ def _server_env() -> dict[str, str]:
     }
 _DB_USER = "root"
 _DB_PASS = "111"
-_DB_NAME = "trustmem_e2e_test"
+_DB_NAME = "memoria_e2e_test"
 
 # Unique prefix per test run so parallel runs don't collide
 _RUN_ID = uuid.uuid4().hex[:8]

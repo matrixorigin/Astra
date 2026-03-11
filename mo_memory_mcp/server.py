@@ -1,4 +1,4 @@
-"""TrustMem Lite — MCP server.
+"""Memoria Lite — MCP server.
 
 Exposes memory tools (store, retrieve, correct, purge, profile, search,
 snapshots, branches) via MCP protocol.
@@ -106,8 +106,8 @@ class EmbeddedBackend(MemoryBackend):
         """Build EmbeddingClient from EMBEDDING_* env vars.
 
         MCP server runs locally as a dev tool. Default to "local" provider
-        (sentence-transformers) so `trustmem init` works without API keys.
-        Production deployments (TrustMem Cloud, mo-agent API) use their own
+        (sentence-transformers) so `memoria init` works without API keys.
+        Production deployments (Memoria, mo-agent API) use their own
         config files which default to "openai" + BAAI/bge-m3.
         """
         provider = os.environ.get("EMBEDDING_PROVIDER") or "local"
@@ -1063,9 +1063,9 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
     """Create MCP server with memory tools."""
 
     server = FastMCP(
-        "trustmem-lite",
+        "memoria-lite",
         instructions=(
-            "TrustMem Lite — persistent memory across conversations (local single-user mode). "
+            "Memoria Lite — persistent memory across conversations (local single-user mode). "
             "\n\n"
             "MANDATORY RULES:\n"
             "1. ALWAYS call memory_retrieve with the user's first message BEFORE responding.\n"
@@ -1482,9 +1482,9 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
 def main():
     import sys
 
-    parser = argparse.ArgumentParser(description="TrustMem Lite — MCP memory server")
+    parser = argparse.ArgumentParser(description="Memoria Lite — MCP memory server")
     parser.add_argument("--api-url", help="Memory service API URL (remote mode)")
-    parser.add_argument("--db-url", help="Database URL for embedded mode (or set TRUSTMEM_DB_URL)")
+    parser.add_argument("--db-url", help="Database URL for embedded mode (or set MEMORIA_DB_URL)")
     parser.add_argument("--token", help="Auth token for remote mode")
     parser.add_argument("--user", default="default", help="Default user ID")
     parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio")
@@ -1499,7 +1499,7 @@ def main():
     if args.api_url:
         backend: MemoryBackend = HTTPBackend(args.api_url, token=args.token)
     else:
-        db_url = args.db_url or os.environ.get("TRUSTMEM_DB_URL")
+        db_url = args.db_url or os.environ.get("MEMORIA_DB_URL")
         if not db_url:
             from mo_memory_mcp.schema import DEFAULT_DB_URL
             db_url = DEFAULT_DB_URL

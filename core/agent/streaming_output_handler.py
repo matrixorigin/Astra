@@ -6,7 +6,7 @@ streaming output of unknown total size.
 Strategy:
 1. Accumulate output in buffer
 2. When buffer exceeds threshold, switch to "storage mode"
-3. Store accumulated + future output in mo-trustmem
+3. Store accumulated + future output in mo-memoria
 4. Return summary + reference
 """
 
@@ -71,7 +71,7 @@ class StreamingOutputAccumulator:
         return None
 
     def _switch_to_storage(self) -> None:
-        """Switch to storage mode - store buffer in mo-trustmem."""
+        """Switch to storage mode - store buffer in mo-memoria."""
         import uuid
 
         from core.memory.types import Memory, MemoryType

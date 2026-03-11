@@ -7,7 +7,7 @@ on:
     branches: [ main, develop ]
 
 jobs:
-  # ── Job 1: Unit + Integration + TrustMem TestClient tests ──────────────
+  # ── Job 1: Unit + Integration + Memoria TestClient tests ──────────────
   test:
     runs-on: ubuntu-latest
 
@@ -42,23 +42,23 @@ jobs:
       - name: Install dependencies
         run: make install-dev-deps
 
-      # Runs: tests/ + trustmem_cloud_v1/tests/ (TestClient, no Docker needed)
+      # Runs: tests/ + memoria/tests/ (TestClient, no Docker needed)
       # Excludes: local_embedding, slow, benchmark
       - name: CI test suite
         env:
           DATABASE_URL: mysql://root:111@localhost:6001/mo_agent
-          TRUSTMEM_MASTER_KEY: ci-master-key-trustmem-cloud
-          TRUSTMEM_DB_HOST: localhost
-          TRUSTMEM_DB_PORT: 6001
-          TRUSTMEM_DB_NAME: trustmem_ci
-          TRUSTMEM_EMBEDDING_PROVIDER: openai
-          TRUSTMEM_EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL || 'BAAI/bge-m3' }}
-          TRUSTMEM_EMBEDDING_DIM: ${{ vars.EMBEDDING_DIM || '1024' }}
-          TRUSTMEM_EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
-          TRUSTMEM_EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL }}
-          TRUSTMEM_RATE_LIMIT_AUTH_KEYS: "1000,60"
-          TRUSTMEM_RATE_LIMIT_CONSOLIDATE: "100,60"
-          TRUSTMEM_RATE_LIMIT_REFLECT: "100,60"
+          MEMORIA_MASTER_KEY: ci-master-key-memoria-cloud
+          MEMORIA_DB_HOST: localhost
+          MEMORIA_DB_PORT: 6001
+          MEMORIA_DB_NAME: memoria_ci
+          MEMORIA_EMBEDDING_PROVIDER: openai
+          MEMORIA_EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL || 'BAAI/bge-m3' }}
+          MEMORIA_EMBEDDING_DIM: ${{ vars.EMBEDDING_DIM || '1024' }}
+          MEMORIA_EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+          MEMORIA_EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL }}
+          MEMORIA_RATE_LIMIT_AUTH_KEYS: "1000,60"
+          MEMORIA_RATE_LIMIT_CONSOLIDATE: "100,60"
+          MEMORIA_RATE_LIMIT_REFLECT: "100,60"
         run: make ci-test
 
       - name: Upload test results
@@ -68,7 +68,7 @@ jobs:
           name: test-results
           path: .pytest_cache/
 
-  # ── Job 2: TrustMem Cloud Docker regression tests ──────────────────────
+  # ── Job 2: Memoria Docker regression tests ──────────────────────
   test-cloud:
     runs-on: ubuntu-latest
     needs: test  # only run if job 1 passes
@@ -94,19 +94,19 @@ jobs:
 
       - name: Create .env for docker compose
         run: |
-          cat > trustmem_cloud_v1/.env << EOF
-          TRUSTMEM_MASTER_KEY=ci-master-key-trustmem-cloud
-          TRUSTMEM_EMBEDDING_PROVIDER=openai
-          TRUSTMEM_EMBEDDING_MODEL=${{ vars.EMBEDDING_MODEL || 'BAAI/bge-m3' }}
-          TRUSTMEM_EMBEDDING_DIM=${{ vars.EMBEDDING_DIM || '1024' }}
-          TRUSTMEM_EMBEDDING_API_KEY=${{ secrets.EMBEDDING_API_KEY }}
-          TRUSTMEM_EMBEDDING_BASE_URL=${{ vars.EMBEDDING_BASE_URL }}
-          TRUSTMEM_RATE_LIMIT_AUTH_KEYS=1000,60
-          TRUSTMEM_RATE_LIMIT_CONSOLIDATE=100,60
-          TRUSTMEM_RATE_LIMIT_REFLECT=100,60
+          cat > memoria/.env << EOF
+          MEMORIA_MASTER_KEY=ci-master-key-memoria-cloud
+          MEMORIA_EMBEDDING_PROVIDER=openai
+          MEMORIA_EMBEDDING_MODEL=${{ vars.EMBEDDING_MODEL || 'BAAI/bge-m3' }}
+          MEMORIA_EMBEDDING_DIM=${{ vars.EMBEDDING_DIM || '1024' }}
+          MEMORIA_EMBEDDING_API_KEY=${{ secrets.EMBEDDING_API_KEY }}
+          MEMORIA_EMBEDDING_BASE_URL=${{ vars.EMBEDDING_BASE_URL }}
+          MEMORIA_RATE_LIMIT_AUTH_KEYS=1000,60
+          MEMORIA_RATE_LIMIT_CONSOLIDATE=100,60
+          MEMORIA_RATE_LIMIT_REFLECT=100,60
           EOF
 
-      - name: Build and start TrustMem Cloud
+      - name: Build and start Memoria
         run: make cloud-start
 
       - name: Wait for API to be ready
@@ -119,15 +119,15 @@ jobs:
 
       - name: Run Docker regression tests
         env:
-          TRUSTMEM_URL: http://localhost:8100
-          TRUSTMEM_MASTER_KEY: ci-master-key-trustmem-cloud
+          MEMORIA_URL: http://localhost:8100
+          MEMORIA_MASTER_KEY: ci-master-key-memoria-cloud
         run: make test-cloud
 
       - name: Cloud logs on failure
         if: failure()
         run: make cloud-logs || true
 
-      - name: Stop TrustMem Cloud
+      - name: Stop Memoria
         if: always()
         run: make cloud-stop
 

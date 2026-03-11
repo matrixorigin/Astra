@@ -76,7 +76,7 @@ class TestProcessToolOutput:
         mock_service.create_memory.assert_not_called()
 
     def test_large_output_stored_and_summarized(self, mock_service):
-        """Large output stored in mo-trustmem with summary returned."""
+        """Large output stored in mo-memoria with summary returned."""
         output = "x" * 20000  # > 10KB
         result = process_tool_output(
             output, "grep", "sess1", "user1", mock_service
@@ -372,8 +372,8 @@ class TestSummarizability:
 class TestFailureModes:
     """Tests for failure mode handling."""
 
-    def test_mo_trustmem_failure_fallback(self):
-        """Falls back to truncation when mo-trustmem fails."""
+    def test_mo_memoria_failure_fallback(self):
+        """Falls back to truncation when mo-memoria fails."""
         mock_service = MagicMock()
         mock_service.create_memory.side_effect = Exception("DB connection failed")
         
@@ -383,5 +383,5 @@ class TestFailureModes:
         )
         
         assert "truncated" in result
-        assert "mo-trustmem unavailable" in result
+        assert "mo-memoria unavailable" in result
         assert len(result) < len(output)

@@ -61,11 +61,11 @@ help:
 	@echo "  make lint               - Run linters"
 	@echo "  make lint-fix           - Auto-fix linting issues"
 	@echo ""
-	@echo "TrustMem Lite (MCP Memory Server):"
-	@echo "  make bump-trustmem-version BUMP=patch  - Bump version (patch/minor/major)"
-	@echo "  make build-trustmem     - Build wheel distribution"
-	@echo "  make publish-trustmem   - Publish to PyPI"
-	@echo "  make publish-trustmem-test - Publish to TestPyPI"
+	@echo "Memoria Lite (MCP Memory Server):"
+	@echo "  make bump-memoria-version BUMP=patch  - Bump version (patch/minor/major)"
+	@echo "  make build-memoria     - Build wheel distribution"
+	@echo "  make publish-memoria   - Publish to PyPI"
+	@echo "  make publish-memoria-test - Publish to TestPyPI"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make dev-start                    # Daily development"
@@ -73,7 +73,7 @@ help:
 	@echo "  make test                         # Run all tests"
 	@echo "  make test-unit                    # Run unit tests only"
 	@echo "  make dev-api-docker-scale REPLICAS=4  # Test load balancing"
-	@echo "  make bump-trustmem-version BUMP=minor # Bump 0.2.3 → 0.3.0"
+	@echo "  make bump-memoria-version BUMP=minor # Bump 0.2.3 → 0.3.0"
 
 # ============================================================================
 # Environment Setup
@@ -449,44 +449,44 @@ test:
 		exit 1; \
 	fi
 	@python -m pytest tests/ -n auto --dist loadscope -v -m "not slow and not benchmark and not local_embedding"
-	@python -m pytest trustmem_cloud_v1/tests/test_e2e.py -n auto --dist loadscope -v
+	@python -m pytest memoria/tests/test_e2e.py -n auto --dist loadscope -v
 
 .PHONY: test-cloud
 test-cloud:
-	@echo "Running TrustMem Cloud Docker regression tests..."
+	@echo "Running Memoria Docker regression tests..."
 	@echo "Requires: make cloud-start"
-	@python -m pytest trustmem_cloud_v1/tests/test_docker.py -v
+	@python -m pytest memoria/tests/test_docker.py -v
 
 .PHONY: cloud-start
 cloud-start:
-	@echo "Starting TrustMem Cloud v1..."
-	@docker compose -f trustmem_cloud_v1/docker-compose.yml up -d
+	@echo "Starting Memoria..."
+	@docker compose -f memoria/docker-compose.yml up -d
 	@echo "API: http://localhost:8100  Swagger: http://localhost:8100/docs"
 
 .PHONY: cloud-stop
 cloud-stop:
-	@docker compose -f trustmem_cloud_v1/docker-compose.yml down
+	@docker compose -f memoria/docker-compose.yml down
 
 .PHONY: cloud-logs
 cloud-logs:
-	@docker compose -f trustmem_cloud_v1/docker-compose.yml logs -f api
+	@docker compose -f memoria/docker-compose.yml logs -f api
 
 .PHONY: cloud-status
 cloud-status:
-	@docker compose -f trustmem_cloud_v1/docker-compose.yml ps
+	@docker compose -f memoria/docker-compose.yml ps
 
 .PHONY: cloud-clean
 cloud-clean:
-	@echo "Stopping and removing TrustMem Cloud v1 (including data)..."
-	@docker compose -f trustmem_cloud_v1/docker-compose.yml down
-	@rm -rf trustmem_cloud_v1/data/
+	@echo "Stopping and removing Memoria (including data)..."
+	@docker compose -f memoria/docker-compose.yml down
+	@rm -rf memoria/data/
 	@echo "Done."
 
 .PHONY: ci-test
 ci-test:
 	@echo "Running CI test suite (excludes local_embedding, slow, benchmark)..."
-	@set -a && [ -f trustmem_cloud_v1/.env ] && . trustmem_cloud_v1/.env; set +a; \
-	python -m pytest tests/ trustmem_cloud_v1/tests/ \
+	@set -a && [ -f memoria/.env ] && . memoria/.env; set +a; \
+	python -m pytest tests/ memoria/tests/ \
 		-n auto --dist loadgroup -v --tb=short \
 		-m "not slow and not benchmark and not local_embedding"
 
@@ -637,36 +637,36 @@ format-check:
 ci: dev-deps-up dev-deps-wait check test dev-deps-down
 	@echo "✅ All CI checks passed!"
 
-# ── TrustMem Lite publish ─────────────────────────────────────────────
+# ── Memoria Lite publish ─────────────────────────────────────────────
 
 BUMP ?= patch
-.PHONY: bump-trustmem-version
-bump-trustmem-version:
-	@python scripts/bump_trustmem_version.py $(BUMP)
+.PHONY: bump-memoria-version
+bump-memoria-version:
+	@python scripts/bump_memoria_version.py $(BUMP)
 
-TRUSTMEM_DIST = dist/trustmem
+MEMORIA_DIST = dist/memoria
 
-.PHONY: build-trustmem
-build-trustmem:
+.PHONY: build-memoria
+build-memoria:
 	@echo "Building trust-mem-lite..."
-	@rm -rf $(TRUSTMEM_DIST)
-	@mkdir -p $(TRUSTMEM_DIST)
+	@rm -rf $(MEMORIA_DIST)
+	@mkdir -p $(MEMORIA_DIST)
 	@cp pyproject.toml pyproject.toml.bak
-	@cp pyproject.trustmem.toml pyproject.toml
-	@python -m build --wheel --outdir $(TRUSTMEM_DIST)
+	@cp pyproject.memoria.toml pyproject.toml
+	@python -m build --wheel --outdir $(MEMORIA_DIST)
 	@mv pyproject.toml.bak pyproject.toml
-	@echo "✅ Built: $$(ls $(TRUSTMEM_DIST)/*.whl)"
+	@echo "✅ Built: $$(ls $(MEMORIA_DIST)/*.whl)"
 
-.PHONY: publish-trustmem
-publish-trustmem: build-trustmem
+.PHONY: publish-memoria
+publish-memoria: build-memoria
 	@echo "Publishing trust-mem-lite to PyPI..."
 	@pip install --quiet twine 2>/dev/null || true
-	@twine upload $(TRUSTMEM_DIST)/*
+	@twine upload $(MEMORIA_DIST)/*
 	@echo "✅ Published trust-mem-lite to PyPI"
 
-.PHONY: publish-trustmem-test
-publish-trustmem-test: build-trustmem
+.PHONY: publish-memoria-test
+publish-memoria-test: build-memoria
 	@echo "Publishing trust-mem-lite to TestPyPI..."
 	@pip install --quiet twine 2>/dev/null || true
-	@twine upload --repository testpypi $(TRUSTMEM_DIST)/*
+	@twine upload --repository testpypi $(MEMORIA_DIST)/*
 	@echo "✅ Published trust-mem-lite to TestPyPI"

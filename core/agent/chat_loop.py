@@ -22,7 +22,7 @@ _UNSET = object()  # Sentinel for "not yet checked"
 MAX_TOOL_ROUNDS = 10
 
 # Hard ceiling on any single tool result in the message chain (~3K tokens).
-# Acts as a safety net when mo-trustmem and budget tracker are both unavailable.
+# Acts as a safety net when mo-memoria and budget tracker are both unavailable.
 MAX_SINGLE_TOOL_RESULT_CHARS = 12000
 TOOL_TIMEOUT_SECONDS = 120
 

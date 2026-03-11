@@ -89,7 +89,7 @@ class TestMCPConfig:
         assert "command" in cfg
         assert cfg["args"] == ["-m", "mo_memory_mcp"]
         # Default embedding config: local + all-MiniLM-L6-v2 + 384
-        assert cfg["env"]["TRUSTMEM_DB_URL"] == ""
+        assert cfg["env"]["MEMORIA_DB_URL"] == ""
         assert cfg["env"]["EMBEDDING_PROVIDER"] == "local"
         assert cfg["env"]["EMBEDDING_MODEL"] == "all-MiniLM-L6-v2"
         assert cfg["env"]["EMBEDDING_DIM"] == "384"
@@ -101,7 +101,7 @@ class TestMCPConfig:
 
     def test_db_url_in_env(self) -> None:
         cfg = _mcp_config("stdio", db_url="mysql+pymysql://u:p@h:6001/db")
-        assert cfg["env"]["TRUSTMEM_DB_URL"] == "mysql+pymysql://u:p@h:6001/db"
+        assert cfg["env"]["MEMORIA_DB_URL"] == "mysql+pymysql://u:p@h:6001/db"
 
     def test_embedding_opts_in_env(self) -> None:
         cfg = _mcp_config("stdio", provider="openai", model="BAAI/bge-m3")
@@ -154,7 +154,7 @@ class TestWriteKiro:
         with tempfile.TemporaryDirectory() as d:
             actions = _write_kiro(Path(d), "stdio")
             mcp = json.loads((Path(d) / ".kiro" / "settings" / "mcp.json").read_text())
-            assert "trustmem-lite" in mcp["mcpServers"]
+            assert "memoria-lite" in mcp["mcpServers"]
             assert (Path(d) / ".kiro" / "steering" / "memory.md").read_text() == "# kiro rule"
             assert len(actions) == 2
 
@@ -167,7 +167,7 @@ class TestWriteKiro:
             _write_kiro(Path(d), "stdio")
             mcp = json.loads((mcp_dir / "mcp.json").read_text())
             assert "other" in mcp["mcpServers"]
-            assert "trustmem-lite" in mcp["mcpServers"]
+            assert "memoria-lite" in mcp["mcpServers"]
 
 
 class TestWriteCursor:
@@ -199,7 +199,7 @@ class TestWriteClaude:
     @patch("cli.mo_memory_cli._get_claude_rule", return_value="\n# claude rule")
     def test_skips_if_already_configured(self, _mock: Mock) -> None:
         with tempfile.TemporaryDirectory() as d:
-            (Path(d) / "CLAUDE.md").write_text("# Has trustmem-lite already")
+            (Path(d) / "CLAUDE.md").write_text("# Has memoria-lite already")
             actions = _write_claude(Path(d), "stdio")
             assert any("already configured" in a for a in actions)
 
@@ -222,12 +222,12 @@ class TestGetDbFactory:
         mock_sm.assert_called_once_with(bind=mock_engine)
 
     def test_with_env_var(self) -> None:
-        """TRUSTMEM_DB_URL env var is used when --db-url is absent."""
+        """MEMORIA_DB_URL env var is used when --db-url is absent."""
         args = argparse.Namespace(db_url=None)
         mock_engine = MagicMock()
         mock_sm = MagicMock(return_value=MagicMock())
 
-        with patch.dict("os.environ", {"TRUSTMEM_DB_URL": "mysql://env"}), \
+        with patch.dict("os.environ", {"MEMORIA_DB_URL": "mysql://env"}), \
              patch("sqlalchemy.create_engine", return_value=mock_engine) as mock_ce, \
              patch("sqlalchemy.orm.sessionmaker", mock_sm):
             _get_db_factory(args)
@@ -241,7 +241,7 @@ class TestGetDbFactory:
         mock_sl = MagicMock()
         # Remove env var if present, then patch api.database module
         with patch.dict("os.environ", {}, clear=False):
-            os.environ.pop("TRUSTMEM_DB_URL", None)
+            os.environ.pop("MEMORIA_DB_URL", None)
             with patch.dict("sys.modules", {"api.database": MagicMock(SessionLocal=mock_sl)}):
                 result = _get_db_factory(args)
         assert result is mock_sl
@@ -257,14 +257,14 @@ class TestGetDbFactory:
             with patch.dict("os.environ", {}, clear=False), \
                  patch("sqlalchemy.create_engine") as mock_ce, \
                  patch("sqlalchemy.orm.sessionmaker") as mock_sm:
-                os.environ.pop("TRUSTMEM_DB_URL", None)
+                os.environ.pop("MEMORIA_DB_URL", None)
                 mock_engine = MagicMock()
                 mock_ce.return_value = mock_engine
                 mock_factory = MagicMock()
                 mock_sm.return_value = mock_factory
                 result = _get_db_factory(args)
             mock_ce.assert_called_once()
-            assert "trustmem" in mock_ce.call_args[0][0]
+            assert "memoria" in mock_ce.call_args[0][0]
             assert result is mock_factory
         finally:
             if saved is not None:
@@ -377,7 +377,7 @@ class TestCmdStatus:
             # Set up kiro as configured
             mcp_dir = Path(d) / ".kiro" / "settings"
             mcp_dir.mkdir(parents=True)
-            (mcp_dir / "mcp.json").write_text('{"mcpServers":{"trustmem-lite":{}}}')
+            (mcp_dir / "mcp.json").write_text('{"mcpServers":{"memoria-lite":{}}}')
 
             args = argparse.Namespace(dir=d)
             with patch("cli.mo_memory_cli._detect_tools", return_value={
@@ -447,42 +447,42 @@ class TestCmdMigrate:
 
 class TestMain:
     def test_governance_args(self) -> None:
-        with patch("sys.argv", ["trustmem", "governance", "--user-id", "bob"]), \
+        with patch("sys.argv", ["memoria", "governance", "--user-id", "bob"]), \
              patch("cli.mo_memory_cli.cmd_governance") as mock_cmd:
             main()
         args = mock_cmd.call_args[0][0]
         assert args.user_id == "bob"
 
     def test_consolidate_requires_user_id(self) -> None:
-        with patch("sys.argv", ["trustmem", "consolidate"]), \
+        with patch("sys.argv", ["memoria", "consolidate"]), \
              pytest.raises(SystemExit):
             main()
 
     def test_reflect_requires_user_id(self) -> None:
-        with patch("sys.argv", ["trustmem", "reflect"]), \
+        with patch("sys.argv", ["memoria", "reflect"]), \
              pytest.raises(SystemExit):
             main()
 
     def test_no_command_shows_help(self) -> None:
-        with patch("sys.argv", ["trustmem"]), \
+        with patch("sys.argv", ["memoria"]), \
              patch("argparse.ArgumentParser.print_help") as mock_help:
             main()
         mock_help.assert_called_once()
 
     def test_status_command(self) -> None:
-        with patch("sys.argv", ["trustmem", "status"]), \
+        with patch("sys.argv", ["memoria", "status"]), \
              patch("cli.mo_memory_cli.cmd_status") as mock_cmd:
             main()
         mock_cmd.assert_called_once()
 
     def test_health_command(self) -> None:
-        with patch("sys.argv", ["trustmem", "health", "--api-url", "http://x:9000"]), \
+        with patch("sys.argv", ["memoria", "health", "--api-url", "http://x:9000"]), \
              patch("cli.mo_memory_cli.cmd_health") as mock_cmd:
             main()
         assert mock_cmd.call_args[0][0].api_url == "http://x:9000"
 
     def test_migrate_force_flag(self) -> None:
-        with patch("sys.argv", ["trustmem", "migrate", "--force", "--dim", "1536"]), \
+        with patch("sys.argv", ["memoria", "migrate", "--force", "--dim", "1536"]), \
              patch("cli.mo_memory_cli.cmd_migrate") as mock_cmd:
             main()
         args = mock_cmd.call_args[0][0]
@@ -490,7 +490,7 @@ class TestMain:
         assert args.dim == "1536"
 
     def test_migrate_default_no_force(self) -> None:
-        with patch("sys.argv", ["trustmem", "migrate"]), \
+        with patch("sys.argv", ["memoria", "migrate"]), \
              patch("cli.mo_memory_cli.cmd_migrate") as mock_cmd:
             main()
         args = mock_cmd.call_args[0][0]
@@ -506,7 +506,7 @@ class TestEnsureDatabase:
     def test_creates_database_via_root_connection(self) -> None:
         """ensure_database connects without DB name and runs CREATE DATABASE."""
         mock_engine = MagicMock()
-        mock_engine.url.database = "trustmem"
+        mock_engine.url.database = "memoria"
         mock_engine.url.set.return_value = "root_url"
 
         mock_root_engine = MagicMock()
@@ -522,7 +522,7 @@ class TestEnsureDatabase:
         mock_ce.assert_called_once_with("root_url", pool_pre_ping=True)
         sql_arg = mock_conn.execute.call_args[0][0]
         assert "CREATE DATABASE IF NOT EXISTS" in sql_arg.text
-        assert "trustmem" in sql_arg.text
+        assert "memoria" in sql_arg.text
         mock_root_engine.dispose.assert_called_once()
 
     def test_skips_when_no_database_name(self) -> None:
@@ -620,7 +620,7 @@ class TestFixEmbeddingDim:
         # No ALTER executed — only SHOW COLUMNS
         assert conn.execute.call_count == 2
         assert "dim mismatch" in caplog.text.lower()
-        assert "trustmem migrate" in caplog.text
+        assert "memoria migrate" in caplog.text
 
     def test_alters_column_with_force(self) -> None:
         from mo_memory_mcp.schema import _fix_embedding_dim
@@ -658,7 +658,7 @@ class TestCmdInitEffectiveDbUrl:
 
             mock_engine = MagicMock()
             mock_engine.url.render_as_string.return_value = (
-                "mysql+pymysql://root:111@localhost:6001/trustmem"
+                "mysql+pymysql://root:111@localhost:6001/memoria"
             )
 
             # cmd_init no longer creates tables — only resolves URL and writes config.
@@ -680,8 +680,8 @@ class TestCmdInitEffectiveDbUrl:
 
             mcp_file = kiro_dir / "settings" / "mcp.json"
             config = json.loads(mcp_file.read_text())
-            env = config["mcpServers"]["trustmem-lite"].get("env", {})
-            assert env.get("TRUSTMEM_DB_URL") == "mysql+pymysql://root:111@localhost:6001/trustmem"
+            env = config["mcpServers"]["memoria-lite"].get("env", {})
+            assert env.get("MEMORIA_DB_URL") == "mysql+pymysql://root:111@localhost:6001/memoria"
 
     def test_explicit_db_url_written_to_mcp_config(self) -> None:
         """When --db-url is given, it's written directly (no resolve, no connection test)."""
@@ -709,8 +709,8 @@ class TestCmdInitEffectiveDbUrl:
 
             mcp_file = kiro_dir / "settings" / "mcp.json"
             config = json.loads(mcp_file.read_text())
-            env = config["mcpServers"]["trustmem-lite"].get("env", {})
-            assert env.get("TRUSTMEM_DB_URL") == "mysql+pymysql://u:p@h:6001/mydb"
+            env = config["mcpServers"]["memoria-lite"].get("env", {})
+            assert env.get("MEMORIA_DB_URL") == "mysql+pymysql://u:p@h:6001/mydb"
 
     def test_password_not_masked(self) -> None:
         """render_as_string(hide_password=False) is used, not str(url)."""
@@ -739,7 +739,7 @@ class TestCmdInitEffectiveDbUrl:
             mock_engine.url.render_as_string.assert_called_once_with(hide_password=False)
             mcp_file = kiro_dir / "settings" / "mcp.json"
             config = json.loads(mcp_file.read_text())
-            url = config["mcpServers"]["trustmem-lite"]["env"]["TRUSTMEM_DB_URL"]
+            url = config["mcpServers"]["memoria-lite"]["env"]["MEMORIA_DB_URL"]
             assert "s3cret" in url
             assert "***" not in url
 
@@ -748,7 +748,7 @@ class TestCmdInitEffectiveDbUrl:
 
 
 class TestCmdInitEmbeddingCheck:
-    """trustmem init warns when sentence-transformers is not installed."""
+    """memoria init warns when sentence-transformers is not installed."""
 
     def _run_init(self, d: str, has_sentence_transformers: bool, capsys) -> str:
         kiro_dir = Path(d) / ".kiro"

@@ -1,10 +1,10 @@
-"""TrustMem Lite CLI — configure AI tools to use shared memory service.
+"""Memoria Lite CLI — configure AI tools to use shared memory service.
 
 Usage:
-    trustmem init       # Detect tools, write MCP config + steering rules
-    trustmem status     # Show connection status
-    trustmem health     # Health check
-    trustmem migrate    # Create memory tables in the database
+    memoria init       # Detect tools, write MCP config + steering rules
+    memoria status     # Show connection status
+    memoria health     # Health check
+    memoria migrate    # Create memory tables in the database
 """
 
 from __future__ import annotations
@@ -20,8 +20,8 @@ if TYPE_CHECKING:
     from core.db_consumer import DbFactory
 
 _VERSION = "0.2.11"
-_PRODUCT = "TrustMem Lite"
-_MCP_SERVER_KEY = "trustmem-lite"
+_PRODUCT = "Memoria Lite"
+_MCP_SERVER_KEY = "memoria-lite"
 
 # ── MCP config templates ──────────────────────────────────────────────
 
@@ -55,7 +55,7 @@ def _mcp_config(mode: str = "stdio", db_url: str | None = None, **embed_opts: st
         }
         dim = _MODEL_DIMS.get(model, "1024")
     env: dict[str, str] = {
-        "TRUSTMEM_DB_URL": db_url or "",
+        "MEMORIA_DB_URL": db_url or "",
         "EMBEDDING_PROVIDER": provider,
         "EMBEDDING_MODEL": model,
         "EMBEDDING_DIM": dim,
@@ -134,7 +134,7 @@ def _safe_write_rule(rule_file: Path, new_content: str, *, force: bool, project_
     existing = rule_file.read_text()
     installed_ver = _installed_rule_version(rule_file)
     import re
-    new_ver_m = re.search(r"trustmem-version:\s*([\d.]+)", new_content[:500])
+    new_ver_m = re.search(r"memoria-version:\s*([\d.]+)", new_content[:500])
     new_ver = new_ver_m.group(1) if new_ver_m else None
 
     # Same version, same content — skip
@@ -273,7 +273,7 @@ def _resolve_engine(db_url: str | None) -> tuple[Any, str]:
     """
     from mo_memory_mcp.schema import DEFAULT_DB_URL
 
-    url = db_url or os.environ.get("TRUSTMEM_DB_URL")
+    url = db_url or os.environ.get("MEMORIA_DB_URL")
     if url:
         from sqlalchemy import create_engine
         return create_engine(url, pool_pre_ping=True), url
@@ -321,7 +321,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     print()
     project_dir = Path(args.dir).resolve()
     mode = args.mode
-    db_url = args.db_url or os.environ.get("TRUSTMEM_DB_URL")
+    db_url = args.db_url or os.environ.get("MEMORIA_DB_URL")
     embed_opts = {}
     for key in ("provider", "model", "dim", "api_key", "base_url"):
         val = getattr(args, f"embedding_{key}", None)
@@ -358,7 +358,7 @@ def cmd_init(args: argparse.Namespace) -> None:
             print("   Install it for better retrieval quality:")
             print("   pip install trust-mem-lite[local-embedding]")
             print("   Or use OpenAI embeddings:")
-            print("   trustmem init --embedding-provider openai --embedding-api-key sk-...")
+            print("   memoria init --embedding-provider openai --embedding-api-key sk-...")
         print()
 
     # ── Step 1: Write MCP configs + steering rules ────────────────
@@ -388,10 +388,10 @@ def cmd_init(args: argparse.Namespace) -> None:
     print("Memory tables will be created automatically when the MCP server starts.")
     print("To change embedding provider before first use, edit the MCP config and")
     print("update EMBEDDING_PROVIDER / EMBEDDING_DIM, then restart your AI tool.")
-    print("Or run manually: trustmem migrate --db-url '...' --dim <dim>")
+    print("Or run manually: memoria migrate --db-url '...' --dim <dim>")
     if mode == "stdio" and not db_url:
         print("\nTip: pass --db-url to connect to a specific database:")
-        print("  trustmem init --db-url 'mysql+pymysql://user:pass@host:6001/db'")
+        print("  memoria init --db-url 'mysql+pymysql://user:pass@host:6001/db'")
 
 
 def _rule_paths(project_dir: Path) -> dict[str, Path]:
@@ -404,11 +404,11 @@ def _rule_paths(project_dir: Path) -> dict[str, Path]:
 
 
 def _installed_rule_version(path: Path) -> str | None:
-    """Extract trustmem-version from an installed rule file."""
+    """Extract memoria-version from an installed rule file."""
     if not path.exists():
         return None
     import re
-    m = re.search(r"trustmem-version:\s*([\d.]+)", path.read_text()[:500])
+    m = re.search(r"memoria-version:\s*([\d.]+)", path.read_text()[:500])
     return m.group(1) if m else None
 
 
@@ -451,7 +451,7 @@ def cmd_status(args: argparse.Namespace) -> None:
 
     if needs_update:
         print()
-        print("  Run 'trustmem update-rules' to update steering rules.")
+        print("  Run 'memoria update-rules' to update steering rules.")
 
 
 def cmd_update_rules(args: argparse.Namespace) -> None:
@@ -482,12 +482,12 @@ def cmd_update_rules(args: argparse.Namespace) -> None:
             # For Claude, rewrite the whole CLAUDE.md section
             if rule_file.exists():
                 existing = rule_file.read_text()
-                if "trustmem-version:" in existing:
+                if "memoria-version:" in existing:
                     # Replace existing section
                     import re
                     new_rule = _get_claude_rule()
                     existing = re.sub(
-                        r"<!-- trustmem-version:.*?(?=\n<!-- |$)",
+                        r"<!-- memoria-version:.*?(?=\n<!-- |$)",
                         new_rule.strip(),
                         existing,
                         flags=re.DOTALL,
@@ -538,7 +538,7 @@ def cmd_migrate(args: argparse.Namespace) -> None:
 
 def _get_db_factory(args: argparse.Namespace) -> DbFactory:
     """Resolve a DbFactory from CLI args, env var, project default, or DEFAULT_DB_URL."""
-    db_url = getattr(args, "db_url", None) or os.environ.get("TRUSTMEM_DB_URL")
+    db_url = getattr(args, "db_url", None) or os.environ.get("MEMORIA_DB_URL")
     if db_url:
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
@@ -623,7 +623,7 @@ def cmd_reflect(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="trustmem", description=f"{_PRODUCT} v{_VERSION} — configure AI tools for shared memory")
+    parser = argparse.ArgumentParser(prog="memoria", description=f"{_PRODUCT} v{_VERSION} — configure AI tools for shared memory")
     parser.add_argument("--dir", default=".", help="Project directory")
     sub = parser.add_subparsers(dest="command")
 
@@ -642,7 +642,7 @@ def main() -> None:
     sub.add_parser("update-rules", help="Update steering rules to latest version")
 
     p_migrate = sub.add_parser("migrate", help="Create memory tables in the database")
-    p_migrate.add_argument("--db-url", help="Database URL (or set TRUSTMEM_DB_URL)")
+    p_migrate.add_argument("--db-url", help="Database URL (or set MEMORIA_DB_URL)")
     p_migrate.add_argument("--dim", help="Embedding vector dimension (default: 384)")
     p_migrate.add_argument("--force", action="store_true",
                            help="ALTER embedding column if dim mismatches (clears existing embeddings)")
@@ -652,15 +652,15 @@ def main() -> None:
 
     p_gov = sub.add_parser("governance", help="Run memory governance: quarantine, cleanup, IVF index health")
     p_gov.add_argument("--user-id", help="User ID (default: all users)")
-    p_gov.add_argument("--db-url", help="Database URL (or set TRUSTMEM_DB_URL)")
+    p_gov.add_argument("--db-url", help="Database URL (or set MEMORIA_DB_URL)")
 
     p_con = sub.add_parser("consolidate", help="Run graph consolidation: conflict detection, orphan cleanup")
     p_con.add_argument("--user-id", required=True, help="User ID")
-    p_con.add_argument("--db-url", help="Database URL (or set TRUSTMEM_DB_URL)")
+    p_con.add_argument("--db-url", help="Database URL (or set MEMORIA_DB_URL)")
 
     p_ref = sub.add_parser("reflect", help="Run reflection: synthesize insights from memory clusters (requires LLM)")
     p_ref.add_argument("--user-id", required=True, help="User ID")
-    p_ref.add_argument("--db-url", help="Database URL (or set TRUSTMEM_DB_URL)")
+    p_ref.add_argument("--db-url", help="Database URL (or set MEMORIA_DB_URL)")
 
     args = parser.parse_args()
     if args.command == "init":

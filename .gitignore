@@ -8,6 +8,7 @@
 
 # Docker volumes (local data)
 deployment/all-in-one/data/
+memoria/data/
 
 # Python
 __pycache__/

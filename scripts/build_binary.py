@@ -6,7 +6,7 @@ Usage:
     python scripts/build_binary.py
 
 Output:
-    dist/trustmem              (single-file binary)
+    dist/memoria              (single-file binary)
 
 The binary bundles the CLI + MCP server. No Python or pip needed at runtime.
 Only exception: local embedding requires a separate `pip install sentence-transformers`.
@@ -66,7 +66,7 @@ EXCLUDES = [
 def build() -> None:
     arch = platform.machine()
     system = platform.system().lower()
-    name = f"trustmem-{system}-{arch}"
+    name = f"memoria-{system}-{arch}"
 
     cmd = [
         sys.executable, "-m", "PyInstaller",

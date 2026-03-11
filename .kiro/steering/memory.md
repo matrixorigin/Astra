@@ -2,9 +2,9 @@
 inclusion: always
 ---
 
-<!-- trustmem-version: 0.2.7 -->
+<!-- memoria-version: 0.2.7 -->
 
-# Memory Integration (TrustMem Lite)
+# Memory Integration (Memoria Lite)
 
 You have persistent memory via MCP tools. Memory survives across conversations.
 

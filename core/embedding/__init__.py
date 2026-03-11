@@ -18,7 +18,7 @@ _shared_client: EmbeddingClient | None = None
 
 
 def set_embedding_client(client: EmbeddingClient) -> None:
-    """Pre-inject a shared EmbeddingClient (e.g. from TrustMem config).
+    """Pre-inject a shared EmbeddingClient (e.g. from Memoria config).
 
     Must be called before any get_embedding_client() call.
     """

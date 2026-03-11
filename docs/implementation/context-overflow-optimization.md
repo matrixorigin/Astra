@@ -20,7 +20,7 @@ Agent 多轮 tool 调用后 context 爆炸，导致 `context length exceeded` �
 
 ---
 
-### 已完成：终极方案（mo-trustmem 原生上下文管理）
+### 已完成：终极方案（mo-memoria 原生上下文管理）
 
 **状态**：✅ v1.4 完成
 
@@ -50,7 +50,7 @@ Agent 多轮 tool 调用后 context 爆炸，导致 `context length exceeded` �
 | 规则摘要 | grep/shell/git/json/file 结构化摘要，零 LLM 成本 |
 | 注册制策略 | `register_summary_strategy()` 支持自定义 tool |
 | 可摘要性检测 | `is_summarizable()` 区分代码文件等不可摘要内容 |
-| mo-trustmem 存储 | 完整输出存 `TOOL_RESULT` 类型，session 隔离 |
+| mo-memoria 存储 | 完整输出存 `TOOL_RESULT` 类型，session 隔离 |
 | Memory 引用 | 返回 `[memory:xxx]` 引用，LLM 可展开 |
 | 引用展开 | `expand_memory_reference()` 支持行范围/query/max_chars |
 | 历史复用 | 相同 tool+params 复用历史结果 |
@@ -59,7 +59,7 @@ Agent 多轮 tool 调用后 context 爆炸，导致 `context length exceeded` �
 | 全局预算管理 | `ContextBudgetManager` 按阶段分配 |
 | Turn 级累积 | `TurnBudgetTracker` 防止多 tool 累积溢出 |
 | Compact 兼容 | 压缩时保留 memory 引用 |
-| 失败降级 | mo-trustmem 不可用时 fallback 到截断 |
+| 失败降级 | mo-memoria 不可用时 fallback 到截断 |
 | 监控指标 | 摘要率、复用率、压缩比等 |
 | Replay 确定性 | 摘要存入 metadata + version |
 | TTL 管理 | TOOL_RESULT 独立 24h TTL |
@@ -75,7 +75,7 @@ Agent 多轮 tool 调用后 context 爆炸，导致 `context length exceeded` �
 # 策略
 1. 累积输出到 buffer
 2. 超过阈值（默认 10KB）时切换到 "storage mode"
-3. 存储到 mo-trustmem，返回 summary + reference
+3. 存储到 mo-memoria，返回 summary + reference
 
 # 使用
 accumulator = StreamingOutputAccumulator(tool_name, session_id, user_id, memory_store)

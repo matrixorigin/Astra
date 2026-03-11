@@ -1,35 +1,35 @@
-# TrustMem Lite — Shared Memory for AI Coding Tools
+# Memoria Lite — Shared Memory for AI Coding Tools
 
-TrustMem Lite gives your AI coding tools (Kiro, Cursor, Claude Code) persistent memory
+Memoria Lite gives your AI coding tools (Kiro, Cursor, Claude Code) persistent memory
 backed by MatrixOne. Facts, preferences, and decisions survive across sessions and
 are shared between tools. This is the local single-user edition.
 
 ## Quick Start
 
 ```bash
-pip install trustmem-lite
+pip install memoria-lite
 
 # Create memory tables
-trustmem migrate --db-url 'mysql+pymysql://root:111@localhost:6001/my_db'
+memoria migrate --db-url 'mysql+pymysql://root:111@localhost:6001/my_db'
 
 # Configure for your project (auto-detects Kiro / Cursor / Claude Code)
 cd your-project
-trustmem init --db-url 'mysql+pymysql://root:111@localhost:6001/my_db'
+memoria init --db-url 'mysql+pymysql://root:111@localhost:6001/my_db'
 
 # Restart your IDE — done!
 ```
 
-## What `trustmem init` Does
+## What `memoria init` Does
 
 1. **Detects AI tools** — scans for `.kiro/`, `.cursor/`, `CLAUDE.md`
-2. **Writes MCP config** — registers the TrustMem Lite MCP server with your IDE (always updated)
+2. **Writes MCP config** — registers the Memoria Lite MCP server with your IDE (always updated)
 3. **Writes steering rules** — tells the AI when to store/retrieve/correct memories (protected, see below)
 
-Does NOT create database tables — run `trustmem migrate` first.
+Does NOT create database tables — run `memoria migrate` first.
 
 ### Steering Rule Protection
 
-`trustmem init` protects steering rules you've customized:
+`memoria init` protects steering rules you've customized:
 
 | Situation | Behavior |
 |-----------|----------|
@@ -41,12 +41,12 @@ Does NOT create database tables — run `trustmem migrate` first.
 
 ### Selecting Tools
 
-By default, `trustmem init` auto-detects installed tools. Use `--tool` to configure specific tools only:
+By default, `memoria init` auto-detects installed tools. Use `--tool` to configure specific tools only:
 
 ```bash
-trustmem init --tool kiro                    # Kiro only
-trustmem init --tool cursor                  # Cursor only
-trustmem init --tool kiro --tool cursor      # Both
+memoria init --tool kiro                    # Kiro only
+memoria init --tool cursor                  # Cursor only
+memoria init --tool kiro --tool cursor      # Both
 ```
 
 If no tools are detected and `--tool` is not specified, init will prompt you to use `--tool`.
@@ -56,18 +56,18 @@ If no tools are detected and `--tool` is not specified, init will prompt you to 
 ### Database (required)
 
 ```bash
-trustmem init --db-url 'mysql+pymysql://user:pass@host:6001/database'
+memoria init --db-url 'mysql+pymysql://user:pass@host:6001/database'
 ```
 
 ### Embedding (optional)
 
-By default, TrustMem Lite uses a local embedding model (`all-MiniLM-L6-v2`, 384 dimensions).
+By default, Memoria Lite uses a local embedding model (`all-MiniLM-L6-v2`, 384 dimensions).
 No API key needed.
 
 To use OpenAI embeddings:
 
 ```bash
-trustmem init \
+memoria init \
   --db-url 'mysql+pymysql://user:pass@host:6001/db' \
   --embedding-provider openai \
   --embedding-api-key sk-... \
@@ -78,7 +78,7 @@ trustmem init \
 To use a local OpenAI-compatible API (Ollama, vLLM, etc.):
 
 ```bash
-trustmem init \
+memoria init \
   --db-url 'mysql+pymysql://user:pass@host:6001/db' \
   --embedding-provider openai \
   --embedding-base-url http://localhost:11434/v1 \
@@ -90,7 +90,7 @@ trustmem init \
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--db-url` | `TRUSTMEM_DB_URL` | — | Database connection URL (required) |
+| `--db-url` | `MEMORIA_DB_URL` | — | Database connection URL (required) |
 | `--embedding-provider` | `EMBEDDING_PROVIDER` | `local` | `local`, `openai`, or `mock` |
 | `--embedding-model` | `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Model name |
 | `--embedding-dim` | `EMBEDDING_DIM` | `384` | Vector dimension |
@@ -105,7 +105,7 @@ IDE (Kiro/Cursor/Claude Code)
   │
   │ stdio (JSON-RPC)
   ▼
-TrustMem Lite MCP server
+Memoria Lite MCP server
   │
   ├── memory_store     → vectorize + persist
   ├── memory_retrieve  → semantic search
@@ -167,7 +167,7 @@ These tools are **expensive** and have cooldowns. Do not call proactively — on
 
 ### Kiro
 
-Files written by `trustmem init`:
+Files written by `memoria init`:
 - `.kiro/settings/mcp.json` — MCP server config (gitignore this)
 - `.kiro/steering/memory.md` — steering rule (commit this)
 
@@ -186,17 +186,17 @@ Files written:
 ## CLI Commands
 
 ```bash
-trustmem init        # Configure MCP + steering rules (auto-detects tools)
-trustmem init --tool kiro              # Configure Kiro only
-trustmem init --tool kiro --tool cursor  # Configure specific tools
-trustmem init --force                  # Overwrite steering rules even if user-customized
-trustmem migrate     # Create memory tables in the database
-trustmem status      # Show which tools are configured
-trustmem update-rules  # Update steering rules to latest version
-trustmem health      # Check memory service health (remote mode)
-trustmem governance  # Run governance cycle (quarantine, cleanup, IVF rebuild)
-trustmem consolidate --user-id <uid>  # Run graph consolidation
-trustmem reflect     --user-id <uid>  # Run reflection (requires LLM)
+memoria init        # Configure MCP + steering rules (auto-detects tools)
+memoria init --tool kiro              # Configure Kiro only
+memoria init --tool kiro --tool cursor  # Configure specific tools
+memoria init --force                  # Overwrite steering rules even if user-customized
+memoria migrate     # Create memory tables in the database
+memoria status      # Show which tools are configured
+memoria update-rules  # Update steering rules to latest version
+memoria health      # Check memory service health (remote mode)
+memoria governance  # Run governance cycle (quarantine, cleanup, IVF rebuild)
+memoria consolidate --user-id <uid>  # Run graph consolidation
+memoria reflect     --user-id <uid>  # Run reflection (requires LLM)
 ```
 
 ### migrate
@@ -207,13 +207,13 @@ Safe to run multiple times (`checkfirst=True`).
 
 ```bash
 # Release: explicit DB URL
-trustmem migrate --db-url 'mysql+pymysql://user:pass@host:6001/db'
+memoria migrate --db-url 'mysql+pymysql://user:pass@host:6001/db'
 
 # Dev: auto-reads project .env config
-trustmem migrate
+memoria migrate
 ```
 
-Priority: `--db-url` > `TRUSTMEM_DB_URL` env var > project `config/settings.py`.
+Priority: `--db-url` > `MEMORIA_DB_URL` env var > project `config/settings.py`.
 
 ## Remote Mode
 
@@ -223,19 +223,19 @@ For shared/team deployments, run the memory service as an HTTP API:
 uvicorn api.memory_app:memory_app --port 8100
 
 # Configure clients to use remote mode
-trustmem init --mode remote
+memoria init --mode remote
 ```
 
 ## Troubleshooting
 
 **"Table mem_memories doesn't exist"**
-- Run `trustmem migrate --db-url '...'` to create tables
-- Dev mode: just `trustmem migrate` (reads project config)
+- Run `memoria migrate --db-url '...'` to create tables
+- Dev mode: just `memoria migrate` (reads project config)
 
 **MCP server won't connect**
 - Check IDE logs for error messages
 - Verify database is reachable: `mysql -h host -P 6001 -u user -p`
-- Test manually: `TRUSTMEM_DB_URL='...' python -m mo_memory_mcp`
+- Test manually: `MEMORIA_DB_URL='...' python -m mo_memory_mcp`
 
 **Memories not vectorized**
 - Check embedding provider is configured correctly
@@ -245,9 +245,9 @@ trustmem init --mode remote
 - Ensure all dependencies are installed: `pip install -e .` or `poetry install` in the project root
 
 **IDE doesn't see the tools**
-- Restart the IDE after running `trustmem init`
+- Restart the IDE after running `memoria init`
 - Check that `.kiro/settings/mcp.json` (or equivalent) exists and is valid JSON
 
 **"No such file or directory" on MCP start**
 - The `command` in MCP config must be an absolute path to python
-- `trustmem init` uses `sys.executable` — re-run init from the correct conda/venv
+- `memoria init` uses `sys.executable` — re-run init from the correct conda/venv

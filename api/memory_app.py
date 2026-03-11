@@ -84,7 +84,7 @@ async def lifespan(app: FastAPI):
 
 
 memory_app = FastAPI(
-    title="TrustMem Lite",
+    title="Memoria Lite",
     description="Memory service for AI coding tools — shared memory across Kiro, Cursor, Claude Code.",
     version="0.1.0",
     docs_url="/docs",
@@ -167,7 +167,7 @@ def health_check():
         db_healthy = False
 
     return {
-        "service": "trustmem-lite",
+        "service": "memoria-lite",
         "status": "healthy" if db_healthy else "unhealthy",
         "database": "connected" if db_healthy else "disconnected",
     }
@@ -176,7 +176,7 @@ def health_check():
 @memory_app.get("/")
 def root():
     return {
-        "name": "trustmem-lite",
+        "name": "memoria-lite",
         "version": "0.1.0",
         "docs": "/docs",
     }
