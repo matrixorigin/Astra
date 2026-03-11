@@ -2,7 +2,7 @@
 
 Install::
 
-    pip install trust-mem-lite
+    pip install memoria-lite
 
 Quick start::
 

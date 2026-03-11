@@ -648,7 +648,7 @@ MEMORIA_DIST = dist/memoria
 
 .PHONY: build-memoria
 build-memoria:
-	@echo "Building trust-mem-lite..."
+	@echo "Building memoria-lite..."
 	@rm -rf $(MEMORIA_DIST)
 	@mkdir -p $(MEMORIA_DIST)
 	@cp pyproject.toml pyproject.toml.bak
@@ -659,14 +659,14 @@ build-memoria:
 
 .PHONY: publish-memoria
 publish-memoria: build-memoria
-	@echo "Publishing trust-mem-lite to PyPI..."
+	@echo "Publishing memoria-lite to PyPI..."
 	@pip install --quiet twine 2>/dev/null || true
 	@twine upload $(MEMORIA_DIST)/*
-	@echo "✅ Published trust-mem-lite to PyPI"
+	@echo "✅ Published memoria-lite to PyPI"
 
 .PHONY: publish-memoria-test
 publish-memoria-test: build-memoria
-	@echo "Publishing trust-mem-lite to TestPyPI..."
+	@echo "Publishing memoria-lite to TestPyPI..."
 	@pip install --quiet twine 2>/dev/null || true
 	@twine upload --repository testpypi $(MEMORIA_DIST)/*
-	@echo "✅ Published trust-mem-lite to TestPyPI"
+	@echo "✅ Published memoria-lite to TestPyPI"

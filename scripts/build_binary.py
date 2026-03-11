@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build trust-mem-lite into a single-file binary using PyInstaller.
+"""Build memoria-lite into a single-file binary using PyInstaller.
 
 Usage:
     pip install pyinstaller

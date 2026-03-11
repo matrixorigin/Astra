@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bump trust-mem-lite version across all files.
+"""Bump memoria-lite version across all files.
 
 Usage:
     python scripts/bump_memoria_version.py patch   # 0.1.0 -> 0.1.1

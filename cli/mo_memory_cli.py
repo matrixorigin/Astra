@@ -356,7 +356,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         except ImportError:
             print("⚠️  sentence-transformers not installed — memories won't be vectorized.")
             print("   Install it for better retrieval quality:")
-            print("   pip install trust-mem-lite[local-embedding]")
+            print("   pip install memoria-lite[local-embedding]")
             print("   Or use OpenAI embeddings:")
             print("   memoria init --embedding-provider openai --embedding-api-key sk-...")
         print()

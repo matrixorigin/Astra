@@ -8,16 +8,16 @@ Works with **Kiro**, **Cursor**, and **Claude Code**. Stores memories in [Matrix
 
 ```bash
 # Install
-pip install 'trust-mem-lite'
+pip install 'memoria-lite'
 
 # For local embeddings (sentence-transformers, +80MB model download on first use)
-pip install 'trust-mem-lite[local-embedding]'
+pip install 'memoria-lite[local-embedding]'
 
 # For OpenAI-compatible embeddings (OpenAI, SiliconFlow, Ollama, etc.)
-pip install 'trust-mem-lite[openai-embedding]'
+pip install 'memoria-lite[openai-embedding]'
 
 # Install from TestPyPI (pre-release testing)
-pip install --index-url https://pypi.org/simple/ --extra-index-url https://test.pypi.org/simple/ 'trust-mem-lite[local-embedding]'
+pip install --index-url https://pypi.org/simple/ --extra-index-url https://test.pypi.org/simple/ 'memoria-lite[local-embedding]'
 
 # Initialize — writes MCP config and steering rules (no DB connection needed)
 memoria init --db-url 'mysql+pymysql://root:111@localhost:6001/memoria'
