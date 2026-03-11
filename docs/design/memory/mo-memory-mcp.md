@@ -103,12 +103,12 @@ directly to the database — no separate service to manage.
 
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
-| `memory_store` | Store a memory | `content`, `memory_type` (default: semantic) |
-| `memory_retrieve` | Recall relevant memories; includes ⚠️ health warnings if issues detected | `query`, `top_k` (default: 5) |
-| `memory_correct` | Fix an existing memory | `memory_id`, `new_content`, `reason` |
+| `memory_store` | Store a memory. Returns `warning` field if embedding client is unavailable (memory stored without vector, retrieval falls back to keyword search) | `content`, `memory_type` (default: semantic) |
+| `memory_retrieve` | Recall relevant memories; uses vector search if embedding available, falls back to keyword search otherwise. Includes ⚠️ health warnings if issues detected | `query`, `top_k` (default: 5) |
+| `memory_correct` | Fix an existing memory. Returns `warning` field if embedding client is unavailable | `memory_id`, `new_content`, `reason` |
 | `memory_purge` | Delete by ID or bulk-delete by topic | `memory_id` or `topic`, `reason` |
 | `memory_profile` | Get user profile summary | — |
-| `memory_search` | Semantic search | `query`, `top_k` (default: 10) |
+| `memory_search` | Semantic search; falls back to keyword search if embedding unavailable | `query`, `top_k` (default: 10) |
 
 ### Maintenance Tools
 
@@ -212,7 +212,9 @@ trustmem init --mode remote
 **Memories not vectorized**
 - Check embedding provider is configured correctly
 - For local provider: `pip install sentence-transformers`
-- For openai provider: verify API key is set
+- For openai provider: verify API key is set and `openai` package is installed (`pip install openai`)
+- If `memory_store` returns a `warning` field, the embedding client failed to initialize — check the above
+- Ensure all dependencies are installed: `pip install -e .` or `poetry install` in the project root
 
 **IDE doesn't see the tools**
 - Restart the IDE after running `trustmem init`

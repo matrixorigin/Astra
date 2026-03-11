@@ -131,9 +131,13 @@ class EmbeddedBackend(MemoryBackend):
         from core.memory.types import MemoryType
 
         db_factory = self._branch_db_factory(user_id)
-        editor = self._create_editor(db_factory, user_id=user_id, embed_client=self._get_embed_client())
+        embed_client = self._get_embed_client()
+        editor = self._create_editor(db_factory, user_id=user_id, embed_client=embed_client)
         mem = editor.inject(user_id, content, memory_type=MemoryType(memory_type), source="mcp", session_id=session_id)
-        return {"memory_id": mem.memory_id, "content": mem.content, "branch": self._get_active_branch(user_id)}
+        result: dict = {"memory_id": mem.memory_id, "content": mem.content, "branch": self._get_active_branch(user_id)}
+        if embed_client is None:
+            result["warning"] = "Embedding client not available — memory stored without vector. Retrieval will fall back to keyword search."
+        return result
 
     def retrieve(self, user_id: str, query: str, top_k: int, session_id: str | None = None) -> list[dict]:
         db_factory = self._branch_db_factory(user_id)
@@ -177,9 +181,13 @@ class EmbeddedBackend(MemoryBackend):
 
     def correct(self, user_id: str, memory_id: str, new_content: str, reason: str) -> dict:
         db_factory = self._branch_db_factory(user_id)
-        editor = self._create_editor(db_factory, user_id=user_id, embed_client=self._get_embed_client())
+        embed_client = self._get_embed_client()
+        editor = self._create_editor(db_factory, user_id=user_id, embed_client=embed_client)
         mem = editor.correct(user_id, memory_id, new_content, reason=reason)
-        return {"memory_id": mem.memory_id, "content": mem.content}
+        result: dict = {"memory_id": mem.memory_id, "content": mem.content}
+        if embed_client is None:
+            result["warning"] = "Embedding client not available — memory stored without vector. Retrieval will fall back to keyword search."
+        return result
 
     def purge(self, user_id: str, memory_id: str | None, topic: str | None, reason: str) -> dict:
         db_factory = self._branch_db_factory(user_id)

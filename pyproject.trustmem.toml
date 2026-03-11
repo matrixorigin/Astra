@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "trust-mem-lite"
-version = "0.2.6"
+version = "0.2.7"
 description = "Persistent memory for AI coding tools (Kiro, Cursor, Claude Code) — local single-user mode"
 authors = ["MatrixOne Team"]
 readme = "mo_memory_mcp/README.md"
@@ -33,9 +33,11 @@ pydantic = "^2.5.0"
 mcp = "^1.26.0"
 uuid-utils = "^0.9.0"
 sentence-transformers = {version = ">=2.2.0", optional = true}
+openai = {version = ">=1.0.0", optional = true}
 
 [tool.poetry.extras]
 local-embedding = ["sentence-transformers"]
+openai-embedding = ["openai"]
 
 [tool.poetry.scripts]
 trustmem = "cli.mo_memory_cli:main"
