@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -61,3 +62,15 @@ print("ok")
         f"stderr:\n{result.stderr}\n"
     )
     assert "ok" in result.stdout
+
+
+def test_package_json_extensions_target_existing_package_files():
+    repo_root = Path(__file__).resolve().parents[2]
+    plugin_dir = repo_root / "plugins" / "openclaw-memory"
+    package_data = json.loads((plugin_dir / "package.json").read_text(encoding="utf-8"))
+
+    extensions = package_data["openclaw"]["extensions"]
+    for relative_path in extensions:
+        assert (plugin_dir / relative_path).exists()
+
+    assert (plugin_dir / "src" / "backend_bridge.py").exists()

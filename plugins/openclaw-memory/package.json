@@ -1,0 +1,33 @@
+{
+  "name": "mo-agent-memory",
+  "version": "0.1.0",
+  "description": "OpenClaw memory plugin package for mo-agent-runtime.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./agent-tools": "./src/agent-tools.ts",
+    "./hooks": "./src/hooks.ts"
+  },
+  "files": [
+    "src/**/*.py",
+    "src/**/*.ts",
+    "README.md",
+    "plugin.yaml",
+    "openclaw.plugin.json",
+    "tsconfig.json",
+    "vitest.config.ts"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "openclaw": {
+    "extensions": ["./src/index.ts"]
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.7"
+  }
+}

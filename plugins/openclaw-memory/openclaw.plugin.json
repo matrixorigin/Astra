@@ -1,0 +1,132 @@
+{
+  "id": "mo-agent-memory",
+  "name": "mo-agent-memory",
+  "version": "0.1.0",
+  "description": "Expose mo-agent-runtime memory recall, memory CRUD, and lifecycle hooks as a host-loadable OpenClaw plugin package.",
+  "author": "MatrixOne Team",
+  "capabilities": [
+    "memory.retrieve",
+    "memory.context_prompt",
+    "memory.recall",
+    "memory.store",
+    "memory.forget",
+    "memory.update",
+    "hook.before_prompt_build",
+    "hook.before_agent_start",
+    "hook.agent_end"
+  ],
+  "tools": [
+    {
+      "name": "memory_recall",
+      "description": "Recall relevant memory snippets for a query."
+    },
+    {
+      "name": "memory_store",
+      "description": "Store an important memory item."
+    },
+    {
+      "name": "memory_forget",
+      "description": "Delete one memory by ID or by query lookup."
+    },
+    {
+      "name": "memory_update",
+      "description": "Update text/category/importance for an existing memory item."
+    }
+  ],
+  "hooks": [
+    {
+      "name": "before_prompt_build",
+      "description": "Modern OpenClaw prompt hook that prepends relevant memories via prependContext."
+    },
+    {
+      "name": "before_agent_start",
+      "description": "Legacy compatibility hook that mirrors the prompt-memory prepend payload."
+    },
+    {
+      "name": "agent_end",
+      "description": "Optional auto-capture hook that stores selected conversation turns."
+    }
+  ],
+  "configSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "autoRecall": {
+        "type": "boolean",
+        "default": false,
+        "description": "Automatically recall relevant memories before prompt assembly."
+      },
+      "autoCapture": {
+        "type": "boolean",
+        "default": true,
+        "description": "Automatically capture selected conversation messages at agent_end."
+      },
+      "captureAssistant": {
+        "type": "boolean",
+        "default": false,
+        "description": "Include assistant messages in auto-capture."
+      },
+      "recallLimit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 20,
+        "default": 3,
+        "description": "Maximum memory snippets injected into the prompt."
+      },
+      "recallMaxTokens": {
+        "type": "integer",
+        "minimum": 256,
+        "maximum": 8000,
+        "default": 4000,
+        "description": "Token budget forwarded to mo-agent memory retrieval."
+      },
+      "captureMaxItems": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 20,
+        "default": 3,
+        "description": "Maximum unique messages stored during auto-capture."
+      },
+      "defaultTaskType": {
+        "type": "string",
+        "enum": ["general", "planning", "debugging", "code_review"],
+        "default": "general",
+        "description": "Fallback mo-agent task type when the host does not provide one."
+      },
+      "embeddingProvider": {
+        "type": "string",
+        "enum": ["mock", "openai"],
+        "default": "mock",
+        "description": "Embedding backend used by the Python memory retriever. OpenAI uses text-embedding-3-small in the current implementation."
+      },
+      "pythonExecutable": {
+        "type": "string",
+        "default": "python3",
+        "description": "Python interpreter used by the packaged bridge."
+      },
+      "runtimeRoot": {
+        "type": "string",
+        "default": "",
+        "description": "Optional path to a mo-agent-runtime checkout so the bridge can import core.context and sdk modules."
+      },
+      "defaultUserId": {
+        "type": "string",
+        "default": "openclaw-user",
+        "description": "Fallback user id for stored memories when the host does not provide one."
+      },
+      "agentId": {
+        "type": "string",
+        "default": "openclaw-memory"
+      },
+      "agentVersion": {
+        "type": "string",
+        "default": "0.1.0"
+      },
+      "memoryEventType": {
+        "type": "string",
+        "default": "system_message"
+      }
+    }
+  }
+}

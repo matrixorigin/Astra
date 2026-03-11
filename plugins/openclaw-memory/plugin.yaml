@@ -1,12 +1,20 @@
+# Legacy compatibility manifest for the earlier Python-oriented adapter package.
 name: mo-agent-memory
 slug: mo-agent-memory
-description: Exposes mo-agent-runtime memory retrieval and context assembly as an OpenClaw community plugin.
+description: Expose mo-agent-runtime memory recall, memory CRUD, and lifecycle hooks as a host-loadable OpenClaw plugin package.
 version: 0.1.0
 author: MatrixOne Team
 entrypoint: src/openclaw_memory_plugin.py
 capabilities:
   - memory.retrieve
   - memory.context_prompt
+  - memory.recall
+  - memory.store
+  - memory.forget
+  - memory.update
+  - hook.before_prompt_build
+  - hook.before_agent_start
+  - hook.agent_end
 runtime:
   language: python
   min_version: "3.10"
