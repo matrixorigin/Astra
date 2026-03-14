@@ -34,7 +34,6 @@ _GROUP_IMPORTS: dict[ModelGroup, list[tuple[str, list[str]]]] = {
         ("core.memory.models.memory", ["MemoryRecord"]),
         ("core.memory.models.memory_config", ["MemoryUserConfig"]),
         ("core.memory.models.memory_edit_log", ["MemoryEditLog"]),
-        ("core.memory.models.memory_experiment", ["MemoryExperiment"]),
         ("core.memory.models.graph", ["GraphEdge", "GraphNode"]),
     ],
     ModelGroup.SKILLS: [

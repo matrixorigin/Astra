@@ -86,11 +86,13 @@ class MemoriaHTTPClient:
         memory_types: Optional[list[str]] = None,
         session_id: Optional[str] = None,
         include_cross_session: bool = True,
-    ) -> list[dict[str, Any]]:
+        explain: bool | str = False,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "query": query,
             "top_k": top_k,
             "include_cross_session": include_cross_session,
+            "explain": explain,
         }
         if memory_types:
             payload["memory_types"] = memory_types
@@ -407,19 +409,23 @@ class MemoriaStorage:
         memory_types: Optional[list[MemoryType]] = None,
         session_id: str = "",
         include_cross_session: bool = True,
+        explain: bool | str = False,
         **kwargs: Any,
     ) -> tuple[list[Memory], Any]:
         type_names = [t.value for t in memory_types] if memory_types else None
-        results = self.client.retrieve(
+        result = self.client.retrieve(
             user_id=user_id,
             query=query,
             top_k=top_k,
             memory_types=type_names,
             session_id=session_id or None,
             include_cross_session=include_cross_session,
+            explain=explain,
         )
-        memories = [self._to_memory(r, user_id) for r in results]
-        return memories, {"source": "memoria", "count": len(memories)}
+        memories_data = result["memories"]
+        explain_info = result.get("explain", {"path": "unknown", "count": len(memories_data)})
+        memories = [self._to_memory(r, user_id) for r in memories_data]
+        return memories, explain_info
 
     def get_profile(self, user_id: str) -> Optional[str]:
         try:

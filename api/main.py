@@ -33,6 +33,16 @@ logger = get_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown events."""
+    # Startup configuration validation
+    logger.info("Validating startup configuration...")
+    try:
+        from core.config_validation import check_startup_config
+        check_startup_config(fail_on_warnings=False)
+    except Exception as e:
+        logger.error(f"Configuration validation failed: {e}")
+        # Don't fail startup on config warnings, but log them
+        logger.warning("Continuing startup despite configuration issues")
+    
     # Startup
     logger.info("Initializing database...")
     try:

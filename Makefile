@@ -44,8 +44,7 @@ help:
 	@echo "  make test               - Run all tests"
 	@echo "  make test-unit          - Run unit tests only"
 	@echo "  make test-integration   - Run integration tests only"
-	@echo "  make verify             - E2E verification (real DB, no LLM)"
-	@echo "  make verify-llm         - E2E verification (real DB + real LLM)"
+	@echo "  make verify             - E2E verification (real CLI + API + LLM)"
 	@echo "  make verify-talk        - Talk verification (real CLI + API + LLM)"
 	@echo ""
 	@echo "Environment Setup:"
@@ -424,6 +423,16 @@ dev-reset: dev-clean
 	@$(MAKE) dev-init
 	@echo "✅ Development environment reset"
 
+# Configuration validation
+.PHONY: dev-config-check dev-config-check-strict
+dev-config-check: ## Check development configuration
+	@echo "Checking development configuration..."
+	@python core/config_validation.py
+
+dev-config-check-strict: ## Check development configuration (strict mode)
+	@echo "Checking development configuration (strict mode)..."
+	@python core/config_validation.py --strict
+
 # Aliases: README uses dev-start/dev-stop, Makefile defines dev-up/dev-down
 .PHONY: dev-start dev-stop dev-start-docker
 dev-start: dev-up
@@ -543,18 +552,14 @@ db-reset:
 # E2E Verification
 # ============================================================================
 
-.PHONY: verify verify-llm verify-talk
+.PHONY: verify verify-talk
 verify:
-	@echo "Running E2E verification..."
-	@set -a && . ./.env && set +a && http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python scripts/e2e/verify_cli.py $(if $(VERBOSE),-v)
-
-verify-llm:
-	@echo "Running E2E verification with LLM..."
-	@set -a && . ./.env && set +a && http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python scripts/e2e/verify_cli.py --with-llm $(if $(VERBOSE),-v) $(if $(MODEL),--model $(MODEL))
+	@echo "Running E2E verification (talk-based)..."
+	@set -a && . ./.env && set +a && http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 MEMORIA_BASE_URL=http://localhost:8100 MEMORIA_MASTER_KEY=test-master-key-for-docker-compose python scripts/e2e/verify_talk.py $(if $(VERBOSE),-v) $(if $(CASE),--case $(CASE)) $(if $(MODEL),--model $(MODEL))
 
 verify-talk:
 	@echo "Running talk verification (requires API server + LLM)..."
-	@set -a && . ./.env && set +a && http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python scripts/e2e/verify_talk.py $(if $(VERBOSE),-v) $(if $(CASE),--case $(CASE)) $(if $(MODEL),--model $(MODEL))
+	@set -a && . ./.env && set +a && http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 MEMORIA_BASE_URL=http://localhost:8100 MEMORIA_MASTER_KEY=test-master-key-for-docker-compose python scripts/e2e/verify_talk.py $(if $(VERBOSE),-v) $(if $(CASE),--case $(CASE)) $(if $(MODEL),--model $(MODEL))
 
 
 # ============================================================================

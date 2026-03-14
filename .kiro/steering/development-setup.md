@@ -127,10 +127,13 @@ open http://localhost:8000/docs
 # 1. Activate environment
 conda activate dev-agent
 
-# 2. Start all services (< 10 seconds)
+# 2. Check configuration (optional but recommended)
+make dev-config-check
+
+# 3. Start all services (< 10 seconds)
 make dev-start
 
-# 3. Verify everything is running
+# 4. Verify everything is running
 make dev-status
 ```
 

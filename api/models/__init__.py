@@ -19,7 +19,6 @@ from core.memory.models import (  # noqa: F401
     GraphEdge,
     GraphNode,
     MemoryEditLog,
-    MemoryExperiment,
     MemoryRecord,
     MemoryUserConfig,
 )

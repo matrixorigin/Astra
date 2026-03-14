@@ -5,7 +5,6 @@ from core.memory.models.memory import MemoryRecord
 from core.memory.models.memory_branch import MemoryBranch
 from core.memory.models.memory_config import MemoryUserConfig
 from core.memory.models.memory_edit_log import MemoryEditLog
-from core.memory.models.memory_experiment import MemoryExperiment
 from core.memory.models.user_state import MemoryUserState
 
 __all__ = [
@@ -13,7 +12,6 @@ __all__ = [
     "GraphNode",
     "MemoryBranch",
     "MemoryEditLog",
-    "MemoryExperiment",
     "MemoryRecord",
     "MemoryUserConfig",
     "MemoryUserState",

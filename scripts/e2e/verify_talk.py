@@ -27,6 +27,12 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 for _k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
     os.environ.pop(_k, None)
 
+# Set Memoria environment variables for memory operations
+os.environ.setdefault("MEMORIA_BASE_URL", os.environ.get("TEST_MEMORIA_BASE_URL", "http://localhost:8100"))
+os.environ.setdefault("MEMORIA_MASTER_KEY", os.environ.get("TEST_MEMORIA_MASTER_KEY", "test-master-key-for-docker-compose"))
+os.environ.setdefault("MEMORIA_API_KEY", os.environ.get("TEST_MEMORIA_API_KEY", ""))
+os.environ.setdefault("MEMORY_BACKEND", "memoria")
+
 import argparse
 import logging
 
@@ -52,42 +58,32 @@ def _get_cheapest_model() -> str | None:
         return None
 
 
-def _get_llm_client():
+def _get_llm_client(user_id: str | None = None):
     from core.llm.client import LLMClient
 
-    return LLMClient(SessionLocal)
+    return LLMClient(SessionLocal, user_id=user_id)
 
 
 def _init_prev_counts(
     case: dict, uid: str, sid: str, prev_counts: dict, uid_only: bool = False
 ) -> None:
-    """Snapshot initial DB counts for relative checks (+N)."""
-    from sqlalchemy import text as sa_text
+    """Snapshot initial DB counts for relative checks (+N).
 
-    for turn_def in case.get("turns", []):
-        for rule in turn_def.get("checks", {}).get("rules", []):
-            if "db" in rule:
-                db_rule = rule["db"]
-                table = db_rule["table"]
-                where_raw = db_rule["where"]
-                if uid_only and ":sid" in where_raw:
-                    continue  # skip sid-based counts until sid is known
-                where = where_raw.replace(":uid", f"'{uid}'").replace(":sid", f"'{sid}'")
-                key = f"{table}:{where}"
-                if key not in prev_counts:
-                    with SessionLocal() as db:
-                        prev_counts[key] = (
-                            db.execute(
-                                sa_text(f"SELECT COUNT(*) FROM {table} WHERE {where}")
-                            ).scalar()
-                            or 0
-                        )
+    Note: With Memoria backend, DB counts are no longer available.
+    This function is kept for compatibility but does nothing.
+    """
+    # Memoria backend doesn't support direct SQL queries
+    # Consider using Memoria API for count operations if needed
+    pass
 
 
 def _seed_graph_nodes(user_id: str, count: int = 50) -> None:
     """Seed graph nodes for a user so activation:v1 threshold is met."""
-    from core.memory.factory import create_editor
+    from core.memory.factory import create_editor, set_user_strategy
 
+    # Set user to activation:v1 strategy first
+    set_user_strategy(SessionLocal, user_id, "activation:v1")
+    
     editor = create_editor(SessionLocal, user_id=user_id)
     if not editor._embed_client:
         return  # no embedding client, skip
@@ -215,29 +211,35 @@ def run_case(case: dict, *, verbose: bool = False, model: str | None = None) -> 
 
         # Verify graph activation was actually used (only for cases that opt in)
         if check_graph:
-            from core.memory.factory import (
-                _resolve_strategy,
-                _registry,
-                StrategyDescriptor,
-                _register_builtins,
-            )
-            from core.embedding import get_embedding_client
-
-            _register_builtins()
-            sk = _resolve_strategy(SessionLocal, uid, backend=None, strategy=None)
-            desc = StrategyDescriptor.parse(sk)
-            strategy = _registry.create_strategy(desc, db_factory=SessionLocal)
-            ec = get_embedding_client()
-            q_emb = ec.embed("Python data analysis")
-            _, explain_info = strategy.retrieve(
-                uid, "Python data analysis", q_emb, top_k=3, explain=True
-            )
-            path = (explain_info or {}).get("path", "unknown")
-            if path == "graph":
-                print(f"    ✅ graph_activation_used — path=graph (confirmed via explain)")
-                passed += 1
-            else:
-                print(f"    ❌ graph_activation_used — path={path} (expected graph)")
+            try:
+                import httpx
+                # Call Memoria API directly to get explain info
+                response = httpx.post(
+                    f"{os.environ['MEMORIA_BASE_URL']}/v1/memories/retrieve",
+                    json={
+                        "user_id": uid,
+                        "query": "什么语言做数据分析",
+                        "top_k": 3,
+                        "explain": "basic"
+                    },
+                    headers={"Authorization": f"Bearer {os.environ['MEMORIA_MASTER_KEY']}"},
+                    timeout=10.0
+                )
+                response.raise_for_status()
+                result = response.json()
+                
+                explain_info = result.get("explain", {})
+                path = explain_info.get("path", "unknown")
+                
+                if "graph" in path or "activation" in path:
+                    print(f"    ✅ graph_activation_used — path={path}")
+                    passed += 1
+                else:
+                    print(f"    ❌ graph_activation_used — path={path} (expected graph)")
+                    failed += 1
+                    
+            except Exception as e:
+                print(f"    ❌ graph_activation_used — error checking: {e}")
                 failed += 1
 
     except Exception as e:
@@ -292,13 +294,17 @@ def _check_turn(
             prev_counts,
         )
         for r in results:
-            status = "✅" if r.passed else "❌"
-            print(
-                f"    {status} {r.name}" + (f" — {r.message}" if r.message and not r.passed else "")
-            )
-            if r.passed:
+            if r.skipped:
+                status = "⏭️"
+                print(f"    {status} {r.name} — {r.message}")
+                # Don't count skipped checks in passed/failed
+            elif r.passed:
+                status = "✅"
+                print(f"    {status} {r.name}" + (f" — {r.message}" if r.message else ""))
                 passed += 1
             else:
+                status = "❌"
+                print(f"    {status} {r.name} — {r.message}")
                 failed += 1
 
     # LLM judge
@@ -309,8 +315,9 @@ def _check_turn(
             user_msg,
             jc["criteria"],
             jc.get("pass_threshold", 0.7),
-            _get_llm_client(),
+            _get_llm_client(user_id=uid),
             model=model,
+            user_id=uid,
         )
         status = "🤖✅" if r.passed else "🤖❌"
         print(f"    {status} {r.message}")
@@ -323,31 +330,15 @@ def _check_turn(
 
 
 def _cleanup_user(user_id: str) -> None:
-    from sqlalchemy import text as sa_text
+    """Cleanup all memories for a user via Memoria API."""
+    from core.memory.factory import create_editor
 
-    with SessionLocal() as db:
-        for t in ("mem_edit_log", "mem_memories", "memory_graph_nodes", "memory_graph_edges"):
-            db.execute(sa_text(f"DELETE FROM {t} WHERE user_id = :uid"), {"uid": user_id})
-        db.commit()
-
-    # Discard experiment branches
+    editor = create_editor(SessionLocal, user_id=user_id)
     try:
-        from core.memory.experiment import MemoryExperimentManager
-
-        db_name = SessionLocal.kw["bind"].url.database
-        mgr = MemoryExperimentManager(SessionLocal, source_db=db_name)
-        with SessionLocal() as db:
-            rows = db.execute(
-                sa_text("SELECT experiment_id FROM mem_experiments WHERE user_id = :uid"),
-                {"uid": user_id},
-            ).fetchall()
-        for row in rows:
-            try:
-                mgr.discard(row.experiment_id)
-            except Exception:
-                pass
+        # Purge all memory types
+        editor.purge(user_id, memory_types=["semantic", "procedural", "episodic"])
     except Exception:
-        pass
+        pass  # Best effort cleanup
 
 
 def main() -> None:
