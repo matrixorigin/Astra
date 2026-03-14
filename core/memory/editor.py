@@ -18,7 +18,7 @@ from sqlalchemy import text
 
 if TYPE_CHECKING:
     from core.db_consumer import DbFactory
-    from core.memory.canonical_storage import CanonicalStorage
+    from core.memory.backends.memoria_http import MemoriaStorage
     from core.memory.strategy.protocol import IndexManager
     from core.memory.types import Memory, MemoryType, TrustTier
 
@@ -48,20 +48,20 @@ class EditLogEntry:
 class MemoryEditor:
     """Inject, correct, and purge memories with audit trail.
 
+    Thin wrapper around MemoriaStorage for admin operations.
     All destructive operations create a snapshot first.
-    All mutations are logged to mem_edit_log.
     """
 
     def __init__(
         self,
-        storage: CanonicalStorage,
+        storage: MemoriaStorage,
         db_factory: DbFactory,
         index_manager: IndexManager | None = None,
         embed_client: Any | None = None,
     ) -> None:
         self._storage = storage
         self._db_factory = db_factory
-        self._index_manager = index_manager
+        self._index_manager = index_manager  # Not used with Memoria
         self._embed_client = embed_client
 
     def inject(
@@ -200,41 +200,7 @@ class MemoryEditor:
         Raises:
             ValueError: If memory_id not found.
         """
-        from core.memory.types import Memory as MemoryObj
-        from core.memory.types import TrustTier
-
-        old = self._storage.get_memory(memory_id)
-        if old is None:
-            raise ValueError(f"Memory {memory_id} not found")
-
-        new_mem = MemoryObj(
-            memory_id=uuid.uuid4().hex,
-            user_id=user_id,
-            content=new_content,
-            memory_type=old.memory_type,
-            trust_tier=TrustTier.T2_CURATED,
-            initial_confidence=old.initial_confidence,
-            session_id=old.session_id,
-            source_event_ids=[f"correct:{memory_id}"],
-            observed_at=datetime.now(timezone.utc),
-        )
-
-        if self._embed_client is not None:
-            try:
-                new_mem.embedding = self._embed_client.embed(new_content)
-            except Exception:
-                logger.warning("Embedding failed for correct", exc_info=True)
-
-        # Use store's supersede: deactivates old, creates new, links them.
-        # supersede() inserts directly into MemoryStore (not through
-        # CanonicalStorage.create_memory), so we must embed here.
-        from core.memory.tabular.store import MemoryStore
-
-        store = MemoryStore(self._db_factory)
-        result = store.supersede(memory_id, new_mem)
-
-        if self._index_manager:
-            self._index_manager.on_memories_stored(user_id, [result], session_id=old.session_id)
+        result = self._storage.correct(user_id, memory_id, new_content, reason=reason)
 
         self._log_edit(
             user_id, "correct",
@@ -269,72 +235,39 @@ class MemoryEditor:
         # Snapshot before destructive op
         snapshot_name = self._create_safety_snapshot(user_id, "purge")
 
-        deactivated = 0
-        purged_ids: list[str] = []
+        # Convert memory_types to list of strings if provided
+        type_list = None
+        if memory_types:
+            type_list = [mt.value for mt in memory_types]
 
-        with self._db_factory() as db:
-            if memory_ids:
-                for mid in memory_ids:
-                    result = db.execute(
-                        text(
-                            "UPDATE mem_memories SET is_active = 0, updated_at = NOW() "
-                            "WHERE memory_id = :mid AND user_id = :uid AND is_active = 1"
-                        ),
-                        {"mid": mid, "uid": user_id},
-                    )
-                    if result.rowcount > 0:
-                        deactivated += result.rowcount
-                        purged_ids.append(mid)
-
-            if memory_types:
-                type_vals = [mt.value for mt in memory_types]
-                for tv in type_vals:
-                    q = (
-                        "UPDATE mem_memories SET is_active = 0, updated_at = NOW() "
-                        "WHERE user_id = :uid AND memory_type = :mt AND is_active = 1"
-                    )
-                    params: dict[str, Any] = {"uid": user_id, "mt": tv}
-                    if before:
-                        q += " AND observed_at < :before"
-                        params["before"] = before
-                    result = db.execute(text(q), params)
-                    deactivated += result.rowcount
-
-            if before and not memory_ids and not memory_types:
-                result = db.execute(
-                    text(
-                        "UPDATE mem_memories SET is_active = 0, updated_at = NOW() "
-                        "WHERE user_id = :uid AND is_active = 1 AND observed_at < :before"
-                    ),
-                    {"uid": user_id, "before": before},
-                )
-                deactivated += result.rowcount
-
-            db.commit()
-
-        if self._index_manager and deactivated > 0:
-            self._index_manager.on_governance(user_id)
+        # Delegate to MemoriaStorage
+        result = self._storage.purge(
+            user_id=user_id,
+            memory_ids=memory_ids,
+            memory_types=type_list,
+            reason=reason,
+        )
 
         self._log_edit(
             user_id, "purge",
-            target_ids=purged_ids,
+            target_ids=memory_ids or [],
             reason=reason,
             snapshot_before=snapshot_name,
         )
-        return PurgeResult(deactivated=deactivated, snapshot_name=snapshot_name)
+        return PurgeResult(deactivated=result.deactivated, snapshot_name=snapshot_name)
 
     # ── Internal helpers ──────────────────────────────────────────────
 
     def _create_safety_snapshot(self, user_id: str, operation: str) -> str | None:
-        """Create a snapshot before destructive operations. Best-effort."""
+        """Create a snapshot before destructive operations. Best-effort.
+
+        Uses Memoria's snapshot API instead of local GitForData.
+        """
         from core.utils.id_generator import generate_id
 
         name = f"pre_{operation}_{generate_id()}"
         try:
-            from core.git_for_data import GitForData
-
-            git = GitForData(self._db_factory)
-            git.create_snapshot(name)
+            self._storage.client.create_snapshot(user_id=user_id, name=name)
             return name
         except Exception:
             logger.warning("Failed to create safety snapshot %s", name, exc_info=True)

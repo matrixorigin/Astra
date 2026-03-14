@@ -234,21 +234,19 @@ def create_editor(
     user_id: str | None = None,
     embed_client: Any | None = _SENTINEL,
 ) -> Any:
-    """Create a MemoryEditor with the appropriate index_manager for the user's strategy.
+    """Create a MemoryEditor with Memoria backend.
 
     Args:
-        db_factory: Database session factory.
-        user_id: If provided, resolves user's strategy to get the right index_manager.
-        embed_client: Embedding client to use. If omitted, auto-resolved from settings.
+        db_factory: Database session factory (kept for API compatibility).
+        user_id: Target user ID for the editor.
+        embed_client: Embedding client (optional, for batch operations).
 
     Returns:
-        MemoryEditor with index_manager wired up.
+        MemoryEditor with MemoriaStorage backend.
     """
     from core.memory.editor import MemoryEditor
 
-    _register_builtins()
-
-    # Resolve embed client: use caller-provided, or auto-resolve from settings.
+    # Resolve embed client
     if embed_client is _SENTINEL:
         embed_client = None
         try:
@@ -261,19 +259,29 @@ def create_editor(
                 exc_info=True,
             )
 
-    # Wire embed_fn into CanonicalStorage so observe_explicit generates embeddings.
-    embed_fn = embed_client.embed if embed_client is not None else None
-    storage = CanonicalStorage(db_factory, embed_fn=embed_fn)
+    # Create Memoria HTTP client
+    memoria_url = os.environ.get("MEMORIA_BASE_URL")
+    memoria_master_key = os.environ.get("MEMORIA_MASTER_KEY")
+    memoria_api_key = os.environ.get("MEMORIA_API_KEY")
 
-    index_manager = None
-    if user_id:
-        strategy_key = _resolve_strategy(db_factory, user_id, backend=None, strategy=None)
-        descriptor = StrategyDescriptor.parse(strategy_key)
-        index_manager = _registry.create_index_manager(
-            descriptor, db_factory=db_factory,
+    if not memoria_url or not (memoria_master_key or memoria_api_key):
+        raise RuntimeError(
+            "Memoria is required for editor. Set MEMORIA_BASE_URL and MEMORIA_MASTER_KEY "
+            "(or MEMORIA_API_KEY) environment variables."
         )
 
-    return MemoryEditor(storage, db_factory, index_manager=index_manager, embed_client=embed_client)
+    from core.memory.backends.memoria_http import MemoriaHTTPClient, MemoriaStorage
+
+    http_client = MemoriaHTTPClient(
+        base_url=memoria_url,
+        api_key=memoria_api_key,
+        master_key=memoria_master_key,
+    )
+
+    storage = MemoriaStorage(http_client, user_id=user_id or "default")
+
+    # Index manager not used with Memoria backend
+    return MemoryEditor(storage, db_factory, index_manager=None, embed_client=embed_client)
 
 
 # ── Per-user strategy binding ─────────────────────────────────────────
