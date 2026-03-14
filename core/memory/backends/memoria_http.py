@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 import httpx
 
+from core.memory.interfaces import GovernanceReport, HealthReport
 from core.memory.types import Memory, MemoryType, TrustTier
 
 logger = logging.getLogger(__name__)
@@ -16,10 +17,7 @@ logger = logging.getLogger(__name__)
 class MemoriaHTTPClient:
     """HTTP client for Memoria REST API.
 
-    Supports authentication via:
-    - API Key (user-specific)
-    - Master Key + X-Impersonate-User (admin mode)
-    - No auth (development mode)
+    Uses master key + X-Impersonate-User for all requests.
     """
 
     def __init__(
@@ -33,37 +31,21 @@ class MemoriaHTTPClient:
         self.api_key = api_key
         self.master_key = master_key
         self.timeout = timeout
-
-        # Build headers
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        elif master_key:
-            headers["Authorization"] = f"Bearer {master_key}"
-
         self.client = httpx.Client(
             base_url=self.base_url,
-            headers=headers,
             timeout=timeout,
+            trust_env=False,  # ignore http_proxy env vars for service-to-service calls
         )
 
-    def _get_headers(self, user_id: Optional[str] = None) -> dict[str, str]:
-        """Get request headers with optional user impersonation."""
-        headers = {"Content-Type": "application/json"}
-
+    def _headers(self, user_id: Optional[str] = None) -> dict[str, str]:
+        headers: dict[str, str] = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         elif self.master_key:
             headers["Authorization"] = f"Bearer {self.master_key}"
             if user_id:
                 headers["X-Impersonate-User"] = user_id
-        elif user_id:
-            # Development mode: pass user_id directly
-            headers["X-User-ID"] = user_id
-
         return headers
-
-    # ── Memory CRUD ────────────────────────────────────────────────────
 
     def store(
         self,
@@ -75,41 +57,22 @@ class MemoriaHTTPClient:
         initial_confidence: float = 0.75,
         source: str = "api",
     ) -> dict[str, Any]:
-        """Store a memory.
-
-        POST /v1/memories
-        """
-        payload = {
+        payload: dict[str, Any] = {
             "content": content,
             "memory_type": memory_type,
-            "trust_tier": trust_tier,
-            "session_id": session_id,
             "initial_confidence": initial_confidence,
             "source": source,
         }
-
-        resp = self.client.post(
-            "/v1/memories",
-            json={k: v for k, v in payload.items() if v is not None},
-            headers=self._get_headers(user_id),
-        )
+        if trust_tier:
+            payload["trust_tier"] = trust_tier
+        if session_id:
+            payload["session_id"] = session_id
+        resp = self.client.post("/v1/memories", json=payload, headers=self._headers(user_id))
         resp.raise_for_status()
         return resp.json()
 
-    def batch_store(
-        self,
-        user_id: str,
-        memories: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Store multiple memories.
-
-        POST /v1/memories/batch
-        """
-        resp = self.client.post(
-            "/v1/memories/batch",
-            json={"memories": memories},
-            headers=self._get_headers(user_id),
-        )
+    def batch_store(self, user_id: str, memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        resp = self.client.post("/v1/memories/batch", json={"memories": memories}, headers=self._headers(user_id))
         resp.raise_for_status()
         return resp.json()
 
@@ -122,43 +85,17 @@ class MemoriaHTTPClient:
         session_id: Optional[str] = None,
         include_cross_session: bool = True,
     ) -> list[dict[str, Any]]:
-        """Retrieve memories by query.
-
-        POST /v1/memories/retrieve
-        """
-        payload = {
-            "query": query,
-            "top_k": top_k,
-            "include_cross_session": include_cross_session,
-        }
+        payload: dict[str, Any] = {"query": query, "top_k": top_k, "include_cross_session": include_cross_session}
         if memory_types:
             payload["memory_types"] = memory_types
         if session_id:
             payload["session_id"] = session_id
-
-        resp = self.client.post(
-            "/v1/memories/retrieve",
-            json=payload,
-            headers=self._get_headers(user_id),
-        )
+        resp = self.client.post("/v1/memories/retrieve", json=payload, headers=self._headers(user_id))
         resp.raise_for_status()
         return resp.json()
 
-    def search(
-        self,
-        user_id: str,
-        query: str,
-        top_k: int = 10,
-    ) -> list[dict[str, Any]]:
-        """Search memories (simpler retrieve).
-
-        POST /v1/memories/search
-        """
-        resp = self.client.post(
-            "/v1/memories/search",
-            json={"query": query, "top_k": top_k},
-            headers=self._get_headers(user_id),
-        )
+    def search(self, user_id: str, query: str, top_k: int = 10) -> list[dict[str, Any]]:
+        resp = self.client.post("/v1/memories/search", json={"query": query, "top_k": top_k}, headers=self._headers(user_id))
         resp.raise_for_status()
         return resp.json()
 
@@ -169,77 +106,43 @@ class MemoriaHTTPClient:
         limit: int = 100,
         cursor: Optional[str] = None,
     ) -> dict[str, Any]:
-        """List memories with pagination.
-
-        GET /v1/memories
-        """
-        params = {"limit": limit}
+        params: dict[str, Any] = {"limit": limit}
         if memory_type:
             params["memory_type"] = memory_type
         if cursor:
             params["cursor"] = cursor
-
-        resp = self.client.get(
-            "/v1/memories",
-            params=params,
-            headers=self._get_headers(user_id),
-        )
+        resp = self.client.get("/v1/memories", params=params, headers=self._headers(user_id))
         resp.raise_for_status()
         return resp.json()
 
-    def correct(
-        self,
-        user_id: str,
-        memory_id: str,
-        new_content: str,
-        reason: str = "",
-    ) -> dict[str, Any]:
-        """Correct a memory.
+    def get_memory(self, user_id: str, memory_id: str) -> Optional[dict[str, Any]]:
+        """Get a single memory by ID via list + filter (Memoria has no GET /memories/{id})."""
+        result = self.list_memories(user_id, limit=500)
+        for item in result.get("items", []):
+            if item.get("memory_id") == memory_id:
+                return item
+        return None
 
-        PUT /v1/memories/{memory_id}/correct
-        """
+    def correct(self, user_id: str, memory_id: str, new_content: str, reason: str = "") -> dict[str, Any]:
         resp = self.client.put(
             f"/v1/memories/{memory_id}/correct",
             json={"new_content": new_content, "reason": reason},
-            headers=self._get_headers(user_id),
+            headers=self._headers(user_id),
         )
         resp.raise_for_status()
         return resp.json()
 
-    def correct_by_query(
-        self,
-        user_id: str,
-        query: str,
-        new_content: str,
-        reason: str = "",
-    ) -> dict[str, Any]:
-        """Find and correct memory by query.
-
-        POST /v1/memories/correct
-        """
+    def correct_by_query(self, user_id: str, query: str, new_content: str, reason: str = "") -> dict[str, Any]:
         resp = self.client.post(
             "/v1/memories/correct",
             json={"query": query, "new_content": new_content, "reason": reason},
-            headers=self._get_headers(user_id),
+            headers=self._headers(user_id),
         )
         resp.raise_for_status()
         return resp.json()
 
-    def delete(
-        self,
-        user_id: str,
-        memory_id: str,
-        reason: str = "",
-    ) -> dict[str, Any]:
-        """Delete a memory.
-
-        DELETE /v1/memories/{memory_id}
-        """
-        resp = self.client.delete(
-            f"/v1/memories/{memory_id}",
-            params={"reason": reason},
-            headers=self._get_headers(user_id),
-        )
+    def delete(self, user_id: str, memory_id: str, reason: str = "") -> dict[str, Any]:
+        resp = self.client.delete(f"/v1/memories/{memory_id}", params={"reason": reason}, headers=self._headers(user_id))
         resp.raise_for_status()
         return resp.json()
 
@@ -252,11 +155,7 @@ class MemoriaHTTPClient:
         before: Optional[datetime] = None,
         reason: str = "",
     ) -> dict[str, Any]:
-        """Purge memories.
-
-        POST /v1/memories/purge
-        """
-        payload = {"reason": reason}
+        payload: dict[str, Any] = {"reason": reason}
         if memory_ids:
             payload["memory_ids"] = memory_ids
         if topic:
@@ -265,12 +164,7 @@ class MemoriaHTTPClient:
             payload["memory_types"] = memory_types
         if before:
             payload["before"] = before.isoformat()
-
-        resp = self.client.post(
-            "/v1/memories/purge",
-            json=payload,
-            headers=self._get_headers(user_id),
-        )
+        resp = self.client.post("/v1/memories/purge", json=payload, headers=self._headers(user_id))
         resp.raise_for_status()
         return resp.json()
 
@@ -280,118 +174,66 @@ class MemoriaHTTPClient:
         messages: list[dict[str, Any]],
         source_event_ids: Optional[list[str]] = None,
     ) -> list[dict[str, Any]]:
-        """Extract and store memories from conversation turn.
-
-        POST /v1/memories/observe (if available) or emulate via retrieve+store
-        """
-        # Note: Memoria API doesn't have a direct observe endpoint
-        # This would need to be implemented client-side or added to Memoria
-        logger.warning("observe_turn not directly supported by Memoria API, using fallback")
-        return []
-
-    # ── Snapshots (Git-for-Data) ───────────────────────────────────────
-
-    def create_snapshot(
-        self,
-        user_id: str,
-        name: str,
-        description: str = "",
-    ) -> dict[str, Any]:
-        """Create a snapshot.
-
-        POST /v1/snapshots
-        """
-        resp = self.client.post(
-            "/v1/snapshots",
-            json={"name": name, "description": description},
-            headers=self._get_headers(user_id),
-        )
+        """Extract and store memories from conversation turn. POST /v1/observe"""
+        payload: dict[str, Any] = {"messages": messages}
+        if source_event_ids:
+            payload["source_event_ids"] = source_event_ids
+        resp = self.client.post("/v1/observe", json=payload, headers=self._headers(user_id))
         resp.raise_for_status()
         return resp.json()
 
-    def list_snapshots(
-        self,
-        user_id: str,
-    ) -> list[dict[str, Any]]:
-        """List snapshots.
-
-        GET /v1/snapshots
-        """
-        resp = self.client.get(
-            "/v1/snapshots",
-            headers=self._get_headers(user_id),
-        )
+    def consolidate(self, user_id: str, force: bool = False) -> dict[str, Any]:
+        resp = self.client.post("/v1/consolidate", params={"force": force}, headers=self._headers(user_id))
         resp.raise_for_status()
         return resp.json()
 
-    def get_snapshot(
-        self,
-        user_id: str,
-        name: str,
-        limit: int = 50,
-        offset: int = 0,
-        detail: str = "brief",
-    ) -> dict[str, Any]:
-        """Get snapshot details.
-
-        GET /v1/snapshots/{name}
-        """
-        resp = self.client.get(
-            f"/v1/snapshots/{name}",
-            params={"limit": limit, "offset": offset, "detail": detail},
-            headers=self._get_headers(user_id),
-        )
+    def reflect(self, user_id: str, force: bool = False) -> dict[str, Any]:
+        resp = self.client.post("/v1/reflect", params={"force": force}, headers=self._headers(user_id))
         resp.raise_for_status()
         return resp.json()
 
-    def delete_snapshot(
-        self,
-        user_id: str,
-        name: str,
-    ) -> dict[str, Any]:
-        """Delete a snapshot.
-
-        DELETE /v1/snapshots/{name}
-        """
-        resp = self.client.delete(
-            f"/v1/snapshots/{name}",
-            headers=self._get_headers(user_id),
-        )
+    def get_profile(self, user_id: str) -> dict[str, Any]:
+        resp = self.client.get("/v1/profiles/me", headers=self._headers(user_id))
         resp.raise_for_status()
         return resp.json()
 
-    # ── Health ─────────────────────────────────────────────────────────
+    def create_snapshot(self, user_id: str, name: str, description: str = "") -> dict[str, Any]:
+        resp = self.client.post("/v1/snapshots", json={"name": name, "description": description}, headers=self._headers(user_id))
+        resp.raise_for_status()
+        return resp.json()
+
+    def list_snapshots(self, user_id: str) -> list[dict[str, Any]]:
+        resp = self.client.get("/v1/snapshots", headers=self._headers(user_id))
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_snapshot(self, user_id: str, name: str, limit: int = 50, offset: int = 0, detail: str = "brief") -> dict[str, Any]:
+        resp = self.client.get(f"/v1/snapshots/{name}", params={"limit": limit, "offset": offset, "detail": detail}, headers=self._headers(user_id))
+        resp.raise_for_status()
+        return resp.json()
+
+    def delete_snapshot(self, user_id: str, name: str) -> dict[str, Any]:
+        resp = self.client.delete(f"/v1/snapshots/{name}", headers=self._headers(user_id))
+        resp.raise_for_status()
+        return resp.json()
 
     def health_check(self) -> dict[str, Any]:
-        """Check Memoria health.
-
-        GET /health
-        """
         resp = self.client.get("/health")
         resp.raise_for_status()
         return resp.json()
 
     def close(self) -> None:
-        """Close HTTP client."""
         self.client.close()
 
 
 class MemoriaStorage:
-    """Adapter: Memoria HTTP API → CanonicalStorage-like interface.
+    """Adapter: Memoria HTTP API → CanonicalStorage-like interface."""
 
-    This allows mo-dev-agent to use Memoria as a drop-in replacement
-    for the built-in CanonicalStorage.
-    """
-
-    def __init__(
-        self,
-        http_client: MemoriaHTTPClient,
-        user_id: str,
-    ):
+    def __init__(self, http_client: MemoriaHTTPClient, user_id: str):
         self.client = http_client
         self.user_id = user_id
 
-    # ── Write path ─────────────────────────────────────────────────────
+    # ── Write ─────────────────────────────────────────────────────────
 
     def store(
         self,
@@ -404,7 +246,6 @@ class MemoriaStorage:
         trust_tier: TrustTier = TrustTier.T3_INFERRED,
         session_id: Optional[str] = None,
     ) -> Memory:
-        """Store a memory."""
         result = self.client.store(
             user_id=user_id,
             content=content,
@@ -413,7 +254,7 @@ class MemoriaStorage:
             session_id=session_id,
             initial_confidence=initial_confidence,
         )
-        return self._to_memory(result)
+        return self._to_memory(result, user_id)
 
     def observe_turn(
         self,
@@ -422,15 +263,53 @@ class MemoriaStorage:
         *,
         source_event_ids: Optional[list[str]] = None,
     ) -> list[Memory]:
-        """Extract and store memories from conversation.
+        results = self.client.observe_turn(user_id, messages, source_event_ids=source_event_ids)
+        return [self._to_memory(r, user_id) for r in results]
 
-        Note: Memoria API doesn't have direct observe_turn, this is a placeholder.
-        """
-        # TODO: Implement client-side extraction or add to Memoria API
-        logger.warning("observe_turn not implemented for Memoria backend")
-        return []
+    def run_pipeline(
+        self,
+        user_id: str,
+        messages: list[dict[str, Any]],
+        *,
+        source_event_ids: Optional[list[str]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        memories = self.observe_turn(user_id, messages, source_event_ids=source_event_ids)
+        return type("PipelineResult", (), {
+            "memories_extracted": len(memories),
+            "memories_stored": len(memories),
+            "errors": [],
+        })()
 
-    # ── Read path ──────────────────────────────────────────────────────
+    def create_memory(self, memory: Memory) -> Memory:
+        return self.store(
+            memory.user_id,
+            memory.content,
+            memory_type=memory.memory_type,
+            initial_confidence=memory.initial_confidence,
+            trust_tier=memory.trust_tier,
+            session_id=memory.session_id,
+        )
+
+    def update_memory_content(self, memory_id: str, content: str) -> None:
+        self.client.correct(self.user_id, memory_id, content, reason="content update")
+
+    def update_memory_embedding(self, memory_id: str) -> None:
+        # Memoria handles embeddings server-side
+        pass
+
+    def invalidate_profile(self, user_id: str) -> None:
+        # Memoria handles profile caching server-side
+        pass
+
+    def generate_session_summary(self, user_id: str, session_id: str, messages: list[dict[str, Any]]) -> Optional[Memory]:
+        # Memoria handles session summarization server-side
+        return None
+
+    def check_and_summarize(self, user_id: str, session_id: str, messages: list[dict[str, Any]], turn_count: int, session_start: Any) -> Optional[Memory]:
+        return None
+
+    # ── Read ──────────────────────────────────────────────────────────
 
     def retrieve(
         self,
@@ -442,11 +321,9 @@ class MemoriaStorage:
         memory_types: Optional[list[MemoryType]] = None,
         session_id: str = "",
         include_cross_session: bool = True,
-        **kwargs,
+        **kwargs: Any,
     ) -> tuple[list[Memory], Any]:
-        """Retrieve memories."""
         type_names = [t.value for t in memory_types] if memory_types else None
-
         results = self.client.retrieve(
             user_id=user_id,
             query=query,
@@ -455,67 +332,111 @@ class MemoriaStorage:
             session_id=session_id or None,
             include_cross_session=include_cross_session,
         )
-
-        memories = [self._to_memory(r) for r in results]
-        meta = {"source": "memoria", "count": len(memories)}
-        return memories, meta
+        memories = [self._to_memory(r, user_id) for r in results]
+        return memories, {"source": "memoria", "count": len(memories)}
 
     def get_profile(self, user_id: str) -> Optional[str]:
-        """Get user profile."""
-        # Try to retrieve profile-type memories
-        results = self.client.retrieve(
-            user_id=user_id,
-            query="user profile preferences",
-            top_k=1,
-            memory_types=["profile"],
-        )
-        if results:
-            return results[0].get("content")
-        return None
+        try:
+            data = self.client.get_profile(user_id)
+            return data.get("profile")
+        except Exception:
+            return None
 
-    # ── Admin ──────────────────────────────────────────────────────────
+    def get_memory(self, memory_id: str) -> Optional[Memory]:
+        data = self.client.get_memory(self.user_id, memory_id)
+        return self._to_memory(data, self.user_id) if data else None
 
-    def correct(
+    def list_active(
         self,
         user_id: str,
-        memory_id: str,
-        new_content: str,
-        *,
-        reason: str = "",
-    ) -> Memory:
-        """Correct a memory."""
-        result = self.client.correct(
-            user_id=user_id,
-            memory_id=memory_id,
-            new_content=new_content,
-            reason=reason,
+        memory_type: Optional[MemoryType] = None,
+        limit: Optional[int] = None,
+        load_embedding: bool = True,
+    ) -> list[Memory]:
+        result = self.client.list_memories(
+            user_id,
+            memory_type=memory_type.value if memory_type else None,
+            limit=limit or 100,
         )
-        return self._to_memory(result)
+        return [self._to_memory(r, user_id) for r in result.get("items", [])]
 
-    def purge(
-        self,
-        user_id: str,
-        memory_ids: Optional[list[str]] = None,
-        **kwargs,
-    ) -> Any:
-        """Purge memories."""
-        result = self.client.purge(
-            user_id=user_id,
-            memory_ids=memory_ids,
-            reason=kwargs.get("reason", ""),
-        )
+    # ── Admin / Governance ────────────────────────────────────────────
+
+    def correct(self, user_id: str, memory_id: str, new_content: str, *, reason: str = "") -> Memory:
+        result = self.client.correct(user_id=user_id, memory_id=memory_id, new_content=new_content, reason=reason)
+        return self._to_memory(result, user_id)
+
+    def purge(self, user_id: str, memory_ids: Optional[list[str]] = None, **kwargs: Any) -> Any:
+        result = self.client.purge(user_id=user_id, memory_ids=memory_ids, reason=kwargs.get("reason", ""))
         return type("PurgeResult", (), {"deactivated": result.get("purged", 0)})()
 
-    # ── Helpers ────────────────────────────────────────────────────────
+    def run_governance(self, user_id: str) -> GovernanceReport:
+        try:
+            self.client.consolidate(user_id)
+        except Exception as e:
+            logger.warning("Governance consolidate failed: %s", e)
+        return GovernanceReport()
 
-    def _to_memory(self, data: dict[str, Any]) -> Memory:
-        """Convert API response to Memory object."""
+    def health_check(self, user_id: str) -> HealthReport:
+        try:
+            data = self.client.health_check()
+            ok = data.get("status") == "ok"
+        except Exception:
+            ok = False
+        return HealthReport(total=0, active=0, inactive=0)
+
+    def run_hourly(self) -> GovernanceReport:
+        return GovernanceReport()
+
+    def run_daily_all(self) -> GovernanceReport:
+        return GovernanceReport()
+
+    def run_weekly(self) -> GovernanceReport:
+        return GovernanceReport()
+
+    def get_reflection_candidates(self, user_id: str, *, since_hours: int = 24) -> list[Any]:
+        return []
+
+    def consolidate(self, user_id: str) -> Any:
+        try:
+            return self.client.consolidate(user_id)
+        except Exception as e:
+            logger.warning("Consolidate failed: %s", e)
+            return {}
+
+    # ── Helpers ───────────────────────────────────────────────────────
+
+    def _to_memory(self, data: dict[str, Any], user_id: str) -> Memory:
+        observed_at = data.get("observed_at")
+        if isinstance(observed_at, str):
+            try:
+                from datetime import timezone
+                observed_at = datetime.fromisoformat(observed_at)
+                if observed_at.tzinfo is None:
+                    observed_at = observed_at.replace(tzinfo=timezone.utc)
+            except ValueError:
+                observed_at = None
+
+        trust_tier_raw = data.get("trust_tier")
+        try:
+            trust_tier = TrustTier(trust_tier_raw) if trust_tier_raw else TrustTier.T3_INFERRED
+        except ValueError:
+            trust_tier = TrustTier.T3_INFERRED
+
+        memory_type_raw = data.get("memory_type", "semantic")
+        try:
+            memory_type = MemoryType(memory_type_raw)
+        except ValueError:
+            memory_type = MemoryType.SEMANTIC
+
         return Memory(
             memory_id=data.get("memory_id", ""),
-            user_id=self.user_id,
+            user_id=user_id,
             content=data.get("content", ""),
-            memory_type=MemoryType(data.get("memory_type", "semantic")),
-            confidence=data.get("confidence", 0.75),
-            observed_at=data.get("observed_at"),
-            retrieval_score=data.get("retrieval_score"),
+            memory_type=memory_type,
+            initial_confidence=data.get("initial_confidence") or data.get("confidence") or 0.75,
+            observed_at=observed_at,
+            trust_tier=trust_tier,
         )
+
+

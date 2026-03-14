@@ -63,7 +63,7 @@ def _register_builtins() -> None:
 
 
 def _register_memoria() -> None:
-    """Register Memoria HTTP backend."""
+    """Register Memoria HTTP backend. Memoria is required — raises if not configured."""
     def _memoria_factory(
         *, db_factory: DbFactory, params: dict | None = None,
         config: Any = None, metrics: Any = None, **kw: Any,
@@ -75,6 +75,12 @@ def _register_memoria() -> None:
         api_key = params.get("api_key") or os.environ.get("MEMORIA_API_KEY")
         master_key = params.get("master_key") or os.environ.get("MEMORIA_MASTER_KEY")
         user_id = params.get("user_id", "default")
+
+        if not api_key and not master_key:
+            raise RuntimeError(
+                "Memoria requires authentication. "
+                "Set MEMORIA_MASTER_KEY or MEMORIA_API_KEY environment variable."
+            )
 
         http_client = MemoriaHTTPClient(
             base_url=base_url,
@@ -189,14 +195,22 @@ def create_memory_service(
     from core.memory.tabular.metrics import MemoryMetrics
     metrics = MemoryMetrics()
 
-    # Create canonical storage (shared by all strategies)
-    storage = CanonicalStorage(
-        db_factory,
-        llm_client=llm_client,
-        embed_fn=embed_fn,
-        config=config,
-        metrics=metrics,
+    # Memoria is required as storage backend
+    memoria_url = os.environ.get("MEMORIA_BASE_URL")
+    memoria_master_key = os.environ.get("MEMORIA_MASTER_KEY")
+    memoria_api_key = os.environ.get("MEMORIA_API_KEY")
+    if not memoria_url or not (memoria_master_key or memoria_api_key):
+        raise RuntimeError(
+            "Memoria is required. Set MEMORIA_BASE_URL and MEMORIA_MASTER_KEY "
+            "(or MEMORIA_API_KEY) environment variables."
+        )
+    from core.memory.backends.memoria_http import MemoriaHTTPClient, MemoriaStorage
+    http_client = MemoriaHTTPClient(
+        base_url=memoria_url,
+        master_key=memoria_master_key,
+        api_key=memoria_api_key,
     )
+    storage = MemoriaStorage(http_client, user_id=user_id or "default")
 
     # Create retrieval strategy + optional index manager
     descriptor = StrategyDescriptor.parse(strategy_key, params=params)

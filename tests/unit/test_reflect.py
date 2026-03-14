@@ -321,15 +321,21 @@ class TestBuildReflectEvidence:
 
     def test_past_lessons_from_memory(self, reflect_session, db_factory, reflect_svc):
         sid, uid, _ = reflect_session
-        from core.memory.tabular.store import MemoryStore
+        from unittest.mock import MagicMock, patch
         from core.memory.types import Memory, MemoryType, TrustTier
-        MemoryStore(db_factory).create(Memory(
-            memory_id="", user_id=uid,
+
+        lesson_mem = Memory(
+            memory_id="m1", user_id=uid,
             memory_type=MemoryType.PROCEDURAL,
             content="reflect test: read_file fails on symlinks, use realpath first",
             trust_tier=TrustTier.T3_INFERRED, session_id=sid,
-        ))
-        result = reflect_svc.build_evidence(sid, uid, "auto", 20)
+        )
+        mock_storage = MagicMock()
+        mock_storage.retrieve.return_value = ([lesson_mem], {})
+
+        with patch("core.memory.backends.get_memoria_storage", return_value=mock_storage):
+            result = reflect_svc.build_evidence(sid, uid, "auto", 20)
+
         assert any("read_file fails on symlinks" in l for l in result["past_lessons"])
         assert any("Past lesson matches" in h for h in result["diagnosis_hints"])
 
@@ -526,25 +532,34 @@ class TestReflectionLearningRealDB:
 
     def test_reflect_then_retry_creates_real_memory(self, reflect_session, db_factory):
         sid, uid, _ = reflect_session
+        from unittest.mock import MagicMock, patch
         from core.agent.turn_hooks import TurnHooks
-        from core.memory.tabular.store import MemoryStore
         from core.memory.types import MemoryType
 
-        hooks = TurnHooks(db_factory)
-        hooks.detect_reflection_learning(
-            sid, uid,
-            [{"function": {"name": "reflect"}}],
-            [{"name": "reflect", "result": "read_file failed: file not found"}],
-        )
-        hooks.detect_reflection_learning(
-            sid, uid,
-            [{"function": {"name": "bash"}}],
-            [{"name": "bash", "result": "ok"}],
-        )
+        mock_storage = MagicMock()
+        stored_memories = []
+        def capture_store(user_id, content, **kwargs):
+            from core.memory.types import Memory
+            m = Memory(memory_id="m1", user_id=user_id, content=content,
+                       memory_type=kwargs.get("memory_type", MemoryType.PROCEDURAL))
+            stored_memories.append(m)
+            return m
+        mock_storage.store.side_effect = capture_store
 
-        store = MemoryStore(db_factory)
-        memories = store.list_active(uid, MemoryType.PROCEDURAL)
-        lessons = [m for m in memories if "Reflection-driven fix" in m.content]
+        hooks = TurnHooks(db_factory)
+        with patch("core.memory.backends.get_memoria_storage", return_value=mock_storage):
+            hooks.detect_reflection_learning(
+                sid, uid,
+                [{"function": {"name": "reflect"}}],
+                [{"name": "reflect", "result": "read_file failed: file not found"}],
+            )
+            hooks.detect_reflection_learning(
+                sid, uid,
+                [{"function": {"name": "bash"}}],
+                [{"name": "bash", "result": "ok"}],
+            )
+
+        lessons = [m for m in stored_memories if "Reflection-driven fix" in m.content]
         assert len(lessons) >= 1
         assert "bash" in lessons[0].content
 

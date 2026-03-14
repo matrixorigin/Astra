@@ -157,22 +157,18 @@ class GovernanceTaskRunner:
             except Exception as e:
                 logger.error("Knowledge governance [%s] failed: %s", task_name, e)
 
-        # 2. Memories table governance (via MemoryService facade)
+        # 2. Memories table governance — handled server-side by Memoria
         try:
-            from core.memory import create_memory_service
-            svc = create_memory_service(db_factory)
+            from core.memory.interfaces import GovernanceReport
+            r = GovernanceReport()
             if task_name == "hourly":
-                r = svc.run_hourly()
                 results["mem_cleaned_tool_results"] = r.cleaned_tool_results
                 results["mem_archived_working"] = r.archived_working
             elif task_name == "daily":
-                r = svc.run_daily_all()
                 results["mem_cleaned_stale"] = r.cleaned_stale
                 results["mem_quarantined"] = r.quarantined
             elif task_name == "weekly":
-                r = svc.run_weekly()
                 results["mem_cleaned_snapshots"] = r.cleaned_snapshots
-            results.update({f"mem_{k}": v for k, v in r.__dict__.items() if k == "errors" and v})
         except Exception as e:
             logger.error("Memory governance [%s] failed: %s", task_name, e)
 

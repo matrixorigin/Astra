@@ -74,23 +74,16 @@ class TestStrategyRegistry:
 
 class TestFactoryStrategyResolution:
     def test_tabular_maps_to_vector_v1(self):
-        from core.memory.factory import create_memory_service
-        svc = create_memory_service(lambda: MagicMock(), backend="tabular")
-        assert svc.strategy_key == "vector:v1"
-        assert svc._index_manager is None
+        from core.memory.factory import _resolve_strategy
+        assert _resolve_strategy(None, None, "tabular", None) == "vector:v1"
 
     def test_graph_maps_to_activation_v1(self):
-        from core.memory.factory import create_memory_service
-        svc = create_memory_service(lambda: MagicMock(), backend="graph")
-        assert svc.strategy_key == "activation:v1"
-        assert svc._index_manager is not None
+        from core.memory.factory import _resolve_strategy
+        assert _resolve_strategy(None, None, "graph", None) == "activation:v1"
 
     def test_explicit_strategy_overrides_backend(self):
-        from core.memory.factory import create_memory_service
-        svc = create_memory_service(
-            lambda: MagicMock(), backend="graph", strategy="vector:v1",
-        )
-        assert svc.strategy_key == "vector:v1"
+        from core.memory.factory import _resolve_strategy
+        assert _resolve_strategy(None, None, "graph", "vector:v1") == "vector:v1"
 
     def test_env_fallback(self, monkeypatch):
         from core.memory.factory import _resolve_strategy

@@ -151,22 +151,12 @@ class TurnHooks(DbConsumer):
         embed_fn = self._embed_fn
 
         def _bg():
-            from core.memory import create_memory_service
-            svc = create_memory_service(db_factory, llm_client=llm, embed_fn=embed_fn, user_id=user_id)
-
             try:
+                from core.memory.backends import get_memoria_storage
+                svc = get_memoria_storage(user_id)
                 svc.run_pipeline(user_id=user_id, messages=messages)
             except Exception as e:
-                logger.debug("Observer failed (non-fatal): %s", e)
-
-            # Check incremental summary thresholds
-            if turn_count > 0 and session_start is not None:
-                try:
-                    svc.check_and_summarize(
-                        user_id, session_id, messages, turn_count, session_start,
-                    )
-                except Exception as e:
-                    logger.debug("Incremental summary failed (non-fatal): %s", e)
+                logger.error("Memory pipeline failed: %s", e)
 
         try:
             threading.Thread(target=_bg, daemon=True).start()
@@ -256,9 +246,9 @@ class TurnHooks(DbConsumer):
             f"Context: {reflect_evidence[:200]}"
         )
         try:
-            from core.memory import create_memory_service
+            from core.memory.backends import get_memoria_storage
             from core.memory.types import MemoryType, TrustTier
-            svc = create_memory_service(self._db_factory, user_id=user_id)
+            svc = get_memoria_storage(user_id)
             svc.store(
                 user_id=user_id,
                 content=lesson,
