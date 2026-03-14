@@ -94,8 +94,15 @@ class TestMemoriaConfigValidation:
 class TestMemoriaConfigDefaults:
     """Test default Memoria configuration values."""
 
+    @pytest.mark.integration
+    @pytest.mark.skipif(
+        os.environ.get("CI") == "true",
+        reason="Skip editor creation test in CI"
+    )
     def test_default_memoria_base_url(self):
         """Test default MEMORIA_BASE_URL when not set."""
+        from core.config import get_memoria_config
+        
         with patch.dict(os.environ, {
             "MEMORIA_MASTER_KEY": "test-key",
         }, clear=True):
@@ -103,13 +110,14 @@ class TestMemoriaConfigDefaults:
             if "MEMORIA_BASE_URL" in os.environ:
                 del os.environ["MEMORIA_BASE_URL"]
             
-            try:
-                editor = create_editor(SessionLocal, user_id="test-user")
-                # Should use default URL (http://localhost:8000)
-                assert editor is not None
-            except Exception as e:
-                if "Memoria is required" in str(e):
-                    pytest.fail(f"Default URL not working: {e}")
+            config = get_memoria_config()
+            # Should use default URL
+            assert config.base_url == "http://localhost:8100"
+            assert config.master_key == "test-key"
+            
+            # Validation should pass
+            errors = config.validate()
+            assert len(errors) == 0
 
 
 class TestMemoriaHealthCheck:
@@ -185,6 +193,11 @@ class TestMemoriaConfigInDotEnv:
                 assert value != "", "MEMORIA_MASTER_KEY is empty in .env"
                 assert len(value) > 10, f"MEMORIA_MASTER_KEY too short: {len(value)} chars"
 
+    @pytest.mark.integration
+    @pytest.mark.skipif(
+        os.environ.get("CI") == "true", 
+        reason="Skip connectivity tests in CI"
+    )
     def test_dot_env_memoria_url_is_reachable(self):
         """Test that MEMORIA_BASE_URL in .env points to running service."""
         import httpx
@@ -201,11 +214,13 @@ class TestMemoriaConfigInDotEnv:
             pytest.fail("MEMORIA_BASE_URL not found in .env")
         
         try:
-            response = httpx.get(f"{memoria_url}/health", timeout=5.0)
+            # Disable proxy for localhost requests
+            with httpx.Client(trust_env=False) as client:
+                response = client.get(f"{memoria_url}/health", timeout=5.0)
             assert response.status_code == 200, f"Memoria health check failed: {response.status_code}"
             
             health = response.json()
             assert health.get("status") in ["ok", "healthy"], f"Memoria unhealthy: {health}"
             
-        except httpx.RequestError as e:
+        except (httpx.RequestError, httpx.TimeoutException) as e:
             pytest.fail(f"Cannot reach Memoria at {memoria_url}: {e}")

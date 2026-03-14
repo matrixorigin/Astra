@@ -156,15 +156,18 @@ class TestMemoriaStorageUnit:
 
     def test_retrieve(self, storage: MemoriaStorage, mock_http_client: MagicMock) -> None:
         """Test retrieve method."""
-        mock_http_client.retrieve.return_value = [
-            {
-                "memory_id": "mem-1",
-                "content": "Memory 1",
-                "memory_type": "semantic",
-                "initial_confidence": 0.9,
-                "observed_at": datetime.now().isoformat(),
-            }
-        ]
+        mock_http_client.retrieve.return_value = {
+            "results": [
+                {
+                    "memory_id": "mem-1",
+                    "content": "Memory 1",
+                    "memory_type": "semantic",
+                    "initial_confidence": 0.9,
+                    "observed_at": datetime.now().isoformat(),
+                }
+            ],
+            "explain": {"path": "graph", "count": 1}
+        }
 
         memories, meta = storage.retrieve(
             user_id="test-user",

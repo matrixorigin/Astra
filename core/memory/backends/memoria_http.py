@@ -92,8 +92,9 @@ class MemoriaHTTPClient:
             "query": query,
             "top_k": top_k,
             "include_cross_session": include_cross_session,
-            "explain": explain,
         }
+        if explain:
+            payload["explain"] = explain if isinstance(explain, str) else "basic"
         if memory_types:
             payload["memory_types"] = memory_types
         if session_id:
@@ -422,8 +423,9 @@ class MemoriaStorage:
             include_cross_session=include_cross_session,
             explain=explain,
         )
-        memories_data = result["memories"]
+        memories_data = result["results"]
         explain_info = result.get("explain", {"path": "unknown", "count": len(memories_data)})
+        explain_info["source"] = "memoria"
         memories = [self._to_memory(r, user_id) for r in memories_data]
         return memories, explain_info
 

@@ -24,28 +24,13 @@ def validate_memoria_config() -> List[str]:
     Returns:
         List of validation errors (empty if all valid)
     """
-    errors = []
+    from core.config import get_memoria_config
     
-    # Check required environment variables
-    memoria_url = os.environ.get("MEMORIA_BASE_URL")
-    memoria_master_key = os.environ.get("MEMORIA_MASTER_KEY")
-    memoria_api_key = os.environ.get("MEMORIA_API_KEY")
-    
-    if not memoria_url:
-        errors.append("MEMORIA_BASE_URL is required but not set")
-    elif not memoria_url.startswith(("http://", "https://")):
-        errors.append(f"MEMORIA_BASE_URL must be HTTP URL, got: {memoria_url}")
-    
-    if not memoria_master_key and not memoria_api_key:
-        errors.append("Either MEMORIA_MASTER_KEY or MEMORIA_API_KEY is required")
-    
-    if memoria_master_key and len(memoria_master_key.strip()) < 8:
-        errors.append("MEMORIA_MASTER_KEY is too short (minimum 8 characters)")
-    
-    if memoria_api_key and not memoria_api_key.startswith("sk-"):
-        errors.append("MEMORIA_API_KEY should start with 'sk-'")
-    
-    return errors
+    try:
+        config = get_memoria_config()
+        return config.validate()
+    except Exception as e:
+        return [f"Failed to load Memoria configuration: {e}"]
 
 
 def validate_memoria_connectivity() -> List[str]:
@@ -54,15 +39,18 @@ def validate_memoria_connectivity() -> List[str]:
     Returns:
         List of connectivity errors (empty if all good)
     """
+    from core.config import get_memoria_config
+    
     errors = []
     
-    memoria_url = os.environ.get("MEMORIA_BASE_URL")
-    if not memoria_url:
-        return ["MEMORIA_BASE_URL not set, skipping connectivity check"]
+    try:
+        config = get_memoria_config()
+    except Exception as e:
+        return [f"Failed to load Memoria config: {e}"]
     
     try:
         # Test health endpoint
-        response = httpx.get(f"{memoria_url}/health", timeout=10.0)
+        response = httpx.get(f"{config.base_url}/health", timeout=10.0)
         
         if response.status_code != 200:
             errors.append(f"Memoria health check failed: HTTP {response.status_code}")
@@ -76,12 +64,11 @@ def validate_memoria_connectivity() -> List[str]:
             errors.append(f"Memoria database not connected: {health.get('database')}")
         
         # Test auth
-        auth_key = os.environ.get("MEMORIA_MASTER_KEY") or os.environ.get("MEMORIA_API_KEY")
-        if auth_key:
+        if config.auth_key:
             auth_response = httpx.post(
-                f"{memoria_url}/v1/memories/retrieve",
+                f"{config.base_url}/v1/memories/retrieve",
                 json={"user_id": "config-test", "query": "test", "top_k": 1},
-                headers={"Authorization": f"Bearer {auth_key}"},
+                headers={"Authorization": f"Bearer {config.auth_key}"},
                 timeout=10.0
             )
             
@@ -91,9 +78,9 @@ def validate_memoria_connectivity() -> List[str]:
                 errors.append(f"Memoria server error: HTTP {auth_response.status_code}")
         
     except httpx.TimeoutException:
-        errors.append(f"Memoria service timeout at {memoria_url}")
+        errors.append(f"Memoria service timeout at {config.base_url}")
     except httpx.RequestError as e:
-        errors.append(f"Cannot reach Memoria at {memoria_url}: {e}")
+        errors.append(f"Cannot reach Memoria at {config.base_url}: {e}")
     except Exception as e:
         errors.append(f"Memoria connectivity check failed: {e}")
     

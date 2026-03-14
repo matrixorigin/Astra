@@ -94,11 +94,12 @@ class TestMemoriaHTTPClient:
         memory_id = result["memory_id"]
 
         # Retrieve
-        results = memoria_client.retrieve(
+        response = memoria_client.retrieve(
             user_id=test_user_id,
             query="Python programming",
             top_k=5,
         )
+        results = response["results"]
         assert len(results) > 0
         assert any(r["memory_id"] == memory_id for r in results)
 
