@@ -171,7 +171,6 @@ class GovernanceTaskRunner:
                 results["mem_quarantined"] = r.quarantined
             elif task_name == "weekly":
                 r = svc.run_weekly()
-                results["mem_cleaned_branches"] = r.cleaned_branches
                 results["mem_cleaned_snapshots"] = r.cleaned_snapshots
             results.update({f"mem_{k}": v for k, v in r.__dict__.items() if k == "errors" and v})
         except Exception as e:

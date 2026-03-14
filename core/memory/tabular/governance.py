@@ -44,7 +44,6 @@ class GovernanceCycleResult:
     quarantined: int = 0
     scenes_created: int = 0
     # Weekly
-    cleaned_branches: int = 0
     cleaned_snapshots: int = 0
     # Health
     pollution_detected: bool = False
@@ -99,7 +98,6 @@ class GovernanceScheduler(DbConsumer):
         result.errors.extend(d.errors)
 
         w = self.run_weekly()
-        result.cleaned_branches = w.cleaned_branches
         result.cleaned_snapshots = w.cleaned_snapshots
         result.errors.extend(w.errors)
 
@@ -257,13 +255,8 @@ class GovernanceScheduler(DbConsumer):
     # ── Weekly ────────────────────────────────────────────────────────
 
     def run_weekly(self) -> GovernanceCycleResult:
-        """Weekly: orphan branch cleanup + snapshot cleanup."""
+        """Weekly: snapshot cleanup."""
         result = GovernanceCycleResult()
-        try:
-            result.cleaned_branches = self.health.cleanup_orphan_branches()
-        except Exception as e:
-            logger.error("Branch cleanup failed: %s", e)
-            result.errors.append(f"branches: {e}")
         try:
             result.cleaned_snapshots = self.health.cleanup_snapshots(
                 keep_last_n=self.config.milestone_snapshot_keep_n

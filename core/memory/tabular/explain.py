@@ -82,18 +82,6 @@ class ObserverStats:
 
 
 @dataclass
-class SandboxStats:
-    """Stats for sandbox validation."""
-    
-    enabled: bool = False
-    branch_name: Optional[str] = None
-    validated: bool = False
-    rolled_back: bool = False
-    error: Optional[str] = None
-    total_ms: float = 0.0
-
-
-@dataclass
 class GovernanceStats:
     """Stats for governance operations."""
     
@@ -108,10 +96,9 @@ class GovernanceStats:
 
 @dataclass
 class PipelineStats:
-    """Stats for the full memory pipeline (observe → sandbox → governance)."""
+    """Stats for the full memory pipeline (observe → governance)."""
     
     observer: Optional[ObserverStats] = None
-    sandbox: Optional[SandboxStats] = None
     governance: Optional[GovernanceStats] = None
     total_ms: float = 0.0
 

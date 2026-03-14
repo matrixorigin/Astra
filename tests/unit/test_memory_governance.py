@@ -68,8 +68,7 @@ class TestRunDaily:
 
 class TestRunWeekly:
     def test_returns_result(self, scheduler):
-        with patch.object(scheduler.health, "cleanup_orphan_branches", return_value=0), \
-             patch.object(scheduler.health, "cleanup_snapshots", return_value=0):
+        with patch.object(scheduler.health, "cleanup_snapshots", return_value=0):
             r = scheduler.run_weekly()
         assert isinstance(r, GovernanceCycleResult)
 
@@ -78,11 +77,11 @@ class TestRunCycle:
     def test_calls_all_frequencies(self, scheduler):
         with patch.object(scheduler, "run_hourly", return_value=GovernanceCycleResult(cleaned_tool_results=1)), \
              patch.object(scheduler, "run_daily", return_value=GovernanceCycleResult(cleaned_stale=2)), \
-             patch.object(scheduler, "run_weekly", return_value=GovernanceCycleResult(cleaned_branches=3)):
+             patch.object(scheduler, "run_weekly", return_value=GovernanceCycleResult(cleaned_snapshots=3)):
             r = scheduler.run_cycle("u1")
         assert r.cleaned_tool_results == 1
         assert r.cleaned_stale == 2
-        assert r.cleaned_branches == 3
+        assert r.cleaned_snapshots == 3
 
 
 class TestNoDecayMutation:

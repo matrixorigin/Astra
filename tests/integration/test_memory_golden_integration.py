@@ -398,61 +398,6 @@ class TestTieredLoaderWithRealDB:
 # Real DB Tests for MO-Native Features
 # ---------------------------------------------------------------------------
 
-class TestSandboxRealDB:
-    """MemorySandbox with real MatrixOne database."""
-
-    def test_branch_create_and_delete(self, db_factory, cleanup_memories):
-        """Branch operations work with real DB — verify NOT fallback."""
-        from core.memory.tabular.sandbox import MemorySandbox
-        from core.memory.tabular.metrics import MemoryMetrics
-
-        store = MemoryStore(db_factory)
-        sandbox = MemorySandbox(db_factory, db_name=os.environ["MATRIXONE_DATABASE"])
-        user_id = _uid()
-
-        # Create base memory with embedding for vector comparison
-        mem = Memory(
-            memory_id=f"base_{uuid7().hex}",
-            user_id=user_id,
-            memory_type=MemoryType.PROFILE,
-            content="Base memory for sandbox test",
-            initial_confidence=0.8,
-            embedding=[0.5] * EMBEDDING_DIM,
-            observed_at=datetime.now(timezone.utc),
-        )
-        cleanup_memories.append(mem.memory_id)
-        store.create(mem)
-
-        # Validate new memories with explain=True
-        new_mem = Memory(
-            memory_id=f"new_{uuid7().hex}",
-            user_id=user_id,
-            memory_type=MemoryType.SEMANTIC,
-            content="New memory to validate",
-            initial_confidence=0.7,
-            embedding=[0.5] * EMBEDDING_DIM,
-            observed_at=datetime.now(timezone.utc),
-        )
-
-        result, stats = sandbox.validate_memories(
-            user_id=user_id,
-            new_memories=[new_mem],
-            query_text="test query",
-            query_embedding=[0.5] * EMBEDDING_DIM,
-            explain=True,
-        )
-
-        # Key assertion: stats.error should be None (not fallback)
-        assert stats is not None, "Should return stats when explain=True"
-        assert stats.error is None, (
-            f"Sandbox validation should succeed without error. "
-            f"Error: {stats.error}"
-        )
-        assert stats.validated is True, "Should have validated successfully"
-        # Result should be True (new memory improves or maintains quality)
-        assert result is True
-
-
 # Serialize DDL-heavy provenance tests — CREATE/DROP SNAPSHOT can conflict
 # with other parallel tests that touch the same MatrixOne catalog.
 @pytest.mark.xdist_group("ddl_provenance")

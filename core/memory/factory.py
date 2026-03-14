@@ -62,7 +62,32 @@ def _register_builtins() -> None:
     _registry.register("activation:v1", _activation_factory, _activation_index_factory)
 
 
+def _register_memoria() -> None:
+    """Register Memoria HTTP backend."""
+    def _memoria_factory(
+        *, db_factory: DbFactory, params: dict | None = None,
+        config: Any = None, metrics: Any = None, **kw: Any,
+    ) -> Any:
+        from core.memory.backends.memoria_http import MemoriaHTTPClient, MemoriaStorage
+
+        params = params or {}
+        base_url = params.get("base_url") or os.environ.get("MEMORIA_BASE_URL", "http://localhost:8000")
+        api_key = params.get("api_key") or os.environ.get("MEMORIA_API_KEY")
+        master_key = params.get("master_key") or os.environ.get("MEMORIA_MASTER_KEY")
+        user_id = params.get("user_id", "default")
+
+        http_client = MemoriaHTTPClient(
+            base_url=base_url,
+            api_key=api_key,
+            master_key=master_key,
+        )
+        return MemoriaStorage(http_client, user_id=user_id)
+
+    _registry.register("memoria:http", _memoria_factory)
+
+
 _register_builtins()
+_register_memoria()
 
 
 # ── Backward-compatible mapping ───────────────────────────────────────
@@ -70,6 +95,7 @@ _register_builtins()
 _BACKEND_TO_STRATEGY: dict[str, str] = {
     "tabular": "vector:v1",
     "graph": "activation:v1",
+    "memoria": "memoria:http",
 }
 
 

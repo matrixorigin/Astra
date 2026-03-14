@@ -1,9 +1,8 @@
-"""Typed memory pipeline: TypedObserver → Sandbox → Persist.
+"""Typed memory pipeline: TypedObserver → Persist.
 
 Pipeline phases:
   Phase 1: Observer extracts candidate memories (NOT yet persisted)
-  Phase 2: Sandbox validates candidates in a zero-copy branch (optional)
-  Phase 3: Persist validated memories (rejected candidates are discarded)
+  Phase 2: Persist memories (with contradiction check)
 
 Reflector removed — no episodic→semantic promotion (episodic type eliminated).
 """
@@ -17,11 +16,10 @@ from typing import Any, Optional
 
 from core.db_consumer import DbFactory
 from core.memory.config import MemoryGovernanceConfig, DEFAULT_CONFIG
-from core.memory.tabular.explain import ObserverStats, SandboxStats, PipelineStats
+from core.memory.tabular.explain import ObserverStats, PipelineStats
 from core.memory.tabular.metrics import MemoryMetrics
 from core.memory.tabular.store import MemoryStore
 from core.memory.tabular.typed_observer import TypedObserver
-from core.memory.tabular.sandbox import MemorySandbox
 from core.memory.tabular.profile import ProfileManager
 from core.memory.types import Memory
 
@@ -31,8 +29,6 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TypedPipelineResult:
     memories_extracted: int = 0
-    memories_validated: int = 0
-    memories_rejected: int = 0
     profile_changed: bool = False
     errors: list[str] = field(default_factory=list)
     stats: Optional[PipelineStats] = None
@@ -46,11 +42,10 @@ def run_typed_memory_pipeline(
     llm_client: Any = None,
     embed_fn: Any = None,
     config: Optional[MemoryGovernanceConfig] = None,
-    query_for_sandbox: Optional[str] = None,
     explain: bool = False,
     metrics: Optional[MemoryMetrics] = None,
 ) -> TypedPipelineResult:
-    """Run typed memory pipeline: extract → validate → persist."""
+    """Run typed memory pipeline: extract → persist."""
     if config is None:
         config = DEFAULT_CONFIG
 
@@ -90,47 +85,9 @@ def run_typed_memory_pipeline(
             result.stats.total_ms = (time.time() - start) * 1000
         return result
 
-    # Phase 2: Sandbox validation (optional)
-    sandbox_stats: Optional[SandboxStats] = None
-    validated = candidates
-    if query_for_sandbox:
-        validated = []
-        try:
-            sandbox = MemorySandbox(db_factory)
-            needs_validation = []
-            for mem in candidates:
-                if mem.memory_type.value in config.sandbox_enabled_types:
-                    needs_validation.append(mem)
-                else:
-                    validated.append(mem)
-
-            if needs_validation:
-                passed, sandbox_stats = sandbox.validate_memories(
-                    user_id=user_id,
-                    new_memories=needs_validation,
-                    query_text=query_for_sandbox,
-                    query_embedding=needs_validation[0].embedding,
-                    explain=explain,
-                )
-                if passed:
-                    validated.extend(needs_validation)
-                    result.memories_validated = len(needs_validation)
-                else:
-                    result.memories_rejected = len(needs_validation)
-                    if sandbox_stats:
-                        sandbox_stats.rolled_back = True
-            else:
-                validated = candidates
-        except Exception as e:
-            logger.warning("Sandbox validation failed, accepting all: %s", e)
-            _metrics.increment("sandbox_validation_errors")
-            if explain and sandbox_stats is None:
-                sandbox_stats = SandboxStats(enabled=True, error=str(e))
-            validated = candidates
-
-    # Phase 3: Persist validated memories (with contradiction check)
+    # Phase 2: Persist memories (with contradiction check)
     persisted: list[Memory] = []
-    for mem in validated:
+    for mem in candidates:
         try:
             stored, c_stats = observer.persist_with_contradiction_check(mem, explain)
             persisted.append(stored)
@@ -149,7 +106,6 @@ def run_typed_memory_pipeline(
 
     if result.stats:
         result.stats.observer = observer_stats
-        result.stats.sandbox = sandbox_stats
         result.stats.total_ms = (time.time() - start) * 1000
 
     return result

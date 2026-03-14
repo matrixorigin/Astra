@@ -1106,7 +1106,6 @@ class TestGovernanceMemoryOnly:
         runner = self._make_runner()
         result = runner.run("weekly")
         assert isinstance(result, dict)
-        assert "mem_cleaned_branches" in result
         assert "mem_cleaned_snapshots" in result
 
     def test_eval_daily_returns_empty(self, db):

@@ -2,9 +2,8 @@
 
 This test verifies that:
 1. Vector search (L2_DISTANCE) actually runs on DB
-2. Fulltext search (MATCH AGAINST) actually runs on DB  
-3. Sandbox branch operations actually run on DB
-4. Contradiction detection actually runs on DB
+2. Fulltext search (MATCH AGAINST) actually runs on DB
+3. Contradiction detection actually runs on DB
 
 All verifications use explain stats — if stats show error, the feature fell back.
 """
@@ -20,7 +19,6 @@ from api.models._constants import EMBEDDING_DIM
 from core.memory.tabular.store import MemoryStore
 from core.memory.tabular.retriever import MemoryRetriever
 from core.memory.tabular.typed_observer import TypedObserver
-from core.memory.tabular.sandbox import MemorySandbox
 from core.memory.types import Memory, MemoryType
 
 
@@ -122,51 +120,6 @@ class TestCriticalPathVerification:
             pytest.fail(f"Fulltext search failed with: {stats.keyword_error}")
         print(f"✓ Fulltext search executed: hit={stats.keyword_hit}, {stats.phase1_candidates} candidates in {stats.phase1_ms:.1f}ms")
 
-    def test_sandbox_branch_actually_executes(self, db_factory, cleanup_memories):
-        """Sandbox branch create/drop runs on DB, not fallback."""
-        store = MemoryStore(db_factory)
-        sandbox = MemorySandbox(db_factory)
-        user_id = _uid()
-
-        # Create base memory
-        mem = Memory(
-            memory_id=f"base_{uuid4().hex}",
-            user_id=user_id,
-            memory_type=MemoryType.PROFILE,
-            content="Base memory for sandbox test",
-            initial_confidence=0.8,
-            embedding=[0.5] * EMBEDDING_DIM,
-            observed_at=datetime.now(timezone.utc),
-        )
-        cleanup_memories.append(mem.memory_id)
-        store.create(mem)
-
-        # New memory to validate
-        new_mem = Memory(
-            memory_id=f"new_{uuid4().hex}",
-            user_id=user_id,
-            memory_type=MemoryType.PROFILE,
-            content="New memory to validate in sandbox",
-            initial_confidence=0.9,
-            embedding=[0.5] * EMBEDDING_DIM,
-            observed_at=datetime.now(timezone.utc),
-        )
-
-        # Validate with explain
-        result, stats = sandbox.validate_memories(
-            user_id=user_id,
-            new_memories=[new_mem],
-            query_text="test",
-            query_embedding=[0.5] * EMBEDDING_DIM,
-            explain=True,
-        )
-
-        # CRITICAL: verify sandbox actually ran
-        assert stats.enabled is True, "Sandbox should be enabled"
-        assert stats.error is None, f"Sandbox failed with: {stats.error}"
-        assert stats.validated is True, "Sandbox should have validated"
-        print(f"✓ Sandbox branch executed: branch={stats.branch_name}, {stats.total_ms:.1f}ms")
-
     def test_contradiction_detection_actually_executes(self, db_factory, cleanup_memories):
         """Contradiction detection L2_DISTANCE runs on DB, not fallback."""
         store = MemoryStore(db_factory)
@@ -215,7 +168,6 @@ class TestCriticalPathVerification:
         """Summary test: run all critical paths and report."""
         store = MemoryStore(db_factory)
         retriever = MemoryRetriever(db_factory)
-        sandbox = MemorySandbox(db_factory)
         user_id = _uid()
 
         # Setup
@@ -251,25 +203,7 @@ class TestCriticalPathVerification:
         ft_ok = stats.keyword_attempted and stats.keyword_error is None
         print(f"[{'✓' if ft_ok else '✗'}] Fulltext Search (MATCH AGAINST): {'OK' if ft_ok else stats.keyword_error}")
 
-        # 3. Sandbox
-        new_mem = Memory(
-            memory_id=f"sbox_{uuid4().hex}",
-            user_id=user_id,
-            memory_type=MemoryType.PROFILE,
-            content="Sandbox test",
-            initial_confidence=0.9,
-            embedding=[0.3] * EMBEDDING_DIM,
-            observed_at=datetime.now(timezone.utc),
-        )
-        _, stats = sandbox.validate_memories(
-            user_id=user_id, new_memories=[new_mem],
-            query_text="test", query_embedding=[0.3] * EMBEDDING_DIM,
-            explain=True,
-        )
-        sb_ok = stats.enabled and stats.error is None
-        print(f"[{'✓' if sb_ok else '✗'}] Sandbox Branch: {'OK' if sb_ok else stats.error}")
-
-        # 4. Contradiction detection
+        # 3. Contradiction detection
         observer = TypedObserver(
             store=store, llm_client=None,
             embed_fn=lambda x: [0.3] * EMBEDDING_DIM,
@@ -290,5 +224,4 @@ class TestCriticalPathVerification:
         # All must pass
         assert vec_ok, "Vector search failed"
         assert ft_ok, "Fulltext search failed"
-        assert sb_ok, "Sandbox failed"
         assert cd_ok, "Contradiction detection failed"

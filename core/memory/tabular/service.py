@@ -210,10 +210,10 @@ class TabularMemoryService:
         *,
         source_event_ids: list[str] | None = None,
     ) -> Any:
-        """Run full typed memory pipeline (extract → sandbox → persist → profile).
+        """Run full typed memory pipeline (extract → persist → profile).
 
         Unlike observe_turn() which only extracts+persists, this runs the
-        complete pipeline including sandbox validation and profile update.
+        complete pipeline including profile update.
         """
         from core.memory.tabular.typed_pipeline import run_typed_memory_pipeline
 
@@ -264,7 +264,6 @@ class TabularMemoryService:
             cleaned_stale=result.cleaned_stale,
             quarantined=result.quarantined,
             scenes_created=result.scenes_created,
-            cleaned_branches=result.cleaned_branches,
             cleaned_snapshots=result.cleaned_snapshots,
             pollution_detected=result.pollution_detected,
             errors=result.errors,
@@ -341,10 +340,9 @@ class TabularMemoryService:
         )
 
     def run_weekly(self) -> GovernanceReport:
-        """Run weekly governance tasks (branch/snapshot cleanup)."""
+        """Run weekly governance tasks (snapshot cleanup)."""
         r = self._governance_lazy.run_weekly()
         return GovernanceReport(
-            cleaned_branches=r.cleaned_branches,
             cleaned_snapshots=r.cleaned_snapshots,
             errors=r.errors,
             total_ms=r.total_ms,

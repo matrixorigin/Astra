@@ -173,7 +173,6 @@ class TestExplainE2E:
             messages=[{"role": "user", "content": "I like Go and testing"}],
             llm_client=mock_llm,
             embed_fn=_embed,
-            query_for_sandbox="Go testing",
             explain=True,
         )
 
@@ -193,8 +192,6 @@ class TestExplainE2E:
         print("\n=== PIPELINE EXPLAIN OUTPUT ===")
         print(f"Result:")
         print(f"  - memories_extracted: {result.memories_extracted}")
-        print(f"  - memories_validated: {result.memories_validated}")
-        print(f"  - memories_rejected: {result.memories_rejected}")
         
         if result.stats:
             print(f"Stats:")
@@ -205,12 +202,6 @@ class TestExplainE2E:
                 print(f"    - memories_stored: {result.stats.observer.memories_stored}")
                 print(f"    - memories_superseded: {result.stats.observer.memories_superseded}")
                 print(f"    - total_ms: {result.stats.observer.total_ms:.2f}ms")
-            if result.stats.sandbox:
-                print(f"  Sandbox:")
-                print(f"    - enabled: {result.stats.sandbox.enabled}")
-                print(f"    - validated: {result.stats.sandbox.validated}")
-                print(f"    - error: {result.stats.sandbox.error}")
-                print(f"    - total_ms: {result.stats.sandbox.total_ms:.2f}ms")
 
         assert result.stats is not None
         assert result.stats.total_ms > 0

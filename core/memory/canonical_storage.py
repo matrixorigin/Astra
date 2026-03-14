@@ -255,7 +255,6 @@ class CanonicalStorage:
             cleaned_stale=result.cleaned_stale,
             quarantined=result.quarantined,
             scenes_created=result.scenes_created,
-            cleaned_branches=result.cleaned_branches,
             cleaned_snapshots=result.cleaned_snapshots,
             pollution_detected=result.pollution_detected,
             errors=result.errors,
@@ -283,7 +282,6 @@ class CanonicalStorage:
     def run_weekly(self) -> GovernanceReport:
         r = self._governance_lazy.run_weekly()
         return GovernanceReport(
-            cleaned_branches=r.cleaned_branches,
             cleaned_snapshots=r.cleaned_snapshots,
             errors=r.errors,
             total_ms=r.total_ms,

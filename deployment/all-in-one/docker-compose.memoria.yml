@@ -1,0 +1,142 @@
+# mo-agent-engine with Memoria backend
+#
+# Usage:
+#   docker-compose -f docker-compose.memoria.yml up -d
+#
+# This configuration uses Memoria as the memory backend instead of
+# the built-in CanonicalStorage.
+
+services:
+
+  # ─── Infrastructure ─────────────────────────────────────────
+
+  matrixone:
+    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
+    hostname: matrixone
+    entrypoint: /entrypoint.sh
+    command: []
+    ports:
+      - "${MATRIXONE_PORT:-6001}:6001"
+    volumes:
+      - ${MATRIXONE_DATA_DIR:-./data/matrixone}:/mo-data
+      - ${MATRIXONE_LOG_DIR:-./data/matrixone/logs}:/mo-logs
+      - ../../matrixone-entrypoint.sh:/entrypoint.sh:ro
+    environment:
+      - TZ=Asia/Shanghai
+    user: "${UID:-1000}:${GID:-1000}"
+    networks:
+      - mo-net
+    healthcheck:
+      test: ["CMD-SHELL", "mysql -h127.0.0.1 -P6001 -uroot -p111 -e 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.2
+    hostname: redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - ${REDIS_DATA_DIR:-./data/redis}:/data
+    user: "${UID:-1000}:${GID:-1000}"
+    networks:
+      - mo-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ─── Memoria Service ────────────────────────────────────────
+
+  memoria:
+    image: ${MEMORIA_IMAGE:-matrixorigin/memoria:latest}
+    hostname: memoria
+    ports:
+      - "${MEMORIA_PORT:-8001}:8000"
+    environment:
+      - DATABASE_URL=mysql://root:111@matrixone:6001/memoria
+      - MASTER_KEY=${MEMORIA_MASTER_KEY:-dev-master-key-change-in-production}
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-openai}
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY}
+      - EMBEDDING_BASE_URL=${EMBEDDING_BASE_URL}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-small}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-1536}
+    depends_on:
+      matrixone:
+        condition: service_healthy
+    networks:
+      - mo-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # ─── mo-dev-agent API ───────────────────────────────────────
+
+  init:
+    build:
+      context: ../..
+    command: ["python", "-m", "cli.mo_admin", "init"]
+    environment:
+      - MATRIXONE_HOST=matrixone
+      - MATRIXONE_PORT=6001
+      - REDIS_URL=redis://redis:6379
+      # Memoria backend configuration
+      - MEMORY_BACKEND=memoria
+      - MEMORIA_BASE_URL=http://memoria:8000
+      - MEMORIA_MASTER_KEY=${MEMORIA_MASTER_KEY:-dev-master-key-change-in-production}
+    depends_on:
+      matrixone:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      memoria:
+        condition: service_healthy
+    networks:
+      - mo-net
+    restart: "no"
+
+  api:
+    build:
+      context: ../..
+    hostname: api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - MATRIXONE_HOST=matrixone
+      - MATRIXONE_PORT=6001
+      - MATRIXONE_DATABASE=${MATRIXONE_DATABASE:-mo_dev_agent}
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+      # Memoria backend configuration
+      - MEMORY_BACKEND=memoria
+      - MEMORIA_BASE_URL=http://memoria:8000
+      - MEMORIA_MASTER_KEY=${MEMORIA_MASTER_KEY:-dev-master-key-change-in-production}
+    env_file:
+      - ../../.env
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      memoria:
+        condition: service_healthy
+    networks:
+      - mo-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+networks:
+  mo-net:
+    driver: bridge

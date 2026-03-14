@@ -11,6 +11,8 @@ import uuid
 import pytest
 from sqlalchemy import text
 
+from api.models._constants import EMBEDDING_DIM
+
 
 @pytest.fixture
 def branch_user(db_session):
@@ -353,50 +355,46 @@ class TestMergeRowcountIntegration:
 
 
 class TestDetectConflictsIntegration:
-    """DB-level test for _detect_conflicts with real cosine_similarity."""
+    """DB-level test for _detect_conflicts with controlled cosine similarity."""
 
-    @pytest.mark.local_embedding
     def test_detects_similar_memories(self, backend, branch_user, db_session):
         """Semantically similar memories (cosine > 0.9) must be detected as conflicts;
         unrelated memories (cosine < 0.9) must not.
 
-        Uses two distinct sentence pairs to exercise the threshold:
-        - "Python is a great language" vs "Python is an excellent language" → cosine ≈ 0.97 (conflict)
-        - "Python is a great language" vs "The weather in Tokyo is sunny" → cosine ≈ 0.05 (no conflict)
+        Uses synthetic embeddings with known cosine similarities:
+        - Similar vectors → cosine ≈ 0.97 (conflict)
+        - Different vectors → cosine ≈ 0.0 (no conflict)
         """
         uid = branch_user
 
-        from core.embedding.client import EmbeddingClient
-        ec = EmbeddingClient(provider="local", model="all-MiniLM-L6-v2", dim=384, api_key="", base_url=None)
-
-        # Two semantically similar Python sentences — cosine should be well above 0.9
-        emb_main = ec.embed("Python is a great programming language")
-        emb_similar = ec.embed("Python is an excellent programming language")
-        # Completely unrelated sentence — cosine should be well below 0.9
-        emb_different = ec.embed("The weather in Tokyo is sunny today")
+        import math
 
         def vec(e):
             return f"[{','.join(str(x) for x in e)}]"
 
-        # Sanity-check the embeddings before inserting into DB.
-        # If the local model produces unexpected similarity, the test should fail
-        # loudly here rather than giving a false pass later.
-        import math
         def cosine(a, b):
             dot = sum(x * y for x, y in zip(a, b))
             na = math.sqrt(sum(x * x for x in a))
             nb = math.sqrt(sum(x * x for x in b))
             return dot / (na * nb) if na and nb else 0.0
 
+        # Create synthetic embeddings with known similarities
+        # emb_main: base vector with first component = 1.0
+        emb_main = [1.0] + [0.0] * (EMBEDDING_DIM - 1)
+        # emb_similar: very similar to emb_main (cosine ≈ 0.97)
+        # Vector with small perturbation to get cosine ≈ 0.97
+        emb_similar = [0.97] + [math.sqrt(1 - 0.97**2)] + [0.0] * (EMBEDDING_DIM - 2)
+        # emb_different: orthogonal to emb_main (cosine ≈ 0.0)
+        emb_different = [0.0, 1.0] + [0.0] * (EMBEDDING_DIM - 2)
+
+        # Verify the similarities
         sim_score = cosine(emb_main, emb_similar)
         diff_score = cosine(emb_main, emb_different)
         assert sim_score > 0.9, (
-            f"Expected similar sentences to have cosine > 0.9, got {sim_score:.3f}. "
-            "Check the local embedding model."
+            f"Expected similar vectors to have cosine > 0.9, got {sim_score:.3f}."
         )
         assert diff_score < 0.9, (
-            f"Expected unrelated sentences to have cosine < 0.9, got {diff_score:.3f}. "
-            "Check the local embedding model."
+            f"Expected different vectors to have cosine < 0.9, got {diff_score:.3f}."
         )
 
         # 1. Insert main memory (similar embedding)

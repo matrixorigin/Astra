@@ -29,7 +29,6 @@ class MemoryGovernanceConfig:
     pitr_range_unit: str = "d"
     milestone_snapshot_keep_n: int = 5
     pollution_threshold: float = 0.3
-    sandbox_enabled_types: tuple[str, ...] = ("profile",)
     contradiction_similarity_threshold: float = 0.85
 
     # ── Cleanup TTLs ──

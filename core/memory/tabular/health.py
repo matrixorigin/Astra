@@ -131,31 +131,7 @@ class MemoryHealth(DbConsumer):
         logger.info("Cleaned up %d old snapshots", dropped)
         return dropped
 
-    def cleanup_orphan_branches(self) -> int:
-        """Clean up sandbox branches that were not properly dropped."""
-        with self._db() as db:
-            rows = db.execute(text("""
-                SELECT table_name FROM information_schema.tables
-                WHERE table_name LIKE 'memories_sandbox_%'
-            """)).fetchall()
 
-        if not rows:
-            return 0
-
-        cleaned = 0
-        with self._db() as db:
-            for r in rows:
-                try:
-                    db.execute(text(
-                        f"data branch delete table {self.db_name}.{r.table_name}"
-                    ))
-                    db.commit()
-                    cleaned += 1
-                    logger.info("Cleaned orphan branch: %s", r.table_name)
-                except Exception as e:
-                    logger.warning("Failed to clean branch %s: %s", r.table_name, e)
-
-        return cleaned
 
     def estimate_capacity(self, user_id: str) -> dict:
         """Estimate memory capacity and IVF index performance headroom.
