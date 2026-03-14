@@ -41,6 +41,7 @@ def _resolve_cheapest(fallback: str) -> str:
     try:
         from api.database import SessionLocal
         from core.llm.router import ModelRegistry
+
         registry = ModelRegistry()
         with SessionLocal() as db:
             registry.load_from_db(db)

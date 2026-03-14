@@ -83,6 +83,7 @@ class TurnResult:
 @dataclass
 class ChatLoopResult:
     """Result of edge_chat_loop execution."""
+
     text: str
     explain_turns: list[dict[str, Any]] | None = None
     usage: dict[str, int] | None = None
@@ -113,6 +114,7 @@ def load_project_rules(project_root: str) -> str | None:
 def detect_edge_profile(project_root: str) -> dict[str, Any]:
     """Detect project profile from local filesystem for cloud context enrichment."""
     import subprocess
+
     root = Path(project_root).resolve()
     profile: dict[str, Any] = {"cwd": str(root)}
 
@@ -120,7 +122,10 @@ def detect_edge_profile(project_root: str) -> dict[str, Any]:
     try:
         branch = subprocess.run(
             ["git", "symbolic-ref", "--short", "HEAD"],
-            cwd=root, capture_output=True, text=True, timeout=5,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if branch.returncode == 0:
             profile["git_branch"] = branch.stdout.strip()
@@ -130,8 +135,12 @@ def detect_edge_profile(project_root: str) -> dict[str, Any]:
 
     # Project type from marker files
     markers = {
-        "go.mod": "go", "Cargo.toml": "rust", "package.json": "node",
-        "pyproject.toml": "python", "pom.xml": "java", "build.gradle": "java",
+        "go.mod": "go",
+        "Cargo.toml": "rust",
+        "package.json": "node",
+        "pyproject.toml": "python",
+        "pom.xml": "java",
+        "build.gradle": "java",
     }
     for marker, ptype in markers.items():
         if (root / marker).exists():
@@ -140,14 +149,30 @@ def detect_edge_profile(project_root: str) -> dict[str, Any]:
 
     # Languages from file extensions (sample top-level + common subdirs)
     exts: set[str] = set()
-    for d in [root, root / "src", root / "pkg", root / "lib",
-              root / "cmd", root / "internal", root / "app"]:
+    for d in [
+        root,
+        root / "src",
+        root / "pkg",
+        root / "lib",
+        root / "cmd",
+        root / "internal",
+        root / "app",
+    ]:
         if d.is_dir():
             for f in islice(d.iterdir(), 50):
                 if f.is_file() and f.suffix:
                     exts.add(f.suffix.lstrip("."))
-    lang_map = {"go": "Go", "rs": "Rust", "py": "Python", "ts": "TypeScript",
-                "js": "JavaScript", "java": "Java", "rb": "Ruby", "c": "C", "cpp": "C++"}
+    lang_map = {
+        "go": "Go",
+        "rs": "Rust",
+        "py": "Python",
+        "ts": "TypeScript",
+        "js": "JavaScript",
+        "java": "Java",
+        "rb": "Ruby",
+        "c": "C",
+        "cpp": "C++",
+    }
     langs = sorted({lang_map[e] for e in exts if e in lang_map})
     if langs:
         profile["languages"] = langs
@@ -315,18 +340,24 @@ def _print_explain(turns: list[dict[str, Any]], file: Any = None, verbose: bool 
             router = rt.get("router", "default")
             skipped = rt.get("skipped_sections", [])
             est = rt.get("estimated_tokens", "?")
-            w(f"{dim}  ├─ routing  {intent}  conf={conf:.2f}  tier={tier}  {rt_ms}ms  ~{est}tok{reset}\n")
+            w(
+                f"{dim}  ├─ routing  {intent}  conf={conf:.2f}  tier={tier}  {rt_ms}ms  ~{est}tok{reset}\n"
+            )
             if verbose:
                 matched = rt.get("matched_by", "?")
                 threshold = rt.get("threshold", "?")
-                w(f"{dim}  │    router={router}  matched_by={matched}  threshold={threshold}{reset}\n")
+                w(
+                    f"{dim}  │    router={router}  matched_by={matched}  threshold={threshold}{reset}\n"
+                )
                 if skipped:
                     w(f"{dim}  │    skipped: {', '.join(skipped)}{reset}\n")
                 t1 = rt.get("tier1")
                 if t1:
                     parts = []
-                    if t1.get("compressed"): parts.append("compressed_memory")
-                    if t1.get("pruned_tools"): parts.append(f"pruned→{t1['pruned_tools']}")
+                    if t1.get("compressed"):
+                        parts.append("compressed_memory")
+                    if t1.get("pruned_tools"):
+                        parts.append(f"pruned→{t1['pruned_tools']}")
                     if parts:
                         w(f"{dim}  │    tier1: {', '.join(parts)}{reset}\n")
         elif rt and rt.get("skipped"):
@@ -358,10 +389,14 @@ def _print_explain(turns: list[dict[str, Any]], file: Any = None, verbose: bool 
                 final = ret.get("final_count", 0)
                 ret_ms = ret.get("total_ms", 0)
                 l1_tok = l1.get("tokens", 0) if l1 else 0
-                w(f"{dim}  ├─ L1 retrieval  {ret_ms:.0f}ms  kw={kw_hit}({p1}) vec={vec_hit}({p2}) → {merged} → {final}  {l1_tok} tokens{reset}\n")
+                w(
+                    f"{dim}  ├─ L1 retrieval  {ret_ms:.0f}ms  kw={kw_hit}({p1}) vec={vec_hit}({p2}) → {merged} → {final}  {l1_tok} tokens{reset}\n"
+                )
                 if verbose:
                     if ret.get("phase1_ms"):
-                        w(f"{dim}  │    phase1={ret['phase1_ms']:.0f}ms  phase2={ret.get('phase2_ms', 0):.0f}ms  merge={ret.get('merge_ms', 0):.0f}ms{reset}\n")
+                        w(
+                            f"{dim}  │    phase1={ret['phase1_ms']:.0f}ms  phase2={ret.get('phase2_ms', 0):.0f}ms  merge={ret.get('merge_ms', 0):.0f}ms{reset}\n"
+                        )
                     if l1 and l1.get("previews"):
                         for preview in l1["previews"][:3]:
                             w(f"{dim}  │    {preview[:100]}{reset}\n")
@@ -374,7 +409,9 @@ def _print_explain(turns: list[dict[str, Any]], file: Any = None, verbose: bool 
                 l1_tok = l1.get("tokens", 0)
                 l1_cnt = l1.get("count", 0)
                 l1_ms = l1.get("ms", 0)
-                w(f"{dim}  ├─ L1 retrieval  {l1_ms:.0f}ms  {l1_cnt} memories  {l1_tok} tokens{reset}\n")
+                w(
+                    f"{dim}  ├─ L1 retrieval  {l1_ms:.0f}ms  {l1_cnt} memories  {l1_tok} tokens{reset}\n"
+                )
             elif l1 or ret:
                 w(f"{dim}  ├─ L1 retrieval  no results{reset}\n")
             elif mem.get("error"):
@@ -385,7 +422,11 @@ def _print_explain(turns: list[dict[str, Any]], file: Any = None, verbose: bool 
             if fs:
                 count = fs.get("count", 0)
                 if count or fs.get("error"):
-                    label = f"few_shot={count}" if not fs.get("error") else f"few_shot error: {fs['error']}"
+                    label = (
+                        f"few_shot={count}"
+                        if not fs.get("error")
+                        else f"few_shot error: {fs['error']}"
+                    )
                     w(f"{dim}  └─ {label}{reset}\n")
             else:
                 # Total timing line
@@ -417,15 +458,21 @@ def _print_explain(turns: list[dict[str, Any]], file: Any = None, verbose: bool 
         if aux:
             aux_tok = sum(a.get("tokens_in", 0) + a.get("tokens_out", 0) for a in aux)
             aux_cost = sum(a.get("cost_usd", 0) for a in aux)
-            w(f"{dim}  ├─ auxiliary LLM  {len(aux)} calls  {aux_tok} tokens  ${aux_cost:.4f}{reset}\n")
+            w(
+                f"{dim}  ├─ auxiliary LLM  {len(aux)} calls  {aux_tok} tokens  ${aux_cost:.4f}{reset}\n"
+            )
             if verbose:
                 for a in aux:
-                    w(f"{dim}  │    {a.get('purpose', '?')}  {a.get('ms', 0)}ms  {a.get('tokens_in', 0)}→{a.get('tokens_out', 0)}{reset}\n")
+                    w(
+                        f"{dim}  │    {a.get('purpose', '?')}  {a.get('ms', 0)}ms  {a.get('tokens_in', 0)}→{a.get('tokens_out', 0)}{reset}\n"
+                    )
     w(f"{dim}Total: {total_ms}ms  tokens: {total_in}→{total_out}{reset}\n")
     w(f"{dim}─────────────────────────────────────────────{reset}\n")
 
 
-def _make_result(text: str, explain_turns: list[dict[str, Any]], usage: dict[str, int]) -> ChatLoopResult:
+def _make_result(
+    text: str, explain_turns: list[dict[str, Any]], usage: dict[str, int]
+) -> ChatLoopResult:
     """Construct ChatLoopResult, converting empty collections to None."""
     return ChatLoopResult(
         text=text,
@@ -609,7 +656,9 @@ async def edge_chat_loop(
         for tc in parsed:
             tool = tool_router.get_tool(tc.name)
             if tool is None:
-                tool_results.append({"tool_call_id": tc.id, "name": tc.name, "result": f"Unknown tool: {tc.name}"})
+                tool_results.append(
+                    {"tool_call_id": tc.id, "name": tc.name, "result": f"Unknown tool: {tc.name}"}
+                )
                 continue
 
             side_effect = resolve_side_effect(tool)
@@ -619,7 +668,13 @@ async def edge_chat_loop(
             if decision == Decision.DENY:
                 renderer.tool_start(tc.name, tc.arguments)
                 renderer.tool_done(tc.name, "Blocked (dangerous)", True)
-                tool_results.append({"tool_call_id": tc.id, "name": tc.name, "result": "Permission denied: command blocked by safety policy"})
+                tool_results.append(
+                    {
+                        "tool_call_id": tc.id,
+                        "name": tc.name,
+                        "result": "Permission denied: command blocked by safety policy",
+                    }
+                )
                 continue
 
             if decision == Decision.ASK:
@@ -630,7 +685,13 @@ async def edge_chat_loop(
                 decision = permissions.prompt_user(tc.name, side_effect, tc.arguments)
                 if decision == Decision.DENY:
                     renderer.tool_done(tc.name, "Denied by user", True)
-                    tool_results.append({"tool_call_id": tc.id, "name": tc.name, "result": "Permission denied by user"})
+                    tool_results.append(
+                        {
+                            "tool_call_id": tc.id,
+                            "name": tc.name,
+                            "result": "Permission denied by user",
+                        }
+                    )
                     continue
 
             approved.append(tc)
@@ -641,7 +702,9 @@ async def edge_chat_loop(
             for tc, r in zip(approved, results):
                 renderer.tool_start(tc.name, tc.arguments)
                 renderer.tool_done(r.name, r.result, r.error)
-                tool_results.append({"tool_call_id": r.tool_call_id, "name": r.name, "result": r.result})
+                tool_results.append(
+                    {"tool_call_id": r.tool_call_id, "name": r.name, "result": r.result}
+                )
 
         # Clear messages after first turn — cloud has the history
         messages = []

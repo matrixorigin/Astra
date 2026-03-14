@@ -14,11 +14,13 @@ from core.verification.hitl_policy import (
 
 def _engine(decay_threshold: int = 5) -> HITLPolicyEngine:
     engine = HITLPolicyEngine(lambda: MagicMock(), decay_threshold=decay_threshold)
-    engine.add_policy(SupervisionPolicy(
-        name="novel-gate",
-        trigger=SupervisionTrigger(novel_skill_use=True),
-        action=SupervisionAction.APPROVE_REJECT,
-    ))
+    engine.add_policy(
+        SupervisionPolicy(
+            name="novel-gate",
+            trigger=SupervisionTrigger(novel_skill_use=True),
+            action=SupervisionAction.APPROVE_REJECT,
+        )
+    )
     return engine
 
 
@@ -56,11 +58,13 @@ class TestDecayBasics:
     def test_decay_observe_only_to_none(self):
         """OBSERVE_ONLY decays to NONE."""
         engine = HITLPolicyEngine(lambda: MagicMock(), decay_threshold=2)
-        engine.add_policy(SupervisionPolicy(
-            name="obs",
-            trigger=SupervisionTrigger(novel_skill_use=True),
-            action=SupervisionAction.OBSERVE_ONLY,
-        ))
+        engine.add_policy(
+            SupervisionPolicy(
+                name="obs",
+                trigger=SupervisionTrigger(novel_skill_use=True),
+                action=SupervisionAction.OBSERVE_ONLY,
+            )
+        )
         for _ in range(2):
             engine.record_outcome("x", success=True)
         ctx = ActionContext(is_novel_skill=True, skill_name="x")

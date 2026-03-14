@@ -29,6 +29,7 @@ class AgentExecutor(DbConsumer):
         self.mock_layer = ToolMockingLayer(mode, db_factory)
 
         from core.agent.execution_backend import BackendRouter
+
         self._backend_router = BackendRouter()
 
     def _enforce_runtime_checks(self, skill_name: str, params: dict[str, Any]) -> None:
@@ -52,7 +53,7 @@ class AgentExecutor(DbConsumer):
 
         Returns:
             The result of the skill execution.
-            
+
         Side effects:
             Records execution metrics (time, cost) to skill_execution_metrics table.
         """
@@ -80,6 +81,7 @@ class AgentExecutor(DbConsumer):
         # and the executor fills it in lazily at first execution.
         if hasattr(skill, "_config_center") and skill._config_center is None:
             from core.skills.config_center import get_config_center
+
             skill._config_center = get_config_center()
 
         # 1.5d. Inject per-user credentials for skills that use external APIs.
@@ -102,16 +104,16 @@ class AgentExecutor(DbConsumer):
         cost = 0.0
         result = None
         error_msg = None
-        
+
         try:
             result = self.mock_layer.execute(
                 skill=skill, params=params, session_id=session_id, parent_event_id=parent_event_id
             )
-            
+
             # Extract cost if result contains LLM response
             if isinstance(result, dict):
                 cost = result.get("cost", 0.0)
-            
+
         except Exception as e:
             logger.error(f"Error executing skill {skill_name}: {e}")
             success = False
@@ -119,7 +121,7 @@ class AgentExecutor(DbConsumer):
             raise
         finally:
             execution_time_ms = int((time.time() - start_time) * 1000)
-            
+
             # Record metrics to database
             self._record_execution_metrics(
                 skill_name=skill_name,
@@ -129,9 +131,9 @@ class AgentExecutor(DbConsumer):
                 success=success,
                 error_msg=error_msg,
             )
-        
+
         return result
-    
+
     def execute_skill_with_feedback(
         self,
         skill_name: str,
@@ -142,10 +144,10 @@ class AgentExecutor(DbConsumer):
         extra_feedback_data: dict[str, Any] | None = None,
     ) -> Any:
         """Execute a skill and automatically record execution time feedback.
-        
+
         This method encapsulates the execution + feedback recording pattern,
         preventing responsibility leakage to the caller (ChatLoop).
-        
+
         Args:
             skill_name: Name of the skill to execute.
             params: Parameters for the skill.
@@ -153,7 +155,7 @@ class AgentExecutor(DbConsumer):
             parent_event_id: The ID of the parent event.
             selection_event_id: Event ID from skill selection (for feedback).
             extra_feedback_data: Additional data to include in feedback (e.g., planning_step).
-            
+
         Returns:
             The result of the skill execution.
         """
@@ -181,9 +183,12 @@ class AgentExecutor(DbConsumer):
             # so learn_from_failures() can read them
             if selection_event_id:
                 self._backfill_selection_event(
-                    selection_event_id, int(_elapsed_ms), _cost, _success,
+                    selection_event_id,
+                    int(_elapsed_ms),
+                    _cost,
+                    _success,
                 )
-    
+
     def _inject_user_credentials(self, skill: Any, skill_name: str, user_id: str) -> None:
         """Inject per-user credentials into skills that use external APIs.
 
@@ -203,6 +208,7 @@ class AgentExecutor(DbConsumer):
 
         try:
             from core.skills.config_center import get_config_center
+
             center = get_config_center()
         except RuntimeError:
             # Config center not initialized (e.g. unit tests without full startup).
@@ -217,6 +223,7 @@ class AgentExecutor(DbConsumer):
                 token = center.get_setting(ns, "github_token", user_id)
                 if token:
                     from github import Auth, Github
+
                     skill.github.token = token
                     skill.github._api._client = Github(
                         auth=Auth.Token(token=token),
@@ -226,7 +233,11 @@ class AgentExecutor(DbConsumer):
                 logger.debug("Failed to inject github token for user %s: %s", user_id, e)
 
     def _backfill_selection_event(
-        self, event_id: str, time_ms: int, cost: float, success: bool,
+        self,
+        event_id: str,
+        time_ms: int,
+        cost: float,
+        success: bool,
     ) -> None:
         """Update skill_selection_events with post-execution metrics.
 
@@ -236,10 +247,15 @@ class AgentExecutor(DbConsumer):
         """
         try:
             from api.models.skill import SkillSelectionEvent
+
             with self._db() as db:
-                evt = db.query(SkillSelectionEvent).filter(
-                    SkillSelectionEvent.event_id == event_id,
-                ).first()
+                evt = (
+                    db.query(SkillSelectionEvent)
+                    .filter(
+                        SkillSelectionEvent.event_id == event_id,
+                    )
+                    .first()
+                )
                 if evt:
                     evt.execution_time_ms = time_ms
                     evt.execution_cost = cost
@@ -257,16 +273,23 @@ class AgentExecutor(DbConsumer):
             from api.models.agent import Event, Session as SessionModel
             from api.models.skill import SkillRegistry as SkillModel
             from sqlalchemy import func
+
             with self._db() as db:
-                sess = db.query(SessionModel.agent_id, SessionModel.event_count).filter(
-                    SessionModel.session_id == session_id
-                ).first()
+                sess = (
+                    db.query(SessionModel.agent_id, SessionModel.event_count)
+                    .filter(SessionModel.session_id == session_id)
+                    .first()
+                )
                 if sess:
                     state["agent_id"] = sess.agent_id
                     state["turn_count"] = sess.event_count or 0
-                state["skills_loaded"] = db.query(func.count()).select_from(
-                    SkillModel
-                ).filter(SkillModel.is_active == 1).scalar() or 0
+                state["skills_loaded"] = (
+                    db.query(func.count())
+                    .select_from(SkillModel)
+                    .filter(SkillModel.is_active == 1)
+                    .scalar()
+                    or 0
+                )
         except Exception as e:
             logger.debug("Failed to build runtime_state: %s", e)
         return state
@@ -281,14 +304,14 @@ class AgentExecutor(DbConsumer):
         error_msg: str | None = None,
     ):
         """Record skill execution metrics to database.
-        
+
         This enables multi-dimensional learning from execution performance.
         """
         try:
             from api.models import SkillExecutionMetric
             from uuid_utils import uuid7
             from datetime import datetime, timezone
-            
+
             metric = SkillExecutionMetric(
                 metric_id=str(uuid7()),
                 session_id=session_id,
@@ -302,14 +325,14 @@ class AgentExecutor(DbConsumer):
             with self._db() as db:
                 db.add(metric)
                 db.commit()
-            
+
             logger.debug(
                 f"Recorded metrics for {skill_name}: "
                 f"time={execution_time_ms}ms, cost=${execution_cost:.4f}, success={success}"
             )
         except Exception as e:
             logger.error(f"Failed to record execution metrics: {e}")
-    
+
     async def execute_skill_stream(
         self,
         skill_name: str,
@@ -318,13 +341,13 @@ class AgentExecutor(DbConsumer):
         parent_event_id: str | None = None,
     ):
         """Execute a skill with streaming output.
-        
+
         Args:
             skill_name: Name of the skill to execute.
             params: Parameters for the skill.
             session_id: The current session ID.
             parent_event_id: The ID of the parent event.
-            
+
         Yields:
             StreamEvent: Stream events from skill execution
         """
@@ -344,19 +367,20 @@ class AgentExecutor(DbConsumer):
         self._enforce_runtime_checks(skill_name, params)
 
         # 2. Check if skill supports streaming
-        if not hasattr(skill, 'execute_stream'):
+        if not hasattr(skill, "execute_stream"):
             # Fall back to non-streaming execution
             result = self.mock_layer.execute(
                 skill=skill, params=params, session_id=session_id, parent_event_id=parent_event_id
             )
             # Yield result as single event
             from core.events.models import StreamEvent, StreamEventType
+
             yield StreamEvent(
                 event_type=StreamEventType.TOOL_RESULT,
                 data={"result": str(result)},
             )
             return
-        
+
         # 3. Execute with streaming
         try:
             async for event in skill.execute_stream(skill.validate_input(params)):
@@ -364,6 +388,7 @@ class AgentExecutor(DbConsumer):
         except Exception as e:
             logger.error(f"Error executing skill {skill_name}: {e}")
             from core.events.models import StreamEvent, StreamEventType
+
             yield StreamEvent(
                 event_type=StreamEventType.RUN_ERROR,
                 data={"error": str(e)},
@@ -374,6 +399,7 @@ class AgentExecutor(DbConsumer):
         """Extract ExecutionRequirements from skill's SkillRequirement."""
         from core.agent.execution_backend import ExecutionRequirements
         from core.skills.base import SkillRequirement
+
         req = getattr(skill, "requirements", None)
         if not isinstance(req, SkillRequirement):
             return ExecutionRequirements()
@@ -385,7 +411,11 @@ class AgentExecutor(DbConsumer):
         )
 
     def _execute_heavyweight_sync(
-        self, skill_name: str, params: dict, req: "ExecutionRequirements", session_id: str,
+        self,
+        skill_name: str,
+        params: dict,
+        req: "ExecutionRequirements",
+        session_id: str,
     ) -> Any:
         """Route heavyweight skill to subprocess (blocking, for sync callers)."""
         import json as _json
@@ -393,23 +423,35 @@ class AgentExecutor(DbConsumer):
         import subprocess
         import sys
 
-        cmd = [sys.executable, "-m", "core.skills.runner",
-               "--skill", skill_name, "--inputs", _json.dumps(params)]
+        cmd = [
+            sys.executable,
+            "-m",
+            "core.skills.runner",
+            "--skill",
+            skill_name,
+            "--inputs",
+            _json.dumps(params),
+        ]
         if req.conda_env:
             cmd = ["conda", "run", "-n", req.conda_env, "--no-capture-output"] + cmd
 
         start_time = time.time()
         try:
             env = {**os.environ, **req.env_vars} if req.env_vars else None
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=req.timeout_seconds, env=env)
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=req.timeout_seconds, env=env
+            )
             elapsed_ms = int((time.time() - start_time) * 1000)
 
             if proc.returncode != 0:
                 err_text = (proc.stderr or "")[-2000:]
                 self._record_execution_metrics(
-                    skill_name=skill_name, session_id=session_id,
-                    execution_time_ms=elapsed_ms, execution_cost=0.0,
-                    success=False, error_msg=err_text,
+                    skill_name=skill_name,
+                    session_id=session_id,
+                    execution_time_ms=elapsed_ms,
+                    execution_cost=0.0,
+                    success=False,
+                    error_msg=err_text,
                 )
                 raise RuntimeError(f"Skill {skill_name} failed: {err_text[-500:]}")
 
@@ -419,14 +461,20 @@ class AgentExecutor(DbConsumer):
                 result = {"output": (proc.stdout or "")[-2000:]}
 
             self._record_execution_metrics(
-                skill_name=skill_name, session_id=session_id,
-                execution_time_ms=elapsed_ms, execution_cost=0.0, success=True,
+                skill_name=skill_name,
+                session_id=session_id,
+                execution_time_ms=elapsed_ms,
+                execution_cost=0.0,
+                success=True,
             )
             return result
         except subprocess.TimeoutExpired:
             self._record_execution_metrics(
-                skill_name=skill_name, session_id=session_id,
-                execution_time_ms=req.timeout_seconds * 1000, execution_cost=0.0,
-                success=False, error_msg="Timeout",
+                skill_name=skill_name,
+                session_id=session_id,
+                execution_time_ms=req.timeout_seconds * 1000,
+                execution_cost=0.0,
+                success=False,
+                error_msg="Timeout",
             )
             raise RuntimeError(f"Skill {skill_name} timed out after {req.timeout_seconds}s")

@@ -31,6 +31,7 @@ def client(db_session):
             yield db_session
         finally:
             pass
+
     app.dependency_overrides[get_db_session] = override_get_db
     yield TestClient(app)
     app.dependency_overrides.clear()
@@ -48,31 +49,37 @@ def clean_models(db_session):
 class TestGetSeedDefaults:
     def test_kimi_returns_fixed_temperature(self):
         from api.routers.models import _get_seed_defaults
+
         d = _get_seed_defaults("kimi-k2.5")
         assert d["quirks"]["fixed_temperature"] == 1.0
 
     def test_kimi_returns_strict_tool_call_ids(self):
         from api.routers.models import _get_seed_defaults
+
         d = _get_seed_defaults("kimi-k2.5")
         assert d["quirks"]["strict_tool_call_ids"] is True
 
     def test_kimi_returns_preserve_reasoning_content(self):
         from api.routers.models import _get_seed_defaults
+
         d = _get_seed_defaults("kimi-k2.5")
         assert d["quirks"]["preserve_reasoning_content"] is True
 
     def test_deepseek_has_no_quirks(self):
         from api.routers.models import _get_seed_defaults
+
         d = _get_seed_defaults("deepseek-chat")
         assert not d.get("quirks")  # None or missing
 
     def test_unknown_model_returns_empty(self):
         from api.routers.models import _get_seed_defaults
+
         assert _get_seed_defaults("my-custom-model") == {}
 
     def test_all_seed_models_with_quirks_have_fixed_temperature_type(self):
         """Any seed model with fixed_temperature must be float, not int or string."""
         from api.routers.models import _get_seed_defaults
+
         for sm in SEED_MODELS:
             d = _get_seed_defaults(sm["model_name"])
             ft = (d.get("quirks") or {}).get("fixed_temperature")
@@ -93,11 +100,15 @@ class TestCreateModelSeedQuirks:
         # Use real seed model name so _get_seed_defaults finds it
         db_session.execute(text("DELETE FROM infra_llm_models WHERE model_name = 'kimi-k2.5'"))
         db_session.commit()
-        resp = client.post("/models", headers=admin_headers, json={
-            "name": "kimi-k2.5",
-            "provider": "moonshot",
-            "api_key": "sk-test",
-        })
+        resp = client.post(
+            "/models",
+            headers=admin_headers,
+            json={
+                "name": "kimi-k2.5",
+                "provider": "moonshot",
+                "api_key": "sk-test",
+            },
+        )
         assert resp.status_code == 201
         data = resp.json()
         assert data["quirks"]["fixed_temperature"] == 1.0, (
@@ -108,12 +119,16 @@ class TestCreateModelSeedQuirks:
 
     def test_kimi_explicit_quirks_not_overridden(self, client, admin_headers, db_session):
         """Explicit quirks from caller must take precedence over seed defaults."""
-        resp = client.post("/models", headers=admin_headers, json={
-            "name": "test-reg-kimi3",
-            "provider": "moonshot",
-            "api_key": "sk-test",
-            "quirks": {"fixed_temperature": 0.5},  # caller overrides
-        })
+        resp = client.post(
+            "/models",
+            headers=admin_headers,
+            json={
+                "name": "test-reg-kimi3",
+                "provider": "moonshot",
+                "api_key": "sk-test",
+                "quirks": {"fixed_temperature": 0.5},  # caller overrides
+            },
+        )
         assert resp.status_code == 201
 
         row = db_session.execute(
@@ -125,11 +140,15 @@ class TestCreateModelSeedQuirks:
 
     def test_unknown_model_gets_no_quirks_injected(self, client, admin_headers, db_session):
         """Unknown model names must not get any quirks injected."""
-        resp = client.post("/models", headers=admin_headers, json={
-            "name": "test-reg-custom",
-            "provider": "openai",
-            "api_key": "sk-test",
-        })
+        resp = client.post(
+            "/models",
+            headers=admin_headers,
+            json={
+                "name": "test-reg-custom",
+                "provider": "openai",
+                "api_key": "sk-test",
+            },
+        )
         assert resp.status_code == 201
 
         row = db_session.execute(
@@ -151,20 +170,30 @@ class TestInitDbSeedSync:
     def test_empty_quirks_restored_by_init_db(self, db_session):
         """If kimi-k2.5 quirks are wiped (e.g. old registration), init_db restores them."""
         # Insert kimi-k2.5 with empty quirks (simulates old registration)
-        db_session.execute(text(
-            "INSERT INTO infra_llm_models "
-            "(model_id, model_name, provider, api_key_encrypted, is_active, quirks) "
-            "VALUES (:id, 'test-reg-kimi-sync', 'moonshot', 'enc', 1, '{}')"
-        ), {"id": str(uuid4())})
+        db_session.execute(
+            text(
+                "INSERT INTO infra_llm_models "
+                "(model_id, model_name, provider, api_key_encrypted, is_active, quirks) "
+                "VALUES (:id, 'test-reg-kimi-sync', 'moonshot', 'enc', 1, '{}')"
+            ),
+            {"id": str(uuid4())},
+        )
         db_session.commit()
 
         # Patch SEED_MODELS to include our test model
         import core.llm.seed_models as sm_mod
         import api.database as db_mod
+
         original = sm_mod.SEED_MODELS
-        sm_mod.SEED_MODELS = [{"model_name": "test-reg-kimi-sync", "quirks": {
-            "fixed_temperature": 1.0, "strict_tool_call_ids": True,
-        }}]
+        sm_mod.SEED_MODELS = [
+            {
+                "model_name": "test-reg-kimi-sync",
+                "quirks": {
+                    "fixed_temperature": 1.0,
+                    "strict_tool_call_ids": True,
+                },
+            }
+        ]
         try:
             db_mod.init_db()
         finally:
@@ -180,19 +209,28 @@ class TestInitDbSeedSync:
 
     def test_null_quirks_restored_by_init_db(self, db_session):
         """NULL quirks (no column value) must also be restored by init_db."""
-        db_session.execute(text(
-            "INSERT INTO infra_llm_models "
-            "(model_id, model_name, provider, api_key_encrypted, is_active) "
-            "VALUES (:id, 'test-reg-kimi-null', 'moonshot', 'enc', 1)"
-        ), {"id": str(uuid4())})
+        db_session.execute(
+            text(
+                "INSERT INTO infra_llm_models "
+                "(model_id, model_name, provider, api_key_encrypted, is_active) "
+                "VALUES (:id, 'test-reg-kimi-null', 'moonshot', 'enc', 1)"
+            ),
+            {"id": str(uuid4())},
+        )
         db_session.commit()
 
         import core.llm.seed_models as sm_mod
         import api.database as db_mod
+
         original = sm_mod.SEED_MODELS
-        sm_mod.SEED_MODELS = [{"model_name": "test-reg-kimi-null", "quirks": {
-            "fixed_temperature": 1.0,
-        }}]
+        sm_mod.SEED_MODELS = [
+            {
+                "model_name": "test-reg-kimi-null",
+                "quirks": {
+                    "fixed_temperature": 1.0,
+                },
+            }
+        ]
         try:
             db_mod.init_db()
         finally:
@@ -213,11 +251,17 @@ class TestRegistryLoadsFixedTemperature:
     """ModelRegistry.load_from_db must expose fixed_temperature via ModelConfig."""
 
     def test_fixed_temperature_available_on_model_config(self, db_session):
-        db_session.execute(text(
-            "INSERT INTO infra_llm_models "
-            "(model_id, model_name, provider, api_key_encrypted, is_active, quirks) "
-            "VALUES (:id, 'test-reg-load', 'moonshot', 'enc', 1, :q)"
-        ), {"id": str(uuid4()), "q": json.dumps({"fixed_temperature": 1.0, "strict_tool_call_ids": True})})
+        db_session.execute(
+            text(
+                "INSERT INTO infra_llm_models "
+                "(model_id, model_name, provider, api_key_encrypted, is_active, quirks) "
+                "VALUES (:id, 'test-reg-load', 'moonshot', 'enc', 1, :q)"
+            ),
+            {
+                "id": str(uuid4()),
+                "q": json.dumps({"fixed_temperature": 1.0, "strict_tool_call_ids": True}),
+            },
+        )
         db_session.commit()
 
         registry = ModelRegistry()
@@ -238,13 +282,19 @@ class TestRegistryLoadsFixedTemperature:
 
         provider = MagicMock()
         provider.complete.return_value = LLMResponse(
-            content="ok", model="kimi-k2.5", provider=LLMProvider.OPENAI,
-            tokens_prompt=10, tokens_completion=5, tokens_total=15,
-            latency_ms=100, cost_usd=0.0,
+            content="ok",
+            model="kimi-k2.5",
+            provider=LLMProvider.OPENAI,
+            tokens_prompt=10,
+            tokens_completion=5,
+            tokens_total=15,
+            latency_ms=100,
+            cost_usd=0.0,
         )
 
         cfg = ModelConfig(
-            model_name="kimi-k2.5", provider="moonshot",
+            model_name="kimi-k2.5",
+            provider="moonshot",
             quirks=ModelQuirks(fixed_temperature=1.0, strict_tool_call_ids=True),
         )
 
@@ -252,7 +302,9 @@ class TestRegistryLoadsFixedTemperature:
             client._dispatch("kimi-k2.5", "complete", messages=[], temperature=0.7)
 
         _, kwargs = provider.complete.call_args
-        assert kwargs["temperature"] == 1.0, f"Expected temperature=1.0, got {kwargs.get('temperature')}"
+        assert kwargs["temperature"] == 1.0, (
+            f"Expected temperature=1.0, got {kwargs.get('temperature')}"
+        )
 
 
 from unittest.mock import MagicMock

@@ -96,15 +96,15 @@ def _try_repair_tool_args(tc_name: str, raw: str) -> dict | None:
     i = 0
     while i < len(s):
         ch = s[i]
-        if ch == '"' and (i == 0 or s[i - 1] != '\\'):
+        if ch == '"' and (i == 0 or s[i - 1] != "\\"):
             in_str = not in_str
             fixed.append(ch)
-        elif in_str and ch == '\n':
-            fixed.append('\\n')
-        elif in_str and ch == '\t':
-            fixed.append('\\t')
-        elif in_str and ch == '\r':
-            fixed.append('\\r')
+        elif in_str and ch == "\n":
+            fixed.append("\\n")
+        elif in_str and ch == "\t":
+            fixed.append("\\t")
+        elif in_str and ch == "\r":
+            fixed.append("\\r")
         else:
             fixed.append(ch)
         i += 1
@@ -117,7 +117,8 @@ def _try_repair_tool_args(tc_name: str, raw: str) -> dict | None:
         if word in ("true", "false", "null"):
             return m.group(0)
         return f': "{word}"{m.group(2)}'
-    s = _re.sub(r':\s*([a-zA-Z_]\w*)(\s*[,}\]])', _quote_bare, s)
+
+    s = _re.sub(r":\s*([a-zA-Z_]\w*)(\s*[,}\]])", _quote_bare, s)
 
     # 5. Try parsing now
     try:
@@ -127,12 +128,12 @@ def _try_repair_tool_args(tc_name: str, raw: str) -> dict | None:
 
     # 5. Truncated — try closing open braces/brackets/quotes
     #    Count unmatched openers and append closers.
-    depth_brace = s.count('{') - s.count('}')
-    depth_bracket = s.count('[') - s.count(']')
+    depth_brace = s.count("{") - s.count("}")
+    depth_bracket = s.count("[") - s.count("]")
     if in_str:
         s += '"'
-    s += ']' * max(depth_bracket, 0)
-    s += '}' * max(depth_brace, 0)
+    s += "]" * max(depth_bracket, 0)
+    s += "}" * max(depth_brace, 0)
     try:
         result = json.loads(s)
         logger.info("Repaired truncated tool_call JSON for %s", tc_name)
@@ -165,7 +166,8 @@ async def _with_heartbeat(sse_generator: AsyncIterator[str]) -> AsyncIterator[st
         while True:
             try:
                 item = await asyncio.wait_for(
-                    queue.get(), timeout=HEARTBEAT_INTERVAL_S,
+                    queue.get(),
+                    timeout=HEARTBEAT_INTERVAL_S,
                 )
             except asyncio.TimeoutError:
                 yield _sse_ping()
@@ -191,19 +193,24 @@ async def _with_heartbeat(sse_generator: AsyncIterator[str]) -> AsyncIterator[st
 # Request / Response models
 # ---------------------------------------------------------------------------
 
+
 class ChatRequest(BaseModel):
     """Chat request — session_id optional (auto-created if omitted)."""
+
     message: str = Field(description="User message")
     session_id: str | None = Field(default=None, description="Session ID (auto-created if omitted)")
     agent_id: str | None = Field(default=None, description="Agent ID")
     model: str | None = Field(default=None, description="Model to use for this request")
     context: dict | None = Field(default=None, description="Optional context")
     max_candidates: int = Field(default=5, description="Max skill candidates")
-    explain: bool = Field(default=False, description="Return execution stats (like EXPLAIN ANALYZE)")
+    explain: bool = Field(
+        default=False, description="Return execution stats (like EXPLAIN ANALYZE)"
+    )
 
 
 class EdgeProfileModel(BaseModel):
     """Validated edge profile schema."""
+
     # extra="ignore" for forward compatibility: older servers accept newer edge fields.
     # Trade-off: typos like "git_brach" are silently ignored. Mitigated by edge-side
     # validation in detect_edge_profile() which constructs the dict programmatically.
@@ -217,20 +224,38 @@ class EdgeProfileModel(BaseModel):
 
 class ChatTurnRequest(BaseModel):
     """Edge-cloud /chat/turn request — one LLM turn in the agentic loop."""
+
     messages: list[dict[str, Any]] = Field(description="Conversation messages from edge")
-    session_id: str | None = Field(default=None, description="Session ID (auto-created on first turn)")
-    tool_results: list[dict[str, Any]] | None = Field(default=None, description="Tool execution results from edge")
-    project_rules: str | None = Field(default=None, description="Project rules (sent on first turn)")
+    session_id: str | None = Field(
+        default=None, description="Session ID (auto-created on first turn)"
+    )
+    tool_results: list[dict[str, Any]] | None = Field(
+        default=None, description="Tool execution results from edge"
+    )
+    project_rules: str | None = Field(
+        default=None, description="Project rules (sent on first turn)"
+    )
     agent_id: str | None = Field(default=None, description="Agent ID")
     model: str | None = Field(default=None, description="Model override")
-    edge_tools: list[dict[str, Any]] | None = Field(default=None, description="Edge tool schemas (OpenAI format)")
-    edge_profile: EdgeProfileModel | None = Field(default=None, description="Edge project profile (cwd, git_branch, languages, project_type)")
-    explain: bool | str = Field(default=False, description="Execution trace: true for normal, 'verbose' for detailed with content previews")
-    router: str | None = Field(default=None, description="Routing strategy name (default: env ROUTING_STRATEGY or 'default')")
+    edge_tools: list[dict[str, Any]] | None = Field(
+        default=None, description="Edge tool schemas (OpenAI format)"
+    )
+    edge_profile: EdgeProfileModel | None = Field(
+        default=None, description="Edge project profile (cwd, git_branch, languages, project_type)"
+    )
+    explain: bool | str = Field(
+        default=False,
+        description="Execution trace: true for normal, 'verbose' for detailed with content previews",
+    )
+    router: str | None = Field(
+        default=None,
+        description="Routing strategy name (default: env ROUTING_STRATEGY or 'default')",
+    )
 
 
 class ChatResponse(BaseModel):
     """Chat response — always returns run_id."""
+
     session_id: str
     run_id: str
     status: str
@@ -280,10 +305,17 @@ def _resolve_skill_versions(names: set[str]) -> dict[str, str]:
 
     if miss:
         from api.models.skill import SkillRegistry as SR
+
         with SessionLocal() as db:
-            rows = db.query(SR.skill_name, SR.version).filter(
-                SR.skill_name.in_(miss), SR.is_active == 1,
-            ).order_by(SR.skill_name, SR.version.desc()).all()
+            rows = (
+                db.query(SR.skill_name, SR.version)
+                .filter(
+                    SR.skill_name.in_(miss),
+                    SR.is_active == 1,
+                )
+                .order_by(SR.skill_name, SR.version.desc())
+                .all()
+            )
             found: set[str] = set()
             for name, ver in rows:
                 if name not in found:  # first row per skill = latest (ORDER BY version DESC)
@@ -301,14 +333,20 @@ def _ensure_session(db: Session, user_id: str, session_id: str | None, agent_id:
     """Return existing session_id or create a new one."""
     if session_id:
         from api.models.agent import Session as SessionModel
-        row = db.query(SessionModel.session_id).filter(SessionModel.session_id == session_id).first()
+
+        row = (
+            db.query(SessionModel.session_id).filter(SessionModel.session_id == session_id).first()
+        )
         if not row:
             raise HTTPException(status_code=404, detail="Session not found")
         return session_id
 
     from core.events.session_manager import SessionManager
+
     mgr = SessionManager(db)
-    session = mgr.create_session(user_id=user_id, metadata={"agent_id": agent_id} if agent_id else None)
+    session = mgr.create_session(
+        user_id=user_id, metadata={"agent_id": agent_id} if agent_id else None
+    )
     return session.session_id
 
 
@@ -348,10 +386,11 @@ def _get_shared_components(db_factory):
         from core.skills.tool_registry import ToolRegistry, ToolSource
         from core.verification.firewall import HallucinationFirewall
 
-        if os.environ.get('DISABLE_GATE_TRIGGER'):
+        if os.environ.get("DISABLE_GATE_TRIGGER"):
             _shared_gate_trigger = None
         else:
             from core.evaluation.gate_trigger import GateTrigger
+
             _shared_gate_trigger = GateTrigger(db_factory=db_factory)
 
         _shared_skill_catalog = SkillCatalog(db_factory, gate_trigger=_shared_gate_trigger)
@@ -359,7 +398,9 @@ def _get_shared_components(db_factory):
             runtime=create_runtime(min_isolation=IsolationLevel.PROCESS),
             db_factory=db_factory,
         )
-        register_builtin_skills(_shared_skill_catalog, db_factory, code_executor=_shared_code_executor)
+        register_builtin_skills(
+            _shared_skill_catalog, db_factory, code_executor=_shared_code_executor
+        )
         _shared_context_manager = ContextManager(db_factory, gate_trigger=_shared_gate_trigger)
 
         _shared_tool_registry = ToolRegistry(embed_fn=_get_shared_embed_fn())
@@ -388,6 +429,7 @@ def _build_chat_loop(db_factory):
     try:
         from core.events.event_logger import _PIPELINE_ENABLED
         from core.events.pipeline import EventPipeline
+
         if _PIPELINE_ENABLED:
             pipeline = EventPipeline(db_factory)
             pipeline.start()
@@ -407,6 +449,7 @@ def _build_chat_loop(db_factory):
     )
 
     from core.memory import create_memory_service
+
     loop.set_observer(create_memory_service(db_factory, llm_client=llm_client))
 
     return loop
@@ -415,6 +458,7 @@ def _build_chat_loop(db_factory):
 def _get_engine():
     from api.database import SessionLocal
     from core.agent.run_engine import RunEngine
+
     return RunEngine(SessionLocal, chat_loop_factory=_build_chat_loop)
 
 
@@ -498,8 +542,10 @@ async def chat(
     )
 
     import asyncio
+
     task = asyncio.create_task(engine.start_run(run))
     from core.agent.run_engine import _run_tasks
+
     _run_tasks[run.run_id] = task
 
     return ChatResponse(session_id=session_id, run_id=run.run_id, status=run.status.value)
@@ -534,9 +580,17 @@ def _transform_event_for_client(event: dict) -> dict:
 
     # ── Tool use ──
     if event_type == "tool_call_start":
-        return {"type": "tool_call_start", "tool": data.get("tool", ""), "call_id": data.get("call_id", "")}
+        return {
+            "type": "tool_call_start",
+            "tool": data.get("tool", ""),
+            "call_id": data.get("call_id", ""),
+        }
     if event_type == "tool_result":
-        return {"type": "tool_result", "call_id": data.get("call_id", ""), "result": data.get("result", "")}
+        return {
+            "type": "tool_result",
+            "call_id": data.get("call_id", ""),
+            "result": data.get("result", ""),
+        }
 
     # ── Lifecycle ──
     if event_type == "run_started":
@@ -552,17 +606,33 @@ def _transform_event_for_client(event: dict) -> dict:
     if event_type == "plan_step_start":
         return {"type": "plan_step_start", "step": data.get("step", "")}
     if event_type == "plan_step_done":
-        return {"type": "plan_step_done", "step": data.get("step", ""), "result": data.get("result", "")}
+        return {
+            "type": "plan_step_done",
+            "step": data.get("step", ""),
+            "result": data.get("result", ""),
+        }
     if event_type == "plan_revised":
         return {"type": "plan_revised", "plan": data.get("plan", {})}
 
     # ── Multi-agent ──
     if event_type == "agent_delegated":
-        return {"type": "agent_delegated", "agent_id": data.get("agent_id", ""), "task": data.get("task", "")}
+        return {
+            "type": "agent_delegated",
+            "agent_id": data.get("agent_id", ""),
+            "task": data.get("task", ""),
+        }
     if event_type == "agent_progress":
-        return {"type": "agent_progress", "agent_id": data.get("agent_id", ""), "progress": data.get("progress", "")}
+        return {
+            "type": "agent_progress",
+            "agent_id": data.get("agent_id", ""),
+            "progress": data.get("progress", ""),
+        }
     if event_type == "agent_completed":
-        return {"type": "agent_completed", "agent_id": data.get("agent_id", ""), "result": data.get("result", "")}
+        return {
+            "type": "agent_completed",
+            "agent_id": data.get("agent_id", ""),
+            "result": data.get("result", ""),
+        }
 
     # ── Keepalive ──
     if event_type == "keepalive":
@@ -607,8 +677,10 @@ async def chat_stream(
             )
 
             import asyncio
+
             task = asyncio.create_task(engine.start_run(run))
             from core.agent.run_engine import _run_tasks
+
             _run_tasks[run.run_id] = task
 
             yield f"data: {json.dumps({'type': 'session_info', 'session_id': session_id, 'run_id': run.run_id})}\n\n"
@@ -619,7 +691,11 @@ async def chat_stream(
                 yield f"data: {json.dumps(client_event)}\n\n"
         except Exception as e:
             logger.error(f"Stream error: {e}", exc_info=True)
-            code = status_to_error_code(e.status_code) if isinstance(e, HTTPException) else "INTERNAL_ERROR"
+            code = (
+                status_to_error_code(e.status_code)
+                if isinstance(e, HTTPException)
+                else "INTERNAL_ERROR"
+            )
             msg = e.detail if isinstance(e, HTTPException) else str(e)
             yield f"data: {json.dumps({'type': 'error', 'message': msg, 'code': code, 'retryable': False})}\n\n"
 
@@ -678,7 +754,11 @@ async def stream_run(
                 yield f"data: {json.dumps(event)}\n\n"
         except Exception as e:
             logger.error(f"Stream run error: {e}", exc_info=True)
-            code = status_to_error_code(e.status_code) if isinstance(e, HTTPException) else "INTERNAL_ERROR"
+            code = (
+                status_to_error_code(e.status_code)
+                if isinstance(e, HTTPException)
+                else "INTERNAL_ERROR"
+            )
             msg = e.detail if isinstance(e, HTTPException) else str(e)
             yield f"data: {json.dumps({'type': 'error', 'message': msg, 'code': code, 'retryable': False})}\n\n"
 
@@ -872,8 +952,10 @@ def _verify_session_owner(user_id: str, session_id: str, db: Session | None = No
     Accepts an optional *db* session to avoid opening a second connection
     when the caller already holds one (e.g. _build_reflect_evidence).
     """
+
     def _check(conn: Session) -> None:
         from api.models.agent import Session as SessionModel
+
         row = conn.query(SessionModel.user_id).filter(SessionModel.session_id == session_id).first()
         if not row:
             raise HTTPException(status_code=404, detail="Session not found")
@@ -887,7 +969,15 @@ def _verify_session_owner(user_id: str, session_id: str, db: Session | None = No
             _check(conn)
 
 
-_ReflectFocus = Literal["auto", "skill_failure", "unexpected_result", "data_quality", "tool_selection", "history", "performance"]
+_ReflectFocus = Literal[
+    "auto",
+    "skill_failure",
+    "unexpected_result",
+    "data_quality",
+    "tool_selection",
+    "history",
+    "performance",
+]
 
 
 def _escape_like(text: str) -> str:
@@ -896,8 +986,11 @@ def _escape_like(text: str) -> str:
 
 
 def _gather_tool_selection(
-    session_id: str, question: str, db: Any,
-    hints: list[str], result: dict[str, Any],
+    session_id: str,
+    question: str,
+    db: Any,
+    hints: list[str],
+    result: dict[str, Any],
 ) -> None:
     """Gather cloud skills, edge tools, and usage counts into *result*."""
     # Cloud skills from in-memory registry.
@@ -913,11 +1006,13 @@ def _gather_tool_selection(
                     continue
                 seen_skills.add(skill.name)
                 schema = skill.to_openai_schema()
-                cloud_skills.append({
-                    "name": skill.name,
-                    "description": skill.description,
-                    "parameters": schema.get("function", {}).get("parameters", {}),
-                })
+                cloud_skills.append(
+                    {
+                        "name": skill.name,
+                        "description": skill.description,
+                        "parameters": schema.get("function", {}).get("parameters", {}),
+                    }
+                )
         result["cloud_skills"] = cloud_skills
     except Exception:
         logger.debug("Failed to load cloud skills for tool_selection", exc_info=True)
@@ -925,17 +1020,22 @@ def _gather_tool_selection(
 
     entry = _peek_session_entry(session_id)
     result["edge_tools"] = [
-        {"name": t.get("function", {}).get("name", "?"),
-         "description": t.get("function", {}).get("description", "")[:80]}
+        {
+            "name": t.get("function", {}).get("name", "?"),
+            "description": t.get("function", {}).get("description", "")[:80],
+        }
         for t in (entry.get("tools", []) if entry else [])
     ]
 
     # Tool usage counts from events
     from api.models.agent import Event as EventModel
+
     usage_rows = (
         db.query(EventModel.content)
         .filter(EventModel.session_id == session_id, EventModel.event_type == "tool_call")
-        .order_by(EventModel.created_at.desc()).limit(50).all()
+        .order_by(EventModel.created_at.desc())
+        .limit(50)
+        .all()
     )
     tool_usage: dict[str, int] = {}
     for (c,) in usage_rows:
@@ -957,15 +1057,24 @@ def _gather_tool_selection(
 
 
 def _gather_history(
-    session_id: str, user_id: str, question: str, db: Any,
+    session_id: str,
+    user_id: str,
+    question: str,
+    db: Any,
     result: dict[str, Any],
 ) -> None:
     """Find similar queries from past sessions using multi-keyword AND match."""
     from api.models.agent import Event as EventModel
 
-    cur_query = db.query(EventModel.content).filter(
-        EventModel.session_id == session_id, EventModel.event_type == "user_query",
-    ).order_by(EventModel.created_at.desc()).first()
+    cur_query = (
+        db.query(EventModel.content)
+        .filter(
+            EventModel.session_id == session_id,
+            EventModel.event_type == "user_query",
+        )
+        .order_by(EventModel.created_at.desc())
+        .first()
+    )
     cur_text = (cur_query[0] if cur_query else question) or ""
 
     if not cur_text:
@@ -993,13 +1102,15 @@ def _gather_history(
         {"uid": user_id, "sid": session_id, "q": match_expr},
     ).fetchall()
     result["related_history"] = [
-        {"session_id": r[0], "query": (r[1] or "")[:200], "ts": str(r[2])}
-        for r in past_rows
+        {"session_id": r[0], "query": (r[1] or "")[:200], "ts": str(r[2])} for r in past_rows
     ]
 
 
 def _build_reflect_evidence(
-    session_id: str, user_id: str, focus: _ReflectFocus, last_n: int,
+    session_id: str,
+    user_id: str,
+    focus: _ReflectFocus,
+    last_n: int,
     question: str = "",
 ) -> dict[str, Any]:
     """Thin wrapper kept for backward compatibility with existing tests.
@@ -1007,6 +1118,7 @@ def _build_reflect_evidence(
     Delegates to :class:`core.agent.reflect_service.ReflectService`.
     """
     from core.agent.reflect_service import ReflectService
+
     svc = ReflectService(
         db_factory=SessionLocal,
         skill_registry=_get_shared_skill_registry(),
@@ -1019,9 +1131,14 @@ def _get_or_create_session_entry(session_id: str) -> dict[str, Any]:
     """Get existing or create new cache entry (may evict LRU entries)."""
     entry = _session_cache.get(session_id)
     if entry is None:
-        entry = {"history": None, "tools": [], "sections": None,
-                 "spend_usd": 0.0, "turn_count": 0,
-                 "created_at": datetime.now(timezone.utc)}
+        entry = {
+            "history": None,
+            "tools": [],
+            "sections": None,
+            "spend_usd": 0.0,
+            "turn_count": 0,
+            "created_at": datetime.now(timezone.utc),
+        }
         _session_cache[session_id] = entry
     return entry
 
@@ -1045,10 +1162,11 @@ def _classify_task(messages: list[dict[str, Any]]) -> str | None:
     if "```" in lower:
         return "code"
     import re
-    if re.search(r'(?<!\w)\.(py|go|ts|js|rs|java|cpp|rb)\b', lower):
+
+    if re.search(r"(?<!\w)\.(py|go|ts|js|rs|java|cpp|rb)\b", lower):
         return "code"
     # Reasoning: require word boundaries to avoid false positives like "classic".
-    if re.search(r'\b(explain|analyze|reason|compare)\b', lower):
+    if re.search(r"\b(explain|analyze|reason|compare)\b", lower):
         return "reasoning"
     # Default: no hint — let the model router use its default.
     return None
@@ -1100,7 +1218,9 @@ def _build_retrieval_view(
         return history, None  # No query to retrieve against
 
     # Try retrieval from agent_events via HybridRetriever
-    retrieved_block, scores = _retrieve_relevant_context(db, session_id, user_query, history, recent)
+    retrieved_block, scores = _retrieve_relevant_context(
+        db, session_id, user_query, history, recent
+    )
 
     result: list[dict[str, Any]] = []
     if system_msg:
@@ -1132,6 +1252,7 @@ def _retrieve_relevant_context(
     try:
         from core.context.hybrid_retrieval import HybridRetriever
         from core.context.embeddings import EmbeddingService
+
         retriever = _get_shared_retriever()
         svc = _get_shared_embed_svc()
         query_embedding = svc.embed_text(user_query)
@@ -1144,7 +1265,11 @@ def _retrieve_relevant_context(
                 limit=10,
             )
             if events:
-                scores = {e.get("event_id", f"evt_{i}"): e.get("score", 0.0) for i, e in enumerate(events) if e.get("event_id")}
+                scores = {
+                    e.get("event_id", f"evt_{i}"): e.get("score", 0.0)
+                    for i, e in enumerate(events)
+                    if e.get("event_id")
+                }
                 return _format_retrieved_events(events, recent_contents), scores
     except Exception:
         logger.debug("Vector retrieval unavailable, using rule-based fallback")
@@ -1285,6 +1410,7 @@ def _build_turn_messages(
         user_query = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
 
         from core.context.prompt_assembler import EdgeContext, PromptAssembler
+
         edge_ctx = EdgeContext(
             project_rules=project_rules,
             edge_tools=edge_tools or [],
@@ -1305,7 +1431,11 @@ def _build_turn_messages(
         context_capture_id = assembled.snapshot_id
         cached_sections = assembled.sections
         memory_stats = assembled.memory_stats
-        logger.debug("Assembled prompt: %d tokens, snapshot=%s", sum(assembled.token_breakdown.values()), assembled.snapshot_id)
+        logger.debug(
+            "Assembled prompt: %d tokens, snapshot=%s",
+            sum(assembled.token_breakdown.values()),
+            assembled.snapshot_id,
+        )
 
         if history and force_rebuild_system:
             # Replace system message, keep conversation history intact
@@ -1328,6 +1458,7 @@ def _build_turn_messages(
                 )
             if refresh_query:
                 from core.context.prompt_assembler import PromptAssembler
+
                 try:
                     refreshed = PromptAssembler(SessionLocal).refresh_memory(
                         session_id=session_id,
@@ -1357,13 +1488,15 @@ def _build_turn_messages(
                 # Annotate in-place so merged history carries the signal
                 annotated = _annotate_tool_result(tr, assessment)
                 tr.update(annotated)
-            tool_quality_assessments.append({
-                "tool_name": assessment.tool_name,
-                "score": assessment.score,
-                "grade": assessment.grade,
-                "signals": assessment.signals,
-                "stale": assessment.stale,
-            })
+            tool_quality_assessments.append(
+                {
+                    "tool_name": assessment.tool_name,
+                    "score": assessment.score,
+                    "grade": assessment.grade,
+                    "signals": assessment.signals,
+                    "stale": assessment.stale,
+                }
+            )
     entry["tool_quality_assessments"] = tool_quality_assessments
 
     # History integrity: merge incoming tool_results into the correct
@@ -1391,16 +1524,19 @@ def _build_turn_messages(
             tc_id = tr.get("tool_call_id", "") if isinstance(tr, dict) else ""
             if tc_id not in consumed and tc_id in last_tc_ids:
                 result = tr.get("result", "")
-                history.append({
-                    "role": "tool",
-                    "tool_call_id": tc_id,
-                    "content": str(result) if not isinstance(result, str) else result,
-                })
+                history.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": str(result) if not isinstance(result, str) else result,
+                    }
+                )
 
     # ── History Compaction ──────────────────────────────────────────────
     # Compact history to avoid context overflow. See _HISTORY_COMPACTION_LIMIT
     # at file top for rationale on the 16K limit.
     from core.context.compaction import compact, needs_compaction
+
     if needs_compaction(history, _HISTORY_COMPACTION_LIMIT):
         history = compact(history, _HISTORY_COMPACTION_LIMIT)
         logger.debug("History compacted to fit context window")
@@ -1415,14 +1551,19 @@ def _build_turn_messages(
     #   system_prompt + retrieved_relevant_old_turns + recent_messages
     # Full history stays in cache for persistence/recovery.
     llm_messages, retrieval_scores = _build_retrieval_view(
-        history, session_id, messages, db,
+        history,
+        session_id,
+        messages,
+        db,
     )
 
     # Persist retrieval relevance scores to ctx_snapshots for introspection
     if retrieval_scores and context_capture_id:
         try:
             db.execute(
-                text("UPDATE ctx_snapshots SET relevance_scores = :scores WHERE context_capture_id = :cid"),
+                text(
+                    "UPDATE ctx_snapshots SET relevance_scores = :scores WHERE context_capture_id = :cid"
+                ),
                 {"scores": json.dumps(retrieval_scores), "cid": context_capture_id},
             )
             db.commit()
@@ -1441,7 +1582,10 @@ _MAX_RECOVERY_EVENTS = 50
 
 
 def _recover_history_from_db(
-    db: Session, user_id: str, session_id: str, agent_id: str | None = None,
+    db: Session,
+    user_id: str,
+    session_id: str,
+    agent_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str] | None]:
     """Rebuild conversation history from persisted events (for server restart recovery).
 
@@ -1454,10 +1598,13 @@ def _recover_history_from_db(
     # Fast path: try snapshot first
     try:
         from api.models.agent import Event as EventModel
+
         snap_row = (
             db.query(EventModel.content, EventModel.created_at)
-            .filter(EventModel.session_id == session_id,
-                    EventModel.event_type == "session_history_snapshot")
+            .filter(
+                EventModel.session_id == session_id,
+                EventModel.event_type == "session_history_snapshot",
+            )
             .order_by(EventModel.created_at.desc())
             .first()
         )
@@ -1467,13 +1614,16 @@ def _recover_history_from_db(
                 # Use the LAST user message for memory retrieval — first_query
                 # would be stale for long conversations.
                 from core.context.prompt_assembler import PromptAssembler
+
                 last_query = next(
                     (m.get("content", "") for m in reversed(history) if m.get("role") == "user"),
                     "",
                 )
                 assembled = PromptAssembler(SessionLocal).assemble(
-                    agent_id=agent_id, user_query=last_query,
-                    session_id=session_id, user_id=user_id,
+                    agent_id=agent_id,
+                    user_query=last_query,
+                    session_id=session_id,
+                    user_id=user_id,
                 )
                 # Replace system message with fresh one (may have updated agent config)
                 history[0] = {"role": "system", "content": assembled.system_message}
@@ -1482,9 +1632,14 @@ def _recover_history_from_db(
                 # was at turn 3 but conversation continued to turn 5).
                 snap_ts = snap_row[1]
                 if snap_ts:
-                    _event_types = ('user_query', 'llm_response', 'tool_call', 'tool_result')
+                    _event_types = ("user_query", "llm_response", "tool_call", "tool_result")
                     post_rows = (
-                        db.query(EventModel.event_type, EventModel.content, EventModel.event_metadata, EventModel.reasoning_content)
+                        db.query(
+                            EventModel.event_type,
+                            EventModel.content,
+                            EventModel.event_metadata,
+                            EventModel.reasoning_content,
+                        )
                         .filter(
                             EventModel.session_id == session_id,
                             EventModel.event_type.in_(_event_types),
@@ -1504,9 +1659,15 @@ def _recover_history_from_db(
     # Fallback: event-by-event reconstruction
     try:
         from api.models.agent import Event as EventModel
-        _event_types = ('user_query', 'llm_response', 'tool_call', 'tool_result')
+
+        _event_types = ("user_query", "llm_response", "tool_call", "tool_result")
         rows = (
-            db.query(EventModel.event_type, EventModel.content, EventModel.event_metadata, EventModel.reasoning_content)
+            db.query(
+                EventModel.event_type,
+                EventModel.content,
+                EventModel.event_metadata,
+                EventModel.reasoning_content,
+            )
             .filter(
                 EventModel.session_id == session_id,
                 EventModel.event_type.in_(_event_types),
@@ -1525,13 +1686,14 @@ def _recover_history_from_db(
                 last_query = r[1] or ""
                 break
         from core.context.prompt_assembler import PromptAssembler
+
         assembled = PromptAssembler(SessionLocal).assemble(
-            agent_id=agent_id, user_query=last_query,
-            session_id=session_id, user_id=user_id,
+            agent_id=agent_id,
+            user_query=last_query,
+            session_id=session_id,
+            user_id=user_id,
         )
-        history: list[dict[str, Any]] = [
-            {"role": "system", "content": assembled.system_message}
-        ]
+        history: list[dict[str, Any]] = [{"role": "system", "content": assembled.system_message}]
         history = _append_recovered_events(history, rows)
         return history, assembled.sections
     except SQLAlchemyError as e:
@@ -1583,9 +1745,9 @@ def _persist_turn_events(
     skill_versions: dict[str, str] = {}
     try:
         all_names = set()
-        for tr in (tool_results or []):
+        for tr in tool_results or []:
             all_names.add(tr.get("name", ""))
-        for tc in (tool_calls or []):
+        for tc in tool_calls or []:
             all_names.add(tc.get("function", {}).get("name", ""))
         all_names.discard("")
         if all_names:
@@ -1597,7 +1759,9 @@ def _persist_turn_events(
     try:
         if user_content:
             user_ev = el.create_user_query(
-                user_id=user_id, session_id=session_id, content=user_content,
+                user_id=user_id,
+                session_id=session_id,
+                content=user_content,
                 causal_chain_id=causal_chain_id,
                 event_id=user_query_event_id,
             )
@@ -1610,7 +1774,8 @@ def _persist_turn_events(
     try:
         if routing_meta and not routing_meta.get("skipped"):
             el.create_stream_event(
-                user_id=user_id, session_id=session_id,
+                user_id=user_id,
+                session_id=session_id,
                 event_type="routing_decision",
                 content=json.dumps(routing_meta),
                 parent_event_id=parent_event_id,
@@ -1629,9 +1794,12 @@ def _persist_turn_events(
                 if tr_name == "get_agent_info":
                     meta["introspection"] = True
                 el.create_stream_event(
-                    user_id=user_id, session_id=session_id,
+                    user_id=user_id,
+                    session_id=session_id,
                     event_type="tool_result",
-                    content=json.dumps({"name": tr_name, "result": tr.get("result", "")[:_AUDIT_CHARS]}),
+                    content=json.dumps(
+                        {"name": tr_name, "result": tr.get("result", "")[:_AUDIT_CHARS]}
+                    ),
                     parent_event_id=parent_event_id,
                     causal_chain_id=causal_chain_id,
                     metadata=meta,
@@ -1641,6 +1809,7 @@ def _persist_turn_events(
             # Backfill execution metrics on the most recent skill_selection_event
             try:
                 from core.agent.turn_hooks import TurnHooks
+
                 _bh = TurnHooks(SessionLocal)
                 _bh.backfill_selection_metrics(session_id, tool_results)
             except Exception:
@@ -1655,7 +1824,8 @@ def _persist_turn_events(
             for qa in assessments:
                 if qa["grade"] != "complete":
                     el.create_stream_event(
-                        user_id=user_id, session_id=session_id,
+                        user_id=user_id,
+                        session_id=session_id,
                         event_type="tool_result_quality",
                         content=json.dumps(qa),
                         parent_event_id=parent_event_id,
@@ -1682,12 +1852,21 @@ def _persist_turn_events(
                 # Written to metadata (not content) for consistent querying — tool_result events
                 # already use metadata.source, so tool_call must match.
                 tc_source = tc.get("_source", "edge")
-                tc_content: dict[str, Any] = {"tool_call_id": tc_id, "name": tc_name, "arguments": tc_func.get("arguments", "{}")}
+                tc_content: dict[str, Any] = {
+                    "tool_call_id": tc_id,
+                    "name": tc_name,
+                    "arguments": tc_func.get("arguments", "{}"),
+                }
                 if tc_source == "cloud":
                     tc_content["source"] = "cloud"
-                tc_meta: dict[str, Any] = {"tool_call_id": tc_id, "name": tc_name, "source": tc_source}
+                tc_meta: dict[str, Any] = {
+                    "tool_call_id": tc_id,
+                    "name": tc_name,
+                    "source": tc_source,
+                }
                 el.create_stream_event(
-                    user_id=user_id, session_id=session_id,
+                    user_id=user_id,
+                    session_id=session_id,
                     event_type="tool_call",
                     content=json.dumps(tc_content),
                     parent_event_id=parent_event_id,
@@ -1707,9 +1886,12 @@ def _persist_turn_events(
             for ctr in cloud_tool_results:
                 ctr_name = ctr.get("name", "")
                 el.create_stream_event(
-                    user_id=user_id, session_id=session_id,
+                    user_id=user_id,
+                    session_id=session_id,
                     event_type="tool_result",
-                    content=json.dumps({"name": ctr_name, "result": ctr.get("result", "")[:_AUDIT_CHARS]}),
+                    content=json.dumps(
+                        {"name": ctr_name, "result": ctr.get("result", "")[:_AUDIT_CHARS]}
+                    ),
                     parent_event_id=parent_event_id,
                     causal_chain_id=causal_chain_id,
                     metadata={
@@ -1736,9 +1918,11 @@ def _persist_turn_events(
             # avoid duplicating it on the llm_response event.
             _rc_for_llm_resp = reasoning_content if (reasoning_content and not tool_calls) else None
             llm_resp_ev = el.create_llm_response(
-                user_id=user_id, session_id=session_id,
+                user_id=user_id,
+                session_id=session_id,
                 content=_content,
-                agent_id="dev-agent", agent_version="0.1.0",
+                agent_id="dev-agent",
+                agent_version="0.1.0",
                 parent_event_id=parent_event_id,
                 causal_chain_id=causal_chain_id,
                 llm_model_used=model_used,
@@ -1752,22 +1936,31 @@ def _persist_turn_events(
         # (edge returning tool_results) don't change the conversation shape,
         # so snapshotting them wastes storage without aiding recovery.
         _is_new_user_turn = user_content is not None
-        if (history and _is_new_user_turn
-                and turn_count > 0 and turn_count % _SNAPSHOT_TURN_INTERVAL == 0):
+        if (
+            history
+            and _is_new_user_turn
+            and turn_count > 0
+            and turn_count % _SNAPSHOT_TURN_INTERVAL == 0
+        ):
             # Compact snapshot: strip verbose tool result content to reduce storage.
             # Recovery only needs message structure (roles, tool_call_ids), not full results.
             compact_history = []
             for msg in history:
                 if msg.get("role") == "tool":
                     content = msg.get("content", "")
-                    compact_history.append({
-                        **msg,
-                        "content": content[:500] + " [truncated]" if len(content) > 500 else content,
-                    })
+                    compact_history.append(
+                        {
+                            **msg,
+                            "content": content[:500] + " [truncated]"
+                            if len(content) > 500
+                            else content,
+                        }
+                    )
                 else:
                     compact_history.append(msg)
             el.create_stream_event(
-                user_id=user_id, session_id=session_id,
+                user_id=user_id,
+                session_id=session_id,
                 event_type="session_history_snapshot",
                 content=json.dumps(compact_history),
                 parent_event_id=parent_event_id,
@@ -1780,6 +1973,7 @@ def _persist_turn_events(
         # parent_event_id = user query event; llm_response_event_id = LLM reply.
         if context_capture_id and parent_event_id:
             from core.context.manager import ContextManager
+
             ContextManager.update_snapshot_llm_ids(
                 SessionLocal,
                 context_capture_id,
@@ -1792,14 +1986,27 @@ def _persist_turn_events(
     # Phase 4: post-turn hooks (decision audit, skill selection, observer, feedback)
     try:
         from core.agent.turn_hooks import TurnHooks
-        hooks = TurnHooks(SessionLocal, llm_client=_get_shared_llm_client(), embed_fn=_get_shared_embed_fn())
+
+        hooks = TurnHooks(
+            SessionLocal, llm_client=_get_shared_llm_client(), embed_fn=_get_shared_embed_fn()
+        )
 
         if parent_event_id:
             hooks.record_ctx_decision_audits(
-                session_id, parent_event_id, tool_calls, full_text,
-                context_capture_id, model_used=model_used,
+                session_id,
+                parent_event_id,
+                tool_calls,
+                full_text,
+                context_capture_id,
+                model_used=model_used,
             )
-            hooks.record_skill_selection(session_id, user_content or "", tool_calls, agent_id=agent_id, skill_versions=skill_versions)
+            hooks.record_skill_selection(
+                session_id,
+                user_content or "",
+                tool_calls,
+                agent_id=agent_id,
+                skill_versions=skill_versions,
+            )
 
             # Backfill execution metrics when tool_results and selection happen in the same turn
             # (cloud skills: user_query → tool_call → tool_result all in one persist call).
@@ -1818,15 +2025,21 @@ def _persist_turn_events(
         if full_text and tool_calls:
             logger.debug(
                 "Observer skipped: intermediate turn has text (%d chars) + %d tool_calls",
-                len(full_text), len(tool_calls),
+                len(full_text),
+                len(tool_calls),
             )
         if is_final_reply:
             observer_messages: list[dict[str, Any]] = []
             if user_content:
                 observer_messages.append({"role": "user", "content": user_content})
             observer_messages.append({"role": "assistant", "content": full_text})
-            hooks.run_observer(session_id, user_id, observer_messages,
-                               turn_count=turn_count, session_start=session_start)
+            hooks.run_observer(
+                session_id,
+                user_id,
+                observer_messages,
+                turn_count=turn_count,
+                session_start=session_start,
+            )
 
         if user_content:
             hooks.detect_implicit_feedback(user_content, messages, parent_event_id)
@@ -1851,6 +2064,7 @@ def _persist_turn_events(
         _sdb = SessionLocal()
         try:
             from sqlalchemy import text as _text
+
             _sdb.execute(
                 _text("""
                     UPDATE agent_sessions
@@ -1884,11 +2098,12 @@ def _get_session_tool_registry(
     The registry is rebuilt per-turn (cheap — just dict inserts).
     """
     from core.skills.tool_registry import ToolRegistry, ToolSource
+
     embed_fn = _get_shared_embed_fn()
     registry = ToolRegistry(embed_fn=embed_fn)
     # memory_program is a core edge tool — always pin it so cloud skills don't crowd it out
     _EDGE_PINNED = frozenset({"memory_program"})
-    for schema in (edge_tools or []):
+    for schema in edge_tools or []:
         name = schema.get("function", {}).get("name", "")
         registry.register_schema(schema, ToolSource.EDGE, pinned=(name in _EDGE_PINNED))
     return registry
@@ -1901,6 +2116,7 @@ def _get_shared_llm_client():
         with _shared_llm_lock:
             if _shared_llm_client is None:
                 from core.llm.client import LLMClient
+
                 _shared_llm_client = LLMClient(SessionLocal)
     return _shared_llm_client
 
@@ -1923,6 +2139,7 @@ def _get_shared_retriever():
         with _shared_retriever_lock:
             if _shared_retriever is None:
                 from core.context.hybrid_retrieval import HybridRetriever
+
                 _shared_retriever = HybridRetriever(SessionLocal)
     return _shared_retriever
 
@@ -1933,6 +2150,7 @@ def _get_shared_embed_svc():
         with _shared_retriever_lock:
             if _shared_embed_svc is None:
                 from core.context.embeddings import EmbeddingService
+
                 _shared_embed_svc = EmbeddingService(SessionLocal)
     return _shared_embed_svc
 
@@ -1942,18 +2160,22 @@ def _update_snapshot_tool_tokens(snapshot_id: str, actual_tool_tokens: int) -> N
     db = SessionLocal()
     try:
         from sqlalchemy import text
+
         # Get current token_budget
         row = db.execute(
             text("SELECT token_budget FROM ctx_snapshots WHERE context_capture_id = :cid"),
-            {"cid": snapshot_id}
+            {"cid": snapshot_id},
         ).fetchone()
         if row and row[0]:
             import json
+
             budget = json.loads(row[0]) if isinstance(row[0], str) else row[0]
             budget["tool_schemas"] = actual_tool_tokens
             db.execute(
-                text("UPDATE ctx_snapshots SET token_budget = :budget WHERE context_capture_id = :cid"),
-                {"budget": json.dumps(budget), "cid": snapshot_id}
+                text(
+                    "UPDATE ctx_snapshots SET token_budget = :budget WHERE context_capture_id = :cid"
+                ),
+                {"budget": json.dumps(budget), "cid": snapshot_id},
             )
             db.commit()
     except Exception:
@@ -2003,18 +2225,19 @@ def _get_cloud_skill_schemas(registry) -> list[dict[str, Any]]:
 async def _execute_cloud_skill(registry, tc_name: str, tc_args: dict[str, Any]) -> str:
     """Execute a cloud skill server-side and return result as string."""
     from core.exceptions import SkillNotFoundError
+
     try:
         skill = registry.get(tc_name)
     except SkillNotFoundError:
         return json.dumps({"error": f"Cloud skill '{tc_name}' not found"})
     try:
-        if hasattr(skill, '_input_cls') and skill._input_cls is not None:
+        if hasattr(skill, "_input_cls") and skill._input_cls is not None:
             validated = skill.validate_input(tc_args)
             output = await skill.execute(validated)
-            if hasattr(output, 'model_dump'):
+            if hasattr(output, "model_dump"):
                 data = output.model_dump(exclude={"cost"}, exclude_none=True)
                 return json.dumps(data, ensure_ascii=False, default=str)
-            return str(getattr(output, 'result', output))
+            return str(getattr(output, "result", output))
         else:
             return await skill.execute(**tc_args)
     except Exception as e:
@@ -2031,6 +2254,7 @@ def _get_shared_embed_fn():
             if _shared_embed_fn is _UNSET:
                 try:
                     from core.context.embeddings import get_embedding_client
+
                     _shared_embed_fn = get_embedding_client().embed
                 except Exception:
                     _shared_embed_fn = None
@@ -2041,15 +2265,21 @@ def _get_shared_embed_fn():
 async def reflect_session(
     session_id: str,
     current_user: Annotated[dict, Depends(get_current_user)],
-    focus: _ReflectFocus = Query(default="auto", description="Focus: auto, skill_failure, unexpected_result, data_quality, tool_selection, history, performance"),
+    focus: _ReflectFocus = Query(
+        default="auto",
+        description="Focus: auto, skill_failure, unexpected_result, data_quality, tool_selection, history, performance",
+    ),
     last_n: int = Query(default=20, ge=1, le=100),
-    question: str = Query(default="", description="Optional: what to investigate (for tool_selection focus)"),
+    question: str = Query(
+        default="", description="Optional: what to investigate (for tool_selection focus)"
+    ),
 ):
     """Unified diagnostic endpoint: event trails, skill decisions, tool selection, cross-session history."""
     user_id = current_user["user_id"]
     _verify_session_owner(user_id, session_id)
 
     from core.agent.reflect_service import ReflectService
+
     svc = ReflectService(
         db_factory=SessionLocal,
         skill_registry=_get_shared_skill_registry(),
@@ -2057,8 +2287,14 @@ async def reflect_session(
     )
 
     import asyncio
+
     return await asyncio.to_thread(
-        svc.build_evidence, session_id, user_id, focus, last_n, question,
+        svc.build_evidence,
+        session_id,
+        user_id,
+        focus,
+        last_n,
+        question,
     )
 
 
@@ -2074,6 +2310,7 @@ async def decision_trace(
     _verify_session_owner(user_id, session_id)
 
     from core.agent.reflect_service import ReflectService
+
     svc = ReflectService(
         db_factory=SessionLocal,
         skill_registry=_get_shared_skill_registry(),
@@ -2081,8 +2318,14 @@ async def decision_trace(
     )
 
     import asyncio
+
     return await asyncio.to_thread(
-        svc.build_evidence, session_id, user_id, "tool_selection", 20, question,
+        svc.build_evidence,
+        session_id,
+        user_id,
+        "tool_selection",
+        20,
+        question,
     )
 
 
@@ -2143,7 +2386,9 @@ async def chat_turn(
                 entry["tools"] = request.edge_tools
                 _session_cache[session_id] = entry
 
-            tools_schema = (existing or {}).get("tools", []) if not request.edge_tools else request.edge_tools
+            tools_schema = (
+                (existing or {}).get("tools", []) if not request.edge_tools else request.edge_tools
+            )
 
             cloud_skill_names: set[str] = set()
             cloud_registry = None
@@ -2159,6 +2404,7 @@ async def chat_turn(
 
             # Build unified registry from all sources
             from core.skills.tool_registry import ToolRegistry, ToolSource
+
             _turn_registry = _get_session_tool_registry(session_id, tools_schema)
 
             # Add cloud skills — pre-filter to avoid registering thousands of
@@ -2182,6 +2428,7 @@ async def chat_turn(
                     # Extract alphabetic words from query for reverse matching
                     # (handles mixed-language queries like "matrixone的issue")
                     import re as _re
+
                     _query_alpha = set(_re.findall(r"[a-z]{3,}", _query_lower))
 
                     _candidates = []
@@ -2190,8 +2437,9 @@ async def chat_turn(
                         if not cs_name or cs_name in edge_tool_names:
                             continue
                         cloud_skill_names.add(cs_name)
-                        _text = (cs_name + " "
-                                 + cs.get("function", {}).get("description", "")).lower()
+                        _text = (
+                            cs_name + " " + cs.get("function", {}).get("description", "")
+                        ).lower()
                         # Forward: query tokens found in skill text
                         _score = sum(1 for t in _query_tokens if t in _text) if _query_tokens else 0
                         # Reverse: skill name parts ↔ query alpha words (bidirectional substring)
@@ -2211,7 +2459,9 @@ async def chat_turn(
                     _candidates.sort(key=lambda x: x[1], reverse=True)
                     for cs, _score in _candidates[:_MAX_CLOUD_CANDIDATES]:
                         _turn_registry.register_schema(
-                            cs, ToolSource.CLOUD, pinned=False,
+                            cs,
+                            ToolSource.CLOUD,
+                            pinned=False,
                         )
                 except Exception as e:
                     logger.debug("Cloud skill loading skipped: %s", e)
@@ -2228,8 +2478,7 @@ async def chat_turn(
                 # which would leak all 10k+ cloud skills into the LLM context.
                 used_names = {tr.get("name", "") for tr in request.tool_results if tr.get("name")}
                 effective_tools_schema = [
-                    t.schema for t in _turn_registry.all_tools()
-                    if t.name in used_names
+                    t.schema for t in _turn_registry.all_tools() if t.name in used_names
                 ] or _turn_registry.select(
                     user_query=user_query,
                     messages=_cached_history or request.messages,
@@ -2250,12 +2499,19 @@ async def chat_turn(
                 _routing_meta = {"skipped": True, "reason": "model_override"}
             else:
                 try:
-                    from core.context.intent_routing import IntentRouter, detect_correction, get_router
+                    from core.context.intent_routing import (
+                        IntentRouter,
+                        detect_correction,
+                        get_router,
+                    )
                     from core.context.routing_metrics import active_request_context
                     from core.metrics import (
-                        adaptive_threshold_value, intent_correction_total,
-                        routing_cache_hit_total, routing_confidence,
-                        routing_efficiency_ratio, routing_fallback_total,
+                        adaptive_threshold_value,
+                        intent_correction_total,
+                        routing_cache_hit_total,
+                        routing_confidence,
+                        routing_efficiency_ratio,
+                        routing_fallback_total,
                         routing_requests_total,
                     )
 
@@ -2267,8 +2523,12 @@ async def chat_turn(
                         _ir = IntentRouter(SessionLocal)
                         _router_name = "default"
                     _force = "question" if (user_query and detect_correction(user_query)) else None
-                    _history_len = len((_cached_entry or {}).get("history") or []) if _cached_entry else 0
-                    _routing_tool_names = [t.get("function", {}).get("name", "") for t in (tools_schema or [])]
+                    _history_len = (
+                        len((_cached_entry or {}).get("history") or []) if _cached_entry else 0
+                    )
+                    _routing_tool_names = [
+                        t.get("function", {}).get("name", "") for t in (tools_schema or [])
+                    ]
 
                     _routing_t0 = time.monotonic()
                     _routing_decision = await _ir.route(
@@ -2291,17 +2551,20 @@ async def chat_turn(
                         "latency_ms": _routing_ms,
                         "forced": _force,
                         "skipped_sections": [
-                            s for s, skip in [
+                            s
+                            for s, skip in [
                                 ("tools", not _routing_decision.plan.load_tools),
                                 ("history", _routing_decision.plan.load_history is False),
                                 ("memory", _routing_decision.plan.load_memory is False),
-                            ] if skip
+                            ]
+                            if skip
                         ],
                         "estimated_tokens": _routing_decision.plan.estimated_tokens,
                     }
                     if _routing_decision.tier1_result:
                         _routing_meta["tier1"] = {
-                            "compressed": _routing_decision.tier1_result.compressed_memory is not None,
+                            "compressed": _routing_decision.tier1_result.compressed_memory
+                            is not None,
                             "pruned_tools": _routing_decision.tier1_result.pruned_tools,
                         }
 
@@ -2319,6 +2582,7 @@ async def chat_turn(
                     # routing_efficiency_ratio: 1 - (routed / full) tokens
                     if _rr.intent and _rr.intent != "question":
                         from core.context.intent_routing import INTENT_PLANS
+
                         _routed_est = _routing_decision.plan.estimated_tokens
                         _full_est = INTENT_PLANS["question"].estimated_tokens
                         if _full_est > 0:
@@ -2333,11 +2597,17 @@ async def chat_turn(
                     _explain_on = bool(request.explain)
                     _verbose_on = request.explain == "verbose"
                     return _build_turn_messages(
-                        db, user_id, session_id,
-                        request.messages, request.tool_results, request.project_rules,
+                        db,
+                        user_id,
+                        session_id,
+                        request.messages,
+                        request.tool_results,
+                        request.project_rules,
                         agent_id=request.agent_id,
                         edge_tools=effective_tools_schema,
-                        edge_profile=request.edge_profile.model_dump(exclude_none=True) if request.edge_profile else None,
+                        edge_profile=request.edge_profile.model_dump(exclude_none=True)
+                        if request.edge_profile
+                        else None,
                         force_rebuild_system=tools_changed,
                         username=current_user.get("username"),
                         explain=_explain_on,
@@ -2359,22 +2629,25 @@ async def chat_turn(
 
             # ── Quality Badge SSE (§5.4) — emit before LLM response ──────
             if _TOOL_QUALITY_ENABLED:
-                for qa in _get_or_create_session_entry(session_id).get("tool_quality_assessments", []):
+                for qa in _get_or_create_session_entry(session_id).get(
+                    "tool_quality_assessments", []
+                ):
                     if qa["grade"] != "complete":
                         yield f"data: {json.dumps({'type': 'tool_result_quality', 'tool_name': qa['tool_name'], 'grade': qa['grade'], 'score': qa['score'], 'signals': qa['signals']})}\n\n"
 
             llm = _get_shared_llm_client()
             with llm.request_context(user_id=user_id), llm.track_auxiliary_calls() as _aux_calls:
-
                 full_text = ""
                 tool_calls: list[dict[str, Any]] = []
                 _turn_reasoning: str = ""  # accumulated reasoning_content for this turn
                 usage: dict[str, int] = {}
                 llm_params: dict[str, Any] = {
-                    k: v for k, v in {
+                    k: v
+                    for k, v in {
                         "temperature": llm.config.get("temperature", 0.7),
                         "max_tokens": llm.config.get("max_tokens"),
-                    }.items() if v is not None
+                    }.items()
+                    if v is not None
                 }
 
                 _deadline = _turn_start + SERVER_TURN_TIMEOUT_S
@@ -2393,7 +2666,9 @@ async def chat_turn(
                 # and feed results back to LLM. Repeat until LLM returns only
                 # edge tool_calls or a final text answer.
                 _MAX_CLOUD_LOOPS = 5
-                _CLOUD_LOOP_MAX_PROMPT_CHARS = 12000  # ~10-16K tokens (file listings are ~0.8 chars/token)
+                _CLOUD_LOOP_MAX_PROMPT_CHARS = (
+                    12000  # ~10-16K tokens (file listings are ~0.8 chars/token)
+                )
                 _current_llm_messages = llm_messages
                 _cloud_skill_failed = False
                 _cloud_skill_error_msg = ""
@@ -2417,9 +2692,15 @@ async def chat_turn(
                     # ones get truncated to 200 chars so the LLM still sees
                     # what tools were called but not the full output.
                     if _cloud_loop > 0:
-                        _total_chars = sum(len(m.get("content") or "") for m in _current_llm_messages)
+                        _total_chars = sum(
+                            len(m.get("content") or "") for m in _current_llm_messages
+                        )
                         if _total_chars > _CLOUD_LOOP_MAX_PROMPT_CHARS:
-                            _tool_indices = [i for i, m in enumerate(_current_llm_messages) if m.get("role") == "tool"]
+                            _tool_indices = [
+                                i
+                                for i, m in enumerate(_current_llm_messages)
+                                if m.get("role") == "tool"
+                            ]
                             for idx in _tool_indices[:-1]:  # keep only last tool result
                                 c = _current_llm_messages[idx].get("content") or ""
                                 if len(c) > 200:
@@ -2429,13 +2710,23 @@ async def chat_turn(
                                     }
 
                     if _cloud_skill_failed:
-                        logger.warning("Cloud loop: final LLM call via chat_stream (no tools), loop=%d", _cloud_loop)
+                        logger.warning(
+                            "Cloud loop: final LLM call via chat_stream (no tools), loop=%d",
+                            _cloud_loop,
+                        )
                     stream: AsyncIterator = (
                         llm.chat_with_tools_stream(
-                            _current_llm_messages, effective_tools_schema, model=model, task_hint=task_hint,
-                        ) if effective_tools_schema and not _cloud_skill_failed else
-                        llm.chat_stream(
-                            _current_llm_messages, user_id, session_id, model=model,
+                            _current_llm_messages,
+                            effective_tools_schema,
+                            model=model,
+                            task_hint=task_hint,
+                        )
+                        if effective_tools_schema and not _cloud_skill_failed
+                        else llm.chat_stream(
+                            _current_llm_messages,
+                            user_id,
+                            session_id,
+                            model=model,
                         )
                     )
                     _timed_out = False
@@ -2458,7 +2749,11 @@ async def chat_turn(
                                 _total_prompt_tokens += p_tok
                                 _total_completion_tokens += c_tok
                                 _has_usage = True
-                                usage = {"prompt": p_tok, "completion": c_tok, "total": p_tok + c_tok}
+                                usage = {
+                                    "prompt": p_tok,
+                                    "completion": c_tok,
+                                    "total": p_tok + c_tok,
+                                }
                                 yield f"data: {json.dumps({'type': 'usage', 'prompt_tokens': p_tok, 'completion_tokens': c_tok, 'cache_read_tokens': chunk.get('cache_read', 0)})}\n\n"
                     except StopAsyncIteration:
                         pass
@@ -2468,7 +2763,9 @@ async def chat_turn(
                     except Exception as _stream_err:
                         if _cloud_skill_failed:
                             # Final LLM call failed — emit the skill error directly as text
-                            logger.warning("Final LLM call after cloud skill failure raised: %s", _stream_err)
+                            logger.warning(
+                                "Final LLM call after cloud skill failure raised: %s", _stream_err
+                            )
                             _fallback = _cloud_skill_error_msg or "The requested operation failed."
                             _loop_text += _fallback
                             yield f"data: {json.dumps({'type': 'text_delta', 'content': _fallback})}\n\n"
@@ -2480,17 +2777,29 @@ async def chat_turn(
                         # Use None for token counts when provider didn't send usage data,
                         # so the client can distinguish "zero tokens" from "unknown".
                         if _has_usage:
-                            _step_p = _total_prompt_tokens - sum(s.get("in", 0) for s in _explain_steps if s["step"] == "llm" and s.get("in") is not None)
-                            _step_c = _total_completion_tokens - sum(s.get("out", 0) for s in _explain_steps if s["step"] == "llm" and s.get("out") is not None)
+                            _step_p = _total_prompt_tokens - sum(
+                                s.get("in", 0)
+                                for s in _explain_steps
+                                if s["step"] == "llm" and s.get("in") is not None
+                            )
+                            _step_c = _total_completion_tokens - sum(
+                                s.get("out", 0)
+                                for s in _explain_steps
+                                if s["step"] == "llm" and s.get("out") is not None
+                            )
                         else:
                             _step_p = None
                             _step_c = None
-                        _explain_steps.append({
-                            "step": "llm", "loop": _cloud_loop,
-                            "duration_ms": round(_llm_elapsed * 1000),
-                            "in": _step_p, "out": _step_c,
-                            "tool_calls": len(_loop_tool_calls),
-                        })
+                        _explain_steps.append(
+                            {
+                                "step": "llm",
+                                "loop": _cloud_loop,
+                                "duration_ms": round(_llm_elapsed * 1000),
+                                "in": _step_p,
+                                "out": _step_c,
+                                "tool_calls": len(_loop_tool_calls),
+                            }
+                        )
 
                     full_text += _loop_text
                     if _loop_reasoning:
@@ -2511,8 +2820,11 @@ async def chat_turn(
 
                     # If a previous cloud skill failed, ignore any new tool_calls from LLM.
                     if _cloud_skill_failed:
-                        logger.warning("Cloud loop: LLM returned %d tool_calls after failure (ignored), text=%r",
-                                       len(_loop_tool_calls), _loop_text[:200])
+                        logger.warning(
+                            "Cloud loop: LLM returned %d tool_calls after failure (ignored), text=%r",
+                            len(_loop_tool_calls),
+                            _loop_text[:200],
+                        )
                         break
 
                     # Partition tool_calls into cloud vs edge.
@@ -2545,7 +2857,11 @@ async def chat_turn(
                     # the preamble to appear twice in session history, which makes
                     # the LLM repeat itself with increasing severity each turn.
                     _tc_entries = [
-                        {"id": tc.get("id", ""), "type": "function", "function": tc.get("function", {})}
+                        {
+                            "id": tc.get("id", ""),
+                            "type": "function",
+                            "function": tc.get("function", {}),
+                        }
                         for tc in cloud_tcs
                     ]
                     assistant_msg_loop: dict[str, Any] = {"role": "assistant"}
@@ -2559,7 +2875,11 @@ async def chat_turn(
                     # _loop_text is already accumulated into full_text (line above)
                     # which goes into the final assistant_msg at session cache persist
                     # time, so omitting content here is safe and intentional.
-                    _history_msg_loop: dict[str, Any] = {"role": "assistant", "content": None, "tool_calls": _tc_entries}
+                    _history_msg_loop: dict[str, Any] = {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": _tc_entries,
+                    }
                     if _loop_reasoning:
                         _history_msg_loop["reasoning_content"] = _loop_reasoning
                     _cloud_loop_history.append(_history_msg_loop)
@@ -2571,7 +2891,9 @@ async def chat_turn(
                         tc_id = tc.get("id", "")
                         args_raw = tc.get("function", {}).get("arguments", "") or "{}"
                         try:
-                            tc_args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                            tc_args = (
+                                json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                            )
                         except json.JSONDecodeError:
                             tc_args = {}
 
@@ -2579,35 +2901,52 @@ async def chat_turn(
                         _skill_start = time.monotonic()
                         cloud_result = await _execute_cloud_skill(cloud_registry, tc_name, tc_args)
                         if request.explain:
-                            _explain_steps.append({
-                                "step": "cloud_skill", "name": tc_name,
-                                "duration_ms": round((time.monotonic() - _skill_start) * 1000),
-                                "in_bytes": len(json.dumps(tc_args)),
-                                "out_bytes": len(cloud_result),
-                            })
+                            _explain_steps.append(
+                                {
+                                    "step": "cloud_skill",
+                                    "name": tc_name,
+                                    "duration_ms": round((time.monotonic() - _skill_start) * 1000),
+                                    "in_bytes": len(json.dumps(tc_args)),
+                                    "out_bytes": len(cloud_result),
+                                }
+                            )
                         # Collect cloud skill execution for deferred persistence
                         # (written by _persist_turn_events in correct order after user_query).
-                        _cloud_tool_calls_for_persist.append({
-                            "id": tc_id, "function": {"name": tc_name, "arguments": json.dumps(tc_args)},
-                            "_source": "cloud",
-                        })
-                        _cloud_tool_results_for_persist.append({
-                            "tool_call_id": tc_id,
-                            "name": tc_name,
-                            "result": cloud_result[:_AUDIT_CHARS],
-                        })
+                        _cloud_tool_calls_for_persist.append(
+                            {
+                                "id": tc_id,
+                                "function": {"name": tc_name, "arguments": json.dumps(tc_args)},
+                                "_source": "cloud",
+                            }
+                        )
+                        _cloud_tool_results_for_persist.append(
+                            {
+                                "tool_call_id": tc_id,
+                                "name": tc_name,
+                                "result": cloud_result[:_AUDIT_CHARS],
+                            }
+                        )
                         yield f"data: {json.dumps({'type': 'cloud_tool_result', 'name': tc_name, 'result': cloud_result[:500]})}\n\n"
                         # Truncate before quality assessment (assess full, truncate for LLM)
                         from core.context.compaction import truncate_tool_result
-                        _cloud_result_raw = cloud_result  # preserve for success check before annotation
+
+                        _cloud_result_raw = (
+                            cloud_result  # preserve for success check before annotation
+                        )
                         # Quality badge for cloud tool results
                         if _TOOL_QUALITY_ENABLED:
                             _cqa = _assess_tool_result(tc_name, cloud_result)
                             if _cqa.needs_annotation:
                                 yield f"data: {json.dumps({'type': 'tool_result_quality', 'tool_name': tc_name, 'grade': _cqa.grade, 'score': _cqa.score, 'signals': _cqa.signals[:5]})}\n\n"
-                                cloud_result = _annotate_tool_result({"result": cloud_result}, _cqa)["result"]
+                                cloud_result = _annotate_tool_result(
+                                    {"result": cloud_result}, _cqa
+                                )["result"]
                         # Append tool result to messages for next LLM call.
-                        _tool_msg: dict[str, Any] = {"role": "tool", "tool_call_id": tc_id, "content": truncate_tool_result(cloud_result)}
+                        _tool_msg: dict[str, Any] = {
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "content": truncate_tool_result(cloud_result),
+                        }
                         _current_llm_messages = _current_llm_messages + [_tool_msg]
                         _cloud_loop_history.append(_tool_msg)
 
@@ -2615,35 +2954,50 @@ async def chat_turn(
                         # retrying with different params or using bash/curl to work around the failure.
                         _cloud_skill_failed = False
                         try:
-                            _cr_parsed = json.loads(_cloud_result_raw) if isinstance(_cloud_result_raw, str) else _cloud_result_raw
+                            _cr_parsed = (
+                                json.loads(_cloud_result_raw)
+                                if isinstance(_cloud_result_raw, str)
+                                else _cloud_result_raw
+                            )
                             if isinstance(_cr_parsed, dict):
                                 if _cr_parsed.get("success") is False:
                                     _cloud_skill_failed = True
-                                    _cloud_skill_error_msg = _cr_parsed.get("result", "Operation failed.")
-                                    logger.warning("Cloud skill %s returned success=False, stopping cloud loop", tc_name)
-                                    _current_llm_messages = _current_llm_messages + [{
-                                        "role": "system",
-                                        "content": (
-                                            "The skill returned success=False. "
-                                            "STOP. Do NOT call any more tools. Do NOT retry with different parameters. "
-                                            "Do NOT use bash, curl, grep, or any other tool to work around this. "
-                                            "Report the error directly to the user and ask them to clarify."
-                                        ),
-                                    }]
+                                    _cloud_skill_error_msg = _cr_parsed.get(
+                                        "result", "Operation failed."
+                                    )
+                                    logger.warning(
+                                        "Cloud skill %s returned success=False, stopping cloud loop",
+                                        tc_name,
+                                    )
+                                    _current_llm_messages = _current_llm_messages + [
+                                        {
+                                            "role": "system",
+                                            "content": (
+                                                "The skill returned success=False. "
+                                                "STOP. Do NOT call any more tools. Do NOT retry with different parameters. "
+                                                "Do NOT use bash, curl, grep, or any other tool to work around this. "
+                                                "Report the error directly to the user and ask them to clarify."
+                                            ),
+                                        }
+                                    ]
                                 elif _cr_parsed.get("guidance"):
                                     # Skill-provided authoritative guidance — injected as system
                                     # message so the LLM treats it as a directive, not a suggestion.
                                     # Also set _guidance_injected so the loop breaks
                                     # immediately after processing all cloud tool results,
                                     # emitting user_message directly without a second LLM call.
-                                    _current_llm_messages = _current_llm_messages + [{
-                                        "role": "system",
-                                        "content": _cr_parsed["guidance"],
-                                    }]
-                                    _cloud_loop_history.append({
-                                        "role": "system",
-                                        "content": _cr_parsed["guidance"],
-                                    })
+                                    _current_llm_messages = _current_llm_messages + [
+                                        {
+                                            "role": "system",
+                                            "content": _cr_parsed["guidance"],
+                                        }
+                                    ]
+                                    _cloud_loop_history.append(
+                                        {
+                                            "role": "system",
+                                            "content": _cr_parsed["guidance"],
+                                        }
+                                    )
                                     _guidance_injected = True
                                     # user_message is the human-facing text shown directly.
                                     # If the skill didn't set it, use a safe generic fallback
@@ -2669,7 +3023,9 @@ async def chat_turn(
                     if _cloud_skill_failed:
                         tool_calls = []
                         # Loop will continue → LLM sees tool_result + hard-stop → returns text only
-                        logger.warning("Cloud loop: continuing for final LLM call (loop=%d)", _cloud_loop)
+                        logger.warning(
+                            "Cloud loop: continuing for final LLM call (loop=%d)", _cloud_loop
+                        )
                         continue
 
                     # If there are also edge tool_calls, emit them and break.
@@ -2689,12 +3045,14 @@ async def chat_turn(
                     tc_name = tc.get("function", {}).get("name", "?")
                     if tc.get("_truncated"):
                         logger.warning("tool_call %s truncated by max_tokens", tc_name)
-                        parsed_args = {"_parse_error": (
-                            "Your output was truncated by max_tokens before the tool_call "
-                            "arguments were complete. The JSON is cut off and cannot be parsed. "
-                            "Please retry with a shorter approach — for example, write smaller "
-                            "sections of code at a time instead of the entire file at once."
-                        )}
+                        parsed_args = {
+                            "_parse_error": (
+                                "Your output was truncated by max_tokens before the tool_call "
+                                "arguments were complete. The JSON is cut off and cannot be parsed. "
+                                "Please retry with a shorter approach — for example, write smaller "
+                                "sections of code at a time instead of the entire file at once."
+                            )
+                        }
                     else:
                         args = tc.get("function", {}).get("arguments", "") or "{}"
                         try:
@@ -2702,9 +3060,12 @@ async def chat_turn(
                         except json.JSONDecodeError:
                             parsed_args = _try_repair_tool_args(tc_name, args)
                             if parsed_args is None:
-                                logger.warning("Malformed tool_call arguments for %s: %s",
-                                               tc_name, args[:200])
-                                parsed_args = {"_parse_error": f"Malformed arguments JSON: {args[:200]}"}
+                                logger.warning(
+                                    "Malformed tool_call arguments for %s: %s", tc_name, args[:200]
+                                )
+                                parsed_args = {
+                                    "_parse_error": f"Malformed arguments JSON: {args[:200]}"
+                                }
                     yield f"data: {json.dumps({'type': 'tool_call', 'id': tc.get('id', ''), 'name': tc_name, 'arguments': parsed_args})}\n\n"
 
                 # Detect prompt leakage: if the LLM echoed back system prompt or tool
@@ -2714,7 +3075,9 @@ async def chat_turn(
                     logger.error(
                         "Prompt leakage detected — discarding response and aborting turn. "
                         "session=%s model=%s text_preview=%r",
-                        session_id, model, full_text[:200],
+                        session_id,
+                        model,
+                        full_text[:200],
                     )
                     yield f"data: {json.dumps({'type': 'error', 'message': 'Model returned invalid response (prompt leakage). Please retry.', 'code': 'PROMPT_LEAK', 'retryable': True})}\n\n"
                     return
@@ -2725,7 +3088,9 @@ async def chat_turn(
                     logger.error(
                         "Repetition loop detected — discarding response and aborting turn. "
                         "session=%s model=%s text_preview=%r",
-                        session_id, model, full_text[:200],
+                        session_id,
+                        model,
+                        full_text[:200],
                     )
                     yield f"data: {json.dumps({'type': 'error', 'message': 'Model returned invalid response (repetition loop). Please retry or switch models.', 'code': 'MODEL_DEGRADED', 'retryable': False})}\n\n"
                     return
@@ -2741,7 +3106,9 @@ async def chat_turn(
                     # Compact old tool results before storing in session cache.
                     # Keep last 2 tool results full; truncate older ones so
                     # future turns don't carry bloated cloud loop history.
-                    _hist_tool_indices = [i for i, m in enumerate(_cloud_loop_history) if m.get("role") == "tool"]
+                    _hist_tool_indices = [
+                        i for i, m in enumerate(_cloud_loop_history) if m.get("role") == "tool"
+                    ]
                     for idx in _hist_tool_indices[:-2]:
                         c = _cloud_loop_history[idx].get("content") or ""
                         if len(c) > 500:
@@ -2762,13 +3129,17 @@ async def chat_turn(
                 # Canonical JSON (sort_keys, compact separators) ensures
                 # consistent signatures regardless of LLM key ordering.
                 if tool_calls:
+
                     def _canonical_args(raw: str) -> str:
                         try:
-                            return json.dumps(json.loads(raw), sort_keys=True, separators=(',', ':'))
+                            return json.dumps(
+                                json.loads(raw), sort_keys=True, separators=(",", ":")
+                            )
                         except (json.JSONDecodeError, TypeError):
                             return raw
+
                     _sig = frozenset(
-                        f"{tc.get('function',{}).get('name','')}:{_canonical_args(tc.get('function',{}).get('arguments',''))}"
+                        f"{tc.get('function', {}).get('name', '')}:{_canonical_args(tc.get('function', {}).get('arguments', ''))}"
                         for tc in tool_calls
                     )
                     _prev_sigs: list = _entry.setdefault("tool_sigs", [])
@@ -2790,15 +3161,18 @@ async def chat_turn(
             # Persist events in background thread (non-blocking, best-effort).
             # Deep-copy mutable dicts to avoid sharing state with the main thread.
             import copy
+
             _persist_args = dict(
-                user_id=user_id, session_id=session_id,
+                user_id=user_id,
+                session_id=session_id,
                 messages=copy.deepcopy(request.messages),
                 tool_results=copy.deepcopy(request.tool_results or []),
                 full_text=full_text,
                 tool_calls=copy.deepcopy(_cloud_tool_calls_for_persist + tool_calls),
                 reasoning_content=_turn_reasoning,
                 cloud_tool_results=copy.deepcopy(_cloud_tool_results_for_persist) or None,
-                context_capture_id=snapshot_id, model_used=resolved_model,
+                context_capture_id=snapshot_id,
+                model_used=resolved_model,
                 token_usage=usage if usage else None,
                 llm_params=llm_params,
                 history=copy.deepcopy(current_history),
@@ -2827,12 +3201,21 @@ async def chat_turn(
 
                     from core.context.manager import ContextManager
                     from core.verification.firewall import HallucinationFirewall
+
                     ctx_mgr = ContextManager(SessionLocal)
                     fw = HallucinationFirewall(SessionLocal, context_manager=ctx_mgr)
-                    result = await asyncio.to_thread(fw.verify_response, full_text, snapshot_id,
-                                                      tool_quality_score=_agg_tool_quality)
+                    result = await asyncio.to_thread(
+                        fw.verify_response,
+                        full_text,
+                        snapshot_id,
+                        tool_quality_score=_agg_tool_quality,
+                    )
                     if not result.safe_to_deliver:
-                        firewall_warning = {'type': 'warning', 'message': 'Response may contain unverified claims', 'claims_failed': result.claims_failed}
+                        firewall_warning = {
+                            "type": "warning",
+                            "message": "Response may contain unverified claims",
+                            "claims_failed": result.claims_failed,
+                        }
                 except Exception as e:
                     logger.debug("Firewall verification skipped: %s", e)
 
@@ -2868,7 +3251,10 @@ async def chat_turn(
             # the cloud accepted its state (from_wire applies validation: max_rounds
             # capped at 20, unknown status → FAILURE). Future: cloud-side breaker
             # state could be merged here if the cloud tracks its own tool failures.
-            _turn_complete_data: dict = {'type': 'turn_complete', 'has_tool_calls': len(tool_calls) > 0}
+            _turn_complete_data: dict = {
+                "type": "turn_complete",
+                "has_tool_calls": len(tool_calls) > 0,
+            }
             # Server-side stall detection: if the same tool signatures repeated
             # for _SERVER_STALL_WINDOW turns, signal the edge to stop looping.
             # NOTE: We use _peek_session_entry() instead of _entry because _entry
@@ -2878,13 +3264,16 @@ async def chat_turn(
             _entry_for_stall = _peek_session_entry(session_id)
             if _entry_for_stall:
                 _sigs = _entry_for_stall.get("tool_sigs", [])
-                if len(_sigs) >= _SERVER_STALL_WINDOW and all(s == _sigs[-1] for s in _sigs[-_SERVER_STALL_WINDOW:]):
-                    _turn_complete_data['stall_detected'] = True
-                    _turn_complete_data['has_tool_calls'] = False  # force edge to stop
-            if hasattr(request, 'execution_state') and request.execution_state:
+                if len(_sigs) >= _SERVER_STALL_WINDOW and all(
+                    s == _sigs[-1] for s in _sigs[-_SERVER_STALL_WINDOW:]
+                ):
+                    _turn_complete_data["stall_detected"] = True
+                    _turn_complete_data["has_tool_calls"] = False  # force edge to stop
+            if hasattr(request, "execution_state") and request.execution_state:
                 from core.agent.turn_state import TurnState
+
                 _ts = TurnState.from_wire(request.execution_state, messages=[], tools_schema=[])
-                _turn_complete_data['execution_state'] = _ts.to_wire()
+                _turn_complete_data["execution_state"] = _ts.to_wire()
             yield f"data: {json.dumps(_turn_complete_data)}\n\n"
 
         except Exception as e:
@@ -2893,6 +3282,7 @@ async def chat_turn(
 
             from core.exceptions import LLMRateLimitError, LLMTimeoutError, TransientError
             from core.llm.client import BudgetExceededError
+
             err: dict[str, Any] = {"type": "error", "message": str(e)}
             if isinstance(e, HTTPException):
                 err["message"] = e.detail
@@ -2912,9 +3302,14 @@ async def chat_turn(
                 # httpx.TransportError (RemoteProtocolError, ReadError, etc.)
                 # from LLM provider connections are transient — allow retry.
                 import httpx as _httpx
+
                 if isinstance(e, _httpx.TransportError):
-                    err.update(code="LLM_TRANSPORT_ERROR", retryable=True, retry_after_ms=2000,
-                               message="LLM provider connection failed. Please retry.")
+                    err.update(
+                        code="LLM_TRANSPORT_ERROR",
+                        retryable=True,
+                        retry_after_ms=2000,
+                        message="LLM provider connection failed. Please retry.",
+                    )
                 else:
                     err.update(code="INTERNAL_ERROR", retryable=False)
             yield f"data: {json.dumps(err)}\n\n"

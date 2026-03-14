@@ -29,7 +29,9 @@ class ExecutionStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
-_TERMINAL = frozenset({ExecutionStatus.COMPLETED, ExecutionStatus.FAILED, ExecutionStatus.CANCELLED})
+_TERMINAL = frozenset(
+    {ExecutionStatus.COMPLETED, ExecutionStatus.FAILED, ExecutionStatus.CANCELLED}
+)
 
 
 @dataclass
@@ -43,6 +45,7 @@ class ExecutionResult:
 @dataclass
 class ExecutionRequirements:
     """Resource requirements for skill execution."""
+
     gpu_required: bool = False
     conda_env: str | None = None
     timeout_seconds: int = 60
@@ -92,9 +95,14 @@ class InProcessBackend(ExecutionBackend):
         """Run skill function directly. Called by BackendRouter for in-process execution."""
         self._results[job_id] = ExecutionResult(job_id=job_id, status=ExecutionStatus.RUNNING)
         try:
-            result = await skill_fn(inputs) if asyncio.iscoroutinefunction(skill_fn) else skill_fn(inputs)
+            result = (
+                await skill_fn(inputs)
+                if asyncio.iscoroutinefunction(skill_fn)
+                else skill_fn(inputs)
+            )
             r = ExecutionResult(
-                job_id=job_id, status=ExecutionStatus.COMPLETED,
+                job_id=job_id,
+                status=ExecutionStatus.COMPLETED,
                 result=result if isinstance(result, dict) else {"output": str(result)},
             )
         except Exception as e:
@@ -103,7 +111,9 @@ class InProcessBackend(ExecutionBackend):
         return r
 
     async def get_status(self, job_id: str) -> ExecutionResult:
-        return self._results.get(job_id, ExecutionResult(job_id=job_id, status=ExecutionStatus.FAILED, error="Unknown"))
+        return self._results.get(
+            job_id, ExecutionResult(job_id=job_id, status=ExecutionStatus.FAILED, error="Unknown")
+        )
 
     async def cancel(self, job_id: str) -> bool:
         return False  # In-process can't be cancelled mid-execution
@@ -137,7 +147,9 @@ class SubprocessBackend(ExecutionBackend):
         return job_id
 
     async def get_status(self, job_id: str) -> ExecutionResult:
-        return self._results.get(job_id, ExecutionResult(job_id=job_id, status=ExecutionStatus.FAILED, error="Unknown"))
+        return self._results.get(
+            job_id, ExecutionResult(job_id=job_id, status=ExecutionStatus.FAILED, error="Unknown")
+        )
 
     async def cancel(self, job_id: str) -> bool:
         task = self._tasks.get(job_id)
@@ -171,32 +183,49 @@ class SubprocessBackend(ExecutionBackend):
             self._tasks.pop(jid, None)
             self._procs.pop(jid, None)
 
-    async def _run(self, job_id: str, skill_name: str, inputs: dict, req: ExecutionRequirements) -> None:
+    async def _run(
+        self, job_id: str, skill_name: str, inputs: dict, req: ExecutionRequirements
+    ) -> None:
         self._results[job_id] = ExecutionResult(job_id=job_id, status=ExecutionStatus.RUNNING)
         proc = None
         try:
-            cmd = [sys.executable, "-m", "core.skills.runner",
-                   "--skill", skill_name, "--inputs", json.dumps(inputs)]
+            cmd = [
+                sys.executable,
+                "-m",
+                "core.skills.runner",
+                "--skill",
+                skill_name,
+                "--inputs",
+                json.dumps(inputs),
+            ]
             if req.conda_env:
                 cmd = ["conda", "run", "-n", req.conda_env, "--no-capture-output"] + cmd
 
             env = {**os.environ, **req.env_vars} if req.env_vars else None
             proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
             self._procs[job_id] = proc
             try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=req.timeout_seconds)
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=req.timeout_seconds
+                )
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.communicate()
-                self._results[job_id] = ExecutionResult(job_id=job_id, status=ExecutionStatus.FAILED, error="Timeout")
+                self._results[job_id] = ExecutionResult(
+                    job_id=job_id, status=ExecutionStatus.FAILED, error="Timeout"
+                )
                 return
 
             if proc.returncode != 0:
                 err_text = stderr.decode(errors="replace")[-2000:] if stderr else ""
                 self._results[job_id] = ExecutionResult(
-                    job_id=job_id, status=ExecutionStatus.FAILED, error=err_text)
+                    job_id=job_id, status=ExecutionStatus.FAILED, error=err_text
+                )
             else:
                 out_text = stdout.decode(errors="replace") if stdout else ""
                 try:
@@ -204,7 +233,8 @@ class SubprocessBackend(ExecutionBackend):
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     result = {"output": out_text[-2000:]}
                 self._results[job_id] = ExecutionResult(
-                    job_id=job_id, status=ExecutionStatus.COMPLETED, result=result)
+                    job_id=job_id, status=ExecutionStatus.COMPLETED, result=result
+                )
         except asyncio.CancelledError:
             if proc and proc.returncode is None:
                 try:
@@ -214,7 +244,9 @@ class SubprocessBackend(ExecutionBackend):
                     pass
             self._results[job_id] = ExecutionResult(job_id=job_id, status=ExecutionStatus.CANCELLED)
         except Exception as e:
-            self._results[job_id] = ExecutionResult(job_id=job_id, status=ExecutionStatus.FAILED, error=str(e))
+            self._results[job_id] = ExecutionResult(
+                job_id=job_id, status=ExecutionStatus.FAILED, error=str(e)
+            )
 
 
 def _is_heavyweight(req: ExecutionRequirements) -> bool:

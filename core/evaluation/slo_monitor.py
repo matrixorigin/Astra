@@ -33,9 +33,9 @@ logger = get_logger(__name__)
 
 class SLOSeverity(str, Enum):
     OK = "ok"
-    WARNING = "warning"      # burn rate > 1.5x
-    CRITICAL = "critical"    # burn rate > 3x
-    BREACH = "breach"        # SLO violated for period
+    WARNING = "warning"  # burn rate > 1.5x
+    CRITICAL = "critical"  # burn rate > 3x
+    BREACH = "breach"  # SLO violated for period
 
 
 @dataclass
@@ -78,8 +78,9 @@ class SLOMonitor(DbConsumer):
     MONTHLY_DAYS = 30
     SLO_COMPLIANCE_TARGET = 0.95  # 95% of days must meet SLO
 
-    def __init__(self, db_factory: DbFactory, slos: list[SLOTarget] | None = None,
-                 gate_trigger=None):
+    def __init__(
+        self, db_factory: DbFactory, slos: list[SLOTarget] | None = None, gate_trigger=None
+    ):
         super().__init__(db_factory)
         self.slos = slos or DEFAULT_SLOS
         self._gate_trigger = gate_trigger  # GateTrigger | None
@@ -125,21 +126,27 @@ class SLOMonitor(DbConsumer):
             return report
 
     def get_daily_metrics(
-        self, agent_id: str, period_days: int,
+        self,
+        agent_id: str,
+        period_days: int,
     ) -> list[dict[str, Any]]:
         """Query daily aggregated metrics for an agent."""
         with self._db() as db:
             return self._query_daily_metrics(db, agent_id, period_days)
 
     def _query_daily_metrics(
-        self, db: "Session", agent_id: str, period_days: int,
+        self,
+        db: "Session",
+        agent_id: str,
+        period_days: int,
     ) -> list[dict[str, Any]]:
         """Query daily aggregated metrics. Caller provides the session.
 
         Raises on DB errors so the caller can distinguish 'no data' from
         'query failed' — returning [] would silently produce false-OK reports.
         """
-        rows = db.execute(text("""
+        rows = db.execute(
+            text("""
             SELECT
                 DATE(created_at) AS day,
                 AVG(quality_score) AS avg_quality,
@@ -153,7 +160,9 @@ class SLOMonitor(DbConsumer):
               AND created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)
             GROUP BY DATE(created_at)
             ORDER BY day
-        """), {"agent_id": agent_id, "days": period_days}).fetchall()
+        """),
+            {"agent_id": agent_id, "days": period_days},
+        ).fetchall()
 
         return [
             {
@@ -167,15 +176,21 @@ class SLOMonitor(DbConsumer):
         ]
 
     def _evaluate_slo(
-        self, slo: SLOTarget, daily_metrics: list[dict[str, Any]],
+        self,
+        slo: SLOTarget,
+        daily_metrics: list[dict[str, Any]],
         period_days: int,
     ) -> SLOStatus:
         """Evaluate a single SLO with burn-rate calculation."""
         if not daily_metrics:
             return SLOStatus(
-                slo=slo, current_value=0.0, met=False,
-                burn_rate=0.0, severity=SLOSeverity.OK,
-                days_elapsed=0, bad_days=0,
+                slo=slo,
+                current_value=0.0,
+                met=False,
+                burn_rate=0.0,
+                severity=SLOSeverity.OK,
+                days_elapsed=0,
+                bad_days=0,
             )
 
         days_elapsed = len(daily_metrics)
@@ -200,20 +215,28 @@ class SLOMonitor(DbConsumer):
         else:
             burn_rate = 0.0
 
-        met = (slo.operator == ">=" and current_value >= slo.target) or \
-              (slo.operator == "<=" and current_value <= slo.target)
+        met = (slo.operator == ">=" and current_value >= slo.target) or (
+            slo.operator == "<=" and current_value <= slo.target
+        )
 
         severity = self._classify_severity(burn_rate, met, days_elapsed, period_days)
 
         return SLOStatus(
-            slo=slo, current_value=round(current_value, 4), met=met,
-            burn_rate=round(burn_rate, 2), severity=severity,
-            days_elapsed=days_elapsed, bad_days=bad_days,
+            slo=slo,
+            current_value=round(current_value, 4),
+            met=met,
+            burn_rate=round(burn_rate, 2),
+            severity=severity,
+            days_elapsed=days_elapsed,
+            bad_days=bad_days,
         )
 
     @staticmethod
     def _classify_severity(
-        burn_rate: float, met: bool, days_elapsed: int, period_days: int,
+        burn_rate: float,
+        met: bool,
+        days_elapsed: int,
+        period_days: int,
     ) -> SLOSeverity:
         if days_elapsed >= period_days and not met:
             return SLOSeverity.BREACH
@@ -237,11 +260,16 @@ class SLOMonitor(DbConsumer):
         slo_name = status.slo.name
 
         if sev == SLOSeverity.WARNING:
-            self._write_event(db, agent_id, "slo_monitoring_increased", {
-                "slo": slo_name,
-                "action": "monitoring_frequency_increased",
-                "burn_rate": status.burn_rate,
-            })
+            self._write_event(
+                db,
+                agent_id,
+                "slo_monitoring_increased",
+                {
+                    "slo": slo_name,
+                    "action": "monitoring_frequency_increased",
+                    "burn_rate": status.burn_rate,
+                },
+            )
             logger.info("SLO warning for %s/%s — increased monitoring", agent_id, slo_name)
 
         elif sev == SLOSeverity.CRITICAL:
@@ -249,7 +277,11 @@ class SLOMonitor(DbConsumer):
             if self._gate_trigger is not None:
                 # Find most recent prompt/skill/config change to bind as regression source
                 recent_change = self._find_recent_change(db, agent_id)
-                change_id = recent_change["change_id"] if recent_change else f"slo_critical:{agent_id}:{slo_name}"
+                change_id = (
+                    recent_change["change_id"]
+                    if recent_change
+                    else f"slo_critical:{agent_id}:{slo_name}"
+                )
                 change_content = {
                     "agent_id": agent_id,
                     "slo": slo_name,
@@ -263,78 +295,108 @@ class SLOMonitor(DbConsumer):
                     change_content=change_content,
                 )
             # Model escalation intent — same as breach
-            self._write_event(db, agent_id, "slo_model_escalation", {
-                "slo": slo_name,
-                "action": "model_escalation_requested",
-                "severity": "critical",
-                "burn_rate": status.burn_rate,
-            })
-            self._write_event(db, agent_id, "slo_gate_triggered", {
-                "slo": slo_name,
-                "action": "replay_gate_triggered",
-                "burn_rate": status.burn_rate,
-            })
+            self._write_event(
+                db,
+                agent_id,
+                "slo_model_escalation",
+                {
+                    "slo": slo_name,
+                    "action": "model_escalation_requested",
+                    "severity": "critical",
+                    "burn_rate": status.burn_rate,
+                },
+            )
+            self._write_event(
+                db,
+                agent_id,
+                "slo_gate_triggered",
+                {
+                    "slo": slo_name,
+                    "action": "replay_gate_triggered",
+                    "burn_rate": status.burn_rate,
+                },
+            )
             logger.warning("SLO critical for %s/%s — gate + model escalation", agent_id, slo_name)
 
         elif sev == SLOSeverity.BREACH:
             # Post-mortem event
-            self._write_event(db, agent_id, "slo_post_mortem", {
-                "slo": slo_name,
-                "action": "post_mortem_created",
-                "current_value": status.current_value,
-                "target": status.slo.target,
-                "bad_days": status.bad_days,
-                "days_elapsed": status.days_elapsed,
-            })
+            self._write_event(
+                db,
+                agent_id,
+                "slo_post_mortem",
+                {
+                    "slo": slo_name,
+                    "action": "post_mortem_created",
+                    "current_value": status.current_value,
+                    "target": status.slo.target,
+                    "bad_days": status.bad_days,
+                    "days_elapsed": status.days_elapsed,
+                },
+            )
             # Model escalation intent — ChatLoop reads this to upgrade model tier
-            self._write_event(db, agent_id, "slo_model_escalation", {
-                "slo": slo_name,
-                "action": "model_escalation_requested",
-                "severity": "breach",
-                "reason": f"SLO breach: {slo_name} = {status.current_value:.4f} "
-                          f"(target {status.slo.operator} {status.slo.target})",
-            })
+            self._write_event(
+                db,
+                agent_id,
+                "slo_model_escalation",
+                {
+                    "slo": slo_name,
+                    "action": "model_escalation_requested",
+                    "severity": "breach",
+                    "reason": f"SLO breach: {slo_name} = {status.current_value:.4f} "
+                    f"(target {status.slo.operator} {status.slo.target})",
+                },
+            )
             # HITL policy tightening intent
-            self._write_event(db, agent_id, "slo_hitl_tightened", {
-                "slo": slo_name,
-                "action": "hitl_policy_tightening_requested",
-                "reason": "SLO breach requires increased human oversight",
-            })
+            self._write_event(
+                db,
+                agent_id,
+                "slo_hitl_tightened",
+                {
+                    "slo": slo_name,
+                    "action": "hitl_policy_tightening_requested",
+                    "reason": "SLO breach requires increased human oversight",
+                },
+            )
             logger.error(
                 "SLO BREACH for %s/%s — post-mortem + escalation + HITL tightening",
-                agent_id, slo_name,
+                agent_id,
+                slo_name,
             )
 
     def _find_recent_change(self, db: "Session", agent_id: str) -> dict[str, Any] | None:
         """Find most recent skill/prompt change (global, not agent-specific).
-        
+
         Returns change metadata to bind as suspected regression source.
         Note: skills_registry and ctx_prompt_templates are global resources without agent_id,
         so this returns the most recent change across all agents within 7 days.
         """
         try:
             # Find most recent skill change
-            skill_row = db.execute(text("""
+            skill_row = db.execute(
+                text("""
                 SELECT skill_name, version, updated_at
                 FROM skills_registry
                 WHERE updated_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
                 ORDER BY updated_at DESC
                 LIMIT 1
-            """)).fetchone()
-        
+            """)
+            ).fetchone()
+
             # Find most recent prompt change
-            prompt_row = db.execute(text("""
+            prompt_row = db.execute(
+                text("""
                 SELECT template_id, version, created_at
                 FROM ctx_prompt_templates
                 WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
                 ORDER BY created_at DESC
                 LIMIT 1
-            """)).fetchone()
-        
+            """)
+            ).fetchone()
+
             # Return the most recent of the two
             skill_ts = skill_row[2] if skill_row else None
             prompt_ts = prompt_row[2] if prompt_row else None
-        
+
             if skill_ts and (not prompt_ts or skill_ts > prompt_ts):
                 return {
                     "change_type": "skill_version_changed",
@@ -356,7 +418,9 @@ class SLOMonitor(DbConsumer):
             logger.warning("Failed to query recent changes: %s", e)
             return None
 
-    def _write_event(self, db: "Session", agent_id: str, event_type: str, payload: dict[str, Any]) -> None:
+    def _write_event(
+        self, db: "Session", agent_id: str, event_type: str, payload: dict[str, Any]
+    ) -> None:
         """Write an auditable system event. Does NOT commit — caller batches.
 
         On failure the session is rolled back so subsequent writes on the
@@ -364,31 +428,40 @@ class SLOMonitor(DbConsumer):
         """
         try:
             from core.utils.id_generator import generate_id
+
             eid = generate_id()
-            db.execute(text("""
+            db.execute(
+                text("""
                 INSERT INTO agent_events
                     (event_id, session_id, user_id, agent_id, agent_version,
                      event_type, content, causal_chain_id, created_at)
                 VALUES
                     (:eid, 'system_slo', 'system', :aid, '1.0.0',
                      :etype, :content, :eid, NOW())
-            """), {
-                "eid": eid,
-                "aid": agent_id,
-                "etype": event_type,
-                "content": json.dumps(payload),
-            })
+            """),
+                {
+                    "eid": eid,
+                    "aid": agent_id,
+                    "etype": event_type,
+                    "content": json.dumps(payload),
+                },
+            )
         except Exception as e:
             db.rollback()
             logger.warning("Failed to write SLO event %s: %s", event_type, e)
 
     def _record_alert(self, db: "Session", agent_id: str, status: SLOStatus):
         """Record SLO alert as auditable event."""
-        self._write_event(db, agent_id, "slo_alert", {
-            "slo": status.slo.name,
-            "severity": status.severity.value,
-            "burn_rate": status.burn_rate,
-            "current_value": status.current_value,
-            "target": status.slo.target,
-            "bad_days": status.bad_days,
-        })
+        self._write_event(
+            db,
+            agent_id,
+            "slo_alert",
+            {
+                "slo": status.slo.name,
+                "severity": status.severity.value,
+                "burn_rate": status.burn_rate,
+                "current_value": status.current_value,
+                "target": status.slo.target,
+                "bad_days": status.bad_days,
+            },
+        )

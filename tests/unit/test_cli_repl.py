@@ -6,8 +6,16 @@ from unittest.mock import MagicMock
 from rich.console import Console
 
 from cli.mo_agent_api import (
-    SLASH_COMMANDS, cmd_help, cmd_model, cmd_session, cmd_clear,
-    cmd_verbose, cmd_compact, cmd_history, cmd_copy, cmd_version,
+    SLASH_COMMANDS,
+    cmd_help,
+    cmd_model,
+    cmd_session,
+    cmd_clear,
+    cmd_verbose,
+    cmd_compact,
+    cmd_history,
+    cmd_copy,
+    cmd_version,
 )
 
 
@@ -22,8 +30,18 @@ class TestSlashCommandRegistry:
             assert callable(handler), f"{name} handler not callable"
 
     def test_expected_commands_present(self):
-        expected = {"/help", "/model", "/session", "/clear", "/verbose",
-                    "/compact", "/history", "/copy", "/doctor", "/version"}
+        expected = {
+            "/help",
+            "/model",
+            "/session",
+            "/clear",
+            "/verbose",
+            "/compact",
+            "/history",
+            "/copy",
+            "/doctor",
+            "/version",
+        }
         assert expected.issubset(set(SLASH_COMMANDS.keys()))
 
 
@@ -118,10 +136,12 @@ class TestCmdHistory:
 
     def test_with_history(self):
         console, buf = _console()
-        state = {"turn_history": [
-            {"role": "user", "preview": "hello"},
-            {"role": "assistant", "preview": "hi there"},
-        ]}
+        state = {
+            "turn_history": [
+                {"role": "user", "preview": "hello"},
+                {"role": "assistant", "preview": "hi there"},
+            ]
+        }
         cmd_history(console=console, state=state)
         output = buf.getvalue()
         assert "hello" in output

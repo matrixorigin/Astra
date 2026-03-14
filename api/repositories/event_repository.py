@@ -43,8 +43,7 @@ class EventRepository:
     ) -> list[EventModel]:
         """List events with filters and pagination pushed to database."""
         query = self.db.query(EventModel).filter(
-            EventModel.session_id == session_id,
-            EventModel.user_id == user_id
+            EventModel.session_id == session_id, EventModel.user_id == user_id
         )
         if event_type:
             query = query.filter(EventModel.event_type == event_type)
@@ -52,9 +51,7 @@ class EventRepository:
 
     def count_by_session(self, session_id: str) -> int:
         """Count events for session."""
-        return self.db.query(EventModel).filter(
-            EventModel.session_id == session_id
-        ).count()
+        return self.db.query(EventModel).filter(EventModel.session_id == session_id).count()
 
     def get_by_user(
         self,
@@ -81,10 +78,12 @@ class EventRepository:
 
     def get_by_causal_chain(self, causal_chain_id: str, user_id: str) -> list[EventModel]:
         """Get events by causal chain."""
-        return self.db.query(EventModel).filter(
-            EventModel.causal_chain_id == causal_chain_id,
-            EventModel.user_id == user_id
-        ).order_by(EventModel.created_at.asc()).all()
+        return (
+            self.db.query(EventModel)
+            .filter(EventModel.causal_chain_id == causal_chain_id, EventModel.user_id == user_id)
+            .order_by(EventModel.created_at.asc())
+            .all()
+        )
 
     def get_by_session(
         self,

@@ -34,13 +34,13 @@ class RepoRegistry(DbConsumer):
         """Create a new repository."""
         with self._db() as db:
             from api.models import Repo as RepoModel
-        
+
             repo_id = str(uuid7())
             now = datetime.now(timezone.utc)
-        
+
             # Derive repo name from URL
             repo_name = repo_url.rstrip("/").split("/")[-1]
-        
+
             # Prepare metadata (include repo_group if present)
             final_metadata = metadata or {}
             if repo_group:
@@ -60,7 +60,7 @@ class RepoRegistry(DbConsumer):
                 created_at=now,
                 updated_at=now,
             )
-        
+
             db.add(repo_model)
             db.commit()
             db.refresh(repo_model)
@@ -71,6 +71,7 @@ class RepoRegistry(DbConsumer):
         """Get repository by ID."""
         with self._db() as db:
             from api.models import Repo as RepoModel
+
             result = db.query(RepoModel).filter(RepoModel.repo_id == repo_id).first()
             if not result:
                 return None
@@ -80,10 +81,15 @@ class RepoRegistry(DbConsumer):
         """Get repository by URL and owner."""
         with self._db() as db:
             from api.models import Repo as RepoModel
-            result = db.query(RepoModel).filter(
-                RepoModel.repo_url == repo_url,
-                RepoModel.user_id == owner_id  # Map owner_id to user_id
-            ).first()
+
+            result = (
+                db.query(RepoModel)
+                .filter(
+                    RepoModel.repo_url == repo_url,
+                    RepoModel.user_id == owner_id,  # Map owner_id to user_id
+                )
+                .first()
+            )
             if not result:
                 return None
             return self._to_model(result)
@@ -96,17 +102,20 @@ class RepoRegistry(DbConsumer):
         max_results = 200
         with self._db() as db:
             from api.models import Repo as RepoModel
+
             query = db.query(RepoModel).filter(
                 RepoModel.user_id == owner_id,  # Map owner_id to user_id
-                RepoModel.status == "active"
+                RepoModel.status == "active",
             )
-        
+
             if repo_type:
                 query = query.filter(RepoModel.repo_type == repo_type.value)
-        
+
             results = query.order_by(RepoModel.created_at.desc()).limit(max_results).all()
             if len(results) >= max_results:
-                logger.warning("list_by_owner(%s) hit limit of %d; results truncated", owner_id, max_results)
+                logger.warning(
+                    "list_by_owner(%s) hit limit of %d; results truncated", owner_id, max_results
+                )
             return [self._to_model(r) for r in results]
 
     def list_by_group(self, repo_group: str) -> list[Repo]:
@@ -117,18 +126,25 @@ class RepoRegistry(DbConsumer):
         """
         with self._db() as db:
             from api.models import Repo as RepoModel
-        
-            results = db.query(RepoModel).filter(
-                RepoModel.status == "active",
-                text("JSON_UNQUOTE(JSON_EXTRACT(repo_metadata, '$.repo_group')) = :rg"),
-            ).params(rg=repo_group).limit(500).all()
-        
+
+            results = (
+                db.query(RepoModel)
+                .filter(
+                    RepoModel.status == "active",
+                    text("JSON_UNQUOTE(JSON_EXTRACT(repo_metadata, '$.repo_group')) = :rg"),
+                )
+                .params(rg=repo_group)
+                .limit(500)
+                .all()
+            )
+
             return [self._to_model(r) for r in results]
 
     def update_token(self, repo_id: str, token_id: str) -> None:
         """Update repository token."""
         with self._db() as db:
             from api.models import Repo as RepoModel
+
             repo = db.query(RepoModel).filter(RepoModel.repo_id == repo_id).first()
             if repo:
                 repo.token_id = token_id
@@ -140,7 +156,7 @@ class RepoRegistry(DbConsumer):
         with self._db() as db:
             from api.models import Repo as RepoModel
             from sqlalchemy.orm.attributes import flag_modified
-        
+
             repo = db.query(RepoModel).filter(RepoModel.repo_id == repo_id).first()
             if repo:
                 # Create a copy to ensure SQLAlchemy detects the change
@@ -156,6 +172,7 @@ class RepoRegistry(DbConsumer):
         """Deactivate repository."""
         with self._db() as db:
             from api.models import Repo as RepoModel
+
             repo = db.query(RepoModel).filter(RepoModel.repo_id == repo_id).first()
             if repo:
                 repo.status = "inactive"
@@ -166,22 +183,23 @@ class RepoRegistry(DbConsumer):
         """Delete repository."""
         with self._db() as db:
             from api.models import Repo as RepoModel
+
             db.query(RepoModel).filter(RepoModel.repo_id == repo_id).delete()
             db.commit()
 
     def _to_model(self, row) -> Repo:
         """Convert database row to Repo model."""
         # Row is an SQLAlchemy model instance (RepoModel)
-        
+
         metadata = row.repo_metadata or {}
         repo_group = metadata.get("repo_group")
-        
+
         return Repo(
             repo_id=row.repo_id,
             repo_url=row.repo_url,
             repo_type=RepoType(row.repo_type) if row.repo_type else RepoType.CODE,
             owner_id=row.user_id,
-            owner_type=OwnerType.USER, # Hardcoded as DB only has user_id
+            owner_type=OwnerType.USER,  # Hardcoded as DB only has user_id
             repo_group=repo_group,
             token_id=row.token_id,
             access_scope=AccessScope(row.access_scope) if row.access_scope else AccessScope.READ,

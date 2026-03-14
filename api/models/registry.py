@@ -38,23 +38,45 @@ _GROUP_IMPORTS: dict[ModelGroup, list[tuple[str, list[str]]]] = {
         ("core.memory.models.graph", ["GraphEdge", "GraphNode"]),
     ],
     ModelGroup.SKILLS: [
-        ("api.models.skill", [
-            "SkillExecutionMetric", "SkillInstallation", "SkillPermission",
-            "SkillRegistry", "SkillResourceBinding", "SkillSelectionEvent",
-            "SkillSelectionLearning", "SkillSetting", "SkillUserCredential",
-        ]),
+        (
+            "api.models.skill",
+            [
+                "SkillExecutionMetric",
+                "SkillInstallation",
+                "SkillPermission",
+                "SkillRegistry",
+                "SkillResourceBinding",
+                "SkillSelectionEvent",
+                "SkillSelectionLearning",
+                "SkillSetting",
+                "SkillUserCredential",
+            ],
+        ),
     ],
     ModelGroup.EVALUATION: [
-        ("api.models.evaluation", [
-            "GateResult", "LLMCallLog", "LLMFeedback",
-            "QualityAssessment", "TrainingData", "UserFeedback",
-        ]),
+        (
+            "api.models.evaluation",
+            [
+                "GateResult",
+                "LLMCallLog",
+                "LLMFeedback",
+                "QualityAssessment",
+                "TrainingData",
+                "UserFeedback",
+            ],
+        ),
     ],
     ModelGroup.CONTEXT: [
-        ("api.models.context", [
-            "ContextSnapshot", "DecisionAudit", "EventEmbedding",
-            "PromptTemplate", "PromptVariant",
-        ]),
+        (
+            "api.models.context",
+            [
+                "ContextSnapshot",
+                "DecisionAudit",
+                "EventEmbedding",
+                "PromptTemplate",
+                "PromptVariant",
+            ],
+        ),
     ],
     ModelGroup.VERIFICATION: [
         ("api.models.verification", ["ClaimEvidence", "HallucinationCheck"]),
@@ -63,19 +85,26 @@ _GROUP_IMPORTS: dict[ModelGroup, list[tuple[str, list[str]]]] = {
         ("api.models.workflow", ["Trigger", "WorkflowDefinition", "WorkflowRun"]),
     ],
     ModelGroup.KNOWLEDGE: [
-        ("skills.knowledge.models", [
-            "SkKnowledgeEntry", "SkKnowledgeEntrySource", "SkKnowledgeRelation",
-        ]),
+        (
+            "skills.knowledge.models",
+            [
+                "SkKnowledgeEntry",
+                "SkKnowledgeEntrySource",
+                "SkKnowledgeRelation",
+            ],
+        ),
     ],
 }
 
 # Memory service loads only these groups.
-MEMORY_SERVICE_GROUPS: frozenset[ModelGroup] = frozenset({
-    ModelGroup.FOUNDATION,
-    ModelGroup.AUTH,
-    ModelGroup.EVENTS,
-    ModelGroup.MEMORY,
-})
+MEMORY_SERVICE_GROUPS: frozenset[ModelGroup] = frozenset(
+    {
+        ModelGroup.FOUNDATION,
+        ModelGroup.AUTH,
+        ModelGroup.EVENTS,
+        ModelGroup.MEMORY,
+    }
+)
 
 # Full runtime loads everything.
 FULL_RUNTIME_GROUPS: frozenset[ModelGroup] = frozenset(ModelGroup)

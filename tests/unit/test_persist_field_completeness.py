@@ -21,44 +21,63 @@ import pytest
 # _persist_turn_events — field completeness
 # ---------------------------------------------------------------------------
 
+
 class TestPersistFieldCompleteness:
     """Verify _persist_turn_events populates all expected fields on each event type."""
 
-    def _run_persist(self, *, tool_calls=None, full_text="response",
-                     model_used="gpt-4o", token_usage=None,
-                     messages=None, tool_results=None,
-                     turn_chain_id=None, user_query_event_id=None):
+    def _run_persist(
+        self,
+        *,
+        tool_calls=None,
+        full_text="response",
+        model_used="gpt-4o",
+        token_usage=None,
+        messages=None,
+        tool_results=None,
+        turn_chain_id=None,
+        user_query_event_id=None,
+    ):
         """Helper: run _persist_turn_events and capture all EventLogger calls."""
         tool_calls = tool_calls or []
         messages = messages or [{"role": "user", "content": "hello"}]
         captured = {"user_query": None, "llm_response": None, "stream_events": []}
 
-        with patch("api.routers.chat.SessionLocal"), \
-             patch("core.events.event_logger.EventLogger") as mock_el_cls, \
-             patch("core.agent.turn_hooks.TurnHooks"):
+        with (
+            patch("api.routers.chat.SessionLocal"),
+            patch("core.events.event_logger.EventLogger") as mock_el_cls,
+            patch("core.agent.turn_hooks.TurnHooks"),
+        ):
             mock_el = MagicMock()
 
             def capture_user_query(**kw):
                 captured["user_query"] = kw
                 return MagicMock(event_id="ev1", causal_chain_id="cc1")
+
             mock_el.create_user_query.side_effect = capture_user_query
 
             def capture_llm_response(**kw):
                 captured["llm_response"] = kw
                 return MagicMock()
+
             mock_el.create_llm_response.side_effect = capture_llm_response
 
             def capture_stream_event(**kw):
                 captured["stream_events"].append(kw)
                 return MagicMock()
+
             mock_el.create_stream_event.side_effect = capture_stream_event
 
             mock_el_cls.return_value = mock_el
 
             from api.routers.chat import _persist_turn_events
+
             _persist_turn_events(
-                "u1", "s1", messages, tool_results,
-                full_text, tool_calls,
+                "u1",
+                "s1",
+                messages,
+                tool_results,
+                full_text,
+                tool_calls,
                 context_capture_id="snap1",
                 model_used=model_used,
                 token_usage=token_usage,
@@ -174,6 +193,7 @@ class TestPersistFieldCompleteness:
         """tool_call and tool_result events must include skill_version from registry."""
         # Clear module-level cache to ensure this test hits the mocked DB
         import api.routers.chat as _chat_mod
+
         _chat_mod._SKILL_VERSION_CACHE.clear()
 
         captured = {"stream_events": []}
@@ -187,28 +207,36 @@ class TestPersistFieldCompleteness:
         mock_session_local.return_value.__enter__ = MagicMock(return_value=mock_db)
         mock_session_local.return_value.__exit__ = MagicMock(return_value=False)
 
-        with patch("api.routers.chat.SessionLocal", mock_session_local), \
-             patch("core.events.event_logger.EventLogger") as mock_el_cls, \
-             patch("core.agent.turn_hooks.TurnHooks"), \
-             patch("core.context.manager.ContextManager.update_snapshot_llm_ids"):
+        with (
+            patch("api.routers.chat.SessionLocal", mock_session_local),
+            patch("core.events.event_logger.EventLogger") as mock_el_cls,
+            patch("core.agent.turn_hooks.TurnHooks"),
+            patch("core.context.manager.ContextManager.update_snapshot_llm_ids"),
+        ):
             mock_el = MagicMock()
-            mock_el.create_user_query.return_value = MagicMock(event_id="ev1", causal_chain_id="cc1")
+            mock_el.create_user_query.return_value = MagicMock(
+                event_id="ev1", causal_chain_id="cc1"
+            )
             mock_el.create_llm_response.return_value = MagicMock(event_id="ev_llm")
 
             def capture_stream(**kw):
                 captured["stream_events"].append(kw)
                 return MagicMock()
+
             mock_el.create_stream_event.side_effect = capture_stream
             mock_el_cls.return_value = mock_el
 
             from api.routers.chat import _persist_turn_events
+
             _persist_turn_events(
-                "u1", "s1",
+                "u1",
+                "s1",
                 [{"role": "user", "content": "hi"}],
                 [{"tool_call_id": "tc1", "name": "read_file", "result": "ok"}],
                 "done",
                 [{"id": "tc1", "function": {"name": "read_file", "arguments": "{}"}}],
-                context_capture_id="snap1", model_used="gpt-4o",
+                context_capture_id="snap1",
+                model_used="gpt-4o",
             )
 
         tc_events = [e for e in captured["stream_events"] if e["event_type"] == "tool_call"]
@@ -233,6 +261,7 @@ class TestPersistFieldCompleteness:
     def test_tool_result_content_truncated_at_audit_limit(self):
         """tool_result content should truncate result to audit limit."""
         from core.context.compaction import MAX_TOOL_RESULT_AUDIT_CHARS
+
         long_result = "x" * (MAX_TOOL_RESULT_AUDIT_CHARS + 1000)
         tr = [{"tool_call_id": "tc1", "name": "bash", "result": long_result}]
         c = self._run_persist(tool_results=tr, messages=[])
@@ -252,6 +281,7 @@ class TestPersistFieldCompleteness:
 # TurnHooks.record_ctx_decision_audits — field completeness
 # ---------------------------------------------------------------------------
 
+
 class TestDecisionAuditFields:
     """Verify DecisionAudit records have all expected fields populated."""
 
@@ -265,15 +295,29 @@ class TestDecisionAuditFields:
             mock_db_ctx.return_value.__exit__ = MagicMock(return_value=False)
 
             def capture_add(obj):
-                for col in ["decision_id", "session_id", "event_id", "decision_type",
-                            "decision_output", "context_capture_id", "model_used"]:
+                for col in [
+                    "decision_id",
+                    "session_id",
+                    "event_id",
+                    "decision_type",
+                    "decision_output",
+                    "context_capture_id",
+                    "model_used",
+                ]:
                     captured[col] = getattr(obj, col, None)
+
             mock_db.add.side_effect = capture_add
 
             from core.agent.turn_hooks import TurnHooks
+
             hooks = TurnHooks(MagicMock())
             hooks.record_ctx_decision_audits(
-                "s1", "ev1", tool_calls, "response text", context_id, model_used=model_used,
+                "s1",
+                "ev1",
+                tool_calls,
+                "response text",
+                context_id,
+                model_used=model_used,
             )
         return captured
 
@@ -323,11 +367,14 @@ class TestDecisionAuditFields:
             mock_db_ctx.return_value.__enter__ = MagicMock(return_value=mock_db)
             mock_db_ctx.return_value.__exit__ = MagicMock(return_value=False)
             captured = {}
+
             def capture_add(obj):
                 captured["decision_output"] = obj.decision_output
+
             mock_db.add.side_effect = capture_add
 
             from core.agent.turn_hooks import TurnHooks
+
             hooks = TurnHooks(MagicMock())
             hooks.record_ctx_decision_audits("s1", "ev1", [], long_text, "snap1")
         assert len(captured["decision_output"]["text"]) == 500
@@ -336,6 +383,7 @@ class TestDecisionAuditFields:
 # ---------------------------------------------------------------------------
 # TurnHooks.record_skill_selection — field completeness
 # ---------------------------------------------------------------------------
+
 
 class TestSkillSelectionFields:
     """Verify SkillSelectionEvent records have all expected fields."""
@@ -349,12 +397,20 @@ class TestSkillSelectionFields:
             mock_db_ctx.return_value.__exit__ = MagicMock(return_value=False)
 
             def capture_add(obj):
-                for col in ["event_id", "session_id", "user_query", "selected_skills",
-                            "skill_name", "selection_method"]:
+                for col in [
+                    "event_id",
+                    "session_id",
+                    "user_query",
+                    "selected_skills",
+                    "skill_name",
+                    "selection_method",
+                ]:
                     captured[col] = getattr(obj, col, None)
+
             mock_db.add.side_effect = capture_add
 
             from core.agent.turn_hooks import TurnHooks
+
             hooks = TurnHooks(MagicMock())
             hooks.record_skill_selection("s1", user_content, tool_calls)
         return captured
@@ -362,6 +418,7 @@ class TestSkillSelectionFields:
     def test_returns_none_for_no_tools(self):
         """No tool_calls → no event, returns None."""
         from core.agent.turn_hooks import TurnHooks
+
         hooks = TurnHooks(MagicMock())
         assert hooks.record_skill_selection("s1", "query", []) is None
 
@@ -413,6 +470,7 @@ class TestSkillSelectionFields:
 # _persist_turn_events — context snapshot linking
 # ---------------------------------------------------------------------------
 
+
 class TestSnapshotLinking:
     """Verify _persist_turn_events links LLM IDs to context snapshot."""
 
@@ -420,25 +478,34 @@ class TestSnapshotLinking:
         """update_snapshot_llm_ids called with correct snapshot_id and event IDs."""
         called_with: dict[str, Any] = {}
 
-        with patch("api.routers.chat.SessionLocal") as mock_sl, \
-             patch("core.events.event_logger.EventLogger") as mock_el_cls, \
-             patch("core.agent.turn_hooks.TurnHooks"), \
-             patch("core.context.manager.ContextManager.update_snapshot_llm_ids") as mock_link:
+        with (
+            patch("api.routers.chat.SessionLocal") as mock_sl,
+            patch("core.events.event_logger.EventLogger") as mock_el_cls,
+            patch("core.agent.turn_hooks.TurnHooks"),
+            patch("core.context.manager.ContextManager.update_snapshot_llm_ids") as mock_link,
+        ):
             mock_el = MagicMock()
-            mock_el.create_user_query.return_value = MagicMock(event_id="ev1", causal_chain_id="cc1")
+            mock_el.create_user_query.return_value = MagicMock(
+                event_id="ev1", causal_chain_id="cc1"
+            )
             mock_el.create_llm_response.return_value = MagicMock(event_id="ev_llm")
             mock_el_cls.return_value = mock_el
 
             def capture_link(*a, **kw):
                 called_with["args"] = a
                 called_with.update(kw)
+
             mock_link.side_effect = capture_link
 
             from api.routers.chat import _persist_turn_events
+
             _persist_turn_events(
-                "u1", "s1",
-                [{"role": "user", "content": "hi"}], None,
-                "response", [],
+                "u1",
+                "s1",
+                [{"role": "user", "content": "hi"}],
+                None,
+                "response",
+                [],
                 context_capture_id="snap1",
             )
 
@@ -451,20 +518,28 @@ class TestSnapshotLinking:
 
     def test_snapshot_not_linked_when_no_snapshot(self):
         """No linking when context_capture_id is None."""
-        with patch("api.routers.chat.SessionLocal"), \
-             patch("core.events.event_logger.EventLogger") as mock_el_cls, \
-             patch("core.agent.turn_hooks.TurnHooks"), \
-             patch("core.context.manager.ContextManager.update_snapshot_llm_ids") as mock_link:
+        with (
+            patch("api.routers.chat.SessionLocal"),
+            patch("core.events.event_logger.EventLogger") as mock_el_cls,
+            patch("core.agent.turn_hooks.TurnHooks"),
+            patch("core.context.manager.ContextManager.update_snapshot_llm_ids") as mock_link,
+        ):
             mock_el = MagicMock()
-            mock_el.create_user_query.return_value = MagicMock(event_id="ev1", causal_chain_id="cc1")
+            mock_el.create_user_query.return_value = MagicMock(
+                event_id="ev1", causal_chain_id="cc1"
+            )
             mock_el.create_llm_response.return_value = MagicMock(event_id="ev_llm")
             mock_el_cls.return_value = mock_el
 
             from api.routers.chat import _persist_turn_events
+
             _persist_turn_events(
-                "u1", "s1",
-                [{"role": "user", "content": "hi"}], None,
-                "response", [],
+                "u1",
+                "s1",
+                [{"role": "user", "content": "hi"}],
+                None,
+                "response",
+                [],
                 context_capture_id=None,
             )
 
@@ -472,23 +547,30 @@ class TestSnapshotLinking:
 
     def test_snapshot_not_linked_when_no_user_query(self):
         """No linking when parent_event_id is None (no user content)."""
-        with patch("api.routers.chat.SessionLocal"), \
-             patch("core.events.event_logger.EventLogger") as mock_el_cls, \
-             patch("core.agent.turn_hooks.TurnHooks"), \
-             patch("core.context.manager.ContextManager.update_snapshot_llm_ids") as mock_link:
+        with (
+            patch("api.routers.chat.SessionLocal"),
+            patch("core.events.event_logger.EventLogger") as mock_el_cls,
+            patch("core.agent.turn_hooks.TurnHooks"),
+            patch("core.context.manager.ContextManager.update_snapshot_llm_ids") as mock_link,
+        ):
             mock_el = MagicMock()
             mock_el.create_llm_response.return_value = MagicMock(event_id="ev_llm")
             mock_el_cls.return_value = mock_el
 
             from api.routers.chat import _persist_turn_events
+
             _persist_turn_events(
-                "u1", "s1",
-                [{"role": "system", "content": "you are helpful"}], None,
-                "response", [],
+                "u1",
+                "s1",
+                [{"role": "system", "content": "you are helpful"}],
+                None,
+                "response",
+                [],
                 context_capture_id="snap1",
             )
 
         mock_link.assert_not_called()
+
 
 class TestNullableJSON:
     """Verify NullableJSON stores Python None as SQL NULL."""
@@ -522,6 +604,7 @@ class TestNullableJSON:
     def test_no_process_result_value_override(self):
         """NullableJSON must NOT override process_result_value — no backward compat."""
         from api.models._types import NullableJSON
+
         assert "process_result_value" not in NullableJSON.__dict__
 
 
@@ -532,22 +615,29 @@ class TestSessionActivityUpdate:
         """session event_count is atomically incremented by events produced."""
         mock_db = MagicMock()
 
-        with patch("api.routers.chat.SessionLocal", return_value=mock_db), \
-             patch("core.events.event_logger.EventLogger") as mock_el_cls, \
-             patch("core.agent.turn_hooks.TurnHooks"):
+        with (
+            patch("api.routers.chat.SessionLocal", return_value=mock_db),
+            patch("core.events.event_logger.EventLogger") as mock_el_cls,
+            patch("core.agent.turn_hooks.TurnHooks"),
+        ):
             mock_el = MagicMock()
             mock_el.create_user_query.return_value = MagicMock(
-                event_id="ev1", causal_chain_id="cc1",
+                event_id="ev1",
+                causal_chain_id="cc1",
             )
             mock_el.create_llm_response.return_value = MagicMock()
             mock_el.create_stream_event.return_value = MagicMock()
             mock_el_cls.return_value = mock_el
 
             from api.routers.chat import _persist_turn_events
+
             _persist_turn_events(
-                "u1", "s1",
-                [{"role": "user", "content": "hi"}], None,
-                "response", [],
+                "u1",
+                "s1",
+                [{"role": "user", "content": "hi"}],
+                None,
+                "response",
+                [],
             )
 
         # Phase 5 issues UPDATE event_count = event_count + :n

@@ -25,17 +25,18 @@ class CodeExecutionRequest:
     resources: ResourceProfile = field(default_factory=ResourceProfile)
     session_id: str | None = None
     data_access: DataAccessLevel = DataAccessLevel.NONE
-    source_db: str | None = None          # Required for READ/WRITE
-    tables: list[str] | None = None       # Required for WRITE — declares accessed tables
+    source_db: str | None = None  # Required for READ/WRITE
+    tables: list[str] | None = None  # Required for WRITE — declares accessed tables
     allowed_imports: list[str] | None = None
 
 
 @dataclass
 class TimeTravelInfo:
     """Records what's needed to audit/reproduce an execution."""
-    started_at: datetime           # Execution start UTC (PITR within GC window)
-    source_db: str                 # Source database name
-    sandbox_db: str                # Sandbox database name
+
+    started_at: datetime  # Execution start UTC (PITR within GC window)
+    source_db: str  # Source database name
+    sandbox_db: str  # Sandbox database name
 
 
 @dataclass
@@ -68,15 +69,18 @@ class CodeExecutor(DbConsumer):
     def execute(self, request: CodeExecutionRequest) -> CodeExecutionResult:
         # 1. GUARD
         verdict = self.security.analyze(
-            request.code, request.language, request.allowed_imports,
+            request.code,
+            request.language,
+            request.allowed_imports,
         )
         if not verdict.safe:
             return CodeExecutionResult(
                 execution=ExecutionResult(
-                    stdout="", stderr="Security check failed: " + "; ".join(
-                        f"[L{i.line}] {i.description}" for i in verdict.issues
-                    ),
-                    exit_code=1, execution_time_ms=0,
+                    stdout="",
+                    stderr="Security check failed: "
+                    + "; ".join(f"[L{i.line}] {i.description}" for i in verdict.issues),
+                    exit_code=1,
+                    execution_time_ms=0,
                 ),
                 security=verdict,
             )
@@ -98,7 +102,8 @@ class CodeExecutor(DbConsumer):
                 raise ValueError("WRITE mode requires tables")
 
             context = self._get_or_create_context(
-                request.session_id, request.source_db,
+                request.session_id,
+                request.source_db,
             )
             context.ensure_created()
             context.ensure_tables(request.tables)
@@ -114,13 +119,18 @@ class CodeExecutor(DbConsumer):
 
         try:
             result = self.runtime.execute(
-                request.code, request.language, request.resources, env or None,
+                request.code,
+                request.language,
+                request.resources,
+                env or None,
             )
         except Exception as e:
             return CodeExecutionResult(
                 execution=ExecutionResult(
-                    stdout="", stderr=f"Runtime error: {e}",
-                    exit_code=1, execution_time_ms=0,
+                    stdout="",
+                    stderr=f"Runtime error: {e}",
+                    exit_code=1,
+                    execution_time_ms=0,
                 ),
                 security=verdict,
             )
@@ -153,7 +163,9 @@ class CodeExecutor(DbConsumer):
             ctx.destroy()
 
     def _get_or_create_context(
-        self, session_id: str, source_db: str,
+        self,
+        session_id: str,
+        source_db: str,
     ) -> DataContext:
         if session_id in self._session_contexts:
             return self._session_contexts[session_id]

@@ -6,9 +6,16 @@ from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch, AsyncMock
 
 from core.agent.triggers import (
-    create_trigger, get_trigger, list_triggers, delete_trigger,
-    fire_trigger, advance_schedule, get_due_triggers,
-    claim_and_advance, verify_secret, _VALID_TRIGGER_TYPES,
+    create_trigger,
+    get_trigger,
+    list_triggers,
+    delete_trigger,
+    fire_trigger,
+    advance_schedule,
+    get_due_triggers,
+    claim_and_advance,
+    verify_secret,
+    _VALID_TRIGGER_TYPES,
 )
 
 
@@ -24,11 +31,13 @@ def mock_db():
 
 
 class TestCreateTrigger:
-
     def test_create_webhook_trigger(self, mock_db):
         result = create_trigger(
-            mock_db, user_id="u1", agent_id="dev-agent",
-            trigger_type="webhook", name="deploy-hook",
+            mock_db,
+            user_id="u1",
+            agent_id="dev-agent",
+            trigger_type="webhook",
+            name="deploy-hook",
             user_input="Deploy triggered",
         )
         assert result["trigger_id"]
@@ -39,8 +48,11 @@ class TestCreateTrigger:
 
     def test_create_schedule_trigger(self, mock_db):
         result = create_trigger(
-            mock_db, user_id="u1", agent_id="dev-agent",
-            trigger_type="schedule", name="daily-report",
+            mock_db,
+            user_id="u1",
+            agent_id="dev-agent",
+            trigger_type="schedule",
+            name="daily-report",
             user_input="Generate daily report",
             cron_expr="0 9 * * *",
         )
@@ -51,45 +63,62 @@ class TestCreateTrigger:
     def test_schedule_requires_cron_expr(self, mock_db):
         with pytest.raises(ValueError, match="cron_expr required"):
             create_trigger(
-                mock_db, user_id="u1", agent_id="dev-agent",
-                trigger_type="schedule", name="bad",
+                mock_db,
+                user_id="u1",
+                agent_id="dev-agent",
+                trigger_type="schedule",
+                name="bad",
                 user_input="no cron",
             )
 
     def test_invalid_cron_expr(self, mock_db):
         with pytest.raises(ValueError, match="Invalid cron"):
             create_trigger(
-                mock_db, user_id="u1", agent_id="dev-agent",
-                trigger_type="schedule", name="bad",
-                user_input="bad cron", cron_expr="not a cron",
+                mock_db,
+                user_id="u1",
+                agent_id="dev-agent",
+                trigger_type="schedule",
+                name="bad",
+                user_input="bad cron",
+                cron_expr="not a cron",
             )
 
     def test_invalid_trigger_type(self, mock_db):
         with pytest.raises(ValueError, match="trigger_type must be"):
             create_trigger(
-                mock_db, user_id="u1", agent_id="dev-agent",
-                trigger_type="banana", name="bad",
+                mock_db,
+                user_id="u1",
+                agent_id="dev-agent",
+                trigger_type="banana",
+                name="bad",
                 user_input="nope",
             )
 
 
 class TestFireTrigger:
-
     def test_fire_webhook(self, mock_db):
         trig = {
-            "trigger_id": "t1", "user_id": "u1", "agent_id": "dev-agent",
-            "trigger_type": "webhook", "user_input": "deploy",
-            "context": None, "is_active": 1, "session_id": None,
-            "cron_expr": None, "secret": "s1",
+            "trigger_id": "t1",
+            "user_id": "u1",
+            "agent_id": "dev-agent",
+            "trigger_type": "webhook",
+            "user_input": "deploy",
+            "context": None,
+            "is_active": 1,
+            "session_id": None,
+            "cron_expr": None,
+            "secret": "s1",
         }
 
         def factory():
             return MagicMock()
 
-        with patch("core.agent.triggers.get_trigger", return_value=trig), \
-             patch("core.agent.run_engine.RunEngine") as MockEngine, \
-             patch("core.agent.triggers._auto_session", return_value="sess-1"), \
-             patch("asyncio.create_task"):
+        with (
+            patch("core.agent.triggers.get_trigger", return_value=trig),
+            patch("core.agent.run_engine.RunEngine") as MockEngine,
+            patch("core.agent.triggers._auto_session", return_value="sess-1"),
+            patch("asyncio.create_task"),
+        ):
             mock_run = MagicMock()
             mock_run.run_id = "run-1"
             mock_run.status.value = "pending"
@@ -122,7 +151,6 @@ class TestFireTrigger:
 
 
 class TestGetDueTriggers:
-
     def test_returns_due_trigger_ids(self, mock_db):
         mock_db.query.return_value.filter.return_value.all.return_value = [("t1",), ("t2",)]
         result = get_due_triggers(mock_db)
@@ -130,11 +158,12 @@ class TestGetDueTriggers:
 
 
 class TestAdvanceSchedule:
-
     def test_advances_next_fire(self, mock_db):
         trig = {
-            "trigger_id": "t1", "cron_expr": "0 9 * * *",
-            "trigger_type": "schedule", "is_active": 1,
+            "trigger_id": "t1",
+            "cron_expr": "0 9 * * *",
+            "trigger_type": "schedule",
+            "is_active": 1,
         }
         with patch("core.agent.triggers.get_trigger", return_value=trig):
             advance_schedule(mock_db, "t1")
@@ -142,7 +171,6 @@ class TestAdvanceSchedule:
 
 
 class TestListAndDelete:
-
     def test_list_triggers(self, mock_db):
         row = MagicMock()
         row.__table__ = MagicMock()
@@ -150,7 +178,9 @@ class TestListAndDelete:
         col.name = "trigger_id"
         row.__table__.columns = [col]
         row.trigger_id = "t1"
-        mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [row]
+        mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [
+            row
+        ]
         result = list_triggers(mock_db, "u1")
         assert len(result) == 1
         assert result[0]["trigger_id"] == "t1"
@@ -161,7 +191,6 @@ class TestListAndDelete:
 
 
 class TestClaimAndAdvance:
-
     def test_claim_succeeds_when_due(self, mock_db):
         trig = {"trigger_id": "t1", "cron_expr": "0 9 * * *", "is_active": 1}
         with patch("core.agent.triggers.get_trigger", return_value=trig):
@@ -179,7 +208,6 @@ class TestClaimAndAdvance:
 
 
 class TestVerifySecret:
-
     def test_correct_secret(self):
         assert verify_secret("abc123", "abc123") is True
 

@@ -97,10 +97,7 @@ class TestParseSkillMd:
     def test_horizontal_rule_in_body(self, tmp_path):
         """Body containing --- (horizontal rule) must not be confused with frontmatter."""
         content = (
-            "---\nname: hr_test\ndescription: has hr\n---\n"
-            "Before rule.\n\n"
-            "---\n\n"
-            "After rule.\n"
+            "---\nname: hr_test\ndescription: has hr\n---\nBefore rule.\n\n---\n\nAfter rule.\n"
         )
         spec = parse_skill_md(_write(tmp_path, content))
         assert spec is not None

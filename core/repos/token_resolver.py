@@ -67,6 +67,7 @@ class TokenResolver(DbConsumer):
         """Create a new token."""
         with self._db() as db:
             from api.models import Token as TokenModel
+
             token_id = str(uuid7())
             now = datetime.now(timezone.utc)
 
@@ -105,6 +106,7 @@ class TokenResolver(DbConsumer):
         """Get token by ID."""
         with self._db() as db:
             from api.models import Token as TokenModel
+
             result = db.query(TokenModel).filter(TokenModel.token_id == token_id).first()
             if not result:
                 return None
@@ -114,7 +116,10 @@ class TokenResolver(DbConsumer):
         """Deactivate token (e.g., on 401 error)."""
         with self._db() as db:
             from api.models import Token as TokenModel
-            db.query(TokenModel).filter(TokenModel.token_id == token_id).update({"is_active": False})
+
+            db.query(TokenModel).filter(TokenModel.token_id == token_id).update(
+                {"is_active": False}
+            )
             db.commit()
             db.expire_all()  # Clear session cache
 
@@ -126,9 +131,11 @@ class TokenResolver(DbConsumer):
             from api.models import Repo as RepoModel
             from api.models import Token as TokenModel
 
-            query = db.query(TokenModel).join(
-                RepoModel, RepoModel.token_id == TokenModel.token_id
-            ).filter(TokenModel.is_active == 1)
+            query = (
+                db.query(TokenModel)
+                .join(RepoModel, RepoModel.token_id == TokenModel.token_id)
+                .filter(TokenModel.is_active == 1)
+            )
 
             if repo_id:
                 query = query.filter(RepoModel.repo_id == repo_id, RepoModel.user_id == user_id)
@@ -144,24 +151,36 @@ class TokenResolver(DbConsumer):
         """Get user default token (no scope_repo)."""
         with self._db() as db:
             from api.models import Token as TokenModel
-            result = db.query(TokenModel).filter(
-                TokenModel.type == 'repo',
-                TokenModel.scope_user_id == user_id,
-                TokenModel.scope_repo.is_(None),
-                TokenModel.is_active == 1
-            ).order_by(TokenModel.created_at.desc()).first()
+
+            result = (
+                db.query(TokenModel)
+                .filter(
+                    TokenModel.type == "repo",
+                    TokenModel.scope_user_id == user_id,
+                    TokenModel.scope_repo.is_(None),
+                    TokenModel.is_active == 1,
+                )
+                .order_by(TokenModel.created_at.desc())
+                .first()
+            )
             return self._to_model(result) if result else None
 
     def _get_global_token(self) -> Token | None:
         """Get global fallback token (no user, no repo scope)."""
         with self._db() as db:
             from api.models import Token as TokenModel
-            result = db.query(TokenModel).filter(
-                TokenModel.type == "repo",
-                TokenModel.scope_user_id.is_(None),
-                TokenModel.scope_repo.is_(None),
-                TokenModel.is_active == 1,
-            ).order_by(TokenModel.created_at.desc()).first()
+
+            result = (
+                db.query(TokenModel)
+                .filter(
+                    TokenModel.type == "repo",
+                    TokenModel.scope_user_id.is_(None),
+                    TokenModel.scope_repo.is_(None),
+                    TokenModel.is_active == 1,
+                )
+                .order_by(TokenModel.created_at.desc())
+                .first()
+            )
             return self._to_model(result) if result else None
 
     def _allow_global_token(self) -> bool:
@@ -169,7 +188,10 @@ class TokenResolver(DbConsumer):
 
         with self._db() as db:
             from api.models import Config
-            result = db.query(Config.value).filter(Config.key_name == "allow_global_repo_token").first()
+
+            result = (
+                db.query(Config.value).filter(Config.key_name == "allow_global_repo_token").first()
+            )
 
             if not result:
                 return False
@@ -177,12 +199,12 @@ class TokenResolver(DbConsumer):
 
     def _to_model(self, row) -> Token:
         """Convert ORM object to Token model.
-        
+
         Automatically decrypts encrypted_value if present.
         """
         from core.auth.encryption import decrypt_token
 
-        metadata = getattr(row, 'token_metadata', None)
+        metadata = getattr(row, "token_metadata", None)
         if isinstance(metadata, str):
             metadata = json.loads(metadata)
 

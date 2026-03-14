@@ -17,8 +17,11 @@ def cleanup(db_session):
     yield
     # Only clean after test
     from api.models import Repo
+
     try:
-        db_session.query(Repo).filter(Repo.repo_url.like('%github.com%')).delete(synchronize_session=False)
+        db_session.query(Repo).filter(Repo.repo_url.like("%github.com%")).delete(
+            synchronize_session=False
+        )
         db_session.commit()
     except:
         pass
@@ -28,9 +31,12 @@ def test_create_repo(registry, db_session):
     """Test creating a repository."""
     # Clean up first
     from api.models import Repo
-    db_session.query(Repo).filter(Repo.repo_url == "https://github.com/matrixorigin/matrixone").delete()
+
+    db_session.query(Repo).filter(
+        Repo.repo_url == "https://github.com/matrixorigin/matrixone"
+    ).delete()
     db_session.commit()
-    
+
     repo = registry.create(
         repo_url="https://github.com/matrixorigin/matrixone",
         repo_type=RepoType.CODE,
@@ -50,6 +56,7 @@ def test_create_repo(registry, db_session):
 
     # Cleanup using ORM
     from api.models import Repo
+
     db_session.query(Repo).filter(Repo.repo_id == repo.repo_id).delete()
     db_session.commit()
 
@@ -70,7 +77,10 @@ def test_get_repo(registry, db_session):
     assert retrieved.repo_url == repo.repo_url
 
     # Cleanup
-    from api.models import Repo; db_session.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db_session.commit()
+    from api.models import Repo
+
+    db_session.query(Repo).filter(Repo.repo_id == repo.repo_id).delete()
+    db_session.commit()
 
 
 def test_get_by_url(registry, db_session):
@@ -88,7 +98,10 @@ def test_get_by_url(registry, db_session):
     assert retrieved.repo_id == repo.repo_id
 
     # Cleanup
-    from api.models import Repo; db_session.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db_session.commit()
+    from api.models import Repo
+
+    db_session.query(Repo).filter(Repo.repo_id == repo.repo_id).delete()
+    db_session.commit()
 
 
 def test_list_by_owner(registry, db_session):
@@ -122,7 +135,10 @@ def test_list_by_owner(registry, db_session):
 
     # Cleanup
     from api.models import Repo
-    db_session.query(Repo).filter(Repo.repo_id.in_([repo1.repo_id, repo2.repo_id])).delete(synchronize_session=False)
+
+    db_session.query(Repo).filter(Repo.repo_id.in_([repo1.repo_id, repo2.repo_id])).delete(
+        synchronize_session=False
+    )
     db_session.commit()
 
 
@@ -143,7 +159,10 @@ def test_update_token(registry, db_session):
     assert updated.token_id == "token_123"
 
     # Cleanup
-    from api.models import Repo; db_session.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db_session.commit()
+    from api.models import Repo
+
+    db_session.query(Repo).filter(Repo.repo_id == repo.repo_id).delete()
+    db_session.commit()
 
 
 def test_update_metadata(registry, db_session):
@@ -166,7 +185,10 @@ def test_update_metadata(registry, db_session):
     assert updated.metadata["ci_enabled"] is True
 
     # Cleanup
-    from api.models import Repo; db_session.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db_session.commit()
+    from api.models import Repo
+
+    db_session.query(Repo).filter(Repo.repo_id == repo.repo_id).delete()
+    db_session.commit()
 
 
 def test_deactivate_repo(registry, db_session):
@@ -190,7 +212,10 @@ def test_deactivate_repo(registry, db_session):
     assert len(repos) == 0
 
     # Cleanup
-    from api.models import Repo; db_session.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db_session.commit()
+    from api.models import Repo
+
+    db_session.query(Repo).filter(Repo.repo_id == repo.repo_id).delete()
+    db_session.commit()
 
 
 def test_repo_groups(registry, db_session):
@@ -219,8 +244,11 @@ def test_repo_groups(registry, db_session):
     docs_repos = registry.list_by_owner("user_group", repo_type=RepoType.DOCS)
     assert len(docs_repos) == 1
     assert docs_repos[0].repo_url == "https://github.com/user/group2"
-    
+
     # Cleanup
     from api.models import Repo
-    db_session.query(Repo).filter(Repo.repo_id.in_([repo1.repo_id, repo2.repo_id])).delete(synchronize_session=False)
+
+    db_session.query(Repo).filter(Repo.repo_id.in_([repo1.repo_id, repo2.repo_id])).delete(
+        synchronize_session=False
+    )
     db_session.commit()

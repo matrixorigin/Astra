@@ -115,6 +115,7 @@ class StepResult(BaseModel):
 
 class WorkflowRun(BaseModel):
     """Runtime state — fully serializable for persistence."""
+
     workflow_name: str
     step_results: dict[str, StepResult] = Field(default_factory=dict)
     current_step_idx: int = 0
@@ -159,12 +160,17 @@ class WorkflowEngine:
         try:
             from api.database import get_db_session
             from api.models import WorkflowRun as WFRunModel
+
             db = next(get_db_session())
             try:
-                row = db.query(WFRunModel).filter(
-                    WFRunModel.run_id == self._wf_run_id,
-                    WFRunModel.status == "cancelled",
-                ).first()
+                row = (
+                    db.query(WFRunModel)
+                    .filter(
+                        WFRunModel.run_id == self._wf_run_id,
+                        WFRunModel.status == "cancelled",
+                    )
+                    .first()
+                )
                 return row is not None
             finally:
                 db.close()
@@ -172,12 +178,16 @@ class WorkflowEngine:
             return False
 
     async def execute(
-        self, workflow: Workflow, initial_inputs: dict | None = None,
+        self,
+        workflow: Workflow,
+        initial_inputs: dict | None = None,
     ) -> WorkflowRun:
         run = WorkflowRun(workflow_name=workflow.name)
         if initial_inputs:
             run.step_results["_initial"] = StepResult(
-                step_id="_initial", status=StepStatus.COMPLETED, output=initial_inputs,
+                step_id="_initial",
+                status=StepStatus.COMPLETED,
+                output=initial_inputs,
             )
 
         coro = self._execute_loop(workflow, run)
@@ -192,11 +202,16 @@ class WorkflowEngine:
         return run
 
     async def resume(
-        self, workflow: Workflow, run: WorkflowRun, event_result: dict,
+        self,
+        workflow: Workflow,
+        run: WorkflowRun,
+        event_result: dict,
     ) -> WorkflowRun:
         if run.waiting_step_id:
             run.step_results[run.waiting_step_id] = StepResult(
-                step_id=run.waiting_step_id, status=StepStatus.COMPLETED, output=event_result,
+                step_id=run.waiting_step_id,
+                status=StepStatus.COMPLETED,
+                output=event_result,
             )
         run.current_step_idx += 1
         run.status = "running"
@@ -243,7 +258,8 @@ class WorkflowEngine:
                         skip_step = workflow.steps[skip_idx]
                         if skip_step.id not in run.step_results:
                             run.step_results[skip_step.id] = StepResult(
-                                step_id=skip_step.id, status=StepStatus.SKIPPED,
+                                step_id=skip_step.id,
+                                status=StepStatus.SKIPPED,
                             )
                     run.current_step_idx = target_idx
                     continue
@@ -255,7 +271,10 @@ class WorkflowEngine:
     # ── Step execution with retry ──
 
     async def _execute_step_with_retry(
-        self, step: Step, run: WorkflowRun, workflow: Workflow,
+        self,
+        step: Step,
+        run: WorkflowRun,
+        workflow: Workflow,
     ) -> StepResult:
         last_result: StepResult | None = None
         for attempt in range(step.retry + 1):
@@ -263,12 +282,17 @@ class WorkflowEngine:
             if result.status != StepStatus.FAILED or attempt >= step.retry:
                 return result
             last_result = result
-            logger.warning(f"Step {step.id} failed (attempt {attempt + 1}/{step.retry + 1}), retrying...")
-            await asyncio.sleep(min(2 ** attempt, 30))  # exponential backoff, cap 30s
+            logger.warning(
+                f"Step {step.id} failed (attempt {attempt + 1}/{step.retry + 1}), retrying..."
+            )
+            await asyncio.sleep(min(2**attempt, 30))  # exponential backoff, cap 30s
         return last_result  # type: ignore[return-value]
 
     async def _execute_step(
-        self, step: Step, run: WorkflowRun, workflow: Workflow,
+        self,
+        step: Step,
+        run: WorkflowRun,
+        workflow: Workflow,
     ) -> StepResult:
         now = datetime.now(timezone.utc).isoformat()
         try:
@@ -281,7 +305,8 @@ class WorkflowEngine:
                     return self._exec_condition(step, run, now)
                 case StepType.WAIT:
                     return StepResult(
-                        step_id=step.id, status=StepStatus.WAITING,
+                        step_id=step.id,
+                        status=StepStatus.WAITING,
                         error=step.wait_for or f"wait:{step.id}",
                         started_at=now,
                     )
@@ -291,14 +316,18 @@ class WorkflowEngine:
                     return await self._exec_loop(step, run, workflow, now)
                 case _:
                     return StepResult(
-                        step_id=step.id, status=StepStatus.FAILED,
-                        error=f"Unknown type: {step.type}", started_at=now,
+                        step_id=step.id,
+                        status=StepStatus.FAILED,
+                        error=f"Unknown type: {step.type}",
+                        started_at=now,
                     )
         except Exception as e:
             logger.error(f"Step {step.id} failed: {e}", exc_info=True)
             return StepResult(
-                step_id=step.id, status=StepStatus.FAILED,
-                error=str(e), started_at=now,
+                step_id=step.id,
+                status=StepStatus.FAILED,
+                error=str(e),
+                started_at=now,
             )
 
     # ── Step type executors ──
@@ -322,7 +351,8 @@ class WorkflowEngine:
             result = await asyncio.wait_for(backend.wait(job_id), timeout=timeout)
         except asyncio.TimeoutError:
             return StepResult(
-                step_id=step.id, status=StepStatus.FAILED,
+                step_id=step.id,
+                status=StepStatus.FAILED,
                 error=f"Job {job_id} timed out after {step.timeout_seconds}s",
                 started_at=now,
             )
@@ -330,16 +360,26 @@ class WorkflowEngine:
 
         if result.status.value == "completed":
             return StepResult(
-                step_id=step.id, status=StepStatus.COMPLETED,
-                output=result.result or {}, started_at=now, completed_at=done,
+                step_id=step.id,
+                status=StepStatus.COMPLETED,
+                output=result.result or {},
+                started_at=now,
+                completed_at=done,
             )
         return StepResult(
-            step_id=step.id, status=StepStatus.FAILED,
-            error=result.error, started_at=now, completed_at=done,
+            step_id=step.id,
+            status=StepStatus.FAILED,
+            error=result.error,
+            started_at=now,
+            completed_at=done,
         )
 
     async def _exec_parallel(
-        self, step: Step, run: WorkflowRun, workflow: Workflow, now: str,
+        self,
+        step: Step,
+        run: WorkflowRun,
+        workflow: Workflow,
+        now: str,
     ) -> StepResult:
         if not step.branches:
             return StepResult(step_id=step.id, status=StepStatus.COMPLETED, started_at=now)
@@ -348,11 +388,13 @@ class WorkflowEngine:
         timeout = step.timeout_seconds if step.timeout_seconds > 0 else None
         try:
             results = await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True), timeout=timeout,
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=timeout,
             )
         except asyncio.TimeoutError:
             return StepResult(
-                step_id=step.id, status=StepStatus.FAILED,
+                step_id=step.id,
+                status=StepStatus.FAILED,
                 error=f"Parallel step timed out after {step.timeout_seconds}s",
                 started_at=now,
             )
@@ -361,20 +403,26 @@ class WorkflowEngine:
         for branch, res in zip(step.branches, results):
             if isinstance(res, Exception):
                 return StepResult(
-                    step_id=step.id, status=StepStatus.FAILED,
-                    error=str(res), started_at=now,
+                    step_id=step.id,
+                    status=StepStatus.FAILED,
+                    error=str(res),
+                    started_at=now,
                 )
             run.step_results[branch.id] = res
             merged[branch.id] = res.output
             if res.status == StepStatus.FAILED:
                 return StepResult(
-                    step_id=step.id, status=StepStatus.FAILED,
-                    error=res.error, started_at=now,
+                    step_id=step.id,
+                    status=StepStatus.FAILED,
+                    error=res.error,
+                    started_at=now,
                 )
 
         return StepResult(
-            step_id=step.id, status=StepStatus.COMPLETED,
-            output=merged, started_at=now,
+            step_id=step.id,
+            status=StepStatus.COMPLETED,
+            output=merged,
+            started_at=now,
             completed_at=datetime.now(timezone.utc).isoformat(),
         )
 
@@ -384,29 +432,43 @@ class WorkflowEngine:
         result = _safe_eval(step.expr, run.step_results)
         jump_to = step.then_step if result else step.else_step
         return StepResult(
-            step_id=step.id, status=StepStatus.COMPLETED,
-            output={"expr_result": result, "jump_to": jump_to}, started_at=now,
+            step_id=step.id,
+            status=StepStatus.COMPLETED,
+            output={"expr_result": result, "jump_to": jump_to},
+            started_at=now,
         )
 
     async def _exec_sub_workflow(self, step: Step, run: WorkflowRun, now: str) -> StepResult:
         sub = self._registered.get(step.workflow_ref or "")
         if not sub:
             return StepResult(
-                step_id=step.id, status=StepStatus.FAILED,
-                error=f"Workflow not found: {step.workflow_ref}", started_at=now,
+                step_id=step.id,
+                status=StepStatus.FAILED,
+                error=f"Workflow not found: {step.workflow_ref}",
+                started_at=now,
             )
         inputs = self._resolve_inputs(step, run)
         sub_run = await self.execute(sub, initial_inputs=inputs)
         if sub_run.status == "completed":
-            output = {sid: sr.output for sid, sr in sub_run.step_results.items() if sid != "_initial"}
-            return StepResult(step_id=step.id, status=StepStatus.COMPLETED, output=output, started_at=now)
+            output = {
+                sid: sr.output for sid, sr in sub_run.step_results.items() if sid != "_initial"
+            }
+            return StepResult(
+                step_id=step.id, status=StepStatus.COMPLETED, output=output, started_at=now
+            )
         return StepResult(
-            step_id=step.id, status=StepStatus.FAILED,
-            error=f"Sub-workflow {sub.name}: {sub_run.status} - {sub_run.error}", started_at=now,
+            step_id=step.id,
+            status=StepStatus.FAILED,
+            error=f"Sub-workflow {sub.name}: {sub_run.status} - {sub_run.error}",
+            started_at=now,
         )
 
     async def _exec_loop(
-        self, step: Step, run: WorkflowRun, workflow: Workflow, now: str,
+        self,
+        step: Step,
+        run: WorkflowRun,
+        workflow: Workflow,
+        now: str,
     ) -> StepResult:
         """Execute body steps repeatedly until `until` condition is true."""
         if not step.body:
@@ -420,7 +482,8 @@ class WorkflowEngine:
                 self._report(workflow.name, body_result)
                 if body_result.status == StepStatus.FAILED:
                     return StepResult(
-                        step_id=step.id, status=StepStatus.FAILED,
+                        step_id=step.id,
+                        status=StepStatus.FAILED,
                         error=f"Loop body step {body_step.id} failed: {body_result.error}",
                         started_at=now,
                     )
@@ -428,14 +491,18 @@ class WorkflowEngine:
             # Check until condition
             if step.until and _safe_eval(step.until, run.step_results):
                 return StepResult(
-                    step_id=step.id, status=StepStatus.COMPLETED,
-                    output={"iterations": iteration + 1}, started_at=now,
+                    step_id=step.id,
+                    status=StepStatus.COMPLETED,
+                    output={"iterations": iteration + 1},
+                    started_at=now,
                     completed_at=datetime.now(timezone.utc).isoformat(),
                 )
 
         return StepResult(
-            step_id=step.id, status=StepStatus.FAILED,
-            error=f"Loop exceeded max_iterations ({step.max_iterations})", started_at=now,
+            step_id=step.id,
+            status=StepStatus.FAILED,
+            error=f"Loop exceeded max_iterations ({step.max_iterations})",
+            started_at=now,
         )
 
     # ── Data flow ──
@@ -466,8 +533,12 @@ class WorkflowEngine:
 # ── Safe expression evaluator (no eval/exec) ──
 
 _OPS = {
-    ">": operator.gt, "<": operator.lt, ">=": operator.ge, "<=": operator.le,
-    "==": operator.eq, "!=": operator.ne,
+    ">": operator.gt,
+    "<": operator.lt,
+    ">=": operator.ge,
+    "<=": operator.le,
+    "==": operator.eq,
+    "!=": operator.ne,
 }
 _EXPR_RE = re.compile(r"^([\w.]+)\s*(>=|<=|!=|==|>|<)\s*(.+)$")
 

@@ -8,10 +8,11 @@ from enum import Enum
 
 class IsolationLevel(str, Enum):
     """How strongly the runtime isolates code from the host."""
-    NONE = "none"            # No isolation (e.g. eval in-process)
-    PROCESS = "process"      # Separate process, rlimit (SubprocessRuntime)
+
+    NONE = "none"  # No isolation (e.g. eval in-process)
+    PROCESS = "process"  # Separate process, rlimit (SubprocessRuntime)
     CONTAINER = "container"  # Docker container
-    MICROVM = "microvm"      # Firecracker / gVisor
+    MICROVM = "microvm"  # Firecracker / gVisor
 
 
 @dataclass(frozen=True)
@@ -23,16 +24,18 @@ class RuntimeCapabilities:
     - Reject network-dependent code if network_isolatable is False
     - Warn user if filesystem_isolated is False
     """
+
     isolation: IsolationLevel
-    network_isolatable: bool    # Can disable network per-execution?
-    filesystem_isolated: bool   # Code cannot access host filesystem?
-    resource_limits: bool       # Enforces memory/CPU limits?
-    reproducible: bool          # Same code + env → same result? (no host state leakage)
+    network_isolatable: bool  # Can disable network per-execution?
+    filesystem_isolated: bool  # Code cannot access host filesystem?
+    resource_limits: bool  # Enforces memory/CPU limits?
+    reproducible: bool  # Same code + env → same result? (no host state leakage)
 
 
 @dataclass
 class ResourceProfile:
     """Resource limits for code execution."""
+
     max_memory_mb: int = 256
     max_cpu_seconds: int = 30
     max_wall_seconds: int = 60
@@ -42,12 +45,15 @@ class ResourceProfile:
 
 # Named profiles for common use cases
 PROFILE_LIGHTWEIGHT = ResourceProfile(max_memory_mb=64, max_cpu_seconds=5, max_wall_seconds=10)
-PROFILE_DATA_ANALYSIS = ResourceProfile(max_memory_mb=1024, max_cpu_seconds=60, max_wall_seconds=120)
+PROFILE_DATA_ANALYSIS = ResourceProfile(
+    max_memory_mb=1024, max_cpu_seconds=60, max_wall_seconds=120
+)
 
 
 @dataclass
 class ExecutionResult:
     """Result of a code execution."""
+
     stdout: str
     stderr: str
     exit_code: int
@@ -99,6 +105,7 @@ def create_runtime(
     # Try Firecracker (strongest isolation)
     try:
         from core.runtime.firecracker_runtime import FirecrackerRuntime
+
         rt = FirecrackerRuntime()
         if rt.health_check() and _satisfies(rt, min_isolation, require_network_isolation):
             return rt
@@ -109,6 +116,7 @@ def create_runtime(
     if min_isolation <= IsolationLevel.CONTAINER:
         try:
             from core.runtime.docker_runtime import DockerRuntime
+
             rt = DockerRuntime(image=image or "python:3.11-slim")
             if rt.health_check() and _satisfies(rt, min_isolation, require_network_isolation):
                 return rt
@@ -118,6 +126,7 @@ def create_runtime(
     # Try Subprocess
     if min_isolation <= IsolationLevel.PROCESS:
         from core.runtime.subprocess_runtime import SubprocessRuntime
+
         rt = SubprocessRuntime()
         if _satisfies(rt, min_isolation, require_network_isolation):
             return rt
@@ -143,6 +152,7 @@ _ISO_ORDER = {
     IsolationLevel.CONTAINER: 2,
     IsolationLevel.MICROVM: 3,
 }
+
 
 def _iso_rank(level: IsolationLevel) -> int:
     return _ISO_ORDER.get(level, 0)

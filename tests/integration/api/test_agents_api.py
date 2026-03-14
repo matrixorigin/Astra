@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 def client():
     """Create test client."""
     from api.main import app
+
     return TestClient(app)
 
 
@@ -18,17 +19,13 @@ def auth_token(client):
     """Get auth token by registering and logging in."""
     # Register
     username = f"testuser_{pytest.test_id}"
-    client.post("/auth/register", json={
-        "username": username,
-        "email": f"{username}@test.com",
-        "password": "testpass123"
-    })
-    
+    client.post(
+        "/auth/register",
+        json={"username": username, "email": f"{username}@test.com", "password": "testpass123"},
+    )
+
     # Login
-    response = client.post("/auth/login", json={
-        "username": username,
-        "password": "testpass123"
-    })
+    response = client.post("/auth/login", json={"username": username, "password": "testpass123"})
     return response.json()["access_token"]
 
 
@@ -36,27 +33,27 @@ def auth_token(client):
 def setup_test_id():
     """Generate unique test ID."""
     import uuid
+
     pytest.test_id = str(uuid.uuid4())
 
 
 def test_create_and_list_agents(client, auth_token):
     """Test creating and listing agents."""
     headers = {"Authorization": f"Bearer {auth_token}"}
-    
+
     # Create agent
-    response = client.post("/agents", headers=headers, json={
-        "name": "Test Agent",
-        "agent_config": {"model": "gpt-4"}
-    })
-    
+    response = client.post(
+        "/agents", headers=headers, json={"name": "Test Agent", "agent_config": {"model": "gpt-4"}}
+    )
+
     if response.status_code != 201:
         print(f"Error: {response.json()}")
-    
+
     assert response.status_code == 201
     agent = response.json()
     assert agent["name"] == "Test Agent"
     agent_id = agent["agent_id"]
-    
+
     # List agents
     response = client.get("/agents", headers=headers)
     assert response.status_code == 200
@@ -68,14 +65,13 @@ def test_create_and_list_agents(client, auth_token):
 def test_get_agent(client, auth_token):
     """Test getting agent by ID."""
     headers = {"Authorization": f"Bearer {auth_token}"}
-    
+
     # Create agent
-    response = client.post("/agents", headers=headers, json={
-        "name": "Get Test",
-        "agent_config": {}
-    })
+    response = client.post(
+        "/agents", headers=headers, json={"name": "Get Test", "agent_config": {}}
+    )
     agent_id = response.json()["agent_id"]
-    
+
     # Get agent
     response = client.get(f"/agents/{agent_id}", headers=headers)
     assert response.status_code == 200
@@ -87,19 +83,19 @@ def test_get_agent(client, auth_token):
 def test_update_agent(client, auth_token):
     """Test updating agent."""
     headers = {"Authorization": f"Bearer {auth_token}"}
-    
+
     # Create agent
-    response = client.post("/agents", headers=headers, json={
-        "name": "Original",
-        "agent_config": {}
-    })
+    response = client.post(
+        "/agents", headers=headers, json={"name": "Original", "agent_config": {}}
+    )
     agent_id = response.json()["agent_id"]
-    
+
     # Update agent
-    response = client.put(f"/agents/{agent_id}", headers=headers, json={
-        "name": "Updated",
-        "agent_config": {"new": "config"}
-    })
+    response = client.put(
+        f"/agents/{agent_id}",
+        headers=headers,
+        json={"name": "Updated", "agent_config": {"new": "config"}},
+    )
     assert response.status_code == 200
     agent = response.json()
     assert agent["name"] == "Updated"
@@ -109,18 +105,17 @@ def test_update_agent(client, auth_token):
 def test_delete_agent(client, auth_token):
     """Test deleting agent."""
     headers = {"Authorization": f"Bearer {auth_token}"}
-    
+
     # Create agent
-    response = client.post("/agents", headers=headers, json={
-        "name": "To Delete",
-        "agent_config": {}
-    })
+    response = client.post(
+        "/agents", headers=headers, json={"name": "To Delete", "agent_config": {}}
+    )
     agent_id = response.json()["agent_id"]
-    
+
     # Delete agent
     response = client.delete(f"/agents/{agent_id}", headers=headers)
     assert response.status_code == 204
-    
+
     # Verify deleted
     response = client.get(f"/agents/{agent_id}", headers=headers)
     assert response.status_code == 404
@@ -142,12 +137,16 @@ def test_unauthorized_access(client):
 def test_create_agent_with_data_source(client, auth_token):
     """Test creating agent with data source."""
     headers = {"Authorization": f"Bearer {auth_token}"}
-    
-    response = client.post("/agents", headers=headers, json={
-        "name": "Data Source Agent",
-        "agent_config": {"model": "gpt-4"},
-        "data_source": {"type": "matrixone"}
-    })
+
+    response = client.post(
+        "/agents",
+        headers=headers,
+        json={
+            "name": "Data Source Agent",
+            "agent_config": {"model": "gpt-4"},
+            "data_source": {"type": "matrixone"},
+        },
+    )
     assert response.status_code == 201
     agent = response.json()
     assert agent["name"] == "Data Source Agent"
@@ -163,9 +162,7 @@ def test_get_agent_not_found(client, auth_token):
 def test_update_agent_not_found(client, auth_token):
     """Test updating non-existent agent."""
     headers = {"Authorization": f"Bearer {auth_token}"}
-    response = client.put("/agents/nonexistent", headers=headers, json={
-        "name": "Updated"
-    })
+    response = client.put("/agents/nonexistent", headers=headers, json={"name": "Updated"})
     assert response.status_code == 404
 
 
@@ -179,31 +176,33 @@ def test_delete_agent_not_found(client, auth_token):
 def test_agent_permission_denied(client, auth_token):
     """Test accessing other user's agent."""
     headers = {"Authorization": f"Bearer {auth_token}"}
-    
+
     # Create agent
-    response = client.post("/agents", headers=headers, json={
-        "name": "Private Agent",
-        "agent_config": {}
-    })
+    response = client.post(
+        "/agents", headers=headers, json={"name": "Private Agent", "agent_config": {}}
+    )
     agent_id = response.json()["agent_id"]
-    
+
     # Create another user
     import time
+
     other_username = f"otheruser_{str(uuid.uuid4())}"
-    client.post("/auth/register", json={
-        "username": other_username,
-        "email": f"{other_username}@test.com",
-        "password": "testpass123"
-    })
-    
+    client.post(
+        "/auth/register",
+        json={
+            "username": other_username,
+            "email": f"{other_username}@test.com",
+            "password": "testpass123",
+        },
+    )
+
     # Login as other user
-    response = client.post("/auth/login", json={
-        "username": other_username,
-        "password": "testpass123"
-    })
+    response = client.post(
+        "/auth/login", json={"username": other_username, "password": "testpass123"}
+    )
     other_token = response.json()["access_token"]
     other_headers = {"Authorization": f"Bearer {other_token}"}
-    
+
     # Try to access first user's agent
     response = client.get(f"/agents/{agent_id}", headers=other_headers)
     assert response.status_code == 404

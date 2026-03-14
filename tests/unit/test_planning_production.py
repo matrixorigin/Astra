@@ -57,8 +57,10 @@ async def test_resumes_plan_from_events_when_available():
 
     loop = _make_chat_loop()
 
-    with patch("core.agent.chat_loop.Planner") as MockPlanner, \
-         patch("core.agent.chat_loop.restore_plan_from_events", return_value=restored_plan):
+    with (
+        patch("core.agent.chat_loop.Planner") as MockPlanner,
+        patch("core.agent.chat_loop.restore_plan_from_events", return_value=restored_plan),
+    ):
         planner = MagicMock()
         planner.check_constraints.return_value = (True, None)
         planner.get_next_steps.side_effect = [[step], []]
@@ -68,9 +70,13 @@ async def test_resumes_plan_from_events_when_available():
         planner.log_plan_completed.return_value = None
         MockPlanner.return_value = planner
 
-        events = await _collect(loop.run_step_with_planning(
-            "goal", "sess", "user",
-        ))
+        events = await _collect(
+            loop.run_step_with_planning(
+                "goal",
+                "sess",
+                "user",
+            )
+        )
 
     # create_plan should NOT have been called
     planner.create_plan.assert_not_called()
@@ -92,8 +98,10 @@ async def test_creates_new_plan_when_no_prior_exists():
 
     loop = _make_chat_loop()
 
-    with patch("core.agent.chat_loop.Planner") as MockPlanner, \
-         patch("core.agent.chat_loop.restore_plan_from_events", return_value=None):
+    with (
+        patch("core.agent.chat_loop.Planner") as MockPlanner,
+        patch("core.agent.chat_loop.restore_plan_from_events", return_value=None),
+    ):
         planner = MagicMock()
         planner.create_plan = AsyncMock(return_value=new_plan)
         planner.check_constraints.return_value = (True, None)
@@ -104,9 +112,13 @@ async def test_creates_new_plan_when_no_prior_exists():
         planner.log_plan_completed.return_value = None
         MockPlanner.return_value = planner
 
-        events = await _collect(loop.run_step_with_planning(
-            "goal", "sess", "user",
-        ))
+        events = await _collect(
+            loop.run_step_with_planning(
+                "goal",
+                "sess",
+                "user",
+            )
+        )
 
     planner.create_plan.assert_called_once()
     plan_created = [e for e in events if e.event_type == StreamEventType.PLAN_CREATED]
@@ -130,8 +142,10 @@ async def test_max_revisions_from_constraints_not_llm_config():
     # Set llm.config to a different value — should be ignored
     loop.llm.config = {"max_revisions": 99}
 
-    with patch("core.agent.chat_loop.Planner") as MockPlanner, \
-         patch("core.agent.chat_loop.restore_plan_from_events", return_value=None):
+    with (
+        patch("core.agent.chat_loop.Planner") as MockPlanner,
+        patch("core.agent.chat_loop.restore_plan_from_events", return_value=None),
+    ):
         planner = MagicMock()
         planner.create_plan = AsyncMock(return_value=plan)
         planner.check_constraints.return_value = (True, None)
@@ -157,8 +171,10 @@ async def test_constraint_violation_logs_plan_failed():
 
     loop = _make_chat_loop()
 
-    with patch("core.agent.chat_loop.Planner") as MockPlanner, \
-         patch("core.agent.chat_loop.restore_plan_from_events", return_value=None):
+    with (
+        patch("core.agent.chat_loop.Planner") as MockPlanner,
+        patch("core.agent.chat_loop.restore_plan_from_events", return_value=None),
+    ):
         planner = MagicMock()
         planner.create_plan = AsyncMock(return_value=plan)
         planner.check_constraints.return_value = (False, "too many steps")
@@ -189,8 +205,10 @@ async def test_step_lifecycle_events_logged():
 
     loop = _make_chat_loop()
 
-    with patch("core.agent.chat_loop.Planner") as MockPlanner, \
-         patch("core.agent.chat_loop.restore_plan_from_events", return_value=None):
+    with (
+        patch("core.agent.chat_loop.Planner") as MockPlanner,
+        patch("core.agent.chat_loop.restore_plan_from_events", return_value=None),
+    ):
         planner = MagicMock()
         planner.create_plan = AsyncMock(return_value=plan)
         planner.check_constraints.return_value = (True, None)
@@ -222,8 +240,10 @@ async def test_plan_completed_logged():
 
     loop = _make_chat_loop()
 
-    with patch("core.agent.chat_loop.Planner") as MockPlanner, \
-         patch("core.agent.chat_loop.restore_plan_from_events", return_value=None):
+    with (
+        patch("core.agent.chat_loop.Planner") as MockPlanner,
+        patch("core.agent.chat_loop.restore_plan_from_events", return_value=None),
+    ):
         planner = MagicMock()
         planner.create_plan = AsyncMock(return_value=plan)
         planner.check_constraints.return_value = (True, None)
@@ -262,8 +282,10 @@ async def test_revision_logged_via_planner():
 
     loop = _make_chat_loop()
 
-    with patch("core.agent.chat_loop.Planner") as MockPlanner, \
-         patch("core.agent.chat_loop.restore_plan_from_events", return_value=None):
+    with (
+        patch("core.agent.chat_loop.Planner") as MockPlanner,
+        patch("core.agent.chat_loop.restore_plan_from_events", return_value=None),
+    ):
         planner = MagicMock()
         planner.create_plan = AsyncMock(return_value=plan)
         planner.check_constraints.return_value = (True, None)
@@ -294,8 +316,10 @@ async def test_planner_receives_event_logger_and_db():
     """Planner is constructed with event_logger and db from ChatLoop."""
     loop = _make_chat_loop()
 
-    with patch("core.agent.chat_loop.Planner") as MockPlanner, \
-         patch("core.agent.chat_loop.restore_plan_from_events", return_value=None):
+    with (
+        patch("core.agent.chat_loop.Planner") as MockPlanner,
+        patch("core.agent.chat_loop.restore_plan_from_events", return_value=None),
+    ):
         plan = MagicMock()
         plan.plan_id = "p1"
         plan.steps = []
@@ -336,8 +360,10 @@ async def test_completed_plan_not_resumed():
 
     loop = _make_chat_loop()
 
-    with patch("core.agent.chat_loop.Planner") as MockPlanner, \
-         patch("core.agent.chat_loop.restore_plan_from_events", return_value=old_plan):
+    with (
+        patch("core.agent.chat_loop.Planner") as MockPlanner,
+        patch("core.agent.chat_loop.restore_plan_from_events", return_value=old_plan),
+    ):
         planner = MagicMock()
         planner.create_plan = AsyncMock(return_value=new_plan)
         planner.check_constraints.return_value = (True, None)
@@ -368,8 +394,10 @@ async def test_restore_failure_falls_back_to_new_plan():
 
     loop = _make_chat_loop()
 
-    with patch("core.agent.chat_loop.Planner") as MockPlanner, \
-         patch("core.agent.chat_loop.restore_plan_from_events", side_effect=RuntimeError("DB down")):
+    with (
+        patch("core.agent.chat_loop.Planner") as MockPlanner,
+        patch("core.agent.chat_loop.restore_plan_from_events", side_effect=RuntimeError("DB down")),
+    ):
         planner = MagicMock()
         planner.create_plan = AsyncMock(return_value=new_plan)
         planner.check_constraints.return_value = (True, None)

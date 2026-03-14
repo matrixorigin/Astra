@@ -16,11 +16,12 @@ from api.routers.chat import (
 # _sse_ping format
 # ---------------------------------------------------------------------------
 
+
 def test_ping_format():
     line = _sse_ping()
     assert line.startswith("data: ")
     assert line.endswith("\n\n")
-    payload = json.loads(line[len("data: "):-2])
+    payload = json.loads(line[len("data: ") : -2])
     assert payload["type"] == "ping"
     assert isinstance(payload["ts"], int)
 
@@ -29,18 +30,19 @@ def test_ping_format():
 # _with_heartbeat
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_pings_emitted_on_slow_generator(monkeypatch):
     """Multiple pings appear when inner generator pauses longer than interval."""
     monkeypatch.setattr("api.routers.chat.HEARTBEAT_INTERVAL_S", 0.05)
 
     async def slow():
-        yield "data: {\"type\":\"a\"}\n\n"
+        yield 'data: {"type":"a"}\n\n'
         await asyncio.sleep(0.5)
-        yield "data: {\"type\":\"b\"}\n\n"
+        yield 'data: {"type":"b"}\n\n'
 
     events = [e async for e in _with_heartbeat(slow())]
-    types = [json.loads(e[len("data: "):-2])["type"] for e in events]
+    types = [json.loads(e[len("data: ") : -2])["type"] for e in events]
     pings = [t for t in types if t == "ping"]
     assert types[0] == "a"
     assert types[-1] == "b"
@@ -53,11 +55,11 @@ async def test_no_ping_on_fast_generator(monkeypatch):
 
     async def fast():
         for i in range(5):
-            yield f"data: {{\"type\":\"e{i}\"}}\n\n"
+            yield f'data: {{"type":"e{i}"}}\n\n'
 
     events = [e async for e in _with_heartbeat(fast())]
     for e in events:
-        payload = json.loads(e[len("data: "):-2])
+        payload = json.loads(e[len("data: ") : -2])
         assert payload["type"] != "ping"
     assert len(events) == 5
 
@@ -67,8 +69,8 @@ async def test_sentinel_terminates_cleanly(monkeypatch):
     monkeypatch.setattr("api.routers.chat.HEARTBEAT_INTERVAL_S", 5)
 
     async def two_events():
-        yield "data: {\"type\":\"x\"}\n\n"
-        yield "data: {\"type\":\"y\"}\n\n"
+        yield 'data: {"type":"x"}\n\n'
+        yield 'data: {"type":"y"}\n\n'
 
     events = [e async for e in _with_heartbeat(two_events())]
     assert len(events) == 2
@@ -79,7 +81,7 @@ async def test_exception_propagates_through_queue(monkeypatch):
     monkeypatch.setattr("api.routers.chat.HEARTBEAT_INTERVAL_S", 5)
 
     async def exploding():
-        yield "data: {\"type\":\"ok\"}\n\n"
+        yield 'data: {"type":"ok"}\n\n'
         raise ValueError("boom")
 
     with pytest.raises(ValueError, match="boom"):
@@ -99,7 +101,7 @@ async def test_drain_task_cancelled_on_consumer_break(monkeypatch):
         try:
             i = 0
             while True:
-                yield f"data: {{\"type\":\"e{i}\"}}\n\n"
+                yield f'data: {{"type":"e{i}"}}\n\n'
                 i += 1
                 await asyncio.sleep(0.01)
         finally:
@@ -125,17 +127,19 @@ async def test_drain_task_cancelled_on_consumer_break(monkeypatch):
 # that requires a full chat_turn integration test with DB + LLM.
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_server_timeout_fires_on_hanging_stream(monkeypatch):
     """If the LLM stream hangs completely, the per-__anext__ timeout fires."""
     monkeypatch.setattr("api.routers.chat.SERVER_TURN_TIMEOUT_S", 0.05)
 
     async def hanging_llm_stream():
-        yield "data: {\"type\":\"text_delta\",\"content\":\"ok\"}\n\n"
+        yield 'data: {"type":"text_delta","content":"ok"}\n\n'
         await asyncio.sleep(10)  # simulate LLM hang
-        yield "data: {\"type\":\"turn_complete\"}\n\n"
+        yield 'data: {"type":"turn_complete"}\n\n'
 
     from api.routers.chat import SERVER_TURN_TIMEOUT_S
+
     _deadline = time.monotonic() + SERVER_TURN_TIMEOUT_S
 
     async def _next_with_timeout(aiter):

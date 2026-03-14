@@ -153,6 +153,7 @@ class TestTokenTypeVerification:
         """Test verifying token with missing type."""
         # Create token without type (manually)
         import jwt
+
         config = JWTConfig()
         token = jwt.encode({"sub": "user_123"}, config.secret_key, algorithm=config.algorithm)
         payload = decode_token(token, config)

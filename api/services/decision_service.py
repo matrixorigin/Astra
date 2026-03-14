@@ -33,10 +33,10 @@ class DecisionService:
         context_capture_id: str,
         decision_type: str,
         decision_output: dict[str, Any],
-        model_params: dict[str, Any] | None = None
+        model_params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """记录决策
-        
+
         Args:
             user_id: 用户ID
             session_id: 会话ID
@@ -45,7 +45,7 @@ class DecisionService:
             decision_type: 决策类型（skill_selection, response_generation, etc.）
             decision_output: 决策输出
             model_params: 模型参数（model, temperature, etc.）
-            
+
         Returns:
             决策记录
         """
@@ -65,7 +65,7 @@ class DecisionService:
                 "context_capture_id": context_capture_id,
                 "decision_type": decision_type,
                 "decision_output": decision_output,
-                "model_params": model_params or {}
+                "model_params": model_params or {},
             }
 
             decision = self.decision_repo.create(decision_data)
@@ -79,9 +79,9 @@ class DecisionService:
                 details={
                     "session_id": session_id,
                     "event_id": event_id,
-                    "decision_type": decision_type
+                    "decision_type": decision_type,
                 },
-                status="success"
+                status="success",
             )
 
             return {
@@ -92,7 +92,7 @@ class DecisionService:
                 "decision_type": decision.decision_type,
                 "decision_output": decision.decision_output,
                 "model_params": decision.model_params,
-                "created_at": decision.created_at.isoformat()
+                "created_at": decision.created_at.isoformat(),
             }
 
         except Exception as e:
@@ -102,15 +102,11 @@ class DecisionService:
                 resource_type="decision",
                 resource_id="unknown",
                 details={"error": str(e)},
-                status="failed"
+                status="failed",
             )
             raise
 
-    def get_decision(
-        self,
-        decision_id: str,
-        user_id: str
-    ) -> dict[str, Any]:
+    def get_decision(self, decision_id: str, user_id: str) -> dict[str, Any]:
         """获取决策记录"""
         decision = self.decision_repo.get_by_id_with_user(decision_id, user_id)
 
@@ -125,14 +121,10 @@ class DecisionService:
             "decision_type": decision.decision_type,
             "decision_output": decision.decision_output,
             "model_params": decision.model_params,
-            "created_at": decision.created_at.isoformat()
+            "created_at": decision.created_at.isoformat(),
         }
 
-    def get_decision_with_context(
-        self,
-        decision_id: str,
-        user_id: str
-    ) -> dict[str, Any]:
+    def get_decision_with_context(self, decision_id: str, user_id: str) -> dict[str, Any]:
         """获取决策及其完整上下文（用于审计）"""
         from api.models import ContextSnapshot
 
@@ -140,9 +132,11 @@ class DecisionService:
         decision = self.get_decision(decision_id, user_id)
 
         # 使用 ORM 获取上下文快照
-        snapshot = self.db_session.query(ContextSnapshot).filter(
-            ContextSnapshot.context_capture_id == decision["context_capture_id"]
-        ).first()
+        snapshot = (
+            self.db_session.query(ContextSnapshot)
+            .filter(ContextSnapshot.context_capture_id == decision["context_capture_id"])
+            .first()
+        )
 
         if snapshot:
             decision["context"] = {
@@ -161,7 +155,7 @@ class DecisionService:
         session_id: str | None = None,
         decision_type: str | None = None,
         limit: int = 50,
-        offset: int = 0
+        offset: int = 0,
     ) -> dict[str, Any]:
         """列出决策记录"""
         if session_id:
@@ -171,16 +165,11 @@ class DecisionService:
                 raise PermissionDeniedError(f"无权限访问 Session {session_id}")
 
             decisions, total = self.decision_repo.list_by_session(
-                session_id=session_id,
-                limit=limit,
-                offset=offset
+                session_id=session_id, limit=limit, offset=offset
             )
         else:
             decisions, total = self.decision_repo.list_by_user(
-                user_id=user_id,
-                decision_type=decision_type,
-                limit=limit,
-                offset=offset
+                user_id=user_id, decision_type=decision_type, limit=limit, offset=offset
             )
 
         return {
@@ -191,11 +180,11 @@ class DecisionService:
                     "event_id": d.event_id,
                     "context_capture_id": d.context_capture_id,
                     "decision_type": d.decision_type,
-                    "created_at": d.created_at.isoformat()
+                    "created_at": d.created_at.isoformat(),
                 }
                 for d in decisions
             ],
             "total": total,
             "limit": limit,
-            "offset": offset
+            "offset": offset,
         }

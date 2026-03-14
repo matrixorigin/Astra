@@ -55,18 +55,26 @@ class TurnHooks(DbConsumer):
 
         from api.models import DecisionAudit
 
-        tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
+        tc_names = (
+            [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
+        )
         try:
             with self._db() as db:
-                db.add(DecisionAudit(
-                    decision_id=str(uuid7()),
-                    session_id=session_id,
-                    event_id=event_id,
-                    decision_type="tool_selection" if tc_names else "response_generation",
-                    decision_output={"text": response_text[:500], "tool_calls": tc_names, "model_used": model_used},
-                    context_capture_id=context_capture_id,
-                    model_used=model_used,
-                ))
+                db.add(
+                    DecisionAudit(
+                        decision_id=str(uuid7()),
+                        session_id=session_id,
+                        event_id=event_id,
+                        decision_type="tool_selection" if tc_names else "response_generation",
+                        decision_output={
+                            "text": response_text[:500],
+                            "tool_calls": tc_names,
+                            "model_used": model_used,
+                        },
+                        context_capture_id=context_capture_id,
+                        model_used=model_used,
+                    )
+                )
                 db.commit()
         except Exception as e:
             logger.debug("Decision audit skipped: %s", e)
@@ -82,7 +90,9 @@ class TurnHooks(DbConsumer):
         skill_versions: dict[str, str] | None = None,
     ) -> str | None:
         """Record skill selection event if tools were called. Returns event_id."""
-        tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
+        tc_names = (
+            [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
+        )
         if not tc_names:
             return None
 
@@ -93,16 +103,18 @@ class TurnHooks(DbConsumer):
         event_id = str(uuid7())
         try:
             with self._db() as db:
-                db.add(SkillSelectionEvent(
-                    event_id=event_id,
-                    session_id=session_id,
-                    agent_id=agent_id,
-                    user_query=(user_content or "")[:2000],
-                    selected_skills=tc_names,
-                    skill_name=tc_names[0],
-                    skill_version=(skill_versions or {}).get(tc_names[0]),
-                    selection_method="llm_tool_choice",
-                ))
+                db.add(
+                    SkillSelectionEvent(
+                        event_id=event_id,
+                        session_id=session_id,
+                        agent_id=agent_id,
+                        user_query=(user_content or "")[:2000],
+                        selected_skills=tc_names,
+                        skill_name=tc_names[0],
+                        skill_version=(skill_versions or {}).get(tc_names[0]),
+                        selection_method="llm_tool_choice",
+                    )
+                )
                 db.commit()
             return event_id
         except Exception as e:
@@ -120,11 +132,14 @@ class TurnHooks(DbConsumer):
             return
         try:
             from api.models.skill import SkillSelectionEvent
+
             with self._db() as db:
                 row = (
                     db.query(SkillSelectionEvent)
-                    .filter(SkillSelectionEvent.session_id == session_id,
-                            SkillSelectionEvent.execution_time_ms.is_(None))
+                    .filter(
+                        SkillSelectionEvent.session_id == session_id,
+                        SkillSelectionEvent.execution_time_ms.is_(None),
+                    )
                     .order_by(SkillSelectionEvent.created_at.desc())
                     .first()
                 )
@@ -153,6 +168,7 @@ class TurnHooks(DbConsumer):
         def _bg():
             try:
                 from core.memory.backends import get_memoria_storage
+
                 svc = get_memoria_storage(user_id)
                 svc.run_pipeline(user_id=user_id, messages=messages)
             except Exception as e:
@@ -221,7 +237,7 @@ class TurnHooks(DbConsumer):
             # Store reflect context for next turn's lesson extraction.
             # tool_results contains the reflect tool's output (the history evidence).
             reflect_output = ""
-            for tr in (tool_results or []):
+            for tr in tool_results or []:
                 if tr.get("name") == "reflect":
                     reflect_output = str(tr.get("result", ""))[:500]
                     break
@@ -248,6 +264,7 @@ class TurnHooks(DbConsumer):
         try:
             from core.memory.backends import get_memoria_storage
             from core.memory.types import MemoryType, TrustTier
+
             svc = get_memoria_storage(user_id)
             svc.store(
                 user_id=user_id,

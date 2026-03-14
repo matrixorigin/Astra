@@ -38,7 +38,7 @@ class SkillService:
         skill_version: str,
         skill_code: str,
         description: str | None = None,
-        metadata: dict[str, Any] | None = None
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """注册技能"""
         db = self.db_session
@@ -46,9 +46,9 @@ class SkillService:
             code_hash = hashlib.sha256(skill_code.encode()).hexdigest()
 
             # 停用旧版本
-            db.query(SkillRegistry).filter(
-                SkillRegistry.skill_name == skill_name
-            ).update({"is_active": 0})
+            db.query(SkillRegistry).filter(SkillRegistry.skill_name == skill_name).update(
+                {"is_active": 0}
+            )
 
             skill_definition = metadata or {}
 
@@ -66,7 +66,7 @@ class SkillService:
                 dependencies=[],
                 priority=5,
                 cost_estimate="medium",
-                side_effect_profile={"category": "read"}
+                side_effect_profile={"category": "read"},
             )
 
             db.add(new_skill)
@@ -79,7 +79,7 @@ class SkillService:
                 resource_type="skill",
                 resource_id=skill_id,
                 details={"skill_name": skill_name, "version": skill_version},
-                status="success"
+                status="success",
             )
 
             return {
@@ -88,7 +88,7 @@ class SkillService:
                 "version": new_skill.version,
                 "description": new_skill.description,
                 "metadata": new_skill.skill_definition or {},
-                "created_at": new_skill.created_at.isoformat() if new_skill.created_at else None
+                "created_at": new_skill.created_at.isoformat() if new_skill.created_at else None,
             }
 
         except Exception as e:
@@ -99,15 +99,11 @@ class SkillService:
                 resource_type="skill",
                 resource_id=skill_id,
                 details={"error": str(e)},
-                status="failed"
+                status="failed",
             )
             raise
 
-    def get_skill(
-        self,
-        skill_id: str,
-        version: str | None = None
-    ) -> dict[str, Any]:
+    def get_skill(self, skill_id: str, version: str | None = None) -> dict[str, Any]:
         """获取技能信息"""
         try:
             query = self.db_session.query(SkillRegistry).filter(SkillRegistry.skill_id == skill_id)
@@ -115,7 +111,9 @@ class SkillService:
             if version:
                 query = query.filter(SkillRegistry.version == version)
             else:
-                query = query.filter(SkillRegistry.is_active == 1).order_by(desc(SkillRegistry.created_at))
+                query = query.filter(SkillRegistry.is_active == 1).order_by(
+                    desc(SkillRegistry.created_at)
+                )
 
             skill = query.first()
 
@@ -128,25 +126,28 @@ class SkillService:
                 "version": skill.version,
                 "description": skill.description,
                 "metadata": skill.skill_definition or {},
-                "created_at": skill.created_at.isoformat() if skill.created_at else None
+                "created_at": skill.created_at.isoformat() if skill.created_at else None,
             }
         except ResourceNotFoundError:
             raise
         except Exception as e:
             raise ResourceNotFoundError(f"获取技能失败: {e!s}")
 
-    def list_skills(
-        self,
-        limit: int = 50,
-        offset: int = 0
-    ) -> dict[str, Any]:
+    def list_skills(self, limit: int = 50, offset: int = 0) -> dict[str, Any]:
         """列出所有技能"""
         try:
-            total = self.db_session.query(SkillRegistry).filter(SkillRegistry.is_active == 1).count()
+            total = (
+                self.db_session.query(SkillRegistry).filter(SkillRegistry.is_active == 1).count()
+            )
 
-            skills = self.db_session.query(SkillRegistry).filter(
-                SkillRegistry.is_active == 1
-            ).order_by(desc(SkillRegistry.created_at)).offset(offset).limit(limit).all()
+            skills = (
+                self.db_session.query(SkillRegistry)
+                .filter(SkillRegistry.is_active == 1)
+                .order_by(desc(SkillRegistry.created_at))
+                .offset(offset)
+                .limit(limit)
+                .all()
+            )
 
             return {
                 "skills": [
@@ -154,40 +155,47 @@ class SkillService:
                         "skill_id": s.skill_id,
                         "skill_name": s.skill_name,
                         "version": s.version,
-                        "description": s.description
+                        "description": s.description,
                     }
                     for s in skills
                 ],
                 "total": total,
                 "limit": limit,
-                "offset": offset
+                "offset": offset,
             }
         except Exception:
             return {"skills": [], "total": 0, "limit": limit, "offset": offset}
 
-    def list_skill_versions(
-        self,
-        skill_id: str
-    ) -> list[dict[str, Any]]:
+    def list_skill_versions(self, skill_id: str) -> list[dict[str, Any]]:
         """列出技能的所有版本"""
         try:
             # First find the skill name from the ID
-            skill = self.db_session.query(SkillRegistry).filter(SkillRegistry.skill_id == skill_id).first()
+            skill = (
+                self.db_session.query(SkillRegistry)
+                .filter(SkillRegistry.skill_id == skill_id)
+                .first()
+            )
             if not skill:
                 # Fallback: try to match by ID only (though ID usually includes name)
-                versions = self.db_session.query(SkillRegistry).filter(
-                    SkillRegistry.skill_id == skill_id
-                ).order_by(desc(SkillRegistry.version)).all()
+                versions = (
+                    self.db_session.query(SkillRegistry)
+                    .filter(SkillRegistry.skill_id == skill_id)
+                    .order_by(desc(SkillRegistry.version))
+                    .all()
+                )
             else:
-                versions = self.db_session.query(SkillRegistry).filter(
-                    SkillRegistry.skill_name == skill.skill_name
-                ).order_by(desc(SkillRegistry.version)).all()
+                versions = (
+                    self.db_session.query(SkillRegistry)
+                    .filter(SkillRegistry.skill_name == skill.skill_name)
+                    .order_by(desc(SkillRegistry.version))
+                    .all()
+                )
 
             return [
                 {
                     "version": v.version,
                     "description": v.description,
-                    "created_at": v.created_at.isoformat() if v.created_at else None
+                    "created_at": v.created_at.isoformat() if v.created_at else None,
                 }
                 for v in versions
             ]

@@ -42,8 +42,8 @@ TOKEN_CHAR_RATIO = 2
 
 # Task-type → ideal zone weight distribution.
 _IDEAL_ZONE_WEIGHTS: dict[str, dict[str, float]] = {
-    "code_gen":  {"code": 0.40, "history": 0.30, "memory": 0.15},
-    "qa":        {"history": 0.45, "memory": 0.30, "code": 0.10},
+    "code_gen": {"code": 0.40, "history": 0.30, "memory": 0.15},
+    "qa": {"history": 0.45, "memory": 0.30, "code": 0.10},
     "debugging": {"code": 0.45, "history": 0.25, "memory": 0.15},
 }
 _DEFAULT_WEIGHTS: dict[str, float] = {"history": 0.35, "code": 0.25, "memory": 0.20}
@@ -52,6 +52,7 @@ _DEFAULT_WEIGHTS: dict[str, float] = {"history": 0.35, "code": 0.25, "memory": 0
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
 
 def _verify_session_owner(db: Session, session_id: str, user_id: str) -> None:
     """Raise 404 if session doesn't exist or doesn't belong to user."""
@@ -92,6 +93,7 @@ def _compute_trend(token_history: list[int]) -> str:
 # Pure analysis functions (no DB access, fully testable)
 # ---------------------------------------------------------------------------
 
+
 def _analyze_context_health(
     budget: dict,
     total_tokens_history: list[int],
@@ -113,7 +115,9 @@ def _analyze_context_health(
     bottleneck_util = 0.0
 
     if is_flat:
-        ref_tokens = llm_prompt_tokens or sum(v for v in budget.values() if isinstance(v, (int, float)))
+        ref_tokens = llm_prompt_tokens or sum(
+            v for v in budget.values() if isinstance(v, (int, float))
+        )
         zone_total = 0
         for zone, val in budget.items():
             if not isinstance(val, (int, float)) or val <= 0:
@@ -128,11 +132,13 @@ def _analyze_context_health(
         # token_usage only records the aggregate prompt total, not per-component counts.
         if llm_prompt_tokens and llm_prompt_tokens > zone_total:
             unmanaged = llm_prompt_tokens - zone_total
-            zones.append({
-                "name": "conversation_history_and_tools",
-                "tokens": unmanaged,
-                "share": round(unmanaged / ref_tokens, 3),
-            })
+            zones.append(
+                {
+                    "name": "conversation_history_and_tools",
+                    "tokens": unmanaged,
+                    "share": round(unmanaged / ref_tokens, 3),
+                }
+            )
         overall_util = round(ref_tokens / cw, 3)
         recommendation_base = f"prompt {ref_tokens:,} / {cw:,} tokens ({overall_util:.0%})"
     else:
@@ -147,21 +153,33 @@ def _analyze_context_health(
             if allocated <= 0:
                 continue
             util = round(used / allocated, 2)
-            status = "high" if util >= ZONE_UTIL_HIGH else ("medium" if util >= ZONE_UTIL_MEDIUM else "ok")
+            status = (
+                "high"
+                if util >= ZONE_UTIL_HIGH
+                else ("medium" if util >= ZONE_UTIL_MEDIUM else "ok")
+            )
             zones.append({"name": zone, "utilization": util, "status": status})
             if util > bottleneck_util:
                 bottleneck_util = util
                 bottleneck_zone = zone
         overall_util = bottleneck_util
-        recommendation_base = f"{bottleneck_zone} zone near limit" if bottleneck_zone else "all zones"
+        recommendation_base = (
+            f"{bottleneck_zone} zone near limit" if bottleneck_zone else "all zones"
+        )
 
-    status = "high" if overall_util >= ZONE_UTIL_HIGH else ("medium" if overall_util >= ZONE_UTIL_MEDIUM else "ok")
+    status = (
+        "high"
+        if overall_util >= ZONE_UTIL_HIGH
+        else ("medium" if overall_util >= ZONE_UTIL_MEDIUM else "ok")
+    )
     trend = _compute_trend(total_tokens_history)
 
     if overall_util >= ZONE_UTIL_HIGH:
         recommendation = f"{recommendation_base} — compaction recommended"
     elif trend == "growing" and len(total_tokens_history) >= 3:
-        recommendation = f"{recommendation_base} — token usage growing, monitor for compaction trigger"
+        recommendation = (
+            f"{recommendation_base} — token usage growing, monitor for compaction trigger"
+        )
     else:
         recommendation = "context healthy"
 
@@ -200,6 +218,7 @@ def _analyze_context_health(
 
 def _zone_balance(budget: dict, task_type: str | None) -> dict:
     """Check if zone allocation matches the task type's ideal distribution."""
+
     def _alloc(v: object) -> int:
         if isinstance(v, dict):
             return v.get("allocated", 0)
@@ -207,8 +226,11 @@ def _zone_balance(budget: dict, task_type: str | None) -> dict:
             return int(v)
         return 0
 
-    managed_zones = {k: v for k, v in budget.items()
-                     if k not in ("system", "skills", "reserve") and _alloc(v) > 0}
+    managed_zones = {
+        k: v
+        for k, v in budget.items()
+        if k not in ("system", "skills", "reserve") and _alloc(v) > 0
+    }
     if not managed_zones:
         return {"balanced": True, "misallocated_zone": None, "matched_profile": None}
 
@@ -232,7 +254,9 @@ def _zone_balance(budget: dict, task_type: str | None) -> dict:
         "balanced": balanced,
         "misallocated_zone": worst_zone if not balanced else None,
         "matched_profile": matched,
-        "recommendation": f"{worst_zone} zone allocation off by {worst_gap:.0%} for {matched} tasks" if not balanced else "zone balance ok",
+        "recommendation": f"{worst_zone} zone allocation off by {worst_gap:.0%} for {matched} tasks"
+        if not balanced
+        else "zone balance ok",
     }
 
 
@@ -243,9 +267,18 @@ def _pollution_ratio(relevance_scores: dict) -> dict:
     scores = list(relevance_scores.values())
     low = sum(1 for s in scores if s < POLLUTION_THRESHOLD)
     pct = round(low / len(scores), 2)
-    status = "polluted" if pct > POLLUTION_STATUS_POLLUTED else ("noisy" if pct > POLLUTION_STATUS_NOISY else "clean")
-    return {"pollution_pct": pct, "status": status,
-            "recommendation": "re-retrieve or raise relevance threshold" if status == "polluted" else "ok"}
+    status = (
+        "polluted"
+        if pct > POLLUTION_STATUS_POLLUTED
+        else ("noisy" if pct > POLLUTION_STATUS_NOISY else "clean")
+    )
+    return {
+        "pollution_pct": pct,
+        "status": status,
+        "recommendation": "re-retrieve or raise relevance threshold"
+        if status == "polluted"
+        else "ok",
+    }
 
 
 def _compaction_effectiveness(token_history: list[int]) -> dict:
@@ -264,7 +297,9 @@ def _compaction_effectiveness(token_history: list[int]) -> dict:
     return {
         "compactions_detected": len(compactions),
         "avg_reduction_pct": avg_reduction,
-        "status": "effective" if avg_reduction >= COMPACTION_EFFECTIVE_PCT else "weak — consider more aggressive compaction",
+        "status": "effective"
+        if avg_reduction >= COMPACTION_EFFECTIVE_PCT
+        else "weak — consider more aggressive compaction",
     }
 
 
@@ -288,14 +323,23 @@ def _relevance_quality(relevance_scores: dict) -> dict:
     high = sum(1 for s in scores if s >= RELEVANCE_HIGH)
     medium = sum(1 for s in scores if RELEVANCE_LOW <= s < RELEVANCE_HIGH)
     low = sum(1 for s in scores if s < RELEVANCE_LOW)
-    quality = "good" if mean >= QUALITY_GOOD else ("degraded" if mean >= QUALITY_DEGRADED else "poor")
-    return {"mean": mean, "high": high, "medium": medium, "low": low,
-            "total": len(scores), "quality": quality}
+    quality = (
+        "good" if mean >= QUALITY_GOOD else ("degraded" if mean >= QUALITY_DEGRADED else "poor")
+    )
+    return {
+        "mean": mean,
+        "high": high,
+        "medium": medium,
+        "low": low,
+        "total": len(scores),
+        "quality": quality,
+    }
 
 
 @dataclass
 class _SnapshotContentRow:
     """Named container for content columns — avoids fragile tuple indexing."""
+
     selected_events: str | None
     code_context: str | None
     skill_definitions: str | None
@@ -350,8 +394,12 @@ def _raw_contents(row: _SnapshotContentRow, token_budget: int) -> dict:
     used = 0
     raw: dict = {}
 
-    for key, blob in [("events", row.selected_events), ("code", row.code_context),
-                       ("skills", row.skill_definitions), ("docs", row.documentation)]:
+    for key, blob in [
+        ("events", row.selected_events),
+        ("code", row.code_context),
+        ("skills", row.skill_definitions),
+        ("docs", row.documentation),
+    ]:
         if not blob or used >= char_budget:
             continue
         try:
@@ -380,6 +428,7 @@ def _raw_contents(row: _SnapshotContentRow, token_budget: int) -> dict:
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
 
 @router.get("/introspection/memory")
 def get_introspection_memory(
@@ -497,11 +546,14 @@ def _get_semantic_stats(db: Session, session_id: str) -> dict:
                 try:
                     budget = json.loads(latest[0])
                     prompt_history = [
-                        u["prompt"] for r in usage_rows
+                        u["prompt"]
+                        for r in usage_rows
                         if (u := _parse_token_usage(r[0])) and u.get("prompt") is not None
                     ]
                     result["health"] = _analyze_context_health(
-                        budget, prompt_history, llm_usage=llm_usage,
+                        budget,
+                        prompt_history,
+                        llm_usage=llm_usage,
                     )
                 except (ValueError, TypeError):
                     pass
@@ -577,7 +629,9 @@ def get_introspection_skills(
             if r[0] in seen or r[0] in installed_names:
                 continue
             seen.add(r[0])
-            cloud.append({"name": r[0], "version": r[1], "description": r[2] or "", "category": r[3] or ""})
+            cloud.append(
+                {"name": r[0], "version": r[1], "description": r[2] or "", "category": r[3] or ""}
+            )
 
         return {"installed": installed, "cloud": cloud}
     except SQLAlchemyError as exc:
@@ -660,10 +714,13 @@ def get_context_snapshot(
     _verify_session_owner(db, session_id, current_user["user_id"])
 
     # Get total count + target row in 2 efficient queries (not fetchall)
-    total_turns = db.execute(
-        text("SELECT COUNT(*) FROM ctx_snapshots WHERE session_id = :sid"),
-        {"sid": session_id},
-    ).scalar() or 0
+    total_turns = (
+        db.execute(
+            text("SELECT COUNT(*) FROM ctx_snapshots WHERE session_id = :sid"),
+            {"sid": session_id},
+        ).scalar()
+        or 0
+    )
 
     if total_turns == 0:
         raise HTTPException(status_code=404, detail="No snapshots for this session")
@@ -671,7 +728,10 @@ def get_context_snapshot(
     # Resolve offset: turn_index is 1-based oldest-first; DB is ordered ASC
     if turn_index:
         if turn_index > total_turns:
-            raise HTTPException(status_code=404, detail=f"Turn {turn_index} not found (session has {total_turns} turns)")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Turn {turn_index} not found (session has {total_turns} turns)",
+            )
         offset = turn_index - 1
         actual_turn = turn_index
     else:
@@ -679,7 +739,11 @@ def get_context_snapshot(
         actual_turn = total_turns
 
     # Fetch only the target row
-    content_cols = ", selected_events, code_context, skill_definitions, documentation" if (detail or raw) else ""
+    content_cols = (
+        ", selected_events, code_context, skill_definitions, documentation"
+        if (detail or raw)
+        else ""
+    )
     row = db.execute(
         text(f"""
             SELECT context_capture_id, token_budget, total_tokens,
@@ -735,7 +799,8 @@ def get_context_snapshot(
                 current_usage = _parse_token_usage(trend_rows[-1][1])
 
             trend_prompts = [
-                u["prompt"] for r in trend_rows
+                u["prompt"]
+                for r in trend_rows
                 if (u := _parse_token_usage(r[1])) and u.get("prompt") is not None
             ]
 
@@ -746,16 +811,18 @@ def get_context_snapshot(
                 result["llm_completion_tokens"] = current_usage.get("completion")
                 result["llm_total_tokens"] = current_usage.get("total")
             result["health"] = _analyze_context_health(
-                budget, list(reversed(trend_prompts)),
+                budget,
+                list(reversed(trend_prompts)),
                 llm_prompt_tokens=current_prompt,
                 llm_usage=current_usage,
             )
             result["zone_balance"] = _zone_balance(budget, row[5])
-            
+
             # Tool tokens vs non-tool tokens breakdown
             tool_tokens = budget.get("tool_schemas", 0)
-            non_tool_tokens = sum(v for k, v in budget.items() 
-                                  if k != "tool_schemas" and isinstance(v, (int, float)))
+            non_tool_tokens = sum(
+                v for k, v in budget.items() if k != "tool_schemas" and isinstance(v, (int, float))
+            )
             total_managed = tool_tokens + non_tool_tokens
             result["token_breakdown"] = {
                 "tool_tokens": tool_tokens,
@@ -831,15 +898,23 @@ def get_retrieval_quality(
 
     overall_mean = round(sum(means) / len(means), 3)
     degrading = len(means) >= 2 and (means[0] - means[-1]) > DEGRADATION_DELTA
-    overall_quality = "degrading" if degrading else (
-        "good" if overall_mean >= QUALITY_GOOD else ("degraded" if overall_mean >= QUALITY_DEGRADED else "poor")
+    overall_quality = (
+        "degrading"
+        if degrading
+        else (
+            "good"
+            if overall_mean >= QUALITY_GOOD
+            else ("degraded" if overall_mean >= QUALITY_DEGRADED else "poor")
+        )
     )
 
     return {
         "turns_sampled": len(rows),
         "overall_quality": overall_quality,
         "mean_relevance": overall_mean,
-        "recommendation": "consider context reset or re-retrieval" if overall_quality in ("degrading", "poor") else "retrieval healthy",
+        "recommendation": "consider context reset or re-retrieval"
+        if overall_quality in ("degrading", "poor")
+        else "retrieval healthy",
     }
 
 

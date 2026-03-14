@@ -51,12 +51,12 @@ class FindSkillsTool(EdgeTool):
 
     def _get_embed_fn(self) -> Callable[[str], list[float]] | None:
         """Get embedding function from configured provider.
-        
+
         Returns None if:
         - Embedding provider not configured
         - API key missing
         - Provider initialization fails
-        
+
         Caller should fall back to keyword search when None.
         """
         try:
@@ -82,9 +82,11 @@ class FindSkillsTool(EdgeTool):
             logger.debug("Failed to initialize embedding client: %s, will use keyword search", e)
             return None
 
-    async def execute(self, query: str, category: str | None = None, limit: int = 5, **kwargs: Any) -> str:
+    async def execute(
+        self, query: str, category: str | None = None, limit: int = 5, **kwargs: Any
+    ) -> str:
         """Search skills using semantic index with keyword fallback.
-        
+
         Strategy:
         1. Try semantic search if embedding function available
         2. Fall back to keyword search if semantic search unavailable or returns no results
@@ -107,7 +109,10 @@ class FindSkillsTool(EdgeTool):
 
             if not skill_names:
                 # Fallback: keyword search in DB when semantic search returns nothing
-                logger.debug("Semantic search returned no results for query '%s', falling back to keyword search", query)
+                logger.debug(
+                    "Semantic search returned no results for query '%s', falling back to keyword search",
+                    query,
+                )
                 return await self._keyword_search(query, category, limit)
 
             # Fetch skill details
@@ -125,16 +130,18 @@ class FindSkillsTool(EdgeTool):
             lines = [f"Found {len(results)} skills matching '{query}':"]
             for r in results:
                 lines.append(f"\n**{r['name']}**")
-                if r.get('description'):
+                if r.get("description"):
                     # Truncate long descriptions to 200 chars with indicator
-                    desc = r['description']
+                    desc = r["description"]
                     if len(desc) > 200:
                         desc = desc[:197] + "..."
                     lines.append(f"  {desc}")
-                if r.get('category'):
+                if r.get("category"):
                     lines.append(f"  Category: {r['category']}")
 
-            lines.append("\nCall these skills directly by name. Use get_agent_info(dimension='capability') only if you need parameter details.")
+            lines.append(
+                "\nCall these skills directly by name. Use get_agent_info(dimension='capability') only if you need parameter details."
+            )
             return "\n".join(lines)
 
         except Exception as e:
@@ -143,7 +150,7 @@ class FindSkillsTool(EdgeTool):
 
     async def _keyword_search(self, query: str, category: str | None, limit: int) -> str:
         """Fallback keyword search when semantic search unavailable.
-        
+
         Performs simple substring matching on skill names and descriptions.
         Scores by: name match (2x weight) > description match (1x weight).
         """
@@ -169,6 +176,7 @@ class FindSkillsTool(EdgeTool):
                 # e.g. "github issues" → words ["github","issues"]
                 #      "issues" ↔ "list_issues" → match
                 import re as _re
+
                 query_words = _re.findall(r"[a-z]{3,}", query.lower())
                 # Also capture short (2-char) pure-alpha tokens when the whole
                 # query is short (e.g. "ci", "go") — avoids UUID fragment noise
@@ -219,7 +227,9 @@ class FindSkillsTool(EdgeTool):
                     if cat:
                         lines.append(f"  Category: {cat}")
 
-                lines.append("\nCall these skills directly by name. Use get_agent_info(dimension='capability') only if you need parameter details.")
+                lines.append(
+                    "\nCall these skills directly by name. Use get_agent_info(dimension='capability') only if you need parameter details."
+                )
                 return "\n".join(lines)
             finally:
                 db.close()
@@ -230,7 +240,7 @@ class FindSkillsTool(EdgeTool):
 
     async def _fetch_skill_details(self, skill_names: list[str]) -> list[dict[str, Any]]:
         """Fetch skill details from database.
-        
+
         Preserves order from semantic search ranking.
         Skips nonexistent or inactive skills.
         """
@@ -243,14 +253,18 @@ class FindSkillsTool(EdgeTool):
 
             db = next(get_db_session())
             try:
-                rows = db.query(
-                    SkillRegistry.skill_name,
-                    SkillRegistry.description,
-                    SkillRegistry.category,
-                ).filter(
-                    SkillRegistry.skill_name.in_(skill_names),
-                    SkillRegistry.is_active == 1,
-                ).all()
+                rows = (
+                    db.query(
+                        SkillRegistry.skill_name,
+                        SkillRegistry.description,
+                        SkillRegistry.category,
+                    )
+                    .filter(
+                        SkillRegistry.skill_name.in_(skill_names),
+                        SkillRegistry.is_active == 1,
+                    )
+                    .all()
+                )
 
                 # Preserve order from semantic search
                 name_to_row = {r[0]: r for r in rows}
@@ -258,11 +272,13 @@ class FindSkillsTool(EdgeTool):
                 for name in skill_names:
                     if name in name_to_row:
                         row = name_to_row[name]
-                        results.append({
-                            "name": row[0],
-                            "description": row[1],
-                            "category": row[2],
-                        })
+                        results.append(
+                            {
+                                "name": row[0],
+                                "description": row[1],
+                                "category": row[2],
+                            }
+                        )
                 return results
             finally:
                 db.close()

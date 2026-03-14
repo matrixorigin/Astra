@@ -37,17 +37,20 @@ class TestContextBudgetTuner:
     # -- propose --
 
     def test_propose_shifts_budget_from_underutilized_to_overutilized(self, tuner):
-        diagnoses = [{
-            "task_type": "debugging",
-            "avg_quality": 2.5,
-            "sample_count": 20,
-            "utilization": {"logs": 0.95, "code": 0.90, "history": 0.10, "docs": 0.15},
-        }]
+        diagnoses = [
+            {
+                "task_type": "debugging",
+                "avg_quality": 2.5,
+                "sample_count": 20,
+                "utilization": {"logs": 0.95, "code": 0.90, "history": 0.10, "docs": 0.15},
+            }
+        ]
         proposals = tuner.propose(diagnoses)
         assert proposals is not None
         ratios = proposals["debugging"]
         # Overutilized sections should get more budget
         from core.context.manager import _BUDGET_RATIOS, TaskType
+
         original = _BUDGET_RATIOS[TaskType.DEBUGGING]
         assert ratios["logs"] >= original["logs"]
         # All ratios should sum to ~1.0
@@ -58,7 +61,9 @@ class TestContextBudgetTuner:
         assert tuner.propose([]) is None
 
     def test_propose_returns_none_when_no_utilization_data(self, tuner):
-        diagnoses = [{"task_type": "debugging", "avg_quality": 2.5, "sample_count": 20, "utilization": {}}]
+        diagnoses = [
+            {"task_type": "debugging", "avg_quality": 2.5, "sample_count": 20, "utilization": {}}
+        ]
         assert tuner.propose(diagnoses) is None
 
     # -- validate_and_deploy --
@@ -83,9 +88,11 @@ class TestContextBudgetTuner:
     # -- tune (full loop) --
 
     def test_tune_no_issues_returns_early(self, tuner):
-        tuner.observe = Mock(return_value=[
-            {"task_type": "general", "avg_quality": 4.5, "sample_count": 50, "budgets": []},
-        ])
+        tuner.observe = Mock(
+            return_value=[
+                {"task_type": "general", "avg_quality": 4.5, "sample_count": 50, "budgets": []},
+            ]
+        )
         result = tuner.tune()
         assert result["status"] == "no_issues"
 
@@ -117,9 +124,11 @@ class TestContextManagerBudgetOverride:
         override = {"debugging": {"logs": 0.50, "code": 0.25, "history": 0.15, "docs": 0.10}}
         db.query.return_value.filter.return_value.first.return_value = (json.dumps(override),)
 
-        with patch("core.context.embeddings.EmbeddingService.__init__", return_value=None), \
-             patch("core.context.prompts.PromptManager.__init__", return_value=None), \
-             patch("core.context.scorer.RelevanceScorer.__init__", return_value=None):
+        with (
+            patch("core.context.embeddings.EmbeddingService.__init__", return_value=None),
+            patch("core.context.prompts.PromptManager.__init__", return_value=None),
+            patch("core.context.scorer.RelevanceScorer.__init__", return_value=None),
+        ):
             mgr = ContextManager(lambda: db)
             ratios = mgr._load_budget_ratios(TaskType.DEBUGGING)
 
@@ -131,9 +140,11 @@ class TestContextManagerBudgetOverride:
         db = Mock()
         db.query.return_value.filter.return_value.first.return_value = None
 
-        with patch("core.context.embeddings.EmbeddingService.__init__", return_value=None), \
-             patch("core.context.prompts.PromptManager.__init__", return_value=None), \
-             patch("core.context.scorer.RelevanceScorer.__init__", return_value=None):
+        with (
+            patch("core.context.embeddings.EmbeddingService.__init__", return_value=None),
+            patch("core.context.prompts.PromptManager.__init__", return_value=None),
+            patch("core.context.scorer.RelevanceScorer.__init__", return_value=None),
+        ):
             mgr = ContextManager(lambda: db)
             ratios = mgr._load_budget_ratios(TaskType.DEBUGGING)
 
@@ -146,9 +157,11 @@ class TestContextManagerBudgetOverride:
         override = {"debugging": {"logs": 0.50, "code": 0.25, "history": 0.15, "docs": 0.10}}
         db.query.return_value.filter.return_value.first.return_value = (json.dumps(override),)
 
-        with patch("core.context.embeddings.EmbeddingService.__init__", return_value=None), \
-             patch("core.context.prompts.PromptManager.__init__", return_value=None), \
-             patch("core.context.scorer.RelevanceScorer.__init__", return_value=None):
+        with (
+            patch("core.context.embeddings.EmbeddingService.__init__", return_value=None),
+            patch("core.context.prompts.PromptManager.__init__", return_value=None),
+            patch("core.context.scorer.RelevanceScorer.__init__", return_value=None),
+        ):
             mgr = ContextManager(lambda: db)
             mgr._load_budget_ratios(TaskType.DEBUGGING)
             mgr._load_budget_ratios(TaskType.DEBUGGING)  # second call should use cache
@@ -162,14 +175,17 @@ class TestContextManagerBudgetOverride:
         db = Mock()
         db.query.side_effect = Exception("connection lost")
 
-        with patch("core.context.embeddings.EmbeddingService.__init__", return_value=None), \
-             patch("core.context.prompts.PromptManager.__init__", return_value=None), \
-             patch("core.context.scorer.RelevanceScorer.__init__", return_value=None), \
-             patch("core.context.manager.logger") as mock_logger:
+        with (
+            patch("core.context.embeddings.EmbeddingService.__init__", return_value=None),
+            patch("core.context.prompts.PromptManager.__init__", return_value=None),
+            patch("core.context.scorer.RelevanceScorer.__init__", return_value=None),
+            patch("core.context.manager.logger") as mock_logger,
+        ):
             mgr = ContextManager(lambda: db)
             ratios = mgr._load_budget_ratios(TaskType.DEBUGGING)
             mock_logger.debug.assert_called_once()
 
         # Should still return defaults
         from core.context.manager import _BUDGET_RATIOS
+
         assert ratios == _BUDGET_RATIOS[TaskType.DEBUGGING]

@@ -37,17 +37,19 @@ class GitForData(DbConsumer):
         """
         with self._db() as db:
             db.commit()  # Commit before DDL
-        
+
             # Validate inputs to prevent SQL injection
             safe_snapshot = validate_identifier(snapshot_name)
             safe_account = validate_identifier(account)
-        
+
             query = f"CREATE SNAPSHOT {safe_snapshot} FOR ACCOUNT {safe_account}"
             db.execute(text(query))
 
             # Get snapshot info
             snapshots = self.list_snapshots()
-            snapshot_info = next((s for s in snapshots if s["snapshot_name"] == snapshot_name), None)
+            snapshot_info = next(
+                (s for s in snapshots if s["snapshot_name"] == snapshot_name), None
+            )
 
             return snapshot_info or {"snapshot_name": snapshot_name, "timestamp": None}
 
@@ -103,10 +105,10 @@ class GitForData(DbConsumer):
 
             # Validate snapshot name
             validate_identifier(snapshot_name)
-        
+
             # Validate query for basic safety
             QueryRequest.validate_query(query)
-        
+
             # Inject snapshot syntax into query
             # Replace FROM table with FROM table {SNAPSHOT = 'name'}
             snapshot_clause = f"{{SNAPSHOT = '{snapshot_name}'}}"
@@ -122,15 +124,10 @@ class GitForData(DbConsumer):
             # Regex to find FROM/JOIN clause and the table name
             # We also look ahead for existing snapshot clause to avoid double injection
             # Pattern: (FROM|JOIN) + whitespace + table_name + optional snapshot clause
-            pattern = r'\b(FROM|JOIN)\s+([a-zA-Z0-9_.]+)(?:\s*\{SNAPSHOT\s*=[^}]+\})?'
-        
-            modified_query = re.sub(
-                pattern, 
-                replace_match, 
-                query, 
-                flags=re.IGNORECASE
-            )
-        
+            pattern = r"\b(FROM|JOIN)\s+([a-zA-Z0-9_.]+)(?:\s*\{SNAPSHOT\s*=[^}]+\})?"
+
+            modified_query = re.sub(pattern, replace_match, query, flags=re.IGNORECASE)
+
             result = db.execute(text(modified_query), params or {})
             return [dict(row._mapping) for row in result]
 
@@ -144,27 +141,27 @@ class GitForData(DbConsumer):
         Warning:
             This operation will restore the entire account state.
             All changes after the snapshot will be lost.
-            
+
         Note:
             This is a heavy operation that affects the entire account.
             For testing, consider using query_snapshot() for read-only access.
         """
         with self._db() as db:
             db.commit()  # Commit before DDL
-        
+
             # Validate inputs
             safe_snapshot = validate_identifier(snapshot_name)
             safe_account = validate_identifier(account)
-        
+
             query = f"RESTORE ACCOUNT {safe_account} FROM SNAPSHOT {safe_snapshot}"
             db.execute(text(query))
 
     def restore_table_from_snapshot(self, table_name: str, snapshot_name: str) -> None:
         """Restore a single table from snapshot using time-travel queries.
-        
+
         This is a lighter alternative to restore_from_snapshot() that only
         affects one table instead of the entire account.
-        
+
         Args:
             table_name: Name of the table to restore
             snapshot_name: Name of the snapshot to restore from
@@ -173,21 +170,23 @@ class GitForData(DbConsumer):
         with self._db() as db:
             safe_table = validate_identifier(table_name)
             safe_snapshot = validate_identifier(snapshot_name)
-        
+
             db.commit()  # Ensure clean transaction state
-        
+
             # Step 1: Get snapshot timestamp
             snapshots = self.list_snapshots()
-            snapshot_info = next((s for s in snapshots if s["snapshot_name"] == safe_snapshot), None)
+            snapshot_info = next(
+                (s for s in snapshots if s["snapshot_name"] == safe_snapshot), None
+            )
             if not snapshot_info:
                 raise ValueError(f"Snapshot {safe_snapshot} not found")
-        
+
             snapshot_ts = snapshot_info["timestamp"]
-        
+
             try:
                 # Step 2: Clear current table data
                 db.execute(text(f"DELETE FROM {safe_table}"))
-            
+
                 # Step 3: Insert data from snapshot using time-travel query
                 # Note: This uses MatrixOne's {SNAPSHOT = 'name'} syntax
                 insert_query = f"""

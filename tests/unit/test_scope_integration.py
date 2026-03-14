@@ -27,22 +27,26 @@ def test_scope_based_token_resolution(db):
     from core.auth.encryption import encrypt_token
 
     # Global token
-    db.add(Token(
-        token_id=str(uuid7()),
-        type="llm",
-        provider="openai",
-        encrypted_value=encrypt_token("global_key"),
-        is_active=True,
-    ))
+    db.add(
+        Token(
+            token_id=str(uuid7()),
+            type="llm",
+            provider="openai",
+            encrypted_value=encrypt_token("global_key"),
+            is_active=True,
+        )
+    )
     # User token
-    db.add(Token(
-        token_id=str(uuid7()),
-        type="llm",
-        provider="openai",
-        scope_user_id="alice",
-        encrypted_value=encrypt_token("alice_key"),
-        is_active=True,
-    ))
+    db.add(
+        Token(
+            token_id=str(uuid7()),
+            type="llm",
+            provider="openai",
+            scope_user_id="alice",
+            encrypted_value=encrypt_token("alice_key"),
+            is_active=True,
+        )
+    )
     db.commit()
 
     # With user scope — should use user token
@@ -73,13 +77,15 @@ def test_scope_resolver_with_real_db_structure(db):
     from uuid_utils import uuid7
     from core.auth.encryption import encrypt_token
 
-    db.add(Token(
-        token_id=str(uuid7()),
-        type="llm",
-        provider="openai",
-        encrypted_value=encrypt_token("global_key"),
-        is_active=True,
-    ))
+    db.add(
+        Token(
+            token_id=str(uuid7()),
+            type="llm",
+            provider="openai",
+            encrypted_value=encrypt_token("global_key"),
+            is_active=True,
+        )
+    )
     db.commit()
 
     chain = ScopeChainBuilder.dev_agent(user_id="alice")

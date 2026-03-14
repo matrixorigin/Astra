@@ -46,7 +46,7 @@ async def test_load_credentials(mock_credentials_path: Path):
                 "access_token": "test_access",
                 "refresh_token": "test_refresh",
             }
-        }
+        },
     }
     mock_credentials_path.write_text(json.dumps(credentials))
 
@@ -373,19 +373,26 @@ async def test_request_non_401_error(mock_credentials_path: Path):
 # Task 2: Refresh failure clears file tokens
 # ============================================================================
 
+
 @pytest.mark.asyncio
 async def test_refresh_failure_clears_file_tokens(tmp_path: Path):
     """When refresh fails, tokens in credentials file should be cleared."""
     creds_path = tmp_path / "credentials.json"
     # Pre-populate with tokens
-    creds_path.write_text(json.dumps({
-        "current_profile": "alice",
-        "profiles": {"alice": {
-            "username": "alice",
-            "access_token": "old_access",
-            "refresh_token": "old_refresh",
-        }}
-    }))
+    creds_path.write_text(
+        json.dumps(
+            {
+                "current_profile": "alice",
+                "profiles": {
+                    "alice": {
+                        "username": "alice",
+                        "access_token": "old_access",
+                        "refresh_token": "old_refresh",
+                    }
+                },
+            }
+        )
+    )
 
     with patch("httpx.AsyncClient") as mock_client_class:
         mock_client = AsyncMock()
@@ -413,6 +420,7 @@ async def test_refresh_failure_clears_file_tokens(tmp_path: Path):
 # ============================================================================
 # Task 4: Profile settings persistence
 # ============================================================================
+
 
 @pytest.mark.asyncio
 async def test_save_and_load_default_model(tmp_path: Path):
@@ -497,12 +505,14 @@ async def test_profile_name_consistency(tmp_path: Path):
 
 class FakeSSE:
     """Minimal SSE event object matching httpx_sse interface."""
+
     def __init__(self, data: str):
         self.data = data
 
 
 class FakeEventSource:
     """Async context manager that yields FakeSSE events."""
+
     def __init__(self, events: list[dict]):
         self._events = events
 
@@ -528,9 +538,15 @@ async def test_sse_stream_auth_error_no_refresh_raises(mock_credentials_path: Pa
             client._refresh_token = None  # no refresh available
 
             with patch("cli.api_client.aconnect_sse") as mock_sse:
-                mock_sse.return_value = FakeEventSource([
-                    {"type": "error", "code": "AUTH_ERROR", "message": "Could not validate credentials"},
-                ])
+                mock_sse.return_value = FakeEventSource(
+                    [
+                        {
+                            "type": "error",
+                            "code": "AUTH_ERROR",
+                            "message": "Could not validate credentials",
+                        },
+                    ]
+                )
 
                 with pytest.raises(AuthenticationError, match="Session expired"):
                     async for _ in client._sse_stream("POST", "/chat/turn", json={}):
@@ -550,7 +566,9 @@ async def test_sse_stream_auth_error_refresh_fails_raises(mock_credentials_path:
         mock_refresh_resp = MagicMock()
         mock_refresh_resp.status_code = 401
         mock_refresh_resp.raise_for_status.side_effect = httpx.HTTPStatusError(
-            "401", request=MagicMock(), response=mock_refresh_resp,
+            "401",
+            request=MagicMock(),
+            response=mock_refresh_resp,
         )
         mock_client.post.return_value = mock_refresh_resp
         mock_client_class.return_value = mock_client
@@ -560,9 +578,15 @@ async def test_sse_stream_auth_error_refresh_fails_raises(mock_credentials_path:
             client._refresh_token = "also_bad_refresh"
 
             with patch("cli.api_client.aconnect_sse") as mock_sse:
-                mock_sse.return_value = FakeEventSource([
-                    {"type": "error", "code": "AUTH_ERROR", "message": "Could not validate credentials"},
-                ])
+                mock_sse.return_value = FakeEventSource(
+                    [
+                        {
+                            "type": "error",
+                            "code": "AUTH_ERROR",
+                            "message": "Could not validate credentials",
+                        },
+                    ]
+                )
 
                 with pytest.raises(AuthenticationError, match="Session expired"):
                     async for _ in client._sse_stream("POST", "/chat/turn", json={}):
@@ -596,15 +620,19 @@ async def test_sse_stream_auth_error_refresh_succeeds(mock_credentials_path: Pat
                 call_count += 1
                 if call_count == 1:
                     # First call: auth error
-                    return FakeEventSource([
-                        {"type": "error", "code": "AUTH_ERROR", "message": "expired"},
-                    ])
+                    return FakeEventSource(
+                        [
+                            {"type": "error", "code": "AUTH_ERROR", "message": "expired"},
+                        ]
+                    )
                 else:
                     # Second call (after refresh): success
-                    return FakeEventSource([
-                        {"type": "text_delta", "content": "Hello"},
-                        {"type": "turn_complete", "has_tool_calls": False},
-                    ])
+                    return FakeEventSource(
+                        [
+                            {"type": "text_delta", "content": "Hello"},
+                            {"type": "turn_complete", "has_tool_calls": False},
+                        ]
+                    )
 
             with patch("cli.api_client.aconnect_sse", side_effect=make_event_source):
                 events = []
@@ -627,11 +655,13 @@ async def test_sse_stream_normal_events_pass_through(mock_credentials_path: Path
             client._access_token = "good_token"
 
             with patch("cli.api_client.aconnect_sse") as mock_sse:
-                mock_sse.return_value = FakeEventSource([
-                    {"type": "session_info", "session_id": "s1"},
-                    {"type": "text_delta", "content": "Hi"},
-                    {"type": "turn_complete", "has_tool_calls": False},
-                ])
+                mock_sse.return_value = FakeEventSource(
+                    [
+                        {"type": "session_info", "session_id": "s1"},
+                        {"type": "text_delta", "content": "Hi"},
+                        {"type": "turn_complete", "has_tool_calls": False},
+                    ]
+                )
 
                 events = []
                 async for event in client._sse_stream("POST", "/chat/turn", json={}):
@@ -651,9 +681,11 @@ async def test_sse_stream_non_auth_error_passes_through(mock_credentials_path: P
             client._access_token = "good_token"
 
             with patch("cli.api_client.aconnect_sse") as mock_sse:
-                mock_sse.return_value = FakeEventSource([
-                    {"type": "error", "code": "RATE_LIMIT", "message": "Too many requests"},
-                ])
+                mock_sse.return_value = FakeEventSource(
+                    [
+                        {"type": "error", "code": "RATE_LIMIT", "message": "Too many requests"},
+                    ]
+                )
 
                 events = []
                 async for event in client._sse_stream("POST", "/chat/turn", json={}):
@@ -667,20 +699,28 @@ async def test_sse_stream_non_auth_error_passes_through(mock_credentials_path: P
 async def test_sse_stream_clears_file_tokens_on_auth_failure(tmp_path: Path):
     """AuthenticationError also clears tokens from the credentials file."""
     creds_path = tmp_path / "credentials.json"
-    creds_path.write_text(json.dumps({
-        "current_profile": "alice",
-        "profiles": {"alice": {
-            "username": "alice",
-            "access_token": "old_access",
-            "refresh_token": "old_refresh",
-        }}
-    }))
+    creds_path.write_text(
+        json.dumps(
+            {
+                "current_profile": "alice",
+                "profiles": {
+                    "alice": {
+                        "username": "alice",
+                        "access_token": "old_access",
+                        "refresh_token": "old_refresh",
+                    }
+                },
+            }
+        )
+    )
 
     async with APIClient(credentials_path=creds_path) as client:
         with patch("cli.api_client.aconnect_sse") as mock_sse:
-            mock_sse.return_value = FakeEventSource([
-                {"type": "error", "code": "AUTH_ERROR", "message": "bad"},
-            ])
+            mock_sse.return_value = FakeEventSource(
+                [
+                    {"type": "error", "code": "AUTH_ERROR", "message": "bad"},
+                ]
+            )
 
             with pytest.raises(AuthenticationError):
                 async for _ in client._sse_stream("POST", "/chat/turn", json={}):
@@ -715,7 +755,8 @@ async def test_proactive_refresh_when_token_near_expiry(mock_credentials_path: P
         mock_refresh_resp.status_code = 200
         mock_refresh_resp.raise_for_status = MagicMock()
         mock_refresh_resp.json.return_value = {
-            "access_token": "new_access", "refresh_token": "new_refresh",
+            "access_token": "new_access",
+            "refresh_token": "new_refresh",
         }
         # normal request response
         mock_ok = MagicMock()

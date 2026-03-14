@@ -53,18 +53,31 @@ def create_trigger(
     if trigger_type == "schedule":
         next_fire = croniter(cron_expr, now).get_next(datetime)
 
-    db.add(Trigger(
-        trigger_id=trigger_id, user_id=user_id, agent_id=agent_id,
-        trigger_type=trigger_type, name=name, user_input=user_input,
-        context=json.dumps(context) if context else None,
-        cron_expr=cron_expr, secret=secret, session_id=session_id,
-        next_fire_at=next_fire, is_active=1, created_at=now,
-    ))
+    db.add(
+        Trigger(
+            trigger_id=trigger_id,
+            user_id=user_id,
+            agent_id=agent_id,
+            trigger_type=trigger_type,
+            name=name,
+            user_input=user_input,
+            context=json.dumps(context) if context else None,
+            cron_expr=cron_expr,
+            secret=secret,
+            session_id=session_id,
+            next_fire_at=next_fire,
+            is_active=1,
+            created_at=now,
+        )
+    )
     db.commit()
 
     result = {
-        "trigger_id": trigger_id, "trigger_type": trigger_type,
-        "name": name, "agent_id": agent_id, "is_active": True,
+        "trigger_id": trigger_id,
+        "trigger_type": trigger_type,
+        "name": name,
+        "agent_id": agent_id,
+        "is_active": True,
     }
     if secret:
         result["secret"] = secret
@@ -83,13 +96,19 @@ def get_trigger(db: Session, trigger_id: str) -> dict | None:
 
 def list_triggers(db: Session, user_id: str, limit: int = 100) -> list[dict]:
     """List triggers for a user.
-    
+
     Args:
         db: Database session
         user_id: User ID filter
         limit: Max results (default 100). Typical users have <10 triggers, but cap prevents abuse.
     """
-    rows = db.query(Trigger).filter(Trigger.user_id == user_id).order_by(Trigger.created_at.desc()).limit(limit).all()
+    rows = (
+        db.query(Trigger)
+        .filter(Trigger.user_id == user_id)
+        .order_by(Trigger.created_at.desc())
+        .limit(limit)
+        .all()
+    )
     return [{c.name: getattr(r, c.name) for c in r.__table__.columns} for r in rows]
 
 
@@ -125,7 +144,11 @@ def fire_trigger(
     if not trig["is_active"]:
         raise ValueError(f"Trigger {trigger_id} is disabled")
 
-    ctx = json.loads(trig["context"]) if isinstance(trig["context"], str) and trig["context"] else (trig["context"] or {})
+    ctx = (
+        json.loads(trig["context"])
+        if isinstance(trig["context"], str) and trig["context"]
+        else (trig["context"] or {})
+    )
     if payload:
         ctx["trigger_payload"] = payload
 
@@ -169,10 +192,14 @@ def claim_and_advance(db: Session, trigger_id: str) -> bool:
         return False
     now = datetime.now(timezone.utc)
     next_fire = croniter(trig["cron_expr"], now).get_next(datetime)
-    count = db.query(Trigger).filter(
-        Trigger.trigger_id == trigger_id,
-        Trigger.next_fire_at <= now,
-    ).update({"next_fire_at": next_fire})
+    count = (
+        db.query(Trigger)
+        .filter(
+            Trigger.trigger_id == trigger_id,
+            Trigger.next_fire_at <= now,
+        )
+        .update({"next_fire_at": next_fire})
+    )
     db.commit()
     return count > 0
 
@@ -184,17 +211,22 @@ def verify_secret(provided: str, expected: str) -> bool:
 
 def get_due_triggers(db: Session) -> list[str]:
     """Get all active schedule triggers whose next_fire_at <= now."""
-    rows = db.query(Trigger.trigger_id).filter(
-        Trigger.trigger_type == "schedule",
-        Trigger.is_active == 1,
-        Trigger.next_fire_at <= datetime.now(timezone.utc),
-    ).all()
+    rows = (
+        db.query(Trigger.trigger_id)
+        .filter(
+            Trigger.trigger_type == "schedule",
+            Trigger.is_active == 1,
+            Trigger.next_fire_at <= datetime.now(timezone.utc),
+        )
+        .all()
+    )
     return [row[0] for row in rows]
 
 
 def _auto_session(db_factory: Callable[[], Session], user_id: str) -> str:
     """Create a session for trigger-fired runs using a short-lived DB session."""
     from core.events.session_manager import SessionManager
+
     db = db_factory()
     try:
         mgr = SessionManager(db)

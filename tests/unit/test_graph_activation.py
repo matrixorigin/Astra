@@ -66,8 +66,7 @@ class TestSpreadingActivation:
 
         store.get_edges_bidirectional.side_effect = mock_bidir
         store.get_edges_for_nodes.side_effect = lambda ids: {
-            nid: [Edge("b", "association", 1.0)] if nid == "a" else []
-            for nid in ids
+            nid: [Edge("b", "association", 1.0)] if nid == "a" else [] for nid in ids
         }
 
         sa = SpreadingActivation(store)
@@ -87,17 +86,25 @@ class TestSpreadingActivation:
 class TestEffectiveConfidence:
     def test_no_created_at(self):
         node = GraphNodeData(
-            node_id="n1", user_id="u1", node_type=NodeType.SEMANTIC,
-            content="test", confidence=0.8,
+            node_id="n1",
+            user_id="u1",
+            node_type=NodeType.SEMANTIC,
+            content="test",
+            confidence=0.8,
         )
         assert _effective_confidence(node) == 0.8
 
     def test_decay_over_time(self):
         from datetime import datetime, timedelta, timezone
+
         old = datetime.now(timezone.utc) - timedelta(days=60)
         node = GraphNodeData(
-            node_id="n1", user_id="u1", node_type=NodeType.SEMANTIC,
-            content="test", confidence=0.8, trust_tier="T3",
+            node_id="n1",
+            user_id="u1",
+            node_type=NodeType.SEMANTIC,
+            content="test",
+            confidence=0.8,
+            trust_tier="T3",
             created_at=old.isoformat(),
         )
         decayed = _effective_confidence(node)
@@ -130,8 +137,12 @@ class TestActivationRetriever:
     def test_returns_scored_nodes(self):
         retriever, store = self._make_retriever()
         node = GraphNodeData(
-            node_id="n1", user_id="u1", node_type=NodeType.SEMANTIC,
-            content="test", confidence=0.8, importance=0.5,
+            node_id="n1",
+            user_id="u1",
+            node_type=NodeType.SEMANTIC,
+            content="test",
+            confidence=0.8,
+            importance=0.5,
         )
         store.find_similar_with_scores.return_value = [(node, 0.9)]
         store.get_nodes_by_ids.return_value = [node]
@@ -144,9 +155,14 @@ class TestActivationRetriever:
     def test_conflict_penalty_applied(self):
         retriever, store = self._make_retriever()
         node = GraphNodeData(
-            node_id="n1", user_id="u1", node_type=NodeType.SEMANTIC,
-            content="test", confidence=0.8, importance=0.5,
-            conflicts_with="n2", conflict_resolution="superseded",
+            node_id="n1",
+            user_id="u1",
+            node_type=NodeType.SEMANTIC,
+            content="test",
+            confidence=0.8,
+            importance=0.5,
+            conflicts_with="n2",
+            conflict_resolution="superseded",
         )
         store.find_similar_with_scores.return_value = [(node, 0.9)]
         store.get_nodes_by_ids.return_value = [node]
@@ -160,14 +176,20 @@ class TestActivationRetriever:
 class TestGraphServiceRetrieve:
     def test_activation_result_converted_to_memories(self):
         from core.memory.graph.service import GraphMemoryService
+
         svc = GraphMemoryService(lambda: MagicMock())
         svc._tabular = MagicMock()
 
         mock_retriever = MagicMock()
         node = GraphNodeData(
-            node_id="n1", user_id="u1", node_type=NodeType.SEMANTIC,
-            content="test", confidence=0.8, memory_id="mem1",
-            session_id="s1", trust_tier="T3",
+            node_id="n1",
+            user_id="u1",
+            node_type=NodeType.SEMANTIC,
+            content="test",
+            confidence=0.8,
+            memory_id="mem1",
+            session_id="s1",
+            trust_tier="T3",
         )
         mock_retriever.retrieve.return_value = [(node, 0.9)]
         svc._activation_retriever = mock_retriever
@@ -179,6 +201,7 @@ class TestGraphServiceRetrieve:
     def test_fallback_to_tabular_on_activation_failure(self):
         from sqlalchemy.exc import OperationalError
         from core.memory.graph.service import GraphMemoryService
+
         svc = GraphMemoryService(lambda: MagicMock())
         svc._tabular = MagicMock()
         svc._tabular.retrieve.return_value = ["tabular_mem"]
@@ -192,6 +215,7 @@ class TestGraphServiceRetrieve:
 
     def test_fallback_when_activation_returns_empty(self):
         from core.memory.graph.service import GraphMemoryService
+
         svc = GraphMemoryService(lambda: MagicMock())
         svc._tabular = MagicMock()
         svc._tabular.retrieve.return_value = ["tabular_mem"]

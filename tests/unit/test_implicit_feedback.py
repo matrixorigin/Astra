@@ -39,10 +39,24 @@ class TestAnalyzeAndStore:
         miner = ImplicitFeedbackMiner(lambda: db)
 
         results = [
-            {"event_id": "e1", "session_id": "s1", "signal_type": "correction",
-             "confidence": 0.8, "evidence": "wrong", "rating": 1, "user_followup": "no"},
-            {"event_id": "e2", "session_id": "s1", "signal_type": "positive",
-             "confidence": 0.9, "evidence": "great", "rating": 5, "user_followup": "thanks"},
+            {
+                "event_id": "e1",
+                "session_id": "s1",
+                "signal_type": "correction",
+                "confidence": 0.8,
+                "evidence": "wrong",
+                "rating": 1,
+                "user_followup": "no",
+            },
+            {
+                "event_id": "e2",
+                "session_id": "s1",
+                "signal_type": "positive",
+                "confidence": 0.9,
+                "evidence": "great",
+                "rating": 5,
+                "user_followup": "thanks",
+            },
         ]
         with patch.object(miner, "analyze_batch", return_value=results):
             with patch("core.context.prompts.PromptFeedback") as MockPF:

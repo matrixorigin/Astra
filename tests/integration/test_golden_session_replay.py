@@ -30,7 +30,9 @@ def _uid():
     return str(uuid7())
 
 
-@pytest.fixture(params=["code_review", "debug_error", "chained_tool_calls", "multi_turn_correction"])
+@pytest.fixture(
+    params=["code_review", "debug_error", "chained_tool_calls", "multi_turn_correction"]
+)
 def golden(request):
     return _load_fixture(request.param)
 
@@ -47,21 +49,23 @@ def seed_session(db_session):
         db_session.add(SessionModel(session_id=sid, user_id=uid, status="active"))
 
         for ev in fixture["events"]:
-            db_session.add(Event(
-                event_id=ev["event_id"],
-                session_id=ev["session_id"],
-                user_id=ev["user_id"],
-                event_type=ev["event_type"],
-                content=ev["content"],
-                causal_chain_id=ev["causal_chain_id"],
-                parent_event_id=ev.get("parent_event_id"),
-                skill_name=ev.get("skill_name"),
-                skill_version=ev.get("skill_version"),
-                event_metadata=ev.get("metadata", {}),
-                token_usage=ev.get("token_usage"),
-                quality_score=ev.get("quality_score"),
-                llm_model_used=ev.get("llm_model_used"),
-            ))
+            db_session.add(
+                Event(
+                    event_id=ev["event_id"],
+                    session_id=ev["session_id"],
+                    user_id=ev["user_id"],
+                    event_type=ev["event_type"],
+                    content=ev["content"],
+                    causal_chain_id=ev["causal_chain_id"],
+                    parent_event_id=ev.get("parent_event_id"),
+                    skill_name=ev.get("skill_name"),
+                    skill_version=ev.get("skill_version"),
+                    event_metadata=ev.get("metadata", {}),
+                    token_usage=ev.get("token_usage"),
+                    quality_score=ev.get("quality_score"),
+                    llm_model_used=ev.get("llm_model_used"),
+                )
+            )
         db_session.commit()
         created.append(sid)
         return sid, fixture["events"], fixture
@@ -71,12 +75,8 @@ def seed_session(db_session):
     # Cleanup
     for sid in created:
         try:
-            db_session.execute(text(
-                "DELETE FROM agent_events WHERE session_id = :s"
-            ), {"s": sid})
-            db_session.execute(text(
-                "DELETE FROM agent_sessions WHERE session_id = :s"
-            ), {"s": sid})
+            db_session.execute(text("DELETE FROM agent_events WHERE session_id = :s"), {"s": sid})
+            db_session.execute(text("DELETE FROM agent_sessions WHERE session_id = :s"), {"s": sid})
             db_session.commit()
         except Exception:
             db_session.rollback()
@@ -91,7 +91,9 @@ class TestGoldenSessionReplay:
         svc = ReplayService(lambda: db_session)
 
         result = svc.replay_session(
-            session_id=sid, user_id=fixture["user_id"], mock_mode=True,
+            session_id=sid,
+            user_id=fixture["user_id"],
+            mock_mode=True,
         )
 
         assert result["status"] == "completed"
@@ -103,7 +105,9 @@ class TestGoldenSessionReplay:
         sid, events, _ = seed_session(golden)
 
         replay = ToolMockingLayer(
-            mode=MockMode.REPLAY, db_factory=lambda: db_session, session_id=sid,
+            mode=MockMode.REPLAY,
+            db_factory=lambda: db_session,
+            session_id=sid,
         )
 
         tool_calls = [e for e in events if e["event_type"] == "tool_call"]
@@ -115,8 +119,7 @@ class TestGoldenSessionReplay:
                 parent_event_id=tc["event_id"],
             )
             assert result is not None, (
-                f"No recorded result for {tc['skill_name']} "
-                f"(event_id={tc['event_id']})"
+                f"No recorded result for {tc['skill_name']} (event_id={tc['event_id']})"
             )
 
     def test_compare_replay_with_original(self, db_session, golden, seed_session):
@@ -125,10 +128,13 @@ class TestGoldenSessionReplay:
         svc = ReplayService(lambda: db_session)
 
         result = svc.replay_session(
-            session_id=sid, user_id=fixture["user_id"], mock_mode=True,
+            session_id=sid,
+            user_id=fixture["user_id"],
+            mock_mode=True,
         )
         comparison = svc.compare_outputs(
-            session_id=sid, user_id=fixture["user_id"],
+            session_id=sid,
+            user_id=fixture["user_id"],
             replay_result=result["result"],
         )
 
@@ -155,7 +161,8 @@ class TestGoldenSessionReplay:
         svc = ReplayService(lambda: db_session)
 
         result = svc.verify_reproducibility(
-            session_id=sid, user_id=fixture["user_id"],
+            session_id=sid,
+            user_id=fixture["user_id"],
         )
         assert result["reproducible"] is True
         assert result["issues"] == []
@@ -180,8 +187,12 @@ class TestGoldenSessionSemanticDiff:
         # Both have tool_call events
         assert "tool_call" in result["event_types"]
         # Event counts differ (6 vs 5)
-        assert result["event_types"]["user_query"]["session1"] != result["event_types"]["user_query"]["session2"] or \
-               result["event_types"]["llm_response"]["session1"] != result["event_types"]["llm_response"]["session2"]
+        assert (
+            result["event_types"]["user_query"]["session1"]
+            != result["event_types"]["user_query"]["session2"]
+            or result["event_types"]["llm_response"]["session1"]
+            != result["event_types"]["llm_response"]["session2"]
+        )
         # Summary should have content
         assert isinstance(result["summary"], str)
 
@@ -195,7 +206,9 @@ class TestChainedToolCallReplay:
         sid, events, _ = seed_session(fixture)
 
         replay = ToolMockingLayer(
-            mode=MockMode.REPLAY, db_factory=lambda: db_session, session_id=sid,
+            mode=MockMode.REPLAY,
+            db_factory=lambda: db_session,
+            session_id=sid,
         )
 
         tool_calls = [e for e in events if e["event_type"] == "tool_call"]
@@ -204,8 +217,10 @@ class TestChainedToolCallReplay:
         skills_seen = []
         for tc in tool_calls:
             r = replay.get_mock_result(
-                tc["skill_name"], tc["metadata"]["skill_params"],
-                sid, parent_event_id=tc["event_id"],
+                tc["skill_name"],
+                tc["metadata"]["skill_params"],
+                sid,
+                parent_event_id=tc["event_id"],
             )
             assert r is not None, f"Missing result for {tc['skill_name']}"
             skills_seen.append(tc["skill_name"])
@@ -246,7 +261,9 @@ class TestRegressionDetection:
 
         # Step 1-2: replay to get baseline
         replay_result = svc.replay_session(
-            session_id=sid, user_id=fixture["user_id"], mock_mode=True,
+            session_id=sid,
+            user_id=fixture["user_id"],
+            mock_mode=True,
         )
         assert replay_result["result"]["failed"] == 0
 
@@ -260,7 +277,8 @@ class TestRegressionDetection:
 
         # Step 4: compare — should detect mismatch
         comparison = svc.compare_outputs(
-            session_id=sid, user_id=fixture["user_id"],
+            session_id=sid,
+            user_id=fixture["user_id"],
             replay_result=replay_result["result"],
         )
 
@@ -280,14 +298,15 @@ class TestRegressionDetection:
 
         # Remove skill_params from a tool_call event's metadata
         tool_calls = [e for e in events if e["event_type"] == "tool_call"]
-        db_session.query(Event).filter(
-            Event.event_id == tool_calls[0]["event_id"]
-        ).update({"event_metadata": {}})
+        db_session.query(Event).filter(Event.event_id == tool_calls[0]["event_id"]).update(
+            {"event_metadata": {}}
+        )
         db_session.commit()
 
         svc = ReplayService(lambda: db_session)
         result = svc.verify_reproducibility(
-            session_id=sid, user_id=fixture["user_id"],
+            session_id=sid,
+            user_id=fixture["user_id"],
         )
 
         assert result["reproducible"] is False

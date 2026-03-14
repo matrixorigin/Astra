@@ -60,10 +60,18 @@ class TestBreakerStoreIntegration:
         assert saved.consecutive_failures == 2
         assert saved.last_failure_at is not None
         # DB returns naive datetime (second precision) — normalize for comparison
-        lfa = saved.last_failure_at.replace(tzinfo=timezone.utc) if saved.last_failure_at.tzinfo is None else saved.last_failure_at
+        lfa = (
+            saved.last_failure_at.replace(tzinfo=timezone.utc)
+            if saved.last_failure_at.tzinfo is None
+            else saved.last_failure_at
+        )
         assert before <= lfa <= after
         assert saved.cooldown_until is not None
-        cu = saved.cooldown_until.replace(tzinfo=timezone.utc) if saved.cooldown_until.tzinfo is None else saved.cooldown_until
+        cu = (
+            saved.cooldown_until.replace(tzinfo=timezone.utc)
+            if saved.cooldown_until.tzinfo is None
+            else saved.cooldown_until
+        )
         assert cu > lfa
         # 2 failures → 30min cooldown
         assert timedelta(minutes=29) <= (cu - lfa) <= timedelta(minutes=31)
@@ -87,9 +95,14 @@ class TestBreakerStoreIntegration:
         assert loaded["shell"].consecutive_failures == 2
 
         # Verify only 1 row (not 2)
-        count = db.query(ToolBreakerState).filter_by(
-            user_id="alice", tool_name="shell",
-        ).count()
+        count = (
+            db.query(ToolBreakerState)
+            .filter_by(
+                user_id="alice",
+                tool_name="shell",
+            )
+            .count()
+        )
         assert count == 1
 
     def test_success_resets_in_db(self, db):
@@ -270,7 +283,6 @@ class TestChatLoopBreakerIntegration:
         final = load_breaker_state(db, "alice")
         assert final["grep"].consecutive_failures == 3
         assert final["grep"].in_cooldown
-
 
     def test_failure_report_shows_blocked_tools(self, db):
         """_build_failure_report generates user-facing message with blocked tools."""

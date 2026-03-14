@@ -54,10 +54,13 @@ class BindSkillResourceTool(EdgeTool):
         "type": "object",
         "properties": {
             "skill_name": {"type": "string", "description": "Skill name"},
-            "resource_key": {"type": "string", "description": "Resource identifier (e.g. 'owner/repo')"},
+            "resource_key": {
+                "type": "string",
+                "description": "Resource identifier (e.g. 'owner/repo')",
+            },
             "bindings": {
                 "type": "object",
-                "description": "Key-value pairs to bind (e.g. {\"read_token\": \"ghp_...\"})",
+                "description": 'Key-value pairs to bind (e.g. {"read_token": "ghp_..."})',
             },
         },
         "required": ["skill_name", "resource_key", "bindings"],
@@ -70,7 +73,9 @@ class BindSkillResourceTool(EdgeTool):
     async def execute(self, **kwargs: Any) -> str:
         try:
             await self._api.bind_skill_resource(
-                kwargs["skill_name"], kwargs["resource_key"], kwargs["bindings"],
+                kwargs["skill_name"],
+                kwargs["resource_key"],
+                kwargs["bindings"],
             )
             return json.dumps({"success": True, "resource_key": kwargs["resource_key"]})
         except Exception as e:
@@ -96,7 +101,8 @@ class ValidateSkillConfigTool(EdgeTool):
     async def execute(self, **kwargs: Any) -> str:
         try:
             result = await self._api.validate_skill_config(
-                kwargs["skill_name"], resource=kwargs.get("resource"),
+                kwargs["skill_name"],
+                resource=kwargs.get("resource"),
             )
             return json.dumps(result)
         except Exception as e:
@@ -139,22 +145,25 @@ class SkillConfigWizardTool(EdgeTool):
             resources = await self._api.list_skill_resources(skill_name)
 
             missing = validation.get("errors", [])
-            return json.dumps({
-                "skill_name": skill_name,
-                "valid": validation.get("valid", False),
-                "missing_count": len(missing),
-                "missing": missing,
-                "current_settings": config.get("settings", {}),
-                "secrets_configured": list(config.get("secrets", {}).keys()),
-                "resources_configured": resources,
-                "instructions": (
-                    f"✅ {skill_name} is fully configured." if not missing
-                    else f"Need to set {len(missing)} value(s): "
-                         + ", ".join(f"{e['section']}.{e['name']}" for e in missing)
-                         + f". Ask the user for each value, then call set_skill_setting"
-                         + f" with skill_name='{skill_name}' (set once — all related skills share this config)."
-                ),
-            })
+            return json.dumps(
+                {
+                    "skill_name": skill_name,
+                    "valid": validation.get("valid", False),
+                    "missing_count": len(missing),
+                    "missing": missing,
+                    "current_settings": config.get("settings", {}),
+                    "secrets_configured": list(config.get("secrets", {}).keys()),
+                    "resources_configured": resources,
+                    "instructions": (
+                        f"✅ {skill_name} is fully configured."
+                        if not missing
+                        else f"Need to set {len(missing)} value(s): "
+                        + ", ".join(f"{e['section']}.{e['name']}" for e in missing)
+                        + f". Ask the user for each value, then call set_skill_setting"
+                        + f" with skill_name='{skill_name}' (set once — all related skills share this config)."
+                    ),
+                }
+            )
         except Exception as e:
             return json.dumps({"success": False, "error": str(e), "skill_name": skill_name})
 

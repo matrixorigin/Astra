@@ -25,13 +25,16 @@ class TestTrainingDataPipeline:
         # First call: fetch user-agent pairs (raw SQL)
         fetch_pairs = Mock()
         fetch_pairs.fetchall.return_value = [
-            ("evt-1", "How do I implement a binary search tree?",
-             "Here's how to implement a binary search tree:\n\n"
-             "1. Define a Node class with value, left, right\n"
-             "2. Implement insert method\n"
-             "3. Implement search method\n\n"
-             "```python\nclass Node:\n    def __init__(self, val):\n        self.val = val\n```\n"
-             "This gives you a working BST with O(log n) operations."),
+            (
+                "evt-1",
+                "How do I implement a binary search tree?",
+                "Here's how to implement a binary search tree:\n\n"
+                "1. Define a Node class with value, left, right\n"
+                "2. Implement insert method\n"
+                "3. Implement search method\n\n"
+                "```python\nclass Node:\n    def __init__(self, val):\n        self.val = val\n```\n"
+                "This gives you a working BST with O(log n) operations.",
+            ),
         ]
         db.execute.return_value = fetch_pairs
 
@@ -51,9 +54,12 @@ class TestTrainingDataPipeline:
 
         pipeline = TrainingDataPipeline(lambda: db)
         example = TrainingExample(
-            example_id="ex-1", session_id="sess-1",
-            input_text="Question", output_text="Answer",
-            quality=DataQuality.GOLD, contamination_score=0.1,
+            example_id="ex-1",
+            session_id="sess-1",
+            input_text="Question",
+            output_text="Answer",
+            quality=DataQuality.GOLD,
+            contamination_score=0.1,
         )
 
         pipeline.store_example(example)
@@ -66,9 +72,12 @@ class TestTrainingDataPipeline:
 
         pipeline = TrainingDataPipeline(lambda: db)
         example = TrainingExample(
-            example_id="ex-1", session_id="sess-1",
-            input_text="Question", output_text="Answer",
-            quality=DataQuality.GOLD, contamination_score=0.1,
+            example_id="ex-1",
+            session_id="sess-1",
+            input_text="Question",
+            output_text="Answer",
+            quality=DataQuality.GOLD,
+            contamination_score=0.1,
         )
 
         pipeline.store_example(example)
@@ -79,7 +88,10 @@ class TestTrainingDataPipeline:
         db = _mock_db()
         row1 = Mock(input_text="Input 1", output_text="Output 1", contamination_score=0.05)
         row2 = Mock(input_text="Input 2", output_text="Output 2", contamination_score=0.1)
-        db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [row1, row2]
+        db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [
+            row1,
+            row2,
+        ]
 
         pipeline = TrainingDataPipeline(lambda: db)
         dataset = pipeline.get_dataset(quality=DataQuality.GOLD, limit=100)
@@ -109,8 +121,13 @@ class TestTrainingDataPipeline:
 
     def test_assess_quality_rejects_refusal(self):
         pipeline = TrainingDataPipeline(_mock_db())
-        assert pipeline._assess_quality("Q", "I can't help with that request.") == DataQuality.REJECTED
-        assert pipeline._assess_quality("Q", "I'm sorry, but I can't assist with this.") == DataQuality.REJECTED
+        assert (
+            pipeline._assess_quality("Q", "I can't help with that request.") == DataQuality.REJECTED
+        )
+        assert (
+            pipeline._assess_quality("Q", "I'm sorry, but I can't assist with this.")
+            == DataQuality.REJECTED
+        )
 
     def test_assess_quality_structured_output_scores_higher(self):
         pipeline = TrainingDataPipeline(_mock_db())
@@ -138,7 +155,10 @@ class TestTrainingDataPipeline:
         db = _mock_db()
         # Existing training data — ORM query chain
         db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [
-            ("What is Python?", "Python is a programming language used for web development and data science."),
+            (
+                "What is Python?",
+                "Python is a programming language used for web development and data science.",
+            ),
         ]
 
         pipeline = TrainingDataPipeline(lambda: db)

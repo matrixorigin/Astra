@@ -19,9 +19,11 @@ def llm_client():
     mock_db.__enter__ = MagicMock(return_value=mock_db)
     mock_db.__exit__ = MagicMock(return_value=False)
 
-    with patch("core.llm.client.get_db_session"), \
-         patch.object(LLMClient, "_init_providers"), \
-         patch.object(LLMClient, "_init_rate_limits"):
+    with (
+        patch("core.llm.client.get_db_session"),
+        patch.object(LLMClient, "_init_providers"),
+        patch.object(LLMClient, "_init_rate_limits"),
+    ):
         client = LLMClient.__new__(LLMClient)
         client._providers = {}
         client._model_keys = {}

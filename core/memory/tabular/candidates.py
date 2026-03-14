@@ -33,11 +33,19 @@ logger = logging.getLogger(__name__)
 
 # Columns needed for Signal 2 (no embedding — saves ~1.5KB/row)
 _LIGHT_COLS = [
-    MemoryRecord.memory_id, MemoryRecord.user_id, MemoryRecord.content,
-    MemoryRecord.memory_type, MemoryRecord.session_id, MemoryRecord.observed_at,
-    MemoryRecord.initial_confidence, MemoryRecord.trust_tier,
-    MemoryRecord.superseded_by, MemoryRecord.is_active,
-    MemoryRecord.source_event_ids, MemoryRecord.created_at, MemoryRecord.updated_at,
+    MemoryRecord.memory_id,
+    MemoryRecord.user_id,
+    MemoryRecord.content,
+    MemoryRecord.memory_type,
+    MemoryRecord.session_id,
+    MemoryRecord.observed_at,
+    MemoryRecord.initial_confidence,
+    MemoryRecord.trust_tier,
+    MemoryRecord.superseded_by,
+    MemoryRecord.is_active,
+    MemoryRecord.source_event_ids,
+    MemoryRecord.created_at,
+    MemoryRecord.updated_at,
 ]
 
 
@@ -53,7 +61,10 @@ class TabularCandidateProvider(DbConsumer):
         self._config = config or DEFAULT_CONFIG
 
     def get_reflection_candidates(
-        self, user_id: str, *, since_hours: int = 24,
+        self,
+        user_id: str,
+        *,
+        since_hours: int = 24,
     ) -> list[ReflectionCandidate]:
         """Collect candidates from all three signals in a single DB session."""
         candidates: list[ReflectionCandidate] = []
@@ -62,7 +73,10 @@ class TabularCandidateProvider(DbConsumer):
         with self._db() as db:
             for name, fn in [
                 ("semantic_clusters", lambda: self._signal_semantic_clusters(db, user_id, cutoff)),
-                ("contradiction_pairs", lambda: self._signal_contradiction_pairs(db, user_id, cutoff)),
+                (
+                    "contradiction_pairs",
+                    lambda: self._signal_contradiction_pairs(db, user_id, cutoff),
+                ),
                 ("summary_recurrence", lambda: self._signal_summary_recurrence(db, user_id)),
             ]:
                 try:
@@ -70,7 +84,11 @@ class TabularCandidateProvider(DbConsumer):
                 except Exception as e:
                     logger.warning(
                         "Signal %s failed for user=%s since=%s: %s",
-                        name, user_id, cutoff, e, exc_info=True,
+                        name,
+                        user_id,
+                        cutoff,
+                        e,
+                        exc_info=True,
                     )
 
         return candidates
@@ -78,7 +96,10 @@ class TabularCandidateProvider(DbConsumer):
     # ── Signal 1: Semantic clustering (DB-side) ───────────────────────
 
     def _signal_semantic_clusters(
-        self, db: DbSession, user_id: str, cutoff: datetime,
+        self,
+        db: DbSession,
+        user_id: str,
+        cutoff: datetime,
     ) -> list[ReflectionCandidate]:
         """Find cross-session clusters via DB-side cosine_similarity self-join.
 
@@ -91,10 +112,13 @@ class TabularCandidateProvider(DbConsumer):
         # DB-side: find all similar cross-session pairs
         pairs = (
             db.query(A.memory_id, A.session_id, B.memory_id, B.session_id)
-            .join(B, and_(
-                A.user_id == B.user_id,
-                A.memory_id < B.memory_id,  # deduplicate
-            ))
+            .join(
+                B,
+                and_(
+                    A.user_id == B.user_id,
+                    A.memory_id < B.memory_id,  # deduplicate
+                ),
+            )
             .filter(
                 A.user_id == user_id,
                 A.is_active == 1,
@@ -106,7 +130,9 @@ class TabularCandidateProvider(DbConsumer):
                 B.observed_at > cutoff,
                 B.embedding.isnot(None),
                 A.session_id != B.session_id,
-                text("cosine_similarity(a.embedding, b.embedding) >= :threshold").bindparams(threshold=self._config.cluster_similarity_threshold),
+                text("cosine_similarity(a.embedding, b.embedding) >= :threshold").bindparams(
+                    threshold=self._config.cluster_similarity_threshold
+                ),
             )
             .limit(5000)
             .all()
@@ -147,11 +173,7 @@ class TabularCandidateProvider(DbConsumer):
             session_ids = list({session_map[m] for m in mids if session_map[m]})
             if len(session_ids) >= self._config.min_cross_session_count:
                 # Fetch full Memory objects for qualifying clusters only
-                rows = (
-                    db.query(MemoryRecord)
-                    .filter(MemoryRecord.memory_id.in_(list(mids)))
-                    .all()
-                )
+                rows = db.query(MemoryRecord).filter(MemoryRecord.memory_id.in_(list(mids))).all()
                 mems = [_to_domain(r) for r in rows]
                 c = ReflectionCandidate(
                     memories=mems,
@@ -165,7 +187,10 @@ class TabularCandidateProvider(DbConsumer):
     # ── Signal 2: Contradiction pairs ─────────────────────────────────
 
     def _signal_contradiction_pairs(
-        self, db: DbSession, user_id: str, cutoff: datetime,
+        self,
+        db: DbSession,
+        user_id: str,
+        cutoff: datetime,
     ) -> list[ReflectionCandidate]:
         """Find memories that superseded each other recently.
 
@@ -193,25 +218,29 @@ class TabularCandidateProvider(DbConsumer):
         for row in rows:
             old_mem = _row_tuple_to_memory(row[:n])
             new_mem = _row_tuple_to_memory(row[n:])
-            session_ids = list({
-                s for s in [old_mem.session_id, new_mem.session_id] if s
-            })
-            candidates.append(ReflectionCandidate(
-                memories=[old_mem, new_mem],
-                signal="contradiction",
-                importance_score=score_candidate(ReflectionCandidate(
+            session_ids = list({s for s in [old_mem.session_id, new_mem.session_id] if s})
+            candidates.append(
+                ReflectionCandidate(
                     memories=[old_mem, new_mem],
                     signal="contradiction",
+                    importance_score=score_candidate(
+                        ReflectionCandidate(
+                            memories=[old_mem, new_mem],
+                            signal="contradiction",
+                            session_ids=session_ids,
+                        )
+                    ),
                     session_ids=session_ids,
-                )),
-                session_ids=session_ids,
-            ))
+                )
+            )
         return candidates
 
     # ── Signal 3: Session summary recurrence (DB-side) ────────────────
 
     def _signal_summary_recurrence(
-        self, db: DbSession, user_id: str,
+        self,
+        db: DbSession,
+        user_id: str,
     ) -> list[ReflectionCandidate]:
         """Find recurring themes across session summaries (7-day window).
 
@@ -225,10 +254,13 @@ class TabularCandidateProvider(DbConsumer):
 
         pairs = (
             db.query(A.memory_id, B.memory_id)
-            .join(B, and_(
-                A.user_id == B.user_id,
-                A.memory_id < B.memory_id,
-            ))
+            .join(
+                B,
+                and_(
+                    A.user_id == B.user_id,
+                    A.memory_id < B.memory_id,
+                ),
+            )
             .filter(
                 A.user_id == user_id,
                 A.memory_type == "semantic",
@@ -241,7 +273,9 @@ class TabularCandidateProvider(DbConsumer):
                 B.is_active == 1,
                 B.observed_at > cutoff_7d,
                 B.embedding.isnot(None),
-                text("cosine_similarity(sa.embedding, sb.embedding) >= :threshold").bindparams(threshold=self._config.cluster_similarity_threshold),
+                text("cosine_similarity(sa.embedding, sb.embedding) >= :threshold").bindparams(
+                    threshold=self._config.cluster_similarity_threshold
+                ),
             )
             .limit(5000)
             .all()
@@ -278,21 +312,21 @@ class TabularCandidateProvider(DbConsumer):
         candidates = []
         for mids in clusters.values():
             if len(mids) >= self._config.min_summary_recurrence:
-                rows = (
-                    db.query(MemoryRecord)
-                    .filter(MemoryRecord.memory_id.in_(list(mids)))
-                    .all()
-                )
-                candidates.append(ReflectionCandidate(
-                    memories=[_to_domain(r) for r in rows],
-                    signal="summary_recurrence",
-                    importance_score=score_candidate(ReflectionCandidate(
+                rows = db.query(MemoryRecord).filter(MemoryRecord.memory_id.in_(list(mids))).all()
+                candidates.append(
+                    ReflectionCandidate(
                         memories=[_to_domain(r) for r in rows],
                         signal="summary_recurrence",
+                        importance_score=score_candidate(
+                            ReflectionCandidate(
+                                memories=[_to_domain(r) for r in rows],
+                                signal="summary_recurrence",
+                                session_ids=[],
+                            )
+                        ),
                         session_ids=[],
-                    )),
-                    session_ids=[],
-                ))
+                    )
+                )
         return candidates
 
 
@@ -301,6 +335,7 @@ class TabularCandidateProvider(DbConsumer):
 
 def _hours_ago(hours: int) -> datetime:
     from datetime import timedelta
+
     return _utcnow() - timedelta(hours=hours)
 
 
@@ -326,25 +361,43 @@ def _to_domain(row: MemoryRecord) -> Memory:
 
 def _row_tuple_to_memory(vals: tuple) -> Memory:
     """Convert a column-tuple (from light query) to Memory. No embedding."""
-    (mid, uid, content, mtype, sid, observed, conf, tier,
-     superseded, active, src_ids, created, updated) = vals
+    (
+        mid,
+        uid,
+        content,
+        mtype,
+        sid,
+        observed,
+        conf,
+        tier,
+        superseded,
+        active,
+        src_ids,
+        created,
+        updated,
+    ) = vals
     return Memory(
-        memory_id=mid, user_id=uid, content=content,
+        memory_id=mid,
+        user_id=uid,
+        content=content,
         memory_type=MemoryType(mtype),
-        session_id=sid, observed_at=observed,
+        session_id=sid,
+        observed_at=observed,
         initial_confidence=conf,
         trust_tier=TrustTier(tier) if tier else TrustTier.T3_INFERRED,
         embedding=None,
         source_event_ids=src_ids or [],
         superseded_by=superseded,
         is_active=bool(active),
-        created_at=created, updated_at=updated,
+        created_at=created,
+        updated_at=updated,
     )
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """Cosine similarity between two vectors. Kept for unit tests."""
     import math
+
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(x * x for x in b))

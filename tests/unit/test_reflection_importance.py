@@ -17,8 +17,12 @@ from core.memory.types import Memory, MemoryType
 
 def _mem(mid="m1", sid="s1", conf=0.8):
     return Memory(
-        memory_id=mid, user_id="u1", memory_type=MemoryType.SEMANTIC,
-        content="test", initial_confidence=conf, session_id=sid,
+        memory_id=mid,
+        user_id="u1",
+        memory_type=MemoryType.SEMANTIC,
+        content="test",
+        initial_confidence=conf,
+        session_id=sid,
     )
 
 
@@ -41,14 +45,16 @@ class TestScoreCandidate:
     def test_large_cross_session_cluster_scores_high(self):
         mems = [_mem(f"m{i}", f"s{i}") for i in range(6)]
         c = ReflectionCandidate(
-            memories=mems, signal="semantic_cluster",
+            memories=mems,
+            signal="semantic_cluster",
             session_ids=["s1", "s2", "s3", "s4"],
         )
         assert score_candidate(c) >= DAILY_THRESHOLD
 
     def test_single_session_cluster_scores_zero_cross_session(self):
         c = ReflectionCandidate(
-            memories=[_mem()], signal="semantic_cluster",
+            memories=[_mem()],
+            signal="semantic_cluster",
             session_ids=["s1"],
         )
         score = score_candidate(c)
@@ -66,7 +72,8 @@ class TestScoreCandidate:
 
     def test_activation_energy_used_for_centrality(self):
         c = ReflectionCandidate(
-            memories=[_mem()], signal="semantic_cluster",
+            memories=[_mem()],
+            signal="semantic_cluster",
             session_ids=["s1", "s2", "s3"],
         )
         score_high = score_candidate(c, activation_energy=0.85)
@@ -76,7 +83,8 @@ class TestScoreCandidate:
     def test_zero_activation_falls_back_to_cluster_size(self):
         mems = [_mem(f"m{i}") for i in range(5)]
         c = ReflectionCandidate(
-            memories=mems, signal="semantic_cluster",
+            memories=mems,
+            signal="semantic_cluster",
             session_ids=["s1", "s2"],
         )
         score = score_candidate(c, activation_energy=0.0)
@@ -85,7 +93,8 @@ class TestScoreCandidate:
 
     def test_activation_energy_capped_at_1(self):
         c = ReflectionCandidate(
-            memories=[_mem()], signal="semantic_cluster",
+            memories=[_mem()],
+            signal="semantic_cluster",
             session_ids=["s1"],
         )
         # Even with activation_energy=5.0, centrality should cap at 1.0
@@ -99,12 +108,14 @@ class TestTaskImportanceWeights:
 
     def test_all_task_weights_sum_to_one(self):
         from core.memory.reflection.importance import TASK_IMPORTANCE_WEIGHTS
+
         for task, weights in TASK_IMPORTANCE_WEIGHTS.items():
             total = sum(weights.values())
             assert total == pytest.approx(1.0), f"{task} weights sum to {total}"
 
     def test_all_task_weights_have_four_keys(self):
         from core.memory.reflection.importance import TASK_IMPORTANCE_WEIGHTS
+
         expected_keys = {"centrality", "cross_session", "contradiction", "recurrence"}
         for task, weights in TASK_IMPORTANCE_WEIGHTS.items():
             assert set(weights.keys()) == expected_keys, f"{task} missing keys"
@@ -127,7 +138,8 @@ class TestTaskImportanceWeights:
         """Code review should weight cross-session higher than default."""
         mems = [_mem(f"m{i}", f"s{i}") for i in range(5)]
         c = ReflectionCandidate(
-            memories=mems, signal="semantic_cluster",
+            memories=mems,
+            signal="semantic_cluster",
             session_ids=["s1", "s2", "s3", "s4"],
         )
         score_default = score_candidate(c)
@@ -139,7 +151,8 @@ class TestTaskImportanceWeights:
 
     def test_unknown_task_uses_defaults(self):
         c = ReflectionCandidate(
-            memories=[_mem()], signal="semantic_cluster",
+            memories=[_mem()],
+            signal="semantic_cluster",
             session_ids=["s1"],
         )
         score_default = score_candidate(c)
@@ -148,7 +161,8 @@ class TestTaskImportanceWeights:
 
     def test_none_task_uses_defaults(self):
         c = ReflectionCandidate(
-            memories=[_mem()], signal="semantic_cluster",
+            memories=[_mem()],
+            signal="semantic_cluster",
             session_ids=["s1"],
         )
         score_default = score_candidate(c)
@@ -159,7 +173,8 @@ class TestTaskImportanceWeights:
         """Same candidate scored under different tasks should differ."""
         mems = [_mem(f"m{i}", f"s{i}") for i in range(4)]
         c = ReflectionCandidate(
-            memories=mems, signal="contradiction",
+            memories=mems,
+            signal="contradiction",
             session_ids=["s1", "s2", "s3"],
         )
         scores = {

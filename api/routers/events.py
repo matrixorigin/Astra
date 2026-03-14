@@ -16,6 +16,7 @@ router = APIRouter()
 # Request/Response Models
 class CreateEventRequest(BaseModel):
     """创建 Event 请求"""
+
     session_id: str
     event_type: str
     content: str
@@ -28,6 +29,7 @@ class CreateEventRequest(BaseModel):
 
 class EventResponse(BaseModel):
     """Event 响应"""
+
     event_id: str
     user_id: str
     session_id: str
@@ -43,6 +45,7 @@ class EventResponse(BaseModel):
 
 class EventListResponse(BaseModel):
     """Event 列表响应"""
+
     events: list[EventResponse]
     total: int
     limit: int
@@ -55,12 +58,9 @@ class EventListResponse(BaseModel):
     response_model=EventResponse,
     status_code=status.HTTP_201_CREATED,
     summary="创建 Event",
-    description="创建一个新的事件"
+    description="创建一个新的事件",
 )
-async def create_event(
-    request: CreateEventRequest,
-    current_user: dict = Depends(get_current_user)
-):
+async def create_event(request: CreateEventRequest, current_user: dict = Depends(get_current_user)):
     """创建 Event"""
     try:
         service = EventService(SessionLocal)
@@ -73,46 +73,27 @@ async def create_event(
             agent_version=request.agent_version,
             parent_event_id=request.parent_event_id,
             causal_chain_id=request.causal_chain_id,
-            metadata=request.metadata
+            metadata=request.metadata,
         )
         return result
     except ResourceNotFoundError as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except PermissionDeniedError as e:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except ResourceNotFoundError as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except PermissionDeniedError as e:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"创建 Event 失败: {e!s}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"创建 Event 失败: {e!s}"
         )
 
 
 @router.get(
-    "",
-    response_model=EventListResponse,
-    summary="列出 Events",
-    description="列出当前用户的事件"
+    "", response_model=EventListResponse, summary="列出 Events", description="列出当前用户的事件"
 )
 async def list_events(
     session_id: str | None = Query(None, description="过滤Session ID"),
@@ -121,7 +102,7 @@ async def list_events(
     causal_chain_id: str | None = Query(None, description="过滤因果链ID"),
     limit: int = Query(50, ge=1, le=100, description="限制数量"),
     offset: int = Query(0, ge=0, description="偏移量"),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     """列出 Events"""
     try:
@@ -133,13 +114,12 @@ async def list_events(
             agent_id=agent_id,
             causal_chain_id=causal_chain_id,
             limit=limit,
-            offset=offset
+            offset=offset,
         )
         return result
     except Exception as e:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"获取 Events 失败: {e!s}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"获取 Events 失败: {e!s}"
         )
 
 
@@ -147,36 +127,23 @@ async def list_events(
     "/{event_id}",
     response_model=EventResponse,
     summary="获取 Event",
-    description="获取指定事件的详细信息"
+    description="获取指定事件的详细信息",
 )
-async def get_event(
-    event_id: str,
-    current_user: dict = Depends(get_current_user)
-):
+async def get_event(event_id: str, current_user: dict = Depends(get_current_user)):
     """获取 Event"""
     try:
         service = EventService(SessionLocal)
         result = service.get_event(event_id=event_id, user_id=current_user["user_id"])
         return result
     except ResourceNotFoundError as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except PermissionDeniedError as e:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"获取 Event 失败: {e!s}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"获取 Event 失败: {e!s}"
         )
 
 
@@ -184,24 +151,19 @@ async def get_event(
     "/causal-chain/{causal_chain_id}",
     response_model=list[EventResponse],
     summary="获取因果链",
-    description="获取因果链中的所有事件"
+    description="获取因果链中的所有事件",
 )
-async def get_causal_chain(
-    causal_chain_id: str,
-    current_user: dict = Depends(get_current_user)
-):
+async def get_causal_chain(causal_chain_id: str, current_user: dict = Depends(get_current_user)):
     """获取因果链"""
     try:
         service = EventService(SessionLocal)
         result = service.get_causal_chain(
-            causal_chain_id=causal_chain_id,
-            user_id=current_user["user_id"]
+            causal_chain_id=causal_chain_id, user_id=current_user["user_id"]
         )
         return result
     except Exception as e:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"获取因果链失败: {e!s}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"获取因果链失败: {e!s}"
         )
 
 
@@ -209,43 +171,30 @@ async def get_causal_chain(
     "/session/{session_id}",
     response_model=EventListResponse,
     summary="获取Session事件",
-    description="获取指定会话中的所有事件"
+    description="获取指定会话中的所有事件",
 )
 async def get_session_events(
     session_id: str,
     limit: int = Query(100, ge=1, le=500, description="限制数量"),
     offset: int = Query(0, ge=0, description="偏移量"),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     """获取Session事件"""
     try:
         service = EventService(SessionLocal)
         result = service.get_session_events(
-            session_id=session_id,
-            user_id=current_user["user_id"],
-            limit=limit,
-            offset=offset
+            session_id=session_id, user_id=current_user["user_id"], limit=limit, offset=offset
         )
         return result
     except ResourceNotFoundError as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except PermissionDeniedError as e:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"获取Session事件失败: {e!s}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"获取Session事件失败: {e!s}"
         )
 
 
@@ -253,33 +202,20 @@ async def get_session_events(
     "/{event_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="删除 Event",
-    description="删除指定的事件"
+    description="删除指定的事件",
 )
-async def delete_event(
-    event_id: str,
-    current_user: dict = Depends(get_current_user)
-):
+async def delete_event(event_id: str, current_user: dict = Depends(get_current_user)):
     """删除 Event"""
     try:
         service = EventService(SessionLocal)
         service.delete_event(event_id=event_id, user_id=current_user["user_id"])
     except ResourceNotFoundError as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except PermissionDeniedError as e:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"删除 Event 失败: {e!s}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"删除 Event 失败: {e!s}"
         )

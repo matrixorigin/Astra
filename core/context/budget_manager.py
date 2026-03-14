@@ -17,15 +17,17 @@ from enum import Enum
 
 class ConversationStage(str, Enum):
     """Conversation stage for dynamic budget allocation."""
-    QUERY = "query"           # Simple question
-    ANALYSIS = "analysis"     # Deep analysis/debugging
-    GENERATION = "generation" # Code generation
-    PLANNING = "planning"     # Multi-step planning
+
+    QUERY = "query"  # Simple question
+    ANALYSIS = "analysis"  # Deep analysis/debugging
+    GENERATION = "generation"  # Code generation
+    PLANNING = "planning"  # Multi-step planning
 
 
 @dataclass
 class BudgetAllocation:
     """Budget allocation in tokens for each context source."""
+
     system_prompt: int = 0
     history: int = 0
     tool_output: int = 0
@@ -33,26 +35,32 @@ class BudgetAllocation:
     memory_l1: int = 0
     code_context: int = 0
     documentation: int = 0
-    
+
     @property
     def total(self) -> int:
         return (
-            self.system_prompt + self.history + self.tool_output +
-            self.memory_l0 + self.memory_l1 + self.code_context + self.documentation
+            self.system_prompt
+            + self.history
+            + self.tool_output
+            + self.memory_l0
+            + self.memory_l1
+            + self.code_context
+            + self.documentation
         )
 
 
 @dataclass
 class TurnBudgetTracker:
     """Track cumulative tool output budget within a single turn."""
+
     max_tool_output_tokens: int
     used_tokens: int = 0
     tool_count: int = 0
-    
+
     @property
     def remaining(self) -> int:
         return max(0, self.max_tool_output_tokens - self.used_tokens)
-    
+
     def should_force_summarize(self, output_size: int) -> bool:
         """Check if output should be force-summarized due to cumulative budget."""
         output_tokens = output_size // 4
@@ -64,7 +72,7 @@ class TurnBudgetTracker:
         if self.used_tokens > self.max_tool_output_tokens * 0.5 and output_tokens > 2000:
             return True
         return False
-    
+
     def record(self, output_size: int) -> None:
         """Record tool output usage."""
         self.used_tokens += output_size // 4
@@ -114,10 +122,10 @@ STAGE_BUDGETS: dict[ConversationStage, dict[str, float]] = {
 
 class ContextBudgetManager:
     """Manages global context budget allocation."""
-    
+
     def __init__(self, max_context_tokens: int = 128000, reserve_for_output: int = 4000):
         """Initialize budget manager.
-        
+
         Args:
             max_context_tokens: Maximum context window size
             reserve_for_output: Tokens to reserve for model output
@@ -125,37 +133,39 @@ class ContextBudgetManager:
         self.max_context_tokens = max_context_tokens
         self.reserve_for_output = reserve_for_output
         self._used: dict[str, int] = {}
-    
+
     @property
     def available_tokens(self) -> int:
         """Total available tokens for context."""
         return self.max_context_tokens - self.reserve_for_output
-    
+
     @property
     def used_tokens(self) -> int:
         """Total tokens used so far."""
         return sum(self._used.values())
-    
+
     @property
     def remaining_tokens(self) -> int:
         """Remaining tokens available."""
         return self.available_tokens - self.used_tokens
-    
-    def allocate(self, stage: ConversationStage | str = ConversationStage.QUERY) -> BudgetAllocation:
+
+    def allocate(
+        self, stage: ConversationStage | str = ConversationStage.QUERY
+    ) -> BudgetAllocation:
         """Allocate budget based on conversation stage.
-        
+
         Args:
             stage: Current conversation stage
-        
+
         Returns:
             BudgetAllocation with token limits for each source
         """
         if isinstance(stage, str):
             stage = ConversationStage(stage)
-        
+
         ratios = STAGE_BUDGETS.get(stage, STAGE_BUDGETS[ConversationStage.QUERY])
         available = self.available_tokens
-        
+
         return BudgetAllocation(
             system_prompt=int(available * ratios["system_prompt"]),
             history=int(available * ratios["history"]),
@@ -165,22 +175,24 @@ class ContextBudgetManager:
             code_context=int(available * ratios["code_context"]),
             documentation=int(available * ratios["documentation"]),
         )
-    
-    def allocate_remaining(self, stage: ConversationStage | str = ConversationStage.QUERY) -> BudgetAllocation:
+
+    def allocate_remaining(
+        self, stage: ConversationStage | str = ConversationStage.QUERY
+    ) -> BudgetAllocation:
         """Allocate remaining budget (after some sources already used).
-        
+
         Args:
             stage: Current conversation stage
-        
+
         Returns:
             BudgetAllocation with token limits for remaining sources
         """
         if isinstance(stage, str):
             stage = ConversationStage(stage)
-        
+
         ratios = STAGE_BUDGETS.get(stage, STAGE_BUDGETS[ConversationStage.QUERY])
         remaining = self.remaining_tokens
-        
+
         return BudgetAllocation(
             system_prompt=int(remaining * ratios["system_prompt"]),
             history=int(remaining * ratios["history"]),
@@ -190,30 +202,32 @@ class ContextBudgetManager:
             code_context=int(remaining * ratios["code_context"]),
             documentation=int(remaining * ratios["documentation"]),
         )
-    
+
     def record_usage(self, source: str, tokens: int) -> None:
         """Record token usage for a source.
-        
+
         Args:
             source: Source name (system_prompt, history, tool_output, etc.)
             tokens: Number of tokens used
         """
         self._used[source] = self._used.get(source, 0) + tokens
-    
+
     def get_usage(self, source: str) -> int:
         """Get token usage for a source."""
         return self._used.get(source, 0)
-    
+
     def reset(self) -> None:
         """Reset all usage tracking."""
         self._used.clear()
-    
-    def get_tool_output_budget(self, stage: ConversationStage | str = ConversationStage.QUERY) -> int:
+
+    def get_tool_output_budget(
+        self, stage: ConversationStage | str = ConversationStage.QUERY
+    ) -> int:
         """Get tool output budget in bytes (for tool_output_handler).
-        
+
         Args:
             stage: Current conversation stage
-        
+
         Returns:
             Budget in bytes (~4 chars per token)
         """
@@ -223,27 +237,29 @@ class ContextBudgetManager:
 
 def classify_stage(query: str, tool_calls_count: int = 0) -> ConversationStage:
     """Classify conversation stage from query and context.
-    
+
     Args:
         query: User query
         tool_calls_count: Number of tool calls so far in this turn
-    
+
     Returns:
         Detected conversation stage
     """
     query_lower = query.lower()
-    
+
     # Planning indicators
     if any(kw in query_lower for kw in ["plan", "step by step", "how to", "implement"]):
         return ConversationStage.PLANNING
-    
+
     # Generation indicators
     if any(kw in query_lower for kw in ["write", "create", "generate", "build", "add"]):
         return ConversationStage.GENERATION
-    
+
     # Analysis indicators (or many tool calls)
-    if tool_calls_count > 2 or any(kw in query_lower for kw in ["debug", "analyze", "why", "investigate", "fix"]):
+    if tool_calls_count > 2 or any(
+        kw in query_lower for kw in ["debug", "analyze", "why", "investigate", "fix"]
+    ):
         return ConversationStage.ANALYSIS
-    
+
     # Default to query
     return ConversationStage.QUERY

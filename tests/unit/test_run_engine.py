@@ -10,9 +10,16 @@ from datetime import datetime, timezone
 
 from core.agent.run import AgentRun, RunStatus, RunTrigger
 from core.agent.run_engine import (
-    RunEngine, _active_runs, _agent_run_events, _run_waiters, _run_tasks,
-    _child_runs, _agent_config_cache, _MAX_RESUME_INPUT_CHARS,
-    _MAX_COMPLETED_RUNS, cleanup_fan_in_tasks,
+    RunEngine,
+    _active_runs,
+    _agent_run_events,
+    _run_waiters,
+    _run_tasks,
+    _child_runs,
+    _agent_config_cache,
+    _MAX_RESUME_INPUT_CHARS,
+    _MAX_COMPLETED_RUNS,
+    cleanup_fan_in_tasks,
 )
 from core.events.models import EventType
 
@@ -35,7 +42,8 @@ def mock_db_factory(mock_db):
 @pytest.fixture
 def engine(mock_db_factory):
     from tests.conftest import make_run_engine_mock_init
-    with patch.object(RunEngine, '__init__', make_run_engine_mock_init()):
+
+    with patch.object(RunEngine, "__init__", make_run_engine_mock_init()):
         e = RunEngine(mock_db_factory)
         # Default: claim always succeeds (single-worker behavior)
         e._try_claim_resume = MagicMock(return_value=True)
@@ -63,10 +71,11 @@ def clean_state():
 
 
 class TestRunEngineCreate:
-
     def test_create_run(self, engine):
         run = engine.create_run(
-            session_id="s1", user_id="u1", user_input="hello",
+            session_id="s1",
+            user_id="u1",
+            user_input="hello",
         )
         assert run.status == RunStatus.PENDING
         assert run.run_id in _active_runs
@@ -75,14 +84,15 @@ class TestRunEngineCreate:
 
     def test_create_run_with_parent(self, engine):
         run = engine.create_run(
-            session_id="s1", user_id="u1", user_input="sub",
+            session_id="s1",
+            user_id="u1",
+            user_input="sub",
             parent_run_id="parent_1",
         )
         assert run.parent_run_id == "parent_1"
 
 
 class TestRunEngineStartRun:
-
     @pytest.mark.asyncio
     async def test_successful_run(self, engine):
         run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
@@ -92,6 +102,7 @@ class TestRunEngineStartRun:
 
         async def fake_stream(**kw):
             from core.events.models import StreamEvent
+
             yield StreamEvent(event_type="text_delta", data={"chunk": "hello"})
 
         mock_loop.run_step_stream = fake_stream
@@ -125,7 +136,9 @@ class TestRunEngineStartRun:
     @pytest.mark.asyncio
     async def test_run_timeout(self, engine):
         run = engine.create_run(
-            session_id="s1", user_id="u1", user_input="hi",
+            session_id="s1",
+            user_id="u1",
+            user_input="hi",
             context={"run_timeout_seconds": 0.05},
         )
 
@@ -155,6 +168,7 @@ class TestRunEngineStartRun:
 
         async def wait_stream(**kw):
             from core.events.models import StreamEvent
+
             yield StreamEvent(event_type="tool_result", data={"wait_for": "job:123"})
 
         mock_loop.run_step_stream = wait_stream
@@ -167,7 +181,6 @@ class TestRunEngineStartRun:
 
 
 class TestRunEngineResume:
-
     @pytest.mark.asyncio
     async def test_resume_injects_result(self, engine):
         run = engine.create_run(session_id="s1", user_id="u1", user_input="train")
@@ -180,6 +193,7 @@ class TestRunEngineResume:
 
         async def resume_stream(**kw):
             from core.events.models import StreamEvent
+
             yield StreamEvent(event_type="text_delta", data={"chunk": "done"})
 
         mock_loop.run_step_stream = resume_stream
@@ -203,7 +217,6 @@ class TestRunEngineResume:
 
 
 class TestRunEngineCancel:
-
     def test_cancel_running(self, engine):
         run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
         run.status = RunStatus.RUNNING
@@ -305,10 +318,11 @@ class TestRunEngineCancel:
 
 
 class TestRunEngineResolveHandle:
-
     @pytest.mark.asyncio
     async def test_resolve_workflow_inner_wait(self, engine):
-        with patch("core.agent.async_tools.resume_workflow", new_callable=AsyncMock, return_value=True):
+        with patch(
+            "core.agent.async_tools.resume_workflow", new_callable=AsyncMock, return_value=True
+        ):
             result = await engine.resolve_handle("approval:1", {"approved": True})
         assert result is True
 
@@ -327,19 +341,26 @@ class TestRunEngineResolveHandle:
 
         async def stream(**kw):
             from core.events.models import StreamEvent
+
             yield StreamEvent(event_type="text_delta", data={"chunk": "ok"})
 
         mock_loop.run_step_stream = stream
 
-        with patch("core.agent.async_tools.resume_workflow", new_callable=AsyncMock, return_value=False), \
-             patch("api.routers.chat._build_chat_loop", return_value=mock_loop):
+        with (
+            patch(
+                "core.agent.async_tools.resume_workflow", new_callable=AsyncMock, return_value=False
+            ),
+            patch("api.routers.chat._build_chat_loop", return_value=mock_loop),
+        ):
             result = await engine.resolve_handle("job:1", {"status": "done"})
 
         assert result is True
 
     @pytest.mark.asyncio
     async def test_resolve_unknown_handle(self, engine):
-        with patch("core.agent.async_tools.resume_workflow", new_callable=AsyncMock, return_value=False):
+        with patch(
+            "core.agent.async_tools.resume_workflow", new_callable=AsyncMock, return_value=False
+        ):
             result = await engine.resolve_handle("unknown:x", {})
         assert result is False
 
@@ -349,7 +370,8 @@ class TestTryClaimResume:
 
     def _make_engine(self, mock_db):
         from tests.conftest import make_run_engine_mock_init
-        with patch.object(RunEngine, '__init__', make_run_engine_mock_init()):
+
+        with patch.object(RunEngine, "__init__", make_run_engine_mock_init()):
             return RunEngine(lambda: mock_db)
 
     def test_claim_succeeds_on_first_insert(self):
@@ -361,6 +383,7 @@ class TestTryClaimResume:
 
     def test_claim_fails_on_integrity_error(self):
         from sqlalchemy.exc import IntegrityError
+
         db = MagicMock()
         db.execute.side_effect = IntegrityError("dup", {}, None)
         engine = self._make_engine(db)
@@ -382,9 +405,12 @@ class TestMultiAgentRuns:
         parent.status = RunStatus.RUNNING
 
         mock_loop = MagicMock()
+
         async def stream(**kw):
             from core.events.models import StreamEvent
+
             yield StreamEvent(event_type="text_delta", data={"chunk": "reviewed"})
+
         mock_loop.run_step_stream = stream
         mock_loop._current_run_id = None
 
@@ -426,9 +452,11 @@ class TestMultiAgentRuns:
 
         async def stream(**kw):
             from core.events.models import StreamEvent
+
             nonlocal call_count
             call_count += 1
             yield StreamEvent(event_type="text_delta", data={"chunk": f"result-{call_count}"})
+
         mock_loop.run_step_stream = stream
 
         with patch("api.routers.chat._build_chat_loop", return_value=mock_loop):
@@ -455,10 +483,20 @@ class TestMultiAgentRuns:
         parent.waiting_for = f"children:{parent.run_id}"
 
         # Create two children manually (don't start them)
-        c1 = engine.create_run(session_id="s1", user_id="u1", user_input="task1",
-                               agent_id="a1", parent_run_id=parent.run_id)
-        c2 = engine.create_run(session_id="s1", user_id="u1", user_input="task2",
-                               agent_id="a2", parent_run_id=parent.run_id)
+        c1 = engine.create_run(
+            session_id="s1",
+            user_id="u1",
+            user_input="task1",
+            agent_id="a1",
+            parent_run_id=parent.run_id,
+        )
+        c2 = engine.create_run(
+            session_id="s1",
+            user_id="u1",
+            user_input="task2",
+            agent_id="a2",
+            parent_run_id=parent.run_id,
+        )
         _child_runs.setdefault(parent.run_id, set()).update({c1.run_id, c2.run_id})
 
         # Only c1 completes
@@ -473,6 +511,7 @@ class TestMultiAgentRuns:
 
 def get_async_tool_registry():
     from core.agent.async_tools import get_async_tool_registry as _get
+
     return _get()
 
 
@@ -493,10 +532,13 @@ class TestResumeInputCap:
 
         async def stream(**kw):
             from core.events.models import StreamEvent
+
             resume_count[0] += 1
             if resume_count[0] < 3:
                 # Simulate another wait
-                yield StreamEvent(event_type="tool_result", data={"wait_for": f"job:{resume_count[0]+1}"})
+                yield StreamEvent(
+                    event_type="tool_result", data={"wait_for": f"job:{resume_count[0] + 1}"}
+                )
             else:
                 yield StreamEvent(event_type="text_delta", data={"chunk": "done"})
 
@@ -537,6 +579,7 @@ class TestResumeInputCap:
 
         async def stream(**kw):
             from core.events.models import StreamEvent
+
             yield StreamEvent(event_type="text_delta", data={"chunk": "ok"})
 
         mock_loop.run_step_stream = stream
@@ -556,10 +599,20 @@ class TestCancelPropagation:
         parent.status = RunStatus.WAITING
         parent.waiting_for = "children:x"
 
-        c1 = engine.create_run(session_id="s1", user_id="u1", user_input="t1",
-                               agent_id="a1", parent_run_id=parent.run_id)
-        c2 = engine.create_run(session_id="s1", user_id="u1", user_input="t2",
-                               agent_id="a2", parent_run_id=parent.run_id)
+        c1 = engine.create_run(
+            session_id="s1",
+            user_id="u1",
+            user_input="t1",
+            agent_id="a1",
+            parent_run_id=parent.run_id,
+        )
+        c2 = engine.create_run(
+            session_id="s1",
+            user_id="u1",
+            user_input="t2",
+            agent_id="a2",
+            parent_run_id=parent.run_id,
+        )
         c1.status = RunStatus.RUNNING
         c2.status = RunStatus.RUNNING
         _child_runs[parent.run_id] = {c1.run_id, c2.run_id}
@@ -583,8 +636,13 @@ class TestCancelPropagation:
         parent = engine.create_run(session_id="s1", user_id="u1", user_input="review")
         parent.status = RunStatus.RUNNING
 
-        c1 = engine.create_run(session_id="s1", user_id="u1", user_input="t1",
-                               agent_id="a1", parent_run_id=parent.run_id)
+        c1 = engine.create_run(
+            session_id="s1",
+            user_id="u1",
+            user_input="t1",
+            agent_id="a1",
+            parent_run_id=parent.run_id,
+        )
         c1.status = RunStatus.COMPLETED  # Already done
         _child_runs[parent.run_id] = {c1.run_id}
 
@@ -617,14 +675,26 @@ class TestFanInDBFallback:
             elif "event_type" in q and "run_id" in q and "ORDER BY created_at" in q:
                 # restore_run — return child as COMPLETED
                 from core.agent.run import AgentRun
+
                 child = AgentRun(
-                    session_id="s1", user_id="u1", user_input="sub",
-                    agent_id="reviewer", status=RunStatus.COMPLETED,
+                    session_id="s1",
+                    user_id="u1",
+                    user_input="sub",
+                    agent_id="reviewer",
+                    status=RunStatus.COMPLETED,
                 )
                 child.run_id = child_id
                 result.fetchall.return_value = [
-                    (EventType.RUN_STARTED.value, child.to_event_content(), '{"run_id":"' + child_id + '"}'),
-                    (EventType.RUN_COMPLETED.value, child.to_event_content(), '{"run_id":"' + child_id + '"}'),
+                    (
+                        EventType.RUN_STARTED.value,
+                        child.to_event_content(),
+                        '{"run_id":"' + child_id + '"}',
+                    ),
+                    (
+                        EventType.RUN_COMPLETED.value,
+                        child.to_event_content(),
+                        '{"run_id":"' + child_id + '"}',
+                    ),
                 ]
             elif "agent_run_events" in q and "SELECT" in q:
                 # _load_events_from_db
@@ -643,6 +713,7 @@ class TestFanInDBFallback:
 
         async def stream(**kw):
             from core.events.models import StreamEvent
+
             yield StreamEvent(event_type="text_delta", data={"chunk": "synthesized"})
 
         mock_loop.run_step_stream = stream
@@ -666,7 +737,8 @@ class TestFanInDBFallback:
 
     def test_get_child_run_ids_from_db(self, engine, mock_db):
         mock_db.execute.return_value.fetchall.return_value = [
-            ("child-1",), ("child-2",),
+            ("child-1",),
+            ("child-2",),
         ]
         ids = engine._get_child_run_ids_from_db("parent-1")
         assert ids == {"child-1", "child-2"}
@@ -678,7 +750,7 @@ class TestFanInDBFallback:
 
     def test_get_run_status_from_db(self, engine):
         """Should delegate to restore_run."""
-        with patch.object(engine, 'restore_run') as mock_restore:
+        with patch.object(engine, "restore_run") as mock_restore:
             mock_run = MagicMock()
             mock_run.status = RunStatus.COMPLETED
             mock_restore.return_value = mock_run
@@ -686,7 +758,7 @@ class TestFanInDBFallback:
             assert status == RunStatus.COMPLETED
 
     def test_get_run_status_from_db_not_found(self, engine):
-        with patch.object(engine, 'restore_run', return_value=None):
+        with patch.object(engine, "restore_run", return_value=None):
             status = engine._get_run_status_from_db("run-1")
             assert status is None
 
@@ -696,6 +768,7 @@ class TestAgentConfigLogging:
 
     def test_load_config_db_error_logs_warning(self, engine, mock_db, caplog):
         import logging
+
         mock_db.execute.side_effect = RuntimeError("connection lost")
         with caplog.at_level(logging.WARNING):
             result = engine._load_agent_config("test-agent")
@@ -704,6 +777,7 @@ class TestAgentConfigLogging:
 
     def test_load_config_success(self, engine, mock_db):
         import json
+
         mock_db.query.return_value.filter.return_value.first.return_value = (
             json.dumps({"system_prompt": "You are helpful"}),
         )
@@ -721,6 +795,7 @@ class TestEventPersistWarning:
 
     def test_append_event_db_failure_logs_error_after_retry(self, engine, mock_db, caplog):
         import logging
+
         run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
         # Make DB write fail persistently
         mock_db.execute.side_effect = RuntimeError("disk full")
@@ -739,10 +814,20 @@ class TestEventPersistWarning:
         """When DB is persistently down, pending buffer is capped at _MAX_PENDING_EVENTS."""
         import logging
         from core.agent.run_engine import _MAX_PENDING_EVENTS
+
         run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
         # Pre-fill buffer beyond cap
-        engine._pending_inserts = [{"run_id": run.run_id, "idx": i, "event_type": "t", "data": "{}", "event_id": None, "agent_id": None}
-                                   for i in range(_MAX_PENDING_EVENTS + 100)]
+        engine._pending_inserts = [
+            {
+                "run_id": run.run_id,
+                "idx": i,
+                "event_type": "t",
+                "data": "{}",
+                "event_id": None,
+                "agent_id": None,
+            }
+            for i in range(_MAX_PENDING_EVENTS + 100)
+        ]
         mock_db.execute.side_effect = RuntimeError("db down")
         with caplog.at_level(logging.WARNING):
             engine._flush_agent_run_events()
@@ -756,7 +841,8 @@ class TestResumeClaimMultiple:
 
     def _make_engine(self, mock_db):
         from tests.conftest import make_run_engine_mock_init
-        with patch.object(RunEngine, '__init__', make_run_engine_mock_init()):
+
+        with patch.object(RunEngine, "__init__", make_run_engine_mock_init()):
             return RunEngine(lambda: mock_db)
 
     def test_multiple_claims_use_different_idx(self):
@@ -764,9 +850,10 @@ class TestResumeClaimMultiple:
         db = MagicMock()
         # Simulate DB returning MIN(idx): None, -1, -2 for successive calls
         min_results = iter([(None,), (-1,), (-2,)])
+
         def _execute(stmt, params=None):
             sql = str(stmt) if not isinstance(stmt, str) else stmt
-            if hasattr(stmt, 'text'):
+            if hasattr(stmt, "text"):
                 sql = stmt.text
             if "MIN(idx)" in sql:
                 row = next(min_results)
@@ -774,6 +861,7 @@ class TestResumeClaimMultiple:
                 result.fetchone.return_value = row
                 return result
             return MagicMock()
+
         db.execute.side_effect = _execute
         engine = self._make_engine(db)
 
@@ -793,16 +881,18 @@ class TestResumeClaimMultiple:
     def test_claim_counter_db_based_cross_worker(self):
         """Counter derived from DB, not in-memory — works across workers."""
         db = MagicMock()
+
         # Worker B sees existing claim at idx=-1 from Worker A
         def _execute(stmt, params=None):
             sql = str(stmt) if not isinstance(stmt, str) else stmt
-            if hasattr(stmt, 'text'):
+            if hasattr(stmt, "text"):
                 sql = stmt.text
             if "MIN(idx)" in sql:
                 result = MagicMock()
                 result.fetchone.return_value = (-1,)  # Worker A already claimed -1
                 return result
             return MagicMock()
+
         db.execute.side_effect = _execute
         engine = self._make_engine(db)
 
@@ -826,7 +916,9 @@ class TestMemoryGC:
         for i in range(_MAX_COMPLETED_RUNS + 50):
             run = engine.create_run(session_id="s1", user_id="u1", user_input=f"task-{i}")
             run.status = RunStatus.COMPLETED
-            run.completed_at = datetime(2026, 1, 1, i // 3600, (i // 60) % 60, i % 60, tzinfo=timezone.utc)
+            run.completed_at = datetime(
+                2026, 1, 1, i // 3600, (i // 60) % 60, i % 60, tzinfo=timezone.utc
+            )
 
         assert len(_active_runs) == _MAX_COMPLETED_RUNS + 50
 
@@ -847,7 +939,9 @@ class TestMemoryGC:
         for i in range(_MAX_COMPLETED_RUNS + 10):
             run = engine.create_run(session_id="s1", user_id="u1", user_input=f"done-{i}")
             run.status = RunStatus.COMPLETED
-            run.completed_at = datetime(2026, 1, 1, i // 3600, (i // 60) % 60, i % 60, tzinfo=timezone.utc)
+            run.completed_at = datetime(
+                2026, 1, 1, i // 3600, (i // 60) % 60, i % 60, tzinfo=timezone.utc
+            )
 
         RunEngine._maybe_gc()
 
@@ -880,9 +974,11 @@ class TestCrossWorkerCancel:
         # _log_run_event and _write_cancel_event_for_run both do db.add()
         # Check that cancel events were persisted via db.add
         add_calls = mock_db.add.call_args_list
-        cancel_events = [c for c in add_calls
-                         if hasattr(c[0][0], 'event_type')
-                         and c[0][0].event_type == EventType.RUN_CANCELLED]
+        cancel_events = [
+            c
+            for c in add_calls
+            if hasattr(c[0][0], "event_type") and c[0][0].event_type == EventType.RUN_CANCELLED
+        ]
         assert len(cancel_events) >= 2
 
 
@@ -892,7 +988,9 @@ class TestCausalChainPropagation:
     @pytest.mark.asyncio
     async def test_child_inherits_causal_chain(self, engine, mock_db):
         parent = engine.create_run(
-            session_id="s1", user_id="u1", user_input="review",
+            session_id="s1",
+            user_id="u1",
+            user_input="review",
             context={"_causal_chain_id": "chain-abc-123"},
         )
         parent.status = RunStatus.RUNNING
@@ -902,6 +1000,7 @@ class TestCausalChainPropagation:
 
         async def stream(**kw):
             from core.events.models import StreamEvent
+
             yield StreamEvent(event_type="text_delta", data={"chunk": "ok"})
 
         mock_loop.run_step_stream = stream
@@ -917,11 +1016,14 @@ class TestCausalChainPropagation:
         # ORM column is `event_metadata` (mapped to DB column "metadata"),
         # not `.metadata` which is SQLAlchemy's schema MetaData object.
         add_calls = mock_db.add.call_args_list
-        child_events = [c[0][0] for c in add_calls
-                        if hasattr(c[0][0], 'causal_chain_id')
-                        and hasattr(c[0][0], 'event_metadata')
-                        and isinstance(getattr(c[0][0], 'event_metadata', None), dict)
-                        and c[0][0].event_metadata.get("run_id") == child.run_id]
+        child_events = [
+            c[0][0]
+            for c in add_calls
+            if hasattr(c[0][0], "causal_chain_id")
+            and hasattr(c[0][0], "event_metadata")
+            and isinstance(getattr(c[0][0], "event_metadata", None), dict)
+            and c[0][0].event_metadata.get("run_id") == child.run_id
+        ]
         assert len(child_events) > 0, "Expected at least one DB event for child run"
         for ev in child_events:
             assert ev.causal_chain_id == "chain-abc-123"
@@ -937,8 +1039,11 @@ class TestConsumeStreamCancellation:
         parent.status = RunStatus.RUNNING
 
         child = engine.create_run(
-            session_id="s1", user_id="u1", user_input="sub",
-            agent_id="reviewer", parent_run_id=parent.run_id,
+            session_id="s1",
+            user_id="u1",
+            user_input="sub",
+            agent_id="reviewer",
+            parent_run_id=parent.run_id,
         )
 
         event_count = [0]
@@ -948,6 +1053,7 @@ class TestConsumeStreamCancellation:
 
         async def stream(**kw):
             from core.events.models import StreamEvent
+
             for i in range(20):
                 event_count[0] += 1
                 yield StreamEvent(event_type="text_delta", data={"chunk": f"chunk-{i}"})
@@ -1039,17 +1145,23 @@ class TestFanInAgentIdFallback:
 
         # Child NOT in _active_runs — simulate cross-worker
         restored_child = AgentRun(
-            session_id="s1", user_id="u1", user_input="sub",
+            session_id="s1",
+            user_id="u1",
+            user_input="sub",
             agent_id="security_reviewer",
         )
         restored_child.run_id = child_id
         restored_child.status = RunStatus.COMPLETED
 
-        engine.restore_run = MagicMock(side_effect=lambda rid: restored_child if rid == child_id else parent)
+        engine.restore_run = MagicMock(
+            side_effect=lambda rid: restored_child if rid == child_id else parent
+        )
         engine.resume_run = AsyncMock()
 
         # Provide events for the child
-        _agent_run_events[child_id] = [{"event_type": "text_delta", "data": {"chunk": "looks good"}}]
+        _agent_run_events[child_id] = [
+            {"event_type": "text_delta", "data": {"chunk": "looks good"}}
+        ]
 
         await engine._check_fan_in(parent.run_id)
 

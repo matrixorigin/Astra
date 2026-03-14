@@ -36,6 +36,7 @@ def time_machine(db):
 def sandbox(db):
     """Sandbox fixture."""
     from sqlalchemy import text
+
     result = db.execute(text("SELECT DATABASE()"))
     current_db = result.scalar()
     return Sandbox(source_db=current_db, db_factory=lambda: db)
@@ -66,7 +67,7 @@ def test_snapshot_creation_and_listing(git):
 def test_time_machine_checkpoint(time_machine, db):
     """Test time machine checkpoint and restore."""
     from sqlalchemy import text
-    
+
     user_id = str(uuid4())
     session_id = str(uuid4())
     checkpoint_name = f"test_checkpoint_{uuid7().hex}".lower()
@@ -87,8 +88,8 @@ def test_time_machine_checkpoint(time_machine, db):
             "event_type": "user_query",
             "content": "Initial query",
             "causal_chain_id": str(uuid4()),
-            "created_at": datetime.now(timezone.utc)
-        }
+            "created_at": datetime.now(timezone.utc),
+        },
     )
     db.commit()
 
@@ -112,8 +113,8 @@ def test_time_machine_checkpoint(time_machine, db):
             "event_type": "agent_response",
             "content": "Response after checkpoint",
             "causal_chain_id": str(uuid4()),
-            "created_at": datetime.now(timezone.utc)
-        }
+            "created_at": datetime.now(timezone.utc),
+        },
     )
     db.commit()
 
@@ -144,7 +145,7 @@ def test_sandbox_creation(sandbox):
 def test_sandbox_experiment(sandbox, db):
     """Test running an experiment in a sandbox with table branching."""
     from sqlalchemy import text
-    
+
     sandbox_name = f"sandbox_{uuid7().hex}".lower()
 
     # Create sandbox with agent_events table branched
@@ -178,8 +179,8 @@ def test_sandbox_experiment(sandbox, db):
             "event_type": "user_query",
             "content": "After sandbox creation",
             "causal_chain_id": str(uuid4()),
-            "created_at": datetime.now(timezone.utc)
-        }
+            "created_at": datetime.now(timezone.utc),
+        },
     )
     db.commit()
 
@@ -200,7 +201,7 @@ def test_sandbox_experiment(sandbox, db):
 def test_git_for_data_restore(git, db):
     """Test snapshot restore functionality using table-level restore."""
     from sqlalchemy import text
-    
+
     snapshot_name = f"test_restore_{uuid7().hex}".lower()
     test_event_id = str(uuid4())
 
@@ -220,8 +221,8 @@ def test_git_for_data_restore(git, db):
             "event_type": "user_query",
             "content": "Original content",
             "causal_chain_id": str(uuid4()),
-            "created_at": datetime.now(timezone.utc)
-        }
+            "created_at": datetime.now(timezone.utc),
+        },
     )
     db.commit()
 
@@ -231,14 +232,14 @@ def test_git_for_data_restore(git, db):
     # Modify event
     db.execute(
         text("UPDATE agent_events SET content = :content WHERE event_id = :event_id"),
-        {"content": "Modified content", "event_id": str(test_event_id)}
+        {"content": "Modified content", "event_id": str(test_event_id)},
     )
     db.commit()
 
     # Verify modification
     result = db.execute(
         text("SELECT content FROM agent_events WHERE event_id = :event_id"),
-        {"event_id": str(test_event_id)}
+        {"event_id": str(test_event_id)},
     )
     row = result.first()
     assert row._mapping["content"] == "Modified content"
@@ -249,7 +250,7 @@ def test_git_for_data_restore(git, db):
     # Verify restoration
     result = db.execute(
         text("SELECT content FROM agent_events WHERE event_id = :event_id"),
-        {"event_id": str(test_event_id)}
+        {"event_id": str(test_event_id)},
     )
     row = result.first()
     assert row._mapping["content"] == "Original content"

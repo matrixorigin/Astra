@@ -47,7 +47,9 @@ class GovernanceCycleResult:
     cleaned_snapshots: int = 0
     # Health
     pollution_detected: bool = False
-    vector_index_health: dict = field(default_factory=dict)  # table → {centroids, imbalance, needs_rebuild}
+    vector_index_health: dict = field(
+        default_factory=dict
+    )  # table → {centroids, imbalance, needs_rebuild}
     errors: list[str] = field(default_factory=list)
     total_ms: float = 0.0
 
@@ -180,8 +182,12 @@ class GovernanceScheduler(DbConsumer):
                             "AND CRC32(user_id) % :shards = :shard "
                             "ORDER BY user_id LIMIT :limit"
                         ),
-                        {"last": last_uid, "limit": batch_size,
-                         "shards": shard_count, "shard": shard_index},
+                        {
+                            "last": last_uid,
+                            "limit": batch_size,
+                            "shards": shard_count,
+                            "shard": shard_index,
+                        },
                     ).fetchall()
                 else:
                     rows = db.execute(
@@ -212,7 +218,9 @@ class GovernanceScheduler(DbConsumer):
         return self._run_daily_for_user(user_id, reflection_engine)
 
     def _run_daily_for_user(
-        self, user_id: str, reflection_engine: Any = None,
+        self,
+        user_id: str,
+        reflection_engine: Any = None,
     ) -> GovernanceCycleResult:
         """Daily governance for a single user. Accepts pre-built reflection engine."""
         result = GovernanceCycleResult()
@@ -245,7 +253,8 @@ class GovernanceScheduler(DbConsumer):
                 if ref_result.scenes_created:
                     logger.info(
                         "Reflection created %d scenes for user %s",
-                        ref_result.scenes_created, user_id,
+                        ref_result.scenes_created,
+                        user_id,
                     )
             except Exception as e:
                 logger.error("Reflection failed: %s", e)
@@ -274,12 +283,15 @@ class GovernanceScheduler(DbConsumer):
         batch_limit = 5000
         with self._db() as db:
             while True:
-                result = db.execute(text("""
+                result = db.execute(
+                    text("""
                     DELETE FROM mem_memories
                     WHERE memory_type = :mtype
                       AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > :ttl
                     LIMIT :batch
-                """), {"mtype": "tool_result", "ttl": ttl, "batch": batch_limit})
+                """),
+                    {"mtype": "tool_result", "ttl": ttl, "batch": batch_limit},
+                )
                 db.commit()
                 total += result.rowcount
                 if result.rowcount < batch_limit:
@@ -292,11 +304,14 @@ class GovernanceScheduler(DbConsumer):
         """Archive working memories from sessions inactive > threshold hours."""
         stale_hours = self.config.working_memory_stale_hours
         with self._db() as db:
-            result = db.execute(text("""
+            result = db.execute(
+                text("""
                 UPDATE mem_memories SET is_active = 0, updated_at = NOW()
                 WHERE memory_type = 'working' AND is_active = 1
                   AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > :stale_hours
-            """), {"stale_hours": stale_hours})
+            """),
+                {"stale_hours": stale_hours},
+            )
             db.commit()
             count = result.rowcount
         if count > 0:
@@ -306,12 +321,15 @@ class GovernanceScheduler(DbConsumer):
     def _cleanup_stale(self, user_id: str, confidence_threshold: float = 0.1) -> int:
         """Delete inactive memories with low initial_confidence (already superseded)."""
         with self._db() as db:
-            result = db.execute(text("""
+            result = db.execute(
+                text("""
                 DELETE FROM mem_memories
                 WHERE user_id = :uid
                   AND is_active = 0
                   AND initial_confidence < :threshold
-            """), {"uid": user_id, "threshold": confidence_threshold})
+            """),
+                {"uid": user_id, "threshold": confidence_threshold},
+            )
             db.commit()
             return result.rowcount
 
@@ -327,12 +345,15 @@ class GovernanceScheduler(DbConsumer):
         with self._db() as db:
             for tier in TrustTier:
                 hl = half_lives[tier.value]
-                result = db.execute(text("""
+                result = db.execute(
+                    text("""
                     UPDATE mem_memories SET is_active = 0, updated_at = NOW()
                     WHERE user_id = :uid AND is_active = 1
                       AND COALESCE(trust_tier, 'T3') = :tier
                       AND (initial_confidence * EXP(-TIMESTAMPDIFF(DAY, observed_at, NOW()) / :hl)) < :threshold
-                """), {"uid": user_id, "tier": tier.value, "hl": hl, "threshold": threshold})
+                """),
+                    {"uid": user_id, "tier": tier.value, "hl": hl, "threshold": threshold},
+                )
                 quarantined += result.rowcount
             db.commit()
         if quarantined > 0:
@@ -350,7 +371,8 @@ class GovernanceScheduler(DbConsumer):
         Called from run_daily() so it runs once per day per user.
         """
         with self._db() as db:
-            result = db.execute(text("""
+            result = db.execute(
+                text("""
                 UPDATE mem_memories AS inc
                 SET inc.is_active = 0, inc.updated_at = NOW()
                 WHERE inc.user_id = :uid
@@ -366,7 +388,9 @@ class GovernanceScheduler(DbConsumer):
                         AND full_s.content LIKE '[session_summary]%'
                         AND full_s.observed_at > inc.observed_at
                   )
-            """), {"uid": user_id, "hours": older_than_hours})
+            """),
+                {"uid": user_id, "hours": older_than_hours},
+            )
             db.commit()
             count = result.rowcount
 
@@ -394,6 +418,7 @@ class GovernanceScheduler(DbConsumer):
         try:
             from api.database import _mo_client
             from matrixone.sqlalchemy_ext.vector_index import VectorOpType
+
             if VectorManager is None:
                 raise RuntimeError("matrixone.vector_manager not available")
             vm = VectorManager(_mo_client)
@@ -411,14 +436,25 @@ class GovernanceScheduler(DbConsumer):
 
         op_type = VectorOpType.VECTOR_L2_OPS  # only l2 supported for now
 
-        logger.info("Rebuilding IVF index %s on %s: lists %d → %d (rows=%d)",
-                    index_name, table, old_lists, new_lists, total_rows)
+        logger.info(
+            "Rebuilding IVF index %s on %s: lists %d → %d (rows=%d)",
+            index_name,
+            table,
+            old_lists,
+            new_lists,
+            total_rows,
+        )
 
         vm.drop(table, index_name)
         vm.create_ivf(table, index_name, column, lists=new_lists, op_type=op_type)
 
         logger.info("IVF index %s rebuilt successfully", index_name)
-        return {"table": table, "old_lists": old_lists, "new_lists": new_lists, "total_rows": total_rows}
+        return {
+            "table": table,
+            "old_lists": old_lists,
+            "new_lists": new_lists,
+            "total_rows": total_rows,
+        }
 
     def _check_vector_index_health(self) -> dict:
         """Check IVF index health for memory tables.
@@ -432,6 +468,7 @@ class GovernanceScheduler(DbConsumer):
         health: dict = {}
         try:
             from api.database import _mo_client
+
             if VectorManager is None:
                 logger.debug("VectorManager not available")
                 return {}
@@ -467,7 +504,10 @@ class GovernanceScheduler(DbConsumer):
                 if needs_rebuild:
                     logger.warning(
                         "IVF index unhealthy for %s: total_rows=%d centroids=%d ratio=%.1f",
-                        table, total_rows, n_centroids, ratio,
+                        table,
+                        total_rows,
+                        n_centroids,
+                        ratio,
                     )
             except Exception as e:
                 health[table] = {"error": str(e)}
@@ -486,6 +526,7 @@ class GovernanceScheduler(DbConsumer):
     ) -> Any:
         """MemoryWriter.store() — delegates to MemoryStore.create()."""
         from core.memory.types import Memory, TrustTier as TT
+
         mem = Memory(
             memory_id="",
             user_id=user_id,

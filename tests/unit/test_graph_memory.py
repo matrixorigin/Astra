@@ -74,7 +74,9 @@ class TestIngestImportance:
         mem = MagicMock()
         mem.initial_confidence = 0.9
         val = _compute_ingest_importance(
-            NodeType.SCENE, memory=mem, neighbor_count=5,
+            NodeType.SCENE,
+            memory=mem,
+            neighbor_count=5,
         )
         assert val <= 1.0
 
@@ -82,10 +84,12 @@ class TestIngestImportance:
 class TestFactory:
     def test_tabular_is_default(self):
         from core.memory.factory import _resolve_strategy
+
         assert _resolve_strategy(None, None, "tabular", None) == "vector:v1"
 
     def test_graph_backend(self):
         from core.memory.factory import _resolve_strategy
+
         assert _resolve_strategy(None, None, "graph", None) == "activation:v1"
 
 
@@ -97,6 +101,7 @@ class TestGraphBuilder:
         store.get_node_by_memory_id.return_value = None
         store.find_similar_with_scores.return_value = []
         from core.memory.graph.graph_builder import GraphBuilder
+
         return GraphBuilder(store), store
 
     def _make_memory(self, mid="m1", sid="s1"):
@@ -122,8 +127,10 @@ class TestGraphBuilder:
     def test_ingest_skips_existing_episodic(self):
         builder, store = self._make_builder()
         existing = GraphNodeData(
-            node_id="existing", user_id="u1",
-            node_type=NodeType.EPISODIC, content="old",
+            node_id="existing",
+            user_id="u1",
+            node_type=NodeType.EPISODIC,
+            content="old",
         )
         store.get_node_by_event_id.return_value = existing
 
@@ -137,8 +144,10 @@ class TestGraphBuilder:
     def test_ingest_builds_temporal_edges(self):
         builder, store = self._make_builder()
         prev = GraphNodeData(
-            node_id="prev", user_id="u1",
-            node_type=NodeType.EPISODIC, content="prev",
+            node_id="prev",
+            user_id="u1",
+            node_type=NodeType.EPISODIC,
+            content="prev",
         )
         store.get_latest_episodic_in_session.return_value = prev
 
@@ -168,8 +177,10 @@ class TestGraphBuilder:
         mem = self._make_memory()
 
         candidate = GraphNodeData(
-            node_id="existing_sem", user_id="u1",
-            node_type=NodeType.SEMANTIC, content="related",
+            node_id="existing_sem",
+            user_id="u1",
+            node_type=NodeType.SEMANTIC,
+            content="related",
         )
         store.find_similar_with_scores.return_value = [(candidate, 0.85)]
 
@@ -199,7 +210,9 @@ class TestGraphServiceWiring:
         svc._graph_builder = mock_builder
 
         result = svc.store(
-            "u1", "test", memory_type=MemoryType.SEMANTIC,
+            "u1",
+            "test",
+            memory_type=MemoryType.SEMANTIC,
             trust_tier=TrustTier.T3_INFERRED,
         )
         assert result == mock_mem
@@ -212,6 +225,7 @@ class TestGraphServiceErrorHandling:
 
     def _make_service(self) -> "GraphMemoryService":
         from core.memory.graph.service import GraphMemoryService
+
         svc = GraphMemoryService(lambda: MagicMock())
         svc._tabular = MagicMock()
         return svc
@@ -229,6 +243,7 @@ class TestGraphServiceErrorHandling:
     def test_retrieve_catches_db_error(self):
         """SQLAlchemy errors in retriever should fall back to tabular."""
         from sqlalchemy.exc import OperationalError
+
         svc = self._make_service()
         mock_retriever = MagicMock()
         mock_retriever.retrieve.side_effect = OperationalError("db", {}, Exception())
@@ -241,6 +256,7 @@ class TestGraphServiceErrorHandling:
     def test_store_queues_pending_on_graph_failure(self):
         """Graph ingest failure queues memory_id for retry."""
         from sqlalchemy.exc import OperationalError
+
         svc = self._make_service()
         mock_mem = MagicMock()
         mock_mem.memory_id = "mem-123"
@@ -271,6 +287,7 @@ class TestGraphServiceErrorHandling:
     def test_observe_turn_queues_pending_on_graph_failure(self):
         """Graph ingest failure during observe_turn queues for retry."""
         from sqlalchemy.exc import OperationalError
+
         svc = self._make_service()
         mock_mem = MagicMock()
         mock_mem.memory_id = "mem-456"

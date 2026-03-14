@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 class ExperimentStatus(str, Enum):
     """Experiment lifecycle status."""
+
     DRAFT = "draft"
     RUNNING = "running"
     COMPLETED = "completed"
@@ -34,13 +35,14 @@ class ExperimentStatus(str, Enum):
 @dataclass
 class PromptVariant:
     """Single prompt variant in experiment."""
+
     variant_id: str
     name: str
     system_prompt: str
     temperature: float = 0.7
     max_tokens: int = 2048
     metadata: dict = field(default_factory=dict)
-    
+
     def to_dict(self) -> dict:
         """Serialize to dict."""
         return {
@@ -56,6 +58,7 @@ class PromptVariant:
 @dataclass
 class ExperimentConfig:
     """Experiment configuration."""
+
     experiment_id: str
     name: str
     description: str
@@ -66,7 +69,7 @@ class ExperimentConfig:
     confidence_threshold: float = 0.95
     min_effect_size: float = 0.05  # Minimum detectable effect
     metadata: dict = field(default_factory=dict)
-    
+
     def to_dict(self) -> dict:
         """Serialize to dict."""
         return {
@@ -86,6 +89,7 @@ class ExperimentConfig:
 @dataclass
 class ExperimentResult:
     """Experiment result with statistical significance."""
+
     experiment_id: str
     variant_id: str
     accuracy: float
@@ -101,10 +105,10 @@ class ExperimentResult:
 
 class PromptExperiment(DbConsumer):
     """Manage prompt experiments in isolated sandboxes with statistical rigor."""
-    
+
     def __init__(self, db_factory: DbFactory, account: str = "sys", source_db: str = "dev_agent"):
         """Initialize experiment manager.
-        
+
         Args:
             db: Database session
             account: Account for sandbox isolation
@@ -114,19 +118,19 @@ class PromptExperiment(DbConsumer):
         self.sandbox = Sandbox(db_factory=db_factory, source_db=source_db, account=account)
         self.branch = Branch(database=source_db, db_factory=db_factory)
         self.source_db = source_db
-    
+
     def create_experiment(self, config: ExperimentConfig) -> str:
         """Create new experiment with sandbox and branched agent_events.
-        
+
         Args:
             config: Experiment configuration
-            
+
         Returns:
             Experiment ID
         """
         with self._db() as db:
             exp_id = config.experiment_id
-        
+
             # 1. Create sandbox for experiment
             self.sandbox.create(
                 name=exp_id,
@@ -134,9 +138,10 @@ class PromptExperiment(DbConsumer):
                 created_by="system",
                 tables=["agent_events"],  # Branch agent_events
             )
-        
+
             # 2. Create experiment_config table in sandbox
-            db.execute(text(f"""
+            db.execute(
+                text(f"""
                 CREATE TABLE {exp_id}.experiment_config (
                     experiment_id VARCHAR(255) PRIMARY KEY,
                     name VARCHAR(255) NOT NULL,
@@ -155,10 +160,12 @@ class PromptExperiment(DbConsumer):
                     winner_variant_id VARCHAR(255) NULL,
                     metadata JSON
                 )
-            """))
-        
+            """)
+            )
+
             # 3. Create variant_results table in sandbox
-            db.execute(text(f"""
+            db.execute(
+                text(f"""
                 CREATE TABLE {exp_id}.variant_results (
                     result_id INT AUTO_INCREMENT PRIMARY KEY,
                     variant_id VARCHAR(255) NOT NULL,
@@ -172,46 +179,53 @@ class PromptExperiment(DbConsumer):
                     INDEX idx_variant (variant_id),
                     INDEX idx_session (session_id)
                 )
-            """))
-        
+            """)
+            )
+
             # 4. Store config
-            db.execute(text(f"""
+            db.execute(
+                text(f"""
                 INSERT INTO {exp_id}.experiment_config 
                 (experiment_id, name, description, skill_name, baseline_variant, test_variants, 
                  sample_size, confidence_threshold, min_effect_size, status, metadata)
                 VALUES (:exp_id, :name, :desc, :skill, :baseline, :test_variants, 
                         :sample_size, :conf_threshold, :min_effect, :status, :metadata)
-            """), {
-                "exp_id": exp_id,
-                "name": config.name,
-                "desc": config.description,
-                "skill": config.skill_name,
-                "baseline": json.dumps(config.baseline_variant.to_dict()),
-                "test_variants": json.dumps([v.to_dict() for v in config.test_variants]),
-                "sample_size": config.sample_size,
-                "conf_threshold": config.confidence_threshold,
-                "min_effect": config.min_effect_size,
-                "status": ExperimentStatus.DRAFT.value,
-                "metadata": json.dumps(config.metadata),
-            })
+            """),
+                {
+                    "exp_id": exp_id,
+                    "name": config.name,
+                    "desc": config.description,
+                    "skill": config.skill_name,
+                    "baseline": json.dumps(config.baseline_variant.to_dict()),
+                    "test_variants": json.dumps([v.to_dict() for v in config.test_variants]),
+                    "sample_size": config.sample_size,
+                    "conf_threshold": config.confidence_threshold,
+                    "min_effect": config.min_effect_size,
+                    "status": ExperimentStatus.DRAFT.value,
+                    "metadata": json.dumps(config.metadata),
+                },
+            )
             db.commit()
-        
+
             return exp_id
-    
+
     def start_experiment(self, experiment_id: str) -> None:
         """Start experiment — route traffic to variants.
-        
+
         Args:
             experiment_id: Experiment ID
         """
         with self._db() as db:
-            db.execute(text(f"""
+            db.execute(
+                text(f"""
                 UPDATE {experiment_id}.experiment_config
                 SET status = :status, started_at = CURRENT_TIMESTAMP
                 WHERE experiment_id = :exp_id
-            """), {"status": ExperimentStatus.RUNNING.value, "exp_id": experiment_id})
+            """),
+                {"status": ExperimentStatus.RUNNING.value, "exp_id": experiment_id},
+            )
             db.commit()
-    
+
     def record_variant_result(
         self,
         experiment_id: str,
@@ -227,15 +241,20 @@ class PromptExperiment(DbConsumer):
 
         For high-volume recording, prefer record_variant_results_batch().
         """
-        self.record_variant_results_batch(experiment_id, [{
-            "variant_id": variant_id,
-            "session_id": session_id,
-            "event_id": event_id,
-            "accuracy": accuracy,
-            "latency_ms": latency_ms,
-            "cost_usd": cost_usd,
-            "satisfaction": satisfaction,
-        }])
+        self.record_variant_results_batch(
+            experiment_id,
+            [
+                {
+                    "variant_id": variant_id,
+                    "session_id": session_id,
+                    "event_id": event_id,
+                    "accuracy": accuracy,
+                    "latency_ms": latency_ms,
+                    "cost_usd": cost_usd,
+                    "satisfaction": satisfaction,
+                }
+            ],
+        )
 
     def record_variant_results_batch(
         self,
@@ -260,13 +279,11 @@ class PromptExperiment(DbConsumer):
                 return 0
             BATCH_LIMIT = 100
             for chunk_start in range(0, len(results), BATCH_LIMIT):
-                chunk = results[chunk_start:chunk_start + BATCH_LIMIT]
+                chunk = results[chunk_start : chunk_start + BATCH_LIMIT]
                 placeholders = []
                 params: dict = {}
                 for i, r in enumerate(chunk):
-                    placeholders.append(
-                        f"(:v{i}, :s{i}, :e{i}, :a{i}, :l{i}, :c{i}, :sat{i})"
-                    )
+                    placeholders.append(f"(:v{i}, :s{i}, :e{i}, :a{i}, :l{i}, :c{i}, :sat{i})")
                     params[f"v{i}"] = r["variant_id"]
                     params[f"s{i}"] = r["session_id"]
                     params[f"e{i}"] = r["event_id"]
@@ -282,19 +299,20 @@ class PromptExperiment(DbConsumer):
                 db.execute(text(sql), params)
             db.commit()
             return len(results)
-    
+
     def get_experiment_results(self, experiment_id: str) -> dict[str, ExperimentResult]:
         """Get aggregated results with statistical significance testing.
-        
+
         Args:
             experiment_id: Experiment ID
-            
+
         Returns:
             Dict mapping variant_id to ExperimentResult
         """
         # Fetch all results
         with self._db() as db:
-            rows = db.execute(text(f"""
+            rows = db.execute(
+                text(f"""
                 SELECT 
                     variant_id,
                     accuracy,
@@ -303,8 +321,9 @@ class PromptExperiment(DbConsumer):
                     satisfaction
                 FROM {experiment_id}.variant_results
                 ORDER BY variant_id
-            """)).fetchall()
-        
+            """)
+            ).fetchall()
+
             # Group by variant
             variant_data = {}
             for row in rows:
@@ -320,15 +339,18 @@ class PromptExperiment(DbConsumer):
                 variant_data[variant_id]["latencies"].append(int(latency or 0))
                 variant_data[variant_id]["costs"].append(float(cost or 0))
                 variant_data[variant_id]["satisfactions"].append(float(satisfaction or 0))
-        
+
             # Get baseline for comparison
             baseline_id = None
             baseline_accuracies = None
             try:
-                config_row = db.execute(text(f"""
+                config_row = db.execute(
+                    text(f"""
                     SELECT baseline_variant FROM {experiment_id}.experiment_config
                     WHERE experiment_id = :exp_id
-                """), {"exp_id": experiment_id}).fetchone()
+                """),
+                    {"exp_id": experiment_id},
+                ).fetchone()
                 if config_row:
                     baseline_config = json.loads(config_row[0])
                     baseline_id = baseline_config["variant_id"]
@@ -336,41 +358,39 @@ class PromptExperiment(DbConsumer):
                         baseline_accuracies = variant_data[baseline_id]["accuracies"]
             except Exception:
                 pass
-        
+
             # Compute statistics with t-test
             results = {}
             for variant_id, data in variant_data.items():
                 accuracies = data["accuracies"]
                 n = len(accuracies)
-            
+
                 if n == 0:
                     continue
-            
+
                 mean_accuracy = sum(accuracies) / n
-            
+
                 # Compute variance (Bessel's correction for sample variance)
                 if n > 1:
                     variance = sum((x - mean_accuracy) ** 2 for x in accuracies) / (n - 1)
                 else:
                     variance = 0.0
-            
-                stddev = variance ** 0.5
-            
+
+                stddev = variance**0.5
+
                 # 95% confidence interval
                 if n > 1:
-                    ci_margin = 1.96 * stddev / (n ** 0.5)
+                    ci_margin = 1.96 * stddev / (n**0.5)
                 else:
                     ci_margin = 0.0
-            
+
                 # Welch's t-test vs baseline (if not baseline itself)
                 p_value = 1.0
                 effect_size = 0.0
-            
+
                 if baseline_id and variant_id != baseline_id and baseline_accuracies:
-                    p_value, effect_size = self._welch_ttest(
-                        baseline_accuracies, accuracies
-                    )
-            
+                    p_value, effect_size = self._welch_ttest(baseline_accuracies, accuracies)
+
                 results[variant_id] = ExperimentResult(
                     experiment_id=experiment_id,
                     variant_id=variant_id,
@@ -383,51 +403,51 @@ class PromptExperiment(DbConsumer):
                     p_value=p_value,
                     effect_size=effect_size,
                 )
-        
+
             return results
-    
+
     def _welch_ttest(self, group1: list[float], group2: list[float]) -> tuple[float, float]:
         """Welch's t-test (unequal variance t-test).
-        
+
         Args:
             group1: First group (baseline)
             group2: Second group (variant)
-            
+
         Returns:
             (p_value, effect_size)
         """
         n1 = len(group1)
         n2 = len(group2)
-        
+
         if n1 < 2 or n2 < 2:
             return 1.0, 0.0
-        
+
         mean1 = sum(group1) / n1
         mean2 = sum(group2) / n2
-        
+
         var1 = sum((x - mean1) ** 2 for x in group1) / (n1 - 1)
         var2 = sum((x - mean2) ** 2 for x in group2) / (n2 - 1)
-        
+
         # Avoid division by zero
         if var1 == 0 and var2 == 0:
             return 1.0, 0.0
-        
+
         # Welch's t-statistic
         se = (var1 / n1 + var2 / n2) ** 0.5
         if se == 0:
             return 1.0, 0.0
-        
+
         t_stat = (mean2 - mean1) / se
-        
+
         # Welch-Satterthwaite degrees of freedom
         numerator = (var1 / n1 + var2 / n2) ** 2
         denominator = (var1 / n1) ** 2 / (n1 - 1) + (var2 / n2) ** 2 / (n2 - 1)
-        
+
         if denominator == 0:
             df = n1 + n2 - 2
         else:
             df = numerator / denominator
-        
+
         # Approximate p-value using t-distribution (two-tailed)
         # For simplicity, use normal approximation for large df
         if df > 30:
@@ -436,16 +456,16 @@ class PromptExperiment(DbConsumer):
         else:
             # Conservative estimate for small df
             p_value = self._t_distribution_pvalue(t_stat, df)
-        
+
         # Cohen's d effect size
         pooled_std = ((var1 + var2) / 2) ** 0.5
         if pooled_std == 0:
             effect_size = 0.0
         else:
             effect_size = (mean2 - mean1) / pooled_std
-        
+
         return min(p_value, 1.0), effect_size
-    
+
     def _normal_cdf(self, x: float) -> float:
         """Approximate normal CDF using error function."""
         # Approximation: Φ(x) ≈ 0.5 * (1 + erf(x / sqrt(2)))
@@ -454,7 +474,7 @@ class PromptExperiment(DbConsumer):
             return 0.0
         if x > 6:
             return 1.0
-        
+
         # Abramowitz and Stegun approximation
         a1 = 0.254829592
         a2 = -0.284496736
@@ -462,80 +482,83 @@ class PromptExperiment(DbConsumer):
         a4 = -1.453152027
         a5 = 1.061405429
         p = 0.3275911
-        
+
         sign = 1 if x >= 0 else -1
-        x = abs(x) / (2 ** 0.5)
-        
+        x = abs(x) / (2**0.5)
+
         t = 1.0 / (1.0 + p * x)
         y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (2.718281828 ** (-x * x))
-        
+
         return 0.5 * (1.0 + sign * y)
-    
+
     def _t_distribution_pvalue(self, t_stat: float, df: float) -> float:
         """Approximate t-distribution p-value (two-tailed)."""
         # For small df, use conservative approximation
         # This is a simplified approximation
         abs_t = abs(t_stat)
-        
+
         if df >= 30:
             return 2 * (1 - self._normal_cdf(abs_t))
-        
+
         # Conservative: use normal approximation with adjustment
         p_normal = 2 * (1 - self._normal_cdf(abs_t))
-        
+
         # Adjustment factor for small df (t-distribution has heavier tails)
         adjustment = 1.0 + 1.0 / (4 * df)
-        
+
         return min(p_normal * adjustment, 1.0)
-    
+
     def determine_winner(self, experiment_id: str) -> Optional[str]:
         """Determine statistical winner using multi-armed bandit logic.
-        
+
         Args:
             experiment_id: Experiment ID
-            
+
         Returns:
             Winner variant_id or None if no clear winner
         """
         with self._db() as db:
             results = self.get_experiment_results(experiment_id)
-        
+
             if not results:
                 return None
-        
+
             # Get baseline
-            config_row = db.execute(text(f"""
+            config_row = db.execute(
+                text(f"""
                 SELECT baseline_variant FROM {experiment_id}.experiment_config
                 WHERE experiment_id = :exp_id
-            """), {"exp_id": experiment_id}).fetchone()
-        
+            """),
+                {"exp_id": experiment_id},
+            ).fetchone()
+
             if not config_row:
                 return None
-        
+
             baseline_config = json.loads(config_row[0])
             baseline_id = baseline_config["variant_id"]
             baseline_result = results.get(baseline_id)
-        
+
             if not baseline_result:
                 return None
-        
+
             # Find variant with highest accuracy and statistically significant improvement
             best_variant = baseline_id
             best_accuracy = baseline_result.accuracy
-        
+
             for variant_id, result in results.items():
                 if variant_id == baseline_id:
                     continue
-            
+
                 # Check if improvement is significant
                 improvement = result.accuracy - baseline_result.accuracy
                 if improvement > 0.05 and result.p_value < 0.05:  # 5% improvement, p < 0.05
                     if result.accuracy > best_accuracy:
                         best_variant = variant_id
                         best_accuracy = result.accuracy
-        
+
             return best_variant
-    
+
     def complete_experiment(
         self,
         experiment_id: str,
@@ -561,11 +584,14 @@ class PromptExperiment(DbConsumer):
                 from core.evaluation.regression_gate import ChangeType
 
                 # Fetch winner prompt content from config
-                config_row = db.execute(text(f"""
+                config_row = db.execute(
+                    text(f"""
                     SELECT baseline_variant, test_variants
                     FROM {experiment_id}.experiment_config
                     WHERE experiment_id = :exp_id
-                """), {"exp_id": experiment_id}).fetchone()
+                """),
+                    {"exp_id": experiment_id},
+                ).fetchone()
 
                 prompt_content = ""
                 if config_row:
@@ -587,42 +613,53 @@ class PromptExperiment(DbConsumer):
                 if gate_result["verdict"] != "pass":
                     logger.warning(
                         "Experiment %s winner %s failed regression gate: %s",
-                        experiment_id, winner_id, gate_result["reason"],
+                        experiment_id,
+                        winner_id,
+                        gate_result["reason"],
                     )
-                    db.execute(text(f"""
+                    db.execute(
+                        text(f"""
                         UPDATE {experiment_id}.experiment_config
                         SET status = 'gate_failed'
                         WHERE experiment_id = :exp_id
-                    """), {"exp_id": experiment_id})
+                    """),
+                        {"exp_id": experiment_id},
+                    )
                     db.commit()
                     return "gate_failed"
 
-            db.execute(text(f"""
+            db.execute(
+                text(f"""
                 UPDATE {experiment_id}.experiment_config
                 SET status = :status, completed_at = CURRENT_TIMESTAMP, winner_variant_id = :winner
                 WHERE experiment_id = :exp_id
-            """), {
-                "status": ExperimentStatus.COMPLETED.value,
-                "winner": winner_id,
-                "exp_id": experiment_id,
-            })
+            """),
+                {
+                    "status": ExperimentStatus.COMPLETED.value,
+                    "winner": winner_id,
+                    "exp_id": experiment_id,
+                },
+            )
 
             db.commit()
             return winner_id
-    
+
     def cleanup_experiment(self, experiment_id: str) -> None:
         """Archive experiment and cleanup sandbox.
-        
+
         Args:
             experiment_id: Experiment ID
         """
         with self._db() as db:
-            db.execute(text(f"""
+            db.execute(
+                text(f"""
                 UPDATE {experiment_id}.experiment_config
                 SET status = :status, archived_at = CURRENT_TIMESTAMP
                 WHERE experiment_id = :exp_id
-            """), {"status": ExperimentStatus.ARCHIVED.value, "exp_id": experiment_id})
+            """),
+                {"status": ExperimentStatus.ARCHIVED.value, "exp_id": experiment_id},
+            )
             db.commit()
-        
+
             # Delete sandbox (includes branched agent_events)
             self.sandbox.delete(experiment_id)

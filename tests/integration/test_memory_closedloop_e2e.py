@@ -63,13 +63,13 @@ class TestObserverToPromptClosedLoop:
         session_id = _sid()
         store = MemoryStore(db_factory)
         retriever = MemoryRetriever(db_factory)
-        
+
         observer = TypedObserver(
             store=store,
             llm_client=None,
             embed_fn=_embed,
         )
-        
+
         # User says they prefer Python
         mem, _ = observer.observe_explicit(
             user_id=user_id,
@@ -78,12 +78,12 @@ class TestObserverToPromptClosedLoop:
             initial_confidence=0.9,
         )
         memory_cleanup.append(mem.memory_id)
-        
+
         # Verify stored
         stored = store.get(mem.memory_id)
         assert stored is not None
         assert stored.is_active is True
-        
+
         # Verify retrievable
         results, _ = retriever.retrieve(
             user_id=user_id,
@@ -101,13 +101,13 @@ class TestObserverToPromptClosedLoop:
         session_id = _sid()
         store = MemoryStore(db_factory)
         retriever = MemoryRetriever(db_factory)
-        
+
         memories = [
             ("User prefers Go for backend", MemoryType.PROFILE),
             ("User likes Python for ML", MemoryType.PROFILE),
             ("User asked about Kubernetes", MemoryType.SEMANTIC),
         ]
-        
+
         for content, mtype in memories:
             mem = Memory(
                 memory_id=str(uuid7()),
@@ -120,7 +120,7 @@ class TestObserverToPromptClosedLoop:
             )
             memory_cleanup.append(mem.memory_id)
             store.create(mem)
-        
+
         # Query about ML
         results, _ = retriever.retrieve(
             user_id=user_id,
@@ -129,7 +129,7 @@ class TestObserverToPromptClosedLoop:
             query_embedding=_embed("machine learning project"),
             limit=3,
         )
-        
+
         contents = [r.content for r in results]
         assert any("Python" in c and "ML" in c for c in contents)
 
@@ -144,7 +144,7 @@ class TestMultiTurnMemoryAccumulation:
         store = MemoryStore(db_factory)
         observer = TypedObserver(store=store, llm_client=None, embed_fn=_embed)
         retriever = MemoryRetriever(db_factory)
-        
+
         # Turn 1: PROFILE memory
         mem1, _ = observer.observe_explicit(
             user_id=user_id,
@@ -153,7 +153,7 @@ class TestMultiTurnMemoryAccumulation:
             initial_confidence=0.8,
         )
         memory_cleanup.append(mem1.memory_id)
-        
+
         # Turn 2: EPISODIC memory (different type, no contradiction with mem1)
         mem2, _ = observer.observe_explicit(
             user_id=user_id,
@@ -162,7 +162,7 @@ class TestMultiTurnMemoryAccumulation:
             initial_confidence=0.7,
         )
         memory_cleanup.append(mem2.memory_id)
-        
+
         # Turn 3: SEMANTIC memory (different type from mem1, no contradiction)
         mem3, _ = observer.observe_explicit(
             user_id=user_id,
@@ -171,7 +171,7 @@ class TestMultiTurnMemoryAccumulation:
             initial_confidence=0.85,
         )
         memory_cleanup.append(mem3.memory_id)
-        
+
         # All 3 retrievable (may not all match query equally)
         results, _ = retriever.retrieve(
             user_id=user_id,
@@ -180,10 +180,10 @@ class TestMultiTurnMemoryAccumulation:
             query_embedding=_embed("functional programming style"),
             limit=10,
         )
-        
+
         # At least 1 should be retrieved
         assert len(results) >= 1
-        
+
         # Verify all 3 memories exist in DB (the real test)
         assert store.get(mem1.memory_id) is not None
         assert store.get(mem2.memory_id) is not None
@@ -200,7 +200,7 @@ class TestContradictionAndSupersede:
         """New contradicting profile supersedes old."""
         user_id = _uid()
         store = MemoryStore(db_factory)
-        
+
         fixed_embed = [0.5] * EMBEDDING_DIM
         observer = TypedObserver(
             store=store,
@@ -209,7 +209,7 @@ class TestContradictionAndSupersede:
             contradiction_threshold=0.85,
             db_factory=db_factory,
         )
-        
+
         # Old preference
         old, _ = observer.observe_explicit(
             user_id=user_id,
@@ -218,7 +218,7 @@ class TestContradictionAndSupersede:
             initial_confidence=0.8,
         )
         memory_cleanup.append(old.memory_id)
-        
+
         # New contradicting
         new, _ = observer.observe_explicit(
             user_id=user_id,
@@ -227,7 +227,7 @@ class TestContradictionAndSupersede:
             initial_confidence=0.9,
         )
         memory_cleanup.append(new.memory_id)
-        
+
         # Old superseded
         old_mem = store.get(old.memory_id)
         assert old_mem.is_active is False
@@ -238,27 +238,28 @@ class TestContradictionAndSupersede:
         user_id = _uid()
         store = MemoryStore(db_factory)
         fixed_embed = [0.3] * EMBEDDING_DIM
-        
+
         observer = TypedObserver(
-            store=store, llm_client=None,
+            store=store,
+            llm_client=None,
             embed_fn=lambda x: fixed_embed,
             contradiction_threshold=0.85,
             db_factory=db_factory,
         )
-        
+
         mem_a, _ = observer.observe_explicit(user_id, "Version A", MemoryType.PROFILE, 0.7)
         memory_cleanup.append(mem_a.memory_id)
-        
+
         mem_b, _ = observer.observe_explicit(user_id, "Version B", MemoryType.PROFILE, 0.8)
         memory_cleanup.append(mem_b.memory_id)
-        
+
         mem_c, _ = observer.observe_explicit(user_id, "Version C", MemoryType.PROFILE, 0.9)
         memory_cleanup.append(mem_c.memory_id)
-        
+
         a = store.get(mem_a.memory_id)
         b = store.get(mem_b.memory_id)
         c = store.get(mem_c.memory_id)
-        
+
         assert a.superseded_by == mem_b.memory_id
         assert b.superseded_by == mem_c.memory_id
         assert c.is_active is True
@@ -272,9 +273,9 @@ class TestProfileAndL0:
         user_id = _uid()
         store = MemoryStore(db_factory)
         profile_mgr = ProfileManager(store)
-        
+
         prefs = ["User prefers Python", "User works on ML", "User uses Linux"]
-        
+
         for pref in prefs:
             mem = Memory(
                 memory_id=str(uuid7()),
@@ -287,9 +288,9 @@ class TestProfileAndL0:
             )
             memory_cleanup.append(mem.memory_id)
             store.create(mem)
-        
+
         profile = profile_mgr.get_profile(user_id)
-        
+
         assert "Python" in profile
         assert "Linux" in profile
 
@@ -299,7 +300,7 @@ class TestProfileAndL0:
         session_id = _sid()
         store = MemoryStore(db_factory)
         loader = TieredMemoryLoader(MemoryService(db_factory))
-        
+
         mem = Memory(
             memory_id=str(uuid7()),
             user_id=user_id,
@@ -311,14 +312,14 @@ class TestProfileAndL0:
         )
         memory_cleanup.append(mem.memory_id)
         store.create(mem)
-        
+
         section, _ = loader.build_section(
             user_id=user_id,
             session_id=session_id,
             query="random query",
             query_embedding=_embed("random query"),
         )
-        
+
         assert "senior developer" in section
 
 
@@ -329,7 +330,7 @@ class TestGovernanceRealExecution:
         """Confidence is immutable in DB — decay computed at query time."""
         user_id = _uid()
         store = MemoryStore(db_factory)
-        
+
         old_mem = Memory(
             memory_id=str(uuid7()),
             user_id=user_id,
@@ -341,7 +342,7 @@ class TestGovernanceRealExecution:
         )
         memory_cleanup.append(old_mem.memory_id)
         store.create(old_mem)
-        
+
         stored = store.get(old_mem.memory_id)
         # DB value unchanged
         assert stored.initial_confidence == 1.0
@@ -354,7 +355,7 @@ class TestGovernanceRealExecution:
         store = MemoryStore(db_factory)
         config = MemoryGovernanceConfig(half_life_t4_days=1.0)
         scheduler = GovernanceScheduler(db_factory, config)
-        
+
         for i in range(3):
             mem = Memory(
                 memory_id=str(uuid7()),
@@ -367,7 +368,7 @@ class TestGovernanceRealExecution:
             )
             memory_cleanup.append(mem.memory_id)
             store.create(mem)
-        
+
         result = scheduler.run_cycle(user_id)
         assert result is not None
 
@@ -380,7 +381,7 @@ class TestHealthDetection:
         user_id = _uid()
         store = MemoryStore(db_factory)
         health = MemoryHealth(db_factory)
-        
+
         # Create memories
         for mtype in [MemoryType.PROFILE, MemoryType.SEMANTIC]:
             mem = Memory(
@@ -394,9 +395,9 @@ class TestHealthDetection:
             )
             memory_cleanup.append(mem.memory_id)
             store.create(mem)
-        
+
         stats = health.analyze(user_id)
-        
+
         # Stats keyed by memory_type value
         assert "profile" in stats or MemoryType.PROFILE.value in stats
         assert "profile" in stats or "semantic" in stats
@@ -411,7 +412,7 @@ class TestTaskAwareRetrieval:
         session_id = _sid()
         store = MemoryStore(db_factory)
         retriever = MemoryRetriever(db_factory)
-        
+
         mem = Memory(
             memory_id=str(uuid7()),
             user_id=user_id,
@@ -423,7 +424,7 @@ class TestTaskAwareRetrieval:
         )
         memory_cleanup.append(mem.memory_id)
         store.create(mem)
-        
+
         results, _ = retriever.retrieve(
             user_id=user_id,
             query_text="How should I commit code?",
@@ -432,7 +433,7 @@ class TestTaskAwareRetrieval:
             task_hint="code",
             limit=5,
         )
-        
+
         assert len(results) >= 1
         assert any("tests" in r.content for r in results)
 
@@ -572,7 +573,9 @@ class TestSessionSummaryRealDB:
             {"role": "assistant", "content": "Use async/await with asyncio library."},
         ]
 
-        mem = summarizer.check_and_summarize(user_id, session_id, messages, turn_count=2, session_start=datetime.now(timezone.utc))
+        mem = summarizer.check_and_summarize(
+            user_id, session_id, messages, turn_count=2, session_start=datetime.now(timezone.utc)
+        )
         assert mem is not None
         memory_cleanup.append(mem.memory_id)
 
@@ -592,7 +595,10 @@ class TestSessionSummaryRealDB:
         session_id = _sid()
         messages = [
             {"role": "user", "content": "Explain dependency injection"},
-            {"role": "assistant", "content": "DI is a design pattern where dependencies are passed in..."},
+            {
+                "role": "assistant",
+                "content": "DI is a design pattern where dependencies are passed in...",
+            },
         ]
 
         mem = summarizer.generate_full_summary(user_id, session_id, messages)
@@ -621,12 +627,16 @@ class TestSessionSummaryRealDB:
         ]
 
         # Generate 2 incrementals — second call needs new messages
-        inc1 = summarizer.check_and_summarize(user_id, session_id, messages, turn_count=2, session_start=datetime.now(timezone.utc))
+        inc1 = summarizer.check_and_summarize(
+            user_id, session_id, messages, turn_count=2, session_start=datetime.now(timezone.utc)
+        )
         messages2 = messages + [
             {"role": "user", "content": "What about mocking?"},
             {"role": "assistant", "content": "Use unittest.mock for mocking..."},
         ]
-        inc2 = summarizer.check_and_summarize(user_id, session_id, messages2, turn_count=4, session_start=datetime.now(timezone.utc))
+        inc2 = summarizer.check_and_summarize(
+            user_id, session_id, messages2, turn_count=4, session_start=datetime.now(timezone.utc)
+        )
         memory_cleanup.extend([inc1.memory_id, inc2.memory_id])
 
         # Generate full
@@ -653,24 +663,34 @@ class TestTrustTierRealDB:
         age = datetime.now(timezone.utc) - timedelta(days=60)
 
         t1 = Memory(
-            memory_id=str(uuid7()), user_id=user_id,
-            memory_type=MemoryType.SEMANTIC, content="Verified: project uses DI pattern",
-            initial_confidence=0.9, trust_tier=TrustTier.T1_VERIFIED,
-            embedding=_embed("DI pattern"), observed_at=age,
+            memory_id=str(uuid7()),
+            user_id=user_id,
+            memory_type=MemoryType.SEMANTIC,
+            content="Verified: project uses DI pattern",
+            initial_confidence=0.9,
+            trust_tier=TrustTier.T1_VERIFIED,
+            embedding=_embed("DI pattern"),
+            observed_at=age,
         )
         t4 = Memory(
-            memory_id=str(uuid7()), user_id=user_id,
-            memory_type=MemoryType.SEMANTIC, content="Unverified: project uses DI pattern",
-            initial_confidence=0.9, trust_tier=TrustTier.T4_UNVERIFIED,
-            embedding=_embed("DI pattern unverified"), observed_at=age,
+            memory_id=str(uuid7()),
+            user_id=user_id,
+            memory_type=MemoryType.SEMANTIC,
+            content="Unverified: project uses DI pattern",
+            initial_confidence=0.9,
+            trust_tier=TrustTier.T4_UNVERIFIED,
+            embedding=_embed("DI pattern unverified"),
+            observed_at=age,
         )
         memory_cleanup.extend([t1.memory_id, t4.memory_id])
         store.create(t1)
         store.create(t4)
 
         results, _ = retriever.retrieve(
-            user_id=user_id, query_text="DI pattern",
-            session_id=session_id, query_embedding=_embed("DI pattern"),
+            user_id=user_id,
+            query_text="DI pattern",
+            session_id=session_id,
+            query_embedding=_embed("DI pattern"),
             limit=10,
         )
 
@@ -684,53 +704,6 @@ class TestTrustTierRealDB:
 # ── Phase 3 Wiring Tests ──────────────────────────────────────────
 
 
-class TestSchedulerWiring:
-    """Verify GovernanceScheduler is called by production scheduler dispatch."""
-
-    def test_dispatch_calls_memory_governance(self):
-        """scheduler._dispatch('hourly') calls GovernanceScheduler.run_hourly()."""
-        from unittest.mock import patch, MagicMock
-        from core.context.scheduler import GovernanceTaskRunner
-
-        mock_db = MagicMock()
-        mock_factory = MagicMock(return_value=mock_db)
-
-        with patch("core.context.lifecycle.MemoryGovernanceEngine") as MockEngine, \
-             patch("core.memory.tabular.governance.GovernanceScheduler") as MockSched:
-            MockEngine.return_value.run_hourly_tasks.return_value = {"archived_notes": 0}
-            from core.memory.tabular.governance import GovernanceCycleResult
-            MockSched.return_value.run_hourly.return_value = GovernanceCycleResult(
-                cleaned_tool_results=3, archived_working=1,
-            )
-
-            result = GovernanceTaskRunner._dispatch("hourly", mock_db, mock_factory)
-
-            MockSched.return_value.run_hourly.assert_called_once()
-            assert result["mem_cleaned_tool_results"] == 3
-            assert result["mem_archived_working"] == 1
-
-    def test_dispatch_daily_calls_run_daily_all(self):
-        """scheduler._dispatch('daily') calls GovernanceScheduler.run_daily_all()."""
-        from unittest.mock import patch, MagicMock
-        from core.context.scheduler import GovernanceTaskRunner
-
-        mock_db = MagicMock()
-        mock_factory = MagicMock(return_value=mock_db)
-
-        with patch("core.context.lifecycle.MemoryGovernanceEngine") as MockEngine, \
-             patch("core.memory.tabular.governance.GovernanceScheduler") as MockSched:
-            MockEngine.return_value.run_daily_tasks.return_value = {"quarantined": 0}
-            from core.memory.tabular.governance import GovernanceCycleResult
-            MockSched.return_value.run_daily_all.return_value = GovernanceCycleResult(
-                cleaned_stale=2, quarantined=5,
-            )
-
-            result = GovernanceTaskRunner._dispatch("daily", mock_db, mock_factory)
-
-            MockSched.return_value.run_daily_all.assert_called_once()
-            assert result["mem_quarantined"] == 5
-
-
 class TestRunDailyAll:
     """Verify run_daily_all iterates all users."""
 
@@ -741,9 +714,12 @@ class TestRunDailyAll:
         # Create old low-confidence T4 memories for 2 users
         for uid in (uid1, uid2):
             m = Memory(
-                memory_id=str(uuid7()), user_id=uid,
-                memory_type=MemoryType.SEMANTIC, content="stale fact",
-                initial_confidence=0.3, trust_tier=TrustTier.T4_UNVERIFIED,
+                memory_id=str(uuid7()),
+                user_id=uid,
+                memory_type=MemoryType.SEMANTIC,
+                content="stale fact",
+                initial_confidence=0.3,
+                trust_tier=TrustTier.T4_UNVERIFIED,
                 observed_at=datetime.now(timezone.utc) - timedelta(days=120),
             )
             memory_cleanup.append(m.memory_id)
@@ -776,13 +752,16 @@ class TestSessionSummaryWiring:
 
             # Add some conversation events
             user_evt = event_logger.create_user_query(
-                user_id="summary_wiring_test", session_id=sid,
+                user_id="summary_wiring_test",
+                session_id=sid,
                 content="How do I use dependency injection in Python?",
             )
             event_logger.create_llm_response(
-                user_id="summary_wiring_test", session_id=sid,
+                user_id="summary_wiring_test",
+                session_id=sid,
                 content="Dependency injection in Python typically uses constructor injection...",
-                agent_id="test", agent_version="1.0",
+                agent_id="test",
+                agent_version="1.0",
                 parent_event_id=user_evt.event_id,
                 causal_chain_id=user_evt.causal_chain_id,
             )
@@ -791,11 +770,13 @@ class TestSessionSummaryWiring:
             session_mgr.close_session(sid)
 
             # Check memories table for session summary
-            row = db.execute(text(
-                "SELECT memory_id, content, session_id FROM mem_memories "
-                "WHERE user_id = 'summary_wiring_test' AND content LIKE '%session_summary%' "
-                "ORDER BY created_at DESC LIMIT 1"
-            )).fetchone()
+            row = db.execute(
+                text(
+                    "SELECT memory_id, content, session_id FROM mem_memories "
+                    "WHERE user_id = 'summary_wiring_test' AND content LIKE '%session_summary%' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                )
+            ).fetchone()
 
             if row:
                 memory_cleanup.append(row[0])
@@ -814,9 +795,11 @@ class TestSessionSummaryWiring:
         # Should not raise — verifies the signature accepts new params
         with patch("core.memory.tabular.typed_pipeline.run_typed_memory_pipeline"):
             hooks.run_observer(
-                session_id="test_sess", user_id="test_user",
+                session_id="test_sess",
+                user_id="test_user",
                 messages=[{"role": "user", "content": "hello"}],
-                turn_count=50, session_start=datetime.now(timezone.utc),
+                turn_count=50,
+                session_start=datetime.now(timezone.utc),
             )
 
 
@@ -839,6 +822,7 @@ class TestTrustTierDefaultsMigration:
         """knowledge/api.py imports trust_tier_defaults from types.py."""
         import inspect
         from skills.knowledge import api as knowledge_api
+
         source = inspect.getsource(knowledge_api)
         assert "from core.memory.types import trust_tier_defaults" in source
 

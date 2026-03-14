@@ -18,6 +18,7 @@ from core.memory.types import _utcnow
 
 class RegressionType(str, Enum):
     """Type of knowledge regression."""
+
     SKILL_DEPRECATED = "skill_deprecated"
     SKILL_UPDATED = "skill_updated"
     KNOWLEDGE_CHANGED = "knowledge_changed"
@@ -27,6 +28,7 @@ class RegressionType(str, Enum):
 @dataclass
 class RegressionSignal:
     """Signal indicating potential regression."""
+
     signal_id: str
     regression_type: RegressionType
     affected_skill: str
@@ -40,6 +42,7 @@ class RegressionSignal:
 @dataclass
 class RegressionReport:
     """Report of detected regressions."""
+
     report_id: str
     signals: list[RegressionSignal]
     total_affected_sessions: int
@@ -49,44 +52,47 @@ class RegressionReport:
 
 class KnowledgeRegression(DbConsumer):
     """Detect knowledge regressions via time-travel queries and historical analysis."""
-    
+
     def __init__(self, db_factory: DbFactory, source_db: str = "dev_agent"):
         """Initialize regression detector.
-        
+
         Args:
             db: Database session
             source_db: Source database for queries
         """
         super().__init__(db_factory)
         self.source_db = source_db
-    
+
     def detect_skill_deprecation(
         self,
         skill_name: str,
         deprecated_at: datetime,
     ) -> RegressionSignal:
         """Detect sessions using deprecated skill before deprecation.
-        
+
         Args:
             skill_name: Skill name
             deprecated_at: When skill was deprecated
-            
+
         Returns:
             RegressionSignal with affected session/decision count
         """
         # Query sessions that used skill before deprecation
         with self._db() as db:
-            result = db.execute(text(f"""
+            result = db.execute(
+                text(f"""
                 SELECT COUNT(DISTINCT session_id) as session_count,
                        COUNT(DISTINCT event_id) as decision_count
                 FROM {self.source_db}.skill_selection_events
                 WHERE skill_name = :skill_name
                 AND created_at < :deprecated_at
-            """), {"skill_name": skill_name, "deprecated_at": deprecated_at}).fetchone()
-        
+            """),
+                {"skill_name": skill_name, "deprecated_at": deprecated_at},
+            ).fetchone()
+
             session_count = result[0] if result and result[0] else 0
             decision_count = result[1] if result and result[1] else 0
-        
+
             return RegressionSignal(
                 signal_id=f"deprecation_{skill_name}_{int(deprecated_at.timestamp())}",
                 regression_type=RegressionType.SKILL_DEPRECATED,
@@ -97,7 +103,7 @@ class KnowledgeRegression(DbConsumer):
                 detected_at=_utcnow(),
                 metadata={"deprecated_at": deprecated_at.isoformat()},
             )
-    
+
     def detect_skill_update_regression(
         self,
         skill_name: str,
@@ -110,15 +116,19 @@ class KnowledgeRegression(DbConsumer):
         ``skill_selection_events`` (indexed ``skill_name`` + ``skill_version``).
         """
         with self._db() as db:
+
             def _stats(version: str):
-                row = db.execute(text(f"""
+                row = db.execute(
+                    text(f"""
                     SELECT COUNT(*) as total,
                            SUM(CASE WHEN execution_success = 1 THEN 1 ELSE 0 END) as ok,
                            AVG(user_feedback_score) as avg_feedback
                     FROM {self.source_db}.skill_selection_events
                     WHERE skill_name = :skill_name
                     AND skill_version = :ver
-                """), {"skill_name": skill_name, "ver": version}).fetchone()
+                """),
+                    {"skill_name": skill_name, "ver": version},
+                ).fetchone()
                 total = int(row[0]) if row and row[0] else 0
                 ok = int(row[1]) if row and row[1] else 0
                 avg_fb = float(row[2]) if row and row[2] else 0.0
@@ -152,7 +162,7 @@ class KnowledgeRegression(DbConsumer):
                     "after_avg_feedback": after_fb,
                 },
             )
-    
+
     def detect_knowledge_change_impact(
         self,
         entry_id: str,
@@ -173,13 +183,16 @@ class KnowledgeRegression(DbConsumer):
         """
         # Single JOIN via relation table — both sides hit indexes
         with self._db() as db:
-            result = db.execute(text(f"""
+            result = db.execute(
+                text(f"""
                 SELECT COUNT(DISTINCT ce.session_id) as session_count,
                        COUNT(DISTINCT ce.event_id) as decision_count
                 FROM {self.source_db}.sk_knowledge_entry_sources kes
                 JOIN {self.source_db}.agent_events ce ON kes.event_id = ce.event_id
                 WHERE kes.entry_id = :entry_id
-            """), {"entry_id": entry_id}).fetchone()
+            """),
+                {"entry_id": entry_id},
+            ).fetchone()
 
             session_count = result[0] if result and result[0] else 0
             decision_count = result[1] if result and result[1] else 0
@@ -194,52 +207,57 @@ class KnowledgeRegression(DbConsumer):
                 detected_at=_utcnow(),
                 metadata={"entry_id": entry_id, "category": category},
             )
-    
+
     def generate_regression_report(
         self,
         start_date: datetime,
         end_date: datetime,
     ) -> RegressionReport:
         """Generate comprehensive regression report for time period.
-        
+
         Args:
             start_date: Report start date
             end_date: Report end date
-            
+
         Returns:
             RegressionReport with all detected signals
         """
         with self._db() as db:
             signals = []
-        
+
             # Query regression tracking table (if exists)
             try:
-                rows = db.execute(text(f"""
+                rows = db.execute(
+                    text(f"""
                     SELECT signal_id, regression_type, affected_skill, affected_sessions, 
                            affected_decisions, confidence, detected_at, metadata
                     FROM {self.source_db}.regression_signals
                     WHERE detected_at BETWEEN :start_date AND :end_date
                     ORDER BY confidence DESC
-                """), {"start_date": start_date, "end_date": end_date}).fetchall()
-            
+                """),
+                    {"start_date": start_date, "end_date": end_date},
+                ).fetchall()
+
                 for row in rows:
                     signal_id, reg_type, skill, sessions, decisions, conf, detected, meta = row
-                    signals.append(RegressionSignal(
-                        signal_id=signal_id,
-                        regression_type=RegressionType(reg_type),
-                        affected_skill=skill,
-                        affected_sessions=sessions,
-                        affected_decisions=decisions,
-                        confidence=conf,
-                        detected_at=detected,
-                        metadata=json.loads(meta) if isinstance(meta, str) else meta or {},
-                    ))
+                    signals.append(
+                        RegressionSignal(
+                            signal_id=signal_id,
+                            regression_type=RegressionType(reg_type),
+                            affected_skill=skill,
+                            affected_sessions=sessions,
+                            affected_decisions=decisions,
+                            confidence=conf,
+                            detected_at=detected,
+                            metadata=json.loads(meta) if isinstance(meta, str) else meta or {},
+                        )
+                    )
             except Exception:
                 pass  # Table may not exist
-        
+
             total_affected_sessions = sum(s.affected_sessions for s in signals)
             total_affected_decisions = sum(s.affected_decisions for s in signals)
-        
+
             return RegressionReport(
                 report_id=f"report_{int(start_date.timestamp())}_{int(end_date.timestamp())}",
                 signals=signals,
@@ -247,18 +265,18 @@ class KnowledgeRegression(DbConsumer):
                 total_affected_decisions=total_affected_decisions,
                 generated_at=_utcnow(),
             )
-    
+
     def get_affected_sessions(
         self,
         signal_id: str,
         limit: int = 100,
     ) -> list[dict]:
         """Get sessions affected by regression signal with full context.
-        
+
         Args:
             signal_id: Signal ID
             limit: Max sessions to return
-            
+
         Returns:
             List of affected session info dicts
         """
@@ -267,8 +285,9 @@ class KnowledgeRegression(DbConsumer):
             if signal_id.startswith("deprecation_"):
                 parts = signal_id.split("_")
                 skill_name = "_".join(parts[1:-1])
-            
-                rows = db.execute(text(f"""
+
+                rows = db.execute(
+                    text(f"""
                     SELECT DISTINCT 
                         e.session_id,
                         COUNT(e.event_id) as event_count,
@@ -278,8 +297,10 @@ class KnowledgeRegression(DbConsumer):
                     WHERE e.skill_name = :skill_name
                     GROUP BY e.session_id
                     LIMIT :limit
-                """), {"skill_name": skill_name, "limit": limit}).fetchall()
-            
+                """),
+                    {"skill_name": skill_name, "limit": limit},
+                ).fetchall()
+
                 return [
                     {
                         "session_id": row[0],
@@ -289,5 +310,5 @@ class KnowledgeRegression(DbConsumer):
                     }
                     for row in rows
                 ]
-        
+
             return []

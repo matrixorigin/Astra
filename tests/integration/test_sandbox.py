@@ -21,7 +21,9 @@ def source_table(db_session):
     """Create a test table in source DB for branching."""
     # Use unique table name to avoid parallel test conflicts
     table_name = f"t_{generate_id()}"  # t_ (2) + 32 = 34 chars
-    db_session.execute(text(f"CREATE TABLE IF NOT EXISTS {SOURCE_DB}.{table_name} (id INT PRIMARY KEY, val INT)"))
+    db_session.execute(
+        text(f"CREATE TABLE IF NOT EXISTS {SOURCE_DB}.{table_name} (id INT PRIMARY KEY, val INT)")
+    )
     db_session.execute(text(f"INSERT INTO {SOURCE_DB}.{table_name} VALUES (1,10),(2,20),(3,30)"))
     db_session.commit()
     yield table_name
@@ -36,6 +38,7 @@ def _unique_name():
 # ===========================================================================
 # Lifecycle
 # ===========================================================================
+
 
 def test_create_and_delete(sandbox):
     name = _unique_name()
@@ -62,7 +65,7 @@ def test_create_with_tables(sandbox, db_session, source_table):
 def test_list_with_filter(sandbox):
     name1 = f"sandbox_exp_{generate_id()}"
     name2 = f"sandbox_prod_{generate_id()}"
-    
+
     sandbox.create(name1)
     sandbox.create(name2)
 
@@ -76,6 +79,7 @@ def test_list_with_filter(sandbox):
 # ===========================================================================
 # Table management
 # ===========================================================================
+
 
 def test_add_remove_table(sandbox, db_session, source_table):
     name = _unique_name()
@@ -117,6 +121,7 @@ def test_isolation(sandbox, db_session, source_table):
 # Snapshot & Restore (on sandbox database)
 # ===========================================================================
 
+
 def test_snapshot_and_restore(sandbox, db_session, source_table):
     name = _unique_name()
     sandbox.create(name, tables=[source_table])
@@ -155,6 +160,7 @@ def test_delete_cleans_snapshots(sandbox, db_session, source_table):
 # ===========================================================================
 # Diff & Merge
 # ===========================================================================
+
 
 def test_diff(sandbox, db_session, source_table):
     name = _unique_name()
@@ -198,6 +204,7 @@ def test_merge(sandbox, db_session, source_table):
 # ===========================================================================
 # Info & Use
 # ===========================================================================
+
 
 def test_info(sandbox, db_session, source_table):
     name = _unique_name()

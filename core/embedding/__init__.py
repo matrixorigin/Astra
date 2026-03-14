@@ -1,7 +1,12 @@
 """Embedding package — unified embedding client with pluggable providers."""
 
 from core.embedding.client import EmbeddingClient
-from core.embedding.providers import BaseEmbeddingProvider, LocalProvider, MockProvider, OpenAIProvider
+from core.embedding.providers import (
+    BaseEmbeddingProvider,
+    LocalProvider,
+    MockProvider,
+    OpenAIProvider,
+)
 
 __all__ = [
     "EmbeddingClient",
@@ -48,6 +53,8 @@ def get_embedding_client() -> EmbeddingClient:
         )
         logging.getLogger(__name__).info(
             "EmbeddingClient: provider=%s, model=%s, dim=%d",
-            s.embedding_provider, s.embedding_model, s.embedding_dim,
+            s.embedding_provider,
+            s.embedding_model,
+            s.embedding_dim,
         )
     return _shared_client

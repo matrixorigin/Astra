@@ -20,23 +20,43 @@ logger = logging.getLogger(__name__)
 
 
 class SensitivityTier(str, Enum):
-    HIGH = "high"      # block
+    HIGH = "high"  # block
     MEDIUM = "medium"  # redact
-    LOW = "low"        # allow
+    LOW = "low"  # allow
 
 
 # (label, tier, pattern, redact_replacement)
 _PATTERNS: list[tuple[str, SensitivityTier, re.Pattern, str]] = [
     # HIGH — block
-    ("aws_key",            SensitivityTier.HIGH,   re.compile(r"(?:AKIA|ABIA|ACCA|ASIA)[0-9A-Z]{16}"), ""),
-    ("private_key",        SensitivityTier.HIGH,   re.compile(r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----"), ""),
-    ("bearer_token",       SensitivityTier.HIGH,   re.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*", re.IGNORECASE), ""),
-    ("password_assignment",SensitivityTier.HIGH,   re.compile(r"(?:password|passwd|secret)\s*[:=]\s*\S+", re.IGNORECASE), ""),
+    ("aws_key", SensitivityTier.HIGH, re.compile(r"(?:AKIA|ABIA|ACCA|ASIA)[0-9A-Z]{16}"), ""),
+    (
+        "private_key",
+        SensitivityTier.HIGH,
+        re.compile(r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----"),
+        "",
+    ),
+    (
+        "bearer_token",
+        SensitivityTier.HIGH,
+        re.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*", re.IGNORECASE),
+        "",
+    ),
+    (
+        "password_assignment",
+        SensitivityTier.HIGH,
+        re.compile(r"(?:password|passwd|secret)\s*[:=]\s*\S+", re.IGNORECASE),
+        "",
+    ),
     # MEDIUM — redact
-    ("email",              SensitivityTier.MEDIUM, re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}"), "[email]"),
-    ("phone",              SensitivityTier.MEDIUM, re.compile(r"\b\d{3}[-.]?\d{3,4}[-.]?\d{4}\b"), "[phone]"),
-    ("ssn",                SensitivityTier.MEDIUM, re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[ssn]"),
-    ("credit_card",        SensitivityTier.MEDIUM, re.compile(r"\b(?:\d[ -]*?){13,19}\b"), "[card]"),
+    (
+        "email",
+        SensitivityTier.MEDIUM,
+        re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}"),
+        "[email]",
+    ),
+    ("phone", SensitivityTier.MEDIUM, re.compile(r"\b\d{3}[-.]?\d{3,4}[-.]?\d{4}\b"), "[phone]"),
+    ("ssn", SensitivityTier.MEDIUM, re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[ssn]"),
+    ("credit_card", SensitivityTier.MEDIUM, re.compile(r"\b(?:\d[ -]*?){13,19}\b"), "[card]"),
 ]
 
 
@@ -82,6 +102,8 @@ def check_sensitivity(text_: str) -> SensitivityResult:
             "sensitivity_redacted",
             extra={"labels": medium_hits, "content_hash": content_hash},
         )
-        return SensitivityResult(blocked=False, redacted_content=redacted, matched_labels=medium_hits)
+        return SensitivityResult(
+            blocked=False, redacted_content=redacted, matched_labels=medium_hits
+        )
 
     return SensitivityResult(blocked=False, redacted_content=None, matched_labels=[])

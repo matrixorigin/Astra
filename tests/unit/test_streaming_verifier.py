@@ -126,9 +126,7 @@ class TestFlush:
 class TestFirewallFallback:
     def test_uses_firewall_when_no_llm(self):
         firewall = Mock()
-        firewall.verify_response.return_value = Mock(
-            claims_failed=1, confidence_score=0.3
-        )
+        firewall.verify_response.return_value = Mock(claims_failed=1, confidence_score=0.3)
         sv = StreamingVerifier(
             firewall=firewall,
             context_capture_id="ctx-1",
@@ -142,9 +140,7 @@ class TestFirewallFallback:
 
     def test_firewall_passes_returns_empty(self):
         firewall = Mock()
-        firewall.verify_response.return_value = Mock(
-            claims_failed=0, confidence_score=0.9
-        )
+        firewall.verify_response.return_value = Mock(claims_failed=0, confidence_score=0.9)
         sv = StreamingVerifier(
             firewall=firewall,
             context_capture_id="ctx-1",
@@ -191,6 +187,7 @@ class TestStreamingVerifierLogging:
         sv.llm_client.chat.side_effect = RuntimeError("LLM down")
         sv._context_text = "some context"
         import logging
+
         with caplog.at_level(logging.WARNING, logger="core.verification.streaming_verifier"):
             # Single sentence → _llm_single_check path
             warnings = sv._llm_batch_check(["Test sentence one."])
@@ -203,6 +200,7 @@ class TestStreamingVerifierLogging:
         sv._context_text = None  # force reload
         sv.firewall.context_manager.load_snapshot.side_effect = RuntimeError("DB down")
         import logging
+
         with caplog.at_level(logging.DEBUG):
             result = sv._llm_batch_check(["Test sentence."])
         assert result == []
@@ -211,6 +209,7 @@ class TestStreamingVerifierLogging:
         sv = _make_sv()  # no LLM → uses firewall fallback
         sv.firewall.verify_response.side_effect = RuntimeError("firewall down")
         import logging
+
         with caplog.at_level(logging.WARNING):
             result = sv._firewall_batch_check(["Test sentence."])
         assert result == []

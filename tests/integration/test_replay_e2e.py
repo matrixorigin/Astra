@@ -30,15 +30,13 @@ def session_id():
 def cleanup(db_session, session_id):
     yield
     try:
-        db_session.execute(text(
-            "DELETE FROM agent_events WHERE session_id = :sid"
-        ), {"sid": session_id})
-        db_session.execute(text(
-            "DELETE FROM agent_sessions WHERE session_id = :sid"
-        ), {"sid": session_id})
-        db_session.execute(text(
-            "DELETE FROM skills_registry WHERE skill_name = 'summarize_pr'"
-        ))
+        db_session.execute(
+            text("DELETE FROM agent_events WHERE session_id = :sid"), {"sid": session_id}
+        )
+        db_session.execute(
+            text("DELETE FROM agent_sessions WHERE session_id = :sid"), {"sid": session_id}
+        )
+        db_session.execute(text("DELETE FROM skills_registry WHERE skill_name = 'summarize_pr'"))
         db_session.commit()
     except Exception:
         db_session.rollback()
@@ -79,21 +77,32 @@ async def test_e2e_skill_version_replay(
 
     Core promise: reproduce today's decision 10 years later.
     """
+
     def mock_chat(*args, **kwargs):
         metadata = kwargs.get("metadata", {})
         version = metadata.get("skill_version", "unknown")
         return LLMResponse(
             content=f"Summary from skill version {version}",
-            model="gpt-4", provider=LLMProvider.OPENAI,
-            tokens_prompt=100, tokens_completion=50, tokens_total=150,
-            latency_ms=1000, cost_usd=0.002,
+            model="gpt-4",
+            provider=LLMProvider.OPENAI,
+            tokens_prompt=100,
+            tokens_completion=50,
+            tokens_total=150,
+            latency_ms=1000,
+            cost_usd=0.002,
         )
 
     async def mock_get_pr(repo_id, pr_number, detail="normal"):
         return {
-            "number": pr_number, "title": f"PR #{pr_number}", "body": "Test PR",
-            "state": "open", "changed_files": 5, "additions": 120, "deletions": 30,
-            "user": "test_user", "created_at": "2026-02-10T00:00:00Z",
+            "number": pr_number,
+            "title": f"PR #{pr_number}",
+            "body": "Test PR",
+            "state": "open",
+            "changed_files": 5,
+            "additions": 120,
+            "deletions": 30,
+            "user": "test_user",
+            "created_at": "2026-02-10T00:00:00Z",
             "updated_at": "2026-02-10T00:00:00Z",
             "html_url": f"https://github.com/owner/repo/pull/{pr_number}",
         }
@@ -114,8 +123,11 @@ async def test_e2e_skill_version_replay(
 
     # 2. Execute and log
     input_data = {
-        "repo_id": 1, "user_id": user_id, "session_id": session_id,
-        "pr_number": 123, "include_diff": True,
+        "repo_id": 1,
+        "user_id": user_id,
+        "session_id": session_id,
+        "pr_number": 123,
+        "include_diff": True,
     }
     input_obj = skill_v1.validate_input(input_data)
     output_v1 = await skill_v1.execute(input_obj)
@@ -123,23 +135,37 @@ async def test_e2e_skill_version_replay(
 
     # Create session record for ReplayService permission check
     from api.models import Session as SessionModel
-    db_session.add(SessionModel(
-        session_id=session_id, user_id=user_id, status="active",
-    ))
+
+    db_session.add(
+        SessionModel(
+            session_id=session_id,
+            user_id=user_id,
+            status="active",
+        )
+    )
 
     event_id = _uid()
-    db_session.add(Event(
-        event_id=event_id, user_id=user_id, session_id=session_id,
-        agent_id="dev-agent", agent_version="0.2.0",
-        event_type="skill_exec", content=output_v1.summary,
-        skill_name=skill_v1.name, skill_version=skill_v1.version,
-        causal_chain_id=event_id,
-        event_metadata={
-            "skill": skill_v1.name, "skill_version": skill_v1.version,
-            "input": input_data, "output": output_v1.model_dump(),
-        },
-        created_at=datetime.now(timezone.utc),
-    ))
+    db_session.add(
+        Event(
+            event_id=event_id,
+            user_id=user_id,
+            session_id=session_id,
+            agent_id="dev-agent",
+            agent_version="0.2.0",
+            event_type="skill_exec",
+            content=output_v1.summary,
+            skill_name=skill_v1.name,
+            skill_version=skill_v1.version,
+            causal_chain_id=event_id,
+            event_metadata={
+                "skill": skill_v1.name,
+                "skill_version": skill_v1.version,
+                "input": input_data,
+                "output": output_v1.model_dump(),
+            },
+            created_at=datetime.now(timezone.utc),
+        )
+    )
     db_session.commit()
 
     # 3. Upgrade to v1.1.0
@@ -151,14 +177,17 @@ async def test_e2e_skill_version_replay(
 
     # 4. Replay via ReplayService
     result = replay_service.replay_session(
-        session_id=session_id, user_id=user_id, mock_mode=True,
+        session_id=session_id,
+        user_id=user_id,
+        mock_mode=True,
     )
     assert result["status"] == "completed"
     assert result["events_replayed"] == 1
 
     # 5. Verify reproducibility
     verification = replay_service.verify_reproducibility(
-        session_id=session_id, user_id=user_id,
+        session_id=session_id,
+        user_id=user_id,
     )
     assert verification["reproducible"] is True
 
@@ -169,24 +198,38 @@ async def test_replay_missing_skill_version(db_session, replay_service, session_
     user_id = "test_user"
 
     from api.models import Session as SessionModel
-    db_session.add(SessionModel(
-        session_id=session_id, user_id=user_id, status="active",
-    ))
+
+    db_session.add(
+        SessionModel(
+            session_id=session_id,
+            user_id=user_id,
+            status="active",
+        )
+    )
 
     event_id = _uid()
-    db_session.add(Event(
-        event_id=event_id, user_id=user_id, session_id=session_id,
-        agent_id="dev-agent", agent_version="0.2.0",
-        event_type="skill_exec", content="Test content",
-        skill_name="nonexistent_skill", skill_version="99.99.99",
-        causal_chain_id=event_id,
-        event_metadata={"skill": "nonexistent_skill", "skill_version": "99.99.99"},
-        created_at=datetime.now(timezone.utc),
-    ))
+    db_session.add(
+        Event(
+            event_id=event_id,
+            user_id=user_id,
+            session_id=session_id,
+            agent_id="dev-agent",
+            agent_version="0.2.0",
+            event_type="skill_exec",
+            content="Test content",
+            skill_name="nonexistent_skill",
+            skill_version="99.99.99",
+            causal_chain_id=event_id,
+            event_metadata={"skill": "nonexistent_skill", "skill_version": "99.99.99"},
+            created_at=datetime.now(timezone.utc),
+        )
+    )
     db_session.commit()
 
     result = replay_service.replay_session(
-        session_id=session_id, user_id=user_id, mock_mode=True,
+        session_id=session_id,
+        user_id=user_id,
+        mock_mode=True,
     )
     assert result["status"] == "completed"
     # Non-skill events replay as passthrough (success)

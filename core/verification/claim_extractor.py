@@ -43,7 +43,7 @@ class ClaimExtractor:
         claims = []
 
         # Match numbers with optional units
-        pattern = r'\b(\d+(?:\.\d+)?(?:%|K|M|B)?)\b'
+        pattern = r"\b(\d+(?:\.\d+)?(?:%|K|M|B)?)\b"
 
         for match in re.finditer(pattern, text):
             value = match.group(1)
@@ -59,7 +59,7 @@ class ClaimExtractor:
         claims = []
 
         # ISO dates (YYYY-MM-DD)
-        pattern = r'\b(\d{4}-\d{2}-\d{2})\b'
+        pattern = r"\b(\d{4}-\d{2}-\d{2})\b"
 
         for match in re.finditer(pattern, text):
             value = match.group(1)
@@ -76,9 +76,9 @@ class ClaimExtractor:
 
         # GitHub references
         patterns = [
-            r'\bPR\s*#(\d+)\b',
-            r'\bissue\s*#(\d+)\b',
-            r'\bcommit\s+([a-f0-9]{7,40})\b',
+            r"\bPR\s*#(\d+)\b",
+            r"\bissue\s*#(\d+)\b",
+            r"\bcommit\s+([a-f0-9]{7,40})\b",
         ]
 
         for pattern in patterns:
@@ -100,7 +100,7 @@ class ClaimExtractor:
 
         # More specific pattern: "X is/are/has/have Y" where X and Y are concrete
         # Avoid matching general prose like "This is a general response"
-        pattern = r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(is|are|has|have)\s+(\d+|[A-Z][a-z]+)\b'
+        pattern = r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(is|are|has|have)\s+(\d+|[A-Z][a-z]+)\b"
 
         for match in re.finditer(pattern, text):
             value = match.group(0)

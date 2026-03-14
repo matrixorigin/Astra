@@ -75,7 +75,10 @@ class IndexManager(Protocol):
         ...
 
     def get_reflection_candidates(
-        self, user_id: str, *, since_hours: int = 24,
+        self,
+        user_id: str,
+        *,
+        since_hours: int = 24,
     ) -> list[ReflectionCandidate] | None:
         """Return reflection candidates from index, or None to use canonical fallback."""
         ...

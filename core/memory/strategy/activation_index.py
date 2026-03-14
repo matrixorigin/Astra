@@ -43,6 +43,7 @@ class ActivationIndexManager:
         self._db_factory = db_factory
         if config is None:
             from core.memory.config import DEFAULT_CONFIG
+
             config = DEFAULT_CONFIG
         self._config = config
         self._store = GraphStore(db_factory)
@@ -60,13 +61,17 @@ class ActivationIndexManager:
         """Ingest memories into graph and run opinion evolution."""
         try:
             created = self._builder.ingest(
-                user_id, memories, [], session_id=session_id,
+                user_id,
+                memories,
+                [],
+                session_id=session_id,
             )
             self._run_opinion_evolution(user_id, created)
         except _RECOVERABLE:
             logger.warning(
                 "Graph ingest failed for %d memories, queued for retry",
-                len(memories), exc_info=True,
+                len(memories),
+                exc_info=True,
             )
             self._pending_sync.extend(m.memory_id for m in memories)
 
@@ -104,7 +109,10 @@ class ActivationIndexManager:
                 continue
             try:
                 self._builder.ingest(
-                    user_id, [mem], [], session_id=mem.session_id,
+                    user_id,
+                    [mem],
+                    [],
+                    session_id=mem.session_id,
                 )
                 result.processed += 1
             except _RECOVERABLE as e:
@@ -117,7 +125,9 @@ class ActivationIndexManager:
         self._store.delete_user_data(user_id)
 
     def _run_opinion_evolution(
-        self, user_id: str, created_nodes: list[Any],
+        self,
+        user_id: str,
+        created_nodes: list[Any],
     ) -> None:
         """Run opinion evolution for newly created nodes."""
         from core.memory.graph.opinion import evolve_opinions
@@ -130,7 +140,8 @@ class ActivationIndexManager:
             except _RECOVERABLE:
                 logger.warning(
                     "Opinion evolution failed for node %s",
-                    node.node_id, exc_info=True,
+                    node.node_id,
+                    exc_info=True,
                 )
 
     @property
@@ -138,7 +149,10 @@ class ActivationIndexManager:
         return len(self._pending_sync)
 
     def get_reflection_candidates(
-        self, user_id: str, *, since_hours: int = 24,
+        self,
+        user_id: str,
+        *,
+        since_hours: int = 24,
     ) -> list | None:
         """Return graph-based reflection candidates, or None for fallback."""
         from core.memory.graph.candidates import GraphCandidateProvider
@@ -146,7 +160,8 @@ class ActivationIndexManager:
         try:
             provider = GraphCandidateProvider(self._db_factory, config=self._config)
             candidates = provider.get_reflection_candidates(
-                user_id, since_hours=since_hours,
+                user_id,
+                since_hours=since_hours,
             )
             return candidates if candidates else None
         except _RECOVERABLE:

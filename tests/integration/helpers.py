@@ -17,11 +17,21 @@ def unique_test_id() -> str:
 
 class NullRenderer:
     """No-op renderer for edge_chat_loop tests."""
-    def text(self, c): pass
-    def tool_start(self, n, a): pass
-    def tool_done(self, n, r, e): pass
-    def error(self, m): pass
-    def info(self, m): pass
+
+    def text(self, c):
+        pass
+
+    def tool_start(self, n, a):
+        pass
+
+    def tool_done(self, n, r, e):
+        pass
+
+    def error(self, m):
+        pass
+
+    def info(self, m):
+        pass
 
 
 async def fake_stream_gen(chunks):

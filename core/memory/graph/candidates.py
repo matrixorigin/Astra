@@ -31,17 +31,22 @@ MIN_SESSIONS = 2
 
 class GraphCandidateProvider:
     def __init__(
-        self, db_factory: DbFactory,
+        self,
+        db_factory: DbFactory,
         config: MemoryGovernanceConfig | None = None,
     ) -> None:
         self._store = GraphStore(db_factory)
         if config is None:
             from core.memory.config import DEFAULT_CONFIG
+
             config = DEFAULT_CONFIG
         self._config = config
 
     def get_reflection_candidates(
-        self, user_id: str, *, since_hours: int = 24,
+        self,
+        user_id: str,
+        *,
+        since_hours: int = 24,
     ) -> list[ReflectionCandidate]:
         node_count = self._store.count_user_nodes(user_id)
         if node_count < MIN_CLUSTER_SIZE:
@@ -49,7 +54,9 @@ class GraphCandidateProvider:
 
         # Use recent episodic nodes as anchors — lightweight metadata-only query
         recent_cols = self._store.get_user_nodes(
-            user_id, node_type=NodeType.EPISODIC, active_only=True,
+            user_id,
+            node_type=NodeType.EPISODIC,
+            active_only=True,
             load_embedding=False,
         )
         anchors_list = sorted(recent_cols, key=lambda n: n.node_id, reverse=True)[:20]
@@ -68,8 +75,7 @@ class GraphCandidateProvider:
         # Load only activated nodes
         activated_nodes = self._store.get_nodes_by_ids(list(activated.keys()))
         semantic_activated = [
-            n for n in activated_nodes
-            if n.node_type in (NodeType.SEMANTIC, NodeType.SCENE)
+            n for n in activated_nodes if n.node_type in (NodeType.SEMANTIC, NodeType.SCENE)
         ]
         if len(semantic_activated) < MIN_CLUSTER_SIZE:
             return []
@@ -86,9 +92,7 @@ class GraphCandidateProvider:
                 continue
             memories = [self._node_to_memory(n) for n in cluster]
             has_conflict = any(n.conflicts_with for n in cluster)
-            avg_activation = sum(
-                activated.get(n.node_id, 0.0) for n in cluster
-            ) / len(cluster)
+            avg_activation = sum(activated.get(n.node_id, 0.0) for n in cluster) / len(cluster)
             c = ReflectionCandidate(
                 memories=memories,
                 signal="contradiction" if has_conflict else "semantic_cluster",
@@ -99,7 +103,8 @@ class GraphCandidateProvider:
         return candidates
 
     def _find_connected_components(
-        self, nodes: list[GraphNodeData],
+        self,
+        nodes: list[GraphNodeData],
     ) -> list[list[GraphNodeData]]:
         """Connected components using edge table (not in-memory edges)."""
         node_set = {n.node_id for n in nodes}

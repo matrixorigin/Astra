@@ -30,21 +30,33 @@ _NEGATIVE_PATTERNS = [
     # Correction signals
     re.compile(r"不对|错了|不是这样|你搞错|不正确|wrong|incorrect|that'?s not", re.I),
     # Frustration signals
-    re.compile(r"没用|废话|能不能好好|别废话|太啰嗦|太长了|说重点|useless|terrible|awful|wtf|seriously\?", re.I),
+    re.compile(
+        r"没用|废话|能不能好好|别废话|太啰嗦|太长了|说重点|useless|terrible|awful|wtf|seriously\?",
+        re.I,
+    ),
     # Rephrasing signals (user re-asks)
-    re.compile(r"我(再|重新)说一(遍|次)|let me rephrase|i('?m| am) asking|i meant|what i want", re.I),
+    re.compile(
+        r"我(再|重新)说一(遍|次)|let me rephrase|i('?m| am) asking|i meant|what i want", re.I
+    ),
     # Clarification demand
-    re.compile(r"具体(一点|点)|详细(说|讲)|举个例子|比如呢|能展开|be more specific|give.+example|elaborate", re.I),
+    re.compile(
+        r"具体(一点|点)|详细(说|讲)|举个例子|比如呢|能展开|be more specific|give.+example|elaborate",
+        re.I,
+    ),
 ]
 
 _POSITIVE_PATTERNS = [
-    re.compile(r"^(谢谢|感谢|太好了|完美|不错|很好|棒|thanks|thank you|perfect|great|awesome|nice|good job|well done)", re.I),
+    re.compile(
+        r"^(谢谢|感谢|太好了|完美|不错|很好|棒|thanks|thank you|perfect|great|awesome|nice|good job|well done)",
+        re.I,
+    ),
 ]
 
 
 @dataclass
 class ImplicitSignal:
     """A detected implicit feedback signal."""
+
     signal_type: str  # rephrasing | correction | frustration | clarification | positive | neutral
     confidence: float  # 0.0 - 1.0
     evidence: str = ""  # matched pattern or reason
@@ -53,6 +65,7 @@ class ImplicitSignal:
 @dataclass
 class ConversationPair:
     """A (user_query, agent_response, user_followup) triple for analysis."""
+
     event_id: str  # event_id of the agent response being evaluated
     user_query: str
     agent_response: str
@@ -103,7 +116,9 @@ class ImplicitFeedbackMiner(DbConsumer):
         super().__init__(db_factory)
         self.llm = llm_client
 
-    def extract_pairs(self, session_id: str | None = None, limit: int = 50) -> list[ConversationPair]:
+    def extract_pairs(
+        self, session_id: str | None = None, limit: int = 50
+    ) -> list[ConversationPair]:
         """Extract (query, response, followup) triples from conversation history."""
         with self._db() as db:
             where = "WHERE e.event_type IN ('user_query', 'llm_response')"
@@ -128,28 +143,37 @@ class ImplicitFeedbackMiner(DbConsumer):
             sessions: dict[str, list] = {}
             for r in rows:
                 sid = r[1]
-                sessions.setdefault(sid, []).append({
-                    "event_id": r[0], "event_type": r[2],
-                    "content": r[3] or "", "parent_event_id": r[4],
-                })
+                sessions.setdefault(sid, []).append(
+                    {
+                        "event_id": r[0],
+                        "event_type": r[2],
+                        "content": r[3] or "",
+                        "parent_event_id": r[4],
+                    }
+                )
 
             pairs = []
             for sid, events in sessions.items():
                 for i in range(len(events) - 2):
-                    if (events[i]["event_type"] == "user_query"
-                        and events[i+1]["event_type"] == "llm_response"
-                        and events[i+2]["event_type"] == "user_query"):
-                        pairs.append(ConversationPair(
-                            event_id=events[i+1]["event_id"],
-                            user_query=events[i]["content"],
-                            agent_response=events[i+1]["content"],
-                            user_followup=events[i+2]["content"],
-                            session_id=sid,
-                        ))
+                    if (
+                        events[i]["event_type"] == "user_query"
+                        and events[i + 1]["event_type"] == "llm_response"
+                        and events[i + 2]["event_type"] == "user_query"
+                    ):
+                        pairs.append(
+                            ConversationPair(
+                                event_id=events[i + 1]["event_id"],
+                                user_query=events[i]["content"],
+                                agent_response=events[i + 1]["content"],
+                                user_followup=events[i + 2]["content"],
+                                session_id=sid,
+                            )
+                        )
             return pairs
 
-    def analyze_batch(self, pairs: list[ConversationPair] | None = None,
-                      session_id: str | None = None) -> list[dict[str, Any]]:
+    def analyze_batch(
+        self, pairs: list[ConversationPair] | None = None, session_id: str | None = None
+    ) -> list[dict[str, Any]]:
         """Analyze conversation pairs for implicit feedback.
 
         Uses heuristic first, escalates ambiguous cases to LLM.
@@ -175,8 +199,9 @@ class ImplicitFeedbackMiner(DbConsumer):
 
         return results
 
-    def analyze_and_store(self, session_id: str | None = None,
-                          template_id: str = "system_general") -> int:
+    def analyze_and_store(
+        self, session_id: str | None = None, template_id: str = "system_general"
+    ) -> int:
         """Full pipeline: extract → analyze → store as eval_llm_feedback records.
 
         Returns number of feedback records created.
@@ -185,6 +210,7 @@ class ImplicitFeedbackMiner(DbConsumer):
             results = self.analyze_batch(session_id=session_id)
             count = 0
             from core.context.prompts import PromptFeedback
+
             pf = PromptFeedback(self._db_factory)
             for r in results:
                 try:
@@ -207,9 +233,12 @@ class ImplicitFeedbackMiner(DbConsumer):
     def _signal_to_feedback(self, pair: ConversationPair, signal: ImplicitSignal) -> dict[str, Any]:
         """Convert signal to feedback dict with estimated rating."""
         rating_map = {
-            "correction": 1, "frustration": 1,
-            "rephrasing": 2, "clarification": 3,
-            "positive": 5, "neutral": 3,
+            "correction": 1,
+            "frustration": 1,
+            "rephrasing": 2,
+            "clarification": 3,
+            "positive": 5,
+            "neutral": 3,
         }
         return {
             "event_id": pair.event_id,
@@ -221,14 +250,16 @@ class ImplicitFeedbackMiner(DbConsumer):
             "user_followup": pair.user_followup[:200],
         }
 
-    def _llm_classify(self, batch: list[tuple[ConversationPair, ImplicitSignal]]) -> list[dict[str, Any]]:
+    def _llm_classify(
+        self, batch: list[tuple[ConversationPair, ImplicitSignal]]
+    ) -> list[dict[str, Any]]:
         """Use LLM to classify ambiguous cases."""
         results = []
         # Build batch prompt for efficiency
         cases_text = ""
         for i, (pair, _) in enumerate(batch[:10]):  # Cap at 10 per batch
             cases_text += (
-                f"\n--- Case {i+1} ---\n"
+                f"\n--- Case {i + 1} ---\n"
                 f"User asked: {pair.user_query[:200]}\n"
                 f"Agent replied: {pair.agent_response[:300]}\n"
                 f"User then said: {pair.user_followup[:200]}\n"
@@ -250,7 +281,8 @@ For each case, respond with ONE line: "Case N: <category> <confidence 0.0-1.0>"
         try:
             response = self.llm.chat(
                 messages=[{"role": "user", "content": prompt}],
-                user_id="system", temperature=0.1,
+                user_id="system",
+                temperature=0.1,
                 task_hint="feedback_analysis",
             )
             content = response.content if hasattr(response, "content") else str(response)

@@ -1,11 +1,18 @@
 """Memory SQLAlchemy model."""
 
 from matrixone import VectorPrecision, VectorType
+
 if not getattr(VectorType, "cache_ok", False):
     VectorType.cache_ok = True
 from matrixone.sqlalchemy_ext import FulltextIndex, FulltextParserType
 from sqlalchemy import (
-    Column, Float, Index, Integer, SmallInteger, String, Text,
+    Column,
+    Float,
+    Index,
+    Integer,
+    SmallInteger,
+    String,
+    Text,
 )
 from sqlalchemy.sql import func
 
@@ -25,7 +32,13 @@ class MemoryRecord(Base):
         Index("idx_memory_user_session", "user_id", "session_id"),
         Index("idx_memory_observed_at", "observed_at"),
         Index("idx_memory_superseded_by", "superseded_by"),
-        Index("idx_memory_user_active_type_observed", "user_id", "is_active", "memory_type", "observed_at"),
+        Index(
+            "idx_memory_user_active_type_observed",
+            "user_id",
+            "is_active",
+            "memory_type",
+            "observed_at",
+        ),
     )
 
     memory_id = Column(String(64), primary_key=True)

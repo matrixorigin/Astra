@@ -82,7 +82,10 @@ class TestHandleScratchpadTool:
             {"note_id": "n1", "note_type": "plan", "content": "my plan"}
         ]
         result = loop._handle_scratchpad_tool(
-            "scratchpad_read", {}, session_id="sess-1", user_id="alice",
+            "scratchpad_read",
+            {},
+            session_id="sess-1",
+            user_id="alice",
         )
         assert result["notes"][0]["note_id"] == "n1"
 
@@ -110,7 +113,10 @@ class TestHandleScratchpadTool:
     def test_unknown_tool_returns_error(self):
         loop, _ = _make_loop()
         result = loop._handle_scratchpad_tool(
-            "scratchpad_unknown", {}, session_id="sess-1", user_id="alice",
+            "scratchpad_unknown",
+            {},
+            session_id="sess-1",
+            user_id="alice",
         )
         assert "error" in result
 

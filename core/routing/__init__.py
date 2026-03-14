@@ -6,10 +6,10 @@ from .routing_service import RoutingService, RoutingDecision
 
 __all__ = [
     "QueryRouter",
-    "RoutingResult", 
+    "RoutingResult",
     "AgentType",
     "AgentConfigManager",
     "AgentConfig",
     "RoutingService",
-    "RoutingDecision"
+    "RoutingDecision",
 ]

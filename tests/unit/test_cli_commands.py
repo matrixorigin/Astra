@@ -73,11 +73,7 @@ class TestAgentCLIToAPI:
         """Test login command calls API client login method."""
         mock_api_client.login.return_value = {"email": "test@example.com"}
 
-        result = runner.invoke(
-            agent_cli,
-            ["login"],
-            input="test@example.com\npassword123\n"
-        )
+        result = runner.invoke(agent_cli, ["login"], input="test@example.com\npassword123\n")
 
         assert result.exit_code == 0
         mock_api_client.login.assert_called_once_with("test@example.com", "password123")
@@ -88,13 +84,13 @@ class TestAgentCLIToAPI:
         mock_api_client.register.return_value = {"email": "new@example.com"}
 
         result = runner.invoke(
-            agent_cli,
-            ["register"],
-            input="new@example.com\npassword123\npassword123\ntestuser\n"
+            agent_cli, ["register"], input="new@example.com\npassword123\npassword123\ntestuser\n"
         )
 
         assert result.exit_code == 0
-        mock_api_client.register.assert_called_once_with("testuser", "password123", "new@example.com")
+        mock_api_client.register.assert_called_once_with(
+            "testuser", "password123", "new@example.com"
+        )
         assert "✅ Registered" in result.output
 
     def test_session_list_calls_api_client(self, runner, mock_api_client):
@@ -106,7 +102,7 @@ class TestAgentCLIToAPI:
                 {"session_id": "sess-1", "user_id": "alice", "status": "active", "event_count": 5},
                 {"session_id": "sess-2", "user_id": "alice", "status": "closed", "event_count": 3},
             ],
-            "total": 2
+            "total": 2,
         }
 
         # API filters by JWT automatically, no --user-id parameter
@@ -123,7 +119,7 @@ class TestAgentCLIToAPI:
             "session_id": "sess-123",
             "user_id": "alice",
             "status": "active",
-            "event_count": 5
+            "event_count": 5,
         }
 
         result = runner.invoke(agent_cli, ["session", "show", "sess-123"])
@@ -137,8 +133,18 @@ class TestAgentCLIToAPI:
         """Test skill list command calls API client."""
         mock_api_client.ensure_authenticated.return_value = True
         mock_api_client.list_skills.return_value = [
-            {"skill_name": "code_search", "version": "1.0", "is_active": True, "description": "Search code"},
-            {"skill_name": "web_search", "version": "1.0", "is_active": True, "description": "Search web"},
+            {
+                "skill_name": "code_search",
+                "version": "1.0",
+                "is_active": True,
+                "description": "Search code",
+            },
+            {
+                "skill_name": "web_search",
+                "version": "1.0",
+                "is_active": True,
+                "description": "Search web",
+            },
         ]
 
         result = runner.invoke(agent_cli, ["skill", "list"])
@@ -150,11 +156,7 @@ class TestAgentCLIToAPI:
     def test_skill_register_calls_api_client(self, runner, mock_api_client, tmp_path):
         """Test skill register command calls API client."""
         skill_file = tmp_path / "skill.json"
-        skill_data = {
-            "skill_name": "test_skill",
-            "version": "1.0",
-            "description": "Test skill"
-        }
+        skill_data = {"skill_name": "test_skill", "version": "1.0", "description": "Test skill"}
         skill_file.write_text(json.dumps(skill_data))
 
         mock_api_client.ensure_authenticated.return_value = True
@@ -171,7 +173,7 @@ class TestAgentCLIToAPI:
         mock_api_client.ensure_authenticated.return_value = True
         mock_api_client.replay_session.return_value = {
             "replay_id": "replay-123",
-            "events_replayed": 5
+            "events_replayed": 5,
         }
 
         result = runner.invoke(agent_cli, ["replay", "sess-123"])
@@ -189,11 +191,7 @@ class TestAdminCLIToAPI:
         """Test admin register command calls admin_register method."""
         mock_admin_api_client.admin_register.return_value = {"username": "newadmin"}
 
-        result = runner.invoke(
-            admin_cli,
-            ["register"],
-            input="newadmin\npassword123\n"
-        )
+        result = runner.invoke(admin_cli, ["register"], input="newadmin\npassword123\n")
 
         assert result.exit_code == 0
         mock_admin_api_client.admin_register.assert_called_once_with(
@@ -207,13 +205,13 @@ class TestAdminCLIToAPI:
         mock_admin_api_client.admin_create_token.return_value = {
             "token_id": "tok-123",
             "token_type": "llm",
-            "provider": "openai"
+            "provider": "openai",
         }
 
         result = runner.invoke(
             admin_cli,
             ["token", "create", "--type", "llm", "--provider", "openai"],
-            input="sk-test-key\n"
+            input="sk-test-key\n",
         )
 
         assert result.exit_code == 0
@@ -224,8 +222,20 @@ class TestAdminCLIToAPI:
         """Test token list command calls API client."""
         mock_admin_api_client.ensure_authenticated.return_value = True
         mock_admin_api_client.admin_list_tokens.return_value = [
-            {"token_id": "tok-1", "type": "llm", "provider": "openai", "is_active": True, "scope_type": "global"},
-            {"token_id": "tok-2", "type": "github", "provider": "github", "is_active": True, "scope_type": "global"},
+            {
+                "token_id": "tok-1",
+                "type": "llm",
+                "provider": "openai",
+                "is_active": True,
+                "scope_type": "global",
+            },
+            {
+                "token_id": "tok-2",
+                "type": "github",
+                "provider": "github",
+                "is_active": True,
+                "scope_type": "global",
+            },
         ]
 
         result = runner.invoke(admin_cli, ["token", "list"])
@@ -255,7 +265,7 @@ class TestAdminCLIToAPI:
             "total": 100,
             "positive": 80,
             "negative": 20,
-            "avg_rating": 4.2
+            "avg_rating": 4.2,
         }
 
         result = runner.invoke(admin_cli, ["feedback", "stats"])

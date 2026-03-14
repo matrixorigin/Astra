@@ -48,15 +48,18 @@ class SessionRepository:
         if status:
             query = query.filter(SessionModel.status == status)
         total = query.count()
-        return query.order_by(SessionModel.created_at.desc()).offset(offset).limit(limit).all(), total
+        return query.order_by(SessionModel.created_at.desc()).offset(offset).limit(
+            limit
+        ).all(), total
 
     def update_status(self, session_id: str, user_id: str, status: str) -> SessionModel | None:
         """Update session status with ownership check at DB level."""
         db = self.db
-        session = db.query(SessionModel).filter(
-            SessionModel.session_id == session_id,
-            SessionModel.user_id == user_id
-        ).first()
+        session = (
+            db.query(SessionModel)
+            .filter(SessionModel.session_id == session_id, SessionModel.user_id == user_id)
+            .first()
+        )
         if not session:
             return None
         session.status = status
@@ -67,9 +70,7 @@ class SessionRepository:
     def update(self, session_id: str, update_data: dict) -> SessionModel | None:
         """Update session with data."""
         db = self.db
-        session = db.query(SessionModel).filter(
-            SessionModel.session_id == session_id
-        ).first()
+        session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
         if not session:
             return None
         for key, value in update_data.items():
@@ -81,9 +82,7 @@ class SessionRepository:
     def delete(self, session_id: str) -> bool:
         """Delete session."""
         db = self.db
-        session = db.query(SessionModel).filter(
-            SessionModel.session_id == session_id
-        ).first()
+        session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
         if not session:
             return False
         db.delete(session)

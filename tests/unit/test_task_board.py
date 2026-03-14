@@ -119,7 +119,12 @@ class TestTaskBoard:
             (
                 "task-1",
                 "Review auth.py",
-                {"team_id": "team-1", "description": "Check security", "status": "open", "created_by": "lead"},
+                {
+                    "team_id": "team-1",
+                    "description": "Check security",
+                    "status": "open",
+                    "created_by": "lead",
+                },
                 datetime(2026, 1, 1, tzinfo=timezone.utc),
             ),
         ]

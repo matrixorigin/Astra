@@ -20,11 +20,13 @@ TEST_EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "1024"))
 # Disable EventPipeline in tests to prevent background DB sessions from leaking
 os.environ["EVENT_PIPELINE_ENABLED"] = "false"
 
+
 # Support parallel testing with worker-specific databases
 def get_worker_id():
     """Get pytest-xdist worker ID for database isolation."""
     worker_id = os.getenv("PYTEST_XDIST_WORKER", "master")
     return worker_id
+
 
 # Set worker-specific database name
 base_db_name = os.getenv("TEST_MATRIXONE_DATABASE", "test_dev_agent_v3")
@@ -48,7 +50,7 @@ TEST_DATABASE_CONFIG = {
     "port": int(os.getenv("TEST_MATRIXONE_PORT", "6001")),
     "user": os.getenv("TEST_MATRIXONE_USER", "root"),
     "password": os.getenv("TEST_MATRIXONE_PASSWORD", "111"),
-    "database": test_db_name
+    "database": test_db_name,
 }
 
 
@@ -73,9 +75,15 @@ def test_engine():
             # Verify critical tables exist — catch cases where CREATE TABLE
             # silently failed under concurrent DDL pressure from 24 xdist workers.
             from sqlalchemy import inspect as sa_inspect
+
             tables = set(sa_inspect(engine).get_table_names(schema=engine.url.database))
-            required = {"agent_events", "eval_gate_results", "skill_selection_events",
-                        "skill_selection_learnings", "infra_configs"}
+            required = {
+                "agent_events",
+                "eval_gate_results",
+                "skill_selection_events",
+                "skill_selection_learnings",
+                "infra_configs",
+            }
             missing = required - tables
             if missing:
                 raise RuntimeError(f"Tables missing after init_db: {missing}")
@@ -84,6 +92,7 @@ def test_engine():
             # correct.  init_db also runs ALTER for existing tables, but we keep
             # this as a safety net for test DBs that predate the migration.
             from sqlalchemy import text as sa_text
+
             for ddl in [
                 "ALTER TABLE agent_events MODIFY COLUMN created_at DATETIME(6) NOT NULL",
                 "ALTER TABLE ctx_snapshots MODIFY COLUMN created_at DATETIME(6) NOT NULL",
@@ -102,10 +111,12 @@ def test_engine():
                 from api.database import SessionLocal
                 from core.skills.catalog import SkillCatalog
                 from core.skills.builtin import register_builtin_skills
+
                 catalog = SkillCatalog(SessionLocal)
                 register_builtin_skills(catalog, SessionLocal)
             except Exception as e:
                 import warnings
+
                 warnings.warn(
                     f"Edge tool registration failed in conftest: {e}",
                     stacklevel=1,
@@ -123,7 +134,7 @@ def test_engine():
     engine.dispose()
 
     yield engine
-    
+
     # Cleanup worker databases on session end
     _cleanup_worker_databases()
     engine.dispose()
@@ -134,10 +145,11 @@ def _cleanup_worker_databases():
     worker_id = get_worker_id()
     if worker_id == "master":
         return  # Only cleanup from master process
-    
+
     try:
         import logging
         from matrixone import Client
+
         # Suppress MatrixOne client logging during teardown (stderr may be closed in xdist workers)
         logging.getLogger("matrixone").setLevel(logging.CRITICAL)
         client = Client(
@@ -145,18 +157,18 @@ def _cleanup_worker_databases():
             port=TEST_DATABASE_CONFIG["port"],
             user=TEST_DATABASE_CONFIG["user"],
             password=TEST_DATABASE_CONFIG["password"],
-            database="mo_catalog"
+            database="mo_catalog",
         )
-        
+
         # Clean up this worker's database
         db_name = TEST_DATABASE_CONFIG["database"]
-        client.execute(f'DROP DATABASE IF EXISTS `{db_name}`')
+        client.execute(f"DROP DATABASE IF EXISTS `{db_name}`")
         client._engine.dispose()
     except Exception:
         pass  # Ignore cleanup errors
 
 
-@pytest.fixture(scope="session") 
+@pytest.fixture(scope="session")
 def test_session_factory(test_engine):
     """Create test session factory."""
     # expire_on_commit=False prevents "Could not refresh instance" errors
@@ -208,6 +220,7 @@ def patch_db_engine(test_engine):
     """
     import sys
     from api import database
+
     test_session_local = sessionmaker(
         autocommit=False, autoflush=False, bind=test_engine, expire_on_commit=False
     )
@@ -232,33 +245,37 @@ def patch_db_engine(test_engine):
 def override_db_dependency(db_session, monkeypatch):
     """Override get_db_session dependency for all tests."""
     from api.database import get_db_session as original_get_db_session
-    
+
     def mock_get_db_session():
         yield db_session
-    
+
     # Override the dependency in api.database
     from api import database
+
     monkeypatch.setattr(database, "get_db_session", mock_get_db_session)
-    
+
     # Override in api.dependencies (if exists)
     try:
         import api.dependencies
+
         monkeypatch.setattr(api.dependencies, "get_db_session", mock_get_db_session)
     except (ImportError, AttributeError):
         pass
-    
+
     # Override FastAPI dependency (only if app is imported)
     try:
         from api.main import app
+
         app.dependency_overrides[original_get_db_session] = lambda: db_session
     except ImportError:
         pass
-    
+
     yield
-    
+
     # Clear overrides
     try:
         from api.main import app
+
         app.dependency_overrides.pop(original_get_db_session, None)
     except ImportError:
         pass
@@ -277,6 +294,7 @@ def _clear_chat_module_state():
     don't use the chat router at all.
     """
     import sys
+
     mod = sys.modules.get("api.routers.chat")
     if mod is not None:
         mod._session_cache.clear()
@@ -301,9 +319,11 @@ def _clear_chat_module_state():
 # Shared SSE / Streaming Test Helpers
 # ============================================================================
 
+
 def parse_sse_events(text: str) -> list[dict]:
     """Parse SSE text into a list of JSON event dicts."""
     import json as _json
+
     events = []
     for line in text.strip().split("\n"):
         if line.startswith("data: "):
@@ -325,15 +345,24 @@ def fake_llm_stream(chunks):
     return _fake_stream_gen(chunks)
 
 
-def get_auth_headers(client, db, *, username="testuser", user_id="test_uid",
-                     email="test@test.com", password="password123"):
+def get_auth_headers(
+    client,
+    db,
+    *,
+    username="testuser",
+    user_id="test_uid",
+    email="test@test.com",
+    password="password123",
+):
     """Create a user (if needed) and return Authorization headers."""
     from api.models import User
     from core.auth.password import hash_password
+
     user = db.query(User).filter(User.username == username).first()
     if not user:
-        user = User(user_id=user_id, username=username,
-                    email=email, password_hash=hash_password(password))
+        user = User(
+            user_id=user_id, username=username, email=email, password_hash=hash_password(password)
+        )
         db.add(user)
         db.commit()
     resp = client.post("/auth/login", json={"username": username, "password": password})
@@ -343,6 +372,7 @@ def get_auth_headers(client, db, *, username="testuser", user_id="test_uid",
 def flush_persist_threads():
     """Join all background persistence threads. Call before DB assertions."""
     import sys
+
     mod = sys.modules.get("api.routers.chat")
     if mod is not None:
         mod._flush_persist_threads()
@@ -352,20 +382,25 @@ def flush_persist_threads():
 # Shared Fixtures for Selector Tests
 # ============================================================================
 
+
 @pytest.fixture
 def mock_llm_selector():
     """Mock LLM for selector tests."""
     from unittest.mock import Mock
     import json
-    
+
     llm = Mock()
-    llm.chat = Mock(return_value=json.dumps({
-        "query_pattern": "review pr",
-        "wrong_skills": ["summarize_pr"],
-        "correct_skills": ["code_review"],
-        "improvement_score": 0.8,
-        "evidence": "User feedback"
-    }))
+    llm.chat = Mock(
+        return_value=json.dumps(
+            {
+                "query_pattern": "review pr",
+                "wrong_skills": ["summarize_pr"],
+                "correct_skills": ["code_review"],
+                "improvement_score": 0.8,
+                "evidence": "User feedback",
+            }
+        )
+    )
     llm.chat_with_tools = Mock(return_value={"tool_calls": []})
     return llm
 
@@ -374,6 +409,7 @@ def mock_llm_selector():
 def clean_skill_learning_db(db_session):
     """Clean skill learning tables before test."""
     from api.models import SkillSelectionLearning, GateResult
+
     db_session.query(SkillSelectionLearning).delete()
     db_session.query(GateResult).filter(GateResult.change_type == "selector").delete()
     db_session.commit()
@@ -387,6 +423,7 @@ def clean_skill_learning_db(db_session):
 def clean_skill_events_db(db_session):
     """Clean skill selection events before test."""
     from api.models import SkillSelectionEvent
+
     db_session.query(SkillSelectionEvent).delete()
     db_session.commit()
     yield db_session

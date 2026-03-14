@@ -34,6 +34,7 @@ class TestExplainE2E:
     def db_factory(self):
         """Real DB factory for integration tests."""
         from api.database import SessionLocal
+
         return SessionLocal
 
     @pytest.fixture
@@ -43,11 +44,12 @@ class TestExplainE2E:
         yield memory_ids
         if memory_ids:
             from sqlalchemy import text
+
             db = db_factory()
             try:
                 db.execute(
                     text("DELETE FROM mem_memories WHERE memory_id IN :ids"),
-                    {"ids": tuple(memory_ids)}
+                    {"ids": tuple(memory_ids)},
                 )
                 db.commit()
             finally:
@@ -162,10 +164,14 @@ class TestExplainE2E:
 
         # Mock LLM to return memories
         mock_llm = MagicMock()
-        mock_llm.chat_with_tools.return_value = {"content": json.dumps([
-            {"type": "profile", "content": "User likes Go", "confidence": 0.9},
-            {"type": "semantic", "content": "Discussed testing", "confidence": 0.7},
-        ])}
+        mock_llm.chat_with_tools.return_value = {
+            "content": json.dumps(
+                [
+                    {"type": "profile", "content": "User likes Go", "confidence": 0.9},
+                    {"type": "semantic", "content": "Discussed testing", "confidence": 0.7},
+                ]
+            )
+        }
 
         result = run_typed_memory_pipeline(
             db_factory=db_factory,
@@ -178,11 +184,11 @@ class TestExplainE2E:
 
         # Cleanup created memories
         from sqlalchemy import text
+
         db = db_factory()
         try:
             rows = db.execute(
-                text("SELECT memory_id FROM mem_memories WHERE user_id = :uid"),
-                {"uid": user_id}
+                text("SELECT memory_id FROM mem_memories WHERE user_id = :uid"), {"uid": user_id}
             ).fetchall()
             for row in rows:
                 cleanup_memories.append(row.memory_id)
@@ -192,7 +198,7 @@ class TestExplainE2E:
         print("\n=== PIPELINE EXPLAIN OUTPUT ===")
         print(f"Result:")
         print(f"  - memories_extracted: {result.memories_extracted}")
-        
+
         if result.stats:
             print(f"Stats:")
             print(f"  - total_ms: {result.stats.total_ms:.2f}ms")
@@ -303,5 +309,7 @@ class TestExplainE2E:
 
         # CRITICAL: This is how we verify no silent fallback
         assert stats.vector_attempted, "Vector search should have been attempted"
-        assert stats.vector_error is None, f"Vector search should not have errors: {stats.vector_error}"
+        assert stats.vector_error is None, (
+            f"Vector search should not have errors: {stats.vector_error}"
+        )
         # If vector_hit is False but no error, it means no results (not fallback)

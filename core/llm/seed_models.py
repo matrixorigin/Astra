@@ -42,7 +42,12 @@ SEED_MODELS = [
         "input_modalities": ["text", "image"],
         "output_modalities": ["text"],
         "supported_parameters": ["tools", "vision", "temperature", "top_p"],
-        "pricing": {"prompt": 0.003, "completion": 0.015, "cache_read": 0.0003, "cache_write": 0.00375},
+        "pricing": {
+            "prompt": 0.003,
+            "completion": 0.015,
+            "cache_read": 0.0003,
+            "cache_write": 0.00375,
+        },
         "architecture": "transformer",
         "tags": ["code", "reasoning"],
         "is_active": True,
@@ -86,11 +91,21 @@ SEED_MODELS = [
 def seed_models(db: Session) -> int:
     """Insert default models if registry is empty. Returns count of seeded models."""
     from api.models import Config
-    if db.query(Config).filter(Config.key_name == "model_registry", Config.scope_type == "global").first():
+
+    if (
+        db.query(Config)
+        .filter(Config.key_name == "model_registry", Config.scope_type == "global")
+        .first()
+    ):
         return 0
-    db.add(Config(
-        config_id=str(uuid7()), key_name="model_registry",
-        value=json.dumps(SEED_MODELS), scope_type="global", scope_user_id=None,
-    ))
+    db.add(
+        Config(
+            config_id=str(uuid7()),
+            key_name="model_registry",
+            value=json.dumps(SEED_MODELS),
+            scope_type="global",
+            scope_user_id=None,
+        )
+    )
     db.commit()
     return len(SEED_MODELS)

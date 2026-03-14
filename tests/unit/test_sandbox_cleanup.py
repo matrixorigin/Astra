@@ -60,10 +60,12 @@ class TestSandboxCleaner:
         assert result == ["sandbox_orphan"]
 
     def test_run_calls_all_tiers(self, cleaner):
-        with patch.object(cleaner, "_find_closed_session_sandboxes", return_value=["s1"]), \
-             patch.object(cleaner, "_find_zombie_session_sandboxes", return_value=["s2"]), \
-             patch.object(cleaner, "_find_expired_unbound", return_value=[]), \
-             patch.object(cleaner, "_find_orphan_databases", return_value=["s3"]):
+        with (
+            patch.object(cleaner, "_find_closed_session_sandboxes", return_value=["s1"]),
+            patch.object(cleaner, "_find_zombie_session_sandboxes", return_value=["s2"]),
+            patch.object(cleaner, "_find_expired_unbound", return_value=[]),
+            patch.object(cleaner, "_find_orphan_databases", return_value=["s3"]),
+        ):
             result = cleaner.run(ttl_hours=24)
             # s1, s2 via _try_delete; s3 via _try_force_delete
             sb = cleaner.sandbox
@@ -75,10 +77,12 @@ class TestSandboxCleaner:
 
     def test_run_counts_failures(self, cleaner):
         cleaner.sandbox.delete.side_effect = RuntimeError("partial")
-        with patch.object(cleaner, "_find_closed_session_sandboxes", return_value=["s1"]), \
-             patch.object(cleaner, "_find_zombie_session_sandboxes", return_value=[]), \
-             patch.object(cleaner, "_find_expired_unbound", return_value=[]), \
-             patch.object(cleaner, "_find_orphan_databases", return_value=[]):
+        with (
+            patch.object(cleaner, "_find_closed_session_sandboxes", return_value=["s1"]),
+            patch.object(cleaner, "_find_zombie_session_sandboxes", return_value=[]),
+            patch.object(cleaner, "_find_expired_unbound", return_value=[]),
+            patch.object(cleaner, "_find_orphan_databases", return_value=[]),
+        ):
             result = cleaner.run()
             assert result["failed"] == 1
             assert result["cleaned"] == 0

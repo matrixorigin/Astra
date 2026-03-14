@@ -26,7 +26,7 @@ from core.skills.mocking import MockMode, ToolMockingLayer
 
 class ReplayService:
     """Replay business service with side-effect isolation
-    
+
     Core functionality:
     - replay_session: Replay entire session with ToolMockingLayer
     - compare_outputs: Compare original and replayed outputs
@@ -50,19 +50,19 @@ class ReplayService:
         user_id: str,
         sandbox_name: str | None = None,
         mock_mode: bool = True,
-        skill_version_override: dict[str, str] | None = None
+        skill_version_override: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Replay a session with side-effect isolation
-        
+
         Uses ToolMockingLayer to prevent real-world side effects during replay.
-        
+
         Workflow:
         1. Validate session exists and user has permission
         2. Fetch all events from session (in chronological order)
         3. Replay each event through ToolMockingLayer
         4. Generate replay report
         5. Record audit log
-        
+
         Args:
             session_id: Session ID to replay
             user_id: User ID (for permission validation)
@@ -73,7 +73,7 @@ class ReplayService:
             skill_version_override: Skill version override (optional, for testing new versions)
                 Format: {"skill_name": "version"}
                 Example: {"code_review": "2.0.0"}
-            
+
         Returns:
             Replay result dict containing:
             - replay_id (str): Replay ID
@@ -88,7 +88,7 @@ class ReplayService:
             - sandbox_name (str|None): Sandbox name used
             - mock_mode (bool): Whether mock mode was used
             - created_at (str): Creation time (ISO format)
-            
+
         Raises:
             ResourceNotFoundError: Session not found
             PermissionDeniedError: User lacks permission
@@ -109,9 +109,7 @@ class ReplayService:
             replayed_events = []
             for event in events:
                 replayed_event = self._replay_event(
-                    event=event,
-                    mock_mode=mock_mode,
-                    skill_version_override=skill_version_override
+                    event=event, mock_mode=mock_mode, skill_version_override=skill_version_override
                 )
                 replayed_events.append(replayed_event)
 
@@ -123,7 +121,7 @@ class ReplayService:
                 "events": replayed_events,
                 "total": total,
                 "successful": sum(1 for e in replayed_events if e.get("success", False)),
-                "failed": sum(1 for e in replayed_events if not e.get("success", False))
+                "failed": sum(1 for e in replayed_events if not e.get("success", False)),
             }
 
             # 6. Record audit log
@@ -138,9 +136,9 @@ class ReplayService:
                     "mock_mode": mock_mode,
                     "events_count": total,
                     "successful": replay_result["successful"],
-                    "failed": replay_result["failed"]
+                    "failed": replay_result["failed"],
                 },
-                status="success"
+                status="success",
             )
 
             return {
@@ -151,7 +149,7 @@ class ReplayService:
                 "sandbox_name": sandbox_name,
                 "mock_mode": mock_mode,
                 "result": replay_result,
-                "created_at": datetime.now(timezone.utc).isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat(),
             }
 
         except Exception as e:
@@ -162,27 +160,24 @@ class ReplayService:
                 resource_type="session",
                 resource_id=session_id,
                 details={"error": str(e)},
-                status="failed"
+                status="failed",
             )
             raise
 
     def _replay_event(
-        self,
-        event: Any,
-        mock_mode: bool,
-        skill_version_override: dict[str, str] | None
+        self, event: Any, mock_mode: bool, skill_version_override: dict[str, str] | None
     ) -> dict[str, Any]:
         """Replay a single event with side-effect isolation
-        
+
         Uses ToolMockingLayer for safe replay:
         - Mock mode: Return recorded results (no side effects)
         - Actual mode: Re-execute skills (requires integration)
-        
+
         Args:
             event: Event object (from EventRepository)
             mock_mode: Whether to use mock mode
             skill_version_override: Skill version override dict
-            
+
         Returns:
             Replay result dict containing:
             - event_id (str): Event ID
@@ -196,14 +191,18 @@ class ReplayService:
         mocker = ToolMockingLayer(
             mode=execution_mode,
             db_factory=self._db_factory,
-            session_id=event.session_id if mock_mode else None
+            session_id=event.session_id if mock_mode else None,
         )
 
         try:
             if event.event_type == "tool_call" and event.skill_name:
                 # Replay tool invocation via mocking layer
                 skill_name = event.skill_name
-                skill_version = skill_version_override.get(skill_name) if skill_version_override else event.skill_version
+                skill_version = (
+                    skill_version_override.get(skill_name)
+                    if skill_version_override
+                    else event.skill_version
+                )
 
                 # Parse skill params from metadata
                 metadata = event.event_metadata if event.event_metadata else {}
@@ -211,9 +210,7 @@ class ReplayService:
 
                 # Invoke skill through mocking layer
                 result = mocker.invoke_skill(
-                    skill_name=skill_name,
-                    params=skill_params,
-                    skill_version=skill_version
+                    skill_name=skill_name, params=skill_params, skill_version=skill_version
                 )
 
                 return {
@@ -221,7 +218,7 @@ class ReplayService:
                     "event_type": event.event_type,
                     "success": True,
                     "content": json.dumps(result),
-                    "error": None
+                    "error": None,
                 }
 
             else:
@@ -231,7 +228,7 @@ class ReplayService:
                     "event_type": event.event_type,
                     "success": True,
                     "content": event.content,
-                    "error": None
+                    "error": None,
                 }
 
         except Exception as e:
@@ -240,31 +237,28 @@ class ReplayService:
                 "event_type": event.event_type,
                 "success": False,
                 "content": None,
-                "error": str(e)
+                "error": str(e),
             }
 
     def compare_outputs(
-        self,
-        session_id: str,
-        user_id: str,
-        replay_result: dict[str, Any]
+        self, session_id: str, user_id: str, replay_result: dict[str, Any]
     ) -> dict[str, Any]:
         """Compare original outputs with replayed outputs
-        
+
         Compares original session with replayed results for:
         1. Verifying system behavior consistency (consistency check)
         2. Detecting regression issues (regression detection)
         3. Assessing new version impact (impact assessment)
         4. Quality assurance (QA)
-        
+
         Args:
             session_id: Session ID
             user_id: User ID (for permission validation)
             replay_result: Replay result (from replay_session)
-            
+
         Returns:
             Comparison result dict
-            
+
         Raises:
             PermissionDeniedError: User lacks permission
         """
@@ -287,14 +281,16 @@ class ReplayService:
             # Check if content matches
             if orig.content != replay.get("content"):
                 mismatched += 1
-                details.append({
-                    "event_index": i,
-                    "event_id": orig.event_id,
-                    "event_type": orig.event_type,
-                    "original": orig.content[:100] if orig.content else "",
-                    "replayed": replay.get("content", "")[:100],
-                    "match": False
-                })
+                details.append(
+                    {
+                        "event_index": i,
+                        "event_id": orig.event_id,
+                        "event_type": orig.event_type,
+                        "original": orig.content[:100] if orig.content else "",
+                        "replayed": replay.get("content", "")[:100],
+                        "match": False,
+                    }
+                )
 
         return {
             "session_id": session_id,
@@ -304,7 +300,7 @@ class ReplayService:
             "match": original_count == replay_count and mismatched == 0,
             "mismatched_events": mismatched,
             "details": details[:10],  # Limit to 10 for readability
-            "compared_at": datetime.now(timezone.utc).isoformat()
+            "compared_at": datetime.now(timezone.utc).isoformat(),
         }
 
     def verify_reproducibility(self, session_id: str, user_id: str) -> dict[str, Any]:
@@ -336,11 +332,13 @@ class ReplayService:
             if event.event_type == "tool_call" and event.skill_name:
                 metadata = event.event_metadata or {}
                 if not metadata.get("skill_params"):
-                    issues.append({
-                        "type": "missing_input",
-                        "event_id": event.event_id,
-                        "message": "Event metadata missing skill_params",
-                    })
+                    issues.append(
+                        {
+                            "type": "missing_input",
+                            "event_id": event.event_id,
+                            "message": "Event metadata missing skill_params",
+                        }
+                    )
 
         return {
             "session_id": session_id,

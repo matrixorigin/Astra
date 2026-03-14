@@ -72,7 +72,8 @@ def evolve_opinions(
         return result
 
     scene_nodes = [
-        n for n in store.get_nodes_by_ids(list(activated_ids))
+        n
+        for n in store.get_nodes_by_ids(list(activated_ids))
         if n.node_type == NodeType.SCENE and n.is_active
     ]
     if not scene_nodes:
@@ -93,7 +94,9 @@ def evolve_opinions(
             memory_type=MemoryType.SEMANTIC,
             content=scene.content,
             initial_confidence=scene.confidence,
-            trust_tier=TrustTier(scene.trust_tier) if scene.trust_tier in {t.value for t in TrustTier} else TrustTier.T3_INFERRED,
+            trust_tier=TrustTier(scene.trust_tier)
+            if scene.trust_tier in {t.value for t in TrustTier}
+            else TrustTier.T3_INFERRED,
         )
 
         update = evolver.evaluate_evidence(sim, scene_mem)
@@ -113,7 +116,9 @@ def evolve_opinions(
         if update.quarantined:
             store.deactivate_node(scene.node_id)
             result.quarantined += 1
-            logger.info("Scene %s quarantined (confidence %.2f)", scene.node_id, update.new_confidence)
+            logger.info(
+                "Scene %s quarantined (confidence %.2f)", scene.node_id, update.new_confidence
+            )
         elif update.new_confidence != update.old_confidence:
             store.update_confidence(scene.node_id, update.new_confidence)
 

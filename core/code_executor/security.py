@@ -18,39 +18,109 @@ class SecurityVerdict:
 
 
 # Modules that can escape the sandbox
-DEFAULT_DENY_IMPORTS = frozenset({
-    "os", "subprocess", "sys", "shutil", "socket", "ctypes", "pickle",
-    "multiprocessing", "http", "ftplib", "telnetlib", "signal", "importlib",
-    "pathlib", "glob", "tempfile", "webbrowser", "code", "codeop",
-    "compileall", "py_compile",
-})
+DEFAULT_DENY_IMPORTS = frozenset(
+    {
+        "os",
+        "subprocess",
+        "sys",
+        "shutil",
+        "socket",
+        "ctypes",
+        "pickle",
+        "multiprocessing",
+        "http",
+        "ftplib",
+        "telnetlib",
+        "signal",
+        "importlib",
+        "pathlib",
+        "glob",
+        "tempfile",
+        "webbrowser",
+        "code",
+        "codeop",
+        "compileall",
+        "py_compile",
+    }
+)
 
 # Safe for data work
-DEFAULT_ALLOW_IMPORTS = frozenset({
-    "json", "math", "datetime", "re", "collections", "itertools", "functools",
-    "typing", "dataclasses", "decimal", "statistics", "csv", "io", "hashlib",
-    "uuid", "string", "textwrap", "enum", "copy", "operator", "numbers",
-    "fractions", "random", "bisect", "heapq", "array", "pprint",
-})
+DEFAULT_ALLOW_IMPORTS = frozenset(
+    {
+        "json",
+        "math",
+        "datetime",
+        "re",
+        "collections",
+        "itertools",
+        "functools",
+        "typing",
+        "dataclasses",
+        "decimal",
+        "statistics",
+        "csv",
+        "io",
+        "hashlib",
+        "uuid",
+        "string",
+        "textwrap",
+        "enum",
+        "copy",
+        "operator",
+        "numbers",
+        "fractions",
+        "random",
+        "bisect",
+        "heapq",
+        "array",
+        "pprint",
+    }
+)
 
 # Dangerous builtins
-DANGEROUS_CALLS = frozenset({
-    "exec", "eval", "compile", "__import__", "globals", "locals",
-    "getattr", "setattr", "delattr", "breakpoint", "exit", "quit",
-    "open",  # File I/O — should use DB instead
-})
+DANGEROUS_CALLS = frozenset(
+    {
+        "exec",
+        "eval",
+        "compile",
+        "__import__",
+        "globals",
+        "locals",
+        "getattr",
+        "setattr",
+        "delattr",
+        "breakpoint",
+        "exit",
+        "quit",
+        "open",  # File I/O — should use DB instead
+    }
+)
 
 # Dangerous attribute access patterns (bypass vectors)
-DANGEROUS_ATTRS = frozenset({
-    "__builtins__", "__subclasses__", "__bases__", "__mro__",
-    "__class__", "__globals__", "__code__", "__func__",
-    "__self__", "__dict__", "__init_subclass__",
-})
+DANGEROUS_ATTRS = frozenset(
+    {
+        "__builtins__",
+        "__subclasses__",
+        "__bases__",
+        "__mro__",
+        "__class__",
+        "__globals__",
+        "__code__",
+        "__func__",
+        "__self__",
+        "__dict__",
+        "__init_subclass__",
+    }
+)
 
 # Dangerous names used as identifiers (not calls)
-DANGEROUS_NAMES = frozenset({
-    "__builtins__", "__loader__", "__spec__",
-})
+DANGEROUS_NAMES = frozenset(
+    {
+        "__builtins__",
+        "__loader__",
+        "__spec__",
+    }
+)
 
 
 class SecurityGuard:
@@ -74,20 +144,27 @@ class SecurityGuard:
         self.allow_imports = allow_imports or set(DEFAULT_ALLOW_IMPORTS)
 
     def analyze(
-        self, code: str, language: str = "python",
+        self,
+        code: str,
+        language: str = "python",
         extra_allowed: list[str] | None = None,
     ) -> SecurityVerdict:
         if language != "python":
-            return SecurityVerdict(safe=False, issues=[
-                SecurityIssue("unsupported", f"Language {language} not supported for analysis", 0)
-            ])
+            return SecurityVerdict(
+                safe=False,
+                issues=[
+                    SecurityIssue(
+                        "unsupported", f"Language {language} not supported for analysis", 0
+                    )
+                ],
+            )
 
         try:
             tree = ast.parse(code)
         except SyntaxError as e:
-            return SecurityVerdict(safe=False, issues=[
-                SecurityIssue("syntax_error", str(e), e.lineno or 0)
-            ])
+            return SecurityVerdict(
+                safe=False, issues=[SecurityIssue("syntax_error", str(e), e.lineno or 0)]
+            )
 
         allowed = self.allow_imports | set(extra_allowed or [])
         issues: list[SecurityIssue] = []
@@ -108,38 +185,53 @@ class SecurityGuard:
             elif isinstance(node, ast.Call):
                 name = self._get_call_name(node)
                 if name in DANGEROUS_CALLS:
-                    issues.append(SecurityIssue(
-                        "dangerous_call", f"Call to '{name}' is not allowed", node.lineno,
-                    ))
+                    issues.append(
+                        SecurityIssue(
+                            "dangerous_call",
+                            f"Call to '{name}' is not allowed",
+                            node.lineno,
+                        )
+                    )
 
             # Check dangerous attribute access (__builtins__, __subclasses__, etc.)
             elif isinstance(node, ast.Attribute):
                 if node.attr in DANGEROUS_ATTRS:
-                    issues.append(SecurityIssue(
-                        "dangerous_attr",
-                        f"Access to '{node.attr}' is not allowed",
-                        node.lineno,
-                    ))
+                    issues.append(
+                        SecurityIssue(
+                            "dangerous_attr",
+                            f"Access to '{node.attr}' is not allowed",
+                            node.lineno,
+                        )
+                    )
 
             # Check dangerous name references
             elif isinstance(node, ast.Name):
                 if node.id in DANGEROUS_NAMES:
-                    issues.append(SecurityIssue(
-                        "dangerous_name",
-                        f"Reference to '{node.id}' is not allowed",
-                        node.lineno,
-                    ))
+                    issues.append(
+                        SecurityIssue(
+                            "dangerous_name",
+                            f"Reference to '{node.id}' is not allowed",
+                            node.lineno,
+                        )
+                    )
 
         return SecurityVerdict(safe=len(issues) == 0, issues=issues)
 
     def _check_import(
-        self, module: str, line: int,
-        allowed: set[str], issues: list[SecurityIssue],
+        self,
+        module: str,
+        line: int,
+        allowed: set[str],
+        issues: list[SecurityIssue],
     ) -> None:
         if module in self.deny_imports:
-            issues.append(SecurityIssue(
-                "dangerous_import", f"Import '{module}' is blocked", line,
-            ))
+            issues.append(
+                SecurityIssue(
+                    "dangerous_import",
+                    f"Import '{module}' is blocked",
+                    line,
+                )
+            )
         elif module not in allowed:
             # Unknown module — not in deny or allow list. Allow it but could be stricter.
             pass

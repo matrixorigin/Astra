@@ -36,8 +36,9 @@ SUMMARY_NAMES_LIMIT = 5
 
 class DiagnosisLevel(str, Enum):
     """Level of detail in diagnosis report."""
-    SUMMARY = "summary"      # Counts + up to 5 names per category
-    DETAILED = "detailed"    # Full diagnosis of ONE issue
+
+    SUMMARY = "summary"  # Counts + up to 5 names per category
+    DETAILED = "detailed"  # Full diagnosis of ONE issue
 
 
 class DiagnoseSkillsInput(SkillInput):
@@ -119,7 +120,11 @@ class DiagnoseSkillsSkill(Skill[DiagnoseSkillsInput, DiagnoseSkillsOutput]):
             output = DiagnoseSkillsOutput(success=True)
 
             # Sources to check
-            sources = ["user", "builtin", "marketplace"] if input_data.source == "all" else [input_data.source]
+            sources = (
+                ["user", "builtin", "marketplace"]
+                if input_data.source == "all"
+                else [input_data.source]
+            )
 
             # Load local skills once
             project_root = Path(__file__).resolve().parent.parent.parent
@@ -131,10 +136,14 @@ class DiagnoseSkillsSkill(Skill[DiagnoseSkillsInput, DiagnoseSkillsOutput]):
             load_errors: list[tuple[str, str, str]] = []  # (name, skill_id, error)
             mismatches: list[tuple[str, str, str, str]] = []  # (name, skill_id, db_ver, local_ver)
 
-            db_skills = db.query(SkillModel).filter(
-                SkillModel.is_active == 1,
-                SkillModel.source.in_(sources),
-            ).all()
+            db_skills = (
+                db.query(SkillModel)
+                .filter(
+                    SkillModel.is_active == 1,
+                    SkillModel.source.in_(sources),
+                )
+                .all()
+            )
 
             output.total_skills = len(db_skills)
 
@@ -168,9 +177,9 @@ class DiagnoseSkillsSkill(Skill[DiagnoseSkillsInput, DiagnoseSkillsOutput]):
             output.load_error_names = [n for n, _, _ in load_errors[:SUMMARY_NAMES_LIMIT]]
             output.mismatch_names = [n for n, _, _, _ in mismatches[:SUMMARY_NAMES_LIMIT]]
             output.more_issues = (
-                len(orphaned) > SUMMARY_NAMES_LIMIT or
-                len(load_errors) > SUMMARY_NAMES_LIMIT or
-                len(mismatches) > SUMMARY_NAMES_LIMIT
+                len(orphaned) > SUMMARY_NAMES_LIMIT
+                or len(load_errors) > SUMMARY_NAMES_LIMIT
+                or len(mismatches) > SUMMARY_NAMES_LIMIT
             )
 
             # Detailed mode: diagnose ONE skill
@@ -178,7 +187,9 @@ class DiagnoseSkillsSkill(Skill[DiagnoseSkillsInput, DiagnoseSkillsOutput]):
                 target = input_data.skill_name
                 if target:
                     # User specified a skill
-                    output.diagnosis = self._detailed_diagnosis(target, project_root, loadable, db_skills)
+                    output.diagnosis = self._detailed_diagnosis(
+                        target, project_root, loadable, db_skills
+                    )
                 else:
                     # Pick first problematic skill
                     if orphaned:
@@ -199,7 +210,9 @@ class DiagnoseSkillsSkill(Skill[DiagnoseSkillsInput, DiagnoseSkillsOutput]):
                             "issue_type": "load_error",
                             "message": err,
                             "suggestion": "Fix the error in skill.py",
-                            "details": {"skill_py_path": str(project_root / "skills" / name / "skill.py")},
+                            "details": {
+                                "skill_py_path": str(project_root / "skills" / name / "skill.py")
+                            },
                         }
                     elif mismatches:
                         name, sid, db_ver, local_ver = mismatches[0]
@@ -218,13 +231,19 @@ class DiagnoseSkillsSkill(Skill[DiagnoseSkillsInput, DiagnoseSkillsOutput]):
                 output.suggestions.append("All skills healthy!")
             else:
                 if output.orphaned:
-                    output.suggestions.append(f"{output.orphaned} orphaned - restore files or cleanup DB")
+                    output.suggestions.append(
+                        f"{output.orphaned} orphaned - restore files or cleanup DB"
+                    )
                 if output.load_errors:
                     output.suggestions.append(f"{output.load_errors} load errors - fix skill.py")
                 if output.version_mismatches:
-                    output.suggestions.append(f"{output.version_mismatches} version mismatches - re-register")
+                    output.suggestions.append(
+                        f"{output.version_mismatches} version mismatches - re-register"
+                    )
                 if output.more_issues:
-                    output.suggestions.append("Use detailed mode with skill_name to inspect specific skill")
+                    output.suggestions.append(
+                        "Use detailed mode with skill_name to inspect specific skill"
+                    )
 
             return output
 
@@ -293,6 +312,7 @@ class DiagnoseSkillsSkill(Skill[DiagnoseSkillsInput, DiagnoseSkillsOutput]):
 
         try:
             import importlib.util
+
             spec = importlib.util.spec_from_file_location("_diag", skill_py)
             if spec is None or spec.loader is None:
                 return "Failed to create module spec"

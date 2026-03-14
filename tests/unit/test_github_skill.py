@@ -141,9 +141,11 @@ class TestGitHubAPIMethods:
         assert "key_files" not in result
 
         # normal does not write to cache
-        cached = db_session.query(SkGithubPRCache).filter_by(
-            repo_full_name="owner/repo", pr_number=42
-        ).one_or_none()
+        cached = (
+            db_session.query(SkGithubPRCache)
+            .filter_by(repo_full_name="owner/repo", pr_number=42)
+            .one_or_none()
+        )
         assert cached is None
 
     @pytest.mark.asyncio
@@ -151,8 +153,10 @@ class TestGitHubAPIMethods:
         """ci_conclusion=failure when any check run failed."""
         mock_repo = MagicMock()
         mock_repo.get_pull.return_value = self._make_mock_pr(1)
-        check_pass = MagicMock(); check_pass.conclusion = "success"
-        check_fail = MagicMock(); check_fail.conclusion = "failure"
+        check_pass = MagicMock()
+        check_pass.conclusion = "success"
+        check_fail = MagicMock()
+        check_fail.conclusion = "failure"
         mock_repo.get_commit.return_value.get_check_runs.return_value = [check_pass, check_fail]
         mock_gh_client.get_repo.return_value = mock_repo
 
@@ -164,8 +168,10 @@ class TestGitHubAPIMethods:
         """ci_conclusion=success when all checks passed (including skipped)."""
         mock_repo = MagicMock()
         mock_repo.get_pull.return_value = self._make_mock_pr(1)
-        check1 = MagicMock(); check1.conclusion = "success"
-        check2 = MagicMock(); check2.conclusion = "skipped"
+        check1 = MagicMock()
+        check1.conclusion = "success"
+        check2 = MagicMock()
+        check2.conclusion = "skipped"
         mock_repo.get_commit.return_value.get_check_runs.return_value = [check1, check2]
         mock_gh_client.get_repo.return_value = mock_repo
 
@@ -371,8 +377,12 @@ class TestGitHubAPIMethods:
         mock_repo.get_issues.return_value = [self._make_mock_issue(1)]
         mock_gh_client.get_repo.return_value = mock_repo
         await api.list_issues(
-            "owner/repo", labels=["bug"], sort="updated",
-            direction="asc", assignee="alice", creator="bob",
+            "owner/repo",
+            labels=["bug"],
+            sort="updated",
+            direction="asc",
+            assignee="alice",
+            creator="bob",
         )
         call_kwargs = mock_repo.get_issues.call_args[1]
         assert call_kwargs["labels"] == ["bug"]
@@ -408,9 +418,7 @@ class TestGitHubAPIMethods:
 
     @pytest.mark.asyncio
     async def test_list_issues_repo_not_found(self, api, mock_gh_client):
-        mock_gh_client.get_repo.side_effect = GithubException(
-            404, {"message": "Not Found"}, None
-        )
+        mock_gh_client.get_repo.side_effect = GithubException(404, {"message": "Not Found"}, None)
         with pytest.raises(GitHubError, match="not found"):
             await api.list_issues("owner/nonexistent")
 
@@ -418,9 +426,7 @@ class TestGitHubAPIMethods:
     async def test_list_issues_rate_limited(self, api, mock_gh_client):
         """Rate limit from get_issues() call (not _get_repo)."""
         mock_repo = MagicMock()
-        mock_repo.get_issues.side_effect = GithubException(
-            403, {"message": "rate limit"}, None
-        )
+        mock_repo.get_issues.side_effect = GithubException(403, {"message": "rate limit"}, None)
         mock_gh_client.get_repo.return_value = mock_repo
         with pytest.raises(GitHubRateLimitError):
             await api.list_issues("owner/repo")
@@ -473,9 +479,7 @@ class TestGitHubAPIMethods:
     @pytest.mark.asyncio
     async def test_get_issue_not_found(self, api, mock_gh_client):
         mock_repo = MagicMock()
-        mock_repo.get_issue.side_effect = GithubException(
-            404, {"message": "Not Found"}, None
-        )
+        mock_repo.get_issue.side_effect = GithubException(404, {"message": "Not Found"}, None)
         mock_gh_client.get_repo.return_value = mock_repo
         with pytest.raises(GitHubError, match="not found"):
             await api.get_issue("owner/repo", 999)
@@ -484,9 +488,7 @@ class TestGitHubAPIMethods:
     async def test_get_issue_rate_limited(self, api, mock_gh_client):
         """Rate limit from get_issue() call (not _get_repo)."""
         mock_repo = MagicMock()
-        mock_repo.get_issue.side_effect = GithubException(
-            403, {"message": "rate limit"}, None
-        )
+        mock_repo.get_issue.side_effect = GithubException(403, {"message": "rate limit"}, None)
         mock_gh_client.get_repo.return_value = mock_repo
         with pytest.raises(GitHubRateLimitError):
             await api.get_issue("owner/repo", 1)
@@ -502,9 +504,7 @@ class TestGitHubAPIMethods:
         assert result["number"] == 99
         assert result["title"] == "New bug"
         assert result["body"] == "desc"
-        mock_repo.create_issue.assert_called_once_with(
-            title="New bug", body="desc", labels=["bug"]
-        )
+        mock_repo.create_issue.assert_called_once_with(title="New bug", body="desc", labels=["bug"])
 
     @pytest.mark.asyncio
     async def test_create_issue_minimal(self, api, mock_gh_client):
@@ -522,9 +522,7 @@ class TestGitHubAPIMethods:
     @pytest.mark.asyncio
     async def test_create_issue_rate_limited(self, api, mock_gh_client):
         mock_repo = MagicMock()
-        mock_repo.create_issue.side_effect = GithubException(
-            403, {"message": "rate limit"}, None
-        )
+        mock_repo.create_issue.side_effect = GithubException(403, {"message": "rate limit"}, None)
         mock_gh_client.get_repo.return_value = mock_repo
         with pytest.raises(GitHubRateLimitError):
             await api.create_issue("owner/repo", "title")
@@ -537,7 +535,9 @@ class TestGitHubAPIMethods:
         mock_gh_client.get_repo.return_value = mock_repo
         await api.create_issue("owner/repo", "Assigned", labels=["bug"], assignees=["alice", "bob"])
         mock_repo.create_issue.assert_called_once_with(
-            title="Assigned", labels=["bug"], assignees=["alice", "bob"],
+            title="Assigned",
+            labels=["bug"],
+            assignees=["alice", "bob"],
         )
 
     @pytest.mark.asyncio
@@ -563,9 +563,7 @@ class TestGitHubAPIMethods:
     @pytest.mark.asyncio
     async def test_get_issue_generic_error(self, api, mock_gh_client):
         mock_repo = MagicMock()
-        mock_repo.get_issue.side_effect = GithubException(
-            500, {"message": "Internal"}, None
-        )
+        mock_repo.get_issue.side_effect = GithubException(500, {"message": "Internal"}, None)
         mock_gh_client.get_repo.return_value = mock_repo
         with pytest.raises(GitHubError, match="Internal"):
             await api.get_issue("owner/repo", 1)
@@ -657,18 +655,14 @@ class TestGitHubAPIMethods:
     @pytest.mark.asyncio
     async def test_get_issue_repo_not_found_propagates(self, api, mock_gh_client):
         """GitHubError from _get_repo propagates through get_issue."""
-        mock_gh_client.get_repo.side_effect = GithubException(
-            404, {"message": "Not Found"}, None
-        )
+        mock_gh_client.get_repo.side_effect = GithubException(404, {"message": "Not Found"}, None)
         with pytest.raises(GitHubError, match="not found"):
             await api.get_issue("owner/gone", 1)
 
     @pytest.mark.asyncio
     async def test_create_issue_repo_not_found_propagates(self, api, mock_gh_client):
         """GitHubError from _get_repo propagates through create_issue."""
-        mock_gh_client.get_repo.side_effect = GithubException(
-            404, {"message": "Not Found"}, None
-        )
+        mock_gh_client.get_repo.side_effect = GithubException(404, {"message": "Not Found"}, None)
         with pytest.raises(GitHubError, match="not found"):
             await api.create_issue("owner/gone", "title")
 
@@ -691,6 +685,7 @@ class TestActions:
     @pytest.mark.asyncio
     async def test_list_prs_action(self):
         from skills.github.actions import ListPRsAction, ListPRsInput
+
         mock_api = AsyncMock(spec=GitHubSkillAPI)
         mock_api.list_prs.return_value = [
             {"number": 1, "title": "PR1", "user": "a", "created_at": "t", "html_url": "u"}
@@ -703,9 +698,11 @@ class TestActions:
     @pytest.mark.asyncio
     async def test_get_pr_checks_action(self):
         from skills.github.actions import GetPRChecksAction, GetPRChecksInput
+
         mock_api = AsyncMock(spec=GitHubSkillAPI)
         mock_api.get_pr_checks.return_value = {
-            "pr_number": 1, "overall": "success",
+            "pr_number": 1,
+            "overall": "success",
             "check_runs": [{"name": "CI", "status": "completed", "conclusion": "success"}],
         }
         action = GetPRChecksAction(api=mock_api)
@@ -715,11 +712,18 @@ class TestActions:
     @pytest.mark.asyncio
     async def test_ci_status_action(self):
         from skills.github.actions import CIStatusAction, CIStatusInput
+
         mock_api = AsyncMock(spec=GitHubSkillAPI)
         mock_api.list_wf_runs.return_value = [
-            {"workflow": "Build", "conclusion": "success",
-             "branch": "main", "pr_number": None, "actor": "bot",
-             "triggered_at": "2026-03-06 12:00", "url": "u"}
+            {
+                "workflow": "Build",
+                "conclusion": "success",
+                "branch": "main",
+                "pr_number": None,
+                "actor": "bot",
+                "triggered_at": "2026-03-06 12:00",
+                "url": "u",
+            }
         ]
         action = CIStatusAction(api=mock_api)
         result = await action.execute(CIStatusInput(repo="o/r"))
@@ -738,6 +742,7 @@ class TestActions:
     @pytest.mark.asyncio
     async def test_ci_status_action_empty_runs(self):
         from skills.github.actions import CIStatusAction, CIStatusInput
+
         mock_api = AsyncMock(spec=GitHubSkillAPI)
         mock_api.list_wf_runs.return_value = []
         action = CIStatusAction(api=mock_api)
@@ -756,10 +761,18 @@ class TestActions:
     async def test_ci_status_action_nonempty_no_guidance(self):
         """Non-empty workflows should NOT set guidance or user_message."""
         from skills.github.actions import CIStatusAction, CIStatusInput
+
         mock_api = AsyncMock(spec=GitHubSkillAPI)
         mock_api.list_wf_runs.return_value = [
-            {"workflow": "CI", "conclusion": "success", "branch": "main",
-             "pr_number": None, "actor": "bot", "triggered_at": "t", "url": "u"}
+            {
+                "workflow": "CI",
+                "conclusion": "success",
+                "branch": "main",
+                "pr_number": None,
+                "actor": "bot",
+                "triggered_at": "t",
+                "url": "u",
+            }
         ]
         action = CIStatusAction(api=mock_api)
         result = await action.execute(CIStatusInput(repo="o/r"))
@@ -769,10 +782,17 @@ class TestActions:
     @pytest.mark.asyncio
     async def test_list_issues_action(self):
         from skills.github.actions import ListIssuesAction, ListIssuesInput
+
         mock_api = AsyncMock(spec=GitHubSkillAPI)
         mock_api.list_issues.return_value = [
-            {"number": 1, "title": "Bug", "state": "open", "user": "a",
-             "labels": ["bug"], "html_url": "u"}
+            {
+                "number": 1,
+                "title": "Bug",
+                "state": "open",
+                "user": "a",
+                "labels": ["bug"],
+                "html_url": "u",
+            }
         ]
         action = ListIssuesAction(api=mock_api)
         inp = ListIssuesInput(repo="o/r", state="closed", labels=["bug"], sort="updated", limit=5)
@@ -783,18 +803,36 @@ class TestActions:
         assert result.issues[0]["title"] == "Bug"
         # Verify parameters forwarded correctly
         mock_api.list_issues.assert_called_once_with(
-            "o/r", "closed", ["bug"], "updated", "desc",
-            None, None, None, None, 5, "brief",
+            "o/r",
+            "closed",
+            ["bug"],
+            "updated",
+            "desc",
+            None,
+            None,
+            None,
+            None,
+            5,
+            "brief",
         )
 
     @pytest.mark.asyncio
     async def test_get_issue_action(self):
         from skills.github.actions import GetIssueAction, GetIssueInput
+
         mock_api = AsyncMock(spec=GitHubSkillAPI)
         mock_api.get_issue.return_value = {
-            "number": 42, "title": "Bug", "body": "desc", "state": "open",
-            "user": "a", "labels": [], "assignees": [], "created_at": "t",
-            "updated_at": "t", "html_url": "u", "comments": 0,
+            "number": 42,
+            "title": "Bug",
+            "body": "desc",
+            "state": "open",
+            "user": "a",
+            "labels": [],
+            "assignees": [],
+            "created_at": "t",
+            "updated_at": "t",
+            "html_url": "u",
+            "comments": 0,
         }
         action = GetIssueAction(api=mock_api)
         result = await action.execute(GetIssueInput(repo="o/r", issue_number=42, detail="full"))
@@ -806,20 +844,36 @@ class TestActions:
     @pytest.mark.asyncio
     async def test_create_issue_action(self):
         from skills.github.actions import CreateIssueAction, CreateIssueInput
+
         mock_api = AsyncMock(spec=GitHubSkillAPI)
         mock_api.create_issue.return_value = {
-            "number": 99, "title": "New", "body": "body text", "state": "open",
-            "user": "a", "labels": ["bug"], "html_url": "u",
+            "number": 99,
+            "title": "New",
+            "body": "body text",
+            "state": "open",
+            "user": "a",
+            "labels": ["bug"],
+            "html_url": "u",
         }
         action = CreateIssueAction(api=mock_api)
-        result = await action.execute(CreateIssueInput(
-            repo="o/r", title="New", body="body text", labels=["bug"], assignees=["alice"],
-        ))
+        result = await action.execute(
+            CreateIssueInput(
+                repo="o/r",
+                title="New",
+                body="body text",
+                labels=["bug"],
+                assignees=["alice"],
+            )
+        )
         assert result.success
         assert result.issue["number"] == 99
         assert result.issue["body"] == "body text"
         mock_api.create_issue.assert_called_once_with(
-            "o/r", "New", "body text", ["bug"], ["alice"],
+            "o/r",
+            "New",
+            "body text",
+            ["bug"],
+            ["alice"],
         )
 
     @pytest.mark.asyncio
@@ -827,6 +881,7 @@ class TestActions:
         from pydantic import ValidationError
 
         from skills.github.actions import CreateIssueInput
+
         with pytest.raises(ValidationError, match="title"):
             CreateIssueInput(repo="o/r", title="   ")
 
@@ -840,6 +895,7 @@ class TestBuiltinIssueSkills:
     @pytest.mark.asyncio
     async def test_list_issues_skill_delegates_through_shim(self):
         from core.skills.builtin import ListIssuesInput, ListIssuesSkill
+
         mock_github = AsyncMock()
         mock_github.list_issues.return_value = [{"number": 1, "title": "Bug"}]
         skill = ListIssuesSkill(github=mock_github)
@@ -847,12 +903,23 @@ class TestBuiltinIssueSkills:
         assert result.success
         assert result.issues == [{"number": 1, "title": "Bug"}]
         mock_github.list_issues.assert_called_once_with(
-            "o/r", "closed", None, "created", "desc", None, None, None, None, 5, "brief",
+            "o/r",
+            "closed",
+            None,
+            "created",
+            "desc",
+            None,
+            None,
+            None,
+            None,
+            5,
+            "brief",
         )
 
     @pytest.mark.asyncio
     async def test_list_issues_skill_missing_repo(self):
         from core.skills.builtin import ListIssuesInput, ListIssuesSkill
+
         skill = ListIssuesSkill(github=AsyncMock())
         result = await skill.execute(ListIssuesInput(repo="", state="open"))
         assert result.success is False
@@ -861,6 +928,7 @@ class TestBuiltinIssueSkills:
     @pytest.mark.asyncio
     async def test_get_issue_skill_delegates_through_shim(self):
         from core.skills.builtin import GetIssueInput, GetIssueSkill
+
         mock_github = AsyncMock()
         mock_github.get_issue.return_value = {"number": 42, "title": "Bug"}
         skill = GetIssueSkill(github=mock_github)
@@ -872,6 +940,7 @@ class TestBuiltinIssueSkills:
     @pytest.mark.asyncio
     async def test_get_issue_skill_missing_repo(self):
         from core.skills.builtin import GetIssueInput, GetIssueSkill
+
         skill = GetIssueSkill(github=AsyncMock())
         result = await skill.execute(GetIssueInput(repo="", issue_number=1))
         assert result.success is False
@@ -879,21 +948,33 @@ class TestBuiltinIssueSkills:
     @pytest.mark.asyncio
     async def test_create_issue_skill_delegates_through_shim(self):
         from core.skills.builtin import CreateIssueInput, CreateIssueSkill
+
         mock_github = AsyncMock()
         mock_github.create_issue.return_value = {"number": 99, "title": "New"}
         skill = CreateIssueSkill(github=mock_github)
-        result = await skill.execute(CreateIssueInput(
-            repo="o/r", title="New", body="desc", labels=["bug"], assignees=["alice"],
-        ))
+        result = await skill.execute(
+            CreateIssueInput(
+                repo="o/r",
+                title="New",
+                body="desc",
+                labels=["bug"],
+                assignees=["alice"],
+            )
+        )
         assert result.success
         assert result.issue["number"] == 99
         mock_github.create_issue.assert_called_once_with(
-            "o/r", "New", "desc", ["bug"], ["alice"],
+            "o/r",
+            "New",
+            "desc",
+            ["bug"],
+            ["alice"],
         )
 
     @pytest.mark.asyncio
     async def test_create_issue_skill_missing_repo(self):
         from core.skills.builtin import CreateIssueInput, CreateIssueSkill
+
         skill = CreateIssueSkill(github=AsyncMock())
         result = await skill.execute(CreateIssueInput(repo="", title="Bug"))
         assert result.success is False
@@ -902,6 +983,7 @@ class TestBuiltinIssueSkills:
         from pydantic import ValidationError
 
         from core.skills.builtin import CreateIssueInput
+
         with pytest.raises(ValidationError, match="title"):
             CreateIssueInput(repo="o/r", title="")
 
@@ -909,6 +991,7 @@ class TestBuiltinIssueSkills:
     async def test_list_issues_skill_falls_back_to_repo_id(self):
         """When repo is empty, skill should try repo_id as fallback."""
         from core.skills.builtin import ListIssuesInput, ListIssuesSkill
+
         mock_github = AsyncMock()
         mock_github.list_issues.return_value = []
         skill = ListIssuesSkill(github=mock_github)
@@ -925,30 +1008,43 @@ class TestBuiltinIssueSkills:
 class TestGitHubClientShim:
     def test_shim_delegates_to_api(self):
         from core.skills.github_client import GitHubClient
+
         client = GitHubClient(token="fake-token")
         assert hasattr(client, "_api")
         assert isinstance(client._api, GitHubSkillAPI)
 
     def test_rate_limit_constant_exported(self):
         from core.skills.github_client import RATE_LIMIT_THRESHOLD
+
         assert RATE_LIMIT_THRESHOLD == 10
 
     @pytest.mark.asyncio
     async def test_shim_list_issues_delegates(self):
         from core.skills.github_client import GitHubClient
+
         client = GitHubClient(token="fake-token")
         client._api = AsyncMock(spec=GitHubSkillAPI)
         client._api.list_issues.return_value = [{"number": 1}]
         result = await client.list_issues("owner/repo", state="closed", labels=["bug"], limit=5)
         assert result == [{"number": 1}]
         client._api.list_issues.assert_called_once_with(
-            "owner/repo", "closed", ["bug"], "created", "desc",
-            None, None, None, None, 5, "brief",
+            "owner/repo",
+            "closed",
+            ["bug"],
+            "created",
+            "desc",
+            None,
+            None,
+            None,
+            None,
+            5,
+            "brief",
         )
 
     @pytest.mark.asyncio
     async def test_shim_get_issue_delegates(self):
         from core.skills.github_client import GitHubClient
+
         client = GitHubClient(token="fake-token")
         client._api = AsyncMock(spec=GitHubSkillAPI)
         client._api.get_issue.return_value = {"number": 42}
@@ -959,9 +1055,12 @@ class TestGitHubClientShim:
     @pytest.mark.asyncio
     async def test_shim_create_issue_delegates(self):
         from core.skills.github_client import GitHubClient
+
         client = GitHubClient(token="fake-token")
         client._api = AsyncMock(spec=GitHubSkillAPI)
         client._api.create_issue.return_value = {"number": 99}
-        result = await client.create_issue("owner/repo", "title", body="b", labels=["x"], assignees=["a"])
+        result = await client.create_issue(
+            "owner/repo", "title", body="b", labels=["x"], assignees=["a"]
+        )
         assert result == {"number": 99}
         client._api.create_issue.assert_called_once_with("owner/repo", "title", "b", ["x"], ["a"])

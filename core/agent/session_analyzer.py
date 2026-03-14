@@ -51,13 +51,16 @@ def _calculate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> f
     if not pricing:
         logger.warning("No pricing data for model %r — cost will be 0", model)
         return 0.0
-    return (prompt_tokens * pricing["input"] / 1_000_000 +
-            completion_tokens * pricing["output"] / 1_000_000)
+    return (
+        prompt_tokens * pricing["input"] / 1_000_000
+        + completion_tokens * pricing["output"] / 1_000_000
+    )
 
 
 @dataclass
 class ExecutionNode:
     """Detailed execution node with phase-level breakdown."""
+
     node_id: str
     node_type: str
     event_id: str | None
@@ -87,7 +90,12 @@ class ExecutionNode:
         line = f"{prefix}{connector}"
 
         # Node type
-        if self.node_type in ("prompt_assembly", "model_inference", "tool_execution", "memory_retrieval"):
+        if self.node_type in (
+            "prompt_assembly",
+            "model_inference",
+            "tool_execution",
+            "memory_retrieval",
+        ):
             line += f"[{self.node_type}]"
         else:
             line += self.node_type
@@ -135,17 +143,21 @@ class ExecutionNode:
         if self.node_type == "tool_result" and self.metadata:
             child_prefix = prefix + ("   " if is_last else "│  ")
             if "api_latency_ms" in self.metadata:
-                lines.append(f"{child_prefix}├─ api_latency: {self.metadata['api_latency_ms']:.0f}ms")
+                lines.append(
+                    f"{child_prefix}├─ api_latency: {self.metadata['api_latency_ms']:.0f}ms"
+                )
             if "result_size_bytes" in self.metadata:
                 kb = self.metadata["result_size_bytes"] / 1024
                 lines.append(f"{child_prefix}├─ result_size: {kb:.1f}KB")
             if "result_size_tokens" in self.metadata:
-                lines.append(f"{child_prefix}└─ tokens_added: {self.metadata['result_size_tokens']:,}")
+                lines.append(
+                    f"{child_prefix}└─ tokens_added: {self.metadata['result_size_tokens']:,}"
+                )
 
         # Children
         child_prefix = prefix + ("   " if is_last else "│  ")
         for i, child in enumerate(self.children):
-            is_last_child = (i == len(self.children) - 1)
+            is_last_child = i == len(self.children) - 1
             lines.extend(child.to_ascii(child_prefix, is_last_child, depth + 1))
 
         return lines
@@ -154,6 +166,7 @@ class ExecutionNode:
 @dataclass
 class ExecutionSummary:
     """Aggregated stats across execution tree."""
+
     total_duration_s: float
     time_by_category: dict[str, float]
     bottleneck_category: str | None
@@ -256,16 +269,22 @@ class SessionReport:
             completion_total = summary.tokens_by_source.get("completion", 0)
 
             if prompt_total > 0:
-                lines.append(f"  ├─ Prompt: {prompt_total:,} ({prompt_total/summary.total_tokens*100:.0f}%)")
+                lines.append(
+                    f"  ├─ Prompt: {prompt_total:,} ({prompt_total / summary.total_tokens * 100:.0f}%)"
+                )
                 for source, count in sorted(summary.tokens_by_source.items(), key=lambda x: -x[1]):
                     if source == "completion":
                         continue
                     pct = (count / prompt_total) * 100
-                    marker = " ⚠️ LARGEST CONTRIBUTOR" if source == summary.largest_token_source else ""
+                    marker = (
+                        " ⚠️ LARGEST CONTRIBUTOR" if source == summary.largest_token_source else ""
+                    )
                     lines.append(f"  │   ├─ {source}: {count:,} ({pct:.0f}%){marker}")
 
             if completion_total > 0:
-                lines.append(f"  └─ Completion: {completion_total:,} ({completion_total/summary.total_tokens*100:.0f}%)")
+                lines.append(
+                    f"  └─ Completion: {completion_total:,} ({completion_total / summary.total_tokens * 100:.0f}%)"
+                )
             lines.append("")
 
         # Cost breakdown
@@ -290,8 +309,13 @@ class SessionReport:
             "session_id": self.session_id,
             "total_duration_s": self.total_duration_s,
             "timeline": [
-                {"ts": str(e.ts), "type": e.event_type, "detail": e.detail,
-                 "skill": e.skill, "gap_s": e.gap_s}
+                {
+                    "ts": str(e.ts),
+                    "type": e.event_type,
+                    "detail": e.detail,
+                    "skill": e.skill,
+                    "gap_s": e.gap_s,
+                }
                 for e in self.timeline
             ],
             "issues": self.issues,
@@ -305,17 +329,23 @@ class SessionAnalyzer(DbConsumer):
 
     def analyze(self, session_id: str) -> SessionReport:
         with self._db() as db:
-            rows = db.execute(text(
-                "SELECT event_id, event_type, content, skill_name, created_at,"
-                " agent_id, metadata, token_usage, llm_model_used"
-                " FROM agent_events WHERE session_id = :sid ORDER BY created_at"
-            ), {"sid": session_id}).fetchall()
+            rows = db.execute(
+                text(
+                    "SELECT event_id, event_type, content, skill_name, created_at,"
+                    " agent_id, metadata, token_usage, llm_model_used"
+                    " FROM agent_events WHERE session_id = :sid ORDER BY created_at"
+                ),
+                {"sid": session_id},
+            ).fetchall()
 
         if not rows:
             return SessionReport(
-                session_id=session_id, timeline=[], total_duration_s=0,
+                session_id=session_id,
+                timeline=[],
+                total_duration_s=0,
                 issues=[{"type": "empty", "description": "No events found"}],
-                recommendations=[], stats={},
+                recommendations=[],
+                stats={},
             )
 
         timeline: list[TimelineEntry] = []
@@ -337,20 +367,27 @@ class SessionAnalyzer(DbConsumer):
             # Build detail
             detail = self._summarize_event(event_type, content, skill_name)
 
-            timeline.append(TimelineEntry(
-                ts=ts, event_type=event_type, detail=detail,
-                skill=skill_name, gap_s=gap_s,
-            ))
+            timeline.append(
+                TimelineEntry(
+                    ts=ts,
+                    event_type=event_type,
+                    detail=detail,
+                    skill=skill_name,
+                    gap_s=gap_s,
+                )
+            )
 
             # Detect issues — skip gaps before user_query (that's user think time, not system latency)
             if gap_s is not None and gap_s >= GAP_THRESHOLD_S and event_type != "user_query":
-                issues.append({
-                    "type": "slow_gap",
-                    "description": f"{gap_s:.0f}s gap before {event_type}"
-                                   + (f" ({skill_name})" if skill_name else ""),
-                    "ts": str(ts),
-                    "gap_s": gap_s,
-                })
+                issues.append(
+                    {
+                        "type": "slow_gap",
+                        "description": f"{gap_s:.0f}s gap before {event_type}"
+                        + (f" ({skill_name})" if skill_name else ""),
+                        "ts": str(ts),
+                        "gap_s": gap_s,
+                    }
+                )
 
             if event_type == "tool_result" and content:
                 try:
@@ -359,11 +396,13 @@ class SessionAnalyzer(DbConsumer):
                     if "Malformed" in result_str or "Error" in result_str or "error" in result_str:
                         error_count += 1
                         name = data.get("name", "unknown")
-                        issues.append({
-                            "type": "tool_error",
-                            "description": f"{name} returned error: {result_str[:150]}",
-                            "ts": str(ts),
-                        })
+                        issues.append(
+                            {
+                                "type": "tool_error",
+                                "description": f"{name} returned error: {result_str[:150]}",
+                                "ts": str(ts),
+                            }
+                        )
                 except (json.JSONDecodeError, TypeError):
                     pass
 
@@ -397,10 +436,12 @@ class SessionAnalyzer(DbConsumer):
 
         def _flush_stall() -> None:
             if len(_consecutive_sigs) >= _STALL_THRESHOLD:
-                _stall_sequences.append({
-                    "tool_signature": _consecutive_sigs[0],
-                    "repeat_count": len(_consecutive_sigs),
-                })
+                _stall_sequences.append(
+                    {
+                        "tool_signature": _consecutive_sigs[0],
+                        "repeat_count": len(_consecutive_sigs),
+                    }
+                )
 
         for r in rows:
             event_type = r[1]
@@ -409,9 +450,11 @@ class SessionAnalyzer(DbConsumer):
                 try:
                     data = json.loads(content) if content else {}
                     # Canonical JSON for arguments so key order doesn't matter.
-                    raw_args = data.get('arguments', '')
+                    raw_args = data.get("arguments", "")
                     try:
-                        canon_args = json.dumps(json.loads(raw_args), sort_keys=True, separators=(',', ':'))
+                        canon_args = json.dumps(
+                            json.loads(raw_args), sort_keys=True, separators=(",", ":")
+                        )
                     except (json.JSONDecodeError, TypeError):
                         canon_args = raw_args
                     sig = f"{data.get('name', '')}:{canon_args}"
@@ -428,14 +471,16 @@ class SessionAnalyzer(DbConsumer):
         _flush_stall()
 
         for seq in _stall_sequences:
-            issues.append({
-                "type": "tool_call_stall",
-                "description": (
-                    f"Tool call loop detected: {seq['tool_signature'].split(':')[0]} "
-                    f"called {seq['repeat_count']}x with identical arguments"
-                ),
-                "repeat_count": seq["repeat_count"],
-            })
+            issues.append(
+                {
+                    "type": "tool_call_stall",
+                    "description": (
+                        f"Tool call loop detected: {seq['tool_signature'].split(':')[0]} "
+                        f"called {seq['repeat_count']}x with identical arguments"
+                    ),
+                    "repeat_count": seq["repeat_count"],
+                }
+            )
             recommendations.append(
                 f"Stall detected: {seq['tool_signature'].split(':')[0]} was called "
                 f"{seq['repeat_count']} times with the same arguments. "
@@ -444,11 +489,13 @@ class SessionAnalyzer(DbConsumer):
 
         # Generate recommendations
         if cloud_loop_count >= 3:
-            issues.append({
-                "type": "cloud_loop_storm",
-                "description": f"{cloud_loop_count} cloud skill calls in one session — "
-                               "LLM may be over-elaborating",
-            })
+            issues.append(
+                {
+                    "type": "cloud_loop_storm",
+                    "description": f"{cloud_loop_count} cloud skill calls in one session — "
+                    "LLM may be over-elaborating",
+                }
+            )
             recommendations.append(
                 "Consider adding a cloud loop budget or early-exit when LLM "
                 "has already produced a satisfactory answer"
@@ -536,13 +583,26 @@ class SessionAnalyzer(DbConsumer):
         """
         if not rows:
             return ExecutionNode(
-                node_id="empty", node_type="empty", event_id=None,
-                ts=datetime.min, duration_s=0,
+                node_id="empty",
+                node_type="empty",
+                event_id=None,
+                ts=datetime.min,
+                duration_s=0,
             )
 
         events = []
         for r in rows:
-            event_id, event_type, content, skill_name, ts, _agent_id, metadata, token_usage, llm_model = r
+            (
+                event_id,
+                event_type,
+                content,
+                skill_name,
+                ts,
+                _agent_id,
+                metadata,
+                token_usage,
+                llm_model,
+            ) = r
             # Merge token_usage and llm_model into metadata for uniform access
             merged_meta = metadata if isinstance(metadata, dict) else {}
             if token_usage:
@@ -554,14 +614,16 @@ class SessionAnalyzer(DbConsumer):
                 }
             if llm_model:
                 merged_meta = {**merged_meta, "model": llm_model}
-            events.append({
-                "event_id": event_id,
-                "event_type": event_type,
-                "content": content,
-                "skill_name": skill_name,
-                "ts": ts,
-                "metadata": merged_meta,
-            })
+            events.append(
+                {
+                    "event_id": event_id,
+                    "event_type": event_type,
+                    "content": content,
+                    "skill_name": skill_name,
+                    "ts": ts,
+                    "metadata": merged_meta,
+                }
+            )
 
         root = self._build_basic_tree(events)
         self._enrich_llm_metrics(root, events)
@@ -580,8 +642,11 @@ class SessionAnalyzer(DbConsumer):
         """
         if not events:
             return ExecutionNode(
-                node_id="empty", node_type="empty", event_id=None,
-                ts=datetime.min, duration_s=0,
+                node_id="empty",
+                node_type="empty",
+                event_id=None,
+                ts=datetime.min,
+                duration_s=0,
             )
 
         first_ts = events[0]["ts"]
@@ -823,7 +888,9 @@ class SessionAnalyzer(DbConsumer):
             if node.tokens_in is not None:
                 tokens_by_source["prompt"] = tokens_by_source.get("prompt", 0) + node.tokens_in
             if node.tokens_out is not None:
-                tokens_by_source["completion"] = tokens_by_source.get("completion", 0) + node.tokens_out
+                tokens_by_source["completion"] = (
+                    tokens_by_source.get("completion", 0) + node.tokens_out
+                )
 
             if node.cost_usd is not None and node.cost_usd > 0:
                 cost_by_turn[current_turn] = cost_by_turn.get(current_turn, 0) + node.cost_usd
@@ -831,7 +898,9 @@ class SessionAnalyzer(DbConsumer):
             # Root causes — only from non-container nodes
             if node.node_type not in self._CONTAINER_TYPES:
                 if "SLOW" in node.issues:
-                    root_causes.append(f"{node.node_type} '{node.detail}' took {node.duration_s:.1f}s")
+                    root_causes.append(
+                        f"{node.node_type} '{node.detail}' took {node.duration_s:.1f}s"
+                    )
                 if "HIGH_TOKEN" in node.issues and node.tokens_in is not None:
                     root_causes.append(f"{node.node_type} used {node.tokens_in:,} tokens")
 
@@ -840,8 +909,12 @@ class SessionAnalyzer(DbConsumer):
 
         traverse(root)
 
-        bottleneck = max(time_by_category.items(), key=lambda x: x[1])[0] if time_by_category else None
-        largest_source = max(tokens_by_source.items(), key=lambda x: x[1])[0] if tokens_by_source else None
+        bottleneck = (
+            max(time_by_category.items(), key=lambda x: x[1])[0] if time_by_category else None
+        )
+        largest_source = (
+            max(tokens_by_source.items(), key=lambda x: x[1])[0] if tokens_by_source else None
+        )
 
         return ExecutionSummary(
             total_duration_s=root.duration_s,

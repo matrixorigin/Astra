@@ -13,7 +13,7 @@ class PermissionChecker(DbConsumer):
 
     def has_role(self, user_id: str, role_name: str) -> bool:
         """Check if user has a specific role.
-        
+
         Args:
             user_id: User UUID or Username
             role_name: Role name (e.g., 'mo_agent_admin')
@@ -63,7 +63,7 @@ class PermissionChecker(DbConsumer):
 
     def can_manage_skills(self, user_id: str, scope: str, scope_id: str | None = None) -> bool:
         """Check if user can manage skills at given scope.
-        
+
         Enforces strict RBAC:
         - Global/Account scope: Admin only
         - User scope: Self or Admin

@@ -16,12 +16,15 @@ if __name__ == "__main__":
 
     print("\nRegistered prompts:")
     from sqlalchemy import text
+
     db = SessionLocal()
-    result = db.execute(text("""
+    result = db.execute(
+        text("""
         SELECT template_id, version, is_active
         FROM ctx_prompt_templates
         ORDER BY template_id, version
-    """))
+    """)
+    )
 
     for row in result:
         status = "✓ active" if row.is_active else "  inactive"

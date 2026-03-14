@@ -39,17 +39,26 @@ class Settings(BaseSettings):
         default="dev-secret-key-change-in-production",
         description="Secret key for encryption",
     )
-    
+
     # Embedding
-    embedding_provider: str = Field(default="openai", description="Embedding provider: local, openai, mock")
+    embedding_provider: str = Field(
+        default="openai", description="Embedding provider: local, openai, mock"
+    )
     embedding_model: str = Field(default="BAAI/bge-m3", description="Embedding model name")
-    embedding_dim: int = Field(default=0, description="Embedding vector dimension (0 = auto-infer from model name)")
-    embedding_api_key: str = Field(default="", description="API key for openai-compatible embedding")
-    embedding_base_url: str | None = Field(default=None, description="Base URL for openai-compatible embedding")
+    embedding_dim: int = Field(
+        default=0, description="Embedding vector dimension (0 = auto-infer from model name)"
+    )
+    embedding_api_key: str = Field(
+        default="", description="API key for openai-compatible embedding"
+    )
+    embedding_base_url: str | None = Field(
+        default=None, description="Base URL for openai-compatible embedding"
+    )
 
     @model_validator(mode="after")
     def infer_embedding_dim(self) -> "Settings":
         from core.embedding.client import KNOWN_DIMENSIONS
+
         if self.embedding_dim == 0:
             known = KNOWN_DIMENSIONS.get(self.embedding_model)
             if known is not None:

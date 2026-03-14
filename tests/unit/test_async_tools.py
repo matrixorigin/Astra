@@ -21,12 +21,12 @@ from core.agent.run import RunStatus
 def clean_fan_in_tasks():
     """Clean fan-in tasks after each test."""
     from core.agent.run_engine import cleanup_fan_in_tasks
+
     yield
     cleanup_fan_in_tasks()
 
 
 class TestAsyncToolRegistry:
-
     def setup_method(self):
         self.reg = AsyncToolRegistry()
 
@@ -78,7 +78,6 @@ class TestAsyncToolRegistry:
 
 
 class TestGlobalRegistry:
-
     def test_singleton(self):
         r1 = get_async_tool_registry()
         r2 = get_async_tool_registry()
@@ -91,7 +90,6 @@ class TestGlobalRegistry:
 
 
 class TestResumeWorkflow:
-
     def setup_method(self):
         _wf_runs.clear()
         _workflow_waits.clear()
@@ -116,7 +114,6 @@ class TestResumeWorkflow:
 
 
 class TestCleanupStaleWorkflows:
-
     @pytest.mark.asyncio
     async def test_cleanup_removes_stale(self):
         """Cleanup should mark stale workflows as failed."""
@@ -155,10 +152,10 @@ class TestCleanupStaleWorkflows:
 
 
 class TestSpawnRuns:
-
     @pytest.mark.asyncio
     async def test_spawn_runs_no_run_id(self):
         from core.agent.async_tools import _execute_spawn_runs
+
         result = await _execute_spawn_runs({"agents": [{"task": "test"}]})
         assert "error" in result
 
@@ -173,27 +170,34 @@ class TestSpawnRuns:
 
         mock_loop = MagicMock()
         mock_loop._current_run_id = None
+
         async def stream(**kw):
             from core.events.models import StreamEvent
+
             yield StreamEvent(event_type="text_delta", data={"chunk": "done"})
+
         mock_loop.run_step_stream = stream
 
         # Create parent run with patched init
-        with patch.object(RunEngine, '__init__', make_run_engine_mock_init()):
+        with patch.object(RunEngine, "__init__", make_run_engine_mock_init()):
             engine = RunEngine(lambda: mock_db)
             parent = engine.create_run(session_id="s1", user_id="u1", user_input="multi")
             parent.status = RunStatus.RUNNING
 
-            with patch("api.database.get_db_session", return_value=iter([mock_db])), \
-                 patch("api.routers.chat._build_chat_loop", return_value=mock_loop):
+            with (
+                patch("api.database.get_db_session", return_value=iter([mock_db])),
+                patch("api.routers.chat._build_chat_loop", return_value=mock_loop),
+            ):
                 result = await _execute_spawn_runs(
-                    {"agents": [
-                        {"agent_id": "reviewer_a", "task": "review security"},
-                        {"agent_id": "reviewer_b", "task": "review perf"},
-                    ]},
+                    {
+                        "agents": [
+                            {"agent_id": "reviewer_a", "task": "review security"},
+                            {"agent_id": "reviewer_b", "task": "review perf"},
+                        ]
+                    },
                     run_id=parent.run_id,
                 )
-            
+
                 # Let pending tasks run while patches are still active
                 await asyncio.sleep(0.1)
 
@@ -205,18 +209,21 @@ class TestSpawnRuns:
     @pytest.mark.asyncio
     async def test_spawn_runs_registered(self):
         from core.agent.async_tools import get_async_tool_registry
+
         reg = get_async_tool_registry()
         assert reg.is_async_tool("spawn_runs")
 
     @pytest.mark.asyncio
     async def test_spawn_runs_empty_agents(self):
         from core.agent.async_tools import _execute_spawn_runs
+
         result = await _execute_spawn_runs({"agents": []}, run_id="run-1")
         assert "error" in result
 
     @pytest.mark.asyncio
     async def test_spawn_runs_missing_agents_key(self):
         from core.agent.async_tools import _execute_spawn_runs
+
         result = await _execute_spawn_runs({}, run_id="run-1")
         assert "error" in result
 
@@ -232,23 +239,30 @@ class TestSpawnRuns:
 
         mock_loop = MagicMock()
         mock_loop._current_run_id = None
+
         async def stream(**kw):
             from core.events.models import StreamEvent
+
             yield StreamEvent(event_type="text_delta", data={"chunk": "done"})
+
         mock_loop.run_step_stream = stream
 
-        with patch.object(RunEngine, '__init__', make_run_engine_mock_init()):
+        with patch.object(RunEngine, "__init__", make_run_engine_mock_init()):
             engine = RunEngine(lambda: mock_db)
             parent = engine.create_run(session_id="s1", user_id="u1", user_input="multi")
             parent.status = RunStatus.RUNNING
 
-            with patch("api.database.get_db_session", return_value=iter([mock_db])), \
-                 patch("api.routers.chat._build_chat_loop", return_value=mock_loop):
+            with (
+                patch("api.database.get_db_session", return_value=iter([mock_db])),
+                patch("api.routers.chat._build_chat_loop", return_value=mock_loop),
+            ):
                 result = await _execute_spawn_runs(
-                    {"agents": [
-                        {"no_task": "bad"},  # Missing 'task' — should be skipped
-                        {"agent_id": "reviewer_a", "task": "review"},
-                    ]},
+                    {
+                        "agents": [
+                            {"no_task": "bad"},  # Missing 'task' — should be skipped
+                            {"agent_id": "reviewer_a", "task": "review"},
+                        ]
+                    },
                     run_id=parent.run_id,
                 )
 

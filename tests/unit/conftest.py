@@ -38,9 +38,14 @@ def make_model_config(
 
 def make_ok_response(model: str = "test-model") -> LLMResponse:
     return LLMResponse(
-        content="ok", model=model, provider=LLMProvider.OPENAI,
-        tokens_prompt=10, tokens_completion=5, tokens_total=15,
-        latency_ms=100, cost_usd=0.001,
+        content="ok",
+        model=model,
+        provider=LLMProvider.OPENAI,
+        tokens_prompt=10,
+        tokens_completion=5,
+        tokens_total=15,
+        latency_ms=100,
+        cost_usd=0.001,
     )
 
 

@@ -113,13 +113,15 @@ class TaskBoard(DbConsumer):
                         "id": task_id,
                         "sid": session_id,
                         "title": title,
-                        "meta": json.dumps({
-                            "team_id": team_id,
-                            "description": description,
-                            "status": "open",
-                            "assigned_to": None,
-                            "created_by": created_by,
-                        }),
+                        "meta": json.dumps(
+                            {
+                                "team_id": team_id,
+                                "description": description,
+                                "status": "open",
+                                "assigned_to": None,
+                                "created_by": created_by,
+                            }
+                        ),
                         "parent": parent_event_id,
                     },
                 )
@@ -322,7 +324,10 @@ class TaskBoard(DbConsumer):
                 return msg_id
 
     def get_messages_for_agent(
-        self, agent_id: str, session_id: str, limit: int = 10,
+        self,
+        agent_id: str,
+        session_id: str,
+        limit: int = 10,
     ) -> list[dict[str, Any]]:
         """Get recent messages for an agent.
 
@@ -343,12 +348,14 @@ class TaskBoard(DbConsumer):
                 meta = meta or {}
                 if meta.get("to_agent") != agent_id:
                     continue
-                messages.append({
-                    "message_id": msg_id,
-                    "from_agent": meta.get("from_agent", ""),
-                    "content": content,
-                    "created_at": created_at.isoformat() if created_at else None,
-                })
+                messages.append(
+                    {
+                        "message_id": msg_id,
+                        "from_agent": meta.get("from_agent", ""),
+                        "content": content,
+                        "created_at": created_at.isoformat() if created_at else None,
+                    }
+                )
                 if len(messages) >= limit:
                     break
             return messages

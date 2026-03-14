@@ -4,15 +4,25 @@ import asyncio
 import pytest
 
 from core.scheduling.trigger_rules import (
-    Condition, ConditionOperator, ConditionLogic,
-    TriggerRule, TriggerRuleRegistry,
+    Condition,
+    ConditionOperator,
+    ConditionLogic,
+    TriggerRule,
+    TriggerRuleRegistry,
 )
 
 
-def make_rule(rule_id="r1", event_type="user_query", conditions=None, logic=ConditionLogic.AND, enabled=True):
+def make_rule(
+    rule_id="r1", event_type="user_query", conditions=None, logic=ConditionLogic.AND, enabled=True
+):
     return TriggerRule(
-        rule_id=rule_id, name=f"Rule {rule_id}", description="test",
-        event_type=event_type, conditions=conditions or [], logic=logic, enabled=enabled,
+        rule_id=rule_id,
+        name=f"Rule {rule_id}",
+        description="test",
+        event_type=event_type,
+        conditions=conditions or [],
+        logic=logic,
+        enabled=enabled,
     )
 
 
@@ -159,9 +169,11 @@ class TestTaskScheduler:
     @pytest.mark.asyncio
     async def test_schedule_task_queues(self):
         from core.scheduling.task_scheduler import TaskScheduler
+
         scheduler = TaskScheduler(max_concurrent=2)
 
-        async def action(event): return "ok"
+        async def action(event):
+            return "ok"
 
         task_id = await scheduler.schedule_task("rule1", {"x": 1}, action, task_id="t1")
         assert task_id == "t1"
@@ -170,9 +182,11 @@ class TestTaskScheduler:
     @pytest.mark.asyncio
     async def test_execute_task_success(self):
         from core.scheduling.task_scheduler import TaskScheduler, TaskStatus
+
         scheduler = TaskScheduler()
 
-        async def action(event): return event["x"] * 2
+        async def action(event):
+            return event["x"] * 2
 
         await scheduler.schedule_task("rule1", {"x": 5}, action, task_id="t1")
         task = await scheduler.pending_tasks.get()
@@ -185,9 +199,11 @@ class TestTaskScheduler:
     @pytest.mark.asyncio
     async def test_execute_task_failure_retries(self):
         from core.scheduling.task_scheduler import TaskScheduler, TaskStatus
+
         scheduler = TaskScheduler()
 
-        async def action(event): raise ValueError("boom")
+        async def action(event):
+            raise ValueError("boom")
 
         await scheduler.schedule_task("rule1", {}, action, task_id="t2")
         task = await scheduler.pending_tasks.get()
@@ -201,9 +217,11 @@ class TestTaskScheduler:
     @pytest.mark.asyncio
     async def test_execute_task_permanent_failure(self):
         from core.scheduling.task_scheduler import TaskScheduler, TaskStatus
+
         scheduler = TaskScheduler()
 
-        async def action(event): raise ValueError("boom")
+        async def action(event):
+            raise ValueError("boom")
 
         await scheduler.schedule_task("rule1", {}, action, task_id="t3")
         task = await scheduler.pending_tasks.get()
@@ -215,6 +233,7 @@ class TestTaskScheduler:
 
     def test_get_stats(self):
         from core.scheduling.task_scheduler import TaskScheduler
+
         scheduler = TaskScheduler(max_concurrent=3)
         stats = scheduler.get_stats()
         assert stats["pending_tasks"] == 0
@@ -223,4 +242,5 @@ class TestTaskScheduler:
 
     def test_get_task_unknown(self):
         from core.scheduling.task_scheduler import TaskScheduler
+
         assert TaskScheduler().get_task("nope") is None

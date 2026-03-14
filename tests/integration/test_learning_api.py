@@ -20,15 +20,23 @@ def client():
 def auth_headers(client):
     """Register + login, return auth headers."""
     from core.utils.id_generator import generate_id
+
     username = f"learn_{generate_id()}"
-    client.post("/auth/register", json={
-        "username": username,
-        "email": f"{username}@test.com",
-        "password": "testpass1234",
-    })
-    resp = client.post("/auth/login", json={
-        "username": username, "password": "testpass1234",
-    })
+    client.post(
+        "/auth/register",
+        json={
+            "username": username,
+            "email": f"{username}@test.com",
+            "password": "testpass1234",
+        },
+    )
+    resp = client.post(
+        "/auth/login",
+        json={
+            "username": username,
+            "password": "testpass1234",
+        },
+    )
     return {"Authorization": f"Bearer {resp.json()['access_token']}"}
 
 
@@ -101,7 +109,7 @@ class TestLearningAPI:
         )
         db.add(event)
         db.commit()
-        
+
         # Submit feedback
         response = client.post(
             "/api/v1/learning/feedback",
@@ -109,20 +117,20 @@ class TestLearningAPI:
                 "event_id": event.event_id,
                 "feedback_type": "wrong_skill",
                 "correct_skills": ["correct_skill"],
-                "satisfaction_score": 2
+                "satisfaction_score": 2,
             },
             headers=auth_headers,
         )
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "success"
-        
+
         # Verify event updated
         db.refresh(event)
         assert event.selection_correctness == 0
         assert event.correction_suggestion == ["correct_skill"]
         assert event.user_feedback_score == 2
-        
+
         # Cleanup
         db.delete(event)
         db.commit()
@@ -134,7 +142,7 @@ class TestLearningAPI:
             json={
                 "event_id": "non_existent",
                 "feedback_type": "wrong_skill",
-                "correct_skills": ["correct_skill"]
+                "correct_skills": ["correct_skill"],
             },
             headers=auth_headers,
         )
@@ -149,7 +157,7 @@ class TestLearningAPI:
             headers=auth_headers,
         )
         assert response.status_code == 422
-        
+
         # Invalid days (negative)
         response = client.post(
             "/api/v1/learning/trigger",

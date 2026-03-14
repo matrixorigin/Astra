@@ -40,8 +40,9 @@ class PromptEvolver(DbConsumer):
         llm_client: LLMClient for LLM-as-judge scoring (optional)
     """
 
-    def __init__(self, db_factory: DbFactory, replay_service=None, llm_client=None,
-                 regression_gate=None) -> None:
+    def __init__(
+        self, db_factory: DbFactory, replay_service=None, llm_client=None, regression_gate=None
+    ) -> None:
         super().__init__(db_factory)
         self.replay_service = replay_service
         self.llm_client = llm_client
@@ -120,8 +121,7 @@ class PromptEvolver(DbConsumer):
 
             db.execute(
                 text(
-                    "UPDATE ctx_prompt_variants SET quality_score = :score "
-                    "WHERE variant_id = :id"
+                    "UPDATE ctx_prompt_variants SET quality_score = :score WHERE variant_id = :id"
                 ),
                 {"score": avg_score, "id": variant_id},
             )
@@ -151,6 +151,7 @@ class PromptEvolver(DbConsumer):
             # Gate check before promotion
             if self.regression_gate is not None:
                 from core.evaluation.regression_gate import ChangeType
+
                 gate_result = self.regression_gate.validate_change(
                     change_type=ChangeType.PROMPT,
                     change_id=f"{prompt_template_id}@{variant_id}",
@@ -163,9 +164,14 @@ class PromptEvolver(DbConsumer):
                 if gate_result.get("verdict") != "approved":
                     logger.warning(
                         "Regression gate rejected prompt variant %s: %s",
-                        variant_id, gate_result.get("verdict"),
+                        variant_id,
+                        gate_result.get("verdict"),
                     )
-                    return {"promoted": False, "reason": "gate_rejected", "gate_result": gate_result}
+                    return {
+                        "promoted": False,
+                        "reason": "gate_rejected",
+                        "gate_result": gate_result,
+                    }
 
             db.execute(
                 text(
@@ -202,9 +208,7 @@ class PromptEvolver(DbConsumer):
                 quality_score=float(row[3]) if row[3] else None,
             )
 
-    def _replay_with_variant(
-        self, session_id: str, variant_id: str, replay_fn=None
-    ) -> float:
+    def _replay_with_variant(self, session_id: str, variant_id: str, replay_fn=None) -> float:
         """Replay a session with a prompt variant and score the result.
 
         Uses ReplayService to replay the session, then scores the replayed
@@ -278,8 +282,7 @@ class PromptEvolver(DbConsumer):
         summary_parts = []
         for d in details[:5]:  # Limit to 5 for prompt size
             summary_parts.append(
-                f"Original: {d.get('original', '')[:100]}\n"
-                f"Replayed: {d.get('replayed', '')[:100]}"
+                f"Original: {d.get('original', '')[:100]}\nReplayed: {d.get('replayed', '')[:100]}"
             )
         summary = "\n---\n".join(summary_parts)
 

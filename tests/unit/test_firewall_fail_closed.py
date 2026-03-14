@@ -92,26 +92,41 @@ class TestChatLoopFirewallMode:
 
     def test_default_mode_is_warn(self):
         from core.agent.chat_loop import ChatLoop
+
         loop = ChatLoop(
-            selector=Mock(), executor=Mock(), llm_client=Mock(),
-            event_logger=Mock(), context_manager=Mock(), firewall=Mock(),
+            selector=Mock(),
+            executor=Mock(),
+            llm_client=Mock(),
+            event_logger=Mock(),
+            context_manager=Mock(),
+            firewall=Mock(),
         )
         assert loop.firewall_mode == "warn"
 
     def test_block_mode_accepted(self):
         from core.agent.chat_loop import ChatLoop
+
         loop = ChatLoop(
-            selector=Mock(), executor=Mock(), llm_client=Mock(),
-            event_logger=Mock(), context_manager=Mock(), firewall=Mock(),
+            selector=Mock(),
+            executor=Mock(),
+            llm_client=Mock(),
+            event_logger=Mock(),
+            context_manager=Mock(),
+            firewall=Mock(),
             firewall_mode="block",
         )
         assert loop.firewall_mode == "block"
 
     def test_invalid_mode_falls_back_to_warn(self):
         from core.agent.chat_loop import ChatLoop
+
         loop = ChatLoop(
-            selector=Mock(), executor=Mock(), llm_client=Mock(),
-            event_logger=Mock(), context_manager=Mock(), firewall=Mock(),
+            selector=Mock(),
+            executor=Mock(),
+            llm_client=Mock(),
+            event_logger=Mock(),
+            context_manager=Mock(),
+            firewall=Mock(),
             firewall_mode="invalid",
         )
         assert loop.firewall_mode == "warn"

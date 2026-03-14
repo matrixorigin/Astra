@@ -18,11 +18,11 @@ def branch(db_session):
     # Use current database
     result = db_session.execute(text("SELECT DATABASE()"))
     current_db = result.scalar()
-    
+
     mgr = Branch(database=current_db, db_factory=lambda: db_session)
-    
+
     yield mgr
-    
+
     # 清理
     try:
         db_session.commit()
@@ -39,8 +39,9 @@ def branch(db_session):
 def test_create_branch(branch, db_session):
     """Test branch creation."""
     import time
+
     suffix = str(int(time.time() * 1000) % 10000)  # 唯一后缀
-    
+
     db_session.execute(text(f"CREATE TABLE test_t0_{suffix} (a INT, b INT, PRIMARY KEY(a))"))
     db_session.execute(text(f"INSERT INTO test_t0_{suffix} VALUES (1,1),(2,2)"))
     db_session.commit()
@@ -50,7 +51,7 @@ def test_create_branch(branch, db_session):
     result = db_session.execute(text(f"SELECT COUNT(*) as count FROM test_t1_{suffix}"))
     count = result.first()._mapping["count"]
     assert count == 2
-    
+
     # Cleanup
     db_session.execute(text(f"DROP TABLE IF EXISTS test_t0_{suffix}"))
     db_session.execute(text(f"DROP TABLE IF EXISTS test_t1_{suffix}"))
@@ -60,8 +61,9 @@ def test_create_branch(branch, db_session):
 def test_diff(branch, db_session):
     """Test diff."""
     import time
+
     suffix = str(int(time.time() * 1000) % 10000)  # 唯一后缀
-    
+
     db_session.execute(text(f"CREATE TABLE test_t0_{suffix} (a INT, b INT, PRIMARY KEY(a))"))
     db_session.execute(text(f"INSERT INTO test_t0_{suffix} VALUES (1,1),(2,2)"))
     db_session.commit()
@@ -75,7 +77,7 @@ def test_diff(branch, db_session):
 
     diff = branch.diff(f"test_t2_{suffix}", f"test_t1_{suffix}")
     assert len(diff) > 0
-    
+
     # Cleanup
     db_session.execute(text(f"DROP TABLE IF EXISTS test_t0_{suffix}"))
     db_session.execute(text(f"DROP TABLE IF EXISTS test_t1_{suffix}"))
@@ -86,8 +88,9 @@ def test_diff(branch, db_session):
 def test_merge(branch, db_session):
     """Test merge."""
     import time
+
     suffix = str(int(time.time() * 1000) % 10000)  # 唯一后缀
-    
+
     db_session.execute(text(f"CREATE TABLE test_t0_{suffix} (a INT, b INT, PRIMARY KEY(a))"))
     db_session.execute(text(f"INSERT INTO test_t0_{suffix} VALUES (1,1),(2,2)"))
     db_session.commit()
@@ -103,7 +106,7 @@ def test_merge(branch, db_session):
     result = db_session.execute(text(f"SELECT COUNT(*) as count FROM test_t1_{suffix}"))
     count = result.first()._mapping["count"]
     assert count == 3
-    
+
     # Cleanup
     db_session.execute(text(f"DROP TABLE IF EXISTS test_t0_{suffix}"))
     db_session.execute(text(f"DROP TABLE IF EXISTS test_t1_{suffix}"))
@@ -114,8 +117,9 @@ def test_merge(branch, db_session):
 def test_delete(branch, db_session):
     """Test delete."""
     import time
+
     suffix = str(int(time.time() * 1000) % 10000)  # 唯一后缀
-    
+
     db_session.execute(text(f"CREATE TABLE test_t0_{suffix} (a INT, b INT, PRIMARY KEY(a))"))
     db_session.execute(text(f"INSERT INTO test_t0_{suffix} VALUES (1,1)"))
     db_session.commit()
@@ -130,9 +134,10 @@ def test_delete(branch, db_session):
 
     # SQLAlchemy wraps pymysql errors
     from sqlalchemy.exc import ProgrammingError
+
     with pytest.raises(ProgrammingError):
         db_session.execute(text(f"SELECT COUNT(*) as count FROM test_t1_{suffix}"))
-    
+
     # Cleanup
     db_session.execute(text(f"DROP TABLE IF EXISTS test_t0_{suffix}"))
     db_session.commit()
@@ -143,10 +148,11 @@ def test_diff_with_snapshot(branch, db_session):
     from core.git_for_data import GitForData
     from uuid_utils import uuid7
     import time
+
     suffix = str(int(time.time() * 1000) % 10000)  # 唯一后缀
 
     git = GitForData(lambda: db_session)
-    
+
     # Use unique snapshot names
     snap1 = f"snap_{str(uuid7()).replace('-', '_')}"
     snap2 = f"snap_{str(uuid7()).replace('-', '_')}"
@@ -163,7 +169,9 @@ def test_diff_with_snapshot(branch, db_session):
     git.create_snapshot(snap2)
 
     # Diff between snapshots - target_snapshot has new data, source_snapshot is old
-    diff = branch.diff(f"test_t0_{suffix}", f"test_t0_{suffix}", target_snapshot=snap2, source_snapshot=snap1)
+    diff = branch.diff(
+        f"test_t0_{suffix}", f"test_t0_{suffix}", target_snapshot=snap2, source_snapshot=snap1
+    )
     assert len(diff) > 0
 
     # Cleanup
@@ -178,8 +186,9 @@ def test_diff_with_snapshot(branch, db_session):
 def test_diff_output_count(branch, db_session):
     """Test diff with count output."""
     import time
+
     suffix = str(int(time.time() * 1000) % 10000)  # 唯一后缀
-    
+
     db_session.execute(text(f"CREATE TABLE test_t0_{suffix} (a INT, b INT, PRIMARY KEY(a))"))
     db_session.execute(text(f"INSERT INTO test_t0_{suffix} VALUES (1,1), (2,2)"))
     db_session.commit()
@@ -204,6 +213,7 @@ def test_diff_with_snapshot_and_count(branch, db_session):
     from core.git_for_data import GitForData
     from uuid_utils import uuid7
     import time
+
     suffix = str(int(time.time() * 1000) % 10000)
 
     git = GitForData(lambda: db_session)
@@ -220,7 +230,13 @@ def test_diff_with_snapshot_and_count(branch, db_session):
     git.create_snapshot(snap2)
 
     # Diff with snapshot and count
-    result = branch.diff(f"test_t0_{suffix}", f"test_t0_{suffix}", output="count", target_snapshot=snap2, source_snapshot=snap1)
+    result = branch.diff(
+        f"test_t0_{suffix}",
+        f"test_t0_{suffix}",
+        output="count",
+        target_snapshot=snap2,
+        source_snapshot=snap1,
+    )
     assert len(result) == 1
     assert "COUNT(*)" in result[0] or "count" in result[0]
 

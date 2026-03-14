@@ -1,4 +1,5 @@
 """Talk session runner — drives mo-agent chat -m via real CLI subprocess."""
+
 from __future__ import annotations
 
 import json
@@ -23,6 +24,7 @@ PYTHON = sys.executable
 @dataclass
 class TurnRecord:
     """Result of one conversation turn."""
+
     user_message: str
     response: str = ""
     tool_calls: list[dict] = field(default_factory=list)
@@ -57,16 +59,19 @@ class TalkSession:
     def setup(self) -> None:
         """Register and login via CLI."""
         # Register
-        self._cli("register",
-                   "--email", f"{self.username}@example.com",
-                   "--password", self.password,
-                   "--username", self.username,
-                   check=False)  # may already exist
+        self._cli(
+            "register",
+            "--email",
+            f"{self.username}@example.com",
+            "--password",
+            self.password,
+            "--username",
+            self.username,
+            check=False,
+        )  # may already exist
 
         # Login
-        self._cli("login",
-                   "--username", self.username,
-                   "--password", self.password)
+        self._cli("login", "--username", self.username, "--password", self.password)
 
         # Fetch JWT UUID so DB checks use the same user_id as memory writes
         try:
@@ -113,10 +118,7 @@ class TalkSession:
 
     def _cli(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         """Run mo-agent CLI command."""
-        cmd = [PYTHON, str(CLI_SCRIPT),
-               "--api-url", self.api_url,
-               "--profile", self.profile,
-               *args]
+        cmd = [PYTHON, str(CLI_SCRIPT), "--api-url", self.api_url, "--profile", self.profile, *args]
 
         env = os.environ.copy()
         env.pop("http_proxy", None)
@@ -126,20 +128,23 @@ class TalkSession:
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
         result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            env=env, cwd=PROJECT_ROOT, timeout=180,
+            cmd,
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=PROJECT_ROOT,
+            timeout=180,
         )
 
         if check and result.returncode != 0:
-            raise RuntimeError(
-                f"CLI failed: {result.stderr.strip() or result.stdout.strip()}"
-            )
+            raise RuntimeError(f"CLI failed: {result.stderr.strip() or result.stdout.strip()}")
         return result
 
     def _read_session_id(self) -> str | None:
         """Read last_session_id from CLI profile."""
         try:
             from cli.api_client import APIClient
+
             profile = APIClient.load_profile(profile=self.profile)
             return profile.get("last_session_id")
         except Exception:
@@ -159,10 +164,13 @@ class TalkSession:
         if not self.session_id:
             return 0
         with self.db_factory() as db:
-            return db.execute(
-                text("SELECT COUNT(*) FROM agent_events WHERE session_id = :sid"),
-                {"sid": self.session_id},
-            ).scalar() or 0
+            return (
+                db.execute(
+                    text("SELECT COUNT(*) FROM agent_events WHERE session_id = :sid"),
+                    {"sid": self.session_id},
+                ).scalar()
+                or 0
+            )
 
     def _get_tool_calls(self, after_count: int, since: str | None = None) -> list[dict]:
         """Get tool calls from agent_events for this turn only."""
@@ -195,7 +203,9 @@ class TalkSession:
                         meta = json.loads(r.metadata)
                     except Exception:
                         meta = {}
-                results.append({"name": meta.get("name", meta.get("tool_name", "")), "args": r.content})
+                results.append(
+                    {"name": meta.get("name", meta.get("tool_name", "")), "args": r.content}
+                )
             return results
 
     def new_session(self) -> None:

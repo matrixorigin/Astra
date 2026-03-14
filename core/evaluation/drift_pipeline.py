@@ -30,6 +30,7 @@ logger = get_logger(__name__)
 @dataclass
 class PipelineResult:
     """Full pipeline execution result."""
+
     signals_detected: int = 0
     signals_confirmed: int = 0
     corrections_applied: int = 0
@@ -70,8 +71,10 @@ def run_drift_pipeline(db_factory: Callable) -> PipelineResult:
             signals_detected=len(report.signals),
             signals_confirmed=len(report.confirmed),
             corrections_applied=sum(
-                1 for c in report.corrections
-                if c.get("action") not in (CorrectionAction.NONE.value, CorrectionAction.ESCALATE_HUMAN.value)
+                1
+                for c in report.corrections
+                if c.get("action")
+                not in (CorrectionAction.NONE.value, CorrectionAction.ESCALATE_HUMAN.value)
             ),
             actions=report.corrections,
         )
@@ -114,6 +117,7 @@ def run_drift_pipeline_async(db_factory: Callable) -> None:
 def _try_build_regression_gate(db_factory):
     try:
         from core.evaluation.regression_gate import RegressionGate
+
         return RegressionGate(db_factory)
     except Exception:
         return None
@@ -123,6 +127,7 @@ def _try_build_prompt_optimizer(db):
     try:
         from core.context.prompt_optimizer import PromptOptimizer
         from core.llm.client import LLMClient
+
         llm = LLMClient(db_factory=lambda: db)
         return PromptOptimizer(lambda: db, llm)
     except Exception:

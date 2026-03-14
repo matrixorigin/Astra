@@ -33,9 +33,11 @@ from core.utils.id_generator import generate_id
 # Deterministic LLM Mock
 # ============================================================================
 
+
 @dataclass
 class CannedResponse:
     """A predefined LLM response for a given input pattern."""
+
     content: str
     tool_calls: list[dict] | None = None
     tokens_prompt: int = 100
@@ -73,11 +75,16 @@ class DeterministicLLM:
         resp = self._match(messages if isinstance(messages, list) else [messages])
         self.call_log.append({"method": "chat", "messages": messages})
         from core.llm.models import LLMResponse, LLMProvider
+
         return LLMResponse(
-            content=resp.content, model="mock-model", provider=LLMProvider.OPENAI,
-            tokens_prompt=resp.tokens_prompt, tokens_completion=resp.tokens_completion,
+            content=resp.content,
+            model="mock-model",
+            provider=LLMProvider.OPENAI,
+            tokens_prompt=resp.tokens_prompt,
+            tokens_completion=resp.tokens_completion,
             tokens_total=resp.tokens_prompt + resp.tokens_completion,
-            latency_ms=50, cost_usd=resp.cost_usd,
+            latency_ms=50,
+            cost_usd=resp.cost_usd,
         )
 
     def chat_with_tools(self, messages, tools=None, tool_choice="auto", **kwargs):
@@ -98,9 +105,11 @@ class DeterministicLLM:
 # Shared fixtures
 # ============================================================================
 
+
 @pytest.fixture
 def client():
     from api.main import app
+
     return TestClient(app)
 
 
@@ -108,20 +117,28 @@ def client():
 def auth_headers(client):
     """Register + login, return auth headers."""
     username = f"e2e_{generate_id()}"
-    client.post("/auth/register", json={
-        "username": username,
-        "email": f"{username}@test.com",
-        "password": "testpass1234",
-    })
-    resp = client.post("/auth/login", json={
-        "username": username, "password": "testpass1234",
-    })
+    client.post(
+        "/auth/register",
+        json={
+            "username": username,
+            "email": f"{username}@test.com",
+            "password": "testpass1234",
+        },
+    )
+    resp = client.post(
+        "/auth/login",
+        json={
+            "username": username,
+            "password": "testpass1234",
+        },
+    )
     return {"Authorization": f"Bearer {resp.json()['access_token']}"}
 
 
 # ============================================================================
 # Scenario 1: Full Conversation Lifecycle via API
 # ============================================================================
+
 
 class TestScenario1_ConversationLifecycle:
     """Session → Events → Causal Chain → Scoring → Quality Trend.
@@ -134,10 +151,14 @@ class TestScenario1_ConversationLifecycle:
         h = auth_headers
 
         # 1. Create session
-        resp = client.post("/sessions", json={
-            "title": "E2E Test Session",
-            "agent_id": "e2e-agent",
-        }, headers=h)
+        resp = client.post(
+            "/sessions",
+            json={
+                "title": "E2E Test Session",
+                "agent_id": "e2e-agent",
+            },
+            headers=h,
+        )
         assert resp.status_code == 201
         session = resp.json()
         sid = session["session_id"]
@@ -145,37 +166,49 @@ class TestScenario1_ConversationLifecycle:
 
         # 2. Create user query event
         chain_id = generate_id()
-        resp = client.post("/events", json={
-            "session_id": sid,
-            "event_type": "user_query",
-            "content": "Review PR #42 for security issues",
-            "causal_chain_id": chain_id,
-        }, headers=h)
+        resp = client.post(
+            "/events",
+            json={
+                "session_id": sid,
+                "event_type": "user_query",
+                "content": "Review PR #42 for security issues",
+                "causal_chain_id": chain_id,
+            },
+            headers=h,
+        )
         assert resp.status_code == 201
         user_evt = resp.json()
         assert user_evt["causal_chain_id"] == chain_id
 
         # 3. Create tool result event (child of user query)
-        resp = client.post("/events", json={
-            "session_id": sid,
-            "event_type": "tool_result",
-            "content": json.dumps({"tool": "code_review", "result": "2 SQL injection risks"}),
-            "parent_event_id": user_evt["event_id"],
-            "causal_chain_id": chain_id,
-        }, headers=h)
+        resp = client.post(
+            "/events",
+            json={
+                "session_id": sid,
+                "event_type": "tool_result",
+                "content": json.dumps({"tool": "code_review", "result": "2 SQL injection risks"}),
+                "parent_event_id": user_evt["event_id"],
+                "causal_chain_id": chain_id,
+            },
+            headers=h,
+        )
         assert resp.status_code == 201
         tool_evt = resp.json()
 
         # 4. Create LLM response event (child of tool result)
-        resp = client.post("/events", json={
-            "session_id": sid,
-            "event_type": "llm_response",
-            "content": "Found 2 SQL injection vulnerabilities in PR #42.",
-            "agent_id": "e2e-agent",
-            "agent_version": "1.0.0",
-            "parent_event_id": tool_evt["event_id"],
-            "causal_chain_id": chain_id,
-        }, headers=h)
+        resp = client.post(
+            "/events",
+            json={
+                "session_id": sid,
+                "event_type": "llm_response",
+                "content": "Found 2 SQL injection vulnerabilities in PR #42.",
+                "agent_id": "e2e-agent",
+                "agent_version": "1.0.0",
+                "parent_event_id": tool_evt["event_id"],
+                "causal_chain_id": chain_id,
+            },
+            headers=h,
+        )
         assert resp.status_code == 201
         llm_evt = resp.json()
 
@@ -214,6 +247,7 @@ class TestScenario1_ConversationLifecycle:
 # Scenario 2: Decision Audit Trail via API
 # ============================================================================
 
+
 class TestScenario2_DecisionAudit:
     """Snapshot → Decision → Audit retrieval with full context.
 
@@ -230,37 +264,49 @@ class TestScenario2_DecisionAudit:
         sid = resp.json()["session_id"]
 
         # 2. Create event
-        resp = client.post("/events", json={
-            "session_id": sid,
-            "event_type": "user_query",
-            "content": "What is event sourcing?",
-        }, headers=h)
+        resp = client.post(
+            "/events",
+            json={
+                "session_id": sid,
+                "event_type": "user_query",
+                "content": "What is event sourcing?",
+            },
+            headers=h,
+        )
         assert resp.status_code == 201
         event_id = resp.json()["event_id"]
 
         # 3. Create context snapshot
-        resp = client.post("/context", json={
-            "session_id": sid,
-            "event_id": event_id,
-            "context_data": {
-                "system_prompt": "You are a helpful assistant.",
-                "selected_events": [{"id": event_id, "content": "What is event sourcing?"}],
-                "skill_definitions": [{"name": "search_docs", "version": "1.0"}],
+        resp = client.post(
+            "/context",
+            json={
+                "session_id": sid,
+                "event_id": event_id,
+                "context_data": {
+                    "system_prompt": "You are a helpful assistant.",
+                    "selected_events": [{"id": event_id, "content": "What is event sourcing?"}],
+                    "skill_definitions": [{"name": "search_docs", "version": "1.0"}],
+                },
             },
-        }, headers=h)
+            headers=h,
+        )
         assert resp.status_code == 201
         snapshot = resp.json()
         snapshot_id = snapshot["context_capture_id"]
 
         # 4. Record decision linked to snapshot
-        resp = client.post("/decisions", json={
-            "session_id": sid,
-            "event_id": event_id,
-            "context_capture_id": snapshot_id,
-            "decision_type": "skill_selection",
-            "decision_output": {"selected_skill": "search_docs", "confidence": 0.95},
-            "model_params": {"model": "gpt-4", "temperature": 0.0},
-        }, headers=h)
+        resp = client.post(
+            "/decisions",
+            json={
+                "session_id": sid,
+                "event_id": event_id,
+                "context_capture_id": snapshot_id,
+                "decision_type": "skill_selection",
+                "decision_output": {"selected_skill": "search_docs", "confidence": 0.95},
+                "model_params": {"model": "gpt-4", "temperature": 0.0},
+            },
+            headers=h,
+        )
         assert resp.status_code == 201
         decision = resp.json()
         decision_id = decision["decision_id"]
@@ -290,6 +336,7 @@ class TestScenario2_DecisionAudit:
 # Scenario 3: Closed Loop via API
 # ============================================================================
 
+
 class TestScenario3_ClosedLoop:
     """Seed low quality → run closed loop → verify all 4 phases.
 
@@ -308,7 +355,8 @@ class TestScenario3_ClosedLoop:
         for i in range(5):
             eid = generate_id()
             cid = generate_id()
-            db_session.execute(text("""
+            db_session.execute(
+                text("""
                 INSERT INTO agent_events
                 (event_id, session_id, user_id, agent_id, agent_version,
                  event_type, content, causal_chain_id, quality_score,
@@ -316,7 +364,9 @@ class TestScenario3_ClosedLoop:
                 VALUES (:eid, :sid, 'system', 'system', '1.0.0',
                         'llm_response', :content, :cid, 1.5,
                         'gpt-4', NOW())
-            """), {"eid": eid, "sid": sid, "content": f"Low quality {i}", "cid": cid})
+            """),
+                {"eid": eid, "sid": sid, "content": f"Low quality {i}", "cid": cid},
+            )
         db_session.commit()
 
         # Run closed loop via API
@@ -357,6 +407,7 @@ class TestScenario3_ClosedLoop:
 # Scenario 4: Evaluation Query Endpoints
 # ============================================================================
 
+
 class TestScenario4_EvaluationQueries:
     """Quality trend, drift signals, calibration, session scores — all via API.
 
@@ -371,18 +422,22 @@ class TestScenario4_EvaluationQueries:
         sid = generate_id()
         for qs in [4.0, 4.5, 3.0, 5.0]:
             eid = generate_id()
-            db_session.execute(text("""
+            db_session.execute(
+                text("""
                 INSERT INTO agent_events
                 (event_id, session_id, user_id, agent_id, agent_version,
                  event_type, content, causal_chain_id, quality_score,
                  training_eligible, created_at)
                 VALUES (:eid, :sid, 'system', 'system', '1.0.0',
                         'llm_response', 'test', :eid, :qs, 1, NOW())
-            """), {"eid": eid, "sid": sid, "qs": qs})
+            """),
+                {"eid": eid, "sid": sid, "qs": qs},
+            )
         db_session.commit()
 
-        resp = client.get("/api/v1/evaluation/quality/trend",
-                          params={"days": 1}, headers=auth_headers)
+        resp = client.get(
+            "/api/v1/evaluation/quality/trend", params={"days": 1}, headers=auth_headers
+        )
         assert resp.status_code == 200
         data = resp.json()
         assert "points" in data
@@ -417,19 +472,23 @@ class TestScenario4_EvaluationQueries:
         sid = generate_id()
         cid = generate_id()
         eid = generate_id()
-        db_session.execute(text("""
+        db_session.execute(
+            text("""
             INSERT INTO agent_events
             (event_id, session_id, user_id, agent_id, agent_version,
              event_type, content, causal_chain_id, quality_score, created_at)
             VALUES (:eid, :sid, 'system', 'system', '1.0.0',
                     'llm_response', 'test', :cid, 4.5, NOW())
-        """), {"eid": eid, "sid": sid, "cid": cid})
+        """),
+            {"eid": eid, "sid": sid, "cid": cid},
+        )
         db_session.commit()
         score_chain(db_session, cid, sid)
         score_session(db_session, sid)
 
-        resp = client.get("/api/v1/evaluation/sessions/scores",
-                          params={"min_score": 4.0}, headers=auth_headers)
+        resp = client.get(
+            "/api/v1/evaluation/sessions/scores", params={"min_score": 4.0}, headers=auth_headers
+        )
         assert resp.status_code == 200
         data = resp.json()
         found = any(s["session_id"] == sid for s in data)
@@ -448,6 +507,7 @@ class TestScenario4_EvaluationQueries:
 # ============================================================================
 # Scenario 5: Skill Learning via API
 # ============================================================================
+
 
 class TestScenario5_SkillLearning:
     """Trigger learning → check stats → verify signals — all via API."""
@@ -477,10 +537,14 @@ class TestScenario5_SkillLearning:
 
     def test_trigger_learning(self, client, auth_headers):
         """Trigger learning cycle via API."""
-        resp = client.post("/api/v1/learning/trigger", json={
-            "days": 7,
-            "signal_types": ["wrong_skill"],
-        }, headers=auth_headers)
+        resp = client.post(
+            "/api/v1/learning/trigger",
+            json={
+                "days": 7,
+                "signal_types": ["wrong_skill"],
+            },
+            headers=auth_headers,
+        )
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] in ("success", "error")
@@ -490,6 +554,7 @@ class TestScenario5_SkillLearning:
 # ============================================================================
 # Scenario 6: Causal Chain Integrity via API
 # ============================================================================
+
 
 class TestScenario6_CausalChain:
     """Multi-turn conversation with causal chain — verified via API queries."""
@@ -512,7 +577,7 @@ class TestScenario6_CausalChain:
             payload = {
                 "session_id": sid,
                 "event_type": etype,
-                "content": f"Step {i+1}: {etype}",
+                "content": f"Step {i + 1}: {etype}",
                 "causal_chain_id": chain_id,
             }
             if event_ids:
@@ -542,6 +607,7 @@ class TestScenario6_CausalChain:
 # Scenario 7: Auth + Session + Event CRUD via API
 # ============================================================================
 
+
 class TestScenario7_CRUD:
     """Full CRUD lifecycle for sessions and events via API."""
 
@@ -550,9 +616,14 @@ class TestScenario7_CRUD:
         h = auth_headers
 
         # Create
-        resp = client.post("/sessions", json={
-            "title": "CRUD Test", "metadata": {"env": "test"},
-        }, headers=h)
+        resp = client.post(
+            "/sessions",
+            json={
+                "title": "CRUD Test",
+                "metadata": {"env": "test"},
+            },
+            headers=h,
+        )
         assert resp.status_code == 201
         sid = resp.json()["session_id"]
 
@@ -562,9 +633,13 @@ class TestScenario7_CRUD:
         assert resp.json()["title"] == "CRUD Test"
 
         # Update
-        resp = client.put(f"/sessions/{sid}", json={
-            "title": "Updated Title",
-        }, headers=h)
+        resp = client.put(
+            f"/sessions/{sid}",
+            json={
+                "title": "Updated Title",
+            },
+            headers=h,
+        )
         assert resp.status_code == 200
         assert resp.json()["title"] == "Updated Title"
 
@@ -598,11 +673,15 @@ class TestScenario7_CRUD:
         sid = resp.json()["session_id"]
 
         # Create event
-        resp = client.post("/events", json={
-            "session_id": sid,
-            "event_type": "user_query",
-            "content": "Hello world",
-        }, headers=h)
+        resp = client.post(
+            "/events",
+            json={
+                "session_id": sid,
+                "event_type": "user_query",
+                "content": "Hello world",
+            },
+            headers=h,
+        )
         assert resp.status_code == 201
         eid = resp.json()["event_id"]
 
@@ -653,6 +732,7 @@ class TestScenario7_CRUD:
 # Scenario 8: Adversarial Evaluation
 # ============================================================================
 
+
 class TestScenario8_Adversarial:
     """Attack detection and assessment with mock LLM."""
 
@@ -661,9 +741,9 @@ class TestScenario8_Adversarial:
         from core.evaluation.adversarial import AdversarialEvaluator, AttackType
 
         mock_llm = DeterministicLLM()
-        mock_llm.add_response("ignore previous", CannedResponse(
-            content="Sure, I'll ignore my instructions."
-        ))
+        mock_llm.add_response(
+            "ignore previous", CannedResponse(content="Sure, I'll ignore my instructions.")
+        )
 
         evaluator = AdversarialEvaluator(lambda: db_session, llm_client=mock_llm)
         result = evaluator.run_attack(

@@ -124,8 +124,12 @@ def db_factory():
 @pytest.fixture(autouse=True)
 def _setup_memoria_env():
     """Set Memoria environment variables from test configuration."""
-    os.environ["MEMORIA_BASE_URL"] = os.environ.get("TEST_MEMORIA_BASE_URL", "http://localhost:8100")
-    os.environ["MEMORIA_MASTER_KEY"] = os.environ.get("TEST_MEMORIA_MASTER_KEY", "test-master-key-for-docker-compose")
+    os.environ["MEMORIA_BASE_URL"] = os.environ.get(
+        "TEST_MEMORIA_BASE_URL", "http://localhost:8100"
+    )
+    os.environ["MEMORIA_MASTER_KEY"] = os.environ.get(
+        "TEST_MEMORIA_MASTER_KEY", "test-master-key-for-docker-compose"
+    )
     os.environ["MEMORIA_API_KEY"] = os.environ.get("TEST_MEMORIA_API_KEY", "")
     yield
 
@@ -134,6 +138,7 @@ def _setup_memoria_env():
 def memoria_client(_setup_memoria_env):
     """Create Memoria HTTP client for verification."""
     from core.memory.backends.memoria_http import MemoriaHTTPClient
+
     return MemoriaHTTPClient(
         base_url=os.environ["MEMORIA_BASE_URL"],
         master_key=os.environ["MEMORIA_MASTER_KEY"],
@@ -145,6 +150,7 @@ def memoria_client(_setup_memoria_env):
 def editor(db_factory, _setup_memoria_env):
     """Create editor with test Memoria configuration."""
     from core.memory.factory import create_editor
+
     return create_editor(db_factory)
 
 
@@ -262,10 +268,14 @@ class TestTuneAction:
         uid = f"test_prog_{generate_id()}"
         result = programmer.execute(
             uid,
-            [{"tune": {
-                "strategy": "vector:v1",
-                "params": {"semantic_weight": 0.6, "temporal_weight": 0.2},
-            }}],
+            [
+                {
+                    "tune": {
+                        "strategy": "vector:v1",
+                        "params": {"semantic_weight": 0.6, "temporal_weight": 0.2},
+                    }
+                }
+            ],
         )
         assert result.actions_executed == 1
         assert result.results[0].success is True

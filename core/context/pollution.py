@@ -14,28 +14,28 @@ logger = get_logger(__name__)
 
 class PollutionDetector(DbConsumer):
     """Detect and quarantine polluted memory entries.
-    
+
     Pollution sources:
     - User injection: deliberately false "facts"
     - Hallucination crystallization: hallucinated responses stored as knowledge
     - Stale knowledge: once-true facts now outdated
     - Contradictions: conflicting entries on same topic
-    
+
     Detection signals:
     - Retrieved often but leads to low-quality decisions
     - Contradicts other entries on same topic
     - Age without revalidation
-    
+
     Example:
         >>> detector = PollutionDetector(db)
         >>> candidates = detector.detect_pollution_candidates("alice")
         >>> detector.quarantine_entry("ke_123", severity="high")
         >>> impact = detector.analyze_cascade_impact("ke_123")
     """
-    
+
     def __init__(self, db_factory: DbFactory):
         super().__init__(db_factory)
-    
+
     def detect_pollution_candidates(
         self,
         user_id: str,
@@ -44,29 +44,30 @@ class PollutionDetector(DbConsumer):
         staleness_days: int = 90,
     ) -> list[dict[str, Any]]:
         """Detect pollution candidates for a user.
-        
+
         Args:
             user_id: User ID
             quality_threshold: Min avg quality score for downstream decisions
             contradiction_threshold: Max contradicting entries allowed
             staleness_days: Days without validation to consider stale
-            
+
         Returns:
             List of pollution candidates with severity
         """
         with self._db() as db:
             from api.models import KnowledgeEntry
-        
-            entries = db.query(KnowledgeEntry).filter(
-                KnowledgeEntry.user_id == user_id,
-                KnowledgeEntry.confidence > 0.3
-            ).all()
-        
+
+            entries = (
+                db.query(KnowledgeEntry)
+                .filter(KnowledgeEntry.user_id == user_id, KnowledgeEntry.confidence > 0.3)
+                .all()
+            )
+
             candidates = []
-        
+
             for entry in entries:
                 signals = self._calculate_pollution_signals(entry)
-            
+
                 # Classify severity
                 severity = self._classify_severity(
                     signals,
@@ -74,59 +75,65 @@ class PollutionDetector(DbConsumer):
                     contradiction_threshold,
                     staleness_days,
                 )
-            
+
                 if severity:
-                    candidates.append({
-                        "entry_id": entry.entry_id,
-                        "key_name": entry.key_name,
-                        "category": entry.category,
-                        "severity": severity,
-                        "signals": signals,
-                    })
-        
+                    candidates.append(
+                        {
+                            "entry_id": entry.entry_id,
+                            "key_name": entry.key_name,
+                            "category": entry.category,
+                            "severity": severity,
+                            "signals": signals,
+                        }
+                    )
+
             logger.info(f"Found {len(candidates)} pollution candidates for {user_id}")
             return candidates
-    
+
     def _calculate_pollution_signals(
         self,
         entry,
     ) -> dict[str, Any]:
         """Calculate pollution detection signals for an entry.
-        
+
         Args:
             entry: KnowledgeEntry instance
-            
+
         Returns:
             Pollution signals
         """
         with self._db() as db:
             from datetime import datetime
-        
+
             # Signal 1: Days since validation
             days_since = (datetime.now() - entry.last_validated_at).days
-        
+
             # Signal 2: Contradicting entries (simplified - check same key)
             from api.models import KnowledgeEntry
-        
-            contradicting = db.query(KnowledgeEntry).filter(
-                KnowledgeEntry.user_id == entry.user_id,
-                KnowledgeEntry.category == entry.category,
-                KnowledgeEntry.key_name == entry.key_name,
-                KnowledgeEntry.entry_id != entry.entry_id,
-                KnowledgeEntry.value != entry.value,
-            ).count()
-        
+
+            contradicting = (
+                db.query(KnowledgeEntry)
+                .filter(
+                    KnowledgeEntry.user_id == entry.user_id,
+                    KnowledgeEntry.category == entry.category,
+                    KnowledgeEntry.key_name == entry.key_name,
+                    KnowledgeEntry.entry_id != entry.entry_id,
+                    KnowledgeEntry.value != entry.value,
+                )
+                .count()
+            )
+
             # Signal 3: Downstream quality (simplified - would need ctx_snapshots join)
             # For now, use confidence as proxy
             downstream_quality = entry.confidence * 5.0  # Scale to 0-5
-        
+
             return {
                 "days_since_validation": days_since,
                 "contradicting_entries": contradicting,
                 "downstream_quality": downstream_quality,
                 "confidence": entry.confidence,
             }
-    
+
     def _classify_severity(
         self,
         signals: dict[str, Any],
@@ -135,30 +142,30 @@ class PollutionDetector(DbConsumer):
         staleness_days: int,
     ) -> str | None:
         """Classify pollution severity.
-        
+
         Args:
             signals: Pollution signals
             quality_threshold: Quality threshold
             contradiction_threshold: Contradiction threshold
             staleness_days: Staleness threshold
-            
+
         Returns:
             Severity level (low, medium, high) or None
         """
         # HIGH: Confirmed downstream harm
         if signals["downstream_quality"] < quality_threshold:
             return "high"
-        
+
         # MEDIUM: Contradictions exist
         if signals["contradicting_entries"] >= contradiction_threshold:
             return "medium"
-        
+
         # LOW: Stale but no harm
         if signals["days_since_validation"] > staleness_days:
             return "low"
-        
+
         return None
-    
+
     def quarantine_entry(
         self,
         entry_id: str,
@@ -166,38 +173,36 @@ class PollutionDetector(DbConsumer):
         reason: str | None = None,
     ) -> bool:
         """Quarantine a polluted entry.
-        
+
         Args:
             entry_id: Entry ID to quarantine
             severity: Severity level (low, medium, high)
             reason: Quarantine reason
-            
+
         Returns:
             True if quarantined
         """
         with self._db() as db:
             from api.models import KnowledgeEntry
-        
-            entry = db.query(KnowledgeEntry).filter(
-                KnowledgeEntry.entry_id == entry_id
-            ).first()
-        
+
+            entry = db.query(KnowledgeEntry).filter(KnowledgeEntry.entry_id == entry_id).first()
+
             if not entry:
                 logger.warning(f"Entry {entry_id} not found")
                 return False
-        
+
             # In production, move to quarantine table
             # For now, set confidence to 0 to exclude from retrieval
             entry.confidence = 0.0
             db.commit()
-        
+
             logger.warning(
                 f"Quarantined entry {entry_id} (severity={severity}): "
                 f"{entry.key_name} - {reason or 'no reason'}"
             )
-        
+
             return True
-    
+
     def analyze_cascade_impact(
         self,
         entry_id: str,
@@ -251,7 +256,9 @@ class PollutionDetector(DbConsumer):
                                 events = json.loads(events)
                             except (json.JSONDecodeError, TypeError):
                                 continue
-                        event_ids = {e.get("event_id") or e for e in events if isinstance(e, (dict, str))}
+                        event_ids = {
+                            e.get("event_id") or e for e in events if isinstance(e, (dict, str))
+                        }
                         if frontier & event_ids:
                             hit_snapshot_ids.add(snap.context_capture_id)
                     if len(batch) < batch_size:
@@ -262,9 +269,11 @@ class PollutionDetector(DbConsumer):
                     break
 
                 # Find decisions linked to those snapshots
-                decisions = db.query(DecisionAudit).filter(
-                    DecisionAudit.context_capture_id.in_(list(hit_snapshot_ids))
-                ).all()
+                decisions = (
+                    db.query(DecisionAudit)
+                    .filter(DecisionAudit.context_capture_id.in_(list(hit_snapshot_ids)))
+                    .all()
+                )
                 new_decision_event_ids: set[str] = set()
                 for d in decisions:
                     if d.decision_id not in affected_decisions:
@@ -277,9 +286,14 @@ class PollutionDetector(DbConsumer):
 
                 # Find knowledge entries sourced from those decision events
                 from api.models import KnowledgeEntrySource
-                sources = db.query(KnowledgeEntrySource.entry_id).filter(
-                    KnowledgeEntrySource.event_id.in_(new_decision_event_ids),
-                ).all()
+
+                sources = (
+                    db.query(KnowledgeEntrySource.entry_id)
+                    .filter(
+                        KnowledgeEntrySource.event_id.in_(new_decision_event_ids),
+                    )
+                    .all()
+                )
                 for (eid,) in sources:
                     if eid not in affected_entries:
                         affected_entries.add(eid)
@@ -293,27 +307,28 @@ class PollutionDetector(DbConsumer):
                 "affected_entries": len(affected_entries),
                 "contamination_depth": depth,
             }
-    
+
     def scan_contradictions(
         self,
         user_id: str,
     ) -> list[dict[str, Any]]:
         """Scan for contradicting knowledge entries.
-        
+
         Args:
             user_id: User ID
-            
+
         Returns:
             List of contradiction groups
         """
         with self._db() as db:
             from api.models import KnowledgeEntry
-        
-            entries = db.query(KnowledgeEntry).filter(
-                KnowledgeEntry.user_id == user_id,
-                KnowledgeEntry.confidence > 0.3
-            ).all()
-        
+
+            entries = (
+                db.query(KnowledgeEntry)
+                .filter(KnowledgeEntry.user_id == user_id, KnowledgeEntry.confidence > 0.3)
+                .all()
+            )
+
             # Group by (category, key)
             groups: dict[tuple[str, str], list] = {}
             for entry in entries:
@@ -321,28 +336,30 @@ class PollutionDetector(DbConsumer):
                 if key not in groups:
                     groups[key] = []
                 groups[key].append(entry)
-        
+
             # Find groups with multiple different values
             contradictions = []
             for key, group in groups.items():
                 if len(group) > 1:
                     values = set(e.value for e in group)
                     if len(values) > 1:
-                        contradictions.append({
-                            "category": key[0],
-                            "key_name": key[1],
-                            "entry_count": len(group),
-                            "value_count": len(values),
-                            "entries": [
-                                {
-                                    "entry_id": e.entry_id,
-                                    "value": e.value,
-                                    "confidence": e.confidence,
-                                }
-                                for e in group
-                            ],
-                        })
-        
+                        contradictions.append(
+                            {
+                                "category": key[0],
+                                "key_name": key[1],
+                                "entry_count": len(group),
+                                "value_count": len(values),
+                                "entries": [
+                                    {
+                                        "entry_id": e.entry_id,
+                                        "value": e.value,
+                                        "confidence": e.confidence,
+                                    }
+                                    for e in group
+                                ],
+                            }
+                        )
+
             logger.info(f"Found {len(contradictions)} contradiction groups for {user_id}")
             return contradictions
 
@@ -378,7 +395,9 @@ class PollutionDetector(DbConsumer):
         else:
             logger.warning(
                 "Quarantine rejected by gate: %s (verdict=%s, reason=%s)",
-                entry_id, verdict, result.get("reason"),
+                entry_id,
+                verdict,
+                result.get("reason"),
             )
 
         return {"entry_id": entry_id, "verdict": verdict, "severity": severity}

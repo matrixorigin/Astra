@@ -115,6 +115,7 @@ def _split_think_tags(content: str) -> tuple[str, str]:
     Returns (reasoning, text) — either may be empty string.
     """
     import re
+
     # Match complete <think>...</think> blocks
     reasoning_parts: list[str] = re.findall(r"<think>(.*?)</think>", content, re.DOTALL)
     # Remove all <think>...</think> blocks (and any dangling </think> tags) from text
@@ -181,12 +182,15 @@ def _accumulate_tool_calls(response_iter) -> Iterator[dict]:
     for tc in buf.values():
         if tc["function"]["name"]:
             if truncated:
-                logger.warning("tool_call %s truncated by max_tokens, arguments incomplete",
-                               tc["function"]["name"])
+                logger.warning(
+                    "tool_call %s truncated by max_tokens, arguments incomplete",
+                    tc["function"]["name"],
+                )
                 tc["_truncated"] = True
             elif not tc["function"]["arguments"]:
-                logger.warning("LLM emitted tool_call %s with empty arguments",
-                               tc["function"]["name"])
+                logger.warning(
+                    "LLM emitted tool_call %s with empty arguments", tc["function"]["name"]
+                )
             yield {"type": "tool_call", "data": tc}
 
 
@@ -426,7 +430,9 @@ class AnthropicProvider(BaseProvider):
             else:
                 user_msgs.append(m)
 
-        system_text = "\n".join(system_parts).strip() if system_parts else "You are a helpful assistant."
+        system_text = (
+            "\n".join(system_parts).strip() if system_parts else "You are a helpful assistant."
+        )
 
         if not self.cache_enabled:
             return system_text, user_msgs
@@ -609,13 +615,15 @@ class AnthropicProvider(BaseProvider):
 
 class MockEchoProvider(BaseProvider):
     """Mock provider that echoes back the user message. For testing only."""
-    
+
     provider = LLMProvider.MOCK
-    
+
     def __init__(self):
         pass
-    
-    def complete(self, messages: list[dict], model: str, temperature: float, max_tokens: int | None) -> LLMResponse:
+
+    def complete(
+        self, messages: list[dict], model: str, temperature: float, max_tokens: int | None
+    ) -> LLMResponse:
         # Echo the last user message
         user_msg = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
         return LLMResponse(
@@ -628,16 +636,18 @@ class MockEchoProvider(BaseProvider):
             latency_ms=1,
             cost_usd=0.0,
         )
-    
-    def complete_stream(self, messages: list[dict], model: str, temperature: float, max_tokens: int | None) -> Iterator[dict]:
+
+    def complete_stream(
+        self, messages: list[dict], model: str, temperature: float, max_tokens: int | None
+    ) -> Iterator[dict]:
         user_msg = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
         response = f"Echo: {user_msg}"
-        
+
         for word in response.split():
             yield {"type": "text", "content": word + " "}
-        
+
         yield {"type": "usage", "prompt": 10, "completion": 10}
-    
+
     def complete_with_tools(
         self,
         messages: list[dict],
@@ -655,7 +665,7 @@ class MockEchoProvider(BaseProvider):
             "model": model,
             "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
         }
-    
+
     def complete_with_tools_stream(
         self,
         messages: list[dict],
@@ -667,10 +677,8 @@ class MockEchoProvider(BaseProvider):
     ) -> Iterator[dict]:
         user_msg = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
         response = f"Echo: {user_msg}"
-        
+
         for word in response.split():
             yield {"type": "text", "content": word + " "}
-        
+
         yield {"type": "usage", "prompt": 10, "completion": 10}
-
-

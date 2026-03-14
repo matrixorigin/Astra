@@ -28,6 +28,7 @@ from core.context.compaction import compact_history_messages
 # Fixtures
 # ============================================================================
 
+
 @pytest.fixture
 def project(tmp_path: Path) -> Path:
     """Project with gitignored artifacts."""
@@ -76,6 +77,7 @@ def project(tmp_path: Path) -> Path:
 # Shared _gitignore loader
 # ============================================================================
 
+
 class TestLoadGitignore:
     def test_loads_existing_gitignore(self, project: Path):
         spec = load_gitignore(str(project))
@@ -92,11 +94,16 @@ class TestLoadGitignore:
     def test_returns_none_when_pathspec_unavailable(self, monkeypatch):
         """Covers the except Exception branch."""
         import cli.tools._gitignore as mod
-        original_import = __builtins__.__import__ if hasattr(__builtins__, '__import__') else __import__
+
+        original_import = (
+            __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
+        )
+
         def fake_import(name, *args, **kwargs):
             if name == "pathspec":
                 raise ImportError("no pathspec")
             return original_import(name, *args, **kwargs)
+
         monkeypatch.setattr("builtins.__import__", fake_import)
         assert mod.load_gitignore("/tmp") is None
 
@@ -104,6 +111,7 @@ class TestLoadGitignore:
 # ============================================================================
 # ListDirTool: gitignore filtering
 # ============================================================================
+
 
 class TestListDirGitignore:
     @pytest.mark.asyncio
@@ -139,6 +147,7 @@ class TestListDirGitignore:
 # ============================================================================
 # ListDirTool: progressive disclosure
 # ============================================================================
+
 
 class TestListDirProgressive:
     @pytest.mark.asyncio
@@ -188,6 +197,7 @@ class TestListDirProgressive:
     async def test_permission_denied_dir(self, tmp_path: Path):
         """Covers PermissionError branch in _walk."""
         import os, stat
+
         restricted = tmp_path / "noperm"
         restricted.mkdir()
         (restricted / "secret.txt").write_text("x")
@@ -219,6 +229,7 @@ class TestListDirProgressive:
     async def test_truncation_at_max_entries(self, tmp_path: Path):
         """Covers MAX_LIST_ENTRIES truncation in execute and _walk."""
         from cli.tools import file_ops
+
         (tmp_path / ".gitignore").write_text("")
         for i in range(30):
             (tmp_path / f"file{i:03d}.txt").write_text("x")
@@ -235,6 +246,7 @@ class TestListDirProgressive:
 # ============================================================================
 # GrepTool: gitignore filtering (Python fallback path)
 # ============================================================================
+
 
 class TestGrepGitignore:
     def test_python_grep_skips_gitignored_dirs(self, project: Path):
@@ -270,6 +282,7 @@ class TestGrepGitignore:
 # ============================================================================
 # GlobTool: gitignore filtering
 # ============================================================================
+
 
 class TestGlobGitignore:
     @pytest.mark.asyncio
@@ -328,6 +341,7 @@ class TestGlobGitignore:
 # tool_output_handler: list_dir summary
 # ============================================================================
 
+
 class TestListDirSummary:
     def test_strategy_registered(self):
         assert "list_dir" in SUMMARY_GENERATORS
@@ -379,6 +393,7 @@ class TestListDirSummary:
 # ============================================================================
 # compaction: compact_history_messages
 # ============================================================================
+
 
 class TestCompactHistoryMessages:
     def test_small_history_returned_as_is(self):
@@ -495,10 +510,12 @@ class TestCompactHistoryMessages:
 # chat_loop: hard limit on tool results
 # ============================================================================
 
+
 class TestToolResultHardLimit:
     def test_hard_limit_is_module_constant(self):
         """MAX_SINGLE_TOOL_RESULT_CHARS is a module-level constant, not loop-local."""
         from core.agent.chat_loop import MAX_SINGLE_TOOL_RESULT_CHARS
+
         assert isinstance(MAX_SINGLE_TOOL_RESULT_CHARS, int)
         assert MAX_SINGLE_TOOL_RESULT_CHARS == 12000
 
@@ -509,9 +526,12 @@ class TestToolResultHardLimit:
         If the format there changes, this test must be updated to match.
         """
         from core.agent.chat_loop import MAX_SINGLE_TOOL_RESULT_CHARS
+
         big = "x" * 20000
         if len(big) > MAX_SINGLE_TOOL_RESULT_CHARS:
-            result = big[:MAX_SINGLE_TOOL_RESULT_CHARS] + f"\n... [hard-truncated from {len(big)} chars]"
+            result = (
+                big[:MAX_SINGLE_TOOL_RESULT_CHARS] + f"\n... [hard-truncated from {len(big)} chars]"
+            )
         assert len(result) < MAX_SINGLE_TOOL_RESULT_CHARS + 100
         assert "hard-truncated" in result
         assert "20000" in result
@@ -519,6 +539,7 @@ class TestToolResultHardLimit:
 
     def test_compaction_truncate_fallback_still_works(self):
         from core.context.compaction import truncate_tool_result, MAX_TOOL_RESULT_CHARS
+
         big = "x" * 20000
         result = truncate_tool_result(big)
         assert len(result) <= MAX_TOOL_RESULT_CHARS + 100

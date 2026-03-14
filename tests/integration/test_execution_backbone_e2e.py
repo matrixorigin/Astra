@@ -72,15 +72,19 @@ class ScriptedProvider:
         yield {"type": "text", "content": r if isinstance(r, str) else json.dumps(r)}
         yield {"type": "usage", "prompt": 10, "completion": 5}
 
-    def complete_with_tools_stream(self, messages, tools, model, tool_choice, temperature, max_tokens):
+    def complete_with_tools_stream(
+        self, messages, tools, model, tool_choice, temperature, max_tokens
+    ):
         r = self._next()
         if isinstance(r, dict) and "tool" in r:
             yield {
                 "type": "tool_calls",
-                "tool_calls": [{
-                    "id": f"call_{self._idx}",
-                    "function": {"name": r["tool"], "arguments": json.dumps(r.get("args", {}))},
-                }],
+                "tool_calls": [
+                    {
+                        "id": f"call_{self._idx}",
+                        "function": {"name": r["tool"], "arguments": json.dumps(r.get("args", {}))},
+                    }
+                ],
             }
         else:
             yield {"type": "text", "content": r if isinstance(r, str) else "done"}
@@ -93,8 +97,10 @@ def _patch_llm(provider):
 
 def _patch_job(job_id: str):
     backend = MagicMock()
+
     async def _submit(*a, **kw):
         return job_id
+
     backend.submit = _submit
     return patch("core.jobs.router.JobRouter.select", return_value=backend)
 
@@ -104,13 +110,11 @@ def _patch_job(job_id: str):
 
 @pytest.fixture(autouse=True)
 def _clean_globals():
-    for d in (_active_runs, _agent_run_events, _run_waiters, _run_tasks,
-              _child_runs):
+    for d in (_active_runs, _agent_run_events, _run_waiters, _run_tasks, _child_runs):
         d.clear()
     cleanup_fan_in_tasks()
     yield
-    for d in (_active_runs, _agent_run_events, _run_waiters, _run_tasks,
-              _child_runs):
+    for d in (_active_runs, _agent_run_events, _run_waiters, _run_tasks, _child_runs):
         d.clear()
     cleanup_fan_in_tasks()
 
@@ -124,15 +128,25 @@ def db(db_session):
 @pytest.fixture
 def session_id(db):
     from core.events.session_manager import SessionManager
-    sid = SessionManager(db).create_session(
-        user_id="test-user", metadata={"source": "backbone_e2e"},
-    ).session_id
+
+    sid = (
+        SessionManager(db)
+        .create_session(
+            user_id="test-user",
+            metadata={"source": "backbone_e2e"},
+        )
+        .session_id
+    )
     yield sid
     # Clean up all test data tied to this session
-    db.execute(text("DELETE FROM agent_run_events WHERE run_id IN "
-                    "(SELECT JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) "
-                    "FROM agent_events WHERE session_id = :sid AND event_type = 'run_started')"),
-               {"sid": sid})
+    db.execute(
+        text(
+            "DELETE FROM agent_run_events WHERE run_id IN "
+            "(SELECT JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) "
+            "FROM agent_events WHERE session_id = :sid AND event_type = 'run_started')"
+        ),
+        {"sid": sid},
+    )
     db.execute(text("DELETE FROM agent_events WHERE session_id = :sid"), {"sid": sid})
     db.execute(text("DELETE FROM wf_triggers WHERE session_id = :sid"), {"sid": sid})
     db.execute(text("DELETE FROM agent_sessions WHERE session_id = :sid"), {"sid": sid})
@@ -142,6 +156,7 @@ def session_id(db):
 @pytest.fixture
 def client():
     from api.main import app
+
     with TestClient(app) as c:
         yield c
 
@@ -149,7 +164,9 @@ def client():
 @pytest.fixture
 def auth_headers(client):
     u = f"bb_{generate_id()}"
-    client.post("/auth/register", json={"username": u, "email": f"{u}@t.com", "password": "testpass1234"})
+    client.post(
+        "/auth/register", json={"username": u, "email": f"{u}@t.com", "password": "testpass1234"}
+    )
     r = client.post("/auth/login", json={"username": u, "password": "testpass1234"})
     return {"Authorization": f"Bearer {r.json()['access_token']}"}
 
@@ -168,6 +185,7 @@ class TestChatHTTP:
 
     def test_chat_returns_run_id(self, client, auth_headers):
         """POST /chat returns 200 with run_id and status."""
+
         # Prevent background task from racing with session teardown.
         # RunEngine state machine is fully tested in Tier B below.
         async def _noop_start_run(self, run):
@@ -225,12 +243,16 @@ class TestRunRestore:
         """Run parks → clear memory → restore from DB shows WAITING."""
         engine = RunEngine(lambda: db)
         run = engine.create_run(
-            session_id=session_id, user_id="test-user", user_input="Restore test",
+            session_id=session_id,
+            user_id="test-user",
+            user_input="Restore test",
         )
         run_id = run.run_id
 
-        with patch("api.routers.chat._build_chat_loop",
-                    return_value=_mock_chat_loop([{"wait_for": "job:restore_001"}])):
+        with patch(
+            "api.routers.chat._build_chat_loop",
+            return_value=_mock_chat_loop([{"wait_for": "job:restore_001"}]),
+        ):
             await engine.start_run(run)
 
         assert run.status == RunStatus.WAITING
@@ -246,12 +268,13 @@ class TestRunRestore:
         """Run completes → clear memory → restore shows COMPLETED."""
         engine = RunEngine(lambda: db)
         run = engine.create_run(
-            session_id=session_id, user_id="test-user", user_input="Complete test",
+            session_id=session_id,
+            user_id="test-user",
+            user_input="Complete test",
         )
         run_id = run.run_id
 
-        with patch("api.routers.chat._build_chat_loop",
-                    return_value=_mock_chat_loop(["Done"])):
+        with patch("api.routers.chat._build_chat_loop", return_value=_mock_chat_loop(["Done"])):
             await engine.start_run(run)
 
         assert run.status == RunStatus.COMPLETED
@@ -270,11 +293,15 @@ class TestWaitResume:
         """Run parks → resume → completes. Full event trail in DB."""
         engine = RunEngine(lambda: db)
         run = engine.create_run(
-            session_id=session_id, user_id="test-user", user_input="Wait test",
+            session_id=session_id,
+            user_id="test-user",
+            user_input="Wait test",
         )
 
-        with patch("api.routers.chat._build_chat_loop",
-                    return_value=_mock_chat_loop([{"wait_for": "job:w1"}, "Resumed!"])):
+        with patch(
+            "api.routers.chat._build_chat_loop",
+            return_value=_mock_chat_loop([{"wait_for": "job:w1"}, "Resumed!"]),
+        ):
             await engine.start_run(run)
             assert run.status == RunStatus.WAITING
 
@@ -283,8 +310,10 @@ class TestWaitResume:
         assert run.status == RunStatus.COMPLETED
 
         rows = db.execute(
-            text("SELECT event_type FROM agent_events "
-                 "WHERE JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) = :rid ORDER BY created_at"),
+            text(
+                "SELECT event_type FROM agent_events "
+                "WHERE JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) = :rid ORDER BY created_at"
+            ),
             {"rid": run.run_id},
         ).fetchall()
         types = [r[0] for r in rows]
@@ -302,12 +331,16 @@ class TestCrossWorkerResume:
         """Worker A parks → crash → Worker B restores and resumes."""
         engine = RunEngine(lambda: db)
         run = engine.create_run(
-            session_id=session_id, user_id="test-user", user_input="Crash test",
+            session_id=session_id,
+            user_id="test-user",
+            user_input="Crash test",
         )
         run_id = run.run_id
 
-        with patch("api.routers.chat._build_chat_loop",
-                    return_value=_mock_chat_loop([{"wait_for": "job:crash_001"}, "Recovered!"])):
+        with patch(
+            "api.routers.chat._build_chat_loop",
+            return_value=_mock_chat_loop([{"wait_for": "job:crash_001"}, "Recovered!"]),
+        ):
             await engine.start_run(run)
 
         assert run.status == RunStatus.WAITING
@@ -320,11 +353,13 @@ class TestCrossWorkerResume:
 
         # Worker B — genuinely separate DB session
         from api.database import SessionLocal
+
         db2 = SessionLocal()
         try:
             engine2 = RunEngine(lambda: db2)
-            with patch("api.routers.chat._build_chat_loop",
-                        return_value=_mock_chat_loop(["Recovered!"])):
+            with patch(
+                "api.routers.chat._build_chat_loop", return_value=_mock_chat_loop(["Recovered!"])
+            ):
                 await engine2.resume_run(run_id, {"data": "ok"})
 
             final = engine2.restore_run(run_id)
@@ -341,14 +376,19 @@ class TestFanOutFanIn:
         """Parent creates children → children tracked with parent_run_id in DB."""
         engine = RunEngine(lambda: db)
         parent = engine.create_run(
-            session_id=session_id, user_id="test-user", user_input="Review code",
+            session_id=session_id,
+            user_id="test-user",
+            user_input="Review code",
         )
         _active_runs[parent.run_id] = parent
 
-        with patch("api.routers.chat._build_chat_loop",
-                    return_value=_mock_chat_loop(["Review done"])):
+        with patch(
+            "api.routers.chat._build_chat_loop", return_value=_mock_chat_loop(["Review done"])
+        ):
             child = await engine.create_child_run(
-                parent.run_id, agent_id="security-reviewer", task="Review security",
+                parent.run_id,
+                agent_id="security-reviewer",
+                task="Review security",
             )
             await _run_tasks[child.run_id]
 
@@ -357,10 +397,12 @@ class TestFanOutFanIn:
 
         # Verify in DB
         rows = db.execute(
-            text("SELECT JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.parent_run_id')) "
-                 "FROM agent_events "
-                 "WHERE event_type = 'run_started' "
-                 "AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) = :rid"),
+            text(
+                "SELECT JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.parent_run_id')) "
+                "FROM agent_events "
+                "WHERE event_type = 'run_started' "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) = :rid"
+            ),
             {"rid": child.run_id},
         ).fetchall()
         assert rows[0][0] == parent.run_id
@@ -374,9 +416,13 @@ class TestTriggerToRun:
         from core.agent.triggers import create_trigger, get_trigger, delete_trigger
 
         trig = create_trigger(
-            db, user_id="test-user", agent_id="dev-agent",
-            trigger_type="webhook", name="ci-done",
-            user_input="CI passed", session_id=session_id,
+            db,
+            user_id="test-user",
+            agent_id="dev-agent",
+            trigger_type="webhook",
+            name="ci-done",
+            user_input="CI passed",
+            session_id=session_id,
         )
         assert trig["secret"]
 
@@ -388,12 +434,21 @@ class TestTriggerToRun:
 
     def test_schedule_claim_prevents_double_fire(self, db, session_id):
         """Only one worker can claim a due schedule trigger."""
-        from core.agent.triggers import create_trigger, claim_and_advance, get_trigger, delete_trigger
+        from core.agent.triggers import (
+            create_trigger,
+            claim_and_advance,
+            get_trigger,
+            delete_trigger,
+        )
 
         trig = create_trigger(
-            db, user_id="test-user", agent_id="dev-agent",
-            trigger_type="schedule", name=f"drift-{generate_id()}",
-            user_input="Check drift", cron_expr="* * * * *",
+            db,
+            user_id="test-user",
+            agent_id="dev-agent",
+            trigger_type="schedule",
+            name=f"drift-{generate_id()}",
+            user_input="Check drift",
+            cron_expr="* * * * *",
             session_id=session_id,
         )
         db.execute(
@@ -423,11 +478,12 @@ class TestSSEPersistence:
         """SSE events in DB; loadable after clearing local buffer."""
         engine = RunEngine(lambda: db)
         run = engine.create_run(
-            session_id=session_id, user_id="test-user", user_input="SSE test",
+            session_id=session_id,
+            user_id="test-user",
+            user_input="SSE test",
         )
 
-        with patch("api.routers.chat._build_chat_loop",
-                    return_value=_mock_chat_loop(["Hello"])):
+        with patch("api.routers.chat._build_chat_loop", return_value=_mock_chat_loop(["Hello"])):
             await engine.start_run(run)
 
         rows = db.execute(
@@ -452,11 +508,15 @@ class TestOptimisticLock:
         """First resume completes run; second resume is no-op."""
         engine = RunEngine(lambda: db)
         run = engine.create_run(
-            session_id=session_id, user_id="test-user", user_input="Lock test",
+            session_id=session_id,
+            user_id="test-user",
+            user_input="Lock test",
         )
 
-        with patch("api.routers.chat._build_chat_loop",
-                    return_value=_mock_chat_loop([{"wait_for": "job:lock"}, "First wins"])):
+        with patch(
+            "api.routers.chat._build_chat_loop",
+            return_value=_mock_chat_loop([{"wait_for": "job:lock"}, "First wins"]),
+        ):
             await engine.start_run(run)
             assert run.status == RunStatus.WAITING
 
@@ -464,7 +524,8 @@ class TestOptimisticLock:
         assert run.status == RunStatus.COMPLETED
 
         # Second resume: no-op
-        with patch("api.routers.chat._build_chat_loop",
-                    return_value=_mock_chat_loop(["Should not run"])):
+        with patch(
+            "api.routers.chat._build_chat_loop", return_value=_mock_chat_loop(["Should not run"])
+        ):
             await engine.resume_run(run.run_id, {"result": "second"})
         assert run.status == RunStatus.COMPLETED

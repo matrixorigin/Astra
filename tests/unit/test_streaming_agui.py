@@ -31,7 +31,10 @@ class TestAGUIProtocolValidator:
         assert any("run_id" in e for e in v.validation_errors)
 
     def test_unexpected_field_warning(self, v):
-        event = {"event_type": "session_info", "data": {"session_id": "s1", "run_id": "r1", "extra": "x"}}
+        event = {
+            "event_type": "session_info",
+            "data": {"session_id": "s1", "run_id": "r1", "extra": "x"},
+        }
         assert v.validate_event(event) is True
         assert any("extra" in w for w in v.validation_warnings)
 
@@ -77,6 +80,7 @@ class TestMultiAgentAggregator:
     @pytest.fixture
     def agg(self):
         from core.streaming.multi_agent_aggregator import MultiAgentAggregator
+
         return MultiAgentAggregator(run_id="run-1")
 
     def test_init(self, agg):

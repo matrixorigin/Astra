@@ -11,9 +11,16 @@ from core.events.event_reader import EventReader, _LIST_COLUMNS
 class TestListColumnsExcludesHeavy:
     """_LIST_COLUMNS must not contain embedding or other heavy blob columns."""
 
-    _EXCLUDED = {"embedding", "context_snapshot", "token_usage",
-                 "skills_snapshot", "llm_params", "desensitized_content",
-                 "embedding_ref", "skill_result"}
+    _EXCLUDED = {
+        "embedding",
+        "context_snapshot",
+        "token_usage",
+        "skills_snapshot",
+        "llm_params",
+        "desensitized_content",
+        "embedding_ref",
+        "skill_result",
+    }
 
     def test_no_embedding_in_list_columns(self):
         col_names = {c.key for c in _LIST_COLUMNS}
@@ -26,9 +33,17 @@ class TestListColumnsExcludesHeavy:
 
     def test_required_columns_present(self):
         col_names = {c.key for c in _LIST_COLUMNS}
-        required = {"event_id", "user_id", "session_id", "agent_id",
-                     "event_type", "content", "created_at",
-                     "parent_event_id", "causal_chain_id"}
+        required = {
+            "event_id",
+            "user_id",
+            "session_id",
+            "agent_id",
+            "event_type",
+            "content",
+            "created_at",
+            "parent_event_id",
+            "causal_chain_id",
+        }
         missing = required - col_names
         assert missing == set(), f"Missing required columns: {missing}"
 
@@ -47,13 +62,16 @@ class TestListQueryExcludesEmbeddingDB:
         eid = str(uuid7())
         chain = str(uuid7())
 
-        db.execute(text(
-            "INSERT INTO agent_events "
-            "(event_id, session_id, user_id, agent_id, agent_version, "
-            " event_type, content, causal_chain_id, created_at) "
-            "VALUES (:eid, :sid, 'test', 'system', '1.0.0', "
-            " 'user_query', 'hello', :chain, NOW())"
-        ), {"eid": eid, "sid": sid, "chain": chain})
+        db.execute(
+            text(
+                "INSERT INTO agent_events "
+                "(event_id, session_id, user_id, agent_id, agent_version, "
+                " event_type, content, causal_chain_id, created_at) "
+                "VALUES (:eid, :sid, 'test', 'system', '1.0.0', "
+                " 'user_query', 'hello', :chain, NOW())"
+            ),
+            {"eid": eid, "sid": sid, "chain": chain},
+        )
         db.commit()
 
         reader = EventReader(lambda: db)
@@ -72,13 +90,16 @@ class TestListQueryExcludesEmbeddingDB:
         eid = str(uuid7())
         chain = str(uuid7())
 
-        db.execute(text(
-            "INSERT INTO agent_events "
-            "(event_id, session_id, user_id, agent_id, agent_version, "
-            " event_type, content, causal_chain_id, created_at) "
-            "VALUES (:eid, :sid, 'test', 'system', '1.0.0', "
-            " 'user_query', 'hello', :chain, NOW())"
-        ), {"eid": eid, "sid": sid, "chain": chain})
+        db.execute(
+            text(
+                "INSERT INTO agent_events "
+                "(event_id, session_id, user_id, agent_id, agent_version, "
+                " event_type, content, causal_chain_id, created_at) "
+                "VALUES (:eid, :sid, 'test', 'system', '1.0.0', "
+                " 'user_query', 'hello', :chain, NOW())"
+            ),
+            {"eid": eid, "sid": sid, "chain": chain},
+        )
         db.commit()
 
         reader = EventReader(lambda: db)

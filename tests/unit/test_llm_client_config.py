@@ -41,9 +41,13 @@ class TestCheckModelPermission:
         # Register a model so it's available
         from core.llm.router import ModelConfig
         from core.llm.models import LLMProvider
-        client.router.registry.register(ModelConfig(
-            model_name="test-model", provider=LLMProvider.OPENAI,
-        ))
+
+        client.router.registry.register(
+            ModelConfig(
+                model_name="test-model",
+                provider=LLMProvider.OPENAI,
+            )
+        )
         # Should not raise
         client._check_model_permission("test-model")
 
@@ -52,9 +56,13 @@ class TestCheckModelPermission:
         client = LLMClient(lambda: db_session, user_id="alice")
         from core.llm.router import ModelConfig
         from core.llm.models import LLMProvider
-        client.router.registry.register(ModelConfig(
-            model_name="gpt-4o", provider=LLMProvider.OPENAI,
-        ))
+
+        client.router.registry.register(
+            ModelConfig(
+                model_name="gpt-4o",
+                provider=LLMProvider.OPENAI,
+            )
+        )
         with pytest.raises(PermissionError, match="not available"):
             client._check_model_permission("nonexistent-model")
 

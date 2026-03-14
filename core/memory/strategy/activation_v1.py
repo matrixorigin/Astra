@@ -82,14 +82,18 @@ class ActivationRetrievalStrategy:
         if query_embedding:
             try:
                 activated = self._activation_retriever.retrieve(
-                    user_id, query, query_embedding,
-                    top_k=top_k, task_type=task_type,
+                    user_id,
+                    query,
+                    query_embedding,
+                    top_k=top_k,
+                    task_type=task_type,
                 )
                 if activated:
                     memories = self._nodes_to_memories(activated)
                     logger.info(
                         "activation:v1 graph path — user=%s results=%d",
-                        user_id, len(memories),
+                        user_id,
+                        len(memories),
                     )
                     explain_info = {"path": "graph", "results": len(memories)} if explain else None
                     return memories, explain_info
@@ -102,8 +106,11 @@ class ActivationRetrievalStrategy:
         # Strategy-internal vector fallback
         logger.debug("activation:v1 vector fallback — user=%s", user_id)
         memories, vec_explain = self._get_vector_fallback().retrieve(
-            user_id, query, query_embedding,
-            top_k=top_k, task_type=task_type,
+            user_id,
+            query,
+            query_embedding,
+            top_k=top_k,
+            task_type=task_type,
             session_id=session_id,
             memory_types=memory_types,
             weights=weights,
@@ -120,7 +127,9 @@ class ActivationRetrievalStrategy:
             from core.memory.strategy.vector_v1 import VectorRetrievalStrategy
 
             self._vector_fallback_strategy = VectorRetrievalStrategy(
-                self._db_factory, config=self._config, metrics=self._metrics,
+                self._db_factory,
+                config=self._config,
+                metrics=self._metrics,
             )
         return self._vector_fallback_strategy
 
@@ -135,14 +144,16 @@ class ActivationRetrievalStrategy:
                 tier = TrustTier(node.trust_tier)
             except ValueError:
                 tier = TrustTier.T3_INFERRED
-            memories.append(Memory(
-                memory_id=node.memory_id or node.node_id,
-                user_id=node.user_id,
-                memory_type=_node_type_to_memory_type(node.node_type),
-                content=node.content,
-                initial_confidence=node.confidence,
-                embedding=node.embedding,
-                session_id=node.session_id,
-                trust_tier=tier,
-            ))
+            memories.append(
+                Memory(
+                    memory_id=node.memory_id or node.node_id,
+                    user_id=node.user_id,
+                    memory_type=_node_type_to_memory_type(node.node_type),
+                    content=node.content,
+                    initial_confidence=node.confidence,
+                    embedding=node.embedding,
+                    session_id=node.session_id,
+                    trust_tier=tier,
+                )
+            )
         return memories

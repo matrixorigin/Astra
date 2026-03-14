@@ -200,7 +200,9 @@ class ListPRsInput(SkillInput):
     repo: str = ""  # "owner/repo", e.g. "matrixorigin/matrixone"
     state: str = "open"  # open, closed, all
     limit: int = 10
-    detail: str = "brief"  # brief | normal (ci_conclusion requires per-PR API call; use get_pr for that)
+    detail: str = (
+        "brief"  # brief | normal (ci_conclusion requires per-PR API call; use get_pr for that)
+    )
 
 
 class ListPRsOutput(SkillOutput):
@@ -237,7 +239,9 @@ class ListPRsSkill(Skill[ListPRsInput, ListPRsOutput]):
         """Execute the skill"""
         repo = input.repo or input.repo_id
         if not repo:
-            return ListPRsOutput(success=False, result="repo is required (e.g. 'matrixorigin/matrixone')", prs=[])
+            return ListPRsOutput(
+                success=False, result="repo is required (e.g. 'matrixorigin/matrixone')", prs=[]
+            )
         resolved_by_search = isinstance(repo, str) and "/" not in repo
         resolved = self.github.resolve_repo(repo) if resolved_by_search else repo
         try:
@@ -245,9 +249,13 @@ class ListPRsSkill(Skill[ListPRsInput, ListPRsOutput]):
         except GitHubError as e:
             return ListPRsOutput(success=False, result=str(e), prs=[])
         except GitHubRateLimitError:
-            return ListPRsOutput(success=False, result="GitHub rate limit exceeded, please try again later.", prs=[])
+            return ListPRsOutput(
+                success=False, result="GitHub rate limit exceeded, please try again later.", prs=[]
+            )
         return ListPRsOutput(
-            success=True, result=prs, prs=prs,
+            success=True,
+            result=prs,
+            prs=prs,
             resolved_repo=resolved if resolved_by_search else None,
             resolved_by_search=resolved_by_search,
         )
@@ -271,7 +279,9 @@ class CIStatusOutput(SkillOutput):
 
     workflows: list[dict]
     resolved_repo: str | None = None  # set when repo name was resolved via GitHub search
-    resolved_by_search: bool = False  # True = LLM should confirm repo with user if result looks wrong
+    resolved_by_search: bool = (
+        False  # True = LLM should confirm repo with user if result looks wrong
+    )
 
 
 class CIStatusSkill(Skill[CIStatusInput, CIStatusOutput]):
@@ -283,8 +293,7 @@ class CIStatusSkill(Skill[CIStatusInput, CIStatusOutput]):
     description = (
         "Check CI/CD workflow run status — recent runs with pass/fail/pending. "
         "detail: brief=workflow/conclusion/branch/date; normal +PR+commit+duration; "
-        "detailed +per-job+failed jobs; full +failed steps. "
-        + _GITHUB_BOILERPLATE
+        "detailed +per-job+failed jobs; full +failed steps. " + _GITHUB_BOILERPLATE
     )
     requirements = SkillRequirement(
         repo_types=[RepoType.CI, RepoType.CODE],
@@ -309,7 +318,11 @@ class CIStatusSkill(Skill[CIStatusInput, CIStatusOutput]):
         except GitHubError as e:
             return CIStatusOutput(success=False, result=str(e), workflows=[])
         except GitHubRateLimitError:
-            return CIStatusOutput(success=False, result="GitHub rate limit exceeded, please try again later.", workflows=[])
+            return CIStatusOutput(
+                success=False,
+                result="GitHub rate limit exceeded, please try again later.",
+                workflows=[],
+            )
         return CIStatusOutput(
             success=True,
             result=runs,
@@ -319,8 +332,12 @@ class CIStatusSkill(Skill[CIStatusInput, CIStatusOutput]):
             guidance=(
                 "No CI workflows found for this repository. "
                 "Do NOT retry with bash, curl, or any other tool."
-            ) if not runs else None,
-            user_message="No GitHub Actions CI workflows are configured for this repository." if not runs else None,
+            )
+            if not runs
+            else None,
+            user_message="No GitHub Actions CI workflows are configured for this repository."
+            if not runs
+            else None,
         )
 
 
@@ -377,21 +394,37 @@ class ListIssuesSkill(Skill[ListIssuesInput, ListIssuesOutput]):
     async def execute(self, input: ListIssuesInput) -> ListIssuesOutput:
         repo = input.repo or input.repo_id
         if not repo:
-            return ListIssuesOutput(success=False, result="repo is required (e.g. 'matrixorigin/matrixone')", issues=[])
+            return ListIssuesOutput(
+                success=False, result="repo is required (e.g. 'matrixorigin/matrixone')", issues=[]
+            )
         resolved_by_search = isinstance(repo, str) and "/" not in repo
         resolved = self.github.resolve_repo(repo) if resolved_by_search else repo
         try:
             issues = await self.github.list_issues(
-                resolved, input.state, input.labels, input.sort, input.direction,
-                input.since, input.assignee, input.creator, input.milestone,
-                input.limit, input.detail,
+                resolved,
+                input.state,
+                input.labels,
+                input.sort,
+                input.direction,
+                input.since,
+                input.assignee,
+                input.creator,
+                input.milestone,
+                input.limit,
+                input.detail,
             )
         except GitHubError as e:
             return ListIssuesOutput(success=False, result=str(e), issues=[])
         except GitHubRateLimitError:
-            return ListIssuesOutput(success=False, result="GitHub rate limit exceeded, please try again later.", issues=[])
+            return ListIssuesOutput(
+                success=False,
+                result="GitHub rate limit exceeded, please try again later.",
+                issues=[],
+            )
         return ListIssuesOutput(
-            success=True, result=issues, issues=issues,
+            success=True,
+            result=issues,
+            issues=issues,
             resolved_repo=resolved if resolved_by_search else None,
             resolved_by_search=resolved_by_search,
         )
@@ -450,9 +483,15 @@ class GetIssueSkill(Skill[GetIssueInput, GetIssueOutput]):
         except GitHubError as e:
             return GetIssueOutput(success=False, result=str(e), issue={})
         except GitHubRateLimitError:
-            return GetIssueOutput(success=False, result="GitHub rate limit exceeded, please try again later.", issue={})
+            return GetIssueOutput(
+                success=False,
+                result="GitHub rate limit exceeded, please try again later.",
+                issue={},
+            )
         return GetIssueOutput(
-            success=True, result=issue, issue=issue,
+            success=True,
+            result=issue,
+            issue=issue,
             resolved_repo=resolved if resolved_by_search else None,
             resolved_by_search=resolved_by_search,
         )
@@ -521,9 +560,15 @@ class CreateIssueSkill(Skill[CreateIssueInput, CreateIssueOutput]):
         except GitHubError as e:
             return CreateIssueOutput(success=False, result=str(e), issue={})
         except GitHubRateLimitError:
-            return CreateIssueOutput(success=False, result="GitHub rate limit exceeded, please try again later.", issue={})
+            return CreateIssueOutput(
+                success=False,
+                result="GitHub rate limit exceeded, please try again later.",
+                issue={},
+            )
         return CreateIssueOutput(
-            success=True, result=issue, issue=issue,
+            success=True,
+            result=issue,
+            issue=issue,
             resolved_repo=resolved if resolved_by_search else None,
             resolved_by_search=resolved_by_search,
         )
@@ -536,17 +581,19 @@ class CreateIssueSkill(Skill[CreateIssueInput, CreateIssueOutput]):
 
 class ExecuteCodeInput(SkillInput):
     """Input for execute_code skill"""
+
     code: str
     language: str = "python"
     data_access: str = "none"  # "none", "read", "write"
-    source_db: str | None = None          # Required for read/write
-    tables: list[str] | None = None       # Required for write
+    source_db: str | None = None  # Required for read/write
+    tables: list[str] | None = None  # Required for write
     session_id: str | None = None
     allowed_imports: list[str] | None = None
 
 
 class ExecuteCodeOutput(SkillOutput):
     """Output for execute_code skill"""
+
     success: bool = False
     result: str = ""
     error: str | None = None
@@ -582,15 +629,17 @@ class ExecuteCodeSkill(Skill[ExecuteCodeInput, ExecuteCodeOutput]):
         from core.code_executor import CodeExecutionRequest
         from core.code_executor.data_context import DataAccessLevel
 
-        result = self.code_executor.execute(CodeExecutionRequest(
-            code=input.code,
-            language=input.language,
-            data_access=DataAccessLevel(input.data_access),
-            source_db=input.source_db,
-            tables=input.tables,
-            session_id=input.session_id,
-            allowed_imports=input.allowed_imports,
-        ))
+        result = self.code_executor.execute(
+            CodeExecutionRequest(
+                code=input.code,
+                language=input.language,
+                data_access=DataAccessLevel(input.data_access),
+                source_db=input.source_db,
+                tables=input.tables,
+                session_id=input.session_id,
+                allowed_imports=input.allowed_imports,
+            )
+        )
 
         time_travel_dict = None
         if result.time_travel:
@@ -606,16 +655,20 @@ class ExecuteCodeSkill(Skill[ExecuteCodeInput, ExecuteCodeOutput]):
             result=result.execution.stdout,
             error=result.execution.stderr if result.execution.exit_code != 0 else None,
             execution_time_ms=result.execution.execution_time_ms,
-            data_diff=[
-                {"table": d.table, "rows": d.rows}
-                for d in result.data_diff
-            ] if result.data_diff else None,
+            data_diff=[{"table": d.table, "rows": d.rows} for d in result.data_diff]
+            if result.data_diff
+            else None,
             time_travel=time_travel_dict,
         )
 
 
 def register_builtin_skills(
-    registry, db_factory, llm=None, github=None, agent_registry=None, chat_loop_factory=None,
+    registry,
+    db_factory,
+    llm=None,
+    github=None,
+    agent_registry=None,
+    chat_loop_factory=None,
     code_executor=None,
 ):
     """Register all built-in skills.
@@ -643,6 +696,7 @@ def register_builtin_skills(
     # without needing the skills/ directory at runtime.
     import yaml
     from pathlib import Path
+
     _manifest_path = Path(__file__).parent.parent.parent / "skills" / "github" / "manifest.yaml"
     _github_manifest: dict | None = None
     if _manifest_path.exists():
@@ -661,7 +715,12 @@ def register_builtin_skills(
             [],
             8,
             "medium",
-            {"scope": "external", "data_source": "external_api", "intent_type": ["analytical", "fetch"], "requires_history": False},
+            {
+                "scope": "external",
+                "data_source": "external_api",
+                "intent_type": ["analytical", "fetch"],
+                "requires_history": False,
+            },
         ),
         (
             ListPRsSkill(github),
@@ -671,7 +730,12 @@ def register_builtin_skills(
             [],
             5,
             "low",
-            {"scope": "external", "data_source": "external_api", "intent_type": ["fetch"], "requires_history": False},
+            {
+                "scope": "external",
+                "data_source": "external_api",
+                "intent_type": ["fetch"],
+                "requires_history": False,
+            },
         ),
         (
             CIStatusSkill(github),
@@ -681,7 +745,12 @@ def register_builtin_skills(
             [],
             7,
             "low",
-            {"scope": "external", "data_source": "external_api", "intent_type": ["fetch"], "requires_history": False},
+            {
+                "scope": "external",
+                "data_source": "external_api",
+                "intent_type": ["fetch"],
+                "requires_history": False,
+            },
         ),
         (
             ListIssuesSkill(github),
@@ -691,7 +760,12 @@ def register_builtin_skills(
             [],
             5,
             "low",
-            {"scope": "external", "data_source": "external_api", "intent_type": ["fetch"], "requires_history": False},
+            {
+                "scope": "external",
+                "data_source": "external_api",
+                "intent_type": ["fetch"],
+                "requires_history": False,
+            },
         ),
         (
             GetIssueSkill(github),
@@ -701,7 +775,12 @@ def register_builtin_skills(
             [],
             5,
             "low",
-            {"scope": "external", "data_source": "external_api", "intent_type": ["fetch"], "requires_history": False},
+            {
+                "scope": "external",
+                "data_source": "external_api",
+                "intent_type": ["fetch"],
+                "requires_history": False,
+            },
         ),
         (
             CreateIssueSkill(github),
@@ -711,7 +790,12 @@ def register_builtin_skills(
             [],
             7,
             "low",
-            {"scope": "external", "data_source": "external_api", "intent_type": ["mutate"], "requires_history": False},
+            {
+                "scope": "external",
+                "data_source": "external_api",
+                "intent_type": ["mutate"],
+                "requires_history": False,
+            },
         ),
     ]
 
@@ -719,7 +803,12 @@ def register_builtin_skills(
         try:
             # Pass github manifest so SkillConfigCenter can find required secrets
             # without needing the skills/ directory on the deployment server.
-            skill_manifest = _github_manifest if category == "github" or subcategory in ("pr_management", "ci_cd", "issue_management") else None
+            skill_manifest = (
+                _github_manifest
+                if category == "github"
+                or subcategory in ("pr_management", "ci_cd", "issue_management")
+                else None
+            )
             registry.register(
                 skill=skill,
                 is_active=True,
@@ -749,7 +838,12 @@ def register_builtin_skills(
                 dependencies=[],
                 priority=9,
                 cost_estimate="medium",
-                tags={"scope": "current_session", "data_source": "session_metadata", "intent_type": ["mutate"], "requires_history": False},
+                tags={
+                    "scope": "current_session",
+                    "data_source": "session_metadata",
+                    "intent_type": ["mutate"],
+                    "requires_history": False,
+                },
             )
             logger.info(f"Registered {exec_skill.name}@{exec_skill.version}")
         except Exception as e:
@@ -758,6 +852,7 @@ def register_builtin_skills(
     # Register introspection skill (zero LLM cost, answers agent self-queries)
     try:
         from skills.introspection.skill import IntrospectionSkill
+
         introspection_skill = IntrospectionSkill(db_factory=db_factory)
         registry.register(
             skill=introspection_skill,
@@ -766,17 +861,30 @@ def register_builtin_skills(
             subcategory="introspection",
             triggers=[
                 # Chinese: agent self-queries
-                "上下文", "多大", "多少轮", "能力", "状态",
+                "上下文",
+                "多大",
+                "多少轮",
+                "能力",
+                "状态",
                 # English: multi-word triggers to avoid false positives
                 # (e.g. "token" alone would match "session token in web app")
-                "context size", "context window", "token usage",
-                "how many turns", "what model", "agent status",
+                "context size",
+                "context window",
+                "token usage",
+                "how many turns",
+                "what model",
+                "agent status",
                 "my capabilities",
             ],
             dependencies=[],
             priority=8,
             cost_estimate="low",
-            tags={"scope": "current_session", "data_source": "session_metadata", "intent_type": ["introspect"], "requires_history": False},
+            tags={
+                "scope": "current_session",
+                "data_source": "session_metadata",
+                "intent_type": ["introspect"],
+                "requires_history": False,
+            },
         )
         logger.info(f"Registered {introspection_skill.name}@{introspection_skill.version}")
     except Exception as e:
@@ -785,6 +893,7 @@ def register_builtin_skills(
     # Register skill config wizard (guided configuration via conversation)
     try:
         from skills.skill_config_wizard.skill import SkillConfigWizardSkill
+
         wizard_skill = SkillConfigWizardSkill(db_factory=db_factory)
         # config_center injected lazily at execution time via executor
         registry.register(
@@ -793,13 +902,21 @@ def register_builtin_skills(
             category="system",
             subcategory="configuration",
             triggers=[
-                "configure skill", "set up skill", "skill config",
-                "配置", "设置 skill",
+                "configure skill",
+                "set up skill",
+                "skill config",
+                "配置",
+                "设置 skill",
             ],
             dependencies=[],
             priority=7,
             cost_estimate="low",
-            tags={"scope": "current_session", "data_source": "session_metadata", "intent_type": ["introspect"], "requires_history": False},
+            tags={
+                "scope": "current_session",
+                "data_source": "session_metadata",
+                "intent_type": ["introspect"],
+                "requires_history": False,
+            },
         )
         logger.info(f"Registered {wizard_skill.name}@{wizard_skill.version}")
     except Exception as e:
@@ -820,12 +937,16 @@ def register_builtin_skills(
                 dependencies=[],
                 priority=10,
                 cost_estimate="low",
-                tags={"scope": "current_session", "data_source": "session_metadata", "intent_type": ["mutate"], "requires_history": False},
+                tags={
+                    "scope": "current_session",
+                    "data_source": "session_metadata",
+                    "intent_type": ["mutate"],
+                    "requires_history": False,
+                },
             )
             logger.info(f"Registered {delegation_skill.name}@{delegation_skill.version}")
         except Exception as e:
             logger.warning(f"Failed to register delegation skill: {e}")
-
 
     # ── Register edge tool metadata ──────────────────────────────
     # Edge tools execute on CLI side but need tags in skills_registry
@@ -833,107 +954,243 @@ def register_builtin_skills(
     # No Skill instance needed — just metadata + tags.
     _edge_tool_metadata = [
         # (name, version, description, category, subcategory, triggers, tags)
-        ("reflect", "1.0.0",
-         "Diagnose PAST behavior: event trails, skill selection audit, "
-         "decision chain evaluation, cross-session history.",
-         "diagnostics", "event_analysis",
-         ["分析", "决策链", "前一个", "上一个", "之前",
-          "analyze", "previous", "decision", "why", "diagnose"],
-         {"scope": "historical", "data_source": "event_store",
-          "intent_type": ["analytical"], "requires_history": True}),
-        ("get_agent_info", "1.0.0",
-         "Query CURRENT runtime state: token counts, context window, "
-         "session info, available tools.",
-         "system", "introspection",
-         ["token", "上下文", "context", "session", "tools",
-          "model", "状态"],
-         {"scope": "current_session", "data_source": "session_metadata",
-          "intent_type": ["introspect"], "requires_history": False}),
-        ("read_file", "1.0.0",
-         "Read file contents from local filesystem.",
-         "file_ops", "read",
-         ["read", "file", "show", "cat", "view"],
-         {"scope": "local", "data_source": "local_filesystem",
-          "intent_type": ["fetch"], "requires_history": False}),
-        ("write_file", "1.0.0",
-         "Create or overwrite a file on local filesystem.",
-         "file_ops", "write",
-         ["write", "create", "save", "file"],
-         {"scope": "local", "data_source": "local_filesystem",
-          "intent_type": ["mutate"], "requires_history": False}),
-        ("str_replace", "1.0.0",
-         "Replace text in an existing file.",
-         "file_ops", "write",
-         ["replace", "edit", "modify", "change"],
-         {"scope": "local", "data_source": "local_filesystem",
-          "intent_type": ["mutate"], "requires_history": False}),
-        ("list_dir", "1.0.0",
-         "List directory contents.",
-         "file_ops", "read",
-         ["list", "ls", "dir", "directory", "tree"],
-         {"scope": "local", "data_source": "local_filesystem",
-          "intent_type": ["fetch"], "requires_history": False}),
-        ("grep", "1.0.0",
-         "Search for text patterns in files.",
-         "search", "text",
-         ["grep", "search", "find", "pattern"],
-         {"scope": "local", "data_source": "local_filesystem",
-          "intent_type": ["fetch"], "requires_history": False}),
-        ("glob", "1.0.0",
-         "Find files matching a glob pattern.",
-         "search", "files",
-         ["glob", "find", "files", "pattern"],
-         {"scope": "local", "data_source": "local_filesystem",
-          "intent_type": ["fetch"], "requires_history": False}),
-        ("bash", "1.0.0",
-         "Execute a shell command.",
-         "shell", "execution",
-         ["bash", "shell", "run", "execute", "command"],
-         {"scope": "local", "data_source": "local_runtime",
-          "intent_type": ["mutate"], "requires_history": False}),
-        ("git_status", "1.0.0",
-         "Show git working tree status.",
-         "vcs", "git",
-         ["git", "status", "changes", "modified"],
-         {"scope": "local", "data_source": "local_vcs",
-          "intent_type": ["fetch"], "requires_history": False}),
-        ("git_diff", "1.0.0",
-         "Show git diff of changes.",
-         "vcs", "git",
-         ["git", "diff", "changes"],
-         {"scope": "local", "data_source": "local_vcs",
-          "intent_type": ["fetch"], "requires_history": False}),
-        ("git_log", "1.0.0",
-         "Show git commit history.",
-         "vcs", "git",
-         ["git", "log", "history", "commits"],
-         {"scope": "cross_session", "data_source": "local_vcs",
-          "intent_type": ["analytical", "fetch"],
-          "requires_history": False}),
-        ("find_skills", "1.0.0",
-         "Discover available skills and their capabilities.",
-         "system", "discovery",
-         ["skills", "capabilities", "what can"],
-         {"scope": "current_session", "data_source": "session_metadata",
-          "intent_type": ["fetch"], "requires_history": False}),
-        ("set_skill_setting", "1.0.0",
-         "Configure a skill setting.",
-         "system", "configuration",
-         ["configure", "setting", "config"],
-         {"scope": "current_session", "data_source": "session_metadata",
-          "intent_type": ["mutate"], "requires_history": False}),
-        ("bind_skill_resource", "1.0.0",
-         "Bind a resource to a skill.",
-         "system", "configuration",
-         ["bind", "resource", "connect"],
-         {"scope": "current_session", "data_source": "session_metadata",
-          "intent_type": ["mutate"], "requires_history": False}),
-        ("validate_skill_config", "1.0.0",
-         "Validate skill configuration.",
-         "system", "configuration",
-         ["validate", "check", "config"],
-         {"scope": "current_session", "data_source": "session_metadata",
-          "intent_type": ["fetch"], "requires_history": False}),
+        (
+            "reflect",
+            "1.0.0",
+            "Diagnose PAST behavior: event trails, skill selection audit, "
+            "decision chain evaluation, cross-session history.",
+            "diagnostics",
+            "event_analysis",
+            [
+                "分析",
+                "决策链",
+                "前一个",
+                "上一个",
+                "之前",
+                "analyze",
+                "previous",
+                "decision",
+                "why",
+                "diagnose",
+            ],
+            {
+                "scope": "historical",
+                "data_source": "event_store",
+                "intent_type": ["analytical"],
+                "requires_history": True,
+            },
+        ),
+        (
+            "get_agent_info",
+            "1.0.0",
+            "Query CURRENT runtime state: token counts, context window, "
+            "session info, available tools.",
+            "system",
+            "introspection",
+            ["token", "上下文", "context", "session", "tools", "model", "状态"],
+            {
+                "scope": "current_session",
+                "data_source": "session_metadata",
+                "intent_type": ["introspect"],
+                "requires_history": False,
+            },
+        ),
+        (
+            "read_file",
+            "1.0.0",
+            "Read file contents from local filesystem.",
+            "file_ops",
+            "read",
+            ["read", "file", "show", "cat", "view"],
+            {
+                "scope": "local",
+                "data_source": "local_filesystem",
+                "intent_type": ["fetch"],
+                "requires_history": False,
+            },
+        ),
+        (
+            "write_file",
+            "1.0.0",
+            "Create or overwrite a file on local filesystem.",
+            "file_ops",
+            "write",
+            ["write", "create", "save", "file"],
+            {
+                "scope": "local",
+                "data_source": "local_filesystem",
+                "intent_type": ["mutate"],
+                "requires_history": False,
+            },
+        ),
+        (
+            "str_replace",
+            "1.0.0",
+            "Replace text in an existing file.",
+            "file_ops",
+            "write",
+            ["replace", "edit", "modify", "change"],
+            {
+                "scope": "local",
+                "data_source": "local_filesystem",
+                "intent_type": ["mutate"],
+                "requires_history": False,
+            },
+        ),
+        (
+            "list_dir",
+            "1.0.0",
+            "List directory contents.",
+            "file_ops",
+            "read",
+            ["list", "ls", "dir", "directory", "tree"],
+            {
+                "scope": "local",
+                "data_source": "local_filesystem",
+                "intent_type": ["fetch"],
+                "requires_history": False,
+            },
+        ),
+        (
+            "grep",
+            "1.0.0",
+            "Search for text patterns in files.",
+            "search",
+            "text",
+            ["grep", "search", "find", "pattern"],
+            {
+                "scope": "local",
+                "data_source": "local_filesystem",
+                "intent_type": ["fetch"],
+                "requires_history": False,
+            },
+        ),
+        (
+            "glob",
+            "1.0.0",
+            "Find files matching a glob pattern.",
+            "search",
+            "files",
+            ["glob", "find", "files", "pattern"],
+            {
+                "scope": "local",
+                "data_source": "local_filesystem",
+                "intent_type": ["fetch"],
+                "requires_history": False,
+            },
+        ),
+        (
+            "bash",
+            "1.0.0",
+            "Execute a shell command.",
+            "shell",
+            "execution",
+            ["bash", "shell", "run", "execute", "command"],
+            {
+                "scope": "local",
+                "data_source": "local_runtime",
+                "intent_type": ["mutate"],
+                "requires_history": False,
+            },
+        ),
+        (
+            "git_status",
+            "1.0.0",
+            "Show git working tree status.",
+            "vcs",
+            "git",
+            ["git", "status", "changes", "modified"],
+            {
+                "scope": "local",
+                "data_source": "local_vcs",
+                "intent_type": ["fetch"],
+                "requires_history": False,
+            },
+        ),
+        (
+            "git_diff",
+            "1.0.0",
+            "Show git diff of changes.",
+            "vcs",
+            "git",
+            ["git", "diff", "changes"],
+            {
+                "scope": "local",
+                "data_source": "local_vcs",
+                "intent_type": ["fetch"],
+                "requires_history": False,
+            },
+        ),
+        (
+            "git_log",
+            "1.0.0",
+            "Show git commit history.",
+            "vcs",
+            "git",
+            ["git", "log", "history", "commits"],
+            {
+                "scope": "cross_session",
+                "data_source": "local_vcs",
+                "intent_type": ["analytical", "fetch"],
+                "requires_history": False,
+            },
+        ),
+        (
+            "find_skills",
+            "1.0.0",
+            "Discover available skills and their capabilities.",
+            "system",
+            "discovery",
+            ["skills", "capabilities", "what can"],
+            {
+                "scope": "current_session",
+                "data_source": "session_metadata",
+                "intent_type": ["fetch"],
+                "requires_history": False,
+            },
+        ),
+        (
+            "set_skill_setting",
+            "1.0.0",
+            "Configure a skill setting.",
+            "system",
+            "configuration",
+            ["configure", "setting", "config"],
+            {
+                "scope": "current_session",
+                "data_source": "session_metadata",
+                "intent_type": ["mutate"],
+                "requires_history": False,
+            },
+        ),
+        (
+            "bind_skill_resource",
+            "1.0.0",
+            "Bind a resource to a skill.",
+            "system",
+            "configuration",
+            ["bind", "resource", "connect"],
+            {
+                "scope": "current_session",
+                "data_source": "session_metadata",
+                "intent_type": ["mutate"],
+                "requires_history": False,
+            },
+        ),
+        (
+            "validate_skill_config",
+            "1.0.0",
+            "Validate skill configuration.",
+            "system",
+            "configuration",
+            ["validate", "check", "config"],
+            {
+                "scope": "current_session",
+                "data_source": "session_metadata",
+                "intent_type": ["fetch"],
+                "requires_history": False,
+            },
+        ),
     ]
 
     for name, ver, desc, cat, subcat, triggers, tags in _edge_tool_metadata:

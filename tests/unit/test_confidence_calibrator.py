@@ -61,10 +61,14 @@ class TestComputeAdjustment:
     def test_insufficient_data_returns_1(self):
         cal = _calibrator([])
         from core.evaluation.confidence_calibrator import CalibrationResult
+
         result = CalibrationResult(
-            mean_confidence=0.8, mean_quality=0.4,
-            calibration_error=0.4, bias=0.4,
-            sample_count=5, bucket_errors=[],
+            mean_confidence=0.8,
+            mean_quality=0.4,
+            calibration_error=0.4,
+            bias=0.4,
+            sample_count=5,
+            bucket_errors=[],
         )
         adj = cal.compute_adjustment(result)
         assert adj["multiplier"] == 1.0
@@ -73,10 +77,14 @@ class TestComputeAdjustment:
     def test_well_calibrated_returns_1(self):
         cal = _calibrator([])
         from core.evaluation.confidence_calibrator import CalibrationResult
+
         result = CalibrationResult(
-            mean_confidence=0.8, mean_quality=0.78,
-            calibration_error=0.02, bias=0.02,
-            sample_count=100, bucket_errors=[],
+            mean_confidence=0.8,
+            mean_quality=0.78,
+            calibration_error=0.02,
+            bias=0.02,
+            sample_count=100,
+            bucket_errors=[],
         )
         adj = cal.compute_adjustment(result)
         assert adj["multiplier"] == 1.0
@@ -85,10 +93,14 @@ class TestComputeAdjustment:
     def test_overconfident_multiplier_below_1(self):
         cal = _calibrator([])
         from core.evaluation.confidence_calibrator import CalibrationResult
+
         result = CalibrationResult(
-            mean_confidence=0.9, mean_quality=0.5,
-            calibration_error=0.4, bias=0.4,
-            sample_count=100, bucket_errors=[],
+            mean_confidence=0.9,
+            mean_quality=0.5,
+            calibration_error=0.4,
+            bias=0.4,
+            sample_count=100,
+            bucket_errors=[],
         )
         adj = cal.compute_adjustment(result)
         assert adj["multiplier"] < 1.0
@@ -97,10 +109,14 @@ class TestComputeAdjustment:
     def test_underconfident_multiplier_above_1(self):
         cal = _calibrator([])
         from core.evaluation.confidence_calibrator import CalibrationResult
+
         result = CalibrationResult(
-            mean_confidence=0.3, mean_quality=0.8,
-            calibration_error=0.5, bias=-0.5,
-            sample_count=100, bucket_errors=[],
+            mean_confidence=0.3,
+            mean_quality=0.8,
+            calibration_error=0.5,
+            bias=-0.5,
+            sample_count=100,
+            bucket_errors=[],
         )
         adj = cal.compute_adjustment(result)
         assert adj["multiplier"] > 1.0
@@ -109,11 +125,15 @@ class TestComputeAdjustment:
     def test_multiplier_clamped_to_range(self):
         cal = _calibrator([])
         from core.evaluation.confidence_calibrator import CalibrationResult
+
         # Extreme overconfidence
         result = CalibrationResult(
-            mean_confidence=1.0, mean_quality=0.0,
-            calibration_error=1.0, bias=1.0,
-            sample_count=100, bucket_errors=[],
+            mean_confidence=1.0,
+            mean_quality=0.0,
+            calibration_error=1.0,
+            bias=1.0,
+            sample_count=100,
+            bucket_errors=[],
         )
         adj = cal.compute_adjustment(result)
         assert adj["multiplier"] >= 0.5  # clamped at 0.5

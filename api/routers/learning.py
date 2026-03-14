@@ -21,20 +21,20 @@ router = APIRouter(prefix="/api/v1/learning", tags=["learning"])
 # Request/Response models
 class LearningTriggerRequest(BaseModel):
     """Trigger learning cycle request."""
+
     days: int = Field(default=7, ge=1, le=30, description="Look back N days")
     force: bool = Field(default=False, description="Force learning even in cooldown")
     signal_types: list[str] = Field(
-        default=["wrong_skill"],
-        description="Learning signal types to process"
+        default=["wrong_skill"], description="Learning signal types to process"
     )
     weights: dict[str, float] | None = Field(
-        default=None,
-        description="Custom weights for multi-dimensional scoring"
+        default=None, description="Custom weights for multi-dimensional scoring"
     )
 
 
 class LearningTriggerResponse(BaseModel):
     """Learning cycle response."""
+
     status: str
     learned: int
     signals_by_type: dict[str, int] | None = None
@@ -48,6 +48,7 @@ class LearningTriggerResponse(BaseModel):
 
 class SkillStatsEntry(BaseModel):
     """Per-skill execution statistics."""
+
     selection_count: int
     success_rate: float
     avg_cost_usd: float
@@ -56,6 +57,7 @@ class SkillStatsEntry(BaseModel):
 
 class LearningStatsResponse(BaseModel):
     """Learning statistics response."""
+
     total_learnings: int
     high_confidence: int
     low_confidence: int
@@ -75,12 +77,14 @@ class LearningStatsResponse(BaseModel):
 
 class SignalTypesResponse(BaseModel):
     """Available signal types response."""
+
     signal_types: list[str]
     descriptions: dict[str, str]
 
 
 class FeedbackRequest(BaseModel):
     """Submit feedback request."""
+
     event_id: str
     feedback_type: str = Field(
         description="Signal type: wrong_skill | slow_execution | high_cost | low_satisfaction"
@@ -92,6 +96,7 @@ class FeedbackRequest(BaseModel):
 
 class FeedbackResponse(BaseModel):
     """Feedback submission response."""
+
     status: str
     message: str
 
@@ -122,7 +127,7 @@ async def get_signal_types(
             "slow_execution": "Execution time exceeds threshold",
             "high_cost": "Execution cost exceeds budget",
             "low_satisfaction": "User satisfaction below threshold",
-        }
+        },
     )
 
 
@@ -132,11 +137,19 @@ async def get_learning_stats(
 ) -> LearningStatsResponse:
     """Get learning statistics — stub after pipeline removal."""
     return LearningStatsResponse(
-        total_learnings=0, high_confidence=0, low_confidence=0,
-        avg_confidence=0.0, by_signal_type={},
-        weights={}, weights_per_signal={}, decay={},
-        total_gates=0, passed_gates=0, failed_gates=0,
-        pass_rate=0.0, avg_improvement_pct=0.0,
+        total_learnings=0,
+        high_confidence=0,
+        low_confidence=0,
+        avg_confidence=0.0,
+        by_signal_type={},
+        weights={},
+        weights_per_signal={},
+        decay={},
+        total_gates=0,
+        passed_gates=0,
+        failed_gates=0,
+        pass_rate=0.0,
+        avg_improvement_pct=0.0,
     )
 
 
@@ -147,17 +160,17 @@ async def submit_feedback(
     db: Session = Depends(get_db_session),
 ) -> FeedbackResponse:
     """Submit feedback for a skill selection event.
-    
+
     Feedback helps the system learn from:
     - Wrong skill selections
     - Slow executions
     - High costs
     - Low user satisfaction
-    
+
     Args:
         request: Feedback data
         db: Database session
-        
+
     Returns:
         Feedback submission result
     """
@@ -165,9 +178,11 @@ async def submit_feedback(
         from api.models import SkillSelectionEvent
 
         # Find event
-        event = db.query(SkillSelectionEvent).filter(
-            SkillSelectionEvent.event_id == request.event_id
-        ).first()
+        event = (
+            db.query(SkillSelectionEvent)
+            .filter(SkillSelectionEvent.event_id == request.event_id)
+            .first()
+        )
 
         if not event:
             raise HTTPException(status_code=404, detail="Event not found")
@@ -184,8 +199,7 @@ async def submit_feedback(
         db.commit()
 
         return FeedbackResponse(
-            status="success",
-            message=f"Feedback recorded for event {request.event_id}"
+            status="success", message=f"Feedback recorded for event {request.event_id}"
         )
 
     except HTTPException:

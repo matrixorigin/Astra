@@ -21,9 +21,17 @@ def _make_chain(rows=None):
     return chain
 
 
-def _mem_row(memory_id, content="text", memory_type="semantic",
-             confidence=0.8, observed_at=None, session_id=None,
-             trust_tier="T3", relevance=1.0, ft_score=1.0):
+def _mem_row(
+    memory_id,
+    content="text",
+    memory_type="semantic",
+    confidence=0.8,
+    observed_at=None,
+    session_id=None,
+    trust_tier="T3",
+    relevance=1.0,
+    ft_score=1.0,
+):
     """Simulate an ORM result row from _phase1."""
     r = MagicMock()
     r.memory_id = memory_id
@@ -106,7 +114,9 @@ class TestRetrievePhase2:
 
     def test_vector_path_invoked_with_embedding(self, retriever, mock_db):
         """When query_embedding is provided, phase2 should run."""
-        retriever.retrieve("u1", "test", session_id="s1", query_embedding=[0.1] * TEST_EMBEDDING_DIM)
+        retriever.retrieve(
+            "u1", "test", session_id="s1", query_embedding=[0.1] * TEST_EMBEDDING_DIM
+        )
         # At least 2 query calls: phase1 fallback + phase2 vector
         assert mock_db.query.call_count >= 2
 
@@ -122,7 +132,9 @@ class TestRetrievePhase2:
             raise RuntimeError("vector down")
 
         mock_db.query.side_effect = side_effect
-        results, _ = retriever.retrieve("u1", "test", session_id="s1", query_embedding=[0.1] * TEST_EMBEDDING_DIM)
+        results, _ = retriever.retrieve(
+            "u1", "test", session_id="s1", query_embedding=[0.1] * TEST_EMBEDDING_DIM
+        )
         assert len(results) >= 1
 
 
@@ -165,8 +177,11 @@ class TestRetrieveExplain:
         mock_db.query.side_effect = side_effect
 
         memories, stats = retriever.retrieve(
-            "u1", "Go testing", session_id="s1",
-            query_embedding=[0.1] * TEST_EMBEDDING_DIM, explain=True,
+            "u1",
+            "Go testing",
+            session_id="s1",
+            query_embedding=[0.1] * TEST_EMBEDDING_DIM,
+            explain=True,
         )
         assert stats is not None
         assert len(stats.candidate_scores) == len(memories)
@@ -199,6 +214,7 @@ class TestRetrieveExplain:
 # BM25 normalization: score/(score+1) saturating transform
 # ---------------------------------------------------------------------------
 
+
 class TestBM25Normalization:
     """Verify the saturating transform used for keyword_score."""
 
@@ -208,23 +224,34 @@ class TestBM25Normalization:
 
     def _make_candidate(self, keyword_score: float):
         from core.memory.tabular.retriever import _Candidate
+
         return _Candidate(
-            memory_id="m1", content="x", memory_type="preference",
-            initial_confidence=0.9, observed_at=datetime.now(timezone.utc),
-            session_id="s1", keyword_score=keyword_score,
+            memory_id="m1",
+            content="x",
+            memory_type="preference",
+            initial_confidence=0.9,
+            observed_at=datetime.now(timezone.utc),
+            session_id="s1",
+            keyword_score=keyword_score,
         )
 
-    @pytest.mark.parametrize("raw,expected_approx", [
-        (0.0, 0.0),
-        (1.0, 0.5),
-        (9.0, 0.9),
-        (999.0, 0.999),
-        (-1.0, 0.0),   # negative clamped to 0
-    ])
+    @pytest.mark.parametrize(
+        "raw,expected_approx",
+        [
+            (0.0, 0.0),
+            (1.0, 0.5),
+            (9.0, 0.9),
+            (999.0, 0.999),
+            (-1.0, 0.0),  # negative clamped to 0
+        ],
+    )
     def test_bm25_score_normalization(self, retriever, raw, expected_approx):
         from core.memory.tabular.retriever import RetrievalWeights
+
         w = RetrievalWeights(vector=0, keyword=1, temporal=0, confidence=0)
         c = self._make_candidate(raw)
-        final, _, kw, _, _ = retriever._score_candidate(c, w, datetime.now(timezone.utc).timestamp())
+        final, _, kw, _, _ = retriever._score_candidate(
+            c, w, datetime.now(timezone.utc).timestamp()
+        )
         assert abs(kw - expected_approx) < 0.01, f"raw={raw} → kw={kw}, expected≈{expected_approx}"
         assert final == pytest.approx(kw)  # keyword weight=1, others=0

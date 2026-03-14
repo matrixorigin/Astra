@@ -29,6 +29,7 @@ def client(db_session):
             yield db_session
         finally:
             pass
+
     app.dependency_overrides[get_db_session] = override_get_db
     yield TestClient(app)
     app.dependency_overrides.clear()
@@ -55,12 +56,14 @@ def _all_quirk_fields() -> set[str]:
 
 # ── Schema Parity ───────────────────────────────────────────────────────────
 
+
 class TestQuirksSchemaParity:
     """QuirksSchema (API) must have the same fields as ModelQuirks (core)."""
 
     def test_quirks_schema_has_all_model_quirks_fields(self):
         """Every field in ModelQuirks must exist in QuirksSchema."""
         from api.routers.models import QuirksSchema
+
         core_fields = _all_quirk_fields()
         api_fields = set(QuirksSchema.model_fields.keys())
         missing = core_fields - api_fields
@@ -71,6 +74,7 @@ class TestQuirksSchemaParity:
 
 
 # ── CREATE ──────────────────────────────────────────────────────────────────
+
 
 class TestCreateModelQuirks:
     def test_create_with_full_quirks_persists_all_fields(self, client, admin_headers, db_session):
@@ -157,6 +161,7 @@ class TestCreateModelQuirks:
 
 # ── UPDATE ──────────────────────────────────────────────────────────────────
 
+
 class TestUpdateModelQuirks:
     def test_update_quirks_persists_to_db(self, client, admin_headers, db_session):
         """PUT /models/{name} with quirks must update DB column."""
@@ -189,12 +194,20 @@ class TestUpdateModelQuirks:
 
     def test_update_quirks_does_not_affect_other_columns(self, client, admin_headers, db_session):
         """Updating quirks must not change other model fields."""
-        _create(client, admin_headers, name="test-upd3", provider="mock",
-                tags=["code"], architecture="transformer")
+        _create(
+            client,
+            admin_headers,
+            name="test-upd3",
+            provider="mock",
+            tags=["code"],
+            architecture="transformer",
+        )
 
         # Read before
         before = db_session.execute(
-            text("SELECT tags, architecture, provider FROM infra_llm_models WHERE model_name = 'test-upd3'")
+            text(
+                "SELECT tags, architecture, provider FROM infra_llm_models WHERE model_name = 'test-upd3'"
+            )
         ).fetchone()
 
         client.put(
@@ -205,7 +218,9 @@ class TestUpdateModelQuirks:
 
         # Read after
         after = db_session.execute(
-            text("SELECT tags, architecture, provider FROM infra_llm_models WHERE model_name = 'test-upd3'")
+            text(
+                "SELECT tags, architecture, provider FROM infra_llm_models WHERE model_name = 'test-upd3'"
+            )
         ).fetchone()
 
         assert before[0] == after[0]  # tags unchanged
@@ -214,6 +229,7 @@ class TestUpdateModelQuirks:
 
 
 # ── load_from_db ─────────────────────────────────────────────────────────────
+
 
 class TestLoadFromDb:
     def _insert_model(self, db_session, model_name: str, provider: str, quirks: dict | None = None):
@@ -235,9 +251,16 @@ class TestLoadFromDb:
 
     def test_load_from_db_reads_quirks_column(self, db_session):
         """ModelRegistry.load_from_db must read quirks from DB, not hardcode by provider."""
-        self._insert_model(db_session, "test-load", "moonshot",
-                           quirks={"fixed_temperature": 1.0, "preserve_reasoning_content": True,
-                                   "strict_tool_call_ids": True})
+        self._insert_model(
+            db_session,
+            "test-load",
+            "moonshot",
+            quirks={
+                "fixed_temperature": 1.0,
+                "preserve_reasoning_content": True,
+                "strict_tool_call_ids": True,
+            },
+        )
 
         registry = ModelRegistry()
         registry.load_from_db(db_session)
@@ -282,8 +305,9 @@ class TestLoadFromDb:
 
     def test_load_from_db_strict_tool_call_ids(self, db_session):
         """strict_tool_call_ids must be read from DB quirks column."""
-        self._insert_model(db_session, "test-strict", "moonshot",
-                           quirks={"strict_tool_call_ids": True})
+        self._insert_model(
+            db_session, "test-strict", "moonshot", quirks={"strict_tool_call_ids": True}
+        )
 
         registry = ModelRegistry()
         registry.load_from_db(db_session)
@@ -324,6 +348,7 @@ class TestLoadFromDb:
 
 # ── ModelQuirks unit tests ──────────────────────────────────────────────────
 
+
 class TestModelQuirksDefaults:
     """Verify ModelQuirks default values are safe (no accidental True/non-None)."""
 
@@ -342,13 +367,14 @@ class TestModelQuirksDefaults:
         for name, field_info in ModelQuirks.model_fields.items():
             annotation = field_info.annotation
             # Check for float | None pattern
-            if hasattr(annotation, "__args__") and type(None) in getattr(annotation, "__args__", ()):
-                assert getattr(q, name) is None, (
-                    f"Optional quirk {name} has non-None default"
-                )
+            if hasattr(annotation, "__args__") and type(None) in getattr(
+                annotation, "__args__", ()
+            ):
+                assert getattr(q, name) is None, f"Optional quirk {name} has non-None default"
 
 
 # ── Startup migration regression ────────────────────────────────────────────
+
 
 class TestInitDbSyncsSeedQuirks:
     """Regression: init_db must sync quirks from SEED_MODELS on every startup.
@@ -364,15 +390,20 @@ class TestInitDbSyncsSeedQuirks:
     def _seed_row(self, client, admin_headers, db_session):
         """Create a model row that mimics a seed model with quirks."""
         from core.llm.seed_models import SEED_MODELS
+
         seeds = [s for s in SEED_MODELS if s.get("quirks")]
         if not seeds:
             pytest.skip("No seed models with quirks defined")
         self._seed_quirks = seeds[0]["quirks"]
 
         # Create via API so all required columns are populated
-        _create(client, admin_headers,
-                name=self.SEED_MODEL_NAME, provider="moonshot",
-                quirks=self._seed_quirks)
+        _create(
+            client,
+            admin_headers,
+            name=self.SEED_MODEL_NAME,
+            provider="moonshot",
+            quirks=self._seed_quirks,
+        )
         yield
         db_session.execute(
             text("DELETE FROM infra_llm_models WHERE model_name = :m"),
@@ -405,6 +436,7 @@ class TestInitDbSyncsSeedQuirks:
 
         # Monkey-patch seed models and re-run init_db
         import core.llm.seed_models as sm_mod
+
         old = sm_mod.SEED_MODELS
         try:
             sm_mod.SEED_MODELS = patched
@@ -420,9 +452,7 @@ class TestInitDbSyncsSeedQuirks:
         ).fetchone()
         quirks = json.loads(row[0]) if isinstance(row[0], str) else row[0]
         for key, val in self._seed_quirks.items():
-            assert quirks.get(key) == val, (
-                f"quirks.{key} expected {val}, got {quirks.get(key)}"
-            )
+            assert quirks.get(key) == val, f"quirks.{key} expected {val}, got {quirks.get(key)}"
 
     def test_fixed_temperature_survives_restart(self, db_session):
         """fixed_temperature must survive init_db restart — the exact bug."""

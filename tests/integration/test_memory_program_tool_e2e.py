@@ -18,8 +18,12 @@ from core.utils.id_generator import generate_id
 @pytest.fixture(autouse=True)
 def _setup_memoria_env():
     """Set Memoria environment variables from test configuration."""
-    os.environ["MEMORIA_BASE_URL"] = os.environ.get("TEST_MEMORIA_BASE_URL", "http://localhost:8100")
-    os.environ["MEMORIA_MASTER_KEY"] = os.environ.get("TEST_MEMORIA_MASTER_KEY", "test-master-key-for-docker-compose")
+    os.environ["MEMORIA_BASE_URL"] = os.environ.get(
+        "TEST_MEMORIA_BASE_URL", "http://localhost:8100"
+    )
+    os.environ["MEMORIA_MASTER_KEY"] = os.environ.get(
+        "TEST_MEMORIA_MASTER_KEY", "test-master-key-for-docker-compose"
+    )
     os.environ["MEMORIA_API_KEY"] = os.environ.get("TEST_MEMORIA_API_KEY", "")
     yield
 
@@ -38,6 +42,7 @@ def uid():
 def memoria_client():
     """Create Memoria HTTP client for verification."""
     from core.memory.backends.memoria_http import MemoriaHTTPClient
+
     return MemoriaHTTPClient(
         base_url=os.environ["MEMORIA_BASE_URL"],
         master_key=os.environ["MEMORIA_MASTER_KEY"],
@@ -59,7 +64,15 @@ class TestInjectE2E:
         result = _call(
             tool,
             user_id=uid,
-            actions=[{"inject": {"content": "Python uses 4-space indent", "type": "semantic", "trust": "T1"}}],
+            actions=[
+                {
+                    "inject": {
+                        "content": "Python uses 4-space indent",
+                        "type": "semantic",
+                        "trust": "T1",
+                    }
+                }
+            ],
             explain=True,
         )
 
@@ -108,7 +121,15 @@ class TestCorrectE2E:
         r2 = _call(
             tool,
             user_id=uid,
-            actions=[{"correct": {"memory_id": old_mid, "new_content": "Earth is round", "reason": "factual error"}}],
+            actions=[
+                {
+                    "correct": {
+                        "memory_id": old_mid,
+                        "new_content": "Earth is round",
+                        "reason": "factual error",
+                    }
+                }
+            ],
             explain=True,
         )
         assert r2["actions_executed"] == 1
@@ -125,11 +146,16 @@ class TestCorrectE2E:
 class TestPurgeE2E:
     def test_purge_by_type(self, tool, uid, memoria_client):
         """Inject 2 semantic + 1 procedural → purge semantic → verify via API."""
-        _call(tool, user_id=uid, actions=[
-            {"inject": {"content": "sem1", "type": "semantic"}},
-            {"inject": {"content": "sem2", "type": "semantic"}},
-            {"inject": {"content": "proc1", "type": "procedural"}},
-        ], explain=True)
+        _call(
+            tool,
+            user_id=uid,
+            actions=[
+                {"inject": {"content": "sem1", "type": "semantic"}},
+                {"inject": {"content": "sem2", "type": "semantic"}},
+                {"inject": {"content": "proc1", "type": "procedural"}},
+            ],
+            explain=True,
+        )
 
         # Verify 3 memories exist
         all_mems = memoria_client.list_memories(uid)

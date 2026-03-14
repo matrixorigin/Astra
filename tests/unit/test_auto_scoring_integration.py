@@ -35,6 +35,7 @@ class TestChatLoopAutoScoring:
         mock_event_logger.create_llm_response.return_value = mock_event
 
         from core.agent.chat_loop import ChatLoop
+
         loop = ChatLoop(
             selector=MagicMock(),
             executor=MagicMock(),
@@ -51,9 +52,11 @@ class TestChatLoopAutoScoring:
         fw = FakeFirewallResult(safe_to_deliver=True, confidence_score=0.9)
 
         loop._log_response(
-            user_id="u1", session_id="s1",
+            user_id="u1",
+            session_id="s1",
             content="Hello world " * 20,
-            parent_event_id="p1", causal_chain_id="c1",
+            parent_event_id="p1",
+            causal_chain_id="c1",
             firewall_result=fw,
         )
 
@@ -68,8 +71,11 @@ class TestChatLoopAutoScoring:
         loop, mock_logger = self._make_loop()
 
         loop._log_response(
-            user_id="u1", session_id="s1",
-            content="Hello", parent_event_id="p1", causal_chain_id="c1",
+            user_id="u1",
+            session_id="s1",
+            content="Hello",
+            parent_event_id="p1",
+            causal_chain_id="c1",
         )
 
         mock_logger.update_quality_score.assert_not_called()
@@ -82,9 +88,11 @@ class TestChatLoopAutoScoring:
 
         # Should not raise
         loop._log_response(
-            user_id="u1", session_id="s1",
+            user_id="u1",
+            session_id="s1",
             content="Hello world " * 20,
-            parent_event_id="p1", causal_chain_id="c1",
+            parent_event_id="p1",
+            causal_chain_id="c1",
             firewall_result=fw,
         )
 
@@ -97,9 +105,11 @@ class TestChatLoopAutoScoring:
         fw = FakeFirewallResult(safe_to_deliver=True, confidence_score=0.95)
 
         loop._log_response(
-            user_id="u1", session_id="s1",
+            user_id="u1",
+            session_id="s1",
             content="word " * 100,  # 100 words
-            parent_event_id="p1", causal_chain_id="c1",
+            parent_event_id="p1",
+            causal_chain_id="c1",
             firewall_result=fw,
         )
 
@@ -115,9 +125,11 @@ class TestChatLoopAutoScoring:
         fw = FakeFirewallResult(safe_to_deliver=False, confidence_score=0.2)
 
         loop._log_response(
-            user_id="u1", session_id="s1",
+            user_id="u1",
+            session_id="s1",
             content="word " * 100,
-            parent_event_id="p1", causal_chain_id="c1",
+            parent_event_id="p1",
+            causal_chain_id="c1",
             firewall_result=fw,
         )
 
@@ -150,7 +162,7 @@ class TestAllPathsPassFirewallResult:
                 block_end = src.find("\n            )", start)
             if block_end == -1:
                 block_end = src.find("\n                )", start)
-            block = src[start:block_end + 20] if block_end != -1 else src[start:start + 500]
+            block = src[start : block_end + 20] if block_end != -1 else src[start : start + 500]
             assert "firewall_result=" in block, (
                 f"_log_response call at offset {start} missing firewall_result=\n"
                 f"Context: {block[:200]}"
@@ -169,6 +181,7 @@ class TestLogResponseTokenUsage:
         mock_event_logger.create_llm_response.return_value = mock_event
 
         from core.agent.chat_loop import ChatLoop
+
         loop = ChatLoop(
             selector=MagicMock(),
             executor=MagicMock(),
@@ -185,8 +198,11 @@ class TestLogResponseTokenUsage:
         usage = {"prompt": 100, "completion": 50, "total": 150}
 
         loop._log_response(
-            user_id="u1", session_id="s1", content="hi",
-            parent_event_id="p1", causal_chain_id="c1",
+            user_id="u1",
+            session_id="s1",
+            content="hi",
+            parent_event_id="p1",
+            causal_chain_id="c1",
             token_usage=usage,
         )
 
@@ -198,8 +214,11 @@ class TestLogResponseTokenUsage:
         loop, mock_logger = self._make_loop()
 
         loop._log_response(
-            user_id="u1", session_id="s1", content="hi",
-            parent_event_id="p1", causal_chain_id="c1",
+            user_id="u1",
+            session_id="s1",
+            content="hi",
+            parent_event_id="p1",
+            causal_chain_id="c1",
         )
 
         call_kwargs = mock_logger.create_llm_response.call_args[1]
@@ -215,6 +234,7 @@ class TestTokenUsageDBPersistence:
     @pytest.fixture
     def event_logger(self, db_session):
         from core.events.event_logger import EventLogger
+
         return EventLogger(db_factory=lambda: db_session)
 
     def test_token_usage_persisted_to_db(self, event_logger, db_session):
@@ -241,6 +261,7 @@ class TestTokenUsageDBPersistence:
         assert row is not None, "Event not found in DB"
 
         import json
+
         usage = json.loads(row[0]) if isinstance(row[0], str) else row[0]
         assert usage["prompt"] == 100
         assert usage["completion"] == 50

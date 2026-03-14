@@ -33,11 +33,13 @@ class TestCorrectionEventLogging:
             user_id=user_id,
             session_id=session_id,
             event_type="intent_correction",
-            content=json.dumps({
-                "original_intent": "command",
-                "corrected_to": "question",
-                "trigger": "不对",
-            }),
+            content=json.dumps(
+                {
+                    "original_intent": "command",
+                    "corrected_to": "question",
+                    "trigger": "不对",
+                }
+            ),
             metadata={
                 "original_confidence": 0.95,
                 "original_tier": 0,
@@ -46,9 +48,12 @@ class TestCorrectionEventLogging:
 
         # Verify via ORM
         from api.models.agent import Event as EventModel
+
         row = (
             db_session.query(EventModel)
-            .filter(EventModel.session_id == session_id, EventModel.event_type == "intent_correction")
+            .filter(
+                EventModel.session_id == session_id, EventModel.event_type == "intent_correction"
+            )
             .order_by(EventModel.created_at.desc())
             .first()
         )
@@ -61,7 +66,11 @@ class TestCorrectionEventLogging:
         assert content["corrected_to"] == "question"
         assert content["trigger"] == "不对"
 
-        meta = json.loads(row.event_metadata) if isinstance(row.event_metadata, str) else row.event_metadata
+        meta = (
+            json.loads(row.event_metadata)
+            if isinstance(row.event_metadata, str)
+            else row.event_metadata
+        )
         assert meta["original_confidence"] == 0.95
         assert meta["original_tier"] == 0
 
@@ -77,6 +86,7 @@ class TestCorrectionOverridesRouting:
         assert detect_correction("不对，你搞错了")
 
         from unittest.mock import patch
+
         with patch("core.context.routing_metrics.adaptive_threshold", return_value=0.80):
             decision = await router.route("不对，你搞错了", history_len=5, force_intent="question")
 

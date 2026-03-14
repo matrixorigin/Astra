@@ -11,7 +11,7 @@ from typing import Dict
 @dataclass
 class ToolContextMetrics:
     """Metrics for tool context engine observability."""
-    
+
     # Counters
     total_tool_outputs: int = 0
     summarized_outputs: int = 0
@@ -20,25 +20,25 @@ class ToolContextMetrics:
     historical_reuse_misses: int = 0
     memory_expand_calls: int = 0
     staleness_rejections: int = 0
-    
+
     # Size tracking
     total_input_bytes: int = 0
     total_output_bytes: int = 0  # After summarization
-    
+
     # Per-tool breakdown
     per_tool_counts: Dict[str, int] = field(default_factory=dict)
     per_tool_summarized: Dict[str, int] = field(default_factory=dict)
-    
+
     # Timestamps
     last_reset: datetime = field(default_factory=datetime.now)
-    
+
     @property
     def summarization_rate(self) -> float:
         """Percentage of outputs that were summarized."""
         if self.total_tool_outputs == 0:
             return 0.0
         return self.summarized_outputs / self.total_tool_outputs
-    
+
     @property
     def reuse_hit_rate(self) -> float:
         """Historical reuse hit rate."""
@@ -46,21 +46,21 @@ class ToolContextMetrics:
         if total == 0:
             return 0.0
         return self.historical_reuse_hits / total
-    
+
     @property
     def compression_ratio(self) -> float:
         """Compression ratio (input / output)."""
         if self.total_output_bytes == 0:
             return 1.0
         return self.total_input_bytes / self.total_output_bytes
-    
+
     @property
     def expand_rate(self) -> float:
         """Rate of memory_expand calls per summarized output."""
         if self.summarized_outputs == 0:
             return 0.0
         return self.memory_expand_calls / self.summarized_outputs
-    
+
     def to_dict(self) -> dict:
         """Export metrics as dict."""
         return {
@@ -80,7 +80,7 @@ class ToolContextMetrics:
             "per_tool_counts": self.per_tool_counts,
             "last_reset": self.last_reset.isoformat(),
         }
-    
+
     def reset(self) -> None:
         """Reset all metrics."""
         self.total_tool_outputs = 0
@@ -107,17 +107,21 @@ def get_metrics() -> ToolContextMetrics:
     return _metrics
 
 
-def record_tool_output(tool_name: str, input_size: int, output_size: int, was_summarized: bool) -> None:
+def record_tool_output(
+    tool_name: str, input_size: int, output_size: int, was_summarized: bool
+) -> None:
     """Record a tool output processing event."""
     with _lock:
         _metrics.total_tool_outputs += 1
         _metrics.total_input_bytes += input_size
         _metrics.total_output_bytes += output_size
         _metrics.per_tool_counts[tool_name] = _metrics.per_tool_counts.get(tool_name, 0) + 1
-        
+
         if was_summarized:
             _metrics.summarized_outputs += 1
-            _metrics.per_tool_summarized[tool_name] = _metrics.per_tool_summarized.get(tool_name, 0) + 1
+            _metrics.per_tool_summarized[tool_name] = (
+                _metrics.per_tool_summarized.get(tool_name, 0) + 1
+            )
         else:
             _metrics.direct_outputs += 1
 

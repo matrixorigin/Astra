@@ -9,8 +9,14 @@ from __future__ import annotations
 from pydantic import Field
 
 from core.skills.base import (
-    Skill, SkillInput, SkillOutput, SkillRequirement,
-    RepoType, AccessScope, SideEffectCategory, SideEffectProfile,
+    Skill,
+    SkillInput,
+    SkillOutput,
+    SkillRequirement,
+    RepoType,
+    AccessScope,
+    SideEffectCategory,
+    SideEffectProfile,
 )
 from core.logging_config import get_logger
 
@@ -42,11 +48,17 @@ class FeedbackTrainerSkill(Skill[TrainerInput, TrainerOutput]):
     version = "1.0.0"
     description = "Train feedback classification model from labeled conversation data"
     requirements = SkillRequirement(
-        repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=False,
-        gpu_required=True, conda_env="agent-engine-train", timeout_seconds=7200,
+        repo_types=[RepoType.CODE],
+        min_access=AccessScope.READ,
+        llm_required=False,
+        gpu_required=True,
+        conda_env="agent-engine-train",
+        timeout_seconds=7200,
     )
     side_effect_profile = SideEffectProfile(
-        category=SideEffectCategory.WRITE, external_apis=[], mock_strategy="skip",
+        category=SideEffectCategory.WRITE,
+        external_apis=[],
+        mock_strategy="skip",
     )
 
     def __init__(self, db=None) -> None:
@@ -63,17 +75,21 @@ class FeedbackTrainerSkill(Skill[TrainerInput, TrainerOutput]):
         # 1. Load dataset
         samples = _load_jsonl(input.dataset_path)
         if len(samples) < 50:
-            return TrainerOutput(success=False, result=None, error=f"Need ≥50 samples, got {len(samples)}")
+            return TrainerOutput(
+                success=False, result=None, error=f"Need ≥50 samples, got {len(samples)}"
+            )
 
         # 2. Split: 80/10/10
         n = len(samples)
-        train_data = samples[:int(n * 0.8)]
-        val_data = samples[int(n * 0.8):int(n * 0.9)]
-        test_data = samples[int(n * 0.9):]
+        train_data = samples[: int(n * 0.8)]
+        val_data = samples[int(n * 0.8) : int(n * 0.9)]
+        test_data = samples[int(n * 0.9) :]
 
         # 3. Train
         metrics = _train(
-            train_data, val_data, test_data,
+            train_data,
+            val_data,
+            test_data,
             base_model=input.base_model,
             epochs=input.epochs,
             batch_size=input.batch_size,
@@ -89,14 +105,18 @@ class FeedbackTrainerSkill(Skill[TrainerInput, TrainerOutput]):
         artifact_id = None
 
         return TrainerOutput(
-            success=True, result=metrics,
-            artifact_id=artifact_id, model_path=onnx_path, metrics=metrics,
+            success=True,
+            result=metrics,
+            artifact_id=artifact_id,
+            model_path=onnx_path,
+            metrics=metrics,
         )
 
 
 def _load_jsonl(path: str) -> list[dict]:
     import json
     from pathlib import Path
+
     data = []
     with Path(path).open() as f:
         for i, line in enumerate(f, 1):
@@ -110,14 +130,23 @@ def _load_jsonl(path: str) -> list[dict]:
 
 
 def _train(
-    train_data: list[dict], val_data: list[dict], test_data: list[dict],
-    *, base_model: str, epochs: int, batch_size: int, lr: float, output_dir: str,
+    train_data: list[dict],
+    val_data: list[dict],
+    test_data: list[dict],
+    *,
+    base_model: str,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    output_dir: str,
 ) -> dict:
     """Fine-tune BERT for 6-class feedback classification."""
     import torch
     from transformers import (
-        AutoTokenizer, AutoModelForSequenceClassification,
-        TrainingArguments, Trainer,
+        AutoTokenizer,
+        AutoModelForSequenceClassification,
+        TrainingArguments,
+        Trainer,
     )
     from datasets import Dataset
 
@@ -134,7 +163,9 @@ def _train(
 
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     model = AutoModelForSequenceClassification.from_pretrained(
-        base_model, num_labels=len(LABELS), problem_type="single_label_classification",
+        base_model,
+        num_labels=len(LABELS),
+        problem_type="single_label_classification",
     )
 
     train_ds = to_hf_dataset(train_data)
@@ -172,6 +203,7 @@ def _train(
     labels_true = predictions.label_ids
 
     from sklearn.metrics import accuracy_score, f1_score
+
     accuracy = accuracy_score(labels_true, preds)
     f1 = f1_score(labels_true, preds, average="weighted")
 

@@ -4,8 +4,8 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 from core.git_for_data import GitForData
 
+
 class TestGitForDataInjection:
-    
     @pytest.fixture
     def mock_db_session(self):
         mock = Mock(spec=Session)
@@ -19,7 +19,7 @@ class TestGitForDataInjection:
     def test_query_at_snapshot_simple_injection(self, git_for_data, mock_db_session):
         """Test simple injection of snapshot clause."""
         git_for_data.query_at_snapshot("SELECT * FROM auth_users", "snap1")
-        
+
         # Verify executed query contains snapshot clause
         call_args = mock_db_session.execute.call_args
         assert call_args is not None
@@ -30,7 +30,7 @@ class TestGitForDataInjection:
         """Test injection with table alias."""
         # Current implementation might be fragile here
         git_for_data.query_at_snapshot("SELECT * FROM auth_users u", "snap1")
-        
+
         call_args = mock_db_session.execute.call_args
         executed_sql = str(call_args[0][0])
         # Depending on implementation, it might be FROM auth_users {SNAPSHOT = 'snap1'} u or FROM auth_users u {SNAPSHOT = 'snap1'}
@@ -43,7 +43,7 @@ class TestGitForDataInjection:
         """Test injection with multiple tables (JOINs)."""
         query = "SELECT * FROM auth_users u JOIN orders o ON u.id = o.user_id"
         git_for_data.query_at_snapshot(query, "snap1")
-        
+
         call_args = mock_db_session.execute.call_args
         executed_sql = str(call_args[0][0])
         assert "FROM auth_users {SNAPSHOT = 'snap1'} u" in executed_sql
@@ -53,7 +53,7 @@ class TestGitForDataInjection:
         """Test injection with irregular whitespace."""
         query = "SELECT * FROM auth_users   WHERE id=1"
         git_for_data.query_at_snapshot(query, "snap1")
-        
+
         call_args = mock_db_session.execute.call_args
         executed_sql = str(call_args[0][0])
         assert "FROM auth_users {SNAPSHOT = 'snap1'}   WHERE" in executed_sql
@@ -62,7 +62,7 @@ class TestGitForDataInjection:
         """Test injection with case insensitivity."""
         query = "select * from auth_users"
         git_for_data.query_at_snapshot(query, "snap1")
-        
+
         call_args = mock_db_session.execute.call_args
         executed_sql = str(call_args[0][0])
         assert "from auth_users {SNAPSHOT = 'snap1'}" in executed_sql
@@ -71,10 +71,10 @@ class TestGitForDataInjection:
         """Test that we don't double inject if snapshot is already present."""
         query = "SELECT * FROM auth_users {SNAPSHOT = 'old_snap'}"
         git_for_data.query_at_snapshot(query, "new_snap")
-        
+
         call_args = mock_db_session.execute.call_args
         executed_sql = str(call_args[0][0])
-        # Should NOT inject new_snap if old_snap is there? 
+        # Should NOT inject new_snap if old_snap is there?
         # Or implementation logic says: if "{SNAPSHOT" in match, return match
         assert "FROM auth_users {SNAPSHOT = 'old_snap'}" in executed_sql
         assert "new_snap" not in executed_sql

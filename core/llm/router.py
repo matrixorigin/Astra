@@ -18,10 +18,10 @@ class ModelPricing(BaseModel):
 
     prompt: float = 0.0
     completion: float = 0.0
-    cache_read: float | None = None   # None = auto-derive from provider defaults
+    cache_read: float | None = None  # None = auto-derive from provider defaults
     cache_write: float | None = None
-    image: float | None = None        # per image (vision models)
-    request: float | None = None      # flat per-request fee
+    image: float | None = None  # per image (vision models)
+    request: float | None = None  # flat per-request fee
 
 
 class ModelQuirks(BaseModel):
@@ -30,8 +30,11 @@ class ModelQuirks(BaseModel):
     Add a new field here when a model deviates from the OpenAI standard.
     Each field is False/None by default so existing models are unaffected.
     """
+
     # Temperature
-    fixed_temperature: float | None = None      # Model only accepts one temperature value (e.g. kimi-k2.5 → 1.0)
+    fixed_temperature: float | None = (
+        None  # Model only accepts one temperature value (e.g. kimi-k2.5 → 1.0)
+    )
 
     # Reasoning / thinking models
     # When True, reasoning_content from the LLM response is preserved in
@@ -45,13 +48,15 @@ class ModelQuirks(BaseModel):
     preserve_reasoning_content: bool = False
 
     # Tool calling
-    no_parallel_tool_calls: bool = False        # Model doesn't support parallel tool calls
-    tool_choice_required: bool = False          # Must always pass tool_choice (some models reject omitting it)
-    strict_tool_call_ids: bool = False          # Model rejects non-standard tool_call_ids (e.g. "read_file:1"); rewrite to "call_xxx"
+    no_parallel_tool_calls: bool = False  # Model doesn't support parallel tool calls
+    tool_choice_required: bool = (
+        False  # Must always pass tool_choice (some models reject omitting it)
+    )
+    strict_tool_call_ids: bool = False  # Model rejects non-standard tool_call_ids (e.g. "read_file:1"); rewrite to "call_xxx"
 
     # Context
-    no_system_message: bool = False             # Model rejects system role (use first user message instead)
-    system_as_user_prefix: bool = False         # Prepend system prompt to first user message
+    no_system_message: bool = False  # Model rejects system role (use first user message instead)
+    system_as_user_prefix: bool = False  # Prepend system prompt to first user message
 
 
 class ModelConfig(BaseModel):
@@ -68,9 +73,9 @@ class ModelConfig(BaseModel):
     # ── Capabilities ──
     context_window: int = 128000
     max_completion_tokens: int | None = None
-    input_modalities: list[str] = ["text"]       # text, image, file, audio
-    output_modalities: list[str] = ["text"]       # text, image, audio
-    supported_parameters: list[str] = []          # tools, structured_outputs, reasoning, vision, ...
+    input_modalities: list[str] = ["text"]  # text, image, file, audio
+    output_modalities: list[str] = ["text"]  # text, image, audio
+    supported_parameters: list[str] = []  # tools, structured_outputs, reasoning, vision, ...
     is_moderated: bool = False
 
     # ── Pricing ──
@@ -78,8 +83,8 @@ class ModelConfig(BaseModel):
     enable_cache: bool = True
 
     # ── Architecture ──
-    architecture: str | None = None               # e.g. "transformer", "moe"
-    parameter_count: str | None = None            # e.g. "70B", "8x7B"
+    architecture: str | None = None  # e.g. "transformer", "moe"
+    parameter_count: str | None = None  # e.g. "70B", "8x7B"
 
     # ── Operational ──
     rpm_limit: int = 500
@@ -252,10 +257,18 @@ class ModelRegistry:
                     description=row.description,
                     context_window=row.context_window or 128000,
                     max_completion_tokens=row.max_completion_tokens,
-                    input_modalities=json.loads(row.input_modalities) if isinstance(row.input_modalities, str) else (row.input_modalities or ["text"]),
-                    output_modalities=json.loads(row.output_modalities) if isinstance(row.output_modalities, str) else (row.output_modalities or ["text"]),
-                    supported_parameters=json.loads(row.supported_parameters) if isinstance(row.supported_parameters, str) else (row.supported_parameters or []),
-                    pricing=json.loads(row.pricing) if isinstance(row.pricing, str) else (row.pricing or {}),
+                    input_modalities=json.loads(row.input_modalities)
+                    if isinstance(row.input_modalities, str)
+                    else (row.input_modalities or ["text"]),
+                    output_modalities=json.loads(row.output_modalities)
+                    if isinstance(row.output_modalities, str)
+                    else (row.output_modalities or ["text"]),
+                    supported_parameters=json.loads(row.supported_parameters)
+                    if isinstance(row.supported_parameters, str)
+                    else (row.supported_parameters or []),
+                    pricing=json.loads(row.pricing)
+                    if isinstance(row.pricing, str)
+                    else (row.pricing or {}),
                     architecture=row.architecture,
                     tags=json.loads(row.tags) if isinstance(row.tags, str) else (row.tags or []),
                     is_active=bool(row.is_active),

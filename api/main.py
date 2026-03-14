@@ -43,11 +43,13 @@ async def lifespan(app: FastAPI):
 
     # Start memory governance scheduler
     from core.context.scheduler import MemoryGovernanceScheduler
+
     scheduler = MemoryGovernanceScheduler()
     await scheduler.start()
 
     # Restore workflows that were waiting when process died
     from core.agent.async_tools import cleanup_stale_workflows, restore_waiting_workflows
+
     restored = restore_waiting_workflows()
     if restored:
         logger.info(f"Restored {restored} waiting workflow(s)")
@@ -56,6 +58,7 @@ async def lifespan(app: FastAPI):
     try:
         from api.database import get_db_session
         from core.auth.seed_roles import seed_roles
+
         db = next(get_db_session())
         seeded = seed_roles(db)
         if seeded:
@@ -68,6 +71,7 @@ async def lifespan(app: FastAPI):
     try:
         from api.database import get_db_session
         from core.agent.seed_agents import seed_agents
+
         db = next(get_db_session())
         seeded = seed_agents(db)
         if seeded:
@@ -88,9 +92,11 @@ async def lifespan(app: FastAPI):
         try:
             with SessionLocal() as db:
                 row = db.execute(
-                    text("SELECT quality_schema FROM skills_registry "
-                         "WHERE skill_name = :name AND is_active = 1 "
-                         "ORDER BY created_at DESC LIMIT 1"),
+                    text(
+                        "SELECT quality_schema FROM skills_registry "
+                        "WHERE skill_name = :name AND is_active = 1 "
+                        "ORDER BY created_at DESC LIMIT 1"
+                    ),
                     {"name": tool_name},
                 ).first()
                 if row and row[0]:
@@ -104,14 +110,17 @@ async def lifespan(app: FastAPI):
     # Initialize SkillConfigCenter singleton — must happen before any skill execution.
     # This is the only correct place: api/ owns SessionLocal and ORM models.
     from api.routers.skill_config import initialize as _init_skill_config
+
     _init_skill_config()
 
     # Periodic workflow cleanup (every hour)
     import asyncio
+
     async def _cleanup_loop():
         while True:
             await asyncio.sleep(3600)
             await cleanup_stale_workflows(max_age_hours=24)
+
     cleanup_task = asyncio.create_task(_cleanup_loop())
 
     # Cron trigger scheduler (check every 30s, session-per-trigger)
@@ -142,6 +151,7 @@ async def lifespan(app: FastAPI):
                         db_claim.close()
             except Exception as e:
                 logger.warning(f"Trigger loop error: {e}")
+
     trigger_task = asyncio.create_task(_trigger_loop())
 
     # Start embedding worker — generates embeddings for agent_events
@@ -149,6 +159,7 @@ async def lifespan(app: FastAPI):
     embedding_worker = None
     try:
         from core.events.embedding_worker import EmbeddingWorker
+
         embedding_worker = EmbeddingWorker(SessionLocal)
         embedding_worker.start()
         logger.info("EmbeddingWorker started")
@@ -168,6 +179,7 @@ async def lifespan(app: FastAPI):
 
     # Graceful job backend shutdown — wait for subprocess cleanup
     from api.routers.jobs import _router as job_router
+
     await job_router.shutdown()
 
     logger.info("Shutting down...")
@@ -236,6 +248,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     if is_sse_endpoint(request.url.path):
         return sse_error_response(422, format_validation_error(exc))
     from fastapi.encoders import jsonable_encoder
+
     return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
 
 
@@ -333,6 +346,7 @@ def health_check():
     # Simple health check - try to execute a query
     try:
         from sqlalchemy import text
+
         db.execute(text("SELECT 1"))
         db_healthy = True
     except Exception:

@@ -31,7 +31,8 @@ class MemoryHealth(DbConsumer):
     def analyze(self, user_id: str) -> dict:
         """Get per-type stats: count, avg_confidence, contradiction_rate, staleness."""
         with self._db() as db:
-            rows = db.execute(text("""
+            rows = db.execute(
+                text("""
                 SELECT
                     memory_type,
                     COUNT(*) as total,
@@ -41,7 +42,9 @@ class MemoryHealth(DbConsumer):
                 FROM mem_memories
                 WHERE user_id = :uid
                 GROUP BY memory_type
-            """), {"uid": user_id}).fetchall()
+            """),
+                {"uid": user_id},
+            ).fetchall()
 
         stats = {}
         for r in rows:
@@ -59,13 +62,16 @@ class MemoryHealth(DbConsumer):
         try:
             with self._db() as db:
                 # Count changes since timestamp
-                result = db.execute(text("""
+                result = db.execute(
+                    text("""
                     SELECT
                         COUNT(*) as total_changes,
                         COUNT(CASE WHEN superseded_by IS NOT NULL THEN 1 END) as supersedes
                     FROM mem_memories
                     WHERE user_id = :uid AND updated_at >= :ts
-                """), {"uid": user_id, "ts": since_timestamp}).fetchone()
+                """),
+                    {"uid": user_id, "ts": since_timestamp},
+                ).fetchone()
 
             total = result.total_changes or 0
             supersedes = result.supersedes or 0
@@ -86,7 +92,8 @@ class MemoryHealth(DbConsumer):
     def suggest_rollback_target(self, user_id: str) -> str | None:
         """Find the most likely bad memory (low confidence, recent, caused supersedes)."""
         with self._db() as db:
-            row = db.execute(text("""
+            row = db.execute(
+                text("""
                 SELECT memory_id
                 FROM mem_memories
                 WHERE user_id = :uid
@@ -94,17 +101,21 @@ class MemoryHealth(DbConsumer):
                   AND initial_confidence < 0.5
                 ORDER BY observed_at DESC
                 LIMIT 1
-            """), {"uid": user_id}).fetchone()
+            """),
+                {"uid": user_id},
+            ).fetchone()
         return row.memory_id if row else None
 
     def cleanup_snapshots(self, keep_last_n: int = 5) -> int:
         """Drop old milestone snapshots, keep last N."""
         with self._db() as db:
-            rows = db.execute(text("""
+            rows = db.execute(
+                text("""
                 SELECT sname FROM mo_catalog.mo_snapshots
                 WHERE prefix_eq(sname, 'mem_milestone_')
                 ORDER BY ts DESC
-            """)).fetchall()
+            """)
+            ).fetchall()
 
         if len(rows) <= keep_last_n:
             return 0
@@ -131,8 +142,6 @@ class MemoryHealth(DbConsumer):
         logger.info("Cleaned up %d old snapshots", dropped)
         return dropped
 
-
-
     def estimate_capacity(self, user_id: str) -> dict:
         """Estimate memory capacity and IVF index performance headroom.
 
@@ -153,7 +162,8 @@ class MemoryHealth(DbConsumer):
 
         with self._db() as db:
             # Per-user active vector count
-            user_row = db.execute(text("""
+            user_row = db.execute(
+                text("""
                 SELECT
                     COUNT(*) as total_active,
                     COUNT(CASE WHEN embedding IS NOT NULL THEN 1 END) as with_embedding,
@@ -161,22 +171,29 @@ class MemoryHealth(DbConsumer):
                     MAX(observed_at) as newest_active
                 FROM mem_memories
                 WHERE user_id = :uid AND is_active = 1
-            """), {"uid": user_id}).fetchone()
+            """),
+                {"uid": user_id},
+            ).fetchone()
 
             # Global vector count (for index-level assessment)
-            global_row = db.execute(text("""
+            global_row = db.execute(
+                text("""
                 SELECT COUNT(*) as global_total
                 FROM mem_memories
                 WHERE is_active = 1 AND embedding IS NOT NULL
-            """)).fetchone()
+            """)
+            ).fetchone()
 
             # 30-day growth rate for this user
-            growth_row = db.execute(text("""
+            growth_row = db.execute(
+                text("""
                 SELECT COUNT(*) as added_30d
                 FROM mem_memories
                 WHERE user_id = :uid
                   AND observed_at >= NOW() - INTERVAL 30 DAY
-            """), {"uid": user_id}).fetchone()
+            """),
+                {"uid": user_id},
+            ).fetchone()
 
         total_active = user_row.total_active or 0
         with_embedding = user_row.with_embedding or 0
@@ -209,7 +226,8 @@ class MemoryHealth(DbConsumer):
     def get_storage_stats(self, user_id: str) -> dict:
         """Get storage statistics for monitoring."""
         with self._db() as db:
-            row = db.execute(text("""
+            row = db.execute(
+                text("""
                 SELECT
                     COUNT(*) as total,
                     SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) as active,
@@ -218,7 +236,9 @@ class MemoryHealth(DbConsumer):
                     MAX(observed_at) as newest
                 FROM mem_memories
                 WHERE user_id = :uid
-            """), {"uid": user_id}).fetchone()
+            """),
+                {"uid": user_id},
+            ).fetchone()
 
         return {
             "total": row.total or 0,

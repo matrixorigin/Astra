@@ -43,8 +43,9 @@ class TestConstraintsCoreRules:
 
         token_count = result.token_breakdown.get("constraints", 0)
         # Dynamic constraints: core rules ~35 tokens, with task-specific ~100-300
-        assert 30 <= token_count <= 500, \
+        assert 30 <= token_count <= 500, (
             f"Constraints token count {token_count} outside reasonable range (30-500)"
+        )
 
 
 class TestConstraintsDynamicLoading:
@@ -164,5 +165,4 @@ class TestConstraintsIntegration:
 
         # Core rules should still be present after compression
         constraints = result.sections.get("constraints", "")
-        assert "Think step-by-step" in constraints, \
-            "Core rules should survive compression"
+        assert "Think step-by-step" in constraints, "Core rules should survive compression"

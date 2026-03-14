@@ -21,7 +21,12 @@ os.environ.setdefault("TOKEN_ENCRYPTION_KEY", "test-key-" + "x" * 32)
 os.environ.setdefault("JWT_SECRET_KEY", "test-jwt-secret-" + "x" * 32)
 
 from api.main import app
-from tests.conftest import parse_sse_events, fake_llm_stream, get_auth_headers, flush_persist_threads
+from tests.conftest import (
+    parse_sse_events,
+    fake_llm_stream,
+    get_auth_headers,
+    flush_persist_threads,
+)
 
 
 @pytest.fixture
@@ -33,7 +38,8 @@ def _unique_auth(client, db, prefix="ec"):
     uid = uuid4().hex
     user_id = str(uuid4())
     headers = get_auth_headers(
-        client, db,
+        client,
+        db,
         username=f"{prefix}_{uid}",
         user_id=user_id,
         email=f"{prefix}_{uid}@test.com",
@@ -43,19 +49,49 @@ def _unique_auth(client, db, prefix="ec"):
 
 
 _TOOLS = (
-    {"type": "function", "function": {"name": "bash", "description": "Run shell command",
-     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
-    {"type": "function", "function": {"name": "read_file", "description": "Read file content",
-     "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
-    {"type": "function", "function": {"name": "grep", "description": "Search text patterns",
-     "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}}},
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run shell command",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read file content",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": "Search text patterns",
+            "parameters": {
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}},
+                "required": ["pattern"],
+            },
+        },
+    },
 )
 
 
 # ── Layer 1: ToolRegistry selects correct tools in /chat/turn ────
 
-class TestToolRegistryInChatTurn:
 
+class TestToolRegistryInChatTurn:
     def _auth(self, client, db):
         return _unique_auth(client, db, "tr_sel")
 
@@ -73,10 +109,16 @@ class TestToolRegistryInChatTurn:
 
         # Use a user query that explicitly names all tools to ensure they are selected
         with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=_capture_stream):
-            r = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "use bash, read_file, and grep tools"}],
-                "edge_tools": list(_TOOLS),
-            }, headers=headers)
+            r = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [
+                        {"role": "user", "content": "use bash, read_file, and grep tools"}
+                    ],
+                    "edge_tools": list(_TOOLS),
+                },
+                headers=headers,
+            )
 
         assert r.status_code == 200
         events = parse_sse_events(r.text)
@@ -97,10 +139,16 @@ class TestToolRegistryInChatTurn:
 
         # Use a user query that explicitly names tools to ensure they are selected
         with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=_capture_stream):
-            r = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "use bash, read_file, and grep tools"}],
-                "edge_tools": list(_TOOLS),
-            }, headers=headers)
+            r = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [
+                        {"role": "user", "content": "use bash, read_file, and grep tools"}
+                    ],
+                    "edge_tools": list(_TOOLS),
+                },
+                headers=headers,
+            )
 
         assert r.status_code == 200
         tool_names = {t["function"]["name"] for t in (captured.get("tools") or [])}
@@ -112,8 +160,8 @@ class TestToolRegistryInChatTurn:
 
 # ── Layer 2: DB ground truth for agent_events ────────────────────
 
-class TestEventPersistenceGroundTruth:
 
+class TestEventPersistenceGroundTruth:
     def _auth(self, client, db):
         return _unique_auth(client, db, "evt_gt")
 
@@ -121,24 +169,39 @@ class TestEventPersistenceGroundTruth:
         """user_query event: all fields verified after /chat/turn."""
         headers, uid = self._auth(client, db)
 
-        with patch("core.llm.client.LLMClient.chat_with_tools_stream",
-                   return_value=fake_llm_stream([
-                       {"type": "text", "content": "Event sourcing stores changes as events."},
-                   ])):
-            r = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "what is event sourcing?"}],
-                "edge_tools": list(_TOOLS),
-            }, headers=headers)
+        with patch(
+            "core.llm.client.LLMClient.chat_with_tools_stream",
+            return_value=fake_llm_stream(
+                [
+                    {"type": "text", "content": "Event sourcing stores changes as events."},
+                ]
+            ),
+        ):
+            r = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "what is event sourcing?"}],
+                    "edge_tools": list(_TOOLS),
+                },
+                headers=headers,
+            )
 
         events = parse_sse_events(r.text)
         sid = next(e["session_id"] for e in events if e["type"] == "session_info")
         flush_persist_threads()
 
-        row = db.execute(sql_text(
-            "SELECT * FROM agent_events "
-            "WHERE session_id = :sid AND event_type = 'user_query' "
-            "ORDER BY created_at DESC LIMIT 1"
-        ), {"sid": sid}).mappings().first()
+        row = (
+            db.execute(
+                sql_text(
+                    "SELECT * FROM agent_events "
+                    "WHERE session_id = :sid AND event_type = 'user_query' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"sid": sid},
+            )
+            .mappings()
+            .first()
+        )
 
         assert row is not None
         assert row["session_id"] == sid
@@ -153,29 +216,51 @@ class TestEventPersistenceGroundTruth:
         """llm_response event shares causal_chain_id and parent_event_id with user_query."""
         headers, _ = self._auth(client, db)
 
-        with patch("core.llm.client.LLMClient.chat_with_tools_stream",
-                   return_value=fake_llm_stream([
-                       {"type": "text", "content": "It stores state changes as events."},
-                   ])):
-            r = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "explain event sourcing"}],
-                "edge_tools": list(_TOOLS),
-            }, headers=headers)
+        with patch(
+            "core.llm.client.LLMClient.chat_with_tools_stream",
+            return_value=fake_llm_stream(
+                [
+                    {"type": "text", "content": "It stores state changes as events."},
+                ]
+            ),
+        ):
+            r = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "explain event sourcing"}],
+                    "edge_tools": list(_TOOLS),
+                },
+                headers=headers,
+            )
 
         sid = next(e["session_id"] for e in parse_sse_events(r.text) if e["type"] == "session_info")
         flush_persist_threads()
 
-        uq = db.execute(sql_text(
-            "SELECT event_id, causal_chain_id FROM agent_events "
-            "WHERE session_id = :sid AND event_type = 'user_query' "
-            "ORDER BY created_at DESC LIMIT 1"
-        ), {"sid": sid}).mappings().first()
+        uq = (
+            db.execute(
+                sql_text(
+                    "SELECT event_id, causal_chain_id FROM agent_events "
+                    "WHERE session_id = :sid AND event_type = 'user_query' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"sid": sid},
+            )
+            .mappings()
+            .first()
+        )
 
-        lr = db.execute(sql_text(
-            "SELECT * FROM agent_events "
-            "WHERE session_id = :sid AND event_type = 'llm_response' "
-            "ORDER BY created_at DESC LIMIT 1"
-        ), {"sid": sid}).mappings().first()
+        lr = (
+            db.execute(
+                sql_text(
+                    "SELECT * FROM agent_events "
+                    "WHERE session_id = :sid AND event_type = 'llm_response' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"sid": sid},
+            )
+            .mappings()
+            .first()
+        )
 
         assert lr is not None
         assert lr["parent_event_id"] == uq["event_id"]
@@ -186,26 +271,45 @@ class TestEventPersistenceGroundTruth:
         """tool_call event records function name, arguments, and skill_name."""
         headers, _ = self._auth(client, db)
 
-        with patch("core.llm.client.LLMClient.chat_with_tools_stream",
-                   return_value=fake_llm_stream([
-                       {"type": "tool_call", "data": {
-                           "id": "tc_ec1", "type": "function",
-                           "function": {"name": "bash", "arguments": '{"command": "ls"}'},
-                       }},
-                   ])):
-            r = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "list current directory"}],
-                "edge_tools": list(_TOOLS),
-            }, headers=headers)
+        with patch(
+            "core.llm.client.LLMClient.chat_with_tools_stream",
+            return_value=fake_llm_stream(
+                [
+                    {
+                        "type": "tool_call",
+                        "data": {
+                            "id": "tc_ec1",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": '{"command": "ls"}'},
+                        },
+                    },
+                ]
+            ),
+        ):
+            r = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "list current directory"}],
+                    "edge_tools": list(_TOOLS),
+                },
+                headers=headers,
+            )
 
         sid = next(e["session_id"] for e in parse_sse_events(r.text) if e["type"] == "session_info")
         flush_persist_threads()
 
-        tc = db.execute(sql_text(
-            "SELECT * FROM agent_events "
-            "WHERE session_id = :sid AND event_type = 'tool_call' "
-            "ORDER BY created_at DESC LIMIT 1"
-        ), {"sid": sid}).mappings().first()
+        tc = (
+            db.execute(
+                sql_text(
+                    "SELECT * FROM agent_events "
+                    "WHERE session_id = :sid AND event_type = 'tool_call' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"sid": sid},
+            )
+            .mappings()
+            .first()
+        )
 
         assert tc is not None
         content = json.loads(tc["content"])
@@ -217,8 +321,8 @@ class TestEventPersistenceGroundTruth:
 
 # ── Layer 3: skill_selection_events ground truth ─────────────────
 
-class TestSkillSelectionEventGroundTruth:
 
+class TestSkillSelectionEventGroundTruth:
     def _auth(self, client, db):
         return _unique_auth(client, db, "sse_gt")
 
@@ -226,25 +330,44 @@ class TestSkillSelectionEventGroundTruth:
         """A turn with tool_calls writes a skill_selection_events row with correct fields."""
         headers, _ = self._auth(client, db)
 
-        with patch("core.llm.client.LLMClient.chat_with_tools_stream",
-                   return_value=fake_llm_stream([
-                       {"type": "tool_call", "data": {
-                           "id": "tc_sse1", "type": "function",
-                           "function": {"name": "read_file", "arguments": '{"path": "/tmp/x"}'},
-                       }},
-                   ])):
-            r = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "read /tmp/x"}],
-                "edge_tools": list(_TOOLS),
-            }, headers=headers)
+        with patch(
+            "core.llm.client.LLMClient.chat_with_tools_stream",
+            return_value=fake_llm_stream(
+                [
+                    {
+                        "type": "tool_call",
+                        "data": {
+                            "id": "tc_sse1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": '{"path": "/tmp/x"}'},
+                        },
+                    },
+                ]
+            ),
+        ):
+            r = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "read /tmp/x"}],
+                    "edge_tools": list(_TOOLS),
+                },
+                headers=headers,
+            )
 
         sid = next(e["session_id"] for e in parse_sse_events(r.text) if e["type"] == "session_info")
         flush_persist_threads()
 
-        row = db.execute(sql_text(
-            "SELECT * FROM skill_selection_events "
-            "WHERE session_id = :sid ORDER BY created_at DESC LIMIT 1"
-        ), {"sid": sid}).mappings().first()
+        row = (
+            db.execute(
+                sql_text(
+                    "SELECT * FROM skill_selection_events "
+                    "WHERE session_id = :sid ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"sid": sid},
+            )
+            .mappings()
+            .first()
+        )
 
         assert row is not None
         assert row["session_id"] == sid
@@ -263,28 +386,37 @@ class TestSkillSelectionEventGroundTruth:
         """A turn with only text (no tool_calls) does NOT write skill_selection_events."""
         headers, _ = self._auth(client, db)
 
-        with patch("core.llm.client.LLMClient.chat_with_tools_stream",
-                   return_value=fake_llm_stream([
-                       {"type": "text", "content": "Hello!"},
-                   ])):
-            r = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "hi"}],
-                "edge_tools": list(_TOOLS),
-            }, headers=headers)
+        with patch(
+            "core.llm.client.LLMClient.chat_with_tools_stream",
+            return_value=fake_llm_stream(
+                [
+                    {"type": "text", "content": "Hello!"},
+                ]
+            ),
+        ):
+            r = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "edge_tools": list(_TOOLS),
+                },
+                headers=headers,
+            )
 
         sid = next(e["session_id"] for e in parse_sse_events(r.text) if e["type"] == "session_info")
         flush_persist_threads()
 
-        row = db.execute(sql_text(
-            "SELECT COUNT(*) FROM skill_selection_events WHERE session_id = :sid"
-        ), {"sid": sid}).scalar()
+        row = db.execute(
+            sql_text("SELECT COUNT(*) FROM skill_selection_events WHERE session_id = :sid"),
+            {"sid": sid},
+        ).scalar()
         assert row == 0
 
 
 # ── Layer 4: session state updated ───────────────────────────────
 
-class TestSessionStateUpdate:
 
+class TestSessionStateUpdate:
     def _auth(self, client, db):
         return _unique_auth(client, db, "sess_st")
 
@@ -293,25 +425,48 @@ class TestSessionStateUpdate:
         headers, _ = self._auth(client, db)
 
         # Use a user query that ensures tools are selected, and patch both chat methods
-        with patch("core.llm.client.LLMClient.chat_with_tools_stream",
-                   return_value=fake_llm_stream([
-                       {"type": "text", "content": "done"},
-                   ])), \
-             patch("core.llm.client.LLMClient.chat_stream",
-                   return_value=fake_llm_stream([
-                       {"type": "text", "content": "done"},
-                   ])):
-            r = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "use bash, read_file, and grep tools"}],
-                "edge_tools": list(_TOOLS),
-            }, headers=headers)
+        with (
+            patch(
+                "core.llm.client.LLMClient.chat_with_tools_stream",
+                return_value=fake_llm_stream(
+                    [
+                        {"type": "text", "content": "done"},
+                    ]
+                ),
+            ),
+            patch(
+                "core.llm.client.LLMClient.chat_stream",
+                return_value=fake_llm_stream(
+                    [
+                        {"type": "text", "content": "done"},
+                    ]
+                ),
+            ),
+        ):
+            r = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [
+                        {"role": "user", "content": "use bash, read_file, and grep tools"}
+                    ],
+                    "edge_tools": list(_TOOLS),
+                },
+                headers=headers,
+            )
 
         sid = next(e["session_id"] for e in parse_sse_events(r.text) if e["type"] == "session_info")
         flush_persist_threads()
 
-        row = db.execute(sql_text(
-            "SELECT event_count, last_active_at FROM agent_sessions WHERE session_id = :sid"
-        ), {"sid": sid}).mappings().first()
+        row = (
+            db.execute(
+                sql_text(
+                    "SELECT event_count, last_active_at FROM agent_sessions WHERE session_id = :sid"
+                ),
+                {"sid": sid},
+            )
+            .mappings()
+            .first()
+        )
 
         assert row is not None
         assert row["event_count"] >= 2  # user_query + llm_response
@@ -320,8 +475,8 @@ class TestSessionStateUpdate:
 
 # ── Layer 5: multi-turn causal chain ─────────────────────────────
 
-class TestMultiTurnCausalChain:
 
+class TestMultiTurnCausalChain:
     def _auth(self, client, db):
         return _unique_auth(client, db, "chain")
 
@@ -330,45 +485,79 @@ class TestMultiTurnCausalChain:
         headers, _ = self._auth(client, db)
 
         # Turn 1: LLM returns tool_call
-        with patch("core.llm.client.LLMClient.chat_with_tools_stream",
-                   return_value=fake_llm_stream([
-                       {"type": "tool_call", "data": {
-                           "id": "tc_chain1", "type": "function",
-                           "function": {"name": "bash", "arguments": '{"command": "ls"}'},
-                       }},
-                   ])):
-            r1 = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "list files"}],
-                "edge_tools": list(_TOOLS),
-            }, headers=headers)
+        with patch(
+            "core.llm.client.LLMClient.chat_with_tools_stream",
+            return_value=fake_llm_stream(
+                [
+                    {
+                        "type": "tool_call",
+                        "data": {
+                            "id": "tc_chain1",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": '{"command": "ls"}'},
+                        },
+                    },
+                ]
+            ),
+        ):
+            r1 = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "list files"}],
+                    "edge_tools": list(_TOOLS),
+                },
+                headers=headers,
+            )
 
-        sid = next(e["session_id"] for e in parse_sse_events(r1.text) if e["type"] == "session_info")
+        sid = next(
+            e["session_id"] for e in parse_sse_events(r1.text) if e["type"] == "session_info"
+        )
         flush_persist_threads()
 
-        chain1 = db.execute(sql_text(
-            "SELECT causal_chain_id FROM agent_events "
-            "WHERE session_id = :sid AND event_type = 'user_query' "
-            "ORDER BY created_at DESC LIMIT 1"
-        ), {"sid": sid}).scalar()
+        chain1 = db.execute(
+            sql_text(
+                "SELECT causal_chain_id FROM agent_events "
+                "WHERE session_id = :sid AND event_type = 'user_query' "
+                "ORDER BY created_at DESC LIMIT 1"
+            ),
+            {"sid": sid},
+        ).scalar()
 
         # Turn 2: continuation with tool_result → LLM returns text
-        with patch("core.llm.client.LLMClient.chat_with_tools_stream",
-                   return_value=fake_llm_stream([
-                       {"type": "text", "content": "Directory listing complete."},
-                   ])):
-            client.post("/chat/turn", json={
-                "messages": [],
-                "session_id": sid,
-                "tool_results": [{"tool_call_id": "tc_chain1", "name": "bash", "result": "file1.py\nfile2.py"}],
-            }, headers=headers)
+        with patch(
+            "core.llm.client.LLMClient.chat_with_tools_stream",
+            return_value=fake_llm_stream(
+                [
+                    {"type": "text", "content": "Directory listing complete."},
+                ]
+            ),
+        ):
+            client.post(
+                "/chat/turn",
+                json={
+                    "messages": [],
+                    "session_id": sid,
+                    "tool_results": [
+                        {
+                            "tool_call_id": "tc_chain1",
+                            "name": "bash",
+                            "result": "file1.py\nfile2.py",
+                        }
+                    ],
+                },
+                headers=headers,
+            )
 
         flush_persist_threads()
 
-        chain2 = db.execute(sql_text(
-            "SELECT causal_chain_id FROM agent_events "
-            "WHERE session_id = :sid AND event_type = 'llm_response' "
-            "ORDER BY created_at DESC LIMIT 1"
-        ), {"sid": sid}).scalar()
+        chain2 = db.execute(
+            sql_text(
+                "SELECT causal_chain_id FROM agent_events "
+                "WHERE session_id = :sid AND event_type = 'llm_response' "
+                "ORDER BY created_at DESC LIMIT 1"
+            ),
+            {"sid": sid},
+        ).scalar()
 
         assert chain1 is not None
         assert chain2 == chain1
@@ -378,38 +567,58 @@ class TestMultiTurnCausalChain:
         headers, _ = self._auth(client, db)
 
         # Turn 1
-        with patch("core.llm.client.LLMClient.chat_with_tools_stream",
-                   return_value=fake_llm_stream([{"type": "text", "content": "ok"}])):
-            r1 = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "turn 1"}],
-                "edge_tools": list(_TOOLS),
-            }, headers=headers)
+        with patch(
+            "core.llm.client.LLMClient.chat_with_tools_stream",
+            return_value=fake_llm_stream([{"type": "text", "content": "ok"}]),
+        ):
+            r1 = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "turn 1"}],
+                    "edge_tools": list(_TOOLS),
+                },
+                headers=headers,
+            )
 
-        sid = next(e["session_id"] for e in parse_sse_events(r1.text) if e["type"] == "session_info")
+        sid = next(
+            e["session_id"] for e in parse_sse_events(r1.text) if e["type"] == "session_info"
+        )
         flush_persist_threads()
 
-        chain1 = db.execute(sql_text(
-            "SELECT causal_chain_id FROM agent_events "
-            "WHERE session_id = :sid AND event_type = 'user_query' "
-            "ORDER BY created_at ASC LIMIT 1"
-        ), {"sid": sid}).scalar()
+        chain1 = db.execute(
+            sql_text(
+                "SELECT causal_chain_id FROM agent_events "
+                "WHERE session_id = :sid AND event_type = 'user_query' "
+                "ORDER BY created_at ASC LIMIT 1"
+            ),
+            {"sid": sid},
+        ).scalar()
 
         # Turn 2: new user query
-        with patch("core.llm.client.LLMClient.chat_with_tools_stream",
-                   return_value=fake_llm_stream([{"type": "text", "content": "ok2"}])):
-            client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "turn 2"}],
-                "session_id": sid,
-                "edge_tools": list(_TOOLS),
-            }, headers=headers)
+        with patch(
+            "core.llm.client.LLMClient.chat_with_tools_stream",
+            return_value=fake_llm_stream([{"type": "text", "content": "ok2"}]),
+        ):
+            client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "turn 2"}],
+                    "session_id": sid,
+                    "edge_tools": list(_TOOLS),
+                },
+                headers=headers,
+            )
 
         flush_persist_threads()
 
-        chain2 = db.execute(sql_text(
-            "SELECT causal_chain_id FROM agent_events "
-            "WHERE session_id = :sid AND event_type = 'user_query' "
-            "ORDER BY created_at DESC LIMIT 1"
-        ), {"sid": sid}).scalar()
+        chain2 = db.execute(
+            sql_text(
+                "SELECT causal_chain_id FROM agent_events "
+                "WHERE session_id = :sid AND event_type = 'user_query' "
+                "ORDER BY created_at DESC LIMIT 1"
+            ),
+            {"sid": sid},
+        ).scalar()
 
         assert chain1 is not None
         assert chain2 is not None
@@ -418,8 +627,8 @@ class TestMultiTurnCausalChain:
 
 # ── Layer 6: cloud skill execution ───────────────────────────────
 
-class TestCloudSkillExecution:
 
+class TestCloudSkillExecution:
     def _auth(self, client, db):
         return _unique_auth(client, db, "cloud")
 
@@ -431,31 +640,51 @@ class TestCloudSkillExecution:
         async def _two_phase(messages, tools, **kw):
             call_count[0] += 1
             if call_count[0] == 1:
-                yield {"type": "tool_call", "data": {
-                    "id": "tc_cloud1", "type": "function",
-                    "function": {"name": "list_prs", "arguments": json.dumps({"repo": "test/repo"})},
-                }}
+                yield {
+                    "type": "tool_call",
+                    "data": {
+                        "id": "tc_cloud1",
+                        "type": "function",
+                        "function": {
+                            "name": "list_prs",
+                            "arguments": json.dumps({"repo": "test/repo"}),
+                        },
+                    },
+                }
             else:
                 yield {"type": "text", "content": "Found 3 PRs"}
 
-        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=_two_phase), \
-             patch("api.routers.chat._execute_cloud_skill", new_callable=AsyncMock) as mock_exec:
+        with (
+            patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=_two_phase),
+            patch("api.routers.chat._execute_cloud_skill", new_callable=AsyncMock) as mock_exec,
+        ):
             mock_exec.return_value = json.dumps({"prs": [{"number": 1, "title": "Fix bug"}]})
 
-            r = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "show PRs for test/repo"}],
-                "edge_tools": list(_TOOLS),
-            }, headers=headers)
+            r = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "show PRs for test/repo"}],
+                    "edge_tools": list(_TOOLS),
+                },
+                headers=headers,
+            )
 
         assert r.status_code == 200
         sid = next(e["session_id"] for e in parse_sse_events(r.text) if e["type"] == "session_info")
         flush_persist_threads()
 
-        rows = db.execute(sql_text(
-            "SELECT content, metadata FROM agent_events "
-            "WHERE session_id = :sid AND event_type = 'tool_result' "
-            "ORDER BY created_at"
-        ), {"sid": sid}).mappings().all()
+        rows = (
+            db.execute(
+                sql_text(
+                    "SELECT content, metadata FROM agent_events "
+                    "WHERE session_id = :sid AND event_type = 'tool_result' "
+                    "ORDER BY created_at"
+                ),
+                {"sid": sid},
+            )
+            .mappings()
+            .all()
+        )
 
         cloud_results = [r for r in rows if r["metadata"] and "cloud" in str(r["metadata"])]
         assert len(cloud_results) >= 1, f"Expected cloud tool_result, got {len(rows)} total"
@@ -471,30 +700,47 @@ class TestCloudSkillExecution:
         async def _two_phase(messages, tools, **kw):
             call_count[0] += 1
             if call_count[0] == 1:
-                yield {"type": "tool_call", "data": {
-                    "id": "tc_cloud2", "type": "function",
-                    "function": {"name": "list_prs", "arguments": '{"repo": "o/r"}'},
-                }}
+                yield {
+                    "type": "tool_call",
+                    "data": {
+                        "id": "tc_cloud2",
+                        "type": "function",
+                        "function": {"name": "list_prs", "arguments": '{"repo": "o/r"}'},
+                    },
+                }
             else:
                 yield {"type": "text", "content": "Done"}
 
-        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=_two_phase), \
-             patch("api.routers.chat._execute_cloud_skill", new_callable=AsyncMock) as mock_exec:
+        with (
+            patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=_two_phase),
+            patch("api.routers.chat._execute_cloud_skill", new_callable=AsyncMock) as mock_exec,
+        ):
             mock_exec.return_value = json.dumps({"success": True, "result": "ok"})
 
-            r = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "list PRs"}],
-                "edge_tools": list(_TOOLS),
-            }, headers=headers)
+            r = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "list PRs"}],
+                    "edge_tools": list(_TOOLS),
+                },
+                headers=headers,
+            )
 
         sid = next(e["session_id"] for e in parse_sse_events(r.text) if e["type"] == "session_info")
         flush_persist_threads()
 
-        tc = db.execute(sql_text(
-            "SELECT content FROM agent_events "
-            "WHERE session_id = :sid AND event_type = 'tool_call' AND skill_name = 'list_prs' "
-            "ORDER BY created_at DESC LIMIT 1"
-        ), {"sid": sid}).mappings().first()
+        tc = (
+            db.execute(
+                sql_text(
+                    "SELECT content FROM agent_events "
+                    "WHERE session_id = :sid AND event_type = 'tool_call' AND skill_name = 'list_prs' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"sid": sid},
+            )
+            .mappings()
+            .first()
+        )
 
         assert tc is not None
         content = json.loads(tc["content"])

@@ -250,9 +250,17 @@ class ListIssuesAction(Skill[ListIssuesInput, ListIssuesOutput]):
 
     async def execute(self, input: ListIssuesInput) -> ListIssuesOutput:
         issues = await self._api.list_issues(
-            input.repo, input.state, input.labels, input.sort, input.direction,
-            input.since, input.assignee, input.creator, input.milestone,
-            input.limit, input.detail,
+            input.repo,
+            input.state,
+            input.labels,
+            input.sort,
+            input.direction,
+            input.since,
+            input.assignee,
+            input.creator,
+            input.milestone,
+            input.limit,
+            input.detail,
         )
         return ListIssuesOutput(success=True, result=issues, issues=issues)
 
@@ -399,6 +407,11 @@ class CIStatusAction(Skill[CIStatusInput, CIStatusOutput]):
                 "Do NOT retry with bash, curl, or any other tool."
             )
         return CIStatusOutput(
-            success=True, result=workflows, workflows=workflows, guidance=guidance,
-            user_message="No GitHub Actions CI workflows are configured for this repository." if not workflows else None,
+            success=True,
+            result=workflows,
+            workflows=workflows,
+            guidance=guidance,
+            user_message="No GitHub Actions CI workflows are configured for this repository."
+            if not workflows
+            else None,
         )

@@ -51,14 +51,14 @@ class TestAgentCLI:
             mock_client.register.return_value = {"email": "bob@example.com"}
 
             result = runner.invoke(
-                agent_cli,
-                ["register"],
-                input="bob@example.com\npassword\npassword\nbob\n"
+                agent_cli, ["register"], input="bob@example.com\npassword\npassword\nbob\n"
             )
             assert result.exit_code == 0
             assert "✅ Registered" in result.output
             mock_client.register.assert_called_once_with(
-                "bob", "password", "bob@example.com",
+                "bob",
+                "password",
+                "bob@example.com",
             )
 
     def test_whoami_authenticated(self, runner):
@@ -68,7 +68,7 @@ class TestAgentCLI:
             mock_client_class.return_value = mock_client
             mock_client.get_current_user.return_value = {
                 "email": "alice@example.com",
-                "user_id": "u_alice"
+                "user_id": "u_alice",
             }
 
             result = runner.invoke(agent_cli, ["whoami"])
@@ -81,12 +81,7 @@ class TestAgentCLI:
             mock_client = MagicMock()
             mock_client_class.return_value = mock_client
             mock_client.list_sessions.return_value = [
-                {
-                    "session_id": "s1",
-                    "user_id": "alice",
-                    "status": "active",
-                    "event_count": 5
-                }
+                {"session_id": "s1", "user_id": "alice", "status": "active", "event_count": 5}
             ]
 
             result = runner.invoke(agent_cli, ["session", "list"])
@@ -114,7 +109,7 @@ class TestAgentCLI:
                 "session_id": "s1",
                 "user_id": "alice",
                 "status": "active",
-                "event_count": 5
+                "event_count": 5,
             }
 
             result = runner.invoke(agent_cli, ["session", "show", "s1"])
@@ -132,7 +127,7 @@ class TestAgentCLI:
                     "skill_name": "summarize",
                     "version": "1.0",
                     "is_active": True,
-                    "description": "Summarize text"
+                    "description": "Summarize text",
                 }
             ]
 
@@ -157,10 +152,7 @@ class TestAgentCLI:
         with patch("cli.mo_agent_api.SyncAPIClient") as mock_client_class:
             mock_client = MagicMock()
             mock_client_class.return_value = mock_client
-            mock_client.replay_session.return_value = {
-                "status": "success",
-                "events_replayed": 5
-            }
+            mock_client.replay_session.return_value = {"status": "success", "events_replayed": 5}
 
             result = runner.invoke(agent_cli, ["replay", "s1"])
             assert result.exit_code == 0
@@ -181,7 +173,8 @@ class TestAdminCLI:
             assert result.exit_code == 0
             assert "✅ Logged in" in result.output
             mock_client.login.assert_called_once_with(
-                "admin@example.com", "password",
+                "admin@example.com",
+                "password",
             )
 
     def test_init_database(self, runner):
@@ -204,13 +197,13 @@ class TestAdminCLI:
             mock_client.admin_create_token.return_value = {
                 "token_id": "t1",
                 "provider": "openai",
-                "scope_type": "global"
+                "scope_type": "global",
             }
 
             result = runner.invoke(
                 admin_cli,
                 ["token", "create", "--type", "llm", "--provider", "openai"],
-                input="secret_key\n"
+                input="secret_key\n",
             )
             assert result.exit_code == 0
             assert "✅ Token created" in result.output
@@ -226,7 +219,7 @@ class TestAdminCLI:
                     "type": "llm",
                     "provider": "openai",
                     "scope_type": "global",
-                    "is_active": True
+                    "is_active": True,
                 }
             ]
 
@@ -251,11 +244,7 @@ class TestAdminCLI:
             mock_client = MagicMock()
             mock_client_class.return_value = mock_client
             mock_client.admin_auth_audit_logs.return_value = [
-                {
-                    "created_at": "2026-02-23T10:00:00",
-                    "action": "token_created",
-                    "user_id": "admin"
-                }
+                {"created_at": "2026-02-23T10:00:00", "action": "token_created", "user_id": "admin"}
             ]
 
             result = runner.invoke(admin_cli, ["audit", "logs"])
@@ -282,7 +271,7 @@ class TestAdminCLI:
                 "total": 100,
                 "positive": 80,
                 "negative": 10,
-                "avg_rating": 4.2
+                "avg_rating": 4.2,
             }
 
             result = runner.invoke(admin_cli, ["feedback", "stats"])
@@ -299,7 +288,7 @@ class TestAdminCLI:
             mock_client.admin_feedback_export.return_value = {
                 "job_id": "job-123",
                 "status": "queued",
-                "download_url": None
+                "download_url": None,
             }
 
             result = runner.invoke(admin_cli, ["feedback", "export"])
@@ -313,7 +302,7 @@ class TestAdminCLI:
             mock_client_class.return_value = mock_client
             mock_client.get_current_user.return_value = {
                 "email": "admin@example.com",
-                "role": "admin"
+                "role": "admin",
             }
 
             result = runner.invoke(admin_cli, ["whoami"])
@@ -329,7 +318,7 @@ class TestAdminCLI:
             mock_client.admin_grant_role.return_value = {
                 "username": "alice",
                 "role_name": "mo_agent_admin",
-                "message": "Role granted successfully"
+                "message": "Role granted successfully",
             }
 
             result = runner.invoke(admin_cli, ["user", "grant-role", "alice", "mo_agent_admin"])
@@ -368,7 +357,7 @@ class TestAdminCLI:
             mock_client.admin_revoke_role.return_value = {
                 "username": "alice",
                 "role_name": "mo_agent_admin",
-                "message": "Role revoked successfully"
+                "message": "Role revoked successfully",
             }
 
             result = runner.invoke(admin_cli, ["user", "revoke-role", "alice", "mo_agent_admin"])
@@ -385,6 +374,7 @@ class TestAdminCLI:
 # ============================================================================
 # Tests: CLI edge mode integration
 # ============================================================================
+
 
 class TestCLIEdgeMode:
     """Test edge mode integration in mo-agent chat."""
@@ -403,18 +393,36 @@ class TestCLIEdgeMode:
             captured["kwargs"] = kwargs
 
         mock_api = AsyncMock()
-        mock_api.get_current_user = AsyncMock(return_value={"user_id": "test-user-id", "username": "testuser"})
+        mock_api.get_current_user = AsyncMock(
+            return_value={"user_id": "test-user-id", "username": "testuser"}
+        )
         mock_api.get_introspection_skills = AsyncMock(return_value={"cloud": [], "installed": []})
 
-        with patch("cli.edge_chat_loop.edge_chat_loop", fake_edge_chat_loop), \
-             patch("core.skills.loader.SkillLoader.discover", return_value=[]):
+        with (
+            patch("cli.edge_chat_loop.edge_chat_loop", fake_edge_chat_loop),
+            patch("core.skills.loader.SkillLoader.discover", return_value=[]),
+        ):
             asyncio.run(_run_edge_turn("test", mock_api, "ses_1", "gpt-4", "agent-1", True))
 
         expected_tools = {
-            "read_file", "write_file", "str_replace", "list_dir",
-            "bash", "git_status", "git_diff", "git_log", "grep", "glob",
-            "get_agent_info", "reflect", "find_skills", "memory_program",
-            "skill_config_wizard", "set_skill_setting", "bind_skill_resource", "validate_skill_config",
+            "read_file",
+            "write_file",
+            "str_replace",
+            "list_dir",
+            "bash",
+            "git_status",
+            "git_diff",
+            "git_log",
+            "grep",
+            "glob",
+            "get_agent_info",
+            "reflect",
+            "find_skills",
+            "memory_program",
+            "skill_config_wizard",
+            "set_skill_setting",
+            "bind_skill_resource",
+            "validate_skill_config",
         }
         assert set(captured["tools"]) == expected_tools
         assert captured["auto_approve"] is True
@@ -433,8 +441,10 @@ class TestCLIEdgeMode:
             call_count += 1
             return ChatLoopResult(text="ok")
 
-        with patch("cli.mo_agent_api.SyncAPIClient") as mock_client_class, \
-             patch("cli.mo_agent_api._run_edge_turn", new=fake_edge):
+        with (
+            patch("cli.mo_agent_api.SyncAPIClient") as mock_client_class,
+            patch("cli.mo_agent_api._run_edge_turn", new=fake_edge),
+        ):
             mock_client = _make_chat_mock(MagicMock())
             mock_client_class.return_value = mock_client
             mock_client.ensure_authenticated.return_value = True
@@ -456,8 +466,10 @@ class TestCLIEdgeMode:
             captured_kwargs["auto_approve"] = args[5] if len(args) > 5 else None
             return ChatLoopResult(text="ok")
 
-        with patch("cli.mo_agent_api.SyncAPIClient") as mock_client_class, \
-             patch("cli.mo_agent_api._run_edge_turn", new=fake_edge):
+        with (
+            patch("cli.mo_agent_api.SyncAPIClient") as mock_client_class,
+            patch("cli.mo_agent_api._run_edge_turn", new=fake_edge),
+        ):
             mock_client = _make_chat_mock(MagicMock())
             mock_client_class.return_value = mock_client
             mock_client.ensure_authenticated.return_value = True
@@ -469,11 +481,14 @@ class TestCLIEdgeMode:
 
     def test_debug_flag_shows_traceback(self, runner):
         """--debug prints full traceback on error."""
+
         async def raise_boom(*args, **kwargs):
             raise ValueError("test boom")
 
-        with patch("cli.mo_agent_api.SyncAPIClient") as mock_client_class, \
-             patch("cli.mo_agent_api._run_edge_turn", new=raise_boom):
+        with (
+            patch("cli.mo_agent_api.SyncAPIClient") as mock_client_class,
+            patch("cli.mo_agent_api._run_edge_turn", new=raise_boom),
+        ):
             mock_client = _make_chat_mock(MagicMock())
             mock_client_class.return_value = mock_client
             mock_client.ensure_authenticated.return_value = True

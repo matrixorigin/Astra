@@ -16,6 +16,7 @@ def load_gitignore(project_root: str) -> "pathspec.PathSpec | None":
     """
     try:
         import pathspec
+
         gi = Path(project_root) / ".gitignore"
         if gi.exists():
             return pathspec.PathSpec.from_lines("gitignore", gi.read_text().splitlines())

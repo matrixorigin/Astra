@@ -145,6 +145,7 @@ async def list_skills(
 
 # Static routes BEFORE parameterized routes — see module docstring.
 
+
 @router.get("/health", response_model=dict)
 async def check_skill_health(
     level: str = Query("summary", description="'summary' or 'detailed'"),
@@ -154,14 +155,20 @@ async def check_skill_health(
     db: Session = Depends(get_db_session),
 ):
     """Check skill health: find orphaned, broken, or mismatched skills."""
-    from skills.diagnose_skills.skill import DiagnoseSkillsInput, DiagnoseSkillsSkill, DiagnosisLevel
+    from skills.diagnose_skills.skill import (
+        DiagnoseSkillsInput,
+        DiagnoseSkillsSkill,
+        DiagnosisLevel,
+    )
 
     skill = DiagnoseSkillsSkill(db=db)
-    result = await skill.execute(DiagnoseSkillsInput(
-        level=DiagnosisLevel.DETAILED if level == "detailed" else DiagnosisLevel.SUMMARY,
-        source=source,
-        skill_name=skill_name,
-    ))
+    result = await skill.execute(
+        DiagnoseSkillsInput(
+            level=DiagnosisLevel.DETAILED if level == "detailed" else DiagnosisLevel.SUMMARY,
+            source=source,
+            skill_name=skill_name,
+        )
+    )
     return result.model_dump()
 
 
@@ -199,10 +206,11 @@ async def publish_skill(
 @router.post("/scaffold")
 async def scaffold_skill(spec_data: dict[str, Any]):
     """Generate skill package from YAML spec. Returns file contents as JSON."""
-    raise NotImplementedError('Module removed in skill system cleanup')
+    raise NotImplementedError("Module removed in skill system cleanup")
 
 
 # Parameterized routes AFTER static routes.
+
 
 @router.get("/{skill_name}/info", response_model=SkillInfoResponse)
 async def get_skill_info(

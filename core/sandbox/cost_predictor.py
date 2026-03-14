@@ -27,6 +27,7 @@ _DEFAULT_AVG_TURNS_PER_SESSION = 8
 @dataclass
 class CostEstimate:
     """Result of a cost prediction."""
+
     operation: str
     model: str
     session_count: int
@@ -108,7 +109,9 @@ class BranchCostPredictor(DbConsumer):
         if budget_remaining is not None and cost > budget_remaining:
             estimate.exceeds_budget = True
             estimate.alternatives = self._suggest_alternatives(
-                total_tokens, budget_remaining, session_count,
+                total_tokens,
+                budget_remaining,
+                session_count,
             )
 
         return estimate
@@ -127,8 +130,11 @@ class BranchCostPredictor(DbConsumer):
         """
         if operation in ("create", "delete"):
             return CostEstimate(
-                operation=operation, model=model, session_count=session_count,
-                estimated_tokens=0, estimated_cost=0.0,
+                operation=operation,
+                model=model,
+                session_count=session_count,
+                estimated_tokens=0,
+                estimated_cost=0.0,
             )
 
         # Diff/merge: estimate based on potential conflict resolution LLM calls
@@ -140,15 +146,20 @@ class BranchCostPredictor(DbConsumer):
         cost = self._estimate_model_cost(model, total_tokens)
 
         estimate = CostEstimate(
-            operation=operation, model=model, session_count=session_count,
-            estimated_tokens=total_tokens, estimated_cost=cost,
+            operation=operation,
+            model=model,
+            session_count=session_count,
+            estimated_tokens=total_tokens,
+            estimated_cost=cost,
             budget_remaining=budget_remaining,
         )
 
         if budget_remaining is not None and cost > budget_remaining:
             estimate.exceeds_budget = True
             estimate.alternatives = self._suggest_alternatives(
-                total_tokens, budget_remaining, session_count,
+                total_tokens,
+                budget_remaining,
+                session_count,
             )
 
         return estimate
@@ -159,44 +170,55 @@ class BranchCostPredictor(DbConsumer):
             return self.router.estimate_cost(model, total_tokens)
         # Fallback: rough pricing per 1K tokens
         fallback_prices = {
-            "gpt-4o": 0.005, "gpt-4o-mini": 0.00015,
-            "claude-sonnet-4-20250514": 0.006, "claude-haiku-3.5": 0.001,
+            "gpt-4o": 0.005,
+            "gpt-4o-mini": 0.00015,
+            "claude-sonnet-4-20250514": 0.006,
+            "claude-haiku-3.5": 0.001,
         }
         price = fallback_prices.get(model, 0.003)
         return round(total_tokens * price / 1000, 6)
 
     def _suggest_alternatives(
-        self, total_tokens: int, budget: float, session_count: int,
+        self,
+        total_tokens: int,
+        budget: float,
+        session_count: int,
     ) -> list[dict[str, Any]]:
         """Suggest cheaper alternatives when budget is exceeded."""
         alternatives = []
 
         # Alternative 1: cheaper model
         for alt_model, label in [
-            ("gpt-4o-mini", "GPT-4o Mini"), ("claude-haiku-3.5", "Claude Haiku"),
+            ("gpt-4o-mini", "GPT-4o Mini"),
+            ("claude-haiku-3.5", "Claude Haiku"),
         ]:
             alt_cost = self._estimate_model_cost(alt_model, total_tokens)
             if alt_cost <= budget:
-                alternatives.append({
-                    "strategy": "cheaper_model",
-                    "model": alt_model,
-                    "label": label,
-                    "estimated_cost": alt_cost,
-                    "savings_pct": round((1 - alt_cost / max(budget, 0.001)) * 100, 1),
-                })
+                alternatives.append(
+                    {
+                        "strategy": "cheaper_model",
+                        "model": alt_model,
+                        "label": label,
+                        "estimated_cost": alt_cost,
+                        "savings_pct": round((1 - alt_cost / max(budget, 0.001)) * 100, 1),
+                    }
+                )
 
         # Alternative 2: reduce session count
         if session_count > 1:
             cost_per_session = self._estimate_model_cost(
-                "gpt-4o", total_tokens // session_count,
+                "gpt-4o",
+                total_tokens // session_count,
             )
             if cost_per_session > 0:
                 max_sessions = int(budget / cost_per_session)
                 if 0 < max_sessions < session_count:
-                    alternatives.append({
-                        "strategy": "reduce_sessions",
-                        "session_count": max_sessions,
-                        "estimated_cost": round(max_sessions * cost_per_session, 6),
-                    })
+                    alternatives.append(
+                        {
+                            "strategy": "reduce_sessions",
+                            "session_count": max_sessions,
+                            "estimated_cost": round(max_sessions * cost_per_session, 6),
+                        }
+                    )
 
         return alternatives

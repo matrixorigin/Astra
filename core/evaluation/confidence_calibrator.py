@@ -25,7 +25,7 @@ class CalibrationResult:
     mean_confidence: float
     mean_quality: float
     calibration_error: float  # |confidence - quality| averaged
-    bias: float               # positive = overconfident, negative = underconfident
+    bias: float  # positive = overconfident, negative = underconfident
     sample_count: int
     bucket_errors: list[dict[str, Any]]  # per-bucket breakdown
 
@@ -48,9 +48,12 @@ class ConfidenceCalibrator(DbConsumer):
         rows = self._query_pairs(agent_id, days)
         if not rows:
             return CalibrationResult(
-                mean_confidence=0.0, mean_quality=0.0,
-                calibration_error=0.0, bias=0.0,
-                sample_count=0, bucket_errors=[],
+                mean_confidence=0.0,
+                mean_quality=0.0,
+                calibration_error=0.0,
+                bias=0.0,
+                sample_count=0,
+                bucket_errors=[],
             )
 
         confidences = [r[0] for r in rows]
@@ -96,7 +99,9 @@ class ConfidenceCalibrator(DbConsumer):
         }
 
     def _query_pairs(
-        self, agent_id: str | None, days: int,
+        self,
+        agent_id: str | None,
+        days: int,
     ) -> list[tuple[float, float]]:
         """Query (confidence_score, quality_score) pairs."""
         with self._db() as db:
@@ -107,7 +112,8 @@ class ConfidenceCalibrator(DbConsumer):
                     agent_filter = "AND agent_id = :agent_id"
                     params["agent_id"] = agent_id
 
-                rows = db.execute(text(f"""
+                rows = db.execute(
+                    text(f"""
                     SELECT
                         CAST(JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.confidence_score')) AS DOUBLE) AS conf,
                         quality_score
@@ -118,7 +124,9 @@ class ConfidenceCalibrator(DbConsumer):
                       AND JSON_EXTRACT(`metadata`, '$.confidence_score') IS NOT NULL
                       AND created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)
                       {agent_filter}
-                """), params).fetchall()
+                """),
+                    params,
+                ).fetchall()
 
                 return [(float(r[0]), float(r[1])) for r in rows if r[0] is not None]
             except Exception as e:
@@ -126,7 +134,9 @@ class ConfidenceCalibrator(DbConsumer):
                 return []
 
     def _compute_ece(
-        self, confidences: list[float], qualities: list[float],
+        self,
+        confidences: list[float],
+        qualities: list[float],
     ) -> list[dict[str, Any]]:
         """Expected Calibration Error with bucket breakdown."""
         n = len(confidences)
@@ -135,28 +145,33 @@ class ConfidenceCalibrator(DbConsumer):
         for i in range(self.BUCKETS):
             lo = i / self.BUCKETS
             hi = (i + 1) / self.BUCKETS
-            indices = [
-                j for j, c in enumerate(confidences) if lo <= c < hi
-            ]
+            indices = [j for j, c in enumerate(confidences) if lo <= c < hi]
             if not indices:
-                buckets.append({
-                    "range": f"[{lo:.1f}, {hi:.1f})",
-                    "count": 0, "avg_confidence": 0, "avg_quality": 0,
-                    "error": 0, "weighted_error": 0,
-                })
+                buckets.append(
+                    {
+                        "range": f"[{lo:.1f}, {hi:.1f})",
+                        "count": 0,
+                        "avg_confidence": 0,
+                        "avg_quality": 0,
+                        "error": 0,
+                        "weighted_error": 0,
+                    }
+                )
                 continue
 
             avg_conf = sum(confidences[j] for j in indices) / len(indices)
             avg_qual = sum(qualities[j] for j in indices) / len(indices)
             error = abs(avg_conf - avg_qual)
 
-            buckets.append({
-                "range": f"[{lo:.1f}, {hi:.1f})",
-                "count": len(indices),
-                "avg_confidence": round(avg_conf, 4),
-                "avg_quality": round(avg_qual, 4),
-                "error": round(error, 4),
-                "weighted_error": round(error * len(indices) / n, 4),
-            })
+            buckets.append(
+                {
+                    "range": f"[{lo:.1f}, {hi:.1f})",
+                    "count": len(indices),
+                    "avg_confidence": round(avg_conf, 4),
+                    "avg_quality": round(avg_qual, 4),
+                    "error": round(error, 4),
+                    "weighted_error": round(error * len(indices) / n, 4),
+                }
+            )
 
         return buckets

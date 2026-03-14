@@ -10,28 +10,28 @@ from core.context.lifecycle import MemoryGovernanceEngine
 
 class TestMemoryGovernanceEngine:
     """Test memory lifecycle governance."""
-    
+
     @pytest.fixture
     def mock_db(self):
         """Mock database session."""
         return Mock()
-    
+
     @pytest.fixture
     def engine(self, mock_db):
         """Create governance engine."""
         return MemoryGovernanceEngine(lambda: mock_db)
-    
+
     def test_hourly_tasks(self, engine, mock_db):
         """Test hourly governance tasks."""
         # Mock UPDATE: query().filter().update() returns rowcount
         mock_db.query.return_value.filter.return_value.update.return_value = 0
-        
+
         results = engine.run_hourly_tasks()
-        
+
         assert "archived_notes" in results
         assert results["archived_notes"] == 0
         assert "sandbox_cleaned" in results
-    
+
     def test_daily_tasks(self, engine, mock_db):
         """Test daily governance tasks."""
         # Mock quarantine query — no entries below threshold
@@ -40,7 +40,7 @@ class TestMemoryGovernanceEngine:
         results = engine.run_daily_tasks()
 
         assert "quarantined" in results
-    
+
     def test_weekly_tasks(self, engine, mock_db):
         """Test weekly governance tasks."""
         # Mock knowledge entries query
@@ -49,14 +49,15 @@ class TestMemoryGovernanceEngine:
         mock_db.query.return_value.filter.return_value.group_by.return_value.having.return_value.limit.return_value.all.return_value = []
         # Mock health reports GROUP BY query: query().group_by().limit().all()
         mock_db.query.return_value.group_by.return_value.limit.return_value.all.return_value = [
-            ("alice", 5, 0.6, 1), ("bob", 3, 0.8, 0),
+            ("alice", 5, 0.6, 1),
+            ("bob", 3, 0.8, 0),
         ]
-        
+
         results = engine.run_weekly_tasks()
-        
+
         assert "contradictions_found" in results
         assert results["health_reports"] == 2
-    
+
     def test_quarantine_low_confidence(self, engine, mock_db):
         """Test quarantine sets confidence to 0 and logs entry_ids."""
         from unittest.mock import MagicMock
@@ -84,12 +85,21 @@ class TestMemoryGovernanceEngine:
         conflict.val_count = 2
 
         # Mock chain: query().filter().group_by().having().limit().all()
-        mock_db.query.return_value.filter.return_value.group_by.return_value.having.return_value.limit.return_value.all.return_value = [conflict]
+        mock_db.query.return_value.filter.return_value.group_by.return_value.having.return_value.limit.return_value.all.return_value = [
+            conflict
+        ]
 
         # Mock entries fetch for conflict details
-        entry1 = Mock(entry_id="ke_1", category="user_preference", key_name="language", value="python")
-        entry2 = Mock(entry_id="ke_2", category="user_preference", key_name="language", value="typescript")
-        mock_db.query.return_value.filter.return_value.limit.return_value.all.return_value = [entry1, entry2]
+        entry1 = Mock(
+            entry_id="ke_1", category="user_preference", key_name="language", value="python"
+        )
+        entry2 = Mock(
+            entry_id="ke_2", category="user_preference", key_name="language", value="typescript"
+        )
+        mock_db.query.return_value.filter.return_value.limit.return_value.all.return_value = [
+            entry1,
+            entry2,
+        ]
 
         # Dedup check returns empty (no existing contradiction events)
         mock_db.execute.return_value.fetchall.return_value = []
@@ -97,15 +107,15 @@ class TestMemoryGovernanceEngine:
         count = engine._scan_contradictions()
 
         assert count == 1
-    
+
     def test_memory_health_stats(self, engine, mock_db):
         """Test memory health statistics via aggregate query."""
         # Mock aggregate: query(count, avg, sum_case).filter().first()
         mock_row = (3, 0.533, 1)  # total=3, avg=0.533, low_confidence=1
         mock_db.query.return_value.filter.return_value.first.return_value = mock_row
-        
+
         stats = engine._get_user_memory_stats("alice")
-        
+
         assert stats["total_entries"] == 3
         assert stats["avg_confidence"] == pytest.approx(0.533, rel=0.01)
         assert stats["low_confidence"] == 1
@@ -213,6 +223,7 @@ class TestGovernanceTaskRunner:
         from core.context.scheduler import MemoryGovernanceScheduler
 
         import asyncio
+
         with patch.dict(os.environ, {"GOVERNANCE_ENABLED": "false"}):
             scheduler = MemoryGovernanceScheduler()
             asyncio.run(scheduler.start())
@@ -240,6 +251,7 @@ class TestSchedulerBackendInterface:
         scheduler = MemoryGovernanceScheduler(backend=backend)
 
         import asyncio
+
         asyncio.run(scheduler.start())
         assert backend.started
         asyncio.run(scheduler.stop())

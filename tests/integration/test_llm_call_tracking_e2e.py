@@ -30,17 +30,27 @@ class TestLogCallPersistence:
         @contextmanager
         def _db():
             yield db_session
+
         client._db = _db
 
         event_id = str(uuid7())
         response = LLMResponse(
-            content="test", model="test-model", provider="openai",
-            tokens_prompt=100, tokens_completion=50, tokens_total=150,
-            latency_ms=200, cost_usd=0.003,
+            content="test",
+            model="test-model",
+            provider="openai",
+            tokens_prompt=100,
+            tokens_completion=50,
+            tokens_total=150,
+            latency_ms=200,
+            cost_usd=0.003,
         )
 
         client._log_call(
-            event_id, "test_user", "openai", response, "success",
+            event_id,
+            "test_user",
+            "openai",
+            response,
+            "success",
             metadata={"task_hint": "memory_extraction", "extra": "data"},
         )
 
@@ -76,13 +86,19 @@ class TestLogCallPersistence:
         @contextmanager
         def _db():
             yield db_session
+
         client._db = _db
 
         event_id = str(uuid7())
         response = LLMResponse(
-            content="test", model="m", provider="openai",
-            tokens_prompt=10, tokens_completion=5, tokens_total=15,
-            latency_ms=50, cost_usd=0.0001,
+            content="test",
+            model="m",
+            provider="openai",
+            tokens_prompt=10,
+            tokens_completion=5,
+            tokens_total=15,
+            latency_ms=50,
+            cost_usd=0.0001,
         )
 
         client._log_call(event_id, "u", "openai", response, "success")
@@ -100,12 +116,18 @@ class TestLogCallPersistence:
         @contextmanager
         def _db():
             yield db_session
+
         client._db = _db
 
         event_id = str(uuid7())
         client._log_call(
-            event_id, "u", "openai", None, "failed",
-            error_message="timeout", latency_ms=5000,
+            event_id,
+            "u",
+            "openai",
+            None,
+            "failed",
+            error_message="timeout",
+            latency_ms=5000,
             metadata={"task_hint": "cot_audit"},
         )
 

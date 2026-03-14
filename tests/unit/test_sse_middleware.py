@@ -40,8 +40,13 @@ class TestSSEExceptionHandlers:
 
     def test_sse_endpoint_validation_error_returns_sse(self, client, db_session):
         """POST /chat/stream with valid auth but missing required field → VALIDATION_ERROR."""
-        headers = get_auth_headers(client, db_session, username="sse_val_user",
-                                   user_id="sse_val_uid", email="sse_val@test.com")
+        headers = get_auth_headers(
+            client,
+            db_session,
+            username="sse_val_user",
+            user_id="sse_val_uid",
+            email="sse_val@test.com",
+        )
         resp = client.post("/chat/stream", json={}, headers=headers)
         assert resp.status_code == 200
         assert "text/event-stream" in resp.headers["content-type"]

@@ -18,6 +18,7 @@ from core.skills.tool_registry import ToolEntry, ToolRegistry, ToolSource
 
 # ── Helpers ──────────────────────────────────────────────────────
 
+
 def _schema(name: str, desc: str = "") -> dict:
     return {"type": "function", "function": {"name": name, "description": desc, "parameters": {}}}
 
@@ -41,6 +42,7 @@ def _score_candidate(query: str, cs_name: str, cs_desc: str) -> int:
 
 # ── Bidirectional Matching ───────────────────────────────────────
 
+
 class TestBidirectionalScoring:
     """Test the keyword scoring logic extracted from chat.py."""
 
@@ -57,7 +59,9 @@ class TestBidirectionalScoring:
 
     def test_chinese_query_with_english_word_create(self):
         """Chinese query with 'issue' also matches create_issue."""
-        score = _score_candidate("matrixone的最新的一个issue?", "create_issue", "Create a new issue")
+        score = _score_candidate(
+            "matrixone的最新的一个issue?", "create_issue", "Create a new issue"
+        )
         assert score >= 2
 
     def test_pure_chinese_query_no_english(self):
@@ -89,7 +93,9 @@ class TestBidirectionalScoring:
         assert "go" not in query_alpha
         assert "ci" not in query_alpha
 
+
 # ── ToolRegistry Selection with Prefilter ────────────────────────
+
 
 class TestRegistrySelectionCJK:
     """End-to-end: Chinese query → ToolRegistry.select() picks correct tools."""
@@ -107,14 +113,18 @@ class TestRegistrySelectionCJK:
             ("list_prs", "List pull requests"),
             ("summarize_pr", "Summarize a PR"),
         ]:
-            r.register_schema(_schema(name, desc), ToolSource.CLOUD, pinned=False, category="github")
+            r.register_schema(
+                _schema(name, desc), ToolSource.CLOUD, pinned=False, category="github"
+            )
         # Non-github cloud skills
         for name, desc in [
             ("execute_code", "Execute code"),
             ("introspection", "Agent introspection"),
             ("reflect", "Self reflection"),
         ]:
-            r.register_schema(_schema(name, desc), ToolSource.CLOUD, pinned=False, category="system")
+            r.register_schema(
+                _schema(name, desc), ToolSource.CLOUD, pinned=False, category="system"
+            )
         return r
 
     def test_chinese_fetch_query_selects_github_skills(self):
@@ -145,6 +155,7 @@ class TestRegistrySelectionCJK:
 
 # ── Large-Scale Catalog ──────────────────────────────────────────
 
+
 class TestLargeScaleCatalog:
     """Verify pre-filter performance and correctness with thousands of skills."""
 
@@ -154,13 +165,17 @@ class TestLargeScaleCatalog:
         for i in range(n):
             r.register_schema(
                 _schema(f"filler_skill_{i}", f"Generic skill number {i}"),
-                ToolSource.CLOUD, pinned=False, category="misc",
+                ToolSource.CLOUD,
+                pinned=False,
+                category="misc",
             )
         # Target skill
         if include_target:
             r.register_schema(
                 _schema("list_issues", "List issues from GitHub repository"),
-                ToolSource.CLOUD, pinned=False, category="github",
+                ToolSource.CLOUD,
+                pinned=False,
+                category="github",
             )
         return r
 
@@ -182,6 +197,7 @@ class TestLargeScaleCatalog:
     def test_prefilter_10k_performance(self):
         """Pre-filter + select on 10k skills completes in <100ms."""
         import time
+
         r = self._build_large_registry(10000)
         messages = [{"role": "user", "content": "matrixone的最新issue"}]
 
@@ -194,6 +210,7 @@ class TestLargeScaleCatalog:
     def test_scoring_10k_performance(self):
         """Bidirectional scoring on 10k skills completes in <50ms."""
         import time
+
         skills = [(f"skill_{i}", f"Description for skill {i}") for i in range(10000)]
         query = "matrixone的最新的一个issue?"
 
@@ -206,6 +223,7 @@ class TestLargeScaleCatalog:
 
 # ── Token Budget Stability ───────────────────────────────────────
 
+
 class TestTokenBudgetStability:
     """Adding edge tools should not push out relevant cloud skills."""
 
@@ -213,13 +231,13 @@ class TestTokenBudgetStability:
         """Regression: MemoryProgramTool addition should not drop list_issues."""
         r = ToolRegistry(embed_fn=None, max_tokens=2500)
         # Pinned edge tools (simulate real setup)
-        for name in ["bash", "read_file", "write_file", "str_replace",
-                      "list_dir", "grep", "glob"]:
+        for name in ["bash", "read_file", "write_file", "str_replace", "list_dir", "grep", "glob"]:
             r.register_schema(_schema(name, f"{name} tool"), ToolSource.EDGE, pinned=True)
         # Extra edge tool (MemoryProgramTool equivalent)
         r.register_schema(
             _schema("memory_program", "Execute memory program from natural language. " * 5),
-            ToolSource.EDGE, pinned=False,
+            ToolSource.EDGE,
+            pinned=False,
         )
         # Cloud skills
         for name, desc in [
@@ -228,7 +246,9 @@ class TestTokenBudgetStability:
             ("list_prs", "List pull requests"),
             ("create_issue", "Create GitHub issue"),
         ]:
-            r.register_schema(_schema(name, desc), ToolSource.CLOUD, pinned=False, category="github")
+            r.register_schema(
+                _schema(name, desc), ToolSource.CLOUD, pinned=False, category="github"
+            )
 
         messages = [{"role": "user", "content": "查看最新的issue"}]
         result = r.select("查看最新的issue", messages)

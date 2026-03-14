@@ -81,7 +81,10 @@ class HallucinationFirewall(DbConsumer):
         self._init_tables()
 
     def verify_response(
-        self, response: str, context_capture_id: str, mode: str = "warn",
+        self,
+        response: str,
+        context_capture_id: str,
+        mode: str = "warn",
         skill_name: str | None = None,
         tool_quality_score: float | None = None,
     ) -> FirewallResult:
@@ -139,8 +142,11 @@ class HallucinationFirewall(DbConsumer):
                 claims_verified=0,
                 claims_failed=0,
                 contradictions=[],
-                warnings=["No verifiable claims — blocked" if mode == "block"
-                          else "No verifiable claims found"],
+                warnings=[
+                    "No verifiable claims — blocked"
+                    if mode == "block"
+                    else "No verifiable claims found"
+                ],
             )
 
         # 2. Load context capture
@@ -212,9 +218,7 @@ class HallucinationFirewall(DbConsumer):
             )
         else:
             confidence = (
-                0.45 * claim_verifiability
-                + 0.30 * context_coverage
-                + 0.25 * knowledge_freshness
+                0.45 * claim_verifiability + 0.30 * context_coverage + 0.25 * knowledge_freshness
             )
 
         safe = confidence >= self.threshold if mode == "block" else True
@@ -250,6 +254,7 @@ class HallucinationFirewall(DbConsumer):
         # Slow path: embedding similarity (if available)
         try:
             from core.context.embeddings import get_embedding_client
+
             client = get_embedding_client()
             claim_vec = client.embed(claim.value)
             ctx_vec = client.embed(context_text[:2000])  # cap context length
@@ -302,9 +307,15 @@ class HallucinationFirewall(DbConsumer):
 
     # Claim type → risk weight (higher = more dangerous when failed)
     _CLAIM_WEIGHTS: dict[str, float] = {
-        "causal": 1.0, "factual": 0.8, "temporal": 0.6, "numeric": 0.5,
+        "causal": 1.0,
+        "factual": 0.8,
+        "temporal": 0.6,
+        "numeric": 0.5,
         # regex extractor types (mapped to equivalent weights)
-        "reference": 0.8, "boolean": 0.8, "number": 0.5, "date": 0.6,
+        "reference": 0.8,
+        "boolean": 0.8,
+        "number": 0.5,
+        "date": 0.6,
     }
 
     @classmethod
@@ -341,6 +352,7 @@ class HallucinationFirewall(DbConsumer):
             # Primary: embedding cosine similarity
             try:
                 from core.context.embeddings import get_embedding_client
+
                 client = get_embedding_client()
                 resp_vec = client.embed(response[:2000])
                 ctx_vec = client.embed(ctx_text[:2000])
@@ -370,6 +382,7 @@ class HallucinationFirewall(DbConsumer):
         """
         try:
             from datetime import datetime, timezone
+
             created = getattr(snapshot, "created_at", None)
             if created:
                 if isinstance(created, str):
@@ -390,6 +403,7 @@ class HallucinationFirewall(DbConsumer):
         Returns 0.8 default when no data available (optimistic prior).
         """
         import time
+
         now = time.monotonic()
         cached = self._skill_cache.get(skill_name)
         if cached and cached[1] > now:
@@ -398,6 +412,7 @@ class HallucinationFirewall(DbConsumer):
         score = 0.8  # optimistic prior
         try:
             from sqlalchemy import text
+
             with self._db() as db:
                 row = db.execute(
                     text(
@@ -433,16 +448,18 @@ class HallucinationFirewall(DbConsumer):
         check_id = f"check_{event_id}"
         for contradiction in result.contradictions:
             for evidence in contradiction.evidence:
-                evidence_rows.append({
-                    "check_id": check_id,
-                    "claim_type": contradiction.claim.type,
-                    "claim_value": contradiction.claim.value,
-                    "source_type": evidence.source_type,
-                    "source_id": evidence.source_id,
-                    "content": evidence.content,
-                    "location": evidence.location,
-                    "confidence": evidence.confidence,
-                })
+                evidence_rows.append(
+                    {
+                        "check_id": check_id,
+                        "claim_type": contradiction.claim.type,
+                        "claim_value": contradiction.claim.value,
+                        "source_type": evidence.source_type,
+                        "source_id": evidence.source_id,
+                        "content": evidence.content,
+                        "location": evidence.location,
+                        "confidence": evidence.confidence,
+                    }
+                )
 
         check_row = {
             "check_id": check_id,
@@ -466,35 +483,41 @@ class HallucinationFirewall(DbConsumer):
         try:
             from api.models import HallucinationCheck, ClaimEvidence
 
-            db.add(HallucinationCheck(
-                check_id=check_row["check_id"],
-                session_id=check_row["session_id"],
-                event_id=check_row["event_id"],
-                context_capture_id=check_row["ctx_id"],
-                claims_total=check_row["total"],
-                claims_verified=check_row["verified"],
-                claims_contradicted=check_row["contradicted"],
-                confidence_score=check_row["confidence"],
-                safe_to_deliver=1 if check_row["safe"] else 0,
-                evidence_count=check_row["evidence"],
-            ))
+            db.add(
+                HallucinationCheck(
+                    check_id=check_row["check_id"],
+                    session_id=check_row["session_id"],
+                    event_id=check_row["event_id"],
+                    context_capture_id=check_row["ctx_id"],
+                    claims_total=check_row["total"],
+                    claims_verified=check_row["verified"],
+                    claims_contradicted=check_row["contradicted"],
+                    confidence_score=check_row["confidence"],
+                    safe_to_deliver=1 if check_row["safe"] else 0,
+                    evidence_count=check_row["evidence"],
+                )
+            )
 
             for row in evidence_rows:
-                db.add(ClaimEvidence(
-                    check_id=row["check_id"],
-                    claim_type=row["claim_type"],
-                    claim_value=row["claim_value"],
-                    source_type=row["source_type"],
-                    source_id=row["source_id"],
-                    content=row["content"],
-                    location=row["location"],
-                    confidence=row["confidence"],
-                ))
+                db.add(
+                    ClaimEvidence(
+                        check_id=row["check_id"],
+                        claim_type=row["claim_type"],
+                        claim_value=row["claim_value"],
+                        source_type=row["source_type"],
+                        source_id=row["source_id"],
+                        content=row["content"],
+                        location=row["location"],
+                        confidence=row["confidence"],
+                    )
+                )
 
             db.commit()
             logger.info(
                 "Verification logged: %d/%d verified, confidence=%.2f",
-                check_row["verified"], check_row["total"], check_row["confidence"],
+                check_row["verified"],
+                check_row["total"],
+                check_row["confidence"],
             )
         except Exception:
             db.rollback()

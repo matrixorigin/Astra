@@ -31,6 +31,7 @@ _END = object()
 def _response_guard_fps(messages: list) -> list[str] | None:
     """Build fingerprints from messages for response guard (lightweight)."""
     from core.llm.response_guard import build_fingerprints
+
     # Normalize LLMMessage objects to dicts before fingerprinting.
     dicts = []
     for m in messages:
@@ -115,9 +116,7 @@ def _rewrite_tool_call_ids(messages: list[dict]) -> list[dict]:
         role = msg.get("role")
         if role == "assistant" and msg.get("tool_calls"):
             msg = dict(msg)
-            msg["tool_calls"] = [
-                {**tc, "id": _map(tc.get("id", ""))} for tc in msg["tool_calls"]
-            ]
+            msg["tool_calls"] = [{**tc, "id": _map(tc.get("id", ""))} for tc in msg["tool_calls"]]
         elif role == "tool" and msg.get("tool_call_id"):
             new_id = _map(msg["tool_call_id"])
             if new_id != msg["tool_call_id"]:
@@ -163,7 +162,8 @@ class LLMClient(DbConsumer):
     # Auxiliary LLM call tracker — collects stats for non-chat calls
     # (memory extraction, verification, etc.) within a turn for EXPLAIN.
     _ctx_aux_calls: ContextVar[list[dict] | None] = ContextVar(
-        "_ctx_aux_calls", default=None,
+        "_ctx_aux_calls",
+        default=None,
     )
 
     @contextmanager
@@ -176,17 +176,25 @@ class LLMClient(DbConsumer):
         finally:
             self._ctx_aux_calls.reset(tok)
 
-    def _record_auxiliary(self, task_hint: str, tokens_prompt: int, tokens_completion: int,
-                          cost_usd: float, latency_ms: int) -> None:
+    def _record_auxiliary(
+        self,
+        task_hint: str,
+        tokens_prompt: int,
+        tokens_completion: int,
+        cost_usd: float,
+        latency_ms: int,
+    ) -> None:
         bucket = self._ctx_aux_calls.get()
         if bucket is not None:
-            bucket.append({
-                "purpose": task_hint,
-                "tokens_in": tokens_prompt,
-                "tokens_out": tokens_completion,
-                "cost_usd": round(cost_usd, 6),
-                "ms": latency_ms,
-            })
+            bucket.append(
+                {
+                    "purpose": task_hint,
+                    "tokens_in": tokens_prompt,
+                    "tokens_out": tokens_completion,
+                    "cost_usd": round(cost_usd, 6),
+                    "ms": latency_ms,
+                }
+            )
 
     @contextmanager
     def request_context(self, user_id: str | None = None):
@@ -224,6 +232,7 @@ class LLMClient(DbConsumer):
             config = None
             try:
                 from api.models import Config
+
                 row = db.query(Config.value).filter(Config.key_name == "llm_config").first()
                 if row:
                     config = json.loads(row[0])
@@ -235,9 +244,13 @@ class LLMClient(DbConsumer):
                 if not provider or not model:
                     try:
                         from api.models import LLMModel
-                        row = db.query(LLMModel.model_name, LLMModel.provider).filter(
-                            LLMModel.is_active == 1
-                        ).order_by(LLMModel.created_at).first()
+
+                        row = (
+                            db.query(LLMModel.model_name, LLMModel.provider)
+                            .filter(LLMModel.is_active == 1)
+                            .order_by(LLMModel.created_at)
+                            .first()
+                        )
                         if row:
                             model = model or row[0]
                             provider = provider or row[1]
@@ -285,17 +298,22 @@ class LLMClient(DbConsumer):
         with self._db() as db:
             try:
                 from core.llm.providers import MockEchoProvider
+
                 self._providers["mock"] = MockEchoProvider()
-                self.router.register(ModelConfig(
-                    model_name="mock-echo", provider="mock",
-                    tags=["test", "builtin"],
-                ))
+                self.router.register(
+                    ModelConfig(
+                        model_name="mock-echo",
+                        provider="mock",
+                        tags=["test", "builtin"],
+                    )
+                )
             except Exception:
                 pass
 
             # Load active models and init their providers (per-model keys)
             try:
                 from api.models import LLMModel
+
                 rows = db.query(LLMModel).filter(LLMModel.is_active == 1).all()
             except Exception as e:
                 logger.debug(f"Failed to load infra_llm_models: {e}")
@@ -345,11 +363,15 @@ class LLMClient(DbConsumer):
         """Get base_url from infra_llm_models table."""
         with self._db() as db:
             from core.llm.constants import PROVIDER_BASE_URLS
+
             try:
                 from api.models import LLMModel
-                row = db.query(LLMModel.base_url).filter(
-                    LLMModel.provider == provider, LLMModel.is_active == 1
-                ).first()
+
+                row = (
+                    db.query(LLMModel.base_url)
+                    .filter(LLMModel.provider == provider, LLMModel.is_active == 1)
+                    .first()
+                )
                 if row and row[0]:
                     return row[0]
             except Exception:
@@ -373,7 +395,7 @@ class LLMClient(DbConsumer):
 
     def _get_provider(self, p, model_name: str | None = None) -> BaseProvider:
         name = p.value if isinstance(p, LLMProvider) else str(p)
-        
+
         # Try model-specific provider first (format: "provider:model").
         # _refresh_providers always stores as "provider:model", so this is
         # the primary lookup path for DB-registered models.
@@ -382,25 +404,28 @@ class LLMClient(DbConsumer):
             provider = self._providers.get(provider_key)
             if provider:
                 return provider
-        
+
         # Fall back to plain provider name — used by built-in providers
         # (e.g. "mock") that are registered without a model-specific key.
         provider = self._providers.get(name)
         if provider:
             return provider
-        
+
         # Not cached — try lazy init from DB.
         provider = self._lazy_init_provider(name, model_name)
         if provider:
             return provider
-        
+
         # Check if model is registered in database
         with self._db() as db:
             from api.models import LLMModel
-            registered = db.query(LLMModel).filter(
-                LLMModel.provider == name, LLMModel.is_active == 1
-            ).first()
-        
+
+            registered = (
+                db.query(LLMModel)
+                .filter(LLMModel.provider == name, LLMModel.is_active == 1)
+                .first()
+            )
+
         if registered:
             raise ValueError(
                 f"Provider '{name}' is registered but failed to initialize. "
@@ -411,8 +436,10 @@ class LLMClient(DbConsumer):
                 f"Provider '{name}' is not available. "
                 f"Check: pip install openai  and  mo-admin model check <model>"
             )
-    
-    def _lazy_init_provider(self, provider_name: str, model_name: str | None = None) -> BaseProvider | None:
+
+    def _lazy_init_provider(
+        self, provider_name: str, model_name: str | None = None
+    ) -> BaseProvider | None:
         """Attempt to initialize a provider on-demand from database.
 
         Always stores with "provider:model" key when model_name is known,
@@ -421,22 +448,27 @@ class LLMClient(DbConsumer):
         try:
             with self._db() as db:
                 from api.models import LLMModel
+
                 if model_name:
-                    row = db.query(LLMModel).filter(
-                        LLMModel.model_name == model_name, LLMModel.is_active == 1
-                    ).first()
+                    row = (
+                        db.query(LLMModel)
+                        .filter(LLMModel.model_name == model_name, LLMModel.is_active == 1)
+                        .first()
+                    )
                 else:
-                    row = db.query(LLMModel).filter(
-                        LLMModel.provider == provider_name, LLMModel.is_active == 1
-                    ).first()
-                
+                    row = (
+                        db.query(LLMModel)
+                        .filter(LLMModel.provider == provider_name, LLMModel.is_active == 1)
+                        .first()
+                    )
+
                 if not row:
                     return None
-                
+
                 api_key = decrypt_token(row.api_key_encrypted)
                 base_url = row.base_url
                 resolved_model = model_name or row.model_name
-                
+
                 if provider_name == "groq" and not base_url:
                     provider = GroqProvider(api_key)
                 elif provider_name == "anthropic" and not base_url:
@@ -444,7 +476,7 @@ class LLMClient(DbConsumer):
                 else:
                     kwargs = {"base_url": base_url} if base_url else {}
                     provider = OpenAIProvider(api_key, **kwargs)
-                
+
                 # Always use "provider:model" key for consistency with _refresh_providers
                 provider_key = f"{provider_name}:{resolved_model}"
                 self._providers[provider_key] = provider
@@ -456,6 +488,7 @@ class LLMClient(DbConsumer):
 
     def _resolve_model(self, model: str | None) -> str:
         from core.llm.model_resolver import resolve_model
+
         return resolve_model(request_model=model, default_model=self.config.get("model", "gpt-4o"))
 
     def resolve_model_name(self, model: str | None = None) -> str:
@@ -471,7 +504,9 @@ class LLMClient(DbConsumer):
         estimated_tokens = 1000
         if messages:
             # ~4 chars per token, rough but better than fixed 1000
-            char_count = sum(len(m.get("content", "") or "") for m in messages if isinstance(m, dict))
+            char_count = sum(
+                len(m.get("content", "") or "") for m in messages if isinstance(m, dict)
+            )
             estimated_tokens = max(char_count // 4, 200)
         estimated_cost = self._active_router.estimate_cost(model, estimated_tokens)
         if self._total_spend_usd + estimated_cost > budget:
@@ -546,7 +581,9 @@ class LLMClient(DbConsumer):
             # Group by provider for better readability
             by_provider: dict[str, list[str]] = {}
             for m in available_models:
-                provider = m.provider.value if isinstance(m.provider, LLMProvider) else str(m.provider)
+                provider = (
+                    m.provider.value if isinstance(m.provider, LLMProvider) else str(m.provider)
+                )
                 if provider not in by_provider:
                     by_provider[provider] = []
                 by_provider[provider].append(m.model_name)
@@ -564,11 +601,7 @@ class LLMClient(DbConsumer):
         self._check_model_permission(model)
         chain = self._active_router.route(model, task_hint=task_hint)
         if not chain:
-            chain = [
-                ModelConfig(
-                    model_name=model, provider=self.config.get("provider", "openai")
-                )
-            ]
+            chain = [ModelConfig(model_name=model, provider=self.config.get("provider", "openai"))]
         return chain
 
     def _dispatch(self, model: str, fn_name: str, task_hint: str | None = None, **kwargs):
@@ -581,19 +614,21 @@ class LLMClient(DbConsumer):
 
         last_error = None
         for model_cfg in chain:
-            provider_name = model_cfg.provider.value if isinstance(model_cfg.provider, LLMProvider) else str(model_cfg.provider)
+            provider_name = (
+                model_cfg.provider.value
+                if isinstance(model_cfg.provider, LLMProvider)
+                else str(model_cfg.provider)
+            )
             breaker = self.rate_limiter.get_breaker(provider_name)
             if not breaker.allow_request():
-                logger.warning(
-                    f"Circuit open for {provider_name}, skipping {model_cfg.model_name}"
-                )
+                logger.warning(f"Circuit open for {provider_name}, skipping {model_cfg.model_name}")
                 continue
 
             try:
                 self.rate_limiter.wait_and_acquire(model_cfg.model_name, estimated_tokens=500)
                 provider = self._get_provider(model_cfg.provider, model_cfg.model_name)
                 # Pass cache config to Anthropic provider
-                if hasattr(provider, 'cache_enabled'):
+                if hasattr(provider, "cache_enabled"):
                     provider.cache_enabled = model_cfg.enable_cache
                 # Some models require a fixed temperature (e.g. kimi-k2.5 only allows 1.0)
                 if model_cfg.fixed_temperature is not None and "temperature" in kwargs:
@@ -670,16 +705,22 @@ class LLMClient(DbConsumer):
             )
             if task_hint:
                 self._record_auxiliary(
-                    task_hint, response.tokens_prompt, response.tokens_completion,
-                    response.cost_usd, response.latency_ms,
+                    task_hint,
+                    response.tokens_prompt,
+                    response.tokens_completion,
+                    response.cost_usd,
+                    response.latency_ms,
                 )
             # Guard: detect degenerate responses before returning to callers.
             from core.llm.response_guard import is_degenerate
+
             _reason = is_degenerate(response.content, _response_guard_fps(messages))
             if _reason:
                 logger.warning(
                     "Response guard (%s) on non-streaming chat: model=%s preview=%r",
-                    _reason, model, (response.content or "")[:200],
+                    _reason,
+                    model,
+                    (response.content or "")[:200],
                 )
                 response.content = ""
                 response.guard_blocked = _reason
@@ -733,11 +774,14 @@ class LLMClient(DbConsumer):
         _content = rd.get("content") or ""
         if _content and not rd.get("tool_calls"):
             from core.llm.response_guard import is_degenerate
+
             _reason = is_degenerate(_content, _response_guard_fps(messages))
             if _reason:
                 logger.warning(
                     "Response guard (%s) on chat_with_tools: model=%s preview=%r",
-                    _reason, model, _content[:200],
+                    _reason,
+                    model,
+                    _content[:200],
                 )
                 rd["content"] = ""
                 rd["guard_blocked"] = _reason
@@ -765,7 +809,11 @@ class LLMClient(DbConsumer):
 
         last_error = None
         for model_cfg in chain:
-            provider_name = model_cfg.provider.value if isinstance(model_cfg.provider, LLMProvider) else str(model_cfg.provider)
+            provider_name = (
+                model_cfg.provider.value
+                if isinstance(model_cfg.provider, LLMProvider)
+                else str(model_cfg.provider)
+            )
             breaker = self.rate_limiter.get_breaker(provider_name)
             if not breaker.allow_request():
                 continue
@@ -773,11 +821,11 @@ class LLMClient(DbConsumer):
                 self.rate_limiter.wait_and_acquire(model_cfg.model_name, estimated_tokens=500)
                 provider = self._get_provider(model_cfg.provider, model_cfg.model_name)
                 usage = {"prompt": 0, "completion": 0, "cache_read": 0, "cache_creation": 0}
-                _temp = model_cfg.fixed_temperature if model_cfg.fixed_temperature is not None else temp
-
-                sync_iter = provider.complete_stream(
-                    messages, model_cfg.model_name, _temp, max_tok
+                _temp = (
+                    model_cfg.fixed_temperature if model_cfg.fixed_temperature is not None else temp
                 )
+
+                sync_iter = provider.complete_stream(messages, model_cfg.model_name, _temp, max_tok)
                 while True:
                     chunk = await asyncio.to_thread(next, sync_iter, _END)
                     if chunk is _END:
@@ -821,14 +869,21 @@ class LLMClient(DbConsumer):
                     "success",
                     metadata=_meta,
                 )
-                yield {"type": "usage", "prompt": usage["prompt"], "completion": usage["completion"],
-                       "cache_read": usage["cache_read"], "cache_creation": usage["cache_creation"]}
+                yield {
+                    "type": "usage",
+                    "prompt": usage["prompt"],
+                    "completion": usage["completion"],
+                    "cache_read": usage["cache_read"],
+                    "cache_creation": usage["cache_creation"],
+                }
                 return
             except (BudgetExceededError, ContextOverflowError, PermissionError):
                 raise
             except Exception as e:
                 if _is_client_error(e):
-                    logger.warning(f"Stream {model_cfg.model_name} client error (not retryable): {e}")
+                    logger.warning(
+                        f"Stream {model_cfg.model_name} client error (not retryable): {e}"
+                    )
                     raise
                 breaker.record_failure()
                 last_error = e
@@ -859,18 +914,28 @@ class LLMClient(DbConsumer):
 
         last_error = None
         for model_cfg in chain:
-            provider_name = model_cfg.provider.value if isinstance(model_cfg.provider, LLMProvider) else str(model_cfg.provider)
+            provider_name = (
+                model_cfg.provider.value
+                if isinstance(model_cfg.provider, LLMProvider)
+                else str(model_cfg.provider)
+            )
             breaker = self.rate_limiter.get_breaker(provider_name)
             if not breaker.allow_request():
                 continue
             try:
                 self.rate_limiter.wait_and_acquire(model_cfg.model_name, estimated_tokens=500)
                 provider = self._get_provider(model_cfg.provider, model_cfg.model_name)
-                if hasattr(provider, 'cache_enabled'):
+                if hasattr(provider, "cache_enabled"):
                     provider.cache_enabled = model_cfg.enable_cache
                 usage = {"prompt": 0, "completion": 0, "cache_read": 0, "cache_creation": 0}
-                _temp = model_cfg.fixed_temperature if model_cfg.fixed_temperature is not None else temp
-                _messages = _rewrite_tool_call_ids(messages) if model_cfg.quirks.strict_tool_call_ids else messages
+                _temp = (
+                    model_cfg.fixed_temperature if model_cfg.fixed_temperature is not None else temp
+                )
+                _messages = (
+                    _rewrite_tool_call_ids(messages)
+                    if model_cfg.quirks.strict_tool_call_ids
+                    else messages
+                )
                 sync_iter = provider.complete_with_tools_stream(
                     _messages, tools, model_cfg.model_name, tool_choice, _temp, max_tok
                 )
@@ -896,34 +961,48 @@ class LLMClient(DbConsumer):
                 )
                 self._record_spend(cost)
                 self._log_call(
-                    trace_id, self._active_user_id, model_cfg.provider,
+                    trace_id,
+                    self._active_user_id,
+                    model_cfg.provider,
                     LLMResponse(
                         content="[streamed+tools]",
-                        model=model_cfg.model_name, provider=model_cfg.provider,
-                        tokens_prompt=usage["prompt"], tokens_completion=usage["completion"],
+                        model=model_cfg.model_name,
+                        provider=model_cfg.provider,
+                        tokens_prompt=usage["prompt"],
+                        tokens_completion=usage["completion"],
                         tokens_total=usage["prompt"] + usage["completion"],
-                        latency_ms=latency, cost_usd=cost,
+                        latency_ms=latency,
+                        cost_usd=cost,
                         cache_read_tokens=usage["cache_read"],
                         cache_creation_tokens=usage["cache_creation"],
                     ),
                     "success",
                     metadata=_meta,
                 )
-                yield {"type": "usage", "prompt": usage["prompt"], "completion": usage["completion"],
-                       "cache_read": usage["cache_read"], "cache_creation": usage["cache_creation"]}
+                yield {
+                    "type": "usage",
+                    "prompt": usage["prompt"],
+                    "completion": usage["completion"],
+                    "cache_read": usage["cache_read"],
+                    "cache_creation": usage["cache_creation"],
+                }
                 return
             except (BudgetExceededError, ContextOverflowError, PermissionError):
                 raise
             except Exception as e:
                 if _is_client_error(e):
-                    logger.warning(f"Stream+tools {model_cfg.model_name} client error (not retryable): {e}")
+                    logger.warning(
+                        f"Stream+tools {model_cfg.model_name} client error (not retryable): {e}"
+                    )
                     raise
                 breaker.record_failure()
                 last_error = e
                 logger.warning(f"Stream+tools {model_cfg.model_name} failed: {e}")
                 continue
 
-        raise ValueError(f"All models failed for tools streaming: {model} (last error: {last_error})")
+        raise ValueError(
+            f"All models failed for tools streaming: {model} (last error: {last_error})"
+        )
 
     # ── Logging (#5 可观测性 & 回溯) ──────────────────────────────
 
@@ -943,28 +1022,44 @@ class LLMClient(DbConsumer):
             provider_str = provider.value if isinstance(provider, LLMProvider) else str(provider)
             try:
                 from api.models import LLMCallLog as LLMCallLogModel
+
                 if response:
-                    db.add(LLMCallLogModel(
-                        log_id=log_id, event_id=event_id, user_id=user_id,
-                        provider=provider_str, model=response.model,
-                        tokens_prompt=response.tokens_prompt,
-                        tokens_completion=response.tokens_completion,
-                        tokens_total=response.tokens_total,
-                        cost_usd=response.cost_usd, latency_ms=response.latency_ms,
-                        status=status,
-                        call_metadata=json.dumps(metadata) if metadata else None,
-                        created_at=datetime.now(timezone.utc),
-                    ))
+                    db.add(
+                        LLMCallLogModel(
+                            log_id=log_id,
+                            event_id=event_id,
+                            user_id=user_id,
+                            provider=provider_str,
+                            model=response.model,
+                            tokens_prompt=response.tokens_prompt,
+                            tokens_completion=response.tokens_completion,
+                            tokens_total=response.tokens_total,
+                            cost_usd=response.cost_usd,
+                            latency_ms=response.latency_ms,
+                            status=status,
+                            call_metadata=json.dumps(metadata) if metadata else None,
+                            created_at=datetime.now(timezone.utc),
+                        )
+                    )
                 else:
-                    db.add(LLMCallLogModel(
-                        log_id=log_id, event_id=event_id, user_id=user_id,
-                        provider=provider_str, model="unknown",
-                        tokens_prompt=0, tokens_completion=0, tokens_total=0,
-                        cost_usd=0.0, latency_ms=latency_ms, status=status,
-                        error_message=error_message,
-                        call_metadata=json.dumps(metadata) if metadata else None,
-                        created_at=datetime.now(timezone.utc),
-                    ))
+                    db.add(
+                        LLMCallLogModel(
+                            log_id=log_id,
+                            event_id=event_id,
+                            user_id=user_id,
+                            provider=provider_str,
+                            model="unknown",
+                            tokens_prompt=0,
+                            tokens_completion=0,
+                            tokens_total=0,
+                            cost_usd=0.0,
+                            latency_ms=latency_ms,
+                            status=status,
+                            error_message=error_message,
+                            call_metadata=json.dumps(metadata) if metadata else None,
+                            created_at=datetime.now(timezone.utc),
+                        )
+                    )
                 db.commit()
             except Exception as e:
                 db.rollback()
@@ -973,6 +1068,7 @@ class LLMClient(DbConsumer):
     def get_call_logs(self, event_id=None, user_id=None) -> list[LLMCallLog]:
         with self._db() as db:
             from api.models import LLMCallLog as LLMCallLogModel
+
             q = db.query(LLMCallLogModel).order_by(LLMCallLogModel.created_at.desc())
             if event_id:
                 q = q.filter(LLMCallLogModel.event_id == event_id)
@@ -994,7 +1090,7 @@ class LLMClient(DbConsumer):
                     cost_usd=float(r.cost_usd),
                     latency_ms=r.latency_ms,
                     status=r.status,
-                    error_message=r.error_message if hasattr(r, 'error_message') else None,
+                    error_message=r.error_message if hasattr(r, "error_message") else None,
                     created_at=r.created_at,
                 )
                 for r in results

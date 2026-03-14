@@ -28,10 +28,20 @@ logger = get_logger(__name__)
 # - get_agent_info / reflect return runtime metadata where zeros are
 #   legitimate (e.g. new session has 0 events) — penalising them causes
 #   the LLM to hallucinate "data quality issues" on perfectly valid data.
-PASSTHROUGH_TOOLS: frozenset[str] = frozenset({
-    "read_file", "write_file", "bash", "grep", "glob", "list_dir", "git",
-    "get_agent_info", "reflect", "introspection",
-})
+PASSTHROUGH_TOOLS: frozenset[str] = frozenset(
+    {
+        "read_file",
+        "write_file",
+        "bash",
+        "grep",
+        "glob",
+        "list_dir",
+        "git",
+        "get_agent_info",
+        "reflect",
+        "introspection",
+    }
+)
 
 _MAX_DEPTH = 4
 _MAX_FIELDS = 100
@@ -41,13 +51,23 @@ _STALE_SECONDS = 86_400  # 24 h
 
 # Explicit timestamp field names to check for staleness
 # Only exact matches (case-insensitive) to avoid false positives like "update_date_info"
-_TIMESTAMP_FIELDS = frozenset({
-    "timestamp", "created_at", "updated_at", "date", "time",
-    "last_updated", "modified_at", "published_at", "fetched_at",
-})
+_TIMESTAMP_FIELDS = frozenset(
+    {
+        "timestamp",
+        "created_at",
+        "updated_at",
+        "date",
+        "time",
+        "last_updated",
+        "modified_at",
+        "published_at",
+        "fetched_at",
+    }
+)
 
 
 # ── Data structures ─────────────────────────────────────────────────────────
+
 
 @dataclass
 class QualityAssessment:
@@ -63,6 +83,7 @@ class QualityAssessment:
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
 
 def _score_to_grade(score: float) -> str:
     if score >= 0.8:
@@ -81,23 +102,23 @@ def flatten_json(
     max_fields: int = _MAX_FIELDS,
 ) -> Generator[tuple[str, Any], None, None]:
     """Yield (dotted_path, leaf_value) pairs, depth- and field-limited.
-    
+
     Handles circular references by tracking visited object IDs.
     """
     count = 0
     seen: set[int] = set()
     stack: list[tuple[str, Any, int]] = [("", d, 0)]
-    
+
     while stack:
         prefix, obj, depth = stack.pop()
-        
+
         # Circular reference guard: skip already-visited objects
         if isinstance(obj, (dict, list)):
             obj_id = id(obj)
             if obj_id in seen:
                 continue
             seen.add(obj_id)
-        
+
         if isinstance(obj, dict) and depth < max_depth:
             for k, v in obj.items():
                 path = f"{prefix}.{k}" if prefix else k
@@ -114,6 +135,7 @@ def flatten_json(
 
 
 # ── Core assessment ──────────────────────────────────────────────────────────
+
 
 def assess_tool_result(
     tool_name: str,
@@ -152,7 +174,9 @@ def assess_tool_result(
         "error" in data and data["error"] and not data.get("success")
     ):
         return QualityAssessment(
-            tool_name=tool_name, score=0.0, grade="empty",
+            tool_name=tool_name,
+            score=0.0,
+            grade="empty",
             signals=["explicit_error: tool returned error"],
         )
 
@@ -168,21 +192,17 @@ def assess_tool_result(
 
     if total == 0:
         return QualityAssessment(
-            tool_name=tool_name, score=0.0, grade="empty",
+            tool_name=tool_name,
+            score=0.0,
+            grade="empty",
             signals=["all_empty: result has no leaf values"],
         )
 
     # Empty containers
-    empty_count = sum(
-        1 for _, v in leaves
-        if v is None or v == {} or v == [] or v == ""
-    )
+    empty_count = sum(1 for _, v in leaves if v is None or v == {} or v == [] or v == "")
 
     # Zero cluster: numeric fields that are exactly 0
-    zero_count = sum(
-        1 for _, v in leaves
-        if isinstance(v, (int, float)) and v == 0
-    )
+    zero_count = sum(1 for _, v in leaves if isinstance(v, (int, float)) and v == 0)
 
     # Null cluster
     null_count = sum(1 for _, v in leaves if v is None)
@@ -226,12 +246,16 @@ def assess_tool_result(
 
     grade = _score_to_grade(score)
     return QualityAssessment(
-        tool_name=tool_name, score=round(score, 2), grade=grade,
-        signals=signals[:5], stale=stale,
+        tool_name=tool_name,
+        score=round(score, 2),
+        grade=grade,
+        signals=signals[:5],
+        stale=stale,
     )
 
 
 # ── Annotation ───────────────────────────────────────────────────────────────
+
 
 def annotate_tool_result(
     tool_result: dict[str, Any],
@@ -248,7 +272,9 @@ def annotate_tool_result(
     lines = [f"[TOOL QUALITY: {assessment.grade.upper()} — score {assessment.score}]"]
     for sig in assessment.signals[:5]:
         lines.append(f"  • {sig}")
-    lines.append("⚠ Respond honestly about data limitations. Do not present missing data as real analysis.")
+    lines.append(
+        "⚠ Respond honestly about data limitations. Do not present missing data as real analysis."
+    )
     annotation = "\n".join(lines)
 
     # Annotate the content/result field
@@ -268,6 +294,7 @@ def annotate_tool_result(
 
 
 # ── Tier 1: Schema-based assessment ─────────────────────────────────────────
+
 
 def _get_nested(d: dict[str, Any], path: str) -> Any:
     """Get nested value by dot-separated path."""
@@ -341,8 +368,11 @@ def assess_with_schema(
 
     score = max(0.0, round(score, 2))
     return QualityAssessment(
-        tool_name=tool_name, score=score, grade=_score_to_grade(score),
-        signals=signals[:5], stale=stale,
+        tool_name=tool_name,
+        score=score,
+        grade=_score_to_grade(score),
+        signals=signals[:5],
+        stale=stale,
     )
 
 
@@ -385,11 +415,23 @@ def invalidate_schema_cache() -> None:
 
 # ── Annotation-ignored detection (Phase 4) ───────────────────────────────────
 
-_LIMITATION_KEYWORDS = frozenset({
-    "不完整", "数据缺失", "无法确认", "数据不足", "暂无数据",
-    "incomplete", "missing data", "unavailable", "insufficient",
-    "cannot confirm", "no data", "data limitation", "data quality",
-})
+_LIMITATION_KEYWORDS = frozenset(
+    {
+        "不完整",
+        "数据缺失",
+        "无法确认",
+        "数据不足",
+        "暂无数据",
+        "incomplete",
+        "missing data",
+        "unavailable",
+        "insufficient",
+        "cannot confirm",
+        "no data",
+        "data limitation",
+        "data quality",
+    }
+)
 
 
 def response_acknowledges_limitation(response: str) -> bool:

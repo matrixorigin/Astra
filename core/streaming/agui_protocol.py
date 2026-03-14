@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 class EventTypeCategory(str, Enum):
     """AG-UI event type categories."""
+
     SESSION = "session"
     PROGRESS = "progress"
     DECISION = "decision"
@@ -27,6 +28,7 @@ class EventTypeCategory(str, Enum):
 @dataclass
 class EventSchema:
     """Schema for event type."""
+
     event_type: str
     category: EventTypeCategory
     required_fields: list[str]
@@ -36,7 +38,7 @@ class EventSchema:
 
 class AGUIProtocolValidator:
     """Validate events against AG-UI protocol."""
-    
+
     # AG-UI event schemas
     SCHEMAS = {
         "session_info": EventSchema(
@@ -110,58 +112,54 @@ class AGUIProtocolValidator:
             description="Connection keepalive",
         ),
     }
-    
+
     def __init__(self):
         """Initialize validator."""
         self.validation_errors: list[str] = []
         self.validation_warnings: list[str] = []
-    
+
     def validate_event(self, event: dict) -> bool:
         """Validate event against schema.
-        
+
         Args:
             event: Event dict to validate
-            
+
         Returns:
             True if valid, False otherwise
         """
         self.validation_errors.clear()
         self.validation_warnings.clear()
-        
+
         event_type = event.get("event_type")
         if not event_type:
             self.validation_errors.append("Missing event_type")
             return False
-        
+
         schema = self.SCHEMAS.get(event_type)
         if not schema:
             self.validation_warnings.append(f"Unknown event_type: {event_type}")
             return True  # Allow unknown types for extensibility
-        
+
         # Check required fields
         data = event.get("data", {})
         for field in schema.required_fields:
             if field not in data:
-                self.validation_errors.append(
-                    f"Missing required field '{field}' in {event_type}"
-                )
-        
+                self.validation_errors.append(f"Missing required field '{field}' in {event_type}")
+
         # Check for unexpected fields
         allowed_fields = set(schema.required_fields) | set(schema.optional_fields)
         for field in data.keys():
             if field not in allowed_fields:
-                self.validation_warnings.append(
-                    f"Unexpected field '{field}' in {event_type}"
-                )
-        
+                self.validation_warnings.append(f"Unexpected field '{field}' in {event_type}")
+
         return len(self.validation_errors) == 0
-    
+
     def validate_stream(self, events: list[dict]) -> dict:
         """Validate entire event stream.
-        
+
         Args:
             events: List of events
-            
+
         Returns:
             Validation report
         """
@@ -173,36 +171,37 @@ class AGUIProtocolValidator:
             "warnings": [],
             "event_type_distribution": {},
         }
-        
+
         for event in events:
             event_type = event.get("event_type", "unknown")
-            report["event_type_distribution"][event_type] = \
+            report["event_type_distribution"][event_type] = (
                 report["event_type_distribution"].get(event_type, 0) + 1
-            
+            )
+
             if self.validate_event(event):
                 report["valid_events"] += 1
             else:
                 report["invalid_events"] += 1
                 report["errors"].extend(self.validation_errors)
-            
+
             report["warnings"].extend(self.validation_warnings)
-        
+
         return report
-    
+
     def get_schema(self, event_type: str) -> Optional[EventSchema]:
         """Get schema for event type.
-        
+
         Args:
             event_type: Event type
-            
+
         Returns:
             Schema or None
         """
         return self.SCHEMAS.get(event_type)
-    
+
     def list_event_types(self) -> list[str]:
         """List all supported event types.
-        
+
         Returns:
             List of event types
         """

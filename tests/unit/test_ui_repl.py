@@ -41,6 +41,7 @@ class TestSlashCommandCompleter:
 class TestCreateSession:
     def test_returns_prompt_session(self, tmp_path):
         from prompt_toolkit import PromptSession
+
         session = create_session(history_path=tmp_path / "history")
         assert isinstance(session, PromptSession)
 

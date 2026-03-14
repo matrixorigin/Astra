@@ -20,6 +20,7 @@ def run_doctor(console: Console, client=None) -> list[tuple[str, bool, str]]:
     try:
         import rich
         from importlib.metadata import version as pkg_version
+
         checks.append(("rich", True, pkg_version("rich")))
     except ImportError:
         checks.append(("rich", False, "not installed"))
@@ -28,6 +29,7 @@ def run_doctor(console: Console, client=None) -> list[tuple[str, bool, str]]:
     try:
         import prompt_toolkit
         from importlib.metadata import version as pkg_version
+
         checks.append(("prompt_toolkit", True, pkg_version("prompt_toolkit")))
     except ImportError:
         checks.append(("prompt_toolkit", False, "not installed"))
@@ -41,6 +43,7 @@ def run_doctor(console: Console, client=None) -> list[tuple[str, bool, str]]:
             # Try a simple connection test
             try:
                 import httpx
+
                 r = httpx.get(f"{client.base_url}/health", timeout=3)
                 checks.append(("API reachable", r.status_code < 500, client.base_url))
             except Exception:
@@ -62,9 +65,12 @@ def run_doctor(console: Console, client=None) -> list[tuple[str, bool, str]]:
     try:
         from pathlib import Path
         import subprocess
+
         git_result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=3,
+            capture_output=True,
+            text=True,
+            timeout=3,
         )
         if git_result.returncode == 0:
             checks.append(("Git repo", True, git_result.stdout.strip()))

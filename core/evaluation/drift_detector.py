@@ -26,9 +26,9 @@ logger = get_logger(__name__)
 
 class DriftSeverity(str, Enum):
     NONE = "none"
-    MILD = "mild"          # week_delta in [-0.5, -0.3)
+    MILD = "mild"  # week_delta in [-0.5, -0.3)
     SIGNIFICANT = "significant"  # week_delta in [-1.0, -0.5)
-    SEVERE = "severe"      # week_delta < -1.0
+    SEVERE = "severe"  # week_delta < -1.0
 
 
 class CorrectionAction(str, Enum):
@@ -87,7 +87,8 @@ class DriftDetector(DbConsumer):
 
     def _detect_model_drift(self) -> list[DriftSignal]:
         with self._db() as db:
-            rows = db.execute(text("""
+            rows = db.execute(
+                text("""
                 SELECT
                     llm_model_used,
                     AVG(CASE WHEN created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
@@ -103,12 +104,15 @@ class DriftDetector(DbConsumer):
                   AND llm_model_used IS NOT NULL
                   AND created_at > DATE_SUB(NOW(), INTERVAL 14 DAY)
                 GROUP BY llm_model_used
-            """)).fetchall()
+            """)
+            ).fetchall()
 
             return [
                 self._build_signal(
-                    model=row[0], template_id=None,
-                    recent_avg=row[1], previous_avg=row[2],
+                    model=row[0],
+                    template_id=None,
+                    recent_avg=row[1],
+                    previous_avg=row[2],
                     sample_count=int(row[3]),
                 )
                 for row in rows
@@ -117,7 +121,8 @@ class DriftDetector(DbConsumer):
 
     def _detect_template_drift(self) -> list[DriftSignal]:
         with self._db() as db:
-            rows = db.execute(text("""
+            rows = db.execute(
+                text("""
                 SELECT
                     llm_model_used,
                     prompt_template_id,
@@ -135,12 +140,15 @@ class DriftDetector(DbConsumer):
                   AND prompt_template_id IS NOT NULL
                   AND created_at > DATE_SUB(NOW(), INTERVAL 14 DAY)
                 GROUP BY llm_model_used, prompt_template_id
-            """)).fetchall()
+            """)
+            ).fetchall()
 
             return [
                 self._build_signal(
-                    model=row[0], template_id=row[1],
-                    recent_avg=row[2], previous_avg=row[3],
+                    model=row[0],
+                    template_id=row[1],
+                    recent_avg=row[2],
+                    previous_avg=row[3],
                     sample_count=int(row[4]),
                 )
                 for row in rows
@@ -148,17 +156,25 @@ class DriftDetector(DbConsumer):
             ]
 
     def _build_signal(
-        self, *, model: str, template_id: str | None,
-        recent_avg: float, previous_avg: float, sample_count: int,
+        self,
+        *,
+        model: str,
+        template_id: str | None,
+        recent_avg: float,
+        previous_avg: float,
+        sample_count: int,
     ) -> DriftSignal:
         recent = float(recent_avg)
         previous = float(previous_avg)
         delta = recent - previous
         severity = DriftDetector._classify(delta, sample_count)
         return DriftSignal(
-            model=model, template_id=template_id,
-            current_avg=recent, previous_avg=previous,
-            week_delta=delta, severity=severity,
+            model=model,
+            template_id=template_id,
+            current_avg=recent,
+            previous_avg=previous,
+            week_delta=delta,
+            severity=severity,
             sample_count=sample_count,
             detected_at=datetime.now(timezone.utc),
         )
@@ -182,14 +198,17 @@ class DriftCorrector(DbConsumer):
     CONFIRM_REPLAY_COUNT = 20
     CONFIRM_THRESHOLD = -0.3  # confirmed if replay delta < this
 
-    def __init__(self, db_factory: DbFactory, regression_gate=None, router=None, prompt_optimizer=None):
+    def __init__(
+        self, db_factory: DbFactory, regression_gate=None, router=None, prompt_optimizer=None
+    ):
         super().__init__(db_factory)
         self.regression_gate = regression_gate
         self.router = router
         self.prompt_optimizer = prompt_optimizer
 
     def confirm_and_correct(
-        self, signals: list[DriftSignal],
+        self,
+        signals: list[DriftSignal],
     ) -> DriftReport:
         """Phase 2+3: confirm signals via replay, then correct."""
         confirmed: list[DriftSignal] = []
@@ -203,7 +222,8 @@ class DriftCorrector(DbConsumer):
                 self._record(signal, correction)
 
         return DriftReport(
-            signals=signals, confirmed=confirmed,
+            signals=signals,
+            confirmed=confirmed,
             corrections=corrections,
             created_at=datetime.now(timezone.utc),
         )
@@ -213,7 +233,8 @@ class DriftCorrector(DbConsumer):
         if not self.regression_gate:
             # No gate available — trust the statistical signal
             return signal.severity in (
-                DriftSeverity.SIGNIFICANT, DriftSeverity.SEVERE,
+                DriftSeverity.SIGNIFICANT,
+                DriftSeverity.SEVERE,
             )
 
         try:
@@ -228,7 +249,8 @@ class DriftCorrector(DbConsumer):
             logger.warning("Drift confirmation replay failed: %s", e)
             # Conservative: treat significant+ as confirmed
             return signal.severity in (
-                DriftSeverity.SIGNIFICANT, DriftSeverity.SEVERE,
+                DriftSeverity.SIGNIFICANT,
+                DriftSeverity.SEVERE,
             )
 
     def _correct(self, signal: DriftSignal) -> dict[str, Any]:
@@ -292,7 +314,9 @@ class DriftCorrector(DbConsumer):
                 if cfg and cfg.fallback_to:
                     logger.info(
                         "Drift correction: routing %s → %s (delta=%.2f)",
-                        signal.model, cfg.fallback_to, signal.week_delta,
+                        signal.model,
+                        cfg.fallback_to,
+                        signal.week_delta,
                     )
                     cfg.is_active = False  # disable drifted model
                     db.commit()
@@ -306,22 +330,25 @@ class DriftCorrector(DbConsumer):
         """Record drift event for audit trail."""
         with self._db() as db:
             try:
-                db.execute(text("""
+                db.execute(
+                    text("""
                     INSERT INTO agent_events
                         (event_id, session_id, user_id, agent_id, agent_version,
                          event_type, content, causal_chain_id, created_at, llm_model_used)
                     VALUES
                         (:event_id, :session_id, :user_id, 'system', '1.0.0',
                          'drift_correction', :content, :chain_id, NOW(), :model)
-                """), {
-                    # Deterministic event_id: same drift signal → same PK → idempotent re-recording
-                    "event_id": f"drift_{signal.model}_{int(signal.detected_at.timestamp())}",
-                    "session_id": "system_drift_detection",
-                    "user_id": "system",
-                    "content": json.dumps(correction, default=str),
-                    "chain_id": f"drift_{signal.model}",
-                    "model": signal.model,
-                })
+                """),
+                    {
+                        # Deterministic event_id: same drift signal → same PK → idempotent re-recording
+                        "event_id": f"drift_{signal.model}_{int(signal.detected_at.timestamp())}",
+                        "session_id": "system_drift_detection",
+                        "user_id": "system",
+                        "content": json.dumps(correction, default=str),
+                        "chain_id": f"drift_{signal.model}",
+                        "model": signal.model,
+                    },
+                )
                 db.commit()
             except Exception as e:
                 logger.warning("Failed to record drift correction: %s", e)

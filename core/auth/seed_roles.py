@@ -5,8 +5,16 @@ from sqlalchemy.orm import Session
 from api.models import Role
 
 SEED_ROLES = [
-    {"role_id": "role-admin", "role_name": "mo_agent_admin", "description": "Administrator with full system access"},
-    {"role_id": "role-user", "role_name": "mo_agent_user", "description": "Regular user with limited access"},
+    {
+        "role_id": "role-admin",
+        "role_name": "mo_agent_admin",
+        "description": "Administrator with full system access",
+    },
+    {
+        "role_id": "role-user",
+        "role_name": "mo_agent_user",
+        "description": "Regular user with limited access",
+    },
 ]
 
 

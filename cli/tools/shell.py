@@ -21,7 +21,10 @@ class BashTool(EdgeTool):
         "type": "object",
         "properties": {
             "command": {"type": "string", "description": "Shell command to execute"},
-            "timeout": {"type": "integer", "description": f"Timeout in seconds (default: {DEFAULT_TIMEOUT})"},
+            "timeout": {
+                "type": "integer",
+                "description": f"Timeout in seconds (default: {DEFAULT_TIMEOUT})",
+            },
         },
         "required": ["command"],
     }

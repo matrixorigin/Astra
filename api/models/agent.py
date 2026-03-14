@@ -3,7 +3,13 @@
 from matrixone import VectorPrecision, VectorType
 from matrixone.sqlalchemy_ext import FulltextIndex, FulltextParserType
 from sqlalchemy import (
-    Column, Float, Index, Integer, SmallInteger, String, Text,
+    Column,
+    Float,
+    Index,
+    Integer,
+    SmallInteger,
+    String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.sql import func
@@ -28,9 +34,7 @@ class Agent(Base):
 
 class Session(Base):
     __tablename__ = "agent_sessions"
-    __table_args__ = (
-        Index("idx_sessions_user_status", "user_id", "status"),
-    )
+    __table_args__ = (Index("idx_sessions_user_status", "user_id", "status"),)
 
     session_id = Column(String(36), primary_key=True)
     user_id = Column(String(36), nullable=False)
@@ -52,7 +56,9 @@ class Session(Base):
 class Event(Base):
     __tablename__ = "agent_events"
     __table_args__ = (
-        FulltextIndex("ft_content_session", ["content", "session_id"], parser=FulltextParserType.NGRAM),
+        FulltextIndex(
+            "ft_content_session", ["content", "session_id"], parser=FulltextParserType.NGRAM
+        ),
         Index("idx_events_user_type_time", "user_id", "event_type", "created_at"),
         Index("idx_events_session_time", "session_id", "created_at"),
         Index("idx_events_parent_type", "parent_event_id", "event_type"),
@@ -90,16 +96,19 @@ class Event(Base):
     parent_run_id = Column(String(36), index=True)
     waiting_for = Column(String(255), index=True)
     dedup_key = Column(String(255), index=True)
-    reasoning_content = Column(Text, nullable=True)  # thinking-model chain-of-thought (e.g. kimi-k2.5)
+    reasoning_content = Column(
+        Text, nullable=True
+    )  # thinking-model chain-of-thought (e.g. kimi-k2.5)
 
 
 class AgentScratchpad(Base):
     """Working memory: structured notes for long-horizon tasks."""
+
     __tablename__ = "agent_scratchpads"
     __table_args__ = (
-        Index('idx_scratchpad_session', 'session_id'),
-        Index('idx_scratchpad_user', 'user_id'),
-        Index('idx_scratchpad_type', 'note_type'),
+        Index("idx_scratchpad_session", "session_id"),
+        Index("idx_scratchpad_user", "user_id"),
+        Index("idx_scratchpad_type", "note_type"),
     )
 
     note_id = Column(String(64), primary_key=True)
@@ -117,10 +126,9 @@ class AgentScratchpad(Base):
 
 class RunEvent(Base):
     """Persisted SSE events for cross-worker streaming."""
+
     __tablename__ = "agent_run_events"
-    __table_args__ = (
-        UniqueConstraint("run_id", "idx", name="uq_run_event_run_idx"),
-    )
+    __table_args__ = (UniqueConstraint("run_id", "idx", name="uq_run_event_run_idx"),)
     id = Column(Integer, primary_key=True, autoincrement=True)
     run_id = Column(String(36), nullable=False, index=True)
     idx = Column(Integer, nullable=False)

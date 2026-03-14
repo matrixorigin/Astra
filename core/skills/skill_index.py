@@ -65,6 +65,7 @@ class SkillIndex(DbConsumer):
         # before they reach the DB (prevents "vector ops between different
         # dimensions" errors from stale or misconfigured embeddings).
         from api.models._constants import EMBEDDING_DIM
+
         self._expected_dim: int = EMBEDDING_DIM
 
     # ------------------------------------------------------------------
@@ -107,6 +108,7 @@ class SkillIndex(DbConsumer):
         if not self._db_factory:
             return False
         from api.models.skill import SkillRegistry
+
         with self._db() as db:
             updated = (
                 db.query(SkillRegistry)
@@ -119,12 +121,15 @@ class SkillIndex(DbConsumer):
     def _upsert_embedding(self, db, skill: Embeddable, *, force: bool = False) -> bool:
         """Embed one skill and UPDATE its row.  Returns True if a row was written."""
         from api.models.skill import SkillRegistry
+
         try:
             vec = self._embed(_skill_text(skill))
             if len(vec) != self._expected_dim:
                 logger.warning(
                     "Dimension mismatch for %s: got %d, expected %d",
-                    skill.name, len(vec), self._expected_dim,
+                    skill.name,
+                    len(vec),
+                    self._expected_dim,
                 )
                 return False
             vec_literal = "[" + ",".join(str(v) for v in vec) + "]"
@@ -145,7 +150,10 @@ class SkillIndex(DbConsumer):
     # ------------------------------------------------------------------
 
     def query(
-        self, text_query: str, top_k: int = 10, max_distance: float | None = None,
+        self,
+        text_query: str,
+        top_k: int = 10,
+        max_distance: float | None = None,
         category: str | None = None,
     ) -> list[str]:
         """Return top-k skill names by L2 distance to *text_query*.
@@ -158,7 +166,10 @@ class SkillIndex(DbConsumer):
         return [name for name, _ in results]
 
     def query_with_scores(
-        self, text_query: str, top_k: int = 10, max_distance: float | None = None,
+        self,
+        text_query: str,
+        top_k: int = 10,
+        max_distance: float | None = None,
         category: str | None = None,
     ) -> list[tuple[str, float]]:
         """Return top-k (skill_name, relevance_score) by L2 distance.
@@ -177,7 +188,8 @@ class SkillIndex(DbConsumer):
         if len(q_vec) != self._expected_dim:
             logger.warning(
                 "Query vector dimension %d != expected %d, skipping",
-                len(q_vec), self._expected_dim,
+                len(q_vec),
+                self._expected_dim,
             )
             return []
 
@@ -186,16 +198,14 @@ class SkillIndex(DbConsumer):
         from matrixone.sqlalchemy_ext import l2_distance
 
         from api.models.skill import SkillRegistry
+
         dist_expr = l2_distance(SkillRegistry.embedding, q_vec).label("dist")
 
         with self._db() as db:
             try:
-                q = (
-                    db.query(SkillRegistry.skill_name, dist_expr)
-                    .filter(
-                        SkillRegistry.is_active == 1,
-                        SkillRegistry.embedding.isnot(None),
-                    )
+                q = db.query(SkillRegistry.skill_name, dist_expr).filter(
+                    SkillRegistry.is_active == 1,
+                    SkillRegistry.embedding.isnot(None),
                 )
                 if category:
                     q = q.filter(SkillRegistry.category == category)
@@ -223,6 +233,7 @@ class SkillIndex(DbConsumer):
         Called when l2_distance fails due to dimension mismatch from stale data.
         """
         from api.models.skill import SkillRegistry
+
         cleared = (
             db.query(SkillRegistry)
             .filter(SkillRegistry.embedding.isnot(None))

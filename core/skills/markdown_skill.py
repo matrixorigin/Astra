@@ -25,11 +25,13 @@ _CATEGORY_TO_SIDE_EFFECT: dict[SideEffectCategory, SideEffect] = {
 
 class MarkdownSkillInput(SkillInput):
     """Input for markdown-based skills — user query is the only input."""
+
     query: str = ""
 
 
 class MarkdownSkillOutput(SkillOutput):
     """Output is the skill's markdown instructions for the LLM."""
+
     instructions: str = ""
 
 
@@ -61,7 +63,8 @@ class MarkdownSkill(Skill[MarkdownSkillInput, MarkdownSkillOutput]):
         so MarkdownSkills work in the ToolRouter alongside EdgeTools.
         """
         return _CATEGORY_TO_SIDE_EFFECT.get(
-            self.side_effect_profile.category, SideEffect.READ,
+            self.side_effect_profile.category,
+            SideEffect.READ,
         )
 
     async def execute(self, input: MarkdownSkillInput) -> MarkdownSkillOutput:

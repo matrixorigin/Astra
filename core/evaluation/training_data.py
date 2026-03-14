@@ -78,7 +78,12 @@ class TrainingDataPipeline(DbConsumer):
                 {"session_id": session_id},
             ).fetchall()
 
-            quality_order = {DataQuality.GOLD: 3, DataQuality.SILVER: 2, DataQuality.BRONZE: 1, DataQuality.REJECTED: 0}
+            quality_order = {
+                DataQuality.GOLD: 3,
+                DataQuality.SILVER: 2,
+                DataQuality.BRONZE: 1,
+                DataQuality.REJECTED: 0,
+            }
             min_order = quality_order[min_quality]
 
             for event_id, user_input, agent_output in rows:
@@ -113,15 +118,17 @@ class TrainingDataPipeline(DbConsumer):
                 logger.debug(f"Skipping duplicate: {content_hash[:16]}")
                 return
 
-            db.add(TrainingData(
-                data_id=str(uuid7()),
-                session_id=example.session_id,
-                input_text=example.input_text,
-                output_text=example.output_text,
-                quality=example.quality.value,
-                contamination_score=example.contamination_score,
-                content_hash=content_hash,
-            ))
+            db.add(
+                TrainingData(
+                    data_id=str(uuid7()),
+                    session_id=example.session_id,
+                    input_text=example.input_text,
+                    output_text=example.output_text,
+                    quality=example.quality.value,
+                    contamination_score=example.contamination_score,
+                    content_hash=content_hash,
+                )
+            )
             db.commit()
 
     def get_dataset(
@@ -133,13 +140,23 @@ class TrainingDataPipeline(DbConsumer):
         with self._db() as db:
             from api.models import TrainingData
 
-            rows = db.query(TrainingData).filter(
-                TrainingData.quality == quality.value,
-                TrainingData.contamination_score < 0.3,
-            ).order_by(TrainingData.contamination_score.asc()).limit(limit).all()
+            rows = (
+                db.query(TrainingData)
+                .filter(
+                    TrainingData.quality == quality.value,
+                    TrainingData.contamination_score < 0.3,
+                )
+                .order_by(TrainingData.contamination_score.asc())
+                .limit(limit)
+                .all()
+            )
 
             return [
-                {"input": r.input_text, "output": r.output_text, "contamination": float(r.contamination_score)}
+                {
+                    "input": r.input_text,
+                    "output": r.output_text,
+                    "contamination": float(r.contamination_score),
+                }
                 for r in rows
             ]
 
@@ -149,11 +166,15 @@ class TrainingDataPipeline(DbConsumer):
             from sqlalchemy import func as sa_func
             from api.models import TrainingData
 
-            rows = db.query(
-                TrainingData.quality,
-                sa_func.count().label("count"),
-                sa_func.avg(TrainingData.contamination_score).label("avg_contamination"),
-            ).group_by(TrainingData.quality).all()
+            rows = (
+                db.query(
+                    TrainingData.quality,
+                    sa_func.count().label("count"),
+                    sa_func.avg(TrainingData.contamination_score).label("avg_contamination"),
+                )
+                .group_by(TrainingData.quality)
+                .all()
+            )
 
             stats: dict[str, Any] = {"total": sum(r[1] for r in rows), "by_quality": {}}
             for quality, count, avg_contamination in rows:
@@ -202,9 +223,14 @@ class TrainingDataPipeline(DbConsumer):
         """Detect refusal/non-answer responses."""
         lower = text.lower().strip()
         refusal_starts = [
-            "i can't", "i cannot", "i'm unable", "i am unable",
-            "i'm sorry, but i can't", "as an ai",
-            "i don't have", "i do not have",
+            "i can't",
+            "i cannot",
+            "i'm unable",
+            "i am unable",
+            "i'm sorry, but i can't",
+            "as an ai",
+            "i don't have",
+            "i do not have",
         ]
         return any(lower.startswith(r) for r in refusal_starts)
 
@@ -285,9 +311,7 @@ class TrainingDataPipeline(DbConsumer):
 
     # ── Contamination Detection ─────────────────────────────────────
 
-    def _check_contamination(
-        self, session_id: str, user_input: str, agent_output: str
-    ) -> float:
+    def _check_contamination(self, session_id: str, user_input: str, agent_output: str) -> float:
         """Check for data contamination via n-gram overlap with existing training data.
 
         Compares against stored training examples to detect near-duplicates.
@@ -296,6 +320,7 @@ class TrainingDataPipeline(DbConsumer):
         # Get recent training data for comparison
         with self._db() as db:
             from api.models import TrainingData
+
             rows = (
                 db.query(TrainingData.input_text, TrainingData.output_text)
                 .filter(TrainingData.session_id != session_id)
@@ -332,5 +357,5 @@ class TrainingDataPipeline(DbConsumer):
 
     def _content_hash(self, input_text: str, output_text: str) -> str:
         """SHA-256 hash of normalized content for dedup."""
-        normalized = (input_text.strip().lower() + "|||" + output_text.strip().lower())
+        normalized = input_text.strip().lower() + "|||" + output_text.strip().lower()
         return hashlib.sha256(normalized.encode()).hexdigest()

@@ -73,7 +73,6 @@ class TestContextFragment:
         assert fragment.metadata == {"key": "value"}
 
 
-
 class TestAllocateBudget:
     """Test token budget allocation."""
 
@@ -270,7 +269,9 @@ class TestRetrieveSemanticKnowledgeHybrid:
         entry.confidence = 0.8
         entry.trust_tier = "verified"
         entry.created_at = None
-        mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [entry]
+        mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [
+            entry
+        ]
 
         with patch("core.context.manager._update_access_tracking"):
             results = context_manager.retrieve_semantic_knowledge("user1", "python")

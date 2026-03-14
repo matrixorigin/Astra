@@ -30,31 +30,54 @@ _registry = StrategyRegistry()
 
 def _register_builtins() -> None:
     """Register built-in strategies."""
+
     def _vector_factory(
-        *, db_factory: DbFactory, params: dict | None = None,
-        config: Any = None, metrics: Any = None, **kw: Any,
+        *,
+        db_factory: DbFactory,
+        params: dict | None = None,
+        config: Any = None,
+        metrics: Any = None,
+        **kw: Any,
     ) -> Any:
         from core.memory.strategy.vector_v1 import VectorRetrievalStrategy
+
         return VectorRetrievalStrategy(
-            db_factory, params=params, config=config, metrics=metrics,
+            db_factory,
+            params=params,
+            config=config,
+            metrics=metrics,
         )
 
     def _activation_factory(
-        *, db_factory: DbFactory, params: dict | None = None,
-        config: Any = None, metrics: Any = None, **kw: Any,
+        *,
+        db_factory: DbFactory,
+        params: dict | None = None,
+        config: Any = None,
+        metrics: Any = None,
+        **kw: Any,
     ) -> Any:
         from core.memory.strategy.activation_v1 import ActivationRetrievalStrategy
+
         return ActivationRetrievalStrategy(
-            db_factory, params=params, config=config, metrics=metrics,
+            db_factory,
+            params=params,
+            config=config,
+            metrics=metrics,
         )
 
     def _activation_index_factory(
-        *, db_factory: DbFactory, params: dict | None = None,
-        config: Any = None, **kw: Any,
+        *,
+        db_factory: DbFactory,
+        params: dict | None = None,
+        config: Any = None,
+        **kw: Any,
     ) -> Any:
         from core.memory.strategy.activation_index import ActivationIndexManager
+
         return ActivationIndexManager(
-            db_factory, params=params, config=config,
+            db_factory,
+            params=params,
+            config=config,
         )
 
     _registry.register("vector:v1", _vector_factory)
@@ -63,14 +86,21 @@ def _register_builtins() -> None:
 
 def _register_memoria() -> None:
     """Register Memoria HTTP backend. Memoria is required — raises if not configured."""
+
     def _memoria_factory(
-        *, db_factory: DbFactory, params: dict | None = None,
-        config: Any = None, metrics: Any = None, **kw: Any,
+        *,
+        db_factory: DbFactory,
+        params: dict | None = None,
+        config: Any = None,
+        metrics: Any = None,
+        **kw: Any,
     ) -> Any:
         from core.memory.backends.memoria_http import MemoriaHTTPClient, MemoriaStorage
 
         params = params or {}
-        base_url = params.get("base_url") or os.environ.get("MEMORIA_BASE_URL", "http://localhost:8000")
+        base_url = params.get("base_url") or os.environ.get(
+            "MEMORIA_BASE_URL", "http://localhost:8000"
+        )
         api_key = params.get("api_key") or os.environ.get("MEMORIA_API_KEY")
         master_key = params.get("master_key") or os.environ.get("MEMORIA_MASTER_KEY")
         user_id = params.get("user_id", "default")
@@ -189,9 +219,11 @@ def create_memory_service(
 
     if config is None:
         from core.memory.config import DEFAULT_CONFIG
+
         config = DEFAULT_CONFIG
 
     from core.memory.tabular.metrics import MemoryMetrics
+
     metrics = MemoryMetrics()
 
     # Memoria is required as storage backend
@@ -204,6 +236,7 @@ def create_memory_service(
             "(or MEMORIA_API_KEY) environment variables."
         )
     from core.memory.backends.memoria_http import MemoriaHTTPClient, MemoriaStorage
+
     http_client = MemoriaHTTPClient(
         base_url=memoria_url,
         master_key=memoria_master_key,
@@ -214,10 +247,15 @@ def create_memory_service(
     # Create retrieval strategy + optional index manager
     descriptor = StrategyDescriptor.parse(strategy_key, params=params)
     retrieval = _registry.create_strategy(
-        descriptor, db_factory=db_factory, config=config, metrics=metrics,
+        descriptor,
+        db_factory=db_factory,
+        config=config,
+        metrics=metrics,
     )
     index_manager = _registry.create_index_manager(
-        descriptor, db_factory=db_factory, config=config,
+        descriptor,
+        db_factory=db_factory,
+        config=config,
     )
 
     return MemoryService(
@@ -250,6 +288,7 @@ def create_editor(
         embed_client = None
         try:
             from core.embedding import get_embedding_client
+
             embed_client = get_embedding_client()
         except Exception:
             logger.warning(
@@ -355,29 +394,42 @@ def switch_user_strategy(
     if needs_backfill:
         # Mark as backfilling
         _upsert_user_config(
-            db_factory, user_id, new_strategy,
-            index_status="backfilling", migrated_from=previous_key,
+            db_factory,
+            user_id,
+            new_strategy,
+            index_status="backfilling",
+            migrated_from=previous_key,
         )
         # Run backfill (synchronous for now; async job in Phase 4)
         try:
             index_mgr.backfill(user_id)  # type: ignore[union-attr]
             _upsert_user_config(
-                db_factory, user_id, new_strategy,
-                index_status="ready", migrated_from=previous_key,
+                db_factory,
+                user_id,
+                new_strategy,
+                index_status="ready",
+                migrated_from=previous_key,
             )
             return SwitchResult(
-                status="ready", strategy_key=new_strategy, previous_key=previous_key,
+                status="ready",
+                strategy_key=new_strategy,
+                previous_key=previous_key,
             )
         except Exception:
             _upsert_user_config(
-                db_factory, user_id, previous_key or "vector:v1",
-                index_status="failed", migrated_from=previous_key,
+                db_factory,
+                user_id,
+                previous_key or "vector:v1",
+                index_status="failed",
+                migrated_from=previous_key,
             )
             raise
     else:
         set_user_strategy(db_factory, user_id, new_strategy)
         return SwitchResult(
-            status="ready", strategy_key=new_strategy, previous_key=previous_key,
+            status="ready",
+            strategy_key=new_strategy,
+            previous_key=previous_key,
         )
 
 

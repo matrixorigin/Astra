@@ -15,8 +15,7 @@ def get_memoria_storage(user_id: str) -> MemoriaStorage:
     api_key = os.environ.get("MEMORIA_API_KEY")
     if not master_key and not api_key:
         raise RuntimeError(
-            "Memoria requires authentication. "
-            "Set MEMORIA_MASTER_KEY or MEMORIA_API_KEY."
+            "Memoria requires authentication. Set MEMORIA_MASTER_KEY or MEMORIA_API_KEY."
         )
     client = MemoriaHTTPClient(base_url=base_url, master_key=master_key, api_key=api_key)
     return MemoriaStorage(client, user_id=user_id)

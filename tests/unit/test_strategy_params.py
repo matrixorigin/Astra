@@ -34,7 +34,8 @@ class TestStrategyParamsValidation:
     def test_validate_valid_params(self):
         """Valid params pass validation and get defaults filled."""
         result = validate_strategy_params(
-            "vector:v1", {"semantic_weight": 0.6},
+            "vector:v1",
+            {"semantic_weight": 0.6},
         )
         assert result is not None
         assert result["semantic_weight"] == 0.6

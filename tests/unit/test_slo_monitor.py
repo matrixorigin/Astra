@@ -22,6 +22,7 @@ def _monitor(daily_rows: list[tuple]) -> SLOMonitor:
 def _daily(avg_quality: float, hallucination_rate: float = 0.0, n: int = 10):
     """Build a fake daily metrics row: (day, avg_quality, hallucination_rate, total)."""
     from datetime import date
+
     return (date.today(), avg_quality, hallucination_rate, n)
 
 

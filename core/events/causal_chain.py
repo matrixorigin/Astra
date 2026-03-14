@@ -55,9 +55,14 @@ class CausalChainManager(DbConsumer):
         from api.models.agent import Event
 
         with self._db() as db:
-            rows = db.query(*_LIST_COLUMNS).filter(
-                Event.parent_event_id == event_id,
-            ).order_by(Event.created_at.asc()).all()
+            rows = (
+                db.query(*_LIST_COLUMNS)
+                .filter(
+                    Event.parent_event_id == event_id,
+                )
+                .order_by(Event.created_at.asc())
+                .all()
+            )
             return [self.reader._row_to_event(self.reader._orm_row_to_dict(r)) for r in rows]
 
     def get_chain_summary(self, causal_chain_id: str) -> dict:

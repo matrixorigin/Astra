@@ -23,26 +23,32 @@ from cli.tools.base import SideEffect
 class TestBypassWarningPatterns:
     """Verify patterns correctly identify potential bypass attempts."""
 
-    @pytest.mark.parametrize("command", [
-        "rm skill.py",
-        "rm /home/user/project/skill.py",
-        "rm -f skill.py",
-        "rm src/main.py",
-        "ls && rm file.py",
-        "echo x; rm file.py",
-    ])
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "rm skill.py",
+            "rm /home/user/project/skill.py",
+            "rm -f skill.py",
+            "rm src/main.py",
+            "ls && rm file.py",
+            "echo x; rm file.py",
+        ],
+    )
     def test_detects_source_file_deletion(self, command: str):
         """rm on source files is detected as potential bypass."""
         assert any(p.search(command) for p in TOOL_BYPASS_WARNING_PATTERNS)
 
-    @pytest.mark.parametrize("command", [
-        "rm -rf build/",
-        "rm -r node_modules",
-        "rm file.log",
-        "ls -la",
-        "echo rm file.py",  # rm as argument, not command
-        "grep rm file.py",
-    ])
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "rm -rf build/",
+            "rm -r node_modules",
+            "rm file.log",
+            "ls -la",
+            "echo rm file.py",  # rm as argument, not command
+            "grep rm file.py",
+        ],
+    )
     def test_ignores_non_bypass_commands(self, command: str):
         """Non-bypass commands are not flagged."""
         assert not any(p.search(command) for p in TOOL_BYPASS_WARNING_PATTERNS)
@@ -76,10 +82,10 @@ class TestPermissionManagerBypassWarning:
         """Even with 'always allow bash', bypass attempts still ASK."""
         pm = PermissionManager()
         pm.set_session_override("bash", Decision.ALLOW)
-        
+
         # Normal command uses override
         assert pm.check("bash", SideEffect.EXECUTE, {"command": "ls"}) == Decision.ALLOW
-        
+
         # Bypass attempt still asks (override doesn't apply)
         decision = pm.check("bash", SideEffect.EXECUTE, {"command": "rm skill.py"})
         assert decision == Decision.ASK

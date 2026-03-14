@@ -55,9 +55,17 @@ class TestFixedTemperatureDispatch:
         cfg = _make_model_config("kimi-k2.5", "moonshot", fixed_temp=1.0, strict_ids=True)
         with _make_test_llm_client(provider, [cfg]) as client:
             messages = [
-                {"role": "assistant", "content": "", "tool_calls": [
-                    {"id": "read_file:1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
-                ]},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "read_file:1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        },
+                    ],
+                },
                 {"role": "tool", "tool_call_id": "read_file:1", "content": "data"},
             ]
             client._dispatch("kimi-k2.5", "complete", messages=messages, temperature=0.7)
@@ -142,6 +150,7 @@ class TestModelSwitchRecovery:
     def test_different_providers_have_independent_breakers(self):
         """moonshot breaker open should not affect deepseek breaker."""
         from core.llm.rate_limiter import RateLimiter
+
         rl = RateLimiter()
 
         moonshot_breaker = rl.get_breaker("moonshot")
@@ -169,7 +178,9 @@ class TestModelSwitchRecovery:
             for _ in range(5):
                 breaker.record_failure()
 
-            result, used_cfg = client._dispatch("kimi-k2.5", "complete", messages=[], temperature=0.7)
+            result, used_cfg = client._dispatch(
+                "kimi-k2.5", "complete", messages=[], temperature=0.7
+            )
 
         # Should have used deepseek (moonshot was skipped)
         assert result.model == "deepseek-chat"
@@ -233,6 +244,7 @@ class TestKimiQuirksCombined:
     def test_kimi_config_from_seed(self):
         """Verify seed data produces correct ModelConfig with all quirks."""
         from core.llm.seed_models import SEED_MODELS
+
         kimi = next(m for m in SEED_MODELS if m["model_name"] == "kimi-k2.5")
 
         cfg = ModelConfig(**kimi)
@@ -245,6 +257,7 @@ class TestKimiQuirksCombined:
     def test_deepseek_has_no_quirks(self):
         """deepseek-chat should have default (no-op) quirks."""
         from core.llm.seed_models import SEED_MODELS
+
         ds = next(m for m in SEED_MODELS if m["model_name"] == "deepseek-chat")
 
         cfg = ModelConfig(**ds)
@@ -262,36 +275,42 @@ class TestClientErrorClassification:
 
     def test_400_is_client_error(self):
         from core.llm.client import _is_client_error
+
         err = type("BadRequestError", (Exception,), {})()
         err.status_code = 400
         assert _is_client_error(err) is True
 
     def test_422_is_client_error(self):
         from core.llm.client import _is_client_error
+
         err = type("ValidationError", (Exception,), {})()
         err.status_code = 422
         assert _is_client_error(err) is True
 
     def test_500_is_not_client_error(self):
         from core.llm.client import _is_client_error
+
         err = type("InternalServerError", (Exception,), {})()
         err.status_code = 500
         assert _is_client_error(err) is False
 
     def test_no_status_code_is_not_client_error(self):
         from core.llm.client import _is_client_error
+
         err = RuntimeError("connection reset")
         assert _is_client_error(err) is False
 
     def test_error_message_with_400(self):
         """Error message containing '400' should be detected."""
         from core.llm.client import _is_client_error
+
         err = Exception("Error code: 400 - {'error': {'message': 'invalid temperature'}}")
         assert _is_client_error(err) is True
 
     def test_429_is_not_client_error(self):
         """429 (rate limit) should NOT be treated as client error — it's retryable."""
         from core.llm.client import _is_client_error
+
         err = type("RateLimitError", (Exception,), {})()
         err.status_code = 429
         assert _is_client_error(err) is False

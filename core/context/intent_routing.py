@@ -31,13 +31,15 @@ logger = logging.getLogger(__name__)
 
 class ToolFilter(str, Enum):
     """Tool filtering mode derived from intent classification."""
-    NONE = "none"                # DEFAULT — no filtering
+
+    NONE = "none"  # DEFAULT — no filtering
     LOCAL_BLOCKED = "local_blocked"  # EXTERNAL_FETCH — block local tools
-    ALL_BLOCKED = "all_blocked"      # CONVERSATIONAL — block all tools
+    ALL_BLOCKED = "all_blocked"  # CONVERSATIONAL — block all tools
 
 
 class TaskType(str, Enum):
     """Task types for context optimization (absorbed from ContextManager)."""
+
     CODE_REVIEW = "code_review"
     PLANNING = "planning"
     DEBUGGING = "debugging"
@@ -48,27 +50,31 @@ class TaskType(str, Enum):
 # Dataclasses
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class RoutingResult:
     """Output of a single classification tier."""
+
     intent: str | None  # preference, command, feedback, question, or None
-    confidence: float   # 0.0, 0.80, or 0.95
-    tier: int           # 0 or 1
-    matched_by: str     # "regex", "heuristic", "both", "llm", "fallback"
+    confidence: float  # 0.0, 0.80, or 0.95
+    tier: int  # 0 or 1
+    matched_by: str  # "regex", "heuristic", "both", "llm", "fallback"
 
 
 @dataclass(frozen=True)
 class ContextLoadingPlan:
     """What to load for a given intent."""
-    load_tools: bool          # include tool schemas
+
+    load_tools: bool  # include tool schemas
     load_history: bool | int  # False=skip, True=full, int=last N turns
-    load_memory: bool | str   # False=skip, True=full, "profile"=L0 only
+    load_memory: bool | str  # False=skip, True=full, "profile"=L0 only
     estimated_tokens: int
 
 
 @dataclass
 class Tier1Result:
     """Output of Tier 1 parallel execution."""
+
     routing: RoutingResult | None = None
     compressed_memory: str | None = None
     pruned_tools: list[str] | None = None
@@ -84,6 +90,7 @@ class RoutingDecision:
     All fields are guaranteed to be populated after IntentRouter.route() —
     callers never need None-checks or fallback defaults.
     """
+
     plan: ContextLoadingPlan
     routing_result: RoutingResult
     tier1_result: Tier1Result | None = None
@@ -98,10 +105,18 @@ class RoutingDecision:
 
 # Intent → ContextLoadingPlan (from doc "Context Loading by Intent" table)
 INTENT_PLANS: dict[str, ContextLoadingPlan] = {
-    "preference": ContextLoadingPlan(load_tools=False, load_history=False, load_memory="profile", estimated_tokens=100),
-    "command":    ContextLoadingPlan(load_tools=True,  load_history=False, load_memory=False,     estimated_tokens=400),
-    "feedback":   ContextLoadingPlan(load_tools=False, load_history=2,     load_memory=False,     estimated_tokens=600),
-    "question":   ContextLoadingPlan(load_tools=True,  load_history=True,  load_memory=True,      estimated_tokens=2400),
+    "preference": ContextLoadingPlan(
+        load_tools=False, load_history=False, load_memory="profile", estimated_tokens=100
+    ),
+    "command": ContextLoadingPlan(
+        load_tools=True, load_history=False, load_memory=False, estimated_tokens=400
+    ),
+    "feedback": ContextLoadingPlan(
+        load_tools=False, load_history=2, load_memory=False, estimated_tokens=600
+    ),
+    "question": ContextLoadingPlan(
+        load_tools=True, load_history=True, load_memory=True, estimated_tokens=2400
+    ),
 }
 
 # Full-context fallback plan (same as question)
@@ -111,6 +126,7 @@ _FALLBACK_PLAN = INTENT_PLANS["question"]
 # ---------------------------------------------------------------------------
 # Router Protocol + Registry
 # ---------------------------------------------------------------------------
+
 
 @runtime_checkable
 class RoutingStrategy(Protocol):
@@ -132,6 +148,7 @@ _registry_lock = __import__("threading").Lock()
 
 def register_router(name: str):
     """Decorator to register a routing strategy by name."""
+
     def _wrap(cls: type) -> type:
         with _registry_lock:
             if name in _ROUTER_REGISTRY:
@@ -141,6 +158,7 @@ def register_router(name: str):
                 )
             _ROUTER_REGISTRY[name] = cls
         return cls
+
     return _wrap
 
 
@@ -170,11 +188,13 @@ def _reset_registry_for_testing() -> None:
 # KeywordRegistry — single-dimension keyword matcher
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class RegistryMatch:
     """Result of a single KeywordRegistry.match() call."""
-    label: str | None   # matched label (e.g. "CONVERSATIONAL") or None
-    score: float        # 0.0 - 1.0
+
+    label: str | None  # matched label (e.g. "CONVERSATIONAL") or None
+    score: float  # 0.0 - 1.0
     matched_keywords: list[str] = field(default_factory=list)
 
 
@@ -191,7 +211,12 @@ class KeywordRegistry:
     Each registry maps labels → keyword lists. match() returns the best-scoring label.
     """
 
-    def __init__(self, name: str, keywords: dict[str, list[str]], negative_keywords: dict[str, list[str]] | None = None):
+    def __init__(
+        self,
+        name: str,
+        keywords: dict[str, list[str]],
+        negative_keywords: dict[str, list[str]] | None = None,
+    ):
         self.name = name
         self._patterns: dict[str, list[tuple[str, re.Pattern[str]]]] = {}
         for label, words in keywords.items():
@@ -238,35 +263,107 @@ _TOOL_FILTER_REGISTRY = KeywordRegistry(
     name="tool_filter",
     keywords={
         "CONVERSATIONAL": [
-            "hello", "hi", "hey", "thanks", "thank you", "bye", "goodbye",
-            "good morning", "good evening", "how are you", "what's up",
-            "who are you", "what can you do", "help me",
-            "yes", "no", "ok", "okay", "sure", "great", "nice",
-            "please", "sorry", "excuse me",
-            "你好", "您好", "谢谢", "感谢", "再见", "拜拜",
-            "早上好", "晚上好", "你是谁", "你能做什么",
-            "好的", "可以", "是的", "不是", "没问题",
-            "请", "抱歉", "对不起",
+            "hello",
+            "hi",
+            "hey",
+            "thanks",
+            "thank you",
+            "bye",
+            "goodbye",
+            "good morning",
+            "good evening",
+            "how are you",
+            "what's up",
+            "who are you",
+            "what can you do",
+            "help me",
+            "yes",
+            "no",
+            "ok",
+            "okay",
+            "sure",
+            "great",
+            "nice",
+            "please",
+            "sorry",
+            "excuse me",
+            "你好",
+            "您好",
+            "谢谢",
+            "感谢",
+            "再见",
+            "拜拜",
+            "早上好",
+            "晚上好",
+            "你是谁",
+            "你能做什么",
+            "好的",
+            "可以",
+            "是的",
+            "不是",
+            "没问题",
+            "请",
+            "抱歉",
+            "对不起",
         ],
         "EXTERNAL_FETCH": [
-            "search online", "look up", "find online", "web search",
-            "what is the latest", "current price", "today's",
-            "fetch from", "download", "api call", "http",
-            "weather", "news", "stock price",
-            "check the website", "browse",
-            "搜索", "查找", "查一下", "网上找",
-            "最新的", "当前价格", "今天的",
-            "下载", "获取", "抓取",
-            "天气", "新闻", "股价",
+            "search online",
+            "look up",
+            "find online",
+            "web search",
+            "what is the latest",
+            "current price",
+            "today's",
+            "fetch from",
+            "download",
+            "api call",
+            "http",
+            "weather",
+            "news",
+            "stock price",
+            "check the website",
+            "browse",
+            "搜索",
+            "查找",
+            "查一下",
+            "网上找",
+            "最新的",
+            "当前价格",
+            "今天的",
+            "下载",
+            "获取",
+            "抓取",
+            "天气",
+            "新闻",
+            "股价",
         ],
     },
     negative_keywords={
         # Code-context keywords suppress EXTERNAL_FETCH
         "EXTERNAL_FETCH": [
-            "file", "code", "class", "function", "method", "variable",
-            "refactor", "implement", "debug", "fix", "bug", "test",
-            "import", "module", "package", "repository", "repo",
-            "algorithm", "sort", "tree", "array", "list", "dict",
+            "file",
+            "code",
+            "class",
+            "function",
+            "method",
+            "variable",
+            "refactor",
+            "implement",
+            "debug",
+            "fix",
+            "bug",
+            "test",
+            "import",
+            "module",
+            "package",
+            "repository",
+            "repo",
+            "algorithm",
+            "sort",
+            "tree",
+            "array",
+            "list",
+            "dict",
         ],
     },
 )
@@ -274,8 +371,8 @@ _TOOL_FILTER_REGISTRY = KeywordRegistry(
 # Dimension 2: Intent (existing Tier 0 regex patterns)
 _INTENT_PATTERNS: dict[str, list[re.Pattern]] = {
     "preference": [re.compile(r"记住|remember|I prefer|I use|需要|always use", re.I)],
-    "command":    [re.compile(r"^(run|execute|delete|create|list)\b", re.I)],
-    "feedback":   [re.compile(r"^(不对|wrong|no,|actually)", re.I)],
+    "command": [re.compile(r"^(run|execute|delete|create|list)\b", re.I)],
+    "feedback": [re.compile(r"^(不对|wrong|no,|actually)", re.I)],
 }
 
 # Dimension 3: Task type (from old classify_task)
@@ -283,8 +380,8 @@ _TASK_TYPE_REGISTRY = KeywordRegistry(
     name="task_type",
     keywords={
         "code_review": ["review", "code review", "PR", "pull request", "refactor", "clean up"],
-        "debugging":   ["debug", "error", "bug", "fix", "traceback", "exception", "crash", "fail"],
-        "planning":    ["plan", "design", "architect", "roadmap", "strategy", "proposal"],
+        "debugging": ["debug", "error", "bug", "fix", "traceback", "exception", "crash", "fail"],
+        "planning": ["plan", "design", "architect", "roadmap", "strategy", "proposal"],
     },
 )
 
@@ -292,6 +389,7 @@ _TASK_TYPE_REGISTRY = KeywordRegistry(
 # ---------------------------------------------------------------------------
 # Tier 0: Unified three-dimension engine
 # ---------------------------------------------------------------------------
+
 
 class Tier0Engine:
     """<1ms regex + heuristic + keyword engine across three dimensions."""
@@ -306,7 +404,9 @@ class Tier0Engine:
         if regex_intent:
             return RoutingResult(intent=regex_intent, confidence=0.80, tier=0, matched_by="regex")
         if heuristic_intent:
-            return RoutingResult(intent=heuristic_intent, confidence=0.80, tier=0, matched_by="heuristic")
+            return RoutingResult(
+                intent=heuristic_intent, confidence=0.80, tier=0, matched_by="heuristic"
+            )
         return RoutingResult(intent=None, confidence=0.0, tier=0, matched_by="none")
 
     def classify_tool_filter(self, query: str) -> tuple[ToolFilter, int]:
@@ -374,7 +474,7 @@ def detect_correction(query: str) -> bool:
 
 _CLASSIFY_PROMPT = (
     "Classify this user message into exactly one intent: preference, command, feedback, question.\n"
-    "Reply with JSON: {\"intent\": \"...\", \"confidence\": 0.0-1.0}\n"
+    'Reply with JSON: {"intent": "...", "confidence": 0.0-1.0}\n'
     "- preference: user states a preference or asks to remember something\n"
     "- command: user wants to execute an action (run, create, delete, list)\n"
     "- feedback: user corrects or disagrees with previous response\n"
@@ -432,11 +532,13 @@ class Tier1Engine:
 
     async def _classify(self, query: str, history_summary: str | None) -> RoutingResult:
         import json as _json
+
         prompt = _CLASSIFY_PROMPT + query
         if history_summary:
             prompt += f"\nRecent context: {history_summary[:200]}"
         resp = await asyncio.wait_for(
-            asyncio.to_thread(self._llm_call, prompt), timeout=_TIER1_TIMEOUT,
+            asyncio.to_thread(self._llm_call, prompt),
+            timeout=_TIER1_TIMEOUT,
         )
         try:
             data = _json.loads(resp)
@@ -456,9 +558,11 @@ class Tier1Engine:
 
     async def _prune_tools(self, query: str, tool_names: list[str]) -> list[str]:
         import json as _json
+
         prompt = _PRUNE_PROMPT.format(query=query, tools=", ".join(tool_names))
         resp = await asyncio.wait_for(
-            asyncio.to_thread(self._llm_call, prompt), timeout=_TIER1_TIMEOUT,
+            asyncio.to_thread(self._llm_call, prompt),
+            timeout=_TIER1_TIMEOUT,
         )
         try:
             parsed = _json.loads(resp)
@@ -470,6 +574,7 @@ class Tier1Engine:
 
     def _llm_call(self, prompt: str) -> str:
         from core.llm.client import LLMClient
+
         llm = LLMClient(self._db_factory)
         resp = llm.chat(
             messages=[{"role": "user", "content": prompt}],
@@ -486,11 +591,22 @@ class Tier1Engine:
 # ---------------------------------------------------------------------------
 
 # Tools considered "local" — blocked when tool_filter is LOCAL_BLOCKED
-LOCAL_TOOLS = frozenset({
-    "grep", "shell", "execute_bash", "file_read", "file_write",
-    "git", "search", "reflect", "introspection",
-    "scratchpad_write", "scratchpad_read", "scratchpad_close",
-})
+LOCAL_TOOLS = frozenset(
+    {
+        "grep",
+        "shell",
+        "execute_bash",
+        "file_read",
+        "file_write",
+        "git",
+        "search",
+        "reflect",
+        "introspection",
+        "scratchpad_write",
+        "scratchpad_read",
+        "scratchpad_close",
+    }
+)
 
 
 @register_router("default")
@@ -533,24 +649,33 @@ class IntentRouter:
                 tool_filter = ToolFilter.ALL_BLOCKED
                 max_tool_rounds = 0
             return RoutingDecision(
-                plan=INTENT_PLANS[force_intent], routing_result=result,
+                plan=INTENT_PLANS[force_intent],
+                routing_result=result,
                 threshold_used=threshold,
-                tool_filter=tool_filter, max_tool_rounds=max_tool_rounds,
+                tool_filter=tool_filter,
+                max_tool_rounds=max_tool_rounds,
                 task_type=task_type,
             )
 
         # Tier 0: intent dimension
         tier0 = self._tier0.classify(query, history_len)
         if tier0.intent and tier0.confidence >= threshold:
-            logger.info("Tier 0 routed: intent=%s conf=%.2f threshold=%.2f", tier0.intent, tier0.confidence, threshold)
+            logger.info(
+                "Tier 0 routed: intent=%s conf=%.2f threshold=%.2f",
+                tier0.intent,
+                tier0.confidence,
+                threshold,
+            )
             # preference intent → ALL_BLOCKED
             if tier0.intent == "preference":
                 tool_filter = ToolFilter.ALL_BLOCKED
                 max_tool_rounds = 0
             return RoutingDecision(
-                plan=INTENT_PLANS[tier0.intent], routing_result=tier0,
+                plan=INTENT_PLANS[tier0.intent],
+                routing_result=tier0,
                 threshold_used=threshold,
-                tool_filter=tool_filter, max_tool_rounds=max_tool_rounds,
+                tool_filter=tool_filter,
+                max_tool_rounds=max_tool_rounds,
                 task_type=task_type,
             )
 
@@ -559,32 +684,45 @@ class IntentRouter:
             tier1 = await self._tier1.run_parallel(query, memory_text, tool_names)
         except Exception as e:
             logger.warning("Tier 1 failed, falling back: %s", e)
-            fallback = RoutingResult(intent="question", confidence=0.0, tier=1, matched_by="fallback")
+            fallback = RoutingResult(
+                intent="question", confidence=0.0, tier=1, matched_by="fallback"
+            )
             return RoutingDecision(
-                plan=_FALLBACK_PLAN, routing_result=fallback, threshold_used=threshold,
-                tool_filter=tool_filter, max_tool_rounds=max_tool_rounds,
+                plan=_FALLBACK_PLAN,
+                routing_result=fallback,
+                threshold_used=threshold,
+                tool_filter=tool_filter,
+                max_tool_rounds=max_tool_rounds,
                 task_type=task_type,
             )
 
         if tier1.routing and tier1.routing.intent and tier1.routing.confidence >= threshold:
             plan = INTENT_PLANS.get(tier1.routing.intent, _FALLBACK_PLAN)
-            logger.info("Tier 1 routed: intent=%s conf=%.2f", tier1.routing.intent, tier1.routing.confidence)
+            logger.info(
+                "Tier 1 routed: intent=%s conf=%.2f", tier1.routing.intent, tier1.routing.confidence
+            )
             if tier1.routing.intent == "preference":
                 tool_filter = ToolFilter.ALL_BLOCKED
                 max_tool_rounds = 0
             return RoutingDecision(
-                plan=plan, routing_result=tier1.routing,
-                tier1_result=tier1, threshold_used=threshold,
-                tool_filter=tool_filter, max_tool_rounds=max_tool_rounds,
+                plan=plan,
+                routing_result=tier1.routing,
+                tier1_result=tier1,
+                threshold_used=threshold,
+                tool_filter=tool_filter,
+                max_tool_rounds=max_tool_rounds,
                 task_type=task_type,
             )
 
         # Fallback — full context
         fallback = RoutingResult(intent="question", confidence=0.0, tier=1, matched_by="fallback")
         return RoutingDecision(
-            plan=_FALLBACK_PLAN, routing_result=fallback,
-            tier1_result=tier1, threshold_used=threshold,
-            tool_filter=tool_filter, max_tool_rounds=max_tool_rounds,
+            plan=_FALLBACK_PLAN,
+            routing_result=fallback,
+            tier1_result=tier1,
+            threshold_used=threshold,
+            tool_filter=tool_filter,
+            max_tool_rounds=max_tool_rounds,
             task_type=task_type,
         )
 
@@ -596,6 +734,7 @@ class IntentRouter:
             loop = None
         if loop and loop.is_running():
             import concurrent.futures
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 return pool.submit(asyncio.run, self.route(**kwargs)).result(timeout=5)
         return asyncio.run(self.route(**kwargs))

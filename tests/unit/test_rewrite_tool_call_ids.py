@@ -20,9 +20,17 @@ class TestRewriteToolCallIds:
     def test_standard_ids_unchanged(self):
         """IDs matching 'call_xxx' must not be rewritten."""
         messages = [
-            {"role": "assistant", "content": "", "tool_calls": [
-                {"id": "call_abc123", "type": "function", "function": {"name": "fn", "arguments": "{}"}},
-            ]},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_abc123",
+                        "type": "function",
+                        "function": {"name": "fn", "arguments": "{}"},
+                    },
+                ],
+            },
             {"role": "tool", "tool_call_id": "call_abc123", "content": "result"},
         ]
         result = _rewrite_tool_call_ids(messages)
@@ -32,9 +40,17 @@ class TestRewriteToolCallIds:
     def test_nonstandard_ids_rewritten(self):
         """IDs like 'read_file:1' must be rewritten to 'call_<uuid>'."""
         messages = [
-            {"role": "assistant", "content": "", "tool_calls": [
-                {"id": "read_file:1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
-            ]},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "read_file:1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    },
+                ],
+            },
             {"role": "tool", "tool_call_id": "read_file:1", "content": "file contents"},
         ]
         result = _rewrite_tool_call_ids(messages)
@@ -47,13 +63,29 @@ class TestRewriteToolCallIds:
     def test_consistent_mapping_across_messages(self):
         """Same non-standard id appearing multiple times must map to the same replacement."""
         messages = [
-            {"role": "assistant", "content": "", "tool_calls": [
-                {"id": "fn:0", "type": "function", "function": {"name": "fn", "arguments": "{}"}},
-            ]},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "fn:0",
+                        "type": "function",
+                        "function": {"name": "fn", "arguments": "{}"},
+                    },
+                ],
+            },
             {"role": "tool", "tool_call_id": "fn:0", "content": "r1"},
-            {"role": "assistant", "content": "", "tool_calls": [
-                {"id": "fn:0", "type": "function", "function": {"name": "fn", "arguments": "{}"}},
-            ]},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "fn:0",
+                        "type": "function",
+                        "function": {"name": "fn", "arguments": "{}"},
+                    },
+                ],
+            },
             {"role": "tool", "tool_call_id": "fn:0", "content": "r2"},
         ]
         result = _rewrite_tool_call_ids(messages)
@@ -68,10 +100,22 @@ class TestRewriteToolCallIds:
     def test_different_nonstandard_ids_get_different_replacements(self):
         """Different non-standard ids must get different replacements."""
         messages = [
-            {"role": "assistant", "content": "", "tool_calls": [
-                {"id": "fn_a:0", "type": "function", "function": {"name": "a", "arguments": "{}"}},
-                {"id": "fn_b:1", "type": "function", "function": {"name": "b", "arguments": "{}"}},
-            ]},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "fn_a:0",
+                        "type": "function",
+                        "function": {"name": "a", "arguments": "{}"},
+                    },
+                    {
+                        "id": "fn_b:1",
+                        "type": "function",
+                        "function": {"name": "b", "arguments": "{}"},
+                    },
+                ],
+            },
             {"role": "tool", "tool_call_id": "fn_a:0", "content": "r1"},
             {"role": "tool", "tool_call_id": "fn_b:1", "content": "r2"},
         ]
@@ -83,9 +127,13 @@ class TestRewriteToolCallIds:
     def test_empty_id_left_as_is(self):
         """Empty string id must not be rewritten."""
         messages = [
-            {"role": "assistant", "content": "", "tool_calls": [
-                {"id": "", "type": "function", "function": {"name": "fn", "arguments": "{}"}},
-            ]},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "", "type": "function", "function": {"name": "fn", "arguments": "{}"}},
+                ],
+            },
         ]
         result = _rewrite_tool_call_ids(messages)
         assert result[0]["tool_calls"][0]["id"] == ""
@@ -103,10 +151,22 @@ class TestRewriteToolCallIds:
     def test_mixed_standard_and_nonstandard(self):
         """Standard ids unchanged, non-standard rewritten, in same batch."""
         messages = [
-            {"role": "assistant", "content": "", "tool_calls": [
-                {"id": "call_good123", "type": "function", "function": {"name": "a", "arguments": "{}"}},
-                {"id": "bad:id:2", "type": "function", "function": {"name": "b", "arguments": "{}"}},
-            ]},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_good123",
+                        "type": "function",
+                        "function": {"name": "a", "arguments": "{}"},
+                    },
+                    {
+                        "id": "bad:id:2",
+                        "type": "function",
+                        "function": {"name": "b", "arguments": "{}"},
+                    },
+                ],
+            },
             {"role": "tool", "tool_call_id": "call_good123", "content": "r1"},
             {"role": "tool", "tool_call_id": "bad:id:2", "content": "r2"},
         ]

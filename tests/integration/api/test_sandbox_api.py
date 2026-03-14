@@ -38,11 +38,9 @@ def db_session():
 @pytest.fixture
 def auth_token(test_user):
     """Generate auth token"""
-    return create_access_token({
-        "sub": test_user.user_id,
-        "username": test_user.username,
-        "type": "access"
-    })
+    return create_access_token(
+        {"sub": test_user.user_id, "username": test_user.username, "type": "access"}
+    )
 
 
 # auth_headers fixture now provided by tests/integration/conftest.py
@@ -54,7 +52,7 @@ def cleanup_sandboxes():
     # Cleanup before test
     db = next(get_db_session())
     sandbox = Sandbox(lambda: db, source_db=SOURCE_DB)
-    
+
     # Clean up both test_sandbox_% and ts_% patterns
     for pattern in ["test_sandbox_%", "ts_%"]:
         sandboxes = sandbox.list_sandboxes(prefix="", pattern=pattern)
@@ -63,9 +61,9 @@ def cleanup_sandboxes():
                 sandbox.delete(s["sandbox_name"], force=True)
             except:
                 pass
-    
+
     yield
-    
+
     # Cleanup after test - clean up both patterns
     for pattern in ["test_sandbox_%", "ts_%"]:
         sandboxes = sandbox.list_sandboxes(prefix="", pattern=pattern)
@@ -78,174 +76,152 @@ def cleanup_sandboxes():
 
 class TestCreateSandbox:
     """测试创建 sandbox API"""
-    
+
     def test_create_sandbox_success(self, client, auth_headers):
         """测试成功创建 sandbox"""
         response = client.post(
             "/sandbox",
             json={
                 "name": f"ts_{generate_id()}",  # test_ (5) + 31 = 36
-                "description": "Test sandbox"
+                "description": "Test sandbox",
             },
-            headers=auth_headers
+            headers=auth_headers,
         )
-        
+
         if response.status_code != 201:
             print(f"Error response: {response.json()}")
-        
+
         assert response.status_code == 201
         data = response.json()
         assert "sandbox_name" in data
         assert data["description"] == "Test sandbox"
-    
+
     def test_create_sandbox_without_auth(self, client):
         """测试未认证"""
-        response = client.post(
-            "/sandbox",
-            json={"name": "test_sandbox"}
-        )
-        
+        response = client.post("/sandbox", json={"name": "test_sandbox"})
+
         assert response.status_code == 401  # returns 401 Unauthorized
-    
+
     def test_create_sandbox_empty_name(self, client, auth_headers):
         """测试空名称"""
-        response = client.post(
-            "/sandbox",
-            json={"name": ""},
-            headers=auth_headers
-        )
-        
+        response = client.post("/sandbox", json={"name": ""}, headers=auth_headers)
+
         assert response.status_code == 422  # Validation error
 
 
 class TestListSandboxes:
     """测试列出 sandboxes API"""
-    
+
     def test_list_sandboxes_success(self, client, auth_headers):
         """测试成功列出 sandboxes"""
         # Create a sandbox first
         sandbox_name = f"ts_{generate_id()}"
-        client.post(
-            "/sandbox",
-            json={"name": sandbox_name},
-            headers=auth_headers
-        )
-        
+        client.post("/sandbox", json={"name": sandbox_name}, headers=auth_headers)
+
         # List sandboxes
         response = client.get("/sandbox", headers=auth_headers)
-        
+
         assert response.status_code == 200
         data = response.json()
         assert "sandboxes" in data
         assert "total" in data
         assert data["total"] >= 1
-    
+
     def test_list_sandboxes_with_pattern(self, client, auth_headers):
         """测试使用过滤模式"""
-        response = client.get(
-            "/sandbox?pattern=test_%",
-            headers=auth_headers
-        )
-        
+        response = client.get("/sandbox?pattern=test_%", headers=auth_headers)
+
         assert response.status_code == 200
-    
+
     def test_list_sandboxes_without_auth(self, client):
         """测试未认证"""
         response = client.get("/sandbox")
-        
+
         assert response.status_code == 401
 
 
 class TestGetSandbox:
     """测试获取 sandbox 信息 API"""
-    
+
     def test_get_sandbox_success(self, client, auth_headers):
         """测试成功获取 sandbox 信息"""
         # Create a sandbox first
         sandbox_name = f"ts_{generate_id()}"
-        create_response = client.post(
-            "/sandbox",
-            json={"name": sandbox_name},
-            headers=auth_headers
-        )
+        create_response = client.post("/sandbox", json={"name": sandbox_name}, headers=auth_headers)
         assert create_response.status_code == 201
-        
+
         # Get sandbox info
         response = client.get(f"/sandbox/{sandbox_name}", headers=auth_headers)
-        
+
         assert response.status_code == 200
         data = response.json()
         assert data["sandbox_name"] == sandbox_name
-    
+
     def test_get_sandbox_not_found(self, client, auth_headers):
         """测试获取不存在的 sandbox"""
         response = client.get("/sandbox/nonexistent", headers=auth_headers)
-        
+
         assert response.status_code == 404
-    
+
     def test_get_sandbox_without_auth(self, client):
         """测试未认证"""
         response = client.get("/sandbox/test")
-        
+
         assert response.status_code == 401
 
 
 class TestDeleteSandbox:
     """测试删除 sandbox API"""
-    
+
     def test_delete_sandbox_success(self, client, auth_headers):
         """测试成功删除 sandbox"""
         # Create a sandbox first
         sandbox_name = f"ts_{generate_id()}"
-        create_response = client.post(
-            "/sandbox",
-            json={"name": sandbox_name},
-            headers=auth_headers
-        )
+        create_response = client.post("/sandbox", json={"name": sandbox_name}, headers=auth_headers)
         assert create_response.status_code == 201
-        
+
         # Delete sandbox
         response = client.delete(f"/sandbox/{sandbox_name}", headers=auth_headers)
-        
+
         assert response.status_code == 204
-        
+
         # Verify deleted
         get_response = client.get(f"/sandbox/{sandbox_name}", headers=auth_headers)
         assert get_response.status_code == 404
-    
+
     def test_delete_sandbox_not_found(self, client, auth_headers):
         """测试删除不存在的 sandbox"""
         response = client.delete("/sandbox/nonexistent", headers=auth_headers)
-        
+
         assert response.status_code == 404
-    
+
     def test_delete_sandbox_without_auth(self, client):
         """测试未认证"""
         response = client.delete("/sandbox/test")
-        
+
         assert response.status_code == 401
 
 
 class TestSandboxPermissions:
     """测试 sandbox 权限控制"""
-    
+
     def test_user_cannot_see_others_sandboxes(self, client, test_user):
         """测试用户不能看到其他人的 sandboxes"""
         from api.repositories import UserRepository
         from core.auth.jwt_manager import create_access_token
         from core.auth.password import hash_password
         from api.database import get_db_session
-        
+
         # Create a second user using consistent pattern
         db_session = next(get_db_session())
         user_repo = UserRepository(lambda: db_session)
-        
+
         # Clean up any existing user
         existing = user_repo.get_by_username("testuser2")
         if existing:
             user_repo.delete(existing.user_id)
             db_session.commit()
-        
+
         # Create second user
         user2_data = {
             "user_id": generate_id(),
@@ -256,36 +232,29 @@ class TestSandboxPermissions:
         }
         user2 = user_repo.create(user2_data)
         db_session.commit()
-        
+
         # Create tokens
-        token1 = create_access_token({
-            "sub": test_user.user_id,
-            "username": test_user.username,
-            "type": "access"
-        })
-        token2 = create_access_token({
-            "sub": user2.user_id,
-            "username": user2.username,
-            "type": "access"
-        })
-        
+        token1 = create_access_token(
+            {"sub": test_user.user_id, "username": test_user.username, "type": "access"}
+        )
+        token2 = create_access_token(
+            {"sub": user2.user_id, "username": user2.username, "type": "access"}
+        )
+
         # User1 creates a sandbox
         sandbox_name = f"ts_{generate_id()}"
         response1 = client.post(
-            "/sandbox",
-            json={"name": sandbox_name},
-            headers={"Authorization": f"Bearer {token1}"}
+            "/sandbox", json={"name": sandbox_name}, headers={"Authorization": f"Bearer {token1}"}
         )
         assert response1.status_code == 201
-        
+
         # User2 tries to get user1's sandbox
         response2 = client.get(
-            f"/sandbox/{sandbox_name}",
-            headers={"Authorization": f"Bearer {token2}"}
+            f"/sandbox/{sandbox_name}", headers={"Authorization": f"Bearer {token2}"}
         )
         # In dev mode, all users can see all sandboxes
         assert response2.status_code == 200
-        
+
         # Cleanup
         try:
             user_repo.delete(user2.user_id)
@@ -298,49 +267,35 @@ class TestSandboxPermissions:
 
 class TestSandboxEdgeCases:
     """测试 sandbox 边界情况"""
-    
+
     def test_create_sandbox_with_special_chars(self, client, auth_headers):
         """测试创建带特殊字符的 sandbox"""
         response = client.post(
             "/sandbox",
-            json={
-                "name": f"ts_{generate_id()}",
-                "description": "Test with special chars: !@#$%"
-            },
-            headers=auth_headers
+            json={"name": f"ts_{generate_id()}", "description": "Test with special chars: !@#$%"},
+            headers=auth_headers,
         )
-        
+
         assert response.status_code == 201
-    
+
     def test_list_sandboxes_with_limit(self, client, auth_headers):
         """测试列出 sandboxes 时的分页"""
-        response = client.get(
-            "/sandbox?limit=10&offset=0",
-            headers=auth_headers
-        )
-        
+        response = client.get("/sandbox?limit=10&offset=0", headers=auth_headers)
+
         assert response.status_code == 200
         data = response.json()
         assert "sandboxes" in data
         assert "total" in data
-    
+
     def test_create_sandbox_duplicate_name(self, client, auth_headers):
         """测试创建重名 sandbox"""
         sandbox_name = f"ts_{generate_id()}"
-        
+
         # Create first sandbox
-        response1 = client.post(
-            "/sandbox",
-            json={"name": sandbox_name},
-            headers=auth_headers
-        )
+        response1 = client.post("/sandbox", json={"name": sandbox_name}, headers=auth_headers)
         assert response1.status_code == 201
-        
+
         # Try to create duplicate
-        response2 = client.post(
-            "/sandbox",
-            json={"name": sandbox_name},
-            headers=auth_headers
-        )
+        response2 = client.post("/sandbox", json={"name": sandbox_name}, headers=auth_headers)
         # Should fail with 400 or 409
         assert response2.status_code in [400, 409, 500]

@@ -44,7 +44,8 @@ class StubSkill(Skill[StubInput, StubOutput]):
         self.version = version
         self.description = f"stub {name}"
         self.requirements = SkillRequirement(
-            repo_types=[RepoType.CODE], min_access=AccessScope.READ,
+            repo_types=[RepoType.CODE],
+            min_access=AccessScope.READ,
         )
         self.side_effect_profile = SideEffectProfile(category=SideEffectCategory.READ)
 
@@ -132,8 +133,11 @@ class TestRegisterFromApi:
         n = _name()
         sid = f"{n}@1.0.0"
         result = catalog.register_from_api(
-            skill_id=sid, skill_name=n, version="1.0.0",
-            skill_code="def run(): pass", description="api skill",
+            skill_id=sid,
+            skill_name=n,
+            version="1.0.0",
+            skill_code="def run(): pass",
+            description="api skill",
         )
         assert result["skill_id"] == sid
         assert result["skill_name"] == n
@@ -144,11 +148,15 @@ class TestRegisterFromApi:
     def test_deactivates_old_versions(self, catalog, db_session):
         n = _name()
         catalog.register_from_api(
-            skill_id=f"{n}@1.0.0", skill_name=n, version="1.0.0",
+            skill_id=f"{n}@1.0.0",
+            skill_name=n,
+            version="1.0.0",
             skill_code="v1",
         )
         catalog.register_from_api(
-            skill_id=f"{n}@2.0.0", skill_name=n, version="2.0.0",
+            skill_id=f"{n}@2.0.0",
+            skill_name=n,
+            version="2.0.0",
             skill_code="v2",
         )
         v1 = db_session.query(SkillModel).filter(SkillModel.skill_id == f"{n}@1.0.0").first()
@@ -160,12 +168,18 @@ class TestRegisterFromApi:
         n = _name()
         sid = f"{n}@1.0.0"
         catalog.register_from_api(
-            skill_id=sid, skill_name=n, version="1.0.0",
-            skill_code="v1", description="old",
+            skill_id=sid,
+            skill_name=n,
+            version="1.0.0",
+            skill_code="v1",
+            description="old",
         )
         catalog.register_from_api(
-            skill_id=sid, skill_name=n, version="1.0.0",
-            skill_code="v1-updated", description="new",
+            skill_id=sid,
+            skill_name=n,
+            version="1.0.0",
+            skill_code="v1-updated",
+            description="new",
         )
         rows = db_session.query(SkillModel).filter(SkillModel.skill_name == n).all()
         assert len(rows) == 1
@@ -174,8 +188,11 @@ class TestRegisterFromApi:
     def test_invalid_source_raises(self, catalog):
         with pytest.raises(ValueError, match="Invalid source"):
             catalog.register_from_api(
-                skill_id="x@1", skill_name="x", version="1",
-                skill_code="x", source="alien",
+                skill_id="x@1",
+                skill_name="x",
+                version="1",
+                skill_code="x",
+                source="alien",
             )
 
 
@@ -237,10 +254,15 @@ class TestPublishUnpublish:
         # _db(), which in tests returns the same db_session.  commit() is
         # safer: if the fixture ever changes to separate connections, the
         # installation row will still be visible to the catalog's query.
-        db_session.add(SkillInstallation(
-            installation_id=_uid(), user_id=_uid(), skill_name=n,
-            skill_version="1.0.0", status="installed",
-        ))
+        db_session.add(
+            SkillInstallation(
+                installation_id=_uid(),
+                user_id=_uid(),
+                skill_name=n,
+                skill_version="1.0.0",
+                status="installed",
+            )
+        )
         db_session.commit()
         assert catalog.unpublish_user_skill(owner, n) == "deprecated"
         row = db_session.query(SkillModel).filter(SkillModel.skill_name == n).first()
@@ -255,9 +277,14 @@ class TestPublishUnpublish:
         uid = _uid()
         catalog.publish_user_skill(uid, n, "1.0.0", "v1")
         catalog.publish_user_skill(uid, n, "2.0.0", "v2")
-        active = db_session.query(SkillModel).filter(
-            SkillModel.skill_name == n, SkillModel.is_active == 1,
-        ).all()
+        active = (
+            db_session.query(SkillModel)
+            .filter(
+                SkillModel.skill_name == n,
+                SkillModel.is_active == 1,
+            )
+            .all()
+        )
         assert len(active) == 1
         assert active[0].version == "2.0.0"
 
@@ -335,8 +362,20 @@ class TestLifecycle:
         catalog.register(StubSkill(n, "2.0.0"), source=SOURCE_BUILTIN)
         assert catalog.rollback(n) == "1.0.0"
         db_session.expire_all()
-        assert db_session.query(SkillModel).filter(SkillModel.skill_id == f"{n}@1.0.0").first().is_active == 1
-        assert db_session.query(SkillModel).filter(SkillModel.skill_id == f"{n}@2.0.0").first().is_active == 0
+        assert (
+            db_session.query(SkillModel)
+            .filter(SkillModel.skill_id == f"{n}@1.0.0")
+            .first()
+            .is_active
+            == 1
+        )
+        assert (
+            db_session.query(SkillModel)
+            .filter(SkillModel.skill_id == f"{n}@2.0.0")
+            .first()
+            .is_active
+            == 0
+        )
 
     def test_rollback_no_active_raises(self, catalog):
         with pytest.raises(ValueError, match="No active version"):
@@ -369,7 +408,10 @@ class TestLifecycle:
         catalog.register(StubSkill(n), source=SOURCE_BUILTIN)
         assert catalog.set_status(n, "1.0.0", "deprecated") is True
         db_session.expire_all()
-        assert db_session.query(SkillModel).filter(SkillModel.skill_name == n).first().status == "deprecated"
+        assert (
+            db_session.query(SkillModel).filter(SkillModel.skill_name == n).first().status
+            == "deprecated"
+        )
 
     def test_set_status_invalid_transition(self, catalog):
         n = _name()
@@ -432,14 +474,16 @@ class TestListAvailable:
 
         # Seed a repo with matching type/access
         rid = _uid()
-        db_session.add(RepoModel(
-            repo_id=rid,
-            user_id="test",
-            repo_url="https://example.com/repo",
-            repo_name="test-repo",
-            repo_type="code",
-            access_scope="read",
-        ))
+        db_session.add(
+            RepoModel(
+                repo_id=rid,
+                user_id="test",
+                repo_url="https://example.com/repo",
+                repo_name="test-repo",
+                repo_type="code",
+                access_scope="read",
+            )
+        )
         db_session.commit()
 
         available = catalog.list_available(rid)
@@ -452,19 +496,22 @@ class TestListAvailable:
 
         write_skill = StubSkill(_name())
         write_skill.requirements = SkillRequirement(
-            repo_types=[RepoType.CODE], min_access=AccessScope.WRITE,
+            repo_types=[RepoType.CODE],
+            min_access=AccessScope.WRITE,
         )
         catalog.register(write_skill, source=SOURCE_BUILTIN)
 
         rid = _uid()
-        db_session.add(RepoModel(
-            repo_id=rid,
-            user_id="test",
-            repo_url="https://example.com/repo2",
-            repo_name="read-repo",
-            repo_type="code",
-            access_scope="read",
-        ))
+        db_session.add(
+            RepoModel(
+                repo_id=rid,
+                user_id="test",
+                repo_url="https://example.com/repo2",
+                repo_name="read-repo",
+                repo_type="code",
+                access_scope="read",
+            )
+        )
         db_session.commit()
 
         names = [s.name for s in catalog.list_available(rid)]

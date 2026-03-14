@@ -10,9 +10,7 @@ class SkGithubRepo(Base):
     """Registered GitHub repositories for a user."""
 
     __tablename__ = "sk_github_repos"
-    __table_args__ = (
-        UniqueConstraint("owner", "name", name="uq_sk_github_repo_owner_name"),
-    )
+    __table_args__ = (UniqueConstraint("owner", "name", name="uq_sk_github_repo_owner_name"),)
 
     repo_id = Column(String(36), primary_key=True)
     owner = Column(String(100), nullable=False)

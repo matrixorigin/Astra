@@ -1,4 +1,5 @@
 """Tests for TypedObserver truncation logic in _extract_via_llm."""
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -9,9 +10,12 @@ class TestObserverTruncation:
 
     def _make_observer(self, mock_llm=None):
         from core.memory.tabular.typed_observer import TypedObserver
+
         return TypedObserver(
-            store=MagicMock(), llm_client=mock_llm or MagicMock(),
-            embed_fn=None, db_factory=None,
+            store=MagicMock(),
+            llm_client=mock_llm or MagicMock(),
+            embed_fn=None,
+            db_factory=None,
         )
 
     def test_truncates_to_max_messages(self):

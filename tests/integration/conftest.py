@@ -18,20 +18,23 @@ def _get_worker_suffix():
 def test_user(db_session):
     """Create a test user for API tests (worker-isolated)."""
     repo = UserRepository(lambda: db_session)
-    
+
     # Use worker-specific username/email to avoid conflicts
     worker_suffix = _get_worker_suffix()
     username = f"testuser{worker_suffix}"
     email = f"test{worker_suffix}@example.com"
-    
+
     # Clean up any existing test user
     existing = repo.get_by_username(username)
     if existing:
         from sqlalchemy import text as _text
-        db_session.execute(_text("DELETE FROM auth_user_roles WHERE user_id = :uid"), {"uid": existing.user_id})
+
+        db_session.execute(
+            _text("DELETE FROM auth_user_roles WHERE user_id = :uid"), {"uid": existing.user_id}
+        )
         repo.delete(existing.user_id)
         db_session.commit()
-    
+
     # Create new test user
     user_data = {
         "user_id": str(uuid4()),
@@ -40,16 +43,19 @@ def test_user(db_session):
         "password_hash": hash_password("testpass123"),
         "is_active": True,
     }
-    
+
     user = repo.create(user_data)
     db_session.commit()
-    
+
     yield user
-    
+
     # Cleanup (user_roles first due to FK)
     try:
         from sqlalchemy import text as _text
-        db_session.execute(_text("DELETE FROM auth_user_roles WHERE user_id = :uid"), {"uid": user.user_id})
+
+        db_session.execute(
+            _text("DELETE FROM auth_user_roles WHERE user_id = :uid"), {"uid": user.user_id}
+        )
         repo.delete(user.user_id)
         db_session.commit()
     except:
@@ -67,7 +73,7 @@ def auth_headers(client, test_user):
             "password": "testpass123",
         },
     )
-    
+
     token = response.json()["access_token"]
     return {"Authorization": f"Bearer {token}"}
 
@@ -109,7 +115,7 @@ def test_session(db_session, test_user):
     """Create a test session."""
     from api.repositories.session_repository import SessionRepository
     from uuid import uuid4
-    
+
     repo = SessionRepository(lambda: db_session)
     session_data = {
         "session_id": str(uuid4()),
@@ -118,12 +124,12 @@ def test_session(db_session, test_user):
         "title": "Test Session",
         "status": "active",
     }
-    
+
     session = repo.create(**session_data)
     db_session.commit()
-    
+
     yield session
-    
+
     # Cleanup
     try:
         repo.delete(session.session_id)

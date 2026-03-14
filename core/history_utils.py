@@ -112,11 +112,16 @@ def merge_tool_results_into_history(
                         history[idx]["content"] = _result_content(pending[tc_id])
                     consumed.add(tc_id)
                 else:
-                    inserts.append((insert_at, {
-                        "role": "tool",
-                        "tool_call_id": tc_id,
-                        "content": _result_content(pending[tc_id]),
-                    }))
+                    inserts.append(
+                        (
+                            insert_at,
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc_id,
+                                "content": _result_content(pending[tc_id]),
+                            },
+                        )
+                    )
                     consumed.add(tc_id)
                     insert_at += 1
 
@@ -140,11 +145,16 @@ def merge_tool_results_into_history(
             insert_at = i + 1 + len(found)
             for tc in msg["tool_calls"]:
                 if tc["id"] in missing:
-                    inserts_heal.append((insert_at, {
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": "[not executed -- edge disconnected]",
-                    }))
+                    inserts_heal.append(
+                        (
+                            insert_at,
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": "[not executed -- edge disconnected]",
+                            },
+                        )
+                    )
                     insert_at += 1
     for pos, placeholder in reversed(inserts_heal):
         history.insert(pos, placeholder)
@@ -153,7 +163,8 @@ def merge_tool_results_into_history(
 
 
 def append_recovered_events(
-    history: list[dict[str, Any]], rows: list,
+    history: list[dict[str, Any]],
+    rows: list,
 ) -> list[dict[str, Any]]:
     """Append DB event rows to an existing history list (OpenAI message format).
 
@@ -191,19 +202,25 @@ def append_recovered_events(
             # Restore reasoning_content from dedicated column (first tool_call in batch)
             if not pending_tool_calls and row_reasoning:
                 pending_reasoning = row_reasoning
-            pending_tool_calls.append({
-                "id": tc_data.get("tool_call_id", meta.get("tool_call_id", "")),
-                "type": "function",
-                "function": {
-                    "name": tc_data.get("name", meta.get("name", "")),
-                    "arguments": tc_data.get("arguments", "{}"),
-                },
-            })
+            pending_tool_calls.append(
+                {
+                    "id": tc_data.get("tool_call_id", meta.get("tool_call_id", "")),
+                    "type": "function",
+                    "function": {
+                        "name": tc_data.get("name", meta.get("name", "")),
+                        "arguments": tc_data.get("arguments", "{}"),
+                    },
+                }
+            )
         elif etype == "tool_result":
             tool_call_id = meta.get("tool_call_id", "")
             tool_name = meta.get("name", "")
             if pending_tool_calls:
-                asst: dict[str, Any] = {"role": "assistant", "content": "", "tool_calls": pending_tool_calls}
+                asst: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": pending_tool_calls,
+                }
                 if pending_reasoning:
                     asst["reasoning_content"] = pending_reasoning
                 history.append(asst)
@@ -213,24 +230,39 @@ def append_recovered_events(
             elif not in_tool_batch:
                 if not tool_call_id:
                     continue
-                history.append({"role": "assistant", "content": "", "tool_calls": [{
-                    "id": tool_call_id, "type": "function",
-                    "function": {"name": tool_name, "arguments": "{}"},
-                }]})
+                history.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": tool_call_id,
+                                "type": "function",
+                                "function": {"name": tool_name, "arguments": "{}"},
+                            }
+                        ],
+                    }
+                )
                 in_tool_batch = True
             try:
                 result_data = json.loads(content) if isinstance(content, str) else {}
             except (json.JSONDecodeError, TypeError):
                 result_data = {}
-            history.append({
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": result_data.get("result", content)[:4000] if isinstance(result_data, dict) else str(content)[:4000],
-            })
+            history.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": result_data.get("result", content)[:4000]
+                    if isinstance(result_data, dict)
+                    else str(content)[:4000],
+                }
+            )
         elif etype == "llm_response":
             in_tool_batch = False
             if pending_tool_calls:
-                history.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
+                history.append(
+                    {"role": "assistant", "content": "", "tool_calls": pending_tool_calls}
+                )
                 pending_tool_calls = []
             # Text-only thinking response: reasoning_content stored on llm_response event
             asst_resp: dict[str, Any] = {"role": "assistant", "content": content}

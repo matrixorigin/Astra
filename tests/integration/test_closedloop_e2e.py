@@ -35,8 +35,9 @@ def _make_gate_trigger(db_session: Session) -> GateTrigger:
     return GateTrigger(db_factory=lambda: db_session)
 
 
-def _make_mock_skill(name: str, version: str = "1.0.0", description: str = "test",
-                     definition: dict | None = None) -> Mock:
+def _make_mock_skill(
+    name: str, version: str = "1.0.0", description: str = "test", definition: dict | None = None
+) -> Mock:
     """Create a Mock that satisfies the Skill interface for register()."""
     skill = Mock()
     skill.name = name
@@ -57,7 +58,8 @@ def _seed_llm_events(db: Session, agent_id: str, n: int = 10, quality: float = 4
     for i in range(n):
         eid = generate_id()
         ts = datetime.now() - timedelta(days=i % 7)
-        db.execute(text("""
+        db.execute(
+            text("""
             INSERT INTO agent_events
                 (event_id, session_id, user_id, agent_id, agent_version,
                  event_type, content, quality_score, `metadata`,
@@ -65,14 +67,16 @@ def _seed_llm_events(db: Session, agent_id: str, n: int = 10, quality: float = 4
             VALUES
                 (:eid, :sid, 'system', :aid, '1.0.0',
                  'llm_response', 'test', :qs, :meta, :eid, :ts)
-        """), {
-            "eid": eid,
-            "sid": f"slo_test_{i}",
-            "aid": agent_id,
-            "qs": quality,
-            "meta": json.dumps({"confidence_score": 0.85}),
-            "ts": ts,
-        })
+        """),
+            {
+                "eid": eid,
+                "sid": f"slo_test_{i}",
+                "aid": agent_id,
+                "qs": quality,
+                "meta": json.dumps({"confidence_score": 0.85}),
+                "ts": ts,
+            },
+        )
     db.commit()
 
 
@@ -213,13 +217,20 @@ class TestFanInConflictResolution:
 
         with patch("core.agent.coordination.detect_conflicts") as mock_detect:
             mock_detect.return_value = [
-                Conflict(artifact="file1.py", agents=["a1", "a2"],
-                         proposals=["fix A in file1", "fix B in file1"]),
-                Conflict(artifact="file2.py", agents=["a1", "a3"],
-                         proposals=["keep file2", "fix C in file2"]),
+                Conflict(
+                    artifact="file1.py",
+                    agents=["a1", "a2"],
+                    proposals=["fix A in file1", "fix B in file1"],
+                ),
+                Conflict(
+                    artifact="file2.py",
+                    agents=["a1", "a3"],
+                    proposals=["keep file2", "fix C in file2"],
+                ),
             ]
             agg = cp.fan_in(
-                results, resolve=True,
+                results,
+                resolve=True,
                 priority_order=["a1", "a2", "a3"],
             )
 
@@ -249,13 +260,21 @@ class TestSLOWeeklyGovernance:
             statuses=[
                 SLOStatus(
                     slo=SLOTarget("quality", "avg_quality", 4.0),
-                    current_value=3.5, met=False, burn_rate=2.0,
-                    severity=SLOSeverity.WARNING, days_elapsed=7, bad_days=3,
+                    current_value=3.5,
+                    met=False,
+                    burn_rate=2.0,
+                    severity=SLOSeverity.WARNING,
+                    days_elapsed=7,
+                    bad_days=3,
                 ),
                 SLOStatus(
                     slo=SLOTarget("hallucination_rate", "hallucination_rate", 0.02, "<="),
-                    current_value=0.01, met=True, burn_rate=0.5,
-                    severity=SLOSeverity.OK, days_elapsed=7, bad_days=0,
+                    current_value=0.01,
+                    met=True,
+                    burn_rate=0.5,
+                    severity=SLOSeverity.OK,
+                    days_elapsed=7,
+                    bad_days=0,
                 ),
             ],
             period_days=7,
@@ -263,7 +282,10 @@ class TestSLOWeeklyGovernance:
         )
 
         with patch("core.evaluation.slo_monitor.SLOMonitor.check_agent", return_value=mock_report):
-            with patch("core.context.lifecycle.MemoryGovernanceEngine._get_agent_ids", return_value=["dev-agent"]):
+            with patch(
+                "core.context.lifecycle.MemoryGovernanceEngine._get_agent_ids",
+                return_value=["dev-agent"],
+            ):
                 result = engine.run_weekly_tasks()
 
         assert "slo_violations" in result
@@ -275,7 +297,9 @@ class TestSLOWeeklyGovernance:
 
         engine = MemoryGovernanceEngine(lambda: db_session)
 
-        with patch("core.evaluation.slo_monitor.SLOMonitor.__init__", side_effect=RuntimeError("SLO boom")):
+        with patch(
+            "core.evaluation.slo_monitor.SLOMonitor.__init__", side_effect=RuntimeError("SLO boom")
+        ):
             result = engine.run_weekly_tasks()
 
         # Other weekly tasks still ran
@@ -301,9 +325,7 @@ class TestSLOWeeklyGovernance:
                 assert hasattr(s, "met")
                 assert hasattr(s, "burn_rate")
         finally:
-            db_session.execute(
-                text("DELETE FROM agent_events WHERE agent_id = 'slo_test_agent'")
-            )
+            db_session.execute(text("DELETE FROM agent_events WHERE agent_id = 'slo_test_agent'"))
             db_session.commit()
 
 
@@ -369,7 +391,8 @@ class TestGovernanceTaskRunnerIntegration:
         runner = GovernanceTaskRunner(db_context_factory=db_ctx)
 
         with patch.object(
-            GovernanceTaskRunner, "_run_eval_daily",
+            GovernanceTaskRunner,
+            "_run_eval_daily",
             return_value={"drift_signals": 0, "skills_learned": 0},
         ):
             result = runner.run("eval_daily")
@@ -395,13 +418,15 @@ class TestGovernanceTaskRunnerIntegration:
         runner = GovernanceTaskRunner(db_context_factory=db_ctx)
 
         # Pre-acquire lock (simulate another instance)
-        db_session.add(DistributedLock(
-            lock_name="governance_eval_daily",
-            instance_id="other-host:9999",
-            acquired_at=datetime.now(),
-            expires_at=datetime.now() + timedelta(seconds=300),
-            task_name="eval_daily",
-        ))
+        db_session.add(
+            DistributedLock(
+                lock_name="governance_eval_daily",
+                instance_id="other-host:9999",
+                acquired_at=datetime.now(),
+                expires_at=datetime.now() + timedelta(seconds=300),
+                task_name="eval_daily",
+            )
+        )
         db_session.commit()
 
         try:
@@ -409,7 +434,9 @@ class TestGovernanceTaskRunnerIntegration:
             assert result is None  # Skipped because lock is held
         finally:
             db_session.execute(
-                text("DELETE FROM infra_distributed_locks WHERE lock_name = 'governance_eval_daily'")
+                text(
+                    "DELETE FROM infra_distributed_locks WHERE lock_name = 'governance_eval_daily'"
+                )
             )
             db_session.commit()
 
@@ -425,18 +452,21 @@ class TestGovernanceTaskRunnerIntegration:
         runner = GovernanceTaskRunner(db_context_factory=db_ctx)
 
         # Pre-acquire expired lock
-        db_session.add(DistributedLock(
-            lock_name="governance_eval_daily",
-            instance_id="dead-host:1234",
-            acquired_at=datetime.now() - timedelta(hours=1),
-            expires_at=datetime.now() - timedelta(minutes=30),  # expired
-            task_name="eval_daily",
-        ))
+        db_session.add(
+            DistributedLock(
+                lock_name="governance_eval_daily",
+                instance_id="dead-host:1234",
+                acquired_at=datetime.now() - timedelta(hours=1),
+                expires_at=datetime.now() - timedelta(minutes=30),  # expired
+                task_name="eval_daily",
+            )
+        )
         db_session.commit()
 
         try:
             with patch.object(
-                GovernanceTaskRunner, "_run_eval_daily",
+                GovernanceTaskRunner,
+                "_run_eval_daily",
                 return_value={"drift_signals": 0},
             ):
                 result = runner.run("eval_daily")
@@ -445,7 +475,9 @@ class TestGovernanceTaskRunnerIntegration:
             assert result["drift_signals"] == 0
         finally:
             db_session.execute(
-                text("DELETE FROM infra_distributed_locks WHERE lock_name = 'governance_eval_daily'")
+                text(
+                    "DELETE FROM infra_distributed_locks WHERE lock_name = 'governance_eval_daily'"
+                )
             )
             db_session.commit()
 
@@ -453,5 +485,3 @@ class TestGovernanceTaskRunnerIntegration:
 # ═══════════════════════════════════════════════════════════════════
 # 8. API-level: /chat creates GateTrigger-wired ChatLoop
 # ═══════════════════════════════════════════════════════════════════
-
-

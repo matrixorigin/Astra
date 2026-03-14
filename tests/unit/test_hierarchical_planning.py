@@ -6,8 +6,6 @@ from core.agent.planner import Plan, PlanConstraints, Planner, PlanStep, PlanSta
 from core.llm.client import LLMClient
 
 
-
-
 @pytest.fixture
 def llm_client(db):
     """LLM client fixture."""

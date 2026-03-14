@@ -23,12 +23,10 @@ class TestStreamPersistence:
     async def test_persist_stream(self):
         """Test that stream events are persisted to database."""
         from unittest.mock import MagicMock
-        
+
         mock_logger = MagicMock()
-        mock_logger.create_stream_event = MagicMock(
-            return_value=MagicMock(event_id="evt1")
-        )
-        
+        mock_logger.create_stream_event = MagicMock(return_value=MagicMock(event_id="evt1"))
+
         persistence = StreamPersistence(mock_logger)
 
         # Create test stream
@@ -74,10 +72,10 @@ class TestStreamPersistence:
     async def test_persist_stream_with_error(self):
         """Test that stream continues even if logging fails."""
         from unittest.mock import MagicMock
-        
+
         mock_logger = MagicMock()
         mock_logger.create_stream_event = MagicMock(side_effect=Exception("DB error"))
-        
+
         persistence = StreamPersistence(mock_logger)
 
         # Create test stream
@@ -110,11 +108,11 @@ class TestStreamReplay:
         """Test replaying stream from logged events."""
         from unittest.mock import MagicMock
         from api.models import Event
-        
+
         # Mock database with events
         mock_db = MagicMock()
         mock_result = MagicMock()
-        
+
         # Create mock events
         event1 = Event(
             event_id="evt1",
@@ -123,11 +121,13 @@ class TestStreamReplay:
             agent_id="test-agent",
             agent_version="1.0.0",
             event_type="stream_run_started",
-            content=json.dumps({
-                "event_type": "run_started",
-                "data": {"query": "test"},
-                "stream_event_id": "evt1",
-            }),
+            content=json.dumps(
+                {
+                    "event_type": "run_started",
+                    "data": {"query": "test"},
+                    "stream_event_id": "evt1",
+                }
+            ),
             causal_chain_id="chain1",
             event_metadata={"agent_id": "test-agent"},
         )
@@ -138,15 +138,17 @@ class TestStreamReplay:
             agent_id="test-agent",
             agent_version="1.0.0",
             event_type="stream_text_delta",
-            content=json.dumps({
-                "event_type": "text_delta",
-                "data": {"chunk": "Hello"},
-                "stream_event_id": "evt2",
-            }),
+            content=json.dumps(
+                {
+                    "event_type": "text_delta",
+                    "data": {"chunk": "Hello"},
+                    "stream_event_id": "evt2",
+                }
+            ),
             causal_chain_id="chain1",
             event_metadata={"agent_id": "test-agent"},
         )
-        
+
         mock_scalars = MagicMock()
         mock_scalars.all.return_value = [event1, event2]
         mock_result.scalars.return_value = mock_scalars
@@ -168,10 +170,10 @@ class TestStreamReplay:
         """Test time-travel replay up to specific timestamp."""
         from unittest.mock import MagicMock
         from api.models import Event
-        
+
         mock_db = MagicMock()
         mock_result = MagicMock()
-        
+
         event1 = Event(
             event_id="evt1",
             user_id="user1",
@@ -179,15 +181,17 @@ class TestStreamReplay:
             agent_id="test-agent",
             agent_version="1.0.0",
             event_type="stream_run_started",
-            content=json.dumps({
-                "event_type": "run_started",
-                "data": {},
-                "stream_event_id": "evt1",
-            }),
+            content=json.dumps(
+                {
+                    "event_type": "run_started",
+                    "data": {},
+                    "stream_event_id": "evt1",
+                }
+            ),
             causal_chain_id="chain1",
             event_metadata={"agent_id": "test-agent"},
         )
-        
+
         mock_scalars = MagicMock()
         mock_scalars.all.return_value = [event1]
         mock_result.scalars.return_value = mock_scalars
@@ -207,10 +211,10 @@ class TestStreamReplay:
         """Test getting stream state at specific timestamp."""
         from unittest.mock import MagicMock
         from api.models import Event
-        
+
         mock_db = MagicMock()
         mock_result = MagicMock()
-        
+
         event1 = Event(
             event_id="evt1",
             user_id="user1",
@@ -218,16 +222,18 @@ class TestStreamReplay:
             agent_id="test-agent",
             agent_version="1.0.0",
             event_type="stream_run_started",
-            content=json.dumps({
-                "event_type": "run_started",
-                "data": {},
-                "stream_event_id": "evt1",
-            }),
+            content=json.dumps(
+                {
+                    "event_type": "run_started",
+                    "data": {},
+                    "stream_event_id": "evt1",
+                }
+            ),
             causal_chain_id="chain1",
             event_metadata={"agent_id": "test-agent"},
         )
         event1.created_at = datetime.now(timezone.utc)
-        
+
         event2 = Event(
             event_id="evt2",
             user_id="user1",
@@ -235,16 +241,18 @@ class TestStreamReplay:
             agent_id="test-agent",
             agent_version="1.0.0",
             event_type="stream_text_delta",
-            content=json.dumps({
-                "event_type": "text_delta",
-                "data": {"delta": "Hello"},
-                "stream_event_id": "evt2",
-            }),
+            content=json.dumps(
+                {
+                    "event_type": "text_delta",
+                    "data": {"delta": "Hello"},
+                    "stream_event_id": "evt2",
+                }
+            ),
             causal_chain_id="chain1",
             event_metadata={"agent_id": "test-agent"},
         )
         event2.created_at = datetime.now(timezone.utc)
-        
+
         mock_scalars = MagicMock()
         mock_scalars.all.return_value = [event1, event2]
         mock_result.scalars.return_value = mock_scalars
@@ -252,9 +260,7 @@ class TestStreamReplay:
 
         # Get state
         replay = StreamReplay(lambda: mock_db)
-        state = replay.get_stream_state_at(
-            "session1", datetime.now(timezone.utc), "chain1"
-        )
+        state = replay.get_stream_state_at("session1", datetime.now(timezone.utc), "chain1")
 
         # Verify state
         assert state["session_id"] == "session1"
@@ -273,9 +279,7 @@ class TestStreamValidator:
         # Create valid stream
         async def valid_stream():
             yield StreamEvent(event_type=StreamEventType.RUN_STARTED, data={})
-            yield StreamEvent(
-                event_type=StreamEventType.TEXT_DELTA, data={"chunk": "Hello"}
-            )
+            yield StreamEvent(event_type=StreamEventType.TEXT_DELTA, data={"chunk": "Hello"})
             yield StreamEvent(event_type=StreamEventType.TEXT_DONE, data={})
             yield StreamEvent(event_type=StreamEventType.RUN_FINISHED, data={})
 
@@ -297,9 +301,7 @@ class TestStreamValidator:
 
         # Create invalid stream (TEXT_DELTA before RUN_STARTED)
         async def invalid_stream():
-            yield StreamEvent(
-                event_type=StreamEventType.TEXT_DELTA, data={"chunk": "Hello"}
-            )
+            yield StreamEvent(event_type=StreamEventType.TEXT_DELTA, data={"chunk": "Hello"})
             yield StreamEvent(event_type=StreamEventType.RUN_STARTED, data={})
 
         # Validate
@@ -324,13 +326,9 @@ class TestStreamValidator:
                 event_type=StreamEventType.TOOL_CALL_START,
                 data={"tool": "test_tool"},
             )
-            yield StreamEvent(
-                event_type=StreamEventType.TOOL_CALL_ARGS, data={"args": "{}"}
-            )
+            yield StreamEvent(event_type=StreamEventType.TOOL_CALL_ARGS, data={"args": "{}"})
             yield StreamEvent(event_type=StreamEventType.TOOL_CALL_END, data={})
-            yield StreamEvent(
-                event_type=StreamEventType.TOOL_RESULT, data={"result": "ok"}
-            )
+            yield StreamEvent(event_type=StreamEventType.TOOL_RESULT, data={"result": "ok"})
             yield StreamEvent(event_type=StreamEventType.RUN_FINISHED, data={})
 
         # Validate
@@ -396,9 +394,7 @@ class TestStreamMultiplexer:
 
         # Create stream without agent_id
         async def untagged_stream():
-            yield StreamEvent(
-                event_type=StreamEventType.TEXT_DELTA, data={"chunk": "test"}
-            )
+            yield StreamEvent(event_type=StreamEventType.TEXT_DELTA, data={"chunk": "test"})
 
         # Merge with agent_id
         streams = {"test-agent": untagged_stream()}
@@ -409,6 +405,7 @@ class TestStreamMultiplexer:
         # Verify agent_id added
         assert len(events) == 1
         assert events[0].agent_id == "test-agent"
+
 
 @pytest.fixture
 def mock_db():

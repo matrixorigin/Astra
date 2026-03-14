@@ -72,8 +72,12 @@ class TestCatalogDBPersistence:
             priority=8,
             cost_estimate="medium",
             status="active",
-            tags={"scope": "external", "data_source": "external_api",
-                  "intent_type": ["fetch"], "requires_history": False},
+            tags={
+                "scope": "external",
+                "data_source": "external_api",
+                "intent_type": ["fetch"],
+                "requires_history": False,
+            },
         )
 
         row = db.query(SkillRegistryModel).filter_by(skill_id="test_list_prs@1.0.0").first()
@@ -158,7 +162,10 @@ class TestRegistryFromCatalog:
         reg = ToolRegistry()
         for name in ("bash", "grep", "read_file"):
             reg.register_schema(
-                {"type": "function", "function": {"name": name, "description": name, "parameters": {}}},
+                {
+                    "type": "function",
+                    "function": {"name": name, "description": name, "parameters": {}},
+                },
                 source=ToolSource.EDGE,
             )
         for s in catalog.list_skills():
@@ -194,7 +201,10 @@ class TestRegistrySelect:
         reg = ToolRegistry(max_tokens=50000)
         for name in ("bash", "read_file", "grep"):
             reg.register_schema(
-                {"type": "function", "function": {"name": name, "description": f"{name} tool", "parameters": {}}},
+                {
+                    "type": "function",
+                    "function": {"name": name, "description": f"{name} tool", "parameters": {}},
+                },
                 source=ToolSource.EDGE,
             )
         for s in catalog.list_skills():
@@ -239,8 +249,11 @@ class TestRegistrySelect:
     def test_conversation_history_prefilter(self, registry):
         messages = [
             {"role": "user", "content": "show prs"},
-            {"role": "assistant", "content": "done",
-             "tool_calls": [{"function": {"name": "test_list_prs", "arguments": "{}"}}]},
+            {
+                "role": "assistant",
+                "content": "done",
+                "tool_calls": [{"function": {"name": "test_list_prs", "arguments": "{}"}}],
+            },
             {"role": "user", "content": "now check CI"},
         ]
         result = registry.select("now check CI", messages)
@@ -261,7 +274,10 @@ class TestChatLoopWiring:
 
         reg = ToolRegistry(max_tokens=50000)
         reg.register_schema(
-            {"type": "function", "function": {"name": "bash", "description": "Run shell", "parameters": {}}},
+            {
+                "type": "function",
+                "function": {"name": "bash", "description": "Run shell", "parameters": {}},
+            },
             source=ToolSource.EDGE,
         )
         for s in catalog.list_skills():
@@ -283,7 +299,10 @@ class TestChatLoopWiring:
 
         reg = ToolRegistry(max_tokens=50000)
         reg.register_schema(
-            {"type": "function", "function": {"name": "bash", "description": "Run shell", "parameters": {}}},
+            {
+                "type": "function",
+                "function": {"name": "bash", "description": "Run shell", "parameters": {}},
+            },
             source=ToolSource.EDGE,
         )
         for s in catalog.list_skills():

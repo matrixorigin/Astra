@@ -8,33 +8,41 @@ from api.dependencies import get_current_user
 from config.settings import get_settings
 # Removed: credential_manager, resolver, skill_manager modules deleted
 
+
 # Exception stubs for deleted modules
 class PermissionDeniedError(Exception):
     pass
 
+
 class SkillNotFoundError(Exception):
     pass
+
 
 class SkillNotInstalledError(Exception):
     pass
 
+
 class CircularDependencyError(Exception):
     pass
 
+
 class DependencyConflictError(Exception):
     pass
+
 
 router = APIRouter()
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+
 def _mgr():
     """Stubbed out - SkillManager module deleted."""
-    raise NotImplementedError('Module removed in skill system cleanup')
+    raise NotImplementedError("Module removed in skill system cleanup")
 
 
 # ── request / response models ────────────────────────────────────────────────
+
 
 class InstallRequest(BaseModel):
     skill_name: str
@@ -61,6 +69,7 @@ class InstalledListResponse(BaseModel):
 
 
 # ── skill lifecycle ──────────────────────────────────────────────────────────
+
 
 @router.post("/install", response_model=InstallationResponse, status_code=status.HTTP_201_CREATED)
 async def install_skill(
@@ -166,6 +175,7 @@ async def list_installed(
 
 # ── credential management ────────────────────────────────────────────────────
 
+
 @router.post("/credentials", status_code=status.HTTP_204_NO_CONTENT)
 async def save_credential(
     req: CredentialRequest,
@@ -173,7 +183,10 @@ async def save_credential(
 ):
     """Save (or update) an encrypted credential for a skill."""
     _mgr().save_credential(
-        current_user["user_id"], req.skill_name, req.credential_name, req.value,
+        current_user["user_id"],
+        req.skill_name,
+        req.credential_name,
+        req.value,
     )
 
 
@@ -185,13 +198,16 @@ async def delete_credential(
 ):
     """Delete a credential."""
     deleted = _mgr().delete_credential(
-        current_user["user_id"], skill_name, credential_name,
+        current_user["user_id"],
+        skill_name,
+        credential_name,
     )
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Credential not found")
 
 
 # ── Lifecycle transitions ─────────────────────────────────────────────────────
+
 
 @router.post("/skills/{skill_name}/publish", status_code=status.HTTP_200_OK)
 def publish_skill(
@@ -200,6 +216,7 @@ def publish_skill(
 ):
     """Publish a skill: draft → active. Triggers regression gate if configured."""
     from core.skills.catalog import SkillCatalog
+
     registry = SkillCatalog(SessionLocal)
     try:
         registry.publish(skill_name)
@@ -215,6 +232,7 @@ def deprecate_skill(
 ):
     """Deprecate a skill: active → deprecated."""
     from core.skills.catalog import SkillCatalog
+
     registry = SkillCatalog(SessionLocal)
     try:
         registry.deprecate(skill_name)

@@ -22,14 +22,29 @@ W_RECURRENCE = 0.20
 
 # §13.3 Task-type-specific weight overrides
 TASK_IMPORTANCE_WEIGHTS: dict[str, dict[str, float]] = {
-    "debugging":   {"contradiction": 0.45, "recurrence": 0.25, "centrality": 0.15, "cross_session": 0.15},
-    "code_review": {"cross_session": 0.35, "centrality": 0.30, "recurrence": 0.20, "contradiction": 0.15},
-    "planning":    {"cross_session": 0.30, "centrality": 0.30, "recurrence": 0.25, "contradiction": 0.15},
+    "debugging": {
+        "contradiction": 0.45,
+        "recurrence": 0.25,
+        "centrality": 0.15,
+        "cross_session": 0.15,
+    },
+    "code_review": {
+        "cross_session": 0.35,
+        "centrality": 0.30,
+        "recurrence": 0.20,
+        "contradiction": 0.15,
+    },
+    "planning": {
+        "cross_session": 0.30,
+        "centrality": 0.30,
+        "recurrence": 0.25,
+        "contradiction": 0.15,
+    },
 }
 
 # Thresholds
 IMMEDIATE_THRESHOLD = 0.7  # event-triggered reflection
-DAILY_THRESHOLD = 0.5      # queued for daily reflection
+DAILY_THRESHOLD = 0.5  # queued for daily reflection
 
 
 def _get_weights(task_type: str | None) -> tuple[float, float, float, float]:
@@ -54,24 +69,20 @@ def score_candidate(
     """
     w_cen, w_cs, w_con, w_rec = _get_weights(task_type)
 
-    centrality = min(activation_energy, 1.0) if activation_energy > 0 else min(len(candidate.memories) / 5.0, 1.0)
+    centrality = (
+        min(activation_energy, 1.0)
+        if activation_energy > 0
+        else min(len(candidate.memories) / 5.0, 1.0)
+    )
     cross_session = min(len(set(candidate.session_ids)) / 3.0, 1.0)
 
     if candidate.signal == "contradiction":
         contradiction = 1.0
-    elif any(
-        getattr(m, "initial_confidence", 1.0) < 0.5
-        for m in candidate.memories
-    ):
+    elif any(getattr(m, "initial_confidence", 1.0) < 0.5 for m in candidate.memories):
         contradiction = 0.7
     else:
         contradiction = 0.0
 
     recurrence = min(len(candidate.memories) / 5.0, 1.0)
 
-    return (
-        w_cen * centrality
-        + w_cs * cross_session
-        + w_con * contradiction
-        + w_rec * recurrence
-    )
+    return w_cen * centrality + w_cs * cross_session + w_con * contradiction + w_rec * recurrence

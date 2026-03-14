@@ -10,8 +10,11 @@ from unittest.mock import MagicMock, patch
 
 from core.context.manager import ContextManager, TaskType
 from core.context.scorer import (
-    ScoringWeights, RelevanceScorer, TASK_WEIGHTS,
-    TopicShiftConfig, _DEFAULT_TOPIC_SHIFT_CONFIG,
+    ScoringWeights,
+    RelevanceScorer,
+    TASK_WEIGHTS,
+    TopicShiftConfig,
+    _DEFAULT_TOPIC_SHIFT_CONFIG,
 )
 from core.utils.similarity import cosine_similarity as _cosine_similarity
 
@@ -166,8 +169,10 @@ class TestDetectTopicShift:
             # Slightly related
             "how do I use type hints in Python": [0.7, 0.3, 0.0],
         }
+
         def embed_text(text):
             return vectors.get(text, [0.33, 0.33, 0.34])
+
         emb.embed_text = embed_text
         return emb
 
@@ -245,6 +250,7 @@ class TestTopicShiftScoring:
 
     def _make_candidate(self, event_id, content, chain_id="chain-old", age_hours=0.5):
         from datetime import datetime, timezone, timedelta
+
         return {
             "event_id": event_id,
             "content": content,
@@ -258,7 +264,9 @@ class TestTopicShiftScoring:
             self._make_candidate("old-topic", "Python decorators", "chain-old", 0.1),
             self._make_candidate("new-topic", "context window size", "chain-new", 2.0),
         ]
-        scored = scorer.score_candidates("how big is my context", candidates, "sess-1", topic_shift=None)
+        scored = scorer.score_candidates(
+            "how big is my context", candidates, "sess-1", topic_shift=None
+        )
         # Old topic event has temporal + causal boost
         old_score = next(s for c, s, _ in scored if c["event_id"] == "old-topic")
         new_score = next(s for c, s, _ in scored if c["event_id"] == "new-topic")
@@ -272,10 +280,16 @@ class TestTopicShiftScoring:
             self._make_candidate("new-topic", "context window size", "chain-new", 2.0),
         ]
         scored_no_shift = scorer.score_candidates(
-            "how big is my context", candidates, "sess-1", topic_shift=None,
+            "how big is my context",
+            candidates,
+            "sess-1",
+            topic_shift=None,
         )
         scored_with_shift = scorer.score_candidates(
-            "how big is my context", candidates, "sess-1", topic_shift=0.9,
+            "how big is my context",
+            candidates,
+            "sess-1",
+            topic_shift=0.9,
         )
 
         def get_score(scored, eid):
@@ -358,6 +372,7 @@ class TestEndToEndImprovement:
         from datetime import datetime, timezone, timedelta
 
         emb = MagicMock()
+
         # Code topic = [1,0,0], introspection = [0,1,0]
         def embed_text(text):
             if any(kw in text.lower() for kw in ["decorator", "python", "code", "function"]):
@@ -365,6 +380,7 @@ class TestEndToEndImprovement:
             if any(kw in text.lower() for kw in ["context", "上下文", "token", "多大"]):
                 return [0.0, 1.0, 0.0]
             return [0.5, 0.5, 0.0]
+
         emb.embed_text = embed_text
         emb.search_similar.return_value = []
 
@@ -455,33 +471,39 @@ class TestEndToEndTopicShift:
         now = datetime.now(timezone.utc)
         events = []
         for i in range(10):
-            events.append({
-                "event_id": f"code-{i}",
-                "event_type": "user_query" if i % 2 == 0 else "llm_response",
-                "content": f"Python decorator example {i}: def my_decorator(func): pass",
-                "created_at": now - timedelta(minutes=20 - i),
-                "parent_event_id": None,
-                "causal_chain_id": "code-chain",
-                "metadata": {},
-            })
+            events.append(
+                {
+                    "event_id": f"code-{i}",
+                    "event_type": "user_query" if i % 2 == 0 else "llm_response",
+                    "content": f"Python decorator example {i}: def my_decorator(func): pass",
+                    "created_at": now - timedelta(minutes=20 - i),
+                    "parent_event_id": None,
+                    "causal_chain_id": "code-chain",
+                    "metadata": {},
+                }
+            )
         # One older but relevant event about context
-        events.append({
-            "event_id": "ctx-old",
-            "event_type": "llm_response",
-            "content": "Your context window is currently using 5000 tokens",
-            "created_at": now - timedelta(hours=2),
-            "parent_event_id": None,
-            "causal_chain_id": "other-chain",
-            "metadata": {},
-        })
+        events.append(
+            {
+                "event_id": "ctx-old",
+                "event_type": "llm_response",
+                "content": "Your context window is currently using 5000 tokens",
+                "created_at": now - timedelta(hours=2),
+                "parent_event_id": None,
+                "causal_chain_id": "other-chain",
+                "metadata": {},
+            }
+        )
         return events
 
     def _build_context_manager(self, embeddings):
         """Create ContextManager with mocked DB and controlled embeddings."""
         mock_db = MagicMock()
 
-        with patch("core.context.embeddings.EmbeddingService") as MockEmbSvc, \
-             patch("core.context.prompts.PromptManager") as MockPrompts:
+        with (
+            patch("core.context.embeddings.EmbeddingService") as MockEmbSvc,
+            patch("core.context.prompts.PromptManager") as MockPrompts,
+        ):
             MockEmbSvc.return_value = embeddings
             MockPrompts.return_value.get_system_prompt.return_value = "You are an agent."
 
@@ -494,7 +516,9 @@ class TestEndToEndTopicShift:
             return cm
 
     def test_build_context_selects_fewer_stale_events_on_topic_shift(
-        self, deterministic_embeddings, code_events,
+        self,
+        deterministic_embeddings,
+        code_events,
     ):
         """Core assertion: topic shift → fewer code events selected.
 
@@ -542,7 +566,9 @@ class TestEndToEndTopicShift:
         )
 
     def test_build_context_relevance_order_changes_on_shift(
-        self, deterministic_embeddings, code_events,
+        self,
+        deterministic_embeddings,
+        code_events,
     ):
         """The score distribution should change when topic shifts.
 
@@ -581,7 +607,9 @@ class TestEndToEndTopicShift:
         )
 
     def test_no_shift_preserves_recency_order(
-        self, deterministic_embeddings, code_events,
+        self,
+        deterministic_embeddings,
+        code_events,
     ):
         """Without topic shift, recent code events should dominate."""
         cm = self._build_context_manager(deterministic_embeddings)
@@ -624,12 +652,14 @@ class TestEndToEndCostSavings:
         from datetime import datetime, timezone, timedelta
 
         emb = MagicMock()
+
         def embed_text(text):
             if "decorator" in text.lower():
                 return [1.0, 0.0, 0.0]
             if "context" in text.lower() or "上下文" in text:
                 return [0.0, 1.0, 0.0]
             return [0.5, 0.5, 0.0]
+
         emb.embed_text = embed_text
         emb.search_similar.return_value = []
 

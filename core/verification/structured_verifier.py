@@ -198,9 +198,7 @@ class StructuredVerifier:
                 return self._extract_context(text, word)
         return None
 
-    def _semantic_verify(
-        self, claim: Claim, evidence: list[Evidence]
-    ) -> tuple[bool, float]:
+    def _semantic_verify(self, claim: Claim, evidence: list[Evidence]) -> tuple[bool, float]:
         """Use LLM for semantic verification.
 
         Args:

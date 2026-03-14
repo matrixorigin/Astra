@@ -93,7 +93,8 @@ class GateTrigger:
                 if verdict == "fail":
                     logger.warning(
                         "GATE FAILED for %s — metrics: %s",
-                        change_id, result.get("metrics"),
+                        change_id,
+                        result.get("metrics"),
                     )
             finally:
                 self._release(db, lock_name)
@@ -119,13 +120,15 @@ class GateTrigger:
 
         # Fast path: INSERT (first writer wins)
         try:
-            db.add(DistributedLock(
-                lock_name=lock_name,
-                instance_id=instance_id,
-                acquired_at=now,
-                expires_at=expires_at,
-                task_name="gate",
-            ))
+            db.add(
+                DistributedLock(
+                    lock_name=lock_name,
+                    instance_id=instance_id,
+                    acquired_at=now,
+                    expires_at=expires_at,
+                    task_name="gate",
+                )
+            )
             db.commit()
             return True
         except (IntegrityError, OperationalError):
@@ -146,6 +149,7 @@ class GateTrigger:
     @staticmethod
     def _release(db, lock_name: str):
         from sqlalchemy import text
+
         try:
             db.execute(
                 text("DELETE FROM infra_distributed_locks WHERE lock_name = :name"),

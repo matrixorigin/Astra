@@ -90,6 +90,7 @@ class SyncAPIClient:
             api = self._ensure_client()
             method = getattr(api, name)
             return self._run(method(*args, **kwargs))
+
         return wrapper
 
 
@@ -97,14 +98,17 @@ class SyncAPIClient:
 # Slash command handlers (used by chat REPL)
 # ============================================================================
 
+
 def _get_console():
     """Lazy import to avoid import cost for non-chat commands."""
     from rich.console import Console
+
     return Console(stderr=True)
 
 
 def cmd_help(console, **_):
     from rich.table import Table
+
     t = Table(show_header=False, box=None, padding=(0, 2))
     t.add_column(style="cyan")
     t.add_column(style="dim")
@@ -137,6 +141,7 @@ def cmd_help(console, **_):
 
 def cmd_model(console, client=None, selected_model=None, cmd_arg=None, state=None, **_):
     from cli.api_client import AuthenticationError
+
     try:
         models = client.admin_list_models()
         active = [m for m in models if m.get("is_active", True)]
@@ -154,9 +159,12 @@ def cmd_model(console, client=None, selected_model=None, cmd_arg=None, state=Non
                     console.print(f"  • {m['name']} ({m['provider']})", style="dim")
         else:
             if not active:
-                console.print("No active models. Run: mo-admin model add <name> <provider>", style="dim")
+                console.print(
+                    "No active models. Run: mo-admin model add <name> <provider>", style="dim"
+                )
             else:
                 from rich.table import Table
+
                 t = Table(show_header=True, box=None)
                 t.add_column("", width=2)
                 t.add_column("Model")
@@ -176,11 +184,15 @@ def cmd_model(console, client=None, selected_model=None, cmd_arg=None, state=Non
 
 def cmd_session(console, session_id=None, username=None, state=None, **_):
     from rich.panel import Panel
+
     model = state.get("selected_model", "(default)") if state else "(default)"
-    console.print(Panel(
-        f"📝 {session_id}\n👤 {username}\n🤖 {model}",
-        title="Session", border_style="bright_black",
-    ))
+    console.print(
+        Panel(
+            f"📝 {session_id}\n👤 {username}\n🤖 {model}",
+            title="Session",
+            border_style="bright_black",
+        )
+    )
 
 
 def cmd_clear(console, client=None, user_id=None, state=None, **_):
@@ -220,8 +232,13 @@ def cmd_copy(console, state=None, **_):
         return
     for tool in ["pbcopy", "xclip", "xsel"]:
         try:
-            subprocess.run([tool], input=last.encode(), check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(
+                [tool],
+                input=last.encode(),
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
             console.print("[green]✓[/green] Copied to clipboard")
             return
         except (FileNotFoundError, subprocess.CalledProcessError):
@@ -231,12 +248,14 @@ def cmd_copy(console, state=None, **_):
 
 def cmd_doctor(console, client=None, **_):
     from cli.ui.doctor import run_doctor
+
     run_doctor(console, client)
 
 
 def cmd_version(console, **_):
     import platform
     from importlib.metadata import version as pkg_version
+
     console.print(f"mo-agent {VERSION}")
     console.print(f"Python {platform.python_version()}", style="dim")
     try:
@@ -251,6 +270,7 @@ def cmd_version(console, **_):
 
 def cmd_login(console, client=None, **_):
     import click as _click
+
     username = _click.prompt("Username")
     password = _click.prompt("Password", hide_input=True)
     try:
@@ -295,6 +315,7 @@ def cmd_skill(console, cmd_arg=None, client=None, state=None, **kw):
         from rich.table import Table
 
         from core.skills.markdown_skill import MarkdownSkill
+
         t = Table(show_header=True, box=None)
         t.add_column("Skill")
         t.add_column("Type", style="dim")
@@ -320,7 +341,7 @@ def cmd_skill(console, cmd_arg=None, client=None, state=None, **kw):
         cls = _to_class(name)
         (skill_dir / "skill.py").write_text(_generate_skill_template(name, cls))
         (skill_dir / "SKILL.md").write_text(
-            f'''---
+            f"""---
 name: {name}
 version: 1.0.0
 description: TODO
@@ -329,7 +350,8 @@ description: TODO
 # {name}
 
 TODO: describe this skill for the LLM.
-''')
+"""
+        )
         console.print(f"[green]✓[/green] Created {skill_dir.relative_to(project_root)}/")
         console.print("  [dim]skill.py[/dim]  — implement your logic here")
         console.print("  [dim]SKILL.md[/dim]  — LLM-facing description (fallback if no skill.py)")
@@ -368,6 +390,7 @@ TODO: describe this skill for the LLM.
 
         try:
             from cli.tools.router import ToolCall, ToolRouter
+
             router = ToolRouter()
             router.register(match.skill)
             coro = router.execute([ToolCall(id="test", name=name, arguments=args)])
@@ -406,7 +429,9 @@ TODO: describe this skill for the LLM.
                 errors = [msg for level, msg in issues if level == "error"]
                 warnings = [msg for level, msg in issues if level == "warning"]
                 if errors:
-                    console.print(f"[red]⚠ {len(errors)} error(s) found — skill may not work correctly:[/red]")
+                    console.print(
+                        f"[red]⚠ {len(errors)} error(s) found — skill may not work correctly:[/red]"
+                    )
                     for msg in errors:
                         console.print(f"  [red]ERROR[/red]: {msg}")
                     console.print(f"  [dim]Fix with: /skill dev {dev_name}[/dim]")
@@ -463,11 +488,13 @@ TODO: describe this skill for the LLM.
         console.print(f"  [dim]{skill_dir.relative_to(project_root)}[/dim]")
         console.print()
         console.print("  [bold]How to use:[/bold]")
-        console.print("  1. Describe what the skill should do (e.g. \"fetch real-time stock price from akshare\")")
+        console.print(
+            '  1. Describe what the skill should do (e.g. "fetch real-time stock price from akshare")'
+        )
         console.print("  2. AI will write the code, then auto-test it")
         console.print("  3. Review the output, ask for changes if needed")
         console.print()
-        console.print(f"  [dim]Test manually:  /skill test {name} {{\"param\": \"value\"}}[/dim]")
+        console.print(f'  [dim]Test manually:  /skill test {name} {{"param": "value"}}[/dim]')
         console.print(f"  [dim]Validate:       /skill validate {name}[/dim]")
         console.print("  [dim]Exit dev mode:  /skill dev off[/dim]")
         sb = kw.get("status_bar")
@@ -493,8 +520,7 @@ TODO: describe this skill for the LLM.
             warnings = [msg for level, msg in issues if level == "warning"]
             if errors:
                 console.print(
-                    f"[red]✗[/red] {name} — "
-                    f"{len(errors)} error(s), {len(warnings)} warning(s)"
+                    f"[red]✗[/red] {name} — {len(errors)} error(s), {len(warnings)} warning(s)"
                 )
                 for msg in errors:
                     console.print(f"  [red]ERROR[/red]: {msg}")
@@ -543,18 +569,28 @@ def _cmd_skill_doctor(console, skill_name: str | None, client):
         status_color = {"healthy": "green", "warning": "yellow", "critical": "red"}
         icon = status_icon.get(result.health_status, "?")
         color = status_color.get(result.health_status, "white")
-        console.print(f"[{color}]{icon}[/{color}] Skill Health: [{color}]{result.health_status.upper()}[/{color}]")
+        console.print(
+            f"[{color}]{icon}[/{color}] Skill Health: [{color}]{result.health_status.upper()}[/{color}]"
+        )
 
         # Summary
         console.print(f"  Total: {result.total_skills} | Healthy: {result.healthy}")
         if result.orphaned:
-            console.print(f"  [red]Orphaned ({result.orphaned}):[/red] {', '.join(result.orphaned_names)}")
+            console.print(
+                f"  [red]Orphaned ({result.orphaned}):[/red] {', '.join(result.orphaned_names)}"
+            )
         if result.load_errors:
-            console.print(f"  [red]Load errors ({result.load_errors}):[/red] {', '.join(result.load_error_names)}")
+            console.print(
+                f"  [red]Load errors ({result.load_errors}):[/red] {', '.join(result.load_error_names)}"
+            )
         if result.version_mismatches:
-            console.print(f"  [yellow]Version mismatches ({result.version_mismatches}):[/yellow] {', '.join(result.mismatch_names)}")
+            console.print(
+                f"  [yellow]Version mismatches ({result.version_mismatches}):[/yellow] {', '.join(result.mismatch_names)}"
+            )
         if result.more_issues:
-            console.print("  [dim]... more issues exist. Use /skill doctor <name> for details[/dim]")
+            console.print(
+                "  [dim]... more issues exist. Use /skill doctor <name> for details[/dim]"
+            )
 
         # Detailed diagnosis
         if result.diagnosis:
@@ -562,7 +598,7 @@ def _cmd_skill_doctor(console, skill_name: str | None, client):
             console.print(f"\n[bold]Diagnosis: {d['skill_name']}[/bold]")
             console.print(f"  Type: {d['issue_type']}")
             console.print(f"  Message: {d['message']}")
-            if d.get('suggestion'):
+            if d.get("suggestion"):
                 console.print(f"  [cyan]Fix:[/cyan] {d['suggestion']}")
 
         # Suggestions
@@ -589,7 +625,9 @@ def _cmd_skill_config(console: "Console", args: str, client: "SyncAPIClient | No
 
     parts = shlex.split(args) if args else []
     if not parts:
-        console.print("[red]Usage: /skill config <name> [--set K=V | --validate | --list-resources][/red]")
+        console.print(
+            "[red]Usage: /skill config <name> [--set K=V | --validate | --list-resources][/red]"
+        )
         return
 
     skill_name = parts[0]
@@ -701,19 +739,19 @@ def _build_skill_dev_context(name: str, skill_dir: Path) -> str:
         "4. If the test fails or returns empty data, fix the code and re-test",
         "",
         "Use the shell tool to test:",
-        '```bash',
+        "```bash",
         f'cd {skill_dir.parent.parent.parent} && python -c "',
-        'import asyncio, json',
-        'from core.skills.loader import SkillLoader',
-        'from pathlib import Path',
-        f'skills = SkillLoader.discover([Path(\"{skill_dir.parent}\")])',
-        f's = next((s for s in skills if s.skill.name == \"{name}\"), None)',
-        'if s:',
-        '    inp = s.skill.validate_input({\"query\": \"test\"})',
-        '    r = asyncio.run(s.skill.execute(inp))',
-        '    print(json.dumps(r.model_dump(), indent=2, ensure_ascii=False, default=str))',
+        "import asyncio, json",
+        "from core.skills.loader import SkillLoader",
+        "from pathlib import Path",
+        f'skills = SkillLoader.discover([Path("{skill_dir.parent}")])',
+        f's = next((s for s in skills if s.skill.name == "{name}"), None)',
+        "if s:",
+        '    inp = s.skill.validate_input({"query": "test"})',
+        "    r = asyncio.run(s.skill.execute(inp))",
+        "    print(json.dumps(r.model_dump(), indent=2, ensure_ascii=False, default=str))",
         '"',
-        '```',
+        "```",
         "",
         "DO NOT consider the skill done until you have seen a successful test output with real data.",
         "",
@@ -1045,15 +1083,18 @@ def _validate_skill_source(skill_dir: Path) -> list[tuple[str, str]]:
                 if not line.startswith("\t"):
                     in_execute = False
             elif in_execute and "raise " in line:
-                issues.append((
-                    "warning",
-                    "Avoid 'raise' in execute() — return Output(success=False, error=...)",
-                ))
+                issues.append(
+                    (
+                        "warning",
+                        "Avoid 'raise' in execute() — return Output(success=False, error=...)",
+                    )
+                )
                 break
 
     # Check for Field descriptions in SkillInput subclasses
     if "SkillInput" in source:
         import re
+
         # Find SkillInput subclass section
         input_section = re.search(r"class \w+\(SkillInput\):.*?(?=class |\Z)", source, re.DOTALL)
         if input_section:
@@ -1067,14 +1108,17 @@ def _validate_skill_source(skill_dir: Path) -> list[tuple[str, str]]:
             skip = {"success", "result", "error", "cost", "repo_id", "user_id", "session_id"}
             missing_desc = [f for f in all_fields if f not in skip and f not in fields_with_field]
             if missing_desc:
-                issues.append((
-                    "warning",
-                    f"Fields without Field(description=...): {', '.join(missing_desc[:3])}",
-                ))
+                issues.append(
+                    (
+                        "warning",
+                        f"Fields without Field(description=...): {', '.join(missing_desc[:3])}",
+                    )
+                )
 
     # Check for Output fields without defaults
     if "SkillOutput" in source:
         import re
+
         # Find any class that inherits from SkillOutput
         output_section = re.search(
             r"class \w+\(SkillOutput\):.*?(?=\nclass |\Z)", source, re.DOTALL
@@ -1086,20 +1130,24 @@ def _validate_skill_source(skill_dir: Path) -> list[tuple[str, str]]:
             skip = {"success", "result", "error", "cost"}
             missing_default = [f for f in no_default if f not in skip]
             if missing_default:
-                issues.append((
-                    "warning",
-                    f"Output fields without defaults: {', '.join(missing_default[:3])}",
-                ))
+                issues.append(
+                    (
+                        "warning",
+                        f"Output fields without defaults: {', '.join(missing_default[:3])}",
+                    )
+                )
 
     # Try to actually load the skill
     try:
         import importlib.util
+
         spec = importlib.util.spec_from_file_location("_skill_validate", skill_py)
         if spec and spec.loader:
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             # Find Skill subclass
             from core.skills.base import Skill as SkillBase
+
             skill_cls = None
             for attr in vars(mod).values():
                 if isinstance(attr, type) and issubclass(attr, SkillBase) and attr is not SkillBase:
@@ -1120,33 +1168,62 @@ def _validate_skill_source(skill_dir: Path) -> list[tuple[str, str]]:
                     # like variable names containing "ak." or comments mentioning "requests".
                     is_network = any(r.value == "network" for r in instance.requirements.runtime)
                     if is_network:
-                        import_lines = [l.strip() for l in source.splitlines()
-                                        if l.strip().startswith(("import ", "from "))]
-                        _HTTP_MODULES = {"httpx", "requests", "aiohttp", "urllib", "akshare", "grpc", "websocket"}
+                        import_lines = [
+                            l.strip()
+                            for l in source.splitlines()
+                            if l.strip().startswith(("import ", "from "))
+                        ]
+                        _HTTP_MODULES = {
+                            "httpx",
+                            "requests",
+                            "aiohttp",
+                            "urllib",
+                            "akshare",
+                            "grpc",
+                            "websocket",
+                        }
                         has_http_import = any(
-                            mod_name in line
-                            for line in import_lines
-                            for mod_name in _HTTP_MODULES
+                            mod_name in line for line in import_lines for mod_name in _HTTP_MODULES
                         )
                         if not has_http_import:
-                            issues.append(("warning", "NETWORK skill but no HTTP/API library imported — verify data source"))
+                            issues.append(
+                                (
+                                    "warning",
+                                    "NETWORK skill but no HTTP/API library imported — verify data source",
+                                )
+                            )
                     # Check data_source is assigned in execute() body (not just mentioned in comments).
                     # Looks for "data_source=" or "data_source =" assignment patterns.
                     if is_network:
-                        if not re.search(r'data_source\s*=', source):
-                            issues.append(("warning", "Missing data_source assignment — set SkillOutput.data_source for provenance tracking"))
+                        if not re.search(r"data_source\s*=", source):
+                            issues.append(
+                                (
+                                    "warning",
+                                    "Missing data_source assignment — set SkillOutput.data_source for provenance tracking",
+                                )
+                            )
                     # Check Output class has business fields beyond base SkillOutput
                     from core.skills.base import SkillOutput as SkillOutputBase
+
                     output_cls = None
                     for attr in vars(mod).values():
-                        if isinstance(attr, type) and issubclass(attr, SkillOutputBase) and attr is not SkillOutputBase:
+                        if (
+                            isinstance(attr, type)
+                            and issubclass(attr, SkillOutputBase)
+                            and attr is not SkillOutputBase
+                        ):
                             output_cls = attr
                             break
                     if output_cls:
                         base_fields = {"success", "result", "error", "cost"}
                         custom_fields = [f for f in output_cls.model_fields if f not in base_fields]
                         if not custom_fields:
-                            issues.append(("warning", "Output has no business fields — skill returns no useful data to LLM"))
+                            issues.append(
+                                (
+                                    "warning",
+                                    "Output has no business fields — skill returns no useful data to LLM",
+                                )
+                            )
                 except Exception as e:
                     issues.append(("error", f"Cannot instantiate skill: {e}"))
     except SyntaxError as e:
@@ -1194,10 +1271,14 @@ def cmd_explain(console, state=None, cmd_arg=None, **_):
     """
     if cmd_arg in ("on", "1", "true"):
         state["explain_mode"] = True
-        console.print("[green]✓[/green] Explain mode [bold]ON[/bold] — will show stats after each turn")
+        console.print(
+            "[green]✓[/green] Explain mode [bold]ON[/bold] — will show stats after each turn"
+        )
     elif cmd_arg == "verbose":
         state["explain_mode"] = "verbose"
-        console.print("[green]✓[/green] Explain mode [bold]VERBOSE[/bold] — will show detailed stats + content previews")
+        console.print(
+            "[green]✓[/green] Explain mode [bold]VERBOSE[/bold] — will show detailed stats + content previews"
+        )
     elif cmd_arg in ("off", "0", "false"):
         state["explain_mode"] = False
         console.print("[dim]Explain mode OFF[/dim]")
@@ -1206,13 +1287,17 @@ def cmd_explain(console, state=None, cmd_arg=None, **_):
         current = state.get("explain_mode", False)
         if not current:
             state["explain_mode"] = True
-            console.print("[green]✓[/green] Explain mode [bold]ON[/bold] — will show stats after each turn")
+            console.print(
+                "[green]✓[/green] Explain mode [bold]ON[/bold] — will show stats after each turn"
+            )
         elif current == "verbose":
             state["explain_mode"] = False
             console.print("[dim]Explain mode OFF[/dim]")
         else:
             state["explain_mode"] = "verbose"
-            console.print("[green]✓[/green] Explain mode [bold]VERBOSE[/bold] — will show detailed stats + content previews")
+            console.print(
+                "[green]✓[/green] Explain mode [bold]VERBOSE[/bold] — will show detailed stats + content previews"
+            )
 
 
 SLASH_COMMANDS = {
@@ -1237,7 +1322,21 @@ SLASH_COMMANDS = {
 # Edge turn runner
 # ============================================================================
 
-async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, auto_approve, renderer=None, extra_rules=None, explain=False, session_info=None, routing_strategy=None, user_id=None):
+
+async def _run_edge_turn(
+    user_input,
+    api_client,
+    session_id,
+    model,
+    agent_id,
+    auto_approve,
+    renderer=None,
+    extra_rules=None,
+    explain=False,
+    session_info=None,
+    routing_strategy=None,
+    user_id=None,
+):
     """Run one edge chat loop turn using the provided APIClient."""
     import os
 
@@ -1257,16 +1356,20 @@ async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, au
     register_search_tools(router, project_root)
 
     from core.skills.loader import SkillLoader
+
     builtin_names = {t.name for t in router.list_tools()}
     for local in SkillLoader.discover(SkillLoader.default_paths(project_root)):
         if local.skill.name in builtin_names:
-            logger.warning("Local skill '%s' skipped — conflicts with built-in tool", local.skill.name)
+            logger.warning(
+                "Local skill '%s' skipped — conflicts with built-in tool", local.skill.name
+            )
             continue
         router.register(local.skill)
 
     from cli.tools.introspection import GetAgentInfoTool
     from cli.tools.reflect import ReflectTool
     from cli.tools.skill_config import register_skill_config_tools
+
     if session_info is None:
         # Use JWT user_id (UUID) so memory writes and context loads use the same key.
         jwt_user_id = user_id or agent_id or ""
@@ -1275,22 +1378,38 @@ async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, au
             jwt_user_id = info.get("user_id") or jwt_user_id
             logger.debug("_run_edge_turn: jwt_user_id=%s (from get_current_user)", jwt_user_id)
         except Exception as e:
-            logger.debug("_run_edge_turn: get_current_user failed: %s, fallback jwt_user_id=%s", e, jwt_user_id)
+            logger.debug(
+                "_run_edge_turn: get_current_user failed: %s, fallback jwt_user_id=%s",
+                e,
+                jwt_user_id,
+            )
         if not jwt_user_id:
-            raise RuntimeError("Cannot determine user_id: not logged in and no --user-id provided. Run 'mo-agent login' first.")
-        session_info = {"session_id": session_id, "agent_id": agent_id or "default-agent", "user_id": jwt_user_id, "model": model, "turn": 0}
+            raise RuntimeError(
+                "Cannot determine user_id: not logged in and no --user-id provided. Run 'mo-agent login' first."
+            )
+        session_info = {
+            "session_id": session_id,
+            "agent_id": agent_id or "default-agent",
+            "user_id": jwt_user_id,
+            "model": model,
+            "turn": 0,
+        }
     perms = PermissionManager(auto_approve=auto_approve)
 
-    router.register(GetAgentInfoTool(tool_router=router, session_info=session_info, api_client=api_client))
+    router.register(
+        GetAgentInfoTool(tool_router=router, session_info=session_info, api_client=api_client)
+    )
     router.register(ReflectTool(api_client=api_client, session_info=session_info))
     register_skill_config_tools(router, api_client)
 
     # Memory programming tool (inject/correct/purge/tune + explain)
     from cli.tools.memory_program import MemoryProgramTool
+
     router.register(MemoryProgramTool(session_info=session_info))
 
     # Skill discovery — fallback for skills not in current tool list
     from cli.tools.skill_discovery import FindSkillsTool
+
     router.register(FindSkillsTool())
 
     # Cloud skill descriptions are already in tool_schemas — no need to duplicate here.
@@ -1304,9 +1423,14 @@ async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, au
     extra_rules = (extra_rules + "\n\n" + skill_rules) if extra_rules else skill_rules
 
     return await edge_chat_loop(
-        user_input, api_client, router, perms,
-        session_id=session_id, project_root=project_root,
-        model=model, agent_id=agent_id,
+        user_input,
+        api_client,
+        router,
+        perms,
+        session_id=session_id,
+        project_root=project_root,
+        model=model,
+        agent_id=agent_id,
         session_info=session_info,
         renderer=renderer,
         extra_rules=extra_rules,
@@ -1318,6 +1442,7 @@ async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, au
 # ============================================================================
 # Click CLI
 # ============================================================================
+
 
 @click.group()
 @click.option("--api-url", default="http://localhost:8000", envvar="MO_AGENT_API_URL")
@@ -1382,17 +1507,28 @@ def logout(ctx):
 
 
 @cli.command()
-@click.option("--user-id", default=None, help="User ID override (defaults to authenticated user's UUID)")
+@click.option(
+    "--user-id", default=None, help="User ID override (defaults to authenticated user's UUID)"
+)
 @click.option("--session-id", default=None)
 @click.option("--message", "-m", default=None, help="Single message (non-interactive mode)")
 @click.option("--model", default=None, help="Model to use for chat")
-@click.option("--router", "routing_strategy", default=None, help="Routing strategy (e.g. 'default', 'experiment_v2')")
+@click.option(
+    "--router",
+    "routing_strategy",
+    default=None,
+    help="Routing strategy (e.g. 'default', 'experiment_v2')",
+)
 @click.option("--resume", is_flag=True, help="Resume last session")
 @click.option("--auto-approve", is_flag=True, help="Auto-approve tool execution")
 @click.option("--debug", is_flag=True, help="Print full traceback on errors")
-@click.option("--explain", is_flag=True, help="Show per-turn execution trace (like EXPLAIN ANALYZE)")
+@click.option(
+    "--explain", is_flag=True, help="Show per-turn execution trace (like EXPLAIN ANALYZE)"
+)
 @click.pass_context
-def chat(ctx, user_id, session_id, message, model, routing_strategy, resume, auto_approve, debug, explain):
+def chat(
+    ctx, user_id, session_id, message, model, routing_strategy, resume, auto_approve, debug, explain
+):
     """Start interactive chat with edge tool execution."""
     from rich.console import Console
     from rich.panel import Panel
@@ -1403,6 +1539,7 @@ def chat(ctx, user_id, session_id, message, model, routing_strategy, resume, aut
 
     if debug:
         from rich.traceback import install
+
         install(show_locals=True)
 
     # --- Auth ---
@@ -1474,15 +1611,22 @@ def chat(ctx, user_id, session_id, message, model, routing_strategy, resume, aut
     # --- Single message mode (-m) ---
     if message:
         from cli.ui.renderer import SimpleRenderer
+
         try:
-            loop_result = client._run(_run_edge_turn(
-                message, client._ensure_client(), session_id,
-                selected_model, user_id, True,
-                renderer=SimpleRenderer(),
-                explain=explain,
-                routing_strategy=routing_strategy,
-                user_id=user_id,
-            ))
+            loop_result = client._run(
+                _run_edge_turn(
+                    message,
+                    client._ensure_client(),
+                    session_id,
+                    selected_model,
+                    user_id,
+                    True,
+                    renderer=SimpleRenderer(),
+                    explain=explain,
+                    routing_strategy=routing_strategy,
+                    user_id=user_id,
+                )
+            )
             # Print response to stdout (renderer already printed streaming text)
         except Exception as e:
             if debug:
@@ -1493,12 +1637,16 @@ def chat(ctx, user_id, session_id, message, model, routing_strategy, resume, aut
         return
 
     # --- Welcome banner ---
-    console.print(Panel(
-        f"[cyan bold]mo-agent[/cyan bold] v{VERSION}\n"
-        f"📝 Session: {session_id}\n"
-        f"🤖 Model: {selected_model or '(default)'}",
-        border_style="bright_black", title="✦ mo-agent", title_align="left",
-    ))
+    console.print(
+        Panel(
+            f"[cyan bold]mo-agent[/cyan bold] v{VERSION}\n"
+            f"📝 Session: {session_id}\n"
+            f"🤖 Model: {selected_model or '(default)'}",
+            border_style="bright_black",
+            title="✦ mo-agent",
+            title_align="left",
+        )
+    )
     console.print("Type [cyan]/help[/cyan] for commands, [cyan]/exit[/cyan] to quit\n", style="dim")
 
     # --- State shared with slash commands ---
@@ -1529,6 +1677,7 @@ def chat(ctx, user_id, session_id, message, model, routing_strategy, resume, aut
         renderer = RichRenderer(console=console)
     else:
         from cli.ui.renderer import SimpleRenderer
+
         renderer = SimpleRenderer()
         status_bar = None
         repl_session = None
@@ -1566,9 +1715,14 @@ def chat(ctx, user_id, session_id, message, model, routing_strategy, resume, aut
                 handler = SLASH_COMMANDS.get(cmd_name)
                 if handler:
                     handler(
-                        console=console, client=client, cmd_arg=cmd_arg,
-                        session_id=state["session_id"], username=username,
-                        user_id=user_id, state=state, status_bar=status_bar,
+                        console=console,
+                        client=client,
+                        cmd_arg=cmd_arg,
+                        session_id=state["session_id"],
+                        username=username,
+                        user_id=user_id,
+                        state=state,
+                        status_bar=status_bar,
                         selected_model=state.get("selected_model"),
                     )
                     # Sync state changes back
@@ -1576,7 +1730,8 @@ def chat(ctx, user_id, session_id, message, model, routing_strategy, resume, aut
                     selected_model = state.get("selected_model")
                     if status_bar:
                         status_bar.update(
-                            session_id=session_id, model=selected_model or "",
+                            session_id=session_id,
+                            model=selected_model or "",
                             skill_dev=state.get("skill_dev_name", ""),
                         )
                 else:
@@ -1596,7 +1751,8 @@ def chat(ctx, user_id, session_id, message, model, routing_strategy, resume, aut
                     skill_dir = Path(state.get("skill_dev_dir", ""))
                     if skill_dir.is_dir():
                         state["skill_dev_context"] = _build_skill_dev_context(
-                            state["skill_dev_name"], skill_dir,
+                            state["skill_dev_name"],
+                            skill_dir,
                         )
                         skill_py = skill_dir / "skill.py"
                         if skill_py.is_file():
@@ -1622,15 +1778,21 @@ def chat(ctx, user_id, session_id, message, model, routing_strategy, resume, aut
 
                 if hasattr(renderer, "begin_response"):
                     renderer.begin_response()
-                loop_result = client._run(_run_edge_turn(
-                    user_input, client._ensure_client(), state["session_id"],
-                    state.get("selected_model"), user_id, auto_approve,
-                    renderer=renderer,
-                    extra_rules=skill_dev_rules,
-                    explain=should_explain,
-                    session_info=state["session_info"],
-                    routing_strategy=routing_strategy,
-                ))
+                loop_result = client._run(
+                    _run_edge_turn(
+                        user_input,
+                        client._ensure_client(),
+                        state["session_id"],
+                        state.get("selected_model"),
+                        user_id,
+                        auto_approve,
+                        renderer=renderer,
+                        extra_rules=skill_dev_rules,
+                        explain=should_explain,
+                        session_info=state["session_info"],
+                        routing_strategy=routing_strategy,
+                    )
+                )
                 result_text = loop_result.text
                 if hasattr(renderer, "end_response"):
                     renderer.end_response()
@@ -1640,6 +1802,7 @@ def chat(ctx, user_id, session_id, message, model, routing_strategy, resume, aut
                 # Auto-print explain after stats
                 if should_explain and loop_result.explain_turns:
                     from cli.edge_chat_loop import _print_explain
+
                     _print_explain(loop_result.explain_turns, verbose=(should_explain == "verbose"))
 
                 # Post-turn: auto-validate if skill.py was modified
@@ -1655,21 +1818,31 @@ def chat(ctx, user_id, session_id, message, model, routing_strategy, resume, aut
                             for msg in errors:
                                 console.print(f"    [red]ERROR[/red]: {msg}")
                         elif warnings:
-                            console.print(f"  [yellow]⚠ Auto-validate: {len(warnings)} warning(s)[/yellow]")
+                            console.print(
+                                f"  [yellow]⚠ Auto-validate: {len(warnings)} warning(s)[/yellow]"
+                            )
                             for msg in warnings:
                                 console.print(f"    [yellow]WARN[/yellow]: {msg}")
                         else:
                             console.print("  [green]✓ Auto-validate: passed[/green]")
-                            console.print(f"    [dim]Test it: /skill test {state.get('skill_dev_name', '')} {{\"param\": \"value\"}}[/dim]")
+                            console.print(
+                                f'    [dim]Test it: /skill test {state.get("skill_dev_name", "")} {{"param": "value"}}[/dim]'
+                            )
 
                 turn_count += 1
                 state["last_response"] = result_text or ""
                 state["turn_history"].append({"role": "user", "preview": user_input[:80]})
-                state["turn_history"].append({"role": "assistant", "preview": (result_text or "")[:80]})
+                state["turn_history"].append(
+                    {"role": "assistant", "preview": (result_text or "")[:80]}
+                )
                 state["session_info"]["turn"] = turn_count
                 if loop_result.usage:
-                    state["session_info"]["prompt_tokens"] = loop_result.usage.get("prompt_tokens", 0)
-                    state["session_info"]["completion_tokens"] = loop_result.usage.get("completion_tokens", 0)
+                    state["session_info"]["prompt_tokens"] = loop_result.usage.get(
+                        "prompt_tokens", 0
+                    )
+                    state["session_info"]["completion_tokens"] = loop_result.usage.get(
+                        "completion_tokens", 0
+                    )
                 if status_bar:
                     status_bar.update(turn=turn_count)
             except AuthenticationError:
@@ -1716,6 +1889,7 @@ def doctor(ctx):
     from rich.console import Console
 
     from cli.ui.doctor import run_doctor
+
     run_doctor(Console(stderr=True), ctx.obj["client"])
 
 
@@ -1752,7 +1926,9 @@ def session_list(ctx, limit):
         click.echo("=" * 80)
         for s in sessions:
             status = "🟢" if s.get("status") == "active" else "⚪"
-            click.echo(f"{status} {s['session_id']} | {s.get('user_id', 'N/A')} | {s.get('event_count', 0)} events")
+            click.echo(
+                f"{status} {s['session_id']} | {s.get('user_id', 'N/A')} | {s.get('event_count', 0)} events"
+            )
     except Exception as e:
         click.echo(f"❌ Error: {e}")
 
@@ -1823,7 +1999,7 @@ def skill_scaffold(yaml_file, output_dir):
     """Generate skill package from YAML declaration."""
     import yaml as _yaml
 
-    raise NotImplementedError('Module removed in skill system cleanup')
+    raise NotImplementedError("Module removed in skill system cleanup")
 
 
 @skill.command("upgrade-check")
@@ -1840,7 +2016,7 @@ def skill_upgrade_check(ctx, skill_name, new_version):
             click.echo("No skills found")
             return
 
-        raise NotImplementedError('Module removed in skill system cleanup')
+        raise NotImplementedError("Module removed in skill system cleanup")
     except Exception as e:
         click.echo(f"❌ Error: {e}")
 
@@ -2022,6 +2198,7 @@ def profile():
 def profile_list():
     """List all profiles."""
     from cli.profile_manager import ProfileManager
+
     manager = ProfileManager()
     profiles = manager.list_profiles()
     if not profiles:
@@ -2038,6 +2215,7 @@ def profile_list():
 def profile_use(profile_name):
     """Switch to a different profile."""
     from cli.profile_manager import ProfileManager
+
     manager = ProfileManager()
     try:
         manager.set_current_profile(profile_name)
@@ -2053,6 +2231,7 @@ def profile_use(profile_name):
 def profile_delete(profile_name):
     """Delete a profile."""
     from cli.profile_manager import ProfileManager
+
     manager = ProfileManager()
     try:
         manager.delete_profile(profile_name)
@@ -2104,7 +2283,10 @@ def memory_program(ctx, instruction, user_id, dry_run, explain, model):
     programmer = MemoryProgrammer(editor, db_factory)
 
     result = programmer.execute(
-        user_id, actions, dry_run=dry_run, program_name="cli",
+        user_id,
+        actions,
+        dry_run=dry_run,
+        program_name="cli",
     )
 
     if result.dry_run:
@@ -2146,7 +2328,10 @@ def memory_run(script_file, user_id, dry_run, explain):
     programmer = MemoryProgrammer(editor, db_factory)
 
     result = programmer.execute(
-        user_id, actions, dry_run=dry_run, program_name=script_file,
+        user_id,
+        actions,
+        dry_run=dry_run,
+        program_name=script_file,
     )
 
     click.echo(f"✅ {result.actions_executed} executed, {result.actions_failed} failed")
@@ -2154,7 +2339,9 @@ def memory_run(script_file, user_id, dry_run, explain):
     if explain:
         for r in result.results:
             status = "✓" if r.success else "✗"
-            click.echo(f"  {status} {r.action_type}: {json.dumps(r.detail) if r.detail else r.error}")
+            click.echo(
+                f"  {status} {r.action_type}: {json.dumps(r.detail) if r.detail else r.error}"
+            )
 
 
 @memory.group("strategy")

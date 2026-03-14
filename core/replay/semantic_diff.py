@@ -23,15 +23,15 @@ _EVENT_COLUMNS = (
 def _validate_name(name: str, label: str = "name") -> None:
     """Validate that name contains only safe characters."""
     if not _SAFE_NAME_RE.match(name):
-        raise ValueError(
-            f"Invalid {label}: {name!r}. Only alphanumeric, dash, underscore allowed."
-        )
+        raise ValueError(f"Invalid {label}: {name!r}. Only alphanumeric, dash, underscore allowed.")
 
 
 class SemanticDiff(DbConsumer):
     """Semantic difference analyzer for agent behaviors."""
 
-    def __init__(self, db_factory: DbFactory, embedding_service: EmbeddingService | None = None) -> None:
+    def __init__(
+        self, db_factory: DbFactory, embedding_service: EmbeddingService | None = None
+    ) -> None:
         super().__init__(db_factory)
         self.reader = EventReader(self._db_factory)
         self._embedder = embedding_service or EmbeddingService(db_factory)
@@ -113,8 +113,14 @@ class SemanticDiff(DbConsumer):
         return {
             "total": {"session1": total1, "session2": total2, "diff": total2 - total1},
             "prompt": {"session1": prompt1, "session2": prompt2, "diff": prompt2 - prompt1},
-            "completion": {"session1": completion1, "session2": completion2, "diff": completion2 - completion1},
-            "efficiency_change": f"{((total2 - total1) / total1 * 100):.1f}%" if total1 > 0 else "N/A",
+            "completion": {
+                "session1": completion1,
+                "session2": completion2,
+                "diff": completion2 - completion1,
+            },
+            "efficiency_change": f"{((total2 - total1) / total1 * 100):.1f}%"
+            if total1 > 0
+            else "N/A",
         }
 
     @staticmethod
@@ -133,7 +139,11 @@ class SemanticDiff(DbConsumer):
         avg2 = _avg_chain_len(events2, chains2)
 
         return {
-            "chain_count": {"session1": len(chains1), "session2": len(chains2), "diff": len(chains2) - len(chains1)},
+            "chain_count": {
+                "session1": len(chains1),
+                "session2": len(chains2),
+                "diff": len(chains2) - len(chains1),
+            },
             "avg_chain_length": {"session1": avg1, "session2": avg2, "diff": avg2 - avg1},
             "complexity_change": "increased" if avg2 > avg1 else "decreased",
         }
@@ -145,7 +155,11 @@ class SemanticDiff(DbConsumer):
         types2 = Counter(e.event_type for e in events2)
         all_types = set(types1.keys()) | set(types2.keys())
         return {
-            t: {"session1": types1.get(t, 0), "session2": types2.get(t, 0), "diff": types2.get(t, 0) - types1.get(t, 0)}
+            t: {
+                "session1": types1.get(t, 0),
+                "session2": types2.get(t, 0),
+                "diff": types2.get(t, 0) - types1.get(t, 0),
+            }
             for t in all_types
         }
 
@@ -162,7 +176,9 @@ class SemanticDiff(DbConsumer):
         }
 
     @staticmethod
-    def _generate_summary(token_diff: dict, path_diff: dict, type_diff: dict, content_diff: dict | None = None) -> str:
+    def _generate_summary(
+        token_diff: dict, path_diff: dict, type_diff: dict, content_diff: dict | None = None
+    ) -> str:
         """Generate human-readable summary."""
         parts = []
         tc = token_diff["total"]["diff"]
@@ -203,12 +219,14 @@ class SemanticDiff(DbConsumer):
             v1 = self._embedder.embed_text(r1)
             v2 = self._embedder.embed_text(r2)
             sim = cosine_similarity(v1, v2)
-            pairs.append({
-                "index": i,
-                "similarity": round(sim, 4),
-                "preview1": r1[:80],
-                "preview2": r2[:80],
-            })
+            pairs.append(
+                {
+                    "index": i,
+                    "similarity": round(sim, 4),
+                    "preview1": r1[:80],
+                    "preview2": r2[:80],
+                }
+            )
 
         overall = sum(p["similarity"] for p in pairs) / len(pairs)
         return {

@@ -11,6 +11,7 @@ from core.skills.loader import SkillManifest
 
 # ── Fixtures ─────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def manifests() -> dict[str, SkillManifest]:
     return {
@@ -24,7 +25,8 @@ def fake_table():
     """Create a real SQLAlchemy Table object for testing."""
     metadata = MetaData()
     return Table(
-        "sk_github_repos", metadata,
+        "sk_github_repos",
+        metadata,
         Column("repo_id", String(36), primary_key=True),
         Column("owner", String(100)),
         Column("name", String(100)),
@@ -48,6 +50,7 @@ def bridge(manifests, fake_table):
 
 # ── Validation ───────────────────────────────────────────────────
 
+
 class TestValidation:
     def test_unauthorized_skill_raises(self, bridge):
         with pytest.raises(PermissionError, match="does not declare dependency"):
@@ -64,8 +67,9 @@ class TestValidation:
     def test_unknown_skill_in_loader_raises(self, manifests):
         db = MagicMock()
         with pytest.raises(KeyError):
-            SkillDataBridge(db=db, requesting_skill="nonexistent",
-                            manifest_loader=lambda name: manifests[name])
+            SkillDataBridge(
+                db=db, requesting_skill="nonexistent", manifest_loader=lambda name: manifests[name]
+            )
 
     def test_count_unauthorized_raises(self, bridge):
         with pytest.raises(PermissionError):
@@ -77,6 +81,7 @@ class TestValidation:
 
 
 # ── Query ────────────────────────────────────────────────────────
+
 
 class TestQuery:
     def test_query_returns_dicts(self, bridge, fake_table):
@@ -142,21 +147,25 @@ class TestQuery:
 
 # ── _apply_filters ───────────────────────────────────────────────
 
+
 class TestApplyFilters:
     def test_no_filters_returns_unchanged(self, fake_table):
         from sqlalchemy import select
+
         stmt = select(fake_table)
         result = _apply_filters(stmt, fake_table, None)
         assert str(result) == str(stmt)
 
     def test_empty_dict_returns_unchanged(self, fake_table):
         from sqlalchemy import select
+
         stmt = select(fake_table)
         result = _apply_filters(stmt, fake_table, {})
         assert str(result) == str(stmt)
 
     def test_valid_filter_adds_where(self, fake_table):
         from sqlalchemy import select
+
         stmt = select(fake_table)
         result = _apply_filters(stmt, fake_table, {"owner": "alice"})
         sql = str(result.compile(compile_kwargs={"literal_binds": False}))
@@ -164,12 +173,14 @@ class TestApplyFilters:
 
     def test_invalid_column_raises(self, fake_table):
         from sqlalchemy import select
+
         stmt = select(fake_table)
         with pytest.raises(ValueError, match="Column.*not found"):
             _apply_filters(stmt, fake_table, {"bad_col": "x"})
 
     def test_multiple_filters(self, fake_table):
         from sqlalchemy import select
+
         stmt = select(fake_table)
         result = _apply_filters(stmt, fake_table, {"owner": "a", "name": "b"})
         sql = str(result.compile(compile_kwargs={"literal_binds": False}))

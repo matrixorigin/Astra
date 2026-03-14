@@ -34,6 +34,7 @@ _SIMILARITY_THRESHOLD = 0.60
 # Utility
 # ---------------------------------------------------------------------------
 
+
 def _errors_similar(a: str, b: str) -> bool:
     """Word-overlap similarity > threshold."""
     wa = set(a.lower().split())
@@ -65,7 +66,8 @@ def _should_break(failures: list[str]) -> bool:
 def _active_tools(state: TurnState) -> list[dict]:
     """Return tools_schema minus blocked tools."""
     return [
-        t for t in state.tools_schema
+        t
+        for t in state.tools_schema
         if t.get("function", {}).get("name") not in state.blocked_tools
     ]
 
@@ -77,6 +79,7 @@ def _wall_clock_exceeded(state: TurnState) -> bool:
 # ---------------------------------------------------------------------------
 # Stages
 # ---------------------------------------------------------------------------
+
 
 class RouteStage:
     """Pre-loop: classify intent, filter tools, set max_rounds.
@@ -90,7 +93,9 @@ class RouteStage:
 
     async def __call__(self, state: TurnState) -> AsyncIterator[TurnEvent]:
         if not self._classify:
-            yield TurnEvent(event_type="stage_complete", data={"stage": "route", "classification": "DEFAULT"})
+            yield TurnEvent(
+                event_type="stage_complete", data={"stage": "route", "classification": "DEFAULT"}
+            )
             return
 
         # Support both sync and async classify callables
@@ -101,20 +106,25 @@ class RouteStage:
         # Handle RoutingDecision from unified router
         if hasattr(result, "tool_filter"):
             from core.context.intent_routing import ToolFilter
+
             if result.tool_filter == ToolFilter.ALL_BLOCKED:
                 state.tools_schema = []
                 state.max_rounds = 0
                 classification = "CONVERSATIONAL"
             elif result.tool_filter == ToolFilter.LOCAL_BLOCKED:
                 state.tools_schema = [
-                    t for t in state.tools_schema
+                    t
+                    for t in state.tools_schema
                     if t.get("function", {}).get("name") not in LOCAL_TOOLS
                 ]
                 state.max_rounds = min(state.max_rounds, result.max_tool_rounds)
                 classification = "EXTERNAL_FETCH"
             else:
                 classification = "DEFAULT"
-            yield TurnEvent(event_type="stage_complete", data={"stage": "route", "classification": classification})
+            yield TurnEvent(
+                event_type="stage_complete",
+                data={"stage": "route", "classification": classification},
+            )
             return
 
         # Legacy: normalize IntentClassification or string
@@ -123,7 +133,9 @@ class RouteStage:
         elif isinstance(result, str):
             classification = result
         else:
-            logger.warning("classify_intent returned unexpected type %s, using DEFAULT", type(result))
+            logger.warning(
+                "classify_intent returned unexpected type %s, using DEFAULT", type(result)
+            )
             classification = "DEFAULT"
 
         if classification == "CONVERSATIONAL":
@@ -131,12 +143,15 @@ class RouteStage:
             state.max_rounds = 0
         elif classification == "EXTERNAL_FETCH":
             state.tools_schema = [
-                t for t in state.tools_schema
+                t
+                for t in state.tools_schema
                 if t.get("function", {}).get("name") not in LOCAL_TOOLS
             ]
             state.max_rounds = min(state.max_rounds, 3)
 
-        yield TurnEvent(event_type="stage_complete", data={"stage": "route", "classification": classification})
+        yield TurnEvent(
+            event_type="stage_complete", data={"stage": "route", "classification": classification}
+        )
 
 
 class CallLLMStage:
@@ -218,7 +233,9 @@ class ExecuteToolsStage:
 
             try:
                 result = await self._execute(fn_name, params)
-                result_str = json.dumps(result, default=str) if not isinstance(result, str) else result
+                result_str = (
+                    json.dumps(result, default=str) if not isinstance(result, str) else result
+                )
                 return call_id, result_str, None, fn_name
             except Exception as e:
                 return call_id, json.dumps({"error": str(e)}), str(e), fn_name
@@ -242,11 +259,13 @@ class ExecuteToolsStage:
                 event_type="tool_result",
                 data={"call_id": call_id, "tool": fn_name, "error": error},
             )
-            state.messages.append({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": result_str,
-            })
+            state.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": result_str,
+                }
+            )
 
         yield TurnEvent(event_type="stage_complete", data={"stage": "execute_tools"})
 
@@ -257,7 +276,10 @@ class EvaluateStage:
     async def __call__(self, state: TurnState) -> AsyncIterator[TurnEvent]:
         if state.outcome is not None:
             # Already resolved (final answer from LLM)
-            yield TurnEvent(event_type="stage_complete", data={"stage": "evaluate", "action": "already_resolved"})
+            yield TurnEvent(
+                event_type="stage_complete",
+                data={"stage": "evaluate", "action": "already_resolved"},
+            )
             return
 
         # Timeout check
@@ -267,7 +289,9 @@ class EvaluateStage:
                 failure_reason="wall_clock_timeout",
                 failed_tools=sorted(state.blocked_tools),
             )
-            yield TurnEvent(event_type="stage_complete", data={"stage": "evaluate", "action": "timeout"})
+            yield TurnEvent(
+                event_type="stage_complete", data={"stage": "evaluate", "action": "timeout"}
+            )
             return
 
         # All tools blocked?
@@ -281,10 +305,14 @@ class EvaluateStage:
                 failure_reason="all_tools_blocked",
                 failed_tools=sorted(state.blocked_tools),
             )
-            yield TurnEvent(event_type="stage_complete", data={"stage": "evaluate", "action": "all_blocked"})
+            yield TurnEvent(
+                event_type="stage_complete", data={"stage": "evaluate", "action": "all_blocked"}
+            )
             return
 
-        yield TurnEvent(event_type="stage_complete", data={"stage": "evaluate", "action": "continue"})
+        yield TurnEvent(
+            event_type="stage_complete", data={"stage": "evaluate", "action": "continue"}
+        )
 
 
 class FinalAnswerStage:
@@ -300,14 +328,19 @@ class FinalAnswerStage:
     async def __call__(self, state: TurnState) -> AsyncIterator[TurnEvent]:
         if state.outcome is not None:
             # Already resolved
-            yield TurnEvent(event_type="stage_complete", data={"stage": "final_answer", "action": "skip"})
+            yield TurnEvent(
+                event_type="stage_complete", data={"stage": "final_answer", "action": "skip"}
+            )
             return
 
         # Rounds exhausted — ask for final answer using a local copy
-        final_messages = [*state.messages, {
-            "role": "system",
-            "content": "Please provide your final answer based on the tool results above.",
-        }]
+        final_messages = [
+            *state.messages,
+            {
+                "role": "system",
+                "content": "Please provide your final answer based on the tool results above.",
+            },
+        ]
 
         if self._call:
             content = await self._call(final_messages)
@@ -321,6 +354,7 @@ class FinalAnswerStage:
 # ---------------------------------------------------------------------------
 # Engine: execute_turn()
 # ---------------------------------------------------------------------------
+
 
 async def execute_turn(
     state: TurnState,
@@ -378,8 +412,11 @@ async def execute_turn(
         async for event in stage(state):
             yield event
 
-    yield TurnEvent(event_type="turn_complete", data={
-        "rounds": state.round,
-        "status": state.outcome.status.value if state.outcome else "unknown",
-        "blocked_tools": sorted(state.blocked_tools),
-    })
+    yield TurnEvent(
+        event_type="turn_complete",
+        data={
+            "rounds": state.round,
+            "status": state.outcome.status.value if state.outcome else "unknown",
+            "blocked_tools": sorted(state.blocked_tools),
+        },
+    )

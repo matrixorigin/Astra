@@ -20,6 +20,7 @@ from cli.tools.reflect import ReflectTool
 # Shared fixtures
 # ============================================================================
 
+
 @pytest.fixture
 def reflect_session(db_factory, db_session):
     """Create a real DB session with a realistic event trail for reflect tests.
@@ -36,30 +37,45 @@ def reflect_session(db_factory, db_session):
     sid = session.session_id
 
     el = EventLogger(db_factory)
-    uq = el.create_user_query(user_id=user_id, session_id=sid,
-                               content="fix the bug in main.py")
+    uq = el.create_user_query(user_id=user_id, session_id=sid, content="fix the bug in main.py")
     chain = uq.causal_chain_id
 
-    el.create_stream_event(user_id=user_id, session_id=sid,
-                           event_type="tool_call",
-                           content=json.dumps({"name": "read_file", "tool_call_id": "tc1"}),
-                           parent_event_id=uq.event_id, causal_chain_id=chain,
-                           skill_name="read_file")
-    el.create_stream_event(user_id=user_id, session_id=sid,
-                           event_type="tool_result",
-                           content=json.dumps({"name": "read_file", "result": "Error: file not found"}),
-                           parent_event_id=uq.event_id, causal_chain_id=chain,
-                           skill_name="read_file")
-    el.create_stream_event(user_id=user_id, session_id=sid,
-                           event_type="tool_call",
-                           content=json.dumps({"name": "bash", "tool_call_id": "tc2"}),
-                           parent_event_id=uq.event_id, causal_chain_id=chain,
-                           skill_name="bash")
-    el.create_stream_event(user_id=user_id, session_id=sid,
-                           event_type="tool_result",
-                           content=json.dumps({"name": "bash", "result": "command executed successfully"}),
-                           parent_event_id=uq.event_id, causal_chain_id=chain,
-                           skill_name="bash")
+    el.create_stream_event(
+        user_id=user_id,
+        session_id=sid,
+        event_type="tool_call",
+        content=json.dumps({"name": "read_file", "tool_call_id": "tc1"}),
+        parent_event_id=uq.event_id,
+        causal_chain_id=chain,
+        skill_name="read_file",
+    )
+    el.create_stream_event(
+        user_id=user_id,
+        session_id=sid,
+        event_type="tool_result",
+        content=json.dumps({"name": "read_file", "result": "Error: file not found"}),
+        parent_event_id=uq.event_id,
+        causal_chain_id=chain,
+        skill_name="read_file",
+    )
+    el.create_stream_event(
+        user_id=user_id,
+        session_id=sid,
+        event_type="tool_call",
+        content=json.dumps({"name": "bash", "tool_call_id": "tc2"}),
+        parent_event_id=uq.event_id,
+        causal_chain_id=chain,
+        skill_name="bash",
+    )
+    el.create_stream_event(
+        user_id=user_id,
+        session_id=sid,
+        event_type="tool_result",
+        content=json.dumps({"name": "bash", "result": "command executed successfully"}),
+        parent_event_id=uq.event_id,
+        causal_chain_id=chain,
+        skill_name="bash",
+    )
 
     yield sid, user_id, chain
 
@@ -67,12 +83,14 @@ def reflect_session(db_factory, db_session):
     from api.models.agent import Event as EventModel, Session as SessionModel
     from api.models.skill import SkillSelectionEvent
     from api.models.context import PromptFeedback
+
     for model in (PromptFeedback, SkillSelectionEvent, EventModel, SessionModel):
         try:
             db_session.query(model).filter(model.session_id == sid).delete()
         except Exception:
             pass
     from core.memory.models.memory import MemoryRecord
+
     try:
         db_session.query(MemoryRecord).filter(MemoryRecord.user_id == user_id).delete()
     except Exception:
@@ -84,6 +102,7 @@ def reflect_session(db_factory, db_session):
 def reflect_svc(db_factory):
     """ReflectService wired to test db_factory."""
     from core.agent.reflect_service import ReflectService
+
     return ReflectService(db_factory=db_factory)
 
 
@@ -106,8 +125,10 @@ def _provenance_classes():
 
         async def execute(self, input: ProvInput) -> ProvOutput:
             return ProvOutput(
-                success=True, value=42.0,
-                data_source="test_api", data_timestamp="2026-03-01T12:00:00Z",
+                success=True,
+                value=42.0,
+                data_source="test_api",
+                data_timestamp="2026-03-01T12:00:00Z",
             )
 
     class WithoutProvenance(Skill[ProvInput, ProvOutput]):
@@ -126,6 +147,7 @@ def _provenance_classes():
 # Helper to create a temp session with events and auto-cleanup
 # ============================================================================
 
+
 @pytest.fixture
 def make_session(db_factory, db_session):
     """Factory fixture: create a session with events, auto-cleanup after test."""
@@ -142,14 +164,18 @@ def make_session(db_factory, db_session):
 
         if events:
             el = EventLogger(db_factory)
-            uq = el.create_user_query(user_id=user_id, session_id=sid,
-                                       content=events[0] if isinstance(events[0], str) else events[0]["content"])
+            uq = el.create_user_query(
+                user_id=user_id,
+                session_id=sid,
+                content=events[0] if isinstance(events[0], str) else events[0]["content"],
+            )
             for evt in events[1:]:
                 if isinstance(evt, str):
                     el.create_user_query(user_id=user_id, session_id=sid, content=evt)
                 elif isinstance(evt, dict):
                     el.create_stream_event(
-                        user_id=user_id, session_id=sid,
+                        user_id=user_id,
+                        session_id=sid,
                         event_type=evt.get("type", "tool_result"),
                         content=json.dumps(evt.get("content_json", {})),
                         parent_event_id=uq.event_id,
@@ -161,6 +187,7 @@ def make_session(db_factory, db_session):
     yield _make
 
     from api.models.agent import Event as EventModel, Session as SessionModel
+
     for sid, uid in created_sids:
         try:
             db_session.query(EventModel).filter(EventModel.session_id == sid).delete()
@@ -174,8 +201,8 @@ def make_session(db_factory, db_session):
 # 1. Edge tool tests (mock HTTP)
 # ============================================================================
 
-class TestReflectTool:
 
+class TestReflectTool:
     @pytest.mark.asyncio
     async def test_no_session_id(self):
         tool = ReflectTool(api_client=AsyncMock(), session_info={})
@@ -191,12 +218,18 @@ class TestReflectTool:
     @pytest.mark.asyncio
     async def test_calls_public_api(self):
         mock_client = AsyncMock()
-        mock_client.get_reflect.return_value = {"session_id": "s1", "focus": "auto", "event_summary": []}
+        mock_client.get_reflect.return_value = {
+            "session_id": "s1",
+            "focus": "auto",
+            "event_summary": [],
+        }
 
         tool = ReflectTool(api_client=mock_client, session_info={"session_id": "s1"})
         result = await tool.execute(focus="skill_failure", last_n=10)
 
-        mock_client.get_reflect.assert_called_once_with("s1", focus="skill_failure", last_n=10, question="")
+        mock_client.get_reflect.assert_called_once_with(
+            "s1", focus="skill_failure", last_n=10, question=""
+        )
         assert json.loads(result)["session_id"] == "s1"
 
     @pytest.mark.asyncio
@@ -208,7 +241,8 @@ class TestReflectTool:
         await tool.execute(focus="tool_selection", question="why not list_prs?")
 
         mock_client.get_reflect.assert_called_once_with(
-            "s1", focus="tool_selection", last_n=20, question="why not list_prs?")
+            "s1", focus="tool_selection", last_n=20, question="why not list_prs?"
+        )
 
     @pytest.mark.asyncio
     async def test_handles_server_error(self):
@@ -222,8 +256,14 @@ class TestReflectTool:
         schema = ReflectTool().to_openai_schema()
         assert schema["function"]["name"] == "reflect"
         assert set(schema["function"]["parameters"]["properties"]["focus"]["enum"]) == {
-            "auto", "skill_failure", "unexpected_result", "data_quality",
-            "tool_selection", "history", "performance"}
+            "auto",
+            "skill_failure",
+            "unexpected_result",
+            "data_quality",
+            "tool_selection",
+            "history",
+            "performance",
+        }
 
     def test_description_mentions_all_focus_values(self):
         """Every focus value mentioned in description must exist in enum (no stale references)."""
@@ -232,10 +272,18 @@ class TestReflectTool:
         all_text = tool.description + tool.parameters["properties"]["focus"]["description"]
         # Extract focus='xxx' patterns from description
         import re
+
         mentioned = set(re.findall(r"'(\w+)'", all_text))
         # Every mentioned value that looks like a focus must be in enum
-        for val in mentioned & {"performance", "skill_failure", "unexpected_result",
-                                "data_quality", "tool_selection", "history", "auto"}:
+        for val in mentioned & {
+            "performance",
+            "skill_failure",
+            "unexpected_result",
+            "data_quality",
+            "tool_selection",
+            "history",
+            "auto",
+        }:
             assert val in enum_vals, f"focus='{val}' in description but not in enum"
 
     def test_description_boundary_with_get_agent_info(self):
@@ -248,14 +296,18 @@ class TestReflectTool:
 # 2. Server evidence — real DB queries via ReflectService
 # ============================================================================
 
-class TestBuildReflectEvidence:
 
+class TestBuildReflectEvidence:
     def test_event_summary(self, reflect_session, reflect_svc):
         sid, uid, _ = reflect_session
         result = reflect_svc.build_evidence(sid, uid, "auto", 20)
         assert result["session_id"] == sid
         assert len(result["event_summary"]) == 5
-        assert {e["type"] for e in result["event_summary"]} == {"user_query", "tool_call", "tool_result"}
+        assert {e["type"] for e in result["event_summary"]} == {
+            "user_query",
+            "tool_call",
+            "tool_result",
+        }
 
     def test_failed_tool_detected(self, reflect_session, reflect_svc):
         sid, uid, _ = reflect_session
@@ -270,10 +322,17 @@ class TestBuildReflectEvidence:
 
     def test_auto_focus_detects_data_quality(self, make_session, reflect_svc):
         uid = "reflect_auto_dq"
-        sid = make_session(uid, [
-            "get price",
-            {"type": "tool_result", "content_json": {"name": "fetch_price", "result": "42.0"}, "skill_name": "fetch_price"},
-        ])
+        sid = make_session(
+            uid,
+            [
+                "get price",
+                {
+                    "type": "tool_result",
+                    "content_json": {"name": "fetch_price", "result": "42.0"},
+                    "skill_name": "fetch_price",
+                },
+            ],
+        )
         result = reflect_svc.build_evidence(sid, uid, "auto", 20)
         assert result["focus"] == "data_quality"
 
@@ -288,8 +347,11 @@ class TestBuildReflectEvidence:
     def test_repeated_failure_hint(self, reflect_session, db_factory, reflect_svc):
         sid, uid, _ = reflect_session
         from core.events.event_logger import EventLogger
+
         EventLogger(db_factory).create_stream_event(
-            user_id=uid, session_id=sid, event_type="tool_result",
+            user_id=uid,
+            session_id=sid,
+            event_type="tool_result",
             content=json.dumps({"name": "read_file", "result": "Error: permission denied"}),
             skill_name="read_file",
         )
@@ -305,12 +367,19 @@ class TestBuildReflectEvidence:
         sid, uid, _ = reflect_session
         from api.models.skill import SkillSelectionEvent
         from uuid_utils import uuid7
-        db_session.add(SkillSelectionEvent(
-            event_id=str(uuid7()), session_id=sid,
-            user_query="fix the bug", skill_name="read_file",
-            selected_skills=["read_file"], selection_method="llm_tool_choice",
-            execution_success=0, execution_time_ms=150,
-        ))
+
+        db_session.add(
+            SkillSelectionEvent(
+                event_id=str(uuid7()),
+                session_id=sid,
+                user_query="fix the bug",
+                skill_name="read_file",
+                selected_skills=["read_file"],
+                selection_method="llm_tool_choice",
+                execution_success=0,
+                execution_time_ms=150,
+            )
+        )
         db_session.commit()
 
         result = reflect_svc.build_evidence(sid, uid, "auto", 20)
@@ -325,10 +394,12 @@ class TestBuildReflectEvidence:
         from core.memory.types import Memory, MemoryType, TrustTier
 
         lesson_mem = Memory(
-            memory_id="m1", user_id=uid,
+            memory_id="m1",
+            user_id=uid,
             memory_type=MemoryType.PROCEDURAL,
             content="reflect test: read_file fails on symlinks, use realpath first",
-            trust_tier=TrustTier.T3_INFERRED, session_id=sid,
+            trust_tier=TrustTier.T3_INFERRED,
+            session_id=sid,
         )
         mock_storage = MagicMock()
         mock_storage.retrieve.return_value = ([lesson_mem], {})
@@ -360,7 +431,9 @@ class TestBuildReflectEvidence:
         mock_skill.name = "list_prs"
         mock_skill.description = "List PRs"
         mock_skill.to_openai_schema.return_value = {
-            "function": {"parameters": {"type": "object", "properties": {"repo": {"type": "string"}}}}
+            "function": {
+                "parameters": {"type": "object", "properties": {"repo": {"type": "string"}}}
+            }
         }
         mock_reg = MagicMock()
         mock_reg._skills = {"list_prs": mock_skill}
@@ -401,13 +474,21 @@ class TestBuildReflectEvidence:
 
         from api.models.agent import Event as EventModel
         from core.events.event_logger import EventLogger
+
         for p, c in [(1000, 50), (2000, 100)]:
-            db_session.add(EventModel(
-                event_id=str(uuid.uuid4()), session_id=sid, user_id=uid,
-                agent_id="test", event_type="llm_response", content=f"resp",
-                causal_chain_id="chain", llm_model_used="test-model",
-                token_usage=json.dumps({"prompt_tokens": p, "completion_tokens": c}),
-            ))
+            db_session.add(
+                EventModel(
+                    event_id=str(uuid.uuid4()),
+                    session_id=sid,
+                    user_id=uid,
+                    agent_id="test",
+                    event_type="llm_response",
+                    content=f"resp",
+                    causal_chain_id="chain",
+                    llm_model_used="test-model",
+                    token_usage=json.dumps({"prompt_tokens": p, "completion_tokens": c}),
+                )
+            )
         db_session.commit()
 
         ts = reflect_svc.build_evidence(sid, uid, "auto", 20)["token_summary"]
@@ -425,20 +506,41 @@ class TestBuildReflectEvidence:
         sid = make_session(uid, ["analyze stock"])
 
         from api.models.agent import Event as EventModel
-        db_session.add(EventModel(
-            event_id=str(uuid.uuid4()), session_id=sid, user_id=uid,
-            agent_id="test", event_type="tool_result_quality", content="",
-            causal_chain_id="chain",
-            event_metadata={"tool_name": "stock_assistant", "quality_score": 0.35,
-                            "quality_grade": "degraded", "missing_fields": ["technical_indicators"]},
-        ))
-        db_session.add(EventModel(
-            event_id=str(uuid.uuid4()), session_id=sid, user_id=uid,
-            agent_id="test", event_type="tool_result_quality", content="",
-            causal_chain_id="chain",
-            event_metadata={"tool_name": "bash", "quality_score": 1.0,
-                            "quality_grade": "complete", "missing_fields": []},
-        ))
+
+        db_session.add(
+            EventModel(
+                event_id=str(uuid.uuid4()),
+                session_id=sid,
+                user_id=uid,
+                agent_id="test",
+                event_type="tool_result_quality",
+                content="",
+                causal_chain_id="chain",
+                event_metadata={
+                    "tool_name": "stock_assistant",
+                    "quality_score": 0.35,
+                    "quality_grade": "degraded",
+                    "missing_fields": ["technical_indicators"],
+                },
+            )
+        )
+        db_session.add(
+            EventModel(
+                event_id=str(uuid.uuid4()),
+                session_id=sid,
+                user_id=uid,
+                agent_id="test",
+                event_type="tool_result_quality",
+                content="",
+                causal_chain_id="chain",
+                event_metadata={
+                    "tool_name": "bash",
+                    "quality_score": 1.0,
+                    "quality_grade": "complete",
+                    "missing_fields": [],
+                },
+            )
+        )
         db_session.commit()
 
         tqs = reflect_svc.build_evidence(sid, uid, "auto", 20)["tool_quality_summary"]
@@ -451,12 +553,20 @@ class TestBuildReflectEvidence:
         sid = make_session(uid, ["big query"])
 
         from api.models.agent import Event as EventModel
-        db_session.add(EventModel(
-            event_id=str(uuid.uuid4()), session_id=sid, user_id=uid,
-            agent_id="test", event_type="llm_response", content="big",
-            causal_chain_id="chain", llm_model_used="gpt-4",
-            token_usage=json.dumps({"prompt_tokens": 60000, "completion_tokens": 2000}),
-        ))
+
+        db_session.add(
+            EventModel(
+                event_id=str(uuid.uuid4()),
+                session_id=sid,
+                user_id=uid,
+                agent_id="test",
+                event_type="llm_response",
+                content="big",
+                causal_chain_id="chain",
+                llm_model_used="gpt-4",
+                token_usage=json.dumps({"prompt_tokens": 60000, "completion_tokens": 2000}),
+            )
+        )
         db_session.commit()
 
         hints = reflect_svc.build_evidence(sid, uid, "auto", 20)["diagnosis_hints"]
@@ -517,13 +627,14 @@ class TestBuildReflectEvidence:
 # 3. Reflection learning — real DB Memory persistence
 # ============================================================================
 
-class TestReflectionLearningRealDB:
 
+class TestReflectionLearningRealDB:
     @pytest.fixture(autouse=True)
     def _cleanup_lessons(self, reflect_session, db_session):
         yield
         _, uid, _ = reflect_session
         from core.memory.models.memory import MemoryRecord
+
         db_session.query(MemoryRecord).filter(
             MemoryRecord.user_id == uid,
             MemoryRecord.content.like("%Reflection-driven%"),
@@ -538,23 +649,32 @@ class TestReflectionLearningRealDB:
 
         mock_storage = MagicMock()
         stored_memories = []
+
         def capture_store(user_id, content, **kwargs):
             from core.memory.types import Memory
-            m = Memory(memory_id="m1", user_id=user_id, content=content,
-                       memory_type=kwargs.get("memory_type", MemoryType.PROCEDURAL))
+
+            m = Memory(
+                memory_id="m1",
+                user_id=user_id,
+                content=content,
+                memory_type=kwargs.get("memory_type", MemoryType.PROCEDURAL),
+            )
             stored_memories.append(m)
             return m
+
         mock_storage.store.side_effect = capture_store
 
         hooks = TurnHooks(db_factory)
         with patch("core.memory.backends.get_memoria_storage", return_value=mock_storage):
             hooks.detect_reflection_learning(
-                sid, uid,
+                sid,
+                uid,
                 [{"function": {"name": "reflect"}}],
                 [{"name": "reflect", "result": "read_file failed: file not found"}],
             )
             hooks.detect_reflection_learning(
-                sid, uid,
+                sid,
+                uid,
                 [{"function": {"name": "bash"}}],
                 [{"name": "bash", "result": "ok"}],
             )
@@ -571,7 +691,8 @@ class TestReflectionLearningRealDB:
 
         hooks = TurnHooks(db_factory)
         hooks.detect_reflection_learning(
-            sid, uid,
+            sid,
+            uid,
             [{"function": {"name": "bash"}}],
             [{"name": "bash", "result": "ok"}],
         )
@@ -585,16 +706,19 @@ class TestReflectionLearningRealDB:
 # 4. Local skill provenance
 # ============================================================================
 
-class TestLocalSkillProvenance:
 
+class TestLocalSkillProvenance:
     @pytest.mark.asyncio
     async def test_data_source_in_tool_result(self, _provenance_classes):
         from cli.tools.router import ToolRouter, ToolCall
+
         _, _, WithProvenance, _ = _provenance_classes
 
         router = ToolRouter()
         router.register(WithProvenance())
-        results = await router.execute([ToolCall(id="tc1", name="test_with_provenance", arguments={"query": "test"})])
+        results = await router.execute(
+            [ToolCall(id="tc1", name="test_with_provenance", arguments={"query": "test"})]
+        )
 
         data = json.loads(results[0].result)
         assert data["data_source"] == "test_api"
@@ -604,11 +728,14 @@ class TestLocalSkillProvenance:
     @pytest.mark.asyncio
     async def test_empty_data_source_still_serialized(self, _provenance_classes):
         from cli.tools.router import ToolRouter, ToolCall
+
         _, _, _, WithoutProvenance = _provenance_classes
 
         router = ToolRouter()
         router.register(WithoutProvenance())
-        results = await router.execute([ToolCall(id="tc1", name="test_no_provenance", arguments={"query": "x"})])
+        results = await router.execute(
+            [ToolCall(id="tc1", name="test_no_provenance", arguments={"query": "x"})]
+        )
 
         data = json.loads(results[0].result)
         assert "data_source" in data
@@ -619,10 +746,11 @@ class TestLocalSkillProvenance:
 # 5. Session cache
 # ============================================================================
 
-class TestSessionCache:
 
+class TestSessionCache:
     def test_peek_returns_none_for_missing(self):
         from api.routers.chat import _peek_session_entry
+
         assert _peek_session_entry("nonexistent_session_xyz") is None
 
 
@@ -630,21 +758,41 @@ class TestSessionCache:
 # 6. EXPLAIN output
 # ============================================================================
 
-class TestPrintExplain:
 
+class TestPrintExplain:
     def test_basic_output(self):
         import io
         from cli.edge_chat_loop import _print_explain
 
         buf = io.StringIO()
-        _print_explain([{
-            "turn": 0, "total_ms": 500,
-            "prompt_tokens": 100, "completion_tokens": 50,
-            "steps": [
-                {"step": "llm", "loop": 0, "duration_ms": 400, "in": 100, "out": 50, "tool_calls": 1},
-                {"step": "cloud_skill", "name": "list_prs", "duration_ms": 80, "in_bytes": 20, "out_bytes": 300},
+        _print_explain(
+            [
+                {
+                    "turn": 0,
+                    "total_ms": 500,
+                    "prompt_tokens": 100,
+                    "completion_tokens": 50,
+                    "steps": [
+                        {
+                            "step": "llm",
+                            "loop": 0,
+                            "duration_ms": 400,
+                            "in": 100,
+                            "out": 50,
+                            "tool_calls": 1,
+                        },
+                        {
+                            "step": "cloud_skill",
+                            "name": "list_prs",
+                            "duration_ms": 80,
+                            "in_bytes": 20,
+                            "out_bytes": 300,
+                        },
+                    ],
+                }
             ],
-        }], file=buf)
+            file=buf,
+        )
 
         output = buf.getvalue()
         assert "EXPLAIN" in output
@@ -658,13 +806,27 @@ class TestPrintExplain:
         from cli.edge_chat_loop import _print_explain
 
         buf = io.StringIO()
-        _print_explain([{
-            "turn": 0, "total_ms": 200,
-            "prompt_tokens": 0, "completion_tokens": 0,
-            "steps": [
-                {"step": "llm", "loop": 0, "duration_ms": 200, "in": None, "out": None, "tool_calls": 0},
+        _print_explain(
+            [
+                {
+                    "turn": 0,
+                    "total_ms": 200,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "steps": [
+                        {
+                            "step": "llm",
+                            "loop": 0,
+                            "duration_ms": 200,
+                            "in": None,
+                            "out": None,
+                            "tool_calls": 0,
+                        },
+                    ],
+                }
             ],
-        }], file=buf)
+            file=buf,
+        )
 
         output = buf.getvalue()
         assert "in=?" in output
@@ -678,7 +840,17 @@ class TestPrintExplain:
         old_stderr = sys.stderr
         sys.stderr = io.StringIO()
         try:
-            _print_explain([{"turn": 0, "total_ms": 10, "prompt_tokens": 0, "completion_tokens": 0, "steps": []}])
+            _print_explain(
+                [
+                    {
+                        "turn": 0,
+                        "total_ms": 10,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "steps": [],
+                    }
+                ]
+            )
             assert "EXPLAIN" in sys.stderr.getvalue()
         finally:
             sys.stderr = old_stderr
@@ -689,21 +861,32 @@ class TestPrintExplain:
         from cli.edge_chat_loop import _print_explain
 
         buf = io.StringIO()
-        _print_explain([{
-            "turn": 0, "total_ms": 300,
-            "prompt_tokens": 100, "completion_tokens": 50,
-            "memory": {
-                "l0": {"loaded": True, "tokens": 20, "ms": 5},
-                "l1": {"loaded": True, "count": 2, "tokens": 50, "ms": 15},
-                "retrieval": {
-                    "keyword_hit": True, "phase1_candidates": 3,
-                    "vector_hit": False, "phase2_candidates": 0,
-                    "merged_candidates": 3, "final_count": 2, "total_ms": 12,
-                },
-                "total_ms": 20,
-            },
-            "steps": [],
-        }], file=buf)
+        _print_explain(
+            [
+                {
+                    "turn": 0,
+                    "total_ms": 300,
+                    "prompt_tokens": 100,
+                    "completion_tokens": 50,
+                    "memory": {
+                        "l0": {"loaded": True, "tokens": 20, "ms": 5},
+                        "l1": {"loaded": True, "count": 2, "tokens": 50, "ms": 15},
+                        "retrieval": {
+                            "keyword_hit": True,
+                            "phase1_candidates": 3,
+                            "vector_hit": False,
+                            "phase2_candidates": 0,
+                            "merged_candidates": 3,
+                            "final_count": 2,
+                            "total_ms": 12,
+                        },
+                        "total_ms": 20,
+                    },
+                    "steps": [],
+                }
+            ],
+            file=buf,
+        )
 
         output = buf.getvalue()
         assert "L0 profile" in output
@@ -718,18 +901,31 @@ class TestPrintExplain:
         from cli.edge_chat_loop import _print_explain
 
         buf = io.StringIO()
-        _print_explain([{
-            "turn": 0, "total_ms": 100,
-            "prompt_tokens": 50, "completion_tokens": 20,
-            "memory": {
-                "l0": {"loaded": False, "tokens": 0, "ms": 1},
-                "retrieval": {"keyword_hit": False, "phase1_candidates": 0,
-                              "vector_hit": False, "phase2_candidates": 0,
-                              "merged_candidates": 0, "final_count": 0, "total_ms": 5},
-                "total_ms": 6,
-            },
-            "steps": [],
-        }], file=buf)
+        _print_explain(
+            [
+                {
+                    "turn": 0,
+                    "total_ms": 100,
+                    "prompt_tokens": 50,
+                    "completion_tokens": 20,
+                    "memory": {
+                        "l0": {"loaded": False, "tokens": 0, "ms": 1},
+                        "retrieval": {
+                            "keyword_hit": False,
+                            "phase1_candidates": 0,
+                            "vector_hit": False,
+                            "phase2_candidates": 0,
+                            "merged_candidates": 0,
+                            "final_count": 0,
+                            "total_ms": 5,
+                        },
+                        "total_ms": 6,
+                    },
+                    "steps": [],
+                }
+            ],
+            file=buf,
+        )
 
         output = buf.getvalue()
         assert "L0 profile  ✗" in output
@@ -739,25 +935,50 @@ class TestPrintExplain:
         from cli.edge_chat_loop import _print_explain
 
         buf = io.StringIO()
-        _print_explain([{
-            "turn": 0, "total_ms": 300,
-            "prompt_tokens": 100, "completion_tokens": 50,
-            "memory": {
-                "l0": {"loaded": True, "tokens": 20, "ms": 5,
-                       "preview": "- User prefers concise responses"},
-                "l1": {"loaded": True, "count": 2, "tokens": 50, "ms": 15,
-                       "previews": ["[semantic] Uses Python for data analysis",
-                                    "[procedural] Always run tests before commit"]},
-                "retrieval": {
-                    "keyword_hit": True, "phase1_candidates": 3,
-                    "vector_hit": False, "phase2_candidates": 0,
-                    "merged_candidates": 3, "final_count": 2, "total_ms": 12,
-                    "phase1_ms": 8, "phase2_ms": 0, "merge_ms": 4,
-                },
-                "total_ms": 20,
-            },
-            "steps": [],
-        }], file=buf, verbose=True)
+        _print_explain(
+            [
+                {
+                    "turn": 0,
+                    "total_ms": 300,
+                    "prompt_tokens": 100,
+                    "completion_tokens": 50,
+                    "memory": {
+                        "l0": {
+                            "loaded": True,
+                            "tokens": 20,
+                            "ms": 5,
+                            "preview": "- User prefers concise responses",
+                        },
+                        "l1": {
+                            "loaded": True,
+                            "count": 2,
+                            "tokens": 50,
+                            "ms": 15,
+                            "previews": [
+                                "[semantic] Uses Python for data analysis",
+                                "[procedural] Always run tests before commit",
+                            ],
+                        },
+                        "retrieval": {
+                            "keyword_hit": True,
+                            "phase1_candidates": 3,
+                            "vector_hit": False,
+                            "phase2_candidates": 0,
+                            "merged_candidates": 3,
+                            "final_count": 2,
+                            "total_ms": 12,
+                            "phase1_ms": 8,
+                            "phase2_ms": 0,
+                            "merge_ms": 4,
+                        },
+                        "total_ms": 20,
+                    },
+                    "steps": [],
+                }
+            ],
+            file=buf,
+            verbose=True,
+        )
 
         output = buf.getvalue()
         assert "VERBOSE" in output
@@ -770,24 +991,47 @@ class TestPrintExplain:
         from cli.edge_chat_loop import _print_explain
 
         buf = io.StringIO()
-        _print_explain([{
-            "turn": 0, "total_ms": 300,
-            "prompt_tokens": 100, "completion_tokens": 50,
-            "memory": {
-                "l0": {"loaded": True, "tokens": 20, "ms": 5,
-                       "preview": "- User prefers concise responses"},
-                "l1": {"loaded": True, "count": 2, "tokens": 50, "ms": 15,
-                       "previews": ["[semantic] Uses Python"]},
-                "retrieval": {
-                    "keyword_hit": True, "phase1_candidates": 3,
-                    "vector_hit": False, "phase2_candidates": 0,
-                    "merged_candidates": 3, "final_count": 2, "total_ms": 12,
-                    "phase1_ms": 8, "phase2_ms": 0, "merge_ms": 4,
-                },
-                "total_ms": 20,
-            },
-            "steps": [],
-        }], file=buf, verbose=False)
+        _print_explain(
+            [
+                {
+                    "turn": 0,
+                    "total_ms": 300,
+                    "prompt_tokens": 100,
+                    "completion_tokens": 50,
+                    "memory": {
+                        "l0": {
+                            "loaded": True,
+                            "tokens": 20,
+                            "ms": 5,
+                            "preview": "- User prefers concise responses",
+                        },
+                        "l1": {
+                            "loaded": True,
+                            "count": 2,
+                            "tokens": 50,
+                            "ms": 15,
+                            "previews": ["[semantic] Uses Python"],
+                        },
+                        "retrieval": {
+                            "keyword_hit": True,
+                            "phase1_candidates": 3,
+                            "vector_hit": False,
+                            "phase2_candidates": 0,
+                            "merged_candidates": 3,
+                            "final_count": 2,
+                            "total_ms": 12,
+                            "phase1_ms": 8,
+                            "phase2_ms": 0,
+                            "merge_ms": 4,
+                        },
+                        "total_ms": 20,
+                    },
+                    "steps": [],
+                }
+            ],
+            file=buf,
+            verbose=False,
+        )
 
         output = buf.getvalue()
         assert "User prefers concise" not in output
@@ -796,52 +1040,76 @@ class TestPrintExplain:
 
 
 class TestEscapeLike:
-
     def test_escapes_percent(self):
         from core.agent.reflect_service import _escape_like
+
         assert _escape_like("100%") == "100\\%"
 
     def test_escapes_underscore(self):
         from core.agent.reflect_service import _escape_like
+
         assert _escape_like("match_test") == "match\\_test"
 
     def test_escapes_backslash(self):
         from core.agent.reflect_service import _escape_like
+
         assert _escape_like("a\\b") == "a\\\\b"
 
     def test_plain_text_unchanged(self):
         from core.agent.reflect_service import _escape_like
+
         assert _escape_like("hello world") == "hello world"
 
 
 class TestExplainSSE:
-
     @pytest.fixture
     def client(self):
         import os
+
         os.environ.setdefault("TOKEN_ENCRYPTION_KEY", "test-key-" + "x" * 32)
         os.environ.setdefault("JWT_SECRET_KEY", "test-jwt-secret-" + "x" * 32)
         from fastapi.testclient import TestClient
         from api.main import app
+
         return TestClient(app)
 
     def test_explain_event_in_stream(self, client, db_session):
         from unittest.mock import patch
         from tests.conftest import get_auth_headers, parse_sse_events, fake_llm_stream
 
-        headers = get_auth_headers(client, db_session, username="explain_usr", user_id="explain_uid", email="ex@t.com")
+        headers = get_auth_headers(
+            client, db_session, username="explain_usr", user_id="explain_uid", email="ex@t.com"
+        )
 
-        stream = fake_llm_stream([
-            {"type": "text", "content": "hello"},
-            {"type": "usage", "prompt": 10, "completion": 5},
-        ])
+        stream = fake_llm_stream(
+            [
+                {"type": "text", "content": "hello"},
+                {"type": "usage", "prompt": 10, "completion": 5},
+            ]
+        )
 
         with patch("core.llm.client.LLMClient.chat_with_tools_stream", return_value=stream):
-            resp = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "run bash command"}],
-                "edge_tools": [{"type": "function", "function": {"name": "bash", "description": "run shell commands", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}}}],
-                "explain": True,
-            }, headers=headers)
+            resp = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "run bash command"}],
+                    "edge_tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "description": "run shell commands",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"command": {"type": "string"}},
+                                },
+                            },
+                        }
+                    ],
+                    "explain": True,
+                },
+                headers=headers,
+            )
 
         assert resp.status_code == 200
         events = parse_sse_events(resp.text)
@@ -856,16 +1124,34 @@ class TestExplainSSE:
         from unittest.mock import patch
         from tests.conftest import get_auth_headers, parse_sse_events, fake_llm_stream
 
-        headers = get_auth_headers(client, db_session, username="explain_nu", user_id="explain_nuid", email="en@t.com")
+        headers = get_auth_headers(
+            client, db_session, username="explain_nu", user_id="explain_nuid", email="en@t.com"
+        )
 
         stream = fake_llm_stream([{"type": "text", "content": "hi"}])
 
         with patch("core.llm.client.LLMClient.chat_with_tools_stream", return_value=stream):
-            resp = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "run bash command"}],
-                "edge_tools": [{"type": "function", "function": {"name": "bash", "description": "run shell commands", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}}}],
-                "explain": True,
-            }, headers=headers)
+            resp = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "run bash command"}],
+                    "edge_tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "description": "run shell commands",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"command": {"type": "string"}},
+                                },
+                            },
+                        }
+                    ],
+                    "explain": True,
+                },
+                headers=headers,
+            )
 
         assert resp.status_code == 200
         events = parse_sse_events(resp.text)

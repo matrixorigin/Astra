@@ -69,7 +69,7 @@ class SessionManager:
         """
         session_id = str(uuid4())
         now = datetime.now(timezone.utc)
-        
+
         db_session = SessionModel(
             session_id=session_id,
             user_id=user_id,
@@ -80,7 +80,7 @@ class SessionManager:
             event_count=0,
             session_metadata=metadata,
         )
-        
+
         db = self._get_session()
         db.add(db_session)
         db.commit()
@@ -119,7 +119,7 @@ class SessionManager:
         """
         db = self._get_session()
         now = datetime.now(timezone.utc)
-        
+
         db_session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
         if db_session:
             db_session.last_active_at = now
@@ -141,10 +141,11 @@ class SessionManager:
             db_session.status = SessionStatus.CLOSED
             db_session.updated_at = datetime.now(timezone.utc)
             db.commit()
-            
+
             # Session-level quality scoring (aggregate chain scores)
             try:
                 from core.evaluation.multi_level_scorer import score_session
+
                 score_session(db, session_id)
             except Exception as e:
                 logger.warning("Session-level scoring failed (non-fatal): %s", e)
@@ -153,10 +154,17 @@ class SessionManager:
             # Avoids N+1: previous code queried distinct chain_ids then per-chain events,
             # plus a second scan for summary — now one query serves both.
             from api.models import Event
-            events = db.query(Event).filter(
-                Event.session_id == session_id,
-                Event.event_type.in_(["user_query", "llm_response"]),
-            ).order_by(Event.created_at).limit(200).all()
+
+            events = (
+                db.query(Event)
+                .filter(
+                    Event.session_id == session_id,
+                    Event.event_type.in_(["user_query", "llm_response"]),
+                )
+                .order_by(Event.created_at)
+                .limit(200)
+                .all()
+            )
 
             # Auto-trigger knowledge extraction (batch by chain)
             try:
@@ -173,7 +181,9 @@ class SessionManager:
                 for chain_id, chain_events in chains.items():
                     extractor.extract_from_events(chain_id, db_session.user_id, chain_events)
 
-                logger.info(f"Extracted knowledge from {len(chains)} chains in session {session_id}")
+                logger.info(
+                    f"Extracted knowledge from {len(chains)} chains in session {session_id}"
+                )
             except Exception as e:
                 logger.error(f"Knowledge extraction failed for session {session_id}: {e}")
 
@@ -190,8 +200,10 @@ class SessionManager:
                 from core.memory import create_memory_service
 
                 messages = [
-                    {"role": "user" if e.event_type == "user_query" else "assistant",
-                     "content": e.content or ""}
+                    {
+                        "role": "user" if e.event_type == "user_query" else "assistant",
+                        "content": e.content or "",
+                    }
                     for e in events
                 ]
                 if messages:
@@ -215,13 +227,13 @@ class SessionManager:
         """
         db = self._get_session()
         query = db.query(SessionModel).filter(SessionModel.user_id == user_id)
-        
+
         if status:
             query = query.filter(SessionModel.status == status)
-        
+
         query = query.order_by(SessionModel.last_active_at.desc()).limit(limit)
         db_sessions = query.all()
-        
+
         return [self._model_to_session(s) for s in db_sessions]
 
     def _model_to_session(self, model: SessionModel) -> Session:

@@ -43,7 +43,9 @@ class TestNoTrigger:
         assert decision.action == SupervisionAction.NONE
 
     def test_confidence_above_threshold_no_trigger(self):
-        engine = _engine(_policy("conf-gate", SupervisionAction.REVIEW_AND_EDIT, confidence_below=0.6))
+        engine = _engine(
+            _policy("conf-gate", SupervisionAction.REVIEW_AND_EDIT, confidence_below=0.6)
+        )
         decision = engine.evaluate(ActionContext(confidence=0.61))
         assert decision.action == SupervisionAction.NONE
 
@@ -61,28 +63,38 @@ class TestSingleTrigger:
         assert decision.action == SupervisionAction.REVIEW_AND_EDIT
 
     def test_affects_resources_triggers(self):
-        engine = _engine(_policy(
-            "prod-gate", SupervisionAction.REVIEW_AND_EDIT,
-            affects_resources=["production", "database"],
-        ))
+        engine = _engine(
+            _policy(
+                "prod-gate",
+                SupervisionAction.REVIEW_AND_EDIT,
+                affects_resources=["production", "database"],
+            )
+        )
         decision = engine.evaluate(ActionContext(resources=["production"]))
         assert decision.action == SupervisionAction.REVIEW_AND_EDIT
 
     def test_affects_resources_no_overlap_no_trigger(self):
-        engine = _engine(_policy(
-            "prod-gate", SupervisionAction.REVIEW_AND_EDIT,
-            affects_resources=["production"],
-        ))
+        engine = _engine(
+            _policy(
+                "prod-gate",
+                SupervisionAction.REVIEW_AND_EDIT,
+                affects_resources=["production"],
+            )
+        )
         decision = engine.evaluate(ActionContext(resources=["staging"]))
         assert decision.action == SupervisionAction.NONE
 
     def test_plan_depth_triggers(self):
-        engine = _engine(_policy("plan-gate", SupervisionAction.APPROVE_REJECT, plan_depth_exceeds=5))
+        engine = _engine(
+            _policy("plan-gate", SupervisionAction.APPROVE_REJECT, plan_depth_exceeds=5)
+        )
         decision = engine.evaluate(ActionContext(plan_depth=6))
         assert decision.action == SupervisionAction.APPROVE_REJECT
 
     def test_plan_depth_at_threshold_no_trigger(self):
-        engine = _engine(_policy("plan-gate", SupervisionAction.APPROVE_REJECT, plan_depth_exceeds=5))
+        engine = _engine(
+            _policy("plan-gate", SupervisionAction.APPROVE_REJECT, plan_depth_exceeds=5)
+        )
         decision = engine.evaluate(ActionContext(plan_depth=5))
         assert decision.action == SupervisionAction.NONE
 
@@ -108,9 +120,12 @@ class TestMostRestrictiveWins:
             _policy("observe", SupervisionAction.OBSERVE_ONLY, novel_skill_use=True),
             _policy("approve", SupervisionAction.APPROVE_REJECT, cost_exceeds=1.0),
         )
-        decision = engine.evaluate(ActionContext(
-            estimated_cost=2.0, is_novel_skill=True,
-        ))
+        decision = engine.evaluate(
+            ActionContext(
+                estimated_cost=2.0,
+                is_novel_skill=True,
+            )
+        )
         assert decision.action == SupervisionAction.APPROVE_REJECT
         assert len(decision.triggered_policies) == 2
 
@@ -120,9 +135,13 @@ class TestMostRestrictiveWins:
             _policy("approve", SupervisionAction.APPROVE_REJECT, cost_exceeds=1.0),
             _policy("takeover", SupervisionAction.TAKEOVER, escalated_by_agent=True),
         )
-        decision = engine.evaluate(ActionContext(
-            estimated_cost=2.0, is_novel_skill=True, agent_escalated=True,
-        ))
+        decision = engine.evaluate(
+            ActionContext(
+                estimated_cost=2.0,
+                is_novel_skill=True,
+                agent_escalated=True,
+            )
+        )
         assert decision.action == SupervisionAction.TAKEOVER
 
     def test_reason_includes_all_triggered(self):
@@ -153,5 +172,7 @@ class TestActionSeverity:
     def test_severity_ordering(self):
         assert SupervisionAction.NONE.severity < SupervisionAction.OBSERVE_ONLY.severity
         assert SupervisionAction.OBSERVE_ONLY.severity < SupervisionAction.APPROVE_REJECT.severity
-        assert SupervisionAction.APPROVE_REJECT.severity < SupervisionAction.REVIEW_AND_EDIT.severity
+        assert (
+            SupervisionAction.APPROVE_REJECT.severity < SupervisionAction.REVIEW_AND_EDIT.severity
+        )
         assert SupervisionAction.REVIEW_AND_EDIT.severity < SupervisionAction.TAKEOVER.severity

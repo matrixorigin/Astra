@@ -51,7 +51,10 @@ class TestRoutingSkipsSections:
     def test_command_skips_history_and_memory(self, db_session):
         edge_ctx = EdgeContext(
             edge_tools=[
-                {"type": "function", "function": {"name": "bash", "description": "Shell", "parameters": {}}},
+                {
+                    "type": "function",
+                    "function": {"name": "bash", "description": "Shell", "parameters": {}},
+                },
             ],
         )
         result = self._assemble_with_plan(db_session, "command", edge_context=edge_ctx)
@@ -120,9 +123,18 @@ class TestTier1Integration:
 
         edge_ctx = EdgeContext(
             edge_tools=[
-                {"type": "function", "function": {"name": "bash", "description": "Shell", "parameters": {}}},
-                {"type": "function", "function": {"name": "grep", "description": "Search", "parameters": {}}},
-                {"type": "function", "function": {"name": "read_file", "description": "Read", "parameters": {}}},
+                {
+                    "type": "function",
+                    "function": {"name": "bash", "description": "Shell", "parameters": {}},
+                },
+                {
+                    "type": "function",
+                    "function": {"name": "grep", "description": "Search", "parameters": {}},
+                },
+                {
+                    "type": "function",
+                    "function": {"name": "read_file", "description": "Read", "parameters": {}},
+                },
             ],
         )
 
@@ -164,6 +176,7 @@ class TestSnapshotContainsRoutingInfo:
 
         # Re-query DB — ground truth verification
         from api.models.context import ContextSnapshot
+
         row = (
             db_session.query(ContextSnapshot)
             .filter(ContextSnapshot.context_capture_id == assembled.snapshot_id)
@@ -177,7 +190,9 @@ class TestSnapshotContainsRoutingInfo:
         assert row.created_at is not None
 
         # token_budget is JSON of breakdown — verify it round-trips
-        budget = json.loads(row.token_budget) if isinstance(row.token_budget, str) else row.token_budget
+        budget = (
+            json.loads(row.token_budget) if isinstance(row.token_budget, str) else row.token_budget
+        )
         assert "identity" in budget
         assert "constraints" in budget
         # Preference skips history and tools — they should NOT be in breakdown
@@ -185,7 +200,11 @@ class TestSnapshotContainsRoutingInfo:
         assert budget.get("tool_schemas") is None or budget.get("tool_schemas", 0) == 0
 
         # system_prompt contains fixed_hashes + variable_sections
-        prompt_data = json.loads(row.system_prompt) if isinstance(row.system_prompt, str) else row.system_prompt
+        prompt_data = (
+            json.loads(row.system_prompt)
+            if isinstance(row.system_prompt, str)
+            else row.system_prompt
+        )
         assert "fixed_hashes" in prompt_data
         assert "identity" in prompt_data["fixed_hashes"]
 
@@ -202,23 +221,46 @@ class TestTokenEfficiencyComparison:
         pref_result = RoutingResult(intent="preference", confidence=0.95, tier=0, matched_by="both")
         pref_decision = RoutingDecision(plan=INTENT_PLANS["preference"], routing_result=pref_result)
         pref = pa.assemble(
-            agent_id=None, user_query="记住我用vim",
-            session_id=unique_test_id(), user_id=uid, routing_decision=pref_decision,
+            agent_id=None,
+            user_query="记住我用vim",
+            session_id=unique_test_id(),
+            user_id=uid,
+            routing_decision=pref_decision,
         )
 
         # Assemble with question intent (full context) — provide tools so there's a difference
         edge_ctx = EdgeContext(
             edge_tools=[
-                {"type": "function", "function": {"name": "bash", "description": "Shell exec", "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}}},
-                {"type": "function", "function": {"name": "grep", "description": "Search files", "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}}}},
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "description": "Shell exec",
+                        "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "grep",
+                        "description": "Search files",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"pattern": {"type": "string"}},
+                        },
+                    },
+                },
             ],
         )
         q_result = RoutingResult(intent="question", confidence=0.95, tier=0, matched_by="both")
         q_decision = RoutingDecision(plan=INTENT_PLANS["question"], routing_result=q_result)
         q = pa.assemble(
-            agent_id=None, user_query="what is event sourcing?",
-            session_id=unique_test_id(), user_id=uid,
-            edge_context=edge_ctx, routing_decision=q_decision,
+            agent_id=None,
+            user_query="what is event sourcing?",
+            session_id=unique_test_id(),
+            user_id=uid,
+            edge_context=edge_ctx,
+            routing_decision=q_decision,
         )
 
         # Preference: no tools, no history

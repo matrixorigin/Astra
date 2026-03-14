@@ -57,6 +57,7 @@ class TestMonthlyBudgetRealDB:
 
         # Re-query DB to verify the row is actually there
         from api.models.evaluation import LLMCallLog
+
         row = db_session.query(LLMCallLog).filter(LLMCallLog.log_id == log_id).first()
         assert row is not None
         assert row.cost_usd == 10.0
@@ -83,6 +84,7 @@ class TestTier1Timeout:
 
         def slow_llm_call(prompt):
             import time
+
             time.sleep(5)  # blocks thread > 2s timeout
             return '{"intent": "command", "confidence": 0.9}'
 
@@ -103,6 +105,7 @@ class TestTier1Timeout:
             call_count += 1
             if "Compress" in prompt:
                 import time
+
                 time.sleep(5)  # slow only for compress
                 return "compressed"
             # Fast for classify

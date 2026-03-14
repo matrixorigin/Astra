@@ -39,9 +39,15 @@ def db(db_session):
 @pytest.fixture
 def session_id(db):
     from core.events.session_manager import SessionManager
-    sid = SessionManager(db).create_session(
-        user_id="test-user", metadata={"source": "trigger_isolation"},
-    ).session_id
+
+    sid = (
+        SessionManager(db)
+        .create_session(
+            user_id="test-user",
+            metadata={"source": "trigger_isolation"},
+        )
+        .session_id
+    )
     yield sid
     db.execute(text("DELETE FROM wf_triggers WHERE session_id = :sid"), {"sid": sid})
     db.execute(text("DELETE FROM agent_sessions WHERE session_id = :sid"), {"sid": sid})
@@ -51,7 +57,9 @@ def session_id(db):
 def _make_due_trigger(db, session_id, name_suffix=""):
     """Create a schedule trigger with next_fire_at in the past (immediately due)."""
     trig = create_trigger(
-        db, user_id="test-user", agent_id="dev-agent",
+        db,
+        user_id="test-user",
+        agent_id="dev-agent",
         trigger_type="schedule",
         name=f"iso-{generate_id()}{name_suffix}",
         user_input="test input",
@@ -187,9 +195,11 @@ class TestFireTriggerUsesFactory:
                 s.close = tracked_close
                 return s
 
-            with patch("core.agent.run_engine.RunEngine") as MockEngine, \
-                 patch("core.agent.triggers._auto_session", return_value=session_id), \
-                 patch("asyncio.create_task"):
+            with (
+                patch("core.agent.run_engine.RunEngine") as MockEngine,
+                patch("core.agent.triggers._auto_session", return_value=session_id),
+                patch("asyncio.create_task"),
+            ):
                 mock_run = MagicMock()
                 mock_run.run_id = "run-1"
                 mock_run.status.value = "pending"
@@ -210,9 +220,11 @@ class TestFireTriggerUsesFactory:
         try:
             from api.database import SessionLocal
 
-            with patch("core.agent.run_engine.RunEngine") as MockEngine, \
-                 patch("core.agent.triggers._auto_session", return_value=session_id), \
-                 patch("asyncio.create_task"):
+            with (
+                patch("core.agent.run_engine.RunEngine") as MockEngine,
+                patch("core.agent.triggers._auto_session", return_value=session_id),
+                patch("asyncio.create_task"),
+            ):
                 mock_run = MagicMock()
                 mock_run.run_id = "run-1"
                 mock_run.status.value = "pending"
@@ -223,8 +235,9 @@ class TestFireTriggerUsesFactory:
             # RunEngine was constructed with the factory callable, not a Session.
             MockEngine.assert_called_once()
             factory_arg = MockEngine.call_args[0][0]
-            assert factory_arg is SessionLocal, \
+            assert factory_arg is SessionLocal, (
                 "RunEngine must receive the exact factory callable passed to fire_trigger"
+            )
         finally:
             delete_trigger(db, tid)
 
@@ -269,7 +282,9 @@ class TestGetDueTriggersRealDB:
 
         # Create a trigger that is NOT due (next_fire_at in the future).
         trig_future = create_trigger(
-            db, user_id="test-user", agent_id="dev-agent",
+            db,
+            user_id="test-user",
+            agent_id="dev-agent",
             trigger_type="schedule",
             name=f"iso-{generate_id()}-future",
             user_input="test input",
@@ -347,9 +362,11 @@ class TestTriggerLoopPattern:
                                 # Simulate fire_trigger raising (e.g. DB error inside fire).
                                 raise RuntimeError("simulated fire failure")
                             # For tid_b, actually call fire_trigger to test full path.
-                            with patch("core.agent.run_engine.RunEngine") as MockEngine, \
-                                 patch("core.agent.triggers._auto_session", return_value=session_id), \
-                                 patch("asyncio.create_task"):
+                            with (
+                                patch("core.agent.run_engine.RunEngine") as MockEngine,
+                                patch("core.agent.triggers._auto_session", return_value=session_id),
+                                patch("asyncio.create_task"),
+                            ):
                                 mock_run = MagicMock()
                                 mock_run.run_id = f"run-{tid}"
                                 mock_run.status.value = "pending"
@@ -367,8 +384,9 @@ class TestTriggerLoopPattern:
             # Verify both claims persisted (next_fire_at advanced).
             for tid in [tid_a, tid_b]:
                 loaded = get_trigger(db, tid)
-                assert loaded["next_fire_at"] > datetime(2020, 1, 2), \
+                assert loaded["next_fire_at"] > datetime(2020, 1, 2), (
                     f"Trigger {tid} claim was lost"
+                )
         finally:
             delete_trigger(db, tid_a)
             delete_trigger(db, tid_b)

@@ -44,6 +44,7 @@ class UserResponse(BaseModel):
     email: str
     display_name: str | None = None
 
+
 router = APIRouter(tags=["authentication"])
 
 
@@ -57,14 +58,16 @@ def register(request: RegisterRequest, db: "Session" = Depends(get_db_session)):
     if repo.get_by_email(request.email):
         raise HTTPException(status_code=400, detail="Email already exists")
 
-    user = repo.create({
-        "user_id": str(uuid4()),
-        "username": request.username,
-        "email": request.email,
-        "password_hash": hash_password(request.password),
-        "display_name": request.display_name,
-        "is_active": 1,
-    })
+    user = repo.create(
+        {
+            "user_id": str(uuid4()),
+            "username": request.username,
+            "email": request.email,
+            "password_hash": hash_password(request.password),
+            "display_name": request.display_name,
+            "is_active": 1,
+        }
+    )
 
     # Atomically assign admin role if no admin exists yet.
     # INSERT ... SELECT ensures only one concurrent registration wins.
@@ -111,13 +114,15 @@ def login(request: LoginRequest, db: "Session" = Depends(get_db_session)):
     refresh_token = create_refresh_token({"sub": user.user_id})
 
     token_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
-    repo.store_refresh_token({
-        "token_id": str(uuid4()),
-        "user_id": user.user_id,
-        "token_hash": token_hash,
-        "expires_at": datetime.now(timezone.utc) + timedelta(days=7),
-        "is_revoked": 0,
-    })
+    repo.store_refresh_token(
+        {
+            "token_id": str(uuid4()),
+            "user_id": user.user_id,
+            "token_hash": token_hash,
+            "expires_at": datetime.now(timezone.utc) + timedelta(days=7),
+            "is_revoked": 0,
+        }
+    )
 
     db.commit()
 
@@ -152,7 +157,11 @@ def refresh(request: RefreshRequest, db: "Session" = Depends(get_db_session)):
     if not token:
         raise HTTPException(status_code=401, detail="Token expired or revoked")
 
-    expires_at = token.expires_at.replace(tzinfo=timezone.utc) if token.expires_at.tzinfo is None else token.expires_at
+    expires_at = (
+        token.expires_at.replace(tzinfo=timezone.utc)
+        if token.expires_at.tzinfo is None
+        else token.expires_at
+    )
     if expires_at < datetime.now(timezone.utc):
         raise HTTPException(status_code=401, detail="Token expired or revoked")
 
@@ -167,12 +176,14 @@ def refresh(request: RefreshRequest, db: "Session" = Depends(get_db_session)):
     new_refresh_token = create_refresh_token({"sub": user.user_id})
 
     new_token_hash = hashlib.sha256(new_refresh_token.encode()).hexdigest()
-    repo.store_refresh_token({
-        "token_id": str(uuid4()),
-        "user_id": user.user_id,
-        "token_hash": new_token_hash,
-        "expires_at": datetime.now(timezone.utc) + timedelta(days=30),
-    })
+    repo.store_refresh_token(
+        {
+            "token_id": str(uuid4()),
+            "user_id": user.user_id,
+            "token_hash": new_token_hash,
+            "expires_at": datetime.now(timezone.utc) + timedelta(days=30),
+        }
+    )
 
     db.commit()
 

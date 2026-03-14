@@ -27,53 +27,69 @@ def quality_session():
     sid = session.session_id
 
     el = EventLogger(SessionLocal)
-    uq = el.create_user_query(user_id=user_id, session_id=sid,
-                               content="中信证券建议买吗？")
+    uq = el.create_user_query(user_id=user_id, session_id=sid, content="中信证券建议买吗？")
     chain = uq.causal_chain_id
 
     # Simulate tool_call + tool_result
     el.create_stream_event(
-        user_id=user_id, session_id=sid,
+        user_id=user_id,
+        session_id=sid,
         event_type="tool_call",
         content=json.dumps({"name": "stock_assistant", "tool_call_id": "tc_q1"}),
-        parent_event_id=uq.event_id, causal_chain_id=chain,
+        parent_event_id=uq.event_id,
+        causal_chain_id=chain,
         skill_name="stock_assistant",
     )
     el.create_stream_event(
-        user_id=user_id, session_id=sid,
+        user_id=user_id,
+        session_id=sid,
         event_type="tool_result",
         content=json.dumps({"name": "stock_assistant", "result": "{}"}),
-        parent_event_id=uq.event_id, causal_chain_id=chain,
+        parent_event_id=uq.event_id,
+        causal_chain_id=chain,
         skill_name="stock_assistant",
     )
 
     # Write the quality event — same code path as Phase 2b in _persist_turn_events
     el.create_stream_event(
-        user_id=user_id, session_id=sid,
+        user_id=user_id,
+        session_id=sid,
         event_type="tool_result_quality",
-        content=json.dumps({
-            "tool_name": "stock_assistant", "score": 0.3,
-            "grade": "degraded",
-            "signals": ["empty_containers: 5/7 fields empty", "zero_cluster: 3 numeric fields are 0"],
-            "stale": False,
-        }),
+        content=json.dumps(
+            {
+                "tool_name": "stock_assistant",
+                "score": 0.3,
+                "grade": "degraded",
+                "signals": [
+                    "empty_containers: 5/7 fields empty",
+                    "zero_cluster: 3 numeric fields are 0",
+                ],
+                "stale": False,
+            }
+        ),
         parent_event_id=uq.event_id,
         causal_chain_id=chain,
         metadata={
             "tool_name": "stock_assistant",
             "quality_score": 0.3,
             "quality_grade": "degraded",
-            "signals": ["empty_containers: 5/7 fields empty", "zero_cluster: 3 numeric fields are 0"],
+            "signals": [
+                "empty_containers: 5/7 fields empty",
+                "zero_cluster: 3 numeric fields are 0",
+            ],
             "stale": False,
         },
     )
 
     # Also add an LLM response so the session looks complete
     el.create_llm_response(
-        user_id=user_id, session_id=sid,
+        user_id=user_id,
+        session_id=sid,
         content="数据不完整，无法给出可靠建议。",
-        agent_id="dev-agent", agent_version="0.1.0",
-        parent_event_id=uq.event_id, causal_chain_id=chain,
+        agent_id="dev-agent",
+        agent_version="0.1.0",
+        parent_event_id=uq.event_id,
+        causal_chain_id=chain,
     )
 
     yield sid, user_id, chain
@@ -97,6 +113,7 @@ class TestQualityEventDBRoundtrip:
         db = SessionLocal()
         try:
             from api.models.agent import Event as EventModel
+
             rows = (
                 db.query(EventModel.event_type, EventModel.content, EventModel.event_metadata)
                 .filter(
@@ -120,6 +137,7 @@ class TestQualityEventDBRoundtrip:
         db = SessionLocal()
         try:
             from api.models.agent import Event as EventModel
+
             row = (
                 db.query(EventModel.event_metadata)
                 .filter(
@@ -149,9 +167,12 @@ class TestQualityEventDBRoundtrip:
         sid, user_id, _ = quality_session
 
         from api.routers.chat import _build_reflect_evidence
+
         evidence = _build_reflect_evidence(
-            session_id=sid, user_id=user_id,
-            focus="auto", last_n=50,
+            session_id=sid,
+            user_id=user_id,
+            focus="auto",
+            last_n=50,
         )
 
         summary = evidence.get("tool_quality_summary", [])
@@ -170,6 +191,7 @@ class TestQualityEventDBRoundtrip:
         db = SessionLocal()
         try:
             from api.models.agent import Event as EventModel
+
             row = (
                 db.query(EventModel.content)
                 .filter(

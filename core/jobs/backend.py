@@ -25,6 +25,7 @@ class JobResult:
 @dataclass
 class JobRequirements:
     """Resource requirements for a background job."""
+
     gpu_required: bool = False
     min_cpus: int = 1
     min_memory_gb: float = 2.0

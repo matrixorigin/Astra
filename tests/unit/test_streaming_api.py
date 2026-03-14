@@ -187,7 +187,10 @@ class TestChatStream:
         mock_engine.start_run = AsyncMock()
 
         async def mock_stream(run_id, **kw):
-            yield {"event_type": "reasoning_message_content", "data": {"content": "Let me think..."}}
+            yield {
+                "event_type": "reasoning_message_content",
+                "data": {"content": "Let me think..."},
+            }
             yield {"event_type": "text_delta", "data": {"chunk": "Answer"}}
             yield {"event_type": "run_finished", "data": {}}
 

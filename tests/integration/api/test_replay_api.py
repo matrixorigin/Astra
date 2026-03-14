@@ -27,7 +27,7 @@ def test_session(client, auth_headers):
         json={"metadata": {}},
     )
     session_id = response.json()["session_id"]
-    
+
     # Create some events
     for i in range(3):
         client.post(
@@ -39,7 +39,7 @@ def test_session(client, auth_headers):
                 "content": f"Message {i}",
             },
         )
-    
+
     return session_id
 
 
@@ -51,9 +51,7 @@ class TestReplaySession:
         response = client.post(
             f"/sessions/{test_session}/replay",
             headers=auth_headers,
-            json={
-                "mock_mode": True
-            },
+            json={"mock_mode": True},
         )
 
         assert response.status_code == 201
@@ -68,10 +66,7 @@ class TestReplaySession:
         response = client.post(
             f"/sessions/{test_session}/replay",
             headers=auth_headers,
-            json={
-                "sandbox_name": "test_sandbox",
-                "mock_mode": True
-            },
+            json={"sandbox_name": "test_sandbox", "mock_mode": True},
         )
 
         assert response.status_code == 201
@@ -92,20 +87,22 @@ class TestReplaySession:
         """Test replay session owned by another user."""
         # Create another user with unique name
         from core.auth.password import hash_password
-        
+
         uid = uuid4().hex
         other_username = f"otherreplay_{uid}"
-        
+
         repo = UserRepository(lambda: db_session)
-        
-        other_user = repo.create({
-            "user_id": str(uuid4()),
-            "username": other_username,
-            "email": f"otherreplay_{uid}@example.com",
-            "password_hash": hash_password("password123"),
-            "is_active": 1,
-        })
-        
+
+        other_user = repo.create(
+            {
+                "user_id": str(uuid4()),
+                "username": other_username,
+                "email": f"otherreplay_{uid}@example.com",
+                "password_hash": hash_password("password123"),
+                "is_active": 1,
+            }
+        )
+
         # Login as other user
         response = client.post(
             "/auth/login",
@@ -116,7 +113,7 @@ class TestReplaySession:
         )
         other_token = response.json()["access_token"]
         other_headers = {"Authorization": f"Bearer {other_token}"}
-        
+
         # Create session as other user
         session_response = client.post(
             "/sessions",
@@ -124,16 +121,16 @@ class TestReplaySession:
             json={"metadata": {}},
         )
         session_id = session_response.json()["session_id"]
-        
+
         # Try to replay as first user
         response = client.post(
             f"/sessions/{session_id}/replay",
             headers=auth_headers,
             json={"mock_mode": True},
         )
-        
+
         assert response.status_code == 403
-        
+
         # Clean up
         repo.delete(other_user.user_id)
         db_session.commit()

@@ -149,11 +149,10 @@ class StreamingVerifier:
             if len(sentences) == 1:
                 return self._llm_single_check(sentences[0], context)
 
-            claims = "\n".join(
-                f"{i + 1}. {s}" for i, s in enumerate(sentences)
-            )
+            claims = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(sentences))
             prompt = _BATCH_ENTAILMENT_PROMPT.format(
-                context=context, claims=claims,
+                context=context,
+                claims=claims,
             )
             response = self.llm_client.chat(
                 messages=[LLMMessage(role="user", content=prompt)],
@@ -162,21 +161,25 @@ class StreamingVerifier:
                 task_hint="entailment_verify",
             )
             return self._parse_batch_verdicts(
-                response.content or "", sentences,
+                response.content or "",
+                sentences,
             )
         except Exception as e:
             logger.warning("LLM batch entailment check failed: %s", e)
             return []
 
     def _llm_single_check(
-        self, sentence: str, context: str,
+        self,
+        sentence: str,
+        context: str,
     ) -> list[str]:
         """Verify a single sentence with the simpler prompt."""
         try:
             from core.llm.models import LLMMessage
 
             prompt = _ENTAILMENT_PROMPT.format(
-                context=context, sentence=sentence,
+                context=context,
+                sentence=sentence,
             )
             response = self.llm_client.chat(
                 messages=[LLMMessage(role="user", content=prompt)],
@@ -197,7 +200,9 @@ class StreamingVerifier:
         return []
 
     def _parse_batch_verdicts(
-        self, response_text: str, sentences: list[str],
+        self,
+        response_text: str,
+        sentences: list[str],
     ) -> list[str]:
         """Parse batch LLM response, return warnings for contradictions."""
         warnings: list[str] = []
@@ -235,7 +240,9 @@ class StreamingVerifier:
         for sentence in sentences:
             try:
                 result = self.firewall.verify_response(
-                    sentence, self.context_capture_id, mode="warn",
+                    sentence,
+                    self.context_capture_id,
+                    mode="warn",
                 )
                 if result.claims_failed > 0 and result.confidence_score < 0.5:
                     self._warned_sentences += 1

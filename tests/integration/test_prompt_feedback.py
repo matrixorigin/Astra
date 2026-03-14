@@ -22,6 +22,7 @@ def feedback(db):
 
     # Cleanup test data
     from sqlalchemy import text
+
     db.execute(text("DELETE FROM eval_llm_feedback WHERE prompt_template_id LIKE 'system_test%'"))
     db.execute(text("DELETE FROM eval_llm_feedback WHERE prompt_template_id = 'system_compare'"))
     db.commit()
@@ -42,9 +43,10 @@ def test_record_feedback(db, feedback):
 
     # Verify stored
     from sqlalchemy import text
+
     result = db.execute(
         text("SELECT * FROM eval_llm_feedback WHERE feedback_id = :feedback_id"),
-        {"feedback_id": feedback_id}
+        {"feedback_id": feedback_id},
     )
     row = result.first()
 

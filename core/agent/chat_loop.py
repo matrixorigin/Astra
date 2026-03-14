@@ -36,7 +36,10 @@ _SCRATCHPAD_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "note_type": {"type": "string", "enum": ["plan", "hypothesis", "finding", "todo", "decision"]},
+                    "note_type": {
+                        "type": "string",
+                        "enum": ["plan", "hypothesis", "finding", "todo", "decision"],
+                    },
                     "content": {"type": "string", "description": "Note content"},
                 },
                 "required": ["note_type", "content"],
@@ -51,7 +54,11 @@ _SCRATCHPAD_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "note_type": {"type": "string", "enum": ["plan", "hypothesis", "finding", "todo", "decision"], "description": "Filter by type (optional)"},
+                    "note_type": {
+                        "type": "string",
+                        "enum": ["plan", "hypothesis", "finding", "todo", "decision"],
+                        "description": "Filter by type (optional)",
+                    },
                 },
             },
         },
@@ -65,14 +72,17 @@ _SCRATCHPAD_TOOLS = [
                 "type": "object",
                 "properties": {
                     "note_id": {"type": "string"},
-                    "status": {"type": "string", "enum": ["completed", "superseded"], "default": "completed"},
+                    "status": {
+                        "type": "string",
+                        "enum": ["completed", "superseded"],
+                        "default": "completed",
+                    },
                 },
                 "required": ["note_id"],
             },
         },
     },
 ]
-
 
 
 def _merge_tool_call_fragments(fragments: list[dict], new_fragments: list[dict]) -> list[dict]:
@@ -118,7 +128,7 @@ class ChatLoop:
         hitl_policy=None,
     ):
         """Initialize ChatLoop.
-        
+
         Args:
             selector: ToolRegistry for tool selection
             executor: Skill executor
@@ -157,58 +167,66 @@ class ChatLoop:
         self._round_text_lens: list[int] = []
         try:
             from core.context.few_shot import FewShotRetriever
-            if hasattr(llm_client, '_db_factory'):
+
+            if hasattr(llm_client, "_db_factory"):
                 self._few_shot = FewShotRetriever(llm_client._db_factory)
         except Exception:
             pass
         # Initialize memory service for tool output handling
         try:
             from core.memory import create_memory_service
-            if hasattr(event_logger, '_db_factory'):
+
+            if hasattr(event_logger, "_db_factory"):
                 self._memory_service = create_memory_service(event_logger._db_factory)
         except Exception:
             pass
         # Initialize global context budget manager
         try:
             from core.context.budget_manager import ContextBudgetManager
-            max_tokens = llm_client.config.get("max_context_tokens", 128000) if hasattr(llm_client, 'config') else 128000
+
+            max_tokens = (
+                llm_client.config.get("max_context_tokens", 128000)
+                if hasattr(llm_client, "config")
+                else 128000
+            )
             self._budget_manager = ContextBudgetManager(max_context_tokens=max_tokens)
         except Exception:
             pass
 
     def _extract_params_from_query(self, query: str) -> dict[str, Any]:
         """Extract common parameters from query using simple patterns.
-        
+
         Extracts:
         - repo: "owner/repo" or bare project name
         - limit/count: numeric values
         - state: open/closed/all
         """
         import re
+
         params: dict[str, Any] = {}
         q = query.lower()
-        
+
         # Extract repo: "owner/repo" pattern
-        repo_match = re.search(r'\b([a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+)\b', query)
+        repo_match = re.search(r"\b([a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+)\b", query)
         if repo_match:
             params["repo"] = repo_match.group(1)
         else:
             # Bare project name after "for", "in", "of"
-            bare_match = re.search(r'\b(?:for|in|of)\s+([a-zA-Z0-9_-]+)\b', q)
+            bare_match = re.search(r"\b(?:for|in|of)\s+([a-zA-Z0-9_-]+)\b", q)
             if bare_match:
                 params["repo"] = bare_match.group(1)
-        
+
         # Extract limit/count
-        limit_match = re.search(r'\b(?:top|last|recent|limit)\s*(\d+)\b', q)
+        limit_match = re.search(r"\b(?:top|last|recent|limit)\s*(\d+)\b", q)
         if limit_match:
             params["limit"] = int(limit_match.group(1))
-        
+
         # Extract state
         if "closed" in q:
             params["state"] = "closed"
         elif "all" in q and ("issue" in q or "pr" in q):
             params["state"] = "all"
-        
+
         return params
 
     def _merge_context(self, ctx, context: dict[str, Any] | None) -> dict[str, Any]:
@@ -318,9 +336,11 @@ class ChatLoop:
             params = json.loads(tc["function"]["arguments"])
 
             from core.agent.async_tools import get_async_tool_registry
+
             _async_registry = get_async_tool_registry()
 
             from core.verification.cot_audit import audit_tool_call
+
             audit = audit_tool_call(
                 user_query=user_input,
                 tool_name=fn_name,
@@ -336,19 +356,27 @@ class ChatLoop:
                 if not hitl_ok:
                     result_str = hitl_msg
                 elif _async_registry.is_async_tool(fn_name):
-                    result = await _async_registry.execute(fn_name, params, run_id=getattr(self, '_current_run_id', None))
+                    result = await _async_registry.execute(
+                        fn_name, params, run_id=getattr(self, "_current_run_id", None)
+                    )
                     result_str = json.dumps(result, default=str)
                     if self.hitl_policy:
                         self.hitl_policy.record_outcome(fn_name, success=True)
                     if result.get("wait_for"):
                         yield StreamEvent(
                             event_type=StreamEventType.TOOL_RESULT,
-                            data={"call_id": tc["id"], "result": result_str[:500], "wait_for": result["wait_for"]},
+                            data={
+                                "call_id": tc["id"],
+                                "result": result_str[:500],
+                                "wait_for": result["wait_for"],
+                            },
                             event_id=user_event.event_id,
                             causal_chain_id=user_event.causal_chain_id,
                             agent_id=self.agent_id,
                         )
-                        messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
+                        messages.append(
+                            {"role": "tool", "tool_call_id": tc["id"], "content": result_str}
+                        )
                         return
                 elif fn_name == "delegate_task":
                     delegated_agent_id = params.get("agent_id", "unknown")
@@ -364,7 +392,11 @@ class ChatLoop:
                         if delegated_event.event_type == StreamEventType.TEXT_DONE:
                             result_text = delegated_event.data.get("full_text", "")
                             has_output = True
-                    result_str = result_text if has_output else f"Agent '{delegated_agent_id}' completed with no text output"
+                    result_str = (
+                        result_text
+                        if has_output
+                        else f"Agent '{delegated_agent_id}' completed with no text output"
+                    )
                     if self.hitl_policy:
                         self.hitl_policy.record_outcome(fn_name, success=True)
                 else:
@@ -372,7 +404,8 @@ class ChatLoop:
                         result = self._handle_scratchpad_tool(fn_name, params, session_id, user_id)
                     elif self.mcp_bridge and self.mcp_bridge.is_mcp_tool(fn_name):
                         result = await asyncio.wait_for(
-                            self.mcp_bridge.call_tool(fn_name, params), timeout=TOOL_TIMEOUT_SECONDS,
+                            self.mcp_bridge.call_tool(fn_name, params),
+                            timeout=TOOL_TIMEOUT_SECONDS,
                         )
                     else:
                         result = await asyncio.wait_for(
@@ -386,7 +419,9 @@ class ChatLoop:
                             ),
                             timeout=TOOL_TIMEOUT_SECONDS,
                         )
-                    result_str = json.dumps(result, default=str) if not isinstance(result, str) else result
+                    result_str = (
+                        json.dumps(result, default=str) if not isinstance(result, str) else result
+                    )
                     self._record_tool_success(fn_name)
                     if self.hitl_policy:
                         self.hitl_policy.record_outcome(fn_name, success=True)
@@ -425,8 +460,10 @@ class ChatLoop:
         )
         # Process tool output unconditionally: large results → summarize (+ store if memory available)
         from core.agent.tool_output_handler import process_tool_output
-        if not hasattr(self, '_turn_budget') or self._turn_budget is None:
+
+        if not hasattr(self, "_turn_budget") or self._turn_budget is None:
             from core.context.budget_manager import TurnBudgetTracker
+
             self._turn_budget = TurnBudgetTracker(max_tool_output_tokens=30000)
 
         remaining = self._turn_budget.remaining
@@ -435,7 +472,7 @@ class ChatLoop:
             tool_name=fn_name,
             session_id=session_id,
             user_id=user_id,
-            memory_service=getattr(self, '_memory_service', None),
+            memory_service=getattr(self, "_memory_service", None),
             turn_event_id=user_event.event_id,
             remaining_tokens=remaining,
         )
@@ -448,24 +485,28 @@ class ChatLoop:
             _parsed = json.loads(result_str) if isinstance(result_str, str) else result
             if isinstance(_parsed, dict):
                 if _parsed.get("success") is False:
-                    messages.append({
-                        "role": "system",
-                        "content": (
-                            "The skill returned success=False. "
-                            "STOP. Do NOT call any more tools. Do NOT retry with different parameters. "
-                            "Do NOT use bash, curl, grep, or any other tool to work around this. "
-                            "Report the error directly to the user and ask them to clarify."
-                        ),
-                    })
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "The skill returned success=False. "
+                                "STOP. Do NOT call any more tools. Do NOT retry with different parameters. "
+                                "Do NOT use bash, curl, grep, or any other tool to work around this. "
+                                "Report the error directly to the user and ask them to clarify."
+                            ),
+                        }
+                    )
                 # Skill-provided authoritative guidance — injected as system
                 # message so the LLM treats it as a directive, not a suggestion.
                 # Also emit user_message as a text event so the CLI can display
                 # it directly if the LLM returns empty after seeing the guidance.
                 elif _parsed.get("guidance"):
-                    messages.append({
-                        "role": "system",
-                        "content": _parsed["guidance"],
-                    })
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": _parsed["guidance"],
+                        }
+                    )
                     _user_msg = _parsed.get("user_message")
                     if _user_msg:
                         yield StreamEvent(
@@ -506,15 +547,22 @@ class ChatLoop:
         #    selected events, skills, docs). NOT a MatrixOne database-level snapshot.
 
         ctx = self.context_manager.build_context(
-            session_id=session_id, query=user_input,
+            session_id=session_id,
+            query=user_input,
         )
-        context_capture_id = self.context_manager.save_snapshot(ctx, session_id, user_event.event_id)
+        context_capture_id = self.context_manager.save_snapshot(
+            ctx, session_id, user_event.event_id
+        )
         logger.debug(f"[stream] Context snapshot: {context_capture_id}")
 
         # 3. Planning: only when explicitly requested via context.
         if (context or {}).get("planning"):
             async for event in self.run_step_with_planning(
-                user_input, session_id, user_id, context, max_candidates,
+                user_input,
+                session_id,
+                user_id,
+                context,
+                max_candidates,
                 context_capture_id=context_capture_id,
                 parent_user_event=user_event,
             ):
@@ -523,12 +571,16 @@ class ChatLoop:
 
         # 4. Build messages with context
         merged_ctx = self._merge_context(ctx, context)
-        messages = self._build_messages(user_input, merged_ctx, session_id=session_id, user_id=user_id)
+        messages = self._build_messages(
+            user_input, merged_ctx, session_id=session_id, user_id=user_id
+        )
 
         # 4.5. Extract parameters from query and add as hint
         extracted_params = self._extract_params_from_query(user_input)
         if extracted_params:
-            hint = "Extracted from query: " + ", ".join(f"{k}={v}" for k, v in extracted_params.items())
+            hint = "Extracted from query: " + ", ".join(
+                f"{k}={v}" for k, v in extracted_params.items()
+            )
             # Append hint to user message
             if messages and messages[-1].get("role") == "user":
                 messages[-1]["content"] += f"\n\n[{hint}]"
@@ -547,6 +599,7 @@ class ChatLoop:
 
         # Append async tools (submit_job, etc.) — always available
         from core.agent.async_tools import get_async_tool_registry
+
         _async_registry = get_async_tool_registry()
         tools_schema = list(tools_schema) + _async_registry.get_schemas()
 
@@ -554,15 +607,18 @@ class ChatLoop:
         allowed = (context or {}).get("allowed_tools")
         if allowed:
             allowed_set = set(allowed)
-            tools_schema = [t for t in tools_schema
-                           if t.get("function", {}).get("name") in allowed_set]
+            tools_schema = [
+                t for t in tools_schema if t.get("function", {}).get("name") in allowed_set
+            ]
 
         # Log RUN_STARTED event
         run_started_event = self.event_logger.create_stream_event(
             user_id=user_id,
             session_id=session_id,
             event_type="stream_run_started",
-            content=json.dumps({"query": user_input, "context_capture_id": str(context_capture_id)}),
+            content=json.dumps(
+                {"query": user_input, "context_capture_id": str(context_capture_id)}
+            ),
             parent_event_id=user_event.event_id,
             causal_chain_id=user_event.causal_chain_id,
         )
@@ -578,10 +634,14 @@ class ChatLoop:
         if not tools_schema:
             # Plain chat — stream text with sentence-level verification
             from core.verification.streaming_verifier import StreamingVerifier
-            sv = StreamingVerifier(firewall=self.firewall, context_capture_id=context_capture_id, llm_client=self.llm)
+
+            sv = StreamingVerifier(
+                firewall=self.firewall, context_capture_id=context_capture_id, llm_client=self.llm
+            )
 
             # Use model from context if provided, otherwise use SLO escalation
             from core.llm.model_resolver import resolve_model
+
             model = resolve_model(
                 request_model=(context or {}).get("model"),
                 slo_escalation_model=self._check_slo_escalation(session_id),
@@ -589,7 +649,10 @@ class ChatLoop:
 
             _llm_usage: dict[str, int] | None = None
             async for chunk_msg in self.llm.chat_stream(
-                messages, user_id, session_id, model=model,
+                messages,
+                user_id,
+                session_id,
+                model=model,
             ):
                 if chunk_msg["type"] == "usage":
                     _llm_usage = {
@@ -653,11 +716,15 @@ class ChatLoop:
             if _guard_reason:
                 logger.error(
                     "Response guard (%s) in chat_loop: session=%s preview=%r",
-                    _guard_reason, session_id, full_text[:200],
+                    _guard_reason,
+                    session_id,
+                    full_text[:200],
                 )
                 yield StreamEvent(
                     event_type=StreamEventType.RUN_ERROR,
-                    data={"error": f"Model returned invalid response ({_guard_reason}). Please retry."},
+                    data={
+                        "error": f"Model returned invalid response ({_guard_reason}). Please retry."
+                    },
                     event_id=user_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
                     agent_id=self.agent_id,
@@ -665,8 +732,12 @@ class ChatLoop:
                 return
 
             # Post-stream: full response-level verification for audit record
-            verification = self.firewall.verify_response(full_text, context_capture_id, mode=self.firewall_mode)
-            self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
+            verification = self.firewall.verify_response(
+                full_text, context_capture_id, mode=self.firewall_mode
+            )
+            self.firewall.log_verification(
+                session_id, user_event.event_id, verification, context_capture_id
+            )
 
             if not verification.safe_to_deliver:
                 logger.warning(
@@ -702,8 +773,14 @@ class ChatLoop:
                 agent_id=self.agent_id,
             )
             self._log_response(
-                user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id,
-                messages=messages, firewall_result=verification, token_usage=_llm_usage,
+                user_id,
+                session_id,
+                full_text,
+                user_event.event_id,
+                user_event.causal_chain_id,
+                messages=messages,
+                firewall_result=verification,
+                token_usage=_llm_usage,
             )
 
             run_finished_event = self.event_logger.create_stream_event(
@@ -732,16 +809,27 @@ class ChatLoop:
         # Unified intent routing — single pass for tool filtering + task type + intent
         # Edge path uses Tier 0 only (<1ms, no LLM call) for tool filtering and task type.
         # The full Tier 0→1 cascade runs in the cloud path (api/routers/chat.py).
-        from core.context.intent_routing import Tier0Engine, ToolFilter, LOCAL_TOOLS, RoutingDecision, RoutingResult, INTENT_PLANS, _FALLBACK_PLAN
+        from core.context.intent_routing import (
+            Tier0Engine,
+            ToolFilter,
+            LOCAL_TOOLS,
+            RoutingDecision,
+            RoutingResult,
+            INTENT_PLANS,
+            _FALLBACK_PLAN,
+        )
+
         # Tier0Engine is stateless — reuse a single instance across calls
-        if not hasattr(self, '_tier0'):
+        if not hasattr(self, "_tier0"):
             self._tier0 = Tier0Engine()
         _tier0 = self._tier0
         _tool_filter, _max_rounds = _tier0.classify_tool_filter(user_input)
         _task_type = _tier0.classify_task_type(user_input)
         _tier0_result = _tier0.classify(user_input)
         _routing = RoutingDecision(
-            plan=INTENT_PLANS.get(_tier0_result.intent, _FALLBACK_PLAN) if _tier0_result.intent else _FALLBACK_PLAN,
+            plan=INTENT_PLANS.get(_tier0_result.intent, _FALLBACK_PLAN)
+            if _tier0_result.intent
+            else _FALLBACK_PLAN,
             routing_result=_tier0_result,
             tool_filter=_tool_filter,
             max_tool_rounds=_max_rounds,
@@ -756,11 +844,13 @@ class ChatLoop:
         # `if not tools_schema:` branch above handles it (plain-chat path).
         if _routing.tool_filter == ToolFilter.LOCAL_BLOCKED and tools_schema:
             tools_schema = [
-                t for t in tools_schema
-                if t.get("function", {}).get("name") not in LOCAL_TOOLS
+                t for t in tools_schema if t.get("function", {}).get("name") not in LOCAL_TOOLS
             ]
-            logger.info("Intent router: LOCAL_BLOCKED — filtered to %d tools, max %d rounds",
-                        len(tools_schema), _effective_max_rounds)
+            logger.info(
+                "Intent router: LOCAL_BLOCKED — filtered to %d tools, max %d rounds",
+                len(tools_schema),
+                _effective_max_rounds,
+            )
 
         # Log unified routing_decision event (replaces the old stream_intent_classification
         # event — contains all three classification dimensions in one event).
@@ -768,29 +858,32 @@ class ChatLoop:
             user_id=user_id,
             session_id=session_id,
             event_type="routing_decision",
-            content=json.dumps({
-                "intent": _routing.routing_result.intent,
-                "confidence": _routing.routing_result.confidence,
-                "tier": _routing.routing_result.tier,
-                "tool_filter": _routing.tool_filter.value,
-                "max_tool_rounds": _routing.max_tool_rounds,
-                "task_type": _routing.task_type.value,
-                "threshold_used": _routing.threshold_used,
-            }),
+            content=json.dumps(
+                {
+                    "intent": _routing.routing_result.intent,
+                    "confidence": _routing.routing_result.confidence,
+                    "tier": _routing.routing_result.tier,
+                    "tool_filter": _routing.tool_filter.value,
+                    "max_tool_rounds": _routing.max_tool_rounds,
+                    "task_type": _routing.task_type.value,
+                    "threshold_used": _routing.threshold_used,
+                }
+            ),
             parent_event_id=user_event.event_id,
             causal_chain_id=user_event.causal_chain_id,
         )
 
         for _round in range(_effective_max_rounds):
-
             # Compact if approaching context limit
             from core.context.compaction import compact, compact_history_messages, needs_compaction
+
             max_tokens = self.llm.config.get("max_context_tokens", 128000)
 
             # Lightweight pre-pass: shrink old tool results
             messages = compact_history_messages(messages)
 
             if isinstance(max_tokens, int) and needs_compaction(messages, max_tokens):
+
                 def llm_summarize(text: str) -> str:
                     try:
                         result = self.llm.chat(
@@ -810,6 +903,7 @@ class ChatLoop:
 
             # Use model from context if provided, otherwise use SLO escalation
             from core.llm.model_resolver import resolve_model
+
             model = resolve_model(
                 request_model=(context or {}).get("model"),
                 slo_escalation_model=self._check_slo_escalation(session_id),
@@ -817,7 +911,9 @@ class ChatLoop:
 
             _llm_usage_tools: dict[str, int] | None = None
             async for chunk in self.llm.chat_with_tools_stream(
-                messages, tools_schema, model=model,
+                messages,
+                tools_schema,
+                model=model,
             ):
                 if chunk["type"] == "usage":
                     _llm_usage_tools = {
@@ -861,11 +957,15 @@ class ChatLoop:
                 if _guard_reason:
                     logger.error(
                         "Response guard (%s) in chat_loop tool path: session=%s preview=%r",
-                        _guard_reason, session_id, full_text[:200],
+                        _guard_reason,
+                        session_id,
+                        full_text[:200],
                     )
                     yield StreamEvent(
                         event_type=StreamEventType.RUN_ERROR,
-                        data={"error": f"Model returned invalid response ({_guard_reason}). Please retry."},
+                        data={
+                            "error": f"Model returned invalid response ({_guard_reason}). Please retry."
+                        },
                         event_id=user_event.event_id,
                         causal_chain_id=user_event.causal_chain_id,
                         agent_id=self.agent_id,
@@ -873,8 +973,15 @@ class ChatLoop:
                     return
 
                 # Verify with firewall (same as non-stream path)
-                verification = self.firewall.verify_response(full_text, context_capture_id, mode=self.firewall_mode, skill_name=last_skill_name)
-                self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
+                verification = self.firewall.verify_response(
+                    full_text,
+                    context_capture_id,
+                    mode=self.firewall_mode,
+                    skill_name=last_skill_name,
+                )
+                self.firewall.log_verification(
+                    session_id, user_event.event_id, verification, context_capture_id
+                )
 
                 if not verification.safe_to_deliver:
                     logger.warning(
@@ -902,8 +1009,14 @@ class ChatLoop:
                     agent_id=self.agent_id,
                 )
                 self._log_response(
-                    user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id,
-                    messages=messages, firewall_result=verification, token_usage=_llm_usage_tools,
+                    user_id,
+                    session_id,
+                    full_text,
+                    user_event.event_id,
+                    user_event.causal_chain_id,
+                    messages=messages,
+                    firewall_result=verification,
+                    token_usage=_llm_usage_tools,
                 )
 
                 run_finished_event = self.event_logger.create_stream_event(
@@ -930,7 +1043,9 @@ class ChatLoop:
             messages.append(asst_msg)
 
             # Check for parallel delegation (multiple delegate_task calls)
-            delegation_calls = [tc for tc in tool_calls if tc["function"]["name"] == "delegate_task"]
+            delegation_calls = [
+                tc for tc in tool_calls if tc["function"]["name"] == "delegate_task"
+            ]
 
             if len(delegation_calls) > 1:
                 last_skill_name = "delegate_task"
@@ -959,13 +1074,15 @@ class ChatLoop:
                 inputs = []
                 for tc in delegation_calls:
                     params = json.loads(tc["function"]["arguments"])
-                    inputs.append(DelegateTaskInput(
-                        agent_id=params.get("agent_id", "unknown"),
-                        task=params.get("task", ""),
-                        context=params.get("context"),
-                        session_id=session_id,
-                        user_id=user_id,
-                    ))
+                    inputs.append(
+                        DelegateTaskInput(
+                            agent_id=params.get("agent_id", "unknown"),
+                            task=params.get("task", ""),
+                            context=params.get("context"),
+                            session_id=session_id,
+                            user_id=user_id,
+                        )
+                    )
 
                 # Execute parallel streaming
                 skill = self.executor.skill_registry.get("delegate_task")
@@ -998,12 +1115,16 @@ class ChatLoop:
                             call_id = agent_to_call.get(agent_id)
                             # Fallback: mark completion even without TEXT_DONE
                             if call_id and call_id not in results:
-                                results[call_id] = f"Agent '{agent_id}' completed with no text output"
+                                results[call_id] = (
+                                    f"Agent '{agent_id}' completed with no text output"
+                                )
                         # Track errors
                         elif event.event_type == StreamEventType.RUN_ERROR:
                             agent_id = event.agent_id
                             call_id = agent_to_call.get(agent_id)
-                            if call_id and call_id not in results:  # Don't overwrite existing results
+                            if (
+                                call_id and call_id not in results
+                            ):  # Don't overwrite existing results
                                 error_msg = event.data.get("error", "Unknown error")
                                 results[call_id] = f"Error: {error_msg}"
 
@@ -1034,7 +1155,9 @@ class ChatLoop:
                         causal_chain_id=user_event.causal_chain_id,
                         agent_id=self.agent_id,
                     )
-                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
+                    messages.append(
+                        {"role": "tool", "tool_call_id": tc["id"], "content": result_str}
+                    )
 
                 # Execute remaining non-delegation tool calls sequentially
                 other_calls = [tc for tc in tool_calls if tc["function"]["name"] != "delegate_task"]
@@ -1042,8 +1165,14 @@ class ChatLoop:
                     fn_name = tc["function"]["name"]
                     last_skill_name = fn_name
                     async for evt in self._execute_single_tool(
-                        tc, fn_name, user_id, session_id, user_input, full_text,
-                        user_event, messages,
+                        tc,
+                        fn_name,
+                        user_id,
+                        session_id,
+                        user_input,
+                        full_text,
+                        user_event,
+                        messages,
                     ):
                         yield evt
                         if evt.data.get("wait_for"):
@@ -1054,8 +1183,14 @@ class ChatLoop:
                     fn_name = tc["function"]["name"]
                     last_skill_name = fn_name
                     async for evt in self._execute_single_tool(
-                        tc, fn_name, user_id, session_id, user_input, full_text,
-                        user_event, messages,
+                        tc,
+                        fn_name,
+                        user_id,
+                        session_id,
+                        user_input,
+                        full_text,
+                        user_event,
+                        messages,
                     ):
                         yield evt
                         if evt.data.get("wait_for"):
@@ -1080,8 +1215,11 @@ class ChatLoop:
                     agent_id=self.agent_id,
                 )
                 self._log_response(
-                    user_id, session_id, failure_report,
-                    user_event.event_id, user_event.causal_chain_id,
+                    user_id,
+                    session_id,
+                    failure_report,
+                    user_event.event_id,
+                    user_event.causal_chain_id,
                     messages=messages,
                     firewall_result=None,
                 )
@@ -1099,15 +1237,17 @@ class ChatLoop:
             self._record_round_tools(tool_calls, full_text)
             if self._detect_stall():
                 logger.info("Stall detected at round %d — nudging LLM to conclude", _round)
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        "You have already tried similar tool calls multiple times without "
-                        "making progress. Stop calling tools and give the user your best "
-                        "answer based on what you have so far. If you could not find what "
-                        "the user asked for, say so directly."
-                    ),
-                })
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "You have already tried similar tool calls multiple times without "
+                            "making progress. Stop calling tools and give the user your best "
+                            "answer based on what you have so far. If you could not find what "
+                            "the user asked for, say so directly."
+                        ),
+                    }
+                )
                 # Remove tools for the next LLM call so it must produce text
                 tools_schema = []
 
@@ -1119,11 +1259,17 @@ class ChatLoop:
             }
         )
         from core.verification.streaming_verifier import StreamingVerifier
-        sv = StreamingVerifier(firewall=self.firewall, context_capture_id=context_capture_id, llm_client=self.llm)
+
+        sv = StreamingVerifier(
+            firewall=self.firewall, context_capture_id=context_capture_id, llm_client=self.llm
+        )
 
         _llm_usage_final: dict[str, int] | None = None
         async for chunk_msg in self.llm.chat_stream(
-            messages, user_id, session_id, model=self._check_slo_escalation(session_id),
+            messages,
+            user_id,
+            session_id,
+            model=self._check_slo_escalation(session_id),
         ):
             if chunk_msg["type"] == "usage":
                 _llm_usage_final = {
@@ -1173,8 +1319,12 @@ class ChatLoop:
         full_text = sv.full_text
 
         # Verify exhausted-rounds answer with firewall
-        verification = self.firewall.verify_response(full_text, context_capture_id, mode=self.firewall_mode, skill_name=last_skill_name)
-        self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
+        verification = self.firewall.verify_response(
+            full_text, context_capture_id, mode=self.firewall_mode, skill_name=last_skill_name
+        )
+        self.firewall.log_verification(
+            session_id, user_event.event_id, verification, context_capture_id
+        )
 
         if not verification.safe_to_deliver:
             logger.warning(
@@ -1195,8 +1345,14 @@ class ChatLoop:
             full_text += warning
 
         self._log_response(
-            user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id,
-            messages=messages, firewall_result=verification, token_usage=_llm_usage_final,
+            user_id,
+            session_id,
+            full_text,
+            user_event.event_id,
+            user_event.causal_chain_id,
+            messages=messages,
+            firewall_result=verification,
+            token_usage=_llm_usage_final,
         )
         yield StreamEvent(
             event_type=StreamEventType.RUN_FINISHED,
@@ -1233,10 +1389,13 @@ class ChatLoop:
 
         if not context_capture_id:
             ctx = self.context_manager.build_context(
-                session_id=session_id, query=user_input,
+                session_id=session_id,
+                query=user_input,
             )
             context_capture_id = self.context_manager.save_snapshot(
-                ctx, session_id, user_event.event_id,
+                ctx,
+                session_id,
+                user_event.event_id,
             )
             logger.debug(f"[planning] Context snapshot: {context_capture_id}")
 
@@ -1248,7 +1407,9 @@ class ChatLoop:
             user_id=user_id,
             session_id=session_id,
             event_type="stream_run_started",
-            content=json.dumps({"query": user_input, "context_capture_id": str(context_capture_id)}),
+            content=json.dumps(
+                {"query": user_input, "context_capture_id": str(context_capture_id)}
+            ),
             parent_event_id=user_event.event_id,
             causal_chain_id=user_event.causal_chain_id,
         )
@@ -1298,7 +1459,10 @@ class ChatLoop:
         is_valid, error_msg = planner.check_constraints(plan)
         if not is_valid:
             planner.log_plan_failed(
-                plan, user_id, session_id, error_msg or "constraint violation",
+                plan,
+                user_id,
+                session_id,
+                error_msg or "constraint violation",
                 parent_event_id=user_event.event_id,
                 causal_chain_id=user_event.causal_chain_id,
             )
@@ -1335,7 +1499,9 @@ class ChatLoop:
             # Check step count constraint
             if len(plan.steps) > constraints.max_steps:
                 planner.log_plan_failed(
-                    plan, user_id, session_id,
+                    plan,
+                    user_id,
+                    session_id,
                     f"Step count {len(plan.steps)} exceeds max {constraints.max_steps}",
                     parent_event_id=user_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
@@ -1351,7 +1517,10 @@ class ChatLoop:
             for step in next_steps:
                 step.status = "in_progress"  # type: ignore
                 planner.log_step_start(
-                    step, plan.plan_id, user_id, session_id,
+                    step,
+                    plan.plan_id,
+                    user_id,
+                    session_id,
                     parent_event_id=user_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
                 )
@@ -1380,8 +1549,13 @@ class ChatLoop:
                     if tool_found or tools_schema:
                         # CoT audit: check for goal hijacking before execution
                         from core.verification.cot_audit import audit_tool_call
+
                         # Use structured skill_params if available, fallback to description
-                        exec_params = step.skill_params if isinstance(step.skill_params, dict) else {"input": step.description}
+                        exec_params = (
+                            step.skill_params
+                            if isinstance(step.skill_params, dict)
+                            else {"input": step.description}
+                        )
                         audit = audit_tool_call(
                             user_query=user_input,
                             tool_name=skill_name,
@@ -1390,7 +1564,9 @@ class ChatLoop:
                             llm_client=self.llm,
                         )
                         if not audit.safe:
-                            logger.warning("CoT audit blocked planning skill %s: %s", skill_name, audit.reason)
+                            logger.warning(
+                                "CoT audit blocked planning skill %s: %s", skill_name, audit.reason
+                            )
                             result = f"Blocked by CoT audit: {audit.reason}"
                             step.status = "blocked"  # type: ignore
                         # HITL policy check
@@ -1400,7 +1576,8 @@ class ChatLoop:
                         # Execute skill with automatic feedback recording
                         elif self.mcp_bridge and self.mcp_bridge.is_mcp_tool(skill_name):
                             result = await self.mcp_bridge.call_tool(
-                                skill_name, exec_params,
+                                skill_name,
+                                exec_params,
                             )
                         else:
                             result = self.executor.execute_skill_with_feedback(
@@ -1426,7 +1603,10 @@ class ChatLoop:
                 step_results.append({"step_id": step.step_id, "result": result})
 
                 planner.log_step_done(
-                    step, plan.plan_id, user_id, session_id,
+                    step,
+                    plan.plan_id,
+                    user_id,
+                    session_id,
                     parent_event_id=user_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
                 )
@@ -1444,7 +1624,9 @@ class ChatLoop:
             _assessment, revised_plan = await planner.reflect(plan, step_results)
             if revised_plan is not None:
                 planner.log_plan_revised(
-                    revised_plan, user_id, session_id,
+                    revised_plan,
+                    user_id,
+                    session_id,
                     parent_event_id=user_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
                 )
@@ -1456,7 +1638,9 @@ class ChatLoop:
 
         # Log plan completion
         planner.log_plan_completed(
-            plan, user_id, session_id,
+            plan,
+            user_id,
+            session_id,
             summary=f"Completed {sum(1 for s in plan.steps if s.status == PlanStatus.COMPLETED)}/{len(plan.steps)} steps",
             parent_event_id=user_event.event_id,
             causal_chain_id=user_event.causal_chain_id,
@@ -1467,17 +1651,26 @@ class ChatLoop:
             f"- Step {r['step_id']}: {str(r['result'])[:500]}" for r in step_results
         )
         synth_messages = [
-            {"role": "system", "content": "Summarise the results of the executed plan steps into a coherent answer for the user."},
-            {"role": "user", "content": f"Original request: {user_input}\n\nPlan results:\n{results_summary}"},
+            {
+                "role": "system",
+                "content": "Summarise the results of the executed plan steps into a coherent answer for the user.",
+            },
+            {
+                "role": "user",
+                "content": f"Original request: {user_input}\n\nPlan results:\n{results_summary}",
+            },
         ]
         from core.llm.model_resolver import resolve_model
+
         model = resolve_model(
             request_model=(context or {}).get("model"),
             slo_escalation_model=self._check_slo_escalation(session_id),
         )
         final_text = ""
         _llm_usage_plan: dict[str, int] | None = None
-        async for chunk_msg in self.llm.chat_stream(synth_messages, user_id, session_id, model=model):
+        async for chunk_msg in self.llm.chat_stream(
+            synth_messages, user_id, session_id, model=model
+        ):
             if chunk_msg["type"] == "usage":
                 _llm_usage_plan = {
                     "prompt": chunk_msg.get("prompt", 0),
@@ -1497,14 +1690,20 @@ class ChatLoop:
                 agent_id=self.agent_id,
             )
 
-        verification = self.firewall.verify_response(final_text, context_capture_id, mode=self.firewall_mode)
+        verification = self.firewall.verify_response(
+            final_text, context_capture_id, mode=self.firewall_mode
+        )
         self.firewall.log_verification(
-            session_id, user_event.event_id, verification, context_capture_id,
+            session_id,
+            user_event.event_id,
+            verification,
+            context_capture_id,
         )
         if not verification.safe_to_deliver:
             logger.warning(
                 "[planning] Firewall: confidence=%.2f, failed=%s",
-                verification.confidence_score, verification.claims_failed,
+                verification.confidence_score,
+                verification.claims_failed,
             )
             warning = (
                 f"\n\n⚠️ Warning: Low confidence ({verification.confidence_score:.0%}). "
@@ -1520,9 +1719,13 @@ class ChatLoop:
             final_text += warning
 
         self._log_response(
-            user_id, session_id, final_text,
-            user_event.event_id, user_event.causal_chain_id,
-            firewall_result=verification, token_usage=_llm_usage_plan,
+            user_id,
+            session_id,
+            final_text,
+            user_event.event_id,
+            user_event.causal_chain_id,
+            firewall_result=verification,
+            token_usage=_llm_usage_plan,
         )
 
         yield StreamEvent(
@@ -1539,8 +1742,10 @@ class ChatLoop:
 
     def _make_llm_call(self, model: str | None = None):
         """Create an async LLM call adapter for the pipeline engine."""
+
         async def llm_call(messages, tools, **kw):
             from core.context.compaction import compact, compact_history_messages, needs_compaction
+
             max_tokens = self.llm.config.get("max_context_tokens", 128000)
 
             def _summarize(text: str) -> str:
@@ -1560,7 +1765,9 @@ class ChatLoop:
 
             if not tools:
                 response = self.llm.chat(
-                    messages=[LLMMessage(role=m["role"], content=m.get("content", "")) for m in messages],
+                    messages=[
+                        LLMMessage(role=m["role"], content=m.get("content", "")) for m in messages
+                    ],
                     user_id="pipeline",
                     model=model,
                 )
@@ -1568,22 +1775,31 @@ class ChatLoop:
 
             try:
                 return self.llm.chat_with_tools(
-                    messages=messages, tools=tools, tool_choice="auto", model=model,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto",
+                    model=model,
                 )
             except Exception as e:
                 if "context length" in str(e).lower() or "token" in str(e).lower():
                     logger.warning("Context length exceeded, forcing compaction")
                     messages = compact(messages, max_tokens // 2, llm_summarize=_summarize)
                     return self.llm.chat_with_tools(
-                        messages=messages, tools=tools, tool_choice="auto", model=model,
+                        messages=messages,
+                        tools=tools,
+                        tool_choice="auto",
+                        model=model,
                     )
                 raise
+
         return llm_call
 
     def _make_tool_execute(self, session_id: str, user_id: str, user_input: str, user_event):
         """Create an async tool execute adapter for the pipeline engine."""
+
         async def tool_execute(fn_name: str, params: dict, **kw):
             from core.verification.cot_audit import audit_tool_call
+
             audit = audit_tool_call(
                 user_query=user_input,
                 tool_name=fn_name,
@@ -1599,15 +1815,19 @@ class ChatLoop:
                 raise RuntimeError(hitl_msg)
 
             from core.agent.async_tools import get_async_tool_registry
+
             _async_registry = get_async_tool_registry()
 
             if _async_registry.is_async_tool(fn_name):
-                return await _async_registry.execute(fn_name, params, run_id=getattr(self, '_current_run_id', None))
+                return await _async_registry.execute(
+                    fn_name, params, run_id=getattr(self, "_current_run_id", None)
+                )
             elif fn_name.startswith("scratchpad_") and self.scratchpad:
                 return self._handle_scratchpad_tool(fn_name, params, session_id, user_id)
             elif self.mcp_bridge and self.mcp_bridge.is_mcp_tool(fn_name):
                 return await asyncio.wait_for(
-                    self.mcp_bridge.call_tool(fn_name, params), timeout=TOOL_TIMEOUT_SECONDS,
+                    self.mcp_bridge.call_tool(fn_name, params),
+                    timeout=TOOL_TIMEOUT_SECONDS,
                 )
             else:
                 return await asyncio.wait_for(
@@ -1621,6 +1841,7 @@ class ChatLoop:
                     ),
                     timeout=TOOL_TIMEOUT_SECONDS,
                 )
+
         return tool_execute
 
     async def _execute_turn_pipeline(
@@ -1637,7 +1858,9 @@ class ChatLoop:
 
         async def final_answer_call(messages, **kw):
             response = self.llm.chat(
-                messages=[LLMMessage(role=m["role"], content=m.get("content", "")) for m in messages],
+                messages=[
+                    LLMMessage(role=m["role"], content=m.get("content", "")) for m in messages
+                ],
                 user_id=state.user_id,
                 model=model,
             )
@@ -1647,7 +1870,10 @@ class ChatLoop:
             state,
             llm_call=self._make_llm_call(model),
             tool_execute=self._make_tool_execute(
-                state.session_id, state.user_id, state.user_input, state.user_event,
+                state.session_id,
+                state.user_id,
+                state.user_input,
+                state.user_event,
             ),
             classify_intent=classify_intent,
             final_answer_call=final_answer_call,
@@ -1672,17 +1898,22 @@ class ChatLoop:
         self._round_text_lens = []
         self._breaker_records: dict[str, Any] = {}  # Actually dict[str, BreakerRecord]
         try:
-            if hasattr(self.event_logger, '_db_factory'):
+            if hasattr(self.event_logger, "_db_factory"):
                 from core.agent.breaker_store import load_breaker_state
+
                 db = self.event_logger._db_factory()
                 try:
-                    user_id = getattr(self, '_current_user_id', None)
+                    user_id = getattr(self, "_current_user_id", None)
                     if user_id:
                         self._breaker_records = load_breaker_state(db, user_id)
                         for name, rec in self._breaker_records.items():
                             if rec.in_cooldown:
                                 self._blocked_tools.add(name)
-                                logger.info("Breaker cooldown active for %s until %s", name, rec.cooldown_until)
+                                logger.info(
+                                    "Breaker cooldown active for %s until %s",
+                                    name,
+                                    rec.cooldown_until,
+                                )
                             # Seed in-memory failures from persisted count so cross-turn
                             # accumulation works: _should_break sees prior failures.
                             # Use unique placeholders to avoid false "similar error" matches —
@@ -1700,11 +1931,12 @@ class ChatLoop:
     def _flush_breaker(self) -> None:
         """Persist dirty breaker records at turn end (1 batch transaction)."""
         try:
-            records = getattr(self, '_breaker_records', {})
+            records = getattr(self, "_breaker_records", {})
             if not any(r.dirty for r in records.values()):
                 return
-            if hasattr(self.event_logger, '_db_factory'):
+            if hasattr(self.event_logger, "_db_factory"):
                 from core.agent.breaker_store import flush_breaker_state
+
                 db = self.event_logger._db_factory()
                 try:
                     flush_breaker_state(db, records)
@@ -1714,7 +1946,7 @@ class ChatLoop:
             logger.debug("Breaker flush failed (non-fatal): %s", e)
 
     def _is_tool_blocked(self, fn_name: str) -> bool:
-        return fn_name in getattr(self, '_blocked_tools', set())
+        return fn_name in getattr(self, "_blocked_tools", set())
 
     def _record_tool_failure(self, fn_name: str, error_msg: str) -> None:
         """Record a tool failure and check breaker. In-memory only — flushed at turn end.
@@ -1724,15 +1956,17 @@ class ChatLoop:
         """
         self._tool_failures.setdefault(fn_name, []).append(error_msg)
         # Always persist failure count — not just on breaker trip
-        records = getattr(self, '_breaker_records', {})
+        records = getattr(self, "_breaker_records", {})
         if fn_name not in records:
             from core.agent.breaker_store import BreakerRecord
+
             records[fn_name] = BreakerRecord(
-                user_id=getattr(self, '_current_user_id', "") or "",
+                user_id=getattr(self, "_current_user_id", "") or "",
                 tool_name=fn_name,
             )
         records[fn_name].record_failure()
         from core.agent.pipeline_stages import _should_break
+
         if _should_break(self._tool_failures[fn_name]):
             self._blocked_tools.add(fn_name)
             logger.warning("Circuit breaker tripped for tool %s", fn_name)
@@ -1740,23 +1974,26 @@ class ChatLoop:
     def _record_tool_success(self, fn_name: str) -> None:
         """Clear failure history on success. In-memory only — flushed at turn end."""
         self._tool_failures.pop(fn_name, None)
-        records = getattr(self, '_breaker_records', {})
+        records = getattr(self, "_breaker_records", {})
         if fn_name in records:
             records[fn_name].record_success()
 
     def _all_tools_blocked(self, tools_schema: list[dict]) -> bool:
         """Check if all available tools are blocked."""
         active = [
-            t for t in tools_schema
-            if t.get("function", {}).get("name") not in getattr(self, '_blocked_tools', set())
+            t
+            for t in tools_schema
+            if t.get("function", {}).get("name") not in getattr(self, "_blocked_tools", set())
         ]
         return len(active) == 0 and len(tools_schema) > 0
 
     def _build_failure_report(self) -> str:
         """Build user-facing failure report from breaker state."""
-        lines = ["I was unable to complete the task. The following tools encountered repeated errors:"]
-        for tool, errors in getattr(self, '_tool_failures', {}).items():
-            if tool in getattr(self, '_blocked_tools', set()):
+        lines = [
+            "I was unable to complete the task. The following tools encountered repeated errors:"
+        ]
+        for tool, errors in getattr(self, "_tool_failures", {}).items():
+            if tool in getattr(self, "_blocked_tools", set()):
                 last_err = errors[-1] if errors else "unknown error"
                 lines.append(f"- **{tool}**: {last_err}")
         lines.append("\nPlease check the tool configuration or try a different approach.")
@@ -1814,7 +2051,11 @@ class ChatLoop:
     # ------------------------------------------------------------------
 
     def _handle_scratchpad_tool(
-        self, fn_name: str, params: dict, session_id: str, user_id: str,
+        self,
+        fn_name: str,
+        params: dict,
+        session_id: str,
+        user_id: str,
     ) -> dict:
         """Execute a scratchpad tool call locally."""
         if fn_name == "scratchpad_write":
@@ -1829,20 +2070,24 @@ class ChatLoop:
 
         if fn_name == "scratchpad_read":
             notes = self.scratchpad.get_active_notes(
-                session_id, note_type=params.get("note_type"),
+                session_id,
+                note_type=params.get("note_type"),
             )
             return {"notes": notes}
 
         if fn_name == "scratchpad_close":
             ok = self.scratchpad.close_note(
-                params["note_id"], status=params.get("status", "completed"),
+                params["note_id"],
+                status=params.get("status", "completed"),
             )
             return {"success": ok}
 
         return {"error": f"Unknown scratchpad tool: {fn_name}"}
 
     def _build_messages(
-        self, user_input: str, context: dict[str, Any] | None,
+        self,
+        user_input: str,
+        context: dict[str, Any] | None,
         session_id: str | None = None,
         user_id: str | None = None,
     ) -> list[dict[str, Any]]:
@@ -1874,7 +2119,7 @@ class ChatLoop:
         sections = [role, constraints]
 
         # §2.5 Dynamic few-shot examples (from high-rated feedback)
-        if hasattr(self, '_few_shot') and self._few_shot:
+        if hasattr(self, "_few_shot") and self._few_shot:
             examples = self._few_shot.retrieve(user_input)
             few_shot_section = self._few_shot.format_for_prompt(examples)
             if few_shot_section:
@@ -1893,8 +2138,14 @@ class ChatLoop:
         selected = context.get("selected_events") if context else None
         if selected and isinstance(selected, list):
             # Budget: ~2000 chars for history (roughly 500 tokens)
-            tb = context.get("token_budget") if isinstance(context.get("token_budget"), dict) else {}
-            allocated = tb.get("history", {}).get("allocated", 500) if isinstance(tb.get("history"), dict) else 500
+            tb = (
+                context.get("token_budget") if isinstance(context.get("token_budget"), dict) else {}
+            )
+            allocated = (
+                tb.get("history", {}).get("allocated", 500)
+                if isinstance(tb.get("history"), dict)
+                else 500
+            )
             budget = (allocated if isinstance(allocated, (int, float)) else 500) * 4
             history_lines = []
             used = 0
@@ -1977,7 +2228,9 @@ class ChatLoop:
         """Sync MCP tool metadata — no-op after skill system cleanup."""
         pass
 
-    def _evaluate_hitl(self, fn_name: str, params: dict, **ctx_overrides) -> tuple[bool, str | None]:
+    def _evaluate_hitl(
+        self, fn_name: str, params: dict, **ctx_overrides
+    ) -> tuple[bool, str | None]:
         """Check HITL policy before tool execution.
 
         Returns (allowed, block_message).
@@ -1987,6 +2240,7 @@ class ChatLoop:
         if not self.hitl_policy:
             return True, None
         from core.verification.hitl_policy import ActionContext, SupervisionAction
+
         # Auto-detect novel skill: never seen in success streak
         is_novel = fn_name not in self.hitl_policy._success_streak
         ctx = ActionContext(
@@ -2001,11 +2255,13 @@ class ChatLoop:
                 logger.info("[HITL] observe_only for %s: %s", fn_name, decision.reason)
             return True, None
         logger.warning("[HITL] %s blocked %s: %s", decision.action.value, fn_name, decision.reason)
-        return False, json.dumps({
-            "error": f"Blocked by HITL policy ({decision.action.value}): {decision.reason}",
-            "hitl_action": decision.action.value,
-            "triggered_policies": decision.triggered_policies,
-        })
+        return False, json.dumps(
+            {
+                "error": f"Blocked by HITL policy ({decision.action.value}): {decision.reason}",
+                "hitl_action": decision.action.value,
+                "triggered_policies": decision.triggered_policies,
+            }
+        )
 
     def _log_response(
         self,
@@ -2042,7 +2298,9 @@ class ChatLoop:
                     response_tokens=response_tokens,
                 )
                 self.event_logger.update_quality_score(
-                    event.event_id, result.quality_score, result.training_eligible,
+                    event.event_id,
+                    result.quality_score,
+                    result.training_eligible,
                 )
             except Exception as e:
                 logger.warning("Auto-score failed (non-fatal): %s", e)
@@ -2050,24 +2308,27 @@ class ChatLoop:
         if causal_chain_id:
             try:
                 from core.evaluation.multi_level_scorer import score_chain
+
                 with self.event_logger._db() as _score_db:
                     score_chain(_score_db, causal_chain_id, session_id)
             except Exception as e:
                 logger.warning("Chain-level scoring failed (non-fatal): %s", e)
         # Task 4.2: Log route_feedback event for learning (non-fatal)
         try:
-            blocked = getattr(self, '_blocked_tools', set())
-            failures = getattr(self, '_tool_failures', {})
+            blocked = getattr(self, "_blocked_tools", set())
+            failures = getattr(self, "_tool_failures", {})
             if blocked or failures:
                 self.event_logger.create_stream_event(
                     user_id=user_id,
                     session_id=session_id,
                     event_type="stream_run_finished",
-                    content=json.dumps({
-                        "route_feedback": True,
-                        "blocked_tools": sorted(blocked),
-                        "tool_failures": {k: len(v) for k, v in failures.items()},
-                    }),
+                    content=json.dumps(
+                        {
+                            "route_feedback": True,
+                            "blocked_tools": sorted(blocked),
+                            "tool_failures": {k: len(v) for k, v in failures.items()},
+                        }
+                    ),
                     parent_event_id=parent_event_id,
                     causal_chain_id=causal_chain_id,
                 )
@@ -2079,6 +2340,7 @@ class ChatLoop:
         if messages:
             from api.database import SessionLocal
             from core.agent.turn_hooks import TurnHooks
+
             hooks = TurnHooks(SessionLocal, llm_client=self.llm, embed_fn=self._get_embed_fn())
             hooks.run_observer(session_id, user_id, messages)
 
@@ -2086,6 +2348,7 @@ class ChatLoop:
         """Lazy-init embedding function for memory pipeline."""
         try:
             from core.context.embeddings import get_embedding_client
+
             return get_embedding_client().embed
         except Exception:
             return None
@@ -2096,14 +2359,18 @@ class ChatLoop:
             return self._escalated_model
         try:
             from sqlalchemy import text
+
             with self.event_logger._db() as _slo_db:
-                row = _slo_db.execute(text("""
+                row = _slo_db.execute(
+                    text("""
                     SELECT 1 FROM agent_events
                     WHERE agent_id = :aid AND event_type = 'slo_model_escalation'
                       AND created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
                     LIMIT 1
-                """), {"aid": self.agent_id}).fetchone()
-            if row and hasattr(self.llm, 'router'):
+                """),
+                    {"aid": self.agent_id},
+                ).fetchone()
+            if row and hasattr(self.llm, "router"):
                 current = self.llm.config.get("model", "gpt-4o-mini")
                 escalated = self.llm.router.escalate(current)
                 if escalated:

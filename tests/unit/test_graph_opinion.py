@@ -15,19 +15,26 @@ from core.memory.graph.types import GraphNodeData, NodeType
 
 
 def _node(
-    node_id: str = "n1", node_type: NodeType = NodeType.SEMANTIC,
-    confidence: float = 0.5, trust_tier: str = "T4",
-    embedding: list[float] | None = None, is_active: bool = True,
+    node_id: str = "n1",
+    node_type: NodeType = NodeType.SEMANTIC,
+    confidence: float = 0.5,
+    trust_tier: str = "T4",
+    embedding: list[float] | None = None,
+    is_active: bool = True,
 ) -> GraphNodeData:
     return GraphNodeData(
-        node_id=node_id, user_id="u1", node_type=node_type,
-        content="test content", embedding=embedding or [0.1] * 8,
-        confidence=confidence, trust_tier=trust_tier, is_active=is_active,
+        node_id=node_id,
+        user_id="u1",
+        node_type=node_type,
+        content="test content",
+        embedding=embedding or [0.1] * 8,
+        confidence=confidence,
+        trust_tier=trust_tier,
+        is_active=is_active,
     )
 
 
 class TestEvolveOpinions:
-
     def _mock_store(self) -> MagicMock:
         store = MagicMock()
         store.get_nodes_by_ids.return_value = []
@@ -73,7 +80,8 @@ class TestEvolveOpinions:
         assert result.scenes_evaluated == 1
         assert result.supporting == 1
         store.update_confidence.assert_called_once_with(
-            "scene1", 0.5 + DEFAULT_CONFIG.opinion_supporting_delta,
+            "scene1",
+            0.5 + DEFAULT_CONFIG.opinion_supporting_delta,
         )
 
     @patch("core.memory.graph.opinion.SpreadingActivation")
@@ -89,7 +97,8 @@ class TestEvolveOpinions:
 
         assert result.contradicting == 1
         store.update_confidence.assert_called_once_with(
-            "scene1", 0.5 + DEFAULT_CONFIG.opinion_contradicting_delta,
+            "scene1",
+            0.5 + DEFAULT_CONFIG.opinion_contradicting_delta,
         )
 
     @patch("core.memory.graph.opinion.SpreadingActivation")
@@ -128,7 +137,9 @@ class TestEvolveOpinions:
         sa_instance = MockSA.return_value
         threshold = DEFAULT_CONFIG.opinion_t4_to_t3_confidence
         delta = DEFAULT_CONFIG.opinion_supporting_delta
-        scene = _node("scene1", NodeType.SCENE, confidence=threshold - delta + 0.001, trust_tier="T4")
+        scene = _node(
+            "scene1", NodeType.SCENE, confidence=threshold - delta + 0.001, trust_tier="T4"
+        )
         sa_instance.get_activated.return_value = {"new1": 1.0, "scene1": 0.4}
         store.get_nodes_by_ids.return_value = [scene]
         store.get_pair_similarity.return_value = 0.9

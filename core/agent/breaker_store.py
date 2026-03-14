@@ -23,7 +23,6 @@ from api.base import Base
 from core.logging_config import get_logger
 
 if TYPE_CHECKING:
-
     from sqlalchemy.orm import Session
 
 logger = get_logger(__name__)
@@ -119,14 +118,16 @@ def flush_breaker_state(db: Session, records: dict[str, BreakerRecord]) -> int:
         return 0
     now = datetime.now(timezone.utc)
     for rec in dirty:
-        db.merge(ToolBreakerState(
-            user_id=rec.user_id,
-            tool_name=rec.tool_name,
-            consecutive_failures=rec.consecutive_failures,
-            last_failure_at=rec.last_failure_at,
-            cooldown_until=rec.cooldown_until,
-            updated_at=now,
-        ))
+        db.merge(
+            ToolBreakerState(
+                user_id=rec.user_id,
+                tool_name=rec.tool_name,
+                consecutive_failures=rec.consecutive_failures,
+                last_failure_at=rec.last_failure_at,
+                cooldown_until=rec.cooldown_until,
+                updated_at=now,
+            )
+        )
     db.commit()
     # Clear dirty only AFTER successful commit — if commit fails, retry will re-write
     for rec in dirty:

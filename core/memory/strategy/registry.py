@@ -68,19 +68,22 @@ class StrategyRegistry:
         logger.info("Registered strategy: %s", key)
 
     def create_strategy(
-        self, descriptor: StrategyDescriptor, **deps: Any,
+        self,
+        descriptor: StrategyDescriptor,
+        **deps: Any,
     ) -> RetrievalStrategy:
         """Create a retrieval strategy instance."""
         entry = self._entries.get(descriptor.key)
         if entry is None:
             raise ValueError(
-                f"Unknown strategy '{descriptor.key}'. "
-                f"Available: {list(self._entries.keys())}"
+                f"Unknown strategy '{descriptor.key}'. Available: {list(self._entries.keys())}"
             )
         return entry.strategy_factory(params=descriptor.params, **deps)
 
     def create_index_manager(
-        self, descriptor: StrategyDescriptor, **deps: Any,
+        self,
+        descriptor: StrategyDescriptor,
+        **deps: Any,
     ) -> IndexManager | None:
         """Create an index manager, or None if strategy needs no index."""
         entry = self._entries.get(descriptor.key)

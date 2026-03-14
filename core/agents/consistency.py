@@ -293,12 +293,14 @@ class ConsistencyVerifier(DbConsumer):
                 emb_a = self.embedding_service.embed(text_a)
                 emb_b = self.embedding_service.embed(text_b)
                 from core.utils.similarity import cosine_similarity
+
                 return cosine_similarity(emb_a, emb_b)
             except Exception:
                 pass  # Fallback to word overlap
-        
+
         # Fallback: word overlap (0.5 = uncertain when input is empty)
         from core.utils.similarity import word_overlap
+
         wa, wb = text_a.lower().split(), text_b.lower().split()
         if not wa or not wb:
             return 0.5

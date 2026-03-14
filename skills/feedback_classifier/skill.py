@@ -9,8 +9,14 @@ from __future__ import annotations
 from pydantic import Field
 
 from core.skills.base import (
-    Skill, SkillInput, SkillOutput, SkillRequirement,
-    RepoType, AccessScope, SideEffectCategory, SideEffectProfile,
+    Skill,
+    SkillInput,
+    SkillOutput,
+    SkillRequirement,
+    RepoType,
+    AccessScope,
+    SideEffectCategory,
+    SideEffectProfile,
 )
 from core.logging_config import get_logger
 
@@ -38,11 +44,14 @@ class FeedbackClassifierSkill(Skill[ClassifierInput, ClassifierOutput]):
     version = "1.0.0"
     description = "Classify implicit user feedback from conversation context"
     requirements = SkillRequirement(
-        repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=False,
+        repo_types=[RepoType.CODE],
+        min_access=AccessScope.READ,
+        llm_required=False,
         timeout_seconds=10,
     )
     side_effect_profile = SideEffectProfile(
-        category=SideEffectCategory.READ, external_apis=[],
+        category=SideEffectCategory.READ,
+        external_apis=[],
     )
 
     def __init__(self, db=None) -> None:
@@ -69,13 +78,19 @@ class FeedbackClassifierSkill(Skill[ClassifierInput, ClassifierOutput]):
 
         text = f"{input.user_query} [SEP] {input.agent_response} [SEP] {input.followup}"
         tokens = self._tokenizer(
-            text[:512], padding="max_length", truncation=True,
-            max_length=256, return_tensors="np",
+            text[:512],
+            padding="max_length",
+            truncation=True,
+            max_length=256,
+            return_tensors="np",
         )
-        outputs = self._session.run(None, {
-            "input_ids": tokens["input_ids"],
-            "attention_mask": tokens["attention_mask"],
-        })
+        outputs = self._session.run(
+            None,
+            {
+                "input_ids": tokens["input_ids"],
+                "attention_mask": tokens["attention_mask"],
+            },
+        )
         logits = outputs[0][0]
 
         # Softmax
@@ -87,8 +102,10 @@ class FeedbackClassifierSkill(Skill[ClassifierInput, ClassifierOutput]):
         confidence = float(probs[pred_idx])
 
         return ClassifierOutput(
-            success=True, result={"signal_type": signal_type, "confidence": confidence},
-            signal_type=signal_type, confidence=confidence,
+            success=True,
+            result={"signal_type": signal_type, "confidence": confidence},
+            signal_type=signal_type,
+            confidence=confidence,
             reasoning=f"model prediction (top: {signal_type}={confidence:.2f})",
         )
 
@@ -96,9 +113,12 @@ class FeedbackClassifierSkill(Skill[ClassifierInput, ClassifierOutput]):
     def _heuristic_fallback(input: ClassifierInput) -> ClassifierOutput:
         """Use ImplicitFeedbackDetector as fallback."""
         from core.context.implicit_feedback import ImplicitFeedbackDetector
+
         signal = ImplicitFeedbackDetector.detect(input.followup, input.agent_response)
         return ClassifierOutput(
-            success=True, result={"signal_type": signal.signal_type, "confidence": signal.confidence},
-            signal_type=signal.signal_type, confidence=signal.confidence,
+            success=True,
+            result={"signal_type": signal.signal_type, "confidence": signal.confidence},
+            signal_type=signal.signal_type,
+            confidence=signal.confidence,
             reasoning=f"heuristic fallback: {signal.evidence}",
         )

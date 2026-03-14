@@ -94,9 +94,7 @@ class LocalJobBackend(JobBackend):
             self._results[job_id] = JobResult(job_id=job_id, status=JobStatus.CANCELLED)
         except Exception as e:
             logger.error(f"Job {job_id} failed: {e}")
-            self._results[job_id] = JobResult(
-                job_id=job_id, status=JobStatus.FAILED, error=str(e)
-            )
+            self._results[job_id] = JobResult(job_id=job_id, status=JobStatus.FAILED, error=str(e))
         finally:
             if self._on_completed:
                 r = self._results.get(job_id)
@@ -109,9 +107,13 @@ class LocalJobBackend(JobBackend):
     @staticmethod
     def _build_cmd(job_type: str, inputs: dict, req: JobRequirements) -> list[str]:
         runner_args = [
-            sys.executable, "-m", "core.jobs.runner",
-            "--job-type", job_type,
-            "--inputs", json.dumps(inputs),
+            sys.executable,
+            "-m",
+            "core.jobs.runner",
+            "--job-type",
+            job_type,
+            "--inputs",
+            json.dumps(inputs),
         ]
         if req.conda_env:
             return ["conda", "run", "-n", req.conda_env, "--no-capture-output"] + runner_args

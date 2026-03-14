@@ -53,11 +53,7 @@ class GitHubSkillAPI:
         if not self._db:
             raise RuntimeError("DB session required for repo management")
         full_name = f"{owner}/{name}"
-        existing = (
-            self._db.query(SkGithubRepo)
-            .filter_by(owner=owner, name=name)
-            .one_or_none()
-        )
+        existing = self._db.query(SkGithubRepo).filter_by(owner=owner, name=name).one_or_none()
         if existing:
             return {"repo_id": existing.repo_id, "full_name": full_name, "created": False}
         repo = SkGithubRepo(
@@ -150,7 +146,7 @@ class GitHubSkillAPI:
         "cancelled": "cancelled",
         "skipped": "skipped",
         "timed_out": "failure",
-        "neutral": "success",   # passed with warnings, not skipped
+        "neutral": "success",  # passed with warnings, not skipped
         "stale": "cancelled",
         None: "pending",
         "in_progress": "pending",
@@ -192,7 +188,9 @@ class GitHubSkillAPI:
         from ci_status which lists workflow runs at the repo level — they serve different purposes.
         """
         if detail not in self._VALID_DETAIL_LEVELS:
-            raise ValueError(f"Invalid detail level {detail!r}, must be one of: {', '.join(sorted(self._VALID_DETAIL_LEVELS))}")
+            raise ValueError(
+                f"Invalid detail level {detail!r}, must be one of: {', '.join(sorted(self._VALID_DETAIL_LEVELS))}"
+            )
         await self._check_rate_limit()
         try:
             gh_repo = self._get_repo(repo)
@@ -206,7 +204,9 @@ class GitHubSkillAPI:
                 commit = gh_repo.get_commit(pr.head.sha)
                 checks = list(commit.get_check_runs())
                 if checks:
-                    conclusions = {self._CONCLUSION_MAP.get(c.conclusion, "unknown") for c in checks}
+                    conclusions = {
+                        self._CONCLUSION_MAP.get(c.conclusion, "unknown") for c in checks
+                    }
                     if "failure" in conclusions:
                         ci_conclusion = "failure"
                     elif conclusions <= {"success", "skipped"}:
@@ -233,29 +233,33 @@ class GitHubSkillAPI:
                 return result
 
             # normal+
-            result.update({
-                "body": self._trunc(pr.body or "", 200),
-                "labels": [lb.name for lb in pr.labels],
-                "reviewers": [r.login for r in pr.requested_reviewers],
-                "additions": pr.additions,
-                "deletions": pr.deletions,
-                "updated_at": self._fmt_ts(pr.updated_at),
-            })
+            result.update(
+                {
+                    "body": self._trunc(pr.body or "", 200),
+                    "labels": [lb.name for lb in pr.labels],
+                    "reviewers": [r.login for r in pr.requested_reviewers],
+                    "additions": pr.additions,
+                    "deletions": pr.deletions,
+                    "updated_at": self._fmt_ts(pr.updated_at),
+                }
+            )
             if detail == "normal":
                 return result
 
             # detailed+
             files = list(pr.get_files())
             files_sorted = sorted(files, key=lambda f: f.changes, reverse=True)[:10]
-            result.update({
-                "key_files": [
-                    {"filename": f.filename, "changes": f.changes, "status": f.status}
-                    for f in files_sorted
-                ],
-                "review_comments": pr.review_comments,
-                "mergeable": pr.mergeable,
-                "merge_state": getattr(pr, "mergeable_state", None),
-            })
+            result.update(
+                {
+                    "key_files": [
+                        {"filename": f.filename, "changes": f.changes, "status": f.status}
+                        for f in files_sorted
+                    ],
+                    "review_comments": pr.review_comments,
+                    "mergeable": pr.mergeable,
+                    "merge_state": getattr(pr, "mergeable_state", None),
+                }
+            )
             if detail == "detailed":
                 return result
 
@@ -264,12 +268,14 @@ class GitHubSkillAPI:
             try:
                 reviews = []
                 for rv in pr.get_reviews():
-                    reviews.append({
-                        "user": rv.user.login,
-                        "state": rv.state,
-                        "body": self._trunc(rv.body, 200),
-                        "submitted_at": self._fmt_ts(rv.submitted_at),
-                    })
+                    reviews.append(
+                        {
+                            "user": rv.user.login,
+                            "state": rv.state,
+                            "body": self._trunc(rv.body, 200),
+                            "submitted_at": self._fmt_ts(rv.submitted_at),
+                        }
+                    )
                 result["reviews"] = reviews
             except (GitHubError, GitHubRateLimitError):
                 raise
@@ -311,7 +317,9 @@ class GitHubSkillAPI:
 
     _LIST_PRS_DETAIL_LEVELS = frozenset({"brief", "normal"})
 
-    async def list_prs(self, repo: str, state: str = "open", limit: int = 10, detail: str = "brief") -> list[dict]:
+    async def list_prs(
+        self, repo: str, state: str = "open", limit: int = 10, detail: str = "brief"
+    ) -> list[dict]:
         """List PRs in a repo.
 
         detail levels (list context — use get_pr for deeper detail on a single PR):
@@ -323,7 +331,9 @@ class GitHubSkillAPI:
         Use get_pr(detail='brief') for a single PR with ci_conclusion.
         """
         if detail not in self._LIST_PRS_DETAIL_LEVELS:
-            raise ValueError(f"Invalid detail level {detail!r} for list_prs, must be one of: brief, normal")
+            raise ValueError(
+                f"Invalid detail level {detail!r} for list_prs, must be one of: brief, normal"
+            )
         await self._check_rate_limit()
         try:
             gh_repo = self._get_repo(repo)
@@ -341,12 +351,14 @@ class GitHubSkillAPI:
                     "html_url": pr.html_url,
                 }
                 if detail != "brief":
-                    item.update({
-                        "body": self._trunc(pr.body or "", 200),
-                        "labels": [lb.name for lb in pr.labels],
-                        "reviewers": [r.login for r in pr.requested_reviewers],
-                        "changed_files": pr.changed_files,
-                    })
+                    item.update(
+                        {
+                            "body": self._trunc(pr.body or "", 200),
+                            "labels": [lb.name for lb in pr.labels],
+                            "reviewers": [r.login for r in pr.requested_reviewers],
+                            "changed_files": pr.changed_files,
+                        }
+                    )
                 result.append(item)
             return result
         except (GitHubError, GitHubRateLimitError):
@@ -368,14 +380,16 @@ class GitHubSkillAPI:
             check_runs = commit.get_check_runs()
             runs = []
             for cr in check_runs:
-                runs.append({
-                    "name": cr.name,
-                    "status": cr.status,
-                    "conclusion": cr.conclusion,
-                    "html_url": cr.html_url,
-                    "started_at": cr.started_at.isoformat() if cr.started_at else None,
-                    "completed_at": cr.completed_at.isoformat() if cr.completed_at else None,
-                })
+                runs.append(
+                    {
+                        "name": cr.name,
+                        "status": cr.status,
+                        "conclusion": cr.conclusion,
+                        "html_url": cr.html_url,
+                        "started_at": cr.started_at.isoformat() if cr.started_at else None,
+                        "completed_at": cr.completed_at.isoformat() if cr.completed_at else None,
+                    }
+                )
             # Overall status
             overall = "success"
             for r in runs:
@@ -412,7 +426,9 @@ class GitHubSkillAPI:
           full     — detailed + complete body (2000), all comments (200 each, up to 20)
         """
         if detail not in GitHubSkillAPI._VALID_DETAIL_LEVELS:
-            raise ValueError(f"Invalid detail level {detail!r}, must be one of: brief, normal, detailed, full")
+            raise ValueError(
+                f"Invalid detail level {detail!r}, must be one of: brief, normal, detailed, full"
+            )
         d: dict = {
             "number": issue.number,
             "title": self._trunc(issue.title, 80),
@@ -426,13 +442,15 @@ class GitHubSkillAPI:
             return d
 
         # normal+
-        d.update({
-            "body": self._trunc(issue.body or "", 200),
-            "assignees": [a.login for a in issue.assignees],
-            "comment_count": issue.comments,
-            "milestone": issue.milestone.title if issue.milestone else None,
-            "updated_at": self._fmt_ts(issue.updated_at),
-        })
+        d.update(
+            {
+                "body": self._trunc(issue.body or "", 200),
+                "assignees": [a.login for a in issue.assignees],
+                "comment_count": issue.comments,
+                "milestone": issue.milestone.title if issue.milestone else None,
+                "updated_at": self._fmt_ts(issue.updated_at),
+            }
+        )
         if detail == "normal":
             return d
 
@@ -444,11 +462,13 @@ class GitHubSkillAPI:
             for c in issue.get_comments():
                 if len(comments) >= comment_limit:
                     break
-                comments.append({
-                    "user": c.user.login,
-                    "created_at": self._fmt_ts(c.created_at),
-                    "body": self._trunc(c.body, 200),
-                })
+                comments.append(
+                    {
+                        "user": c.user.login,
+                        "created_at": self._fmt_ts(c.created_at),
+                        "body": self._trunc(c.body, 200),
+                    }
+                )
             d["recent_comments"] = comments
         except Exception as exc:
             logger.warning("Failed to fetch comments for issue #%s: %s", issue.number, exc)
@@ -458,12 +478,14 @@ class GitHubSkillAPI:
 
         # full — expand body and add metadata
         d["body"] = self._trunc(issue.body or "", 2000)
-        d.update({
-            "reactions": issue.reactions if isinstance(issue.reactions, dict) else {},
-            "closed_at": self._fmt_ts(issue.closed_at),
-            "closed_by": issue.closed_by.login if issue.closed_by else None,
-            "locked": issue.locked,
-        })
+        d.update(
+            {
+                "reactions": issue.reactions if isinstance(issue.reactions, dict) else {},
+                "closed_at": self._fmt_ts(issue.closed_at),
+                "closed_by": issue.closed_by.login if issue.closed_by else None,
+                "locked": issue.locked,
+            }
+        )
         return d
 
     async def list_issues(
@@ -502,6 +524,7 @@ class GitHubSkillAPI:
                 kwargs["labels"] = labels
             if since:
                 from datetime import datetime as dt
+
                 try:
                     kwargs["since"] = dt.fromisoformat(since)
                 except ValueError as exc:
@@ -649,10 +672,12 @@ class GitHubSkillAPI:
                         failed_jobs = []
                         for job in jobs:
                             job_conclusion = self._CONCLUSION_MAP.get(job.conclusion, "unknown")
-                            job_list.append({
-                                "name": job.name,
-                                "conclusion": job_conclusion,
-                            })
+                            job_list.append(
+                                {
+                                    "name": job.name,
+                                    "conclusion": job_conclusion,
+                                }
+                            )
                             if job_conclusion == "failure":
                                 failed_jobs.append(job.name)
                         item["jobs"] = job_list
@@ -665,11 +690,13 @@ class GitHubSkillAPI:
                                     continue
                                 for step in job.steps:
                                     if step.conclusion == "failure":
-                                        failed_steps.append({
-                                            "job": job.name,
-                                            "step": step.name,
-                                            "number": step.number,
-                                        })
+                                        failed_steps.append(
+                                            {
+                                                "job": job.name,
+                                                "step": step.name,
+                                                "number": step.number,
+                                            }
+                                        )
                             item["failed_steps"] = failed_steps
                     except (GitHubError, GitHubRateLimitError):
                         raise  # propagate rate-limit / auth errors
@@ -731,16 +758,18 @@ class GitHubSkillAPI:
                 existing.data = pr_data
                 existing.fetched_at = now
             else:
-                self._db.add(SkGithubPRCache(
-                    cache_id=str(uuid.uuid4()),
-                    repo_full_name=repo,
-                    pr_number=pr_data["number"],
-                    title=pr_data.get("title"),
-                    state=pr_data.get("state"),
-                    author=pr_data.get("user"),
-                    data=pr_data,
-                    fetched_at=now,
-                ))
+                self._db.add(
+                    SkGithubPRCache(
+                        cache_id=str(uuid.uuid4()),
+                        repo_full_name=repo,
+                        pr_number=pr_data["number"],
+                        title=pr_data.get("title"),
+                        state=pr_data.get("state"),
+                        author=pr_data.get("user"),
+                        data=pr_data,
+                        fetched_at=now,
+                    )
+                )
             self._db.flush()
         except Exception as e:
             logger.debug(f"PR cache upsert failed (non-fatal): {e}")

@@ -13,12 +13,26 @@ from core.utils.similarity import cosine_similarity as _cosine_similarity
 
 # ── Fixtures ─────────────────────────────────────────────────────
 
+
 def _schema(name: str, desc: str = "") -> dict:
     return {"type": "function", "function": {"name": name, "description": desc, "parameters": {}}}
 
 
-def _entry(name: str, pinned: bool = False, source: ToolSource = ToolSource.CLOUD, desc: str = "", category: str = "") -> ToolEntry:
-    return ToolEntry(name=name, description=desc or name, schema=_schema(name, desc or name), source=source, pinned=pinned, category=category)
+def _entry(
+    name: str,
+    pinned: bool = False,
+    source: ToolSource = ToolSource.CLOUD,
+    desc: str = "",
+    category: str = "",
+) -> ToolEntry:
+    return ToolEntry(
+        name=name,
+        description=desc or name,
+        schema=_schema(name, desc or name),
+        source=source,
+        pinned=pinned,
+        category=category,
+    )
 
 
 @pytest.fixture
@@ -33,6 +47,7 @@ def registry() -> ToolRegistry:
 
 
 # ── Registration ─────────────────────────────────────────────────
+
 
 class TestRegistration:
     def test_register_and_get(self):
@@ -90,6 +105,7 @@ class TestRegistration:
 
 # ── Pinned vs Dynamic ───────────────────────────────────────────
 
+
 class TestPinnedDynamic:
     def test_pinned_tools(self, registry):
         pinned = registry.pinned_tools()
@@ -106,6 +122,7 @@ class TestPinnedDynamic:
 
 
 # ── Selection ────────────────────────────────────────────────────
+
 
 class TestSelect:
     def test_select_includes_all_pinned(self, registry):
@@ -149,6 +166,7 @@ class TestSelect:
 
 # ── Token Budget ─────────────────────────────────────────────────
 
+
 class TestTokenBudget:
     def test_pinned_never_dropped(self):
         r = ToolRegistry(max_tokens=1)  # Tiny budget
@@ -176,6 +194,7 @@ class TestTokenBudget:
 
 
 # ── Embedding Selection ──────────────────────────────────────────
+
 
 class TestEmbeddingSelect:
     def test_with_embed_fn(self):
@@ -211,6 +230,7 @@ class TestEmbeddingSelect:
 
 # ── Cosine Similarity ────────────────────────────────────────────
 
+
 class TestCosineSimilarity:
     def test_identical_vectors(self):
         assert _cosine_similarity([1, 0], [1, 0]) == pytest.approx(1.0)
@@ -230,6 +250,7 @@ class TestCosineSimilarity:
 
 # ── Prefilter Integration ────────────────────────────────────────
 
+
 class TestPrefilterIntegration:
     def test_prefilter_reorders_for_history_query(self):
         """History+analytical query should prefer historical-scoped tools."""
@@ -240,9 +261,11 @@ class TestPrefilterIntegration:
 
         messages = [
             {"role": "user", "content": "list prs"},
-            {"role": "assistant", "content": "done", "tool_calls": [
-                {"function": {"name": "list_prs", "arguments": "{}"}}
-            ]},
+            {
+                "role": "assistant",
+                "content": "done",
+                "tool_calls": [{"function": {"name": "list_prs", "arguments": "{}"}}],
+            },
             {"role": "user", "content": "分析一下前一个上下文"},
         ]
         result = r.select("分析一下前一个上下文", messages)
@@ -259,10 +282,12 @@ class TestPrefilterIntegration:
 
 # ── register_skill ───────────────────────────────────────────────
 
+
 class TestRegisterSkill:
     def test_register_skill_from_base(self):
         """Register a Skill instance via register_skill()."""
         from unittest.mock import MagicMock
+
         skill = MagicMock()
         skill.name = "test_skill"
         skill.description = "A test skill"
@@ -278,6 +303,7 @@ class TestRegisterSkill:
 
     def test_register_skill_auto_pinned(self):
         from unittest.mock import MagicMock
+
         skill = MagicMock()
         skill.name = "bash"
         skill.description = "Run shell"

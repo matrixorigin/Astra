@@ -1,7 +1,14 @@
 """Evaluation, quality, feedback, and training models."""
 
 from sqlalchemy import (
-    Column, Float, Index, Integer, SmallInteger, String, Text, UniqueConstraint,
+    Column,
+    Float,
+    Index,
+    Integer,
+    SmallInteger,
+    String,
+    Text,
+    UniqueConstraint,
 )
 from sqlalchemy.sql import func
 
@@ -75,9 +82,7 @@ class LLMCallLog(Base):
 
 class UserFeedback(Base):
     __tablename__ = "eval_user_feedback"
-    __table_args__ = (
-        Index("ix_feedback_agent_created", "agent_id", "created_at"),
-    )
+    __table_args__ = (Index("ix_feedback_agent_created", "agent_id", "created_at"),)
     feedback_id = Column(String(64), primary_key=True)
     user_id = Column(String(36), nullable=False, index=True)
     agent_id = Column(String(64), index=True)

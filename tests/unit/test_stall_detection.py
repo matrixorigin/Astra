@@ -27,7 +27,6 @@ def loop():
 
 
 class TestRecordRoundTools:
-
     def test_extracts_name_and_args(self, loop):
         loop._record_round_tools([_make_tc("grep", '{"pattern":"foo"}')])
         assert len(loop._round_tool_sigs) == 1
@@ -35,10 +34,12 @@ class TestRecordRoundTools:
         assert sig == 'grep:{"pattern":"foo"}'
 
     def test_multiple_tools_in_one_round(self, loop):
-        loop._record_round_tools([
-            _make_tc("grep", '{"pattern":"a"}'),
-            _make_tc("fs_read", '{"path":"/x"}'),
-        ])
+        loop._record_round_tools(
+            [
+                _make_tc("grep", '{"pattern":"a"}'),
+                _make_tc("fs_read", '{"path":"/x"}'),
+            ]
+        )
         assert len(loop._round_tool_sigs[0]) == 2
 
     def test_empty_args_default(self, loop):
@@ -53,7 +54,6 @@ _FILLER = "x" * 30
 
 
 class TestDetectStall:
-
     def test_no_stall_below_window(self, loop):
         """Fewer rounds than window → never stall."""
         loop._record_round_tools([_make_tc("grep", '{"p":"a"}')], _FILLER)

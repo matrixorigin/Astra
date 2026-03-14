@@ -112,7 +112,9 @@ class TieredMemoryLoader:
             stats.l0_ms = (time.time() - l0_start) * 1000
 
         l1_start = time.time() if explain else 0
-        l1, retrieval_stats = self.load_l1(user_id, session_id, query, query_embedding, task_hint, explain=explain)
+        l1, retrieval_stats = self.load_l1(
+            user_id, session_id, query, query_embedding, task_hint, explain=explain
+        )
         if l1:
             parts.append(l1)
         if stats:

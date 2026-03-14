@@ -40,13 +40,19 @@ def main() -> None:
 
         skill = registry.get(args.skill)
         if not skill:
-            print(json.dumps({
-                "error": f"Skill '{args.skill}' not found",
-                "hint": DIAGNOSE_HINT,
-            }), file=sys.stderr)
+            print(
+                json.dumps(
+                    {
+                        "error": f"Skill '{args.skill}' not found",
+                        "hint": DIAGNOSE_HINT,
+                    }
+                ),
+                file=sys.stderr,
+            )
             sys.exit(1)
 
         import asyncio
+
         validated = skill.validate_input(inputs)
         result = asyncio.run(skill.execute(validated))
 
@@ -59,19 +65,29 @@ def main() -> None:
 
         json.dump(output, sys.stdout)
     except ImportError as e:
-        print(json.dumps({
-            "error": f"Failed to load skill: {e}",
-            "hint": DIAGNOSE_HINT,
-        }), file=sys.stderr)
+        print(
+            json.dumps(
+                {
+                    "error": f"Failed to load skill: {e}",
+                    "hint": DIAGNOSE_HINT,
+                }
+            ),
+            file=sys.stderr,
+        )
         sys.exit(1)
     except Exception as e:
         err_type = type(e).__name__
         # Skill-related errors get the hint
         if "skill" in str(e).lower() or "load" in str(e).lower():
-            print(json.dumps({
-                "error": f"{err_type}: {e}",
-                "hint": DIAGNOSE_HINT,
-            }), file=sys.stderr)
+            print(
+                json.dumps(
+                    {
+                        "error": f"{err_type}: {e}",
+                        "hint": DIAGNOSE_HINT,
+                    }
+                ),
+                file=sys.stderr,
+            )
         else:
             print(json.dumps({"error": f"{err_type}: {e}"}), file=sys.stderr)
         sys.exit(1)

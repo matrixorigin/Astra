@@ -13,9 +13,11 @@ class TestContextOverflowDetection:
     @pytest.fixture
     def mock_llm_client(self, db_factory):
         """Create LLMClient with mocked router (8K context window)."""
-        with patch.object(LLMClient, '_init_providers'):
+        with patch.object(LLMClient, "_init_providers"):
             client = LLMClient(db_factory)
-            mock_model = ModelConfig(model_name="test-model", provider="openai", context_window=8000)
+            mock_model = ModelConfig(
+                model_name="test-model", provider="openai", context_window=8000
+            )
             mock_router = MagicMock()
             mock_router.list_models.return_value = [mock_model]
             client.router = mock_router
@@ -75,7 +77,7 @@ class TestContextOverflowDetection:
 
     def test_unknown_model_uses_default_128k(self, db_factory):
         """Unknown model should use default 128K context window."""
-        with patch.object(LLMClient, '_init_providers'):
+        with patch.object(LLMClient, "_init_providers"):
             client = LLMClient(db_factory)
             mock_router = MagicMock()
             mock_router.list_models.return_value = []  # No models

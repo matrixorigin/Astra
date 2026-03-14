@@ -24,9 +24,7 @@ class TestClickSubcommandsStillWork:
     def test_whoami(self):
         runner = CliRunner()
         with patch("cli.mo_agent_api.SyncAPIClient") as mock:
-            mock.return_value.get_current_user.return_value = {
-                "email": "a@b.com", "user_id": "u1"
-            }
+            mock.return_value.get_current_user.return_value = {"email": "a@b.com", "user_id": "u1"}
             result = runner.invoke(agent_cli, ["whoami"])
             assert result.exit_code == 0
             assert "a@b.com" in result.output
@@ -57,8 +55,18 @@ class TestSlashCommandDispatch:
     """Verify slash command dispatch works correctly."""
 
     def test_all_commands_in_registry(self):
-        expected = {"/help", "/model", "/session", "/clear", "/verbose",
-                    "/compact", "/history", "/copy", "/doctor", "/version"}
+        expected = {
+            "/help",
+            "/model",
+            "/session",
+            "/clear",
+            "/verbose",
+            "/compact",
+            "/history",
+            "/copy",
+            "/doctor",
+            "/version",
+        }
         assert expected.issubset(set(SLASH_COMMANDS.keys()))
 
     def test_help_output(self):
@@ -84,12 +92,14 @@ class TestRendererSelection:
 
     def test_rich_renderer_is_tty(self):
         from cli.ui.renderer import RichRenderer
+
         r = RichRenderer()
         assert hasattr(r, "begin_response")
         assert hasattr(r, "end_response")
 
     def test_simple_renderer_non_tty(self):
         from cli.ui.renderer import SimpleRenderer
+
         r = SimpleRenderer()
         # SimpleRenderer should not have begin_response/end_response
         assert not hasattr(r, "begin_response")
@@ -105,6 +115,7 @@ class TestStateManagement:
         client.create_session.return_value = {"session_id": "new_ses"}
         state = {"session_id": "old_ses"}
         from cli.mo_agent_api import cmd_clear
+
         cmd_clear(console=console, client=client, state=state)
         assert state["session_id"] == "new_ses"
 
@@ -117,6 +128,7 @@ class TestStateManagement:
         ]
         state = {"selected_model": None}
         from cli.mo_agent_api import cmd_model
+
         cmd_model(console=console, client=client, cmd_arg="gpt-4", state=state)
         assert state["selected_model"] == "gpt-4"
 
@@ -125,6 +137,7 @@ class TestStateManagement:
         console = Console(file=buf, force_terminal=True, width=80)
         from cli.ui.status_bar import StatusBar
         from cli.mo_agent_api import cmd_verbose, cmd_compact
+
         sb = StatusBar()
         assert not sb.verbose
         cmd_verbose(console=console, status_bar=sb)
@@ -151,7 +164,9 @@ class TestAuthErrorInRepl:
             client._run.side_effect = lambda coro: asyncio.run(coro)
             client._ensure_client.return_value = client
 
-            with patch("cli.mo_agent_api._run_edge_turn", side_effect=AuthenticationError("expired")):
+            with patch(
+                "cli.mo_agent_api._run_edge_turn", side_effect=AuthenticationError("expired")
+            ):
                 result = runner.invoke(agent_cli, ["chat"], input="hello\n")
 
             assert "Session expired" in result.output

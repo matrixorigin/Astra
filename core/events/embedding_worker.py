@@ -17,7 +17,13 @@ from sqlalchemy.orm import Session
 logger = logging.getLogger(__name__)
 
 # Event types worth embedding (content is semantically meaningful)
-EMBED_EVENT_TYPES = ("user_query", "llm_response", "tool_result", "plan_created", "knowledge_extracted")
+EMBED_EVENT_TYPES = (
+    "user_query",
+    "llm_response",
+    "tool_result",
+    "plan_created",
+    "knowledge_extracted",
+)
 
 # Poll interval and batch size
 _POLL_INTERVAL_S = 1.0
@@ -66,6 +72,7 @@ class EmbeddingWorker:
         db = self._db_factory()
         try:
             from core.context.embeddings import EmbeddingService
+
             svc = EmbeddingService(self._db_factory)
 
             while not self._closed:
@@ -123,7 +130,11 @@ class EmbeddingWorker:
                     {"event_id": row.event_id, "embedding": vec_str, "model": svc.model},
                 )
             except Exception:
-                logger.warning("Failed to embed event %s — marking as skipped to prevent retry loop", row.event_id, exc_info=True)
+                logger.warning(
+                    "Failed to embed event %s — marking as skipped to prevent retry loop",
+                    row.event_id,
+                    exc_info=True,
+                )
                 # Insert a sentinel row so this event is not retried indefinitely
                 try:
                     db.execute(
@@ -155,6 +166,7 @@ class EmbeddingWorker:
             db = self._db_factory()
         try:
             from core.context.embeddings import EmbeddingService
+
             svc = EmbeddingService(self._db_factory)
             return self._process_batch(db, svc)
         finally:

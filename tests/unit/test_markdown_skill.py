@@ -39,12 +39,14 @@ class TestMarkdownSkill:
     def test_side_effect_is_read(self, skill):
         """MarkdownSkill must expose side_effect for the permission system."""
         from cli.tools.base import SideEffect
+
         assert skill.side_effect == SideEffect.READ
         assert skill.side_effect.value == "read"
 
     def test_works_in_tool_router(self, skill):
         """MarkdownSkill registered in ToolRouter must be introspectable."""
         from cli.tools.router import ToolRouter
+
         router = ToolRouter()
         router.register(skill)
         tools = router.list_tools()
@@ -57,9 +59,12 @@ class TestMarkdownSkill:
     async def test_execute_through_router(self, skill):
         """ToolRouter dispatches to MarkdownSkill via validate_input → execute(input)."""
         from cli.tools.router import ToolRouter, ToolCall
+
         router = ToolRouter()
         router.register(skill)
-        results = await router.execute([ToolCall(id="tc1", name="test_skill", arguments={"query": "hello"})])
+        results = await router.execute(
+            [ToolCall(id="tc1", name="test_skill", arguments={"query": "hello"})]
+        )
         assert len(results) == 1
         assert not results[0].error
         assert "Do the thing." in results[0].result
@@ -68,6 +73,7 @@ class TestMarkdownSkill:
     async def test_execute_through_router_empty_query(self, skill):
         """MarkdownSkill works with empty query (query has default)."""
         from cli.tools.router import ToolRouter, ToolCall
+
         router = ToolRouter()
         router.register(skill)
         results = await router.execute([ToolCall(id="tc1", name="test_skill", arguments={})])

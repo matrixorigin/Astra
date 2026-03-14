@@ -18,9 +18,13 @@ def mock_db():
 class TestTypedPipeline:
     def test_extracts_memories(self, mock_db):
         mock_llm = MagicMock()
-        mock_llm.chat_with_tools.return_value = {"content": json.dumps([
-            {"type": "profile", "content": "likes Go", "confidence": 0.9},
-        ])}
+        mock_llm.chat_with_tools.return_value = {
+            "content": json.dumps(
+                [
+                    {"type": "profile", "content": "likes Go", "confidence": 0.9},
+                ]
+            )
+        }
 
         with patch("core.memory.tabular.typed_pipeline.MemoryStore") as MockStore:
             mock_store = MagicMock()
@@ -39,9 +43,13 @@ class TestTypedPipeline:
 
     def test_detects_profile_change(self, mock_db):
         mock_llm = MagicMock()
-        mock_llm.chat_with_tools.return_value = {"content": json.dumps([
-            {"type": "profile", "content": "prefers vim", "confidence": 0.9},
-        ])}
+        mock_llm.chat_with_tools.return_value = {
+            "content": json.dumps(
+                [
+                    {"type": "profile", "content": "prefers vim", "confidence": 0.9},
+                ]
+            )
+        }
 
         with patch("core.memory.tabular.typed_pipeline.MemoryStore") as MockStore:
             mock_store = MagicMock()
@@ -60,9 +68,13 @@ class TestTypedPipeline:
 
     def test_no_profile_change_for_semantic(self, mock_db):
         mock_llm = MagicMock()
-        mock_llm.chat_with_tools.return_value = {"content": json.dumps([
-            {"type": "semantic", "content": "discussed testing", "confidence": 0.7},
-        ])}
+        mock_llm.chat_with_tools.return_value = {
+            "content": json.dumps(
+                [
+                    {"type": "semantic", "content": "discussed testing", "confidence": 0.7},
+                ]
+            )
+        }
 
         with patch("core.memory.tabular.typed_pipeline.MemoryStore") as MockStore:
             mock_store = MagicMock()

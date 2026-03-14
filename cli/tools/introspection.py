@@ -55,7 +55,17 @@ class GetAgentInfoTool(EdgeTool):
             "properties": {
                 "dimension": {
                     "type": "string",
-                    "enum": ["capability", "state", "memory", "memory_recall", "identity", "context_snapshot", "context_trend", "retrieval_quality", "all"],
+                    "enum": [
+                        "capability",
+                        "state",
+                        "memory",
+                        "memory_recall",
+                        "identity",
+                        "context_snapshot",
+                        "context_trend",
+                        "retrieval_quality",
+                        "all",
+                    ],
                     "description": (
                         "Which dimension to query. "
                         "'memory_recall': explain why specific memories were retrieved for a query — "
@@ -82,11 +92,25 @@ class GetAgentInfoTool(EdgeTool):
     def side_effect(self) -> SideEffect:
         return SideEffect.READ
 
-    _VALID_DIMENSIONS = {"capability", "state", "memory", "memory_recall", "identity", "context_snapshot", "context_trend", "retrieval_quality", "all"}
+    _VALID_DIMENSIONS = {
+        "capability",
+        "state",
+        "memory",
+        "memory_recall",
+        "identity",
+        "context_snapshot",
+        "context_trend",
+        "retrieval_quality",
+        "all",
+    }
 
     async def execute(self, dimension: str = "all", **kwargs: Any) -> str:
         if dimension not in self._VALID_DIMENSIONS:
-            return json.dumps({"error": f"Invalid dimension '{dimension}'. Valid: {sorted(self._VALID_DIMENSIONS)}"})
+            return json.dumps(
+                {
+                    "error": f"Invalid dimension '{dimension}'. Valid: {sorted(self._VALID_DIMENSIONS)}"
+                }
+            )
 
         info: dict[str, Any] = {}
 
@@ -151,7 +175,9 @@ class GetAgentInfoTool(EdgeTool):
             turn_index = kwargs.get("turn_index")
             if self._api_client and session_id:
                 try:
-                    info["context_snapshot"] = await self._api_client.get_introspection_context_snapshot(
+                    info[
+                        "context_snapshot"
+                    ] = await self._api_client.get_introspection_context_snapshot(
                         session_id, turn_index=turn_index, detail=True
                     )
                 except Exception as exc:
@@ -162,7 +188,9 @@ class GetAgentInfoTool(EdgeTool):
         if dimension in ("context_trend",):
             if self._api_client and session_id:
                 try:
-                    info["context_trend"] = await self._api_client.get_introspection_context_trend(session_id)
+                    info["context_trend"] = await self._api_client.get_introspection_context_trend(
+                        session_id
+                    )
                 except Exception as exc:
                     info["context_trend"] = {"error": str(exc)}
             else:
@@ -171,7 +199,9 @@ class GetAgentInfoTool(EdgeTool):
         if dimension in ("retrieval_quality",):
             if self._api_client and session_id:
                 try:
-                    info["retrieval_quality"] = await self._api_client.get_introspection_retrieval_quality(session_id)
+                    info[
+                        "retrieval_quality"
+                    ] = await self._api_client.get_introspection_retrieval_quality(session_id)
                 except Exception as exc:
                     info["retrieval_quality"] = {"error": str(exc)}
             else:
@@ -184,7 +214,8 @@ class GetAgentInfoTool(EdgeTool):
             elif self._api_client and session_id:
                 try:
                     info["memory_recall"] = await self._api_client.get_introspection_recall(
-                        session_id, query=query,
+                        session_id,
+                        query=query,
                     )
                 except Exception as exc:
                     info["memory_recall"] = {"error": str(exc)}

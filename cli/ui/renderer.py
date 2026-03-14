@@ -73,7 +73,8 @@ class RichRenderer:
         detail = args.get("command", args.get("path", ""))
         self._console.print(
             f"  {THEME.tool} [yellow]{name}[/yellow]: {detail}… ",
-            end="", highlight=False,
+            end="",
+            highlight=False,
         )
 
     def tool_done(self, name: str, result: str, error: bool) -> None:
@@ -102,10 +103,10 @@ class RichRenderer:
         if "prompt_tokens" in usage:
             # Format large numbers compactly: 9755 -> 9.8k
             p = usage["prompt_tokens"]
-            parts.append(f"↓{p/1000:.1f}k" if p >= 1000 else f"↓{p}")
+            parts.append(f"↓{p / 1000:.1f}k" if p >= 1000 else f"↓{p}")
         if "completion_tokens" in usage:
             c = usage["completion_tokens"]
-            parts.append(f"↑{c/1000:.1f}k" if c >= 1000 else f"↑{c}")
+            parts.append(f"↑{c / 1000:.1f}k" if c >= 1000 else f"↑{c}")
         if parts:
             self._console.print(f"  [dim]{' '.join(parts)}[/dim]")
 

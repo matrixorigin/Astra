@@ -94,7 +94,7 @@ def _split_frontmatter(text: str) -> tuple[str | None, str]:
     for i, line in enumerate(lines):
         if line.rstrip() == "---":
             fm = "\n".join(lines[:i])
-            body = "\n".join(lines[i + 1:])
+            body = "\n".join(lines[i + 1 :])
             return fm, body
 
     # No closing --- found

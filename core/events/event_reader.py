@@ -15,10 +15,17 @@ from core.db_consumer import DbConsumer, DbFactory
 # Columns to load for list queries — excludes embedding (~6KB/row),
 # context_snapshot, token_usage, skills_snapshot, llm_params (heavy JSON).
 _LIST_COLUMNS = [
-    Event.event_id, Event.user_id, Event.session_id,
-    Event.agent_id, Event.agent_version, Event.event_type,
-    Event.content, Event.event_metadata, Event.created_at,
-    Event.parent_event_id, Event.causal_chain_id,
+    Event.event_id,
+    Event.user_id,
+    Event.session_id,
+    Event.agent_id,
+    Event.agent_version,
+    Event.event_type,
+    Event.content,
+    Event.event_metadata,
+    Event.created_at,
+    Event.parent_event_id,
+    Event.causal_chain_id,
 ]
 
 
@@ -40,6 +47,7 @@ class EventReader(DbConsumer):
         Returns:
             ConversationEvent: Event object
         """
+
         # Parse JSON fields — MatrixOne stores NULL as JSON string "null"
         def _parse_json(val):
             if not val or val == "null":
@@ -104,7 +112,7 @@ class EventReader(DbConsumer):
             query = text("SELECT * FROM agent_events WHERE event_id = :event_id")
             result = db.execute(query, {"event_id": event_id})
             row = result.fetchone()
-        
+
             if row:
                 # Convert row (SQLAlchemy Row) to dict
                 row_dict = dict(row._mapping)
@@ -124,9 +132,13 @@ class EventReader(DbConsumer):
             list[ConversationEvent]: List of events
         """
         with self._db() as db:
-            q = db.query(*_LIST_COLUMNS).filter(
-                Event.session_id == session_id,
-            ).order_by(Event.created_at.desc())
+            q = (
+                db.query(*_LIST_COLUMNS)
+                .filter(
+                    Event.session_id == session_id,
+                )
+                .order_by(Event.created_at.desc())
+            )
             if limit:
                 q = q.limit(limit)
             rows = q.all()
@@ -143,9 +155,13 @@ class EventReader(DbConsumer):
             list[ConversationEvent]: List of events
         """
         with self._db() as db:
-            q = db.query(*_LIST_COLUMNS).filter(
-                Event.user_id == user_id,
-            ).order_by(Event.created_at.desc())
+            q = (
+                db.query(*_LIST_COLUMNS)
+                .filter(
+                    Event.user_id == user_id,
+                )
+                .order_by(Event.created_at.desc())
+            )
             if limit:
                 q = q.limit(limit)
             rows = q.all()
@@ -161,7 +177,12 @@ class EventReader(DbConsumer):
             list[ConversationEvent]: List of events in chronological order
         """
         with self._db() as db:
-            rows = db.query(*_LIST_COLUMNS).filter(
-                Event.causal_chain_id == causal_chain_id,
-            ).order_by(Event.created_at.asc()).all()
+            rows = (
+                db.query(*_LIST_COLUMNS)
+                .filter(
+                    Event.causal_chain_id == causal_chain_id,
+                )
+                .order_by(Event.created_at.asc())
+                .all()
+            )
             return [self._row_to_event(self._orm_row_to_dict(r)) for r in rows]

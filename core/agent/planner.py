@@ -119,15 +119,17 @@ def get_plan_constraints() -> PlanConstraints:
 class Planner:
     """Plans and manages PAOR loop execution."""
 
-    def __init__(self, llm_client, constraints: PlanConstraints | None = None, event_logger=None, db=None):
+    def __init__(
+        self, llm_client, constraints: PlanConstraints | None = None, event_logger=None, db=None
+    ):
         self.llm = llm_client
         self.constraints = constraints or get_plan_constraints()
         self.event_logger = event_logger
         self.db = db  # For sandbox operations
 
     async def create_plan(
-        self, 
-        goal: str, 
+        self,
+        goal: str,
         context: str = "",
         user_id: str | None = None,
         session_id: str | None = None,
@@ -174,7 +176,8 @@ Output format (JSON):
             response = self.llm.chat(
                 messages=messages,
                 user_id="system",
-                session_id="planning", task_hint="planning",
+                session_id="planning",
+                task_hint="planning",
             )
 
             # Parse JSON from response
@@ -313,7 +316,8 @@ Output format (JSON):
             response = self.llm.chat(
                 messages=messages,
                 user_id="system",
-                session_id="planning", task_hint="planning",
+                session_id="planning",
+                task_hint="planning",
             )
 
             content = response.content.strip()
@@ -388,7 +392,9 @@ Output format (JSON):
         """
         # Check depth limit
         if parent_plan.depth >= self.constraints.max_depth:
-            logger.warning(f"Max depth {self.constraints.max_depth} reached, skipping decomposition")
+            logger.warning(
+                f"Max depth {self.constraints.max_depth} reached, skipping decomposition"
+            )
             return None
 
         # Ask LLM if step needs decomposition
@@ -416,7 +422,9 @@ Sub-steps format:
         ]
 
         try:
-            response = self.llm.chat(messages=messages, user_id="system", session_id="planning", task_hint="planning")
+            response = self.llm.chat(
+                messages=messages, user_id="system", session_id="planning", task_hint="planning"
+            )
 
             content = response.content.strip()
             if content.startswith("```json"):
@@ -578,7 +586,9 @@ Sub-steps format:
                 "goal": plan.goal,
                 "reason": reason,
                 "completed_steps": sum(1 for s in plan.steps if s.status == PlanStatus.COMPLETED),
-                "failed_step": next((s.step_id for s in plan.steps if s.status == PlanStatus.FAILED), None),
+                "failed_step": next(
+                    (s.step_id for s in plan.steps if s.status == PlanStatus.FAILED), None
+                ),
             },
             parent_event_id=parent_event_id,
             causal_chain_id=causal_chain_id,
@@ -631,7 +641,7 @@ def restore_plan_from_events(db, goal_id: str) -> Plan | None:
         Latest plan state or None if not found / already finished
     """
     from sqlalchemy import text
-    
+
     # Query the latest plan for this goal
     result = db.execute(
         text("""
@@ -712,21 +722,21 @@ def execute_plan_in_sandbox(
     sandbox_name: str | None = None,
 ) -> dict:
     """Execute plan in sandbox for dry-run validation.
-    
+
     Args:
         plan: Plan to execute
         db: SQLAlchemy Session
         executor_fn: Function to execute each step (step -> result)
         sandbox_name: Optional sandbox name (auto-generated if None)
-        
+
     Returns:
         dict with execution results and sandbox info
-        
+
     Example:
         >>> def my_executor(step):
         ...     # Execute step logic
         ...     return {"success": True, "output": "..."}
-        >>> 
+        >>>
         >>> result = execute_plan_in_sandbox(
         ...     plan=plan,
         ...     db=db,
@@ -736,11 +746,11 @@ def execute_plan_in_sandbox(
         >>> print(result["success"])  # True/False
     """
     from core.sandbox.sandbox import Sandbox
-    
+
     # Generate sandbox name if not provided (use timestamp + random for uniqueness)
     if sandbox_name is None:
         sandbox_name = generate_prefixed_id("plan_dry_run")
-    
+
     sandbox = Sandbox(db_factory=lambda: db)
     results = {
         "sandbox_name": sandbox_name,
@@ -749,7 +759,7 @@ def execute_plan_in_sandbox(
         "steps": [],
         "error": None,
     }
-    
+
     try:
         # Create sandbox
         sandbox.create(
@@ -758,42 +768,46 @@ def execute_plan_in_sandbox(
             created_by="planner",
             tags=["dry-run", "plan", plan.plan_id],
         )
-        
+
         # Execute each step in sandbox context
         for step in plan.steps:
             try:
                 # Execute step
                 step_result = executor_fn(step)
-                
-                results["steps"].append({
-                    "step_id": step.step_id,
-                    "description": step.description,
-                    "success": True,
-                    "result": step_result,
-                })
-                
+
+                results["steps"].append(
+                    {
+                        "step_id": step.step_id,
+                        "description": step.description,
+                        "success": True,
+                        "result": step_result,
+                    }
+                )
+
             except Exception as e:
                 results["success"] = False
-                results["steps"].append({
-                    "step_id": step.step_id,
-                    "description": step.description,
-                    "success": False,
-                    "error": str(e),
-                })
+                results["steps"].append(
+                    {
+                        "step_id": step.step_id,
+                        "description": step.description,
+                        "success": False,
+                        "error": str(e),
+                    }
+                )
                 # Stop on first failure
                 break
-        
+
         # Cleanup: delete sandbox after dry-run
         sandbox.delete(sandbox_name)
-        
+
     except Exception as e:
         results["success"] = False
         results["error"] = str(e)
-        
+
         # Cleanup on error
         try:
             sandbox.delete(sandbox_name)
         except Exception:
             pass
-    
+
     return results

@@ -35,8 +35,9 @@ def _assistant_with_tool_call(tc_id: str, name: str, args: str = "{}") -> dict:
     return {
         "role": "assistant",
         "content": "",
-        "tool_calls": [{"id": tc_id, "type": "function",
-                        "function": {"name": name, "arguments": args}}],
+        "tool_calls": [
+            {"id": tc_id, "type": "function", "function": {"name": name, "arguments": args}}
+        ],
     }
 
 
@@ -114,10 +115,16 @@ class TestMultiRoundTokenGrowth:
 
         # Recent tool results (last 6 messages) should be preserved
         # Old ones should be cleared
-        cleared = [m for m in compacted if m.get("role") == "tool"
-                   and "cleared" in m.get("content", "").lower()]
-        preserved = [m for m in compacted if m.get("role") == "tool"
-                     and "cleared" not in m.get("content", "").lower()]
+        cleared = [
+            m
+            for m in compacted
+            if m.get("role") == "tool" and "cleared" in m.get("content", "").lower()
+        ]
+        preserved = [
+            m
+            for m in compacted
+            if m.get("role") == "tool" and "cleared" not in m.get("content", "").lower()
+        ]
 
         assert len(cleared) > 0, "Some old tool results should be cleared"
         assert len(preserved) > 0, "Recent tool results should be preserved"

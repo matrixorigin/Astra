@@ -1,6 +1,7 @@
 """Graph SQLAlchemy models — nodes and edges for memory graph."""
 
 from matrixone import VectorPrecision, VectorType
+
 if not getattr(VectorType, "cache_ok", False):
     VectorType.cache_ok = True
 from matrixone.sqlalchemy_ext import FulltextIndex, FulltextParserType

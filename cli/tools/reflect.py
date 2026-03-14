@@ -32,7 +32,15 @@ class ReflectTool(EdgeTool):
         "properties": {
             "focus": {
                 "type": "string",
-                "enum": ["auto", "skill_failure", "unexpected_result", "data_quality", "tool_selection", "history", "performance"],
+                "enum": [
+                    "auto",
+                    "skill_failure",
+                    "unexpected_result",
+                    "data_quality",
+                    "tool_selection",
+                    "history",
+                    "performance",
+                ],
                 "description": (
                     "What to investigate. "
                     "'performance': timing, gaps, bottlenecks, high token usage. "
@@ -59,7 +67,9 @@ class ReflectTool(EdgeTool):
     }
     side_effect = SideEffect.READ
 
-    async def execute(self, focus: str = "auto", question: str = "", last_n: int = 20, **_: Any) -> str:
+    async def execute(
+        self, focus: str = "auto", question: str = "", last_n: int = 20, **_: Any
+    ) -> str:
         session_id = self._session.get("session_id")
         if not session_id:
             return json.dumps({"error": "No session_id available"})
@@ -68,7 +78,8 @@ class ReflectTool(EdgeTool):
 
         try:
             data = await self._api_client.get_reflect(
-                session_id, focus=focus, last_n=last_n, question=question)
+                session_id, focus=focus, last_n=last_n, question=question
+            )
             return json.dumps(data, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"error": f"Reflect failed: {e}"})

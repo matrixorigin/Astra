@@ -188,6 +188,7 @@ class TestMCPBridgeRefresh:
 class TestChatLoopMCPIntegration:
     def _make_loop(self):
         from core.agent.chat_loop import ChatLoop
+
         return ChatLoop(
             selector=MagicMock(),
             executor=MagicMock(),
@@ -219,7 +220,11 @@ class TestMCPRetry:
         content_item.text = "ok"
         del content_item.data
         success = MagicMock(content=[content_item], isError=False)
-        session.call_tool.side_effect = [ConnectionError("reset"), ConnectionError("reset"), success]
+        session.call_tool.side_effect = [
+            ConnectionError("reset"),
+            ConnectionError("reset"),
+            success,
+        ]
 
         await bridge._register_server("s", session, "stdio")
         result = await bridge.call_tool("s__flaky", {})
@@ -312,5 +317,3 @@ class TestMCPToolsChangedCallback:
         bridge.set_on_tools_changed(callback)
         await bridge.close()
         callback.assert_called_once()
-
-

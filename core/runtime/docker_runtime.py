@@ -14,7 +14,13 @@ from datetime import datetime, timezone
 import docker
 from docker.errors import ContainerError, ImageNotFound, APIError
 
-from core.runtime import ExecutionResult, ResourceProfile, Runtime, RuntimeCapabilities, IsolationLevel
+from core.runtime import (
+    ExecutionResult,
+    ResourceProfile,
+    Runtime,
+    RuntimeCapabilities,
+    IsolationLevel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +75,10 @@ class DockerRuntime(Runtime):
     ) -> ExecutionResult:
         if language not in self.supported_languages:
             return ExecutionResult(
-                stdout="", stderr=f"Unsupported language: {language}",
-                exit_code=1, execution_time_ms=0,
+                stdout="",
+                stderr=f"Unsupported language: {language}",
+                exit_code=1,
+                execution_time_ms=0,
             )
 
         resources = resources or ResourceProfile()
@@ -80,7 +88,8 @@ class DockerRuntime(Runtime):
         # Wrapper: write code to tmp, exec with timeout
         wrapper = json.dumps(code)
         cmd = [
-            "python3", "-c",
+            "python3",
+            "-c",
             f"import signal,sys; signal.alarm({resources.max_cpu_seconds}); exec({wrapper})",
         ]
 
@@ -135,7 +144,7 @@ class DockerRuntime(Runtime):
 
             truncated = False
             if len(stdout.encode()) > resources.max_output_bytes:
-                stdout = stdout[:resources.max_output_bytes]
+                stdout = stdout[: resources.max_output_bytes]
                 truncated = True
 
             return ExecutionResult(
@@ -154,13 +163,17 @@ class DockerRuntime(Runtime):
                 return self.execute(code, language, resources, env)
             except Exception as e:
                 return ExecutionResult(
-                    stdout="", stderr=f"Failed to pull image: {e}",
-                    exit_code=1, execution_time_ms=0,
+                    stdout="",
+                    stderr=f"Failed to pull image: {e}",
+                    exit_code=1,
+                    execution_time_ms=0,
                 )
         except APIError as e:
             elapsed_ms = (time.monotonic() - start) * 1000
             return ExecutionResult(
-                stdout="", stderr=f"Docker API error: {e}",
-                exit_code=1, execution_time_ms=round(elapsed_ms, 2),
+                stdout="",
+                stderr=f"Docker API error: {e}",
+                exit_code=1,
+                execution_time_ms=round(elapsed_ms, 2),
                 started_at=started_at,
             )

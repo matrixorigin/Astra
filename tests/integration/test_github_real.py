@@ -58,9 +58,11 @@ async def test_real_github_get_pr(github_client):
     registry = RepoRegistry(lambda: github_client._session)
 
     # Check if repo exists
-    existing = github_client._session.query(Repo).filter(
-        Repo.repo_url == "https://github.com/octocat/Hello-World"
-    ).first()
+    existing = (
+        github_client._session.query(Repo)
+        .filter(Repo.repo_url == "https://github.com/octocat/Hello-World")
+        .first()
+    )
 
     if existing:
         repo_id = existing.repo_id
@@ -97,9 +99,11 @@ async def test_real_github_list_prs(github_client):
 
     registry = RepoRegistry(lambda: github_client._session)
 
-    existing = github_client._session.query(Repo).filter(
-        Repo.repo_url == "https://github.com/octocat/Hello-World"
-    ).first()
+    existing = (
+        github_client._session.query(Repo)
+        .filter(Repo.repo_url == "https://github.com/octocat/Hello-World")
+        .first()
+    )
 
     if existing:
         repo_id = existing.repo_id

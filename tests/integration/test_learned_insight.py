@@ -32,18 +32,20 @@ def cleanup(db_session):
 def _insert_events(db, agent_id, count, success_count):
     """Insert count events, first success_count with execution_success=1, rest=0."""
     for i in range(count):
-        db.add(SkillSelectionEvent(
-            event_id=str(uuid7()),
-            session_id=f"sess-{i}",
-            agent_id=agent_id,
-            user_query=f"test query {i}",
-            selected_skills=["tool_a", "tool_b"],
-            skill_name="tool_a",
-            skill_version="1.0.0",
-            selection_method="llm_tool_choice",
-            execution_success=1 if i < success_count else 0,
-            execution_time_ms=100 + i,
-        ))
+        db.add(
+            SkillSelectionEvent(
+                event_id=str(uuid7()),
+                session_id=f"sess-{i}",
+                agent_id=agent_id,
+                user_query=f"test query {i}",
+                selected_skills=["tool_a", "tool_b"],
+                skill_name="tool_a",
+                skill_version="1.0.0",
+                selection_method="llm_tool_choice",
+                execution_success=1 if i < success_count else 0,
+                execution_time_ms=100 + i,
+            )
+        )
     db.commit()
 
 
@@ -56,7 +58,9 @@ class TestLearnedInsightRealDB:
 
         result = assembler._get_learned_insight("agent-alpha", "specialist")
 
-        assert result == "I focus deeply on my domain but may need to delegate cross-domain questions."
+        assert (
+            result == "I focus deeply on my domain but may need to delegate cross-domain questions."
+        )
 
     def test_just_below_threshold_returns_baseline(self, assembler, db_session):
         """Exactly 49 interactions → still baseline (boundary)."""
@@ -64,7 +68,10 @@ class TestLearnedInsightRealDB:
 
         result = assembler._get_learned_insight("agent-49", "default")
 
-        assert result == "I'm still learning about my strengths and weaknesses. I'll improve as we work together."
+        assert (
+            result
+            == "I'm still learning about my strengths and weaknesses. I'll improve as we work together."
+        )
 
     def test_at_threshold_returns_data_driven(self, assembler, db_session):
         """Exactly 50 interactions → data-driven insight."""
@@ -72,7 +79,9 @@ class TestLearnedInsightRealDB:
 
         result = assembler._get_learned_insight("agent-beta", "specialist")
 
-        assert result == "Based on recent history: 80% skill selection accuracy over 50 interactions."
+        assert (
+            result == "Based on recent history: 80% skill selection accuracy over 50 interactions."
+        )
 
     def test_above_threshold_accuracy(self, assembler, db_session):
         """100 interactions, 90 success → 90% accuracy."""
@@ -80,7 +89,9 @@ class TestLearnedInsightRealDB:
 
         result = assembler._get_learned_insight("agent-gamma", "default")
 
-        assert result == "Based on recent history: 90% skill selection accuracy over 100 interactions."
+        assert (
+            result == "Based on recent history: 90% skill selection accuracy over 100 interactions."
+        )
 
     def test_no_agent_id_returns_baseline(self, assembler, db_session):
         """agent_id=None → baseline, even if DB has data for other agents."""
@@ -89,7 +100,9 @@ class TestLearnedInsightRealDB:
 
         result = assembler._get_learned_insight(None, "orchestrator")
 
-        assert result == "I break down tasks and delegate to specialists rather than solving directly."
+        assert (
+            result == "I break down tasks and delegate to specialists rather than solving directly."
+        )
 
     def test_unknown_agent_type_returns_default(self, assembler):
         """Unknown agent type → default insight."""
@@ -105,9 +118,15 @@ class TestLearnedInsightRealDB:
         result_a = assembler._get_learned_insight("agent-A", "specialist")
         result_b = assembler._get_learned_insight("agent-B", "specialist")
 
-        assert result_a == "Based on recent history: 83% skill selection accuracy over 60 interactions."
+        assert (
+            result_a
+            == "Based on recent history: 83% skill selection accuracy over 60 interactions."
+        )
         # Agent B below threshold → baseline
-        assert result_b == "I focus deeply on my domain but may need to delegate cross-domain questions."
+        assert (
+            result_b
+            == "I focus deeply on my domain but may need to delegate cross-domain questions."
+        )
 
     def test_zero_success_rate(self, assembler, db_session):
         """All failures → 0% accuracy."""
@@ -115,38 +134,45 @@ class TestLearnedInsightRealDB:
 
         result = assembler._get_learned_insight("agent-fail", "default")
 
-        assert result == "Based on recent history: 0% skill selection accuracy over 50 interactions."
+        assert (
+            result == "Based on recent history: 0% skill selection accuracy over 50 interactions."
+        )
 
     def test_old_data_excluded_by_30day_window(self, assembler, db_session):
         """Events older than 30 days are excluded from insight calculation."""
         from datetime import timedelta
+
         agent = "agent-old"
         # Naive UTC to match DB column convention (func.now() stores naive).
         old_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=60)
 
         # 60 old events (outside 30-day window)
         for i in range(60):
-            db_session.add(SkillSelectionEvent(
-                event_id=str(uuid7()),
-                session_id=f"sess-old-{i}",
-                agent_id=agent,
-                user_query=f"old query {i}",
-                skill_name="tool_a",
-                selection_method="llm",
-                execution_success=1,
-                created_at=old_time,
-            ))
+            db_session.add(
+                SkillSelectionEvent(
+                    event_id=str(uuid7()),
+                    session_id=f"sess-old-{i}",
+                    agent_id=agent,
+                    user_query=f"old query {i}",
+                    skill_name="tool_a",
+                    selection_method="llm",
+                    execution_success=1,
+                    created_at=old_time,
+                )
+            )
         # 10 recent events (inside window)
         for i in range(10):
-            db_session.add(SkillSelectionEvent(
-                event_id=str(uuid7()),
-                session_id=f"sess-new-{i}",
-                agent_id=agent,
-                user_query=f"new query {i}",
-                skill_name="tool_a",
-                selection_method="llm",
-                execution_success=1,
-            ))
+            db_session.add(
+                SkillSelectionEvent(
+                    event_id=str(uuid7()),
+                    session_id=f"sess-new-{i}",
+                    agent_id=agent,
+                    user_query=f"new query {i}",
+                    skill_name="tool_a",
+                    selection_method="llm",
+                    execution_success=1,
+                )
+            )
         db_session.commit()
 
         # Only 10 recent events count → below threshold → baseline
@@ -162,30 +188,32 @@ class TestSkillSelectionEventFields:
         eid = str(uuid7())
         before = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
 
-        db_session.add(SkillSelectionEvent(
-            event_id=eid,
-            session_id="sess-field-test",
-            agent_id="agent-field-test",
-            user_query="How do I deploy to production?",
-            selected_skills=["deploy_tool", "config_tool"],
-            skill_name="deploy_tool",
-            skill_version="2.1.0",
-            selection_method="llm_tool_choice",
-            candidate_scores={"deploy_tool": 0.95, "config_tool": 0.72},
-            execution_result={"status": "success", "output": "deployed"},
-            execution_success=1,
-            execution_time_ms=342,
-            execution_cost=0.0023,
-            user_feedback_score=5,
-            selection_correctness=1,
-            correction_suggestion={"suggested": "deploy_tool", "reason": "correct"},
-        ))
+        db_session.add(
+            SkillSelectionEvent(
+                event_id=eid,
+                session_id="sess-field-test",
+                agent_id="agent-field-test",
+                user_query="How do I deploy to production?",
+                selected_skills=["deploy_tool", "config_tool"],
+                skill_name="deploy_tool",
+                skill_version="2.1.0",
+                selection_method="llm_tool_choice",
+                candidate_scores={"deploy_tool": 0.95, "config_tool": 0.72},
+                execution_result={"status": "success", "output": "deployed"},
+                execution_success=1,
+                execution_time_ms=342,
+                execution_cost=0.0023,
+                user_feedback_score=5,
+                selection_correctness=1,
+                correction_suggestion={"suggested": "deploy_tool", "reason": "correct"},
+            )
+        )
         db_session.commit()
 
         # Re-read from DB to verify persistence
-        row = db_session.query(SkillSelectionEvent).filter(
-            SkillSelectionEvent.event_id == eid
-        ).one()
+        row = (
+            db_session.query(SkillSelectionEvent).filter(SkillSelectionEvent.event_id == eid).one()
+        )
 
         assert row.event_id == eid
         assert row.session_id == "sess-field-test"
@@ -209,19 +237,21 @@ class TestSkillSelectionEventFields:
     def test_agent_id_nullable(self, db_session):
         """agent_id can be NULL (pipeline write path doesn't have it)."""
         eid = str(uuid7())
-        db_session.add(SkillSelectionEvent(
-            event_id=eid,
-            session_id="sess-no-agent",
-            agent_id=None,
-            user_query="test",
-            skill_name="tool_x",
-            selection_method="pipeline",
-        ))
+        db_session.add(
+            SkillSelectionEvent(
+                event_id=eid,
+                session_id="sess-no-agent",
+                agent_id=None,
+                user_query="test",
+                skill_name="tool_x",
+                selection_method="pipeline",
+            )
+        )
         db_session.commit()
 
-        row = db_session.query(SkillSelectionEvent).filter(
-            SkillSelectionEvent.event_id == eid
-        ).one()
+        row = (
+            db_session.query(SkillSelectionEvent).filter(SkillSelectionEvent.event_id == eid).one()
+        )
 
         assert row.agent_id is None
         assert row.session_id == "sess-no-agent"
@@ -232,26 +262,30 @@ class TestSkillSelectionEventFields:
         agent = "agent-partial"
         # 30 events WITH execution data
         for i in range(30):
-            db_session.add(SkillSelectionEvent(
-                event_id=str(uuid7()),
-                session_id=f"sess-{i}",
-                agent_id=agent,
-                user_query=f"q{i}",
-                skill_name="t",
-                selection_method="llm",
-                execution_success=1,
-            ))
+            db_session.add(
+                SkillSelectionEvent(
+                    event_id=str(uuid7()),
+                    session_id=f"sess-{i}",
+                    agent_id=agent,
+                    user_query=f"q{i}",
+                    skill_name="t",
+                    selection_method="llm",
+                    execution_success=1,
+                )
+            )
         # 50 events WITHOUT execution data (execution_success=NULL)
         for i in range(50):
-            db_session.add(SkillSelectionEvent(
-                event_id=str(uuid7()),
-                session_id=f"sess-null-{i}",
-                agent_id=agent,
-                user_query=f"q{i}",
-                skill_name="t",
-                selection_method="llm",
-                execution_success=None,
-            ))
+            db_session.add(
+                SkillSelectionEvent(
+                    event_id=str(uuid7()),
+                    session_id=f"sess-null-{i}",
+                    agent_id=agent,
+                    user_query=f"q{i}",
+                    skill_name="t",
+                    selection_method="llm",
+                    execution_success=None,
+                )
+            )
         db_session.commit()
 
         # Only 30 have execution data → below threshold → baseline
@@ -276,9 +310,9 @@ class TestTurnHooksAgentId:
         )
 
         assert eid is not None
-        row = db_session.query(SkillSelectionEvent).filter(
-            SkillSelectionEvent.event_id == eid
-        ).one()
+        row = (
+            db_session.query(SkillSelectionEvent).filter(SkillSelectionEvent.event_id == eid).one()
+        )
 
         assert row.agent_id == "dev-agent"
         assert row.session_id == "sess-hook-test"
@@ -300,9 +334,9 @@ class TestTurnHooksAgentId:
         )
 
         assert eid is not None
-        row = db_session.query(SkillSelectionEvent).filter(
-            SkillSelectionEvent.event_id == eid
-        ).one()
+        row = (
+            db_session.query(SkillSelectionEvent).filter(SkillSelectionEvent.event_id == eid).one()
+        )
 
         assert row.agent_id is None
         assert row.skill_name == "search"
@@ -315,13 +349,16 @@ class TestTurnHooksAgentId:
         tool_calls = [{"function": {"name": "deploy", "arguments": "{}"}}]
 
         eid = hooks.record_skill_selection(
-            "sess-backfill", "deploy app", tool_calls, agent_id="agent-x",
+            "sess-backfill",
+            "deploy app",
+            tool_calls,
+            agent_id="agent-x",
         )
         hooks.backfill_selection_metrics("sess-backfill", tool_calls, elapsed_ms=250)
 
-        row = db_session.query(SkillSelectionEvent).filter(
-            SkillSelectionEvent.event_id == eid
-        ).one()
+        row = (
+            db_session.query(SkillSelectionEvent).filter(SkillSelectionEvent.event_id == eid).one()
+        )
 
         assert row.execution_success == 1
         assert row.execution_time_ms == 250
@@ -341,12 +378,12 @@ class TestTurnHooksAgentId:
         # Backfill should target eid2 (latest with execution_time_ms=NULL)
         hooks.backfill_selection_metrics("sess-multi", tc, elapsed_ms=200)
 
-        row1 = db_session.query(SkillSelectionEvent).filter(
-            SkillSelectionEvent.event_id == eid1
-        ).one()
-        row2 = db_session.query(SkillSelectionEvent).filter(
-            SkillSelectionEvent.event_id == eid2
-        ).one()
+        row1 = (
+            db_session.query(SkillSelectionEvent).filter(SkillSelectionEvent.event_id == eid1).one()
+        )
+        row2 = (
+            db_session.query(SkillSelectionEvent).filter(SkillSelectionEvent.event_id == eid2).one()
+        )
 
         assert row1.execution_time_ms == 100
         assert row2.execution_time_ms == 200

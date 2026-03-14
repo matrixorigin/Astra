@@ -39,7 +39,9 @@ class TurnOutcome:
 class TurnEvent:
     """Internal pipeline event — converted to StreamEvent at the boundary."""
 
-    event_type: str  # e.g. "llm_chunk", "tool_start", "tool_result", "stage_complete", "turn_complete"
+    event_type: (
+        str  # e.g. "llm_chunk", "tool_start", "tool_result", "stage_complete", "turn_complete"
+    )
     data: dict[str, Any] = field(default_factory=dict)
 
 
@@ -80,7 +82,9 @@ class TurnState:
                 "content": self.outcome.content,
                 "failure_reason": self.outcome.failure_reason,
                 "failed_tools": self.outcome.failed_tools,
-            } if self.outcome else None,
+            }
+            if self.outcome
+            else None,
         }
 
     @classmethod

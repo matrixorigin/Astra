@@ -48,6 +48,7 @@ class MemoryGovernanceEngine(DbConsumer):
     def _get_agent_ids(self) -> list[str]:
         with self._db() as db:
             from api.models import Agent
+
             return [a.agent_id for a in db.query(Agent.agent_id).limit(self._MAX_AGENTS).all()]
 
     # ── Hourly ────────────────────────────────────────────────────────
@@ -57,6 +58,7 @@ class MemoryGovernanceEngine(DbConsumer):
         results["archived_notes"] = self._archive_closed_notes()
         try:
             from core.sandbox.cleanup import SandboxCleaner
+
             cleaner = SandboxCleaner(db_factory=self._db_factory)
             cleanup = cleaner.run()
             results["sandbox_cleaned"] = cleanup.get("cleaned", 0)
@@ -83,10 +85,11 @@ class MemoryGovernanceEngine(DbConsumer):
         results["health_reports"] = self._generate_health_reports()
         try:
             from core.evaluation.slo_monitor import SLOMonitor
+
             monitor = SLOMonitor(self._db_factory)
             agent_ids = self._get_agent_ids()
             total_violations = 0
-            for aid in (agent_ids or ["dev-agent"]):
+            for aid in agent_ids or ["dev-agent"]:
                 report = monitor.check_agent(aid, period_days=7)
                 total_violations += sum(1 for s in report.statuses if not s.met)
             results["slo_violations"] = total_violations
@@ -100,11 +103,17 @@ class MemoryGovernanceEngine(DbConsumer):
     def _archive_closed_notes(self) -> int:
         with self._db() as db:
             from api.models import AgentScratchpad
-            count = db.query(AgentScratchpad).filter(
-                AgentScratchpad.status == "completed"
-            ).update(
-                {AgentScratchpad.status: "archived", AgentScratchpad.updated_at: datetime.now()},
-                synchronize_session=False,
+
+            count = (
+                db.query(AgentScratchpad)
+                .filter(AgentScratchpad.status == "completed")
+                .update(
+                    {
+                        AgentScratchpad.status: "archived",
+                        AgentScratchpad.updated_at: datetime.now(),
+                    },
+                    synchronize_session=False,
+                )
             )
             if count:
                 db.commit()
@@ -114,12 +123,19 @@ class MemoryGovernanceEngine(DbConsumer):
     def _quarantine_low_confidence(self, threshold: float = 0.3) -> int:
         with self._db() as db:
             from api.models import KnowledgeEntry
-            to_quarantine = db.query(
-                KnowledgeEntry.entry_id, KnowledgeEntry.key_name, KnowledgeEntry.confidence,
-            ).filter(
-                KnowledgeEntry.confidence < threshold,
-                KnowledgeEntry.confidence > 0,
-            ).all()
+
+            to_quarantine = (
+                db.query(
+                    KnowledgeEntry.entry_id,
+                    KnowledgeEntry.key_name,
+                    KnowledgeEntry.confidence,
+                )
+                .filter(
+                    KnowledgeEntry.confidence < threshold,
+                    KnowledgeEntry.confidence > 0,
+                )
+                .all()
+            )
             if not to_quarantine:
                 return 0
             ids = [r[0] for r in to_quarantine]
@@ -135,24 +151,28 @@ class MemoryGovernanceEngine(DbConsumer):
                     "governance_quarantine",
                     {"entry_ids": ids, "threshold": threshold, "count": len(ids)},
                 )
-            logger.info("Quarantined %d low-confidence entries (threshold=%.2f)", len(ids), threshold)
+            logger.info(
+                "Quarantined %d low-confidence entries (threshold=%.2f)", len(ids), threshold
+            )
             return len(ids)
 
     def _scan_contradictions(self) -> int:
         with self._db() as db:
             from api.models import KnowledgeEntry
             from sqlalchemy import text
-            conflicts = db.query(
-                KnowledgeEntry.category,
-                KnowledgeEntry.key_name,
-                func.count(func.distinct(KnowledgeEntry.value)).label("val_count"),
-            ).filter(
-                KnowledgeEntry.confidence > 0.3
-            ).group_by(
-                KnowledgeEntry.category, KnowledgeEntry.key_name
-            ).having(
-                func.count(func.distinct(KnowledgeEntry.value)) > 1
-            ).limit(100).all()
+
+            conflicts = (
+                db.query(
+                    KnowledgeEntry.category,
+                    KnowledgeEntry.key_name,
+                    func.count(func.distinct(KnowledgeEntry.value)).label("val_count"),
+                )
+                .filter(KnowledgeEntry.confidence > 0.3)
+                .group_by(KnowledgeEntry.category, KnowledgeEntry.key_name)
+                .having(func.count(func.distinct(KnowledgeEntry.value)) > 1)
+                .limit(100)
+                .all()
+            )
             if not conflicts:
                 return 0
             dedup_keys = [f"{c.category}:{c.key_name}" for c in conflicts]
@@ -170,27 +190,44 @@ class MemoryGovernanceEngine(DbConsumer):
                 dk = f"{c.category}:{c.key_name}"
                 if dk in reported:
                     continue
-                entries = db.query(KnowledgeEntry).filter(
-                    KnowledgeEntry.category == c.category,
-                    KnowledgeEntry.key_name == c.key_name,
-                    KnowledgeEntry.confidence > 0.3,
-                ).limit(10).all()
+                entries = (
+                    db.query(KnowledgeEntry)
+                    .filter(
+                        KnowledgeEntry.category == c.category,
+                        KnowledgeEntry.key_name == c.key_name,
+                        KnowledgeEntry.confidence > 0.3,
+                    )
+                    .limit(10)
+                    .all()
+                )
                 contradictions += 1
                 self._write_governance_event(
                     "contradiction_detected",
-                    {"dedup_key": dk, "category": c.category, "key": c.key_name,
-                     "entry_ids": [e.entry_id for e in entries],
-                     "values": list(set(e.value for e in entries))[:5]},
+                    {
+                        "dedup_key": dk,
+                        "category": c.category,
+                        "key": c.key_name,
+                        "entry_ids": [e.entry_id for e in entries],
+                        "values": list(set(e.value for e in entries))[:5],
+                    },
                     dedup_key=dk,
                 )
-                logger.warning("Contradiction: %s.%s has %d different values", c.category, c.key_name, c.val_count)
+                logger.warning(
+                    "Contradiction: %s.%s has %d different values",
+                    c.category,
+                    c.key_name,
+                    c.val_count,
+                )
             return contradictions
 
-    def _write_governance_event(self, event_type: str, content: dict[str, Any], dedup_key: str | None = None) -> None:
+    def _write_governance_event(
+        self, event_type: str, content: dict[str, Any], dedup_key: str | None = None
+    ) -> None:
         with self._db() as db:
             import json
             from uuid_utils import uuid7
             from sqlalchemy import text
+
             eid = str(uuid7())
             try:
                 db.execute(
@@ -199,9 +236,14 @@ class MemoryGovernanceEngine(DbConsumer):
                              event_type, content, causal_chain_id, dedup_key, created_at)
                             VALUES (:eid, 'system_governance', 'system', 'governance', '1.0',
                                     :etype, :content, :cid, :dk, :ts)"""),
-                    {"eid": eid, "etype": event_type,
-                     "content": json.dumps(content, default=str),
-                     "cid": eid, "dk": dedup_key, "ts": datetime.now()},
+                    {
+                        "eid": eid,
+                        "etype": event_type,
+                        "content": json.dumps(content, default=str),
+                        "cid": eid,
+                        "dk": dedup_key,
+                        "ts": datetime.now(),
+                    },
                 )
                 db.commit()
             except Exception as e:
@@ -211,29 +253,43 @@ class MemoryGovernanceEngine(DbConsumer):
     def _generate_health_reports(self) -> int:
         with self._db() as db:
             from api.models import KnowledgeEntry
+
             low_expr = _low_confidence_expr(KnowledgeEntry)
-            rows = db.query(
-                KnowledgeEntry.user_id,
-                func.count(KnowledgeEntry.entry_id),
-                func.avg(KnowledgeEntry.confidence),
-                low_expr,
-            ).group_by(KnowledgeEntry.user_id).limit(self._MAX_HEALTH_REPORT_USERS).all()
+            rows = (
+                db.query(
+                    KnowledgeEntry.user_id,
+                    func.count(KnowledgeEntry.entry_id),
+                    func.avg(KnowledgeEntry.confidence),
+                    low_expr,
+                )
+                .group_by(KnowledgeEntry.user_id)
+                .limit(self._MAX_HEALTH_REPORT_USERS)
+                .all()
+            )
             for user_id, total, avg_conf, low_conf in rows:
                 logger.info(
                     "Memory health for %s: %d entries, avg confidence %.2f, %d low confidence",
-                    user_id, total, float(avg_conf or 0), int(low_conf or 0),
+                    user_id,
+                    total,
+                    float(avg_conf or 0),
+                    int(low_conf or 0),
                 )
             return len(rows)
 
     def _get_user_memory_stats(self, user_id: str) -> dict[str, Any]:
         with self._db() as db:
             from api.models import KnowledgeEntry
+
             low_expr = _low_confidence_expr(KnowledgeEntry)
-            row = db.query(
-                func.count(KnowledgeEntry.entry_id),
-                func.avg(KnowledgeEntry.confidence),
-                low_expr,
-            ).filter(KnowledgeEntry.user_id == user_id).first()
+            row = (
+                db.query(
+                    func.count(KnowledgeEntry.entry_id),
+                    func.avg(KnowledgeEntry.confidence),
+                    low_expr,
+                )
+                .filter(KnowledgeEntry.user_id == user_id)
+                .first()
+            )
             total = row[0] or 0
             if total == 0:
                 return {"total_entries": 0, "avg_confidence": 0.0, "low_confidence": 0}
@@ -259,21 +315,29 @@ class MemoryGovernanceEngine(DbConsumer):
                 return {"total_entries": 0}
             quarantined = int(row[3] or 0)
 
-            tier_rows = db.query(
-                KnowledgeEntry.trust_tier,
-                func.count(KnowledgeEntry.entry_id),
-            ).group_by(KnowledgeEntry.trust_tier).all()
+            tier_rows = (
+                db.query(
+                    KnowledgeEntry.trust_tier,
+                    func.count(KnowledgeEntry.entry_id),
+                )
+                .group_by(KnowledgeEntry.trust_tier)
+                .all()
+            )
             tier_counts = {r[0]: r[1] for r in tier_rows}
 
-            contradiction_count = db.query(
-                func.count(func.distinct(
-                    func.concat(KnowledgeEntry.category, ':', KnowledgeEntry.key_name)
-                ))
-            ).filter(
-                KnowledgeEntry.confidence > _LOW_CONFIDENCE_THRESHOLD
-            ).having(
-                func.count(func.distinct(KnowledgeEntry.value)) > 1
-            ).scalar() or 0
+            contradiction_count = (
+                db.query(
+                    func.count(
+                        func.distinct(
+                            func.concat(KnowledgeEntry.category, ":", KnowledgeEntry.key_name)
+                        )
+                    )
+                )
+                .filter(KnowledgeEntry.confidence > _LOW_CONFIDENCE_THRESHOLD)
+                .having(func.count(func.distinct(KnowledgeEntry.value)) > 1)
+                .scalar()
+                or 0
+            )
 
             return {
                 "total_entries": total,

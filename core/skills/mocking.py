@@ -76,7 +76,7 @@ class ToolMockingLayer(DbConsumer):
         self.mode = mode
         self.result_storage = result_storage
         self.session_id = session_id
-            
+
         if self.mode == MockMode.REPLAY and not self.session_id:
             raise ValueError("session_id required for replay mode")
 
@@ -113,7 +113,10 @@ class ToolMockingLayer(DbConsumer):
             # For WRITE operations, try to use recorded results
             if skill.side_effect_profile.category == SideEffectCategory.WRITE:
                 recorded = self._get_recorded_result(
-                    skill.name, params, session_id, parent_event_id,
+                    skill.name,
+                    params,
+                    session_id,
+                    parent_event_id,
                     expected_version=getattr(skill, "version", None),
                 )
                 if recorded is not None:
@@ -137,7 +140,11 @@ class ToolMockingLayer(DbConsumer):
         # Record result in production mode
         if self.mode == MockMode.PRODUCTION:
             self._record_result(
-                skill.name, params, result, session_id, parent_event_id,
+                skill.name,
+                params,
+                result,
+                session_id,
+                parent_event_id,
                 skill_version=getattr(skill, "version", None),
             )
 
@@ -174,8 +181,10 @@ class ToolMockingLayer(DbConsumer):
         if self.mode == MockMode.REPLAY:
             if not self.session_id:
                 raise ValueError("session_id required for replay mode")
-            
-            result = self.get_mock_result(skill_name, params, self.session_id, parent_event_id=event_id)
+
+            result = self.get_mock_result(
+                skill_name, params, self.session_id, parent_event_id=event_id
+            )
             if result is None:
                 # Fallback: check if result is stored in side_effects or somewhere else?
                 # core/replay/tool_mocking.py raised ReplayError.
@@ -189,12 +198,12 @@ class ToolMockingLayer(DbConsumer):
             # Validate only, return mock result
             if not isinstance(params, dict):
                 raise ValueError(f"Invalid params type for {skill_name}: expected dict")
-            
+
             return {
                 "status": "dry_run",
                 "skill_id": skill_name,
                 "params": params,
-                "note": "Validated successfully, no execution"
+                "note": "Validated successfully, no execution",
             }
 
         elif self.mode == MockMode.PRODUCTION:
@@ -202,7 +211,7 @@ class ToolMockingLayer(DbConsumer):
                 f"Real execution not supported via invoke_skill in production mode. "
                 f"Use execute() with Skill object instead."
             )
-        
+
         else:
             raise ValueError(f"Unknown execution mode: {self.mode}")
 
@@ -227,27 +236,36 @@ class ToolMockingLayer(DbConsumer):
         """
         try:
             from api.models import Event as EventModel
-            
+
             # Compute params hash for matching
             params_hash = self._hash_params(params)
             with self._db() as session:
                 if parent_event_id:
-                    event = session.query(EventModel).filter(
-                        EventModel.parent_event_id == parent_event_id,
-                        EventModel.skill_name == skill_name,
-                        EventModel.event_type.in_(['tool_result', 'stream_tool_result'])
-                    ).first()
+                    event = (
+                        session.query(EventModel)
+                        .filter(
+                            EventModel.parent_event_id == parent_event_id,
+                            EventModel.skill_name == skill_name,
+                            EventModel.event_type.in_(["tool_result", "stream_tool_result"]),
+                        )
+                        .first()
+                    )
                 else:
                     logger.warning(
                         f"Using fuzzy lookup for {skill_name} without parent_event_id. "
                         f"This is not concurrency-safe. "
                         f"Pass parent_event_id from the tool_call event for deterministic lookups."
                     )
-                    event = session.query(EventModel).filter(
-                        EventModel.session_id == session_id,
-                        EventModel.skill_name == skill_name,
-                        EventModel.event_type.in_(['tool_result', 'stream_tool_result'])
-                    ).order_by(EventModel.created_at.desc()).first()
+                    event = (
+                        session.query(EventModel)
+                        .filter(
+                            EventModel.session_id == session_id,
+                            EventModel.skill_name == skill_name,
+                            EventModel.event_type.in_(["tool_result", "stream_tool_result"]),
+                        )
+                        .order_by(EventModel.created_at.desc())
+                        .first()
+                    )
 
                 if event and event.event_metadata:
                     metadata = event.event_metadata
@@ -259,7 +277,11 @@ class ToolMockingLayer(DbConsumer):
                         )
                         return None
                     recorded_version = metadata.get("skill_version")
-                    if expected_version and recorded_version and recorded_version != expected_version:
+                    if (
+                        expected_version
+                        and recorded_version
+                        and recorded_version != expected_version
+                    ):
                         logger.warning(
                             f"Skill version mismatch for {skill_name}: "
                             f"recorded={recorded_version}, current={expected_version}. "
@@ -286,8 +308,8 @@ class ToolMockingLayer(DbConsumer):
             params=params,
             result=result,
             session_id=self.session_id or "unknown",  # Fallback if not set
-            parent_event_id=None, # Not used in this manual update path
-            event_id_override=event_id
+            parent_event_id=None,  # Not used in this manual update path
+            event_id_override=event_id,
         )
 
     @property
@@ -295,15 +317,20 @@ class ToolMockingLayer(DbConsumer):
         """Get all recorded results for the current session (for testing)."""
         if not self.session_id:
             return {}
-        
+
         from api.models import Event as EventModel
+
         with self._db() as session:
-            events = session.query(EventModel).filter(
-                EventModel.session_id == self.session_id,
-                EventModel.event_metadata.isnot(None),
-                EventModel.event_type.in_(['tool_result', 'stream_tool_result'])
-            ).all()
-            
+            events = (
+                session.query(EventModel)
+                .filter(
+                    EventModel.session_id == self.session_id,
+                    EventModel.event_metadata.isnot(None),
+                    EventModel.event_type.in_(["tool_result", "stream_tool_result"]),
+                )
+                .all()
+            )
+
             results = {}
             for event in events:
                 metadata = event.event_metadata or {}
@@ -376,17 +403,17 @@ class ToolMockingLayer(DbConsumer):
 
             # Update event
             from api.models import Event as EventModel
-            
+
             with self._db() as session:
                 query = session.query(EventModel)
-                
+
                 if event_id_override:
                     query = query.filter(EventModel.event_id == event_id_override)
                 elif parent_event_id:
                     query = query.filter(
                         EventModel.parent_event_id == parent_event_id,
                         EventModel.skill_name == skill_name,
-                        EventModel.event_type.in_(['tool_result', 'stream_tool_result'])
+                        EventModel.event_type.in_(["tool_result", "stream_tool_result"]),
                     )
                 else:
                     logger.warning(
@@ -397,11 +424,11 @@ class ToolMockingLayer(DbConsumer):
                     query = query.filter(
                         EventModel.session_id == session_id,
                         EventModel.skill_name == skill_name,
-                        EventModel.event_type.in_(['tool_result', 'stream_tool_result'])
+                        EventModel.event_type.in_(["tool_result", "stream_tool_result"]),
                     ).order_by(EventModel.created_at.desc())
-                
+
                 event = query.first()
-                
+
                 if event:
                     existing_metadata = event.event_metadata or {}
                     existing_metadata.update(metadata)

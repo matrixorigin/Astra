@@ -118,6 +118,7 @@ def parse_script(raw: str | dict | list) -> list[dict]:
     if isinstance(raw, str):
         import re
         import yaml
+
         raw = re.sub(r"^```(?:ya?ml)?\s*\n", "", raw.strip())
         raw = re.sub(r"\n```\s*$", "", raw)
         try:
@@ -264,8 +265,9 @@ class MemoryProgrammer:
             return ProgramResult(
                 actions_executed=0,
                 results=[
-                    ActionResult(action_type=_get_action_type(a), success=True,
-                                 detail={"dry_run": True})
+                    ActionResult(
+                        action_type=_get_action_type(a), success=True, detail={"dry_run": True}
+                    )
                     for a in actions
                 ],
                 dry_run=True,
@@ -303,7 +305,10 @@ class MemoryProgrammer:
         return pr
 
     def _log_program_audit(
-        self, user_id: str, program_name: str, result: ProgramResult,
+        self,
+        user_id: str,
+        program_name: str,
+        result: ProgramResult,
     ) -> None:
         """Write a program-level entry to mem_edit_log."""
         import json
@@ -339,7 +344,9 @@ class MemoryProgrammer:
         except Exception:
             logger.debug("Failed to log program audit for %s", user_id, exc_info=True)
 
-    def _execute_action(self, user_id: str, action: dict, *, session_id: str | None = None) -> ActionResult:
+    def _execute_action(
+        self, user_id: str, action: dict, *, session_id: str | None = None
+    ) -> ActionResult:
         """Execute a single action via MemoryEditor."""
         raw_type = _get_action_type(action)
         display_type = "inject" if raw_type == _BATCH_INJECT_KEY else raw_type
@@ -347,41 +354,55 @@ class MemoryProgrammer:
             if raw_type == "inject":
                 return self._do_inject(user_id, action["inject"], session_id=session_id)
             if raw_type == _BATCH_INJECT_KEY:
-                return self._do_batch_inject(user_id, action[_BATCH_INJECT_KEY], session_id=session_id)
+                return self._do_batch_inject(
+                    user_id, action[_BATCH_INJECT_KEY], session_id=session_id
+                )
             if raw_type == "correct":
                 return self._do_correct(user_id, action["correct"])
             if raw_type == "purge":
                 return self._do_purge(user_id, action["purge"])
             if raw_type == "tune":
                 return self._do_tune(user_id, action["tune"])
-            return ActionResult(action_type=display_type, success=False,
-                                error=f"Unknown action: {display_type}")
+            return ActionResult(
+                action_type=display_type, success=False, error=f"Unknown action: {display_type}"
+            )
         except Exception as e:
             return ActionResult(action_type=display_type, success=False, error=str(e))
 
     def _do_batch_inject(
-        self, user_id: str, specs: list[dict], *, session_id: str | None = None,
+        self,
+        user_id: str,
+        specs: list[dict],
+        *,
+        session_id: str | None = None,
     ) -> ActionResult:
         for spec in specs:
             if not spec.get("content"):
                 return ActionResult(
-                    action_type="inject", success=False,
+                    action_type="inject",
+                    success=False,
                     error="inject requires 'content'",
                 )
 
-        stored = self._editor.batch_inject(user_id, specs, source="batch_inject", session_id=session_id)
+        stored = self._editor.batch_inject(
+            user_id, specs, source="batch_inject", session_id=session_id
+        )
         return ActionResult(
-            action_type="inject", success=True,
+            action_type="inject",
+            success=True,
             detail={"memory_ids": [m.memory_id for m in stored], "count": len(stored)},
         )
 
-    def _do_inject(self, user_id: str, spec: dict, *, session_id: str | None = None) -> ActionResult:
+    def _do_inject(
+        self, user_id: str, spec: dict, *, session_id: str | None = None
+    ) -> ActionResult:
         from core.memory.types import MemoryType, TrustTier
 
         content = spec.get("content")
         if not content:
-            return ActionResult(action_type="inject", success=False,
-                                error="inject requires 'content'")
+            return ActionResult(
+                action_type="inject", success=False, error="inject requires 'content'"
+            )
 
         _TYPE_ALIASES = {"preference": "profile", "fact": "semantic", "skill": "procedural"}
         raw_type = spec.get("type", "semantic")
@@ -389,17 +410,27 @@ class MemoryProgrammer:
 
         raw_trust = spec.get("trust", "T2")
         if isinstance(raw_trust, (int, float)):
-            raw_trust = "T1" if raw_trust >= 0.9 else "T2" if raw_trust >= 0.7 else "T3" if raw_trust >= 0.4 else "T4"
+            raw_trust = (
+                "T1"
+                if raw_trust >= 0.9
+                else "T2"
+                if raw_trust >= 0.7
+                else "T3"
+                if raw_trust >= 0.4
+                else "T4"
+            )
         trust = TrustTier(raw_trust)
 
         mem = self._editor.inject(
-            user_id, content,
+            user_id,
+            content,
             memory_type=mem_type,
             trust_tier=trust,
             session_id=session_id,
         )
         return ActionResult(
-            action_type="inject", success=True,
+            action_type="inject",
+            success=True,
             detail={"memory_id": mem.memory_id},
         )
 
@@ -407,15 +438,21 @@ class MemoryProgrammer:
         memory_id = spec.get("memory_id")
         new_content = spec.get("new_content")
         if not memory_id or not new_content:
-            return ActionResult(action_type="correct", success=False,
-                                error="correct requires 'memory_id' and 'new_content'")
+            return ActionResult(
+                action_type="correct",
+                success=False,
+                error="correct requires 'memory_id' and 'new_content'",
+            )
 
         mem = self._editor.correct(
-            user_id, memory_id, new_content,
+            user_id,
+            memory_id,
+            new_content,
             reason=spec.get("reason", ""),
         )
         return ActionResult(
-            action_type="correct", success=True,
+            action_type="correct",
+            success=True,
             detail={"old_id": memory_id, "new_id": mem.memory_id},
         )
 
@@ -430,9 +467,11 @@ class MemoryProgrammer:
 
         before: datetime | None = None
         if before_str := filter_spec.get("before"):
-            before = datetime.fromisoformat(before_str).replace(tzinfo=timezone.utc) \
-                if datetime.fromisoformat(before_str).tzinfo is None \
+            before = (
+                datetime.fromisoformat(before_str).replace(tzinfo=timezone.utc)
+                if datetime.fromisoformat(before_str).tzinfo is None
                 else datetime.fromisoformat(before_str)
+            )
 
         result = self._editor.purge(
             user_id,
@@ -442,9 +481,9 @@ class MemoryProgrammer:
             reason=spec.get("reason", ""),
         )
         return ActionResult(
-            action_type="purge", success=True,
-            detail={"deactivated": result.deactivated,
-                    "snapshot": result.snapshot_name},
+            action_type="purge",
+            success=True,
+            detail={"deactivated": result.deactivated, "snapshot": result.snapshot_name},
         )
 
     def _do_tune(self, user_id: str, spec: dict) -> ActionResult:
@@ -453,8 +492,7 @@ class MemoryProgrammer:
         strategy = spec.get("strategy")
         params = spec.get("params")
         if not strategy:
-            return ActionResult(action_type="tune", success=False,
-                                error="tune requires 'strategy'")
+            return ActionResult(action_type="tune", success=False, error="tune requires 'strategy'")
 
         validated = validate_strategy_params(strategy, params)
 
@@ -473,12 +511,15 @@ class MemoryProgrammer:
                 db.commit()
 
         return ActionResult(
-            action_type="tune", success=True,
+            action_type="tune",
+            success=True,
             detail={"strategy": strategy, "params": validated},
         )
 
 
-def nl_to_script(user_input: str, user_id: str, llm_client: Any, *, model: str | None = None) -> list[dict]:
+def nl_to_script(
+    user_input: str, user_id: str, llm_client: Any, *, model: str | None = None
+) -> list[dict]:
     """Convert natural language instruction to structured actions via LLM."""
     from core.memory.programmer_prompts import NL_TO_SCRIPT_PROMPT
 

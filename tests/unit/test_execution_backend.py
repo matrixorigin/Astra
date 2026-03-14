@@ -4,8 +4,12 @@ import pytest
 from unittest.mock import MagicMock
 
 from core.agent.execution_backend import (
-    InProcessBackend, SubprocessBackend, BackendRouter,
-    ExecutionRequirements, ExecutionResult, ExecutionStatus,
+    InProcessBackend,
+    SubprocessBackend,
+    BackendRouter,
+    ExecutionRequirements,
+    ExecutionResult,
+    ExecutionStatus,
     _is_heavyweight,
 )
 
@@ -14,8 +18,8 @@ from core.agent.execution_backend import (
 # ExecutionRequirements
 # ---------------------------------------------------------------------------
 
-class TestExecutionRequirements:
 
+class TestExecutionRequirements:
     def test_defaults_are_lightweight(self):
         req = ExecutionRequirements()
         assert _is_heavyweight(req) is False
@@ -54,19 +58,23 @@ class TestExecutionRequirements:
 # BackendRouter — single source of truth
 # ---------------------------------------------------------------------------
 
-class TestBackendRouter:
 
+class TestBackendRouter:
     def test_routes_lightweight_to_in_process(self):
         router = BackendRouter()
         assert isinstance(router.select(ExecutionRequirements()), InProcessBackend)
 
     def test_routes_gpu_to_subprocess(self):
         router = BackendRouter()
-        assert isinstance(router.select(ExecutionRequirements(gpu_required=True)), SubprocessBackend)
+        assert isinstance(
+            router.select(ExecutionRequirements(gpu_required=True)), SubprocessBackend
+        )
 
     def test_routes_conda_to_subprocess(self):
         router = BackendRouter()
-        assert isinstance(router.select(ExecutionRequirements(conda_env="ml-env")), SubprocessBackend)
+        assert isinstance(
+            router.select(ExecutionRequirements(conda_env="ml-env")), SubprocessBackend
+        )
 
     def test_select_and_is_lightweight_consistent(self):
         """select() and is_lightweight() must always agree (single source of truth)."""
@@ -92,8 +100,8 @@ class TestBackendRouter:
 # InProcessBackend
 # ---------------------------------------------------------------------------
 
-class TestInProcessBackend:
 
+class TestInProcessBackend:
     @pytest.mark.asyncio
     async def test_execute_sync_success(self):
         backend = InProcessBackend()
@@ -164,8 +172,8 @@ class TestInProcessBackend:
 # SubprocessBackend
 # ---------------------------------------------------------------------------
 
-class TestSubprocessBackend:
 
+class TestSubprocessBackend:
     @pytest.mark.asyncio
     async def test_cancel_unknown_job(self):
         backend = SubprocessBackend()
@@ -192,15 +200,17 @@ class TestSubprocessBackend:
 # AgentExecutor routing
 # ---------------------------------------------------------------------------
 
-class TestAgentExecutorRouting:
 
+class TestAgentExecutorRouting:
     def test_get_execution_requirements_default(self):
         from core.agent.executor import AgentExecutor
         from core.skills.base import SkillRequirement
         from core.repos import RepoType, AccessScope
+
         skill = MagicMock()
         skill.requirements = SkillRequirement(
-            repo_types=[RepoType.CODE], min_access=AccessScope.READ,
+            repo_types=[RepoType.CODE],
+            min_access=AccessScope.READ,
         )
         req = AgentExecutor._get_execution_requirements(skill)
         assert req.gpu_required is False
@@ -210,10 +220,14 @@ class TestAgentExecutorRouting:
         from core.agent.executor import AgentExecutor
         from core.skills.base import SkillRequirement
         from core.repos import RepoType, AccessScope
+
         skill = MagicMock()
         skill.requirements = SkillRequirement(
-            repo_types=[RepoType.CODE], min_access=AccessScope.READ,
-            gpu_required=True, conda_env="train-env", timeout_seconds=3600,
+            repo_types=[RepoType.CODE],
+            min_access=AccessScope.READ,
+            gpu_required=True,
+            conda_env="train-env",
+            timeout_seconds=3600,
         )
         req = AgentExecutor._get_execution_requirements(skill)
         assert req.gpu_required is True
@@ -221,6 +235,7 @@ class TestAgentExecutorRouting:
 
     def test_get_execution_requirements_no_requirements(self):
         from core.agent.executor import AgentExecutor
+
         skill = MagicMock(spec=[])  # No requirements attr
         req = AgentExecutor._get_execution_requirements(skill)
         assert req.gpu_required is False
@@ -228,6 +243,7 @@ class TestAgentExecutorRouting:
     def test_mock_requirements_treated_as_lightweight(self):
         """MagicMock requirements should not route to heavyweight."""
         from core.agent.executor import AgentExecutor
+
         skill = MagicMock()  # requirements is MagicMock
         req = AgentExecutor._get_execution_requirements(skill)
         router = BackendRouter()
@@ -238,60 +254,76 @@ class TestAgentExecutorRouting:
 # _execute_heavyweight_sync edge cases
 # ---------------------------------------------------------------------------
 
-class TestExecuteHeavyweightSync:
 
+class TestExecuteHeavyweightSync:
     def _make_executor(self):
         from unittest.mock import patch
         from core.agent.executor import AgentExecutor
         from core.skills.mocking import MockMode
+
         db = MagicMock()
         registry = MagicMock()
         with patch("core.skills.mocking.ToolMockingLayer.__init__", return_value=None):
-            executor = AgentExecutor(db_factory=lambda: db, registry=registry, mode=MockMode.PRODUCTION)
+            executor = AgentExecutor(
+                db_factory=lambda: db, registry=registry, mode=MockMode.PRODUCTION
+            )
         executor._record_execution_metrics = MagicMock()
         return executor
 
     def test_empty_stdout_returns_empty_dict(self):
         """If subprocess returns 0 but empty stdout, should return {} not crash."""
         import subprocess
+
         executor = self._make_executor()
         req = ExecutionRequirements(gpu_required=True)
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(subprocess, "run", lambda *a, **kw: MagicMock(
-                returncode=0, stdout="", stderr=""))
+            mp.setattr(
+                subprocess, "run", lambda *a, **kw: MagicMock(returncode=0, stdout="", stderr="")
+            )
             result = executor._execute_heavyweight_sync("s", {}, req, "sess")
             assert result == {}
 
     def test_invalid_json_stdout_returns_output_dict(self):
         """If subprocess returns 0 but non-JSON stdout, should not crash."""
         import subprocess
+
         executor = self._make_executor()
         req = ExecutionRequirements(gpu_required=True)
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(subprocess, "run", lambda *a, **kw: MagicMock(
-                returncode=0, stdout="not json at all", stderr=""))
+            mp.setattr(
+                subprocess,
+                "run",
+                lambda *a, **kw: MagicMock(returncode=0, stdout="not json at all", stderr=""),
+            )
             result = executor._execute_heavyweight_sync("s", {}, req, "sess")
             assert result == {"output": "not json at all"}
 
     def test_nonzero_exit_raises_with_stderr(self):
         """Non-zero exit should raise RuntimeError with stderr content."""
         import subprocess
+
         executor = self._make_executor()
         req = ExecutionRequirements(gpu_required=True)
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(subprocess, "run", lambda *a, **kw: MagicMock(
-                returncode=1, stdout="", stderr="some error"))
+            mp.setattr(
+                subprocess,
+                "run",
+                lambda *a, **kw: MagicMock(returncode=1, stdout="", stderr="some error"),
+            )
             with pytest.raises(RuntimeError, match="some error"):
                 executor._execute_heavyweight_sync("s", {}, req, "sess")
 
     def test_timeout_raises_runtime_error(self):
         """TimeoutExpired should be caught and re-raised as RuntimeError."""
         import subprocess
+
         executor = self._make_executor()
         req = ExecutionRequirements(gpu_required=True, timeout_seconds=1)
         with pytest.MonkeyPatch.context() as mp:
+
             def raise_timeout(*a, **kw):
                 raise subprocess.TimeoutExpired(cmd="x", timeout=1)
+
             mp.setattr(subprocess, "run", raise_timeout)
             with pytest.raises(RuntimeError, match="timed out"):
                 executor._execute_heavyweight_sync("s", {}, req, "sess")
@@ -301,11 +333,12 @@ class TestExecuteHeavyweightSync:
 # SkillRequirement backward compat
 # ---------------------------------------------------------------------------
 
-class TestSkillRequirementExtension:
 
+class TestSkillRequirementExtension:
     def test_new_fields_have_defaults(self):
         from core.skills.base import SkillRequirement
         from core.repos import RepoType, AccessScope
+
         req = SkillRequirement(repo_types=[RepoType.CODE], min_access=AccessScope.READ)
         assert req.gpu_required is False
         assert req.conda_env is None
@@ -315,9 +348,13 @@ class TestSkillRequirementExtension:
     def test_heavyweight_skill_requirement(self):
         from core.skills.base import SkillRequirement
         from core.repos import RepoType, AccessScope
+
         req = SkillRequirement(
-            repo_types=[RepoType.CODE], min_access=AccessScope.READ,
-            gpu_required=True, conda_env="train-env", timeout_seconds=3600,
+            repo_types=[RepoType.CODE],
+            min_access=AccessScope.READ,
+            gpu_required=True,
+            conda_env="train-env",
+            timeout_seconds=3600,
         )
         assert req.gpu_required is True
         assert req.conda_env == "train-env"

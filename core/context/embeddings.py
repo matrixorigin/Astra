@@ -24,6 +24,7 @@ def get_embedding_client() -> EmbeddingClient:
     Delegates to :func:`core.embedding.get_embedding_client`.
     """
     from core.embedding import get_embedding_client as _get
+
     return _get()
 
 
@@ -60,7 +61,9 @@ class EmbeddingService(DbConsumer):
     def embed_text(self, text: str) -> list[float]:
         return self._client.embed(text)
 
-    def store_embedding(self, event_id: str, embedding: list[float], metadata: dict[str, Any] | None = None):
+    def store_embedding(
+        self, event_id: str, embedding: list[float], metadata: dict[str, Any] | None = None
+    ):
         dim = self._client.dimension
         if len(embedding) != dim:
             raise ValueError(f"Embedding must be {dim} dimensions, got {len(embedding)}")
@@ -68,6 +71,7 @@ class EmbeddingService(DbConsumer):
         from sqlalchemy.dialects.mysql import insert
 
         from api.models.context import EventEmbedding
+
         _meta = EventEmbedding.__table__.c.metadata
         with self._db() as db:
             stmt = (
@@ -88,8 +92,11 @@ class EmbeddingService(DbConsumer):
             db.commit()
 
     def search_similar(
-        self, query_embedding: list[float], limit: int = 10,
-        session_id: str | None = None, filters: dict[str, Any] | None = None,
+        self,
+        query_embedding: list[float],
+        limit: int = 10,
+        session_id: str | None = None,
+        filters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         dim = self._client.dimension
         if len(query_embedding) != dim:
@@ -105,24 +112,27 @@ class EmbeddingService(DbConsumer):
         sim_expr = (1.0 / (1.0 + dist)).label("similarity")
 
         with self._db() as db:
-            query = (
-                db.query(
-                    Event.event_id, Event.session_id, Event.content,
-                    Event.event_type, Event.created_at,
-                    dist_expr, sim_expr,
-                )
-                .join(EventEmbedding, Event.event_id == EventEmbedding.event_id)
-            )
+            query = db.query(
+                Event.event_id,
+                Event.session_id,
+                Event.content,
+                Event.event_type,
+                Event.created_at,
+                dist_expr,
+                sim_expr,
+            ).join(EventEmbedding, Event.event_id == EventEmbedding.event_id)
             if session_id:
                 query = query.filter(Event.session_id == session_id)
             if filters:
                 from matrixone.sqlalchemy_ext import json_extract_string
+
                 for key, value in filters.items():
                     if key == "event_type":
                         query = query.filter(Event.event_type == value)
                     else:
                         query = query.filter(
-                            json_extract_string(EventEmbedding.embedding_metadata, f"$.{key}") == value
+                            json_extract_string(EventEmbedding.embedding_metadata, f"$.{key}")
+                            == value
                         )
             query = query.order_by("distance").limit(limit)
             return [dict(row._mapping) for row in query.all()]

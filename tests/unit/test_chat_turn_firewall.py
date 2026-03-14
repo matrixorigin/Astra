@@ -23,21 +23,32 @@ class TestChatTurnFirewall:
     """Verify firewall integration in /chat/turn."""
 
     def _auth(self, client, db):
-        return get_auth_headers(client, db, username="fwuser",
-                                user_id="fw_user", email="fw@test.com")
+        return get_auth_headers(
+            client, db, username="fwuser", user_id="fw_user", email="fw@test.com"
+        )
 
     def test_firewall_called_on_text_response(self, client, db):
         """Firewall runs with correct args when LLM produces text and snapshot exists."""
         headers = self._auth(client, db)
         mock_fw_result = MagicMock(safe_to_deliver=True, claims_failed=0)
 
-        with patch("core.llm.client.LLMClient.chat_stream",
-                   return_value=fake_llm_stream([{"type": "text", "content": "Hello!"}])), \
-             patch("core.verification.firewall.HallucinationFirewall.verify_response",
-                   return_value=mock_fw_result) as mock_verify:
-            resp = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "hi"}],
-            }, headers=headers)
+        with (
+            patch(
+                "core.llm.client.LLMClient.chat_stream",
+                return_value=fake_llm_stream([{"type": "text", "content": "Hello!"}]),
+            ),
+            patch(
+                "core.verification.firewall.HallucinationFirewall.verify_response",
+                return_value=mock_fw_result,
+            ) as mock_verify,
+        ):
+            resp = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                headers=headers,
+            )
 
         events = parse_sse_events(resp.text)
         assert any(e["type"] == "turn_complete" for e in events)
@@ -50,18 +61,46 @@ class TestChatTurnFirewall:
         """Firewall does NOT run when LLM only produces tool calls (no text)."""
         headers = self._auth(client, db)
 
-        with patch("core.llm.client.LLMClient.chat_with_tools_stream",
-                   return_value=fake_llm_stream([
-                       {"type": "tool_call", "data": {
-                           "id": "tc_1", "type": "function",
-                           "function": {"name": "read_file", "arguments": '{"path": "a.py"}'},
-                       }},
-                   ])), \
-             patch("core.verification.firewall.HallucinationFirewall.verify_response") as mock_verify:
-            resp = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "read a.py"}],
-                "edge_tools": [{"type": "function", "function": {"name": "read_file", "description": "r", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}],
-            }, headers=headers)
+        with (
+            patch(
+                "core.llm.client.LLMClient.chat_with_tools_stream",
+                return_value=fake_llm_stream(
+                    [
+                        {
+                            "type": "tool_call",
+                            "data": {
+                                "id": "tc_1",
+                                "type": "function",
+                                "function": {"name": "read_file", "arguments": '{"path": "a.py"}'},
+                            },
+                        },
+                    ]
+                ),
+            ),
+            patch(
+                "core.verification.firewall.HallucinationFirewall.verify_response"
+            ) as mock_verify,
+        ):
+            resp = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "read a.py"}],
+                    "edge_tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "description": "r",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"path": {"type": "string"}},
+                                },
+                            },
+                        }
+                    ],
+                },
+                headers=headers,
+            )
 
         events = parse_sse_events(resp.text)
         assert any(e["type"] == "turn_complete" for e in events)
@@ -71,13 +110,23 @@ class TestChatTurnFirewall:
         """Firewall exception is caught — stream completes normally."""
         headers = self._auth(client, db)
 
-        with patch("core.llm.client.LLMClient.chat_stream",
-                   return_value=fake_llm_stream([{"type": "text", "content": "Hello!"}])), \
-             patch("core.verification.firewall.HallucinationFirewall.verify_response",
-                   side_effect=RuntimeError("firewall boom")):
-            resp = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "hi"}],
-            }, headers=headers)
+        with (
+            patch(
+                "core.llm.client.LLMClient.chat_stream",
+                return_value=fake_llm_stream([{"type": "text", "content": "Hello!"}]),
+            ),
+            patch(
+                "core.verification.firewall.HallucinationFirewall.verify_response",
+                side_effect=RuntimeError("firewall boom"),
+            ),
+        ):
+            resp = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                headers=headers,
+            )
 
         events = parse_sse_events(resp.text)
         assert any(e["type"] == "turn_complete" for e in events)
@@ -88,13 +137,23 @@ class TestChatTurnFirewall:
         headers = self._auth(client, db)
         mock_fw_result = MagicMock(safe_to_deliver=False, claims_failed=2)
 
-        with patch("core.llm.client.LLMClient.chat_stream",
-                   return_value=fake_llm_stream([{"type": "text", "content": "The file contains X"}])), \
-             patch("core.verification.firewall.HallucinationFirewall.verify_response",
-                   return_value=mock_fw_result):
-            resp = client.post("/chat/turn", json={
-                "messages": [{"role": "user", "content": "what's in the file?"}],
-            }, headers=headers)
+        with (
+            patch(
+                "core.llm.client.LLMClient.chat_stream",
+                return_value=fake_llm_stream([{"type": "text", "content": "The file contains X"}]),
+            ),
+            patch(
+                "core.verification.firewall.HallucinationFirewall.verify_response",
+                return_value=mock_fw_result,
+            ),
+        ):
+            resp = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "what's in the file?"}],
+                },
+                headers=headers,
+            )
 
         events = parse_sse_events(resp.text)
         warnings = [e for e in events if e.get("type") == "warning"]

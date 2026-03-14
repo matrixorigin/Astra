@@ -21,6 +21,7 @@ router = APIRouter()
 
 # ── Request / Response schemas ────────────────────────────────────────
 
+
 class StoreRequest(BaseModel):
     content: str = Field(..., min_length=1)
     memory_type: str = Field(default="fact")
@@ -75,28 +76,36 @@ class MemoryResponse(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
+
 def _to_response(mem: Any) -> dict[str, Any]:
     return {
         "memory_id": mem.memory_id,
         "content": mem.content,
         "memory_type": str(mem.memory_type) if mem.memory_type else "fact",
-        "trust_tier": str(mem.trust_tier) if hasattr(mem, "trust_tier") and mem.trust_tier else None,
+        "trust_tier": str(mem.trust_tier)
+        if hasattr(mem, "trust_tier") and mem.trust_tier
+        else None,
         "confidence": getattr(mem, "initial_confidence", None),
-        "observed_at": mem.observed_at.isoformat() if hasattr(mem, "observed_at") and mem.observed_at else None,
+        "observed_at": mem.observed_at.isoformat()
+        if hasattr(mem, "observed_at") and mem.observed_at
+        else None,
     }
 
 
 def _get_service(db_factory: DbFactory, user_id: str):
     from core.memory.factory import create_memory_service
+
     return create_memory_service(db_factory, user_id=user_id)
 
 
 def _get_editor(db_factory: DbFactory, user_id: str):
     from core.memory.factory import create_editor
+
     return create_editor(db_factory, user_id=user_id)
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────
+
 
 @router.post("/memories", status_code=status.HTTP_201_CREATED)
 def store_memory(

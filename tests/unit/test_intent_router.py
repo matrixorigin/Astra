@@ -19,6 +19,7 @@ from core.context.intent_routing import (
 # KeywordRegistry
 # ============================================================================
 
+
 class TestKeywordRegistry:
     def test_match_returns_best_label(self):
         reg = KeywordRegistry("test", {"a": ["hello", "hi"], "b": ["bye"]})
@@ -61,33 +62,51 @@ class TestKeywordRegistry:
 # Tier0Engine — Tool Filter
 # ============================================================================
 
+
 class TestTier0ToolFilter:
-    @pytest.mark.parametrize("query", [
-        "hello", "hi", "hey", "thanks", "thank you", "你好", "谢谢",
-        "ok", "sure", "great",
-    ])
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "hello",
+            "hi",
+            "hey",
+            "thanks",
+            "thank you",
+            "你好",
+            "谢谢",
+            "ok",
+            "sure",
+            "great",
+        ],
+    )
     def test_conversational_blocked(self, query):
         engine = Tier0Engine()
         tf, max_rounds = engine.classify_tool_filter(query)
         assert tf == ToolFilter.ALL_BLOCKED
         assert max_rounds == 0
 
-    @pytest.mark.parametrize("query", [
-        "search online for the latest Python release",
-        "帮我搜索一下最新的新闻",
-        "what's the weather today",
-    ])
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "search online for the latest Python release",
+            "帮我搜索一下最新的新闻",
+            "what's the weather today",
+        ],
+    )
     def test_external_fetch(self, query):
         engine = Tier0Engine()
         tf, max_rounds = engine.classify_tool_filter(query)
         assert tf == ToolFilter.LOCAL_BLOCKED
         assert max_rounds == 3
 
-    @pytest.mark.parametrize("query", [
-        "How do I implement a binary search tree in Python?",
-        "Read the file core/agent/chat_loop.py and find the bug",
-        "Refactor the SkillManager class to use dependency injection",
-    ])
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "How do I implement a binary search tree in Python?",
+            "Read the file core/agent/chat_loop.py and find the bug",
+            "Refactor the SkillManager class to use dependency injection",
+        ],
+    )
     def test_default_no_filter(self, query):
         engine = Tier0Engine()
         tf, max_rounds = engine.classify_tool_filter(query)
@@ -126,20 +145,24 @@ class TestTier0ToolFilter:
 # Tier0Engine — Task Type
 # ============================================================================
 
+
 class TestTier0TaskType:
-    @pytest.mark.parametrize("query,expected", [
-        ("Please review this PR", TaskType.CODE_REVIEW),
-        ("code review for auth module", TaskType.CODE_REVIEW),
-        ("refactor the parser", TaskType.CODE_REVIEW),
-        ("debug this error", TaskType.DEBUGGING),
-        ("fix the crash in login", TaskType.DEBUGGING),
-        ("there's a traceback here", TaskType.DEBUGGING),
-        ("plan the migration", TaskType.PLANNING),
-        ("design a new API", TaskType.PLANNING),
-        ("create a roadmap", TaskType.PLANNING),
-        ("hello world", TaskType.GENERAL),
-        ("what is this?", TaskType.GENERAL),
-    ])
+    @pytest.mark.parametrize(
+        "query,expected",
+        [
+            ("Please review this PR", TaskType.CODE_REVIEW),
+            ("code review for auth module", TaskType.CODE_REVIEW),
+            ("refactor the parser", TaskType.CODE_REVIEW),
+            ("debug this error", TaskType.DEBUGGING),
+            ("fix the crash in login", TaskType.DEBUGGING),
+            ("there's a traceback here", TaskType.DEBUGGING),
+            ("plan the migration", TaskType.PLANNING),
+            ("design a new API", TaskType.PLANNING),
+            ("create a roadmap", TaskType.PLANNING),
+            ("hello world", TaskType.GENERAL),
+            ("what is this?", TaskType.GENERAL),
+        ],
+    )
     def test_task_type_classification(self, query, expected):
         engine = Tier0Engine()
         assert engine.classify_task_type(query) == expected
@@ -159,6 +182,7 @@ class TestTier0TaskType:
 # ============================================================================
 # Cross-dimension: tool_filter + task_type are independent
 # ============================================================================
+
 
 class TestCrossDimension:
     def test_external_fetch_with_code_review(self):

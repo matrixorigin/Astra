@@ -44,21 +44,39 @@ def _mid():
 
 def _embed(val: float = 0.5):
     from tests.conftest import TEST_EMBEDDING_DIM
+
     return [val] * TEST_EMBEDDING_DIM
 
 
-def _insert(db, user_id, content, *, memory_type="semantic", session_id="s1",
-            embedding=None, observed_at=None, trust_tier="T3",
-            initial_confidence=0.65, superseded_by=None, is_active=1):
+def _insert(
+    db,
+    user_id,
+    content,
+    *,
+    memory_type="semantic",
+    session_id="s1",
+    embedding=None,
+    observed_at=None,
+    trust_tier="T3",
+    initial_confidence=0.65,
+    superseded_by=None,
+    is_active=1,
+):
     """Insert a memory record directly into DB and return it."""
     mid = _mid()
     obs = observed_at or _now()
     row = MemoryRecord(
-        memory_id=mid, user_id=user_id, session_id=session_id,
-        memory_type=memory_type, content=content,
-        initial_confidence=initial_confidence, trust_tier=trust_tier,
-        embedding=embedding, source_event_ids=[],
-        superseded_by=superseded_by, is_active=is_active,
+        memory_id=mid,
+        user_id=user_id,
+        session_id=session_id,
+        memory_type=memory_type,
+        content=content,
+        initial_confidence=initial_confidence,
+        trust_tier=trust_tier,
+        embedding=embedding,
+        source_event_ids=[],
+        superseded_by=superseded_by,
+        is_active=is_active,
         observed_at=obs,
     )
     db.add(row)
@@ -85,8 +103,7 @@ def _get(db, memory_id):
 
 def _active(db, user_id, memory_type=None):
     db.expire_all()
-    q = db.query(MemoryRecord).filter(
-        MemoryRecord.user_id == user_id, MemoryRecord.is_active == 1)
+    q = db.query(MemoryRecord).filter(MemoryRecord.user_id == user_id, MemoryRecord.is_active == 1)
     if memory_type:
         q = q.filter(MemoryRecord.memory_type == memory_type)
     return q.all()
@@ -104,13 +121,24 @@ def _all(db, user_id, memory_type=None):
 
 
 class TestToolResultTTL:
-
     def test_expired_cleaned_fresh_survives(self, db, db_factory):
         uid = _uid()
-        old = _insert(db, uid, "old result", memory_type="tool_result",
-                      observed_at=_ago(hours=25), session_id="s1")
-        fresh = _insert(db, uid, "fresh result", memory_type="tool_result",
-                        observed_at=_ago(hours=1), session_id="s2")
+        old = _insert(
+            db,
+            uid,
+            "old result",
+            memory_type="tool_result",
+            observed_at=_ago(hours=25),
+            session_id="s1",
+        )
+        fresh = _insert(
+            db,
+            uid,
+            "fresh result",
+            memory_type="tool_result",
+            observed_at=_ago(hours=1),
+            session_id="s2",
+        )
         old_id, fresh_id = old.memory_id, fresh.memory_id
         fresh_obs = fresh.observed_at
         fresh_conf = fresh.initial_confidence
@@ -146,13 +174,24 @@ class TestToolResultTTL:
 
 
 class TestWorkingMemoryArchival:
-
     def test_stale_archived_recent_intact(self, db, db_factory):
         uid = _uid()
-        stale = _insert(db, uid, "old scratch", memory_type="working",
-                        observed_at=_ago(hours=3), session_id="s1")
-        recent = _insert(db, uid, "new scratch", memory_type="working",
-                         observed_at=_ago(minutes=30), session_id="s2")
+        stale = _insert(
+            db,
+            uid,
+            "old scratch",
+            memory_type="working",
+            observed_at=_ago(hours=3),
+            session_id="s1",
+        )
+        recent = _insert(
+            db,
+            uid,
+            "new scratch",
+            memory_type="working",
+            observed_at=_ago(minutes=30),
+            session_id="s2",
+        )
 
         gov = GovernanceScheduler(db_factory)
         result = gov.run_hourly()
@@ -161,7 +200,9 @@ class TestWorkingMemoryArchival:
         # Stale: is_active flipped to 0, updated_at changed, rest unchanged
         s = _get(db, stale.memory_id)
         assert s.is_active == 0
-        assert s.updated_at.replace(tzinfo=None) >= stale.updated_at.replace(tzinfo=None)  # updated_at bumped
+        assert s.updated_at.replace(tzinfo=None) >= stale.updated_at.replace(
+            tzinfo=None
+        )  # updated_at bumped
         assert s.memory_id == stale.memory_id
         assert s.user_id == uid
         assert s.session_id == "s1"
@@ -193,34 +234,49 @@ class TestConfidenceDecayQuarantine:
         """T4 (conf=0.4, hl=30d) @ 15d: 0.4×exp(-15/30)=0.243 < 0.3"""
         uid = _uid()
         obs = _ago(days=15)
-        m = _insert(db, uid, "weak belief", trust_tier="T4",
-                    initial_confidence=0.4, observed_at=obs, session_id="s1")
+        m = _insert(
+            db,
+            uid,
+            "weak belief",
+            trust_tier="T4",
+            initial_confidence=0.4,
+            observed_at=obs,
+            session_id="s1",
+        )
 
         gov = GovernanceScheduler(db_factory)
         result = gov.run_daily(uid)
         assert result.quarantined == 1
 
         s = _get(db, m.memory_id)
-        assert s.is_active == 0                          # quarantined
-        assert s.updated_at.replace(tzinfo=None) >= m.updated_at.replace(tzinfo=None)              # updated_at bumped
+        assert s.is_active == 0  # quarantined
+        assert s.updated_at.replace(tzinfo=None) >= m.updated_at.replace(
+            tzinfo=None
+        )  # updated_at bumped
         # All other fields unchanged
         assert s.memory_id == m.memory_id
         assert s.user_id == uid
         assert s.session_id == "s1"
         assert s.memory_type == "semantic"
         assert s.content == "weak belief"
-        assert s.initial_confidence == 0.4               # NOT decayed in DB
+        assert s.initial_confidence == 0.4  # NOT decayed in DB
         assert s.trust_tier == "T4"
         assert s.embedding is None
         assert s.source_event_ids == []
         assert s.superseded_by is None
-        assert _ts_eq(s.observed_at, obs)                      # NOT changed
+        assert _ts_eq(s.observed_at, obs)  # NOT changed
 
     def test_t4_survives_fields(self, db, db_factory):
         """T4 (conf=0.4, hl=30d) @ 5d: 0.4×exp(-5/30)=0.339 > 0.3"""
         uid = _uid()
-        m = _insert(db, uid, "recent belief", trust_tier="T4",
-                    initial_confidence=0.4, observed_at=_ago(days=5))
+        m = _insert(
+            db,
+            uid,
+            "recent belief",
+            trust_tier="T4",
+            initial_confidence=0.4,
+            observed_at=_ago(days=5),
+        )
 
         gov = GovernanceScheduler(db_factory)
         result = gov.run_daily(uid)
@@ -235,8 +291,14 @@ class TestConfidenceDecayQuarantine:
     def test_t3_survives_at_15d(self, db, db_factory):
         """T3 (conf=0.65, hl=60d) @ 15d: 0.65×exp(-15/60)=0.506 > 0.3"""
         uid = _uid()
-        m = _insert(db, uid, "inferred fact", trust_tier="T3",
-                    initial_confidence=0.65, observed_at=_ago(days=15))
+        m = _insert(
+            db,
+            uid,
+            "inferred fact",
+            trust_tier="T3",
+            initial_confidence=0.65,
+            observed_at=_ago(days=15),
+        )
 
         gov = GovernanceScheduler(db_factory)
         assert gov.run_daily(uid).quarantined == 0
@@ -245,8 +307,9 @@ class TestConfidenceDecayQuarantine:
     def test_t3_quarantined_at_50d(self, db, db_factory):
         """T3 (conf=0.65, hl=60d) @ 50d: 0.65×exp(-50/60)=0.283 < 0.3"""
         uid = _uid()
-        m = _insert(db, uid, "old fact", trust_tier="T3",
-                    initial_confidence=0.65, observed_at=_ago(days=50))
+        m = _insert(
+            db, uid, "old fact", trust_tier="T3", initial_confidence=0.65, observed_at=_ago(days=50)
+        )
 
         gov = GovernanceScheduler(db_factory)
         assert gov.run_daily(uid).quarantined == 1
@@ -255,8 +318,14 @@ class TestConfidenceDecayQuarantine:
     def test_t1_survives_at_200d(self, db, db_factory):
         """T1 (conf=0.95, hl=365d) @ 200d: 0.95×exp(-200/365)=0.549 > 0.3"""
         uid = _uid()
-        m = _insert(db, uid, "verified", trust_tier="T1",
-                    initial_confidence=0.95, observed_at=_ago(days=200))
+        m = _insert(
+            db,
+            uid,
+            "verified",
+            trust_tier="T1",
+            initial_confidence=0.95,
+            observed_at=_ago(days=200),
+        )
 
         gov = GovernanceScheduler(db_factory)
         assert gov.run_daily(uid).quarantined == 0
@@ -265,12 +334,15 @@ class TestConfidenceDecayQuarantine:
     def test_mixed_tiers_selective(self, db, db_factory):
         """Only the weak T4 quarantined; T3 and fresh T4 survive."""
         uid = _uid()
-        t4_old = _insert(db, uid, "t4 old", trust_tier="T4",
-                         initial_confidence=0.4, observed_at=_ago(days=15))
-        t3 = _insert(db, uid, "t3", trust_tier="T3",
-                     initial_confidence=0.65, observed_at=_ago(days=15))
-        t4_fresh = _insert(db, uid, "t4 fresh", trust_tier="T4",
-                           initial_confidence=0.4, observed_at=_ago(days=2))
+        t4_old = _insert(
+            db, uid, "t4 old", trust_tier="T4", initial_confidence=0.4, observed_at=_ago(days=15)
+        )
+        t3 = _insert(
+            db, uid, "t3", trust_tier="T3", initial_confidence=0.65, observed_at=_ago(days=15)
+        )
+        t4_fresh = _insert(
+            db, uid, "t4 fresh", trust_tier="T4", initial_confidence=0.4, observed_at=_ago(days=2)
+        )
 
         gov = GovernanceScheduler(db_factory)
         assert gov.run_daily(uid).quarantined == 1
@@ -284,12 +356,17 @@ class TestConfidenceDecayQuarantine:
 
 
 class TestContradictionSupersede:
-
     def test_supersede_chain_candidate_fields(self, db, db_factory):
         uid = _uid()
         new = _insert(db, uid, "Python 3.12 is best", session_id="s2")
-        old = _insert(db, uid, "Python 3.11 is best", session_id="s1",
-                      superseded_by=new.memory_id, is_active=0)
+        old = _insert(
+            db,
+            uid,
+            "Python 3.11 is best",
+            session_id="s1",
+            superseded_by=new.memory_id,
+            is_active=0,
+        )
 
         provider = TabularCandidateProvider(db_factory)
         candidates = provider.get_reflection_candidates(uid, since_hours=1)
@@ -329,25 +406,34 @@ class TestContradictionSupersede:
 
 
 class TestReflectionFullCycle:
-
     def test_scene_persisted_all_fields(self, db, db_factory):
         """Cross-session pattern → LLM synthesis → scene memory with all fields verified."""
         uid = _uid()
         emb = _embed(0.9)
         source_ids = []
         for i in range(5):
-            m = _insert(db, uid, f"Always run tests before commit v{i}",
-                        session_id=f"s{i}", embedding=emb, memory_type="procedural")
+            m = _insert(
+                db,
+                uid,
+                f"Always run tests before commit v{i}",
+                session_id=f"s{i}",
+                embedding=emb,
+                memory_type="procedural",
+            )
             source_ids.append(m.memory_id)
 
         before = _now()
         mock_llm = MagicMock()
-        mock_llm.chat.return_value = json.dumps([{
-            "type": "procedural",
-            "content": "User consistently runs tests before committing",
-            "confidence": 0.6,
-            "evidence_summary": "Observed in 5 sessions",
-        }])
+        mock_llm.chat.return_value = json.dumps(
+            [
+                {
+                    "type": "procedural",
+                    "content": "User consistently runs tests before committing",
+                    "confidence": 0.6,
+                    "evidence_summary": "Observed in 5 sessions",
+                }
+            ]
+        )
 
         gov = GovernanceScheduler(db_factory, llm_client=mock_llm)
         result = gov.run_daily(uid)
@@ -356,21 +442,25 @@ class TestReflectionFullCycle:
         assert result.scenes_created >= 1
 
         # Find the scene in DB
-        scene = db.query(MemoryRecord).filter(
-            MemoryRecord.user_id == uid,
-            MemoryRecord.content.like("%consistently runs tests%"),
-        ).first()
+        scene = (
+            db.query(MemoryRecord)
+            .filter(
+                MemoryRecord.user_id == uid,
+                MemoryRecord.content.like("%consistently runs tests%"),
+            )
+            .first()
+        )
         assert scene is not None
 
         # Verify EVERY field
         assert len(scene.memory_id) > 0
         assert scene.user_id == uid
-        assert scene.session_id is None           # scene has no session
+        assert scene.session_id is None  # scene has no session
         assert scene.memory_type == "procedural"
         assert scene.content == "User consistently runs tests before committing"
         assert scene.initial_confidence == 0.6
-        assert scene.trust_tier == "T4"           # new scenes start at T4
-        assert scene.embedding is None            # no embed_fn provided
+        assert scene.trust_tier == "T4"  # new scenes start at T4
+        assert scene.embedding is None  # no embed_fn provided
         assert scene.superseded_by is None
         assert scene.is_active == 1
         assert scene.observed_at is not None
@@ -405,25 +495,44 @@ class TestReflectionFullCycle:
 
 
 class TestFullLifecycle:
-
     def test_multiday_simulation(self, db, db_factory):
         """Day 0 → hourly → Day 15: complete lifecycle with field verification."""
         uid = _uid()
         emb = _embed(0.7)
 
         # ── Day 0: Initial burst ──
-        sem1 = _insert(db, uid, "User prefers dark mode", session_id="s1",
-                       embedding=emb, trust_tier="T4", initial_confidence=0.4)
-        sem2 = _insert(db, uid, "User prefers dark mode", session_id="s2",
-                       embedding=emb, trust_tier="T4", initial_confidence=0.4)
-        sem3 = _insert(db, uid, "Use pytest for testing", session_id="s3",
-                       embedding=_embed(0.1), trust_tier="T3", initial_confidence=0.65)
-        tr_old = _insert(db, uid, "grep output", memory_type="tool_result",
-                         observed_at=_ago(hours=25))
-        tr_new = _insert(db, uid, "ls output", memory_type="tool_result",
-                         observed_at=_ago(hours=2))
-        wk = _insert(db, uid, "scratch notes", memory_type="working",
-                     observed_at=_ago(hours=3))
+        sem1 = _insert(
+            db,
+            uid,
+            "User prefers dark mode",
+            session_id="s1",
+            embedding=emb,
+            trust_tier="T4",
+            initial_confidence=0.4,
+        )
+        sem2 = _insert(
+            db,
+            uid,
+            "User prefers dark mode",
+            session_id="s2",
+            embedding=emb,
+            trust_tier="T4",
+            initial_confidence=0.4,
+        )
+        sem3 = _insert(
+            db,
+            uid,
+            "Use pytest for testing",
+            session_id="s3",
+            embedding=_embed(0.1),
+            trust_tier="T3",
+            initial_confidence=0.65,
+        )
+        tr_old = _insert(
+            db, uid, "grep output", memory_type="tool_result", observed_at=_ago(hours=25)
+        )
+        tr_new = _insert(db, uid, "ls output", memory_type="tool_result", observed_at=_ago(hours=2))
+        wk = _insert(db, uid, "scratch notes", memory_type="working", observed_at=_ago(hours=3))
         tr_old_id = tr_old.memory_id
         tr_new_id = tr_new.memory_id
         wk_id = wk.memory_id
@@ -452,11 +561,14 @@ class TestFullLifecycle:
         assert len(_active(db, uid)) == 4  # 3 semantic + 1 fresh tool_result
 
         # ── Simulate Day 15: backdate T4 memories ──
-        db.execute(text("""
+        db.execute(
+            text("""
             UPDATE mem_memories
             SET observed_at = DATE_SUB(NOW(), INTERVAL 15 DAY)
             WHERE user_id = :uid AND trust_tier = 'T4'
-        """), {"uid": uid})
+        """),
+            {"uid": uid},
+        )
         db.commit()
 
         d = gov.run_daily(uid)
@@ -488,14 +600,15 @@ class TestFullLifecycle:
 
 
 class TestUserIsolation:
-
     def test_quarantine_does_not_cross_users(self, db, db_factory):
         uid_a, uid_b = _uid(), _uid()
 
-        a = _insert(db, uid_a, "A old", trust_tier="T4",
-                    initial_confidence=0.4, observed_at=_ago(days=15))
-        b = _insert(db, uid_b, "B fresh", trust_tier="T4",
-                    initial_confidence=0.4, observed_at=_ago(days=2))
+        a = _insert(
+            db, uid_a, "A old", trust_tier="T4", initial_confidence=0.4, observed_at=_ago(days=15)
+        )
+        b = _insert(
+            db, uid_b, "B fresh", trust_tier="T4", initial_confidence=0.4, observed_at=_ago(days=2)
+        )
 
         gov = GovernanceScheduler(db_factory)
         gov.run_daily(uid_a)
@@ -514,10 +627,8 @@ class TestUserIsolation:
 
     def test_tool_result_cleanup_cross_user(self, db, db_factory):
         uid_a, uid_b = _uid(), _uid()
-        a = _insert(db, uid_a, "A expired", memory_type="tool_result",
-                    observed_at=_ago(hours=25))
-        b = _insert(db, uid_b, "B fresh", memory_type="tool_result",
-                    observed_at=_ago(hours=1))
+        a = _insert(db, uid_a, "A expired", memory_type="tool_result", observed_at=_ago(hours=25))
+        b = _insert(db, uid_b, "B fresh", memory_type="tool_result", observed_at=_ago(hours=1))
         a_id, b_id = a.memory_id, b.memory_id
 
         GovernanceScheduler(db_factory).run_hourly()
@@ -533,7 +644,6 @@ class TestUserIsolation:
 
 
 class TestStaleInactiveCleanup:
-
     def test_inactive_low_conf_deleted_others_kept(self, db, db_factory):
         uid = _uid()
         garbage = _insert(db, uid, "garbage", is_active=0, initial_confidence=0.05)
@@ -564,14 +674,19 @@ class TestStaleInactiveCleanup:
 
 
 class TestRunDailyAll:
-
     def test_multi_user_batch(self, db, db_factory):
         uids = [_uid() for _ in range(3)]
         ids = {}
         for uid in uids:
             g = _insert(db, uid, "garbage", is_active=0, initial_confidence=0.05)
-            w = _insert(db, uid, "weak T4", trust_tier="T4",
-                        initial_confidence=0.4, observed_at=_ago(days=15))
+            w = _insert(
+                db,
+                uid,
+                "weak T4",
+                trust_tier="T4",
+                initial_confidence=0.4,
+                observed_at=_ago(days=15),
+            )
             ids[uid] = {"garbage_id": g.memory_id, "weak_id": w.memory_id}
 
         gov = GovernanceScheduler(db_factory)

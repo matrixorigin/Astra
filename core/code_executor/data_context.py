@@ -17,15 +17,15 @@ from core.db_consumer import DbConsumer, DbFactory
 
 
 class DataAccessLevel(Enum):
-    NONE = "none"       # No database access
-    READ = "read"       # Direct source DB with read-only user
-    WRITE = "write"     # Session-scoped sandbox with table-level branch
+    NONE = "none"  # No database access
+    READ = "read"  # Direct source DB with read-only user
+    WRITE = "write"  # Session-scoped sandbox with table-level branch
 
 
 @dataclass
 class TableDiff:
     table: str
-    rows: list[dict]   # raw diff rows from `data branch diff`
+    rows: list[dict]  # raw diff rows from `data branch diff`
 
 
 @dataclass
@@ -85,6 +85,7 @@ class DataContext(DbConsumer):
             # Register in infra_sandbox_metadata for cleanup tracking
             try:
                 import json
+
                 db.execute(
                     text(f"""
                         INSERT INTO {self.source_db}.infra_sandbox_metadata
@@ -139,9 +140,7 @@ class DataContext(DbConsumer):
                 continue
         return diffs
 
-    def merge(
-        self, tables: list[str] | None = None, on_conflict: str = "skip"
-    ) -> MergeResult:
+    def merge(self, tables: list[str] | None = None, on_conflict: str = "skip") -> MergeResult:
         """Merge sandbox changes back to source using native data branch merge."""
         if self.access != DataAccessLevel.WRITE:
             raise RuntimeError("Merge requires WRITE access")
@@ -177,9 +176,12 @@ class DataContext(DbConsumer):
                 db.commit()
                 # Clean metadata
                 try:
-                    db.execute(text(
-                        f"DELETE FROM {self.source_db}.infra_sandbox_metadata WHERE sandbox_name = :n"
-                    ), {"n": self.sandbox_name})
+                    db.execute(
+                        text(
+                            f"DELETE FROM {self.source_db}.infra_sandbox_metadata WHERE sandbox_name = :n"
+                        ),
+                        {"n": self.sandbox_name},
+                    )
                     db.commit()
                 except Exception:
                     pass

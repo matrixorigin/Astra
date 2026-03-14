@@ -99,23 +99,25 @@ class TestGetSession:
         # Create another user
         from core.auth.password import hash_password
         from uuid import uuid4
-        
+
         repo = UserRepository(lambda: db_session)
-        
+
         # Clean up first
         existing = repo.get_by_username("otheruser")
         if existing:
             repo.delete(existing.user_id)
             db_session.commit()
-        
-        other_user = repo.create({
-            "user_id": str(uuid4()),
-            "username": "otheruser",
-            "email": "other@example.com",
-            "password_hash": hash_password("password123"),
-            "is_active": 1,
-        })
-        
+
+        other_user = repo.create(
+            {
+                "user_id": str(uuid4()),
+                "username": "otheruser",
+                "email": "other@example.com",
+                "password_hash": hash_password("password123"),
+                "is_active": 1,
+            }
+        )
+
         # Login as other user
         response = client.post(
             "/auth/login",
@@ -126,7 +128,7 @@ class TestGetSession:
         )
         other_token = response.json()["access_token"]
         other_headers = {"Authorization": f"Bearer {other_token}"}
-        
+
         # Create session as other user
         create_response = client.post(
             "/sessions",
@@ -134,12 +136,12 @@ class TestGetSession:
             json={"metadata": {}},
         )
         session_id = create_response.json()["session_id"]
-        
+
         # Try to get session as first user
         response = client.get(f"/sessions/{session_id}", headers=auth_headers)
-        
+
         assert response.status_code == 404
-        
+
         # Clean up
         repo.delete(other_user.user_id)
         db_session.commit()
@@ -185,23 +187,25 @@ class TestUpdateSession:
         """Test update session owned by another user."""
         from core.auth.password import hash_password
         from uuid import uuid4
-        
+
         repo = UserRepository(lambda: db_session)
-        
+
         # Clean up first
         existing = repo.get_by_username("updateuser")
         if existing:
             repo.delete(existing.user_id)
             db_session.commit()
-        
-        other_user = repo.create({
-            "user_id": str(uuid4()),
-            "username": "updateuser",
-            "email": "update@example.com",
-            "password_hash": hash_password("password123"),
-            "is_active": 1,
-        })
-        
+
+        other_user = repo.create(
+            {
+                "user_id": str(uuid4()),
+                "username": "updateuser",
+                "email": "update@example.com",
+                "password_hash": hash_password("password123"),
+                "is_active": 1,
+            }
+        )
+
         # Login as other user
         response = client.post(
             "/auth/login",
@@ -212,7 +216,7 @@ class TestUpdateSession:
         )
         other_token = response.json()["access_token"]
         other_headers = {"Authorization": f"Bearer {other_token}"}
-        
+
         # Create session as other user
         create_response = client.post(
             "/sessions",
@@ -220,16 +224,16 @@ class TestUpdateSession:
             json={"metadata": {}},
         )
         session_id = create_response.json()["session_id"]
-        
+
         # Try to update session as first user
         response = client.put(
             f"/sessions/{session_id}",
             headers=auth_headers,
             json={"title": "Updated"},
         )
-        
+
         assert response.status_code == 404
-        
+
         # Clean up
         repo.delete(other_user.user_id)
         db_session.commit()
@@ -252,7 +256,7 @@ class TestDeleteSession:
         response = client.delete(f"/sessions/{session_id}", headers=auth_headers)
 
         assert response.status_code == 204
-        
+
         # Verify deleted
         get_response = client.get(f"/sessions/{session_id}", headers=auth_headers)
         assert get_response.status_code == 404

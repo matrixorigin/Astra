@@ -22,12 +22,8 @@ class JWTConfig:
             secret = secret.ljust(32, "0")
         self.secret_key = secret
         self.algorithm = os.getenv("JWT_ALGORITHM", "HS256")
-        self.access_token_expire_minutes = int(
-            os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "60")
-        )
-        self.refresh_token_expire_days = int(
-            os.getenv("JWT_REFRESH_TOKEN_EXPIRE_DAYS", "7")
-        )
+        self.access_token_expire_minutes = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+        self.refresh_token_expire_days = int(os.getenv("JWT_REFRESH_TOKEN_EXPIRE_DAYS", "7"))
 
 
 def create_access_token(data: dict[str, Any], config: JWTConfig | None = None) -> str:
@@ -52,11 +48,7 @@ def create_access_token(data: dict[str, Any], config: JWTConfig | None = None) -
     # Add standard claims
     now = datetime.now(timezone.utc)
     expire = now + timedelta(minutes=config.access_token_expire_minutes)
-    to_encode.update({
-        "exp": expire,
-        "iat": now,
-        "type": "access"
-    })
+    to_encode.update({"exp": expire, "iat": now, "type": "access"})
 
     encoded_jwt = jwt.encode(to_encode, config.secret_key, algorithm=config.algorithm)
     return encoded_jwt
@@ -84,11 +76,7 @@ def create_refresh_token(data: dict[str, Any], config: JWTConfig | None = None) 
     # Add standard claims
     now = datetime.now(timezone.utc)
     expire = now + timedelta(days=config.refresh_token_expire_days)
-    to_encode.update({
-        "exp": expire,
-        "iat": now,
-        "type": "refresh"
-    })
+    to_encode.update({"exp": expire, "iat": now, "type": "refresh"})
 
     encoded_jwt = jwt.encode(to_encode, config.secret_key, algorithm=config.algorithm)
     return encoded_jwt
@@ -115,7 +103,9 @@ def decode_token(token: str, config: JWTConfig | None = None) -> dict[str, Any]:
     """
     config = config or JWTConfig()
     try:
-        payload: dict[str, Any] = jwt.decode(token, config.secret_key, algorithms=[config.algorithm])
+        payload: dict[str, Any] = jwt.decode(
+            token, config.secret_key, algorithms=[config.algorithm]
+        )
         return payload
     except InvalidTokenError as e:
         logger.warning(f"Invalid token: {e}")

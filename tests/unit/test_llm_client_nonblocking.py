@@ -15,10 +15,12 @@ import pytest
 
 def _make_slow_sync_iter(chunks, delay=0.1):
     """Return a sync iterator that sleeps between chunks."""
+
     def _iter():
         for c in chunks:
             time.sleep(delay)
             yield c
+
     return _iter()
 
 
@@ -26,6 +28,7 @@ def _make_client(provider_mock):
     """Build a minimal LLMClient with a mocked provider, bypassing DB."""
     with patch("core.llm.client.LLMClient.__init__", return_value=None):
         from core.llm.client import LLMClient
+
         client = LLMClient.__new__(LLMClient)
     client._providers = {"mock": provider_mock}
     client._model_keys = {}
@@ -35,9 +38,13 @@ def _make_client(provider_mock):
     client._ctx_router = LLMClient._ctx_router
     client.user_id = "test"
     router_mock = MagicMock()
-    router_mock.route.return_value = [MagicMock(
-        model_name="m", provider="mock", enable_cache=False,
-    )]
+    router_mock.route.return_value = [
+        MagicMock(
+            model_name="m",
+            provider="mock",
+            enable_cache=False,
+        )
+    ]
     router_mock.calculate_cost.return_value = 0.0
     client.router = router_mock
     rl = MagicMock()
@@ -83,7 +90,8 @@ async def test_chat_with_tools_stream_yields_control():
     """Concurrent task runs while chat_with_tools_stream iterates."""
     provider = MagicMock()
     provider.complete_with_tools_stream.return_value = _make_slow_sync_iter(
-        [{"type": "text", "content": "hi"}, _USAGE_CHUNK], delay=0.3,
+        [{"type": "text", "content": "hi"}, _USAGE_CHUNK],
+        delay=0.3,
     )
     client = _make_client(provider)
     collected = await _assert_event_loop_not_blocked(
@@ -97,7 +105,8 @@ async def test_chat_stream_yields_control():
     """Concurrent task runs while chat_stream iterates."""
     provider = MagicMock()
     provider.complete_stream.return_value = _make_slow_sync_iter(
-        [{"type": "text", "content": "hello"}, _USAGE_CHUNK], delay=0.3,
+        [{"type": "text", "content": "hello"}, _USAGE_CHUNK],
+        delay=0.3,
     )
     client = _make_client(provider)
     collected = await _assert_event_loop_not_blocked(

@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ToolCall:
     """A tool call from the LLM."""
+
     id: str
     name: str
     arguments: dict[str, Any]
@@ -29,6 +30,7 @@ class ToolCall:
 @dataclass
 class ToolResult:
     """Result of executing a tool call."""
+
     tool_call_id: str
     name: str
     result: str
@@ -40,7 +42,11 @@ class ExecutionHook(Protocol):
     """Optional hook for metrics/audit on each tool execution."""
 
     def on_tool_executed(
-        self, name: str, execution_time_ms: int, success: bool, error: str | None = None,
+        self,
+        name: str,
+        execution_time_ms: int,
+        success: bool,
+        error: str | None = None,
     ) -> None: ...
 
 
@@ -74,14 +80,18 @@ class ToolRouter:
         tool = self._tools.get(tc.name)
         if not tool:
             return ToolResult(
-                tool_call_id=tc.id, name=tc.name,
-                result=f"Unknown tool: {tc.name}", error=True,
+                tool_call_id=tc.id,
+                name=tc.name,
+                result=f"Unknown tool: {tc.name}",
+                error=True,
             )
         # Detect server-side argument parse failures (malformed JSON from LLM).
         if "_parse_error" in tc.arguments:
             return ToolResult(
-                tool_call_id=tc.id, name=tc.name,
-                result=tc.arguments["_parse_error"], error=True,
+                tool_call_id=tc.id,
+                name=tc.name,
+                result=tc.arguments["_parse_error"],
+                error=True,
             )
         # Validate required parameters before execution so the LLM gets
         # a clear error instead of a Python TypeError traceback.
@@ -91,7 +101,10 @@ class ToolRouter:
             if missing:
                 msg = f"Missing required parameter(s): {', '.join(missing)}"
                 return ToolResult(
-                    tool_call_id=tc.id, name=tc.name, result=msg, error=True,
+                    tool_call_id=tc.id,
+                    name=tc.name,
+                    result=msg,
+                    error=True,
                 )
             # Warn on unknown parameters so LLM gets feedback instead of
             # silent default-value fallback (e.g. dir_path vs path).
@@ -101,29 +114,37 @@ class ToolRouter:
                 valid = ", ".join(sorted(known)) if known else "(none)"
                 msg = f"Unknown parameter(s): {', '.join(unknown)}. Valid: {valid}"
                 return ToolResult(
-                    tool_call_id=tc.id, name=tc.name, result=msg, error=True,
+                    tool_call_id=tc.id,
+                    name=tc.name,
+                    result=msg,
+                    error=True,
                 )
         t0 = time.monotonic()
         try:
             # EdgeTool: execute(**kwargs) -> str
             # Typed Skill: execute(input: SkillInput) -> SkillOutput
-            if hasattr(tool, '_input_cls') and tool._input_cls is not None \
-                    and not isinstance(tool, EdgeTool):
+            if (
+                hasattr(tool, "_input_cls")
+                and tool._input_cls is not None
+                and not isinstance(tool, EdgeTool)
+            ):
                 validated = tool.validate_input(tc.arguments)
                 output = await tool.execute(validated)
                 # Serialize full output as JSON so LLM sees all fields
-                if hasattr(output, 'model_dump'):
+                if hasattr(output, "model_dump"):
                     data = output.model_dump(exclude={"cost"}, exclude_none=True)
                     result = json.dumps(data, ensure_ascii=False, default=str)
                 else:
-                    result = str(output.result) if hasattr(output, 'result') else str(output)
+                    result = str(output.result) if hasattr(output, "result") else str(output)
             else:
                 result = await tool.execute(**tc.arguments)
             elapsed = int((time.monotonic() - t0) * 1000)
             if self._hook:
                 self._hook.on_tool_executed(tc.name, elapsed, True)
             return ToolResult(
-                tool_call_id=tc.id, name=tc.name, result=result,
+                tool_call_id=tc.id,
+                name=tc.name,
+                result=result,
                 execution_time_ms=elapsed,
             )
         except Exception as e:
@@ -132,8 +153,10 @@ class ToolRouter:
             if self._hook:
                 self._hook.on_tool_executed(tc.name, elapsed, False, error_msg)
             return ToolResult(
-                tool_call_id=tc.id, name=tc.name,
-                result=error_msg, error=True,
+                tool_call_id=tc.id,
+                name=tc.name,
+                result=error_msg,
+                error=True,
                 execution_time_ms=elapsed,
             )
 

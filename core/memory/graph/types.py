@@ -13,10 +13,10 @@ class NodeType(str, enum.Enum):
 
 
 class EdgeType(str, enum.Enum):
-    TEMPORAL = "temporal"        # sequential events (weight: 1.0)
+    TEMPORAL = "temporal"  # sequential events (weight: 1.0)
     ABSTRACTION = "abstraction"  # event grounds concept (weight: 0.8)
     ASSOCIATION = "association"  # concept co-occurrence (weight: cosine_sim)
-    CAUSAL = "causal"            # cause-effect (weight: 1.5)
+    CAUSAL = "causal"  # cause-effect (weight: 1.5)
     CONSOLIDATION = "consolidation"  # scene synthesis (weight: 1.0)
 
 

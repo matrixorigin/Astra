@@ -31,10 +31,10 @@ class EventService:
         agent_version: str | None = None,
         parent_event_id: str | None = None,
         causal_chain_id: str | None = None,
-        metadata: dict[str, Any] | None = None
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """创建 Event
-        
+
         Args:
             user_id: 用户ID
             session_id: Session ID
@@ -45,10 +45,10 @@ class EventService:
             parent_event_id: 父事件ID
             causal_chain_id: 因果链ID
             metadata: 元数据
-            
+
         Returns:
             Event信息
-            
+
         Raises:
             ValueError: Session不存在或无权限
         """
@@ -65,6 +65,7 @@ class EventService:
         # 3. 如果没有提供causal_chain_id，生成新的
         if causal_chain_id is None:
             from uuid_utils import uuid7
+
             causal_chain_id = str(uuid7())
 
         try:
@@ -80,16 +81,14 @@ class EventService:
                 "agent_version": agent_version,
                 "parent_event_id": parent_event_id,
                 "causal_chain_id": causal_chain_id,
-                "event_metadata": metadata  # 使用正确的字段名
+                "event_metadata": metadata,  # 使用正确的字段名
             }
 
             event = self.event_repo.create(event_data)
 
             # 4. 更新Session的事件计数
             try:
-                self.session_repo.update(session_id, {
-                    "event_count": session.event_count + 1
-                })
+                self.session_repo.update(session_id, {"event_count": session.event_count + 1})
             except:
                 # 静默失败，不影响主流程
                 pass
@@ -100,12 +99,8 @@ class EventService:
                 action="event_create",
                 resource_type="event",
                 resource_id=event.event_id,
-                details={
-                    "event_type": event_type,
-                    "session_id": session_id,
-                    "agent_id": agent_id
-                },
-                status="success"
+                details={"event_type": event_type, "session_id": session_id, "agent_id": agent_id},
+                status="success",
             )
 
             return {
@@ -119,7 +114,7 @@ class EventService:
                 "parent_event_id": event.parent_event_id,
                 "causal_chain_id": event.causal_chain_id,
                 "metadata": event.event_metadata or {},
-                "created_at": event.created_at.isoformat()
+                "created_at": event.created_at.isoformat(),
             }
 
         except Exception as e:
@@ -130,20 +125,20 @@ class EventService:
                 resource_type="event",
                 resource_id="unknown",
                 details={"error": str(e)},
-                status="failed"
+                status="failed",
             )
             raise
 
     def get_event(self, event_id: str, user_id: str) -> dict[str, Any]:
         """获取 Event 信息
-        
+
         Args:
             event_id: Event ID
             user_id: 用户ID
-            
+
         Returns:
             Event信息
-            
+
         Raises:
             ValueError: Event不存在或无权限
         """
@@ -167,7 +162,7 @@ class EventService:
             "parent_event_id": event.parent_event_id,
             "causal_chain_id": event.causal_chain_id,
             "metadata": event.event_metadata or {},
-            "created_at": event.created_at.isoformat()
+            "created_at": event.created_at.isoformat(),
         }
 
     def list_events(
@@ -178,10 +173,10 @@ class EventService:
         agent_id: str | None = None,
         causal_chain_id: str | None = None,
         limit: int = 50,
-        offset: int = 0
+        offset: int = 0,
     ) -> dict[str, Any]:
         """列出用户的 Events
-        
+
         Args:
             user_id: 用户ID
             session_id: 过滤Session ID
@@ -190,7 +185,7 @@ class EventService:
             causal_chain_id: 过滤因果链ID
             limit: 限制数量
             offset: 偏移量
-            
+
         Returns:
             Events列表和总数
         """
@@ -201,7 +196,7 @@ class EventService:
             agent_id=agent_id,
             causal_chain_id=causal_chain_id,
             limit=limit,
-            offset=offset
+            offset=offset,
         )
 
         return {
@@ -217,26 +212,22 @@ class EventService:
                     "parent_event_id": event.parent_event_id,
                     "causal_chain_id": event.causal_chain_id,
                     "metadata": event.event_metadata or {},
-                    "created_at": event.created_at.isoformat()
+                    "created_at": event.created_at.isoformat(),
                 }
                 for event in events
             ],
             "total": total,
             "limit": limit,
-            "offset": offset
+            "offset": offset,
         }
 
-    def get_causal_chain(
-        self,
-        causal_chain_id: str,
-        user_id: str
-    ) -> list[dict[str, Any]]:
+    def get_causal_chain(self, causal_chain_id: str, user_id: str) -> list[dict[str, Any]]:
         """获取因果链中的所有事件
-        
+
         Args:
             causal_chain_id: 因果链ID
             user_id: 用户ID
-            
+
         Returns:
             因果链中的所有事件，按时间排序
         """
@@ -254,29 +245,25 @@ class EventService:
                 "parent_event_id": event.parent_event_id,
                 "causal_chain_id": event.causal_chain_id,
                 "metadata": event.event_metadata or {},
-                "created_at": event.created_at.isoformat()
+                "created_at": event.created_at.isoformat(),
             }
             for event in events
         ]
 
     def get_session_events(
-        self,
-        session_id: str,
-        user_id: str,
-        limit: int = 100,
-        offset: int = 0
+        self, session_id: str, user_id: str, limit: int = 100, offset: int = 0
     ) -> dict[str, Any]:
         """获取Session中的所有事件
-        
+
         Args:
             session_id: Session ID
             user_id: 用户ID
             limit: 限制数量
             offset: 偏移量
-            
+
         Returns:
             Session中的事件列表
-            
+
         Raises:
             ValueError: Session不存在或无权限
         """
@@ -289,9 +276,7 @@ class EventService:
             raise ValueError(f"无权限访问 Session {session_id}")
 
         events, total = self.event_repo.get_by_session(
-            session_id=session_id,
-            limit=limit,
-            offset=offset
+            session_id=session_id, limit=limit, offset=offset
         )
 
         return {
@@ -307,22 +292,22 @@ class EventService:
                     "parent_event_id": event.parent_event_id,
                     "causal_chain_id": event.causal_chain_id,
                     "metadata": event.event_metadata or {},
-                    "created_at": event.created_at.isoformat()
+                    "created_at": event.created_at.isoformat(),
                 }
                 for event in events
             ],
             "total": total,
             "limit": limit,
-            "offset": offset
+            "offset": offset,
         }
 
     def delete_event(self, event_id: str, user_id: str) -> None:
         """删除 Event
-        
+
         Args:
             event_id: Event ID
             user_id: 用户ID
-            
+
         Raises:
             ValueError: Event不存在或无权限
         """
@@ -345,7 +330,7 @@ class EventService:
                 resource_type="event",
                 resource_id=event_id,
                 details={"event_type": event.event_type},
-                status="success"
+                status="success",
             )
 
         except Exception as e:
@@ -356,6 +341,6 @@ class EventService:
                 resource_type="event",
                 resource_id=event_id,
                 details={"error": str(e)},
-                status="failed"
+                status="failed",
             )
             raise

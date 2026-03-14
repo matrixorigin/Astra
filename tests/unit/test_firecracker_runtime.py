@@ -41,26 +41,32 @@ class TestFirecrackerRuntime:
             assert _is_available() is False
 
     def test_is_available_checks_kvm(self):
-        with patch("core.runtime.firecracker_runtime.platform") as mock_plat, \
-             patch("core.runtime.firecracker_runtime.os.path.exists") as mock_exists, \
-             patch("core.runtime.firecracker_runtime.shutil.which") as mock_which:
+        with (
+            patch("core.runtime.firecracker_runtime.platform") as mock_plat,
+            patch("core.runtime.firecracker_runtime.os.path.exists") as mock_exists,
+            patch("core.runtime.firecracker_runtime.shutil.which") as mock_which,
+        ):
             mock_plat.system.return_value = "Linux"
             mock_exists.return_value = False  # no /dev/kvm
             assert _is_available() is False
 
     def test_is_available_checks_binary(self):
-        with patch("core.runtime.firecracker_runtime.platform") as mock_plat, \
-             patch("core.runtime.firecracker_runtime.os.path.exists") as mock_exists, \
-             patch("core.runtime.firecracker_runtime.shutil.which") as mock_which:
+        with (
+            patch("core.runtime.firecracker_runtime.platform") as mock_plat,
+            patch("core.runtime.firecracker_runtime.os.path.exists") as mock_exists,
+            patch("core.runtime.firecracker_runtime.shutil.which") as mock_which,
+        ):
             mock_plat.system.return_value = "Linux"
             mock_exists.return_value = True  # /dev/kvm exists
-            mock_which.return_value = None   # no firecracker binary
+            mock_which.return_value = None  # no firecracker binary
             assert _is_available() is False
 
     def test_is_available_all_present(self):
-        with patch("core.runtime.firecracker_runtime.platform") as mock_plat, \
-             patch("core.runtime.firecracker_runtime.os.path.exists") as mock_exists, \
-             patch("core.runtime.firecracker_runtime.shutil.which") as mock_which:
+        with (
+            patch("core.runtime.firecracker_runtime.platform") as mock_plat,
+            patch("core.runtime.firecracker_runtime.os.path.exists") as mock_exists,
+            patch("core.runtime.firecracker_runtime.shutil.which") as mock_which,
+        ):
             mock_plat.system.return_value = "Linux"
             mock_exists.return_value = True
             mock_which.return_value = "/usr/bin/firecracker"
@@ -84,6 +90,7 @@ class TestFirecrackerRuntime:
     @patch.object(FirecrackerRuntime, "_api_put")
     def test_execute_wall_timeout(self, mock_api, mock_wait, mock_popen, runtime):
         import subprocess as sp
+
         mock_proc = Mock()
         mock_proc.poll.return_value = None
         # First wait() → timeout; second wait() in finally → ok
@@ -114,12 +121,11 @@ class TestCreateRuntimeWithFirecracker:
     def test_firecracker_selected_when_available(self):
         """create_runtime picks Firecracker when it passes health_check."""
         from core.runtime import create_runtime
+
         with patch("core.runtime.firecracker_runtime.FirecrackerRuntime") as MockFC:
             mock_rt = MockFC.return_value
             mock_rt.health_check.return_value = True
-            mock_rt.capabilities = FirecrackerRuntime(
-                kernel_path="x", rootfs_path="x"
-            ).capabilities
+            mock_rt.capabilities = FirecrackerRuntime(kernel_path="x", rootfs_path="x").capabilities
             rt = create_runtime(min_isolation=IsolationLevel.PROCESS)
             assert rt is mock_rt
 
@@ -127,8 +133,11 @@ class TestCreateRuntimeWithFirecracker:
         """Falls through to Subprocess when Firecracker and Docker unavailable."""
         from core.runtime import create_runtime
         from core.runtime.subprocess_runtime import SubprocessRuntime
-        with patch("core.runtime.firecracker_runtime.FirecrackerRuntime") as MockFC, \
-             patch("core.runtime.docker_runtime.DockerRuntime") as MockDocker:
+
+        with (
+            patch("core.runtime.firecracker_runtime.FirecrackerRuntime") as MockFC,
+            patch("core.runtime.docker_runtime.DockerRuntime") as MockDocker,
+        ):
             MockFC.return_value.health_check.return_value = False
             MockDocker.return_value.health_check.return_value = False
             rt = create_runtime(min_isolation=IsolationLevel.PROCESS)
@@ -137,6 +146,7 @@ class TestCreateRuntimeWithFirecracker:
     def test_microvm_required_but_unavailable(self):
         """Raises when MICROVM required but Firecracker not available."""
         from core.runtime import create_runtime
+
         with patch("core.runtime.firecracker_runtime.FirecrackerRuntime") as MockFC:
             MockFC.return_value.health_check.return_value = False
             with pytest.raises(RuntimeError, match="No runtime available"):

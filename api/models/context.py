@@ -2,7 +2,13 @@
 
 from matrixone import VectorPrecision, VectorType
 from sqlalchemy import (
-    Column, Float, Integer, SmallInteger, String, Text, UniqueConstraint,
+    Column,
+    Float,
+    Integer,
+    SmallInteger,
+    String,
+    Text,
+    UniqueConstraint,
 )
 from sqlalchemy.sql import func
 
@@ -17,6 +23,7 @@ class PromptFragment(Base):
     Fixed sections (identity, self_model, constraints) are stored once and
     referenced by hash. This deduplicates repeated content across turns/sessions.
     """
+
     __tablename__ = "ctx_prompt_fragments"
     fragment_hash = Column(String(64), primary_key=True)  # SHA256 prefix
     content = Column(Text, nullable=False)
@@ -97,7 +104,7 @@ class PromptTemplate(Base):
 class PromptVariant(Base):
     __tablename__ = "ctx_prompt_variants"
     __table_args__ = (
-        UniqueConstraint('prompt_template_id', 'version', name='uq_template_version'),
+        UniqueConstraint("prompt_template_id", "version", name="uq_template_version"),
     )
     variant_id = Column(String(64), primary_key=True)
     prompt_template_id = Column(String(64), nullable=False, index=True)

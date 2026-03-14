@@ -19,20 +19,22 @@ OutputT = TypeVar("OutputT", bound="SkillOutput")
 # Runtime requirements — executor uses these to route execution
 # ---------------------------------------------------------------------------
 
+
 class RuntimeRequirement(str, Enum):
     """What runtime capabilities a skill needs. Executor routes based on these."""
 
     FILESYSTEM = "filesystem"  # Needs local filesystem access → local runtime
-    DATABASE = "database"      # Needs platform DB → remote runtime
-    NETWORK = "network"        # Needs network/API access → either runtime
-    SANDBOX = "sandbox"        # Needs isolated sandbox → remote runtime
-    GPU = "gpu"                # Needs GPU → heavyweight backend
-    NONE = "none"              # Pure computation, runs anywhere
+    DATABASE = "database"  # Needs platform DB → remote runtime
+    NETWORK = "network"  # Needs network/API access → either runtime
+    SANDBOX = "sandbox"  # Needs isolated sandbox → remote runtime
+    GPU = "gpu"  # Needs GPU → heavyweight backend
+    NONE = "none"  # Pure computation, runs anywhere
 
 
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
+
 
 class RepoType(str, Enum):
     CODE = "code"
@@ -52,13 +54,14 @@ class SideEffectCategory(str, Enum):
 
     READ = "read"
     WRITE = "write"
-    EXECUTE = "execute"        # Shell/subprocess execution
+    EXECUTE = "execute"  # Shell/subprocess execution
     DESTRUCTIVE = "destructive"
 
 
 # ---------------------------------------------------------------------------
 # Profiles and requirements
 # ---------------------------------------------------------------------------
+
 
 class SideEffectProfile(BaseModel):
     category: SideEffectCategory
@@ -85,6 +88,7 @@ class SkillRequirement(BaseModel):
 # Input / Output
 # ---------------------------------------------------------------------------
 
+
 class SkillInput(BaseModel):
     """Base class for skill inputs."""
 
@@ -108,15 +112,18 @@ class SkillOutput(BaseModel):
     result: Any = None
     error: str | None = None
     cost: float = 0.0
-    data_source: str = ""       # Origin of data, e.g. "alpha_vantage_api". Empty string means not set.
-    data_timestamp: str = ""    # ISO 8601 when data was fetched. Empty string means not set.
+    data_source: str = ""  # Origin of data, e.g. "alpha_vantage_api". Empty string means not set.
+    data_timestamp: str = ""  # ISO 8601 when data was fetched. Empty string means not set.
     guidance: str | None = None  # Authoritative post-result instruction injected as system message
-    user_message: str | None = None  # Human-facing message shown directly to user when guidance fires
+    user_message: str | None = (
+        None  # Human-facing message shown directly to user when guidance fires
+    )
 
 
 # ---------------------------------------------------------------------------
 # Skill base class
 # ---------------------------------------------------------------------------
+
 
 class Skill(ABC, Generic[InputT, OutputT]):
     """Base class for ALL tools/skills in the system.
@@ -146,6 +153,7 @@ class Skill(ABC, Generic[InputT, OutputT]):
         if len(self.description) <= 80:
             return self.description
         return self.description[:77] + "..."
+
     side_effect_profile: SideEffectProfile = SideEffectProfile(
         category=SideEffectCategory.READ,
     )
@@ -168,8 +176,10 @@ class Skill(ABC, Generic[InputT, OutputT]):
 
     def validate_input(self, input_data: dict) -> InputT:
         if self._input_cls is None:
-            raise TypeError(f"{type(self).__name__} has no _input_cls; "
-                            "specify Generic type args or override validate_input()")
+            raise TypeError(
+                f"{type(self).__name__} has no _input_cls; "
+                "specify Generic type args or override validate_input()"
+            )
         return self._input_cls(**input_data)  # type: ignore[return-value]
 
     @abstractmethod
@@ -185,10 +195,14 @@ class Skill(ABC, Generic[InputT, OutputT]):
         """
         if self._input_cls is not None:
             schema = self._input_cls.model_json_schema()
-            props = {k: v for k, v in schema.get("properties", {}).items()
-                     if k not in SkillInput._FRAMEWORK_FIELDS}
-            required = [r for r in schema.get("required", [])
-                        if r not in SkillInput._FRAMEWORK_FIELDS]
+            props = {
+                k: v
+                for k, v in schema.get("properties", {}).items()
+                if k not in SkillInput._FRAMEWORK_FIELDS
+            }
+            required = [
+                r for r in schema.get("required", []) if r not in SkillInput._FRAMEWORK_FIELDS
+            ]
             params = {"type": "object", "properties": props}
             if required:
                 params["required"] = required

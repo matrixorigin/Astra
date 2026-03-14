@@ -20,20 +20,20 @@ class TestSQLInjectionPrevention:
         # SQL injection attempts
         with pytest.raises(ValueError, match="Invalid identifier"):
             validate_identifier("'; DROP TABLE auth_users--")
-        
+
         with pytest.raises(ValueError, match="Invalid identifier"):
             validate_identifier("table; DELETE FROM auth_users")
-        
+
         with pytest.raises(ValueError, match="Invalid identifier"):
             validate_identifier("table UNION SELECT * FROM passwords")
-        
+
         # Special characters
         with pytest.raises(ValueError, match="Invalid identifier"):
             validate_identifier("table-name")
-        
+
         with pytest.raises(ValueError, match="Invalid identifier"):
             validate_identifier("table name")
-        
+
         with pytest.raises(ValueError, match="Invalid identifier"):
             validate_identifier("table@name")
 
@@ -41,7 +41,7 @@ class TestSQLInjectionPrevention:
         """Test identifier must start with letter or underscore."""
         with pytest.raises(ValueError, match="must start with letter or underscore"):
             validate_identifier("123table")
-        
+
         # Dot is rejected by pattern check first
         with pytest.raises(ValueError, match="Invalid identifier"):
             validate_identifier(".table")
@@ -50,7 +50,7 @@ class TestSQLInjectionPrevention:
         """Test identifier length limits."""
         # Valid length
         assert validate_identifier("a" * 64) == "a" * 64
-        
+
         # Too long
         with pytest.raises(ValueError, match="too long"):
             validate_identifier("a" * 65)
@@ -64,17 +64,17 @@ class TestSQLInjectionPrevention:
         """Test sandbox creation rejects SQL injection attempts."""
         from unittest.mock import Mock
         from sqlalchemy.orm import Session
-        
+
         mock_db = Mock(spec=Session)
         sandbox = Sandbox(lambda: mock_db)
-        
+
         # SQL injection attempts should be rejected
         with pytest.raises(ValueError):
             sandbox.create("'; DROP TABLE auth_users--")
-        
+
         with pytest.raises(ValueError):
             sandbox.create("test; DELETE FROM events")
-        
+
         with pytest.raises(ValueError):
             sandbox.create("test UNION SELECT * FROM passwords")
 
@@ -82,10 +82,10 @@ class TestSQLInjectionPrevention:
         """Test sandbox deletion rejects SQL injection attempts."""
         from unittest.mock import Mock
         from sqlalchemy.orm import Session
-        
+
         mock_db = Mock(spec=Session)
         sandbox = Sandbox(lambda: mock_db)
-        
+
         with pytest.raises(ValueError):
             sandbox.delete("'; DROP TABLE auth_users--")
 
@@ -93,12 +93,12 @@ class TestSQLInjectionPrevention:
         """Test add_table rejects SQL injection via Branch._qualify → validate_identifier."""
         from unittest.mock import Mock
         from sqlalchemy.orm import Session
-        
+
         mock_db = Mock(spec=Session)
         sandbox = Sandbox(lambda: mock_db)
-        
+
         with pytest.raises(ValueError):
             sandbox.add_table("'; DROP TABLE auth_users--", "t1")
-        
+
         with pytest.raises(ValueError):
             sandbox.add_table("sandbox1", "'; DROP TABLE auth_users--")

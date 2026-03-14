@@ -18,49 +18,111 @@ logger = get_logger(__name__)
 
 # ── Valid tag values (registration-time validation) ──────────────
 
-VALID_SCOPES = frozenset({
-    "current_session",
-    "historical",
-    "cross_session",
-    "external",
-    "local",           # local filesystem / runtime / VCS
-})
+VALID_SCOPES = frozenset(
+    {
+        "current_session",
+        "historical",
+        "cross_session",
+        "external",
+        "local",  # local filesystem / runtime / VCS
+    }
+)
 
-VALID_DATA_SOURCES = frozenset({
-    "session_metadata",
-    "event_store",
-    "memory_store",
-    "external_api",
-    "local_filesystem",
-    "local_runtime",
-    "local_vcs",
-})
+VALID_DATA_SOURCES = frozenset(
+    {
+        "session_metadata",
+        "event_store",
+        "memory_store",
+        "external_api",
+        "local_filesystem",
+        "local_runtime",
+        "local_vcs",
+    }
+)
 
-VALID_INTENT_TYPES = frozenset({
-    "analytical",
-    "fetch",
-    "mutate",
-    "introspect",
-})
+VALID_INTENT_TYPES = frozenset(
+    {
+        "analytical",
+        "fetch",
+        "mutate",
+        "introspect",
+    }
+)
 
 # ── Default tag inference from category ──────────────────────────
 
 _CATEGORY_TAG_DEFAULTS: dict[str, dict[str, Any]] = {
-    "github": {"scope": "external", "data_source": "external_api", "intent_type": ["fetch", "mutate"], "requires_history": False},
-    "jira": {"scope": "external", "data_source": "external_api", "intent_type": ["fetch", "mutate"], "requires_history": False},
-    "external": {"scope": "external", "data_source": "external_api", "intent_type": ["fetch"], "requires_history": False},
-    "code_execution": {"scope": "current_session", "data_source": "local_runtime", "intent_type": ["mutate"], "requires_history": False},
-    "system": {"scope": "current_session", "data_source": "session_metadata", "intent_type": ["introspect"], "requires_history": False},
-    "multi_agent": {"scope": "current_session", "data_source": "session_metadata", "intent_type": ["mutate"], "requires_history": False},
-    "file_ops": {"scope": "local", "data_source": "local_filesystem", "intent_type": ["fetch", "mutate"], "requires_history": False},
-    "search": {"scope": "local", "data_source": "local_filesystem", "intent_type": ["fetch"], "requires_history": False},
-    "shell": {"scope": "local", "data_source": "local_runtime", "intent_type": ["mutate"], "requires_history": False},
-    "vcs": {"scope": "local", "data_source": "local_vcs", "intent_type": ["fetch"], "requires_history": False},
-    "diagnostics": {"scope": "historical", "data_source": "event_store", "intent_type": ["analytical"], "requires_history": True},
+    "github": {
+        "scope": "external",
+        "data_source": "external_api",
+        "intent_type": ["fetch", "mutate"],
+        "requires_history": False,
+    },
+    "jira": {
+        "scope": "external",
+        "data_source": "external_api",
+        "intent_type": ["fetch", "mutate"],
+        "requires_history": False,
+    },
+    "external": {
+        "scope": "external",
+        "data_source": "external_api",
+        "intent_type": ["fetch"],
+        "requires_history": False,
+    },
+    "code_execution": {
+        "scope": "current_session",
+        "data_source": "local_runtime",
+        "intent_type": ["mutate"],
+        "requires_history": False,
+    },
+    "system": {
+        "scope": "current_session",
+        "data_source": "session_metadata",
+        "intent_type": ["introspect"],
+        "requires_history": False,
+    },
+    "multi_agent": {
+        "scope": "current_session",
+        "data_source": "session_metadata",
+        "intent_type": ["mutate"],
+        "requires_history": False,
+    },
+    "file_ops": {
+        "scope": "local",
+        "data_source": "local_filesystem",
+        "intent_type": ["fetch", "mutate"],
+        "requires_history": False,
+    },
+    "search": {
+        "scope": "local",
+        "data_source": "local_filesystem",
+        "intent_type": ["fetch"],
+        "requires_history": False,
+    },
+    "shell": {
+        "scope": "local",
+        "data_source": "local_runtime",
+        "intent_type": ["mutate"],
+        "requires_history": False,
+    },
+    "vcs": {
+        "scope": "local",
+        "data_source": "local_vcs",
+        "intent_type": ["fetch"],
+        "requires_history": False,
+    },
+    "diagnostics": {
+        "scope": "historical",
+        "data_source": "event_store",
+        "intent_type": ["analytical"],
+        "requires_history": True,
+    },
 }
 
 
 # ── SkillTags ────────────────────────────────────────────────────
+
 
 @dataclass(frozen=True)
 class SkillTags:
@@ -91,10 +153,14 @@ class SkillTags:
         if scope not in VALID_SCOPES:
             raise ValueError(f"Invalid scope: {scope!r}. Must be one of {sorted(VALID_SCOPES)}")
         if data_source not in VALID_DATA_SOURCES:
-            raise ValueError(f"Invalid data_source: {data_source!r}. Must be one of {sorted(VALID_DATA_SOURCES)}")
+            raise ValueError(
+                f"Invalid data_source: {data_source!r}. Must be one of {sorted(VALID_DATA_SOURCES)}"
+            )
         invalid_intents = set(intent_type) - VALID_INTENT_TYPES
         if invalid_intents:
-            raise ValueError(f"Invalid intent_type: {sorted(invalid_intents)}. Must be from {sorted(VALID_INTENT_TYPES)}")
+            raise ValueError(
+                f"Invalid intent_type: {sorted(invalid_intents)}. Must be from {sorted(VALID_INTENT_TYPES)}"
+            )
 
         return cls(
             scope=scope,
@@ -149,30 +215,70 @@ class ToolWrapper:
 # Single words like "get", "last", "status" are too common in general English.
 # Chinese markers can be shorter because they are more semantically specific.
 
-_HISTORY_MARKERS = frozenset({
-    # Chinese: specific history references
-    "前一个", "上一轮", "刚才", "之前", "上次",
-    # English: multi-word to avoid matching "last PR" or "before we start"
-    "previous context", "previous session", "previous turn",
-    "last session", "last turn", "last conversation",
-    "earlier context", "earlier session",
-    "before that",
-})
+_HISTORY_MARKERS = frozenset(
+    {
+        # Chinese: specific history references
+        "前一个",
+        "上一轮",
+        "刚才",
+        "之前",
+        "上次",
+        # English: multi-word to avoid matching "last PR" or "before we start"
+        "previous context",
+        "previous session",
+        "previous turn",
+        "last session",
+        "last turn",
+        "last conversation",
+        "earlier context",
+        "earlier session",
+        "before that",
+    }
+)
 
-_ANALYTICAL_MARKERS = frozenset({
-    "分析", "评估", "为什么", "怎么回事", "原因",
-    "analyze", "evaluate", "why", "assess", "diagnose",
-})
+_ANALYTICAL_MARKERS = frozenset(
+    {
+        "分析",
+        "评估",
+        "为什么",
+        "怎么回事",
+        "原因",
+        "analyze",
+        "evaluate",
+        "why",
+        "assess",
+        "diagnose",
+    }
+)
 
-_FETCH_MARKERS = frozenset({
-    "查看", "列出", "最新", "情况", "查询",
-    "show me", "list", "latest", "get the",
-})
+_FETCH_MARKERS = frozenset(
+    {
+        "查看",
+        "列出",
+        "最新",
+        "情况",
+        "查询",
+        "show me",
+        "list",
+        "latest",
+        "get the",
+    }
+)
 
-_MUTATE_MARKERS = frozenset({
-    "创建", "修改", "删除", "新建", "更新",
-    "create", "update", "delete", "modify", "remove",
-})
+_MUTATE_MARKERS = frozenset(
+    {
+        "创建",
+        "修改",
+        "删除",
+        "新建",
+        "更新",
+        "create",
+        "update",
+        "delete",
+        "modify",
+        "remove",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -258,6 +364,7 @@ class ConversationState:
 
 # ── Pre-filter logic ─────────────────────────────────────────────
 
+
 def pre_filter(
     skills: list[HasTags],
     state: ConversationState | None,
@@ -287,7 +394,7 @@ def pre_filter(
                 prev_idx = i
                 break
         if prev_idx is not None and prev_idx > 0:
-            boosted = [skills[prev_idx]] + skills[:prev_idx] + skills[prev_idx + 1:]
+            boosted = [skills[prev_idx]] + skills[:prev_idx] + skills[prev_idx + 1 :]
             logger.info("Pre-filter: continuity → boost %s to front", state.previous_skill)
             return boosted, True
 

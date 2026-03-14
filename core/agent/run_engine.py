@@ -27,7 +27,9 @@ _run_waiters: dict[str, asyncio.Event] = {}
 _run_tasks: dict[str, asyncio.Task] = {}
 _child_runs: dict[str, set[str]] = {}  # parent_run_id → {child_run_ids}
 _run_notifiers: dict[str, asyncio.Event] = {}  # wake stream_agent_run_events
-_agent_config_cache: dict[str, dict | None] = {}  # agent_id → config (module-level, survives across runs)
+_agent_config_cache: dict[
+    str, dict | None
+] = {}  # agent_id → config (module-level, survives across runs)
 _fan_in_tasks: set[asyncio.Task] = set()  # Track fan-in tasks for cleanup
 _cancel_pending: set[asyncio.Task] = set()  # Hold refs to cancelled tasks until done
 
@@ -48,7 +50,7 @@ def cleanup_run_tasks() -> None:
     import asyncio
 
     tasks_to_cancel = [t for t in _run_tasks.values() if not t.done()]
-    
+
     for t in tasks_to_cancel:
         try:
             t.cancel()
@@ -61,9 +63,7 @@ def cleanup_run_tasks() -> None:
         try:
             loop = asyncio.get_event_loop()
             if not loop.is_closed() and not loop.is_running():
-                loop.run_until_complete(
-                    asyncio.gather(*tasks_to_cancel, return_exceptions=True)
-                )
+                loop.run_until_complete(asyncio.gather(*tasks_to_cancel, return_exceptions=True))
         except Exception:
             pass
 
@@ -98,7 +98,9 @@ async def _periodic_gc() -> None:
             await asyncio.sleep(_GC_INTERVAL_SECONDS)
             RunEngine._maybe_gc()
             gc.collect()
-            logger.debug(f"Periodic GC: {len(_active_runs)} active runs, {len(_agent_run_events)} event buffers")
+            logger.debug(
+                f"Periodic GC: {len(_active_runs)} active runs, {len(_agent_run_events)} event buffers"
+            )
         except asyncio.CancelledError:
             logger.info("Periodic GC task cancelled")
             break
@@ -217,6 +219,7 @@ class RunEngine(DbConsumer):
         try:
             with self._db() as db:
                 from api.models import Agent
+
                 row = db.query(Agent.agent_config).filter(Agent.agent_id == agent_id).first()
                 if row and row[0]:
                     config = row[0] if isinstance(row[0], dict) else json.loads(row[0])
@@ -258,11 +261,12 @@ class RunEngine(DbConsumer):
                 self._apply_agent_config(run.agent_id, run.context)
 
             # Build ChatLoop — pass db_factory so it also uses short-lived sessions
-            factory = getattr(self, '_chat_loop_factory', None)
+            factory = getattr(self, "_chat_loop_factory", None)
             if factory:
                 loop = factory(self._db_factory)
             else:
                 from api.routers.chat import _build_chat_loop
+
                 loop = _build_chat_loop(self._db_factory)
             loop._current_run_id = run.run_id
 
@@ -275,11 +279,17 @@ class RunEngine(DbConsumer):
         except asyncio.TimeoutError:
             logger.error(f"Run {run.run_id} timed out after {timeout}s")
             run.status = RunStatus.FAILED
-            self._log_run_event(run, EventType.RUN_FAILED, {"error": f"Run timed out after {timeout}s"})
-            self._append_event(run.run_id, {
-                "event_type": "run_error", "data": {"error": f"Run timed out after {timeout}s"},
-                "run_id": run.run_id,
-            })
+            self._log_run_event(
+                run, EventType.RUN_FAILED, {"error": f"Run timed out after {timeout}s"}
+            )
+            self._append_event(
+                run.run_id,
+                {
+                    "event_type": "run_error",
+                    "data": {"error": f"Run timed out after {timeout}s"},
+                    "run_id": run.run_id,
+                },
+            )
             raise
         except asyncio.CancelledError:
             run.status = RunStatus.CANCELLED
@@ -290,16 +300,24 @@ class RunEngine(DbConsumer):
             logger.error(f"Run {run.run_id} failed: {e}", exc_info=True)
             run.status = RunStatus.FAILED
             self._log_run_event(run, EventType.RUN_FAILED, {"error": str(e)})
-            self._append_event(run.run_id, {
-                "event_type": "run_error", "data": {"error": str(e)},
-                "run_id": run.run_id,
-            })
+            self._append_event(
+                run.run_id,
+                {
+                    "event_type": "run_error",
+                    "data": {"error": str(e)},
+                    "run_id": run.run_id,
+                },
+            )
             raise
         finally:
             self._flush_agent_run_events()
             # Shutdown EventPipeline
             try:
-                _pipeline = getattr(getattr(loop, 'event_logger', None), '_pipeline', None) if loop else None
+                _pipeline = (
+                    getattr(getattr(loop, "event_logger", None), "_pipeline", None)
+                    if loop
+                    else None
+                )
                 if _pipeline:
                     _shutdown_task = _pipeline.shutdown()
                     if _shutdown_task:
@@ -311,15 +329,18 @@ class RunEngine(DbConsumer):
                 pass
             # Wait for GateTrigger daemon threads (run in executor to avoid blocking the event loop)
             try:
-                gt = getattr(loop, '_gate_trigger', None) if loop else None
-                if gt and hasattr(gt, 'wait_all'):
+                gt = getattr(loop, "_gate_trigger", None) if loop else None
+                if gt and hasattr(gt, "wait_all"):
                     await asyncio.get_running_loop().run_in_executor(None, gt.wait_all, 5.0)
             except Exception:
                 pass
             _run_tasks.pop(run.run_id, None)
             _run_waiters.get(run.run_id, asyncio.Event()).set()
-            if run.parent_run_id and run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED) \
-                    and not getattr(run, '_cancelled_externally', False):
+            if (
+                run.parent_run_id
+                and run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED)
+                and not getattr(run, "_cancelled_externally", False)
+            ):
                 try:
                     await self._check_fan_in(run.parent_run_id)
                 except Exception:
@@ -355,9 +376,13 @@ class RunEngine(DbConsumer):
             if event.data.get("wait_for"):
                 run.status = RunStatus.WAITING
                 run.waiting_for = event.data["wait_for"]
-                self._log_run_event(run, EventType.RUN_WAITING, {
-                    "waiting_for": run.waiting_for,
-                })
+                self._log_run_event(
+                    run,
+                    EventType.RUN_WAITING,
+                    {
+                        "waiting_for": run.waiting_for,
+                    },
+                )
                 return
 
     async def resume_run(self, run_id: str, result: dict) -> None:
@@ -409,11 +434,14 @@ class RunEngine(DbConsumer):
             f"Original task: {original_input}"
         )[:_MAX_RESUME_INPUT_CHARS]
 
-        self._append_event(run.run_id, {
-            "event_type": "tool_result",
-            "data": {"result": result},
-            "run_id": run.run_id,
-        })
+        self._append_event(
+            run.run_id,
+            {
+                "event_type": "tool_result",
+                "data": {"result": result},
+                "run_id": run.run_id,
+            },
+        )
         await self.start_run(run)
 
     def cancel_run(self, run_id: str) -> bool:
@@ -422,10 +450,16 @@ class RunEngine(DbConsumer):
             # Run not on this worker — write cancel event to DB so the
             # owning worker picks it up via periodic _is_cancelled_in_db check.
             restored = self.restore_run(run_id)
-            if not restored or restored.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
+            if not restored or restored.status in (
+                RunStatus.COMPLETED,
+                RunStatus.FAILED,
+                RunStatus.CANCELLED,
+            ):
                 return False
             return self._write_cancel_event_for_run(
-                run_id, restored.session_id, restored.user_id,
+                run_id,
+                restored.session_id,
+                restored.user_id,
             )
         if run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
             return False
@@ -452,7 +486,11 @@ class RunEngine(DbConsumer):
                 _cancel_pending.add(child_task)
                 child_task.add_done_callback(_cancel_pending.discard)
             child = _active_runs.get(cid)
-            if child and child.status not in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
+            if child and child.status not in (
+                RunStatus.COMPLETED,
+                RunStatus.FAILED,
+                RunStatus.CANCELLED,
+            ):
                 child.status = RunStatus.CANCELLED
                 self._log_run_event(child, EventType.RUN_CANCELLED)
             elif not child:
@@ -470,6 +508,7 @@ class RunEngine(DbConsumer):
     def _cancel_workflow(self, wf_id: str) -> None:
         """Propagate cancel to a workflow and its in-memory state."""
         from core.agent.async_tools import _wf_runs, _workflow_waits
+
         entry = _wf_runs.pop(wf_id, None)
         if entry and entry.get("engine"):
             entry["engine"].cancel(entry["workflow"].name)
@@ -479,8 +518,10 @@ class RunEngine(DbConsumer):
         try:
             with self._db() as db:
                 db.execute(
-                    text("UPDATE wf_runs SET status='cancelled', error='Cancelled by user' "
-                         "WHERE run_id = :wf_id AND status IN ('running','waiting')"),
+                    text(
+                        "UPDATE wf_runs SET status='cancelled', error='Cancelled by user' "
+                        "WHERE run_id = :wf_id AND status IN ('running','waiting')"
+                    ),
                     {"wf_id": wf_id},
                 )
                 db.commit()
@@ -532,7 +573,9 @@ class RunEngine(DbConsumer):
             pass
         return _active_runs.get(run_id)
 
-    async def stream_agent_run_events(self, run_id: str, last_index: int = 0) -> AsyncIterator[dict]:
+    async def stream_agent_run_events(
+        self, run_id: str, last_index: int = 0
+    ) -> AsyncIterator[dict]:
         """Yield events as they arrive. Cross-worker safe via DB polling."""
         idx = last_index
         local = run_id in _agent_run_events
@@ -563,11 +606,19 @@ class RunEngine(DbConsumer):
 
                 # Check if run is done
                 run = _active_runs.get(run_id)
-                if run and run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
+                if run and run.status in (
+                    RunStatus.COMPLETED,
+                    RunStatus.FAILED,
+                    RunStatus.CANCELLED,
+                ):
                     return
                 if not run and elapsed_idle >= 2.0 and int(elapsed_idle) % 2 == 0:
                     db_run = self.restore_run(run_id)
-                    if not db_run or db_run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
+                    if not db_run or db_run.status in (
+                        RunStatus.COMPLETED,
+                        RunStatus.FAILED,
+                        RunStatus.CANCELLED,
+                    ):
                         return
 
                 # Wait: event-driven for local, interval for cross-worker
@@ -602,14 +653,16 @@ class RunEngine(DbConsumer):
         events = _agent_run_events.setdefault(run_id, [])
         idx = len(events)
         events.append(sse)
-        self._pending_inserts.append({
-            "run_id": run_id,
-            "idx": idx,
-            "event_type": sse.get("event_type", ""),
-            "data": json.dumps(sse.get("data", {})),
-            "event_id": sse.get("event_id"),
-            "agent_id": sse.get("agent_id"),
-        })
+        self._pending_inserts.append(
+            {
+                "run_id": run_id,
+                "idx": idx,
+                "event_type": sse.get("event_type", ""),
+                "data": json.dumps(sse.get("data", {})),
+                "event_id": sse.get("event_id"),
+                "agent_id": sse.get("agent_id"),
+            }
+        )
         if len(self._pending_inserts) >= _RUN_EVENT_FLUSH_SIZE:
             self._flush_agent_run_events()
 
@@ -651,7 +704,9 @@ class RunEngine(DbConsumer):
                 self._pending_inserts = merged
                 self._flush_agent_run_events(_retried=True)
             else:
-                logger.error("Event batch commit failed after retry, %d events dropped: %s", len(batch), e)
+                logger.error(
+                    "Event batch commit failed after retry, %d events dropped: %s", len(batch), e
+                )
 
     def _load_events_from_db(self, run_id: str, after_index: int = 0) -> list[dict]:
         """Load events from DB for cross-worker streaming."""
@@ -670,13 +725,15 @@ class RunEngine(DbConsumer):
                     data = row[1]
                     if isinstance(data, str):
                         data = json.loads(data)
-                    result.append({
-                        "event_type": row[0],
-                        "data": data,
-                        "event_id": row[2],
-                        "agent_id": row[3],
-                        "run_id": run_id,
-                    })
+                    result.append(
+                        {
+                            "event_type": row[0],
+                            "data": data,
+                            "event_id": row[2],
+                            "agent_id": row[3],
+                            "run_id": run_id,
+                        }
+                    )
                 return result
         except Exception as e:
             logger.error(f"Failed to load events from DB for {run_id}: {e}")
@@ -692,8 +749,10 @@ class RunEngine(DbConsumer):
         with self._db() as db:
             try:
                 row = db.execute(
-                    text("SELECT MIN(idx) FROM agent_run_events "
-                         "WHERE run_id = :run_id AND event_type = 'resume_claim'"),
+                    text(
+                        "SELECT MIN(idx) FROM agent_run_events "
+                        "WHERE run_id = :run_id AND event_type = 'resume_claim'"
+                    ),
                     {"run_id": run_id},
                 ).fetchone()
                 prev_min = row[0] if row and row[0] is not None else 0
@@ -762,11 +821,14 @@ class RunEngine(DbConsumer):
         self._log_run_event(run, EventType.RUN_COMPLETED)
 
         if run.parent_run_id:
-            self._append_event(run.parent_run_id, {
-                "event_type": "child_run_completed",
-                "data": {"child_run_id": run.run_id},
-                "run_id": run.parent_run_id,
-            })
+            self._append_event(
+                run.parent_run_id,
+                {
+                    "event_type": "child_run_completed",
+                    "data": {"child_run_id": run.run_id},
+                    "run_id": run.parent_run_id,
+                },
+            )
 
     async def _check_fan_in(self, parent_run_id: str) -> None:
         """If all child runs completed, resume the parent with aggregated results.
@@ -813,7 +875,7 @@ class RunEngine(DbConsumer):
             agent_id = child.agent_id if child else cid
             results[agent_id] = {
                 "run_id": cid,
-                "status": status.value if hasattr(status, 'value') else str(status),
+                "status": status.value if hasattr(status, "value") else str(status),
                 "output": final_text or "(no text output)",
                 "tool_results": tool_results,
             }
@@ -849,7 +911,9 @@ class RunEngine(DbConsumer):
         restored = self.restore_run(run_id)
         return restored.agent_id if restored else run_id
 
-    def _log_run_event(self, run: AgentRun, event_type: EventType, extra_meta: dict | None = None) -> None:
+    def _log_run_event(
+        self, run: AgentRun, event_type: EventType, extra_meta: dict | None = None
+    ) -> None:
         meta = {"run_id": run.run_id}
         if run.parent_run_id:
             meta["parent_run_id"] = run.parent_run_id
@@ -891,10 +955,7 @@ class RunEngine(DbConsumer):
     def _maybe_gc() -> None:
         """Remove oldest completed runs from memory if over threshold."""
         terminal = {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}
-        completed = [
-            (rid, r) for rid, r in _active_runs.items()
-            if r.status in terminal
-        ]
+        completed = [(rid, r) for rid, r in _active_runs.items() if r.status in terminal]
         if len(completed) <= _MAX_COMPLETED_RUNS:
             return
         # Sort by completed_at, remove oldest
@@ -909,7 +970,9 @@ class RunEngine(DbConsumer):
     @staticmethod
     def _stream_event_to_dict(event: StreamEvent, run_id: str) -> dict:
         return {
-            "event_type": event.event_type.value if hasattr(event.event_type, 'value') else str(event.event_type),
+            "event_type": event.event_type.value
+            if hasattr(event.event_type, "value")
+            else str(event.event_type),
             "data": event.data,
             "event_id": event.event_id,
             "causal_chain_id": event.causal_chain_id,

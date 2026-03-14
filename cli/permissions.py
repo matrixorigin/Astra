@@ -41,7 +41,9 @@ TOOL_BYPASS_WARNING_PATTERNS = [
     # Also matches chained: ls && rm file.py, echo x; rm file.py
     # Does NOT match: rm -rf dir/, rm -r dir (directory operations)
     # Does NOT match: echo rm file.py, grep rm file.py (rm as argument)
-    re.compile(r"(?:^|[;&|]\s*)\s*rm\s+(-[a-zA-Z]*\s+)?[^\s]+\.(py|js|ts|go|rs|java|c|cpp|h|md|txt|json|yaml|yml|toml|sh)\b"),
+    re.compile(
+        r"(?:^|[;&|]\s*)\s*rm\s+(-[a-zA-Z]*\s+)?[^\s]+\.(py|js|ts|go|rs|java|c|cpp|h|md|txt|json|yaml|yml|toml|sh)\b"
+    ),
 ]
 
 
@@ -137,22 +139,30 @@ class PermissionManager:
             detail = str(args)[:100]
         return f"⚡ {tool_name}: {detail}"
 
-    def prompt_user(self, tool_name: str, side_effect: SideEffect, args: dict[str, Any]) -> Decision:
+    def prompt_user(
+        self, tool_name: str, side_effect: SideEffect, args: dict[str, Any]
+    ) -> Decision:
         """Interactive permission prompt with rich formatting when available.
 
         Raises KeyboardInterrupt on Ctrl-C so the caller can cancel the
         entire turn instead of silently treating it as "deny".
         """
         import sys
+
         if sys.stdin.isatty():
             try:
                 from rich.console import Console
                 from rich.panel import Panel
+
                 console = Console(stderr=True)
-                console.print(Panel(
-                    self.format_prompt(tool_name, args),
-                    border_style="yellow", title="Permission", title_align="left",
-                ))
+                console.print(
+                    Panel(
+                        self.format_prompt(tool_name, args),
+                        border_style="yellow",
+                        title="Permission",
+                        title_align="left",
+                    )
+                )
                 console.print(
                     "  [green]\\[Y]es[/green]  [red]\\[N]o[/red]  "
                     "[cyan]\\[A]lways[/cyan]  [red]\\[D]eny always[/red]",

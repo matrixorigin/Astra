@@ -152,7 +152,9 @@ class ConflictResolver(DbConsumer):
         for agent_id in priority_order:
             for proposal in conflict.proposals:
                 if proposal.agent_id == agent_id:
-                    logger.info(f"Conflict {conflict.conflict_id} resolved by authority: {agent_id}")
+                    logger.info(
+                        f"Conflict {conflict.conflict_id} resolved by authority: {agent_id}"
+                    )
                     return proposal
 
         # Fallback: first proposal
@@ -176,10 +178,7 @@ class ConflictResolver(DbConsumer):
             scored = [(p, scoring_fn(p)) for p in conflict.proposals]
         else:
             # Simple: proposals with evidence score higher
-            scored = [
-                (p, len(p.evidence or {}) if p.evidence else 0)
-                for p in conflict.proposals
-            ]
+            scored = [(p, len(p.evidence or {}) if p.evidence else 0) for p in conflict.proposals]
 
         winner = max(scored, key=lambda x: x[1])[0]
         logger.info(f"Conflict {conflict.conflict_id} resolved by evidence: {winner.agent_id}")

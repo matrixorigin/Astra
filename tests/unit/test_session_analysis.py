@@ -21,12 +21,14 @@ import pytest
 # 1. SessionAnalyzer tests
 # ============================================================================
 
+
 class TestSessionAnalyzer:
     """Test SessionAnalyzer with real DB events."""
 
     @pytest.fixture
     def analyzer(self, db_factory):
         from core.agent.session_analyzer import SessionAnalyzer
+
         return SessionAnalyzer(db_factory)
 
     @pytest.fixture
@@ -47,17 +49,33 @@ class TestSessionAnalyzer:
         # Create events via EventLogger (handles all required columns)
         events_spec = [
             ("user_query", "test question", None, base),
-            ("tool_call", json.dumps({"name": "stock_assistant", "tool_call_id": "tc1"}),
-             "stock_assistant", base + timedelta(seconds=1)),
-            ("tool_result", json.dumps({"name": "stock_assistant", "result": "Malformed arguments JSON: bad"}),
-             "stock_assistant", base + timedelta(seconds=8)),
+            (
+                "tool_call",
+                json.dumps({"name": "stock_assistant", "tool_call_id": "tc1"}),
+                "stock_assistant",
+                base + timedelta(seconds=1),
+            ),
+            (
+                "tool_result",
+                json.dumps({"name": "stock_assistant", "result": "Malformed arguments JSON: bad"}),
+                "stock_assistant",
+                base + timedelta(seconds=8),
+            ),
             ("llm_response", "Here is the answer", None, base + timedelta(seconds=9)),
             # 50s gap — simulates cloud skill loop
-            ("tool_call", json.dumps({"name": "execute_code", "arguments": {}, "source": "cloud"}),
-             None, base + timedelta(seconds=59)),
+            (
+                "tool_call",
+                json.dumps({"name": "execute_code", "arguments": {}, "source": "cloud"}),
+                None,
+                base + timedelta(seconds=59),
+            ),
             # Another 40s gap
-            ("tool_call", json.dumps({"name": "execute_code", "arguments": {}, "source": "cloud"}),
-             None, base + timedelta(seconds=99)),
+            (
+                "tool_call",
+                json.dumps({"name": "execute_code", "arguments": {}, "source": "cloud"}),
+                None,
+                base + timedelta(seconds=99),
+            ),
             ("llm_response", "Final answer", None, base + timedelta(seconds=140)),
         ]
 
@@ -69,30 +87,40 @@ class TestSessionAnalyzer:
         for etype, content, skill, ts in events_spec[1:]:
             if etype == "llm_response":
                 ev = el.create_llm_response(
-                    user_id=user_id, session_id=sid, content=content,
-                    agent_id="dev-agent", agent_version="0.1.0",
-                    parent_event_id=uq.event_id, causal_chain_id=chain,
+                    user_id=user_id,
+                    session_id=sid,
+                    content=content,
+                    agent_id="dev-agent",
+                    agent_version="0.1.0",
+                    parent_event_id=uq.event_id,
+                    causal_chain_id=chain,
                 )
             else:
                 ev = el.create_stream_event(
-                    user_id=user_id, session_id=sid, event_type=etype,
-                    content=content, parent_event_id=uq.event_id,
-                    causal_chain_id=chain, skill_name=skill,
+                    user_id=user_id,
+                    session_id=sid,
+                    event_type=etype,
+                    content=content,
+                    parent_event_id=uq.event_id,
+                    causal_chain_id=chain,
+                    skill_name=skill,
                 )
             event_ids.append((ev.event_id, ts))
 
         # Backfill created_at to simulate time gaps
         with db_factory() as db:
             for eid, ts in event_ids:
-                db.execute(text(
-                    "UPDATE agent_events SET created_at = :ts WHERE event_id = :eid"
-                ), {"ts": ts, "eid": eid})
+                db.execute(
+                    text("UPDATE agent_events SET created_at = :ts WHERE event_id = :eid"),
+                    {"ts": ts, "eid": eid},
+                )
             db.commit()
 
         yield sid, user_id
 
         # Cleanup
         from api.models.agent import Event as EventModel, Session as SessionModel
+
         db_session.query(EventModel).filter(EventModel.session_id == sid).delete()
         db_session.query(SessionModel).filter(SessionModel.session_id == sid).delete()
         db_session.commit()
@@ -164,8 +192,9 @@ class TestSessionAnalyzer:
         report = analyzer.analyze(sid)
 
         # Should recommend model routing for large gaps
-        has_latency_rec = any("latency" in r.lower() or "model" in r.lower()
-                             for r in report.recommendations)
+        has_latency_rec = any(
+            "latency" in r.lower() or "model" in r.lower() for r in report.recommendations
+        )
         has_error_rec = any("error" in r.lower() for r in report.recommendations)
         assert has_latency_rec or has_error_rec
 
@@ -178,10 +207,40 @@ class TestSessionAnalyzer:
         rows = [
             # First turn
             ("e1", "user_query", "first question", None, t0, None, {}, None, None),
-            ("e2", "llm_response", "answer 1", None, t0 + timedelta(seconds=2), None, {}, None, None),
+            (
+                "e2",
+                "llm_response",
+                "answer 1",
+                None,
+                t0 + timedelta(seconds=2),
+                None,
+                {},
+                None,
+                None,
+            ),
             # 445s user think time before second user_query — must NOT be flagged
-            ("e3", "user_query", "second question", None, t0 + timedelta(seconds=447), None, {}, None, None),
-            ("e4", "llm_response", "answer 2", None, t0 + timedelta(seconds=449), None, {}, None, None),
+            (
+                "e3",
+                "user_query",
+                "second question",
+                None,
+                t0 + timedelta(seconds=447),
+                None,
+                {},
+                None,
+                None,
+            ),
+            (
+                "e4",
+                "llm_response",
+                "answer 2",
+                None,
+                t0 + timedelta(seconds=449),
+                None,
+                {},
+                None,
+                None,
+            ),
         ]
 
         mock_db = MagicMock()
@@ -201,12 +260,17 @@ class TestSessionAnalyzer:
 
     def test_summarize_event_types(self, analyzer):
         from core.agent.session_analyzer import SessionAnalyzer
+
         assert SessionAnalyzer._summarize_event("user_query", "hello world", None) == "hello world"
-        assert SessionAnalyzer._summarize_event("session_history_snapshot", None, None) == "snapshot"
+        assert (
+            SessionAnalyzer._summarize_event("session_history_snapshot", None, None) == "snapshot"
+        )
         assert "→" in SessionAnalyzer._summarize_event(
-            "tool_call", json.dumps({"name": "bash"}), "bash")
+            "tool_call", json.dumps({"name": "bash"}), "bash"
+        )
         assert "←" in SessionAnalyzer._summarize_event(
-            "tool_result", json.dumps({"name": "bash", "result": "ok"}), "bash")
+            "tool_result", json.dumps({"name": "bash", "result": "ok"}), "bash"
+        )
 
     def test_stall_detection_in_analyzer(self):
         """Analyzer detects repeated identical tool calls as a stall pattern.
@@ -224,21 +288,58 @@ class TestSessionAnalyzer:
         for i in range(5):
             base = i * 3 + 1
             events.append(
-                (f"r{i}", "llm_response", "Checking...", None,
-                 t0 + timedelta(seconds=base), None, {}, None, None))
+                (
+                    f"r{i}",
+                    "llm_response",
+                    "Checking...",
+                    None,
+                    t0 + timedelta(seconds=base),
+                    None,
+                    {},
+                    None,
+                    None,
+                )
+            )
             events.append(
-                (f"tc{i}", "tool_call",
-                 json.dumps({"name": "git_status", "arguments": "{}"}),
-                 None, t0 + timedelta(seconds=base + 1), None, {}, None, None))
+                (
+                    f"tc{i}",
+                    "tool_call",
+                    json.dumps({"name": "git_status", "arguments": "{}"}),
+                    None,
+                    t0 + timedelta(seconds=base + 1),
+                    None,
+                    {},
+                    None,
+                    None,
+                )
+            )
             events.append(
-                (f"tr{i}", "tool_result",
-                 json.dumps({"name": "git_status", "result": "M file.py"}),
-                 None, t0 + timedelta(seconds=base + 2), None, {}, None, None))
+                (
+                    f"tr{i}",
+                    "tool_result",
+                    json.dumps({"name": "git_status", "result": "M file.py"}),
+                    None,
+                    t0 + timedelta(seconds=base + 2),
+                    None,
+                    {},
+                    None,
+                    None,
+                )
+            )
         rows = [
             ("e0", "user_query", "check status", None, t0, None, {}, None, None),
             *events,
-            ("e_final", "llm_response", "Here is the answer", None,
-             t0 + timedelta(seconds=20), None, {}, None, None),
+            (
+                "e_final",
+                "llm_response",
+                "Here is the answer",
+                None,
+                t0 + timedelta(seconds=20),
+                None,
+                {},
+                None,
+                None,
+            ),
         ]
 
         mock_db = MagicMock()
@@ -266,17 +367,50 @@ class TestSessionAnalyzer:
         t0 = datetime(2026, 1, 1, 0, 0, 0)
         rows = [
             ("e0", "user_query", "explore", None, t0, None, {}, None, None),
-            ("tc1", "tool_call",
-             json.dumps({"name": "read_file", "arguments": '{"path":"a.py"}'}),
-             None, t0 + timedelta(seconds=1), None, {}, None, None),
-            ("tc2", "tool_call",
-             json.dumps({"name": "read_file", "arguments": '{"path":"b.py"}'}),
-             None, t0 + timedelta(seconds=2), None, {}, None, None),
-            ("tc3", "tool_call",
-             json.dumps({"name": "read_file", "arguments": '{"path":"c.py"}'}),
-             None, t0 + timedelta(seconds=3), None, {}, None, None),
-            ("e_final", "llm_response", "Done", None,
-             t0 + timedelta(seconds=4), None, {}, None, None),
+            (
+                "tc1",
+                "tool_call",
+                json.dumps({"name": "read_file", "arguments": '{"path":"a.py"}'}),
+                None,
+                t0 + timedelta(seconds=1),
+                None,
+                {},
+                None,
+                None,
+            ),
+            (
+                "tc2",
+                "tool_call",
+                json.dumps({"name": "read_file", "arguments": '{"path":"b.py"}'}),
+                None,
+                t0 + timedelta(seconds=2),
+                None,
+                {},
+                None,
+                None,
+            ),
+            (
+                "tc3",
+                "tool_call",
+                json.dumps({"name": "read_file", "arguments": '{"path":"c.py"}'}),
+                None,
+                t0 + timedelta(seconds=3),
+                None,
+                {},
+                None,
+                None,
+            ),
+            (
+                "e_final",
+                "llm_response",
+                "Done",
+                None,
+                t0 + timedelta(seconds=4),
+                None,
+                {},
+                None,
+                None,
+            ),
         ]
 
         mock_db = MagicMock()
@@ -308,22 +442,71 @@ class TestSessionAnalyzer:
         rows = [
             ("e0", "user_query", "check", None, t0, None, {}, None, None),
             # Round 1: 2 identical calls
-            ("r0", "llm_response", "Let me check...", None, t0 + timedelta(seconds=1), None, {}, None, None),
+            (
+                "r0",
+                "llm_response",
+                "Let me check...",
+                None,
+                t0 + timedelta(seconds=1),
+                None,
+                {},
+                None,
+                None,
+            ),
             ("tc1", "tool_call", tc, None, t0 + timedelta(seconds=2), None, {}, None, None),
             ("tr1", "tool_result", tr, None, t0 + timedelta(seconds=3), None, {}, None, None),
-            ("r1", "llm_response", "Checking again...", None, t0 + timedelta(seconds=4), None, {}, None, None),
+            (
+                "r1",
+                "llm_response",
+                "Checking again...",
+                None,
+                t0 + timedelta(seconds=4),
+                None,
+                {},
+                None,
+                None,
+            ),
             ("tc2", "tool_call", tc, None, t0 + timedelta(seconds=5), None, {}, None, None),
             ("tr2", "tool_result", tr, None, t0 + timedelta(seconds=6), None, {}, None, None),
             # llm_response between rounds — must NOT reset stall tracking
-            ("r2", "llm_response", "One more time...", None, t0 + timedelta(seconds=7), None, {}, None, None),
+            (
+                "r2",
+                "llm_response",
+                "One more time...",
+                None,
+                t0 + timedelta(seconds=7),
+                None,
+                {},
+                None,
+                None,
+            ),
             # Round 2: 2 more identical calls → total 4 ≥ threshold 3
             ("tc3", "tool_call", tc, None, t0 + timedelta(seconds=8), None, {}, None, None),
             ("tr3", "tool_result", tr, None, t0 + timedelta(seconds=9), None, {}, None, None),
-            ("r3", "llm_response", "And again...", None, t0 + timedelta(seconds=10), None, {}, None, None),
+            (
+                "r3",
+                "llm_response",
+                "And again...",
+                None,
+                t0 + timedelta(seconds=10),
+                None,
+                {},
+                None,
+                None,
+            ),
             ("tc4", "tool_call", tc, None, t0 + timedelta(seconds=11), None, {}, None, None),
             ("tr4", "tool_result", tr, None, t0 + timedelta(seconds=12), None, {}, None, None),
-            ("e_final", "llm_response", "Done", None,
-             t0 + timedelta(seconds=13), None, {}, None, None),
+            (
+                "e_final",
+                "llm_response",
+                "Done",
+                None,
+                t0 + timedelta(seconds=13),
+                None,
+                {},
+                None,
+                None,
+            ),
         ]
 
         mock_db = MagicMock()
@@ -337,8 +520,9 @@ class TestSessionAnalyzer:
         report = analyzer.analyze("stall-across-llm-response")
 
         stall_issues = [i for i in report.issues if i["type"] == "tool_call_stall"]
-        assert len(stall_issues) == 1, \
+        assert len(stall_issues) == 1, (
             "4 identical calls across llm_response boundary should be detected as stall"
+        )
         assert stall_issues[0]["repeat_count"] == 4
 
 
@@ -346,26 +530,31 @@ class TestSessionAnalyzer:
 # 1b. Execution tree, summary, cost, and ASCII rendering (unit tests)
 # ============================================================================
 
+
 class TestCalculateCost:
     """Unit tests for _calculate_cost."""
 
     def test_known_model(self):
         from core.agent.session_analyzer import _calculate_cost
+
         cost = _calculate_cost("gpt-4o", 1_000_000, 1_000_000)
         assert cost == pytest.approx(2.50 + 10.00)
 
     def test_prefix_match(self):
         from core.agent.session_analyzer import _calculate_cost
+
         cost = _calculate_cost("gpt-4o-2024-08-06", 1_000_000, 0)
         assert cost == pytest.approx(2.50)
 
     def test_unknown_model_returns_zero(self):
         from core.agent.session_analyzer import _calculate_cost
+
         cost = _calculate_cost("unknown-model-xyz", 1000, 1000)
         assert cost == 0.0
 
     def test_zero_tokens(self):
         from core.agent.session_analyzer import _calculate_cost
+
         assert _calculate_cost("gpt-4o", 0, 0) == 0.0
 
 
@@ -374,9 +563,14 @@ class TestExecutionNodeAscii:
 
     def test_single_node(self):
         from core.agent.session_analyzer import ExecutionNode
+
         node = ExecutionNode(
-            node_id="1", node_type="user_query", event_id="1",
-            ts=datetime(2026, 1, 1), duration_s=5.0, detail="hello",
+            node_id="1",
+            node_type="user_query",
+            event_id="1",
+            ts=datetime(2026, 1, 1),
+            duration_s=5.0,
+            detail="hello",
         )
         lines = node.to_ascii()
         assert len(lines) == 1
@@ -386,9 +580,13 @@ class TestExecutionNodeAscii:
 
     def test_parent_duration_pct_shown(self):
         from core.agent.session_analyzer import ExecutionNode
+
         node = ExecutionNode(
-            node_id="1", node_type="llm_response", event_id="1",
-            ts=datetime(2026, 1, 1), duration_s=3.0,
+            node_id="1",
+            node_type="llm_response",
+            event_id="1",
+            ts=datetime(2026, 1, 1),
+            duration_s=3.0,
             parent_duration_pct=75.0,
         )
         lines = node.to_ascii()
@@ -397,9 +595,13 @@ class TestExecutionNodeAscii:
     def test_parent_duration_pct_zero_shown(self):
         """parent_duration_pct=0.0 should still render (not be skipped by truthiness)."""
         from core.agent.session_analyzer import ExecutionNode
+
         node = ExecutionNode(
-            node_id="1", node_type="llm_response", event_id="1",
-            ts=datetime(2026, 1, 1), duration_s=1.0,
+            node_id="1",
+            node_type="llm_response",
+            event_id="1",
+            ts=datetime(2026, 1, 1),
+            duration_s=1.0,
             parent_duration_pct=0.0,
         )
         lines = node.to_ascii()
@@ -407,19 +609,28 @@ class TestExecutionNodeAscii:
 
     def test_tokens_displayed(self):
         from core.agent.session_analyzer import ExecutionNode
+
         node = ExecutionNode(
-            node_id="1", node_type="llm_response", event_id="1",
-            ts=datetime(2026, 1, 1), duration_s=1.0,
-            tokens_in=100, tokens_out=50,
+            node_id="1",
+            node_type="llm_response",
+            event_id="1",
+            ts=datetime(2026, 1, 1),
+            duration_s=1.0,
+            tokens_in=100,
+            tokens_out=50,
         )
         lines = node.to_ascii()
         assert "100→50 tokens" in lines[0]
 
     def test_cost_displayed(self):
         from core.agent.session_analyzer import ExecutionNode
+
         node = ExecutionNode(
-            node_id="1", node_type="llm_response", event_id="1",
-            ts=datetime(2026, 1, 1), duration_s=1.0,
+            node_id="1",
+            node_type="llm_response",
+            event_id="1",
+            ts=datetime(2026, 1, 1),
+            duration_s=1.0,
             cost_usd=0.0123,
         )
         lines = node.to_ascii()
@@ -427,9 +638,13 @@ class TestExecutionNodeAscii:
 
     def test_issues_displayed(self):
         from core.agent.session_analyzer import ExecutionNode
+
         node = ExecutionNode(
-            node_id="1", node_type="tool_result", event_id="1",
-            ts=datetime(2026, 1, 1), duration_s=15.0,
+            node_id="1",
+            node_type="tool_result",
+            event_id="1",
+            ts=datetime(2026, 1, 1),
+            duration_s=15.0,
             issues=["SLOW", "BOTTLENECK"],
         )
         lines = node.to_ascii()
@@ -438,14 +653,21 @@ class TestExecutionNodeAscii:
 
     def test_children_rendered(self):
         from core.agent.session_analyzer import ExecutionNode
+
         child = ExecutionNode(
-            node_id="c1", node_type="tool_call", event_id="c1",
-            ts=datetime(2026, 1, 1), duration_s=0,
+            node_id="c1",
+            node_type="tool_call",
+            event_id="c1",
+            ts=datetime(2026, 1, 1),
+            duration_s=0,
             detail="bash",
         )
         parent = ExecutionNode(
-            node_id="p1", node_type="llm_response", event_id="p1",
-            ts=datetime(2026, 1, 1), duration_s=2.0,
+            node_id="p1",
+            node_type="llm_response",
+            event_id="p1",
+            ts=datetime(2026, 1, 1),
+            duration_s=2.0,
             children=[child],
         )
         lines = parent.to_ascii()
@@ -455,9 +677,13 @@ class TestExecutionNodeAscii:
 
     def test_tool_result_metadata_rendered(self):
         from core.agent.session_analyzer import ExecutionNode
+
         node = ExecutionNode(
-            node_id="1", node_type="tool_result", event_id="1",
-            ts=datetime(2026, 1, 1), duration_s=1.0,
+            node_id="1",
+            node_type="tool_result",
+            event_id="1",
+            ts=datetime(2026, 1, 1),
+            duration_s=1.0,
             metadata={"api_latency_ms": 500, "result_size_bytes": 2048, "result_size_tokens": 300},
         )
         lines = node.to_ascii()
@@ -469,14 +695,34 @@ class TestExecutionNodeAscii:
 class TestBuildExecutionTree:
     """Unit tests for _build_execution_tree and _build_basic_tree."""
 
-    def _make_row(self, event_id, event_type, content, skill_name, ts, agent_id="agent", metadata=None,
-                  token_usage=None, llm_model=None):
+    def _make_row(
+        self,
+        event_id,
+        event_type,
+        content,
+        skill_name,
+        ts,
+        agent_id="agent",
+        metadata=None,
+        token_usage=None,
+        llm_model=None,
+    ):
         """Create a fake DB row tuple matching the SELECT column order (9 columns)."""
-        return (event_id, event_type, content, skill_name, ts, agent_id, metadata or {},
-                token_usage, llm_model)
+        return (
+            event_id,
+            event_type,
+            content,
+            skill_name,
+            ts,
+            agent_id,
+            metadata or {},
+            token_usage,
+            llm_model,
+        )
 
     def _make_analyzer(self):
         from core.agent.session_analyzer import SessionAnalyzer
+
         # SessionAnalyzer needs a db_factory but tree building doesn't use DB
         return SessionAnalyzer(db_factory=lambda: None)
 
@@ -516,8 +762,16 @@ class TestBuildExecutionTree:
         rows = [
             self._make_row("e1", "user_query", "do stuff", None, t0),
             self._make_row("e2", "llm_response", "calling tool", None, t0 + timedelta(seconds=1)),
-            self._make_row("e3", "tool_call", json.dumps({"name": "bash"}), "bash", t0 + timedelta(seconds=2)),
-            self._make_row("e4", "tool_result", json.dumps({"name": "bash", "result": "ok"}), "bash", t0 + timedelta(seconds=5)),
+            self._make_row(
+                "e3", "tool_call", json.dumps({"name": "bash"}), "bash", t0 + timedelta(seconds=2)
+            ),
+            self._make_row(
+                "e4",
+                "tool_result",
+                json.dumps({"name": "bash", "result": "ok"}),
+                "bash",
+                t0 + timedelta(seconds=5),
+            ),
             self._make_row("e5", "llm_response", "done", None, t0 + timedelta(seconds=7)),
         ]
         tree = analyzer._build_execution_tree(rows)
@@ -545,10 +799,26 @@ class TestBuildExecutionTree:
         rows = [
             self._make_row("e1", "user_query", "q", None, t0),
             self._make_row("e2", "llm_response", "r", None, t0 + timedelta(seconds=1)),
-            self._make_row("e3", "tool_call", json.dumps({"name": "foo"}), "foo", t0 + timedelta(seconds=2)),
-            self._make_row("e4", "tool_call", json.dumps({"name": "bar"}), "bar", t0 + timedelta(seconds=3)),
-            self._make_row("e5", "tool_result", json.dumps({"name": "foo", "result": "ok"}), "foo", t0 + timedelta(seconds=5)),
-            self._make_row("e6", "tool_result", json.dumps({"name": "bar", "result": "ok"}), "bar", t0 + timedelta(seconds=6)),
+            self._make_row(
+                "e3", "tool_call", json.dumps({"name": "foo"}), "foo", t0 + timedelta(seconds=2)
+            ),
+            self._make_row(
+                "e4", "tool_call", json.dumps({"name": "bar"}), "bar", t0 + timedelta(seconds=3)
+            ),
+            self._make_row(
+                "e5",
+                "tool_result",
+                json.dumps({"name": "foo", "result": "ok"}),
+                "foo",
+                t0 + timedelta(seconds=5),
+            ),
+            self._make_row(
+                "e6",
+                "tool_result",
+                json.dumps({"name": "bar", "result": "ok"}),
+                "bar",
+                t0 + timedelta(seconds=6),
+            ),
         ]
         tree = analyzer._build_execution_tree(rows)
         llm = tree.children[0].children[0]
@@ -568,8 +838,16 @@ class TestBuildExecutionTree:
         rows = [
             self._make_row("e1", "user_query", "q", None, t0),
             self._make_row("e2", "llm_response", "r", None, t0 + timedelta(seconds=1)),
-            self._make_row("e3", "tool_call", json.dumps({"name": "x"}), "x", t0 + timedelta(seconds=2)),
-            self._make_row("e4", "tool_result", json.dumps({"name": "x", "result": "ok"}), "x", t0 + timedelta(seconds=4)),
+            self._make_row(
+                "e3", "tool_call", json.dumps({"name": "x"}), "x", t0 + timedelta(seconds=2)
+            ),
+            self._make_row(
+                "e4",
+                "tool_result",
+                json.dumps({"name": "x", "result": "ok"}),
+                "x",
+                t0 + timedelta(seconds=4),
+            ),
         ]
         tree = analyzer._build_execution_tree(rows)
         llm = tree.children[0].children[0]
@@ -584,8 +862,12 @@ class TestBuildExecutionTree:
         rows = [
             self._make_row("e1", "user_query", "q", None, t0),
             self._make_row("e2", "llm_response", "r", None, t0 + timedelta(seconds=1)),
-            self._make_row("e3", "tool_call", "not json", "fallback_skill", t0 + timedelta(seconds=2)),
-            self._make_row("e4", "tool_result", "also not json", "fallback_skill", t0 + timedelta(seconds=3)),
+            self._make_row(
+                "e3", "tool_call", "not json", "fallback_skill", t0 + timedelta(seconds=2)
+            ),
+            self._make_row(
+                "e4", "tool_result", "also not json", "fallback_skill", t0 + timedelta(seconds=3)
+            ),
         ]
         tree = analyzer._build_execution_tree(rows)
         # Should not raise; tool_call should use skill_name as fallback
@@ -599,7 +881,13 @@ class TestBuildExecutionTree:
         rows = [
             self._make_row("e1", "user_query", "q", None, t0),
             self._make_row("e2", "llm_response", "r", None, t0 + timedelta(seconds=1)),
-            self._make_row("e3", "tool_result", json.dumps({"name": "orphan", "result": "ok"}), "orphan", t0 + timedelta(seconds=2)),
+            self._make_row(
+                "e3",
+                "tool_result",
+                json.dumps({"name": "orphan", "result": "ok"}),
+                "orphan",
+                t0 + timedelta(seconds=2),
+            ),
         ]
         tree = analyzer._build_execution_tree(rows)
         llm = tree.children[0].children[0]
@@ -625,8 +913,16 @@ class TestBuildExecutionTree:
         rows = [
             self._make_row("e1", "user_query", "q", None, t0),
             self._make_row("e2", "llm_response", "r", None, t0 + timedelta(seconds=5)),
-            self._make_row("e3", "tool_call", json.dumps({"name": "x"}), "x", t0 + timedelta(seconds=6)),
-            self._make_row("e4", "tool_result", json.dumps({"name": "x", "result": "ok"}), "x", t0 + timedelta(seconds=20)),
+            self._make_row(
+                "e3", "tool_call", json.dumps({"name": "x"}), "x", t0 + timedelta(seconds=6)
+            ),
+            self._make_row(
+                "e4",
+                "tool_result",
+                json.dumps({"name": "x", "result": "ok"}),
+                "x",
+                t0 + timedelta(seconds=20),
+            ),
         ]
         tree = analyzer._build_execution_tree(rows)
         uq = tree.children[0]
@@ -639,7 +935,11 @@ class TestBuildExecutionTree:
         rows = [
             self._make_row("e1", "user_query", "q", None, t0),
             self._make_row(
-                "e2", "llm_response", "r", None, t0 + timedelta(seconds=2),
+                "e2",
+                "llm_response",
+                "r",
+                None,
+                t0 + timedelta(seconds=2),
                 token_usage={"prompt_tokens": 1000, "completion_tokens": 200},
                 llm_model="gpt-4o",
             ),
@@ -657,11 +957,20 @@ class TestBuildExecutionTree:
         rows = [
             self._make_row("e1", "user_query", "q", None, t0),
             self._make_row("e2", "llm_response", "r", None, t0 + timedelta(seconds=1)),
-            self._make_row("e3", "tool_call", json.dumps({"name": "bash"}), "bash", t0 + timedelta(seconds=2)),
             self._make_row(
-                "e4", "tool_result", json.dumps({"name": "bash", "result": "ok"}), "bash",
+                "e3", "tool_call", json.dumps({"name": "bash"}), "bash", t0 + timedelta(seconds=2)
+            ),
+            self._make_row(
+                "e4",
+                "tool_result",
+                json.dumps({"name": "bash", "result": "ok"}),
+                "bash",
                 t0 + timedelta(seconds=5),
-                metadata={"duration_ms": 3000, "result_size_bytes": 4096, "result_size_tokens": 500},
+                metadata={
+                    "duration_ms": 3000,
+                    "result_size_bytes": 4096,
+                    "result_size_tokens": 500,
+                },
             ),
         ]
         tree = analyzer._build_execution_tree(rows)
@@ -677,38 +986,54 @@ class TestCalculateMetrics:
 
     def _make_analyzer(self):
         from core.agent.session_analyzer import SessionAnalyzer
+
         return SessionAnalyzer(db_factory=lambda: None)
 
     def test_slow_detection(self):
         from core.agent.session_analyzer import ExecutionNode, SLOW_NODE_THRESHOLD_S
+
         analyzer = self._make_analyzer()
         node = ExecutionNode(
-            node_id="1", node_type="tool_result", event_id="1",
-            ts=datetime(2026, 1, 1), duration_s=SLOW_NODE_THRESHOLD_S,
+            node_id="1",
+            node_type="tool_result",
+            event_id="1",
+            ts=datetime(2026, 1, 1),
+            duration_s=SLOW_NODE_THRESHOLD_S,
         )
         analyzer._calculate_metrics(node, None)
         assert "SLOW" in node.issues
 
     def test_not_slow_below_threshold(self):
         from core.agent.session_analyzer import ExecutionNode, SLOW_NODE_THRESHOLD_S
+
         analyzer = self._make_analyzer()
         node = ExecutionNode(
-            node_id="1", node_type="tool_result", event_id="1",
-            ts=datetime(2026, 1, 1), duration_s=SLOW_NODE_THRESHOLD_S - 1,
+            node_id="1",
+            node_type="tool_result",
+            event_id="1",
+            ts=datetime(2026, 1, 1),
+            duration_s=SLOW_NODE_THRESHOLD_S - 1,
         )
         analyzer._calculate_metrics(node, None)
         assert "SLOW" not in node.issues
 
     def test_bottleneck_detection(self):
         from core.agent.session_analyzer import ExecutionNode
+
         analyzer = self._make_analyzer()
         parent = ExecutionNode(
-            node_id="p", node_type="user_query", event_id="p",
-            ts=datetime(2026, 1, 1), duration_s=10.0,
+            node_id="p",
+            node_type="user_query",
+            event_id="p",
+            ts=datetime(2026, 1, 1),
+            duration_s=10.0,
         )
         child = ExecutionNode(
-            node_id="c", node_type="llm_response", event_id="c",
-            ts=datetime(2026, 1, 1), duration_s=8.0,
+            node_id="c",
+            node_type="llm_response",
+            event_id="c",
+            ts=datetime(2026, 1, 1),
+            duration_s=8.0,
         )
         analyzer._calculate_metrics(child, parent)
         assert "BOTTLENECK" in child.issues
@@ -716,10 +1041,14 @@ class TestCalculateMetrics:
 
     def test_high_token_detection(self):
         from core.agent.session_analyzer import ExecutionNode, HIGH_TOKEN_THRESHOLD
+
         analyzer = self._make_analyzer()
         node = ExecutionNode(
-            node_id="1", node_type="llm_response", event_id="1",
-            ts=datetime(2026, 1, 1), duration_s=1.0,
+            node_id="1",
+            node_type="llm_response",
+            event_id="1",
+            ts=datetime(2026, 1, 1),
+            duration_s=1.0,
             tokens_in=HIGH_TOKEN_THRESHOLD + 1,
         )
         analyzer._calculate_metrics(node, None)
@@ -727,10 +1056,14 @@ class TestCalculateMetrics:
 
     def test_expensive_detection(self):
         from core.agent.session_analyzer import ExecutionNode, EXPENSIVE_THRESHOLD_USD
+
         analyzer = self._make_analyzer()
         node = ExecutionNode(
-            node_id="1", node_type="llm_response", event_id="1",
-            ts=datetime(2026, 1, 1), duration_s=1.0,
+            node_id="1",
+            node_type="llm_response",
+            event_id="1",
+            ts=datetime(2026, 1, 1),
+            duration_s=1.0,
             cost_usd=EXPENSIVE_THRESHOLD_USD + 0.001,
         )
         analyzer._calculate_metrics(node, None)
@@ -738,10 +1071,14 @@ class TestCalculateMetrics:
 
     def test_large_context_detection(self):
         from core.agent.session_analyzer import ExecutionNode, LARGE_CONTEXT_THRESHOLD
+
         analyzer = self._make_analyzer()
         node = ExecutionNode(
-            node_id="1", node_type="tool_result", event_id="1",
-            ts=datetime(2026, 1, 1), duration_s=1.0,
+            node_id="1",
+            node_type="tool_result",
+            event_id="1",
+            ts=datetime(2026, 1, 1),
+            duration_s=1.0,
             metadata={"result_size_tokens": LARGE_CONTEXT_THRESHOLD + 1},
         )
         analyzer._calculate_metrics(node, None)
@@ -749,11 +1086,16 @@ class TestCalculateMetrics:
 
     def test_no_issues_on_clean_node(self):
         from core.agent.session_analyzer import ExecutionNode
+
         analyzer = self._make_analyzer()
         node = ExecutionNode(
-            node_id="1", node_type="llm_response", event_id="1",
-            ts=datetime(2026, 1, 1), duration_s=1.0,
-            tokens_in=100, cost_usd=0.001,
+            node_id="1",
+            node_type="llm_response",
+            event_id="1",
+            ts=datetime(2026, 1, 1),
+            duration_s=1.0,
+            tokens_in=100,
+            cost_usd=0.001,
         )
         analyzer._calculate_metrics(node, None)
         assert node.issues == []
@@ -764,31 +1106,45 @@ class TestBuildSummary:
 
     def _make_analyzer(self):
         from core.agent.session_analyzer import SessionAnalyzer
+
         return SessionAnalyzer(db_factory=lambda: None)
 
     def test_self_time_accounting(self):
         """Time uses 'self time' (node - children), not leaf-only."""
         from core.agent.session_analyzer import ExecutionNode
+
         analyzer = self._make_analyzer()
 
         # llm_response: 10s total, child tool_result: 8s → self time = 2s
         child = ExecutionNode(
-            node_id="c", node_type="tool_result", event_id="c",
-            ts=datetime(2026, 1, 1), duration_s=8.0,
+            node_id="c",
+            node_type="tool_result",
+            event_id="c",
+            ts=datetime(2026, 1, 1),
+            duration_s=8.0,
         )
         parent = ExecutionNode(
-            node_id="p", node_type="llm_response", event_id="p",
-            ts=datetime(2026, 1, 1), duration_s=10.0,
+            node_id="p",
+            node_type="llm_response",
+            event_id="p",
+            ts=datetime(2026, 1, 1),
+            duration_s=10.0,
             children=[child],
         )
         uq = ExecutionNode(
-            node_id="uq", node_type="user_query", event_id="uq",
-            ts=datetime(2026, 1, 1), duration_s=10.0,
+            node_id="uq",
+            node_type="user_query",
+            event_id="uq",
+            ts=datetime(2026, 1, 1),
+            duration_s=10.0,
             children=[parent],
         )
         root = ExecutionNode(
-            node_id="r", node_type="session", event_id=None,
-            ts=datetime(2026, 1, 1), duration_s=10.0,
+            node_id="r",
+            node_type="session",
+            event_id=None,
+            ts=datetime(2026, 1, 1),
+            duration_s=10.0,
             children=[uq],
         )
 
@@ -799,21 +1155,33 @@ class TestBuildSummary:
 
     def test_token_aggregation(self):
         from core.agent.session_analyzer import ExecutionNode
+
         analyzer = self._make_analyzer()
 
         llm1 = ExecutionNode(
-            node_id="l1", node_type="llm_response", event_id="l1",
-            ts=datetime(2026, 1, 1), duration_s=1.0,
-            tokens_in=1000, tokens_out=200,
+            node_id="l1",
+            node_type="llm_response",
+            event_id="l1",
+            ts=datetime(2026, 1, 1),
+            duration_s=1.0,
+            tokens_in=1000,
+            tokens_out=200,
         )
         llm2 = ExecutionNode(
-            node_id="l2", node_type="llm_response", event_id="l2",
-            ts=datetime(2026, 1, 1), duration_s=1.0,
-            tokens_in=500, tokens_out=100,
+            node_id="l2",
+            node_type="llm_response",
+            event_id="l2",
+            ts=datetime(2026, 1, 1),
+            duration_s=1.0,
+            tokens_in=500,
+            tokens_out=100,
         )
         root = ExecutionNode(
-            node_id="r", node_type="session", event_id=None,
-            ts=datetime(2026, 1, 1), duration_s=5.0,
+            node_id="r",
+            node_type="session",
+            event_id=None,
+            ts=datetime(2026, 1, 1),
+            duration_s=5.0,
             children=[llm1, llm2],
         )
 
@@ -825,26 +1193,39 @@ class TestBuildSummary:
     def test_cost_by_turn(self):
         """Each llm_response gets a distinct turn number (depth-first order)."""
         from core.agent.session_analyzer import ExecutionNode
+
         analyzer = self._make_analyzer()
 
         llm1 = ExecutionNode(
-            node_id="l1", node_type="llm_response", event_id="l1",
-            ts=datetime(2026, 1, 1), duration_s=2.0,
+            node_id="l1",
+            node_type="llm_response",
+            event_id="l1",
+            ts=datetime(2026, 1, 1),
+            duration_s=2.0,
             cost_usd=0.005,
         )
         llm2 = ExecutionNode(
-            node_id="l2", node_type="llm_response", event_id="l2",
-            ts=datetime(2026, 1, 1), duration_s=1.0,
+            node_id="l2",
+            node_type="llm_response",
+            event_id="l2",
+            ts=datetime(2026, 1, 1),
+            duration_s=1.0,
             cost_usd=0.010,
         )
         uq = ExecutionNode(
-            node_id="uq", node_type="user_query", event_id="uq",
-            ts=datetime(2026, 1, 1), duration_s=5.0,
+            node_id="uq",
+            node_type="user_query",
+            event_id="uq",
+            ts=datetime(2026, 1, 1),
+            duration_s=5.0,
             children=[llm1, llm2],
         )
         root = ExecutionNode(
-            node_id="r", node_type="session", event_id=None,
-            ts=datetime(2026, 1, 1), duration_s=5.0,
+            node_id="r",
+            node_type="session",
+            event_id=None,
+            ts=datetime(2026, 1, 1),
+            duration_s=5.0,
             children=[uq],
         )
 
@@ -855,17 +1236,24 @@ class TestBuildSummary:
 
     def test_root_causes_from_slow_nodes(self):
         from core.agent.session_analyzer import ExecutionNode, SLOW_NODE_THRESHOLD_S
+
         analyzer = self._make_analyzer()
 
         slow = ExecutionNode(
-            node_id="s", node_type="tool_result", event_id="s",
-            ts=datetime(2026, 1, 1), duration_s=SLOW_NODE_THRESHOLD_S + 5,
+            node_id="s",
+            node_type="tool_result",
+            event_id="s",
+            ts=datetime(2026, 1, 1),
+            duration_s=SLOW_NODE_THRESHOLD_S + 5,
             detail="slow_tool",
             issues=["SLOW"],
         )
         root = ExecutionNode(
-            node_id="r", node_type="session", event_id=None,
-            ts=datetime(2026, 1, 1), duration_s=20.0,
+            node_id="r",
+            node_type="session",
+            event_id=None,
+            ts=datetime(2026, 1, 1),
+            duration_s=20.0,
             children=[slow],
         )
 
@@ -874,11 +1262,15 @@ class TestBuildSummary:
 
     def test_empty_tree_summary(self):
         from core.agent.session_analyzer import ExecutionNode
+
         analyzer = self._make_analyzer()
 
         root = ExecutionNode(
-            node_id="r", node_type="session", event_id=None,
-            ts=datetime(2026, 1, 1), duration_s=0,
+            node_id="r",
+            node_type="session",
+            event_id=None,
+            ts=datetime(2026, 1, 1),
+            duration_s=0,
         )
         summary = analyzer._build_summary(root)
         assert summary.total_tokens == 0
@@ -892,6 +1284,7 @@ class TestRenderSummary:
 
     def test_renders_time_breakdown(self):
         from core.agent.session_analyzer import SessionReport, ExecutionSummary
+
         summary = ExecutionSummary(
             total_duration_s=10.0,
             time_by_category={"llm_inference": 7.0, "tool_execution": 3.0},
@@ -904,8 +1297,12 @@ class TestRenderSummary:
             root_causes=[],
         )
         report = SessionReport(
-            session_id="test", timeline=[], total_duration_s=10.0,
-            issues=[], recommendations=[], stats={},
+            session_id="test",
+            timeline=[],
+            total_duration_s=10.0,
+            issues=[],
+            recommendations=[],
+            stats={},
         )
         lines = report._render_summary(summary)
         text = "\n".join(lines)
@@ -915,6 +1312,7 @@ class TestRenderSummary:
 
     def test_renders_token_breakdown(self):
         from core.agent.session_analyzer import SessionReport, ExecutionSummary
+
         summary = ExecutionSummary(
             total_duration_s=5.0,
             time_by_category={},
@@ -927,8 +1325,12 @@ class TestRenderSummary:
             root_causes=[],
         )
         report = SessionReport(
-            session_id="test", timeline=[], total_duration_s=5.0,
-            issues=[], recommendations=[], stats={},
+            session_id="test",
+            timeline=[],
+            total_duration_s=5.0,
+            issues=[],
+            recommendations=[],
+            stats={},
         )
         lines = report._render_summary(summary)
         text = "\n".join(lines)
@@ -940,12 +1342,14 @@ class TestRenderSummary:
 # 2. _try_repair_tool_args bare-word fix
 # ============================================================================
 
+
 class TestTryRepairToolArgs:
     """Test the bare-word JSON value repair in _try_repair_tool_args."""
 
     @pytest.fixture
     def repair_fn(self):
         from api.routers.chat import _try_repair_tool_args
+
         return _try_repair_tool_args
 
     def test_bare_word_value(self, repair_fn):
@@ -1005,6 +1409,7 @@ class TestTryRepairToolArgs:
 # 3. edge_chat_loop cloud event handling
 # ============================================================================
 
+
 class TestCloudLoopProgressEvents:
     """Test that _consume_turn handles cloud_loop_progress and cloud_tool_result."""
 
@@ -1019,16 +1424,22 @@ class TestCloudLoopProgressEvents:
 
         def text(self, chunk: str) -> None:
             self.texts.append(chunk)
+
         def tool_start(self, name: str, args: dict[str, Any]) -> None:
             self.tool_starts.append(name)
+
         def tool_done(self, name: str, result: str, error: bool) -> None:
             self.tool_dones.append((name, error))
+
         def error(self, msg: str) -> None:
             self.errors.append(msg)
+
         def info(self, msg: str) -> None:
             self.infos.append(msg)
+
         def thinking(self, msg: str = "") -> None:
             self.thinking_msgs.append(msg)
+
         def thinking_hide(self) -> None:
             pass
 
@@ -1048,8 +1459,9 @@ class TestCloudLoopProgressEvents:
         assert result.text == "Done"
         # thinking() should have been called for both cloud events
         assert len(renderer.thinking_msgs) >= 2
-        assert any("cloud skill" in m.lower() or "step" in m.lower()
-                    for m in renderer.thinking_msgs)
+        assert any(
+            "cloud skill" in m.lower() or "step" in m.lower() for m in renderer.thinking_msgs
+        )
 
     @pytest.mark.asyncio
     async def test_cloud_events_without_thinking_method(self):
@@ -1065,12 +1477,21 @@ class TestCloudLoopProgressEvents:
         @dataclass
         class MinimalRenderer:
             texts: list[str] = field(default_factory=list)
+
             def text(self, chunk: str) -> None:
                 self.texts.append(chunk)
-            def tool_start(self, name: str, args: dict) -> None: pass
-            def tool_done(self, name: str, result: str, error: bool) -> None: pass
-            def error(self, msg: str) -> None: pass
-            def info(self, msg: str) -> None: pass
+
+            def tool_start(self, name: str, args: dict) -> None:
+                pass
+
+            def tool_done(self, name: str, result: str, error: bool) -> None:
+                pass
+
+            def error(self, msg: str) -> None:
+                pass
+
+            def info(self, msg: str) -> None:
+                pass
 
         renderer = MinimalRenderer()
         result = await _consume_turn(fake_stream(), renderer)
@@ -1081,6 +1502,7 @@ class TestCloudLoopProgressEvents:
 # ============================================================================
 # 4. ReflectService performance focus
 # ============================================================================
+
 
 class TestReflectPerformanceFocus:
     """Test that performance focus returns session_report."""
@@ -1102,12 +1524,14 @@ class TestReflectPerformanceFocus:
         yield sid, user_id
 
         from api.models.agent import Event as EventModel, Session as SessionModel
+
         db_session.query(EventModel).filter(EventModel.session_id == sid).delete()
         db_session.query(SessionModel).filter(SessionModel.session_id == sid).delete()
         db_session.commit()
 
     def test_performance_focus_returns_report(self, simple_session, db_factory):
         from core.agent.reflect_service import ReflectService
+
         sid, user_id = simple_session
 
         svc = ReflectService(db_factory=db_factory)
@@ -1121,6 +1545,7 @@ class TestReflectPerformanceFocus:
 
     def test_performance_markdown_has_structure(self, simple_session, db_factory):
         from core.agent.reflect_service import ReflectService
+
         sid, user_id = simple_session
 
         svc = ReflectService(db_factory=db_factory)
@@ -1133,6 +1558,7 @@ class TestReflectPerformanceFocus:
 
     def test_auto_focus_also_includes_report(self, simple_session, db_factory):
         from core.agent.reflect_service import ReflectService
+
         sid, user_id = simple_session
 
         svc = ReflectService(db_factory=db_factory)
@@ -1142,6 +1568,7 @@ class TestReflectPerformanceFocus:
 
     def test_non_performance_focus_excludes_report(self, simple_session, db_factory):
         from core.agent.reflect_service import ReflectService
+
         sid, user_id = simple_session
 
         svc = ReflectService(db_factory=db_factory)

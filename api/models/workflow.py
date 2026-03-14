@@ -1,7 +1,11 @@
 """Workflow, trigger models."""
 
 from sqlalchemy import (
-    Column, Integer, SmallInteger, String, Text,
+    Column,
+    Integer,
+    SmallInteger,
+    String,
+    Text,
 )
 from sqlalchemy.sql import func
 

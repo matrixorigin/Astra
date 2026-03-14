@@ -55,6 +55,7 @@ class TestCIStatusSkillGuidance:
     async def test_empty_runs_sets_guidance_and_user_message(self):
         """Empty workflow list → guidance + user_message set."""
         from core.skills.builtin import CIStatusSkill, CIStatusInput
+
         mock_client = AsyncMock()
         mock_client.list_wf_runs.return_value = []
         skill = CIStatusSkill(github=mock_client)
@@ -69,10 +70,18 @@ class TestCIStatusSkillGuidance:
     async def test_nonempty_runs_no_guidance(self):
         """Non-empty workflow list → no guidance, no user_message."""
         from core.skills.builtin import CIStatusSkill, CIStatusInput
+
         mock_client = AsyncMock()
         mock_client.list_wf_runs.return_value = [
-            {"workflow": "CI", "conclusion": "success", "branch": "main",
-             "pr_number": None, "actor": "bot", "triggered_at": "t", "url": "u"}
+            {
+                "workflow": "CI",
+                "conclusion": "success",
+                "branch": "main",
+                "pr_number": None,
+                "actor": "bot",
+                "triggered_at": "t",
+                "url": "u",
+            }
         ]
         skill = CIStatusSkill(github=mock_client)
 
@@ -84,18 +93,21 @@ class TestCIStatusSkillGuidance:
 class TestGuidanceInjectionLogic:
     """Verify the if/elif priority: success=False > guidance > nothing."""
 
-    @pytest.mark.parametrize("result_dict,expected_system_content", [
-        # success=False takes priority over guidance
-        ({"success": False, "guidance": "ignored"}, "success=False"),
-        # guidance injected when success is not False
-        ({"success": True, "guidance": "Stop."}, "Stop."),
-        # no guidance, no system message
-        ({"success": True}, None),
-        # guidance=None → no injection
-        ({"success": True, "guidance": None}, None),
-        # guidance="" → no injection (falsy)
-        ({"success": True, "guidance": ""}, None),
-    ])
+    @pytest.mark.parametrize(
+        "result_dict,expected_system_content",
+        [
+            # success=False takes priority over guidance
+            ({"success": False, "guidance": "ignored"}, "success=False"),
+            # guidance injected when success is not False
+            ({"success": True, "guidance": "Stop."}, "Stop."),
+            # no guidance, no system message
+            ({"success": True}, None),
+            # guidance=None → no injection
+            ({"success": True, "guidance": None}, None),
+            # guidance="" → no injection (falsy)
+            ({"success": True, "guidance": ""}, None),
+        ],
+    )
     def test_priority(self, result_dict, expected_system_content):
         """Simulate the chat loop's post-tool-result branching."""
         messages: list[dict] = []

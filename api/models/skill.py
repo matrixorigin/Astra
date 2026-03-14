@@ -2,7 +2,14 @@
 
 from matrixone import VectorPrecision, VectorType
 from sqlalchemy import (
-    Column, Float, Index, Integer, SmallInteger, String, Text, UniqueConstraint,
+    Column,
+    Float,
+    Index,
+    Integer,
+    SmallInteger,
+    String,
+    Text,
+    UniqueConstraint,
 )
 from sqlalchemy.sql import func
 
@@ -67,8 +74,7 @@ class SkillInstallation(Base):
 class SkillUserCredential(Base):
     __tablename__ = "skill_user_credentials"
     __table_args__ = (
-        UniqueConstraint("user_id", "skill_name", "credential_name",
-                         name="uq_user_skill_cred"),
+        UniqueConstraint("user_id", "skill_name", "credential_name", name="uq_user_skill_cred"),
     )
 
     credential_id = Column(String(36), primary_key=True)
@@ -83,8 +89,9 @@ class SkillUserCredential(Base):
 class SkillPermission(Base):
     __tablename__ = "skill_permissions"
     __table_args__ = (
-        UniqueConstraint("skill_name", "grantee_type", "grantee_id", "permission_type",
-                         name="uq_skill_grantee"),
+        UniqueConstraint(
+            "skill_name", "grantee_type", "grantee_id", "permission_type", name="uq_skill_grantee"
+        ),
     )
 
     permission_id = Column(String(36), primary_key=True)
@@ -135,6 +142,7 @@ class SkillSelectionLearning(Base):
     Reserved for future use by ToolRegistry.select() as a score adjustment step.
     Table kept in DB; not actively written to yet.
     """
+
     __tablename__ = "skill_selection_learnings"
     learning_id = Column(String(36), primary_key=True)
     query_pattern = Column(String(255), nullable=False, index=True)
@@ -159,10 +167,14 @@ class SkillSetting(Base):
 
     Scope chain: user → tenant → global → manifest default.
     """
+
     __tablename__ = "skill_settings"
     __table_args__ = (
         UniqueConstraint(
-            "skill_name", "setting_name", "scope_type", "scope_id",
+            "skill_name",
+            "setting_name",
+            "scope_type",
+            "scope_id",
             name="uq_skill_setting_scope",
         ),
         Index("ix_ss_skill_scope", "skill_name", "scope_type", "scope_id"),
@@ -173,8 +185,8 @@ class SkillSetting(Base):
     setting_name = Column(String(100), nullable=False)
     setting_value = Column(Text, nullable=False)
     is_secret = Column(SmallInteger, nullable=False, default=0)
-    scope_type = Column(String(20), nullable=False)   # "global" | "tenant" | "user"
-    scope_id = Column(String(36), nullable=True)      # NULL for global
+    scope_type = Column(String(20), nullable=False)  # "global" | "tenant" | "user"
+    scope_id = Column(String(36), nullable=True)  # NULL for global
     created_at = Column(DateTime6, default=func.now(), nullable=False)
     updated_at = Column(DateTime6, default=func.now(), onupdate=func.now())
     updated_by = Column(String(36), nullable=False)
@@ -185,10 +197,14 @@ class SkillResourceBinding(Base):
 
     Each row = one (user, skill, resource_key, binding_name) tuple.
     """
+
     __tablename__ = "skill_resource_bindings"
     __table_args__ = (
         UniqueConstraint(
-            "user_id", "skill_name", "resource_key", "binding_name",
+            "user_id",
+            "skill_name",
+            "resource_key",
+            "binding_name",
             name="uq_skill_resource_binding",
         ),
         Index("ix_srb_user_skill", "user_id", "skill_name"),

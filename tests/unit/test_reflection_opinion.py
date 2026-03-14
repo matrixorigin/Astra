@@ -21,8 +21,11 @@ T4_TO_T3_CONFIDENCE = DEFAULT_CONFIG.opinion_t4_to_t3_confidence
 
 def _scene(confidence: float = 0.5, tier: TrustTier = TrustTier.T4_UNVERIFIED) -> Memory:
     return Memory(
-        memory_id="scene-1", user_id="u1", memory_type=MemoryType.SEMANTIC,
-        content="User prefers verbose errors", initial_confidence=confidence,
+        memory_id="scene-1",
+        user_id="u1",
+        memory_type=MemoryType.SEMANTIC,
+        content="User prefers verbose errors",
+        initial_confidence=confidence,
         trust_tier=tier,
     )
 

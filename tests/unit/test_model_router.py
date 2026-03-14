@@ -35,12 +35,16 @@ class TestRouteDecision:
 class TestModelRouter:
     def test_classify_complexity_critical(self):
         router = ModelRouter(lambda: _mock_db())
-        assert router.classify_complexity("deploy", "Deploy to production") == TaskComplexity.CRITICAL
+        assert (
+            router.classify_complexity("deploy", "Deploy to production") == TaskComplexity.CRITICAL
+        )
         assert router.classify_complexity("security", "Security review") == TaskComplexity.CRITICAL
 
     def test_classify_complexity_complex(self):
         router = ModelRouter(lambda: _mock_db())
-        assert router.classify_complexity("refactor", "Refactor auth module") == TaskComplexity.COMPLEX
+        assert (
+            router.classify_complexity("refactor", "Refactor auth module") == TaskComplexity.COMPLEX
+        )
         assert router.classify_complexity("design", "Design new API") == TaskComplexity.COMPLEX
 
     def test_classify_complexity_medium(self):
@@ -50,17 +54,25 @@ class TestModelRouter:
 
     def test_classify_complexity_simple(self):
         router = ModelRouter(lambda: _mock_db())
-        assert router.classify_complexity("status", "What's the CI status?") == TaskComplexity.SIMPLE
+        assert (
+            router.classify_complexity("status", "What's the CI status?") == TaskComplexity.SIMPLE
+        )
         assert router.classify_complexity("info", "Tell me about X") == TaskComplexity.SIMPLE
 
     def test_route_critical_selects_best_model(self):
         """Critical tasks always pick the most capable (first) model."""
         router = ModelRouter(lambda: _mock_db())
 
-        with patch.object(router, "_get_efficiency_ranking", return_value={}), \
-             patch.object(router, "_estimate_cost", return_value=0.03):
-            decision = router.route("deploy", "Deploy to production",
-                                    available_models=["gpt-4", "gpt-3.5"], scope_id="u1")
+        with (
+            patch.object(router, "_get_efficiency_ranking", return_value={}),
+            patch.object(router, "_estimate_cost", return_value=0.03),
+        ):
+            decision = router.route(
+                "deploy",
+                "Deploy to production",
+                available_models=["gpt-4", "gpt-3.5"],
+                scope_id="u1",
+            )
 
         assert decision.model == "gpt-4"
         assert decision.complexity == TaskComplexity.CRITICAL
@@ -70,10 +82,13 @@ class TestModelRouter:
         """Simple tasks pick the cheapest (last) model."""
         router = ModelRouter(lambda: _mock_db())
 
-        with patch.object(router, "_get_efficiency_ranking", return_value={}), \
-             patch.object(router, "_estimate_cost", return_value=0.001):
-            decision = router.route("status", "What's the status?",
-                                    available_models=["gpt-4", "gpt-3.5"], scope_id="u1")
+        with (
+            patch.object(router, "_get_efficiency_ranking", return_value={}),
+            patch.object(router, "_estimate_cost", return_value=0.001),
+        ):
+            decision = router.route(
+                "status", "What's the status?", available_models=["gpt-4", "gpt-3.5"], scope_id="u1"
+            )
 
         assert decision.model == "gpt-3.5"
         assert decision.complexity == TaskComplexity.SIMPLE
@@ -84,8 +99,7 @@ class TestModelRouter:
         db = _mock_db()
         router = ModelRouter(lambda: db)
 
-        router.record_quality(task_type="code_review", model="gpt-4",
-                              quality_score=4.5, cost=0.03)
+        router.record_quality(task_type="code_review", model="gpt-4", quality_score=4.5, cost=0.03)
 
         db.add.assert_not_called()
 

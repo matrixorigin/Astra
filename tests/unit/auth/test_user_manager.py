@@ -44,7 +44,7 @@ class TestCreateUser:
         assert user["email"] == "test@example.com"
         assert user["display_name"] == "Test User"
         assert "user_id" in user
-        
+
         # Verify DB interactions
         assert mock_db_session.add.called
         assert mock_db_session.commit.called
@@ -53,7 +53,7 @@ class TestCreateUser:
         """Test creating user with duplicate username."""
         # Setup mock to return an existing user when checking username
         existing_user = User(username="existing", email="other@example.com")
-        
+
         # Configure the mock to return existing_user for the first query (username check)
         mock_db_session.query.return_value.filter.return_value.first.side_effect = [existing_user]
 
@@ -68,7 +68,10 @@ class TestCreateUser:
         """Test creating user with duplicate email."""
         # Setup mock: first call (username) returns None, second call (email) returns existing user
         existing_user = User(username="other", email="existing@example.com")
-        mock_db_session.query.return_value.filter.return_value.first.side_effect = [None, existing_user]
+        mock_db_session.query.return_value.filter.return_value.first.side_effect = [
+            None,
+            existing_user,
+        ]
 
         with pytest.raises(ValueError, match="Email 'existing@example.com' already exists"):
             user_manager.create_user(
@@ -97,14 +100,12 @@ class TestAuthenticateUser:
         """Test successful authentication."""
         # Create a real User object (detached) with hashed password
         from core.auth.password import hash_password
+
         password = "password123"
         user_obj = User(
-            user_id="u1", 
-            username="testuser", 
-            password_hash=hash_password(password),
-            is_active=True
+            user_id="u1", username="testuser", password_hash=hash_password(password), is_active=True
         )
-        
+
         mock_db_session.query.return_value.filter.return_value.first.return_value = user_obj
 
         user = user_manager.authenticate_user("testuser", password)
@@ -122,11 +123,7 @@ class TestAuthenticateUser:
 
     def test_authenticate_inactive_user(self, user_manager, mock_db_session):
         """Test authentication with inactive user."""
-        user_obj = User(
-            user_id="u1", 
-            username="testuser", 
-            is_active=False
-        )
+        user_obj = User(user_id="u1", username="testuser", is_active=False)
         mock_db_session.query.return_value.filter.return_value.first.return_value = user_obj
 
         user = user_manager.authenticate_user("testuser", "password123")
@@ -136,11 +133,12 @@ class TestAuthenticateUser:
     def test_authenticate_wrong_password(self, user_manager, mock_db_session):
         """Test authentication with wrong password."""
         from core.auth.password import hash_password
+
         user_obj = User(
-            user_id="u1", 
-            username="testuser", 
+            user_id="u1",
+            username="testuser",
             password_hash=hash_password("correct"),
-            is_active=True
+            is_active=True,
         )
         mock_db_session.query.return_value.filter.return_value.first.return_value = user_obj
 
@@ -189,13 +187,10 @@ class TestRefreshToken:
         """Test verifying valid refresh token."""
         from api.models import RefreshToken
         from unittest.mock import patch
-        
+
         expires_at = datetime.now(timezone.utc) + timedelta(days=7)
         token_obj = RefreshToken(
-            token_hash="hashed_token",
-            user_id="user_123",
-            expires_at=expires_at,
-            is_revoked=False
+            token_hash="hashed_token", user_id="user_123", expires_at=expires_at, is_revoked=False
         )
         # verify_refresh_token uses .all()
         mock_db_session.query.return_value.filter.return_value.all.return_value = [token_obj]
@@ -215,7 +210,7 @@ class TestRefreshToken:
 
     def test_verify_refresh_token_revoked(self, user_manager, mock_db_session):
         """Test verifying revoked refresh token.
-        
+
         Revoked tokens are excluded by the SQL filter (is_revoked == 0),
         so the query returns no candidates.
         """
@@ -229,7 +224,7 @@ class TestRefreshToken:
         """Test verifying expired refresh token."""
         from api.models import RefreshToken
         from unittest.mock import patch
-        
+
         # The code filters by expires_at > now, so expired tokens won't be returned by query
         mock_db_session.query.return_value.filter.return_value.all.return_value = []
 
@@ -241,7 +236,7 @@ class TestRefreshToken:
         """Test successful token revocation."""
         from api.models import RefreshToken
         from unittest.mock import patch
-        
+
         token_obj = RefreshToken(token_hash="hashed_token", is_revoked=False)
         mock_db_session.query.return_value.filter.return_value.all.return_value = [token_obj]
 
@@ -259,4 +254,3 @@ class TestRefreshToken:
         result = user_manager.revoke_refresh_token("token_abc")
 
         assert result is False
-

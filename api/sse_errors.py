@@ -24,7 +24,11 @@ _SSE_PATH_PATTERNS: list[re.Pattern] = [
     re.compile(r"^/streaming/chat$"),
 ]
 
-SSE_HEADERS: dict[str, str] = {"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
+SSE_HEADERS: dict[str, str] = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
 
 _STATUS_TO_CODE: dict[int, str] = {
     401: "AUTH_ERROR",
@@ -49,11 +53,15 @@ def format_validation_error(exc) -> str:
     Produces a concise, client-friendly message like "message: Field required"
     instead of leaking raw Pydantic internals and pydantic.dev URLs.
     """
-    parts = [f"{'.'.join(str(loc_item) for loc_item in e['loc'])}: {e['msg']}" for e in exc.errors()]
+    parts = [
+        f"{'.'.join(str(loc_item) for loc_item in e['loc'])}: {e['msg']}" for e in exc.errors()
+    ]
     return "; ".join(parts) or "Validation error"
 
 
-def sse_error_response(status_code: int, message: str, code: str | None = None, retryable: bool = False) -> StreamingResponse:
+def sse_error_response(
+    status_code: int, message: str, code: str | None = None, retryable: bool = False
+) -> StreamingResponse:
     """Return a StreamingResponse with a single SSE error event."""
     if code is None:
         code = status_to_error_code(status_code)

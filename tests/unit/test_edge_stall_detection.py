@@ -193,13 +193,17 @@ class TestSkillDiscoveryOutput:
         ]
         output = "\n".join(lines)
         assert "Call these skills directly by name" in output
-        assert "get_agent_info" not in output.split("Call these skills")[0]  # not before the instruction
+        assert (
+            "get_agent_info" not in output.split("Call these skills")[0]
+        )  # not before the instruction
 
     def test_description_warns_against_repeat(self):
         """find_skills description must warn against repeated calls."""
         from cli.tools.skill_discovery import FindSkillsTool
+
         t = FindSkillsTool()
         assert "do not call find_skills again" in t.description.lower()
+
 
 class TestKeywordSearchMatching:
     """Test find_skills keyword search uses word-level bidirectional matching."""
@@ -207,6 +211,7 @@ class TestKeywordSearchMatching:
     def _score(self, query: str, skill_name: str, desc: str = "", cat: str = "github") -> int:
         """Replicate _keyword_search scoring logic including system-category penalty."""
         import re
+
         query_words = re.findall(r"[a-z]{3,}", query.lower())
         if not query_words:
             query_words = re.findall(r"[a-z]{2,}", query.lower())
@@ -250,63 +255,72 @@ class TestKeywordSearchMatching:
 
     SKILL_CATALOG = {
         # name → (category, description_snippet)
-        "list_issues":       ("github",  "List issues excludes PRs detail brief title state labels"),
-        "list_prs":          ("github",  "List pull requests from a GitHub repository"),
-        "get_issue":         ("github",  "Get a specific issue by number"),
-        "create_issue":      ("github",  "Create a new GitHub issue requires title"),
-        "ci_status":         ("github",  "Check CI CD workflow run status recent runs pass fail pending"),
-        "summarize_pr":      ("github",  "Summarize a specific GitHub PR using LLM analysis"),
-        "bash":              ("shell",   "Execute a shell command"),
-        "read_file":         ("file_ops","Read file contents from local filesystem"),
-        "write_file":        ("file_ops","Create or overwrite a file on local filesystem"),
-        "grep":              ("search",  "Search for text patterns in files"),
-        "glob":              ("search",  "Find files matching a glob pattern"),
-        "git_status":        ("vcs",     "Show git working tree status"),
-        "git_diff":          ("vcs",     "Show git diff of changes"),
-        "git_log":           ("vcs",     "Show git commit history"),
-        "skill_config_wizard":("system", "Show what configuration a skill needs and what is already set configure github token"),
-        "set_skill_setting": ("system",  "Configure a skill setting set token api key"),
-        "find_skills":       ("system",  "Discover available skills and their capabilities"),
-        "get_agent_info":    ("system",  "Query current runtime state token counts context window session info available tools"),
+        "list_issues": ("github", "List issues excludes PRs detail brief title state labels"),
+        "list_prs": ("github", "List pull requests from a GitHub repository"),
+        "get_issue": ("github", "Get a specific issue by number"),
+        "create_issue": ("github", "Create a new GitHub issue requires title"),
+        "ci_status": ("github", "Check CI CD workflow run status recent runs pass fail pending"),
+        "summarize_pr": ("github", "Summarize a specific GitHub PR using LLM analysis"),
+        "bash": ("shell", "Execute a shell command"),
+        "read_file": ("file_ops", "Read file contents from local filesystem"),
+        "write_file": ("file_ops", "Create or overwrite a file on local filesystem"),
+        "grep": ("search", "Search for text patterns in files"),
+        "glob": ("search", "Find files matching a glob pattern"),
+        "git_status": ("vcs", "Show git working tree status"),
+        "git_diff": ("vcs", "Show git diff of changes"),
+        "git_log": ("vcs", "Show git commit history"),
+        "skill_config_wizard": (
+            "system",
+            "Show what configuration a skill needs and what is already set configure github token",
+        ),
+        "set_skill_setting": ("system", "Configure a skill setting set token api key"),
+        "find_skills": ("system", "Discover available skills and their capabilities"),
+        "get_agent_info": (
+            "system",
+            "Query current runtime state token counts context window session info available tools",
+        ),
     }
 
-    @pytest.mark.parametrize("query,expected_skill", [
-        # GitHub issues
-        ("matrixone的最新issue",          "list_issues"),
-        ("查看最新的issue",                "list_issues"),
-        ("list issues in matrixone",      "list_issues"),
-        ("show me open issues",           "list_issues"),
-        ("GitHub issues search",          "list_issues"),
-        ("get issue #123",                "get_issue"),
-        ("show issue details",            "get_issue"),
-        # PRs
-        ("list pull requests",            "list_prs"),
-        ("show open PRs",                 "list_prs"),
-        ("recent pull requests",          "list_prs"),
-        ("summarize PR 456",              "summarize_pr"),
-        # CI
-        ("check CI status",               "ci_status"),
-        ("workflow run failed",           "ci_status"),
-        ("build status",                  "ci_status"),
-        # Create
-        ("create a new issue",            "create_issue"),
-        # Shell
-        ("run a shell command",           "bash"),
-        ("execute bash script",           "bash"),
-        # Files
-        ("read the config file",          "read_file"),
-        ("write to output file",          "write_file"),
-        # Search
-        ("grep for TODO in code",         "grep"),
-        ("find files matching pattern",   "glob"),
-        # Git
-        ("show git status",               "git_status"),
-        ("git diff changes",              "git_diff"),
-        ("git log history",               "git_log"),
-        # Config (system skill via name match)
-        ("configure skill settings",      "skill_config_wizard"),
-        ("set skill token",               "set_skill_setting"),
-    ])
+    @pytest.mark.parametrize(
+        "query,expected_skill",
+        [
+            # GitHub issues
+            ("matrixone的最新issue", "list_issues"),
+            ("查看最新的issue", "list_issues"),
+            ("list issues in matrixone", "list_issues"),
+            ("show me open issues", "list_issues"),
+            ("GitHub issues search", "list_issues"),
+            ("get issue #123", "get_issue"),
+            ("show issue details", "get_issue"),
+            # PRs
+            ("list pull requests", "list_prs"),
+            ("show open PRs", "list_prs"),
+            ("recent pull requests", "list_prs"),
+            ("summarize PR 456", "summarize_pr"),
+            # CI
+            ("check CI status", "ci_status"),
+            ("workflow run failed", "ci_status"),
+            ("build status", "ci_status"),
+            # Create
+            ("create a new issue", "create_issue"),
+            # Shell
+            ("run a shell command", "bash"),
+            ("execute bash script", "bash"),
+            # Files
+            ("read the config file", "read_file"),
+            ("write to output file", "write_file"),
+            # Search
+            ("grep for TODO in code", "grep"),
+            ("find files matching pattern", "glob"),
+            # Git
+            ("show git status", "git_status"),
+            ("git diff changes", "git_diff"),
+            ("git log history", "git_log"),
+            # Config (system skill via name match)
+            ("configure skill settings", "skill_config_wizard"),
+            ("set skill token", "set_skill_setting"),
+        ],
+    )
     def test_query_matches_expected_skill(self, query, expected_skill):
         cat, desc = self.SKILL_CATALOG[expected_skill]
         assert self._score(query, expected_skill, desc, cat) > 0, (
@@ -315,32 +329,36 @@ class TestKeywordSearchMatching:
 
     # ── Parametrized: system skills should NOT appear for non-config queries ─
 
-    @pytest.mark.parametrize("query", [
-        "GitHub issues search",
-        "matrixone的最新issue",
-        "list pull requests",
-        "check CI status",
-        "show open PRs",
-        "summarize PR 456",
-        "run a shell command",
-    ])
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "GitHub issues search",
+            "matrixone的最新issue",
+            "list pull requests",
+            "check CI status",
+            "show open PRs",
+            "summarize PR 456",
+            "run a shell command",
+        ],
+    )
     def test_system_skill_not_matched_by_data_queries(self, query):
         """skill_config_wizard must not appear for non-config queries."""
         cat, desc = self.SKILL_CATALOG["skill_config_wizard"]
         score = self._score(query, "skill_config_wizard", desc, cat)
-        assert score == 0, (
-            f"skill_config_wizard should NOT match {query!r} (got score={score})"
-        )
+        assert score == 0, f"skill_config_wizard should NOT match {query!r} (got score={score})"
 
     # ── Parametrized: queries that should NOT match unrelated skills ────────
 
-    @pytest.mark.parametrize("query,wrong_skill", [
-        ("deploy kubernetes",    "list_issues"),
-        ("send email",           "ci_status"),
-        ("database migration",   "list_prs"),
-        ("resize image",         "bash"),
-        ("translate text",       "grep"),
-    ])
+    @pytest.mark.parametrize(
+        "query,wrong_skill",
+        [
+            ("deploy kubernetes", "list_issues"),
+            ("send email", "ci_status"),
+            ("database migration", "list_prs"),
+            ("resize image", "bash"),
+            ("translate text", "grep"),
+        ],
+    )
     def test_no_false_positives(self, query, wrong_skill):
         cat, desc = self.SKILL_CATALOG[wrong_skill]
         assert self._score(query, wrong_skill, desc, cat) == 0, (

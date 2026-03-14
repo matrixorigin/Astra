@@ -33,9 +33,9 @@ _write_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ctx_snapshot
 # Each maps section → fraction of available tokens (after fixed allocations)
 _BUDGET_RATIOS: dict[TaskType, dict[str, float]] = {
     TaskType.CODE_REVIEW: {"code": 0.50, "history": 0.20, "docs": 0.20, "logs": 0.10},
-    TaskType.DEBUGGING:   {"logs": 0.40, "code": 0.30, "history": 0.20, "docs": 0.10},
-    TaskType.PLANNING:    {"history": 0.50, "code": 0.20, "docs": 0.20, "logs": 0.10},
-    TaskType.GENERAL:     {"history": 0.40, "code": 0.30, "docs": 0.20, "logs": 0.10},
+    TaskType.DEBUGGING: {"logs": 0.40, "code": 0.30, "history": 0.20, "docs": 0.10},
+    TaskType.PLANNING: {"history": 0.50, "code": 0.20, "docs": 0.20, "logs": 0.10},
+    TaskType.GENERAL: {"history": 0.40, "code": 0.30, "docs": 0.20, "logs": 0.10},
 }
 
 
@@ -66,7 +66,9 @@ class Context:
     relevance_scores: dict[str, float]
     task_type: TaskType
     retrieved_events: list[dict[str, Any]] | None = None  # Raw retrieval for replay
-    topic_shift_score: float = 0.0  # 0=same topic, 1=new topic; used by ChatLoop for STALE_CONTEXT feedback
+    topic_shift_score: float = (
+        0.0  # 0=same topic, 1=new topic; used by ChatLoop for STALE_CONTEXT feedback
+    )
 
     def to_prompt(self) -> str:
         """Convert context to LLM prompt."""
@@ -99,7 +101,10 @@ class ContextManager(DbConsumer):
     """Orchestrate context selection and assembly."""
 
     def __init__(
-        self, db_factory: DbFactory, embedding_provider: str = "mock", gate_trigger=None,
+        self,
+        db_factory: DbFactory,
+        embedding_provider: str = "mock",
+        gate_trigger=None,
     ):
         """Initialize context manager.
 
@@ -190,7 +195,9 @@ class ContextManager(DbConsumer):
 
             # 5. Assemble context
             context = self._assemble_context(
-                selected, budget, task_type, 
+                selected,
+                budget,
+                task_type,
                 assembly_time_ms=int((time.time() - start_time) * 1000),
                 retrieved_events=candidates,  # Store raw retrieval for replay
                 topic_shift_score=getattr(self, "_last_topic_shift", 0.0),
@@ -220,9 +227,9 @@ class ContextManager(DbConsumer):
 
         ratios = self._load_budget_ratios(task_type)
         budget: dict[str, dict[str, int]] = {
-            "system":  {"allocated": 500,  "used": 0},
-            "skills":  {"allocated": 1000, "used": 0},
-            "reserve": {"allocated": 500,  "used": 0},
+            "system": {"allocated": 500, "used": 0},
+            "skills": {"allocated": 1000, "used": 0},
+            "reserve": {"allocated": 500, "used": 0},
         }
         for section, ratio in ratios.items():
             budget[section] = {"allocated": int(available * ratio), "used": 0}
@@ -235,16 +242,25 @@ class ContextManager(DbConsumer):
     def _load_budget_ratios(self, task_type: TaskType) -> dict[str, float]:
         """Load budget ratios, preferring DB overrides over hardcoded defaults."""
         now = time.monotonic()
-        if self._budget_cache is not None and (now - self._budget_cache_ts) < self._BUDGET_CACHE_TTL:
+        if (
+            self._budget_cache is not None
+            and (now - self._budget_cache_ts) < self._BUDGET_CACHE_TTL
+        ):
             if task_type.value in self._budget_cache:
                 return self._budget_cache[task_type.value]
             return _BUDGET_RATIOS[task_type]
 
         try:
             import json
+
             with self._db() as db:
                 from api.models import Config
-                row = db.query(Config.value).filter(Config.key_name == "context_budget_ratios").first()
+
+                row = (
+                    db.query(Config.value)
+                    .filter(Config.key_name == "context_budget_ratios")
+                    .first()
+                )
             if row:
                 overrides = json.loads(row[0]) if isinstance(row[0], str) else row[0]
                 self._budget_cache = overrides
@@ -258,23 +274,27 @@ class ContextManager(DbConsumer):
             logger.debug("Failed to load budget overrides, using defaults: %s", e)
         return _BUDGET_RATIOS[task_type]
 
-
     def _retrieve_candidates(self, session_id: str, query: str) -> list[dict[str, Any]]:
         """Retrieve candidate events for context (fallback method)."""
         from api.models import Event
+
         with self._db() as db:
             # Projection: only load fields needed for scoring (skip embedding, snapshots, etc.)
-            events = db.query(
-                Event.event_id,
-                Event.event_type,
-                Event.content,
-                Event.created_at,
-                Event.parent_event_id,
-                Event.causal_chain_id,
-                Event.event_metadata,
-            ).filter(
-                Event.session_id == session_id
-            ).order_by(Event.created_at.desc()).limit(100).all()
+            events = (
+                db.query(
+                    Event.event_id,
+                    Event.event_type,
+                    Event.content,
+                    Event.created_at,
+                    Event.parent_event_id,
+                    Event.causal_chain_id,
+                    Event.event_metadata,
+                )
+                .filter(Event.session_id == session_id)
+                .order_by(Event.created_at.desc())
+                .limit(100)
+                .all()
+            )
 
         # Safe after session close: Event has only Column() attrs, no lazy relationships.
         return [
@@ -291,20 +311,17 @@ class ContextManager(DbConsumer):
         ]
 
     def _retrieve_hybrid(
-        self, 
-        session_id: str, 
-        query: str, 
-        current_chain_id: str | None = None
+        self, session_id: str, query: str, current_chain_id: str | None = None
     ) -> list[dict[str, Any]]:
         """Retrieve events using MatrixOne hybrid search.
-        
+
         Combines vector similarity, keyword matching, temporal decay, and causal proximity.
         """
         from core.context.hybrid_retrieval import HybridRetriever
-        
+
         # Generate query embedding
         query_embedding = self.embeddings.embed_text(query)
-        
+
         # Use hybrid retriever
         retriever = HybridRetriever(self._db_factory)
         events = retriever.retrieve_events(
@@ -314,7 +331,7 @@ class ContextManager(DbConsumer):
             current_chain_id=current_chain_id,
             limit=50,  # Get more candidates for scoring
         )
-        
+
         return events
 
     def retrieve_semantic_knowledge(
@@ -337,6 +354,7 @@ class ContextManager(DbConsumer):
         # Primary path: hybrid retrieval (vector + keyword + confidence)
         try:
             from core.context.hybrid_retrieval import HybridRetriever
+
             query_embedding = self.embeddings.embed_text(query)
             retriever = HybridRetriever(self._db_factory)
             results = retriever.retrieve_knowledge(
@@ -347,7 +365,9 @@ class ContextManager(DbConsumer):
                 confidence_threshold=min_confidence,
             )
             if results:
-                logger.debug("Hybrid knowledge retrieval: %d entries for: %s", len(results), query[:50])
+                logger.debug(
+                    "Hybrid knowledge retrieval: %d entries for: %s", len(results), query[:50]
+                )
                 return results
         except Exception as e:
             logger.warning("Hybrid knowledge retrieval failed, falling back to keyword: %s", e)
@@ -363,10 +383,16 @@ class ContextManager(DbConsumer):
 
         try:
             with self._db() as db:
-                entries = db.query(KnowledgeEntry).filter(
-                    KnowledgeEntry.user_id == user_id,
-                    KnowledgeEntry.confidence >= min_confidence,
-                ).order_by(KnowledgeEntry.confidence.desc()).limit(limit * 2).all()
+                entries = (
+                    db.query(KnowledgeEntry)
+                    .filter(
+                        KnowledgeEntry.user_id == user_id,
+                        KnowledgeEntry.confidence >= min_confidence,
+                    )
+                    .order_by(KnowledgeEntry.confidence.desc())
+                    .limit(limit * 2)
+                    .all()
+                )
         except Exception as e:
             logger.warning("Keyword knowledge fallback failed: %s", e)
             return []
@@ -383,16 +409,18 @@ class ContextManager(DbConsumer):
             elif any(word in entry.value.lower() for word in query_lower.split() if len(word) > 3):
                 relevance = 0.5
 
-            results.append({
-                "entry_id": entry.entry_id,
-                "category": entry.category,
-                "key_name": entry.key_name,
-                "value": entry.value,
-                "confidence": entry.confidence,
-                "trust_tier": entry.trust_tier,
-                "relevance": relevance,
-                "created_at": entry.created_at,
-            })
+            results.append(
+                {
+                    "entry_id": entry.entry_id,
+                    "category": entry.category,
+                    "key_name": entry.key_name,
+                    "value": entry.value,
+                    "confidence": entry.confidence,
+                    "trust_tier": entry.trust_tier,
+                    "relevance": relevance,
+                    "created_at": entry.created_at,
+                }
+            )
 
         results.sort(key=lambda x: x["relevance"] * x["confidence"], reverse=True)
         top = results[:limit]
@@ -431,7 +459,11 @@ class ContextManager(DbConsumer):
 
         # Use the new configurable scorer with topic shift awareness
         scored_with_signals = self.scorer.score_candidates(
-            query, candidates, session_id, task_type, topic_shift=topic_shift,
+            query,
+            candidates,
+            session_id,
+            task_type,
+            topic_shift=topic_shift,
         )
 
         # Convert to old format (candidate, score) for compatibility
@@ -439,7 +471,9 @@ class ContextManager(DbConsumer):
 
         logger.debug(
             "Scored %d candidates (task=%s, topic_shift=%.2f)",
-            len(scored), task_type.value, topic_shift,
+            len(scored),
+            task_type.value,
+            topic_shift,
         )
         # Store for build_context to propagate to Context dataclass
         self._last_topic_shift = topic_shift
@@ -493,7 +527,9 @@ class ContextManager(DbConsumer):
         # Load code context for code-related tasks
         code_context = []
         if task_type in [TaskType.CODE_REVIEW, TaskType.DEBUGGING]:
-            code_context = self._get_code_context(selected_events, budget.get("code", {}).get("allocated", 0))
+            code_context = self._get_code_context(
+                selected_events, budget.get("code", {}).get("allocated", 0)
+            )
 
         total_tokens = sum(s["tokens"] for s in selected) + budget["system"]["allocated"]
 
@@ -545,8 +581,9 @@ class ContextManager(DbConsumer):
     def _get_skill_definitions(self, token_budget: int) -> list[dict[str, Any]]:
         """Get active skill definitions from DB within token budget (cached 60s)."""
         import time as _time
+
         now = _time.monotonic()
-        cache = getattr(self, '_skill_def_cache', None)
+        cache = getattr(self, "_skill_def_cache", None)
         if cache and now - cache[0] < 60:
             return cache[1][:] if cache[1] else []
 
@@ -554,9 +591,7 @@ class ContextManager(DbConsumer):
 
         try:
             with self._db() as db:
-                skills = db.query(SkillModel).filter(
-                    SkillModel.is_active == 1
-                ).all()
+                skills = db.query(SkillModel).filter(SkillModel.is_active == 1).all()
         except Exception as e:
             logger.warning("Failed to load skill definitions: %s", e)
             return []
@@ -594,7 +629,9 @@ class ContextManager(DbConsumer):
 
         # Non-capturing group so findall returns full match, not just extension.
         # Supports hyphens, dots, and @ in directory/file names.
-        file_pattern = r"[\w.@/-]+\.(?:py|tsx|ts|jsx|js|go|java|rs|cpp|c|h|rb|sh|yaml|yml|json|toml)"
+        file_pattern = (
+            r"[\w.@/-]+\.(?:py|tsx|ts|jsx|js|go|java|rs|cpp|c|h|rb|sh|yaml|yml|json|toml)"
+        )
 
         seen: set[str] = set()
         code_files: list[dict[str, str]] = []
@@ -606,11 +643,13 @@ class ContextManager(DbConsumer):
                 if path in seen or len(code_files) >= 5:
                     continue
                 seen.add(path)
-                code_files.append({
-                    "file": path,
-                    "mentioned_in": event["event_id"],
-                    "summary": f"File mentioned in conversation: {path}",
-                })
+                code_files.append(
+                    {
+                        "file": path,
+                        "mentioned_in": event["event_id"],
+                        "summary": f"File mentioned in conversation: {path}",
+                    }
+                )
 
         return code_files
 
@@ -634,7 +673,10 @@ class ContextManager(DbConsumer):
         # Prepare all data synchronously (must happen on caller's thread
         # because Context object may not be safe to share)
         skills_used = [
-            {"skill_name": s.get("skill_name") or s.get("name", ""), "version": s.get("version", "latest")}
+            {
+                "skill_name": s.get("skill_name") or s.get("name", ""),
+                "version": s.get("version", "latest"),
+            }
             for s in context.skill_definitions
         ]
 
@@ -672,6 +714,7 @@ class ContextManager(DbConsumer):
         db = db_factory()
         try:
             from api.models import ContextSnapshot as SnapshotModel
+
             snapshot = SnapshotModel(**payload)
             db.add(snapshot)
             db.commit()
@@ -697,13 +740,17 @@ class ContextManager(DbConsumer):
         have LLM IDs, which is non-critical metadata.
         """
         import time
+
         db = db_factory()
         try:
             from api.models import ContextSnapshot as SnapshotModel
+
             for attempt in range(5):
-                rows_updated = db.query(SnapshotModel).filter(
-                    SnapshotModel.context_capture_id == context_capture_id
-                ).update(update_dict)
+                rows_updated = (
+                    db.query(SnapshotModel)
+                    .filter(SnapshotModel.context_capture_id == context_capture_id)
+                    .update(update_dict)
+                )
                 db.commit()
                 if rows_updated > 0:
                     return
@@ -711,7 +758,9 @@ class ContextManager(DbConsumer):
                 delay = 0.05 * (attempt + 1)
                 _logging.getLogger(__name__).debug(
                     "Snapshot %s not found (attempt %d/5), retrying in %.0fms",
-                    context_capture_id, attempt + 1, delay * 1000,
+                    context_capture_id,
+                    attempt + 1,
+                    delay * 1000,
                 )
                 time.sleep(delay)
             _logging.getLogger(__name__).warning(
@@ -722,7 +771,8 @@ class ContextManager(DbConsumer):
         except Exception:
             db.rollback()
             _logging.getLogger(__name__).warning(
-                "Failed to update snapshot %s", context_capture_id,
+                "Failed to update snapshot %s",
+                context_capture_id,
                 exc_info=True,
             )
         finally:
@@ -740,8 +790,10 @@ class ContextManager(DbConsumer):
 
     @staticmethod
     def update_snapshot_llm_ids(
-        db_factory: DbFactory, context_capture_id: str,
-        llm_request_id: str | None = None, llm_response_id: str | None = None,
+        db_factory: DbFactory,
+        context_capture_id: str,
+        llm_request_id: str | None = None,
+        llm_response_id: str | None = None,
     ) -> None:
         """Update context capture with LLM request/response IDs (async).
 
@@ -772,9 +824,11 @@ class ContextManager(DbConsumer):
         from api.models import ContextSnapshot as SnapshotModel
 
         with self._db() as db:
-            row = db.query(SnapshotModel).filter(
-                SnapshotModel.context_capture_id == context_capture_id
-            ).first()
+            row = (
+                db.query(SnapshotModel)
+                .filter(SnapshotModel.context_capture_id == context_capture_id)
+                .first()
+            )
 
         if not row:
             raise ContextError(f"Context capture not found: {context_capture_id}")

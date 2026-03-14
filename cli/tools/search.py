@@ -24,14 +24,19 @@ class GrepTool(EdgeTool):
         "type": "object",
         "properties": {
             "pattern": {"type": "string", "description": "Regex pattern to search for"},
-            "path": {"type": "string", "description": "Directory to search (default: project root)"},
+            "path": {
+                "type": "string",
+                "description": "Directory to search (default: project root)",
+            },
             "include": {"type": "string", "description": "File glob filter (e.g. '*.py', '*.go')"},
         },
         "required": ["pattern"],
     }
     side_effect = SideEffect.READ
 
-    async def execute(self, pattern: str, path: str = ".", include: str | None = None, **_: Any) -> str:
+    async def execute(
+        self, pattern: str, path: str = ".", include: str | None = None, **_: Any
+    ) -> str:
         # Use ripgrep if available, fall back to Python
         search_path = Path(self._root) / path if not Path(path).is_absolute() else Path(path)
         if not search_path.exists():
@@ -52,7 +57,9 @@ class GrepTool(EdgeTool):
         args.append(path)
         try:
             proc = await asyncio.create_subprocess_exec(
-                *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
             if proc.returncode in (0, 1):  # 1 = no matches
@@ -87,7 +94,9 @@ class GrepTool(EdgeTool):
     def _iter_files(self, root: Path, include: str | None) -> list[Path]:
         files = []
         for item in root.rglob("*"):
-            if item.name.startswith(".") or any(p.startswith(".") for p in item.relative_to(root).parts):
+            if item.name.startswith(".") or any(
+                p.startswith(".") for p in item.relative_to(root).parts
+            ):
                 continue
             if self._ignore_spec:
                 try:
@@ -113,7 +122,10 @@ class GlobTool(EdgeTool):
     parameters = {
         "type": "object",
         "properties": {
-            "pattern": {"type": "string", "description": "Glob pattern (e.g. '**/*.py', 'src/**/*.go')"},
+            "pattern": {
+                "type": "string",
+                "description": "Glob pattern (e.g. '**/*.py', 'src/**/*.go')",
+            },
             "path": {"type": "string", "description": "Base directory (default: project root)"},
         },
         "required": ["pattern"],

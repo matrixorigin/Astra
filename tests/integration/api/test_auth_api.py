@@ -28,7 +28,7 @@ def db_session():
 def cleanup_test_users(db_session):
     """Clean up test users before and after each test."""
     repo = UserRepository(lambda: db_session)
-    
+
     # Clean before
     test_usernames = ["testuser", "existing", "loginuser", "refreshuser", "logoutuser"]
     for username in test_usernames:
@@ -36,9 +36,9 @@ def cleanup_test_users(db_session):
         if user:
             repo.delete(user.user_id)
     db_session.commit()
-    
+
     yield
-    
+
     # Clean after
     for username in test_usernames:
         user = repo.get_by_username(username)

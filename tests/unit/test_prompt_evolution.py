@@ -64,9 +64,7 @@ class TestPromptEvolver:
 
     def test_get_best_variant(self):
         db = _mock_db()
-        db.execute.return_value = Mock(
-            fetchone=Mock(return_value=("var-1", 2, "Best prompt", 4.8))
-        )
+        db.execute.return_value = Mock(fetchone=Mock(return_value=("var-1", 2, "Best prompt", 4.8)))
 
         evolver = PromptEvolver(lambda: db)
         variant = evolver.get_best_variant("template-1")

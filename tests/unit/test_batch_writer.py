@@ -11,6 +11,7 @@ from core.events.batch_writer import BatchEventWriter, get_batch_writer
 @pytest.fixture(autouse=True)
 def reset_global_writer():
     import core.events.batch_writer as mod
+
     mod._writer = None
     yield
     mod._writer = None
@@ -56,11 +57,21 @@ class TestBatchEventWriterFlush:
 
     def test_flush_calls_batch_insert(self):
         writer, mock_db, mock_session = make_writer()
-        writer._buffer = [{"event_id": "e1", "user_id": "u", "session_id": "s",
-                           "agent_id": None, "agent_version": None,
-                           "event_type": "user_query", "content": "hi",
-                           "parent_event_id": None, "causal_chain_id": None,
-                           "created_at": None, "metadata": None}]
+        writer._buffer = [
+            {
+                "event_id": "e1",
+                "user_id": "u",
+                "session_id": "s",
+                "agent_id": None,
+                "agent_version": None,
+                "event_type": "user_query",
+                "content": "hi",
+                "parent_event_id": None,
+                "causal_chain_id": None,
+                "created_at": None,
+                "metadata": None,
+            }
+        ]
         with patch.object(writer, "_batch_insert") as mock_insert:
             writer._flush()
         mock_insert.assert_called_once()

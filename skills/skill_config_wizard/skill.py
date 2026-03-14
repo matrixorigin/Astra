@@ -71,7 +71,8 @@ class SkillConfigWizardSkill(Skill[ConfigWizardInput, ConfigWizardOutput]):
     async def execute(self, inp: ConfigWizardInput) -> ConfigWizardOutput:
         if not self._config_center:
             return ConfigWizardOutput(
-                success=False, error="Config center not available",
+                success=False,
+                error="Config center not available",
             )
 
         user_id = inp.user_id or ""
@@ -79,13 +80,17 @@ class SkillConfigWizardSkill(Skill[ConfigWizardInput, ConfigWizardOutput]):
 
         # Validate to find what's missing
         errors = self._config_center.validate(
-            skill_name, user_id, resource_key=inp.resource_key,
+            skill_name,
+            user_id,
+            resource_key=inp.resource_key,
         )
         error_names = {(e.section, e.name, e.resource_key) for e in errors}
 
         # Resolve current config
         config = self._config_center.resolve_all(
-            skill_name, user_id, resource_key=inp.resource_key,
+            skill_name,
+            user_id,
+            resource_key=inp.resource_key,
         )
 
         # Load manifest for descriptions
@@ -104,34 +109,40 @@ class SkillConfigWizardSkill(Skill[ConfigWizardInput, ConfigWizardOutput]):
             name = s["name"]
             is_missing = ("settings", name, None) in error_names
             current = config.settings.get(name)
-            items.append({
-                "name": name,
-                "section": "settings",
-                "description": s.get("description", ""),
-                "type": s.get("type", "string"),
-                "required": s.get("required", False),
-                "has_default": "default" in s,
-                "default_value": str(s["default"]) if "default" in s else None,
-                "current_value": str(current) if current is not None else None,
-                "status": "missing" if is_missing else ("ok" if current is not None or "default" in s else "optional"),
-            })
+            items.append(
+                {
+                    "name": name,
+                    "section": "settings",
+                    "description": s.get("description", ""),
+                    "type": s.get("type", "string"),
+                    "required": s.get("required", False),
+                    "has_default": "default" in s,
+                    "default_value": str(s["default"]) if "default" in s else None,
+                    "current_value": str(current) if current is not None else None,
+                    "status": "missing"
+                    if is_missing
+                    else ("ok" if current is not None or "default" in s else "optional"),
+                }
+            )
 
         # Secrets
         for s in manifest.get("secrets", []):
             name = s["name"]
             is_missing = ("secrets", name, None) in error_names
             has_value = name in config.secrets
-            items.append({
-                "name": name,
-                "section": "secrets",
-                "description": s.get("description", ""),
-                "type": "secret",
-                "required": s.get("required", False),
-                "has_default": "default" in s,
-                "default_value": None,  # never expose secret defaults
-                "current_value": "***" if has_value else None,
-                "status": "missing" if is_missing else ("ok" if has_value else "optional"),
-            })
+            items.append(
+                {
+                    "name": name,
+                    "section": "secrets",
+                    "description": s.get("description", ""),
+                    "type": "secret",
+                    "required": s.get("required", False),
+                    "has_default": "default" in s,
+                    "default_value": None,  # never expose secret defaults
+                    "current_value": "***" if has_value else None,
+                    "status": "missing" if is_missing else ("ok" if has_value else "optional"),
+                }
+            )
 
         # Resource bindings
         res_spec = manifest.get("resources", {})
@@ -140,18 +151,24 @@ class SkillConfigWizardSkill(Skill[ConfigWizardInput, ConfigWizardOutput]):
                 bname = b["name"]
                 is_missing = ("resources", bname, inp.resource_key) in error_names
                 has_value = config.resource and bname in config.resource
-                items.append({
-                    "name": bname,
-                    "section": "resources",
-                    "description": b.get("description", ""),
-                    "type": b.get("type", "string"),
-                    "required": b.get("required", False),
-                    "resource_key": inp.resource_key,
-                    "has_default": "default" in b,
-                    "default_value": str(b["default"]) if "default" in b and b.get("type") != "secret" else None,
-                    "current_value": "***" if has_value and b.get("type") == "secret" else (str(config.resource[bname]) if has_value else None),
-                    "status": "missing" if is_missing else ("ok" if has_value else "optional"),
-                })
+                items.append(
+                    {
+                        "name": bname,
+                        "section": "resources",
+                        "description": b.get("description", ""),
+                        "type": b.get("type", "string"),
+                        "required": b.get("required", False),
+                        "resource_key": inp.resource_key,
+                        "has_default": "default" in b,
+                        "default_value": str(b["default"])
+                        if "default" in b and b.get("type") != "secret"
+                        else None,
+                        "current_value": "***"
+                        if has_value and b.get("type") == "secret"
+                        else (str(config.resource[bname]) if has_value else None),
+                        "status": "missing" if is_missing else ("ok" if has_value else "optional"),
+                    }
+                )
 
         missing = [i for i in items if i["status"] == "missing"]
         missing_count = len(missing)
@@ -166,13 +183,21 @@ class SkillConfigWizardSkill(Skill[ConfigWizardInput, ConfigWizardOutput]):
                 hint = f" — {m['description']}" if m.get("description") else ""
                 if sec == "secrets":
                     lines.append(f"  • Secret '{m['name']}'{hint}")
-                    lines.append(f"    → Ask user for the value, then call: set_skill_setting('{skill_name}', '{m['name']}', '<value>')")
+                    lines.append(
+                        f"    → Ask user for the value, then call: set_skill_setting('{skill_name}', '{m['name']}', '<value>')"
+                    )
                 elif sec == "resources":
-                    lines.append(f"  • Resource binding '{m['name']}' for {m.get('resource_key', '?')}{hint}")
-                    lines.append(f"    → Ask user, then call: bind_skill_resource('{skill_name}', '{m.get('resource_key')}', {{'{m['name']}': '<value>'}})")
+                    lines.append(
+                        f"  • Resource binding '{m['name']}' for {m.get('resource_key', '?')}{hint}"
+                    )
+                    lines.append(
+                        f"    → Ask user, then call: bind_skill_resource('{skill_name}', '{m.get('resource_key')}', {{'{m['name']}': '<value>'}})"
+                    )
                 else:
                     lines.append(f"  • Setting '{m['name']}'{hint}")
-                    lines.append(f"    → Ask user, then call: set_skill_setting('{skill_name}', '{m['name']}', '<value>')")
+                    lines.append(
+                        f"    → Ask user, then call: set_skill_setting('{skill_name}', '{m['name']}', '<value>')"
+                    )
             instructions = "\n".join(lines)
 
         return ConfigWizardOutput(

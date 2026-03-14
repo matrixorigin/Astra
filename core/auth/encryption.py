@@ -12,18 +12,18 @@ class TokenEncryption:
 
     def __init__(self, secret_key: str | None = None):
         """Initialize with secret key from env or parameter.
-        
+
         Raises:
             RuntimeError: If TOKEN_ENCRYPTION_KEY is not set in production.
         """
         key_source = secret_key or os.getenv("TOKEN_ENCRYPTION_KEY")
-        
+
         if not key_source:
             raise RuntimeError(
                 "TOKEN_ENCRYPTION_KEY environment variable must be set. "
                 "Generate a key with: python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'"
             )
-        
+
         # Derive a 32-byte key from arbitrary-length secret
         key = hashlib.sha256(key_source.encode()).digest()
         self._fernet = Fernet(base64.urlsafe_b64encode(key))

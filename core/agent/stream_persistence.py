@@ -128,7 +128,7 @@ class StreamPersistence:
 
         Returns:
             str: Database event type string
-            
+
         Raises:
             ValueError: If stream_type is not mapped
         """
@@ -177,8 +177,8 @@ class StreamPersistence:
             StreamEventType.CUSTOM: "stream_custom",
             StreamEventType.RAW: "stream_raw",
         }
-        
+
         if stream_type not in mapping:
             raise ValueError(f"Unmapped StreamEventType: {stream_type}")
-            
+
         return mapping[stream_type]

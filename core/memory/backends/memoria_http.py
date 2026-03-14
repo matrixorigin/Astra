@@ -72,7 +72,9 @@ class MemoriaHTTPClient:
         return resp.json()
 
     def batch_store(self, user_id: str, memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        resp = self.client.post("/v1/memories/batch", json={"memories": memories}, headers=self._headers(user_id))
+        resp = self.client.post(
+            "/v1/memories/batch", json={"memories": memories}, headers=self._headers(user_id)
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -85,17 +87,27 @@ class MemoriaHTTPClient:
         session_id: Optional[str] = None,
         include_cross_session: bool = True,
     ) -> list[dict[str, Any]]:
-        payload: dict[str, Any] = {"query": query, "top_k": top_k, "include_cross_session": include_cross_session}
+        payload: dict[str, Any] = {
+            "query": query,
+            "top_k": top_k,
+            "include_cross_session": include_cross_session,
+        }
         if memory_types:
             payload["memory_types"] = memory_types
         if session_id:
             payload["session_id"] = session_id
-        resp = self.client.post("/v1/memories/retrieve", json=payload, headers=self._headers(user_id))
+        resp = self.client.post(
+            "/v1/memories/retrieve", json=payload, headers=self._headers(user_id)
+        )
         resp.raise_for_status()
         return resp.json()
 
     def search(self, user_id: str, query: str, top_k: int = 10) -> list[dict[str, Any]]:
-        resp = self.client.post("/v1/memories/search", json={"query": query, "top_k": top_k}, headers=self._headers(user_id))
+        resp = self.client.post(
+            "/v1/memories/search",
+            json={"query": query, "top_k": top_k},
+            headers=self._headers(user_id),
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -123,7 +135,9 @@ class MemoriaHTTPClient:
                 return item
         return None
 
-    def correct(self, user_id: str, memory_id: str, new_content: str, reason: str = "") -> dict[str, Any]:
+    def correct(
+        self, user_id: str, memory_id: str, new_content: str, reason: str = ""
+    ) -> dict[str, Any]:
         resp = self.client.put(
             f"/v1/memories/{memory_id}/correct",
             json={"new_content": new_content, "reason": reason},
@@ -132,7 +146,9 @@ class MemoriaHTTPClient:
         resp.raise_for_status()
         return resp.json()
 
-    def correct_by_query(self, user_id: str, query: str, new_content: str, reason: str = "") -> dict[str, Any]:
+    def correct_by_query(
+        self, user_id: str, query: str, new_content: str, reason: str = ""
+    ) -> dict[str, Any]:
         resp = self.client.post(
             "/v1/memories/correct",
             json={"query": query, "new_content": new_content, "reason": reason},
@@ -142,7 +158,9 @@ class MemoriaHTTPClient:
         return resp.json()
 
     def delete(self, user_id: str, memory_id: str, reason: str = "") -> dict[str, Any]:
-        resp = self.client.delete(f"/v1/memories/{memory_id}", params={"reason": reason}, headers=self._headers(user_id))
+        resp = self.client.delete(
+            f"/v1/memories/{memory_id}", params={"reason": reason}, headers=self._headers(user_id)
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -183,12 +201,16 @@ class MemoriaHTTPClient:
         return resp.json()
 
     def consolidate(self, user_id: str, force: bool = False) -> dict[str, Any]:
-        resp = self.client.post("/v1/consolidate", params={"force": force}, headers=self._headers(user_id))
+        resp = self.client.post(
+            "/v1/consolidate", params={"force": force}, headers=self._headers(user_id)
+        )
         resp.raise_for_status()
         return resp.json()
 
     def reflect(self, user_id: str, force: bool = False) -> dict[str, Any]:
-        resp = self.client.post("/v1/reflect", params={"force": force}, headers=self._headers(user_id))
+        resp = self.client.post(
+            "/v1/reflect", params={"force": force}, headers=self._headers(user_id)
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -198,23 +220,41 @@ class MemoriaHTTPClient:
         return resp.json()
 
     def create_snapshot(self, user_id: str, name: str, description: str = "") -> dict[str, Any]:
-        resp = self.client.post("/v1/snapshots", json={"name": name, "description": description}, headers=self._headers(user_id))
+        resp = self.client.post(
+            "/v1/snapshots",
+            json={"name": name, "description": description},
+            headers=self._headers(user_id),
+        )
         resp.raise_for_status()
         return resp.json()
 
     def list_snapshots(self, user_id: str) -> list[dict[str, Any]]:
         resp = self.client.get("/v1/snapshots", headers=self._headers(user_id))
         resp.raise_for_status()
+        # Handle empty response body (some servers return 200 with empty body)
+        content = resp.content.strip()
+        if not content:
+            return []
         return resp.json()
 
-    def get_snapshot(self, user_id: str, name: str, limit: int = 50, offset: int = 0, detail: str = "brief") -> dict[str, Any]:
-        resp = self.client.get(f"/v1/snapshots/{name}", params={"limit": limit, "offset": offset, "detail": detail}, headers=self._headers(user_id))
+    def get_snapshot(
+        self, user_id: str, name: str, limit: int = 50, offset: int = 0, detail: str = "brief"
+    ) -> dict[str, Any]:
+        resp = self.client.get(
+            f"/v1/snapshots/{name}",
+            params={"limit": limit, "offset": offset, "detail": detail},
+            headers=self._headers(user_id),
+        )
         resp.raise_for_status()
         return resp.json()
 
     def delete_snapshot(self, user_id: str, name: str) -> dict[str, Any]:
         resp = self.client.delete(f"/v1/snapshots/{name}", headers=self._headers(user_id))
         resp.raise_for_status()
+        # Handle empty response body (204 No Content)
+        content = resp.content.strip()
+        if not content:
+            return {"name": name, "deleted": True}
         return resp.json()
 
     def health_check(self) -> dict[str, Any]:
@@ -269,8 +309,12 @@ class MemoriaStorage:
         for mem in memories:
             mem_dict = {
                 "content": mem.content,
-                "memory_type": mem.memory_type.value if hasattr(mem.memory_type, 'value') else str(mem.memory_type),
-                "trust_tier": mem.trust_tier.value if hasattr(mem.trust_tier, 'value') else str(mem.trust_tier),
+                "memory_type": mem.memory_type.value
+                if hasattr(mem.memory_type, "value")
+                else str(mem.memory_type),
+                "trust_tier": mem.trust_tier.value
+                if hasattr(mem.trust_tier, "value")
+                else str(mem.trust_tier),
                 "initial_confidence": mem.initial_confidence,
                 "source": "batch_inject",
             }
@@ -304,11 +348,15 @@ class MemoriaStorage:
         **kwargs: Any,
     ) -> Any:
         memories = self.observe_turn(user_id, messages, source_event_ids=source_event_ids)
-        return type("PipelineResult", (), {
-            "memories_extracted": len(memories),
-            "memories_stored": len(memories),
-            "errors": [],
-        })()
+        return type(
+            "PipelineResult",
+            (),
+            {
+                "memories_extracted": len(memories),
+                "memories_stored": len(memories),
+                "errors": [],
+            },
+        )()
 
     def create_memory(self, memory: Memory) -> Memory:
         return self.store(
@@ -331,11 +379,20 @@ class MemoriaStorage:
         # Memoria handles profile caching server-side
         pass
 
-    def generate_session_summary(self, user_id: str, session_id: str, messages: list[dict[str, Any]]) -> Optional[Memory]:
+    def generate_session_summary(
+        self, user_id: str, session_id: str, messages: list[dict[str, Any]]
+    ) -> Optional[Memory]:
         # Memoria handles session summarization server-side
         return None
 
-    def check_and_summarize(self, user_id: str, session_id: str, messages: list[dict[str, Any]], turn_count: int, session_start: Any) -> Optional[Memory]:
+    def check_and_summarize(
+        self,
+        user_id: str,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        turn_count: int,
+        session_start: Any,
+    ) -> Optional[Memory]:
         return None
 
     # ── Read ──────────────────────────────────────────────────────────
@@ -391,8 +448,12 @@ class MemoriaStorage:
 
     # ── Admin / Governance ────────────────────────────────────────────
 
-    def correct(self, user_id: str, memory_id: str, new_content: str, *, reason: str = "") -> Memory:
-        result = self.client.correct(user_id=user_id, memory_id=memory_id, new_content=new_content, reason=reason)
+    def correct(
+        self, user_id: str, memory_id: str, new_content: str, *, reason: str = ""
+    ) -> Memory:
+        result = self.client.correct(
+            user_id=user_id, memory_id=memory_id, new_content=new_content, reason=reason
+        )
         return self._to_memory(result, user_id)
 
     def purge(self, user_id: str, memory_ids: Optional[list[str]] = None, **kwargs: Any) -> Any:
@@ -400,7 +461,7 @@ class MemoriaStorage:
         memory_types = kwargs.get("memory_types")
         if memory_types:
             # Convert MemoryType enums to strings
-            memory_types = [mt.value if hasattr(mt, 'value') else str(mt) for mt in memory_types]
+            memory_types = [mt.value if hasattr(mt, "value") else str(mt) for mt in memory_types]
 
         result = self.client.purge(
             user_id=user_id,
@@ -453,6 +514,7 @@ class MemoriaStorage:
         if isinstance(observed_at, str):
             try:
                 from datetime import timezone
+
                 observed_at = datetime.fromisoformat(observed_at)
                 if observed_at.tzinfo is None:
                     observed_at = observed_at.replace(tzinfo=timezone.utc)
@@ -480,5 +542,3 @@ class MemoriaStorage:
             observed_at=observed_at,
             trust_tier=trust_tier,
         )
-
-

@@ -57,6 +57,7 @@ class TestRateLimiter:
     @pytest.mark.asyncio
     async def test_middleware_blocked(self, limiter):
         from fastapi import HTTPException
+
         request = MagicMock()
         request.state.user_id = "u_block"
         call_next = AsyncMock()
@@ -85,6 +86,7 @@ class TestCausalChainManager:
     @pytest.fixture
     def manager(self):
         from core.events.causal_chain import CausalChainManager
+
         mock_factory = MagicMock()
         mock_db = MagicMock()
         mock_factory.return_value.__enter__ = MagicMock(return_value=mock_db)
@@ -95,6 +97,7 @@ class TestCausalChainManager:
 
     def _make_event(self, event_id, parent_id=None, chain_id="chain1", event_type="user_query"):
         from core.events.models import ConversationEvent
+
         e = MagicMock(spec=ConversationEvent)
         e.event_id = event_id
         e.parent_event_id = parent_id
@@ -118,7 +121,9 @@ class TestCausalChainManager:
     def test_get_parent_event_with_parent(self, manager):
         child = self._make_event("e2", parent_id="e1")
         parent = self._make_event("e1")
-        manager.reader.get_event = MagicMock(side_effect=lambda eid: child if eid == "e2" else parent)
+        manager.reader.get_event = MagicMock(
+            side_effect=lambda eid: child if eid == "e2" else parent
+        )
         result = manager.get_parent_event("e2")
         assert result is parent
 

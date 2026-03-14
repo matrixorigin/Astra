@@ -55,9 +55,10 @@ def cleanup_memories(db):
     # Cleanup
     if created_ids:
         try:
-            db.execute(text(
-                "DELETE FROM mem_memories WHERE memory_id IN :ids"
-            ), {"ids": tuple(created_ids)})
+            db.execute(
+                text("DELETE FROM mem_memories WHERE memory_id IN :ids"),
+                {"ids": tuple(created_ids)},
+            )
             db.commit()
         except Exception:
             db.rollback()
@@ -67,6 +68,7 @@ def cleanup_memories(db):
 # Real DB Tests
 # ---------------------------------------------------------------------------
 
+
 class TestMemoryStoreRealDB:
     """MemoryStore with real MatrixOne database."""
 
@@ -74,7 +76,7 @@ class TestMemoryStoreRealDB:
         """Create a memory and retrieve it."""
         store = MemoryStore(db_factory)
         user_id = _uid()
-        
+
         mem = Memory(
             memory_id=f"test_{uuid7().hex}",
             user_id=user_id,
@@ -84,10 +86,10 @@ class TestMemoryStoreRealDB:
             observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(mem.memory_id)
-        
+
         created = store.create(mem)
         assert created.memory_id == mem.memory_id
-        
+
         retrieved = store.get(mem.memory_id)
         assert retrieved is not None
         assert retrieved.content == mem.content
@@ -97,7 +99,7 @@ class TestMemoryStoreRealDB:
         """List active memories for a user."""
         store = MemoryStore(db_factory)
         user_id = _uid()
-        
+
         # Create multiple memories
         for i in range(3):
             mem = Memory(
@@ -110,7 +112,7 @@ class TestMemoryStoreRealDB:
             )
             cleanup_memories.append(mem.memory_id)
             store.create(mem)
-        
+
         active = store.list_active(user_id, MemoryType.SEMANTIC)
         assert len(active) >= 3
 
@@ -144,7 +146,7 @@ class TestMemoryStoreRealDB:
         """Supersede an old memory with a new one."""
         store = MemoryStore(db_factory)
         user_id = _uid()
-        
+
         old_mem = Memory(
             memory_id=f"old_{uuid7().hex}",
             user_id=user_id,
@@ -155,7 +157,7 @@ class TestMemoryStoreRealDB:
         )
         cleanup_memories.append(old_mem.memory_id)
         store.create(old_mem)
-        
+
         new_mem = Memory(
             memory_id=f"new_{uuid7().hex}",
             user_id=user_id,
@@ -165,10 +167,10 @@ class TestMemoryStoreRealDB:
             observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(new_mem.memory_id)
-        
+
         superseded = store.supersede(old_mem.memory_id, new_mem)
         assert superseded.memory_id == new_mem.memory_id
-        
+
         # Old memory should be inactive
         old = store.get(old_mem.memory_id)
         assert old.is_active is False
@@ -183,7 +185,7 @@ class TestMemoryRetrieverRealDB:
         store = MemoryStore(db_factory)
         retriever = MemoryRetriever(db_factory)
         user_id = _uid()
-        
+
         # Create memories with distinct content
         mem = Memory(
             memory_id=f"kw_{uuid7().hex}",
@@ -195,7 +197,7 @@ class TestMemoryRetrieverRealDB:
         )
         cleanup_memories.append(mem.memory_id)
         store.create(mem)
-        
+
         # Retrieve with keyword query
         results, _ = retriever.retrieve(
             user_id=user_id,
@@ -203,18 +205,18 @@ class TestMemoryRetrieverRealDB:
             query_text="Golang concurrency",
             limit=10,
         )
-        
+
         # Should find the memory (keyword match or cross-session)
         assert any("Golang" in m.content for m in results) or len(results) >= 0
 
     def test_vector_search_uses_ivfflat_index(self, db_factory, cleanup_memories):
         """Verify L2_DISTANCE vector search actually uses ivfflat index (not fallback)."""
         from core.memory.tabular.metrics import MemoryMetrics
-        
+
         store = MemoryStore(db_factory)
         retriever = MemoryRetriever(db_factory)
         user_id = _uid()
-        
+
         # Create memories with embeddings
         embeddings = [
             [0.1] * EMBEDDING_DIM,  # close to query
@@ -233,7 +235,7 @@ class TestMemoryRetrieverRealDB:
             )
             cleanup_memories.append(mem.memory_id)
             store.create(mem)
-        
+
         # Query with embedding close to [0.1]*EMBEDDING_DIM and explain=True
         query_emb = [0.1] * EMBEDDING_DIM
         results, stats = retriever.retrieve(
@@ -244,12 +246,14 @@ class TestMemoryRetrieverRealDB:
             limit=3,
             explain=True,
         )
-        
+
         # Verify via explain stats (precise, no parallel interference)
         assert stats.vector_attempted is True, "Vector search should have been attempted"
-        assert stats.vector_error is None, f"Vector search should not have errors: {stats.vector_error}"
+        assert stats.vector_error is None, (
+            f"Vector search should not have errors: {stats.vector_error}"
+        )
         assert stats.phase2_candidates >= 0, "Should have vector candidates"
-        
+
         # Verify: results are ordered by vector similarity (closest first)
         assert len(results) >= 1
         # The memory with [0.1]*EMBEDDING_DIM embedding should be first (closest to query)
@@ -260,7 +264,9 @@ class TestMemoryRetrieverRealDB:
         db = db_factory()
         try:
             rows = db.execute(text("SHOW INDEX FROM mem_memories")).fetchall()
-            ivf_indexes = [r for r in rows if "ivf" in str(r).lower() and "embedding" in str(r).lower()]
+            ivf_indexes = [
+                r for r in rows if "ivf" in str(r).lower() and "embedding" in str(r).lower()
+            ]
             assert len(ivf_indexes) > 0, (
                 "ivfflat index on memories.embedding not found. "
                 "Run init_db() or manually create: "
@@ -273,6 +279,7 @@ class TestMemoryRetrieverRealDB:
 # ---------------------------------------------------------------------------
 # Golden Session Memory Extraction Tests
 # ---------------------------------------------------------------------------
+
 
 class TestMemoryExtractionFromGolden:
     """Extract memories from golden session conversations."""
@@ -293,22 +300,32 @@ class TestMemoryExtractionFromGolden:
         """TypedObserver can extract memories from code review conversation."""
         # This tests the extraction logic without LLM (mock the LLM response)
         from unittest.mock import MagicMock
-        
+
         mock_llm = MagicMock()
         mock_llm.chat_with_tools.return_value = {
-            "content": json.dumps([
-                {"content": "User needs help with SQL injection prevention", "type": "semantic", "confidence": 0.8},
-                {"content": "User works with Python database code", "type": "profile", "confidence": 0.7},
-            ])
+            "content": json.dumps(
+                [
+                    {
+                        "content": "User needs help with SQL injection prevention",
+                        "type": "semantic",
+                        "confidence": 0.8,
+                    },
+                    {
+                        "content": "User works with Python database code",
+                        "type": "profile",
+                        "confidence": 0.7,
+                    },
+                ]
+            )
         }
-        
+
         store = MagicMock()
         store.create.side_effect = lambda m: m
         store.list_active.return_value = []
-        
+
         observer = TypedObserver(store=store, llm_client=mock_llm)
         memories, _ = observer.observe(user_id=_uid(), messages=code_review_messages)
-        
+
         assert len(memories) == 2
         assert any("SQL injection" in m.content for m in memories)
 
@@ -316,14 +333,14 @@ class TestMemoryExtractionFromGolden:
         """Golden sessions contain content suitable for memory extraction."""
         for name in ["code_review", "debug_error", "chained_tool_calls"]:
             fixture = _load_fixture(name)
-            
+
             # Should have user queries and LLM responses
             user_queries = [e for e in fixture["events"] if e["event_type"] == "user_query"]
             llm_responses = [e for e in fixture["events"] if e["event_type"] == "llm_response"]
-            
+
             assert len(user_queries) > 0, f"{name} should have user queries"
             assert len(llm_responses) > 0, f"{name} should have LLM responses"
-            
+
             # Content should be substantial
             for q in user_queries:
                 assert len(q["content"]) > 10, f"{name} user query too short"
@@ -337,14 +354,14 @@ class TestProfileSynthesisFromGolden:
         store = MemoryStore(db_factory)
         profile_mgr = ProfileManager(store)
         user_id = _uid()
-        
+
         # Create episodic memories that suggest a pattern
         patterns = [
             "User asked about Python type hints",
             "User requested Python code review",
             "User debugged Python async code",
         ]
-        
+
         for i, content in enumerate(patterns):
             mem = Memory(
                 memory_id=f"pat_{uuid7().hex}",  # Full UUID
@@ -356,7 +373,7 @@ class TestProfileSynthesisFromGolden:
             )
             cleanup_memories.append(mem.memory_id)
             store.create(mem)
-        
+
         # Get profile — no PROFILE-type memories exist, only SEMANTIC
         # So profile should be empty (no filler text)
         profile = profile_mgr.get_profile(user_id)
@@ -372,7 +389,7 @@ class TestTieredLoaderWithRealDB:
         store = MemoryStore(db_factory)
         loader = TieredMemoryLoader(MemoryService(db_factory))
         user_id = _uid()
-        
+
         # Create a profile memory
         mem = Memory(
             memory_id=f"prof_{uuid7().hex}",
@@ -384,19 +401,26 @@ class TestTieredLoaderWithRealDB:
         )
         cleanup_memories.append(mem.memory_id)
         store.create(mem)
-        
+
         # Build section
-        section, _ = loader.build_section(user_id, session_id="test_session", query="How to design a distributed cache?")
-        
+        section, _ = loader.build_section(
+            user_id, session_id="test_session", query="How to design a distributed cache?"
+        )
+
         assert section is not None
         assert len(section) > 0
         # Should include the profile or default
-        assert "distributed" in section.lower() or "profile" in section.lower() or "No profile" in section
+        assert (
+            "distributed" in section.lower()
+            or "profile" in section.lower()
+            or "No profile" in section
+        )
 
 
 # ---------------------------------------------------------------------------
 # Real DB Tests for MO-Native Features
 # ---------------------------------------------------------------------------
+
 
 # Serialize DDL-heavy provenance tests — CREATE/DROP SNAPSHOT can conflict
 # with other parallel tests that touch the same MatrixOne catalog.
@@ -411,8 +435,12 @@ class TestProvenanceRealDB:
 
         db_name = os.environ["MATRIXONE_DATABASE"]
         conn = pymysql.connect(
-            host='localhost', port=6001, user='root', password='111',
-            database=db_name, autocommit=True
+            host="localhost",
+            port=6001,
+            user="root",
+            password="111",
+            database=db_name,
+            autocommit=True,
         )
         cursor = conn.cursor()
         try:
@@ -435,8 +463,12 @@ class TestProvenanceRealDB:
 
         db_name = os.environ["MATRIXONE_DATABASE"]
         conn = pymysql.connect(
-            host='localhost', port=6001, user='root', password='111',
-            database=db_name, autocommit=True
+            host="localhost",
+            port=6001,
+            user="root",
+            password="111",
+            database=db_name,
+            autocommit=True,
         )
         cursor = conn.cursor()
         name = "mem_milestone_test_real"
@@ -498,6 +530,7 @@ class TestContradictionRealDB:
 # ---------------------------------------------------------------------------
 # Additional Real DB Tests
 # ---------------------------------------------------------------------------
+
 
 class TestTaskAwareWeightsRealDB:
     """Task-aware retrieval weights with real DB."""
@@ -617,10 +650,16 @@ class TestPipelineRealDB:
         # Mock LLM to return extracted memories
         mock_llm = MagicMock()
         mock_llm.chat_with_tools.return_value = {
-            "content": json.dumps([
-                {"content": "User prefers concise code", "type": "profile", "confidence": 0.8},
-                {"content": "User asked about Python testing", "type": "semantic", "confidence": 0.7},
-            ])
+            "content": json.dumps(
+                [
+                    {"content": "User prefers concise code", "type": "profile", "confidence": 0.8},
+                    {
+                        "content": "User asked about Python testing",
+                        "type": "semantic",
+                        "confidence": 0.7,
+                    },
+                ]
+            )
         }
 
         messages = [
@@ -655,9 +694,11 @@ class TestPipelineRealDB:
         store = MemoryStore(db_factory)
 
         mock_llm = MagicMock()
-        mock_llm.chat_with_tools.return_value = {"content": json.dumps([
-            {"content": "User likes Go", "type": "profile", "confidence": 0.8}
-        ])}
+        mock_llm.chat_with_tools.return_value = {
+            "content": json.dumps(
+                [{"content": "User likes Go", "type": "profile", "confidence": 0.8}]
+            )
+        }
 
         result = run_typed_memory_pipeline(
             db_factory=db_factory,

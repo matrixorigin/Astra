@@ -125,13 +125,12 @@ class TestAllToolsBlocked:
     @pytest.mark.asyncio
     async def test_all_blocked_does_not_trigger_on_empty_schema(self):
         """EvaluateStage guard: empty tools_schema should NOT trigger all_tools_blocked."""
+
         async def mock_llm_call(messages, tools, **kw):
             return {"content": "answer", "tool_calls": []}
 
         state = _make_state(tools_schema=[], max_rounds=1)
-        await _collect_events(
-            execute_turn(state, llm_call=mock_llm_call, tool_execute=AsyncMock())
-        )
+        await _collect_events(execute_turn(state, llm_call=mock_llm_call, tool_execute=AsyncMock()))
 
         assert state.outcome is not None
         assert state.outcome.status == TurnStatus.SUCCESS
@@ -249,8 +248,11 @@ class TestMaxRoundsExhausted:
         assert state.round == 3
 
         # Verify messages were NOT mutated by FinalAnswerStage
-        system_msgs = [m for m in state.messages if m.get("role") == "system"
-                       and "final answer" in m.get("content", "").lower()]
+        system_msgs = [
+            m
+            for m in state.messages
+            if m.get("role") == "system" and "final answer" in m.get("content", "").lower()
+        ]
         assert len(system_msgs) == 0, "FinalAnswerStage should not mutate state.messages"
 
         # Verify turn_complete event
@@ -261,6 +263,7 @@ class TestMaxRoundsExhausted:
     @pytest.mark.asyncio
     async def test_exhausted_without_final_answer_call(self):
         """When no final_answer_call is provided, use default message."""
+
         async def mock_llm_call(messages, tools, **kw):
             return {"content": "", "tool_calls": [_tool_call("grep")]}
 
@@ -290,6 +293,7 @@ class TestWallClockTimeout:
         Flow: round 0 starts (not timed out yet) → tool sleeps 0.5s → round 0 ends →
         round 1 starts → timeout check fires (0.5s > 0.1s) → exit.
         """
+
         async def mock_llm_call(messages, tools, **kw):
             return {"content": "", "tool_calls": [_tool_call("grep")]}
 
@@ -497,8 +501,9 @@ class TestRoutingConversational:
         assert state.round == 0
 
         # Verify route stage_complete event
-        route_events = [e for e in events if e.event_type == "stage_complete"
-                        and e.data.get("stage") == "route"]
+        route_events = [
+            e for e in events if e.event_type == "stage_complete" and e.data.get("stage") == "route"
+        ]
         assert len(route_events) == 1
         assert route_events[0].data["classification"] == "CONVERSATIONAL"
 
@@ -551,8 +556,9 @@ class TestRoutingExternalFetch:
         assert "shell" not in tool_names
 
         # Verify route event
-        route_events = [e for e in events if e.event_type == "stage_complete"
-                        and e.data.get("stage") == "route"]
+        route_events = [
+            e for e in events if e.event_type == "stage_complete" and e.data.get("stage") == "route"
+        ]
         assert len(route_events) == 1
         assert route_events[0].data["classification"] == "EXTERNAL_FETCH"
 
@@ -569,12 +575,17 @@ class TestRoutingWithRoutingDecision:
     async def test_routing_decision_default(self):
         """RoutingDecision with NONE tool_filter → no changes."""
         from core.context.intent_routing import (
-            INTENT_PLANS, RoutingDecision, RoutingResult, ToolFilter,
+            INTENT_PLANS,
+            RoutingDecision,
+            RoutingResult,
+            ToolFilter,
         )
 
         decision = RoutingDecision(
             plan=INTENT_PLANS["question"],
-            routing_result=RoutingResult(intent="question", confidence=0.9, tier=0, matched_by="regex"),
+            routing_result=RoutingResult(
+                intent="question", confidence=0.9, tier=0, matched_by="regex"
+            ),
             tool_filter=ToolFilter.NONE,
         )
 
@@ -598,12 +609,17 @@ class TestRoutingWithRoutingDecision:
     async def test_routing_decision_all_blocked(self):
         """RoutingDecision with ALL_BLOCKED → tools cleared, max_rounds=0."""
         from core.context.intent_routing import (
-            INTENT_PLANS, RoutingDecision, RoutingResult, ToolFilter,
+            INTENT_PLANS,
+            RoutingDecision,
+            RoutingResult,
+            ToolFilter,
         )
 
         decision = RoutingDecision(
             plan=INTENT_PLANS["preference"],
-            routing_result=RoutingResult(intent="preference", confidence=0.9, tier=0, matched_by="regex"),
+            routing_result=RoutingResult(
+                intent="preference", confidence=0.9, tier=0, matched_by="regex"
+            ),
             tool_filter=ToolFilter.ALL_BLOCKED,
             max_tool_rounds=0,
         )
@@ -699,6 +715,7 @@ class TestObservability:
     @pytest.mark.asyncio
     async def test_event_stream_structure_happy_path(self):
         """Verify complete event stream order for a simple happy path."""
+
         async def mock_llm_call(messages, tools, **kw):
             return {"content": "answer", "tool_calls": []}
 
@@ -798,6 +815,7 @@ class TestBlockedToolInParallelBatch:
         assert "shell" in executed_tools
 
         # Verify grep's tool message contains error
-        grep_msg = next(m for m in state.messages
-                        if m.get("role") == "tool" and m.get("tool_call_id") == "c1")
+        grep_msg = next(
+            m for m in state.messages if m.get("role") == "tool" and m.get("tool_call_id") == "c1"
+        )
         assert "blocked" in grep_msg["content"].lower()

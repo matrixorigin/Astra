@@ -28,11 +28,7 @@ class ContextService:
         return self._db_factory()
 
     def create_snapshot(
-        self,
-        user_id: str,
-        session_id: str,
-        event_id: str,
-        context_data: dict[str, Any]
+        self, user_id: str, session_id: str, event_id: str, context_data: dict[str, Any]
     ) -> dict[str, Any]:
         """创建上下文快照"""
         # 验证权限
@@ -69,8 +65,8 @@ class ContextService:
                     "assembly_time_ms": context_data.get("assembly_time_ms"),
                     "relevance_scores": json.dumps(context_data.get("relevance_scores")),
                     "task_type": context_data.get("task_type"),
-                    "created_at": datetime.now(timezone.utc)
-                }
+                    "created_at": datetime.now(timezone.utc),
+                },
             )
             db.commit()
 
@@ -81,7 +77,7 @@ class ContextService:
                 resource_type="context_snapshot",
                 resource_id=context_capture_id,
                 details={"session_id": session_id, "event_id": event_id},
-                status="success"
+                status="success",
             )
 
             return {
@@ -89,7 +85,7 @@ class ContextService:
                 "session_id": session_id,
                 "event_id": event_id,
                 "context_data": context_data,
-                "created_at": datetime.now(timezone.utc).isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat(),
             }
 
         except Exception as e:
@@ -99,15 +95,11 @@ class ContextService:
                 resource_type="context_snapshot",
                 resource_id="unknown",
                 details={"error": str(e)},
-                status="failed"
+                status="failed",
             )
             raise
 
-    def get_snapshot(
-        self,
-        context_capture_id: str,
-        user_id: str
-    ) -> dict[str, Any]:
+    def get_snapshot(self, context_capture_id: str, user_id: str) -> dict[str, Any]:
         """获取上下文快照"""
         try:
             result = self.db_session.execute(
@@ -121,8 +113,8 @@ class ContextService:
                     JOIN agent_sessions s ON cs.session_id = s.session_id
                     WHERE cs.context_capture_id = :context_capture_id AND s.user_id = :user_id
                     """),
-                {"context_capture_id": context_capture_id, "user_id": user_id}
-                )
+                {"context_capture_id": context_capture_id, "user_id": user_id},
+            )
 
             row = result.first()
 
@@ -134,15 +126,27 @@ class ContextService:
             # 重构为 context_data
             context_data = {
                 "system_prompt": result_dict["system_prompt"],
-                "skill_definitions": json.loads(result_dict["skill_definitions"]) if result_dict["skill_definitions"] else [],
-                "selected_events": json.loads(result_dict["selected_events"]) if result_dict["selected_events"] else [],
-                "code_context": json.loads(result_dict["code_context"]) if result_dict["code_context"] else {},
-                "documentation": json.loads(result_dict["documentation"]) if result_dict["documentation"] else {},
+                "skill_definitions": json.loads(result_dict["skill_definitions"])
+                if result_dict["skill_definitions"]
+                else [],
+                "selected_events": json.loads(result_dict["selected_events"])
+                if result_dict["selected_events"]
+                else [],
+                "code_context": json.loads(result_dict["code_context"])
+                if result_dict["code_context"]
+                else {},
+                "documentation": json.loads(result_dict["documentation"])
+                if result_dict["documentation"]
+                else {},
                 "total_tokens": result_dict["total_tokens"],
-                "token_budget": json.loads(result_dict["token_budget"]) if result_dict["token_budget"] else {},
+                "token_budget": json.loads(result_dict["token_budget"])
+                if result_dict["token_budget"]
+                else {},
                 "assembly_time_ms": result_dict["assembly_time_ms"],
-                "relevance_scores": json.loads(result_dict["relevance_scores"]) if result_dict["relevance_scores"] else {},
-                "task_type": result_dict["task_type"]
+                "relevance_scores": json.loads(result_dict["relevance_scores"])
+                if result_dict["relevance_scores"]
+                else {},
+                "task_type": result_dict["task_type"],
             }
 
             return {
@@ -150,7 +154,9 @@ class ContextService:
                 "session_id": result_dict["session_id"],
                 "event_id": result_dict["event_id"],
                 "context_data": context_data,
-                "created_at": result_dict["created_at"].isoformat() if result_dict.get("created_at") else None
+                "created_at": result_dict["created_at"].isoformat()
+                if result_dict.get("created_at")
+                else None,
             }
         except ResourceNotFoundError:
             raise
@@ -158,11 +164,7 @@ class ContextService:
             raise ResourceNotFoundError(f"获取快照失败: {e!s}")
 
     def list_snapshots(
-        self,
-        user_id: str,
-        session_id: str | None = None,
-        limit: int = 50,
-        offset: int = 0
+        self, user_id: str, session_id: str | None = None, limit: int = 50, offset: int = 0
     ) -> dict[str, Any]:
         """列出上下文快照"""
         try:
@@ -181,13 +183,15 @@ class ContextService:
                         ORDER BY created_at DESC
                         LIMIT :limit OFFSET :offset
                         """),
-                    {"session_id": session_id, "limit": limit, "offset": offset}
+                    {"session_id": session_id, "limit": limit, "offset": offset},
                 )
                 snapshots = [dict(row._mapping) for row in result]
 
                 count_result = db.execute(
-                    text("SELECT COUNT(*) as total FROM ctx_snapshots WHERE session_id = :session_id"),
-                    {"session_id": session_id}
+                    text(
+                        "SELECT COUNT(*) as total FROM ctx_snapshots WHERE session_id = :session_id"
+                    ),
+                    {"session_id": session_id},
                 )
                 total = count_result.first()._mapping["total"]
             else:
@@ -200,7 +204,7 @@ class ContextService:
                         ORDER BY cs.created_at DESC
                         LIMIT :limit OFFSET :offset
                         """),
-                    {"user_id": user_id, "limit": limit, "offset": offset}
+                    {"user_id": user_id, "limit": limit, "offset": offset},
                 )
                 snapshots = [dict(row._mapping) for row in result]
 
@@ -211,7 +215,7 @@ class ContextService:
                         JOIN agent_sessions s ON cs.session_id = s.session_id
                         WHERE s.user_id = :user_id
                         """),
-                    {"user_id": user_id}
+                    {"user_id": user_id},
                 )
                 total = count_result.first()._mapping["total"]
 
@@ -221,14 +225,14 @@ class ContextService:
                         "context_capture_id": s["context_capture_id"],
                         "session_id": s["session_id"],
                         "event_id": s["event_id"],
-                        "created_at": s["created_at"].isoformat() if s.get("created_at") else None
+                        "created_at": s["created_at"].isoformat() if s.get("created_at") else None,
                     }
                     for s in snapshots
-                    ],
-                    "total": total,
-                    "limit": limit,
-                    "offset": offset
-                }
+                ],
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+            }
         except PermissionDeniedError:
             raise
         except Exception as e:

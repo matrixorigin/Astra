@@ -20,13 +20,21 @@ class TestTheme:
 
     def test_styles_are_rich_style(self):
         for name in (
-            "assistant_style", "tool_style", "success_style", "failure_style",
-            "error_style", "info_style", "prompt_style", "dim_style", "border_style",
+            "assistant_style",
+            "tool_style",
+            "success_style",
+            "failure_style",
+            "error_style",
+            "info_style",
+            "prompt_style",
+            "dim_style",
+            "border_style",
         ):
             val = getattr(THEME, name)
             assert isinstance(val, Style), f"{name} should be rich.style.Style"
 
     def test_frozen(self):
         import pytest
+
         with pytest.raises(AttributeError):
             THEME.prompt = ">"  # type: ignore[misc]

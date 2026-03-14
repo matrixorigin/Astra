@@ -55,8 +55,11 @@ def test_store_and_retrieve_embedding(db, db_factory):
 
     # Retrieve
     from sqlalchemy import text
+
     row = db.execute(
-        text("SELECT model_name, model_version, metadata FROM ctx_event_embeddings WHERE event_id = :event_id"),
+        text(
+            "SELECT model_name, model_version, metadata FROM ctx_event_embeddings WHERE event_id = :event_id"
+        ),
         {"event_id": event_id},
     ).fetchone()
 
@@ -83,32 +86,33 @@ def test_cosine_similarity(db, db_factory):
     user_id = str(uuid4())
     session_id = str(uuid4())
 
-    session = session_repo.create({
-        "session_id": session_id,
-        "user_id": user_id
-    })
+    session = session_repo.create({"session_id": session_id, "user_id": user_id})
 
     # Create events
     event1_id = str(uuid4())
     event2_id = str(uuid4())
 
-    event1 = event_repo.create({
-        "event_id": event1_id,
-        "user_id": user_id,
-        "session_id": session_id,
-        "event_type": "user_query",
-        "content": "Hello world",
-        "causal_chain_id": str(uuid4())
-    })
+    event1 = event_repo.create(
+        {
+            "event_id": event1_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "event_type": "user_query",
+            "content": "Hello world",
+            "causal_chain_id": str(uuid4()),
+        }
+    )
 
-    event2 = event_repo.create({
-        "event_id": event2_id,
-        "user_id": user_id,
-        "session_id": session_id,
-        "event_type": "user_query",
-        "content": "Hello world",
-        "causal_chain_id": str(uuid4())
-    })
+    event2 = event_repo.create(
+        {
+            "event_id": event2_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "event_type": "user_query",
+            "content": "Hello world",
+            "causal_chain_id": str(uuid4()),
+        }
+    )
 
     # Same text should have distance = 0
     emb1 = service.embed_text("Hello world")
@@ -140,10 +144,7 @@ def test_search_similar(db, db_factory):
     user_id = str(uuid4())
     session_id = str(uuid4())
 
-    session = session_repo.create({
-        "session_id": session_id,
-        "user_id": user_id
-    })
+    session = session_repo.create({"session_id": session_id, "user_id": user_id})
 
     # Create events with different content
     contents = [
@@ -154,14 +155,16 @@ def test_search_similar(db, db_factory):
 
     for content in contents:
         event_id = str(uuid4())
-        event = event_repo.create({
-            "event_id": event_id,
-            "user_id": user_id,
-            "session_id": session_id,
-            "event_type": "user_query",
-            "content": content,
-            "causal_chain_id": str(uuid4())
-        })
+        event = event_repo.create(
+            {
+                "event_id": event_id,
+                "user_id": user_id,
+                "session_id": session_id,
+                "event_type": "user_query",
+                "content": content,
+                "causal_chain_id": str(uuid4()),
+            }
+        )
 
         # Generate and store embedding
         embedding = service.embed_text(content)
@@ -197,31 +200,32 @@ def test_search_with_json_extract_filter(db, db_factory):
     user_id = str(uuid4())
     session_id = str(uuid4())
 
-    session = session_repo.create({
-        "session_id": session_id,
-        "user_id": user_id
-    })
+    session = session_repo.create({"session_id": session_id, "user_id": user_id})
 
     # Create events with metadata
     event1_id = str(uuid4())
-    event1 = event_repo.create({
-        "event_id": event1_id,
-        "user_id": user_id,
-        "session_id": session_id,
-        "event_type": "user_query",
-        "content": "How to implement auth?",
-        "causal_chain_id": str(uuid4())
-    })
+    event1 = event_repo.create(
+        {
+            "event_id": event1_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "event_type": "user_query",
+            "content": "How to implement auth?",
+            "causal_chain_id": str(uuid4()),
+        }
+    )
 
     event2_id = str(uuid4())
-    event2 = event_repo.create({
-        "event_id": event2_id,
-        "user_id": user_id,
-        "session_id": session_id,
-        "event_type": "user_query",
-        "content": "What's the weather?",
-        "causal_chain_id": str(uuid4())
-    })
+    event2 = event_repo.create(
+        {
+            "event_id": event2_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "event_type": "user_query",
+            "content": "What's the weather?",
+            "causal_chain_id": str(uuid4()),
+        }
+    )
 
     # Store embeddings with metadata
     emb1 = service.embed_text("How to implement auth?")

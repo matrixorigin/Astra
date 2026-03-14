@@ -21,14 +21,25 @@ from core.verification.tool_quality import (
 
 # ── Task 2: Assessment wiring ───────────────────────────────────────────────
 
+
 class TestAssessmentWiring:
     """Verify assess + annotate logic matches what chat.py does inline."""
 
     def test_degraded_tool_result_annotated_in_history(self):
         """Degraded result gets quality annotation prepended."""
-        tr = {"name": "stock_assistant", "tool_call_id": "tc1", "result": json.dumps({
-            "data": {}, "info": {}, "risk_score": 0, "confidence": 0, "volatility": 0,
-        })}
+        tr = {
+            "name": "stock_assistant",
+            "tool_call_id": "tc1",
+            "result": json.dumps(
+                {
+                    "data": {},
+                    "info": {},
+                    "risk_score": 0,
+                    "confidence": 0,
+                    "volatility": 0,
+                }
+            ),
+        }
         assessment = assess_tool_result(tr["name"], tr["result"])
         assert assessment.needs_annotation
         annotated = annotate_tool_result(tr, assessment)
@@ -36,9 +47,18 @@ class TestAssessmentWiring:
 
     def test_complete_tool_result_unchanged(self):
         """Complete result is not modified."""
-        tr = {"name": "weather", "tool_call_id": "tc2", "result": json.dumps({
-            "temperature": 22, "humidity": 65, "wind_speed": 12, "city": "Beijing",
-        })}
+        tr = {
+            "name": "weather",
+            "tool_call_id": "tc2",
+            "result": json.dumps(
+                {
+                    "temperature": 22,
+                    "humidity": 65,
+                    "wind_speed": 12,
+                    "city": "Beijing",
+                }
+            ),
+        }
         assessment = assess_tool_result(tr["name"], tr["result"])
         assert not assessment.needs_annotation
         annotated = annotate_tool_result(tr, assessment)
@@ -75,6 +95,7 @@ class TestAssessmentWiring:
 
 # ── Task 3: Quality event logging ───────────────────────────────────────────
 
+
 class TestQualityEventLogging:
     """Verify quality event emission logic matches chat.py Phase 2b."""
 
@@ -83,35 +104,58 @@ class TestQualityEventLogging:
         events = []
         for qa in assessments:
             if qa["grade"] != "complete":
-                events.append({
-                    "event_type": "tool_result_quality",
-                    "content": json.dumps(qa),
-                    "metadata": qa,
-                })
+                events.append(
+                    {
+                        "event_type": "tool_result_quality",
+                        "content": json.dumps(qa),
+                        "metadata": qa,
+                    }
+                )
         return events
 
     def test_quality_event_emitted_for_degraded(self):
         a = assess_tool_result("stock_assistant", {"data": {}, "info": {}})
-        qa_dict = {"tool_name": a.tool_name, "score": a.score, "grade": a.grade,
-                   "signals": a.signals, "stale": a.stale}
+        qa_dict = {
+            "tool_name": a.tool_name,
+            "score": a.score,
+            "grade": a.grade,
+            "signals": a.signals,
+            "stale": a.stale,
+        }
         events = self._simulate_phase2b([qa_dict])
         assert len(events) == 1
         assert events[0]["event_type"] == "tool_result_quality"
 
     def test_no_quality_event_for_passthrough(self):
         a = assess_tool_result("bash", {"output": "hello"})
-        qa_dict = {"tool_name": a.tool_name, "score": a.score, "grade": a.grade,
-                   "signals": a.signals, "stale": a.stale}
+        qa_dict = {
+            "tool_name": a.tool_name,
+            "score": a.score,
+            "grade": a.grade,
+            "signals": a.signals,
+            "stale": a.stale,
+        }
         events = self._simulate_phase2b([qa_dict])
         assert len(events) == 0
 
     def test_quality_event_metadata_correct(self):
-        a = assess_tool_result("stock_assistant", {
-            "risk_score": 0, "confidence": 0, "volatility": 0,
-            "data": {}, "name": "test",
-        })
-        qa_dict = {"tool_name": a.tool_name, "score": a.score, "grade": a.grade,
-                   "signals": a.signals, "stale": a.stale}
+        a = assess_tool_result(
+            "stock_assistant",
+            {
+                "risk_score": 0,
+                "confidence": 0,
+                "volatility": 0,
+                "data": {},
+                "name": "test",
+            },
+        )
+        qa_dict = {
+            "tool_name": a.tool_name,
+            "score": a.score,
+            "grade": a.grade,
+            "signals": a.signals,
+            "stale": a.stale,
+        }
         events = self._simulate_phase2b([qa_dict])
         assert len(events) == 1
         meta = events[0]["metadata"]
@@ -128,13 +172,22 @@ class TestQualityEventLogging:
         """
         # Simulate what reflect's _build_reflect_evidence would see
         quality_events = [
-            {"event_type": "tool_result_quality", "content": json.dumps({
-                "tool_name": "stock_assistant", "score": 0.3, "grade": "degraded",
-                "signals": ["empty_containers: 3/4 fields empty"], "stale": False,
-            })},
+            {
+                "event_type": "tool_result_quality",
+                "content": json.dumps(
+                    {
+                        "tool_name": "stock_assistant",
+                        "score": 0.3,
+                        "grade": "degraded",
+                        "signals": ["empty_containers: 3/4 fields empty"],
+                        "stale": False,
+                    }
+                ),
+            },
         ]
         # Reflect filters: only non-complete
-        surfaced = [e for e in quality_events
-                    if json.loads(e["content"]).get("grade") != "complete"]
+        surfaced = [
+            e for e in quality_events if json.loads(e["content"]).get("grade") != "complete"
+        ]
         assert len(surfaced) == 1
         assert json.loads(surfaced[0]["content"])["tool_name"] == "stock_assistant"

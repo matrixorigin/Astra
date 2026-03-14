@@ -9,6 +9,7 @@ from matrixone.sqlalchemy_ext import VectorType, VectorPrecision
 
 class SkKnowledgeEntry(Base):
     """Semantic memory: extracted knowledge that persists across sessions."""
+
     __tablename__ = "sk_knowledge_entries"
     entry_id = Column(String(64), primary_key=True)
     user_id = Column(String(64), nullable=False, index=True)
@@ -43,6 +44,7 @@ class SkKnowledgeEntry(Base):
 
 class SkKnowledgeEntrySource(Base):
     """Provenance: which events directly produced each knowledge entry."""
+
     __tablename__ = "sk_knowledge_entry_sources"
     entry_id = Column(String(64), primary_key=True)
     event_id = Column(String(64), primary_key=True, index=True)
@@ -50,6 +52,7 @@ class SkKnowledgeEntrySource(Base):
 
 class SkKnowledgeRelation(Base):
     """Entity-relationship layer over sk_knowledge_entries (knowledge graph edges)."""
+
     __tablename__ = "sk_knowledge_relations"
     __table_args__ = (
         UniqueConstraint("subject_id", "predicate", "object_id", name="uq_sk_knowledge_spo"),

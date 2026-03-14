@@ -24,14 +24,14 @@ def _console():
 
 # Reusable echo skill source — typed Skill (not MarkdownSkill)
 _ECHO_SKILL_PY = (
-    'from core.skills.base import Skill, SkillInput, SkillOutput\n'
-    'from pydantic import Field\n'
+    "from core.skills.base import Skill, SkillInput, SkillOutput\n"
+    "from pydantic import Field\n"
     'class EI(SkillInput):\n    query: str = ""\n'
     'class EO(SkillOutput):\n    echo: str = ""\n'
-    'class EchoSkill(Skill[EI, EO]):\n'
+    "class EchoSkill(Skill[EI, EO]):\n"
     '    name = "echo"\n    version = "1.0.0"\n    description = "echo"\n'
-    '    async def execute(self, input: EI) -> EO:\n'
-    '        return EO(success=True, echo=input.query)\n'
+    "    async def execute(self, input: EI) -> EO:\n"
+    "        return EO(success=True, echo=input.query)\n"
 )
 
 
@@ -48,6 +48,7 @@ def echo_skill(tmp_path, monkeypatch):
 # ============================================================================
 # /skill new
 # ============================================================================
+
 
 class TestSkillNew:
     def test_creates_loadable_skill(self, tmp_path, monkeypatch):
@@ -67,6 +68,7 @@ class TestSkillNew:
         assert 'name = "my_tool"' in content
 
         from core.skills.loader import SkillLoader
+
         skills = SkillLoader.discover([tmp_path / ".mo-agent" / "skills"])
         assert len(skills) == 1
         assert skills[0].skill.name == "my_tool"
@@ -99,6 +101,7 @@ class TestSkillNew:
 # /skill test
 # ============================================================================
 
+
 class TestSkillTest:
     def test_runs_typed_skill(self, echo_skill):
         console, buf = _console()
@@ -130,12 +133,12 @@ class TestSkillTest:
         skill_dir = tmp_path / ".mo-agent" / "skills" / "fail"
         skill_dir.mkdir(parents=True)
         (skill_dir / "skill.py").write_text(
-            'from core.skills.base import Skill, SkillInput, SkillOutput\n'
+            "from core.skills.base import Skill, SkillInput, SkillOutput\n"
             'class I(SkillInput):\n    query: str = ""\n'
-            'class O(SkillOutput):\n    pass\n'
-            'class FailSkill(Skill[I, O]):\n'
+            "class O(SkillOutput):\n    pass\n"
+            "class FailSkill(Skill[I, O]):\n"
             '    name = "fail"\n    version = "1.0.0"\n    description = "fail"\n'
-            '    async def execute(self, input):\n'
+            "    async def execute(self, input):\n"
             '        raise ValueError("boom")\n'
         )
         console, buf = _console()
@@ -151,15 +154,15 @@ class TestSkillTest:
         skill_dir = tmp_path / ".mo-agent" / "skills" / "empty"
         skill_dir.mkdir(parents=True)
         (skill_dir / "skill.py").write_text(
-            'from core.skills.base import Skill, SkillInput, SkillOutput\n'
+            "from core.skills.base import Skill, SkillInput, SkillOutput\n"
             'class I(SkillInput):\n    query: str = ""\n'
-            'class O(SkillOutput):\n    data: dict = {}\n'
-            'class EmptySkill(Skill[I, O]):\n'
+            "class O(SkillOutput):\n    data: dict = {}\n"
+            "class EmptySkill(Skill[I, O]):\n"
             '    name = "empty"\n'
             '    version = "1.0.0"\n'
             '    description = "returns empty"\n'
-            '    async def execute(self, input):\n'
-            '        return O(success=True)\n'
+            "    async def execute(self, input):\n"
+            "        return O(success=True)\n"
         )
         console, buf = _console()
         cmd_skill(console, cmd_arg="test empty")
@@ -172,6 +175,7 @@ class TestSkillTest:
 # ============================================================================
 # /skill dev
 # ============================================================================
+
 
 class TestSkillDev:
     def test_sets_state_with_file_contents(self, tmp_path, monkeypatch):
@@ -237,24 +241,24 @@ class TestSkillDev:
 # /skill list
 # ============================================================================
 
+
 class TestSkillList:
     def test_shows_both_types(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         md_dir = tmp_path / ".mo-agent" / "skills" / "md-skill"
         md_dir.mkdir(parents=True)
         (md_dir / "SKILL.md").write_text(
-            "---\nname: md_skill\nversion: 1.0.0\n"
-            "description: markdown skill\n---\nbody"
+            "---\nname: md_skill\nversion: 1.0.0\ndescription: markdown skill\n---\nbody"
         )
         py_dir = tmp_path / ".mo-agent" / "skills" / "py-skill"
         py_dir.mkdir(parents=True)
         (py_dir / "skill.py").write_text(
-            'from core.skills.base import Skill, SkillInput, SkillOutput\n'
-            'class I(SkillInput):\n    pass\n'
-            'class O(SkillOutput):\n    pass\n'
-            'class PySkill(Skill[I, O]):\n'
+            "from core.skills.base import Skill, SkillInput, SkillOutput\n"
+            "class I(SkillInput):\n    pass\n"
+            "class O(SkillOutput):\n    pass\n"
+            "class PySkill(Skill[I, O]):\n"
             '    name = "py_skill"\n    version = "1.0.0"\n    description = "python skill"\n'
-            '    async def execute(self, input): return O(success=True)\n'
+            "    async def execute(self, input): return O(success=True)\n"
         )
         console, buf = _console()
         cmd_skill(console, cmd_arg="list")
@@ -275,6 +279,7 @@ class TestSkillList:
 # ============================================================================
 # Helpers
 # ============================================================================
+
 
 class TestHelpers:
     def test_to_class_snake(self):
@@ -339,6 +344,7 @@ class TestHelpers:
 # /skill validate
 # ============================================================================
 
+
 class TestSkillValidate:
     """Tests for /skill validate command and _validate_skill_source."""
 
@@ -349,14 +355,14 @@ class TestSkillValidate:
         skill_dir.mkdir(parents=True)
         # Use Field(description=...) for input, and default for output
         (skill_dir / "skill.py").write_text(
-            'from core.skills.base import Skill, SkillInput, SkillOutput\n'
-            'from pydantic import Field\n'
+            "from core.skills.base import Skill, SkillInput, SkillOutput\n"
+            "from pydantic import Field\n"
             'class GI(SkillInput):\n    query: str = Field(description="test query")\n'
             'class GO(SkillOutput):\n    data: str = ""\n'
-            'class GoodSkill(Skill[GI, GO]):\n'
+            "class GoodSkill(Skill[GI, GO]):\n"
             '    name = "good"\n    version = "1.0.0"\n    description = "A good skill"\n'
-            '    async def execute(self, input: GI) -> GO:\n'
-            '        return GO(success=True, data=input.query)\n'
+            "    async def execute(self, input: GI) -> GO:\n"
+            "        return GO(success=True, data=input.query)\n"
         )
         console, buf = _console()
         cmd_skill(console, cmd_arg="validate good")
@@ -368,13 +374,13 @@ class TestSkillValidate:
         skill_dir = tmp_path / "sync-skill"
         skill_dir.mkdir(parents=True)
         (skill_dir / "skill.py").write_text(
-            'from core.skills.base import Skill, SkillInput, SkillOutput\n'
-            'class I(SkillInput):\n    pass\n'
-            'class O(SkillOutput):\n    pass\n'
-            'class SyncSkill(Skill[I, O]):\n'
+            "from core.skills.base import Skill, SkillInput, SkillOutput\n"
+            "class I(SkillInput):\n    pass\n"
+            "class O(SkillOutput):\n    pass\n"
+            "class SyncSkill(Skill[I, O]):\n"
             '    name = "sync"\n    version = "1.0.0"\n    description = "sync"\n'
-            '    def execute(self, input):\n'  # Missing async!
-            '        return O(success=True)\n'
+            "    def execute(self, input):\n"  # Missing async!
+            "        return O(success=True)\n"
         )
         issues = _validate_skill_source(skill_dir)
         errors = [msg for level, msg in issues if level == "error"]
@@ -385,12 +391,12 @@ class TestSkillValidate:
         skill_dir = tmp_path / "raise-skill"
         skill_dir.mkdir(parents=True)
         (skill_dir / "skill.py").write_text(
-            'from core.skills.base import Skill, SkillInput, SkillOutput\n'
-            'class I(SkillInput):\n    pass\n'
-            'class O(SkillOutput):\n    pass\n'
-            'class RaiseSkill(Skill[I, O]):\n'
+            "from core.skills.base import Skill, SkillInput, SkillOutput\n"
+            "class I(SkillInput):\n    pass\n"
+            "class O(SkillOutput):\n    pass\n"
+            "class RaiseSkill(Skill[I, O]):\n"
             '    name = "raise_test"\n    version = "1.0.0"\n    description = "test"\n'
-            '    async def execute(self, input):\n'
+            "    async def execute(self, input):\n"
             '        raise ValueError("boom")\n'
         )
         issues = _validate_skill_source(skill_dir)
@@ -402,13 +408,13 @@ class TestSkillValidate:
         skill_dir = tmp_path / "no-desc-skill"
         skill_dir.mkdir(parents=True)
         (skill_dir / "skill.py").write_text(
-            'from core.skills.base import Skill, SkillInput, SkillOutput\n'
-            'class I(SkillInput):\n    query: str\n'  # No Field(description=...)
+            "from core.skills.base import Skill, SkillInput, SkillOutput\n"
+            "class I(SkillInput):\n    query: str\n"  # No Field(description=...)
             'class O(SkillOutput):\n    data: str = ""\n'
-            'class NoDescSkill(Skill[I, O]):\n'
+            "class NoDescSkill(Skill[I, O]):\n"
             '    name = "no_desc"\n    version = "1.0.0"\n    description = "test"\n'
-            '    async def execute(self, input):\n'
-            '        return O(success=True)\n'
+            "    async def execute(self, input):\n"
+            "        return O(success=True)\n"
         )
         issues = _validate_skill_source(skill_dir)
         warnings = [msg for level, msg in issues if level == "warning"]
@@ -419,13 +425,13 @@ class TestSkillValidate:
         skill_dir = tmp_path / "no-default-skill"
         skill_dir.mkdir(parents=True)
         (skill_dir / "skill.py").write_text(
-            'from core.skills.base import Skill, SkillInput, SkillOutput\n'
-            'from pydantic import Field\n'
+            "from core.skills.base import Skill, SkillInput, SkillOutput\n"
+            "from pydantic import Field\n"
             'class I(SkillInput):\n    query: str = Field(description="q")\n'
-            'class O(SkillOutput):\n    data: str\n'  # No default!
-            'class NoDefaultSkill(Skill[I, O]):\n'
+            "class O(SkillOutput):\n    data: str\n"  # No default!
+            "class NoDefaultSkill(Skill[I, O]):\n"
             '    name = "no_default"\n    version = "1.0.0"\n    description = "test"\n'
-            '    async def execute(self, input):\n'
+            "    async def execute(self, input):\n"
             '        return O(success=True, data="x")\n'
         )
         issues = _validate_skill_source(skill_dir)
@@ -463,15 +469,15 @@ class TestSkillValidate:
         skill_dir = tmp_path / "todo-skill"
         skill_dir.mkdir(parents=True)
         (skill_dir / "skill.py").write_text(
-            'from core.skills.base import Skill, SkillInput, SkillOutput\n'
-            'from pydantic import Field\n'
+            "from core.skills.base import Skill, SkillInput, SkillOutput\n"
+            "from pydantic import Field\n"
             'class I(SkillInput):\n    query: str = Field(description="q")\n'
             'class O(SkillOutput):\n    data: str = ""\n'
-            'class TodoSkill(Skill[I, O]):\n'
+            "class TodoSkill(Skill[I, O]):\n"
             '    name = "todo"\n    version = "1.0.0"\n'
             '    description = "TODO: fill this in"\n'
-            '    async def execute(self, input):\n'
-            '        return O(success=True)\n'
+            "    async def execute(self, input):\n"
+            "        return O(success=True)\n"
         )
         issues = _validate_skill_source(skill_dir)
         warnings = [msg for level, msg in issues if level == "warning"]
@@ -496,6 +502,7 @@ class TestSkillValidate:
 # /skill example
 # ============================================================================
 
+
 class TestSkillExample:
     """Tests for /skill example command."""
 
@@ -514,6 +521,7 @@ class TestSkillExample:
 # Template generation
 # ============================================================================
 
+
 class TestGenerateSkillTemplate:
     """Tests for _generate_skill_template."""
 
@@ -524,6 +532,7 @@ class TestGenerateSkillTemplate:
         skill_py.write_text(template)
 
         import importlib.util
+
         spec = importlib.util.spec_from_file_location("_test_skill", skill_py)
         assert spec is not None
         mod = importlib.util.module_from_spec(spec)
@@ -553,6 +562,7 @@ class TestGenerateSkillTemplate:
         (skill_dir / "skill.py").write_text(template)
 
         from core.skills.loader import SkillLoader
+
         skills = SkillLoader.discover([tmp_path])
         assert len(skills) == 1
         assert skills[0].skill.name == "loadable"
@@ -560,7 +570,7 @@ class TestGenerateSkillTemplate:
     def test_template_has_field_descriptions(self):
         """Generated template includes Field(description=...)."""
         template = _generate_skill_template("desc_test", "DescTest")
-        assert 'Field(description=' in template
+        assert "Field(description=" in template
 
     def test_template_has_async_execute(self):
         """Generated template has async execute method."""
@@ -578,6 +588,7 @@ class TestGenerateSkillTemplate:
 # ============================================================================
 # Enhanced dev context
 # ============================================================================
+
 
 class TestEnhancedDevContext:
     """Tests for enhanced _build_skill_dev_context."""

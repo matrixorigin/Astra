@@ -24,9 +24,7 @@ class Sandbox(DbConsumer):
     PITR is created on sandbox database at creation time.
     """
 
-    def __init__(
-        self, db_factory: DbFactory, source_db: str = "dev_agent", account: str = "sys"
-    ):
+    def __init__(self, db_factory: DbFactory, source_db: str = "dev_agent", account: str = "sys"):
         super().__init__(db_factory)
         self.source_db = source_db
         self.account = account
@@ -77,9 +75,11 @@ class Sandbox(DbConsumer):
             try:
                 db.execute(text(f"drop pitr if exists {pitr_name}"))
                 db.commit()
-                db.execute(text(
-                    f"create pitr {pitr_name} for database {name} range {pitr_range} '{pitr_unit}'"
-                ))
+                db.execute(
+                    text(
+                        f"create pitr {pitr_name} for database {name} range {pitr_range} '{pitr_unit}'"
+                    )
+                )
                 db.commit()
             except Exception:
                 pass  # PITR creation is best-effort
@@ -172,9 +172,12 @@ class Sandbox(DbConsumer):
 
             # Delete metadata
             try:
-                db.execute(text(
-                    f"DELETE FROM {self.source_db}.infra_sandbox_metadata WHERE sandbox_name = :name"
-                ), {"name": name})
+                db.execute(
+                    text(
+                        f"DELETE FROM {self.source_db}.infra_sandbox_metadata WHERE sandbox_name = :name"
+                    ),
+                    {"name": name},
+                )
                 db.commit()
             except Exception as e:
                 if not force:
@@ -208,7 +211,7 @@ class Sandbox(DbConsumer):
         with self._db() as db:
             try:
                 # Validate sandbox name to prevent SQL injection
-                if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', sandbox):
+                if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", sandbox):
                     raise ValueError(f"Invalid sandbox name: {sandbox}")
                 result = db.execute(text(f"SHOW TABLES FROM {sandbox}"))
                 return [row._mapping[f"Tables_in_{sandbox}"] for row in result]
@@ -223,7 +226,9 @@ class Sandbox(DbConsumer):
         """Create snapshot of sandbox database state."""
         with self._db() as db:
             result = db.execute(
-                text(f"SELECT 1 FROM {self.source_db}.infra_sandbox_metadata WHERE sandbox_name = :s"),
+                text(
+                    f"SELECT 1 FROM {self.source_db}.infra_sandbox_metadata WHERE sandbox_name = :s"
+                ),
                 {"s": sandbox},
             )
             if not result.first():
@@ -242,7 +247,7 @@ class Sandbox(DbConsumer):
         raw = self._list_snapshots_raw(sandbox)
         result = []
         for full_name in raw:
-            short = full_name[len(prefix):]
+            short = full_name[len(prefix) :]
             result.append({"name": short, "full_name": full_name})
         return result
 
@@ -252,9 +257,9 @@ class Sandbox(DbConsumer):
             full_name = f"{sandbox}__{snapshot_name}"
             validate_identifier(full_name)
             db.commit()
-            db.execute(text(
-                f"restore account {self.account} database {sandbox} from snapshot {full_name}"
-            ))
+            db.execute(
+                text(f"restore account {self.account} database {sandbox} from snapshot {full_name}")
+            )
             db.commit()
             self._touch_metadata(sandbox)
 
@@ -301,7 +306,9 @@ class Sandbox(DbConsumer):
         """Get sandbox info with metadata."""
         with self._db() as db:
             result_meta = db.execute(
-                text(f"SELECT * FROM {self.source_db}.infra_sandbox_metadata WHERE sandbox_name = :s"),
+                text(
+                    f"SELECT * FROM {self.source_db}.infra_sandbox_metadata WHERE sandbox_name = :s"
+                ),
                 {"s": sandbox},
             )
             metadata = result_meta.first()
@@ -386,6 +393,7 @@ class Sandbox(DbConsumer):
                 params["description"] = description
             if tags is not None:
                 import json
+
                 updates.append("tags = :tags")
                 params["tags"] = json.dumps(tags)
             if status is not None:
@@ -394,7 +402,11 @@ class Sandbox(DbConsumer):
 
             if updates:
                 updates.append("updated_at = CURRENT_TIMESTAMP")
-                q = f"UPDATE {self.source_db}.infra_sandbox_metadata SET " + ", ".join(updates) + " WHERE sandbox_name = :name"
+                q = (
+                    f"UPDATE {self.source_db}.infra_sandbox_metadata SET "
+                    + ", ".join(updates)
+                    + " WHERE sandbox_name = :name"
+                )
                 db.execute(text(q), params)
                 db.commit()
 
@@ -408,9 +420,7 @@ class Sandbox(DbConsumer):
             prefix = f"{sandbox}__"
             try:
                 db.commit()
-                result = db.execute(text(
-                    f"show snapshots where snapshot_name like '{prefix}%'"
-                ))
+                result = db.execute(text(f"show snapshots where snapshot_name like '{prefix}%'"))
                 return [row._mapping["snapshot_name"] for row in result]
             except Exception:
                 return []
@@ -418,8 +428,11 @@ class Sandbox(DbConsumer):
     def _touch_metadata(self, sandbox: str) -> None:
         """Update updated_at timestamp."""
         with self._db() as db:
-            db.execute(text(
-                f"UPDATE {self.source_db}.infra_sandbox_metadata SET updated_at = CURRENT_TIMESTAMP(6) "
-                f"WHERE sandbox_name = :s"
-            ), {"s": sandbox})
+            db.execute(
+                text(
+                    f"UPDATE {self.source_db}.infra_sandbox_metadata SET updated_at = CURRENT_TIMESTAMP(6) "
+                    f"WHERE sandbox_name = :s"
+                ),
+                {"s": sandbox},
+            )
             db.commit()

@@ -21,6 +21,7 @@ from core.context.intent_routing import (
 # ContextLoadingPlan + INTENT_PLANS
 # ============================================================================
 
+
 class TestIntentPlans:
     def test_preference_plan(self):
         p = INTENT_PLANS["preference"]
@@ -59,36 +60,43 @@ class TestIntentPlans:
 # Tier 0 Engine — Regex
 # ============================================================================
 
+
 class TestTier0Regex:
-    @pytest.mark.parametrize("query,expected_intent", [
-        ("记住我用vim", "preference"),
-        ("remember I prefer tabs", "preference"),
-        ("I use pytest -n auto", "preference"),
-        ("I prefer dark mode", "preference"),
-        ("需要用moerr", "preference"),
-        ("always use gofmt", "preference"),
-        ("run the tests", "command"),
-        ("execute this script", "command"),
-        ("delete that file", "command"),
-        ("create a new branch", "command"),
-        ("list all sessions", "command"),
-        ("不对", "feedback"),
-        ("wrong, that's not right", "feedback"),
-        ("no, I meant something else", "feedback"),
-        ("actually I want Python", "feedback"),
-    ])
+    @pytest.mark.parametrize(
+        "query,expected_intent",
+        [
+            ("记住我用vim", "preference"),
+            ("remember I prefer tabs", "preference"),
+            ("I use pytest -n auto", "preference"),
+            ("I prefer dark mode", "preference"),
+            ("需要用moerr", "preference"),
+            ("always use gofmt", "preference"),
+            ("run the tests", "command"),
+            ("execute this script", "command"),
+            ("delete that file", "command"),
+            ("create a new branch", "command"),
+            ("list all sessions", "command"),
+            ("不对", "feedback"),
+            ("wrong, that's not right", "feedback"),
+            ("no, I meant something else", "feedback"),
+            ("actually I want Python", "feedback"),
+        ],
+    )
     def test_regex_matches(self, query, expected_intent):
         engine = Tier0Engine()
         result = engine._regex_classify(query)
         assert result == expected_intent, f"Expected {expected_intent} for '{query}', got {result}"
 
-    @pytest.mark.parametrize("query", [
-        "what is event sourcing?",
-        "explain this error",
-        "how does the memory system work?",
-        "hello",
-        "",
-    ])
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "what is event sourcing?",
+            "explain this error",
+            "how does the memory system work?",
+            "hello",
+            "",
+        ],
+    )
     def test_regex_no_match(self, query):
         engine = Tier0Engine()
         assert engine._regex_classify(query) is None
@@ -97,6 +105,7 @@ class TestTier0Regex:
 # ============================================================================
 # Tier 0 Engine — Heuristic
 # ============================================================================
+
 
 class TestTier0Heuristic:
     def test_short_question_returns_none(self):
@@ -123,6 +132,7 @@ class TestTier0Heuristic:
 # ============================================================================
 # Tier 0 Engine — Merge Logic
 # ============================================================================
+
 
 class TestTier0Merge:
     def test_both_agree_confidence_095(self):
@@ -169,29 +179,36 @@ class TestTier0Merge:
 # Correction Detection
 # ============================================================================
 
+
 class TestCorrectionDetection:
-    @pytest.mark.parametrize("query", [
-        "不对",
-        "错了，不是这样",
-        "你搞错了",
-        "不正确",
-        "wrong, that's not what I meant",
-        "incorrect answer",
-        "that's not right",
-        "no, I said Python not Java",
-        "actually, I want something different",
-    ])
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "不对",
+            "错了，不是这样",
+            "你搞错了",
+            "不正确",
+            "wrong, that's not what I meant",
+            "incorrect answer",
+            "that's not right",
+            "no, I said Python not Java",
+            "actually, I want something different",
+        ],
+    )
     def test_correction_detected(self, query):
         assert detect_correction(query) is True
 
-    @pytest.mark.parametrize("query", [
-        "what is event sourcing?",
-        "run the tests",
-        "记住我用vim",
-        "hello",
-        "explain this code",
-        "",
-    ])
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "what is event sourcing?",
+            "run the tests",
+            "记住我用vim",
+            "hello",
+            "explain this code",
+            "",
+        ],
+    )
     def test_no_correction(self, query):
         assert detect_correction(query) is False
 
@@ -200,11 +217,13 @@ class TestCorrectionDetection:
 # Router Registry
 # ============================================================================
 
+
 class TestRouterRegistry:
     @pytest.fixture(autouse=True)
     def _clean_registry(self):
         """Ensure custom routers registered in tests don't leak to other tests."""
         from core.context.intent_routing import _reset_registry_for_testing
+
         yield
         _reset_registry_for_testing()
 
@@ -214,24 +233,31 @@ class TestRouterRegistry:
     def test_get_default_returns_intent_router(self):
         from core.context.intent_routing import get_router, IntentRouter
         from unittest.mock import MagicMock
+
         r = get_router("default", db_factory=MagicMock())
         assert isinstance(r, IntentRouter)
 
     def test_get_unknown_raises_key_error(self):
         from core.context.intent_routing import get_router
         from unittest.mock import MagicMock
+
         with pytest.raises(KeyError):
             get_router("nonexistent", db_factory=MagicMock())
 
     def test_duplicate_registration_raises_value_error(self):
         from core.context.intent_routing import register_router
+
         @register_router("dup_test")
         class First:
-            def __init__(self, db_factory): pass
+            def __init__(self, db_factory):
+                pass
+
         with pytest.raises(ValueError, match="already registered"):
+
             @register_router("dup_test")
             class Second:
-                def __init__(self, db_factory): pass
+                def __init__(self, db_factory):
+                    pass
 
     def test_register_and_instantiate_custom_router(self):
         from core.context.intent_routing import register_router, get_router, RoutingStrategy
@@ -241,12 +267,17 @@ class TestRouterRegistry:
         class CustomRouter:
             def __init__(self, db_factory):
                 self.db_factory = db_factory
-            async def route(self, query, history_len=0, memory_text=None,
-                          tool_names=None, force_intent=None):
+
+            async def route(
+                self, query, history_len=0, memory_text=None, tool_names=None, force_intent=None
+            ):
                 return RoutingDecision(
                     plan=INTENT_PLANS["question"],
                     routing_result=RoutingResult(
-                        intent="question", confidence=1.0, tier=0, matched_by="custom",
+                        intent="question",
+                        confidence=1.0,
+                        tier=0,
+                        matched_by="custom",
                     ),
                 )
 
@@ -257,20 +288,28 @@ class TestRouterRegistry:
 
     def test_list_routers_sorted(self):
         from core.context.intent_routing import register_router
+
         @register_router("zzz_last")
         class Z:
-            def __init__(self, db_factory): pass
+            def __init__(self, db_factory):
+                pass
+
         @register_router("aaa_first")
         class A:
-            def __init__(self, db_factory): pass
+            def __init__(self, db_factory):
+                pass
+
         names = list_routers()
         assert names == sorted(names)
 
     def test_reset_preserves_default_only(self):
         from core.context.intent_routing import register_router, _reset_registry_for_testing
+
         @register_router("ephemeral")
         class E:
-            def __init__(self, db_factory): pass
+            def __init__(self, db_factory):
+                pass
+
         assert "ephemeral" in list_routers()
         _reset_registry_for_testing()
         assert "ephemeral" not in list_routers()
@@ -281,14 +320,18 @@ class TestRouterRegistry:
 # RoutingDecision — new unified fields
 # ============================================================================
 
+
 class TestRoutingDecisionFields:
     """Verify RoutingDecision carries tool_filter, max_tool_rounds, task_type."""
 
     def test_defaults(self):
         from core.context.intent_routing import ToolFilter, TaskType, MAX_TOOL_ROUNDS
+
         rd = RoutingDecision(
             plan=INTENT_PLANS["question"],
-            routing_result=RoutingResult(intent="question", confidence=0.9, tier=0, matched_by="regex"),
+            routing_result=RoutingResult(
+                intent="question", confidence=0.9, tier=0, matched_by="regex"
+            ),
         )
         assert rd.tool_filter == ToolFilter.NONE
         assert rd.max_tool_rounds == MAX_TOOL_ROUNDS
@@ -297,9 +340,12 @@ class TestRoutingDecisionFields:
 
     def test_explicit_fields(self):
         from core.context.intent_routing import ToolFilter, TaskType
+
         rd = RoutingDecision(
             plan=INTENT_PLANS["command"],
-            routing_result=RoutingResult(intent="command", confidence=0.95, tier=0, matched_by="both"),
+            routing_result=RoutingResult(
+                intent="command", confidence=0.95, tier=0, matched_by="both"
+            ),
             tool_filter=ToolFilter.LOCAL_BLOCKED,
             max_tool_rounds=3,
             task_type=TaskType.DEBUGGING,

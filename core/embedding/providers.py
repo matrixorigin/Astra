@@ -54,14 +54,13 @@ class LocalProvider(BaseEmbeddingProvider):
         self._model = self._load(model)
         actual = self._model.get_sentence_embedding_dimension()
         if actual != dim:
-            raise ValueError(
-                f"Model {model} produces {actual}-dim vectors but config says {dim}"
-            )
+            raise ValueError(f"Model {model} produces {actual}-dim vectors but config says {dim}")
 
     @staticmethod
     def _load(model: str):
         if model not in _local_model_cache:
             from sentence_transformers import SentenceTransformer
+
             _local_model_cache[model] = SentenceTransformer(model)
         return _local_model_cache[model]
 
@@ -82,6 +81,7 @@ class OpenAIProvider(BaseEmbeddingProvider):
         if not api_key:
             raise ValueError("OpenAI embedding provider requires api_key")
         import openai as _openai
+
         kwargs: dict = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url

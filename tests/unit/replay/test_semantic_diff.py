@@ -6,12 +6,20 @@ from types import SimpleNamespace
 from core.replay.semantic_diff import SemanticDiff, _validate_name
 
 
-def _event(event_type="user_query", token_total=0, token_prompt=0, token_completion=0,
-           causal_chain_id=None, quality_score=None):
+def _event(
+    event_type="user_query",
+    token_total=0,
+    token_prompt=0,
+    token_completion=0,
+    causal_chain_id=None,
+    quality_score=None,
+):
     """Create a minimal mock event for testing pure comparison functions."""
     token_usage = None
     if token_total > 0:
-        token_usage = SimpleNamespace(total=token_total, prompt=token_prompt, completion=token_completion)
+        token_usage = SimpleNamespace(
+            total=token_total, prompt=token_prompt, completion=token_completion
+        )
     return SimpleNamespace(
         event_type=event_type,
         token_usage=token_usage,
@@ -69,7 +77,11 @@ class TestCompareDecisionPaths:
 
     def test_complexity_change(self):
         e1 = [_event(causal_chain_id="c1")]
-        e2 = [_event(causal_chain_id="c2"), _event(causal_chain_id="c2"), _event(causal_chain_id="c2")]
+        e2 = [
+            _event(causal_chain_id="c2"),
+            _event(causal_chain_id="c2"),
+            _event(causal_chain_id="c2"),
+        ]
         result = SemanticDiff._compare_decision_paths(e1, e2)
         assert result["complexity_change"] == "increased"
 

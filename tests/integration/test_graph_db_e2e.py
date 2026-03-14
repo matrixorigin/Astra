@@ -43,6 +43,7 @@ def _different_embed() -> list[float]:
 @pytest.fixture
 def db_factory():
     from api.database import SessionLocal
+
     return SessionLocal
 
 
@@ -60,6 +61,7 @@ def user_id():
 def cleanup(db_factory, user_id):
     yield
     from sqlalchemy import text
+
     db = db_factory()
     try:
         db.execute(text("DELETE FROM memory_graph_edges WHERE user_id = :uid"), {"uid": user_id})
@@ -72,6 +74,7 @@ def cleanup(db_factory, user_id):
 class TestDDL:
     def test_both_tables_exist(self, db_factory):
         from sqlalchemy import inspect as sa_inspect
+
         db = db_factory()
         try:
             tables = set(sa_inspect(db.bind).get_table_names())
@@ -84,10 +87,16 @@ class TestDDL:
 class TestNodeCRUD:
     def test_create_and_read(self, store, user_id):
         node = GraphNodeData(
-            node_id=uuid4().hex, user_id=user_id,
-            node_type=NodeType.EPISODIC, content="test",
-            embedding=_embed(), event_id="evt1", session_id="s1",
-            confidence=0.9, trust_tier="T2", importance=0.5,
+            node_id=uuid4().hex,
+            user_id=user_id,
+            node_type=NodeType.EPISODIC,
+            content="test",
+            embedding=_embed(),
+            event_id="evt1",
+            session_id="s1",
+            confidence=0.9,
+            trust_tier="T2",
+            importance=0.5,
         )
         store.create_node(node)
 
@@ -102,8 +111,10 @@ class TestNodeCRUD:
     def test_batch_create(self, store, user_id):
         nodes = [
             GraphNodeData(
-                node_id=uuid4().hex, user_id=user_id,
-                node_type=NodeType.SEMANTIC, content=f"n{i}",
+                node_id=uuid4().hex,
+                user_id=user_id,
+                node_type=NodeType.SEMANTIC,
+                content=f"n{i}",
             )
             for i in range(5)
         ]
@@ -112,8 +123,10 @@ class TestNodeCRUD:
 
     def test_deactivate(self, store, user_id):
         node = GraphNodeData(
-            node_id=uuid4().hex, user_id=user_id,
-            node_type=NodeType.SEMANTIC, content="bye",
+            node_id=uuid4().hex,
+            user_id=user_id,
+            node_type=NodeType.SEMANTIC,
+            content="bye",
         )
         store.create_node(node)
         store.deactivate_node(node.node_id, superseded_by="new")
@@ -125,8 +138,10 @@ class TestNodeCRUD:
 
     def test_conflict_resolution_persisted(self, store, user_id):
         node = GraphNodeData(
-            node_id=uuid4().hex, user_id=user_id,
-            node_type=NodeType.SEMANTIC, content="c",
+            node_id=uuid4().hex,
+            user_id=user_id,
+            node_type=NodeType.SEMANTIC,
+            content="c",
             conflict_resolution="kept",
         )
         store.create_node(node)
@@ -137,16 +152,23 @@ class TestEdgeCRUD:
     def test_add_and_query_edges(self, store, user_id):
         a_id, b_id, c_id = uuid4().hex, uuid4().hex, uuid4().hex
         for nid, content in [(a_id, "a"), (b_id, "b"), (c_id, "c")]:
-            store.create_node(GraphNodeData(
-                node_id=nid, user_id=user_id,
-                node_type=NodeType.SEMANTIC, content=content,
-            ))
+            store.create_node(
+                GraphNodeData(
+                    node_id=nid,
+                    user_id=user_id,
+                    node_type=NodeType.SEMANTIC,
+                    content=content,
+                )
+            )
 
-        store.add_edges_batch([
-            (a_id, b_id, EdgeType.ASSOCIATION.value, 0.8),
-            (a_id, c_id, EdgeType.TEMPORAL.value, 1.0),
-            (b_id, c_id, EdgeType.CAUSAL.value, 1.5),
-        ], user_id)
+        store.add_edges_batch(
+            [
+                (a_id, b_id, EdgeType.ASSOCIATION.value, 0.8),
+                (a_id, c_id, EdgeType.TEMPORAL.value, 1.0),
+                (b_id, c_id, EdgeType.CAUSAL.value, 1.5),
+            ],
+            user_id,
+        )
 
         # Outgoing from a
         out_a = store.get_outgoing_edges(a_id)
@@ -166,10 +188,14 @@ class TestEdgeCRUD:
     def test_duplicate_edge_not_added(self, store, user_id):
         a_id, b_id = uuid4().hex, uuid4().hex
         for nid in [a_id, b_id]:
-            store.create_node(GraphNodeData(
-                node_id=nid, user_id=user_id,
-                node_type=NodeType.SEMANTIC, content="x",
-            ))
+            store.create_node(
+                GraphNodeData(
+                    node_id=nid,
+                    user_id=user_id,
+                    node_type=NodeType.SEMANTIC,
+                    content="x",
+                )
+            )
 
         edge = [(a_id, b_id, EdgeType.ASSOCIATION.value, 0.8)]
         store.add_edges_batch(edge, user_id)
@@ -180,15 +206,22 @@ class TestEdgeCRUD:
     def test_neighbor_ids(self, store, user_id):
         a_id, b_id, c_id = uuid4().hex, uuid4().hex, uuid4().hex
         for nid in [a_id, b_id, c_id]:
-            store.create_node(GraphNodeData(
-                node_id=nid, user_id=user_id,
-                node_type=NodeType.SEMANTIC, content="x",
-            ))
+            store.create_node(
+                GraphNodeData(
+                    node_id=nid,
+                    user_id=user_id,
+                    node_type=NodeType.SEMANTIC,
+                    content="x",
+                )
+            )
 
-        store.add_edges_batch([
-            (a_id, b_id, "association", 0.8),
-            (c_id, a_id, "temporal", 1.0),
-        ], user_id)
+        store.add_edges_batch(
+            [
+                (a_id, b_id, "association", 0.8),
+                (c_id, a_id, "temporal", 1.0),
+            ],
+            user_id,
+        )
 
         neighbors = store.get_neighbor_ids({a_id})
         assert b_id in neighbors  # outgoing
@@ -197,15 +230,22 @@ class TestEdgeCRUD:
     def test_association_edges_query(self, store, user_id):
         a_id, b_id = uuid4().hex, uuid4().hex
         for nid in [a_id, b_id]:
-            store.create_node(GraphNodeData(
-                node_id=nid, user_id=user_id,
-                node_type=NodeType.SEMANTIC, content="x",
-            ))
+            store.create_node(
+                GraphNodeData(
+                    node_id=nid,
+                    user_id=user_id,
+                    node_type=NodeType.SEMANTIC,
+                    content="x",
+                )
+            )
 
-        store.add_edges_batch([
-            (a_id, b_id, "association", 0.8),
-            (a_id, b_id, "temporal", 1.0),  # different type, same pair
-        ], user_id)
+        store.add_edges_batch(
+            [
+                (a_id, b_id, "association", 0.8),
+                (a_id, b_id, "temporal", 1.0),  # different type, same pair
+            ],
+            user_id,
+        )
 
         assoc = store.get_association_edges(user_id, min_weight=0.7)
         assert len(assoc) == 1
@@ -215,16 +255,25 @@ class TestEdgeCRUD:
 class TestVectorSearch:
     def _seed(self, store, user_id):
         a = GraphNodeData(
-            node_id=uuid4().hex, user_id=user_id,
-            node_type=NodeType.SEMANTIC, content="A", embedding=_embed(0.1),
+            node_id=uuid4().hex,
+            user_id=user_id,
+            node_type=NodeType.SEMANTIC,
+            content="A",
+            embedding=_embed(0.1),
         )
         b = GraphNodeData(
-            node_id=uuid4().hex, user_id=user_id,
-            node_type=NodeType.SEMANTIC, content="B", embedding=_similar_embed(),
+            node_id=uuid4().hex,
+            user_id=user_id,
+            node_type=NodeType.SEMANTIC,
+            content="B",
+            embedding=_similar_embed(),
         )
         d = GraphNodeData(
-            node_id=uuid4().hex, user_id=user_id,
-            node_type=NodeType.SEMANTIC, content="D", embedding=_different_embed(),
+            node_id=uuid4().hex,
+            user_id=user_id,
+            node_type=NodeType.SEMANTIC,
+            content="D",
+            embedding=_different_embed(),
         )
         store.create_nodes_batch([a, b, d])
         return a, b, d
@@ -253,18 +302,26 @@ class TestVectorSearch:
 class TestMarkConflict:
     def test_atomic(self, store, user_id):
         older = GraphNodeData(
-            node_id=uuid4().hex, user_id=user_id,
-            node_type=NodeType.SEMANTIC, content="old", confidence=0.8,
+            node_id=uuid4().hex,
+            user_id=user_id,
+            node_type=NodeType.SEMANTIC,
+            content="old",
+            confidence=0.8,
         )
         newer = GraphNodeData(
-            node_id=uuid4().hex, user_id=user_id,
-            node_type=NodeType.SEMANTIC, content="new", confidence=0.9,
+            node_id=uuid4().hex,
+            user_id=user_id,
+            node_type=NodeType.SEMANTIC,
+            content="new",
+            confidence=0.9,
         )
         store.create_nodes_batch([older, newer])
 
         store.mark_conflict(
-            older_id=older.node_id, newer_id=newer.node_id,
-            confidence_factor=0.5, old_confidence=0.8,
+            older_id=older.node_id,
+            newer_id=newer.node_id,
+            confidence_factor=0.5,
+            old_confidence=0.8,
         )
 
         lo = store.get_node(older.node_id)
@@ -279,10 +336,15 @@ class TestMarkConflict:
 
 class TestSkeletonLoad:
     def test_no_embedding(self, store, user_id):
-        store.create_node(GraphNodeData(
-            node_id=uuid4().hex, user_id=user_id,
-            node_type=NodeType.SEMANTIC, content="test", embedding=_embed(),
-        ))
+        store.create_node(
+            GraphNodeData(
+                node_id=uuid4().hex,
+                user_id=user_id,
+                node_type=NodeType.SEMANTIC,
+                content="test",
+                embedding=_embed(),
+            )
+        )
         nodes = store.get_user_nodes(user_id, load_embedding=False)
         assert len(nodes) == 1
         assert nodes[0].embedding is None
@@ -295,21 +357,32 @@ class TestOpinionEvolution:
     def _seed_scene_and_event(self, store, user_id, scene_embed, event_embed):
         """Create a scene node and a new event node, return their IDs."""
         scene = GraphNodeData(
-            node_id=uuid4().hex, user_id=user_id,
-            node_type=NodeType.SCENE, content="User prefers verbose errors",
-            embedding=scene_embed, confidence=0.5, trust_tier="T4",
+            node_id=uuid4().hex,
+            user_id=user_id,
+            node_type=NodeType.SCENE,
+            content="User prefers verbose errors",
+            embedding=scene_embed,
+            confidence=0.5,
+            trust_tier="T4",
         )
         event_node = GraphNodeData(
-            node_id=uuid4().hex, user_id=user_id,
-            node_type=NodeType.EPISODIC, content="Show me detailed errors",
-            embedding=event_embed, confidence=1.0, trust_tier="T1",
+            node_id=uuid4().hex,
+            user_id=user_id,
+            node_type=NodeType.EPISODIC,
+            content="Show me detailed errors",
+            embedding=event_embed,
+            confidence=1.0,
+            trust_tier="T1",
         )
         store.create_nodes_batch([scene, event_node])
 
         # Edge so activation can reach the scene from the event
-        store.add_edges_batch([
-            (event_node.node_id, scene.node_id, EdgeType.ABSTRACTION.value, 0.8),
-        ], user_id)
+        store.add_edges_batch(
+            [
+                (event_node.node_id, scene.node_id, EdgeType.ABSTRACTION.value, 0.8),
+            ],
+            user_id,
+        )
 
         return scene, event_node
 
@@ -334,7 +407,10 @@ class TestOpinionEvolution:
 
         # Very different embeddings → low cosine similarity → contradicting
         scene, event_node = self._seed_scene_and_event(
-            store, user_id, _embed(0.1), _different_embed(),
+            store,
+            user_id,
+            _embed(0.1),
+            _different_embed(),
         )
 
         result = evolve_opinions(store, event_node.node_id, user_id)
@@ -350,19 +426,30 @@ class TestOpinionEvolution:
 
         # Start at very low confidence, contradicting will push below quarantine
         scene = GraphNodeData(
-            node_id=uuid4().hex, user_id=user_id,
-            node_type=NodeType.SCENE, content="Weak belief",
-            embedding=_embed(0.1), confidence=0.15, trust_tier="T4",
+            node_id=uuid4().hex,
+            user_id=user_id,
+            node_type=NodeType.SCENE,
+            content="Weak belief",
+            embedding=_embed(0.1),
+            confidence=0.15,
+            trust_tier="T4",
         )
         event_node = GraphNodeData(
-            node_id=uuid4().hex, user_id=user_id,
-            node_type=NodeType.EPISODIC, content="Contradicts",
-            embedding=_different_embed(), confidence=1.0, trust_tier="T1",
+            node_id=uuid4().hex,
+            user_id=user_id,
+            node_type=NodeType.EPISODIC,
+            content="Contradicts",
+            embedding=_different_embed(),
+            confidence=1.0,
+            trust_tier="T1",
         )
         store.create_nodes_batch([scene, event_node])
-        store.add_edges_batch([
-            (event_node.node_id, scene.node_id, EdgeType.ABSTRACTION.value, 0.8),
-        ], user_id)
+        store.add_edges_batch(
+            [
+                (event_node.node_id, scene.node_id, EdgeType.ABSTRACTION.value, 0.8),
+            ],
+            user_id,
+        )
 
         result = evolve_opinions(store, event_node.node_id, user_id)
 
@@ -375,19 +462,30 @@ class TestOpinionEvolution:
         from core.memory.graph.opinion import evolve_opinions
 
         scene = GraphNodeData(
-            node_id=uuid4().hex, user_id=user_id,
-            node_type=NodeType.SCENE, content="Strong belief",
-            embedding=_embed(0.1), confidence=0.78, trust_tier="T4",
+            node_id=uuid4().hex,
+            user_id=user_id,
+            node_type=NodeType.SCENE,
+            content="Strong belief",
+            embedding=_embed(0.1),
+            confidence=0.78,
+            trust_tier="T4",
         )
         event_node = GraphNodeData(
-            node_id=uuid4().hex, user_id=user_id,
-            node_type=NodeType.EPISODIC, content="Supporting",
-            embedding=_similar_embed(), confidence=1.0, trust_tier="T1",
+            node_id=uuid4().hex,
+            user_id=user_id,
+            node_type=NodeType.EPISODIC,
+            content="Supporting",
+            embedding=_similar_embed(),
+            confidence=1.0,
+            trust_tier="T1",
         )
         store.create_nodes_batch([scene, event_node])
-        store.add_edges_batch([
-            (event_node.node_id, scene.node_id, EdgeType.ABSTRACTION.value, 0.8),
-        ], user_id)
+        store.add_edges_batch(
+            [
+                (event_node.node_id, scene.node_id, EdgeType.ABSTRACTION.value, 0.8),
+            ],
+            user_id,
+        )
 
         result = evolve_opinions(store, event_node.node_id, user_id)
 
@@ -399,9 +497,12 @@ class TestOpinionEvolution:
     def test_update_confidence_and_tier(self, store, user_id):
         """Verify the update_confidence_and_tier method works in real DB."""
         node = GraphNodeData(
-            node_id=uuid4().hex, user_id=user_id,
-            node_type=NodeType.SCENE, content="test",
-            confidence=0.5, trust_tier="T4",
+            node_id=uuid4().hex,
+            user_id=user_id,
+            node_type=NodeType.SCENE,
+            content="test",
+            confidence=0.5,
+            trust_tier="T4",
         )
         store.create_node(node)
 
@@ -433,23 +534,34 @@ class TestTrustTierLifecycleE2E:
 
         # 1. Create scene at T4, confidence 0.5
         scene = GraphNodeData(
-            node_id=uuid4().hex, user_id=user_id,
-            node_type=NodeType.SCENE, content="User prefers verbose errors",
-            embedding=_embed(0.1), confidence=0.5, trust_tier="T4",
+            node_id=uuid4().hex,
+            user_id=user_id,
+            node_type=NodeType.SCENE,
+            content="User prefers verbose errors",
+            embedding=_embed(0.1),
+            confidence=0.5,
+            trust_tier="T4",
         )
         store.create_node(scene)
 
         # 2. Simulate multiple supporting events to push confidence above 0.8
         for i in range(7):
             ev = GraphNodeData(
-                node_id=uuid4().hex, user_id=user_id,
-                node_type=NodeType.EPISODIC, content=f"verbose error request {i}",
-                embedding=_similar_embed(), confidence=1.0, trust_tier="T1",
+                node_id=uuid4().hex,
+                user_id=user_id,
+                node_type=NodeType.EPISODIC,
+                content=f"verbose error request {i}",
+                embedding=_similar_embed(),
+                confidence=1.0,
+                trust_tier="T1",
             )
             store.create_node(ev)
-            store.add_edges_batch([
-                (ev.node_id, scene.node_id, EdgeType.ABSTRACTION.value, 0.8),
-            ], user_id)
+            store.add_edges_batch(
+                [
+                    (ev.node_id, scene.node_id, EdgeType.ABSTRACTION.value, 0.8),
+                ],
+                user_id,
+            )
             evolve_opinions(store, ev.node_id, user_id)
 
         # Verify confidence rose above threshold
@@ -467,10 +579,13 @@ class TestTrustTierLifecycleE2E:
         # 4. Fake the age by updating created_at directly
         from sqlalchemy import text
         from core.memory.models.graph import GraphNode
+
         with SessionLocal() as db:
-            db.query(GraphNode).filter_by(node_id=scene.node_id).update({
-                "created_at": text("DATE_SUB(NOW(), INTERVAL 10 DAY)"),
-            })
+            db.query(GraphNode).filter_by(node_id=scene.node_id).update(
+                {
+                    "created_at": text("DATE_SUB(NOW(), INTERVAL 10 DAY)"),
+                }
+            )
             db.commit()
 
         # 5. Now consolidation should promote T4→T3
@@ -490,9 +605,13 @@ class TestTrustTierLifecycleE2E:
 
         # 1. Create scene at T3, confidence below threshold
         scene = GraphNodeData(
-            node_id=uuid4().hex, user_id=user_id,
-            node_type=NodeType.SCENE, content="Stale belief",
-            embedding=_embed(0.1), confidence=0.5, trust_tier="T3",
+            node_id=uuid4().hex,
+            user_id=user_id,
+            node_type=NodeType.SCENE,
+            content="Stale belief",
+            embedding=_embed(0.1),
+            confidence=0.5,
+            trust_tier="T3",
         )
         store.create_node(scene)
 
@@ -503,10 +622,13 @@ class TestTrustTierLifecycleE2E:
         # 3. Fake age to 65 days
         from sqlalchemy import text
         from core.memory.models.graph import GraphNode
+
         with SessionLocal() as db:
-            db.query(GraphNode).filter_by(node_id=scene.node_id).update({
-                "created_at": text("DATE_SUB(NOW(), INTERVAL 65 DAY)"),
-            })
+            db.query(GraphNode).filter_by(node_id=scene.node_id).update(
+                {
+                    "created_at": text("DATE_SUB(NOW(), INTERVAL 65 DAY)"),
+                }
+            )
             db.commit()
 
         # 4. Now consolidation should demote T3→T4
@@ -541,16 +663,18 @@ class TestIntentDrivenLoadingE2E:
         for i in range(count):
             emb = [0.1] * EMBEDDING_DIM
             emb[i % EMBEDDING_DIM] += 0.05 * (i % 10)
-            nodes.append(GraphNodeData(
-                node_id=f"n{i}_{user_id[:8]}",
-                user_id=user_id,
-                node_type=NodeType.SEMANTIC,
-                content=f"node {i}",
-                embedding=emb,
-                confidence=0.8,
-                importance=0.5,
-                trust_tier="T3",
-            ))
+            nodes.append(
+                GraphNodeData(
+                    node_id=f"n{i}_{user_id[:8]}",
+                    user_id=user_id,
+                    node_type=NodeType.SEMANTIC,
+                    content=f"node {i}",
+                    embedding=emb,
+                    confidence=0.8,
+                    importance=0.5,
+                    trust_tier="T3",
+                )
+            )
         store.create_nodes_batch(nodes)
 
         # Minimal topology: anchor(n0) has exactly 2 outgoing edges
@@ -611,8 +735,11 @@ class TestIntentDrivenLoadingE2E:
         query_emb = list(nodes[0].embedding)
 
         results = retriever.retrieve(
-            user_id, "test query", query_emb,
-            top_k=10, task_type="debugging",
+            user_id,
+            "test query",
+            query_emb,
+            top_k=10,
+            task_type="debugging",
         )
 
         assert len(results) > 0, "should return results with 55 nodes"
@@ -646,10 +773,18 @@ class TestIntentDrivenLoadingE2E:
         query_emb = list(nodes[0].embedding)
 
         results_debug = retriever.retrieve(
-            user_id, "q", query_emb, top_k=20, task_type="debugging",
+            user_id,
+            "q",
+            query_emb,
+            top_k=20,
+            task_type="debugging",
         )
         results_plan = retriever.retrieve(
-            user_id, "q", query_emb, top_k=20, task_type="planning",
+            user_id,
+            "q",
+            query_emb,
+            top_k=20,
+            task_type="planning",
         )
 
         # Both should return results
@@ -683,7 +818,10 @@ class TestIntentDrivenLoadingE2E:
 
         # Real end-to-end: service → retriever → activation → DB
         results = svc.retrieve(
-            user_id, "test", query_embedding=query_emb, task_hint="debugging",
+            user_id,
+            "test",
+            query_embedding=query_emb,
+            task_hint="debugging",
         )
         # With 55 nodes (above MIN_GRAPH_NODES=50), activation path should fire
         assert len(results) > 0, "service should return memories via activation path"
@@ -711,27 +849,34 @@ class TestTaskImportanceWeightsE2E:
         for i in range(55):
             emb = [0.1] * EMBEDDING_DIM
             emb[i % EMBEDDING_DIM] += 0.05 * (i % 10)
-            nodes.append(GraphNodeData(
-                node_id=f"n{i}_{user_id[:8]}",
-                user_id=user_id,
-                node_type=NodeType.SEMANTIC,
-                content=f"node {i}",
-                embedding=emb,
-                confidence=0.8,
-                trust_tier="T3",
-                importance=0.5,  # default
-            ))
+            nodes.append(
+                GraphNodeData(
+                    node_id=f"n{i}_{user_id[:8]}",
+                    user_id=user_id,
+                    node_type=NodeType.SEMANTIC,
+                    content=f"node {i}",
+                    embedding=emb,
+                    confidence=0.8,
+                    trust_tier="T3",
+                    importance=0.5,  # default
+                )
+            )
         store.create_nodes_batch(nodes)
 
         # Build a candidate that represents a contradiction cluster
         mems = [
-            Memory(memory_id=f"m{i}", user_id=user_id,
-                   memory_type=MemoryType.SEMANTIC, content=f"mem {i}",
-                   session_id=f"s{i}")
+            Memory(
+                memory_id=f"m{i}",
+                user_id=user_id,
+                memory_type=MemoryType.SEMANTIC,
+                content=f"mem {i}",
+                session_id=f"s{i}",
+            )
             for i in range(4)
         ]
         candidate = ReflectionCandidate(
-            memories=mems, signal="contradiction",
+            memories=mems,
+            signal="contradiction",
             session_ids=["s0", "s1", "s2"],
         )
 
@@ -757,7 +902,10 @@ class TestTaskImportanceWeightsE2E:
         retriever = ActivationRetriever(store)
         query_emb = list(nodes[0].embedding)
         results = retriever.retrieve(
-            user_id, "test", query_emb, top_k=55,
+            user_id,
+            "test",
+            query_emb,
+            top_k=55,
         )
 
         # Find both nodes in results
@@ -771,6 +919,7 @@ class TestTaskImportanceWeightsE2E:
 
 
 # ── Graph candidates and service ──────────────────────────────────────
+
 
 class TestGraphCandidatesAndService:
     """GraphCandidateProvider and ActivationIndexManager.get_reflection_candidates."""
@@ -787,7 +936,8 @@ class TestGraphCandidatesAndService:
         # Create some memories and index them
         for i in range(3):
             mem = Memory(
-                memory_id=uuid4().hex, user_id=user_id,
+                memory_id=uuid4().hex,
+                user_id=user_id,
                 memory_type=MemoryType.SEMANTIC,
                 content=f"reflection candidate {i}",
                 initial_confidence=0.7,
@@ -811,7 +961,8 @@ class TestGraphCandidatesAndService:
 
         for i in range(5):
             mem = Memory(
-                memory_id=uuid4().hex, user_id=user_id,
+                memory_id=uuid4().hex,
+                user_id=user_id,
                 memory_type=MemoryType.SEMANTIC,
                 content=f"graph candidate {i}",
                 initial_confidence=0.6 + i * 0.05,

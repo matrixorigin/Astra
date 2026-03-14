@@ -99,8 +99,13 @@ def test_score_candidates_basic(db, event_logger):
     )
 
     # Get candidates using SQLAlchemy
-    events = db.query(EventModel).filter(EventModel.session_id == session_id).order_by(EventModel.created_at.desc()).all()
-    
+    events = (
+        db.query(EventModel)
+        .filter(EventModel.session_id == session_id)
+        .order_by(EventModel.created_at.desc())
+        .all()
+    )
+
     candidates = [
         {
             "event_id": e.event_id,
@@ -148,7 +153,7 @@ def test_task_specific_scoring(db, event_logger):
 
     # Get candidates using SQLAlchemy
     events = db.query(EventModel).filter(EventModel.session_id == session_id).all()
-    
+
     candidates = [
         {
             "event_id": e.event_id,

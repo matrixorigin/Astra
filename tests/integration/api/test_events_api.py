@@ -77,23 +77,25 @@ class TestCreateEvent:
         # Create another user
         from core.auth.password import hash_password
         from uuid import uuid4
-        
+
         repo = UserRepository(lambda: db_session)
-        
+
         # Clean up first
         existing = repo.get_by_username("otheruser")
         if existing:
             repo.delete(existing.user_id)
             db_session.commit()
-        
-        other_user = repo.create({
-            "user_id": str(uuid4()),
-            "username": "otheruser",
-            "email": "other@example.com",
-            "password_hash": hash_password("otherpass123"),
-            "is_active": 1,
-        })
-        
+
+        other_user = repo.create(
+            {
+                "user_id": str(uuid4()),
+                "username": "otheruser",
+                "email": "other@example.com",
+                "password_hash": hash_password("otherpass123"),
+                "is_active": 1,
+            }
+        )
+
         # Login as other user
         response = client.post(
             "/auth/login",
@@ -104,7 +106,7 @@ class TestCreateEvent:
         )
         other_token = response.json()["access_token"]
         other_headers = {"Authorization": f"Bearer {other_token}"}
-        
+
         # Create session as other user
         session_response = client.post(
             "/sessions",
@@ -112,7 +114,7 @@ class TestCreateEvent:
             json={"metadata": {}},
         )
         session_id = session_response.json()["session_id"]
-        
+
         # Try to create event as first user
         response = client.post(
             "/events",
@@ -123,9 +125,9 @@ class TestCreateEvent:
                 "content": "test",
             },
         )
-        
+
         assert response.status_code == 404
-        
+
         # Clean up
         repo.delete(other_user.user_id)
         db_session.commit()
@@ -207,7 +209,7 @@ class TestCausalChain:
             },
         )
         event1 = event1_response.json()
-        
+
         # Create second event with parent
         event2_response = client.post(
             "/events",
@@ -220,13 +222,13 @@ class TestCausalChain:
                 "causal_chain_id": event1["causal_chain_id"],
             },
         )
-        
+
         # Get causal chain
         response = client.get(
             f"/events/causal-chain/{event1['causal_chain_id']}",
             headers=auth_headers,
         )
-        
+
         assert response.status_code == 200
         data = response.json()
         assert len(data) == 2
@@ -250,13 +252,13 @@ class TestSessionEvents:
                     "content": f"Message {i}",
                 },
             )
-        
+
         # Get session events
         response = client.get(
             f"/events/session/{test_session}",
             headers=auth_headers,
         )
-        
+
         assert response.status_code == 200
         data = response.json()
         assert len(data["events"]) == 3
@@ -279,12 +281,12 @@ class TestDeleteEvent:
             },
         )
         event_id = create_response.json()["event_id"]
-        
+
         # Delete event
         response = client.delete(f"/events/{event_id}", headers=auth_headers)
-        
+
         assert response.status_code == 204
-        
+
         # Verify deleted
         get_response = client.get(f"/events/{event_id}", headers=auth_headers)
         assert get_response.status_code == 404
@@ -292,5 +294,5 @@ class TestDeleteEvent:
     def test_delete_event_not_found(self, client, auth_headers):
         """Test deleting non-existent event."""
         response = client.delete("/events/nonexistent", headers=auth_headers)
-        
+
         assert response.status_code == 404

@@ -37,18 +37,19 @@ logger = get_logger(__name__)
 # ── Task definitions ────────────────────────────────────────────────
 
 GOVERNANCE_TASKS: dict[str, dict[str, Any]] = {
-    "hourly":  {"interval": 3600,   "lock_name": "governance_hourly"},
-    "daily":   {"interval": 86400,  "lock_name": "governance_daily"},
-    "weekly":  {"interval": 604800, "lock_name": "governance_weekly"},
+    "hourly": {"interval": 3600, "lock_name": "governance_hourly"},
+    "daily": {"interval": 86400, "lock_name": "governance_daily"},
+    "weekly": {"interval": 604800, "lock_name": "governance_weekly"},
     # Evaluation closed-loop tasks — auto-trigger drift/calibration/learning
     "eval_daily": {"interval": 86400, "lock_name": "governance_eval_daily"},
 }
 
-LOCK_TTL = 300          # 5 min — lock expires if no heartbeat
+LOCK_TTL = 300  # 5 min — lock expires if no heartbeat
 HEARTBEAT_INTERVAL = 60  # renew every 60s during task execution
 
 
 # ── Abstract interfaces ────────────────────────────────────────────
+
 
 class SchedulerBackend(ABC):
     """How tasks are scheduled. Swap for any distributed scheduler."""
@@ -67,6 +68,7 @@ class SchedulerBackend(ABC):
 
 
 # ── Task runner with distributed locking ────────────────────────────
+
 
 class GovernanceTaskRunner:
     """Executes governance tasks with distributed locking + heartbeat.
@@ -111,6 +113,7 @@ class GovernanceTaskRunner:
                 db_factory = self._db_factory
                 if db_factory is None:
                     from api.database import SessionLocal
+
                     db_factory = SessionLocal
                 result = self._dispatch(task_name, db, db_factory, self._memory_only)
                 self._persist_run(db, task_name, result)
@@ -128,7 +131,9 @@ class GovernanceTaskRunner:
     # ── Task dispatch ──────────────────────────────────────────
 
     @staticmethod
-    def _dispatch(task_name: str, db: Session, db_factory: Callable, memory_only: bool = False) -> dict[str, int]:
+    def _dispatch(
+        task_name: str, db: Session, db_factory: Callable, memory_only: bool = False
+    ) -> dict[str, int]:
         """Route task_name to the appropriate executor.
 
         Runs both (unless memory_only=True):
@@ -151,6 +156,7 @@ class GovernanceTaskRunner:
         if not memory_only:
             try:
                 from core.context.lifecycle import MemoryGovernanceEngine
+
                 engine = MemoryGovernanceEngine(db_factory)
                 ke_results = getattr(engine, f"run_{task_name}_tasks")()
                 results.update(ke_results)
@@ -160,6 +166,7 @@ class GovernanceTaskRunner:
         # 2. Memories table governance — handled server-side by Memoria
         try:
             from core.memory.interfaces import GovernanceReport
+
             r = GovernanceReport()
             if task_name == "hourly":
                 results["mem_cleaned_tool_results"] = r.cleaned_tool_results
@@ -173,6 +180,7 @@ class GovernanceTaskRunner:
             logger.error("Memory governance [%s] failed: %s", task_name, e)
 
         return results
+
     @staticmethod
     def _run_eval_daily(db_factory: Callable) -> dict[str, int]:
         """Run daily evaluation closed-loop: drift → calibration → learning.
@@ -186,6 +194,7 @@ class GovernanceTaskRunner:
         # Phase 1: Drift detection + auto-correction
         try:
             from core.evaluation.drift_pipeline import run_drift_pipeline
+
             drift = run_drift_pipeline(db_factory=db_factory)
             results["drift_signals"] = drift.signals_detected
             results["drift_corrections"] = drift.corrections_applied
@@ -196,6 +205,7 @@ class GovernanceTaskRunner:
         # Phase 2: Confidence calibration
         try:
             from core.evaluation.confidence_calibrator import ConfidenceCalibrator
+
             cal = ConfidenceCalibrator(db_factory)
             cal_result = cal.measure(days=7)
             results["calibration_error"] = round(cal_result.calibration_error * 100)
@@ -206,6 +216,7 @@ class GovernanceTaskRunner:
         try:
             from core.learning.input_face_learner import InputFaceLearner
             from core.llm.client import LLMClient
+
             llm = LLMClient(db_factory)
             learner = InputFaceLearner(db_factory, llm)
             face_results = learner.diagnose_and_fix(days=7)
@@ -232,13 +243,16 @@ class GovernanceTaskRunner:
         # Fast path: try insert
         try:
             from api.models import DistributedLock
-            db.add(DistributedLock(
-                lock_name=lock_name,
-                instance_id=self._instance_id,
-                acquired_at=now,
-                expires_at=expires_at,
-                task_name=lock_name.split("_", 1)[1],
-            ))
+
+            db.add(
+                DistributedLock(
+                    lock_name=lock_name,
+                    instance_id=self._instance_id,
+                    acquired_at=now,
+                    expires_at=expires_at,
+                    task_name=lock_name.split("_", 1)[1],
+                )
+            )
             db.commit()
             return True
         except (IntegrityError, OperationalError):
@@ -273,6 +287,7 @@ class GovernanceTaskRunner:
     def _persist_run(db: Session, task_name: str, result: dict[str, int]) -> None:
         """Write governance run result to governance_runs for trend tracking."""
         import json
+
         try:
             db.execute(
                 text(
@@ -314,6 +329,7 @@ class GovernanceTaskRunner:
 
 # ── Default backend: asyncio ───────────────────────────────────────
 
+
 class AsyncIOBackend(SchedulerBackend):
     """Zero-dependency asyncio backend. Good for dev and small deploys."""
 
@@ -323,8 +339,7 @@ class AsyncIOBackend(SchedulerBackend):
 
     async def start(self, tasks: dict[str, int]) -> None:
         self._async_tasks = [
-            asyncio.create_task(self._loop(name, interval))
-            for name, interval in tasks.items()
+            asyncio.create_task(self._loop(name, interval)) for name, interval in tasks.items()
         ]
 
     async def stop(self) -> None:
@@ -345,6 +360,7 @@ class AsyncIOBackend(SchedulerBackend):
 
 
 # ── Public façade ───────────────────────────────────────────────────
+
 
 class MemoryGovernanceScheduler:
     """Façade: wires task runner + backend.
@@ -368,6 +384,7 @@ class MemoryGovernanceScheduler:
         self._enabled = os.environ.get("GOVERNANCE_ENABLED", "true").lower() == "true"
         if backend is None and self._enabled:
             from api.database import get_db_context
+
             runner = GovernanceTaskRunner(get_db_context)
             backend = AsyncIOBackend(runner)
         self._backend = backend

@@ -74,13 +74,18 @@ class TestContradictionDetection:
 
         store = MagicMock()
         observer = TypedObserver(
-            store=store, llm_client=None, embed_fn=None,
+            store=store,
+            llm_client=None,
+            embed_fn=None,
             db_factory=lambda: mock_db,
         )
 
         new_mem = Memory(
-            memory_id="new1", user_id="u", memory_type=MemoryType.PROFILE,
-            content="User prefers spaces", initial_confidence=0.9,
+            memory_id="new1",
+            user_id="u",
+            memory_type=MemoryType.PROFILE,
+            content="User prefers spaces",
+            initial_confidence=0.9,
             embedding=[0.1] * 768,
             observed_at=datetime.now(timezone.utc),
         )
@@ -101,13 +106,18 @@ class TestContradictionDetection:
 
         store = MagicMock()
         observer = TypedObserver(
-            store=store, llm_client=None, embed_fn=None,
+            store=store,
+            llm_client=None,
+            embed_fn=None,
             db_factory=lambda: mock_db,
         )
 
         rust_mem = Memory(
-            memory_id="rust1", user_id="u", memory_type=MemoryType.PROFILE,
-            content="User likes Rust", initial_confidence=0.8,
+            memory_id="rust1",
+            user_id="u",
+            memory_type=MemoryType.PROFILE,
+            content="User likes Rust",
+            initial_confidence=0.8,
             embedding=[0.0] * 767 + [1.0],
             observed_at=datetime.now(timezone.utc),
         )
@@ -121,8 +131,11 @@ class TestContradictionDetection:
         observer = TypedObserver(store=store, llm_client=None, embed_fn=None, db_factory=None)
 
         new_mem = Memory(
-            memory_id="new1", user_id="u", memory_type=MemoryType.PROFILE,
-            content="User prefers spaces", initial_confidence=0.9,
+            memory_id="new1",
+            user_id="u",
+            memory_type=MemoryType.PROFILE,
+            content="User prefers spaces",
+            initial_confidence=0.9,
             embedding=[0.1] * 768,
             observed_at=datetime.now(timezone.utc),
         )
@@ -141,9 +154,9 @@ class TestHealthDetection:
 
         health = MemoryHealth(db_factory)
         # Verify methods exist
-        assert hasattr(health, 'analyze')
-        assert hasattr(health, 'detect_pollution')
-        assert hasattr(health, 'suggest_rollback_target')
+        assert hasattr(health, "analyze")
+        assert hasattr(health, "detect_pollution")
+        assert hasattr(health, "suggest_rollback_target")
 
 
 class TestGovernanceConfig:
@@ -208,11 +221,11 @@ class TestObserverExtraction:
         """_parse_json_array extracts JSON from markdown code blocks."""
         from core.memory.tabular.typed_observer import _parse_json_array
 
-        text = '''Here are the memories:
+        text = """Here are the memories:
 ```json
 [{"content": "User likes Python", "type": "profile", "confidence": 0.8}]
 ```
-'''
+"""
         result = _parse_json_array(text)
         assert len(result) == 1
         assert result[0]["content"] == "User likes Python"

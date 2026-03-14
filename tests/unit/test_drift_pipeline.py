@@ -17,14 +17,20 @@ from core.evaluation.drift_pipeline import PipelineResult, run_drift_pipeline
 
 
 def _signal(
-    model="gpt-4", severity=DriftSeverity.SIGNIFICANT, delta=-0.6,
+    model="gpt-4",
+    severity=DriftSeverity.SIGNIFICANT,
+    delta=-0.6,
     template_id=None,
 ) -> DriftSignal:
     return DriftSignal(
-        model=model, template_id=template_id,
-        current_avg=3.4, previous_avg=3.4 - delta,
-        week_delta=delta, severity=severity,
-        sample_count=20, detected_at=datetime.now(timezone.utc),
+        model=model,
+        template_id=template_id,
+        current_avg=3.4,
+        previous_avg=3.4 - delta,
+        week_delta=delta,
+        severity=severity,
+        sample_count=20,
+        detected_at=datetime.now(timezone.utc),
     )
 
 
@@ -50,11 +56,16 @@ class TestPipelineWithSignals:
         sig = _signal(severity=DriftSeverity.SIGNIFICANT, delta=-0.6)
 
         report = DriftReport(
-            signals=[sig], confirmed=[sig],
-            corrections=[{
-                "model": "gpt-4", "action": CorrectionAction.OPTIMIZE_PROMPT.value,
-                "severity": "significant", "week_delta": -0.6,
-            }],
+            signals=[sig],
+            confirmed=[sig],
+            corrections=[
+                {
+                    "model": "gpt-4",
+                    "action": CorrectionAction.OPTIMIZE_PROMPT.value,
+                    "severity": "significant",
+                    "week_delta": -0.6,
+                }
+            ],
             created_at=datetime.now(timezone.utc),
         )
 
@@ -77,7 +88,8 @@ class TestPipelineWithSignals:
         sig = _signal()
 
         report = DriftReport(
-            signals=[sig], confirmed=[sig],
+            signals=[sig],
+            confirmed=[sig],
             corrections=[{"model": "gpt-4", "action": CorrectionAction.ESCALATE_HUMAN.value}],
             created_at=datetime.now(timezone.utc),
         )
@@ -98,7 +110,8 @@ class TestPipelineWithSignals:
         sig = _signal(severity=DriftSeverity.MILD)
 
         report = DriftReport(
-            signals=[sig], confirmed=[],
+            signals=[sig],
+            confirmed=[],
             corrections=[{"model": "gpt-4", "action": CorrectionAction.NONE.value}],
             created_at=datetime.now(timezone.utc),
         )
@@ -122,7 +135,8 @@ class TestPipelineWithSignals:
         sig2 = _signal(model="claude-3", severity=DriftSeverity.SEVERE)
 
         report = DriftReport(
-            signals=[sig1, sig2], confirmed=[sig1, sig2],
+            signals=[sig1, sig2],
+            confirmed=[sig1, sig2],
             corrections=[
                 {"model": "gpt-4", "action": CorrectionAction.OPTIMIZE_PROMPT.value},
                 {"model": "claude-3", "action": CorrectionAction.FALLBACK_MODEL.value},

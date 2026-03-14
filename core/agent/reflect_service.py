@@ -9,8 +9,13 @@ from core.logging_config import get_logger
 logger = get_logger(__name__)
 
 _ReflectFocus = Literal[
-    "auto", "skill_failure", "unexpected_result",
-    "data_quality", "tool_selection", "history", "performance",
+    "auto",
+    "skill_failure",
+    "unexpected_result",
+    "data_quality",
+    "tool_selection",
+    "history",
+    "performance",
 ]
 
 
@@ -71,8 +76,11 @@ class ReflectService(DbConsumer):
 
             rows = (
                 db.query(
-                    EventModel.event_type, content_col,
-                    EventModel.created_at, EventModel.llm_model_used, EventModel.skill_name,
+                    EventModel.event_type,
+                    content_col,
+                    EventModel.created_at,
+                    EventModel.llm_model_used,
+                    EventModel.skill_name,
                     EventModel.token_usage,
                 )
                 .filter(EventModel.session_id == session_id)
@@ -108,7 +116,9 @@ class ReflectService(DbConsumer):
                     total_completion += c
                     llm_calls += 1
                     model = r[3] or "unknown"
-                    entry = cost_by_model.setdefault(model, {"prompt": 0, "completion": 0, "calls": 0})
+                    entry = cost_by_model.setdefault(
+                        model, {"prompt": 0, "completion": 0, "calls": 0}
+                    )
                     entry["prompt"] += p
                     entry["completion"] += c
                     entry["calls"] += 1
@@ -138,7 +148,8 @@ class ReflectService(DbConsumer):
             if focus == "auto":
                 has_failure = any(e.get("failed") for e in events)
                 has_missing_provenance = any(
-                    e.get("type") == "tool_result" and e.get("result_preview")
+                    e.get("type") == "tool_result"
+                    and e.get("result_preview")
                     and "data_source" not in e.get("result_preview", "")
                     for e in events
                 )
@@ -159,9 +170,12 @@ class ReflectService(DbConsumer):
 
             sel_rows = (
                 db.query(
-                    SkillSelectionEvent.skill_name, SkillSelectionEvent.selected_skills,
-                    SkillSelectionEvent.selection_reasoning, SkillSelectionEvent.execution_success,
-                    SkillSelectionEvent.execution_time_ms, SkillSelectionEvent.created_at,
+                    SkillSelectionEvent.skill_name,
+                    SkillSelectionEvent.selected_skills,
+                    SkillSelectionEvent.selection_reasoning,
+                    SkillSelectionEvent.execution_success,
+                    SkillSelectionEvent.execution_time_ms,
+                    SkillSelectionEvent.created_at,
                 )
                 .filter(SkillSelectionEvent.session_id == session_id)
                 .order_by(SkillSelectionEvent.created_at.desc())
@@ -170,9 +184,12 @@ class ReflectService(DbConsumer):
             )
             result["skill_history"] = [
                 {
-                    "skill": r[0], "selected": r[1], "reasoning": (r[2] or "")[:200],
+                    "skill": r[0],
+                    "selected": r[1],
+                    "reasoning": (r[2] or "")[:200],
                     "success": bool(r[3]) if r[3] is not None else None,
-                    "time_ms": r[4], "ts": str(r[5]) if r[5] else None,
+                    "time_ms": r[4],
+                    "ts": str(r[5]) if r[5] else None,
                 }
                 for r in sel_rows
             ]
@@ -184,8 +201,10 @@ class ReflectService(DbConsumer):
 
                 svc = get_memoria_storage(user_id)
                 memories, _ = svc.retrieve(
-                    user_id, "procedural lessons",
-                    memory_types=[MemoryType.PROCEDURAL], top_k=5,
+                    user_id,
+                    "procedural lessons",
+                    memory_types=[MemoryType.PROCEDURAL],
+                    top_k=5,
                 )
                 result["past_lessons"] = [m.content for m in memories]
                 for m in memories:
@@ -202,7 +221,9 @@ class ReflectService(DbConsumer):
 
                 subq = (
                     db.query(EventModel.event_id)
-                    .filter(EventModel.session_id == session_id, EventModel.event_type == "user_query")
+                    .filter(
+                        EventModel.session_id == session_id, EventModel.event_type == "user_query"
+                    )
                     .subquery()
                 )
                 fb_rows = (
@@ -213,8 +234,7 @@ class ReflectService(DbConsumer):
                     .all()
                 )
                 result["feedback_signals"] = [
-                    {"signal": r[0], "ts": str(r[1]) if r[1] else None}
-                    for r in fb_rows
+                    {"signal": r[0], "ts": str(r[1]) if r[1] else None} for r in fb_rows
                 ]
             except Exception:
                 result["feedback_signals"] = []
@@ -224,7 +244,9 @@ class ReflectService(DbConsumer):
                 if evt.get("type") == "tool_result" and evt.get("result_preview"):
                     preview = evt.get("result_preview", "")
                     if "data_source" not in preview and evt.get("tool_name"):
-                        hints.append(f"Tool '{evt['tool_name']}' result has no data_source provenance")
+                        hints.append(
+                            f"Tool '{evt['tool_name']}' result has no data_source provenance"
+                        )
                         break
 
             # 6. Tool selection — always collected (focus only affects hints)
@@ -240,6 +262,7 @@ class ReflectService(DbConsumer):
             context_budgets: list[dict[str, Any]] = []
             try:
                 from sqlalchemy import text as sql_text
+
                 budget_rows = db.execute(
                     sql_text("""
                         SELECT token_budget, created_at FROM ctx_snapshots
@@ -250,10 +273,13 @@ class ReflectService(DbConsumer):
                 ).fetchall()
                 for budget_json, snap_ts in budget_rows:
                     if budget_json:
-                        budget = json.loads(budget_json) if isinstance(budget_json, str) else budget_json
+                        budget = (
+                            json.loads(budget_json) if isinstance(budget_json, str) else budget_json
+                        )
                         tool_tokens_total += budget.get("tool_schemas", 0)
                         non_tool_tokens_total += sum(
-                            v for k, v in budget.items()
+                            v
+                            for k, v in budget.items()
                             if k != "tool_schemas" and isinstance(v, (int, float))
                         )
                         context_budgets.append({"ts": str(snap_ts), **budget})
@@ -268,16 +294,24 @@ class ReflectService(DbConsumer):
                 "llm_calls": llm_calls,
                 "tool_tokens": tool_tokens_total,
                 "non_tool_tokens": non_tool_tokens_total,
-                "tool_ratio": round(tool_tokens_total / total_managed, 2) if total_managed > 0 else 0,
+                "tool_ratio": round(tool_tokens_total / total_managed, 2)
+                if total_managed > 0
+                else 0,
                 "by_model": {
-                    model: {"prompt_tokens": v["prompt"], "completion_tokens": v["completion"], "calls": v["calls"]}
+                    model: {
+                        "prompt_tokens": v["prompt"],
+                        "completion_tokens": v["completion"],
+                        "calls": v["calls"],
+                    }
                     for model, v in cost_by_model.items()
                 },
             }
             if context_budgets:
                 result["context_budgets"] = context_budgets
             if total_managed > 0 and tool_tokens_total / total_managed > 0.6:
-                hints.append(f"Tool schemas consuming {tool_tokens_total / total_managed:.0%} of managed context — consider enabling high-confidence selection")
+                hints.append(
+                    f"Tool schemas consuming {tool_tokens_total / total_managed:.0%} of managed context — consider enabling high-confidence selection"
+                )
 
             # 9. Tool quality summary
             try:
@@ -303,18 +337,22 @@ class ReflectService(DbConsumer):
                         continue
                     grade = m.get("quality_grade", "")
                     if grade and grade != "complete":
-                        quality_items.append({
-                            "tool": m.get("tool_name", "unknown"),
-                            "grade": grade,
-                            "score": m.get("quality_score"),
-                            "missing_fields": m.get("missing_fields", []),
-                        })
+                        quality_items.append(
+                            {
+                                "tool": m.get("tool_name", "unknown"),
+                                "grade": grade,
+                                "score": m.get("quality_score"),
+                                "missing_fields": m.get("missing_fields", []),
+                            }
+                        )
                 result["tool_quality_summary"] = quality_items
             except Exception:
                 result["tool_quality_summary"] = []
 
             if total_prompt > 50000:
-                hints.append(f"High token usage: {total_prompt + total_completion:,} total tokens across {llm_calls} LLM calls")
+                hints.append(
+                    f"High token usage: {total_prompt + total_completion:,} total tokens across {llm_calls} LLM calls"
+                )
 
         result["diagnosis_hints"] = hints
 
@@ -322,6 +360,7 @@ class ReflectService(DbConsumer):
         if original_focus in ("performance", "auto"):
             try:
                 from core.agent.session_analyzer import SessionAnalyzer
+
                 analyzer = SessionAnalyzer(self._db_factory)
                 report = analyzer.analyze(session_id)
                 result["session_report"] = report.to_dict()
@@ -354,8 +393,7 @@ class ReflectService(DbConsumer):
         # 1. Filter out reflect's own events from event_summary
         evts = result.get("event_summary", [])
         result["event_summary"] = [
-            e for e in evts
-            if e.get("skill") != "reflect" and e.get("tool_name") != "reflect"
+            e for e in evts if e.get("skill") != "reflect" and e.get("tool_name") != "reflect"
         ]
 
         # 2. Compact cloud_skills: name + short description only
@@ -377,8 +415,12 @@ class ReflectService(DbConsumer):
     # ------------------------------------------------------------------
 
     def _gather_tool_selection(
-        self, session_id: str, question: str, db: Any,
-        hints: list[str], result: dict[str, Any],
+        self,
+        session_id: str,
+        question: str,
+        db: Any,
+        hints: list[str],
+        result: dict[str, Any],
     ) -> None:
         """Cloud skills, edge tools, and usage counts.
 
@@ -394,7 +436,9 @@ class ReflectService(DbConsumer):
         usage_rows = (
             db.query(sa_func.json_unquote(sa_func.json_extract(EventModel.content, "$.name")))
             .filter(EventModel.session_id == session_id, EventModel.event_type == "tool_call")
-            .order_by(EventModel.created_at.desc()).limit(50).all()
+            .order_by(EventModel.created_at.desc())
+            .limit(50)
+            .all()
         )
         tool_usage: dict[str, int] = {}
         for (name,) in usage_rows:
@@ -410,7 +454,7 @@ class ReflectService(DbConsumer):
         try:
             all_skills: dict[str, dict[str, Any]] = {}
             if self._registry:
-                skills_iter = getattr(self._registry, 'list_skills', None)
+                skills_iter = getattr(self._registry, "list_skills", None)
                 if callable(skills_iter):
                     try:
                         skills = skills_iter()
@@ -426,7 +470,9 @@ class ReflectService(DbConsumer):
                     all_skills[skill.name] = {
                         "name": skill.name,
                         "description": skill.description,
-                        "parameters": skill.to_openai_schema().get("function", {}).get("parameters", {}),
+                        "parameters": skill.to_openai_schema()
+                        .get("function", {})
+                        .get("parameters", {}),
                     }
 
             # 3. Partition: used / question-relevant / other
@@ -436,8 +482,10 @@ class ReflectService(DbConsumer):
             for name, info in all_skills.items():
                 if name in used_names:
                     cloud_skills.append(info)
-                elif question_words and any(w in name.lower() or w in (info["description"] or "").lower()
-                                            for w in question_words):
+                elif question_words and any(
+                    w in name.lower() or w in (info["description"] or "").lower()
+                    for w in question_words
+                ):
                     cloud_skills.append(info)
                 else:
                     other_names.append(name)
@@ -458,8 +506,10 @@ class ReflectService(DbConsumer):
 
         entry = self._peek_session(session_id)
         result["edge_tools"] = [
-            {"name": t.get("function", {}).get("name", "?"),
-             "description": t.get("function", {}).get("description", "")[:80]}
+            {
+                "name": t.get("function", {}).get("name", "?"),
+                "description": t.get("function", {}).get("description", "")[:80],
+            }
             for t in (entry.get("tools", []) if entry else [])
         ]
 
@@ -475,16 +525,26 @@ class ReflectService(DbConsumer):
                     hints.append(f"Skill '{s['name']}' params: {json.dumps(s['parameters'])[:200]}")
 
     def _gather_history(
-        self, session_id: str, user_id: str, question: str, db: Any,
+        self,
+        session_id: str,
+        user_id: str,
+        question: str,
+        db: Any,
         result: dict[str, Any],
     ) -> None:
         """Find similar queries from past sessions via index scan + Python filter."""
         from datetime import datetime, timedelta, timezone
         from api.models.agent import Event as EventModel
 
-        cur_query = db.query(EventModel.content).filter(
-            EventModel.session_id == session_id, EventModel.event_type == "user_query",
-        ).order_by(EventModel.created_at.desc()).first()
+        cur_query = (
+            db.query(EventModel.content)
+            .filter(
+                EventModel.session_id == session_id,
+                EventModel.event_type == "user_query",
+            )
+            .order_by(EventModel.created_at.desc())
+            .first()
+        )
         cur_text = (cur_query[0] if cur_query else question) or ""
 
         if not cur_text:

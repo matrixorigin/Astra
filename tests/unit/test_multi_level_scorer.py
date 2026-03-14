@@ -15,6 +15,7 @@ from core.evaluation.multi_level_scorer import (
 
 # ── Helpers ──────────────────────────────────────────────────────
 
+
 def _make_row(**kwargs):
     """Create a mock DB row with attribute access."""
     m = MagicMock()
@@ -28,16 +29,19 @@ def _mock_db_for_chain(scores: list[float]):
     db = MagicMock()
     rows = [_make_row(event_id=f"e{i}", quality_score=s) for i, s in enumerate(scores)]
     # 1st call = step query, 2nd = upsert SELECT (no existing row), 3rd = upsert INSERT
-    call_results = iter([
-        MagicMock(fetchall=MagicMock(return_value=rows)),  # step query
-        MagicMock(fetchone=MagicMock(return_value=None)),   # upsert SELECT
-        MagicMock(),                                        # upsert INSERT
-    ])
+    call_results = iter(
+        [
+            MagicMock(fetchall=MagicMock(return_value=rows)),  # step query
+            MagicMock(fetchone=MagicMock(return_value=None)),  # upsert SELECT
+            MagicMock(),  # upsert INSERT
+        ]
+    )
     db.execute = MagicMock(side_effect=lambda *a, **kw: next(call_results))
     return db
 
 
 # ── Chain-level tests ────────────────────────────────────────────
+
 
 class TestScoreChain:
     def test_no_scored_steps_returns_none(self):
@@ -97,6 +101,7 @@ class TestScoreChain:
 
 # ── Session-level tests ──────────────────────────────────────────
 
+
 class TestScoreSession:
     def test_no_chains_returns_none(self):
         db = MagicMock()
@@ -106,11 +111,13 @@ class TestScoreSession:
     def test_single_chain(self):
         db = MagicMock()
         chain_row = _make_row(target_id="c1", score=4.0, step_count=3, failure_count=0)
-        call_results = iter([
-            MagicMock(fetchall=MagicMock(return_value=[chain_row])),  # chain query
-            MagicMock(fetchone=MagicMock(return_value=None)),          # upsert SELECT
-            MagicMock(),                                               # upsert INSERT
-        ])
+        call_results = iter(
+            [
+                MagicMock(fetchall=MagicMock(return_value=[chain_row])),  # chain query
+                MagicMock(fetchone=MagicMock(return_value=None)),  # upsert SELECT
+                MagicMock(),  # upsert INSERT
+            ]
+        )
         db.execute = MagicMock(side_effect=lambda *a, **kw: next(call_results))
         result = score_session(db, "sess1")
         assert result is not None
@@ -124,11 +131,13 @@ class TestScoreSession:
             _make_row(target_id="c1", score=5.0, step_count=1, failure_count=0),
             _make_row(target_id="c2", score=2.0, step_count=9, failure_count=2),
         ]
-        call_results = iter([
-            MagicMock(fetchall=MagicMock(return_value=chains)),
-            MagicMock(fetchone=MagicMock(return_value=None)),  # upsert SELECT
-            MagicMock(),                                        # upsert INSERT
-        ])
+        call_results = iter(
+            [
+                MagicMock(fetchall=MagicMock(return_value=chains)),
+                MagicMock(fetchone=MagicMock(return_value=None)),  # upsert SELECT
+                MagicMock(),  # upsert INSERT
+            ]
+        )
         db.execute = MagicMock(side_effect=lambda *a, **kw: next(call_results))
         result = score_session(db, "sess1")
         # (5*1 + 2*9) / 10 = 2.3 — dominated by the longer chain
@@ -136,6 +145,7 @@ class TestScoreSession:
 
 
 # ── ChatLoop wiring test ─────────────────────────────────────────
+
 
 class TestChatLoopChainScoring:
     def test_log_response_triggers_chain_scoring(self):
@@ -150,8 +160,11 @@ class TestChatLoopChainScoring:
 
         with patch("core.evaluation.multi_level_scorer.score_chain") as mock_sc:
             loop._log_response(
-                user_id="u1", session_id="s1", content="hello",
-                parent_event_id="p1", causal_chain_id="chain1",
+                user_id="u1",
+                session_id="s1",
+                content="hello",
+                parent_event_id="p1",
+                causal_chain_id="chain1",
             )
             mock_sc.assert_called_once()
             assert mock_sc.call_args[0][1] == "chain1"
@@ -168,8 +181,11 @@ class TestChatLoopChainScoring:
 
         with patch("core.evaluation.multi_level_scorer.score_chain") as mock_sc:
             loop._log_response(
-                user_id="u1", session_id="s1", content="hello",
-                parent_event_id="p1", causal_chain_id=None,
+                user_id="u1",
+                session_id="s1",
+                content="hello",
+                parent_event_id="p1",
+                causal_chain_id=None,
             )
             mock_sc.assert_not_called()
 
@@ -182,20 +198,27 @@ class TestChatLoopChainScoring:
         loop.llm = MagicMock()
         loop.llm.config = {"model": "gpt-4"}
 
-        with patch("core.evaluation.multi_level_scorer.score_chain", side_effect=RuntimeError("boom")):
+        with patch(
+            "core.evaluation.multi_level_scorer.score_chain", side_effect=RuntimeError("boom")
+        ):
             # Should not raise
             loop._log_response(
-                user_id="u1", session_id="s1", content="hello",
-                parent_event_id="p1", causal_chain_id="chain1",
+                user_id="u1",
+                session_id="s1",
+                content="hello",
+                parent_event_id="p1",
+                causal_chain_id="chain1",
             )
 
 
 # ── Structural test ──────────────────────────────────────────────
+
 
 class TestStructural:
     def test_score_chain_called_in_log_response(self):
         """Verify score_chain import exists in _log_response."""
         import inspect
         from core.agent.chat_loop import ChatLoop
+
         source = inspect.getsource(ChatLoop._log_response)
         assert "score_chain" in source

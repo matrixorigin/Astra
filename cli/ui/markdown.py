@@ -17,8 +17,11 @@ def install_prettier_code_blocks() -> None:
             code = str(self.text).rstrip()
             yield Text(self.lexer_name, style="dim")
             yield Syntax(
-                code, self.lexer_name, theme=self.theme,
-                background_color="default", word_wrap=True,
+                code,
+                self.lexer_name,
+                theme=self.theme,
+                background_color="default",
+                word_wrap=True,
             )
             yield Text(f"/{self.lexer_name}", style="dim")
 
@@ -94,14 +97,17 @@ class StreamingMarkdown:
         # Start auto-refresh thread (1s interval) if not already running
         if not getattr(self, "_thinking_timer", None):
             import threading
+
             stop = threading.Event()
             self._thinking_stop = stop
+
             def _refresh():
                 while not stop.wait(1.0):
                     if self._thinking_shown:
                         self._render_thinking()
                     else:
                         break
+
             self._thinking_timer = threading.Thread(target=_refresh, daemon=True)
             self._thinking_timer.start()
 

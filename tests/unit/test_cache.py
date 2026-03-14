@@ -11,6 +11,7 @@ from core.cache import RedisCache, cached, get_cache
 @pytest.fixture(autouse=True)
 def reset_global_cache():
     import core.cache as mod
+
     mod._cache = None
     yield
     mod._cache = None

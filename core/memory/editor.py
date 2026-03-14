@@ -159,7 +159,9 @@ class MemoryEditor:
                 for mem, emb in zip(memories, embeddings, strict=True):
                     mem.embedding = emb
             except Exception:
-                logger.warning("Batch embedding failed, continuing without embeddings", exc_info=True)
+                logger.warning(
+                    "Batch embedding failed, continuing without embeddings", exc_info=True
+                )
 
         # Batch store — 1 transaction
         stored = self._storage.batch_store(memories)
@@ -170,7 +172,8 @@ class MemoryEditor:
 
         # Single audit entry
         self._log_edit(
-            user_id, "inject",
+            user_id,
+            "inject",
             target_ids=[m.memory_id for m in stored],
             reason=source,
         )
@@ -203,7 +206,8 @@ class MemoryEditor:
         result = self._storage.correct(user_id, memory_id, new_content, reason=reason)
 
         self._log_edit(
-            user_id, "correct",
+            user_id,
+            "correct",
             target_ids=[memory_id, result.memory_id],
             reason=reason,
         )
@@ -249,7 +253,8 @@ class MemoryEditor:
         )
 
         self._log_edit(
-            user_id, "purge",
+            user_id,
+            "purge",
             target_ids=memory_ids or [],
             reason=reason,
             snapshot_before=snapshot_name,
@@ -264,8 +269,17 @@ class MemoryEditor:
         Uses Memoria's snapshot API instead of local GitForData.
         """
         from core.utils.id_generator import generate_id
+        import time
+        import random
 
-        name = f"pre_{operation}_{generate_id()}"
+        # Use timestamp + random + suffix to stay under 64 char limit
+        # Format: pre_{operation}_{timestamp}_{random}_{suffix}
+        # timestamp: 13 digits (ms), random: 4 digits, suffix: 8 chars from id
+        timestamp = int(time.time() * 1000)  # millisecond timestamp
+        rand = random.randint(1000, 9999)  # 4-digit random
+        # Take last 8 chars from generate_id (32-char UUID)
+        suffix = generate_id()[-8:]
+        name = f"pre_{operation}_{timestamp}_{rand}_{suffix}"
         try:
             self._storage.client.create_snapshot(user_id=user_id, name=name)
             return name

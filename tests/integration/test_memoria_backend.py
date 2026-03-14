@@ -108,10 +108,7 @@ class TestMemoriaHTTPClient:
         test_user_id: str,
     ) -> None:
         """Test batch storing memories."""
-        memories = [
-            {"content": f"Memory {i}", "memory_type": "semantic"}
-            for i in range(3)
-        ]
+        memories = [{"content": f"Memory {i}", "memory_type": "semantic"} for i in range(3)]
 
         results = memoria_client.batch_store(test_user_id, memories)
         assert len(results) == 3
@@ -199,8 +196,16 @@ class TestMemoriaHTTPClient:
         snapshots = memoria_client.list_snapshots(test_user_id)
         assert any(s["name"] == snapshot_name for s in snapshots)
 
-        # Cleanup
-        memoria_client.delete_snapshot(user_id=test_user_id, name=snapshot_name)
+        retrieved = memoria_client.get_snapshot(user_id=test_user_id, name=snapshot_name)
+        assert retrieved is not None
+        assert retrieved["name"] == snapshot_name
+        assert retrieved["description"] == "Test snapshot"
+
+        deleted = memoria_client.delete_snapshot(user_id=test_user_id, name=snapshot_name)
+        assert deleted["name"] == snapshot_name or deleted.get("deleted", False) is True
+
+        snapshots_after = memoria_client.list_snapshots(test_user_id)
+        assert not any(s["name"] == snapshot_name for s in snapshots_after)
 
 
 class TestMemoriaStorage:

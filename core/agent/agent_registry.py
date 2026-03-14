@@ -7,7 +7,7 @@ from pydantic import BaseModel, model_validator
 
 class AgentProfile(BaseModel):
     """Profile for an agent.
-    
+
     Defines agent capabilities, permissions, and behavior according to
     the multi-agent architecture in agents-and-orchestration.md.
     """
@@ -27,11 +27,11 @@ class AgentProfile(BaseModel):
         # Validate triggers are only set for system agents
         if self.triggers and self.tier != "system":
             raise ValueError("Only system agents can have triggers")
-        
+
         # Validate delegation permissions
         if self.can_delegate and self.tier not in ["orchestrator", "system"]:
             raise ValueError("Only orchestrator and system agents can delegate")
-        
+
         return self
 
 
@@ -43,14 +43,14 @@ class AgentRegistry:
 
     def register(self, profile: AgentProfile) -> None:
         """Register a new agent profile.
-        
+
         Validates delegate_to references exist.
         """
         # Validate delegate_to references
         for target_id in profile.delegate_to:
             if target_id not in self._agents:
                 raise ValueError(f"Delegate target '{target_id}' not found in registry")
-        
+
         self._agents[profile.agent_id] = profile
 
     def _ensure_initialized(self) -> None:
@@ -71,7 +71,7 @@ class AgentRegistry:
             del self._agents[agent_id]
             return True
         return False
-    
+
     def can_delegate(self, from_agent: str, to_agent: str) -> bool:
         """Check if from_agent can delegate to to_agent."""
         profile = self.get(from_agent)

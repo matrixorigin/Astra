@@ -148,6 +148,7 @@ class TestSummarizeOldTurns:
             _msg("user", "new"),
             _msg("assistant", "new"),
         ]
+
         def bad_summarizer(text):
             raise RuntimeError("LLM down")
 

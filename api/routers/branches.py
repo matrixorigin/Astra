@@ -33,11 +33,16 @@ SafeIdent = Annotated[str, AfterValidator(_check_ident)]
 # Request / Response models
 # ---------------------------------------------------------------------------
 
+
 class CreateBranchRequest(BaseModel):
     name: SafeIdent = Field(..., description="Branch (target) table or database name")
     source: SafeIdent = Field(..., description="Source table or database name")
-    snapshot: SafeIdent | None = Field(default=None, description="Optional snapshot name for point-in-time branch")
-    is_database: bool = Field(default=False, description="Branch a full database instead of a single table")
+    snapshot: SafeIdent | None = Field(
+        default=None, description="Optional snapshot name for point-in-time branch"
+    )
+    is_database: bool = Field(
+        default=False, description="Branch a full database instead of a single table"
+    )
 
 
 class DiffRequest(BaseModel):
@@ -84,15 +89,18 @@ class CostEstimateResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _get_branch():
     from api.database import settings
     from core.sandbox.branch import Branch
+
     return Branch(database=settings.matrixone_database, db_factory=SessionLocal)
 
 
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_branch(
@@ -102,8 +110,10 @@ def create_branch(
     """Create a zero-copy branch from source."""
     try:
         _get_branch().create(
-            name=request.name, source=request.source,
-            snapshot=request.snapshot, is_database=request.is_database,
+            name=request.name,
+            source=request.source,
+            snapshot=request.snapshot,
+            is_database=request.is_database,
         )
         return {"status": "created", "name": request.name, "source": request.source}
     except Exception as e:
@@ -118,7 +128,8 @@ def diff_branch(
     """Three-way diff between two tables/snapshots."""
     try:
         rows = _get_branch().diff(
-            target=request.target, source=request.source,
+            target=request.target,
+            source=request.source,
             output=request.output,
             target_snapshot=request.target_snapshot,
             source_snapshot=request.source_snapshot,
@@ -136,7 +147,8 @@ def merge_branch(
     """Merge source into target with conflict strategy."""
     try:
         _get_branch().merge(
-            source=request.source, target=request.target,
+            source=request.source,
+            target=request.target,
             on_conflict=request.on_conflict,
         )
         return {"status": "merged", "source": request.source, "target": request.target}
@@ -166,12 +178,14 @@ def estimate_cost(
     from core.sandbox.cost_predictor import BranchCostPredictor
 
     est = BranchCostPredictor(SessionLocal).estimate_branch(
-        operation=request.operation, model=request.model,
+        operation=request.operation,
+        model=request.model,
         session_count=request.session_count,
         budget_remaining=request.budget_remaining,
     )
     return CostEstimateResponse(
-        operation=est.operation, model=est.model,
+        operation=est.operation,
+        model=est.model,
         estimated_tokens=est.estimated_tokens,
         estimated_cost=est.estimated_cost,
         exceeds_budget=est.exceeds_budget,

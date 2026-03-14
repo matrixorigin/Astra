@@ -32,16 +32,16 @@ class SessionService:
         user_id: str,
         agent_id: str | None = None,
         title: str | None = None,
-        metadata: dict[str, Any] | None = None
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """创建 Session
-        
+
         Args:
             user_id: 用户ID
             agent_id: Agent ID (可选)
             title: 会话标题
             metadata: 元数据
-            
+
         Returns:
             Session信息
         """
@@ -61,7 +61,7 @@ class SessionService:
                 "title": title,
                 "session_metadata": metadata,  # 使用正确的字段名
                 "status": "active",
-                "event_count": 0
+                "event_count": 0,
             }
 
             session = self.session_repo.create(session_data)
@@ -73,7 +73,7 @@ class SessionService:
                 resource_type="session",
                 resource_id=session.session_id,
                 details={"title": title, "agent_id": agent_id},
-                status="success"
+                status="success",
             )
 
             return {
@@ -86,7 +86,7 @@ class SessionService:
                 "event_count": session.event_count,
                 "created_at": session.created_at.isoformat(),
                 "updated_at": session.updated_at.isoformat() if session.updated_at else None,
-                "ended_at": session.ended_at.isoformat() if session.ended_at else None
+                "ended_at": session.ended_at.isoformat() if session.ended_at else None,
             }
 
         except Exception as e:
@@ -97,20 +97,20 @@ class SessionService:
                 resource_type="session",
                 resource_id="unknown",
                 details={"error": str(e)},
-                status="failed"
+                status="failed",
             )
             raise
 
     def get_session(self, session_id: str, user_id: str) -> dict[str, Any]:
         """获取 Session 信息
-        
+
         Args:
             session_id: Session ID
             user_id: 用户ID
-            
+
         Returns:
             Session信息
-            
+
         Raises:
             ValueError: Session不存在或无权限
         """
@@ -133,7 +133,7 @@ class SessionService:
             "event_count": session.event_count,
             "created_at": session.created_at.isoformat(),
             "updated_at": session.updated_at.isoformat() if session.updated_at else None,
-            "ended_at": session.ended_at.isoformat() if session.ended_at else None
+            "ended_at": session.ended_at.isoformat() if session.ended_at else None,
         }
 
     def list_sessions(
@@ -142,26 +142,22 @@ class SessionService:
         agent_id: str | None = None,
         status: str | None = None,
         limit: int = 50,
-        offset: int = 0
+        offset: int = 0,
     ) -> dict[str, Any]:
         """列出用户的 Sessions
-        
+
         Args:
             user_id: 用户ID
             agent_id: 过滤Agent ID
             status: 过滤状态
             limit: 限制数量
             offset: 偏移量
-            
+
         Returns:
             Sessions列表和总数
         """
         sessions, total = self.session_repo.list_by_user(
-            user_id=user_id,
-            agent_id=agent_id,
-            status=status,
-            limit=limit,
-            offset=offset
+            user_id=user_id, agent_id=agent_id, status=status, limit=limit, offset=offset
         )
 
         return {
@@ -176,13 +172,13 @@ class SessionService:
                     "event_count": session.event_count,
                     "created_at": session.created_at.isoformat(),
                     "updated_at": session.updated_at.isoformat() if session.updated_at else None,
-                    "ended_at": session.ended_at.isoformat() if session.ended_at else None
+                    "ended_at": session.ended_at.isoformat() if session.ended_at else None,
                 }
                 for session in sessions
             ],
             "total": total,
             "limit": limit,
-            "offset": offset
+            "offset": offset,
         }
 
     def update_session(
@@ -191,20 +187,20 @@ class SessionService:
         user_id: str,
         title: str | None = None,
         metadata: dict[str, Any] | None = None,
-        status: str | None = None
+        status: str | None = None,
     ) -> dict[str, Any]:
         """更新 Session
-        
+
         Args:
             session_id: Session ID
             user_id: 用户ID
             title: 新标题
             metadata: 新元数据
             status: 新状态
-            
+
         Returns:
             更新后的Session信息
-            
+
         Raises:
             ValueError: Session不存在或无权限
         """
@@ -251,7 +247,7 @@ class SessionService:
                 resource_type="session",
                 resource_id=session_id,
                 details=update_data,
-                status="success"
+                status="success",
             )
 
             return {
@@ -263,8 +259,12 @@ class SessionService:
                 "status": updated_session.status,
                 "event_count": updated_session.event_count,
                 "created_at": updated_session.created_at.isoformat(),
-                "updated_at": updated_session.updated_at.isoformat() if updated_session.updated_at else None,
-                "ended_at": updated_session.ended_at.isoformat() if updated_session.ended_at else None
+                "updated_at": updated_session.updated_at.isoformat()
+                if updated_session.updated_at
+                else None,
+                "ended_at": updated_session.ended_at.isoformat()
+                if updated_session.ended_at
+                else None,
             }
 
         except Exception as e:
@@ -275,17 +275,17 @@ class SessionService:
                 resource_type="session",
                 resource_id=session_id,
                 details={"error": str(e)},
-                status="failed"
+                status="failed",
             )
             raise
 
     def delete_session(self, session_id: str, user_id: str) -> None:
         """删除 Session
-        
+
         Args:
             session_id: Session ID
             user_id: 用户ID
-            
+
         Raises:
             ValueError: Session不存在或无权限
         """
@@ -308,7 +308,7 @@ class SessionService:
                 resource_type="session",
                 resource_id=session_id,
                 details={"title": session.title},
-                status="success"
+                status="success",
             )
 
         except Exception as e:
@@ -319,7 +319,7 @@ class SessionService:
                 resource_type="session",
                 resource_id=session_id,
                 details={"error": str(e)},
-                status="failed"
+                status="failed",
             )
             raise
 
@@ -343,6 +343,7 @@ class SessionService:
 
         try:
             from sqlalchemy import text
+
             self.session_repo.db.execute(
                 text(
                     "UPDATE agent_sessions SET event_count = event_count + 1 "
@@ -360,8 +361,11 @@ class SessionService:
             from sqlalchemy import text
 
             from core.sandbox import Sandbox
+
             result = self.db_session.execute(
-                text("SELECT sandbox_name FROM infra_sandbox_metadata WHERE session_id = :sid AND status = 'active'"),
+                text(
+                    "SELECT sandbox_name FROM infra_sandbox_metadata WHERE session_id = :sid AND status = 'active'"
+                ),
                 {"sid": session_id},
             )
             names = [row._mapping["sandbox_name"] for row in result]
@@ -382,6 +386,7 @@ class SessionService:
             # Session-level quality scoring
             try:
                 from core.evaluation.multi_level_scorer import score_session
+
                 score_session(db, session_id)
             except Exception as e:
                 self._logger.warning("Session-level scoring failed (non-fatal): %s", e)
@@ -393,9 +398,12 @@ class SessionService:
                 from skills.knowledge.api import KnowledgeExtractor
 
                 extractor = KnowledgeExtractor(db, event_logger=EventLogger.from_session(db))
-                chains = db.query(Event.causal_chain_id).filter(
-                    Event.session_id == session_id
-                ).distinct().all()
+                chains = (
+                    db.query(Event.causal_chain_id)
+                    .filter(Event.session_id == session_id)
+                    .distinct()
+                    .all()
+                )
                 for (chain_id,) in chains:
                     extractor.extract_from_chain(chain_id, user_id)
             except Exception as e:

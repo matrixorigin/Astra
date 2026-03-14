@@ -29,6 +29,7 @@ def executor(runtime, guard):
 # 1. Real subprocess execution
 # ===========================================================================
 
+
 class TestRealExecution:
     def test_arithmetic(self, executor):
         r = executor.execute(CodeExecutionRequest(code="print(2 ** 10)"))
@@ -36,9 +37,11 @@ class TestRealExecution:
         assert r.execution.stdout.strip() == "1024"
 
     def test_string_operations(self, executor):
-        r = executor.execute(CodeExecutionRequest(
-            code="print('hello world'.upper())",
-        ))
+        r = executor.execute(
+            CodeExecutionRequest(
+                code="print('hello world'.upper())",
+            )
+        )
         assert r.execution.exit_code == 0
         assert "HELLO WORLD" in r.execution.stdout
 
@@ -52,6 +55,7 @@ print(json.dumps({"average": avg, "count": len(data)}))
         r = executor.execute(CodeExecutionRequest(code=code))
         assert r.execution.exit_code == 0
         import json
+
         output = json.loads(r.execution.stdout.strip())
         assert output["average"] == 91.0
         assert output["count"] == 2
@@ -147,6 +151,7 @@ print(fibonacci(10))
 # 2. Security + execution integration
 # ===========================================================================
 
+
 class TestSecurityIntegration:
     def test_blocked_code_never_executes(self, executor):
         """Dangerous code is rejected before reaching subprocess."""
@@ -187,30 +192,38 @@ class TestSecurityIntegration:
 # 3. Resource limits
 # ===========================================================================
 
+
 class TestResourceLimits:
     def test_timeout_kills_execution(self, executor):
-        r = executor.execute(CodeExecutionRequest(
-            code="import time; time.sleep(100)",
-            resources=ResourceProfile(max_wall_seconds=1),
-        ))
+        r = executor.execute(
+            CodeExecutionRequest(
+                code="import time; time.sleep(100)",
+                resources=ResourceProfile(max_wall_seconds=1),
+            )
+        )
         assert r.execution.exit_code == 137
         assert "timed out" in r.execution.stderr
         assert r.execution.execution_time_ms < 5000  # Should be ~1s, not 100s
 
     def test_output_truncation(self, executor):
         code = "print('x' * 2_000_000)"
-        r = executor.execute(CodeExecutionRequest(
-            code=code,
-            resources=ResourceProfile(max_output_bytes=500),
-        ))
+        r = executor.execute(
+            CodeExecutionRequest(
+                code=code,
+                resources=ResourceProfile(max_output_bytes=500),
+            )
+        )
         assert r.execution.exit_code == 0
         assert r.execution.truncated is True
         assert len(r.execution.stdout) <= 500
 
     def test_lightweight_profile(self, executor):
-        r = executor.execute(CodeExecutionRequest(
-            code="print('fast')", resources=PROFILE_LIGHTWEIGHT,
-        ))
+        r = executor.execute(
+            CodeExecutionRequest(
+                code="print('fast')",
+                resources=PROFILE_LIGHTWEIGHT,
+            )
+        )
         assert r.execution.exit_code == 0
         assert "fast" in r.execution.stdout
 
@@ -218,6 +231,7 @@ class TestResourceLimits:
 # ===========================================================================
 # 4. Error handling
 # ===========================================================================
+
 
 class TestErrorHandling:
     def test_runtime_error(self, executor):
@@ -262,9 +276,12 @@ class TestErrorHandling:
     def test_memory_error_code(self, executor):
         """Code that tries to allocate too much memory."""
         code = "x = [0] * (10**9)"  # ~8GB
-        r = executor.execute(CodeExecutionRequest(
-            code=code, resources=ResourceProfile(max_wall_seconds=5),
-        ))
+        r = executor.execute(
+            CodeExecutionRequest(
+                code=code,
+                resources=ResourceProfile(max_wall_seconds=5),
+            )
+        )
         # Should fail (MemoryError or killed)
         assert r.execution.exit_code != 0
 
@@ -272,6 +289,7 @@ class TestErrorHandling:
 # ===========================================================================
 # 5. Environment isolation
 # ===========================================================================
+
 
 class TestIsolation:
     def test_no_file_access_to_project(self, executor):
@@ -314,11 +332,14 @@ print(dsn)
 # 6. End-to-end data analysis workflow (no DB)
 # ===========================================================================
 
+
 class TestDataAnalysisWorkflow:
     def test_full_analysis_pipeline(self, executor):
         """Simulate a multi-step data analysis without DB."""
         # Step 1: Generate data
-        r1 = executor.execute(CodeExecutionRequest(code="""
+        r1 = executor.execute(
+            CodeExecutionRequest(
+                code="""
 import json
 data = [
     {"user": "alice", "action": "login", "cost": 10},
@@ -333,9 +354,12 @@ totals = defaultdict(float)
 for d in data:
     totals[d["user"]] += d["cost"]
 print(json.dumps(dict(sorted(totals.items(), key=lambda x: -x[1]))))
-"""))
+"""
+            )
+        )
         assert r1.execution.exit_code == 0
         import json
+
         totals = json.loads(r1.execution.stdout.strip())
         assert totals["bob"] == 150
         assert totals["alice"] == 40
@@ -359,6 +383,7 @@ print(f"stdev={statistics.stdev(data):.1f}")
 # 7. Skill registration
 # ===========================================================================
 
+
 class TestSkillRegistration:
     def test_register_with_code_executor(self):
         """ExecuteCodeSkill can be registered via register_builtin_skills."""
@@ -376,11 +401,14 @@ class TestSkillRegistration:
 # 8. Missing integration scenarios
 # ===========================================================================
 
+
 class TestMissingIntegration:
     @pytest.fixture
     def executor(self):
         return CodeExecutor(
-            runtime=SubprocessRuntime(), db_factory=lambda: None, branch=None,
+            runtime=SubprocessRuntime(),
+            db_factory=lambda: None,
+            branch=None,
             security=SecurityGuard(),
         )
 
@@ -393,10 +421,12 @@ class TestMissingIntegration:
 
     def test_timeout_elapsed_time_reasonable(self, executor):
         """Elapsed time on timeout should be ≈ wall_seconds."""
-        r = executor.execute(CodeExecutionRequest(
-            code="import time; time.sleep(100)",
-            resources=ResourceProfile(max_wall_seconds=1),
-        ))
+        r = executor.execute(
+            CodeExecutionRequest(
+                code="import time; time.sleep(100)",
+                resources=ResourceProfile(max_wall_seconds=1),
+            )
+        )
         assert r.execution.exit_code == 137
         assert 500 <= r.execution.execution_time_ms <= 3000
 

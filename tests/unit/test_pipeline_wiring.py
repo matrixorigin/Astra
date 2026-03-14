@@ -27,9 +27,14 @@ class TestEventLoggerSessionLifecycle:
     def _make_event(self):
         TestEventLoggerSessionLifecycle._counter += 1
         return ConversationEvent(
-            event_id=f"e{self._counter}", user_id="u1", session_id="s1",
-            agent_id="a", agent_version="1", event_type=EventType.USER_QUERY,
-            content="hello", causal_chain_id="c1",
+            event_id=f"e{self._counter}",
+            user_id="u1",
+            session_id="s1",
+            agent_id="a",
+            agent_version="1",
+            event_type=EventType.USER_QUERY,
+            content="hello",
+            causal_chain_id="c1",
         )
 
     def test_factory_mode_creates_and_closes_session_per_log_event(self):
@@ -115,9 +120,14 @@ class TestEventLoggerDelegation:
         """log_event() should call pipeline.emit() instead of DB write."""
         el, mock_session, mock_pipeline = self._make_logger()
         ev = ConversationEvent(
-            event_id="e1", user_id="u1", session_id="s1",
-            agent_id="a", agent_version="1", event_type=EventType.USER_QUERY,
-            content="hello", causal_chain_id="c1",
+            event_id="e1",
+            user_id="u1",
+            session_id="s1",
+            agent_id="a",
+            agent_version="1",
+            event_type=EventType.USER_QUERY,
+            content="hello",
+            causal_chain_id="c1",
         )
         result = el.log_event(ev)
         assert result == "evt-123"
@@ -131,9 +141,14 @@ class TestEventLoggerDelegation:
         """When disabled, log_event() should do synchronous DB write."""
         el, mock_session, mock_pipeline = self._make_logger()
         ev = ConversationEvent(
-            event_id="e1", user_id="u1", session_id="s1",
-            agent_id="a", agent_version="1", event_type=EventType.USER_QUERY,
-            content="hello", causal_chain_id="c1",
+            event_id="e1",
+            user_id="u1",
+            session_id="s1",
+            agent_id="a",
+            agent_version="1",
+            event_type=EventType.USER_QUERY,
+            content="hello",
+            causal_chain_id="c1",
         )
         el.log_event(ev)
         # Pipeline should NOT be called
@@ -160,9 +175,14 @@ class TestEventLoggerDelegation:
         mock_session = MagicMock(spec=Session)
         el = EventLogger.from_session(mock_session, pipeline=None)
         ev = ConversationEvent(
-            event_id="e1", user_id="u1", session_id="s1",
-            agent_id="a", agent_version="1", event_type=EventType.USER_QUERY,
-            content="hello", causal_chain_id="c1",
+            event_id="e1",
+            user_id="u1",
+            session_id="s1",
+            agent_id="a",
+            agent_version="1",
+            event_type=EventType.USER_QUERY,
+            content="hello",
+            causal_chain_id="c1",
         )
         el.log_event(ev)
         mock_session.add.assert_called_once()
@@ -183,9 +203,13 @@ class TestEventLoggerDelegation:
         """create_llm_response → log_event → pipeline.emit."""
         el, _, mock_pipeline = self._make_logger()
         el.create_llm_response(
-            user_id="u1", session_id="s1", content="answer",
-            agent_id="a", agent_version="1",
-            parent_event_id="p1", causal_chain_id="c1",
+            user_id="u1",
+            session_id="s1",
+            content="answer",
+            agent_id="a",
+            agent_version="1",
+            parent_event_id="p1",
+            causal_chain_id="c1",
         )
         assert mock_pipeline.emit.call_count == 1
         emitted = mock_pipeline.emit.call_args[0][0]
@@ -196,8 +220,10 @@ class TestEventLoggerDelegation:
         """create_stream_event → log_event → pipeline.emit."""
         el, _, mock_pipeline = self._make_logger()
         el.create_stream_event(
-            user_id="u1", session_id="s1",
-            event_type="stream_text_delta", content="chunk",
+            user_id="u1",
+            session_id="s1",
+            event_type="stream_text_delta",
+            content="chunk",
         )
         assert mock_pipeline.emit.call_count == 1
 
@@ -246,7 +272,9 @@ class TestChatLoopFlushOrdering:
         context_manager.save_snapshot.return_value = "snap-1"
         firewall = MagicMock()
         firewall.verify_response.return_value = MagicMock(
-            safe_to_deliver=True, confidence_score=1.0, claims_failed=0,
+            safe_to_deliver=True,
+            confidence_score=1.0,
+            claims_failed=0,
         )
 
         def tracked_build_context(**kwargs):
@@ -256,8 +284,12 @@ class TestChatLoopFlushOrdering:
         context_manager.build_context = tracked_build_context
 
         loop = ChatLoop(
-            selector=selector, executor=executor, llm_client=llm_client,
-            event_logger=el, context_manager=context_manager, firewall=firewall,
+            selector=selector,
+            executor=executor,
+            llm_client=llm_client,
+            event_logger=el,
+            context_manager=context_manager,
+            firewall=firewall,
         )
         return loop, call_order, mock_pipeline
 
@@ -265,9 +297,7 @@ class TestChatLoopFlushOrdering:
     def test_run_step_flush_before_build_context(self):
         """run_step: create_user_query → flush_critical → build_context."""
         loop, call_order, _ = self._make_chat_loop()
-        result = asyncio.run(
-            loop.run_step("hello", session_id="s1", user_id="u1")
-        )
+        result = asyncio.run(loop.run_step("hello", session_id="s1", user_id="u1"))
         assert call_order[:3] == ["create_user_query", "flush_critical", "build_context"]
 
 
@@ -285,6 +315,7 @@ class TestRunEngineFlushOnTerminal:
 
     def _make_engine_and_run(self):
         from core.agent.run_engine import RunEngine
+
         mock_session = MagicMock(spec=Session)
         engine = RunEngine(lambda: mock_session)
         mock_run = MagicMock()
@@ -326,7 +357,9 @@ class TestRunEngineFlushOnTerminal:
     def test_log_run_event_uses_short_lived_session(self):
         """Each _log_run_event call acquires and releases its own session."""
         from core.agent.run_engine import RunEngine
+
         sessions_created = []
+
         def tracking_factory():
             s = MagicMock(spec=Session)
             sessions_created.append(s)

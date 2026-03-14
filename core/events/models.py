@@ -210,7 +210,9 @@ class ConversationEvent(BaseModel):
     token_usage: TokenUsage | None = Field(default=None, description="Token usage statistics")
     embedding_ref: str | None = Field(default=None, description="External vector store chunk ID")
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    prompt_template_id: str | None = Field(default=None, description="References ctx_prompt_templates")
+    prompt_template_id: str | None = Field(
+        default=None, description="References ctx_prompt_templates"
+    )
     skills_snapshot: list[dict[str, Any]] | None = Field(
         default=None, description="Skills used with versions"
     )
@@ -232,14 +234,11 @@ class ConversationEvent(BaseModel):
     skill_name: str | None = Field(
         default=None, description="Skill/tool name for tool_call/tool_result events"
     )
-    skill_version: str | None = Field(
-        default=None, description="Skill version at invocation time"
-    )
-    skill_result: Any | None = Field(
-        default=None, description="Skill execution result"
-    )
+    skill_version: str | None = Field(default=None, description="Skill version at invocation time")
+    skill_result: Any | None = Field(default=None, description="Skill execution result")
     reasoning_content: str | None = Field(
-        default=None, description="Thinking-model chain-of-thought (e.g. kimi-k2.5 reasoning_content)"
+        default=None,
+        description="Thinking-model chain-of-thought (e.g. kimi-k2.5 reasoning_content)",
     )
 
     model_config = {"use_enum_values": True}

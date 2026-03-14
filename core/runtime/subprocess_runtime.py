@@ -8,7 +8,13 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
-from core.runtime import ExecutionResult, ResourceProfile, Runtime, RuntimeCapabilities, IsolationLevel
+from core.runtime import (
+    ExecutionResult,
+    ResourceProfile,
+    Runtime,
+    RuntimeCapabilities,
+    IsolationLevel,
+)
 
 _IS_LINUX = platform.system() == "Linux"
 
@@ -37,7 +43,9 @@ class SubprocessRuntime(Runtime):
         try:
             r = subprocess.run(
                 ["python3", "-c", "print('ok')"],
-                capture_output=True, timeout=5, text=True,
+                capture_output=True,
+                timeout=5,
+                text=True,
             )
             return r.returncode == 0
         except Exception:
@@ -52,8 +60,10 @@ class SubprocessRuntime(Runtime):
     ) -> ExecutionResult:
         if language not in self.supported_languages:
             return ExecutionResult(
-                stdout="", stderr=f"Unsupported language: {language}",
-                exit_code=1, execution_time_ms=0,
+                stdout="",
+                stderr=f"Unsupported language: {language}",
+                exit_code=1,
+                execution_time_ms=0,
             )
 
         resources = resources or ResourceProfile()
@@ -96,7 +106,7 @@ class SubprocessRuntime(Runtime):
                 stdout = proc.stdout
                 truncated = False
                 if len(stdout.encode()) > resources.max_output_bytes:
-                    stdout = stdout[:resources.max_output_bytes]
+                    stdout = stdout[: resources.max_output_bytes]
                     truncated = True
 
                 return ExecutionResult(
@@ -110,14 +120,18 @@ class SubprocessRuntime(Runtime):
             except subprocess.TimeoutExpired:
                 elapsed_ms = (time.monotonic() - start) * 1000
                 return ExecutionResult(
-                    stdout="", stderr=f"Execution timed out after {resources.max_wall_seconds}s",
-                    exit_code=137, execution_time_ms=round(elapsed_ms, 2),
+                    stdout="",
+                    stderr=f"Execution timed out after {resources.max_wall_seconds}s",
+                    exit_code=137,
+                    execution_time_ms=round(elapsed_ms, 2),
                     started_at=started_at,
                 )
             except Exception as e:
                 elapsed_ms = (time.monotonic() - start) * 1000
                 return ExecutionResult(
-                    stdout="", stderr=str(e),
-                    exit_code=1, execution_time_ms=round(elapsed_ms, 2),
+                    stdout="",
+                    stderr=str(e),
+                    exit_code=1,
+                    execution_time_ms=round(elapsed_ms, 2),
                     started_at=started_at,
                 )

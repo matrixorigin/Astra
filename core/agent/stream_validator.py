@@ -29,15 +29,17 @@ from core.logging_config import get_logger
 logger = get_logger(__name__)
 
 # Events that are valid in any active (non-terminal) state
-_PASSTHROUGH_EVENTS = frozenset({
-    StreamEventType.STATE_SNAPSHOT,
-    StreamEventType.STATE_DELTA,
-    StreamEventType.MESSAGES_SNAPSHOT,
-    StreamEventType.CUSTOM,
-    StreamEventType.RAW,
-    StreamEventType.STEP_STARTED,
-    StreamEventType.STEP_FINISHED,
-})
+_PASSTHROUGH_EVENTS = frozenset(
+    {
+        StreamEventType.STATE_SNAPSHOT,
+        StreamEventType.STATE_DELTA,
+        StreamEventType.MESSAGES_SNAPSHOT,
+        StreamEventType.CUSTOM,
+        StreamEventType.RAW,
+        StreamEventType.STEP_STARTED,
+        StreamEventType.STEP_FINISHED,
+    }
+)
 
 
 class StreamState(str, Enum):

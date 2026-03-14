@@ -95,7 +95,8 @@ def score_session(db: Session, session_id: str) -> dict[str, Any] | None:
     # Weight by step_count: longer chains contribute more
     total_w = sum(chain_weights) or 1
     session_score = round(
-        sum(s * w for s, w in zip(chain_scores, chain_weights)) / total_w, 2,
+        sum(s * w for s, w in zip(chain_scores, chain_weights)) / total_w,
+        2,
     )
     session_score = max(0.0, min(5.0, session_score))
 
@@ -113,7 +114,11 @@ def score_session(db: Session, session_id: str) -> dict[str, Any] | None:
 
 
 def _upsert_assessment(
-    db: Session, level: str, target_id: str, session_id: str, result: dict,
+    db: Session,
+    level: str,
+    target_id: str,
+    session_id: str,
+    result: dict,
 ) -> None:
     """Insert or update a quality assessment row.
 
@@ -128,30 +133,50 @@ def _upsert_assessment(
     details = _json_dumps(result.get("details"))
 
     row = db.execute(
-        text("SELECT assessment_id FROM eval_quality_assessments "
-             "WHERE level = :lvl AND target_id = :tid"),
+        text(
+            "SELECT assessment_id FROM eval_quality_assessments "
+            "WHERE level = :lvl AND target_id = :tid"
+        ),
         {"lvl": level, "tid": target_id},
     ).fetchone()
 
     if row:
         db.execute(
-            text("UPDATE eval_quality_assessments "
-                 "SET score = :score, step_count = :sc, failure_count = :fc, "
-                 "details = :details, updated_at = :now "
-                 "WHERE assessment_id = :aid"),
-            {"score": result["score"], "sc": sc, "fc": fc,
-             "details": details, "now": now, "aid": row.assessment_id},
+            text(
+                "UPDATE eval_quality_assessments "
+                "SET score = :score, step_count = :sc, failure_count = :fc, "
+                "details = :details, updated_at = :now "
+                "WHERE assessment_id = :aid"
+            ),
+            {
+                "score": result["score"],
+                "sc": sc,
+                "fc": fc,
+                "details": details,
+                "now": now,
+                "aid": row.assessment_id,
+            },
         )
     else:
         db.execute(
-            text("INSERT INTO eval_quality_assessments "
-                 "(assessment_id, level, target_id, session_id, score, "
-                 "step_count, failure_count, details, created_at, updated_at) "
-                 "VALUES (:aid, :lvl, :tid, :sid, :score, :sc, :fc, "
-                 ":details, :now, :now)"),
-            {"aid": str(uuid7()), "lvl": level, "tid": target_id,
-             "sid": session_id, "score": result["score"], "sc": sc,
-             "fc": fc, "details": details, "now": now},
+            text(
+                "INSERT INTO eval_quality_assessments "
+                "(assessment_id, level, target_id, session_id, score, "
+                "step_count, failure_count, details, created_at, updated_at) "
+                "VALUES (:aid, :lvl, :tid, :sid, :score, :sc, :fc, "
+                ":details, :now, :now)"
+            ),
+            {
+                "aid": str(uuid7()),
+                "lvl": level,
+                "tid": target_id,
+                "sid": session_id,
+                "score": result["score"],
+                "sc": sc,
+                "fc": fc,
+                "details": details,
+                "now": now,
+            },
         )
     db.commit()
 
@@ -160,4 +185,5 @@ def _json_dumps(obj: Any) -> str | None:
     if obj is None:
         return None
     import json
+
     return json.dumps(obj)

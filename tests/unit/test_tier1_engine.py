@@ -20,7 +20,9 @@ class TestTier1Classify:
     async def test_classify_returns_valid_intent(self):
         engine = Tier1Engine(db_factory=MagicMock())
         mock_resp = _mock_llm_response('{"intent": "preference", "confidence": 0.9}')
-        with patch.object(engine, "_llm_call", return_value='{"intent": "preference", "confidence": 0.9}'):
+        with patch.object(
+            engine, "_llm_call", return_value='{"intent": "preference", "confidence": 0.9}'
+        ):
             result = await engine._classify("remember I use vim", None)
         assert result.intent == "preference"
         assert result.confidence == 0.9
@@ -38,7 +40,9 @@ class TestTier1Classify:
     @pytest.mark.asyncio
     async def test_classify_unknown_intent_falls_back(self):
         engine = Tier1Engine(db_factory=MagicMock())
-        with patch.object(engine, "_llm_call", return_value='{"intent": "unknown", "confidence": 0.8}'):
+        with patch.object(
+            engine, "_llm_call", return_value='{"intent": "unknown", "confidence": 0.8}'
+        ):
             result = await engine._classify("hello", None)
         assert result.intent == "question"
 
@@ -92,9 +96,11 @@ class TestTier1Parallel:
         async def mock_prune(q, t):
             return ["bash"]
 
-        with patch.object(engine, "_classify", side_effect=mock_classify), \
-             patch.object(engine, "_compress", side_effect=mock_compress), \
-             patch.object(engine, "_prune_tools", side_effect=mock_prune):
+        with (
+            patch.object(engine, "_classify", side_effect=mock_classify),
+            patch.object(engine, "_compress", side_effect=mock_compress),
+            patch.object(engine, "_prune_tools", side_effect=mock_prune),
+        ):
             result = await engine.run_parallel(
                 "run tests", memory_text="x" * 200, tool_names=["bash", "grep", "read_file", "git"]
             )
@@ -114,8 +120,10 @@ class TestTier1Parallel:
         async def mock_compress(t):
             return "compressed"
 
-        with patch.object(engine, "_classify", side_effect=mock_classify), \
-             patch.object(engine, "_compress", side_effect=mock_compress):
+        with (
+            patch.object(engine, "_classify", side_effect=mock_classify),
+            patch.object(engine, "_compress", side_effect=mock_compress),
+        ):
             result = await engine.run_parallel("test", memory_text="x" * 200)
 
         assert result.routing is None  # classify failed

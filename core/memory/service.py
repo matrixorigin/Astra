@@ -82,8 +82,11 @@ class MemoryService:
     ) -> tuple[list[Memory], Any]:
         """Retrieve memories via the active retrieval strategy."""
         return self._retrieval.retrieve(
-            user_id, query, query_embedding,
-            top_k=top_k, task_type=task_hint,
+            user_id,
+            query,
+            query_embedding,
+            top_k=top_k,
+            task_type=task_hint,
             session_id=session_id,
             memory_types=memory_types,
             weights=weights,
@@ -109,7 +112,8 @@ class MemoryService:
     ) -> Memory:
         """Store memory in canonical storage, then update index."""
         mem = self._storage.store(
-            user_id, content,
+            user_id,
+            content,
             memory_type=memory_type,
             source_event_ids=source_event_ids,
             initial_confidence=initial_confidence,
@@ -118,7 +122,9 @@ class MemoryService:
         )
         if self._index_manager:
             self._index_manager.on_memories_stored(
-                user_id, [mem], session_id=session_id,
+                user_id,
+                [mem],
+                session_id=session_id,
             )
         return mem
 
@@ -131,12 +137,16 @@ class MemoryService:
     ) -> list[Memory]:
         """Extract memories from turn, then update index."""
         memories = self._storage.observe_turn(
-            user_id, messages, source_event_ids=source_event_ids,
+            user_id,
+            messages,
+            source_event_ids=source_event_ids,
         )
         if self._index_manager and memories:
             session_id = memories[0].session_id if memories else None
             self._index_manager.on_memories_stored(
-                user_id, memories, session_id=session_id,
+                user_id,
+                memories,
+                session_id=session_id,
             )
         return memories
 
@@ -148,7 +158,9 @@ class MemoryService:
         source_event_ids: list[str] | None = None,
     ) -> Any:
         return self._storage.run_pipeline(
-            user_id, messages, source_event_ids=source_event_ids,
+            user_id,
+            messages,
+            source_event_ids=source_event_ids,
         )
 
     def invalidate_profile(self, user_id: str) -> None:
@@ -171,7 +183,11 @@ class MemoryService:
         session_start: Any,
     ) -> Memory | None:
         return self._storage.check_and_summarize(
-            user_id, session_id, messages, turn_count, session_start,
+            user_id,
+            session_id,
+            messages,
+            turn_count,
+            session_start,
         )
 
     # ── MemoryAdmin ───────────────────────────────────────────────────
@@ -205,13 +221,15 @@ class MemoryService:
         """Get reflection candidates from index manager or canonical fallback."""
         if self._index_manager:
             result = self._index_manager.get_reflection_candidates(
-                user_id, since_hours=since_hours,
+                user_id,
+                since_hours=since_hours,
             )
             if result is not None:
                 return result
 
         return self._storage.get_reflection_candidates(
-            user_id, since_hours=since_hours,
+            user_id,
+            since_hours=since_hours,
         )
 
     # ── Low-level CRUD (for Tool Context Engine) ──────────────────────
@@ -236,7 +254,9 @@ class MemoryService:
         load_embedding: bool = True,
     ) -> list[Memory]:
         return self._storage.list_active(
-            user_id, memory_type=memory_type, limit=limit,
+            user_id,
+            memory_type=memory_type,
+            limit=limit,
             load_embedding=load_embedding,
         )
 

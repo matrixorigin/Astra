@@ -93,11 +93,11 @@ def test_complete_conversation_flow(session_repo, event_repo, db_session):
     # 5. Verify events
     events = event_repo.list_by_session(session.session_id, user_id)
     assert len(events) == 2
-    
+
     # Find events by type instead of assuming order
     user_events = [e for e in events if e.event_type == "user_query"]
     llm_events = [e for e in events if e.event_type == "llm_response"]
-    
+
     assert len(user_events) == 1
     assert len(llm_events) == 1
     assert user_events[0].event_id == user_event.event_id
@@ -126,7 +126,7 @@ def test_multi_turn_conversation(session_repo, event_repo, db_session):
     # Create 3 turns
     for i in range(3):
         causal_chain_id = str(uuid4())
-        
+
         # User query
         user_event_data = {
             "event_id": str(uuid4()),
@@ -135,13 +135,13 @@ def test_multi_turn_conversation(session_repo, event_repo, db_session):
             "agent_id": "system",
             "agent_version": "1.0.0",
             "event_type": "user_query",
-            "content": f"Question {i+1}",
+            "content": f"Question {i + 1}",
             "created_at": datetime.now(timezone.utc),
             "event_metadata": {},
             "causal_chain_id": causal_chain_id,
         }
         user_event = event_repo.create(user_event_data)
-        
+
         # LLM response
         llm_event_data = {
             "event_id": str(uuid4()),
@@ -150,7 +150,7 @@ def test_multi_turn_conversation(session_repo, event_repo, db_session):
             "agent_id": "dev-agent",
             "agent_version": "0.1.0",
             "event_type": "llm_response",
-            "content": f"Answer {i+1}",
+            "content": f"Answer {i + 1}",
             "created_at": datetime.now(timezone.utc),
             "event_metadata": {},
             "parent_event_id": user_event.event_id,

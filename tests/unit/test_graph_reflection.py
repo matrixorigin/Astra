@@ -10,6 +10,7 @@ from core.memory.graph.types import Edge, EdgeType, GraphNodeData, NodeType
 class TestGraphCandidateProvider:
     def _make_provider(self):
         from core.memory.graph.candidates import GraphCandidateProvider
+
         provider = GraphCandidateProvider(lambda: MagicMock())
         provider._store = MagicMock()
         return provider
@@ -28,6 +29,7 @@ class TestGraphCandidateProvider:
 class TestConnectedComponents:
     def test_single_component(self):
         from core.memory.graph.candidates import GraphCandidateProvider
+
         p = GraphCandidateProvider(lambda: MagicMock())
         p._store = MagicMock()
 
@@ -46,6 +48,7 @@ class TestConnectedComponents:
 
     def test_two_components(self):
         from core.memory.graph.candidates import GraphCandidateProvider
+
         p = GraphCandidateProvider(lambda: MagicMock())
         p._store = MagicMock()
 
@@ -67,6 +70,7 @@ class TestConnectedComponents:
 class TestGraphConsolidator:
     def _make_consolidator(self):
         from core.memory.graph.consolidation import GraphConsolidator
+
         c = GraphConsolidator(lambda: MagicMock())
         c._store = MagicMock()
         c._store.get_association_edges.return_value = []
@@ -84,12 +88,20 @@ class TestGraphConsolidator:
         c = self._make_consolidator()
 
         node_a = GraphNodeData(
-            node_id="a", user_id="u1", node_type=NodeType.SEMANTIC,
-            content="prefers Go", session_id="s1", confidence=0.7,
+            node_id="a",
+            user_id="u1",
+            node_type=NodeType.SEMANTIC,
+            content="prefers Go",
+            session_id="s1",
+            confidence=0.7,
         )
         node_b = GraphNodeData(
-            node_id="b", user_id="u1", node_type=NodeType.SEMANTIC,
-            content="prefers Python", session_id="s2", confidence=0.6,
+            node_id="b",
+            user_id="u1",
+            node_type=NodeType.SEMANTIC,
+            content="prefers Python",
+            session_id="s2",
+            confidence=0.6,
         )
 
         c._store.get_association_edges_with_current_sim.return_value = [
@@ -106,16 +118,29 @@ class TestGraphConsolidator:
         c = self._make_consolidator()
 
         scene = GraphNodeData(
-            node_id="scene1", user_id="u1", node_type=NodeType.SCENE,
-            content="insight", source_nodes=["src1", "src2", "src3"],
+            node_id="scene1",
+            user_id="u1",
+            node_type=NodeType.SCENE,
+            content="insight",
+            source_nodes=["src1", "src2", "src3"],
         )
 
         c._store.get_user_nodes.return_value = [scene]
         c._store.get_nodes_by_ids.return_value = [
-            GraphNodeData(node_id="src1", user_id="u1", node_type=NodeType.SEMANTIC,
-                          content="x", is_active=False),
-            GraphNodeData(node_id="src2", user_id="u1", node_type=NodeType.SEMANTIC,
-                          content="y", is_active=False),
+            GraphNodeData(
+                node_id="src1",
+                user_id="u1",
+                node_type=NodeType.SEMANTIC,
+                content="x",
+                is_active=False,
+            ),
+            GraphNodeData(
+                node_id="src2",
+                user_id="u1",
+                node_type=NodeType.SEMANTIC,
+                content="y",
+                is_active=False,
+            ),
         ]
 
         result = c.consolidate("u1")
@@ -126,17 +151,30 @@ class TestGraphConsolidator:
         c = self._make_consolidator()
 
         scene = GraphNodeData(
-            node_id="scene1", user_id="u1", node_type=NodeType.SCENE,
-            content="insight", confidence=0.9,
+            node_id="scene1",
+            user_id="u1",
+            node_type=NodeType.SCENE,
+            content="insight",
+            confidence=0.9,
             source_nodes=["src1", "src2", "src3", "src4"],
         )
 
         c._store.get_user_nodes.return_value = [scene]
         c._store.get_nodes_by_ids.return_value = [
-            GraphNodeData(node_id="src1", user_id="u1", node_type=NodeType.SEMANTIC,
-                          content="x", is_active=True),
-            GraphNodeData(node_id="src2", user_id="u1", node_type=NodeType.SEMANTIC,
-                          content="y", is_active=False),
+            GraphNodeData(
+                node_id="src1",
+                user_id="u1",
+                node_type=NodeType.SEMANTIC,
+                content="x",
+                is_active=True,
+            ),
+            GraphNodeData(
+                node_id="src2",
+                user_id="u1",
+                node_type=NodeType.SEMANTIC,
+                content="y",
+                is_active=False,
+            ),
         ]
 
         result = c.consolidate("u1")
@@ -147,12 +185,12 @@ class TestGraphConsolidator:
         assert args[1] == pytest.approx(0.72)
 
 
-
 class TestTrustTierLifecycle:
     """§4.7 — T4→T3 promotion (age-gated) and T3→T4 demotion."""
 
     def _make_consolidator(self):
         from core.memory.graph.consolidation import GraphConsolidator
+
         c = GraphConsolidator(lambda: MagicMock())
         c._store = MagicMock()
         c._store.get_association_edges.return_value = []
@@ -160,10 +198,15 @@ class TestTrustTierLifecycle:
 
     def _scene(self, node_id="s1", confidence=0.85, trust_tier="T4", age_days=10):
         from datetime import datetime, timedelta, timezone
+
         created = datetime.now(timezone.utc) - timedelta(days=age_days)
         return GraphNodeData(
-            node_id=node_id, user_id="u1", node_type=NodeType.SCENE,
-            content="insight", confidence=confidence, trust_tier=trust_tier,
+            node_id=node_id,
+            user_id="u1",
+            node_type=NodeType.SCENE,
+            content="insight",
+            confidence=confidence,
+            trust_tier=trust_tier,
             created_at=created.isoformat(),
         )
 
@@ -234,9 +277,11 @@ class TestTrustTierLifecycle:
         assert result.promoted == 0
         assert result.demoted == 0
 
+
 class TestGraphServiceReflection:
     def _make_service(self):
         from core.memory.graph.service import GraphMemoryService
+
         svc = GraphMemoryService(lambda: MagicMock())
         svc._tabular = MagicMock()
         return svc
@@ -252,9 +297,12 @@ class TestGraphServiceReflection:
 
     def test_candidates_fallback_to_tabular_on_error(self):
         from sqlalchemy.exc import OperationalError
+
         svc = self._make_service()
         mock_candidates = MagicMock()
-        mock_candidates.get_reflection_candidates.side_effect = OperationalError("db", {}, Exception("conn lost"))
+        mock_candidates.get_reflection_candidates.side_effect = OperationalError(
+            "db", {}, Exception("conn lost")
+        )
         svc._graph_candidates = mock_candidates
         svc._tabular._governance_lazy = MagicMock()
         svc._tabular._governance_lazy.get_reflection_candidates.return_value = ["fallback"]
@@ -267,6 +315,7 @@ class TestGraphServiceReflection:
         svc._tabular.run_governance.return_value = MagicMock(errors=[])
 
         from core.memory.graph.consolidation import ConsolidationResult
+
         mock_consolidator = MagicMock()
         mock_consolidator.consolidate.return_value = ConsolidationResult()
         svc._graph_consolidator = mock_consolidator
@@ -277,6 +326,7 @@ class TestGraphServiceReflection:
     def test_consolidate_direct_access(self):
         svc = self._make_service()
         from core.memory.graph.consolidation import ConsolidationResult
+
         mock_consolidator = MagicMock()
         mock_consolidator.consolidate.return_value = ConsolidationResult(conflicts_detected=2)
         svc._graph_consolidator = mock_consolidator

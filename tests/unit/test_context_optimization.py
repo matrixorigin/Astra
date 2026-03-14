@@ -30,14 +30,26 @@ class TestBuildSkillCategories:
             (f"{prefix}_alert", "monitoring", "Check alerts", 10),
         ]
         for name, cat, desc, priority in skills:
-            db.execute(sql_text(
-                "INSERT INTO skills_registry (skill_id, skill_name, version, description, category, priority, is_active) "
-                "VALUES (:id, :name, '1.0.0', :desc, :cat, :priority, 1)"
-            ), {"id": f"{name}@1.0.0", "name": name, "desc": desc, "cat": cat, "priority": priority})
+            db.execute(
+                sql_text(
+                    "INSERT INTO skills_registry (skill_id, skill_name, version, description, category, priority, is_active) "
+                    "VALUES (:id, :name, '1.0.0', :desc, :cat, :priority, 1)"
+                ),
+                {
+                    "id": f"{name}@1.0.0",
+                    "name": name,
+                    "desc": desc,
+                    "cat": cat,
+                    "priority": priority,
+                },
+            )
         db.commit()
 
     def _cleanup(self, db, prefix: str):
-        db.execute(sql_text("DELETE FROM skills_registry WHERE skill_name LIKE :pat"), {"pat": f"{prefix}%"})
+        db.execute(
+            sql_text("DELETE FROM skills_registry WHERE skill_name LIKE :pat"),
+            {"pat": f"{prefix}%"},
+        )
         db.commit()
 
     def test_categories_grouped_correctly(self, db_session):
@@ -71,7 +83,9 @@ class TestBuildSkillCategories:
             # Without exclusion
             result1 = pa._build_skill_categories(db_session, exclude_names=set())
             # With exclusion
-            result2 = pa._build_skill_categories(db_session, exclude_names={f"{prefix}_pr", f"{prefix}_ci"})
+            result2 = pa._build_skill_categories(
+                db_session, exclude_names={f"{prefix}_pr", f"{prefix}_ci"}
+            )
 
             # Both should work
             assert result1 is not None
@@ -79,6 +93,7 @@ class TestBuildSkillCategories:
             # Total should be different (result2 has lower total)
             # Extract total from "- N cloud skills in M categories:"
             import re
+
             match1 = re.search(r"(\d+) cloud skills", result1)
             match2 = re.search(r"(\d+) cloud skills", result2)
             if match1 and match2:
@@ -97,9 +112,10 @@ class TestBuildSkillCategories:
         # Query with exclude_names that would exclude everything
         # First, get all active skills
         from api.models import SkillRegistry
-        all_skills = db_session.query(SkillRegistry.skill_name).filter(
-            SkillRegistry.is_active == 1
-        ).all()
+
+        all_skills = (
+            db_session.query(SkillRegistry.skill_name).filter(SkillRegistry.is_active == 1).all()
+        )
         all_names = {s[0] for s in all_skills}
 
         # Exclude all - should return None or empty
@@ -141,14 +157,20 @@ class TestFindSkillsKeywordSearch:
             (f"{prefix}_deploy", "devops", "Deploy application to production"),
         ]
         for name, cat, desc in skills:
-            db.execute(sql_text(
-                "INSERT INTO skills_registry (skill_id, skill_name, version, description, category, is_active) "
-                "VALUES (:id, :name, '1.0.0', :desc, :cat, 1)"
-            ), {"id": f"{name}@1.0.0", "name": name, "desc": desc, "cat": cat})
+            db.execute(
+                sql_text(
+                    "INSERT INTO skills_registry (skill_id, skill_name, version, description, category, is_active) "
+                    "VALUES (:id, :name, '1.0.0', :desc, :cat, 1)"
+                ),
+                {"id": f"{name}@1.0.0", "name": name, "desc": desc, "cat": cat},
+            )
         db.commit()
 
     def _cleanup(self, db, prefix: str):
-        db.execute(sql_text("DELETE FROM skills_registry WHERE skill_name LIKE :pat"), {"pat": f"{prefix}%"})
+        db.execute(
+            sql_text("DELETE FROM skills_registry WHERE skill_name LIKE :pat"),
+            {"pat": f"{prefix}%"},
+        )
         db.commit()
 
     @pytest.mark.asyncio
@@ -216,14 +238,25 @@ class TestFindSkillsFetchDetails:
 
     def _seed_skills(self, db, prefix: str):
         """Insert test skills."""
-        db.execute(sql_text(
-            "INSERT INTO skills_registry (skill_id, skill_name, version, description, category, is_active) "
-            "VALUES (:id, :name, '1.0.0', :desc, :cat, 1)"
-        ), {"id": f"{prefix}_test@1.0.0", "name": f"{prefix}_test", "desc": "Test skill", "cat": "test"})
+        db.execute(
+            sql_text(
+                "INSERT INTO skills_registry (skill_id, skill_name, version, description, category, is_active) "
+                "VALUES (:id, :name, '1.0.0', :desc, :cat, 1)"
+            ),
+            {
+                "id": f"{prefix}_test@1.0.0",
+                "name": f"{prefix}_test",
+                "desc": "Test skill",
+                "cat": "test",
+            },
+        )
         db.commit()
 
     def _cleanup(self, db, prefix: str):
-        db.execute(sql_text("DELETE FROM skills_registry WHERE skill_name LIKE :pat"), {"pat": f"{prefix}%"})
+        db.execute(
+            sql_text("DELETE FROM skills_registry WHERE skill_name LIKE :pat"),
+            {"pat": f"{prefix}%"},
+        )
         db.commit()
 
     @pytest.mark.asyncio
@@ -254,10 +287,17 @@ class TestFindSkillsFetchDetails:
         prefix = unique_test_id()
         # Insert multiple skills
         for name in ["alpha", "beta", "gamma"]:
-            db_session.execute(sql_text(
-                "INSERT INTO skills_registry (skill_id, skill_name, version, description, category, is_active) "
-                "VALUES (:id, :name, '1.0.0', :desc, 'test', 1)"
-            ), {"id": f"{prefix}_{name}@1.0.0", "name": f"{prefix}_{name}", "desc": f"Skill {name}"})
+            db_session.execute(
+                sql_text(
+                    "INSERT INTO skills_registry (skill_id, skill_name, version, description, category, is_active) "
+                    "VALUES (:id, :name, '1.0.0', :desc, 'test', 1)"
+                ),
+                {
+                    "id": f"{prefix}_{name}@1.0.0",
+                    "name": f"{prefix}_{name}",
+                    "desc": f"Skill {name}",
+                },
+            )
         db_session.commit()
 
         try:
@@ -413,9 +453,7 @@ class TestSnapshotDeduplication:
 
         # Verify identity fragment was created with correct hash
         expected_hash = hashlib.sha256(identity_content.encode()).hexdigest()
-        fragment = db_session.query(PromptFragment).filter_by(
-            fragment_hash=expected_hash
-        ).first()
+        fragment = db_session.query(PromptFragment).filter_by(fragment_hash=expected_hash).first()
 
         assert fragment is not None, "Fragment should be created"
         assert fragment.content == identity_content
@@ -423,9 +461,9 @@ class TestSnapshotDeduplication:
         assert fragment.token_count == 10
 
         # Verify history (variable) is NOT stored as fragment
-        history_fragments = db_session.query(PromptFragment).filter(
-            PromptFragment.content.contains("Hello")
-        ).all()
+        history_fragments = (
+            db_session.query(PromptFragment).filter(PromptFragment.content.contains("Hello")).all()
+        )
         assert len(history_fragments) == 0, "Variable sections should not be fragments"
 
     def test_same_content_reuses_hash(self, db_session):
@@ -451,9 +489,9 @@ class TestSnapshotDeduplication:
 
         # Verify only one fragment exists for this content
         expected_hash = hashlib.sha256(identity_content.encode()).hexdigest()
-        identity_fragments = db_session.query(PromptFragment).filter_by(
-            fragment_hash=expected_hash
-        ).all()
+        identity_fragments = (
+            db_session.query(PromptFragment).filter_by(fragment_hash=expected_hash).all()
+        )
 
         assert len(identity_fragments) == 1, "Same content should produce exactly 1 fragment"
 
@@ -478,9 +516,10 @@ class TestSnapshotDeduplication:
         snapshot_id = pa._save_snapshot("test_session", sections, breakdown)
 
         # Query snapshot
-        row = db_session.execute(sql_text(
-            "SELECT system_prompt FROM ctx_snapshots WHERE context_capture_id = :cid"
-        ), {"cid": snapshot_id}).fetchone()
+        row = db_session.execute(
+            sql_text("SELECT system_prompt FROM ctx_snapshots WHERE context_capture_id = :cid"),
+            {"cid": snapshot_id},
+        ).fetchone()
 
         data = json.loads(row[0])
 
@@ -500,59 +539,60 @@ class TestSnapshotDeduplication:
         assert "identity" not in data["variable_sections"]
 
 
-
 class TestParameterExtraction:
     """Test parameter extraction from query."""
 
     def test_extract_owner_repo(self):
         """Extract owner/repo format."""
         from core.agent.chat_loop import ChatLoop
-        
+
         loop = ChatLoop.__new__(ChatLoop)
-        
+
         params = loop._extract_params_from_query("check ci for matrixorigin/matrixone")
         assert params.get("repo") == "matrixorigin/matrixone"
 
     def test_extract_bare_repo(self):
         """Extract bare project name after 'for'."""
         from core.agent.chat_loop import ChatLoop
-        
+
         loop = ChatLoop.__new__(ChatLoop)
-        
+
         params = loop._extract_params_from_query("check ci for matrixone")
         assert params.get("repo") == "matrixone"
 
     def test_extract_limit(self):
         """Extract numeric limit."""
         from core.agent.chat_loop import ChatLoop
-        
+
         loop = ChatLoop.__new__(ChatLoop)
-        
+
         params = loop._extract_params_from_query("show top 10 prs")
         assert params.get("limit") == 10
-        
+
         params = loop._extract_params_from_query("last 5 issues")
         assert params.get("limit") == 5
 
     def test_extract_state(self):
         """Extract state (open/closed/all)."""
         from core.agent.chat_loop import ChatLoop
-        
+
         loop = ChatLoop.__new__(ChatLoop)
-        
+
         params = loop._extract_params_from_query("list closed issues")
         assert params.get("state") == "closed"
-        
+
         params = loop._extract_params_from_query("show all prs")
         assert params.get("state") == "all"
 
     def test_extract_multiple(self):
         """Extract multiple parameters."""
         from core.agent.chat_loop import ChatLoop
-        
+
         loop = ChatLoop.__new__(ChatLoop)
-        
-        params = loop._extract_params_from_query("list top 5 closed issues for matrixorigin/matrixone")
+
+        params = loop._extract_params_from_query(
+            "list top 5 closed issues for matrixorigin/matrixone"
+        )
         assert params.get("repo") == "matrixorigin/matrixone"
         assert params.get("limit") == 5
         assert params.get("state") == "closed"
@@ -560,9 +600,9 @@ class TestParameterExtraction:
     def test_no_extraction(self):
         """No parameters extracted from generic query."""
         from core.agent.chat_loop import ChatLoop
-        
+
         loop = ChatLoop.__new__(ChatLoop)
-        
+
         params = loop._extract_params_from_query("what is event sourcing")
         assert params == {}
 
@@ -576,6 +616,7 @@ class TestEdgeToolFiltering:
         # Server-side select_tools_for_turn handles pre_filter + LLM selection.
         # Verify _filter_relevant_tools no longer exists.
         import cli.edge_chat_loop as ecl
+
         assert not hasattr(ecl, "_filter_relevant_tools")
         assert not hasattr(ecl, "_CORE_TOOLS")
 
@@ -584,18 +625,21 @@ class TestEdgeToolFiltering:
         from core.skills.prefilter import ConversationState, SkillTags, ToolWrapper, pre_filter
 
         tools = [
-            ToolWrapper("get_agent_info",
-                        SkillTags("current_session", "session_metadata",
-                                  ("introspect",), False),
-                        {"function": {"name": "get_agent_info"}}),
-            ToolWrapper("reflect",
-                        SkillTags("historical", "event_store",
-                                  ("analytical",), True),
-                        {"function": {"name": "reflect"}}),
+            ToolWrapper(
+                "get_agent_info",
+                SkillTags("current_session", "session_metadata", ("introspect",), False),
+                {"function": {"name": "get_agent_info"}},
+            ),
+            ToolWrapper(
+                "reflect",
+                SkillTags("historical", "event_store", ("analytical",), True),
+                {"function": {"name": "reflect"}},
+            ),
             ToolWrapper("grep", None, {"function": {"name": "grep"}}),
         ]
         state = ConversationState(
-            references_history=True, is_analytical=True,
+            references_history=True,
+            is_analytical=True,
         )
         reordered, applied = pre_filter(tools, state)
         names = [w.name for w in reordered]
@@ -618,65 +662,65 @@ class TestDynamicConstraints:
     def test_core_rules_always_included(self):
         """Core rules are always present."""
         from core.context.prompt_assembler import PromptAssembler
-        
+
         assembler = PromptAssembler.__new__(PromptAssembler)
-        
+
         constraints = assembler._build_constraints("what is event sourcing", [])
-        
+
         assert "Think step-by-step" in constraints
         assert "NEVER fabricate data" in constraints
 
     def test_file_editing_rules_with_file_tools(self):
         """File editing rules included when file tools available."""
         from core.context.prompt_assembler import PromptAssembler
-        
+
         assembler = PromptAssembler.__new__(PromptAssembler)
         tools = [{"function": {"name": "str_replace"}}]
-        
+
         constraints = assembler._build_constraints("edit the file", tools)
-        
+
         assert "str_replace" in constraints
         assert "File editing" in constraints
 
     def test_no_file_rules_for_query(self):
         """File editing rules excluded for pure queries."""
         from core.context.prompt_assembler import PromptAssembler
-        
+
         assembler = PromptAssembler.__new__(PromptAssembler)
         tools = [{"function": {"name": "ci_status"}}]
-        
+
         constraints = assembler._build_constraints("check ci status", tools)
-        
+
         assert "File editing" not in constraints
 
     def test_reflection_rules_for_why_questions(self):
         """Reflection rules included for 'why' questions."""
         from core.context.prompt_assembler import PromptAssembler
-        
+
         assembler = PromptAssembler.__new__(PromptAssembler)
-        
+
         constraints = assembler._build_constraints("why did it fail", [])
-        
+
         assert "Reflection" in constraints
 
     def test_introspection_rules_for_capability_questions(self):
         """Introspection rules included for capability questions."""
         from core.context.prompt_assembler import PromptAssembler
-        
+
         assembler = PromptAssembler.__new__(PromptAssembler)
-        
+
         constraints = assembler._build_constraints("what can you do", [])
-        
+
         assert "Self-Model" in constraints
 
     def test_all_rules_without_query(self):
         """All rules included when no query context."""
         from core.context.prompt_assembler import PromptAssembler
-        
+
         assembler = PromptAssembler.__new__(PromptAssembler)
-        
+
         constraints = assembler._build_constraints(None, None)
-        
+
         # Should include all rule blocks
         assert "File editing" in constraints
         assert "Tool selection" in constraints
@@ -693,7 +737,7 @@ class TestCatalogForcedSelection:
             {"function": {"name": "tool1"}},
             {"function": {"name": "tool2"}},
         ]
-        
+
         # With 2 tools, catalog should be used (> 1 is True)
         assert len(tools_schema) > 1
 
@@ -711,15 +755,14 @@ class TestTokenBreakdown:
             "memory": 10,
             "history": 500,
         }
-        
+
         tool_tokens = budget.get("tool_schemas", 0)
         non_tool_tokens = sum(
-            v for k, v in budget.items()
-            if k != "tool_schemas" and isinstance(v, (int, float))
+            v for k, v in budget.items() if k != "tool_schemas" and isinstance(v, (int, float))
         )
         total_managed = tool_tokens + non_tool_tokens
         tool_ratio = tool_tokens / total_managed if total_managed > 0 else 0
-        
+
         assert tool_tokens == 4000
         assert non_tool_tokens == 985  # 300 + 150 + 25 + 10 + 500
         assert total_managed == 4985
@@ -732,15 +775,14 @@ class TestTokenBreakdown:
             "constraints": 150,
             "history": 500,
         }
-        
+
         tool_tokens = budget.get("tool_schemas", 0)
         non_tool_tokens = sum(
-            v for k, v in budget.items()
-            if k != "tool_schemas" and isinstance(v, (int, float))
+            v for k, v in budget.items() if k != "tool_schemas" and isinstance(v, (int, float))
         )
         total_managed = tool_tokens + non_tool_tokens
         tool_ratio = tool_tokens / total_managed if total_managed > 0 else 0
-        
+
         assert tool_tokens == 0
         assert non_tool_tokens == 950
         assert tool_ratio == 0.0
@@ -748,21 +790,20 @@ class TestTokenBreakdown:
     def test_recommendation_when_tool_heavy(self):
         """Recommendation triggered when tool_ratio > 0.7."""
         budget = {"tool_schemas": 5000, "other": 1000}
-        
+
         tool_tokens = budget.get("tool_schemas", 0)
         non_tool_tokens = sum(
-            v for k, v in budget.items()
-            if k != "tool_schemas" and isinstance(v, (int, float))
+            v for k, v in budget.items() if k != "tool_schemas" and isinstance(v, (int, float))
         )
         total_managed = tool_tokens + non_tool_tokens
         tool_ratio = tool_tokens / total_managed if total_managed > 0 else 0
-        
+
         recommendation = (
             "tool_schemas dominating context — consider high-confidence or catalog selection"
             if total_managed > 0 and tool_ratio > 0.7
             else "balanced"
         )
-        
+
         assert tool_ratio > 0.7
         assert "dominating" in recommendation
 
@@ -778,40 +819,44 @@ class TestChatTurnHighConfidence:
         from uuid_utils import uuid7
 
         from api.routers.chat import _update_snapshot_tool_tokens
-        
+
         # Create a test snapshot
         snapshot_id = str(uuid7())
         initial_budget = {"tool_schemas": 5000, "self_model": 300, "constraints": 150}
-        
-        db_session.execute(text("""
+
+        db_session.execute(
+            text("""
             INSERT INTO ctx_snapshots 
             (context_capture_id, session_id, event_id, token_budget, total_tokens, created_at)
             VALUES (:cid, :sid, :eid, :budget, :total, NOW())
-        """), {
-            "cid": snapshot_id,
-            "sid": f"test_{uuid7().hex[:8]}",
-            "eid": snapshot_id,
-            "budget": json.dumps(initial_budget),
-            "total": 5450,
-        })
+        """),
+            {
+                "cid": snapshot_id,
+                "sid": f"test_{uuid7().hex[:8]}",
+                "eid": snapshot_id,
+                "budget": json.dumps(initial_budget),
+                "total": 5450,
+            },
+        )
         db_session.commit()
-        
+
         # Update tool tokens
         _update_snapshot_tool_tokens(snapshot_id, 500)
-        
+
         # Verify update
-        row = db_session.execute(text(
-            "SELECT token_budget FROM ctx_snapshots WHERE context_capture_id = :cid"
-        ), {"cid": snapshot_id}).fetchone()
-        
+        row = db_session.execute(
+            text("SELECT token_budget FROM ctx_snapshots WHERE context_capture_id = :cid"),
+            {"cid": snapshot_id},
+        ).fetchone()
+
         updated_budget = json.loads(row[0]) if isinstance(row[0], str) else row[0]
         assert updated_budget["tool_schemas"] == 500
         assert updated_budget["self_model"] == 300  # unchanged
-        
+
         # Cleanup
-        db_session.execute(text(
-            "DELETE FROM ctx_snapshots WHERE context_capture_id = :cid"
-        ), {"cid": snapshot_id})
+        db_session.execute(
+            text("DELETE FROM ctx_snapshots WHERE context_capture_id = :cid"), {"cid": snapshot_id}
+        )
         db_session.commit()
 
 
@@ -831,20 +876,29 @@ class TestTokenBreakdownIntegration:
         event_id = str(uuid7())
         budget = {"system_prompt": 120, "history": 350, "tool_schemas": 480}
 
-        db_session.execute(text("""
+        db_session.execute(
+            text("""
             INSERT INTO ctx_snapshots
                 (context_capture_id, session_id, event_id, token_budget, total_tokens, created_at)
             VALUES (:sid, :sess, :eid, :budget, :total, NOW())
-        """), {
-            "sid": snapshot_id, "sess": session_id, "eid": event_id,
-            "budget": json.dumps(budget), "total": 950,
-        })
+        """),
+            {
+                "sid": snapshot_id,
+                "sess": session_id,
+                "eid": event_id,
+                "budget": json.dumps(budget),
+                "total": 950,
+            },
+        )
         db_session.commit()
 
         # Re-query from DB to verify what was actually persisted
-        row = db_session.execute(text(
-            "SELECT token_budget, total_tokens FROM ctx_snapshots WHERE context_capture_id = :sid"
-        ), {"sid": snapshot_id}).fetchone()
+        row = db_session.execute(
+            text(
+                "SELECT token_budget, total_tokens FROM ctx_snapshots WHERE context_capture_id = :sid"
+            ),
+            {"sid": snapshot_id},
+        ).fetchone()
 
         assert row is not None, "Snapshot must be persisted"
         saved_budget = json.loads(row[0]) if isinstance(row[0], str) else row[0]
@@ -859,10 +913,9 @@ class TestTokenBreakdownIntegration:
         # Verify tool vs non-tool separation
         tool_tokens = saved_budget["tool_schemas"]
         non_tool_tokens = sum(
-            v for k, v in saved_budget.items()
+            v
+            for k, v in saved_budget.items()
             if k != "tool_schemas" and isinstance(v, (int, float))
         )
         assert tool_tokens == 480
         assert non_tool_tokens == 470  # 120 + 350
-
-

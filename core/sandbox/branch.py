@@ -71,9 +71,7 @@ class Branch(DbConsumer):
             result = db.execute(text(query))
             return [dict(row._mapping) for row in result]
 
-    def merge(
-        self, source: str, target: str, on_conflict: str = "skip"
-    ) -> None:
+    def merge(self, source: str, target: str, on_conflict: str = "skip") -> None:
         """Merge source into target using native data branch merge.
 
         Args:

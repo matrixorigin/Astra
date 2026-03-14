@@ -30,27 +30,31 @@ def test_data(client, auth_headers):
     # Create session
     resp = client.post("/sessions", headers=auth_headers, json={"metadata": {}})
     session_id = resp.json()["session_id"]
-    
+
     # Create event
-    resp = client.post("/events", headers=auth_headers, json={
-        "session_id": session_id,
-        "event_type": "user_query",
-        "content": "test"
-    })
+    resp = client.post(
+        "/events",
+        headers=auth_headers,
+        json={"session_id": session_id, "event_type": "user_query", "content": "test"},
+    )
     event_id = resp.json()["event_id"]
-    
+
     # Create snapshot
-    resp = client.post("/context", headers=auth_headers, json={
-        "session_id": session_id,
-        "event_id": event_id,
-        "context_data": {"system_prompt": "test", "task_type": "test"}
-    })
+    resp = client.post(
+        "/context",
+        headers=auth_headers,
+        json={
+            "session_id": session_id,
+            "event_id": event_id,
+            "context_data": {"system_prompt": "test", "task_type": "test"},
+        },
+    )
     context_capture_id = resp.json()["context_capture_id"]
-    
+
     return {
         "session_id": session_id,
         "event_id": event_id,
-        "context_capture_id": context_capture_id
+        "context_capture_id": context_capture_id,
     }
 
 
@@ -65,7 +69,7 @@ def test_record_decision_success(client, auth_headers, test_data):
             "context_capture_id": test_data["context_capture_id"],
             "decision_type": "skill_selection",
             "decision_output": {"selected_skill": "code_review"},
-            "model_params": {"model": "gpt-4", "temperature": 0.7}
+            "model_params": {"model": "gpt-4", "temperature": 0.7},
         },
     )
 
@@ -87,7 +91,7 @@ def test_get_decision_success(client, auth_headers, test_data):
             "event_id": test_data["event_id"],
             "context_capture_id": test_data["context_capture_id"],
             "decision_type": "response_generation",
-            "decision_output": {"response": "test"}
+            "decision_output": {"response": "test"},
         },
     )
     decision_id = create_resp.json()["decision_id"]
@@ -111,7 +115,7 @@ def test_audit_decision_success(client, auth_headers, test_data):
             "event_id": test_data["event_id"],
             "context_capture_id": test_data["context_capture_id"],
             "decision_type": "skill_selection",
-            "decision_output": {"skill": "test"}
+            "decision_output": {"skill": "test"},
         },
     )
     decision_id = create_resp.json()["decision_id"]
@@ -138,7 +142,7 @@ def test_list_decisions_success(client, auth_headers, test_data):
                 "event_id": test_data["event_id"],
                 "context_capture_id": test_data["context_capture_id"],
                 "decision_type": "test",
-                "decision_output": {"index": i}
+                "decision_output": {"index": i},
             },
         )
 

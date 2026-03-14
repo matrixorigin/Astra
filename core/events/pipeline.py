@@ -242,7 +242,9 @@ class EventPipeline:
         except Exception:
             db.rollback()
             db.close()
-            logger.warning("Background flush failed (%d events), retrying with new session", len(batch))
+            logger.warning(
+                "Background flush failed (%d events), retrying with new session", len(batch)
+            )
             db = self._db_factory()
             try:
                 self._do_flush(db, batch)
@@ -303,7 +305,11 @@ class EventPipeline:
                 re_rows.append(_to_re_values(ev, run_id, idx))
 
                 # Clean up counter on terminal events to prevent unbounded growth
-                if et_enum in (EventType.RUN_COMPLETED, EventType.RUN_FAILED, EventType.RUN_CANCELLED):
+                if et_enum in (
+                    EventType.RUN_COMPLETED,
+                    EventType.RUN_FAILED,
+                    EventType.RUN_CANCELLED,
+                ):
                     self._run_event_counters.pop(run_id, None)
 
         if ce_rows:

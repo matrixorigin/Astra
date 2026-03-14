@@ -14,18 +14,23 @@ def cleanup_skills():
     from sqlalchemy.orm import Session
     from sqlalchemy import text
     from api.routers.skills import reset_catalog
+
     db = next(get_db_session())
-    
+
     # Clean before
     reset_catalog()
-    db.execute(text('DELETE FROM skills_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"'))
+    db.execute(
+        text('DELETE FROM skills_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"')
+    )
     db.commit()
-    
+
     yield
-    
+
     # Clean after
     reset_catalog()
-    db.execute(text('DELETE FROM skills_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"'))
+    db.execute(
+        text('DELETE FROM skills_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"')
+    )
     db.commit()
     db.close()
 
@@ -48,7 +53,7 @@ def db_session():
 def test_register_skill_success(client, auth_headers):
     """Test successful skill registration."""
     skill_id = f"test_skill_{uuid4().hex}"
-    
+
     response = client.post(
         "/skills",
         headers=auth_headers,
@@ -58,13 +63,13 @@ def test_register_skill_success(client, auth_headers):
             "skill_version": "1.0.0",
             "skill_code": "def test(): pass",
             "description": "A test skill",
-            "metadata": {"category": "test"}
+            "metadata": {"category": "test"},
         },
     )
 
     if response.status_code != 201:
         print(f"Error response: {response.text}")
-    
+
     assert response.status_code == 201
     data = response.json()
     assert data["skill_id"] == skill_id
@@ -75,7 +80,7 @@ def test_register_skill_success(client, auth_headers):
 def test_get_skill_success(client, auth_headers):
     """Test successful skill retrieval."""
     skill_id = f"test_skill_{uuid4().hex}"
-    
+
     # Register first
     client.post(
         "/skills",
@@ -84,7 +89,7 @@ def test_get_skill_success(client, auth_headers):
             "skill_id": skill_id,
             "skill_name": "Get Test",
             "skill_version": "1.0.0",
-            "skill_code": "pass"
+            "skill_code": "pass",
         },
     )
 

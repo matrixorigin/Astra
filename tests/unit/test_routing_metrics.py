@@ -43,10 +43,12 @@ class TestActiveRequests:
         # Start 5 concurrent requests
         b = threading.Barrier(6)
         for _ in range(5):
-            t = threading.Thread(target=lambda: (
-                active_request_context().__enter__(),
-                b.wait(timeout=2),
-            ))
+            t = threading.Thread(
+                target=lambda: (
+                    active_request_context().__enter__(),
+                    b.wait(timeout=2),
+                )
+            )
             # Simpler: just check inc/dec
         with active_request_context():
             with active_request_context():

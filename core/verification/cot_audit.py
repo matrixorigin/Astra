@@ -19,9 +19,16 @@ logger = get_logger(__name__)
 
 # Layer 1: Keywords indicating prompt injection or goal hijacking
 _INJECTION_PATTERNS = [
-    "ignore previous", "ignore above", "disregard",
-    "new instructions", "system prompt", "you are now",
-    "act as", "override", "forget everything", "do not follow",
+    "ignore previous",
+    "ignore above",
+    "disregard",
+    "new instructions",
+    "system prompt",
+    "you are now",
+    "act as",
+    "override",
+    "forget everything",
+    "do not follow",
 ]
 
 _ALIGNMENT_PROMPT = """\
@@ -66,7 +73,8 @@ def audit_tool_call(
         if pattern in text_to_scan:
             logger.warning(
                 "CoT audit BLOCKED (pattern): '%s' in tool call %s",
-                pattern, tool_name,
+                pattern,
+                tool_name,
             )
             return CoTAuditResult(
                 safe=False,
@@ -78,6 +86,7 @@ def audit_tool_call(
     if llm_client and assistant_reasoning:
         try:
             from core.llm.base import LLMMessage
+
             prompt = _ALIGNMENT_PROMPT.format(
                 user_query=user_query,
                 tool_name=tool_name,
@@ -94,7 +103,8 @@ def audit_tool_call(
             if "MISALIGNED" in verdict:
                 logger.warning(
                     "CoT audit BLOCKED (semantic): tool %s misaligned with query '%s'",
-                    tool_name, user_query[:80],
+                    tool_name,
+                    user_query[:80],
                 )
                 return CoTAuditResult(
                     safe=False,

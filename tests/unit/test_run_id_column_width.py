@@ -16,16 +16,20 @@ from api.models.workflow import WorkflowRun
 # Unit: ORM model metadata
 # ---------------------------------------------------------------------------
 
+
 class TestRunIdColumnWidth:
     """run_id stores UUIDs — must be String(36), not String(255)."""
 
-    @pytest.mark.parametrize("model,column", [
-        (Event, "run_id"),
-        (Event, "parent_run_id"),
-        (RunEvent, "run_id"),
-        (RunEvent, "event_id"),
-        (WorkflowRun, "agent_run_id"),
-    ])
+    @pytest.mark.parametrize(
+        "model,column",
+        [
+            (Event, "run_id"),
+            (Event, "parent_run_id"),
+            (RunEvent, "run_id"),
+            (RunEvent, "event_id"),
+            (WorkflowRun, "agent_run_id"),
+        ],
+    )
     def test_column_is_string_36(self, model, column):
         col = model.__table__.c[column]
         assert isinstance(col.type, String) and col.type.length == 36
@@ -47,6 +51,7 @@ class TestCancelledQueryIndex:
 # Integration: real DB ground truth
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def db(db_session):
     yield db_session
@@ -55,13 +60,16 @@ def db(db_session):
 class TestRunIdColumnWidthDB:
     """Verify actual DB column type matches ORM declaration."""
 
-    @pytest.mark.parametrize("table,column", [
-        ("agent_events", "run_id"),
-        ("agent_events", "parent_run_id"),
-        ("agent_run_events", "run_id"),
-        ("agent_run_events", "event_id"),
-        ("wf_runs", "agent_run_id"),
-    ])
+    @pytest.mark.parametrize(
+        "table,column",
+        [
+            ("agent_events", "run_id"),
+            ("agent_events", "parent_run_id"),
+            ("agent_run_events", "run_id"),
+            ("agent_run_events", "event_id"),
+            ("wf_runs", "agent_run_id"),
+        ],
+    )
     def test_db_column_varchar_36(self, db, table, column):
         rows = db.execute(
             text(f"SHOW COLUMNS FROM {table} LIKE :col"),
@@ -95,13 +103,16 @@ class TestRunIdValueRoundtrip:
         chain = str(uuid7())
         sid = str(uuid7())
 
-        db.execute(text(
-            "INSERT INTO agent_events "
-            "(event_id, session_id, user_id, agent_id, agent_version, "
-            " event_type, content, causal_chain_id, run_id, created_at) "
-            "VALUES (:eid, :sid, 'test', 'system', '1.0.0', "
-            " 'test', 'x', :chain, :rid, NOW())"
-        ), {"eid": eid, "sid": sid, "chain": chain, "rid": rid})
+        db.execute(
+            text(
+                "INSERT INTO agent_events "
+                "(event_id, session_id, user_id, agent_id, agent_version, "
+                " event_type, content, causal_chain_id, run_id, created_at) "
+                "VALUES (:eid, :sid, 'test', 'system', '1.0.0', "
+                " 'test', 'x', :chain, :rid, NOW())"
+            ),
+            {"eid": eid, "sid": sid, "chain": chain, "rid": rid},
+        )
         db.commit()
 
         row = db.execute(

@@ -37,6 +37,7 @@ class OpinionEvolver:
 
     def __init__(self, config: MemoryGovernanceConfig | None = None) -> None:
         from core.memory.config import DEFAULT_CONFIG
+
         c = config or DEFAULT_CONFIG
         self._supporting_delta = c.opinion_supporting_delta
         self._contradicting_delta = c.opinion_contradicting_delta

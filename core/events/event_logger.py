@@ -87,10 +87,10 @@ class EventLogger(DbConsumer):
         # Embedding is now decoupled — generated asynchronously by EmbeddingWorker
         # Extract high-frequency query fields from metadata
         metadata = event.metadata or {}
-        run_id = metadata.get('run_id')
-        parent_run_id = metadata.get('parent_run_id')
-        waiting_for = metadata.get('waiting_for')
-        
+        run_id = metadata.get("run_id")
+        parent_run_id = metadata.get("parent_run_id")
+        waiting_for = metadata.get("waiting_for")
+
         db_event = EventModel(
             event_id=event.event_id,
             user_id=event.user_id,
@@ -101,7 +101,9 @@ class EventLogger(DbConsumer):
             content=event.content,
             desensitized_content=event.desensitized_content,
             event_metadata=event.metadata,
-            context_snapshot=event.context_snapshot.model_dump() if event.context_snapshot else None,
+            context_snapshot=event.context_snapshot.model_dump()
+            if event.context_snapshot
+            else None,
             token_usage=event.token_usage.model_dump() if event.token_usage else None,
             embedding_ref=event.embedding_ref,
             embedding=None,  # No longer written inline; EmbeddingWorker fills ctx_event_embeddings
@@ -124,7 +126,7 @@ class EventLogger(DbConsumer):
             waiting_for=waiting_for,
             reasoning_content=event.reasoning_content or None,
         )
-        
+
         with self._db() as db:
             db.add(db_event)
             db.commit()
@@ -356,7 +358,10 @@ class EventLogger(DbConsumer):
         return event
 
     def update_quality_score(
-        self, event_id: str, quality_score: float, training_eligible: bool,
+        self,
+        event_id: str,
+        quality_score: float,
+        training_eligible: bool,
     ) -> None:
         """Update quality_score and training_eligible on an existing event."""
         with self._db() as db:

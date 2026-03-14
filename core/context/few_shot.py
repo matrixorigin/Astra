@@ -62,11 +62,13 @@ class FewShotRetriever(DbConsumer):
 
                 examples = []
                 for _, row in scored[: self.max_examples]:
-                    examples.append({
-                        "input": row[1],
-                        "output": row[2] or "(no response captured)",
-                        "rating": row[0],
-                    })
+                    examples.append(
+                        {
+                            "input": row[1],
+                            "output": row[2] or "(no response captured)",
+                            "rating": row[0],
+                        }
+                    )
                 return examples
 
             except Exception as e:

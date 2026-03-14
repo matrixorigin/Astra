@@ -63,10 +63,12 @@ class ModelRouter(DbConsumer):
         if self.llm_client:
             try:
                 result = self.llm_client.chat(
-                    messages=[{
-                        "role": "user",
-                        "content": f"Classify complexity (simple/medium/complex/critical):\n{query}"
-                    }],
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": f"Classify complexity (simple/medium/complex/critical):\n{query}",
+                        }
+                    ],
                     user_id="routing",
                     task_hint="routing",
                 )
@@ -136,8 +138,7 @@ class ModelRouter(DbConsumer):
         estimated_cost = self._estimate_cost(model, task_type)
 
         logger.info(
-            f"Routed {task_type} ({complexity.value}) to {model}: {reason} "
-            f"(est. ${estimated_cost})"
+            f"Routed {task_type} ({complexity.value}) to {model}: {reason} (est. ${estimated_cost})"
         )
 
         return RouteDecision(
@@ -182,8 +183,7 @@ class ModelRouter(DbConsumer):
 
         # Filter by min_quality and efficiency
         candidates = [
-            m for m in available_models
-            if m in efficiency and quality_data.get(m, 0) >= min_quality
+            m for m in available_models if m in efficiency and quality_data.get(m, 0) >= min_quality
         ]
 
         if candidates:

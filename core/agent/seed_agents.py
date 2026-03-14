@@ -76,15 +76,20 @@ SEED_AGENTS = [
 def seed_agents(db) -> int:
     """Insert seed agents if they don't exist. Returns count of inserted agents."""
     from api.models import Agent
+
     count = 0
     for agent in SEED_AGENTS:
         if db.query(Agent).filter(Agent.agent_id == agent["agent_id"]).first():
             continue
-        db.add(Agent(
-            agent_id=agent["agent_id"], agent_name=agent["agent_name"],
-            agent_type=agent["agent_type"], owner_user_id="system",
-            agent_config=agent["agent_config"],
-        ))
+        db.add(
+            Agent(
+                agent_id=agent["agent_id"],
+                agent_name=agent["agent_name"],
+                agent_type=agent["agent_type"],
+                owner_user_id="system",
+                agent_config=agent["agent_config"],
+            )
+        )
         count += 1
     db.commit()
     return count

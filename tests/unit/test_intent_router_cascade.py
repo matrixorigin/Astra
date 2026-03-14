@@ -47,8 +47,12 @@ class TestTier0LowConfidenceTriggersTier1:
         tier1_result = Tier1Result(
             routing=RoutingResult(intent="question", confidence=0.9, tier=1, matched_by="llm"),
         )
-        with patch("core.context.routing_metrics.adaptive_threshold", return_value=0.85), \
-             patch.object(router._tier1, "run_parallel", new_callable=AsyncMock, return_value=tier1_result):
+        with (
+            patch("core.context.routing_metrics.adaptive_threshold", return_value=0.85),
+            patch.object(
+                router._tier1, "run_parallel", new_callable=AsyncMock, return_value=tier1_result
+            ),
+        ):
             decision = await router.route("what is event sourcing?", history_len=3)
         assert decision.routing_result.intent == "question"
         assert decision.routing_result.tier == 1
@@ -60,8 +64,12 @@ class TestTier0LowConfidenceTriggersTier1:
         tier1_result = Tier1Result(
             routing=RoutingResult(intent="preference", confidence=0.92, tier=1, matched_by="llm"),
         )
-        with patch("core.context.routing_metrics.adaptive_threshold", return_value=0.85), \
-             patch.object(router._tier1, "run_parallel", new_callable=AsyncMock, return_value=tier1_result):
+        with (
+            patch("core.context.routing_metrics.adaptive_threshold", return_value=0.85),
+            patch.object(
+                router._tier1, "run_parallel", new_callable=AsyncMock, return_value=tier1_result
+            ),
+        ):
             decision = await router.route("记住我用vim", history_len=3)
         # Tier 0 was 0.80 < 0.85 threshold, so Tier 1 ran
         assert decision.routing_result.tier == 1
@@ -71,8 +79,15 @@ class TestTier0LowConfidenceTriggersTier1:
 class TestTier1FailureFallback:
     @pytest.mark.asyncio
     async def test_tier1_exception_falls_back(self, router):
-        with patch("core.context.routing_metrics.adaptive_threshold", return_value=0.85), \
-             patch.object(router._tier1, "run_parallel", new_callable=AsyncMock, side_effect=RuntimeError("LLM down")):
+        with (
+            patch("core.context.routing_metrics.adaptive_threshold", return_value=0.85),
+            patch.object(
+                router._tier1,
+                "run_parallel",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("LLM down"),
+            ),
+        ):
             decision = await router.route("what is this?", history_len=3)
         assert decision.routing_result.intent == "question"
         assert decision.routing_result.matched_by == "fallback"
@@ -83,8 +98,12 @@ class TestTier1FailureFallback:
         tier1_result = Tier1Result(
             routing=RoutingResult(intent="command", confidence=0.5, tier=1, matched_by="llm"),
         )
-        with patch("core.context.routing_metrics.adaptive_threshold", return_value=0.85), \
-             patch.object(router._tier1, "run_parallel", new_callable=AsyncMock, return_value=tier1_result):
+        with (
+            patch("core.context.routing_metrics.adaptive_threshold", return_value=0.85),
+            patch.object(
+                router._tier1, "run_parallel", new_callable=AsyncMock, return_value=tier1_result
+            ),
+        ):
             decision = await router.route("do something", history_len=3)
         assert decision.routing_result.intent == "question"
         assert decision.routing_result.matched_by == "fallback"

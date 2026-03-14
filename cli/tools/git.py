@@ -11,8 +11,11 @@ MAX_OUTPUT = 30 * 1024  # 30KB (~7K tokens)
 async def _find_git_root(project_root: str) -> str | None:
     """Find the git repo root from project_root (handles subdirectories)."""
     proc = await asyncio.create_subprocess_exec(
-        "git", "rev-parse", "--show-toplevel",
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        "git",
+        "rev-parse",
+        "--show-toplevel",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
         cwd=project_root,
     )
     stdout, _ = await proc.communicate()
@@ -24,7 +27,8 @@ async def _git(project_root: str, *args: str) -> str:
     git_root = await _find_git_root(project_root)
     cwd = git_root or project_root
     proc = await asyncio.create_subprocess_exec(
-        "git", *args,
+        "git",
+        *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
@@ -64,7 +68,10 @@ class GitDiffTool(EdgeTool):
         "type": "object",
         "properties": {
             "ref": {"type": "string", "description": "Git ref to diff against (e.g. HEAD~1, main)"},
-            "staged": {"type": "boolean", "description": "If true, show staged (cached) changes instead of unstaged"},
+            "staged": {
+                "type": "boolean",
+                "description": "If true, show staged (cached) changes instead of unstaged",
+            },
         },
     }
     side_effect = SideEffect.READ

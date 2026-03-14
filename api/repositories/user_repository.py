@@ -26,8 +26,8 @@ class UserRepository:
 
     def create(self, user_data: dict) -> UserModel:
         """Create user."""
-        if 'is_active' not in user_data:
-            user_data['is_active'] = True
+        if "is_active" not in user_data:
+            user_data["is_active"] = True
         db = self.db
         user = UserModel(**user_data)
         db.add(user)
@@ -50,9 +50,9 @@ class UserRepository:
     def update_last_login(self, user_id: str) -> None:
         """Update last login time."""
         db = self.db
-        db.query(UserModel).filter(UserModel.user_id == user_id).update({
-            "last_login_at": datetime.now(timezone.utc)
-        })
+        db.query(UserModel).filter(UserModel.user_id == user_id).update(
+            {"last_login_at": datetime.now(timezone.utc)}
+        )
         db.commit()
 
     def store_refresh_token(self, token_data: dict) -> RefreshTokenModel:
@@ -65,17 +65,20 @@ class UserRepository:
 
     def get_refresh_token(self, token_hash: str) -> RefreshTokenModel | None:
         """Get refresh token by hash."""
-        return self.db.query(RefreshTokenModel).filter(
-            RefreshTokenModel.token_hash == token_hash,
-            RefreshTokenModel.is_revoked == 0
-        ).first()
+        return (
+            self.db.query(RefreshTokenModel)
+            .filter(RefreshTokenModel.token_hash == token_hash, RefreshTokenModel.is_revoked == 0)
+            .first()
+        )
 
     def revoke_refresh_token(self, token_hash: str) -> bool:
         """Revoke refresh token."""
         db = self.db
-        result = db.query(RefreshTokenModel).filter(
-            RefreshTokenModel.token_hash == token_hash
-        ).update({"is_revoked": 1})
+        result = (
+            db.query(RefreshTokenModel)
+            .filter(RefreshTokenModel.token_hash == token_hash)
+            .update({"is_revoked": 1})
+        )
         db.commit()
         return result > 0
 

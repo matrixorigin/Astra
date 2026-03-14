@@ -24,6 +24,7 @@ router = APIRouter(prefix="/api/v1/evaluation")
 # Response models
 # ---------------------------------------------------------------------------
 
+
 class QualityTrendPoint(BaseModel):
     date: str
     avg_score: float
@@ -75,7 +76,9 @@ class SessionScoreResponse(BaseModel):
 
 
 class GateValidateRequest(BaseModel):
-    change_type: str = Field(..., pattern="^(prompt|skill|config|selector|context_budget|knowledge)$")
+    change_type: str = Field(
+        ..., pattern="^(prompt|skill|config|selector|context_budget|knowledge)$"
+    )
     change_id: str
     change_content: dict[str, Any]
     golden_session_count: int = Field(default=50, ge=1, le=500)
@@ -119,6 +122,7 @@ class ClosedLoopResponse(BaseModel):
 # Endpoints
 # ---------------------------------------------------------------------------
 
+
 @router.get("/quality/trend", response_model=QualityTrendResponse)
 def get_quality_trend(
     days: int = Query(default=14, ge=1, le=90),
@@ -134,7 +138,8 @@ def get_quality_trend(
         params["model"] = model
 
     try:
-        rows = db.execute(text(f"""
+        rows = db.execute(
+            text(f"""
             SELECT DATE(created_at) AS d,
                    AVG(quality_score) AS avg_score,
                    COUNT(*) AS cnt,
@@ -145,26 +150,30 @@ def get_quality_trend(
               {model_filter}
             GROUP BY d, llm_model_used
             ORDER BY d ASC
-        """), params).fetchall()
+        """),
+            params,
+        ).fetchall()
     except Exception:
         logger.debug("quality/trend: table not ready, returning empty")
         return QualityTrendResponse(points=[], overall_avg=0.0, total_events=0)
 
     points = [
         QualityTrendPoint(
-            date=str(r[0]), avg_score=round(float(r[1]), 2),
-            count=int(r[2]), model=r[3],
+            date=str(r[0]),
+            avg_score=round(float(r[1]), 2),
+            count=int(r[2]),
+            model=r[3],
         )
         for r in rows
     ]
     total = sum(p.count for p in points)
-    overall = (
-        sum(p.avg_score * p.count for p in points) / total
-        if total else 0.0
-    )
+    overall = sum(p.avg_score * p.count for p in points) / total if total else 0.0
     return QualityTrendResponse(
-        points=points, overall_avg=round(overall, 2), total_events=total,
+        points=points,
+        overall_avg=round(overall, 2),
+        total_events=total,
     )
+
 
 @router.get("/drift", response_model=list[DriftSignalResponse])
 def detect_drift(
@@ -181,7 +190,8 @@ def detect_drift(
         return []
     return [
         DriftSignalResponse(
-            model=s.model, template_id=s.template_id,
+            model=s.model,
+            template_id=s.template_id,
             current_avg=round(s.current_avg, 2),
             previous_avg=round(s.previous_avg, 2),
             delta=round(s.week_delta, 2),
@@ -200,25 +210,33 @@ def get_gate_history(
 ) -> list[GateResultResponse]:
     """Recent regression gate results."""
     try:
-        rows = db.execute(text("""
+        rows = db.execute(
+            text("""
             SELECT gate_id, change_type, change_id, sessions_tested,
                    error_rate, score_delta, passed, created_at
             FROM eval_gate_results
             ORDER BY created_at DESC
             LIMIT :limit
-        """), {"limit": limit}).fetchall()
+        """),
+            {"limit": limit},
+        ).fetchall()
     except Exception:
         return []
 
     return [
         GateResultResponse(
-            gate_id=r[0], change_type=r[1], change_id=r[2],
-            sessions_tested=int(r[3]), error_rate=float(r[4]),
-            score_delta=float(r[5]), passed=bool(r[6]),
+            gate_id=r[0],
+            change_type=r[1],
+            change_id=r[2],
+            sessions_tested=int(r[3]),
+            error_rate=float(r[4]),
+            score_delta=float(r[5]),
+            passed=bool(r[6]),
             created_at=r[7].isoformat() if r[7] else None,
         )
         for r in rows
     ]
+
 
 @router.get("/calibration", response_model=CalibrationResponse)
 def get_calibration(
@@ -237,8 +255,12 @@ def get_calibration(
     except Exception:
         logger.debug("calibration: not ready, returning defaults")
         return CalibrationResponse(
-            mean_confidence=0.0, mean_quality=0.0, calibration_error=0.0,
-            bias=0.0, sample_count=0, adjustment_multiplier=1.0,
+            mean_confidence=0.0,
+            mean_quality=0.0,
+            calibration_error=0.0,
+            bias=0.0,
+            sample_count=0,
+            adjustment_multiplier=1.0,
             adjustment_reason="no data",
         )
     return CalibrationResponse(
@@ -261,23 +283,29 @@ def get_session_scores(
 ) -> list[SessionScoreResponse]:
     """Session-level quality scores from eval_quality_assessments."""
     try:
-        rows = db.execute(text("""
+        rows = db.execute(
+            text("""
             SELECT target_id, score, COALESCE(step_count, 0)
             FROM eval_quality_assessments
             WHERE level = 'session' AND score >= :min_score
             ORDER BY updated_at DESC
             LIMIT :limit
-        """), {"limit": limit, "min_score": min_score}).fetchall()
+        """),
+            {"limit": limit, "min_score": min_score},
+        ).fetchall()
     except Exception:
         logger.debug("sessions/scores: table not ready, returning empty")
         return []
 
     return [
         SessionScoreResponse(
-            session_id=r[0], score=round(float(r[1]), 2), chain_count=int(r[2]),
+            session_id=r[0],
+            score=round(float(r[1]), 2),
+            chain_count=int(r[2]),
         )
         for r in rows
     ]
+
 
 # ---------------------------------------------------------------------------
 # Action endpoints — closed-loop evaluation
@@ -409,18 +437,28 @@ def run_closed_loop(
         ]
     except Exception as e:
         logger.error("Closed loop learner phase failed: %s", e)
-        diagnoses = [LoopDiagnosisItem(
-            input_face="all", bottleneck="learner_unavailable",
-            applied=False, gate_verdict="error", error=str(e),
-        )]
+        diagnoses = [
+            LoopDiagnosisItem(
+                input_face="all",
+                bottleneck="learner_unavailable",
+                applied=False,
+                gate_verdict="error",
+                error=str(e),
+            )
+        ]
 
     # Phase 4: Skill selection learning (removed — SkillPipeline deleted)
     skill_learning_resp: dict[str, Any] | None = None
 
     # Record — audit trail for the loop execution itself
     _record_loop_event(
-        loop_id, drift_resp, calibration_resp, diagnoses,
-        skill_learning_resp, dry_run, db,
+        loop_id,
+        drift_resp,
+        calibration_resp,
+        diagnoses,
+        skill_learning_resp,
+        dry_run,
+        db,
     )
 
     return ClosedLoopResponse(
@@ -444,25 +482,39 @@ def _record_loop_event(
     """Persist closed-loop execution as an auditable conversation event."""
     try:
         # causal_chain_id = loop_id: each loop execution is its own causal chain root
-        db.execute(text("""
+        db.execute(
+            text("""
             INSERT INTO agent_events
             (event_id, session_id, user_id, agent_id, agent_version,
              event_type, content, causal_chain_id, created_at)
             VALUES (:eid, 'system', 'system', 'system', '1.0.0',
                     'closed_loop_execution', :content, :eid, NOW())
-        """), {
-            "eid": loop_id,
-            "content": json.dumps({
-                "dry_run": dry_run,
-                "drift": {"detected": drift.signals_detected, "confirmed": drift.signals_confirmed,
-                          "corrected": drift.corrections_applied},
-                "calibration": {"error": calibration.calibration_error,
-                                "bias": calibration.bias} if calibration else None,
-                "diagnoses": [{"face": d.input_face, "applied": d.applied,
-                               "verdict": d.gate_verdict} for d in diagnoses],
-                "skill_learning": skill_learning,
-            }),
-        })
+        """),
+            {
+                "eid": loop_id,
+                "content": json.dumps(
+                    {
+                        "dry_run": dry_run,
+                        "drift": {
+                            "detected": drift.signals_detected,
+                            "confirmed": drift.signals_confirmed,
+                            "corrected": drift.corrections_applied,
+                        },
+                        "calibration": {
+                            "error": calibration.calibration_error,
+                            "bias": calibration.bias,
+                        }
+                        if calibration
+                        else None,
+                        "diagnoses": [
+                            {"face": d.input_face, "applied": d.applied, "verdict": d.gate_verdict}
+                            for d in diagnoses
+                        ],
+                        "skill_learning": skill_learning,
+                    }
+                ),
+            },
+        )
         db.commit()
     except Exception as e:
         logger.warning("Failed to record loop event: %s", e)
@@ -473,8 +525,10 @@ def _record_loop_event(
 # Trust Report — aggregated trust health indicators
 # ---------------------------------------------------------------------------
 
+
 class TrustReportResponse(BaseModel):
     """Aggregated trust health across confidence, SLO, drift, hallucination."""
+
     confidence_calibration: dict[str, Any] | None = None
     slo_summary: dict[str, Any] | None = None
     drift_summary: dict[str, Any] | None = None
@@ -499,6 +553,7 @@ def trust_report(
     # 1. Confidence calibration
     try:
         from core.evaluation.confidence_calibrator import ConfidenceCalibrator
+
         cal = ConfidenceCalibrator(lambda: db)
         cal_result = cal.measure(agent_id=agent_id, days=days)
         result.confidence_calibration = {
@@ -513,6 +568,7 @@ def trust_report(
     # 2. SLO compliance
     try:
         from core.evaluation.slo_monitor import SLOMonitor
+
         monitor = SLOMonitor(lambda: db)
         report = monitor.check_agent(agent_id, period_days=days)
         total = len(report.statuses)
@@ -530,6 +586,7 @@ def trust_report(
     # 3. Drift
     try:
         from core.evaluation.drift_detector import DriftDetector
+
         detector = DriftDetector(lambda: db)
         signals = detector.detect()
         critical = sum(1 for s in signals if s.severity.value == "critical")
@@ -544,13 +601,16 @@ def trust_report(
 
     # 4. Hallucination stats — direct SQL, needs its own short-lived session
     try:
-        row = db.execute(text("""
+        row = db.execute(
+            text("""
             SELECT COUNT(*) as total,
                    SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(content, '$.safe_to_deliver')) = 'true' THEN 1 ELSE 0 END) as safe
             FROM agent_events
             WHERE event_type = 'hallucination_check'
               AND created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
-        """), {"days": days}).fetchone()
+        """),
+            {"days": days},
+        ).fetchone()
         if row and row[0] > 0:
             result.hallucination_stats = {
                 "checks_total": row[0],
@@ -564,9 +624,11 @@ def trust_report(
     result.overall_trust_score = round(sum(scores) / len(scores), 4) if scores else 0.0
     return result
 
+
 # ---------------------------------------------------------------------------
 # SLO Dashboard — per-agent SLO status + history + auto-response
 # ---------------------------------------------------------------------------
+
 
 class SLODashboardEntry(BaseModel):
     agent_id: str
@@ -586,38 +648,45 @@ def slo_dashboard(
 ):
     """SLO dashboard: check all agents and return compliance status."""
     try:
-        rows = db.execute(text("""
+        rows = db.execute(
+            text("""
             SELECT DISTINCT agent_id FROM agent_events
             WHERE event_type = 'llm_response'
               AND created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
               AND agent_id IS NOT NULL
-        """), {"days": period_days}).fetchall()
+        """),
+            {"days": period_days},
+        ).fetchall()
         agent_ids = [r[0] for r in rows] if rows else []
 
         from core.evaluation.slo_monitor import SLOMonitor
+
         monitor = SLOMonitor(lambda: db)
         entries = []
         for aid in agent_ids:
             report = monitor.check_agent(aid, period_days=period_days)
-            entries.append(SLODashboardEntry(
-                agent_id=aid,
-                statuses=[
-                    {
-                        "slo": s.slo.name,
-                        "target": s.slo.target,
-                        "current": s.current_value,
-                        "met": s.met,
-                        "burn_rate": s.burn_rate,
-                        "severity": s.severity.value,
-                        "bad_days": s.bad_days,
-                    }
-                    for s in report.statuses
-                ],
-                period_days=period_days,
-            ))
+            entries.append(
+                SLODashboardEntry(
+                    agent_id=aid,
+                    statuses=[
+                        {
+                            "slo": s.slo.name,
+                            "target": s.slo.target,
+                            "current": s.current_value,
+                            "met": s.met,
+                            "burn_rate": s.burn_rate,
+                            "severity": s.severity.value,
+                            "bad_days": s.bad_days,
+                        }
+                        for s in report.statuses
+                    ],
+                    period_days=period_days,
+                )
+            )
         return SLODashboardResponse(agents=entries)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/slo/{agent_id}/history")
 def slo_history(
@@ -628,6 +697,7 @@ def slo_history(
 ):
     """SLO history: daily metrics for a single agent."""
     from core.evaluation.slo_monitor import SLOMonitor
+
     monitor = SLOMonitor(lambda: db)
     metrics = monitor.get_daily_metrics(agent_id, days)
     return {"agent_id": agent_id, "days": days, "daily_metrics": metrics}
@@ -636,6 +706,7 @@ def slo_history(
 # ---------------------------------------------------------------------------
 # Observability Metrics — 6-layer aggregation
 # ---------------------------------------------------------------------------
+
 
 @router.get("/observability/metrics")
 def observability_metrics(
@@ -648,20 +719,24 @@ def observability_metrics(
     result: dict[str, Any] = {}
 
     # Decision layer
-    row = db.execute(text("""
+    row = db.execute(
+        text("""
         SELECT AVG(quality_score) as avg_quality,
                COUNT(*) as total_responses
         FROM agent_events
         WHERE agent_id = :aid AND event_type = 'llm_response'
           AND created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
-    """), {"aid": agent_id, "days": days}).fetchone()
+    """),
+        {"aid": agent_id, "days": days},
+    ).fetchone()
     result["decision"] = {
         "avg_quality": round(float(row[0]), 4) if row and row[0] else 0,
         "total_responses": int(row[1]) if row else 0,
     }
 
     # Session layer
-    row = db.execute(text("""
+    row = db.execute(
+        text("""
         SELECT COUNT(DISTINCT session_id) as sessions,
                AVG(turn_count) as avg_turns
         FROM (
@@ -671,19 +746,24 @@ def observability_metrics(
               AND created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
             GROUP BY session_id
         ) sub
-    """), {"aid": agent_id, "days": days}).fetchone()
+    """),
+        {"aid": agent_id, "days": days},
+    ).fetchone()
     result["session"] = {
         "active_sessions": int(row[0]) if row and row[0] else 0,
         "avg_turns_per_session": round(float(row[1]), 1) if row and row[1] else 0,
     }
 
     # Skill layer
-    row = db.execute(text("""
+    row = db.execute(
+        text("""
         SELECT COUNT(*) as total,
                SUM(CASE WHEN execution_success = 1 THEN 1 ELSE 0 END) as ok
         FROM skill_selection_events
         WHERE created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
-    """), {"days": days}).fetchone()
+    """),
+        {"days": days},
+    ).fetchone()
     total_sel = int(row[0]) if row and row[0] else 0
     ok_sel = int(row[1]) if row and row[1] else 0
     result["skill"] = {
@@ -693,9 +773,11 @@ def observability_metrics(
 
     return {"agent_id": agent_id, "period_days": days, "metrics": result}
 
+
 # ---------------------------------------------------------------------------
 # Memory Health — aggregated memory pipeline status
 # ---------------------------------------------------------------------------
+
 
 class MemoryHealthResponse(BaseModel):
     memories: dict[str, int] = {}
@@ -713,16 +795,19 @@ def memory_health(
     """Memory pipeline health: memories, knowledge, pollution."""
     uid = user_id or current_user.get("user_id", "system")
     result = MemoryHealthResponse()
-    
+
     # Memories (new system)
     try:
-        row = db.execute(text("""
+        row = db.execute(
+            text("""
             SELECT COUNT(*) as total,
                    SUM(CASE WHEN memory_type = 'episodic' THEN 1 ELSE 0 END) as episodic,
                    SUM(CASE WHEN memory_type = 'semantic' THEN 1 ELSE 0 END) as semantic,
                    SUM(CASE WHEN memory_type = 'profile' THEN 1 ELSE 0 END) as profile
             FROM mem_memories WHERE user_id = :uid AND is_active = 1
-        """), {"uid": uid}).fetchone()
+        """),
+            {"uid": uid},
+        ).fetchone()
         if row:
             result.memories = {
                 "total": row[0],
@@ -735,12 +820,15 @@ def memory_health(
 
     # Knowledge entries
     try:
-        row = db.execute(text("""
+        row = db.execute(
+            text("""
             SELECT COUNT(*) as total,
                    SUM(CASE WHEN confidence < 0.3 THEN 1 ELSE 0 END) as low_conf,
                    SUM(CASE WHEN confidence = 0 THEN 1 ELSE 0 END) as quarantined
             FROM sk_knowledge_entries WHERE user_id = :uid
-        """), {"uid": uid}).fetchone()
+        """),
+            {"uid": uid},
+        ).fetchone()
         if row:
             result.knowledge = {
                 "total": row[0],
@@ -752,11 +840,13 @@ def memory_health(
 
     # Recent governance runs
     try:
-        rows = db.execute(text("""
+        rows = db.execute(
+            text("""
             SELECT task_name, result
             FROM governance_runs
             ORDER BY completed_at DESC LIMIT 5
-        """)).fetchall()
+        """)
+        ).fetchall()
         if rows:
             result.governance = {r[0]: r[1] for r in rows if r[1]}
     except Exception:
@@ -769,10 +859,12 @@ def memory_health(
 def memory_metrics() -> dict:
     """Memory system performance metrics."""
     from core.memory.tabular.metrics import metrics
+
     return metrics.get_stats()
 
 
 # ── Training Data Pipeline ─────────────────────────────────────────────────────
+
 
 class TrainingDataExtractRequest(BaseModel):
     name: str = "auto_extract"
@@ -796,6 +888,7 @@ def extract_training_data(
     """Extract high-quality conversation pairs as training data."""
     from core.data_versioning.training_data_pipeline import DatasetConfig, TrainingDataPipeline
     from core.utils.id_generator import generate_id
+
     pipeline = TrainingDataPipeline(lambda: db)
     dataset_id = generate_id()
     config = DatasetConfig(
@@ -824,10 +917,14 @@ def export_training_data(
 ):
     """Export a training dataset as JSONL file."""
     from core.data_versioning.training_data_pipeline import TrainingDataPipeline
+
     pipeline = TrainingDataPipeline(lambda: db)
     try:
         output_path = pipeline.export_dataset(dataset_id, format=format)
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
     from fastapi.responses import FileResponse
-    return FileResponse(path=output_path, media_type="application/jsonl", filename=f"{dataset_id}.{format}")
+
+    return FileResponse(
+        path=output_path, media_type="application/jsonl", filename=f"{dataset_id}.{format}"
+    )

@@ -28,7 +28,7 @@ def make_step(step_id, result=None, fail=False, depends_on=None):
 
 def make_workflow(wf_id="wf-1", steps=None):
     wf = WorkflowDefinition(workflow_id=wf_id, name="Test WF", description="desc")
-    for s in (steps or []):
+    for s in steps or []:
         wf.add_step(s)
     return wf
 

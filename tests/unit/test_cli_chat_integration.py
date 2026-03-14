@@ -59,14 +59,22 @@ class TestRichRendererWithEdgeLoop:
     async def test_text_only_turn(self, router, perms):
         """Single turn text response renders through RichRenderer."""
         renderer, console, buf = _make_renderer()
-        api = MockAPIClient([[
-            {"type": "text_delta", "content": "The answer is 42."},
-            {"type": "turn_complete", "has_tool_calls": False},
-        ]])
+        api = MockAPIClient(
+            [
+                [
+                    {"type": "text_delta", "content": "The answer is 42."},
+                    {"type": "turn_complete", "has_tool_calls": False},
+                ]
+            ]
+        )
         renderer.begin_response()
         result = await edge_chat_loop(
-            "what is 42?", api, router, perms,
-            session_id="s1", renderer=renderer,
+            "what is 42?",
+            api,
+            router,
+            perms,
+            session_id="s1",
+            renderer=renderer,
         )
         renderer.end_response()
         assert "42" in result.text
@@ -75,23 +83,34 @@ class TestRichRendererWithEdgeLoop:
     async def test_tool_call_turn(self, router, perms, project):
         """Turn with tool call renders tool start/done."""
         renderer, console, buf = _make_renderer()
-        api = MockAPIClient([
-            # Turn 1: tool call
+        api = MockAPIClient(
             [
-                {"type": "text_delta", "content": "Let me read that."},
-                {"type": "tool_call", "id": "tc_1", "name": "read_file",
-                 "arguments": {"path": "hello.txt"}},
-                {"type": "turn_complete", "has_tool_calls": True},
-            ],
-            # Turn 2: final answer
-            [
-                {"type": "text_delta", "content": "The file says Hello."},
-                {"type": "turn_complete", "has_tool_calls": False},
-            ],
-        ])
+                # Turn 1: tool call
+                [
+                    {"type": "text_delta", "content": "Let me read that."},
+                    {
+                        "type": "tool_call",
+                        "id": "tc_1",
+                        "name": "read_file",
+                        "arguments": {"path": "hello.txt"},
+                    },
+                    {"type": "turn_complete", "has_tool_calls": True},
+                ],
+                # Turn 2: final answer
+                [
+                    {"type": "text_delta", "content": "The file says Hello."},
+                    {"type": "turn_complete", "has_tool_calls": False},
+                ],
+            ]
+        )
         result = await edge_chat_loop(
-            "read hello.txt", api, router, perms,
-            session_id="s1", project_root=str(project), renderer=renderer,
+            "read hello.txt",
+            api,
+            router,
+            perms,
+            session_id="s1",
+            project_root=str(project),
+            renderer=renderer,
         )
         output = buf.getvalue()
         assert "read_file" in output
@@ -117,25 +136,40 @@ class TestRichRendererWithEdgeLoop:
     async def test_multi_turn(self, router, perms, project):
         """Multi-turn with tool calls accumulates correctly."""
         renderer, console, buf = _make_renderer()
-        api = MockAPIClient([
+        api = MockAPIClient(
             [
-                {"type": "tool_call", "id": "tc_1", "name": "read_file",
-                 "arguments": {"path": "hello.txt"}},
-                {"type": "turn_complete", "has_tool_calls": True},
-            ],
-            [
-                {"type": "tool_call", "id": "tc_2", "name": "bash",
-                 "arguments": {"command": "echo done"}},
-                {"type": "turn_complete", "has_tool_calls": True},
-            ],
-            [
-                {"type": "text_delta", "content": "All done."},
-                {"type": "turn_complete", "has_tool_calls": False},
-            ],
-        ])
+                [
+                    {
+                        "type": "tool_call",
+                        "id": "tc_1",
+                        "name": "read_file",
+                        "arguments": {"path": "hello.txt"},
+                    },
+                    {"type": "turn_complete", "has_tool_calls": True},
+                ],
+                [
+                    {
+                        "type": "tool_call",
+                        "id": "tc_2",
+                        "name": "bash",
+                        "arguments": {"command": "echo done"},
+                    },
+                    {"type": "turn_complete", "has_tool_calls": True},
+                ],
+                [
+                    {"type": "text_delta", "content": "All done."},
+                    {"type": "turn_complete", "has_tool_calls": False},
+                ],
+            ]
+        )
         result = await edge_chat_loop(
-            "do stuff", api, router, perms,
-            session_id="s1", project_root=str(project), renderer=renderer,
+            "do stuff",
+            api,
+            router,
+            perms,
+            session_id="s1",
+            project_root=str(project),
+            renderer=renderer,
         )
         assert "All done" in result.text
         output = buf.getvalue()

@@ -25,12 +25,14 @@ class TestSkillTagsValidation:
     """Registration-time validation of skill tags."""
 
     def test_valid_tags(self):
-        tags = SkillTags.from_dict({
-            "scope": "external",
-            "data_source": "external_api",
-            "intent_type": ["fetch", "mutate"],
-            "requires_history": False,
-        })
+        tags = SkillTags.from_dict(
+            {
+                "scope": "external",
+                "data_source": "external_api",
+                "intent_type": ["fetch", "mutate"],
+                "requires_history": False,
+            }
+        )
         assert tags.scope == "external"
         assert tags.data_source == "external_api"
         assert tags.intent_type == ("fetch", "mutate")  # sorted tuple
@@ -38,60 +40,74 @@ class TestSkillTagsValidation:
 
     def test_invalid_scope_raises(self):
         with pytest.raises(ValueError, match="Invalid scope"):
-            SkillTags.from_dict({
-                "scope": "invalid_value",
-                "data_source": "external_api",
-                "intent_type": ["fetch"],
-            })
+            SkillTags.from_dict(
+                {
+                    "scope": "invalid_value",
+                    "data_source": "external_api",
+                    "intent_type": ["fetch"],
+                }
+            )
 
     def test_invalid_data_source_raises(self):
         with pytest.raises(ValueError, match="Invalid data_source"):
-            SkillTags.from_dict({
-                "scope": "external",
-                "data_source": "unknown_source",
-                "intent_type": ["fetch"],
-            })
+            SkillTags.from_dict(
+                {
+                    "scope": "external",
+                    "data_source": "unknown_source",
+                    "intent_type": ["fetch"],
+                }
+            )
 
     def test_invalid_intent_type_raises(self):
         with pytest.raises(ValueError, match="Invalid intent_type"):
-            SkillTags.from_dict({
-                "scope": "external",
-                "data_source": "external_api",
-                "intent_type": ["fetch", "nonexistent"],
-            })
+            SkillTags.from_dict(
+                {
+                    "scope": "external",
+                    "data_source": "external_api",
+                    "intent_type": ["fetch", "nonexistent"],
+                }
+            )
 
     def test_empty_scope_raises(self):
         with pytest.raises(ValueError, match="Invalid scope"):
-            SkillTags.from_dict({
-                "scope": "",
-                "data_source": "external_api",
-                "intent_type": [],
-            })
+            SkillTags.from_dict(
+                {
+                    "scope": "",
+                    "data_source": "external_api",
+                    "intent_type": [],
+                }
+            )
 
     def test_empty_intent_type_is_valid(self):
-        tags = SkillTags.from_dict({
-            "scope": "external",
-            "data_source": "external_api",
-            "intent_type": [],
-            "requires_history": True,
-        })
+        tags = SkillTags.from_dict(
+            {
+                "scope": "external",
+                "data_source": "external_api",
+                "intent_type": [],
+                "requires_history": True,
+            }
+        )
         assert tags.intent_type == ()
         assert tags.requires_history is True
 
     def test_requires_history_defaults_false(self):
-        tags = SkillTags.from_dict({
-            "scope": "historical",
-            "data_source": "event_store",
-            "intent_type": ["analytical"],
-        })
+        tags = SkillTags.from_dict(
+            {
+                "scope": "historical",
+                "data_source": "event_store",
+                "intent_type": ["analytical"],
+            }
+        )
         assert tags.requires_history is False
 
     def test_validate_tags_function(self):
-        tags = validate_tags({
-            "scope": "current_session",
-            "data_source": "session_metadata",
-            "intent_type": ["introspect"],
-        })
+        tags = validate_tags(
+            {
+                "scope": "current_session",
+                "data_source": "session_metadata",
+                "intent_type": ["introspect"],
+            }
+        )
         assert isinstance(tags, SkillTags)
         assert tags.scope == "current_session"
 
@@ -129,16 +145,22 @@ class TestSkillTagsSerialization:
         assert restored == original
 
     def test_intent_type_sorted_on_creation(self):
-        tags = SkillTags.from_dict({
-            "scope": "external",
-            "data_source": "external_api",
-            "intent_type": ["mutate", "fetch", "analytical"],
-        })
+        tags = SkillTags.from_dict(
+            {
+                "scope": "external",
+                "data_source": "external_api",
+                "intent_type": ["mutate", "fetch", "analytical"],
+            }
+        )
         assert tags.intent_type == ("analytical", "fetch", "mutate")
 
     def test_frozen_immutable(self):
-        tags = SkillTags(scope="external", data_source="external_api",
-                         intent_type=("fetch",), requires_history=False)
+        tags = SkillTags(
+            scope="external",
+            data_source="external_api",
+            intent_type=("fetch",),
+            requires_history=False,
+        )
         with pytest.raises(AttributeError):
             tags.scope = "historical"
 
@@ -258,9 +280,11 @@ class TestConversationStateExtraction:
     def test_previous_skill_extraction(self):
         msgs = [
             {"role": "user", "content": "list prs"},
-            {"role": "assistant", "content": "here are prs", "tool_calls": [
-                {"function": {"name": "list_prs", "arguments": "{}"}}
-            ]},
+            {
+                "role": "assistant",
+                "content": "here are prs",
+                "tool_calls": [{"function": {"name": "list_prs", "arguments": "{}"}}],
+            },
             {"role": "user", "content": "分析一下前一个上下文"},
         ]
         state = ConversationState.from_messages(msgs)
@@ -318,6 +342,7 @@ class TestConversationStateExtraction:
 @dataclass
 class MockSkill:
     """Minimal skill mock for pre-filter tests."""
+
     name: str
     tags: SkillTags | None = None
 
@@ -327,12 +352,24 @@ class TestPreFilterRules:
 
     def test_history_analytical_prefers_historical(self):
         """Rule 1: history + analytical → prefer historical scope."""
-        introspection = MockSkill("introspection", SkillTags(
-            scope="current_session", data_source="session_metadata",
-            intent_type=("introspect",), requires_history=False))
-        event_reader = MockSkill("event_reader", SkillTags(
-            scope="historical", data_source="event_store",
-            intent_type=("analytical",), requires_history=True))
+        introspection = MockSkill(
+            "introspection",
+            SkillTags(
+                scope="current_session",
+                data_source="session_metadata",
+                intent_type=("introspect",),
+                requires_history=False,
+            ),
+        )
+        event_reader = MockSkill(
+            "event_reader",
+            SkillTags(
+                scope="historical",
+                data_source="event_store",
+                intent_type=("analytical",),
+                requires_history=True,
+            ),
+        )
 
         state = ConversationState(references_history=True, is_analytical=True)
         result, applied = pre_filter([introspection, event_reader], state)
@@ -344,12 +381,24 @@ class TestPreFilterRules:
 
     def test_history_analytical_cross_session_also_preferred(self):
         """Rule 1: cross_session scope is also preferred for history+analytical."""
-        current = MockSkill("current", SkillTags(
-            scope="current_session", data_source="session_metadata",
-            intent_type=("introspect",), requires_history=False))
-        memory = MockSkill("memory", SkillTags(
-            scope="cross_session", data_source="memory_store",
-            intent_type=("analytical",), requires_history=True))
+        current = MockSkill(
+            "current",
+            SkillTags(
+                scope="current_session",
+                data_source="session_metadata",
+                intent_type=("introspect",),
+                requires_history=False,
+            ),
+        )
+        memory = MockSkill(
+            "memory",
+            SkillTags(
+                scope="cross_session",
+                data_source="memory_store",
+                intent_type=("analytical",),
+                requires_history=True,
+            ),
+        )
 
         state = ConversationState(references_history=True, is_analytical=True)
         result, applied = pre_filter([current, memory], state)
@@ -359,12 +408,24 @@ class TestPreFilterRules:
 
     def test_fetch_prefers_external(self):
         """Rule 2: fetch without history → prefer external scope."""
-        local = MockSkill("local", SkillTags(
-            scope="current_session", data_source="session_metadata",
-            intent_type=("introspect",), requires_history=False))
-        github = MockSkill("github", SkillTags(
-            scope="external", data_source="external_api",
-            intent_type=("fetch",), requires_history=False))
+        local = MockSkill(
+            "local",
+            SkillTags(
+                scope="current_session",
+                data_source="session_metadata",
+                intent_type=("introspect",),
+                requires_history=False,
+            ),
+        )
+        github = MockSkill(
+            "github",
+            SkillTags(
+                scope="external",
+                data_source="external_api",
+                intent_type=("fetch",),
+                requires_history=False,
+            ),
+        )
 
         state = ConversationState(is_fetch=True)
         result, applied = pre_filter([local, github], state)
@@ -374,12 +435,24 @@ class TestPreFilterRules:
 
     def test_fetch_with_history_does_not_trigger_rule2(self):
         """Rule 2 requires no history reference."""
-        local = MockSkill("local", SkillTags(
-            scope="current_session", data_source="session_metadata",
-            intent_type=("introspect",), requires_history=False))
-        github = MockSkill("github", SkillTags(
-            scope="external", data_source="external_api",
-            intent_type=("fetch",), requires_history=False))
+        local = MockSkill(
+            "local",
+            SkillTags(
+                scope="current_session",
+                data_source="session_metadata",
+                intent_type=("introspect",),
+                requires_history=False,
+            ),
+        )
+        github = MockSkill(
+            "github",
+            SkillTags(
+                scope="external",
+                data_source="external_api",
+                intent_type=("fetch",),
+                requires_history=False,
+            ),
+        )
 
         state = ConversationState(is_fetch=True, references_history=True, is_analytical=True)
         # Rule 1 fires (history+analytical), not Rule 2
@@ -389,12 +462,24 @@ class TestPreFilterRules:
 
     def test_mutate_prefers_mutate_intent(self):
         """Rule 3: mutate → prefer skills with mutate intent."""
-        reader = MockSkill("reader", SkillTags(
-            scope="external", data_source="external_api",
-            intent_type=("fetch",), requires_history=False))
-        creator = MockSkill("creator", SkillTags(
-            scope="external", data_source="external_api",
-            intent_type=("mutate",), requires_history=False))
+        reader = MockSkill(
+            "reader",
+            SkillTags(
+                scope="external",
+                data_source="external_api",
+                intent_type=("fetch",),
+                requires_history=False,
+            ),
+        )
+        creator = MockSkill(
+            "creator",
+            SkillTags(
+                scope="external",
+                data_source="external_api",
+                intent_type=("mutate",),
+                requires_history=False,
+            ),
+        )
 
         state = ConversationState(is_mutate=True)
         result, applied = pre_filter([reader, creator], state)
@@ -404,12 +489,24 @@ class TestPreFilterRules:
 
     def test_no_signals_no_filtering(self):
         """No signals → pass through unchanged."""
-        a = MockSkill("a", SkillTags(
-            scope="external", data_source="external_api",
-            intent_type=("fetch",), requires_history=False))
-        b = MockSkill("b", SkillTags(
-            scope="current_session", data_source="session_metadata",
-            intent_type=("introspect",), requires_history=False))
+        a = MockSkill(
+            "a",
+            SkillTags(
+                scope="external",
+                data_source="external_api",
+                intent_type=("fetch",),
+                requires_history=False,
+            ),
+        )
+        b = MockSkill(
+            "b",
+            SkillTags(
+                scope="current_session",
+                data_source="session_metadata",
+                intent_type=("introspect",),
+                requires_history=False,
+            ),
+        )
 
         state = ConversationState()
         result, applied = pre_filter([a, b], state)
@@ -432,9 +529,15 @@ class TestPreFilterRules:
 
     def test_skills_without_tags_go_to_normal_bucket(self):
         """Untagged skills are not removed or deprioritized."""
-        tagged = MockSkill("tagged", SkillTags(
-            scope="historical", data_source="event_store",
-            intent_type=("analytical",), requires_history=True))
+        tagged = MockSkill(
+            "tagged",
+            SkillTags(
+                scope="historical",
+                data_source="event_store",
+                intent_type=("analytical",),
+                requires_history=True,
+            ),
+        )
         untagged = MockSkill("untagged", tags=None)
 
         state = ConversationState(references_history=True, is_analytical=True)
@@ -447,12 +550,24 @@ class TestPreFilterRules:
 
     def test_all_same_scope_no_reorder(self):
         """If all skills have the same scope, no reordering happens."""
-        a = MockSkill("a", SkillTags(
-            scope="external", data_source="external_api",
-            intent_type=("fetch",), requires_history=False))
-        b = MockSkill("b", SkillTags(
-            scope="external", data_source="external_api",
-            intent_type=("fetch",), requires_history=False))
+        a = MockSkill(
+            "a",
+            SkillTags(
+                scope="external",
+                data_source="external_api",
+                intent_type=("fetch",),
+                requires_history=False,
+            ),
+        )
+        b = MockSkill(
+            "b",
+            SkillTags(
+                scope="external",
+                data_source="external_api",
+                intent_type=("fetch",),
+                requires_history=False,
+            ),
+        )
 
         state = ConversationState(is_fetch=True)
         _result, applied = pre_filter([a, b], state)
@@ -462,12 +577,33 @@ class TestPreFilterRules:
     def test_preserves_all_skills(self):
         """Pre-filter never removes skills, only reorders."""
         skills = [
-            MockSkill("a", SkillTags(scope="current_session", data_source="session_metadata",
-                                     intent_type=("introspect",), requires_history=False)),
-            MockSkill("b", SkillTags(scope="historical", data_source="event_store",
-                                     intent_type=("analytical",), requires_history=True)),
-            MockSkill("c", SkillTags(scope="external", data_source="external_api",
-                                     intent_type=("fetch",), requires_history=False)),
+            MockSkill(
+                "a",
+                SkillTags(
+                    scope="current_session",
+                    data_source="session_metadata",
+                    intent_type=("introspect",),
+                    requires_history=False,
+                ),
+            ),
+            MockSkill(
+                "b",
+                SkillTags(
+                    scope="historical",
+                    data_source="event_store",
+                    intent_type=("analytical",),
+                    requires_history=True,
+                ),
+            ),
+            MockSkill(
+                "c",
+                SkillTags(
+                    scope="external",
+                    data_source="external_api",
+                    intent_type=("fetch",),
+                    requires_history=False,
+                ),
+            ),
             MockSkill("d", tags=None),
         ]
         state = ConversationState(references_history=True, is_analytical=True)
@@ -486,15 +622,33 @@ class TestMultiTurnContinuity:
 
     def test_previous_skill_boosted_to_front(self):
         """When previous_skill exists and turn_count > 1, boost it."""
-        find_skills = MockSkill("find_skills", SkillTags(
-            scope="current_session", data_source="session_metadata",
-            intent_type=("introspect",), requires_history=False))
-        list_prs = MockSkill("list_prs", SkillTags(
-            scope="external", data_source="external_api",
-            intent_type=("fetch",), requires_history=False))
-        read_file = MockSkill("read_file", SkillTags(
-            scope="local", data_source="local_filesystem",
-            intent_type=("fetch",), requires_history=False))
+        find_skills = MockSkill(
+            "find_skills",
+            SkillTags(
+                scope="current_session",
+                data_source="session_metadata",
+                intent_type=("introspect",),
+                requires_history=False,
+            ),
+        )
+        list_prs = MockSkill(
+            "list_prs",
+            SkillTags(
+                scope="external",
+                data_source="external_api",
+                intent_type=("fetch",),
+                requires_history=False,
+            ),
+        )
+        read_file = MockSkill(
+            "read_file",
+            SkillTags(
+                scope="local",
+                data_source="local_filesystem",
+                intent_type=("fetch",),
+                requires_history=False,
+            ),
+        )
 
         state = ConversationState(previous_skill="list_prs", turn_count=2)
         result, applied = pre_filter([find_skills, list_prs, read_file], state)
@@ -505,9 +659,15 @@ class TestMultiTurnContinuity:
 
     def test_previous_skill_already_first_no_reorder(self):
         """If previous_skill is already first, no reorder needed."""
-        list_prs = MockSkill("list_prs", SkillTags(
-            scope="external", data_source="external_api",
-            intent_type=("fetch",), requires_history=False))
+        list_prs = MockSkill(
+            "list_prs",
+            SkillTags(
+                scope="external",
+                data_source="external_api",
+                intent_type=("fetch",),
+                requires_history=False,
+            ),
+        )
         other = MockSkill("other", tags=None)
 
         state = ConversationState(previous_skill="list_prs", turn_count=2)
@@ -542,20 +702,34 @@ class TestMultiTurnContinuity:
         Turn 1: user asks 'matrixone 最新的两个pr情况？' → list_prs succeeds.
         Turn 2: user asks 'tidb呢' → should still prefer list_prs.
         """
-        list_prs = MockSkill("list_prs", SkillTags(
-            scope="external", data_source="external_api",
-            intent_type=("fetch",), requires_history=False))
-        find_skills = MockSkill("find_skills", SkillTags(
-            scope="current_session", data_source="session_metadata",
-            intent_type=("introspect",), requires_history=False))
+        list_prs = MockSkill(
+            "list_prs",
+            SkillTags(
+                scope="external",
+                data_source="external_api",
+                intent_type=("fetch",),
+                requires_history=False,
+            ),
+        )
+        find_skills = MockSkill(
+            "find_skills",
+            SkillTags(
+                scope="current_session",
+                data_source="session_metadata",
+                intent_type=("introspect",),
+                requires_history=False,
+            ),
+        )
 
         # Simulate full server-side history
         history = [
             {"role": "system", "content": "You are..."},
             {"role": "user", "content": "matrixone 最新的两个pr情况？"},
-            {"role": "assistant", "content": "...", "tool_calls": [
-                {"function": {"name": "list_prs", "arguments": "{}"}}
-            ]},
+            {
+                "role": "assistant",
+                "content": "...",
+                "tool_calls": [{"function": {"name": "list_prs", "arguments": "{}"}}],
+            },
             {"role": "tool", "content": "...", "tool_call_id": "x"},
             {"role": "assistant", "content": "根据查询结果..."},
             {"role": "user", "content": "tidb呢"},
@@ -577,18 +751,32 @@ class TestRealFailureCase:
     def test_session_019cbb9e_disambiguation(self):
         """User asked '分析一下前一个上下文的情况还有决策链评估'.
         introspection was selected but event_reader was correct."""
-        introspection = MockSkill("introspection", SkillTags(
-            scope="current_session", data_source="session_metadata",
-            intent_type=("introspect",), requires_history=False))
-        event_reader = MockSkill("event_reader", SkillTags(
-            scope="historical", data_source="event_store",
-            intent_type=("analytical",), requires_history=True))
+        introspection = MockSkill(
+            "introspection",
+            SkillTags(
+                scope="current_session",
+                data_source="session_metadata",
+                intent_type=("introspect",),
+                requires_history=False,
+            ),
+        )
+        event_reader = MockSkill(
+            "event_reader",
+            SkillTags(
+                scope="historical",
+                data_source="event_store",
+                intent_type=("analytical",),
+                requires_history=True,
+            ),
+        )
 
         msgs = [
             {"role": "user", "content": "matrixone 最新的两个pr情况？"},
-            {"role": "assistant", "content": "...", "tool_calls": [
-                {"function": {"name": "list_prs", "arguments": "{}"}}
-            ]},
+            {
+                "role": "assistant",
+                "content": "...",
+                "tool_calls": [{"function": {"name": "list_prs", "arguments": "{}"}}],
+            },
             {"role": "user", "content": "分析一下前一个上下文的情况还有决策链评估"},
         ]
         state = ConversationState.from_messages(msgs)

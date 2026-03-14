@@ -79,8 +79,12 @@ class TestGetAgentInfo:
             "query": "Python async",
             "retrieved_count": 2,
             "ranking": [
-                {"rank": 1, "memory_id": "m1", "final_score": 0.8,
-                 "scores": {"vector": 0.0, "keyword": 1.0, "temporal": 0.9, "confidence": 0.7}},
+                {
+                    "rank": 1,
+                    "memory_id": "m1",
+                    "final_score": 0.8,
+                    "scores": {"vector": 0.0, "keyword": 1.0, "temporal": 0.9, "confidence": 0.7},
+                },
             ],
         }
 
@@ -95,7 +99,8 @@ class TestGetAgentInfo:
         assert data["memory_recall"]["retrieved_count"] == 2
         assert data["memory_recall"]["ranking"][0]["memory_id"] == "m1"
         mock_api.get_introspection_recall.assert_called_once_with(
-            "s1", query="Python async",
+            "s1",
+            query="Python async",
         )
 
     @pytest.mark.asyncio

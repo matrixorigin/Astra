@@ -7,6 +7,7 @@ Tests that _persist_turn_events writes every event with correct:
 - event_count on agent_sessions updated after persist
 - continuation turns (tool_results without new user_query) reuse chain
 """
+
 import time
 import pytest
 import sqlalchemy as sa
@@ -17,6 +18,7 @@ from uuid_utils import uuid7
 def turn_session(db):
     """Create a fresh session for turn event tests."""
     from api.models.agent import Session as SessionModel
+
     sid = str(uuid7())
     uid = str(uuid7())
     db.add(SessionModel(session_id=sid, user_id=uid, agent_id="test", status="active"))
@@ -32,8 +34,10 @@ def turn_session(db):
 def _run_persist(session_id, user_id, turn_chain_id, user_query_event_id, **kwargs):
     """Run _persist_turn_events and wait for the background thread."""
     from api.routers.chat import _persist_turn_events
+
     _persist_turn_events(
-        user_id, session_id,
+        user_id,
+        session_id,
         messages=kwargs.get("messages", [{"role": "user", "content": "hello"}]),
         tool_results=kwargs.get("tool_results", []),
         full_text=kwargs.get("full_text", "response"),
@@ -48,10 +52,13 @@ def _run_persist(session_id, user_id, turn_chain_id, user_query_event_id, **kwar
 
 
 def _fetch_events(db, session_id):
-    rows = db.execute(sa.text("""
+    rows = db.execute(
+        sa.text("""
         SELECT event_id, event_type, causal_chain_id, parent_event_id, created_at
         FROM agent_events WHERE session_id = :sid ORDER BY created_at
-    """), {"sid": session_id}).fetchall()
+    """),
+        {"sid": session_id},
+    ).fetchall()
     return [dict(r._mapping) for r in rows]
 
 
@@ -63,8 +70,13 @@ class TestTurnEventChain:
         sid, uid = turn_session
         chain = str(uuid7())
         uq_eid = str(uuid7())
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}])
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}],
+        )
 
         events = _fetch_events(db, sid)
         assert len(events) >= 2
@@ -113,8 +125,13 @@ class TestTurnEventChain:
         sid, uid = turn_session
         chain = str(uuid7())
         uq_eid = str(uuid7())
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}])
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}],
+        )
 
         events = _fetch_events(db, sid)
         uq = next(e for e in events if e["event_type"] == "user_query")
@@ -126,8 +143,13 @@ class TestTurnEventChain:
         sid, uid = turn_session
         chain = str(uuid7())
         uq_eid = str(uuid7())
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_results=[{"name": "read_file", "result": "content", "tool_call_id": "tc1"}])
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_results=[{"name": "read_file", "result": "content", "tool_call_id": "tc1"}],
+        )
 
         events = _fetch_events(db, sid)
         tr = next((e for e in events if e["event_type"] == "tool_result"), None)
@@ -137,8 +159,13 @@ class TestTurnEventChain:
     def test_session_event_count_updated(self, db, turn_session):
         """agent_sessions.event_count must equal actual event count after persist."""
         sid, uid = turn_session
-        _run_persist(sid, uid, str(uuid7()), str(uuid7()),
-                     tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}])
+        _run_persist(
+            sid,
+            uid,
+            str(uuid7()),
+            str(uuid7()),
+            tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}],
+        )
 
         events = _fetch_events(db, sid)
         sess = db.execute(
@@ -201,15 +228,25 @@ class TestContinuationTurnChain:
         uq_eid = str(uuid7())
 
         # Turn 1: user query + tool_call
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}],
-                     full_text="Let me run that.")
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}],
+            full_text="Let me run that.",
+        )
 
         # Turn 1 continuation: tool_results come back, no new user_query.
         # Reuse same chain and user_query_event_id.
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_results=[{"name": "bash", "result": "ok", "tool_call_id": "tc1"}],
-                     full_text="Done.")
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_results=[{"name": "bash", "result": "ok", "tool_call_id": "tc1"}],
+            full_text="Done.",
+        )
 
         events = _fetch_events(db, sid)
         chains = {e["causal_chain_id"] for e in events}
@@ -225,14 +262,24 @@ class TestContinuationTurnChain:
         uq_eid = str(uuid7())
 
         # Turn 1: user query + tool_call
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}],
-                     full_text="Running.")
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}],
+            full_text="Running.",
+        )
 
         # Continuation: tool_results only
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_results=[{"name": "bash", "result": "output", "tool_call_id": "tc1"}],
-                     full_text="Here is the result.")
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_results=[{"name": "bash", "result": "output", "tool_call_id": "tc1"}],
+            full_text="Here is the result.",
+        )
 
         events = _fetch_events(db, sid)
         tool_results = [e for e in events if e["event_type"] == "tool_result"]
@@ -253,14 +300,24 @@ class TestContinuationTurnChain:
         uq_eid = str(uuid7())
 
         # Turn 1: user query + tool_call
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}],
-                     full_text="Running.")
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}],
+            full_text="Running.",
+        )
 
         # Continuation: tool_results + final response
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_results=[{"name": "bash", "result": "output", "tool_call_id": "tc1"}],
-                     full_text="Here is the result.")
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_results=[{"name": "bash", "result": "output", "tool_call_id": "tc1"}],
+            full_text="Here is the result.",
+        )
 
         events = _fetch_events(db, sid)
         llm_responses = [e for e in events if e["event_type"] == "llm_response"]
@@ -281,33 +338,45 @@ class TestContinuationTurnChain:
         uq_eid = str(uuid7())
 
         # Step 1: user query → LLM returns tool_call
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_calls=[{"id": "tc1", "function": {"name": "read_file", "arguments": "{}"}}],
-                     full_text="")
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_calls=[{"id": "tc1", "function": {"name": "read_file", "arguments": "{}"}}],
+            full_text="",
+        )
 
         # Step 2: tool_result → LLM returns another tool_call
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_results=[{"name": "read_file", "result": "file content", "tool_call_id": "tc1"}],
-                     tool_calls=[{"id": "tc2", "function": {"name": "write_file", "arguments": "{}"}}],
-                     full_text="")
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_results=[{"name": "read_file", "result": "file content", "tool_call_id": "tc1"}],
+            tool_calls=[{"id": "tc2", "function": {"name": "write_file", "arguments": "{}"}}],
+            full_text="",
+        )
 
         # Step 3: tool_result → LLM returns final text
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_results=[{"name": "write_file", "result": "ok", "tool_call_id": "tc2"}],
-                     full_text="Done, file updated.")
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_results=[{"name": "write_file", "result": "ok", "tool_call_id": "tc2"}],
+            full_text="Done, file updated.",
+        )
 
         events = _fetch_events(db, sid)
         chains = {e["causal_chain_id"] for e in events}
-        assert chains == {chain}, (
-            f"3-step tool loop must have exactly 1 chain. Found: {chains}"
-        )
+        assert chains == {chain}, f"3-step tool loop must have exactly 1 chain. Found: {chains}"
 
         # Verify all events have parent pointing to user_query
         non_uq = [e for e in events if e["event_type"] != "user_query"]
         for e in non_uq:
             assert e["parent_event_id"] == uq_eid, (
-                f"{e['event_type']}.parent_event_id = {e['parent_event_id']}, "
-                f"expected {uq_eid}"
+                f"{e['event_type']}.parent_event_id = {e['parent_event_id']}, expected {uq_eid}"
             )
 
     def test_new_user_query_starts_new_chain(self, db, turn_session):
@@ -319,12 +388,22 @@ class TestContinuationTurnChain:
         uq_eid2 = str(uuid7())
 
         # Turn 1: user query + tool loop
-        _run_persist(sid, uid, chain1, uq_eid1,
-                     tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}],
-                     full_text="Running.")
-        _run_persist(sid, uid, chain1, uq_eid1,
-                     tool_results=[{"name": "bash", "result": "ok", "tool_call_id": "tc1"}],
-                     full_text="Done.")
+        _run_persist(
+            sid,
+            uid,
+            chain1,
+            uq_eid1,
+            tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}],
+            full_text="Running.",
+        )
+        _run_persist(
+            sid,
+            uid,
+            chain1,
+            uq_eid1,
+            tool_results=[{"name": "bash", "result": "ok", "tool_call_id": "tc1"}],
+            full_text="Done.",
+        )
 
         # Turn 2: new user query — must be a different chain
         _run_persist(sid, uid, chain2, uq_eid2, full_text="Sure thing.")
@@ -354,15 +433,25 @@ class TestContinuationTurnChain:
         uq_eid = str(uuid7())
 
         # Initial turn with tool_call
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_calls=[{"id": "tc1", "function": {"name": "search", "arguments": "{}"}}],
-                     full_text="Searching.")
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_calls=[{"id": "tc1", "function": {"name": "search", "arguments": "{}"}}],
+            full_text="Searching.",
+        )
 
         # Continuation: only tool_results, no user message
-        _run_persist(sid, uid, chain, uq_eid,
-                     messages=[],  # no user message
-                     tool_results=[{"name": "search", "result": "found it", "tool_call_id": "tc1"}],
-                     full_text="Found the result.")
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            messages=[],  # no user message
+            tool_results=[{"name": "search", "result": "found it", "tool_call_id": "tc1"}],
+            full_text="Found the result.",
+        )
 
         events = _fetch_events(db, sid)
         for e in events:
@@ -388,11 +477,20 @@ class TestCloudToolCallOrdering:
         uq_eid = str(uuid7())
 
         # Simulate a turn with a cloud tool_call (marked with _source=cloud)
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_calls=[
-                         {"id": "cloud-tc1", "function": {"name": "ci_status", "arguments": "{}"}, "_source": "cloud"},
-                     ],
-                     full_text="Here are the CI results.")
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_calls=[
+                {
+                    "id": "cloud-tc1",
+                    "function": {"name": "ci_status", "arguments": "{}"},
+                    "_source": "cloud",
+                },
+            ],
+            full_text="Here are the CI results.",
+        )
 
         events = _fetch_events(db, sid)
         uq = next(e for e in events if e["event_type"] == "user_query")
@@ -410,20 +508,31 @@ class TestCloudToolCallOrdering:
         chain = str(uuid7())
         uq_eid = str(uuid7())
 
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_calls=[
-                         {"id": "cloud-tc1", "function": {"name": "ci_status", "arguments": "{}"}, "_source": "cloud"},
-                     ],
-                     full_text="Results.")
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_calls=[
+                {
+                    "id": "cloud-tc1",
+                    "function": {"name": "ci_status", "arguments": "{}"},
+                    "_source": "cloud",
+                },
+            ],
+            full_text="Results.",
+        )
 
         events = _fetch_events(db, sid)
         tc = next(e for e in events if e["event_type"] == "tool_call")
 
         # Fetch full content
-        content_row = db.execute(sa.text(
-            "SELECT content FROM agent_events WHERE event_id = :eid"
-        ), {"eid": tc["event_id"]}).fetchone()
+        content_row = db.execute(
+            sa.text("SELECT content FROM agent_events WHERE event_id = :eid"),
+            {"eid": tc["event_id"]},
+        ).fetchone()
         import json
+
         content = json.loads(content_row[0])
         assert content.get("source") == "cloud", (
             f"Cloud tool_call must have source='cloud' in content, got: {content}"
@@ -444,28 +553,35 @@ class TestHistorySnapshotCompaction:
         history = [
             {"role": "system", "content": "You are a helper."},
             {"role": "user", "content": "hello"},
-            {"role": "assistant", "content": "", "tool_calls": [
-                {"id": "tc1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
-            ]},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"},
+                    }
+                ],
+            },
             {"role": "tool", "tool_call_id": "tc1", "content": large_result},
             {"role": "assistant", "content": "Done."},
         ]
 
         # turn_count=3 triggers snapshot (SNAPSHOT_TURN_INTERVAL=3)
-        _run_persist(sid, uid, chain, uq_eid,
-                     full_text="Done.",
-                     history=history,
-                     turn_count=3)
+        _run_persist(sid, uid, chain, uq_eid, full_text="Done.", history=history, turn_count=3)
 
         events = _fetch_events(db, sid)
         snap = next((e for e in events if e["event_type"] == "session_history_snapshot"), None)
         assert snap is not None, "Expected a session_history_snapshot event"
 
         # Fetch full content
-        content_row = db.execute(sa.text(
-            "SELECT content FROM agent_events WHERE event_id = :eid"
-        ), {"eid": snap["event_id"]}).fetchone()
+        content_row = db.execute(
+            sa.text("SELECT content FROM agent_events WHERE event_id = :eid"),
+            {"eid": snap["event_id"]},
+        ).fetchone()
         import json
+
         snap_history = json.loads(content_row[0])
 
         # Find the tool message
@@ -483,30 +599,44 @@ class TestSkillSelectionMetrics:
     def _register_skill(self, db):
         """Ensure a skill exists in the registry so _resolve_skill_versions finds it."""
         from api.models.skill import SkillRegistry
+
         sid = "ci_status@1.0.0"
         existing = db.query(SkillRegistry).filter_by(skill_id=sid).first()
         if not existing:
-            db.add(SkillRegistry(
-                skill_id=sid, skill_name="ci_status", version="1.0.0",
-                is_active=1, status="active",
-            ))
+            db.add(
+                SkillRegistry(
+                    skill_id=sid,
+                    skill_name="ci_status",
+                    version="1.0.0",
+                    is_active=1,
+                    status="active",
+                )
+            )
             db.commit()
 
     def _fetch_selection(self, db, session_id):
-        rows = db.execute(sa.text("""
+        rows = db.execute(
+            sa.text("""
             SELECT skill_name, skill_version, execution_success, execution_time_ms
             FROM skill_selection_events WHERE session_id = :sid
             ORDER BY created_at
-        """), {"sid": session_id}).fetchall()
+        """),
+            {"sid": session_id},
+        ).fetchall()
         return [dict(r._mapping) for r in rows]
 
     def test_skill_version_populated(self, db, turn_session):
         """skill_version must be set from the registry, not NULL."""
         sid, uid = turn_session
         chain, uq_eid = str(uuid7()), str(uuid7())
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_calls=[{"id": "tc1", "function": {"name": "ci_status", "arguments": "{}"}}],
-                     agent_id="test")
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_calls=[{"id": "tc1", "function": {"name": "ci_status", "arguments": "{}"}}],
+            agent_id="test",
+        )
 
         rows = self._fetch_selection(db, sid)
         assert len(rows) == 1
@@ -517,11 +647,16 @@ class TestSkillSelectionMetrics:
         """Cloud skill: tool_call + tool_result in same turn → execution_success=1."""
         sid, uid = turn_session
         chain, uq_eid = str(uuid7()), str(uuid7())
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_calls=[{"id": "tc1", "function": {"name": "ci_status", "arguments": "{}"}}],
-                     tool_results=[{"tool_call_id": "tc1", "name": "ci_status", "result": "ok"}],
-                     full_text="CI is green.",
-                     agent_id="test")
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_calls=[{"id": "tc1", "function": {"name": "ci_status", "arguments": "{}"}}],
+            tool_results=[{"tool_call_id": "tc1", "name": "ci_status", "result": "ok"}],
+            full_text="CI is green.",
+            agent_id="test",
+        )
 
         rows = self._fetch_selection(db, sid)
         assert len(rows) == 1
@@ -531,10 +666,15 @@ class TestSkillSelectionMetrics:
         """Edge skill: tool_call only (no result yet) → execution_success stays NULL."""
         sid, uid = turn_session
         chain, uq_eid = str(uuid7()), str(uuid7())
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_calls=[{"id": "tc1", "function": {"name": "ci_status", "arguments": "{}"}}],
-                     full_text="",
-                     agent_id="test")
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_calls=[{"id": "tc1", "function": {"name": "ci_status", "arguments": "{}"}}],
+            full_text="",
+            agent_id="test",
+        )
 
         rows = self._fetch_selection(db, sid)
         assert len(rows) == 1
@@ -548,26 +688,34 @@ class TestEventTimestampPrecision:
         """Events persisted in one _persist_turn_events call must have distinct created_at."""
         sid, uid = turn_session
         chain, uq_eid = str(uuid7()), str(uuid7())
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}],
-                     tool_results=[{"tool_call_id": "tc1", "name": "bash", "result": "ok"}],
-                     full_text="done")
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}],
+            tool_results=[{"tool_call_id": "tc1", "name": "bash", "result": "ok"}],
+            full_text="done",
+        )
 
         events = _fetch_events(db, sid)
         timestamps = [e["created_at"] for e in events]
         # All timestamps should be unique (microsecond precision prevents collisions)
-        assert len(timestamps) == len(set(timestamps)), (
-            f"Timestamp collisions: {timestamps}"
-        )
+        assert len(timestamps) == len(set(timestamps)), f"Timestamp collisions: {timestamps}"
 
     def test_event_ordering_matches_causal_order(self, db, turn_session):
         """user_query < tool_result < tool_call < llm_response in created_at order."""
         sid, uid = turn_session
         chain, uq_eid = str(uuid7()), str(uuid7())
-        _run_persist(sid, uid, chain, uq_eid,
-                     tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}],
-                     tool_results=[{"tool_call_id": "tc0", "name": "prev", "result": "ok"}],
-                     full_text="response")
+        _run_persist(
+            sid,
+            uid,
+            chain,
+            uq_eid,
+            tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}],
+            tool_results=[{"tool_call_id": "tc0", "name": "prev", "result": "ok"}],
+            full_text="response",
+        )
 
         events = _fetch_events(db, sid)
         types = [e["event_type"] for e in events]
@@ -585,20 +733,24 @@ class TestEventTimestampPrecision:
         # Insert an event with a known microsecond value directly to avoid
         # relying on datetime.now() which could theoretically return .000000.
         from datetime import datetime, timezone
+
         known_ts = datetime(2026, 6, 15, 12, 0, 0, 654321, tzinfo=timezone.utc)
         eid = str(uuid7())
-        db.execute(sa.text("""
+        db.execute(
+            sa.text("""
             INSERT INTO agent_events
                 (event_id, session_id, user_id, agent_id, agent_version,
                  event_type, content, causal_chain_id, created_at)
             VALUES (:eid, :sid, :uid, 'sys', '1.0.0',
                     'test', 'usec-test', 'chain-usec', :ts)
-        """), {"eid": eid, "sid": sid, "uid": uid, "ts": known_ts})
+        """),
+            {"eid": eid, "sid": sid, "uid": uid, "ts": known_ts},
+        )
         db.commit()
 
-        row = db.execute(sa.text(
-            "SELECT created_at FROM agent_events WHERE event_id = :eid"
-        ), {"eid": eid}).fetchone()
+        row = db.execute(
+            sa.text("SELECT created_at FROM agent_events WHERE event_id = :eid"), {"eid": eid}
+        ).fetchone()
         assert row[0].microsecond == 654321, (
             f"Expected microsecond=654321, got {row[0].microsecond} — DATETIME(6) not working"
         )

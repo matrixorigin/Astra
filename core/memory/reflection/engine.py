@@ -96,7 +96,8 @@ class ReflectionEngine:
         # 1. Get candidates
         try:
             candidates = self._provider.get_reflection_candidates(
-                user_id, since_hours=since_hours,
+                user_id,
+                since_hours=since_hours,
             )
         except Exception as e:
             logger.error("Reflection candidate retrieval failed: %s", e)
@@ -110,9 +111,7 @@ class ReflectionEngine:
             return result
 
         # 2. Score and filter
-        scored = [
-            (c, c.importance_score) for c in candidates
-        ]
+        scored = [(c, c.importance_score) for c in candidates]
         passed = [(c, s) for c, s in scored if s >= self._threshold]
         result.candidates_passed = len(passed)
 
@@ -183,7 +182,9 @@ class ReflectionEngine:
         return self._parse_insights(raw, candidate)
 
     def _parse_insights(
-        self, raw: str, candidate: ReflectionCandidate,
+        self,
+        raw: str,
+        candidate: ReflectionCandidate,
     ) -> list[SynthesizedInsight]:
         """Parse LLM JSON output into SynthesizedInsight list.
 
@@ -197,7 +198,7 @@ class ReflectionEngine:
             raise ValueError(f"No JSON array in LLM output: {text[:200]}")
 
         try:
-            items = json.loads(text[start:end + 1])
+            items = json.loads(text[start : end + 1])
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON in LLM output: {e} — {text[:200]}") from e
 
@@ -209,13 +210,15 @@ class ReflectionEngine:
             except (KeyError, ValueError):
                 continue
             conf = max(0.3, min(0.7, float(item.get("confidence", 0.5))))
-            insights.append(SynthesizedInsight(
-                memory_type=mt,
-                content=item.get("content", ""),
-                confidence=conf,
-                evidence_summary=item.get("evidence_summary", ""),
-                source_memory_ids=source_ids,
-            ))
+            insights.append(
+                SynthesizedInsight(
+                    memory_type=mt,
+                    content=item.get("content", ""),
+                    confidence=conf,
+                    evidence_summary=item.get("evidence_summary", ""),
+                    source_memory_ids=source_ids,
+                )
+            )
         return insights
 
     def _persist_insight(self, user_id: str, insight: SynthesizedInsight) -> None:

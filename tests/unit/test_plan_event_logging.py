@@ -65,7 +65,9 @@ class TestPlanEventLogging:
 
         assert event.event_id is not None
         assert event.event_type == "plan_created"
-        metadata = event.metadata if isinstance(event.metadata, dict) else json.loads(event.metadata)
+        metadata = (
+            event.metadata if isinstance(event.metadata, dict) else json.loads(event.metadata)
+        )
         assert metadata["plan_id"] == "plan_001"
         assert metadata["goal"] == "Test goal"
 
@@ -85,7 +87,9 @@ class TestPlanEventLogging:
             plan_data=plan_data,
         )
 
-        metadata = event.metadata if isinstance(event.metadata, dict) else json.loads(event.metadata)
+        metadata = (
+            event.metadata if isinstance(event.metadata, dict) else json.loads(event.metadata)
+        )
         assert metadata["revision_of"] == "plan_001"
 
     def test_create_plan_event_with_causal_chain(self, event_logger, db):
@@ -165,21 +169,27 @@ class TestRestorePlanFromEvents:
     def test_restore_plan_basic(self, db):
         """Test restoring a basic plan from events."""
         from uuid_utils import uuid7
-        
+
         # Create plan event - use ORM attribute names
-        db.add(Event(
-            event_id=str(uuid7()),
-            session_id="session_001",
-            event_type="plan_created",
-            content=json.dumps({
-                "plan_id": "plan_001",
-                "goal": "Test goal",
-                "steps": [{"step_id": "step_1", "description": "Test step", "status": "pending"}]
-            }),
-            event_metadata={"goal": "Test goal"},  # Use ORM attribute, dict not string
-            user_id="user_001",
-            causal_chain_id=str(uuid7()),
-        ))
+        db.add(
+            Event(
+                event_id=str(uuid7()),
+                session_id="session_001",
+                event_type="plan_created",
+                content=json.dumps(
+                    {
+                        "plan_id": "plan_001",
+                        "goal": "Test goal",
+                        "steps": [
+                            {"step_id": "step_1", "description": "Test step", "status": "pending"}
+                        ],
+                    }
+                ),
+                event_metadata={"goal": "Test goal"},  # Use ORM attribute, dict not string
+                user_id="user_001",
+                causal_chain_id=str(uuid7()),
+            )
+        )
         db.commit()
 
         plan = restore_plan_from_events(db, "Test goal")
@@ -192,55 +202,76 @@ class TestRestorePlanFromEvents:
     def test_restore_plan_with_step_progress(self, db):
         """Test restoring plan with step progress."""
         from uuid_utils import uuid7
-        
+
         chain_id = str(uuid7())
-        
+
         # Create plan event
-        db.add(Event(
-            event_id=str(uuid7()),
-            session_id="session_001",
-            event_type="plan_created",
-            content=json.dumps({
-                "plan_id": "plan_001",
-                "goal": "Test",
-                "steps": [
-                    {"step_id": "step_1", "description": "Step 1", "status": "pending"},
-                    {"step_id": "step_2", "description": "Step 2", "status": "pending"}
-                ]
-            }),
-            event_metadata={"goal": "Test"},
-            user_id="user_001",
-            causal_chain_id=chain_id,
-        ))
-        
+        db.add(
+            Event(
+                event_id=str(uuid7()),
+                session_id="session_001",
+                event_type="plan_created",
+                content=json.dumps(
+                    {
+                        "plan_id": "plan_001",
+                        "goal": "Test",
+                        "steps": [
+                            {"step_id": "step_1", "description": "Step 1", "status": "pending"},
+                            {"step_id": "step_2", "description": "Step 2", "status": "pending"},
+                        ],
+                    }
+                ),
+                event_metadata={"goal": "Test"},
+                user_id="user_001",
+                causal_chain_id=chain_id,
+            )
+        )
+
         # Create step events
-        db.add(Event(
-            event_id=str(uuid7()),
-            session_id="session_001",
-            event_type="plan_step_start",
-            content=json.dumps({"plan_id": "plan_001", "step_id": "step_1", "description": "Step 1"}),
-            user_id="user_001",
-            causal_chain_id=chain_id,
-        ))
-        
-        db.add(Event(
-            event_id=str(uuid7()),
-            session_id="session_001",
-            event_type="plan_step_done",
-            content=json.dumps({"plan_id": "plan_001", "step_id": "step_1", "status": "completed", "result": "Success"}),
-            user_id="user_001",
-            causal_chain_id=chain_id,
-        ))
-        
-        db.add(Event(
-            event_id=str(uuid7()),
-            session_id="session_001",
-            event_type="plan_step_start",
-            content=json.dumps({"plan_id": "plan_001", "step_id": "step_2", "description": "Step 2"}),
-            user_id="user_001",
-            causal_chain_id=chain_id,
-        ))
-        
+        db.add(
+            Event(
+                event_id=str(uuid7()),
+                session_id="session_001",
+                event_type="plan_step_start",
+                content=json.dumps(
+                    {"plan_id": "plan_001", "step_id": "step_1", "description": "Step 1"}
+                ),
+                user_id="user_001",
+                causal_chain_id=chain_id,
+            )
+        )
+
+        db.add(
+            Event(
+                event_id=str(uuid7()),
+                session_id="session_001",
+                event_type="plan_step_done",
+                content=json.dumps(
+                    {
+                        "plan_id": "plan_001",
+                        "step_id": "step_1",
+                        "status": "completed",
+                        "result": "Success",
+                    }
+                ),
+                user_id="user_001",
+                causal_chain_id=chain_id,
+            )
+        )
+
+        db.add(
+            Event(
+                event_id=str(uuid7()),
+                session_id="session_001",
+                event_type="plan_step_start",
+                content=json.dumps(
+                    {"plan_id": "plan_001", "step_id": "step_2", "description": "Step 2"}
+                ),
+                user_id="user_001",
+                causal_chain_id=chain_id,
+            )
+        )
+
         db.commit()
 
         plan = restore_plan_from_events(db, "Test")
@@ -260,40 +291,60 @@ class TestRestorePlanFromEvents:
     def test_restore_revised_plan(self, db):
         """Test restoring the latest revision of a plan."""
         from uuid_utils import uuid7
-        
+
         chain_id = str(uuid7())
-        
+
         # Create original plan
-        db.add(Event(
-            event_id=str(uuid7()),
-            session_id="session_001",
-            event_type="plan_created",
-            content=json.dumps({
-                "plan_id": "plan_001",
-                "goal": "Test",
-                "steps": [{"step_id": "step_1", "description": "Original step", "status": "pending"}]
-            }),
-            event_metadata={"goal": "Test"},
-            user_id="user_001",
-            causal_chain_id=chain_id,
-        ))
-        
+        db.add(
+            Event(
+                event_id=str(uuid7()),
+                session_id="session_001",
+                event_type="plan_created",
+                content=json.dumps(
+                    {
+                        "plan_id": "plan_001",
+                        "goal": "Test",
+                        "steps": [
+                            {
+                                "step_id": "step_1",
+                                "description": "Original step",
+                                "status": "pending",
+                            }
+                        ],
+                    }
+                ),
+                event_metadata={"goal": "Test"},
+                user_id="user_001",
+                causal_chain_id=chain_id,
+            )
+        )
+
         # Create revised plan
-        db.add(Event(
-            event_id=str(uuid7()),
-            session_id="session_001",
-            event_type="plan_revised",
-            content=json.dumps({
-                "plan_id": "plan_002",
-                "goal": "Test",
-                "revision_of": "plan_001",
-                "steps": [{"step_id": "step_1", "description": "Revised step", "status": "pending"}]
-            }),
-            event_metadata={"goal": "Test", "revision_of": "plan_001"},
-            user_id="user_001",
-            causal_chain_id=chain_id,
-        ))
-        
+        db.add(
+            Event(
+                event_id=str(uuid7()),
+                session_id="session_001",
+                event_type="plan_revised",
+                content=json.dumps(
+                    {
+                        "plan_id": "plan_002",
+                        "goal": "Test",
+                        "revision_of": "plan_001",
+                        "steps": [
+                            {
+                                "step_id": "step_1",
+                                "description": "Revised step",
+                                "status": "pending",
+                            }
+                        ],
+                    }
+                ),
+                event_metadata={"goal": "Test", "revision_of": "plan_001"},
+                user_id="user_001",
+                causal_chain_id=chain_id,
+            )
+        )
+
         db.commit()
 
         plan = restore_plan_from_events(db, "Test")
@@ -308,27 +359,33 @@ class TestRestorePlanFromEvents:
 
         chain_id = str(uuid7())
 
-        db.add(Event(
-            event_id=str(uuid7()),
-            session_id="session_001",
-            event_type="plan_created",
-            content=json.dumps({
-                "plan_id": "plan_done",
-                "goal": "Finished goal",
-                "steps": [{"step_id": "s1", "description": "Done", "status": "completed"}],
-            }),
-            event_metadata={"goal": "Finished goal"},
-            user_id="user_001",
-            causal_chain_id=chain_id,
-        ))
-        db.add(Event(
-            event_id=str(uuid7()),
-            session_id="session_001",
-            event_type="plan_completed",
-            content=json.dumps({"plan_id": "plan_done", "summary": "all done"}),
-            user_id="user_001",
-            causal_chain_id=chain_id,
-        ))
+        db.add(
+            Event(
+                event_id=str(uuid7()),
+                session_id="session_001",
+                event_type="plan_created",
+                content=json.dumps(
+                    {
+                        "plan_id": "plan_done",
+                        "goal": "Finished goal",
+                        "steps": [{"step_id": "s1", "description": "Done", "status": "completed"}],
+                    }
+                ),
+                event_metadata={"goal": "Finished goal"},
+                user_id="user_001",
+                causal_chain_id=chain_id,
+            )
+        )
+        db.add(
+            Event(
+                event_id=str(uuid7()),
+                session_id="session_001",
+                event_type="plan_completed",
+                content=json.dumps({"plan_id": "plan_done", "summary": "all done"}),
+                user_id="user_001",
+                causal_chain_id=chain_id,
+            )
+        )
         db.commit()
 
         plan = restore_plan_from_events(db, "Finished goal")
@@ -340,27 +397,33 @@ class TestRestorePlanFromEvents:
 
         chain_id = str(uuid7())
 
-        db.add(Event(
-            event_id=str(uuid7()),
-            session_id="session_001",
-            event_type="plan_created",
-            content=json.dumps({
-                "plan_id": "plan_fail",
-                "goal": "Failed goal",
-                "steps": [{"step_id": "s1", "description": "Fail", "status": "pending"}],
-            }),
-            event_metadata={"goal": "Failed goal"},
-            user_id="user_001",
-            causal_chain_id=chain_id,
-        ))
-        db.add(Event(
-            event_id=str(uuid7()),
-            session_id="session_001",
-            event_type="plan_failed",
-            content=json.dumps({"plan_id": "plan_fail", "reason": "constraint violation"}),
-            user_id="user_001",
-            causal_chain_id=chain_id,
-        ))
+        db.add(
+            Event(
+                event_id=str(uuid7()),
+                session_id="session_001",
+                event_type="plan_created",
+                content=json.dumps(
+                    {
+                        "plan_id": "plan_fail",
+                        "goal": "Failed goal",
+                        "steps": [{"step_id": "s1", "description": "Fail", "status": "pending"}],
+                    }
+                ),
+                event_metadata={"goal": "Failed goal"},
+                user_id="user_001",
+                causal_chain_id=chain_id,
+            )
+        )
+        db.add(
+            Event(
+                event_id=str(uuid7()),
+                session_id="session_001",
+                event_type="plan_failed",
+                content=json.dumps({"plan_id": "plan_fail", "reason": "constraint violation"}),
+                user_id="user_001",
+                causal_chain_id=chain_id,
+            )
+        )
         db.commit()
 
         plan = restore_plan_from_events(db, "Failed goal")

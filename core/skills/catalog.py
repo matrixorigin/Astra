@@ -80,6 +80,7 @@ class SkillCatalog(DbConsumer):
         if embed_fn is None:
             try:
                 from core.context.embeddings import get_embedding_client
+
                 embed_fn = get_embedding_client().embed
             except Exception:
                 pass
@@ -130,6 +131,7 @@ class SkillCatalog(DbConsumer):
             raise ValueError(f"Invalid source: {source}")
         if tags is not None:
             from core.skills.prefilter import validate_tags
+
             validate_tags(tags)  # Raises ValueError on invalid
         if status == "draft":
             is_active = False
@@ -346,33 +348,38 @@ class SkillCatalog(DbConsumer):
                 if embedding_val is not None:
                     existing.embedding = embedding_val
             else:
-                db.add(SkillModel(
-                    skill_id=skill_id,
-                    skill_name=skill_name,
-                    version=version,
-                    description=description,
-                    skill_definition=skill_definition,
-                    code_hash=code_hash,
-                    git_commit_hash=git_commit_hash,
-                    is_active=1 if is_active else 0,
-                    status=status,
-                    source=source,
-                    created_by=created_by,
-                    category=category,
-                    subcategory=subcategory,
-                    triggers=triggers,
-                    dependencies=dependencies,
-                    priority=priority,
-                    cost_estimate=cost_estimate,
-                    side_effect_profile=side_effect_profile,
-                    manifest=manifest,
-                    tags=tags,
-                    embedding=embedding_val,
-                ))
+                db.add(
+                    SkillModel(
+                        skill_id=skill_id,
+                        skill_name=skill_name,
+                        version=version,
+                        description=description,
+                        skill_definition=skill_definition,
+                        code_hash=code_hash,
+                        git_commit_hash=git_commit_hash,
+                        is_active=1 if is_active else 0,
+                        status=status,
+                        source=source,
+                        created_by=created_by,
+                        category=category,
+                        subcategory=subcategory,
+                        triggers=triggers,
+                        dependencies=dependencies,
+                        priority=priority,
+                        cost_estimate=cost_estimate,
+                        side_effect_profile=side_effect_profile,
+                        manifest=manifest,
+                        tags=tags,
+                        embedding=embedding_val,
+                    )
+                )
             db.commit()
 
     def _compute_embedding(
-        self, name: str, description: str | None, triggers: list | None,
+        self,
+        name: str,
+        description: str | None,
+        triggers: list | None,
     ) -> str | None:
         """Return vector literal for DB storage, or None if embedding unavailable."""
         if not self._embed_fn:
@@ -435,23 +442,25 @@ class SkillCatalog(DbConsumer):
                     SkillModel.skill_name == name,
                     SkillModel.created_by == user_id,
                 ).update({"is_active": 0})
-                db.add(SkillModel(
-                    skill_id=skill_id,
-                    skill_name=name,
-                    version=version,
-                    description=description,
-                    is_active=1,
-                    status="active",
-                    source=SOURCE_USER,
-                    created_by=user_id,
-                    is_public=0,
-                    triggers=triggers,
-                    dependencies=dependencies,
-                    manifest=manifest,
-                    category=category,
-                    priority=priority,
-                    cost_estimate="low",
-                ))
+                db.add(
+                    SkillModel(
+                        skill_id=skill_id,
+                        skill_name=name,
+                        version=version,
+                        description=description,
+                        is_active=1,
+                        status="active",
+                        source=SOURCE_USER,
+                        created_by=user_id,
+                        is_public=0,
+                        triggers=triggers,
+                        dependencies=dependencies,
+                        manifest=manifest,
+                        category=category,
+                        priority=priority,
+                        cost_estimate="low",
+                    )
+                )
             db.commit()
 
         self._invalidate_cache()
@@ -462,20 +471,28 @@ class SkillCatalog(DbConsumer):
         from api.models import SkillInstallation
 
         with self._db() as db:
-            rows = db.query(SkillModel).filter(
-                SkillModel.skill_name == name,
-                SkillModel.source == SOURCE_USER,
-                SkillModel.created_by == user_id,
-            ).all()
+            rows = (
+                db.query(SkillModel)
+                .filter(
+                    SkillModel.skill_name == name,
+                    SkillModel.source == SOURCE_USER,
+                    SkillModel.created_by == user_id,
+                )
+                .all()
+            )
             if not rows:
                 raise SkillNotFoundError(name)
 
             # Check if other users have installed it
-            install_count = db.query(SkillInstallation).filter(
-                SkillInstallation.skill_name == name,
-                SkillInstallation.status == "installed",
-                SkillInstallation.user_id != user_id,
-            ).count()
+            install_count = (
+                db.query(SkillInstallation)
+                .filter(
+                    SkillInstallation.skill_name == name,
+                    SkillInstallation.status == "installed",
+                    SkillInstallation.user_id != user_id,
+                )
+                .count()
+            )
 
             if install_count > 0:
                 for row in rows:
@@ -496,7 +513,9 @@ class SkillCatalog(DbConsumer):
 
     # ── Conflict detection ────────────────────────────────────────
 
-    def _check_name_conflict(self, db: Session, name: str, source: str, user_id: str | None) -> None:
+    def _check_name_conflict(
+        self, db: Session, name: str, source: str, user_id: str | None
+    ) -> None:
         """Check for name conflicts based on source hierarchy."""
         existing = db.query(SkillModel).filter(SkillModel.skill_name == name).first()
         if not existing:
@@ -532,10 +551,14 @@ class SkillCatalog(DbConsumer):
         with self._db() as db:
             # Look up by (skill_name, version) — the skill_id primary key may
             # be an opaque string rather than the "name@version" convention.
-            existing = db.query(SkillModel).filter(
-                SkillModel.skill_name == skill_name,
-                SkillModel.version == version,
-            ).first()
+            existing = (
+                db.query(SkillModel)
+                .filter(
+                    SkillModel.skill_name == skill_name,
+                    SkillModel.version == version,
+                )
+                .first()
+            )
             if not existing:
                 return False
 
@@ -573,10 +596,15 @@ class SkillCatalog(DbConsumer):
             return
 
         with self._db() as db:
-            row = db.query(SkillModel).filter(
-                SkillModel.skill_name == skill_name,
-                SkillModel.status.in_(("draft", "deprecated")),
-            ).order_by(SkillModel.created_at.desc()).first()
+            row = (
+                db.query(SkillModel)
+                .filter(
+                    SkillModel.skill_name == skill_name,
+                    SkillModel.status.in_(("draft", "deprecated")),
+                )
+                .order_by(SkillModel.created_at.desc())
+                .first()
+            )
             if not row:
                 raise ValueError(f"No draft/deprecated version of '{skill_name}' to activate")
             target_version = row.version
@@ -592,9 +620,14 @@ class SkillCatalog(DbConsumer):
         Delegates to ``set_status`` so transition rules are enforced uniformly.
         """
         with self._db() as db:
-            row = db.query(SkillModel).filter(
-                SkillModel.skill_name == skill_name, SkillModel.is_active == 1,
-            ).first()
+            row = (
+                db.query(SkillModel)
+                .filter(
+                    SkillModel.skill_name == skill_name,
+                    SkillModel.is_active == 1,
+                )
+                .first()
+            )
             if not row:
                 raise ValueError(f"No active skill '{skill_name}' to deprecate")
             target_version = row.version
@@ -623,17 +656,27 @@ class SkillCatalog(DbConsumer):
         as an ``active → active`` no-op.
         """
         with self._db() as db:
-            current = db.query(SkillModel).filter(
-                SkillModel.skill_name == skill_name, SkillModel.is_active == 1,
-            ).first()
+            current = (
+                db.query(SkillModel)
+                .filter(
+                    SkillModel.skill_name == skill_name,
+                    SkillModel.is_active == 1,
+                )
+                .first()
+            )
             if not current:
                 raise ValueError(f"No active version of '{skill_name}' to rollback")
 
-            previous = db.query(SkillModel).filter(
-                SkillModel.skill_name == skill_name,
-                SkillModel.is_active == 0,
-                SkillModel.status == "active",
-            ).order_by(SkillModel.created_at.desc(), SkillModel.skill_id.desc()).first()
+            previous = (
+                db.query(SkillModel)
+                .filter(
+                    SkillModel.skill_name == skill_name,
+                    SkillModel.is_active == 0,
+                    SkillModel.status == "active",
+                )
+                .order_by(SkillModel.created_at.desc(), SkillModel.skill_id.desc())
+                .first()
+            )
             if not previous:
                 raise ValueError(f"No previous version of '{skill_name}' to rollback to")
 
@@ -653,9 +696,13 @@ class SkillCatalog(DbConsumer):
     def uninstall(self, skill_name: str) -> int:
         """Remove all versions of a skill from catalog. Returns count removed."""
         with self._db() as db:
-            count = db.query(SkillModel).filter(
-                SkillModel.skill_name == skill_name,
-            ).delete(synchronize_session="fetch")
+            count = (
+                db.query(SkillModel)
+                .filter(
+                    SkillModel.skill_name == skill_name,
+                )
+                .delete(synchronize_session="fetch")
+            )
             db.commit()
         self._evict(skill_name)
         logger.info("Uninstalled %s (%d versions)", skill_name, count)
@@ -718,7 +765,10 @@ class SkillCatalog(DbConsumer):
         return self._query_metadata(skill_name)
 
     def _query_metadata(
-        self, skill_name: str, timestamp: str | None = None, commit: str | None = None,
+        self,
+        skill_name: str,
+        timestamp: str | None = None,
+        commit: str | None = None,
     ) -> dict | None:
         """Cached DB query for skill metadata.
 
@@ -737,21 +787,35 @@ class SkillCatalog(DbConsumer):
 
         with self._db() as db:
             if commit:
-                skill = db.query(SkillModel).filter(
-                    SkillModel.skill_name == skill_name,
-                    SkillModel.git_commit_hash == commit,
-                ).order_by(SkillModel.created_at.desc()).first()
+                skill = (
+                    db.query(SkillModel)
+                    .filter(
+                        SkillModel.skill_name == skill_name,
+                        SkillModel.git_commit_hash == commit,
+                    )
+                    .order_by(SkillModel.created_at.desc())
+                    .first()
+                )
             elif timestamp:
                 dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-                skill = db.query(SkillModel).filter(
-                    SkillModel.skill_name == skill_name,
-                    SkillModel.created_at <= dt,
-                ).order_by(SkillModel.created_at.desc()).first()
+                skill = (
+                    db.query(SkillModel)
+                    .filter(
+                        SkillModel.skill_name == skill_name,
+                        SkillModel.created_at <= dt,
+                    )
+                    .order_by(SkillModel.created_at.desc())
+                    .first()
+                )
             else:
-                skill = db.query(SkillModel).filter(
-                    SkillModel.skill_name == skill_name,
-                    SkillModel.is_active == 1,
-                ).first()
+                skill = (
+                    db.query(SkillModel)
+                    .filter(
+                        SkillModel.skill_name == skill_name,
+                        SkillModel.is_active == 1,
+                    )
+                    .first()
+                )
 
             if not skill:
                 self._metadata_cache[cache_key] = _CACHE_MISS
@@ -764,73 +828,93 @@ class SkillCatalog(DbConsumer):
 
     def list_by_source(self, source: str, limit: int = 100) -> list[dict[str, Any]]:
         """List skills filtered by source.
-        
+
         Args:
             source: Skill source filter
             limit: Max results (default 100, prevents unbounded queries)
         """
         with self._db() as db:
             # Projection: skip embedding column (not returned by _row_to_dict anyway)
-            rows = db.query(
-                SkillModel.skill_id,
-                SkillModel.skill_name,
-                SkillModel.version,
-                SkillModel.description,
-                SkillModel.skill_definition,
-                SkillModel.git_commit_hash,
-                SkillModel.source,
-                SkillModel.status,
-                SkillModel.is_active,
-                SkillModel.created_by,
-                SkillModel.category,
-                SkillModel.cost_estimate,
-                SkillModel.triggers,
-                SkillModel.dependencies,
-                SkillModel.priority,
-                SkillModel.created_at,
-            ).filter(
-                SkillModel.source == source, SkillModel.is_active == 1,
-            ).order_by(SkillModel.created_at.desc()).limit(limit).all()
+            rows = (
+                db.query(
+                    SkillModel.skill_id,
+                    SkillModel.skill_name,
+                    SkillModel.version,
+                    SkillModel.description,
+                    SkillModel.skill_definition,
+                    SkillModel.git_commit_hash,
+                    SkillModel.source,
+                    SkillModel.status,
+                    SkillModel.is_active,
+                    SkillModel.created_by,
+                    SkillModel.category,
+                    SkillModel.cost_estimate,
+                    SkillModel.triggers,
+                    SkillModel.dependencies,
+                    SkillModel.priority,
+                    SkillModel.created_at,
+                )
+                .filter(
+                    SkillModel.source == source,
+                    SkillModel.is_active == 1,
+                )
+                .order_by(SkillModel.created_at.desc())
+                .limit(limit)
+                .all()
+            )
             return [self._row_tuple_to_dict(r) for r in rows]
 
     def list_by_owner(self, user_id: str, limit: int = 100) -> list[dict[str, Any]]:
         """List skills created by a specific user.
-        
+
         Args:
             user_id: User ID filter
             limit: Max results (default 100, prevents unbounded queries)
         """
         with self._db() as db:
             # Projection: skip embedding column
-            rows = db.query(
-                SkillModel.skill_id,
-                SkillModel.skill_name,
-                SkillModel.version,
-                SkillModel.description,
-                SkillModel.skill_definition,
-                SkillModel.git_commit_hash,
-                SkillModel.source,
-                SkillModel.status,
-                SkillModel.is_active,
-                SkillModel.created_by,
-                SkillModel.category,
-                SkillModel.cost_estimate,
-                SkillModel.triggers,
-                SkillModel.dependencies,
-                SkillModel.priority,
-                SkillModel.created_at,
-            ).filter(
-                SkillModel.created_by == user_id,
-            ).order_by(SkillModel.created_at.desc()).limit(limit).all()
+            rows = (
+                db.query(
+                    SkillModel.skill_id,
+                    SkillModel.skill_name,
+                    SkillModel.version,
+                    SkillModel.description,
+                    SkillModel.skill_definition,
+                    SkillModel.git_commit_hash,
+                    SkillModel.source,
+                    SkillModel.status,
+                    SkillModel.is_active,
+                    SkillModel.created_by,
+                    SkillModel.category,
+                    SkillModel.cost_estimate,
+                    SkillModel.triggers,
+                    SkillModel.dependencies,
+                    SkillModel.priority,
+                    SkillModel.created_at,
+                )
+                .filter(
+                    SkillModel.created_by == user_id,
+                )
+                .order_by(SkillModel.created_at.desc())
+                .limit(limit)
+                .all()
+            )
             return [self._row_tuple_to_dict(r) for r in rows]
 
     def list_active(self, limit: int = 100, offset: int = 0) -> dict[str, Any]:
         """List all active skills with pagination."""
         with self._db() as db:
             total = db.query(SkillModel).filter(SkillModel.is_active == 1).count()
-            rows = db.query(SkillModel).filter(
-                SkillModel.is_active == 1,
-            ).order_by(SkillModel.created_at.desc()).offset(offset).limit(limit).all()
+            rows = (
+                db.query(SkillModel)
+                .filter(
+                    SkillModel.is_active == 1,
+                )
+                .order_by(SkillModel.created_at.desc())
+                .offset(offset)
+                .limit(limit)
+                .all()
+            )
             return {
                 "skills": [self._row_to_dict(r) for r in rows],
                 "total": total,
@@ -843,23 +927,35 @@ class SkillCatalog(DbConsumer):
         from api.models import SkillInstallation
 
         with self._db() as db:
-            skill = db.query(SkillModel).filter(
-                SkillModel.skill_name == name, SkillModel.is_active == 1,
-            ).first()
+            skill = (
+                db.query(SkillModel)
+                .filter(
+                    SkillModel.skill_name == name,
+                    SkillModel.is_active == 1,
+                )
+                .first()
+            )
             if not skill:
                 return None
 
-            install_count = db.query(SkillInstallation).filter(
-                SkillInstallation.skill_name == name,
-                SkillInstallation.status == "installed",
-            ).count()
+            install_count = (
+                db.query(SkillInstallation)
+                .filter(
+                    SkillInstallation.skill_name == name,
+                    SkillInstallation.status == "installed",
+                )
+                .count()
+            )
 
             info = self._row_to_dict(skill)
             info["install_count"] = install_count
             return info
 
     def get_visible_skills(
-        self, user_id: str, *, per_group: int = 50,
+        self,
+        user_id: str,
+        *,
+        per_group: int = 50,
     ) -> dict[str, Any]:
         """Get skills visible to a user, grouped by source.
 
@@ -877,8 +973,7 @@ class SkillCatalog(DbConsumer):
             )
             platform_total = platform_q.count()
             platform_skills = (
-                platform_q.order_by(SkillModel.created_at.desc())
-                .limit(per_group).all()
+                platform_q.order_by(SkillModel.created_at.desc()).limit(per_group).all()
             )
 
             # User's own published skills
@@ -887,25 +982,24 @@ class SkillCatalog(DbConsumer):
                 SkillModel.source == SOURCE_USER,
             )
             user_total = user_q.count()
-            user_skills = (
-                user_q.order_by(SkillModel.created_at.desc())
-                .limit(per_group).all()
-            )
+            user_skills = user_q.order_by(SkillModel.created_at.desc()).limit(per_group).all()
 
             # Installed skill names — scoped to current page across all groups
-            page_names = (
-                [s.skill_name for s in platform_skills]
-                + [s.skill_name for s in user_skills]
-            )
+            page_names = [s.skill_name for s in platform_skills] + [
+                s.skill_name for s in user_skills
+            ]
             if page_names:
                 installed_names = {
-                    r.skill_name for r in db.query(
+                    r.skill_name
+                    for r in db.query(
                         SkillInstallation.skill_name,
-                    ).filter(
+                    )
+                    .filter(
                         SkillInstallation.user_id == user_id,
                         SkillInstallation.status == "installed",
                         SkillInstallation.skill_name.in_(page_names),
-                    ).all()
+                    )
+                    .all()
                 }
             else:
                 installed_names = set()
@@ -931,12 +1025,21 @@ class SkillCatalog(DbConsumer):
     def list_versions(self, skill_name: str) -> list[dict[str, Any]]:
         """List all versions of a skill."""
         with self._db() as db:
-            rows = db.query(SkillModel).filter(
-                SkillModel.skill_name == skill_name,
-            ).order_by(SkillModel.created_at.desc()).all()
+            rows = (
+                db.query(SkillModel)
+                .filter(
+                    SkillModel.skill_name == skill_name,
+                )
+                .order_by(SkillModel.created_at.desc())
+                .all()
+            )
             return [
-                {"version": r.version, "status": r.status, "is_active": r.is_active,
-                 "created_at": r.created_at.isoformat() if r.created_at else None}
+                {
+                    "version": r.version,
+                    "status": r.status,
+                    "is_active": r.is_active,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
                 for r in rows
             ]
 
@@ -961,7 +1064,9 @@ class SkillCatalog(DbConsumer):
                 continue
             req = skill.requirements
             type_ok = repo_type in [rt.value for rt in req.repo_types]
-            access_ok = _ACCESS_ORDER.get(repo_access, 0) >= _ACCESS_ORDER.get(req.min_access.value, 0)
+            access_ok = _ACCESS_ORDER.get(repo_access, 0) >= _ACCESS_ORDER.get(
+                req.min_access.value, 0
+            )
             if type_ok and access_ok:
                 available.append(skill)
         return available
@@ -999,10 +1104,14 @@ class SkillCatalog(DbConsumer):
         # Find active DB skills that aren't loadable
         orphans = []
         with self._db() as db:
-            active_skills = db.query(SkillModel).filter(
-                SkillModel.is_active == 1,
-                SkillModel.source == source,
-            ).all()
+            active_skills = (
+                db.query(SkillModel)
+                .filter(
+                    SkillModel.is_active == 1,
+                    SkillModel.source == source,
+                )
+                .all()
+            )
 
             for skill in active_skills:
                 if skill.skill_name not in loadable_names:
@@ -1023,9 +1132,13 @@ class SkillCatalog(DbConsumer):
             return 0
 
         with self._db() as db:
-            count = db.query(SkillModel).filter(
-                SkillModel.skill_id.in_(skill_ids),
-            ).update({"is_active": 0, "status": "orphaned"}, synchronize_session="fetch")
+            count = (
+                db.query(SkillModel)
+                .filter(
+                    SkillModel.skill_id.in_(skill_ids),
+                )
+                .update({"is_active": 0, "status": "orphaned"}, synchronize_session="fetch")
+            )
             db.commit()
 
         self._invalidate_cache()
@@ -1093,7 +1206,7 @@ class SkillCatalog(DbConsumer):
     @staticmethod
     def _row_tuple_to_dict(row) -> dict[str, Any]:
         """Convert query result tuple (from column projection) to metadata dict.
-        
+
         Used when querying specific columns instead of full ORM objects.
         Returns same shape as _row_to_dict() for consistency.
         """

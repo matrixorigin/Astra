@@ -57,16 +57,25 @@ class HybridRetriever(DbConsumer):
             try:
                 dist = l2_distance(EventEmbedding.embedding, query_embedding)
                 sem_score = (weights["semantic"] * (1.0 / (1.0 + dist))).label("sem")
-                temp_score = (weights["temporal"] * func.exp(
-                    -func.timestampdiff(text("HOUR"), Event.created_at, func.now()) / 24.0
-                )).label("temp")
+                temp_score = (
+                    weights["temporal"]
+                    * func.exp(
+                        -func.timestampdiff(text("HOUR"), Event.created_at, func.now()) / 24.0
+                    )
+                ).label("temp")
 
                 rows = (
                     db.query(
-                        Event.event_id, Event.session_id, Event.event_type,
-                        Event.content, Event.created_at, Event.causal_chain_id,
-                        Event.parent_event_id, Event.event_metadata,
-                        sem_score, temp_score,
+                        Event.event_id,
+                        Event.session_id,
+                        Event.event_type,
+                        Event.content,
+                        Event.created_at,
+                        Event.causal_chain_id,
+                        Event.parent_event_id,
+                        Event.event_metadata,
+                        sem_score,
+                        temp_score,
                     )
                     .join(EventEmbedding, Event.event_id == EventEmbedding.event_id)
                     .filter(Event.session_id == session_id)
@@ -75,7 +84,11 @@ class HybridRetriever(DbConsumer):
                     .all()
                 )
                 for r in rows:
-                    causal_bonus = weights["causal"] if (current_chain_id and r.causal_chain_id == current_chain_id) else 0.0
+                    causal_bonus = (
+                        weights["causal"]
+                        if (current_chain_id and r.causal_chain_id == current_chain_id)
+                        else 0.0
+                    )
                     events_by_id[r.event_id] = {
                         "event_id": r.event_id,
                         "session_id": r.session_id,
@@ -94,6 +107,7 @@ class HybridRetriever(DbConsumer):
             # 2. Fulltext search
             try:
                 from matrixone.sqlalchemy_ext import boolean_match
+
                 ft = boolean_match("content", "session_id").must(query_text)
                 # compile() returns a complete SQL literal with the query text
                 # inlined by the SDK — no bind-parameter placeholders.  Escaping
@@ -104,9 +118,14 @@ class HybridRetriever(DbConsumer):
                 ft_score_col = literal_column(ft_sql).label("ft_score")
                 rows = (
                     db.query(
-                        Event.event_id, Event.session_id, Event.event_type,
-                        Event.content, Event.created_at, Event.causal_chain_id,
-                        Event.parent_event_id, Event.event_metadata,
+                        Event.event_id,
+                        Event.session_id,
+                        Event.event_type,
+                        Event.content,
+                        Event.created_at,
+                        Event.causal_chain_id,
+                        Event.parent_event_id,
+                        Event.event_metadata,
                         ft_score_col,
                     )
                     .filter(ft, Event.session_id == session_id)
@@ -144,7 +163,11 @@ class HybridRetriever(DbConsumer):
         events = events[:limit]
 
         if events:
-            logger.info("Hybrid retrieval: %d events, top score: %.3f", len(events), events[0]["relevance_score"])
+            logger.info(
+                "Hybrid retrieval: %d events, top score: %.3f",
+                len(events),
+                events[0]["relevance_score"],
+            )
         return events
 
     def update_weights_from_feedback(
@@ -172,7 +195,11 @@ class HybridRetriever(DbConsumer):
             Updated weights dict (also stored in-memory for next retrieval).
         """
         if not (0.0 <= quality_score <= 1.0):
-            logger.warning("Invalid quality_score %.3f for session %s, skipping weight update", quality_score, session_id)
+            logger.warning(
+                "Invalid quality_score %.3f for session %s, skipping weight update",
+                quality_score,
+                session_id,
+            )
             return self._current_weights()
 
         vector_frac = retrieval_metadata.get("vector_fraction", 0.5)
@@ -184,7 +211,7 @@ class HybridRetriever(DbConsumer):
         # Nudge semantic/keyword weights proportional to their usage fraction
         w = self._current_weights()
         w["semantic"] = max(0.05, min(0.80, w["semantic"] + learning_rate * reward * vector_frac))
-        w["keyword"]  = max(0.05, min(0.80, w["keyword"]  + learning_rate * reward * keyword_frac))
+        w["keyword"] = max(0.05, min(0.80, w["keyword"] + learning_rate * reward * keyword_frac))
 
         # Renormalize all four weights so they sum to 1.
         # temporal and causal are included in the denominator so the total stays
@@ -198,15 +225,29 @@ class HybridRetriever(DbConsumer):
         self._weights = w
         logger.info(
             "Weight update for session %s (quality=%.2f): semantic=%.3f keyword=%.3f temporal=%.3f causal=%.3f",
-            session_id, quality_score, w["semantic"], w["keyword"], w["temporal"], w["causal"],
+            session_id,
+            quality_score,
+            w["semantic"],
+            w["keyword"],
+            w["temporal"],
+            w["causal"],
         )
         return w
 
     def _current_weights(self) -> dict[str, float]:
         """Return current weights (instance-level override or defaults)."""
-        return dict(getattr(self, "_weights", {
-            "semantic": 0.35, "keyword": 0.25, "temporal": 0.20, "causal": 0.20,
-        }))
+        return dict(
+            getattr(
+                self,
+                "_weights",
+                {
+                    "semantic": 0.35,
+                    "keyword": 0.25,
+                    "temporal": 0.20,
+                    "causal": 0.20,
+                },
+            )
+        )
 
     def retrieve_knowledge(
         self,
@@ -235,13 +276,22 @@ class HybridRetriever(DbConsumer):
         with self._db() as db:
             # Vector + confidence scoring
             try:
-                sem = (weights["semantic"] * (1.0 / (1.0 + l2_distance(K.embedding, query_embedding)))).label("sem")
+                sem = (
+                    weights["semantic"] * (1.0 / (1.0 + l2_distance(K.embedding, query_embedding)))
+                ).label("sem")
                 conf = (weights["confidence"] * K.confidence).label("conf")
                 rows = (
                     db.query(
-                        K.entry_id, K.category, K.key_name, K.value,
-                        K.confidence, K.trust_tier, K.created_at, K.last_validated_at,
-                        sem, conf,
+                        K.entry_id,
+                        K.category,
+                        K.key_name,
+                        K.value,
+                        K.confidence,
+                        K.trust_tier,
+                        K.created_at,
+                        K.last_validated_at,
+                        sem,
+                        conf,
                     )
                     .filter(
                         K.user_id == user_id,
@@ -255,22 +305,30 @@ class HybridRetriever(DbConsumer):
                 entries_by_id: dict[str, dict[str, Any]] = {}
                 for r in rows:
                     entries_by_id[r.entry_id] = {
-                        "entry_id": r.entry_id, "category": r.category,
-                        "key_name": r.key_name, "value": r.value,
-                        "confidence": float(r.confidence), "trust_tier": r.trust_tier,
+                        "entry_id": r.entry_id,
+                        "category": r.category,
+                        "key_name": r.key_name,
+                        "value": r.value,
+                        "confidence": float(r.confidence),
+                        "trust_tier": r.trust_tier,
                         "created_at": r.created_at.isoformat() if r.created_at else None,
-                        "last_validated_at": r.last_validated_at.isoformat() if r.last_validated_at else None,
+                        "last_validated_at": r.last_validated_at.isoformat()
+                        if r.last_validated_at
+                        else None,
                         "relevance_score": float(r.sem) + float(r.conf),
                     }
 
                 # Fulltext boost — add BM25-weighted keyword score to matching entries
                 try:
                     from matrixone.sqlalchemy_ext import boolean_match
+
                     ft = boolean_match("value").must(query_text)
                     # compile() returns a complete SQL literal — see events
                     # retrieval comment above for rationale.
                     ft_sql = ft.compile()
-                    assert ft_sql.startswith("MATCH("), f"Unexpected ft.compile() output: {ft_sql!r}"
+                    assert ft_sql.startswith("MATCH("), (
+                        f"Unexpected ft.compile() output: {ft_sql!r}"
+                    )
                     ft_score_col = literal_column(ft_sql).label("ft_score")
                     ft_rows = (
                         db.query(K.entry_id, ft_score_col)
@@ -293,12 +351,20 @@ class HybridRetriever(DbConsumer):
                             raw = ft_scores.get(full.entry_id, 0.0)
                             norm = raw / (raw + 1.0) if raw > 0 else 0.0
                             entries_by_id[full.entry_id] = {
-                                "entry_id": full.entry_id, "category": full.category,
-                                "key_name": full.key_name, "value": full.value,
-                                "confidence": float(full.confidence), "trust_tier": full.trust_tier,
-                                "created_at": full.created_at.isoformat() if full.created_at else None,
-                                "last_validated_at": full.last_validated_at.isoformat() if full.last_validated_at else None,
-                                "relevance_score": weights["keyword"] * norm + weights["confidence"] * float(full.confidence),
+                                "entry_id": full.entry_id,
+                                "category": full.category,
+                                "key_name": full.key_name,
+                                "value": full.value,
+                                "confidence": float(full.confidence),
+                                "trust_tier": full.trust_tier,
+                                "created_at": full.created_at.isoformat()
+                                if full.created_at
+                                else None,
+                                "last_validated_at": full.last_validated_at.isoformat()
+                                if full.last_validated_at
+                                else None,
+                                "relevance_score": weights["keyword"] * norm
+                                + weights["confidence"] * float(full.confidence),
                             }
                 except Exception as e:
                     logger.warning("Knowledge fulltext search failed (non-fatal): %s", e)
@@ -307,9 +373,15 @@ class HybridRetriever(DbConsumer):
                     except Exception:
                         pass
 
-                entries = sorted(entries_by_id.values(), key=lambda x: x["relevance_score"], reverse=True)[:limit]
+                entries = sorted(
+                    entries_by_id.values(), key=lambda x: x["relevance_score"], reverse=True
+                )[:limit]
                 if entries:
-                    logger.info("Knowledge retrieval: %d entries, top score: %.3f", len(entries), entries[0]["relevance_score"])
+                    logger.info(
+                        "Knowledge retrieval: %d entries, top score: %.3f",
+                        len(entries),
+                        entries[0]["relevance_score"],
+                    )
             except Exception as e:
                 logger.error("Knowledge retrieval failed: %s", e)
 
@@ -321,6 +393,7 @@ class HybridRetriever(DbConsumer):
             if entries:
                 try:
                     from skills.knowledge.api import expand_with_graph
+
                     seed_ids = [e["entry_id"] for e in entries[:5]]
                     expanded_ids = expand_with_graph(db, seed_ids, limit_per_entry=2)
                     if expanded_ids:
@@ -329,19 +402,32 @@ class HybridRetriever(DbConsumer):
                         if new_ids:
                             graph_rows = (
                                 db.query(K)
-                                .filter(K.entry_id.in_(new_ids), K.user_id == user_id, K.confidence > confidence_threshold)
+                                .filter(
+                                    K.entry_id.in_(new_ids),
+                                    K.user_id == user_id,
+                                    K.confidence > confidence_threshold,
+                                )
                                 .all()
                             )
                             for r in graph_rows:
-                                entries.append({
-                                    "entry_id": r.entry_id, "category": r.category,
-                                    "key_name": r.key_name, "value": r.value,
-                                    "confidence": float(r.confidence), "trust_tier": r.trust_tier,
-                                    "created_at": r.created_at.isoformat() if r.created_at else None,
-                                    "last_validated_at": r.last_validated_at.isoformat() if r.last_validated_at else None,
-                                    "relevance_score": 0.0,
-                                    "source": "graph_expansion",
-                                })
+                                entries.append(
+                                    {
+                                        "entry_id": r.entry_id,
+                                        "category": r.category,
+                                        "key_name": r.key_name,
+                                        "value": r.value,
+                                        "confidence": float(r.confidence),
+                                        "trust_tier": r.trust_tier,
+                                        "created_at": r.created_at.isoformat()
+                                        if r.created_at
+                                        else None,
+                                        "last_validated_at": r.last_validated_at.isoformat()
+                                        if r.last_validated_at
+                                        else None,
+                                        "relevance_score": 0.0,
+                                        "source": "graph_expansion",
+                                    }
+                                )
                             if graph_rows:
                                 tracked_ids.extend(r.entry_id for r in graph_rows)
                 except Exception as e:
@@ -350,6 +436,7 @@ class HybridRetriever(DbConsumer):
         # Fire-and-forget access tracking outside the read session
         if tracked_ids:
             from skills.knowledge.api import update_access_tracking
+
             update_access_tracking(self._db, tracked_ids)
 
         return entries

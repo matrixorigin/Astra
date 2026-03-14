@@ -36,6 +36,7 @@ class TestCriticalPathVerification:
     @pytest.fixture
     def db_factory(self):
         from api.database import SessionLocal
+
         return SessionLocal
 
     @pytest.fixture
@@ -44,11 +45,12 @@ class TestCriticalPathVerification:
         yield memory_ids
         if memory_ids:
             from sqlalchemy import text
+
             db = db_factory()
             try:
                 db.execute(
                     text("DELETE FROM mem_memories WHERE memory_id IN :ids"),
-                    {"ids": tuple(memory_ids)}
+                    {"ids": tuple(memory_ids)},
                 )
                 db.commit()
             finally:
@@ -85,7 +87,9 @@ class TestCriticalPathVerification:
         # CRITICAL: verify vector search actually ran
         assert stats.vector_attempted is True, "Vector search should have been attempted"
         assert stats.vector_error is None, f"Vector search failed with: {stats.vector_error}"
-        print(f"✓ Vector search executed: {stats.phase2_candidates} candidates in {stats.phase2_ms:.1f}ms")
+        print(
+            f"✓ Vector search executed: {stats.phase2_candidates} candidates in {stats.phase2_ms:.1f}ms"
+        )
 
     def test_fulltext_search_actually_executes(self, db_factory, cleanup_memories):
         """MATCH AGAINST fulltext search runs on DB, not fallback."""
@@ -118,7 +122,9 @@ class TestCriticalPathVerification:
         # Note: keyword_hit may be False if no fulltext index, but error should be None if it ran
         if stats.keyword_error:
             pytest.fail(f"Fulltext search failed with: {stats.keyword_error}")
-        print(f"✓ Fulltext search executed: hit={stats.keyword_hit}, {stats.phase1_candidates} candidates in {stats.phase1_ms:.1f}ms")
+        print(
+            f"✓ Fulltext search executed: hit={stats.keyword_hit}, {stats.phase1_candidates} candidates in {stats.phase1_ms:.1f}ms"
+        )
 
     def test_contradiction_detection_actually_executes(self, db_factory, cleanup_memories):
         """Contradiction detection L2_DISTANCE runs on DB, not fallback."""
@@ -162,7 +168,9 @@ class TestCriticalPathVerification:
         # Should have found the contradiction (same embedding, different content)
         assert stats.found is True, "Should have found contradiction"
         assert stats.superseded_id == old_mem.memory_id, "Should have superseded old memory"
-        print(f"✓ Contradiction detection executed: found={stats.found}, superseded={stats.superseded_id}, {stats.query_ms:.1f}ms")
+        print(
+            f"✓ Contradiction detection executed: found={stats.found}, superseded={stats.superseded_id}, {stats.query_ms:.1f}ms"
+        )
 
     def test_all_paths_summary(self, db_factory, cleanup_memories):
         """Summary test: run all critical paths and report."""
@@ -183,29 +191,39 @@ class TestCriticalPathVerification:
         cleanup_memories.append(mem.memory_id)
         store.create(mem)
 
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("CRITICAL PATH VERIFICATION SUMMARY")
-        print("="*60)
+        print("=" * 60)
 
         # 1. Vector search
         _, stats = retriever.retrieve(
-            user_id=user_id, query_text="test", session_id="s",
-            query_embedding=[0.3] * EMBEDDING_DIM, explain=True,
+            user_id=user_id,
+            query_text="test",
+            session_id="s",
+            query_embedding=[0.3] * EMBEDDING_DIM,
+            explain=True,
         )
         vec_ok = stats.vector_attempted and stats.vector_error is None
-        print(f"[{'✓' if vec_ok else '✗'}] Vector Search (L2_DISTANCE): {'OK' if vec_ok else stats.vector_error}")
+        print(
+            f"[{'✓' if vec_ok else '✗'}] Vector Search (L2_DISTANCE): {'OK' if vec_ok else stats.vector_error}"
+        )
 
         # 2. Fulltext search
         _, stats = retriever.retrieve(
-            user_id=user_id, query_text="Summary test", session_id="s",
+            user_id=user_id,
+            query_text="Summary test",
+            session_id="s",
             explain=True,
         )
         ft_ok = stats.keyword_attempted and stats.keyword_error is None
-        print(f"[{'✓' if ft_ok else '✗'}] Fulltext Search (MATCH AGAINST): {'OK' if ft_ok else stats.keyword_error}")
+        print(
+            f"[{'✓' if ft_ok else '✗'}] Fulltext Search (MATCH AGAINST): {'OK' if ft_ok else stats.keyword_error}"
+        )
 
         # 3. Contradiction detection
         observer = TypedObserver(
-            store=store, llm_client=None,
+            store=store,
+            llm_client=None,
             embed_fn=lambda x: [0.3] * EMBEDDING_DIM,
             db_factory=db_factory,
         )
@@ -217,9 +235,11 @@ class TestCriticalPathVerification:
             explain=True,
         )
         cd_ok = stats.checked and stats.error is None
-        print(f"[{'✓' if cd_ok else '✗'}] Contradiction Detection: {'OK' if cd_ok else stats.error}")
+        print(
+            f"[{'✓' if cd_ok else '✗'}] Contradiction Detection: {'OK' if cd_ok else stats.error}"
+        )
 
-        print("="*60)
+        print("=" * 60)
 
         # All must pass
         assert vec_ok, "Vector search failed"

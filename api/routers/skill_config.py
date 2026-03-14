@@ -50,12 +50,18 @@ def initialize() -> None:
     def _manifest_loader(skill_name: str) -> dict | None:
         db = SessionLocal()
         try:
-            row = db.query(
-                SkillRegistry.manifest, SkillRegistry.skill_definition,
-            ).filter(
-                SkillRegistry.skill_name == skill_name,
-                SkillRegistry.is_active == 1,
-            ).order_by(SkillRegistry.created_at.desc()).first()
+            row = (
+                db.query(
+                    SkillRegistry.manifest,
+                    SkillRegistry.skill_definition,
+                )
+                .filter(
+                    SkillRegistry.skill_name == skill_name,
+                    SkillRegistry.is_active == 1,
+                )
+                .order_by(SkillRegistry.created_at.desc())
+                .first()
+            )
             if not row:
                 return None
             if row[0]:
@@ -75,6 +81,7 @@ def _get_center() -> SkillConfigCenter:
     if _center is not None:
         return _center
     from core.skills.config_center import get_config_center
+
     return get_config_center()
 
 
@@ -102,16 +109,21 @@ def _resolve_config_namespace(skill_name: str) -> str:
     from api.models.skill import SkillRegistry as SkillModel
     from core.logging_config import get_logger as _get_logger
     from api.database import SessionLocal
+
     _log = _get_logger(__name__)
 
     db = SessionLocal()
     try:
         # Single query: get this skill's category + manifest, and all siblings' manifests.
         # We use a subquery to first get the category, then fetch all skills in that category.
-        own = db.query(SkillModel.category, SkillModel.manifest).filter(
-            SkillModel.skill_name == skill_name,
-            SkillModel.is_active == 1,
-        ).first()
+        own = (
+            db.query(SkillModel.category, SkillModel.manifest)
+            .filter(
+                SkillModel.skill_name == skill_name,
+                SkillModel.is_active == 1,
+            )
+            .first()
+        )
         if not own:
             return skill_name
 
@@ -124,11 +136,15 @@ def _resolve_config_namespace(skill_name: str) -> str:
             return skill_name
 
         # Find any sibling in the same category that has a manifest.
-        sibling = db.query(SkillModel.manifest).filter(
-            SkillModel.category == category,
-            SkillModel.is_active == 1,
-            SkillModel.manifest.isnot(None),
-        ).first()
+        sibling = (
+            db.query(SkillModel.manifest)
+            .filter(
+                SkillModel.category == category,
+                SkillModel.is_active == 1,
+                SkillModel.manifest.isnot(None),
+            )
+            .first()
+        )
         if sibling and sibling[0]:
             ns = sibling[0].get("name")
             if ns:
@@ -138,9 +154,6 @@ def _resolve_config_namespace(skill_name: str) -> str:
     finally:
         db.close()
     return skill_name
-
-
-
 
 
 def _resolve_scope(
@@ -196,8 +209,10 @@ async def validate_config(
     errors = center.validate(ns, current_user["user_id"], resource_key=resource)
     return ValidationResponse(
         valid=len(errors) == 0,
-        errors=[{"section": e.section, "name": e.name,
-                 "resource_key": e.resource_key, "error": e.error} for e in errors],
+        errors=[
+            {"section": e.section, "name": e.name, "resource_key": e.resource_key, "error": e.error}
+            for e in errors
+        ],
     )
 
 
@@ -216,9 +231,7 @@ async def get_effective_config(
     return ConfigResponse(
         settings=config.settings,
         secrets=dict.fromkeys(config.secrets, "***"),
-        resources_configured=len(
-            center.list_resources(current_user["user_id"], ns)
-        ),
+        resources_configured=len(center.list_resources(current_user["user_id"], ns)),
     )
 
 
@@ -235,8 +248,11 @@ async def set_setting(
     scope_type, scope_id = _resolve_scope(scope, current_user["user_id"], db)
     center = _get_center()
     center.set_setting(
-        skill_name, setting_name, body.value,
-        scope_type=scope_type, scope_id=scope_id,
+        skill_name,
+        setting_name,
+        body.value,
+        scope_type=scope_type,
+        scope_id=scope_id,
         updated_by=current_user["user_id"],
     )
     return {"status": "ok"}
@@ -253,7 +269,9 @@ async def delete_setting(
     """Delete a setting at a specific scope."""
     scope_type, scope_id = _resolve_scope(scope, current_user["user_id"], db)
     center = _get_center()
-    deleted = center.delete_setting(skill_name, setting_name, scope_type=scope_type, scope_id=scope_id)
+    deleted = center.delete_setting(
+        skill_name, setting_name, scope_type=scope_type, scope_id=scope_id
+    )
     if not deleted:
         raise HTTPException(status_code=404, detail="Setting not found at this scope")
     return {"status": "deleted"}

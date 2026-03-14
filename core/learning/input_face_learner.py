@@ -100,9 +100,13 @@ class InputFaceLearner(DbConsumer):
                     results.append(result)
             except Exception as e:
                 logger.error("InputFaceLearner failed on %s: %s", face.value, e)
-                results.append(DiagnosisResult(
-                    input_face=face, bottleneck="", error=str(e),
-                ))
+                results.append(
+                    DiagnosisResult(
+                        input_face=face,
+                        bottleneck="",
+                        error=str(e),
+                    )
+                )
 
         return results
 
@@ -111,7 +115,11 @@ class InputFaceLearner(DbConsumer):
     # ------------------------------------------------------------------
 
     def _run_face(
-        self, face: InputFace, *, days: int, dry_run: bool,
+        self,
+        face: InputFace,
+        *,
+        days: int,
+        dry_run: bool,
     ) -> DiagnosisResult | None:
         if face == InputFace.PROMPT:
             return self._handle_prompt(days=days, dry_run=dry_run)
@@ -124,7 +132,10 @@ class InputFaceLearner(DbConsumer):
     # ── Prompt ────────────────────────────────────────────────────
 
     def _handle_prompt(
-        self, *, days: int, dry_run: bool,
+        self,
+        *,
+        days: int,
+        dry_run: bool,
     ) -> DiagnosisResult | None:
         """Find low-rated prompt templates and trigger PromptOptimizer."""
         with self._db() as db:
@@ -151,7 +162,11 @@ class InputFaceLearner(DbConsumer):
             result = DiagnosisResult(
                 input_face=InputFace.PROMPT,
                 bottleneck=f"Template '{template_id}' has {case_count} low-rated cases (avg={avg_rating:.1f})",
-                evidence={"template_id": template_id, "cases": case_count, "avg_rating": float(avg_rating)},
+                evidence={
+                    "template_id": template_id,
+                    "cases": case_count,
+                    "avg_rating": float(avg_rating),
+                },
             )
 
             from core.context.prompt_optimizer import PromptOptimizer
@@ -181,7 +196,10 @@ class InputFaceLearner(DbConsumer):
     # ── Context Budget ────────────────────────────────────────────
 
     def _handle_context_budget(
-        self, *, days: int, dry_run: bool,
+        self,
+        *,
+        days: int,
+        dry_run: bool,
     ) -> DiagnosisResult | None:
         """Detect task types where context was insufficient (truncation or low quality)."""
         with self._db() as db:
@@ -242,7 +260,9 @@ class InputFaceLearner(DbConsumer):
             return result
 
     def _propose_budget_adjustment(
-        self, task_type: str, truncation_rate: float,
+        self,
+        task_type: str,
+        truncation_rate: float,
     ) -> dict[str, Any]:
         """Propose budget ratio adjustment based on truncation patterns."""
         from core.context.manager import _BUDGET_RATIOS, TaskType
@@ -269,7 +289,9 @@ class InputFaceLearner(DbConsumer):
         return {"task_type": task_type, "current": current, "proposed": proposed}
 
     def _apply_budget_adjustment(
-        self, task_type: str, proposal: dict[str, Any],
+        self,
+        task_type: str,
+        proposal: dict[str, Any],
     ) -> None:
         """Apply budget adjustment to runtime config."""
         from core.context.manager import _BUDGET_RATIOS, TaskType
@@ -287,7 +309,10 @@ class InputFaceLearner(DbConsumer):
     # ── Knowledge ─────────────────────────────────────────────────
 
     def _handle_knowledge(
-        self, *, days: int, dry_run: bool,
+        self,
+        *,
+        days: int,
+        dry_run: bool,
     ) -> DiagnosisResult | None:
         """Detect stale or contradictory knowledge causing quality issues."""
         with self._db() as db:
@@ -364,13 +389,15 @@ class InputFaceLearner(DbConsumer):
                         {
                             "eid": eid,
                             "etype": "input_face_learning",
-                            "content": json.dumps({
-                                "face": InputFace.KNOWLEDGE.value,
-                                "bottleneck": result.bottleneck,
-                                "proposal": result.proposal,
-                                "gate_verdict": result.gate_verdict,
-                                "applied": result.applied,
-                            }),
+                            "content": json.dumps(
+                                {
+                                    "face": InputFace.KNOWLEDGE.value,
+                                    "bottleneck": result.bottleneck,
+                                    "proposal": result.proposal,
+                                    "gate_verdict": result.gate_verdict,
+                                    "applied": result.applied,
+                                }
+                            ),
                         },
                     )
 
@@ -387,7 +414,9 @@ class InputFaceLearner(DbConsumer):
     # ------------------------------------------------------------------
 
     def _record_learning_event(
-        self, face: InputFace, result: DiagnosisResult,
+        self,
+        face: InputFace,
+        result: DiagnosisResult,
     ) -> None:
         """Record learning action as a conversation event for audit trail."""
         with self._db() as db:
@@ -406,13 +435,15 @@ class InputFaceLearner(DbConsumer):
                     {
                         "eid": eid,
                         "etype": "input_face_learning",
-                        "content": json.dumps({
-                            "face": face.value,
-                            "bottleneck": result.bottleneck,
-                            "proposal": result.proposal,
-                            "gate_verdict": result.gate_verdict,
-                            "applied": result.applied,
-                        }),
+                        "content": json.dumps(
+                            {
+                                "face": face.value,
+                                "bottleneck": result.bottleneck,
+                                "proposal": result.proposal,
+                                "gate_verdict": result.gate_verdict,
+                                "applied": result.applied,
+                            }
+                        ),
                     },
                 )
                 db.commit()

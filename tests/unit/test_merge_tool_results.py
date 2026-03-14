@@ -35,8 +35,7 @@ def _assistant_tc(*tc_ids):
         "role": "assistant",
         "content": "",
         "tool_calls": [
-            {"id": tid, "type": "function",
-             "function": {"name": f"tool_{tid}", "arguments": "{}"}}
+            {"id": tid, "type": "function", "function": {"name": f"tool_{tid}", "arguments": "{}"}}
             for tid in tc_ids
         ],
     }
@@ -52,8 +51,7 @@ def _tr(tc_id, result="real result"):
 
 
 def _placeholder(tc_id):
-    return {"role": "tool", "tool_call_id": tc_id,
-            "content": "[not executed -- edge disconnected]"}
+    return {"role": "tool", "tool_call_id": tc_id, "content": "[not executed -- edge disconnected]"}
 
 
 def _validate_sequence(history):
@@ -84,6 +82,7 @@ def _validate_sequence(history):
 # Scenario 1: Edge disconnects, never sends tool_results
 # ============================================================================
 
+
 class TestEdgeDisconnect:
     def test_all_tool_calls_healed(self):
         """No tool_results at all → all get placeholders."""
@@ -106,6 +105,7 @@ class TestEdgeDisconnect:
 # ============================================================================
 # Scenario 2: Edge sends partial tool_results
 # ============================================================================
+
 
 class TestPartialResults:
     def test_one_of_two_results(self):
@@ -137,6 +137,7 @@ class TestPartialResults:
 # (THE BUG THAT TRIGGERED THIS REWRITE)
 # ============================================================================
 
+
 class TestCloudRestart:
     def test_results_merged_into_correct_position(self):
         """Cloud recovered history with orphaned tool_calls.
@@ -148,9 +149,7 @@ class TestCloudRestart:
             _assistant_tc("tc1"),
             # No tool message — cloud just recovered from DB
         ]
-        consumed = merge_tool_results_into_history(
-            history, [_tr("tc1", "file contents")]
-        )
+        consumed = merge_tool_results_into_history(history, [_tr("tc1", "file contents")])
         assert consumed == {"tc1"}
         _validate_sequence(history)
         # Result should be right after assistant, not at end
@@ -165,9 +164,7 @@ class TestCloudRestart:
             _user(),
             _assistant_tc("tc1", "tc2"),
         ]
-        consumed = merge_tool_results_into_history(
-            history, [_tr("tc1", "r1"), _tr("tc2", "r2")]
-        )
+        consumed = merge_tool_results_into_history(history, [_tr("tc1", "r1"), _tr("tc2", "r2")])
         assert consumed == {"tc1", "tc2"}
         _validate_sequence(history)
         assert len(history) == 5  # sys + user + assistant + 2 tools
@@ -177,14 +174,13 @@ class TestCloudRestart:
 # Scenario 4: Cloud restarts, edge sends partial tool_results
 # ============================================================================
 
+
 class TestCloudRestartPartial:
     def test_partial_merge_plus_heal(self):
         """Cloud recovered with 3 orphaned tool_calls.
         Edge sends results for 2 of 3. Third gets placeholder."""
         history = [_sys(), _user(), _assistant_tc("tc1", "tc2", "tc3")]
-        consumed = merge_tool_results_into_history(
-            history, [_tr("tc1", "r1"), _tr("tc3", "r3")]
-        )
+        consumed = merge_tool_results_into_history(history, [_tr("tc1", "r1"), _tr("tc3", "r3")])
         assert consumed == {"tc1", "tc3"}
         _validate_sequence(history)
         tool_msgs = {m["tool_call_id"]: m for m in history if m["role"] == "tool"}
@@ -196,6 +192,7 @@ class TestCloudRestartPartial:
 # ============================================================================
 # Scenario 5: Cloud restarts, edge already gave up
 # ============================================================================
+
 
 class TestCloudRestartEdgeGaveUp:
     def test_no_results_all_healed(self):
@@ -210,6 +207,7 @@ class TestCloudRestartEdgeGaveUp:
 # ============================================================================
 # Scenario 6: DB trailing tool_calls (API crashed mid-execution)
 # ============================================================================
+
 
 class TestTrailingToolCalls:
     def test_trailing_tool_calls_healed(self):
@@ -227,9 +225,7 @@ class TestTrailingToolCalls:
     def test_trailing_tool_calls_with_late_results(self):
         """API crashed, but edge retries and sends results."""
         history = [_sys(), _user(), _assistant_tc("tc1")]
-        consumed = merge_tool_results_into_history(
-            history, [_tr("tc1", "late result")]
-        )
+        consumed = merge_tool_results_into_history(history, [_tr("tc1", "late result")])
         assert consumed == {"tc1"}
         _validate_sequence(history)
         assert history[3]["content"] == "late result"
@@ -238,6 +234,7 @@ class TestTrailingToolCalls:
 # ============================================================================
 # Scenario 7: tool_results for unknown tool_call_ids
 # ============================================================================
+
 
 class TestUnknownToolCallIds:
     def test_unknown_ids_not_consumed(self):
@@ -253,9 +250,7 @@ class TestUnknownToolCallIds:
     def test_all_unknown(self):
         """All tool_results have unknown IDs."""
         history = [_sys(), _user(), _assistant_text("no tools")]
-        consumed = merge_tool_results_into_history(
-            history, [_tr("tc_ghost", "phantom")]
-        )
+        consumed = merge_tool_results_into_history(history, [_tr("tc_ghost", "phantom")])
         assert consumed == set()
         _validate_sequence(history)
 
@@ -264,11 +259,13 @@ class TestUnknownToolCallIds:
 # Scenario 8: Multiple tool_calls, mixed existing and incoming
 # ============================================================================
 
+
 class TestMixedExistingAndIncoming:
     def test_some_already_in_history(self):
         """History has result for tc1, edge sends tc2. tc1 not duplicated."""
         history = [
-            _sys(), _user(),
+            _sys(),
+            _user(),
             _assistant_tc("tc1", "tc2"),
             _tool("tc1", "already here"),
         ]
@@ -289,6 +286,7 @@ class TestMixedExistingAndIncoming:
 # Scenario 9: Multiple assistant messages with tool_calls
 # ============================================================================
 
+
 class TestMultipleAssistantToolCalls:
     def test_results_go_to_correct_assistant(self):
         """Two assistant messages with tool_calls in history.
@@ -303,9 +301,7 @@ class TestMultipleAssistantToolCalls:
             _assistant_tc("tc2"),
             # tc2 has no result (cloud restarted here)
         ]
-        consumed = merge_tool_results_into_history(
-            history, [_tr("tc2", "result 2")]
-        )
+        consumed = merge_tool_results_into_history(history, [_tr("tc2", "result 2")])
         assert consumed == {"tc2"}
         _validate_sequence(history)
         # tc2 result should be right after its assistant message
@@ -324,9 +320,7 @@ class TestMultipleAssistantToolCalls:
             _assistant_tc("tc2"),
             # no result for tc2
         ]
-        consumed = merge_tool_results_into_history(
-            history, [_tr("tc2", "r2")]
-        )
+        consumed = merge_tool_results_into_history(history, [_tr("tc2", "r2")])
         assert consumed == {"tc2"}
         _validate_sequence(history)
         # tc1 should be healed, tc2 should have real result
@@ -339,12 +333,15 @@ class TestMultipleAssistantToolCalls:
 # Scenario 10: Normal in-memory path (no recovery needed)
 # ============================================================================
 
+
 class TestNormalPath:
     def test_no_orphans_no_results(self):
         """Clean history, no tool_results → no changes."""
         history = [
-            _sys(), _user(),
-            _assistant_tc("tc1"), _tool("tc1", "done"),
+            _sys(),
+            _user(),
+            _assistant_tc("tc1"),
+            _tool("tc1", "done"),
             _assistant_text("all good"),
         ]
         original_len = len(history)
@@ -356,12 +353,12 @@ class TestNormalPath:
     def test_already_complete_history(self):
         """All tool_calls already have results. Incoming results are duplicates."""
         history = [
-            _sys(), _user(),
-            _assistant_tc("tc1"), _tool("tc1", "existing"),
+            _sys(),
+            _user(),
+            _assistant_tc("tc1"),
+            _tool("tc1", "existing"),
         ]
-        consumed = merge_tool_results_into_history(
-            history, [_tr("tc1", "duplicate")]
-        )
+        consumed = merge_tool_results_into_history(history, [_tr("tc1", "duplicate")])
         # tc1 is consumed (so it won't be appended again) but content unchanged
         assert "tc1" in consumed
         _validate_sequence(history)
@@ -374,6 +371,7 @@ class TestNormalPath:
 # ============================================================================
 # Edge cases
 # ============================================================================
+
 
 class TestEdgeCases:
     def test_empty_history(self):
@@ -405,9 +403,7 @@ class TestEdgeCases:
     def test_tool_result_with_empty_content(self):
         """tool_result with empty string content."""
         history = [_sys(), _user(), _assistant_tc("tc1")]
-        consumed = merge_tool_results_into_history(
-            history, [{"tool_call_id": "tc1", "result": ""}]
-        )
+        consumed = merge_tool_results_into_history(history, [{"tool_call_id": "tc1", "result": ""}])
         assert consumed == {"tc1"}
         _validate_sequence(history)
         assert history[3]["content"] == ""
@@ -415,9 +411,7 @@ class TestEdgeCases:
     def test_tool_result_missing_result_key(self):
         """tool_result without 'result' key defaults to empty string."""
         history = [_sys(), _user(), _assistant_tc("tc1")]
-        consumed = merge_tool_results_into_history(
-            history, [{"tool_call_id": "tc1"}]
-        )
+        consumed = merge_tool_results_into_history(history, [{"tool_call_id": "tc1"}])
         assert consumed == {"tc1"}
         _validate_sequence(history)
         assert history[3]["content"] == ""
@@ -426,6 +420,7 @@ class TestEdgeCases:
 # ============================================================================
 # Scenario 11: Placeholder replacement (edge disconnects → heal → reconnect)
 # ============================================================================
+
 
 class TestPlaceholderReplacement:
     """Edge disconnects → heal inserts placeholder → edge reconnects with real results."""
@@ -443,12 +438,13 @@ class TestPlaceholderReplacement:
     def test_placeholder_replaced_multiple_tools(self):
         """Two healed placeholders, both get real results."""
         history = [
-            _sys(), _user(), _assistant_tc("tc1", "tc2"),
-            _placeholder("tc1"), _placeholder("tc2"),
+            _sys(),
+            _user(),
+            _assistant_tc("tc1", "tc2"),
+            _placeholder("tc1"),
+            _placeholder("tc2"),
         ]
-        consumed = merge_tool_results_into_history(
-            history, [_tr("tc1", "r1"), _tr("tc2", "r2")]
-        )
+        consumed = merge_tool_results_into_history(history, [_tr("tc1", "r1"), _tr("tc2", "r2")])
         assert consumed == {"tc1", "tc2"}
         _validate_sequence(history)
         tool_msgs = {m["tool_call_id"]: m for m in history if m["role"] == "tool"}
@@ -458,8 +454,11 @@ class TestPlaceholderReplacement:
     def test_placeholder_partial_replacement(self):
         """Two healed, only one gets real result. Other stays placeholder."""
         history = [
-            _sys(), _user(), _assistant_tc("tc1", "tc2"),
-            _placeholder("tc1"), _placeholder("tc2"),
+            _sys(),
+            _user(),
+            _assistant_tc("tc1", "tc2"),
+            _placeholder("tc1"),
+            _placeholder("tc2"),
         ]
         consumed = merge_tool_results_into_history(history, [_tr("tc1", "real")])
         assert "tc1" in consumed
@@ -471,12 +470,13 @@ class TestPlaceholderReplacement:
     def test_multi_turn_placeholder_then_real(self):
         """Turn 1: tool_calls → Turn 2: user msg (heals) → Turn 3: real results."""
         history = [
-            _sys(), _user("read file"), _assistant_tc("tc1"),
-            _placeholder("tc1"), _user("continue"),
+            _sys(),
+            _user("read file"),
+            _assistant_tc("tc1"),
+            _placeholder("tc1"),
+            _user("continue"),
         ]
-        consumed = merge_tool_results_into_history(
-            history, [_tr("tc1", "file contents")]
-        )
+        consumed = merge_tool_results_into_history(history, [_tr("tc1", "file contents")])
         assert "tc1" in consumed
         _validate_sequence(history)
         tc1_msgs = [m for m in history if m.get("tool_call_id") == "tc1"]
@@ -487,10 +487,11 @@ class TestPlaceholderReplacement:
         """tool_result with non-string content (dict, int) is coerced to str."""
         history = [_sys(), _user(), _assistant_tc("tc1", "tc2")]
         consumed = merge_tool_results_into_history(
-            history, [
+            history,
+            [
                 {"tool_call_id": "tc1", "result": {"key": "value"}},
                 {"tool_call_id": "tc2", "result": 42},
-            ]
+            ],
         )
         assert consumed == {"tc1", "tc2"}
         _validate_sequence(history)
@@ -501,8 +502,6 @@ class TestPlaceholderReplacement:
     def test_non_dict_tool_result_skipped(self):
         """Non-dict entries in tool_results are silently skipped."""
         history = [_sys(), _user(), _assistant_tc("tc1")]
-        consumed = merge_tool_results_into_history(
-            history, [_tr("tc1", "ok"), "not a dict", 123]
-        )
+        consumed = merge_tool_results_into_history(history, [_tr("tc1", "ok"), "not a dict", 123])
         assert consumed == {"tc1"}
         _validate_sequence(history)

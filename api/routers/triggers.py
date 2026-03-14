@@ -32,12 +32,17 @@ async def create_trigger(
     db: Session = Depends(get_db_session),
 ):
     from core.agent.triggers import create_trigger
+
     try:
         return create_trigger(
-            db, user_id=current_user["user_id"],
-            agent_id=request.agent_id, trigger_type=request.trigger_type,
-            name=request.name, user_input=request.user_input,
-            context=request.context, cron_expr=request.cron_expr,
+            db,
+            user_id=current_user["user_id"],
+            agent_id=request.agent_id,
+            trigger_type=request.trigger_type,
+            name=request.name,
+            user_input=request.user_input,
+            context=request.context,
+            cron_expr=request.cron_expr,
             session_id=request.session_id,
         )
     except ValueError as e:
@@ -50,6 +55,7 @@ async def list_triggers(
     db: Session = Depends(get_db_session),
 ):
     from core.agent.triggers import list_triggers
+
     return list_triggers(db, current_user["user_id"])
 
 
@@ -60,6 +66,7 @@ async def delete_trigger(
     db: Session = Depends(get_db_session),
 ):
     from core.agent.triggers import delete_trigger, get_trigger
+
     trig = get_trigger(db, trigger_id)
     if not trig:
         raise HTTPException(status_code=404, detail="Trigger not found")
@@ -77,6 +84,7 @@ async def fire_webhook(
 ):
     """Fire a webhook trigger. No auth header needed — uses secret instead."""
     from core.agent.triggers import fire_trigger, get_trigger, verify_secret
+
     trig = get_trigger(db, trigger_id)
     if not trig:
         raise HTTPException(status_code=404, detail="Trigger not found")
@@ -86,6 +94,7 @@ async def fire_webhook(
         raise HTTPException(status_code=403, detail="Invalid secret")
     try:
         from api.database import SessionLocal
+
         return fire_trigger(SessionLocal, trigger_id, payload=request.payload)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

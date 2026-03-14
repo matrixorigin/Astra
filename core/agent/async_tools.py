@@ -74,6 +74,7 @@ def get_async_tool_registry() -> AsyncToolRegistry:
 
 # ── Built-in: submit_job ──
 
+
 async def _execute_submit_job(params: dict[str, Any], run_id: str | None = None) -> dict:
     from core.jobs.backend import JobRequirements
     from core.jobs.router import JobRouter
@@ -124,6 +125,7 @@ _registry.register("submit_job", _execute_submit_job, _SUBMIT_JOB_SCHEMA)
 
 # ── Built-in: submit_workflow ──
 
+
 async def _execute_submit_workflow(params: dict[str, Any], run_id: str | None = None) -> dict:
     """Submit a workflow. Persists to wf_definitions + wf_runs tables."""
     import asyncio as _aio
@@ -143,7 +145,11 @@ async def _execute_submit_workflow(params: dict[str, Any], run_id: str | None = 
     _persist_workflow_start(wf_id, workflow, initial_inputs, run_id)
 
     # In-memory state for resume
-    _wf_runs[wf_id] = {"workflow": workflow, "engine": WorkflowEngine(wf_run_id=wf_id), "wf_run": None}
+    _wf_runs[wf_id] = {
+        "workflow": workflow,
+        "engine": WorkflowEngine(wf_run_id=wf_id),
+        "wf_run": None,
+    }
 
     async def _run_then_resolve() -> None:
         entry = _wf_runs[wf_id]
@@ -225,12 +231,17 @@ def _find_workflow_by_wait_handle(handle: str) -> str | None:
     try:
         from api.database import get_db_session
         from api.models import WorkflowRun as WFRunModel
+
         db = next(get_db_session())
         try:
-            row = db.query(WFRunModel).filter(
-                WFRunModel.status == "waiting",
-                WFRunModel.waiting_for == handle,
-            ).first()
+            row = (
+                db.query(WFRunModel)
+                .filter(
+                    WFRunModel.status == "waiting",
+                    WFRunModel.waiting_for == handle,
+                )
+                .first()
+            )
             return row.run_id if row else None
         finally:
             db.close()
@@ -251,9 +262,13 @@ def _restore_workflow_entry(wf_id: str) -> dict | None:
             row = db.query(WFRunModel).filter(WFRunModel.run_id == wf_id).first()
             if not row:
                 return None
-            wf_def = db.query(WorkflowDefinition).filter(
-                WorkflowDefinition.workflow_id == row.workflow_id,
-            ).first()
+            wf_def = (
+                db.query(WorkflowDefinition)
+                .filter(
+                    WorkflowDefinition.workflow_id == row.workflow_id,
+                )
+                .first()
+            )
             if not wf_def:
                 return None
 
@@ -280,7 +295,9 @@ def _workflow_result(wf_id: str, wf_run) -> dict:
     return {
         "workflow_id": wf_id,
         "status": wf_run.status,
-        "steps": {sid: sr.model_dump() for sid, sr in wf_run.step_results.items() if sid != "_initial"},
+        "steps": {
+            sid: sr.model_dump() for sid, sr in wf_run.step_results.items() if sid != "_initial"
+        },
     }
 
 
@@ -291,10 +308,13 @@ def _resolve_workflow(wf_id: str, result: dict) -> None:
     reg = get_async_tool_registry()
     waiting_run_id = reg.resolve_handle(f"workflow:{wf_id}")
     if waiting_run_id:
+
         async def _do_resume():
             from core.agent.run_engine import RunEngine
             from api.database import SessionLocal
+
             await RunEngine(SessionLocal).resume_run(waiting_run_id, result)
+
         _aio.create_task(_do_resume())
     _wf_runs.pop(wf_id, None)
 
@@ -307,16 +327,22 @@ async def cleanup_stale_workflows(max_age_hours: int = 24) -> int:
     Returns count of cleaned workflows.
     """
     from datetime import datetime, timezone, timedelta
+
     try:
         from api.database import get_db_session
         from api.models import WorkflowRun as WFRunModel
+
         db = next(get_db_session())
         try:
             cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
-            stale = db.query(WFRunModel).filter(
-                WFRunModel.status.in_(["running", "waiting"]),
-                WFRunModel.started_at < cutoff,
-            ).all()
+            stale = (
+                db.query(WFRunModel)
+                .filter(
+                    WFRunModel.status.in_(["running", "waiting"]),
+                    WFRunModel.started_at < cutoff,
+                )
+                .all()
+            )
             count = 0
             for row in stale:
                 row.status = "failed"
@@ -343,18 +369,24 @@ def _persist_workflow_state(wf_id: str, wf_run) -> None:
     try:
         from api.database import get_db_session
         from api.models import WorkflowRun as WFRunModel
+
         db = next(get_db_session())
         try:
             row = db.query(WFRunModel).filter(WFRunModel.run_id == wf_id).first()
             if row:
                 row.status = wf_run.status
                 row.current_step_idx = wf_run.current_step_idx
-                row.step_results = {sid: sr.model_dump() for sid, sr in wf_run.step_results.items() if sid != "_initial"}
+                row.step_results = {
+                    sid: sr.model_dump()
+                    for sid, sr in wf_run.step_results.items()
+                    if sid != "_initial"
+                }
                 row.waiting_for = wf_run.waiting_for
                 row.waiting_step_id = wf_run.waiting_step_id
                 row.error = wf_run.error
                 if wf_run.status in ("completed", "failed", "cancelled"):
                     from datetime import datetime, timezone
+
                     row.completed_at = datetime.now(timezone.utc)
                 db.commit()
         finally:
@@ -363,31 +395,42 @@ def _persist_workflow_state(wf_id: str, wf_run) -> None:
         logger.error(f"Failed to persist workflow run {wf_id}: {e}")
 
 
-def _persist_workflow_start(wf_id: str, workflow, initial_inputs: dict, agent_run_id: str | None) -> None:
+def _persist_workflow_start(
+    wf_id: str, workflow, initial_inputs: dict, agent_run_id: str | None
+) -> None:
     """Create wf_definitions + wf_runs records."""
     try:
         from api.database import get_db_session
         from api.models import WorkflowDefinition, WorkflowRun as WFRunModel
+
         db = next(get_db_session())
         try:
             # Upsert definition
             def_id = f"{workflow.name}@latest"
-            existing = db.query(WorkflowDefinition).filter(WorkflowDefinition.workflow_id == def_id).first()
+            existing = (
+                db.query(WorkflowDefinition)
+                .filter(WorkflowDefinition.workflow_id == def_id)
+                .first()
+            )
             if not existing:
-                db.add(WorkflowDefinition(
-                    workflow_id=def_id,
-                    name=workflow.name,
-                    version="latest",
-                    definition=workflow.model_dump(),
-                ))
+                db.add(
+                    WorkflowDefinition(
+                        workflow_id=def_id,
+                        name=workflow.name,
+                        version="latest",
+                        definition=workflow.model_dump(),
+                    )
+                )
             # Create run
-            db.add(WFRunModel(
-                run_id=wf_id,
-                workflow_id=def_id,
-                agent_run_id=agent_run_id,
-                status="running",
-                inputs=initial_inputs,
-            ))
+            db.add(
+                WFRunModel(
+                    run_id=wf_id,
+                    workflow_id=def_id,
+                    agent_run_id=agent_run_id,
+                    status="running",
+                    inputs=initial_inputs,
+                )
+            )
             db.commit()
         finally:
             db.close()
@@ -432,10 +475,22 @@ _SUBMIT_WORKFLOW_SCHEMA = {
                                 "type": "array",
                                 "description": "For type=parallel: list of sub-steps to run concurrently",
                             },
-                            "expr": {"type": "string", "description": "For type=condition: e.g. 'steps.train.accuracy > 0.9'"},
-                            "then_step": {"type": "string", "description": "Step id if condition is true"},
-                            "else_step": {"type": "string", "description": "Step id if condition is false"},
-                            "wait_for": {"type": "string", "description": "For type=wait: event to wait for"},
+                            "expr": {
+                                "type": "string",
+                                "description": "For type=condition: e.g. 'steps.train.accuracy > 0.9'",
+                            },
+                            "then_step": {
+                                "type": "string",
+                                "description": "Step id if condition is true",
+                            },
+                            "else_step": {
+                                "type": "string",
+                                "description": "Step id if condition is false",
+                            },
+                            "wait_for": {
+                                "type": "string",
+                                "description": "For type=wait: event to wait for",
+                            },
                         },
                         "required": ["id", "type"],
                     },
@@ -451,6 +506,7 @@ _registry.register("submit_workflow", _execute_submit_workflow, _SUBMIT_WORKFLOW
 
 # ── Built-in: spawn_runs (multi-agent fan-out) ──
 
+
 async def _execute_spawn_runs(params: dict[str, Any], run_id: str | None = None) -> dict:
     """Spawn child agent runs. Parent parks until all children complete."""
     if not run_id:
@@ -463,6 +519,7 @@ async def _execute_spawn_runs(params: dict[str, Any], run_id: str | None = None)
         return {"error": f"Parent run {run_id} not found in active runs"}
 
     from api.database import SessionLocal
+
     engine = RunEngine(SessionLocal)
 
     try:
@@ -509,9 +566,18 @@ _SPAWN_RUNS_SCHEMA = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "agent_id": {"type": "string", "description": "Agent to run (e.g. security_reviewer)"},
-                            "task": {"type": "string", "description": "Task description for the agent"},
-                            "context": {"type": "object", "description": "Optional context for the agent"},
+                            "agent_id": {
+                                "type": "string",
+                                "description": "Agent to run (e.g. security_reviewer)",
+                            },
+                            "task": {
+                                "type": "string",
+                                "description": "Task description for the agent",
+                            },
+                            "context": {
+                                "type": "object",
+                                "description": "Optional context for the agent",
+                            },
                         },
                         "required": ["task"],
                     },
@@ -549,7 +615,12 @@ def restore_waiting_workflows() -> int:
         db = next(get_db_session())
         try:
             restore_batch = 200
-            rows = db.query(WFRunModel).filter(WFRunModel.status == "waiting").limit(restore_batch).all()
+            rows = (
+                db.query(WFRunModel)
+                .filter(WFRunModel.status == "waiting")
+                .limit(restore_batch)
+                .all()
+            )
             if len(rows) >= restore_batch:
                 logger.warning(
                     "restore_waiting_workflows hit limit of %d; some workflows may not be restored",
@@ -557,9 +628,13 @@ def restore_waiting_workflows() -> int:
                 )
             count = 0
             for row in rows:
-                wf_def = db.query(WorkflowDefinition).filter(
-                    WorkflowDefinition.workflow_id == row.workflow_id,
-                ).first()
+                wf_def = (
+                    db.query(WorkflowDefinition)
+                    .filter(
+                        WorkflowDefinition.workflow_id == row.workflow_id,
+                    )
+                    .first()
+                )
                 if not wf_def:
                     continue
 
@@ -576,7 +651,9 @@ def restore_waiting_workflows() -> int:
                     wf_run.step_results[sid] = StepResult(**sr_data)
 
                 _wf_runs[row.run_id] = {
-                    "workflow": workflow, "engine": WorkflowEngine(), "wf_run": wf_run,
+                    "workflow": workflow,
+                    "engine": WorkflowEngine(),
+                    "wf_run": wf_run,
                 }
                 if row.waiting_for:
                     _workflow_waits[row.waiting_for] = row.run_id

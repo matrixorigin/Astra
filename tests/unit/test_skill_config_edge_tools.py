@@ -34,8 +34,9 @@ class TestSkillLoaderDoesNotOverwriteEdgeTool:
         router.register(tool_a)
         router.register(tool_b)
 
-        assert router.get_tool("skill_config_wizard") is tool_b, \
+        assert router.get_tool("skill_config_wizard") is tool_b, (
             "ToolRouter.register() must overwrite — production guard is in mo_agent_api.py"
+        )
 
     def test_production_guard_prevents_overwrite(self):
         """The production guard in mo_agent_api.py must skip skills already registered."""
@@ -55,8 +56,9 @@ class TestSkillLoaderDoesNotOverwriteEdgeTool:
                 continue  # ← this is the guard we're testing
             router.register(local.skill)
 
-        assert router.get_tool("skill_config_wizard") is original, \
+        assert router.get_tool("skill_config_wizard") is original, (
             "Production guard must prevent skills/ directory from overwriting edge tools"
+        )
 
 
 class TestGithubManifestFormat:
@@ -76,4 +78,3 @@ class TestGithubManifestFormat:
 
         token = next(s for s in manifest["secrets"] if s["name"] == "github_token")
         assert token.get("required") is True
-

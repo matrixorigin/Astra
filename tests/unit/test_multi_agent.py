@@ -12,8 +12,15 @@ from sqlalchemy.orm import Session
 
 from core.agent.run import RunStatus
 from core.agent.run_engine import (
-    RunEngine, _active_runs, _agent_run_events, _run_waiters, _run_tasks, _child_runs,
-    _MAX_RESUME_INPUT_CHARS, cleanup_fan_in_tasks, _agent_config_cache,
+    RunEngine,
+    _active_runs,
+    _agent_run_events,
+    _run_waiters,
+    _run_tasks,
+    _child_runs,
+    _MAX_RESUME_INPUT_CHARS,
+    cleanup_fan_in_tasks,
+    _agent_config_cache,
 )
 from core.events.models import StreamEvent, StreamEventType
 
@@ -48,7 +55,8 @@ def mock_db():
 @pytest.fixture
 def engine(mock_db):
     from tests.conftest import make_run_engine_mock_init
-    with patch.object(RunEngine, '__init__', make_run_engine_mock_init()):
+
+    with patch.object(RunEngine, "__init__", make_run_engine_mock_init()):
         e = RunEngine(lambda: mock_db)
         e._try_claim_resume = MagicMock(return_value=True)
         return e
@@ -72,7 +80,7 @@ def _make_mock_loop(responses: list[str]):
 
             if text.startswith("TOOL:spawn_runs:"):
                 # Simulate async tool call → wait_for
-                payload = json.loads(text[len("TOOL:spawn_runs:"):])
+                payload = json.loads(text[len("TOOL:spawn_runs:") :])
                 yield StreamEvent(
                     event_type=StreamEventType.TOOL_RESULT,
                     data={"wait_for": payload["wait_for"]},
@@ -87,17 +95,18 @@ def _make_mock_loop(responses: list[str]):
 
 
 class TestMultiAgentE2E:
-
     @pytest.mark.asyncio
     async def test_single_child_run_lifecycle(self, engine):
         """Parent creates one child, child completes, parent resumes."""
         # Child will output "LGTM, no issues found"
         child_loop = _make_mock_loop(["LGTM, no issues found"])
         # Parent will output "Review complete: all clear"
-        parent_loop = _make_mock_loop([
-            "Starting review...",  # First run (before wait)
-            "Review complete: all clear",  # After resume
-        ])
+        parent_loop = _make_mock_loop(
+            [
+                "Starting review...",  # First run (before wait)
+                "Review complete: all clear",  # After resume
+            ]
+        )
 
         # We need different loops for parent vs child
         loops = {"parent": parent_loop, "child": child_loop}
@@ -154,7 +163,8 @@ class TestMultiAgentE2E:
         child_events = _agent_run_events.get(child.run_id, [])
         child_text = "".join(
             ev.get("data", {}).get("chunk", "")
-            for ev in child_events if ev.get("event_type") == "text_delta"
+            for ev in child_events
+            if ev.get("event_type") == "text_delta"
         )
         assert "LGTM" in child_text
 
@@ -191,7 +201,9 @@ class TestMultiAgentE2E:
             return loop
 
         with patch("api.routers.chat._build_chat_loop", side_effect=build_loop):
-            parent = engine.create_run(session_id="s1", user_id="u1", user_input="Review auth module")
+            parent = engine.create_run(
+                session_id="s1", user_id="u1", user_input="Review auth module"
+            )
             parent.status = RunStatus.WAITING
             parent.waiting_for = f"children:{parent.run_id}"
 
@@ -249,7 +261,8 @@ class TestMultiAgentE2E:
 
             # Wait for all child tasks (some may raise)
             await asyncio.gather(
-                _run_tasks[c_ok.run_id], _run_tasks[c_fail.run_id],
+                _run_tasks[c_ok.run_id],
+                _run_tasks[c_fail.run_id],
                 return_exceptions=True,
             )
 
@@ -262,10 +275,12 @@ class TestMultiAgentE2E:
     async def test_agent_config_injection(self, engine, mock_db):
         """Child run should receive system_prompt from agent config."""
         mock_db.query.return_value.filter.return_value.first.return_value = (
-            json.dumps({
-                "system_prompt": "You are a security expert.",
-                "allowed_tools": ["read_file"],
-            }),
+            json.dumps(
+                {
+                    "system_prompt": "You are a security expert.",
+                    "allowed_tools": ["read_file"],
+                }
+            ),
         )
 
         received_context = {}
@@ -337,9 +352,9 @@ class TestMultiAgentE2E:
 
 
 class TestSeedAgents:
-
     def test_seed_inserts_agents(self):
         from core.agent.seed_agents import seed_agents, SEED_AGENTS
+
         db = MagicMock()
         db.query.return_value.filter.return_value.first.return_value = None
         count = seed_agents(db)
@@ -348,6 +363,7 @@ class TestSeedAgents:
 
     def test_seed_skips_existing(self):
         from core.agent.seed_agents import seed_agents
+
         db = MagicMock()
         db.query.return_value.filter.return_value.first.return_value = MagicMock()
         count = seed_agents(db)
@@ -355,6 +371,7 @@ class TestSeedAgents:
 
     def test_seed_agent_configs(self):
         from core.agent.seed_agents import SEED_AGENTS
+
         for agent in SEED_AGENTS:
             assert "system_prompt" in agent["agent_config"]
             assert len(agent["agent_config"]["system_prompt"]) > 20

@@ -45,6 +45,7 @@ def _flush_pool():
     """Wait for all pending writes to complete."""
     import core.context.manager as mod
     from concurrent.futures import ThreadPoolExecutor
+
     mod._write_pool.shutdown(wait=True)
     mod._write_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ctx_snapshot")
 

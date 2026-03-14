@@ -22,7 +22,9 @@ class PromptManager(DbConsumer):
         self.gate_trigger = gate_trigger
         self._cache: dict[str, str] = {}
 
-    def get_system_prompt(self, template_id: str = "system_general", version: str | None = None) -> str:
+    def get_system_prompt(
+        self, template_id: str = "system_general", version: str | None = None
+    ) -> str:
         """Get system prompt by ID and version.
 
         Args:
@@ -59,7 +61,7 @@ class PromptManager(DbConsumer):
                 if not version:
                     self._cache[template_id] = content
                 return content
-            
+
             # Fallback to hardcoded defaults if DB empty
             logger.warning(f"Prompt template {template_id} not found in DB, using fallback")
             return self._get_fallback_prompt(template_id)
@@ -84,8 +86,10 @@ class PromptManager(DbConsumer):
                 # If active, deactivate others
                 if is_active:
                     db.execute(
-                        text("UPDATE ctx_prompt_templates SET is_active = 0 WHERE template_id = :template_id"),
-                        {"template_id": template_id}
+                        text(
+                            "UPDATE ctx_prompt_templates SET is_active = 0 WHERE template_id = :template_id"
+                        ),
+                        {"template_id": template_id},
                     )
 
                 db.execute(
@@ -102,11 +106,11 @@ class PromptManager(DbConsumer):
                         "template_id": template_id,
                         "content": content,
                         "version": version,
-                        "is_active": 1 if is_active else 0
-                    }
+                        "is_active": 1 if is_active else 0,
+                    },
                 )
                 db.commit()
-            
+
             # Update cache
             if is_active:
                 self._cache[template_id] = content
@@ -118,7 +122,7 @@ class PromptManager(DbConsumer):
                     version=version,
                     content=content,
                 )
-            
+
             logger.info(f"Registered prompt {template_id} version {version}")
 
         except Exception as e:
@@ -181,11 +185,15 @@ class PromptManager(DbConsumer):
 
                 # Deactivate current, activate previous
                 db.execute(
-                    text("UPDATE ctx_prompt_templates SET is_active = 0 WHERE template_id = :tid AND version = :ver"),
+                    text(
+                        "UPDATE ctx_prompt_templates SET is_active = 0 WHERE template_id = :tid AND version = :ver"
+                    ),
                     {"tid": template_id, "ver": current.version},
                 )
                 db.execute(
-                    text("UPDATE ctx_prompt_templates SET is_active = 1 WHERE template_id = :tid AND version = :ver"),
+                    text(
+                        "UPDATE ctx_prompt_templates SET is_active = 1 WHERE template_id = :tid AND version = :ver"
+                    ),
                     {"tid": template_id, "ver": previous.version},
                 )
                 db.commit()
@@ -193,7 +201,9 @@ class PromptManager(DbConsumer):
             # Invalidate cache
             self._cache.pop(template_id, None)
 
-            logger.info("Rolled back %s from %s to %s", template_id, current.version, previous.version)
+            logger.info(
+                "Rolled back %s from %s to %s", template_id, current.version, previous.version
+            )
             return previous.version
 
         except Exception as e:
@@ -318,15 +328,18 @@ class PromptFeedback(DbConsumer):
 
         with self._db() as db:
             from api.models import LLMFeedback
-            db.add(LLMFeedback(
-                feedback_id=feedback_id,
-                prompt_template_id=prompt_template_id,
-                prompt_version=prompt_version,
-                llm_request_id=llm_request_id,
-                rating=user_rating,
-                comment=user_comment,
-                feedback_metadata=metadata or {},
-            ))
+
+            db.add(
+                LLMFeedback(
+                    feedback_id=feedback_id,
+                    prompt_template_id=prompt_template_id,
+                    prompt_version=prompt_version,
+                    llm_request_id=llm_request_id,
+                    rating=user_rating,
+                    comment=user_comment,
+                    feedback_metadata=metadata or {},
+                )
+            )
             db.commit()
 
         logger.info(
@@ -356,7 +369,7 @@ class PromptFeedback(DbConsumer):
                 FROM eval_llm_feedback
                 {where_clause}
                 """),
-                params
+                params,
             )
             stats_row = result.first()
 
@@ -368,13 +381,15 @@ class PromptFeedback(DbConsumer):
                 GROUP BY rating
                 ORDER BY rating
                 """),
-                params
+                params,
             )
             distribution = result.fetchall()
 
         return {
             "total_count": stats_row.total_count if stats_row else 0,
-            "avg_rating": float(stats_row.avg_rating) if stats_row and stats_row.avg_rating else 0.0,
+            "avg_rating": float(stats_row.avg_rating)
+            if stats_row and stats_row.avg_rating
+            else 0.0,
             "min_rating": stats_row.min_rating if stats_row else 0,
             "max_rating": stats_row.max_rating if stats_row else 0,
             "distribution": {row.rating: row.count for row in distribution},
@@ -400,7 +415,7 @@ class PromptFeedback(DbConsumer):
                 ORDER BY created_at DESC
                 LIMIT :limit
                 """),
-                {"template_id": prompt_template_id, "threshold": threshold, "limit": limit}
+                {"template_id": prompt_template_id, "threshold": threshold, "limit": limit},
             )
             rows = result.fetchall()
 

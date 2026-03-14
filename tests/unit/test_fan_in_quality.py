@@ -20,7 +20,6 @@ from unittest.mock import Mock
 
 
 class TestExtractArtifacts:
-
     def test_extracts_file_paths(self):
         text = "Found issue in `auth.py` and `login.py`"
         arts = _extract_artifacts(text)
@@ -56,7 +55,6 @@ class TestExtractArtifacts:
 
 
 class TestDetectConflicts:
-
     def test_no_conflict_single_result(self):
         results = [Result(agent_id="a", success=True, output="Fix auth.py")]
         assert detect_conflicts(results) == []
@@ -91,7 +89,11 @@ class TestDetectConflicts:
         results = [
             Result(agent_id="code", success=True, output="Modify validate() to add logging"),
             Result(agent_id="perf", success=True, output="Don't touch validate(), it's hot-path"),
-            Result(agent_id="security", success=True, output="Rewrite validate() for input sanitization"),
+            Result(
+                agent_id="security",
+                success=True,
+                output="Rewrite validate() for input sanitization",
+            ),
         ]
         conflicts = detect_conflicts(results)
         validate_conflicts = [c for c in conflicts if "validate()" in c.artifact]
@@ -111,7 +113,6 @@ class TestDetectConflicts:
 
 
 class TestFanIn:
-
     def _make_coord(self):
         return CoordinationPatterns(delegation_skill=Mock())
 

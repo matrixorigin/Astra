@@ -12,6 +12,7 @@ Usage:
     make verify-talk CASE=memory_basic  # run one case
     make verify-talk VERBOSE=1          # verbose
 """
+
 from __future__ import annotations
 
 import os
@@ -44,6 +45,7 @@ logging.basicConfig(level=logging.WARNING)
 def _get_cheapest_model() -> str | None:
     try:
         from core.llm.model_resolver import _resolve_cheapest
+
         model = _resolve_cheapest("")
         return model if model else None
     except Exception:
@@ -52,12 +54,16 @@ def _get_cheapest_model() -> str | None:
 
 def _get_llm_client():
     from core.llm.client import LLMClient
+
     return LLMClient(SessionLocal)
 
 
-def _init_prev_counts(case: dict, uid: str, sid: str, prev_counts: dict, uid_only: bool = False) -> None:
+def _init_prev_counts(
+    case: dict, uid: str, sid: str, prev_counts: dict, uid_only: bool = False
+) -> None:
     """Snapshot initial DB counts for relative checks (+N)."""
     from sqlalchemy import text as sa_text
+
     for turn_def in case.get("turns", []):
         for rule in turn_def.get("checks", {}).get("rules", []):
             if "db" in rule:
@@ -70,9 +76,12 @@ def _init_prev_counts(case: dict, uid: str, sid: str, prev_counts: dict, uid_onl
                 key = f"{table}:{where}"
                 if key not in prev_counts:
                     with SessionLocal() as db:
-                        prev_counts[key] = db.execute(
-                            sa_text(f"SELECT COUNT(*) FROM {table} WHERE {where}")
-                        ).scalar() or 0
+                        prev_counts[key] = (
+                            db.execute(
+                                sa_text(f"SELECT COUNT(*) FROM {table} WHERE {where}")
+                            ).scalar()
+                            or 0
+                        )
 
 
 def _seed_graph_nodes(user_id: str, count: int = 50) -> None:
@@ -84,18 +93,37 @@ def _seed_graph_nodes(user_id: str, count: int = 50) -> None:
         return  # no embedding client, skip
 
     topics = [
-        "Python", "Rust", "Go", "TypeScript", "Java", "C++", "Ruby", "Swift",
-        "machine learning", "data analysis", "web development", "database",
-        "API design", "microservices", "DevOps", "cloud computing",
-        "algorithms", "data structures", "system design", "testing",
+        "Python",
+        "Rust",
+        "Go",
+        "TypeScript",
+        "Java",
+        "C++",
+        "Ruby",
+        "Swift",
+        "machine learning",
+        "data analysis",
+        "web development",
+        "database",
+        "API design",
+        "microservices",
+        "DevOps",
+        "cloud computing",
+        "algorithms",
+        "data structures",
+        "system design",
+        "testing",
     ]
     batch: list[dict] = []
     for i in range(count):
         topic = topics[i % len(topics)]
-        batch.append({
-            "content": f"Background: user has experience with {topic} (seed {i})",
-            "type": "semantic", "trust": "T3",
-        })
+        batch.append(
+            {
+                "content": f"Background: user has experience with {topic} (seed {i})",
+                "type": "semantic",
+                "trust": "T3",
+            }
+        )
         if len(batch) >= 10:
             editor.batch_inject(user_id, batch, source="verify-talk-seed")
             batch = []
@@ -109,7 +137,7 @@ def run_case(case: dict, *, verbose: bool = False, model: str | None = None) -> 
     passed = failed = 0
     prev_counts: dict[str, int] = {}
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Case: {name}")
     print(f"  {case.get('description', '')}")
 
@@ -166,11 +194,20 @@ def run_case(case: dict, *, verbose: bool = False, model: str | None = None) -> 
         if "rules" in final:
             print(f"\n  Final checks:")
             results = run_rule_checks(
-                final["rules"], "", [], SessionLocal, uid, sid, prev_counts,
+                final["rules"],
+                "",
+                [],
+                SessionLocal,
+                uid,
+                sid,
+                prev_counts,
             )
             for r in results:
                 status = "✅" if r.passed else "❌"
-                print(f"    {status} {r.name}" + (f" — {r.message}" if r.message and not r.passed else ""))
+                print(
+                    f"    {status} {r.name}"
+                    + (f" — {r.message}" if r.message and not r.passed else "")
+                )
                 if r.passed:
                     passed += 1
                 else:
@@ -178,15 +215,23 @@ def run_case(case: dict, *, verbose: bool = False, model: str | None = None) -> 
 
         # Verify graph activation was actually used (only for cases that opt in)
         if check_graph:
-            from core.memory.factory import _resolve_strategy, _registry, StrategyDescriptor, _register_builtins
+            from core.memory.factory import (
+                _resolve_strategy,
+                _registry,
+                StrategyDescriptor,
+                _register_builtins,
+            )
             from core.embedding import get_embedding_client
+
             _register_builtins()
             sk = _resolve_strategy(SessionLocal, uid, backend=None, strategy=None)
             desc = StrategyDescriptor.parse(sk)
             strategy = _registry.create_strategy(desc, db_factory=SessionLocal)
             ec = get_embedding_client()
             q_emb = ec.embed("Python data analysis")
-            _, explain_info = strategy.retrieve(uid, "Python data analysis", q_emb, top_k=3, explain=True)
+            _, explain_info = strategy.retrieve(
+                uid, "Python data analysis", q_emb, top_k=3, explain=True
+            )
             path = (explain_info or {}).get("path", "unknown")
             if path == "graph":
                 print(f"    ✅ graph_activation_used — path=graph (confirmed via explain)")
@@ -208,13 +253,19 @@ def run_case(case: dict, *, verbose: bool = False, model: str | None = None) -> 
 
 
 def _check_turn(
-    idx: int, turn_def: dict, record, uid: str, sid: str,
-    prev_counts: dict, verbose: bool, model: str | None,
+    idx: int,
+    turn_def: dict,
+    record,
+    uid: str,
+    sid: str,
+    prev_counts: dict,
+    verbose: bool,
+    model: str | None,
 ) -> tuple[int, int]:
     """Run checks for one turn. Returns (passed, failed)."""
     passed = failed = 0
     user_msg = turn_def["user"]
-    print(f"\n  Turn {idx+1}: \"{user_msg}\"")
+    print(f'\n  Turn {idx + 1}: "{user_msg}"')
 
     if record.error:
         print(f"    ❌ ERROR: {record.error}")
@@ -225,19 +276,26 @@ def _check_turn(
         if record.tool_calls:
             print(f"    tools: {[tc['name'] for tc in record.tool_calls]}")
             for tc in record.tool_calls:
-                print(f"      {tc['name']} args: {str(tc.get('args',''))[:200]}")
+                print(f"      {tc['name']} args: {str(tc.get('args', ''))[:200]}")
 
     checks = turn_def.get("checks", {})
 
     # Rule checks
     if "rules" in checks:
         results = run_rule_checks(
-            checks["rules"], record.response, record.tool_calls,
-            SessionLocal, uid, sid, prev_counts,
+            checks["rules"],
+            record.response,
+            record.tool_calls,
+            SessionLocal,
+            uid,
+            sid,
+            prev_counts,
         )
         for r in results:
             status = "✅" if r.passed else "❌"
-            print(f"    {status} {r.name}" + (f" — {r.message}" if r.message and not r.passed else ""))
+            print(
+                f"    {status} {r.name}" + (f" — {r.message}" if r.message and not r.passed else "")
+            )
             if r.passed:
                 passed += 1
             else:
@@ -247,9 +305,12 @@ def _check_turn(
     if "llm_judge" in checks:
         jc = checks["llm_judge"]
         r = llm_judge(
-            record.response, user_msg, jc["criteria"],
+            record.response,
+            user_msg,
+            jc["criteria"],
             jc.get("pass_threshold", 0.7),
-            _get_llm_client(), model=model,
+            _get_llm_client(),
+            model=model,
         )
         status = "🤖✅" if r.passed else "🤖❌"
         print(f"    {status} {r.message}")
@@ -263,6 +324,7 @@ def _check_turn(
 
 def _cleanup_user(user_id: str) -> None:
     from sqlalchemy import text as sa_text
+
     with SessionLocal() as db:
         for t in ("mem_edit_log", "mem_memories", "memory_graph_nodes", "memory_graph_edges"):
             db.execute(sa_text(f"DELETE FROM {t} WHERE user_id = :uid"), {"uid": user_id})
@@ -271,6 +333,7 @@ def _cleanup_user(user_id: str) -> None:
     # Discard experiment branches
     try:
         from core.memory.experiment import MemoryExperimentManager
+
         db_name = SessionLocal.kw["bind"].url.database
         mgr = MemoryExperimentManager(SessionLocal, source_db=db_name)
         with SessionLocal() as db:
@@ -285,6 +348,7 @@ def _cleanup_user(user_id: str) -> None:
                 pass
     except Exception:
         pass
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Talk Verification")
@@ -319,7 +383,7 @@ def main() -> None:
         total_passed += p
         total_failed += f
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Total: {total_passed} passed, {total_failed} failed")
     sys.exit(1 if total_failed else 0)
 

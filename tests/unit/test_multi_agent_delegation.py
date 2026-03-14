@@ -76,12 +76,8 @@ class TestAgentRegistryDelegation:
     def test_register_with_valid_delegate_to(self):
         """Test registering agent with valid delegate_to references."""
         # Register target agents first
-        self.registry.register(
-            AgentProfile(agent_id="agent1", system_prompt="Agent 1")
-        )
-        self.registry.register(
-            AgentProfile(agent_id="agent2", system_prompt="Agent 2")
-        )
+        self.registry.register(AgentProfile(agent_id="agent1", system_prompt="Agent 1"))
+        self.registry.register(AgentProfile(agent_id="agent2", system_prompt="Agent 2"))
 
         # Register orchestrator that delegates to them
         orchestrator = AgentProfile(
@@ -111,13 +107,9 @@ class TestAgentRegistryDelegation:
     def test_can_delegate_check(self):
         """Test can_delegate permission check."""
         # Register target agents first
-        self.registry.register(
-            AgentProfile(agent_id="agent1", system_prompt="Agent 1")
-        )
-        self.registry.register(
-            AgentProfile(agent_id="agent2", system_prompt="Agent 2")
-        )
-        
+        self.registry.register(AgentProfile(agent_id="agent1", system_prompt="Agent 1"))
+        self.registry.register(AgentProfile(agent_id="agent2", system_prompt="Agent 2"))
+
         # Register orchestrator that can delegate to agent1
         self.registry.register(
             AgentProfile(
@@ -140,9 +132,7 @@ class TestAgentRegistryDelegation:
 
     def test_can_delegate_to_anyone(self):
         """Test delegation with empty delegate_to (can delegate to anyone)."""
-        self.registry.register(
-            AgentProfile(agent_id="agent1", system_prompt="Agent 1")
-        )
+        self.registry.register(AgentProfile(agent_id="agent1", system_prompt="Agent 1"))
         self.registry.register(
             AgentProfile(
                 agent_id="orchestrator",

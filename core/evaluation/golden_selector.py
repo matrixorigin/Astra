@@ -25,15 +25,15 @@ logger = get_logger(__name__)
 
 class GoldenSessionSelector(DbConsumer):
     """Select and manage golden sessions for regression testing."""
-    
+
     def __init__(self, db_factory: DbFactory):
         """Initialize selector.
-        
+
         Args:
             db: SQLAlchemy session
         """
         super().__init__(db_factory)
-    
+
     def select_golden_sessions(
         self,
         min_quality_score: float = 4.0,
@@ -44,7 +44,7 @@ class GoldenSessionSelector(DbConsumer):
         prompt_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Select golden sessions based on quality criteria.
-        
+
         Args:
             min_quality_score: Minimum quality score (0-5)
             min_confidence: Minimum trust confidence (0-1)
@@ -52,7 +52,7 @@ class GoldenSessionSelector(DbConsumer):
             limit: Maximum sessions to return
             skill_name: Filter by skill name (optional)
             prompt_id: Filter by prompt ID (optional)
-        
+
         Returns:
             List of golden session dicts with metadata
         """
@@ -72,49 +72,51 @@ class GoldenSessionSelector(DbConsumer):
                 WHERE e.event_type = 'llm_response'
                 AND e.quality_score >= :min_quality
             """
-        
+
             params = {"min_quality": min_quality_score}
-        
+
             # Add skill filter
             if skill_name:
                 query += " AND e.skills_snapshot LIKE :skill_name"
                 params["skill_name"] = f"%{skill_name}%"
-        
+
             # Add prompt filter
             if prompt_id:
                 query += " AND e.prompt_template_id = :prompt_id"
                 params["prompt_id"] = prompt_id
-        
+
             # Order by quality and recency
             query += """
                 ORDER BY e.quality_score DESC, e.created_at DESC
                 LIMIT :limit
             """
             params["limit"] = limit
-        
+
             try:
                 result = db.execute(text(query), params).fetchall()
-            
+
                 sessions = []
                 for row in result:
-                    sessions.append({
-                        "event_id": row[0],
-                        "session_id": row[1],
-                        "user_id": row[2],
-                        "content": row[3],
-                        "quality_score": row[4],
-                        "created_at": row[5],
-                        "metadata": row[6],
-                        "skills_snapshot": row[7],
-                    })
-            
+                    sessions.append(
+                        {
+                            "event_id": row[0],
+                            "session_id": row[1],
+                            "user_id": row[2],
+                            "content": row[3],
+                            "quality_score": row[4],
+                            "created_at": row[5],
+                            "metadata": row[6],
+                            "skills_snapshot": row[7],
+                        }
+                    )
+
                 logger.info(f"Selected {len(sessions)} golden sessions")
                 return sessions
-        
+
             except Exception as e:
                 logger.error(f"Failed to select golden sessions: {e}")
                 return []
-    
+
     def tag_golden_session(
         self,
         event_id: str,
@@ -122,12 +124,12 @@ class GoldenSessionSelector(DbConsumer):
         reason: str = "",
     ) -> bool:
         """Tag an event as part of a golden set.
-        
+
         Args:
             event_id: Event ID to tag
             golden_set_id: Golden set identifier
             reason: Reason for selection
-        
+
         Returns:
             True if successful
         """
@@ -138,11 +140,11 @@ class GoldenSessionSelector(DbConsumer):
                     text("SELECT metadata FROM agent_events WHERE event_id = :event_id"),
                     {"event_id": event_id},
                 ).fetchone()
-            
+
                 if not result:
                     logger.error(f"Event {event_id} not found")
                     return False
-            
+
                 # Parse and update metadata
                 metadata = {}
                 try:
@@ -156,18 +158,18 @@ class GoldenSessionSelector(DbConsumer):
                 except Exception as parse_err:
                     logger.warning(f"Could not parse metadata: {type(parse_err).__name__}")
                     metadata = {}
-            
+
                 # Add golden set info
                 if not isinstance(metadata, dict):
                     metadata = {}
-            
+
                 if "evaluation" not in metadata:
                     metadata["evaluation"] = {}
-            
+
                 metadata["evaluation"]["golden_set_id"] = golden_set_id
                 metadata["evaluation"]["golden_reason"] = reason
                 metadata["evaluation"]["golden_tagged_at"] = datetime.now(timezone.utc).isoformat()
-            
+
                 # Update metadata
                 db.execute(
                     text("UPDATE agent_events SET metadata = :metadata WHERE event_id = :event_id"),
@@ -178,7 +180,7 @@ class GoldenSessionSelector(DbConsumer):
                 )
                 db.commit()
                 return True
-        
+
             except Exception as e:
                 error_msg = "Failed to tag golden session"
                 try:
@@ -191,7 +193,7 @@ class GoldenSessionSelector(DbConsumer):
                 except Exception:
                     pass
                 return False
-    
+
     def create_golden_set(
         self,
         sessions: list[dict[str, Any]],
@@ -199,21 +201,21 @@ class GoldenSessionSelector(DbConsumer):
         description: str = "",
     ) -> str:
         """Create a versioned golden set.
-        
+
         Args:
             sessions: List of golden sessions
             name: Golden set name
             description: Description
-        
+
         Returns:
             Golden set ID
         """
         golden_set_id = str(uuid7())
         timestamp = datetime.now(timezone.utc).isoformat()
-        
+
         if not name:
             name = f"golden_set_{golden_set_id[:8]}"
-        
+
         # Tag all sessions in the set
         for session in sessions:
             self.tag_golden_session(
@@ -221,19 +223,19 @@ class GoldenSessionSelector(DbConsumer):
                 golden_set_id=golden_set_id,
                 reason=f"Quality score: {session.get('quality_score', 0):.2f}",
             )
-        
+
         logger.info(f"Created golden set {golden_set_id} with {len(sessions)} sessions")
         return golden_set_id
-    
+
     def get_golden_set(
         self,
         golden_set_id: str,
     ) -> list[dict[str, Any]]:
         """Retrieve sessions from a golden set.
-        
+
         Args:
             golden_set_id: Golden set ID
-        
+
         Returns:
             List of sessions in the set
         """
@@ -252,36 +254,42 @@ class GoldenSessionSelector(DbConsumer):
                     FROM agent_events
                     ORDER BY created_at DESC
                 """
-            
+
                 result = db.execute(text(query)).fetchall()
-            
+
                 sessions = []
                 for row in result:
                     try:
                         metadata_str = row[6]
                         if metadata_str is not None:
                             metadata = json.loads(str(metadata_str))
-                            if isinstance(metadata, dict) and metadata.get("evaluation", {}).get("golden_set_id") == golden_set_id:
-                                sessions.append({
-                                    "event_id": row[0],
-                                    "session_id": row[1],
-                                    "user_id": row[2],
-                                    "content": row[3],
-                                    "quality_score": row[4],
-                                    "created_at": row[5],
-                                })
+                            if (
+                                isinstance(metadata, dict)
+                                and metadata.get("evaluation", {}).get("golden_set_id")
+                                == golden_set_id
+                            ):
+                                sessions.append(
+                                    {
+                                        "event_id": row[0],
+                                        "session_id": row[1],
+                                        "user_id": row[2],
+                                        "content": row[3],
+                                        "quality_score": row[4],
+                                        "created_at": row[5],
+                                    }
+                                )
                     except (json.JSONDecodeError, TypeError, AttributeError):
                         pass
-            
+
                 return sessions
-        
+
             except Exception as e:
                 logger.error(f"Failed to retrieve golden set {golden_set_id}: {e}")
                 return []
-    
+
     def list_golden_sets(self) -> list[dict[str, Any]]:
         """List all golden sets.
-        
+
         Returns:
             List of golden set metadata
         """
@@ -296,9 +304,9 @@ class GoldenSessionSelector(DbConsumer):
                     WHERE metadata IS NOT NULL
                     ORDER BY created_at DESC
                 """
-            
+
                 result = db.execute(text(query)).fetchall()
-            
+
                 # Group by golden_set_id
                 sets_dict = {}
                 for row in result:
@@ -317,9 +325,9 @@ class GoldenSessionSelector(DbConsumer):
                                 sets_dict[golden_set_id]["session_count"] += 1
                         except (json.JSONDecodeError, TypeError):
                             pass
-            
+
                 return list(sets_dict.values())
-        
+
             except Exception as e:
                 logger.error(f"Failed to list golden sets: {e}")
                 return []

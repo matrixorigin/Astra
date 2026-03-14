@@ -6,6 +6,7 @@ Reuses SyncAPIClient from mo-agent for consistent auth/session handling.
 
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import json
@@ -32,6 +33,7 @@ def require_auth(client: SyncAPIClient) -> None:
 # Root group
 # ============================================================================
 
+
 @click.group()
 @click.option("--api-url", default="http://localhost:8000", envvar="MO_AGENT_API_URL")
 @click.option("--profile", default=None, envvar="MO_AGENT_PROFILE", help="Profile to use")
@@ -46,6 +48,7 @@ def cli(ctx, api_url, profile):
 # ============================================================================
 # Auth
 # ============================================================================
+
 
 @cli.command()
 @click.option("--username", prompt=True)
@@ -70,7 +73,8 @@ def register(ctx, username, password, email):
     """Register new admin user."""
     try:
         ctx.obj["client"].admin_register(
-            username=username, password=password,
+            username=username,
+            password=password,
             email=email or f"{username}@example.com",
         )
         click.echo(f"✅ Admin registered: {username}")
@@ -113,6 +117,7 @@ def init(ctx):
 # Model management
 # ============================================================================
 
+
 @cli.group()
 def model():
     """Manage LLM models."""
@@ -125,24 +130,41 @@ def model():
 @click.option("--base-url", default=None, help="Custom base URL (OpenAI-compatible)")
 @click.option("--description", default=None, help="Model description")
 @click.option("--pricing-prompt", type=float, default=None, help="Price per 1k prompt tokens (USD)")
-@click.option("--pricing-completion", type=float, default=None, help="Price per 1k completion tokens (USD)")
+@click.option(
+    "--pricing-completion", type=float, default=None, help="Price per 1k completion tokens (USD)"
+)
 @click.option("--tags", default=None, help="Comma-separated tags (e.g. code,fast,cheap)")
 @click.option("--context-window", type=int, default=None, help="Context window size")
 @click.option("--max-completion-tokens", type=int, default=None, help="Max completion tokens")
 @click.pass_context
-def model_add(ctx, model_name, provider, api_key, base_url, description,
-              pricing_prompt, pricing_completion, tags, context_window, max_completion_tokens):
+def model_add(
+    ctx,
+    model_name,
+    provider,
+    api_key,
+    base_url,
+    description,
+    pricing_prompt,
+    pricing_completion,
+    tags,
+    context_window,
+    max_completion_tokens,
+):
     """Register a model with API key. Validates connectivity."""
     client = ctx.obj["client"]
     require_auth(client)
     try:
         tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
         result = client.admin_create_model(
-            model_name=model_name, provider=provider,
-            api_key=api_key, base_url=base_url,
+            model_name=model_name,
+            provider=provider,
+            api_key=api_key,
+            base_url=base_url,
             description=description,
-            pricing_prompt=pricing_prompt, pricing_completion=pricing_completion,
-            tags=tag_list, context_window=context_window,
+            pricing_prompt=pricing_prompt,
+            pricing_completion=pricing_completion,
+            tags=tag_list,
+            context_window=context_window,
             max_completion_tokens=max_completion_tokens,
         )
         conn = result.get("connectivity", "unknown")
@@ -173,6 +195,7 @@ def model_list(ctx):
         from rich.console import Console
         from rich.table import Table
         from rich.text import Text as RichText
+
         console = Console()
         t = Table(show_header=True, box=None)
         t.add_column("", width=2)
@@ -211,7 +234,9 @@ def model_show(ctx, model_name):
             click.echo(f"  base_url:      {m['base_url']}")
         pricing = m.get("pricing", {})
         if pricing.get("prompt") or pricing.get("completion"):
-            click.echo(f"  pricing:       ${pricing.get('prompt', 0)}/1k prompt, ${pricing.get('completion', 0)}/1k completion")
+            click.echo(
+                f"  pricing:       ${pricing.get('prompt', 0)}/1k prompt, ${pricing.get('completion', 0)}/1k completion"
+            )
         click.echo(f"  context:       {m.get('context_window', 128000)}")
         if m.get("max_completion_tokens"):
             click.echo(f"  max_tokens:    {m['max_completion_tokens']}")
@@ -229,32 +254,61 @@ def model_show(ctx, model_name):
 @click.option("--base-url", default=None, help="New base URL")
 @click.option("--description", default=None, help="Model description")
 @click.option("--pricing-prompt", type=float, default=None, help="Price per 1k prompt tokens (USD)")
-@click.option("--pricing-completion", type=float, default=None, help="Price per 1k completion tokens (USD)")
+@click.option(
+    "--pricing-completion", type=float, default=None, help="Price per 1k completion tokens (USD)"
+)
 @click.option("--tags", default=None, help="Comma-separated tags (e.g. code,fast,cheap)")
 @click.option("--context-window", type=int, default=None, help="Context window size")
 @click.option("--max-completion-tokens", type=int, default=None, help="Max completion tokens")
 @click.option("--activate/--deactivate", default=None, help="Set model active/inactive")
 @click.pass_context
-def model_update(ctx, model_name, api_key, base_url, description,
-                 pricing_prompt, pricing_completion, tags, context_window,
-                 max_completion_tokens, activate):
+def model_update(
+    ctx,
+    model_name,
+    api_key,
+    base_url,
+    description,
+    pricing_prompt,
+    pricing_completion,
+    tags,
+    context_window,
+    max_completion_tokens,
+    activate,
+):
     """Update model config or API key."""
     client = ctx.obj["client"]
     require_auth(client)
-    if all(v is None for v in [api_key, base_url, description, pricing_prompt,
-                                pricing_completion, tags, context_window,
-                                max_completion_tokens, activate]):
-        click.echo("Nothing to update. Use --api-key, --base-url, --description, --pricing-prompt, "
-                    "--pricing-completion, --tags, --context-window, --max-completion-tokens, "
-                    "--activate, or --deactivate")
+    if all(
+        v is None
+        for v in [
+            api_key,
+            base_url,
+            description,
+            pricing_prompt,
+            pricing_completion,
+            tags,
+            context_window,
+            max_completion_tokens,
+            activate,
+        ]
+    ):
+        click.echo(
+            "Nothing to update. Use --api-key, --base-url, --description, --pricing-prompt, "
+            "--pricing-completion, --tags, --context-window, --max-completion-tokens, "
+            "--activate, or --deactivate"
+        )
         return
     try:
         tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
         result = client.admin_update_model(
-            model_name=model_name, api_key=api_key,
-            base_url=base_url, description=description,
-            pricing_prompt=pricing_prompt, pricing_completion=pricing_completion,
-            tags=tag_list, context_window=context_window,
+            model_name=model_name,
+            api_key=api_key,
+            base_url=base_url,
+            description=description,
+            pricing_prompt=pricing_prompt,
+            pricing_completion=pricing_completion,
+            tags=tag_list,
+            context_window=context_window,
             max_completion_tokens=max_completion_tokens,
             is_active=activate,
         )
@@ -353,10 +407,15 @@ def model_load(ctx, file):
             tags = [t.strip() for t in tags.split(",") if t.strip()]
         try:
             result = client.admin_create_model(
-                model_name=name, provider=provider, api_key=api_key,
-                base_url=m.get("base_url"), description=m.get("description"),
-                pricing_prompt=m.get("pricing_prompt"), pricing_completion=m.get("pricing_completion"),
-                tags=tags, context_window=m.get("context_window"),
+                model_name=name,
+                provider=provider,
+                api_key=api_key,
+                base_url=m.get("base_url"),
+                description=m.get("description"),
+                pricing_prompt=m.get("pricing_prompt"),
+                pricing_completion=m.get("pricing_completion"),
+                tags=tags,
+                context_window=m.get("context_window"),
                 max_completion_tokens=m.get("max_completion_tokens"),
             )
             conn = result.get("connectivity", "unknown")
@@ -372,6 +431,7 @@ def model_load(ctx, file):
 # ============================================================================
 # Token management
 # ============================================================================
+
 
 @cli.group()
 def token():
@@ -391,8 +451,11 @@ def token_create(ctx, token_type, provider, value, scope_type, scope_id):
     require_auth(client)
     try:
         result = client.admin_create_token(
-            token_type=token_type, provider=provider,
-            token_value=value, scope=scope_type, scope_id=scope_id,
+            token_type=token_type,
+            provider=provider,
+            token_value=value,
+            scope=scope_type,
+            scope_id=scope_id,
         )
         click.echo(f"✅ Token created: {result['token_id']}")
     except Exception as e:
@@ -429,6 +492,7 @@ def token_list(ctx, token_type):
 # ============================================================================
 # User management
 # ============================================================================
+
 
 @cli.group()
 def user():
@@ -471,6 +535,7 @@ def user_revoke_role(ctx, username, role_name):
 # Skill management (NEW — admin-side skill lifecycle)
 # ============================================================================
 
+
 @cli.group()
 def skill():
     """Manage skills (admin operations)."""
@@ -508,8 +573,17 @@ def skill_show(ctx, skill_name):
     require_auth(client)
     try:
         s = client.get_skill(skill_name)
-        for k in ("skill_name", "version", "status", "source", "description",
-                   "is_active", "is_public", "created_by", "created_at"):
+        for k in (
+            "skill_name",
+            "version",
+            "status",
+            "source",
+            "description",
+            "is_active",
+            "is_public",
+            "created_by",
+            "created_at",
+        ):
             if k in s:
                 click.echo(f"  {k}: {s[k]}")
         if s.get("manifest"):
@@ -535,8 +609,7 @@ def skill_versions(ctx, skill_name):
         for v in versions:
             active = "→" if v.get("is_active") else " "
             click.echo(
-                f"  {active} v{v['version']}  [{v.get('status', '?')}]  "
-                f"{v.get('created_at', '')}"
+                f"  {active} v{v['version']}  [{v.get('status', '?')}]  {v.get('created_at', '')}"
             )
     except Exception as e:
         click.echo(f"❌ Error: {e}")
@@ -563,7 +636,7 @@ def skill_register(ctx, skill_file):
 @click.option("--output-dir", default="skills/", type=click.Path(), help="Output directory")
 def skill_scaffold(yaml_file, output_dir):
     """Generate skill package from YAML declaration."""
-    raise NotImplementedError('Module removed in skill system cleanup')
+    raise NotImplementedError("Module removed in skill system cleanup")
 
 
 @skill.command("upgrade-check")
@@ -579,7 +652,7 @@ def skill_upgrade_check(ctx, skill_name, new_version):
         if not skills:
             click.echo("No skills found")
             return
-        raise NotImplementedError('Module removed in skill system cleanup')
+        raise NotImplementedError("Module removed in skill system cleanup")
     except Exception as e:
         click.echo(f"❌ Error: {e}")
 
@@ -587,6 +660,7 @@ def skill_upgrade_check(ctx, skill_name, new_version):
 # ============================================================================
 # Prompt management (NEW)
 # ============================================================================
+
 
 @cli.group()
 def prompt():
@@ -615,6 +689,7 @@ def prompt_optimize(ctx, prompt_text, model):
 # ============================================================================
 # Audit
 # ============================================================================
+
 
 @cli.group()
 def audit():
@@ -647,6 +722,7 @@ def audit_logs(ctx, user, since, limit):
 # ============================================================================
 # Feedback
 # ============================================================================
+
 
 @cli.group()
 def feedback():
@@ -695,6 +771,7 @@ def feedback_export(ctx):
 # Interactive shell
 # ============================================================================
 
+
 @cli.command()
 @click.pass_context
 def shell(ctx):
@@ -715,6 +792,7 @@ def shell(ctx):
 
     try:
         from prompt_toolkit.completion import WordCompleter
+
         completer = WordCompleter(cmd_names, sentence=True)
     except ImportError:
         completer = None

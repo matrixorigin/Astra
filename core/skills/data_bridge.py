@@ -39,9 +39,7 @@ class SkillDataBridge:
         # depends_on is list[Dependency] after loader parses manifest.yaml.
         # Defensive: also handle raw strings for callers that construct
         # SkillManifest directly (e.g. tests) without going through parse_depends_on.
-        self._allowed: set[str] = {
-            d.name if hasattr(d, "name") else str(d) for d in own.depends_on
-        }
+        self._allowed: set[str] = {d.name if hasattr(d, "name") else str(d) for d in own.depends_on}
 
     def query(
         self,
@@ -55,7 +53,9 @@ class SkillDataBridge:
         stmt = select(tbl)
         stmt = _apply_filters(stmt, tbl, filters)
         stmt = stmt.limit(limit)
-        logger.info("SkillDataBridge: %s → %s.%s filters=%s", self._skill, target_skill, table, filters)
+        logger.info(
+            "SkillDataBridge: %s → %s.%s filters=%s", self._skill, target_skill, table, filters
+        )
         rows = self._db.execute(stmt).mappings().all()
         return [dict(r) for r in rows]
 

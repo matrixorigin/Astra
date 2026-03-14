@@ -14,9 +14,17 @@ from core.db_consumer import DbConsumer, DbFactory
 _SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 _DEFAULT_COLUMNS = [
-    "event_id", "user_id", "session_id", "agent_id", "agent_version",
-    "event_type", "content", "metadata", "created_at",
-    "parent_event_id", "causal_chain_id",
+    "event_id",
+    "user_id",
+    "session_id",
+    "agent_id",
+    "agent_version",
+    "event_type",
+    "content",
+    "metadata",
+    "created_at",
+    "parent_event_id",
+    "causal_chain_id",
 ]
 
 
@@ -28,8 +36,7 @@ def _validate_checkpoint_name(name: str) -> None:
     """
     if not _SAFE_NAME_RE.match(name):
         raise ValueError(
-            f"Invalid checkpoint name: {name!r}. "
-            "Only alphanumeric, dash, underscore allowed."
+            f"Invalid checkpoint name: {name!r}. Only alphanumeric, dash, underscore allowed."
         )
 
 

@@ -24,31 +24,45 @@ def setup_database(test_session_factory):
 
     with test_session_factory() as db:
         # Ensure admin role exists
-        exists = db.execute(text("SELECT 1 FROM auth_roles WHERE role_id = 'mo-agent-admin-role'")).scalar()
+        exists = db.execute(
+            text("SELECT 1 FROM auth_roles WHERE role_id = 'mo-agent-admin-role'")
+        ).scalar()
         if not exists:
-            db.execute(text("""
+            db.execute(
+                text("""
                 INSERT INTO auth_roles (role_id, role_name, description)
                 VALUES ('mo-agent-admin-role', 'mo_agent_admin', 'Administrator role')
-            """))
+            """)
+            )
 
         # Insert a sentinel user so regular_user is never the "first user" and won't auto-get admin
         sentinel_id = str(uuid.uuid4())
-        db.execute(text("""
+        db.execute(
+            text("""
             INSERT INTO auth_users (user_id, username, email, password_hash, is_active, created_at)
             VALUES (:uid, '__sentinel__', '__sentinel__@test.invalid', 'x', 1, NOW())
-        """), {"uid": sentinel_id})
+        """),
+            {"uid": sentinel_id},
+        )
         # Give sentinel admin role so subsequent registrations don't auto-become admin
-        db.execute(text("""
+        db.execute(
+            text("""
             INSERT INTO auth_user_roles (user_id, role_id)
             VALUES (:uid, 'mo-agent-admin-role')
-        """), {"uid": sentinel_id})
+        """),
+            {"uid": sentinel_id},
+        )
         db.commit()
 
     yield
 
     # Cleanup sentinel
     with test_session_factory() as db:
-        db.execute(text("DELETE FROM auth_user_roles WHERE user_id IN (SELECT user_id FROM auth_users WHERE username = '__sentinel__')"))
+        db.execute(
+            text(
+                "DELETE FROM auth_user_roles WHERE user_id IN (SELECT user_id FROM auth_users WHERE username = '__sentinel__')"
+            )
+        )
         db.execute(text("DELETE FROM auth_users WHERE username = '__sentinel__'"))
         db.commit()
 
@@ -96,6 +110,7 @@ def admin_user(client, db_session):
 
     # Decode token to get user_id
     from core.auth.jwt_manager import decode_token
+
     payload = decode_token(token)
     user_id = payload["sub"]
 

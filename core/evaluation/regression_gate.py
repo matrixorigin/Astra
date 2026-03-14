@@ -35,6 +35,7 @@ def _validate_sandbox_name(name: str) -> None:
 
 class ChangeType(str, Enum):
     """Type of change being validated"""
+
     PROMPT = "prompt"
     SKILL = "skill"
     CONFIG = "config"
@@ -96,8 +97,13 @@ class RegressionGate(DbConsumer):
                 sandbox_name,
                 description=f"Gate {gate_id}",
                 created_by="system",
-                tables=["ctx_prompt_templates", "skills_registry", "infra_configs",
-                         "agent_events", "sk_knowledge_entries"],
+                tables=[
+                    "ctx_prompt_templates",
+                    "skills_registry",
+                    "infra_configs",
+                    "agent_events",
+                    "sk_knowledge_entries",
+                ],
             )
 
             # 3. Apply change to sandbox
@@ -119,14 +125,16 @@ class RegressionGate(DbConsumer):
                         sandbox_name=sandbox_name,
                         mock_mode=True,
                     )
-                    replay_results.append({
-                        "session_id": session["session_id"],
-                        "original_score": session["avg_score"],
-                        "replay_status": result["status"],
-                        "events_replayed": result["events_replayed"],
-                        "successful": result["result"]["successful"],
-                        "failed": result["result"]["failed"],
-                    })
+                    replay_results.append(
+                        {
+                            "session_id": session["session_id"],
+                            "original_score": session["avg_score"],
+                            "replay_status": result["status"],
+                            "events_replayed": result["events_replayed"],
+                            "successful": result["result"]["successful"],
+                            "failed": result["result"]["failed"],
+                        }
+                    )
 
             # 5. Compute metrics
             metrics = self._compute_metrics(golden_sessions, replay_results)
@@ -226,20 +234,24 @@ class RegressionGate(DbConsumer):
         with self._db() as db:
             try:
                 if change_type == ChangeType.PROMPT:
-                    db.execute(text(f"""
+                    db.execute(
+                        text(f"""
                         UPDATE {sandbox_name}.ctx_prompt_templates
                         SET content = :content, updated_at = NOW()
                         WHERE template_id = :template_id
-                    """), {
-                        "content": change_content.get("content", ""),
-                        "template_id": change_content.get("template_id", change_id),
-                    })
+                    """),
+                        {
+                            "content": change_content.get("content", ""),
+                            "template_id": change_content.get("template_id", change_id),
+                        },
+                    )
 
                 elif change_type == ChangeType.SKILL:
                     skill_definition = change_content.get("definition")
                     if skill_definition is None:
                         skill_definition = change_content.get("skill_definition", {})
-                    db.execute(text(f"""
+                    db.execute(
+                        text(f"""
                         INSERT INTO {sandbox_name}.skills_registry
                         (skill_id, skill_name, version, description, skill_definition,
                          is_active, created_at, updated_at)
@@ -248,41 +260,53 @@ class RegressionGate(DbConsumer):
                         ON DUPLICATE KEY UPDATE
                         skill_definition = :definition, version = :version,
                         description = :description, is_active = 1, updated_at = NOW()
-                    """), {
-                        "skill_id": change_id,
-                        "skill_name": change_content.get("skill_name") or change_content.get("name", change_id),
-                        "version": change_content.get("version", "1.0.0"),
-                        "description": change_content.get("description", ""),
-                        "definition": skill_definition,
-                    })
+                    """),
+                        {
+                            "skill_id": change_id,
+                            "skill_name": change_content.get("skill_name")
+                            or change_content.get("name", change_id),
+                            "version": change_content.get("version", "1.0.0"),
+                            "description": change_content.get("description", ""),
+                            "definition": skill_definition,
+                        },
+                    )
 
                 elif change_type == ChangeType.CONFIG:
-                    db.execute(text(f"""
+                    db.execute(
+                        text(f"""
                         UPDATE {sandbox_name}.configs
                         SET value = :value, updated_at = NOW()
                         WHERE key_name = :key_name
-                    """), {
-                        "key_name": change_content.get("key", change_id),
-                        "value": change_content.get("value", ""),
-                    })
+                    """),
+                        {
+                            "key_name": change_content.get("key", change_id),
+                            "value": change_content.get("value", ""),
+                        },
+                    )
 
                 elif change_type == ChangeType.SELECTOR:
-                    db.execute(text(f"""
+                    db.execute(
+                        text(f"""
                         UPDATE {sandbox_name}.configs
                         SET value = :value, updated_at = NOW()
                         WHERE key_name = 'selector_config'
-                    """), {
-                        "value": json.dumps(change_content, default=str),
-                    })
+                    """),
+                        {
+                            "value": json.dumps(change_content, default=str),
+                        },
+                    )
 
                 elif change_type == ChangeType.CONTEXT_BUDGET:
-                    db.execute(text(f"""
+                    db.execute(
+                        text(f"""
                         INSERT INTO {sandbox_name}.configs (key_name, value, updated_at)
                         VALUES ('context_budget_ratios', :value, NOW())
                         ON DUPLICATE KEY UPDATE value = :value, updated_at = NOW()
-                    """), {
-                        "value": json.dumps(change_content, default=str),
-                    })
+                    """),
+                        {
+                            "value": json.dumps(change_content, default=str),
+                        },
+                    )
 
                 elif change_type == ChangeType.KNOWLEDGE:
                     entry_id = change_content.get("entry_id")
@@ -290,20 +314,26 @@ class RegressionGate(DbConsumer):
                         raise ValueError("KNOWLEDGE change requires entry_id")
                     action = change_content.get("action", "quarantine")
                     if action == "quarantine":
-                        db.execute(text(f"""
+                        db.execute(
+                            text(f"""
                             UPDATE {sandbox_name}.sk_knowledge_entries
                             SET confidence = 0.0
                             WHERE entry_id = :entry_id
-                        """), {"entry_id": entry_id})
+                        """),
+                            {"entry_id": entry_id},
+                        )
                     elif action == "restore":
-                        db.execute(text(f"""
+                        db.execute(
+                            text(f"""
                             UPDATE {sandbox_name}.sk_knowledge_entries
                             SET confidence = :confidence
                             WHERE entry_id = :entry_id
-                        """), {
-                            "entry_id": entry_id,
-                            "confidence": change_content.get("confidence", 0.8),
-                        })
+                        """),
+                            {
+                                "entry_id": entry_id,
+                                "confidence": change_content.get("confidence", 0.8),
+                            },
+                        )
 
                 elif change_type == ChangeType.SLO_CRITICAL:
                     suspected = change_content.get("suspected_cause")
@@ -311,7 +341,8 @@ class RegressionGate(DbConsumer):
                         skill_name = suspected.get("skill_name") or suspected.get("name")
                         version = suspected.get("version")
                         if skill_name and version:
-                            db.execute(text(f"""
+                            db.execute(
+                                text(f"""
                                 INSERT INTO {sandbox_name}.skills_registry
                                 (skill_id, skill_name, version, description, skill_definition,
                                  is_active, created_at, updated_at)
@@ -322,22 +353,29 @@ class RegressionGate(DbConsumer):
                                 ON DUPLICATE KEY UPDATE
                                 skill_definition = VALUES(skill_definition),
                                 is_active = 1, updated_at = NOW()
-                            """), {"skill_name": skill_name, "version": version})
+                            """),
+                                {"skill_name": skill_name, "version": version},
+                            )
                     elif suspected and suspected.get("change_type") == "prompt_template_changed":
                         template_id = suspected.get("template_id")
                         version = suspected.get("version")
                         if template_id and version:
-                            db.execute(text(f"""
+                            db.execute(
+                                text(f"""
                                 INSERT INTO {sandbox_name}.ctx_prompt_templates
                                 (template_id, version, content, created_at)
                                 SELECT template_id, version, content, created_at
                                 FROM ctx_prompt_templates
                                 WHERE template_id = :template_id AND version = :version
                                 ON DUPLICATE KEY UPDATE content = VALUES(content)
-                            """), {"template_id": template_id, "version": version})
+                            """),
+                                {"template_id": template_id, "version": version},
+                            )
 
                 db.commit()
-                logger.info("Applied %s change %s to sandbox %s", change_type, change_id, sandbox_name)
+                logger.info(
+                    "Applied %s change %s to sandbox %s", change_type, change_id, sandbox_name
+                )
 
             except Exception as e:
                 logger.error("Failed to apply change to sandbox: %s", e)
@@ -393,10 +431,16 @@ class RegressionGate(DbConsumer):
     ) -> tuple[str, str]:
         """Make pass/fail decision based on metrics."""
         if metrics["error_rate"] > error_rate_threshold:
-            return "fail", f"error_rate {metrics['error_rate']:.2%} > threshold {error_rate_threshold:.2%}"
+            return (
+                "fail",
+                f"error_rate {metrics['error_rate']:.2%} > threshold {error_rate_threshold:.2%}",
+            )
 
         if metrics["score_delta"] < score_regression_threshold:
-            return "fail", f"score_delta {metrics['score_delta']:.2f} < threshold {score_regression_threshold:.2f}"
+            return (
+                "fail",
+                f"score_delta {metrics['score_delta']:.2f} < threshold {score_regression_threshold:.2f}",
+            )
 
         return "pass", "all_metrics_within_threshold"
 
@@ -451,12 +495,7 @@ class RegressionGate(DbConsumer):
     def get_gate_history(self, limit: int = 10) -> list[dict[str, Any]]:
         """Get gate validation history via ORM."""
         with self._db() as db:
-            rows = (
-                db.query(GateResult)
-                .order_by(GateResult.created_at.desc())
-                .limit(limit)
-                .all()
-            )
+            rows = db.query(GateResult).order_by(GateResult.created_at.desc()).limit(limit).all()
 
             return [
                 {

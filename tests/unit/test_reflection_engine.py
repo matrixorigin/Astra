@@ -13,13 +13,18 @@ from core.memory.types import Memory, MemoryType, TrustTier
 
 def _mem(mid: str = "m1", session_id: str = "s1", content: str = "test") -> Memory:
     return Memory(
-        memory_id=mid, user_id="u1", memory_type=MemoryType.SEMANTIC,
-        content=content, session_id=session_id,
+        memory_id=mid,
+        user_id="u1",
+        memory_type=MemoryType.SEMANTIC,
+        content=content,
+        session_id=session_id,
     )
 
 
 def _candidate(
-    n_memories: int = 3, n_sessions: int = 3, signal: str = "semantic_cluster",
+    n_memories: int = 3,
+    n_sessions: int = 3,
+    signal: str = "semantic_cluster",
     importance: float = 0.6,
 ) -> ReflectionCandidate:
     return ReflectionCandidate(
@@ -46,13 +51,21 @@ class TestMemoryWriterProtocolCompliance:
         writer.store.return_value = sentinel.memory
 
         llm = MagicMock()
-        llm.chat.return_value = json.dumps([{
-            "type": "procedural", "content": "test insight",
-            "confidence": 0.5, "evidence_summary": "e",
-        }])
+        llm.chat.return_value = json.dumps(
+            [
+                {
+                    "type": "procedural",
+                    "content": "test insight",
+                    "confidence": 0.5,
+                    "evidence_summary": "e",
+                }
+            ]
+        )
 
         engine = ReflectionEngine(
-            candidate_provider=provider, writer=writer, llm_client=llm,
+            candidate_provider=provider,
+            writer=writer,
+            llm_client=llm,
         )
         result = engine.reflect("u1")
 
@@ -70,7 +83,6 @@ class TestMemoryWriterProtocolCompliance:
 
 
 class TestReflectionEngine:
-
     def _make_engine(self, candidates, llm_response, threshold=DAILY_THRESHOLD):
         provider = MagicMock()
         provider.get_reflection_candidates.return_value = candidates
@@ -81,8 +93,10 @@ class TestReflectionEngine:
         llm.chat.return_value = llm_response
 
         engine = ReflectionEngine(
-            candidate_provider=provider, writer=writer,
-            llm_client=llm, threshold=threshold,
+            candidate_provider=provider,
+            writer=writer,
+            llm_client=llm,
+            threshold=threshold,
         )
         return engine, provider, writer, llm
 
@@ -101,7 +115,8 @@ class TestReflectionEngine:
     def test_candidates_below_threshold_filtered_out(self):
         # Single-session, small cluster → low score
         weak = ReflectionCandidate(
-            memories=[_mem("m1", "s1")], signal="semantic_cluster",
+            memories=[_mem("m1", "s1")],
+            signal="semantic_cluster",
             session_ids=["s1"],
         )
         engine, provider, writer, llm = self._make_engine([weak], "")
@@ -114,12 +129,16 @@ class TestReflectionEngine:
 
     def test_qualifying_candidate_triggers_llm_and_persist(self):
         candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)
-        llm_response = json.dumps([{
-            "type": "procedural",
-            "content": "Always run linter before commit",
-            "confidence": 0.6,
-            "evidence_summary": "User corrected this 3 times",
-        }])
+        llm_response = json.dumps(
+            [
+                {
+                    "type": "procedural",
+                    "content": "Always run linter before commit",
+                    "confidence": 0.6,
+                    "evidence_summary": "User corrected this 3 times",
+                }
+            ]
+        )
         engine, provider, writer, llm = self._make_engine([candidate], llm_response)
 
         result = engine.reflect("u1")
@@ -142,10 +161,22 @@ class TestReflectionEngine:
 
     def test_llm_returns_two_insights(self):
         candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)
-        llm_response = json.dumps([
-            {"type": "procedural", "content": "Insight 1", "confidence": 0.5, "evidence_summary": "e1"},
-            {"type": "semantic", "content": "Insight 2", "confidence": 0.4, "evidence_summary": "e2"},
-        ])
+        llm_response = json.dumps(
+            [
+                {
+                    "type": "procedural",
+                    "content": "Insight 1",
+                    "confidence": 0.5,
+                    "evidence_summary": "e1",
+                },
+                {
+                    "type": "semantic",
+                    "content": "Insight 2",
+                    "confidence": 0.4,
+                    "evidence_summary": "e2",
+                },
+            ]
+        )
         engine, provider, writer, llm = self._make_engine([candidate], llm_response)
 
         result = engine.reflect("u1")
@@ -174,9 +205,16 @@ class TestReflectionEngine:
 
     def test_confidence_clamped_to_range(self):
         candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)
-        llm_response = json.dumps([
-            {"type": "semantic", "content": "test", "confidence": 0.99, "evidence_summary": "e"},
-        ])
+        llm_response = json.dumps(
+            [
+                {
+                    "type": "semantic",
+                    "content": "test",
+                    "confidence": 0.99,
+                    "evidence_summary": "e",
+                },
+            ]
+        )
         engine, provider, writer, llm = self._make_engine([candidate], llm_response)
 
         result = engine.reflect("u1")
@@ -186,9 +224,11 @@ class TestReflectionEngine:
 
     def test_confidence_clamped_min(self):
         candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)
-        llm_response = json.dumps([
-            {"type": "semantic", "content": "test", "confidence": 0.1, "evidence_summary": "e"},
-        ])
+        llm_response = json.dumps(
+            [
+                {"type": "semantic", "content": "test", "confidence": 0.1, "evidence_summary": "e"},
+            ]
+        )
         engine, provider, writer, llm = self._make_engine([candidate], llm_response)
 
         result = engine.reflect("u1")
@@ -197,9 +237,16 @@ class TestReflectionEngine:
 
     def test_invalid_memory_type_skipped(self):
         candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)
-        llm_response = json.dumps([
-            {"type": "invalid_type", "content": "test", "confidence": 0.5, "evidence_summary": "e"},
-        ])
+        llm_response = json.dumps(
+            [
+                {
+                    "type": "invalid_type",
+                    "content": "test",
+                    "confidence": 0.5,
+                    "evidence_summary": "e",
+                },
+            ]
+        )
         engine, provider, writer, llm = self._make_engine([candidate], llm_response)
 
         result = engine.reflect("u1")
@@ -210,7 +257,9 @@ class TestReflectionEngine:
         provider = MagicMock()
         provider.get_reflection_candidates.side_effect = RuntimeError("db down")
         engine = ReflectionEngine(
-            candidate_provider=provider, writer=MagicMock(), llm_client=MagicMock(),
+            candidate_provider=provider,
+            writer=MagicMock(),
+            llm_client=MagicMock(),
         )
 
         result = engine.reflect("u1")
@@ -226,7 +275,9 @@ class TestReflectionEngine:
         llm = MagicMock()
         llm.chat.side_effect = RuntimeError("rate limited")
         engine = ReflectionEngine(
-            candidate_provider=provider, writer=MagicMock(), llm_client=llm,
+            candidate_provider=provider,
+            writer=MagicMock(),
+            llm_client=llm,
         )
 
         result = engine.reflect("u1")
@@ -238,11 +289,13 @@ class TestReflectionEngine:
 
     def test_max_two_insights_per_candidate(self):
         candidate = _candidate(n_memories=5, n_sessions=4, signal="contradiction", importance=0.6)
-        llm_response = json.dumps([
-            {"type": "semantic", "content": "i1", "confidence": 0.5, "evidence_summary": "e"},
-            {"type": "semantic", "content": "i2", "confidence": 0.5, "evidence_summary": "e"},
-            {"type": "semantic", "content": "i3", "confidence": 0.5, "evidence_summary": "e"},
-        ])
+        llm_response = json.dumps(
+            [
+                {"type": "semantic", "content": "i1", "confidence": 0.5, "evidence_summary": "e"},
+                {"type": "semantic", "content": "i2", "confidence": 0.5, "evidence_summary": "e"},
+                {"type": "semantic", "content": "i3", "confidence": 0.5, "evidence_summary": "e"},
+            ]
+        )
         engine, provider, writer, llm = self._make_engine([candidate], llm_response)
 
         result = engine.reflect("u1")

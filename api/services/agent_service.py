@@ -13,68 +13,70 @@ from core.db_consumer import DbFactory
 
 class CreateAgentRequest(BaseModel):
     """Agent创建请求验证模型"""
+
     name: str = Field(..., min_length=1, max_length=100, description="Agent名称")
     agent_config: dict[str, Any] | None = Field(default_factory=dict, description="Agent配置")
     data_source: dict[str, Any] | None = Field(default_factory=dict, description="数据源配置")
 
-    @field_validator('name')
+    @field_validator("name")
     @classmethod
     def validate_name(cls, v: str) -> str:
         """验证名称不为空白"""
         if not v or not v.strip():
-            raise ValueError('Agent name cannot be empty or whitespace')
+            raise ValueError("Agent name cannot be empty or whitespace")
         return v.strip()
 
-    @field_validator('agent_config')
+    @field_validator("agent_config")
     @classmethod
     def validate_agent_config(cls, v: dict[str, Any] | None) -> dict[str, Any]:
         """验证agent_config必须是字典"""
         if v is None:
             return {}
         if not isinstance(v, dict):
-            raise ValueError('agent_config must be a dictionary')
+            raise ValueError("agent_config must be a dictionary")
         return v
 
-    @field_validator('data_source')
+    @field_validator("data_source")
     @classmethod
     def validate_data_source(cls, v: dict[str, Any] | None) -> dict[str, Any]:
         """验证data_source必须是字典"""
         if v is None:
             return {"type": "matrixone", "database": "dev_agent"}
         if not isinstance(v, dict):
-            raise ValueError('data_source must be a dictionary')
+            raise ValueError("data_source must be a dictionary")
         return v
 
 
 class UpdateAgentRequest(BaseModel):
     """Agent更新请求验证模型"""
+
     name: str | None = Field(None, min_length=1, max_length=100, description="Agent名称")
     agent_config: dict[str, Any] | None = Field(None, description="Agent配置")
     data_source: dict[str, Any] | None = Field(None, description="数据源配置")
     is_active: bool | None = Field(None, description="是否激活")
 
-    @field_validator('name')
+    @field_validator("name")
     @classmethod
     def validate_name(cls, v: str | None) -> str | None:
         """验证名称不为空白"""
         if v is not None and (not v or not v.strip()):
-            raise ValueError('Agent name cannot be empty or whitespace')
+            raise ValueError("Agent name cannot be empty or whitespace")
         return v.strip() if v else None
 
-    @field_validator('agent_config')
+    @field_validator("agent_config")
     @classmethod
     def validate_agent_config(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
         """验证agent_config必须是字典"""
         if v is not None and not isinstance(v, dict):
-            raise ValueError('agent_config must be a dictionary')
+            raise ValueError("agent_config must be a dictionary")
         return v
 
-    @field_validator('data_source')
+    @field_validator("data_source")
     @classmethod
     def validate_data_source(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
         """验证data_source必须是字典"""
         if v is not None and not isinstance(v, dict):
-            raise ValueError('data_source must be a dictionary')
+            raise ValueError("data_source must be a dictionary")
         return v
 
 
@@ -92,28 +94,26 @@ class AgentService:
         user_id: str,
         name: str,
         agent_config: dict[str, Any] | None = None,
-        data_source: dict[str, Any] | None = None
+        data_source: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """创建 Agent
-        
+
         Args:
             user_id: 用户ID
             name: Agent名称
             agent_config: Agent配置
             data_source: 数据源配置
-            
+
         Returns:
             Agent信息
-            
+
         Raises:
             ValueError: 参数错误
         """
         # 1. 参数验证 - 使用Pydantic模型
         try:
             request = CreateAgentRequest(
-                name=name,
-                agent_config=agent_config,
-                data_source=data_source
+                name=name, agent_config=agent_config, data_source=data_source
             )
         except Exception as e:
             raise ValueError(f"Invalid input: {e}")
@@ -129,7 +129,7 @@ class AgentService:
                 "owner_user_id": user_id,
                 "agent_config": request.agent_config,
                 "data_source": request.data_source,
-                "is_active": True
+                "is_active": True,
             }
 
             agent = self.agent_repo.create(agent_data)
@@ -141,7 +141,7 @@ class AgentService:
                 resource_type="agent",
                 resource_id=agent.agent_id,
                 details={"name": request.name},
-                status="success"
+                status="success",
             )
 
             # 4. 返回结果
@@ -154,7 +154,7 @@ class AgentService:
                 "data_source": agent.data_source,
                 "is_active": agent.is_active,
                 "created_at": agent.created_at.isoformat(),
-                "updated_at": agent.updated_at.isoformat() if agent.updated_at else None
+                "updated_at": agent.updated_at.isoformat() if agent.updated_at else None,
             }
 
         except Exception as e:
@@ -165,20 +165,20 @@ class AgentService:
                 resource_type="agent",
                 resource_id=name,
                 details={"error": str(e)},
-                status="failed"
+                status="failed",
             )
             raise
 
     def get_agent(self, agent_id: str, user_id: str) -> dict[str, Any]:
         """获取 Agent 信息
-        
+
         Args:
             agent_id: Agent ID
             user_id: 用户ID
-            
+
         Returns:
             Agent信息
-            
+
         Raises:
             ValueError: Agent不存在或无权限
         """
@@ -200,15 +200,15 @@ class AgentService:
             "data_source": agent.data_source,
             "is_active": agent.is_active,
             "created_at": agent.created_at.isoformat(),
-            "updated_at": agent.updated_at.isoformat() if agent.updated_at else None
+            "updated_at": agent.updated_at.isoformat() if agent.updated_at else None,
         }
 
     def list_agents(self, user_id: str) -> list[dict[str, Any]]:
         """列出用户的 Agents
-        
+
         Args:
             user_id: 用户ID
-            
+
         Returns:
             Agent列表
         """
@@ -224,7 +224,7 @@ class AgentService:
                 "data_source": agent.data_source,
                 "is_active": agent.is_active,
                 "created_at": agent.created_at.isoformat(),
-                "updated_at": agent.updated_at.isoformat() if agent.updated_at else None
+                "updated_at": agent.updated_at.isoformat() if agent.updated_at else None,
             }
             for agent in agents
         ]
@@ -236,10 +236,10 @@ class AgentService:
         name: str | None = None,
         agent_config: dict[str, Any] | None = None,
         data_source: dict[str, Any] | None = None,
-        is_active: bool | None = None
+        is_active: bool | None = None,
     ) -> dict[str, Any]:
         """更新 Agent
-        
+
         Args:
             agent_id: Agent ID
             user_id: 用户ID
@@ -247,20 +247,17 @@ class AgentService:
             agent_config: 新配置
             data_source: 新数据源
             is_active: 是否激活
-            
+
         Returns:
             更新后的Agent信息
-            
+
         Raises:
             ValueError: Agent不存在或无权限
         """
         # 1. 参数验证 - 使用Pydantic模型
         try:
             request = UpdateAgentRequest(
-                name=name,
-                agent_config=agent_config,
-                data_source=data_source,
-                is_active=is_active
+                name=name, agent_config=agent_config, data_source=data_source, is_active=is_active
             )
         except Exception as e:
             raise ValueError(f"Invalid input: {e}")
@@ -300,7 +297,7 @@ class AgentService:
                 resource_type="agent",
                 resource_id=agent_id,
                 details=update_data,
-                status="success"
+                status="success",
             )
 
             return {
@@ -312,7 +309,9 @@ class AgentService:
                 "data_source": updated_agent.data_source,
                 "is_active": updated_agent.is_active,
                 "created_at": updated_agent.created_at.isoformat(),
-                "updated_at": updated_agent.updated_at.isoformat() if updated_agent.updated_at else None
+                "updated_at": updated_agent.updated_at.isoformat()
+                if updated_agent.updated_at
+                else None,
             }
 
         except Exception as e:
@@ -323,17 +322,17 @@ class AgentService:
                 resource_type="agent",
                 resource_id=agent_id,
                 details={"error": str(e)},
-                status="failed"
+                status="failed",
             )
             raise
 
     def delete_agent(self, agent_id: str, user_id: str) -> None:
         """删除 Agent
-        
+
         Args:
             agent_id: Agent ID
             user_id: 用户ID
-            
+
         Raises:
             ValueError: Agent不存在或无权限
         """
@@ -356,7 +355,7 @@ class AgentService:
                 resource_type="agent",
                 resource_id=agent_id,
                 details={"name": agent.agent_name},
-                status="success"
+                status="success",
             )
 
         except Exception as e:
@@ -367,6 +366,6 @@ class AgentService:
                 resource_type="agent",
                 resource_id=agent_id,
                 details={"error": str(e)},
-                status="failed"
+                status="failed",
             )
             raise

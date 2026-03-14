@@ -22,16 +22,27 @@ from core.context.compaction import (
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
+
 def _make_turn(turn_num: int, tool_result_chars: int = 500) -> list[dict]:
     """Generate one complete turn: user + assistant(tc) + tool + assistant."""
     return [
         {"role": "user", "content": f"Question about topic {turn_num}"},
-        {"role": "assistant", "content": "", "tool_calls": [
-            {"id": f"tc-{turn_num}", "type": "function",
-             "function": {"name": f"tool_{turn_num}", "arguments": "{}"}}
-        ]},
-        {"role": "tool", "tool_call_id": f"tc-{turn_num}",
-         "content": f"Result for topic {turn_num}: " + "x" * tool_result_chars},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": f"tc-{turn_num}",
+                    "type": "function",
+                    "function": {"name": f"tool_{turn_num}", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": f"tc-{turn_num}",
+            "content": f"Result for topic {turn_num}: " + "x" * tool_result_chars,
+        },
         {"role": "assistant", "content": f"Here is the answer for topic {turn_num}. " + "y" * 200},
     ]
 
@@ -45,6 +56,7 @@ def _build_history(num_turns: int, tool_result_chars: int = 500) -> list[dict]:
 
 
 # ── Step 1: Compaction threshold tests ───────────────────────────────
+
 
 class TestCompactionThreshold:
     """Verify compaction triggers at the lowered 16K char threshold."""
@@ -68,13 +80,15 @@ class TestCompactionThreshold:
         """6-turn history with large tool results should trigger compaction."""
         history = _build_history(6, tool_result_chars=3000)
         total_chars = sum(len(m.get("content") or "") for m in history)
-        assert total_chars > _COMPACT_HISTORY_THRESHOLD, \
+        assert total_chars > _COMPACT_HISTORY_THRESHOLD, (
             f"Test setup: {total_chars} chars should exceed {_COMPACT_HISTORY_THRESHOLD}"
+        )
 
         result = compact_history_messages(history)
         result_chars = sum(len(m.get("content") or "") for m in result)
-        assert result_chars < total_chars, \
+        assert result_chars < total_chars, (
             f"Compaction should reduce: {result_chars} >= {total_chars}"
+        )
 
     def test_recent_2_turns_preserved_after_compaction(self):
         """Last 2 user turns must be kept in full fidelity."""
@@ -87,10 +101,11 @@ class TestCompactionThreshold:
         original_recent = history[last_2_start:]
 
         # Find corresponding messages in result
-        result_recent = result[-len(original_recent):]
+        result_recent = result[-len(original_recent) :]
         for orig, comp in zip(original_recent, result_recent):
-            assert orig.get("content") == comp.get("content"), \
+            assert orig.get("content") == comp.get("content"), (
                 f"Recent message modified: {orig.get('content')[:50]} != {comp.get('content')[:50]}"
+            )
 
     def test_old_tool_results_truncated(self):
         """Tool results from old turns should be truncated."""
@@ -99,24 +114,28 @@ class TestCompactionThreshold:
 
         # First tool result (oldest) should be truncated
         first_tool = next(m for m in result if m.get("role") == "tool")
-        assert len(first_tool["content"]) < 3000, \
+        assert len(first_tool["content"]) < 3000, (
             f"Old tool result not truncated: {len(first_tool['content'])} chars"
+        )
         assert "truncated" in first_tool["content"].lower() or len(first_tool["content"]) <= 500
 
 
 # ── Step 2: EmbeddingWorker type coverage ────────────────────────────
+
 
 class TestEmbeddingWorkerTypes:
     """Verify tool_result is in EMBED_EVENT_TYPES."""
 
     def test_tool_result_in_embed_types(self):
         from core.events.embedding_worker import EMBED_EVENT_TYPES
+
         assert "tool_result" in EMBED_EVENT_TYPES
         assert "user_query" in EMBED_EVENT_TYPES
         assert "llm_response" in EMBED_EVENT_TYPES
 
 
 # ── Step 3: Retrieval view construction ──────────────────────────────
+
 
 class TestRetrievalView:
     """Verify _build_retrieval_view trims history correctly."""
@@ -148,8 +167,9 @@ class TestRetrievalView:
             result, _scores = _build_retrieval_view(history, "test-session", current_messages, db)
 
         # Result should be smaller than full history
-        assert len(result) < len(history), \
+        assert len(result) < len(history), (
             f"Retrieval view should be smaller: {len(result)} >= {len(history)}"
+        )
 
         # System message should be first
         assert result[0].get("role") == "system"
@@ -173,14 +193,17 @@ class TestRetrievalView:
         for num_turns in [4, 8, 12, 16]:
             history = _build_history(num_turns, tool_result_chars=500)
             with db_factory() as db:
-                result, _scores = _build_retrieval_view(history, f"test-{num_turns}", current_messages, db)
+                result, _scores = _build_retrieval_view(
+                    history, f"test-{num_turns}", current_messages, db
+                )
             tokens = estimate_tokens(result)
             token_counts.append(tokens)
 
         # Token count should NOT grow linearly with turns
         # Allow some variance but 16-turn should not be 4x of 4-turn
-        assert token_counts[-1] < token_counts[0] * 2.5, \
+        assert token_counts[-1] < token_counts[0] * 2.5, (
             f"Tokens growing too fast: {token_counts} (4→16 turns)"
+        )
 
     def test_system_message_always_present(self, db_factory):
         """System message must always be in the result."""
@@ -198,6 +221,7 @@ class TestRetrievalView:
 
 # ── Step 4: Fallback behavior ────────────────────────────────────────
 
+
 class TestRetrievalFallback:
     """Verify fallback to rule-based extraction when embeddings unavailable."""
 
@@ -206,7 +230,9 @@ class TestRetrievalFallback:
 
         history = _build_history(6)
         # Inject a message with specific keyword
-        history.insert(5, {"role": "assistant", "content": "The database migration completed successfully"})
+        history.insert(
+            5, {"role": "assistant", "content": "The database migration completed successfully"}
+        )
 
         recent = history[-8:]
         result = _rule_based_extraction(history, recent, "database migration")
@@ -241,6 +267,7 @@ class TestRetrievalFallback:
 
 # ── Step 5: _build_turn_messages integration ─────────────────────────
 
+
 class TestBuildTurnMessagesRetrieval:
     """Verify _build_turn_messages uses retrieval view on Turn 3+."""
 
@@ -256,21 +283,24 @@ class TestBuildTurnMessagesRetrieval:
         try:
             with db_factory() as db:
                 result, _, _ = _build_turn_messages(
-                    db=db, user_id="test-user", session_id=session_id,
+                    db=db,
+                    user_id="test-user",
+                    session_id=session_id,
                     messages=[{"role": "user", "content": "What about topic 2?"}],
-                    tool_results=None, project_rules=None,
+                    tool_results=None,
+                    project_rules=None,
                 )
 
             # Result should be smaller than full history
             result_tokens = estimate_tokens(result)
             full_tokens = estimate_tokens(history)
-            assert result_tokens < full_tokens, \
+            assert result_tokens < full_tokens, (
                 f"Retrieval view should be smaller: {result_tokens} >= {full_tokens}"
+            )
 
             # Full history should still be in cache (unchanged)
             cached = _session_cache[session_id]["history"]
-            assert len(cached) >= len(history), \
-                "Cache should retain full history"
+            assert len(cached) >= len(history), "Cache should retain full history"
         finally:
             _session_cache.pop(session_id, None)
 
@@ -287,9 +317,12 @@ class TestBuildTurnMessagesRetrieval:
         try:
             with db_factory() as db:
                 _build_turn_messages(
-                    db=db, user_id="test-user", session_id=session_id,
+                    db=db,
+                    user_id="test-user",
+                    session_id=session_id,
                     messages=[{"role": "user", "content": "hello"}],
-                    tool_results=None, project_rules=None,
+                    tool_results=None,
+                    project_rules=None,
                 )
 
             cached = _session_cache[session_id]["history"]

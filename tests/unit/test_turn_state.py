@@ -223,9 +223,11 @@ class TestWireSerialization:
 
     def test_from_wire_invalid_status_falls_back(self):
         """Invalid status from untrusted edge client -> FAILURE fallback."""
-        restored = TurnState.from_wire({
-            "outcome": {"status": "bogus_status", "content": "bad"},
-        })
+        restored = TurnState.from_wire(
+            {
+                "outcome": {"status": "bogus_status", "content": "bad"},
+            }
+        )
         assert restored.outcome is not None
         assert restored.outcome.status == TurnStatus.FAILURE
         assert restored.outcome.content == "bad"
@@ -234,9 +236,11 @@ class TestWireSerialization:
 
     def test_from_wire_missing_status_key_falls_back(self):
         """Missing 'status' key in outcome -> FAILURE fallback."""
-        restored = TurnState.from_wire({
-            "outcome": {"content": "no status field"},
-        })
+        restored = TurnState.from_wire(
+            {
+                "outcome": {"content": "no status field"},
+            }
+        )
         assert restored.outcome is not None
         assert restored.outcome.status == TurnStatus.FAILURE
 

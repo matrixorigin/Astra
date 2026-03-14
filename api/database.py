@@ -42,6 +42,7 @@ from sqlalchemy.dialects.mysql.base import MySQLDDLCompiler as _MySQLDDLCompiler
 
 _orig_visit_create_index = _MySQLDDLCompiler.visit_create_index
 
+
 def _visit_create_index(self, create, **kw):
     idx = create.element
     if isinstance(idx, _FulltextIndex):
@@ -51,6 +52,7 @@ def _visit_create_index(self, create, **kw):
             sql += f" WITH PARSER {idx.parser}"
         return sql
     return _orig_visit_create_index(self, create, **kw)
+
 
 _MySQLDDLCompiler.visit_create_index = _visit_create_index
 
@@ -90,6 +92,7 @@ _DISCONNECT_PATTERNS = (
     "Broken pipe",
 )
 
+
 @_sa_event.listens_for(engine, "handle_error")
 def _handle_disconnect_errors(context):
     if context.original_exception:
@@ -97,13 +100,14 @@ def _handle_disconnect_errors(context):
         if any(p in msg for p in _DISCONNECT_PATTERNS):
             context.is_disconnect = True
 
+
 # Session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def get_db_session() -> Session:
     """Get database session for dependency injection.
-    
+
     Yields:
         Session: SQLAlchemy session
     """
@@ -120,7 +124,7 @@ def get_db_session() -> Session:
 @contextmanager
 def get_db_context():
     """Get database session as context manager.
-    
+
     Yields:
         Session: SQLAlchemy session
     """
@@ -146,6 +150,7 @@ def _get_column_names(inspector, table_name: str, schema: str | None) -> set[str
     """
     import warnings
     from sqlalchemy.exc import SAWarning
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", SAWarning)
         return {c["name"] for c in inspector.get_columns(table_name, schema=schema)}
@@ -163,13 +168,17 @@ def init_db():
     # Sync seed quirks (e.g. fixed_temperature) into existing model rows.
     try:
         from core.llm.seed_models import SEED_MODELS
+
         with engine.begin() as conn:
             for sm in SEED_MODELS:
                 if sm.get("quirks"):
-                    conn.execute(text(
-                        "UPDATE infra_llm_models SET quirks = :q "
-                        "WHERE model_name = :m AND (quirks IS NULL OR CAST(quirks AS CHAR) = '{}')"
-                    ), {"q": json.dumps(sm["quirks"]), "m": sm["model_name"]})
+                    conn.execute(
+                        text(
+                            "UPDATE infra_llm_models SET quirks = :q "
+                            "WHERE model_name = :m AND (quirks IS NULL OR CAST(quirks AS CHAR) = '{}')"
+                        ),
+                        {"q": json.dumps(sm["quirks"]), "m": sm["model_name"]},
+                    )
     except Exception as e:
         logger.warning("Seed quirks sync failed: %s", e)
 
@@ -188,9 +197,13 @@ def init_db():
                 idx_rows = conn.execute(text(f"SHOW INDEX FROM {tbl}")).fetchall()
                 if not any(idx_name in str(r) for r in idx_rows):
                     VectorIndex.create_index(
-                        engine, table_name=tbl, name=idx_name,
-                        column=col_name, index_type="ivfflat",
-                        lists=10, op_type="vector_l2_ops",
+                        engine,
+                        table_name=tbl,
+                        name=idx_name,
+                        column=col_name,
+                        index_type="ivfflat",
+                        lists=10,
+                        op_type="vector_l2_ops",
                     )
         except Exception as e:
             logger.debug("Vector index %s skipped: %s", idx_name, e)

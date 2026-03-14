@@ -35,6 +35,7 @@ Only extract clear, factual statements. Skip vague or uncertain information.
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+
 def _normalize_value(v: str) -> str:
     """Normalize a knowledge value for semantic-equivalent comparison.
 
@@ -64,7 +65,10 @@ def _normalize_value(v: str) -> str:
 
 # ── Access tracking ───────────────────────────────────────────────────────────
 
-def update_access_tracking(db_factory, entry_ids: list[str], *, _done: "threading.Event | None" = None) -> None:
+
+def update_access_tracking(
+    db_factory, entry_ids: list[str], *, _done: "threading.Event | None" = None
+) -> None:
     """Bump access_count and last_accessed_at for retrieved entries.
 
     Runs in a background thread to avoid blocking the read path.
@@ -97,6 +101,7 @@ def update_access_tracking(db_factory, entry_ids: list[str], *, _done: "threadin
 
 
 # ── Knowledge Graph (relations) ───────────────────────────────────────────────
+
 
 def add_relation(
     db: Session,
@@ -142,12 +147,21 @@ def add_relation(
                 (relation_id, subject_id, predicate, object_id, weight, source, created_at)
                 VALUES (:rid, :sid, :pred, :oid, :w, :src, NOW())
             """),
-            {"rid": rid, "sid": subject_id, "pred": predicate, "oid": object_id, "w": weight, "src": source},
+            {
+                "rid": rid,
+                "sid": subject_id,
+                "pred": predicate,
+                "oid": object_id,
+                "w": weight,
+                "src": source,
+            },
         )
         db.commit()
         return rid
     except Exception as e:
-        logger.warning("Failed to add relation %s -[%s]-> %s: %s", subject_id, predicate, object_id, e)
+        logger.warning(
+            "Failed to add relation %s -[%s]-> %s: %s", subject_id, predicate, object_id, e
+        )
         db.rollback()
         return None
 
@@ -197,7 +211,12 @@ def get_neighbors(
     try:
         rows = db.execute(text(sql), params).fetchall()
         return [
-            {"neighbor_id": r.neighbor_id, "predicate": r.predicate, "weight": float(r.weight), "direction": r.dir}
+            {
+                "neighbor_id": r.neighbor_id,
+                "predicate": r.predicate,
+                "weight": float(r.weight),
+                "direction": r.dir,
+            }
             for r in rows
         ]
     except Exception as e:
@@ -246,6 +265,7 @@ def expand_with_graph(
 
 # ── Knowledge Extractor ──────────────────────────────────────────────────────
 
+
 class KnowledgeExtractor:
     """Extract semantic knowledge from conversation events.
 
@@ -254,11 +274,11 @@ class KnowledgeExtractor:
     """
 
     PREFERENCE_PATTERNS = re.compile(
-        r'\b(i prefer|i like|i want|i use|i always|i never)\b',
+        r"\b(i prefer|i like|i want|i use|i always|i never)\b",
         re.IGNORECASE,
     )
     PATTERN_PATTERNS = re.compile(
-        r'\b(pattern|architecture|uses|implements|follows)\b',
+        r"\b(pattern|architecture|uses|implements|follows)\b",
         re.IGNORECASE,
     )
 
@@ -271,15 +291,23 @@ class KnowledgeExtractor:
         """Extract knowledge from completed causal chain."""
         from api.models import Event
 
-        events = self.db.query(Event).filter(
-            Event.causal_chain_id == causal_chain_id,
-            Event.user_id == user_id,
-        ).order_by(Event.created_at).all()
+        events = (
+            self.db.query(Event)
+            .filter(
+                Event.causal_chain_id == causal_chain_id,
+                Event.user_id == user_id,
+            )
+            .order_by(Event.created_at)
+            .all()
+        )
 
         return self.extract_from_events(causal_chain_id, user_id, events)
 
     def extract_from_events(
-        self, causal_chain_id: str, user_id: str, events: list,
+        self,
+        causal_chain_id: str,
+        user_id: str,
+        events: list,
     ) -> list[dict[str, Any]]:
         """Extract knowledge from pre-loaded events (avoids extra DB query)."""
         if not events:
@@ -298,10 +326,12 @@ class KnowledgeExtractor:
                     user_id=user_id,
                     session_id="system",
                     event_type="knowledge_extracted",
-                    content=json.dumps({
-                        "causal_chain_id": causal_chain_id,
-                        "entries": stored,
-                    }),
+                    content=json.dumps(
+                        {
+                            "causal_chain_id": causal_chain_id,
+                            "entries": stored,
+                        }
+                    ),
                     metadata={
                         "causal_chain_id": causal_chain_id,
                         "count": len(stored),
@@ -317,9 +347,7 @@ class KnowledgeExtractor:
         from core.memory.tabular.json_utils import parse_json_array
         from core.memory.types import trust_tier_defaults
 
-        conv_text = "\n".join(
-            f"[{e.event_type}]: {e.content[:500]}" for e in events if e.content
-        )
+        conv_text = "\n".join(f"[{e.event_type}]: {e.content[:500]}" for e in events if e.content)
         event_ids = [e.event_id for e in events]
 
         try:
@@ -337,7 +365,13 @@ class KnowledgeExtractor:
             return []
 
         defaults = trust_tier_defaults("T3")
-        valid_categories = {"user_preference", "codebase_pattern", "domain_fact", "tool_behavior", "entity"}
+        valid_categories = {
+            "user_preference",
+            "codebase_pattern",
+            "domain_fact",
+            "tool_behavior",
+            "entity",
+        }
         extracted = []
         for item in raw:
             if not isinstance(item, dict) or not item.get("key_name") or not item.get("value"):
@@ -345,16 +379,18 @@ class KnowledgeExtractor:
             category = item.get("category", "domain_fact")
             if category not in valid_categories:
                 category = "domain_fact"
-            extracted.append({
-                "user_id": user_id,
-                "category": category,
-                "key_name": item["key_name"],
-                "value": item["value"],
-                "source_event_ids": event_ids,
-                "extraction_method": "llm_extraction",
-                "trust_tier": "T3",
-                "confidence": defaults["initial_confidence"],
-            })
+            extracted.append(
+                {
+                    "user_id": user_id,
+                    "category": category,
+                    "key_name": item["key_name"],
+                    "value": item["value"],
+                    "source_event_ids": event_ids,
+                    "extraction_method": "llm_extraction",
+                    "trust_tier": "T3",
+                    "confidence": defaults["initial_confidence"],
+                }
+            )
         return extracted
 
     def _extract_via_regex(self, events, user_id: str) -> list[dict[str, Any]]:
@@ -374,6 +410,7 @@ class KnowledgeExtractor:
         content = event.content
         if "typescript" in content.lower():
             from core.memory.types import trust_tier_defaults
+
             defaults = trust_tier_defaults("T3")
             return {
                 "user_id": user_id,
@@ -391,6 +428,7 @@ class KnowledgeExtractor:
         content = event.content.lower()
         if "dependency injection" in content:
             from core.memory.types import trust_tier_defaults
+
             defaults = trust_tier_defaults("T3")
             return {
                 "user_id": user_id,
@@ -416,11 +454,14 @@ class KnowledgeExtractor:
             key = (entry["user_id"], entry["category"], entry["key_name"])
             entries_by_key[key] = entry
 
-        keys_to_check = [(e["user_id"], e["category"], e["key_name"]) for e in entries_by_key.values()]
+        keys_to_check = [
+            (e["user_id"], e["category"], e["key_name"]) for e in entries_by_key.values()
+        ]
 
         existing_entries = {}
         if keys_to_check:
             from sqlalchemy import or_, and_
+
             conditions = [
                 and_(
                     KnowledgeEntry.user_id == user_id,
@@ -444,19 +485,26 @@ class KnowledgeExtractor:
                     existing.last_validated_at = now
                     existing.updated_at = now
                     for eid in source_ids:
-                        self.db.execute(text(
-                            "INSERT IGNORE INTO sk_knowledge_entry_sources (entry_id, event_id) "
-                            "VALUES (:eid, :evid)"
-                        ), {"eid": existing.entry_id, "evid": eid})
-                    stored.append({
-                        "entry_id": existing.entry_id,
-                        "action": "updated",
-                        "confidence": existing.confidence,
-                    })
+                        self.db.execute(
+                            text(
+                                "INSERT IGNORE INTO sk_knowledge_entry_sources (entry_id, event_id) "
+                                "VALUES (:eid, :evid)"
+                            ),
+                            {"eid": existing.entry_id, "evid": eid},
+                        )
+                    stored.append(
+                        {
+                            "entry_id": existing.entry_id,
+                            "action": "updated",
+                            "confidence": existing.confidence,
+                        }
+                    )
                 else:
                     logger.warning(
                         "Knowledge contradiction: %s = %r vs %r",
-                        entry["key_name"], existing.value, entry["value"],
+                        entry["key_name"],
+                        existing.value,
+                        entry["value"],
                     )
                     existing.confidence = max(0.0, existing.confidence - 0.3)
                     existing.updated_at = now
@@ -476,11 +524,13 @@ class KnowledgeExtractor:
                     self.db.add(knowledge)
                     for eid in source_ids:
                         self.db.add(KnowledgeEntrySource(entry_id=entry_id, event_id=eid))
-                    stored.append({
-                        "entry_id": entry_id,
-                        "action": "contradiction",
-                        "confidence": entry["confidence"],
-                    })
+                    stored.append(
+                        {
+                            "entry_id": entry_id,
+                            "action": "contradiction",
+                            "confidence": entry["confidence"],
+                        }
+                    )
             else:
                 entry_id = str(uuid7())
                 knowledge = KnowledgeEntry(
@@ -497,12 +547,18 @@ class KnowledgeExtractor:
                 self.db.add(knowledge)
                 for eid in source_ids:
                     self.db.add(KnowledgeEntrySource(entry_id=entry_id, event_id=eid))
-                stored.append({
-                    "entry_id": entry_id,
-                    "action": "created",
-                    "confidence": entry["confidence"],
-                })
-                logger.info("Created knowledge entry: %s (confidence=%s)", entry["key_name"], entry["confidence"])
+                stored.append(
+                    {
+                        "entry_id": entry_id,
+                        "action": "created",
+                        "confidence": entry["confidence"],
+                    }
+                )
+                logger.info(
+                    "Created knowledge entry: %s (confidence=%s)",
+                    entry["key_name"],
+                    entry["confidence"],
+                )
 
         self.db.commit()
         return stored
@@ -513,10 +569,14 @@ class KnowledgeExtractor:
         from core.memory.config import DEFAULT_CONFIG
         from core.memory.types import TrustTier
 
-        entries = self.db.query(KnowledgeEntry).filter(
-            KnowledgeEntry.user_id == user_id,
-            KnowledgeEntry.confidence > 0.3,
-        ).all()
+        entries = (
+            self.db.query(KnowledgeEntry)
+            .filter(
+                KnowledgeEntry.user_id == user_id,
+                KnowledgeEntry.confidence > 0.3,
+            )
+            .all()
+        )
 
         count = 0
         now = datetime.now()
@@ -524,7 +584,11 @@ class KnowledgeExtractor:
             anchor = entry.last_validated_at or entry.created_at
             if anchor is None:
                 continue
-            hl = DEFAULT_CONFIG.half_lives.get(entry.trust_tier, half_life_days) if entry.trust_tier else half_life_days
+            hl = (
+                DEFAULT_CONFIG.half_lives.get(entry.trust_tier, half_life_days)
+                if entry.trust_tier
+                else half_life_days
+            )
             days_since = (now - anchor).days
             new_conf = entry.initial_confidence * (0.5 ** (days_since / hl))
             if new_conf != entry.confidence:
@@ -540,13 +604,17 @@ class KnowledgeExtractor:
         """Quarantine entries below confidence threshold."""
         from api.models import KnowledgeEntry
 
-        count = self.db.query(KnowledgeEntry).filter(
-            KnowledgeEntry.user_id == user_id,
-            KnowledgeEntry.confidence < threshold,
-            KnowledgeEntry.confidence > 0,
-        ).update(
-            {KnowledgeEntry.confidence: 0, KnowledgeEntry.updated_at: datetime.now()},
-            synchronize_session=False,
+        count = (
+            self.db.query(KnowledgeEntry)
+            .filter(
+                KnowledgeEntry.user_id == user_id,
+                KnowledgeEntry.confidence < threshold,
+                KnowledgeEntry.confidence > 0,
+            )
+            .update(
+                {KnowledgeEntry.confidence: 0, KnowledgeEntry.updated_at: datetime.now()},
+                synchronize_session=False,
+            )
         )
 
         if count:

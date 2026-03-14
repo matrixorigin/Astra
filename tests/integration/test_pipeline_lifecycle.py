@@ -4,11 +4,26 @@ Verifies that the pipeline is properly created, started, and shut down
 in the real production wiring path — not just in unit tests with mocks.
 """
 
+import os
 import asyncio
 
 import pytest
 from unittest.mock import patch
 from datetime import datetime, timezone
+
+
+@pytest.fixture(autouse=True)
+def _setup_memoria_env():
+    """Set Memoria environment variables from test configuration."""
+    os.environ["MEMORIA_BASE_URL"] = os.environ.get(
+        "TEST_MEMORIA_BASE_URL", "http://localhost:8100"
+    )
+    os.environ["MEMORIA_MASTER_KEY"] = os.environ.get(
+        "TEST_MEMORIA_MASTER_KEY", "test-master-key-for-docker-compose"
+    )
+    os.environ["MEMORIA_API_KEY"] = os.environ.get("TEST_MEMORIA_API_KEY", "")
+    yield
+
 
 from core.events.models import ConversationEvent, EventType
 from uuid_utils import uuid7
@@ -16,6 +31,7 @@ from uuid_utils import uuid7
 
 def _session_local():
     from api import database
+
     return database.SessionLocal
 
 
@@ -130,13 +146,19 @@ class TestPipelineLifecycleInBuildChatLoop:
 
         class SpyPipeline:
             """Minimal pipeline spy that tracks shutdown."""
+
             _closed = False
             stats = {"emitted": 0, "flushed": 0, "dropped": 0}
             _flush_task = None
 
-            def start(self): pass
-            def emit(self, e): return e.event_id
-            def flush_critical(self): pass
+            def start(self):
+                pass
+
+            def emit(self, e):
+                return e.event_id
+
+            def flush_critical(self):
+                pass
 
             def shutdown(self, timeout=2.0):
                 self._closed = True
@@ -156,13 +178,18 @@ class TestPipelineLifecycleInBuildChatLoop:
         mock_loop.run_step_stream = fake_stream
 
         from tests.conftest import make_run_engine_mock_init
-        with patch.object(RunEngine, '__init__', make_run_engine_mock_init()):
+
+        with patch.object(RunEngine, "__init__", make_run_engine_mock_init()):
             engine = RunEngine(lambda: mock_db)
             run = engine.create_run(session_id="s1", user_id="u1", user_input="test")
-            run.status = __import__('core.agent.run_engine', fromlist=['RunStatus']).RunStatus.RUNNING
+            run.status = __import__(
+                "core.agent.run_engine", fromlist=["RunStatus"]
+            ).RunStatus.RUNNING
 
-            with patch("api.database.get_db_session", return_value=iter([mock_db])), \
-                 patch("api.routers.chat._build_chat_loop", return_value=mock_loop):
+            with (
+                patch("api.database.get_db_session", return_value=iter([mock_db])),
+                patch("api.routers.chat._build_chat_loop", return_value=mock_loop),
+            ):
                 await engine.start_run(run)
 
         assert len(shutdown_called) == 1, "Pipeline.shutdown() must be called in start_run finally"

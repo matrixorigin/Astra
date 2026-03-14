@@ -43,6 +43,7 @@ class GraphConsolidator:
         self._store = GraphStore(db_factory)
         if config is None:
             from core.memory.config import DEFAULT_CONFIG
+
             config = DEFAULT_CONFIG
         self._config = config
 
@@ -115,8 +116,10 @@ class GraphConsolidator:
                 older, newer = neighbor, node
 
             self._store.mark_conflict(
-                older_id=older.node_id, newer_id=newer.node_id,
-                confidence_factor=0.5, old_confidence=older.confidence,
+                older_id=older.node_id,
+                newer_id=newer.node_id,
+                confidence_factor=0.5,
+                old_confidence=older.confidence,
             )
             conflicts_found += 1
 
@@ -125,7 +128,9 @@ class GraphConsolidator:
     def _check_source_integrity(self, user_id: str) -> int:
         """Check scene nodes for orphaned sources."""
         scene_nodes = self._store.get_user_nodes(
-            user_id, node_type=NodeType.SCENE, active_only=True,
+            user_id,
+            node_type=NodeType.SCENE,
+            active_only=True,
             load_embedding=False,
         )
         orphaned = 0
@@ -157,7 +162,9 @@ class GraphConsolidator:
 
         # Load all active scene nodes (skeleton — no embeddings)
         scenes = self._store.get_user_nodes(
-            user_id, node_type=NodeType.SCENE, active_only=True,
+            user_id,
+            node_type=NodeType.SCENE,
+            active_only=True,
             load_embedding=False,
         )
 
@@ -171,24 +178,32 @@ class GraphConsolidator:
                 # Promotion: confidence > 0.8 AND age > 7 days
                 if scene.confidence >= confidence_threshold and age_days >= min_age_days:
                     self._store.update_confidence_and_tier(
-                        scene.node_id, scene.confidence, "T3",
+                        scene.node_id,
+                        scene.confidence,
+                        "T3",
                     )
                     promoted += 1
                     logger.info(
                         "Promoted scene %s T4→T3 (confidence=%.2f, age=%d days)",
-                        scene.node_id, scene.confidence, age_days,
+                        scene.node_id,
+                        scene.confidence,
+                        age_days,
                     )
 
             elif scene.trust_tier == "T3":
                 # Demotion: stale T3 with low confidence → back to T4
                 if age_days >= T3_DEMOTION_STALE_DAYS and scene.confidence < confidence_threshold:
                     self._store.update_confidence_and_tier(
-                        scene.node_id, scene.confidence, "T4",
+                        scene.node_id,
+                        scene.confidence,
+                        "T4",
                     )
                     demoted += 1
                     logger.info(
                         "Demoted scene %s T3→T4 (confidence=%.2f, age=%d days)",
-                        scene.node_id, scene.confidence, age_days,
+                        scene.node_id,
+                        scene.confidence,
+                        age_days,
                     )
 
         return promoted, demoted

@@ -14,25 +14,36 @@ from uuid_utils import uuid7
 from api.models import Event
 from core.exceptions import ReplayError
 from core.skills.base import (
-    AccessScope, RepoType, SideEffectCategory, SideEffectProfile,
-    Skill, SkillInput, SkillOutput, SkillRequirement,
+    AccessScope,
+    RepoType,
+    SideEffectCategory,
+    SideEffectProfile,
+    Skill,
+    SkillInput,
+    SkillOutput,
+    SkillRequirement,
 )
 from core.skills.mocking import MockMode, SecurityError, ToolMockingLayer
 
 
 # ── Mock skills ───────────────────────────────────────────
 
+
 class ReadInput(SkillInput):
     query: str
 
+
 class ReadOutput(SkillOutput):
     data: str
+
 
 class MockReadSkill(Skill):
     name = "mock_read"
     version = "1.0.0"
     description = "Read skill for testing"
-    requirements = SkillRequirement(repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=False)
+    requirements = SkillRequirement(
+        repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=False
+    )
     side_effect_profile = SideEffectProfile(category=SideEffectCategory.READ, external_apis=[])
 
     def validate_input(self, input_data: dict) -> ReadInput:
@@ -46,8 +57,12 @@ class MockWriteSkill(Skill):
     name = "mock_write"
     version = "1.0.0"
     description = "Write skill for testing"
-    requirements = SkillRequirement(repo_types=[RepoType.CODE], min_access=AccessScope.WRITE, llm_required=False)
-    side_effect_profile = SideEffectProfile(category=SideEffectCategory.WRITE, external_apis=["github"])
+    requirements = SkillRequirement(
+        repo_types=[RepoType.CODE], min_access=AccessScope.WRITE, llm_required=False
+    )
+    side_effect_profile = SideEffectProfile(
+        category=SideEffectCategory.WRITE, external_apis=["github"]
+    )
 
     def validate_input(self, input_data: dict) -> ReadInput:
         return ReadInput(**input_data)
@@ -60,8 +75,12 @@ class MockDestructiveSkill(Skill):
     name = "mock_destroy"
     version = "1.0.0"
     description = "Destructive skill for testing"
-    requirements = SkillRequirement(repo_types=[RepoType.CODE], min_access=AccessScope.WRITE, llm_required=False)
-    side_effect_profile = SideEffectProfile(category=SideEffectCategory.DESTRUCTIVE, external_apis=[])
+    requirements = SkillRequirement(
+        repo_types=[RepoType.CODE], min_access=AccessScope.WRITE, llm_required=False
+    )
+    side_effect_profile = SideEffectProfile(
+        category=SideEffectCategory.DESTRUCTIVE, external_apis=[]
+    )
 
     def validate_input(self, input_data: dict) -> ReadInput:
         return ReadInput(**input_data)
@@ -71,6 +90,7 @@ class MockDestructiveSkill(Skill):
 
 
 # ── Fixtures ──────────────────────────────────────────────
+
 
 def _uid():
     return str(uuid7())
@@ -85,40 +105,45 @@ def session_id():
 def cleanup(db_session, session_id):
     yield
     try:
-        db_session.execute(text(
-            "DELETE FROM agent_events WHERE session_id = :sid"
-        ), {"sid": session_id})
-        db_session.execute(text(
-            "DELETE FROM agent_sessions WHERE session_id = :sid"
-        ), {"sid": session_id})
+        db_session.execute(
+            text("DELETE FROM agent_events WHERE session_id = :sid"), {"sid": session_id}
+        )
+        db_session.execute(
+            text("DELETE FROM agent_sessions WHERE session_id = :sid"), {"sid": session_id}
+        )
         db_session.commit()
     except Exception:
         db_session.rollback()
 
 
-def _create_tool_result_event(db, session_id, skill_name, skill_version, params, parent_event_id=None):
+def _create_tool_result_event(
+    db, session_id, skill_name, skill_version, params, parent_event_id=None
+):
     """Insert a tool_result event that ToolMockingLayer can find."""
     eid = _uid()
-    db.add(Event(
-        event_id=eid,
-        session_id=session_id,
-        user_id="test_user",
-        event_type="tool_result",
-        content="",
-        skill_name=skill_name,
-        skill_version=skill_version,
-        parent_event_id=parent_event_id,
-        causal_chain_id=_uid(),
-        event_metadata={
-            "skill_params": params,
-            "skill_result": {"data": f"recorded:{params.get('query', '')}"},
-        },
-    ))
+    db.add(
+        Event(
+            event_id=eid,
+            session_id=session_id,
+            user_id="test_user",
+            event_type="tool_result",
+            content="",
+            skill_name=skill_name,
+            skill_version=skill_version,
+            parent_event_id=parent_event_id,
+            causal_chain_id=_uid(),
+            event_metadata={
+                "skill_params": params,
+                "skill_result": {"data": f"recorded:{params.get('query', '')}"},
+            },
+        )
+    )
     db.commit()
     return eid
 
 
 # ── Tests ─────────────────────────────────────────────────
+
 
 class TestProductionRecordThenReplay:
     """Record via PRODUCTION mode, replay via REPLAY mode."""
@@ -130,18 +155,20 @@ class TestProductionRecordThenReplay:
         parent_eid = _uid()
 
         # Create the event that _record_result will update
-        db_session.add(Event(
-            event_id=_uid(),
-            session_id=session_id,
-            user_id="test_user",
-            event_type="tool_result",
-            content="",
-            skill_name="mock_write",
-            skill_version="1.0.0",
-            parent_event_id=parent_eid,
-            causal_chain_id=_uid(),
-            event_metadata={},
-        ))
+        db_session.add(
+            Event(
+                event_id=_uid(),
+                session_id=session_id,
+                user_id="test_user",
+                event_type="tool_result",
+                content="",
+                skill_name="mock_write",
+                skill_version="1.0.0",
+                parent_event_id=parent_eid,
+                causal_chain_id=_uid(),
+                event_metadata={},
+            )
+        )
         db_session.commit()
 
         # Record in PRODUCTION
@@ -150,8 +177,12 @@ class TestProductionRecordThenReplay:
         assert result.data == "write:hello"
 
         # Replay in REPLAY
-        replay = ToolMockingLayer(mode=MockMode.REPLAY, db_factory=lambda: db_session, session_id=session_id)
-        replayed = replay.get_mock_result("mock_write", params, session_id, parent_event_id=parent_eid)
+        replay = ToolMockingLayer(
+            mode=MockMode.REPLAY, db_factory=lambda: db_session, session_id=session_id
+        )
+        replayed = replay.get_mock_result(
+            "mock_write", params, session_id, parent_event_id=parent_eid
+        )
         assert replayed is not None
         assert replayed["data"] == "write:hello"
 
@@ -161,7 +192,9 @@ class TestReplayBlocksDestructive:
 
     def test_destructive_blocked(self, db_session, session_id):
         skill = MockDestructiveSkill()
-        replay = ToolMockingLayer(mode=MockMode.REPLAY, db_factory=lambda: db_session, session_id=session_id)
+        replay = ToolMockingLayer(
+            mode=MockMode.REPLAY, db_factory=lambda: db_session, session_id=session_id
+        )
         with pytest.raises(SecurityError, match="Blocked destructive"):
             replay.execute(skill, {"query": "x"}, session_id)
 
@@ -175,27 +208,34 @@ class TestReplayWithVersionMismatch:
         parent_eid = _uid()
 
         # Create recorded event with v1.0.0
-        db_session.add(Event(
-            event_id=_uid(),
-            session_id=session_id,
-            user_id="test_user",
-            event_type="tool_result",
-            content="",
-            skill_name="mock_read",
-            skill_version="1.0.0",
-            parent_event_id=parent_eid,
-            causal_chain_id=_uid(),
-            event_metadata={
-                "skill_params": params,
-                "skill_result": {"data": "v1-result"},
-                "skill_version": "1.0.0",
-            },
-        ))
+        db_session.add(
+            Event(
+                event_id=_uid(),
+                session_id=session_id,
+                user_id="test_user",
+                event_type="tool_result",
+                content="",
+                skill_name="mock_read",
+                skill_version="1.0.0",
+                parent_event_id=parent_eid,
+                causal_chain_id=_uid(),
+                event_metadata={
+                    "skill_params": params,
+                    "skill_result": {"data": "v1-result"},
+                    "skill_version": "1.0.0",
+                },
+            )
+        )
         db_session.commit()
 
-        replay = ToolMockingLayer(mode=MockMode.REPLAY, db_factory=lambda: db_session, session_id=session_id)
+        replay = ToolMockingLayer(
+            mode=MockMode.REPLAY, db_factory=lambda: db_session, session_id=session_id
+        )
         result = replay._get_recorded_result(
-            "mock_read", params, session_id, parent_eid,
+            "mock_read",
+            params,
+            session_id,
+            parent_eid,
             expected_version="2.0.0",
         )
         # Should still return the result but with a warning
@@ -214,20 +254,26 @@ class TestReplayServiceFullSession:
         user_id = "test_user"
 
         # Create session
-        db_session.add(SessionModel(
-            session_id=session_id, user_id=user_id, status="active",
-        ))
+        db_session.add(
+            SessionModel(
+                session_id=session_id,
+                user_id=user_id,
+                status="active",
+            )
+        )
 
         # Create events
         for i in range(3):
-            db_session.add(Event(
-                event_id=_uid(),
-                session_id=session_id,
-                user_id=user_id,
-                event_type="user_query" if i % 2 == 0 else "llm_response",
-                content=f"content_{i}",
-                causal_chain_id=_uid(),
-            ))
+            db_session.add(
+                Event(
+                    event_id=_uid(),
+                    session_id=session_id,
+                    user_id=user_id,
+                    event_type="user_query" if i % 2 == 0 else "llm_response",
+                    content=f"content_{i}",
+                    causal_chain_id=_uid(),
+                )
+            )
         db_session.commit()
 
         svc = ReplayService(lambda: db_session)
@@ -240,7 +286,8 @@ class TestReplayServiceFullSession:
 
         # Compare
         comparison = svc.compare_outputs(
-            session_id=session_id, user_id=user_id,
+            session_id=session_id,
+            user_id=user_id,
             replay_result=result["result"],
         )
         assert comparison["match"] is True

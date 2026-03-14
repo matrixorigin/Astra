@@ -102,7 +102,10 @@ class CandidateProvider(Protocol):
     """Each backend implements this to feed the shared ReflectionEngine."""
 
     def get_reflection_candidates(
-        self, user_id: str, *, since_hours: int = 24,
+        self,
+        user_id: str,
+        *,
+        since_hours: int = 24,
     ) -> list[ReflectionCandidate]:
         """Return candidate clusters for reflection."""
         ...

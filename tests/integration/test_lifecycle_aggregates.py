@@ -40,19 +40,27 @@ def _seed_knowledge(db, user_id):
     for conf, tier in [(0.9, "T1"), (0.7, "T2"), (0.1, "T3")]:
         eid = str(uuid7())
         ids.append(eid)
-        db.add(KnowledgeEntry(
-            entry_id=eid, user_id=user_id, category="test",
-            key_name=f"k_{eid[:6]}", value="v",
-            extraction_method="test", trust_tier=tier,
-            confidence=conf, initial_confidence=conf,
-            access_count=0, version=1,
-        ))
+        db.add(
+            KnowledgeEntry(
+                entry_id=eid,
+                user_id=user_id,
+                category="test",
+                key_name=f"k_{eid[:6]}",
+                value="v",
+                extraction_method="test",
+                trust_tier=tier,
+                confidence=conf,
+                initial_confidence=conf,
+                access_count=0,
+                version=1,
+            )
+        )
     db.commit()
     yield ids
     # cleanup
     from sqlalchemy import text
-    db.execute(text("DELETE FROM sk_knowledge_entries WHERE entry_id IN :ids"),
-               {"ids": tuple(ids)})
+
+    db.execute(text("DELETE FROM sk_knowledge_entries WHERE entry_id IN :ids"), {"ids": tuple(ids)})
     db.commit()
 
 
@@ -63,15 +71,21 @@ def _seed_scratchpads(db, user_id):
     for status in ("completed", "completed", "active"):
         nid = str(uuid7())
         ids.append(nid)
-        db.add(AgentScratchpad(
-            note_id=nid, session_id=str(uuid7()), user_id=user_id,
-            note_type="plan", content="test", status=status,
-        ))
+        db.add(
+            AgentScratchpad(
+                note_id=nid,
+                session_id=str(uuid7()),
+                user_id=user_id,
+                note_type="plan",
+                content="test",
+                status=status,
+            )
+        )
     db.commit()
     yield ids
     from sqlalchemy import text
-    db.execute(text("DELETE FROM agent_scratchpads WHERE note_id IN :ids"),
-               {"ids": tuple(ids)})
+
+    db.execute(text("DELETE FROM agent_scratchpads WHERE note_id IN :ids"), {"ids": tuple(ids)})
     db.commit()
 
 
@@ -82,16 +96,24 @@ class TestLifecycleAggregates:
         count = engine._archive_closed_notes()
         assert count == 2  # exactly our 2 completed notes
         # Verify status actually changed
-        archived = db.query(AgentScratchpad).filter(
-            AgentScratchpad.note_id.in_(_seed_scratchpads),
-            AgentScratchpad.status == "archived",
-        ).count()
+        archived = (
+            db.query(AgentScratchpad)
+            .filter(
+                AgentScratchpad.note_id.in_(_seed_scratchpads),
+                AgentScratchpad.status == "archived",
+            )
+            .count()
+        )
         assert archived == 2
         # Active note untouched
-        active = db.query(AgentScratchpad).filter(
-            AgentScratchpad.note_id.in_(_seed_scratchpads),
-            AgentScratchpad.status == "active",
-        ).count()
+        active = (
+            db.query(AgentScratchpad)
+            .filter(
+                AgentScratchpad.note_id.in_(_seed_scratchpads),
+                AgentScratchpad.status == "active",
+            )
+            .count()
+        )
         assert active == 1
 
     def test_generate_health_reports(self, engine, _seed_knowledge):

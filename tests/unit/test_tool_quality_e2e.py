@@ -26,18 +26,20 @@ class TestE2EPipeline:
         tool_result = {
             "name": "stock_assistant",
             "tool_call_id": "call_019ca950",
-            "result": json.dumps({
-                "stock_code": "600030",
-                "stock_name": "中信证券",
-                "current_price": 0,
-                "price_change": 0,
-                "technical_indicators": {},
-                "trend_analysis": {},
-                "risk_score": 0,
-                "risk_factors": [],
-                "recommendation": "",
-                "confidence": 50,
-            }),
+            "result": json.dumps(
+                {
+                    "stock_code": "600030",
+                    "stock_name": "中信证券",
+                    "current_price": 0,
+                    "price_change": 0,
+                    "technical_indicators": {},
+                    "trend_analysis": {},
+                    "risk_score": 0,
+                    "risk_factors": [],
+                    "recommendation": "",
+                    "confidence": 50,
+                }
+            ),
         }
 
         # Step 1: Assess
@@ -70,13 +72,15 @@ class TestE2EPipeline:
         tool_result = {
             "name": "weather",
             "tool_call_id": "call_healthy",
-            "result": json.dumps({
-                "temperature": 22.5,
-                "humidity": 65,
-                "wind_speed": 12,
-                "city": "Beijing",
-                "forecast": "sunny",
-            }),
+            "result": json.dumps(
+                {
+                    "temperature": 22.5,
+                    "humidity": 65,
+                    "wind_speed": 12,
+                    "city": "Beijing",
+                    "forecast": "sunny",
+                }
+            ),
         }
         original_result = tool_result["result"]
 

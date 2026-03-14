@@ -61,6 +61,6 @@ class TestSummaryQualityEvaluator:
         metrics = evaluator.get_aggregate_metrics()
 
         assert metrics["total_evaluations"] == 3
-        assert metrics["decision_match_rate"] == pytest.approx(2/3)
+        assert metrics["decision_match_rate"] == pytest.approx(2 / 3)
         assert "grep" in metrics["by_tool"]
         assert "shell" in metrics["by_tool"]

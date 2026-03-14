@@ -49,9 +49,7 @@ class AgentRepository:
         offset: int = 0,
     ) -> list[AgentModel]:
         """List agents with filters pushed to database."""
-        query = self.db.query(AgentModel).filter(
-            AgentModel.owner_user_id == owner_user_id
-        )
+        query = self.db.query(AgentModel).filter(AgentModel.owner_user_id == owner_user_id)
         if agent_type:
             query = query.filter(AgentModel.agent_type == agent_type)
         if is_active is not None:
@@ -61,10 +59,11 @@ class AgentRepository:
     def update(self, agent_id: str, owner_user_id: str, updates: dict) -> AgentModel | None:
         """Update agent with ownership verification at DB level."""
         db = self.db
-        agent = db.query(AgentModel).filter(
-            AgentModel.agent_id == agent_id,
-            AgentModel.owner_user_id == owner_user_id
-        ).first()
+        agent = (
+            db.query(AgentModel)
+            .filter(AgentModel.agent_id == agent_id, AgentModel.owner_user_id == owner_user_id)
+            .first()
+        )
         if not agent:
             return None
         for key, value in updates.items():
@@ -76,15 +75,14 @@ class AgentRepository:
     def delete(self, agent_id: str, owner_user_id: str) -> bool:
         """Delete agent with ownership verification at DB level."""
         db = self.db
-        result = db.query(AgentModel).filter(
-            AgentModel.agent_id == agent_id,
-            AgentModel.owner_user_id == owner_user_id
-        ).delete()
+        result = (
+            db.query(AgentModel)
+            .filter(AgentModel.agent_id == agent_id, AgentModel.owner_user_id == owner_user_id)
+            .delete()
+        )
         db.commit()
         return result > 0
 
     def count_by_owner(self, owner_user_id: str) -> int:
         """Count agents - optimized query."""
-        return self.db.query(AgentModel).filter(
-            AgentModel.owner_user_id == owner_user_id
-        ).count()
+        return self.db.query(AgentModel).filter(AgentModel.owner_user_id == owner_user_id).count()

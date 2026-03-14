@@ -17,14 +17,16 @@ class TestStructuredSummary:
 
     def test_grep_summary_format(self):
         """Grep summary includes per-file breakdown and line numbers."""
-        output = "\n".join([
-            "file1.py:10:match1",
-            "file1.py:20:match2",
-            "file2.py:5:match3",
-            "file3.py:1:match4",
-        ])
+        output = "\n".join(
+            [
+                "file1.py:10:match1",
+                "file1.py:20:match2",
+                "file2.py:5:match3",
+                "file3.py:1:match4",
+            ]
+        )
         summary = generate_structured_summary(output, "grep")
-        
+
         assert "4 matches" in summary
         assert "3 files" in summary
         assert "file1.py" in summary
@@ -35,7 +37,7 @@ class TestStructuredSummary:
         lines = [f"line{i}" for i in range(100)]
         output = "\n".join(lines)
         summary = generate_structured_summary(output, "shell")
-        
+
         assert "100 lines" in summary
         assert "line0" in summary  # head
         assert "line99" in summary  # tail
@@ -51,7 +53,7 @@ class TestStructuredSummary:
         """Unknown tool uses default truncation."""
         output = "x" * 5000
         summary = generate_structured_summary(output, "unknown_tool")
-        
+
         assert len(summary) < 3000
         assert "bytes total" in summary
 
@@ -68,26 +70,22 @@ class TestProcessToolOutput:
     def test_small_output_returned_directly(self, mock_service):
         """Output under threshold returned without storing."""
         output = "small result"
-        result = process_tool_output(
-            output, "grep", "sess1", "user1", mock_service
-        )
-        
+        result = process_tool_output(output, "grep", "sess1", "user1", mock_service)
+
         assert result == output
         mock_service.create_memory.assert_not_called()
 
     def test_large_output_stored_and_summarized(self, mock_service):
         """Large output stored in mo-memoria with summary returned."""
         output = "x" * 20000  # > 10KB
-        result = process_tool_output(
-            output, "grep", "sess1", "user1", mock_service
-        )
-        
+        result = process_tool_output(output, "grep", "sess1", "user1", mock_service)
+
         # Should store via create_memory
         mock_service.create_memory.assert_called_once()
         mem_arg = mock_service.create_memory.call_args[0][0]
         assert mem_arg.memory_type == MemoryType.TOOL_RESULT
         assert mem_arg.session_id == "sess1"
-        
+
         # Should return summary + reference
         assert "memory:mem_123" in result
         assert "20000 bytes" in result
@@ -96,10 +94,9 @@ class TestProcessToolOutput:
         """Turn event ID passed for provenance."""
         output = "x" * 20000
         process_tool_output(
-            output, "grep", "sess1", "user1", mock_service,
-            turn_event_id="event_456"
+            output, "grep", "sess1", "user1", mock_service, turn_event_id="event_456"
         )
-        
+
         mem_arg = mock_service.create_memory.call_args[0][0]
         assert "event_456" in mem_arg.source_event_ids
 
@@ -115,15 +112,14 @@ class TestFindSimilarResult:
         """No similar results returns None."""
         mock_service.retrieve.return_value = ([], None)
 
-        result = find_similar_result(
-            "grep", {"pattern": "test"}, "sess1", "user1", mock_service
-        )
+        result = find_similar_result("grep", {"pattern": "test"}, "sess1", "user1", mock_service)
 
         assert result is None
 
     def test_matching_result_returns_reference(self, mock_service):
         """Matching result returns memory reference."""
         from datetime import datetime, timedelta, timezone
+
         mock_memory = MagicMock()
         mock_memory.memory_id = "mem_old"
         mock_memory.content = "test pattern found in file.py"
@@ -131,9 +127,7 @@ class TestFindSimilarResult:
         mock_memory.created_at = datetime.now(timezone.utc) - timedelta(seconds=60)
         mock_service.retrieve.return_value = ([mock_memory], None)
 
-        result = find_similar_result(
-            "grep", {"pattern": "test"}, "sess1", "user1", mock_service
-        )
+        result = find_similar_result("grep", {"pattern": "test"}, "sess1", "user1", mock_service)
 
         assert "memory:mem_old" in result
         assert "Reusing" in result
@@ -141,6 +135,7 @@ class TestFindSimilarResult:
     def test_stale_result_returns_none(self, mock_service):
         """Result older than max_age_seconds returns None."""
         from datetime import datetime, timedelta, timezone
+
         mock_memory = MagicMock()
         mock_memory.memory_id = "mem_old"
         mock_memory.content = "test pattern found"
@@ -149,7 +144,11 @@ class TestFindSimilarResult:
         mock_service.retrieve.return_value = ([mock_memory], None)
 
         result = find_similar_result(
-            "grep", {"pattern": "test"}, "sess1", "user1", mock_service,
+            "grep",
+            {"pattern": "test"},
+            "sess1",
+            "user1",
+            mock_service,
             max_age_seconds=300,
         )
 
@@ -160,8 +159,7 @@ class TestFindSimilarResult:
         mock_service.retrieve.return_value = ([], None)
 
         find_similar_result(
-            "grep", {"pattern": "test"}, "sess1", "user1", mock_service,
-            cross_session=True
+            "grep", {"pattern": "test"}, "sess1", "user1", mock_service, cross_session=True
         )
 
         call_kwargs = mock_service.retrieve.call_args[1]
@@ -186,11 +184,13 @@ class TestDynamicThreshold:
     def test_default_threshold(self):
         """None remaining_tokens uses default threshold."""
         from core.agent.tool_output_handler import compute_dynamic_threshold, SUMMARY_THRESHOLD
+
         assert compute_dynamic_threshold(None) == SUMMARY_THRESHOLD
 
     def test_low_budget_reduces_threshold(self):
         """Low remaining tokens reduces threshold."""
         from core.agent.tool_output_handler import compute_dynamic_threshold, MIN_THRESHOLD
+
         # 5000 tokens * 4 chars * 0.2 = 4000 bytes
         threshold = compute_dynamic_threshold(5000)
         assert threshold == 4000
@@ -198,6 +198,7 @@ class TestDynamicThreshold:
     def test_high_budget_increases_threshold(self):
         """High remaining tokens increases threshold (up to max)."""
         from core.agent.tool_output_handler import compute_dynamic_threshold, MAX_THRESHOLD
+
         # 100000 tokens would give 80000 bytes, but capped at MAX
         threshold = compute_dynamic_threshold(100000)
         assert threshold == MAX_THRESHOLD
@@ -205,6 +206,7 @@ class TestDynamicThreshold:
     def test_very_low_budget_uses_minimum(self):
         """Very low budget uses minimum threshold."""
         from core.agent.tool_output_handler import compute_dynamic_threshold, MIN_THRESHOLD
+
         # 1000 tokens * 4 * 0.2 = 800 bytes, but min is 2KB
         threshold = compute_dynamic_threshold(1000)
         assert threshold == MIN_THRESHOLD
@@ -215,11 +217,14 @@ class TestSummaryRegistry:
 
     def test_register_custom_strategy(self):
         """Can register custom summary strategy."""
-        from core.agent.tool_output_handler import register_summary_strategy, generate_structured_summary
-        
+        from core.agent.tool_output_handler import (
+            register_summary_strategy,
+            generate_structured_summary,
+        )
+
         def custom_summary(output: str) -> str:
             return f"CUSTOM: {len(output)} bytes"
-        
+
         register_summary_strategy("my_tool", custom_summary)
         result = generate_structured_summary("test content", "my_tool")
         assert result == "CUSTOM: 12 bytes"
@@ -228,7 +233,7 @@ class TestSummaryRegistry:
         """JSON summary extracts keys."""
         from core.agent.tool_output_handler import generate_structured_summary
         import json
-        
+
         data = {"key1": "value1", "key2": "value2", "key3": "value3"}
         result = generate_structured_summary(json.dumps(data), "api_call")
         assert "3 keys" in result
@@ -237,9 +242,9 @@ class TestSummaryRegistry:
     def test_file_content_summary(self):
         """File content summary shows head and tail."""
         from core.agent.tool_output_handler import generate_structured_summary
-        
+
         lines = [f"line{i}" for i in range(100)]
-        output = '\n'.join(lines)
+        output = "\n".join(lines)
         result = generate_structured_summary(output, "fs_read")
         assert "100 lines" in result
         assert "line0" in result
@@ -252,24 +257,24 @@ class TestMemoryExpand:
     def test_expand_full_content(self):
         """Expand returns full content."""
         from core.agent.tool_output_handler import expand_memory_reference
-        
+
         mock_service = MagicMock()
         mock_memory = MagicMock()
         mock_memory.content = "line1\nline2\nline3"
         mock_service.get_memory.return_value = mock_memory
-        
+
         result = expand_memory_reference("mem_123", mock_service)
         assert result == "line1\nline2\nline3"
 
     def test_expand_with_line_range(self):
         """Expand with line range returns subset."""
         from core.agent.tool_output_handler import expand_memory_reference
-        
+
         mock_service = MagicMock()
         mock_memory = MagicMock()
         mock_memory.content = "line1\nline2\nline3\nline4\nline5"
         mock_service.get_memory.return_value = mock_memory
-        
+
         result = expand_memory_reference("mem_123", mock_service, start_line=2, end_line=4)
         assert "line2" in result
         assert "line3" in result
@@ -279,12 +284,12 @@ class TestMemoryExpand:
     def test_expand_with_query_filter(self):
         """Expand with query filters matching lines."""
         from core.agent.tool_output_handler import expand_memory_reference
-        
+
         mock_service = MagicMock()
         mock_memory = MagicMock()
         mock_memory.content = "error: something\ninfo: ok\nerror: another"
         mock_service.get_memory.return_value = mock_memory
-        
+
         result = expand_memory_reference("mem_123", mock_service, query="error")
         assert "2 of 3 lines matching" in result
         assert "error: something" in result
@@ -293,10 +298,10 @@ class TestMemoryExpand:
     def test_expand_not_found(self):
         """Expand returns error for missing memory."""
         from core.agent.tool_output_handler import expand_memory_reference
-        
+
         mock_service = MagicMock()
         mock_service.get_memory.return_value = None
-        
+
         result = expand_memory_reference("mem_missing", mock_service)
         assert "not found" in result
 
@@ -316,8 +321,12 @@ class TestStalenessCheck:
         mock_service.retrieve.return_value = ([mock_memory], None)
 
         result = find_similar_result(
-            "grep", {"pattern": "test"}, "sess1", "user1", mock_service,
-            max_age_seconds=300  # 5 min max
+            "grep",
+            {"pattern": "test"},
+            "sess1",
+            "user1",
+            mock_service,
+            max_age_seconds=300,  # 5 min max
         )
         assert result is None  # Rejected due to staleness
 
@@ -334,8 +343,7 @@ class TestStalenessCheck:
         mock_service.retrieve.return_value = ([mock_memory], None)
 
         result = find_similar_result(
-            "grep", {"pattern": "test"}, "sess1", "user1", mock_service,
-            max_age_seconds=300
+            "grep", {"pattern": "test"}, "sess1", "user1", mock_service, max_age_seconds=300
         )
         assert result is not None
         assert "mem_fresh" in result
@@ -347,24 +355,28 @@ class TestSummarizability:
     def test_grep_is_summarizable(self):
         """Grep output is summarizable."""
         from core.agent.tool_output_handler import is_summarizable
+
         output = "file.py:10:match\nfile.py:20:match"
         assert is_summarizable("grep", output) is True
 
     def test_fs_read_not_summarizable(self):
         """fs_read is in non-summarizable list."""
         from core.agent.tool_output_handler import is_summarizable
+
         output = "some content"
         assert is_summarizable("fs_read", output) is False
 
     def test_code_content_not_summarizable(self):
         """Code content detected and not summarized."""
         from core.agent.tool_output_handler import is_summarizable
+
         output = "import os\n\ndef main():\n    pass"
         assert is_summarizable("shell", output) is False
 
     def test_large_code_is_summarizable(self):
         """Large code files (>200 lines) can be summarized."""
         from core.agent.tool_output_handler import is_summarizable
+
         output = "import os\n" + "\n".join([f"line{i}" for i in range(300)])
         assert is_summarizable("shell", output) is True
 
@@ -376,12 +388,10 @@ class TestFailureModes:
         """Falls back to truncation when mo-memoria fails."""
         mock_service = MagicMock()
         mock_service.create_memory.side_effect = Exception("DB connection failed")
-        
+
         output = "x" * 50000
-        result = process_tool_output(
-            output, "grep", "sess1", "user1", mock_service
-        )
-        
+        result = process_tool_output(output, "grep", "sess1", "user1", mock_service)
+
         assert "truncated" in result
         assert "mo-memoria unavailable" in result
         assert len(result) < len(output)

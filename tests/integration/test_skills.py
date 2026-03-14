@@ -30,9 +30,10 @@ def test_skill_registry_register(db_session, registry, llm, github):
     """Test skill registration"""
     # Clean up first
     from api.models import SkillRegistry as SkillModel
+
     db_session.query(SkillModel).filter(SkillModel.skill_name == "summarize_pr").delete()
     db_session.commit()
-    
+
     skill = SummarizePRSkill(llm, github, db_session)
     registry.register(skill)
 
@@ -51,9 +52,10 @@ def test_skill_registry_versioning(db_session, registry, llm, github):
     """Test skill versioning"""
     # Clean up first
     from api.models import SkillRegistry as SkillModel
+
     db_session.query(SkillModel).filter(SkillModel.skill_name == "summarize_pr").delete()
     db_session.commit()
-    
+
     # Register v1.0.0
     skill_v1 = SummarizePRSkill(llm, github, db_session)
     skill_v1.version = "1.0.0"
@@ -73,10 +75,14 @@ def test_skill_registry_versioning(db_session, registry, llm, github):
 
     # Check database using ORM
     from api.models import SkillRegistry as SkillModel
-    rows = db_session.query(SkillModel).filter(
-        SkillModel.skill_name == "summarize_pr"
-    ).order_by(SkillModel.version).all()
-    
+
+    rows = (
+        db_session.query(SkillModel)
+        .filter(SkillModel.skill_name == "summarize_pr")
+        .order_by(SkillModel.version)
+        .all()
+    )
+
     assert len(rows) == 2
     assert rows[0].version == "1.0.0"
     assert rows[0].is_active in (0, False)
@@ -275,12 +281,29 @@ async def test_register_builtin_skills_then_execute(db_session):
     db_factory = lambda: db_session
 
     # Mock GitHub methods on the client that register_builtin_skills will create
-    mock_prs = [{"number": 1, "title": "PR #1", "user": "u", "created_at": "2026-01-01", "html_url": "http://x"}]
-    mock_runs = [{"name": "CI", "status": "completed", "conclusion": "success", "html_url": "http://x", "created_at": "2026-01-01"}]
+    mock_prs = [
+        {
+            "number": 1,
+            "title": "PR #1",
+            "user": "u",
+            "created_at": "2026-01-01",
+            "html_url": "http://x",
+        }
+    ]
+    mock_runs = [
+        {
+            "name": "CI",
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": "http://x",
+            "created_at": "2026-01-01",
+        }
+    ]
 
     registry = SkillRegistry(db_factory)
 
     from unittest.mock import AsyncMock, MagicMock
+
     fake_gh = MagicMock()
     fake_gh.list_prs = AsyncMock(return_value=mock_prs)
     fake_gh.list_wf_runs = AsyncMock(return_value=mock_runs)
@@ -289,7 +312,9 @@ async def test_register_builtin_skills_then_execute(db_session):
 
     # Retrieve from registry and execute — this is the path /chat/turn uses
     list_prs_skill = registry.get("list_prs")
-    inp = list_prs_skill.validate_input({"repo": "matrixorigin/matrixone", "state": "open", "limit": 1})
+    inp = list_prs_skill.validate_input(
+        {"repo": "matrixorigin/matrixone", "state": "open", "limit": 1}
+    )
     out = await list_prs_skill.execute(inp)
     assert out.success is True
     assert len(out.prs) == 1
@@ -313,19 +338,32 @@ async def test_summarize_pr_works_with_sync_llm(db_session):
     from unittest.mock import MagicMock, AsyncMock
 
     fake_gh = MagicMock()
-    fake_gh.get_pr = AsyncMock(return_value={
-        "number": 1, "title": "test", "body": "desc",
-        "changed_files": 2, "additions": 10, "deletions": 5,
-    })
+    fake_gh.get_pr = AsyncMock(
+        return_value={
+            "number": 1,
+            "title": "test",
+            "body": "desc",
+            "changed_files": 2,
+            "additions": 10,
+            "deletions": 5,
+        }
+    )
     fake_gh.get_pr_diff = AsyncMock(return_value="diff")
 
     # Intentionally sync — mimics real LLMClient.chat
     fake_llm = MagicMock()
-    fake_llm.chat = MagicMock(return_value=LLMResponse(
-        content="Summary", model="gpt-4", provider=LLMProvider.OPENAI,
-        tokens_prompt=10, tokens_completion=5, tokens_total=15,
-        latency_ms=100, cost_usd=0.001,
-    ))
+    fake_llm.chat = MagicMock(
+        return_value=LLMResponse(
+            content="Summary",
+            model="gpt-4",
+            provider=LLMProvider.OPENAI,
+            tokens_prompt=10,
+            tokens_completion=5,
+            tokens_total=15,
+            latency_ms=100,
+            cost_usd=0.001,
+        )
+    )
 
     skill = SummarizePRSkill(fake_llm, fake_gh)
     inp = skill.validate_input({"repo": "owner/repo", "pr_number": 1})

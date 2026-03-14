@@ -1,4 +1,5 @@
 """Rule and LLM-based checks for talk verification cases."""
+
 from __future__ import annotations
 
 import logging
@@ -20,6 +21,7 @@ class CheckResult:
 
 
 # ── Rule checks ──────────────────────────────────────────────────────
+
 
 def check_tool_called(tool_name: str, tool_calls: list[dict]) -> CheckResult:
     names = [tc.get("name", "") for tc in tool_calls]
@@ -92,7 +94,7 @@ def check_db_rule(
                 delta = int(expected_str[1:])
                 prev = prev_counts.get(key, 0)
                 ok = actual == prev + delta
-                msg = f"count={actual}, expected {prev}+{delta}={prev+delta}"
+                msg = f"count={actual}, expected {prev}+{delta}={prev + delta}"
             elif expected_str.startswith(">="):
                 threshold = int(expected_str[2:])
                 ok = actual >= threshold
@@ -120,27 +122,33 @@ def check_db_rule(
                             val = str(row_dict.get(field_name, ""))
                             substr = constraint["contains"]
                             ok = substr.lower() in val.lower()
-                            results.append(CheckResult(
-                                f"db:{table}:{field_name}:contains:{substr}",
-                                ok,
-                                f"value='{val[:100]}'" if not ok else "",
-                            ))
+                            results.append(
+                                CheckResult(
+                                    f"db:{table}:{field_name}:contains:{substr}",
+                                    ok,
+                                    f"value='{val[:100]}'" if not ok else "",
+                                )
+                            )
                         if "not_null" in constraint:
                             val = row_dict.get(field_name)
                             ok = val is not None
-                            results.append(CheckResult(
-                                f"db:{table}:{field_name}:not_null",
-                                ok,
-                                "value is None" if not ok else "",
-                            ))
+                            results.append(
+                                CheckResult(
+                                    f"db:{table}:{field_name}:not_null",
+                                    ok,
+                                    "value is None" if not ok else "",
+                                )
+                            )
                     else:
                         val = row_dict.get(field_name)
                         ok = val == constraint
-                        results.append(CheckResult(
-                            f"db:{table}:{field_name}={constraint}",
-                            ok,
-                            f"actual={val}" if not ok else "",
-                        ))
+                        results.append(
+                            CheckResult(
+                                f"db:{table}:{field_name}={constraint}",
+                                ok,
+                                f"actual={val}" if not ok else "",
+                            )
+                        )
 
     return results
 
@@ -162,27 +170,35 @@ def check_session_integrity(db_factory: Any, sid: str) -> list[CheckResult]:
 
         # causal_chain_id not null on all events
         nulls = [e for e in events if not e.causal_chain_id]
-        results.append(CheckResult(
-            "session_integrity:causal_chain_id",
-            len(nulls) == 0,
-            f"{len(nulls)} events missing causal_chain_id" if nulls else "",
-        ))
+        results.append(
+            CheckResult(
+                "session_integrity:causal_chain_id",
+                len(nulls) == 0,
+                f"{len(nulls)} events missing causal_chain_id" if nulls else "",
+            )
+        )
 
         # llm_response events have parent_event_id
         llm_events = [e for e in events if e.event_type == "llm_response"]
         missing_parent = [e for e in llm_events if not e.parent_event_id]
-        results.append(CheckResult(
-            "session_integrity:llm_response_has_parent",
-            len(missing_parent) == 0,
-            f"{len(missing_parent)} llm_response events missing parent_event_id" if missing_parent else "",
-        ))
+        results.append(
+            CheckResult(
+                "session_integrity:llm_response_has_parent",
+                len(missing_parent) == 0,
+                f"{len(missing_parent)} llm_response events missing parent_event_id"
+                if missing_parent
+                else "",
+            )
+        )
 
         # at least one llm_response exists
-        results.append(CheckResult(
-            "session_integrity:has_llm_response",
-            len(llm_events) > 0,
-            f"event types: {[e.event_type for e in events]}" if not llm_events else "",
-        ))
+        results.append(
+            CheckResult(
+                "session_integrity:has_llm_response",
+                len(llm_events) > 0,
+                f"event types: {[e.event_type for e in events]}" if not llm_events else "",
+            )
+        )
 
         # session record: status=active, event_count matches
         session_row = db.execute(
@@ -190,20 +206,28 @@ def check_session_integrity(db_factory: Any, sid: str) -> list[CheckResult]:
             {"sid": sid},
         ).first()
         if session_row:
-            results.append(CheckResult(
-                "session_integrity:status_active",
-                session_row.status == "active",
-                f"status={session_row.status}" if session_row.status != "active" else "",
-            ))
-            results.append(CheckResult(
-                "session_integrity:event_count_positive",
-                session_row.event_count > 0,
-                f"event_count={session_row.event_count}" if session_row.event_count <= 0 else "",
-            ))
+            results.append(
+                CheckResult(
+                    "session_integrity:status_active",
+                    session_row.status == "active",
+                    f"status={session_row.status}" if session_row.status != "active" else "",
+                )
+            )
+            results.append(
+                CheckResult(
+                    "session_integrity:event_count_positive",
+                    session_row.event_count > 0,
+                    f"event_count={session_row.event_count}"
+                    if session_row.event_count <= 0
+                    else "",
+                )
+            )
         else:
-            results.append(CheckResult(
-                "session_integrity:session_record_exists", False, "no session record found"
-            ))
+            results.append(
+                CheckResult(
+                    "session_integrity:session_record_exists", False, "no session record found"
+                )
+            )
 
     return results
 
@@ -215,10 +239,13 @@ def check_turn_count_increases(
     key = f"__events:{sid}"
     prev = prev_counts.get(key, 0)
     with db_factory() as db:
-        actual = db.execute(
-            text("SELECT COUNT(*) FROM agent_events WHERE session_id = :sid"),
-            {"sid": sid},
-        ).scalar() or 0
+        actual = (
+            db.execute(
+                text("SELECT COUNT(*) FROM agent_events WHERE session_id = :sid"),
+                {"sid": sid},
+            ).scalar()
+            or 0
+        )
     prev_counts[key] = actual
     increased = actual > prev
     return CheckResult(
@@ -261,6 +288,7 @@ def run_rule_checks(
 
 # ── LLM judge ────────────────────────────────────────────────────────
 
+
 def llm_judge(
     response: str,
     user_message: str,
@@ -281,12 +309,14 @@ def llm_judge(
     )
     try:
         from core.llm.client import LLMMessage
+
         messages = [LLMMessage(role="user", content=prompt)]
         resp = llm_client.chat(messages, user_id="__verify_judge", model=model)
         raw = resp.content if hasattr(resp, "content") else str(resp)
         match = re.search(r"(\d+\.?\d*)", raw.strip())
         if not match:
             import logging
+
             logging.getLogger(__name__).warning("llm_judge got non-numeric response: %r", raw[:200])
         score = float(match.group(1)) if match else 0.0
         score = min(1.0, max(0.0, score))

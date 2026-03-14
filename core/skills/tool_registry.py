@@ -28,27 +28,30 @@ logger = get_logger(__name__)
 
 class ToolSource(str, Enum):
     """Where a tool comes from."""
-    EDGE = "edge"          # CLI-side tools (file_ops, bash, grep...)
-    LOCAL = "local"        # User-defined .mo-agent/skills/
-    CLOUD = "cloud"        # Server-side builtin/marketplace skills
-    MCP = "mcp"            # External MCP server tools
+
+    EDGE = "edge"  # CLI-side tools (file_ops, bash, grep...)
+    LOCAL = "local"  # User-defined .mo-agent/skills/
+    CLOUD = "cloud"  # Server-side builtin/marketplace skills
+    MCP = "mcp"  # External MCP server tools
 
 
 @dataclass(frozen=True)
 class ToolEntry:
     """A registered tool with metadata for selection."""
+
     name: str
     description: str
-    schema: dict[str, Any]          # OpenAI function calling schema
+    schema: dict[str, Any]  # OpenAI function calling schema
     source: ToolSource
-    pinned: bool = False            # Always include in LLM context
-    category: str = ""              # For tag-based filtering
-    execute_fn: Any = None          # Callable for server-side execution (cloud/local)
+    pinned: bool = False  # Always include in LLM context
+    category: str = ""  # For tag-based filtering
+    execute_fn: Any = None  # Callable for server-side execution (cloud/local)
 
     @property
     def schema_tokens(self) -> int:
         """Rough token estimate for this tool's schema (~4 chars/token)."""
         import json
+
         try:
             return len(json.dumps(self.schema)) // 4
         except (TypeError, ValueError):
@@ -57,10 +60,17 @@ class ToolEntry:
 
 # Default pinned tools — these are needed in almost every coding interaction.
 # Everything else is selected dynamically per request.
-_DEFAULT_PINNED = frozenset({
-    "read_file", "write_file", "str_replace", "list_dir",
-    "grep", "glob", "bash",
-})
+_DEFAULT_PINNED = frozenset(
+    {
+        "read_file",
+        "write_file",
+        "str_replace",
+        "list_dir",
+        "grep",
+        "glob",
+        "bash",
+    }
+)
 
 # Max dynamic tools to retrieve per request
 _MAX_DYNAMIC_TOOLS = 8
@@ -73,11 +83,20 @@ def _default_tags_for_source(source: ToolSource):
     """Fallback SkillTags when a tool has no category. Ensures edge tools
     get scope='local' so the prefilter can deprioritize them for fetch queries."""
     from core.skills.prefilter import SkillTags
+
     if source in (ToolSource.CLOUD, ToolSource.MCP):
-        return SkillTags(scope="external", data_source="external_api",
-                         intent_type=("fetch",), requires_history=False)
-    return SkillTags(scope="local", data_source="local_filesystem",
-                     intent_type=("fetch",), requires_history=False)
+        return SkillTags(
+            scope="external",
+            data_source="external_api",
+            intent_type=("fetch",),
+            requires_history=False,
+        )
+    return SkillTags(
+        scope="local",
+        data_source="local_filesystem",
+        intent_type=("fetch",),
+        requires_history=False,
+    )
 
 
 class ToolRegistry:
@@ -225,7 +244,7 @@ class ToolRegistry:
         if user_query and self._embed_fn and len(dynamic_pool) > self._max_dynamic:
             dynamic_pool = self._embedding_select(user_query, dynamic_pool)
         else:
-            dynamic_pool = dynamic_pool[:self._max_dynamic]
+            dynamic_pool = dynamic_pool[: self._max_dynamic]
 
         # Step 4: Merge and enforce token budget
         selected = pinned + dynamic_pool
@@ -238,13 +257,16 @@ class ToolRegistry:
     # ── Internal selection stages ────────────────────────────────
 
     def _intent_filter(
-        self, user_query: str, pool: list[ToolEntry],
+        self,
+        user_query: str,
+        pool: list[ToolEntry],
     ) -> list[ToolEntry]:
         """Filter dynamic pool by intent classification. Zero cost."""
         if not user_query:
             return pool
         try:
             from core.context.intent_routing import Tier0Engine, ToolFilter
+
             engine = Tier0Engine()
             tool_filter, _ = engine.classify_tool_filter(user_query)
             if tool_filter == ToolFilter.ALL_BLOCKED:
@@ -256,7 +278,9 @@ class ToolRegistry:
         return pool
 
     def _prefilter(
-        self, messages: list[dict[str, Any]], pool: list[ToolEntry],
+        self,
+        messages: list[dict[str, Any]],
+        pool: list[ToolEntry],
     ) -> list[ToolEntry]:
         """Reorder dynamic pool by conversation state signals. Zero cost."""
         try:
@@ -266,12 +290,16 @@ class ToolRegistry:
                 ToolWrapper,
                 pre_filter,
             )
+
             state = ConversationState.from_messages(messages)
             wrappers = [
                 ToolWrapper(
                     name=t.name,
-                    tags=(SkillTags.infer_from_category(t.category) if t.category
-                          else _default_tags_for_source(t.source)),
+                    tags=(
+                        SkillTags.infer_from_category(t.category)
+                        if t.category
+                        else _default_tags_for_source(t.source)
+                    ),
                     schema=t.schema,
                 )
                 for t in pool
@@ -286,7 +314,9 @@ class ToolRegistry:
         return pool
 
     def _embedding_select(
-        self, user_query: str, pool: list[ToolEntry],
+        self,
+        user_query: str,
+        pool: list[ToolEntry],
     ) -> list[ToolEntry]:
         """Select top-K from pool using embedding similarity."""
         try:
@@ -304,10 +334,10 @@ class ToolRegistry:
                 scored.append((entry, sim))
 
             scored.sort(key=lambda x: x[1], reverse=True)
-            return [e for e, _ in scored[:self._max_dynamic]]
+            return [e for e, _ in scored[: self._max_dynamic]]
         except Exception as e:
             logger.debug("Embedding select failed, using truncation: %s", e)
-            return pool[:self._max_dynamic]
+            return pool[: self._max_dynamic]
 
     def _ensure_embeddings(self, pool: list[ToolEntry]) -> None:
         """Compute embeddings for tools that don't have one cached."""
@@ -337,10 +367,9 @@ class ToolRegistry:
             else:
                 logger.debug(
                     "Token budget exceeded (%d/%d), dropping %s",
-                    total_tokens, self._max_tokens, entry.name,
+                    total_tokens,
+                    self._max_tokens,
+                    entry.name,
                 )
                 break
         return schemas
-
-
-

@@ -38,9 +38,7 @@ class TestEnhancedFirewallIntegration:
                 ]
             ),
             # Verification for claim 1
-            json.dumps(
-                {"verified": True, "confidence": 0.95, "reasoning": "Found in events"}
-            ),
+            json.dumps({"verified": True, "confidence": 0.95, "reasoning": "Found in events"}),
             # Verification for claim 2
             json.dumps(
                 {
@@ -89,6 +87,7 @@ class TestEnhancedFirewallIntegration:
 
         # Log verification
         from unittest.mock import patch
+
         with patch("core.verification.firewall._fw_pool") as mock_pool:
             mock_pool.submit.side_effect = lambda fn, *a, **kw: fn(*a, **kw)
             firewall.log_verification("sess_1", "evt_1", result, "snap_123")
@@ -162,24 +161,18 @@ class TestEnhancedFirewallIntegration:
                     }
                 ]
             ),
-            json.dumps(
-                {"verified": True, "confidence": 0.98, "reasoning": "Multiple sources"}
-            ),
+            json.dumps({"verified": True, "confidence": 0.98, "reasoning": "Multiple sources"}),
         ]
 
         snapshot = Mock()
-        snapshot.selected_events = [
-            {"event_id": "evt_1", "content": "I made the function async"}
-        ]
+        snapshot.selected_events = [{"event_id": "evt_1", "content": "I made the function async"}]
         snapshot.code_context = [
             {
                 "file_path": "src/main.py",
                 "content": "async def process():\n    pass",
             }
         ]
-        snapshot.documentation = [
-            {"doc_id": "doc_1", "content": "The process function is async"}
-        ]
+        snapshot.documentation = [{"doc_id": "doc_1", "content": "The process function is async"}]
 
         context_manager.load_snapshot.return_value = snapshot
 
@@ -248,7 +241,10 @@ class TestEnhancedFirewallIntegration:
 
         # Should fail open
         assert result.safe_to_deliver is True
-        assert "extraction failed" in result.warnings[0].lower() or "no verifiable" in result.warnings[0].lower()
+        assert (
+            "extraction failed" in result.warnings[0].lower()
+            or "no verifiable" in result.warnings[0].lower()
+        )
 
     def test_snapshot_load_failure(self):
         """Test handling of snapshot load failures."""
@@ -257,9 +253,9 @@ class TestEnhancedFirewallIntegration:
         llm_client = Mock()
 
         # Mock successful claim extraction
-        llm_client.generate.return_value = json.dumps([
-            {"type": "numeric", "value": "5 files", "context": "", "position": 0}
-        ])
+        llm_client.generate.return_value = json.dumps(
+            [{"type": "numeric", "value": "5 files", "context": "", "position": 0}]
+        )
 
         # Mock snapshot load failure
         context_manager.load_snapshot.side_effect = Exception("Snapshot not found")

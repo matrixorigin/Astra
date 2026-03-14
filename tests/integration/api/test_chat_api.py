@@ -78,13 +78,18 @@ class TestChatAPI:
         assert data["status"] == "pending"
 
     @patch("api.routers.chat._get_engine")
-    def test_chat_with_existing_session(self, mock_get_engine, client, auth_headers, db_session, test_user):
+    def test_chat_with_existing_session(
+        self, mock_get_engine, client, auth_headers, db_session, test_user
+    ):
         from core.events.session_manager import SessionManager
+
         mgr = SessionManager(db_session)
         session = mgr.create_session(user_id=test_user.user_id)
 
         mock_get_engine.return_value = _mock_engine("reply2")
-        resp = client.post("/chat", json={"session_id": session.session_id, "message": "hi"}, headers=auth_headers)
+        resp = client.post(
+            "/chat", json={"session_id": session.session_id, "message": "hi"}, headers=auth_headers
+        )
         assert resp.status_code == 200
         assert resp.json()["session_id"] == session.session_id
 
@@ -94,7 +99,9 @@ class TestChatAPI:
 
     @patch("api.routers.chat._get_engine")
     def test_chat_nonexistent_session(self, mock_get_engine, client, auth_headers):
-        resp = client.post("/chat", json={"session_id": "no_such_id", "message": "hi"}, headers=auth_headers)
+        resp = client.post(
+            "/chat", json={"session_id": "no_such_id", "message": "hi"}, headers=auth_headers
+        )
         assert resp.status_code == 404
 
     @patch("api.routers.chat._get_engine")
@@ -155,7 +162,9 @@ class TestChatAPI:
         assert resp.status_code == 403
 
     @patch("api.routers.chat._get_engine")
-    def test_cancel_finished_run_returns_409(self, mock_get_engine, client, auth_headers, test_user):
+    def test_cancel_finished_run_returns_409(
+        self, mock_get_engine, client, auth_headers, test_user
+    ):
         """Cancelling an already-finished run returns 409."""
         engine = _mock_engine()
         run = AgentRun(session_id="test", user_id=test_user.user_id, user_input="hi")
@@ -173,11 +182,15 @@ class TestSSEProtocolCompliance:
 
     def test_stream_nonexistent_session_returns_sse_error(self, client, auth_headers):
         """POST /chat/stream with bad session_id → SSE error event."""
-        resp = client.post("/chat/stream", json={"session_id": "no_such_id", "message": "hi"}, headers=auth_headers)
+        resp = client.post(
+            "/chat/stream", json={"session_id": "no_such_id", "message": "hi"}, headers=auth_headers
+        )
         assert resp.status_code == 200
         assert "text/event-stream" in resp.headers["content-type"]
         events = parse_sse_events(resp.text)
-        assert any(e.get("type") == "error" and "not found" in e.get("message", "").lower() for e in events)
+        assert any(
+            e.get("type") == "error" and "not found" in e.get("message", "").lower() for e in events
+        )
 
     @patch("api.routers.chat._get_engine")
     def test_stream_run_not_found_returns_sse_error(self, mock_get_engine, client, auth_headers):

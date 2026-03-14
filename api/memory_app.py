@@ -38,13 +38,18 @@ def _init_memory_db() -> None:
     ]:
         try:
             from sqlalchemy import text
+
             with engine.begin() as conn:
                 idx_rows = conn.execute(text(f"SHOW INDEX FROM {tbl}")).fetchall()
                 if not any(idx_name in str(r) for r in idx_rows):
                     VectorIndex.create_index(
-                        engine, table_name=tbl, name=idx_name,
-                        column=col_name, index_type="ivfflat",
-                        lists=10, op_type="vector_l2_ops",
+                        engine,
+                        table_name=tbl,
+                        name=idx_name,
+                        column=col_name,
+                        index_type="ivfflat",
+                        lists=10,
+                        op_type="vector_l2_ops",
                     )
         except Exception as e:
             logger.debug("Vector index %s skipped: %s", idx_name, e)
@@ -62,6 +67,7 @@ async def lifespan(app: FastAPI):
 
     # Memory governance scheduler (decay, quarantine, compression)
     from core.context.scheduler import MemoryGovernanceScheduler
+
     scheduler = MemoryGovernanceScheduler()
     await scheduler.start()
 
@@ -69,6 +75,7 @@ async def lifespan(app: FastAPI):
     try:
         from api.database import get_db_session
         from core.auth.seed_roles import seed_roles
+
         db = next(get_db_session())
         seeded = seed_roles(db)
         if seeded:
@@ -95,6 +102,7 @@ memory_app = FastAPI(
 
 # ── Exception handlers (same as main app) ────────────────────────────
 
+
 @memory_app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
@@ -107,7 +115,9 @@ async def global_exception_handler(request: Request, exc: Exception):
 async def http_exception_handler(request: Request, exc: HTTPException):
     if is_sse_endpoint(request.url.path):
         return sse_error_response(exc.status_code, exc.detail)
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
+    return JSONResponse(
+        status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers
+    )
 
 
 @memory_app.exception_handler(RequestValidationError)
@@ -115,10 +125,12 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     if is_sse_endpoint(request.url.path):
         return sse_error_response(422, format_validation_error(exc))
     from fastapi.encoders import jsonable_encoder
+
     return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
 
 
 # ── Middleware ─────────────────────────────────────────────────────────
+
 
 @memory_app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -153,6 +165,7 @@ memory_app.include_router(memory_router.router, prefix="/v1", tags=["memory"])
 
 
 # ── Health ────────────────────────────────────────────────────────────
+
 
 @memory_app.get("/health")
 def health_check():

@@ -56,9 +56,7 @@ class TestGetProfile:
 
     def test_respects_token_limit(self, manager, mock_store):
         # Create many long memories
-        mock_store.list_active.return_value = [
-            _profile_mem("x" * 500) for _ in range(10)
-        ]
+        mock_store.list_active.return_value = [_profile_mem("x" * 500) for _ in range(10)]
         profile = manager.get_profile("u1")
         # Should be truncated
         assert len(profile) < 5000
@@ -93,8 +91,11 @@ class TestUpdateFromMemories:
         manager.get_profile("u1")
 
         episodic = Memory(
-            memory_id="e1", user_id="u1", memory_type=MemoryType.SEMANTIC,
-            content="event", initial_confidence=0.7,
+            memory_id="e1",
+            user_id="u1",
+            memory_type=MemoryType.SEMANTIC,
+            content="event",
+            initial_confidence=0.7,
         )
         result = manager.update_from_memories("u1", [episodic])
 

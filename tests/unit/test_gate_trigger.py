@@ -30,11 +30,17 @@ class TestGateTriggerAsync:
 
         trigger = GateTrigger(db_factory=db_factory)
 
-        with patch.object(trigger, "_run_gate", side_effect=lambda *a, **kw: fired.set()) as mock_run:
+        with patch.object(
+            trigger, "_run_gate", side_effect=lambda *a, **kw: fired.set()
+        ) as mock_run:
             trigger.on_skill_change("my_skill", "1.0.0", {"param": "value"})
             fired.wait(timeout=2.0)
             assert fired.is_set()
-            mock_run.assert_called_once_with("skill", "my_skill@1.0.0", {"name": "my_skill", "version": "1.0.0", "definition": {"param": "value"}})
+            mock_run.assert_called_once_with(
+                "skill",
+                "my_skill@1.0.0",
+                {"name": "my_skill", "version": "1.0.0", "definition": {"param": "value"}},
+            )
 
     def test_on_prompt_change_fires_thread(self):
         fired = threading.Event()
@@ -42,13 +48,20 @@ class TestGateTriggerAsync:
 
         trigger = GateTrigger(db_factory=db_factory)
 
-        with patch.object(trigger, "_run_gate", side_effect=lambda *a, **kw: fired.set()) as mock_run:
+        with patch.object(
+            trigger, "_run_gate", side_effect=lambda *a, **kw: fired.set()
+        ) as mock_run:
             trigger.on_prompt_change("system_prompt", "v2", "You are a helpful assistant.")
             fired.wait(timeout=2.0)
             assert fired.is_set()
             mock_run.assert_called_once_with(
-                "prompt", "system_prompt@v2",
-                {"template_id": "system_prompt", "version": "v2", "content": "You are a helpful assistant."},
+                "prompt",
+                "system_prompt@v2",
+                {
+                    "template_id": "system_prompt",
+                    "version": "v2",
+                    "content": "You are a helpful assistant.",
+                },
             )
 
     def test_thread_is_daemon(self):
@@ -87,9 +100,11 @@ class TestGateTriggerAsync:
 class TestRunGate:
     def _patched_run(self, gate, db, trigger):
         """Helper: patch RegressionGate + lock so _run_gate executes gate."""
-        with patch("core.evaluation.gate_trigger.RegressionGate", return_value=gate), \
-             patch.object(trigger, "_try_acquire", return_value=True), \
-             patch.object(trigger, "_release"):
+        with (
+            patch("core.evaluation.gate_trigger.RegressionGate", return_value=gate),
+            patch.object(trigger, "_try_acquire", return_value=True),
+            patch.object(trigger, "_release"),
+        ):
             yield
 
     def test_run_gate_calls_validate_change(self):
@@ -99,9 +114,11 @@ class TestRunGate:
         gate.validate_change.return_value = {"verdict": "pass", "metrics": {}}
         trigger = GateTrigger(db_factory=db_factory)
 
-        with patch("core.evaluation.gate_trigger.RegressionGate", return_value=gate), \
-             patch.object(trigger, "_try_acquire", return_value=True), \
-             patch.object(trigger, "_release"):
+        with (
+            patch("core.evaluation.gate_trigger.RegressionGate", return_value=gate),
+            patch.object(trigger, "_try_acquire", return_value=True),
+            patch.object(trigger, "_release"),
+        ):
             trigger._run_gate("skill", "my_skill@1.0", {"name": "my_skill"})
 
         gate.validate_change.assert_called_once()
@@ -113,8 +130,10 @@ class TestRunGate:
         gate = Mock()
         trigger = GateTrigger(db_factory=db_factory)
 
-        with patch("core.evaluation.gate_trigger.RegressionGate", return_value=gate), \
-             patch.object(trigger, "_try_acquire", return_value=False):
+        with (
+            patch("core.evaluation.gate_trigger.RegressionGate", return_value=gate),
+            patch.object(trigger, "_try_acquire", return_value=False),
+        ):
             trigger._run_gate("skill", "my_skill@1.0", {})
 
         gate.validate_change.assert_not_called()
@@ -126,10 +145,12 @@ class TestRunGate:
         gate.validate_change.return_value = {"verdict": "fail", "metrics": {"error_rate": 0.1}}
         trigger = GateTrigger(db_factory=db_factory)
 
-        with patch("core.evaluation.gate_trigger.RegressionGate", return_value=gate), \
-             patch.object(trigger, "_try_acquire", return_value=True), \
-             patch.object(trigger, "_release"), \
-             patch("core.evaluation.gate_trigger.logger") as mock_logger:
+        with (
+            patch("core.evaluation.gate_trigger.RegressionGate", return_value=gate),
+            patch.object(trigger, "_try_acquire", return_value=True),
+            patch.object(trigger, "_release"),
+            patch("core.evaluation.gate_trigger.logger") as mock_logger,
+        ):
             trigger._run_gate("prompt", "tmpl@v2", {"content": "..."})
             mock_logger.warning.assert_called_once()
 
@@ -138,9 +159,11 @@ class TestRunGate:
         db_factory = Mock(return_value=db)
         trigger = GateTrigger(db_factory=db_factory)
 
-        with patch("core.evaluation.gate_trigger.RegressionGate", side_effect=RuntimeError("boom")), \
-             patch.object(trigger, "_try_acquire", return_value=True), \
-             patch.object(trigger, "_release"):
+        with (
+            patch("core.evaluation.gate_trigger.RegressionGate", side_effect=RuntimeError("boom")),
+            patch.object(trigger, "_try_acquire", return_value=True),
+            patch.object(trigger, "_release"),
+        ):
             trigger._run_gate("skill", "s@1.0", {})  # must not raise
 
         db.close.assert_called_once()
@@ -152,9 +175,11 @@ class TestRunGate:
         gate.validate_change.return_value = {"verdict": "pass", "metrics": {}}
         trigger = GateTrigger(db_factory=db_factory)
 
-        with patch("core.evaluation.gate_trigger.RegressionGate", return_value=gate), \
-             patch.object(trigger, "_try_acquire", return_value=True), \
-             patch.object(trigger, "_release"):
+        with (
+            patch("core.evaluation.gate_trigger.RegressionGate", return_value=gate),
+            patch.object(trigger, "_try_acquire", return_value=True),
+            patch.object(trigger, "_release"),
+        ):
             trigger._run_gate("skill", "s@1.0", {})
 
         db.close.assert_called_once()
@@ -167,9 +192,11 @@ class TestRunGate:
         trigger = GateTrigger(db_factory=db_factory)
         release = Mock()
 
-        with patch("core.evaluation.gate_trigger.RegressionGate", return_value=gate), \
-             patch.object(trigger, "_try_acquire", return_value=True), \
-             patch.object(trigger, "_release", release):
+        with (
+            patch("core.evaluation.gate_trigger.RegressionGate", return_value=gate),
+            patch.object(trigger, "_try_acquire", return_value=True),
+            patch.object(trigger, "_release", release),
+        ):
             trigger._run_gate("skill", "s@1.0", {})
 
         release.assert_called_once()

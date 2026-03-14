@@ -83,7 +83,9 @@ class TestChunkLevelReplay:
     """Replay from agent_run_events when run is complete."""
 
     @pytest.mark.asyncio
-    async def test_completed_run_replays_chunks(self, db_session, run_id, session_id, chain_id, cleanup):
+    async def test_completed_run_replays_chunks(
+        self, db_session, run_id, session_id, chain_id, cleanup
+    ):
         """Normal completed run → chunk-level output from agent_run_events."""
         # Populate agent_run_events with stream chunks
         _insert_run_event(db_session, run_id, 0, "text_message_start", {"role": "assistant"})
@@ -106,7 +108,9 @@ class TestChunkLevelReplay:
         assert events[3].event_type == StreamEventType.TEXT_MESSAGE_END
 
     @pytest.mark.asyncio
-    async def test_chunk_output_matches_original_order(self, db_session, run_id, session_id, chain_id, cleanup):
+    async def test_chunk_output_matches_original_order(
+        self, db_session, run_id, session_id, chain_id, cleanup
+    ):
         """Chunks replayed in idx order, matching original stream."""
         _insert_run_event(db_session, run_id, 0, "text_message_start", {"role": "assistant"})
         _insert_run_event(db_session, run_id, 1, "text_message_content", {"delta": "A"})
@@ -129,7 +133,9 @@ class TestFulltextFallback:
     """Fallback to llm_response when chunks are missing."""
 
     @pytest.mark.asyncio
-    async def test_missing_chunks_falls_back_to_fulltext(self, db_session, run_id, session_id, chain_id, cleanup):
+    async def test_missing_chunks_falls_back_to_fulltext(
+        self, db_session, run_id, session_id, chain_id, cleanup
+    ):
         """Simulated crash: no agent_run_events → fallback to llm_response."""
         # Only llm_response in agent_events, no agent_run_events
         _insert_llm_response(db_session, session_id, run_id, chain_id, "Full response text")
@@ -148,7 +154,9 @@ class TestFulltextFallback:
         assert events[2].event_type == StreamEventType.TEXT_MESSAGE_END
 
     @pytest.mark.asyncio
-    async def test_incomplete_run_falls_back(self, db_session, run_id, session_id, chain_id, cleanup):
+    async def test_incomplete_run_falls_back(
+        self, db_session, run_id, session_id, chain_id, cleanup
+    ):
         """Run with chunks but no terminal event → falls back to full-text."""
         # Chunks exist but no run_completed/run_failed
         _insert_run_event(db_session, run_id, 0, "text_message_start", {"role": "assistant"})
@@ -184,7 +192,13 @@ class TestToolOnlyTurn:
                 "VALUES (:eid, :sid, 'test_user', 'test-agent', '0.1', "
                 "'tool_call', :content, :chain, :run_id, NOW())"
             ),
-            {"eid": eid, "sid": session_id, "content": "calling tool X", "chain": chain_id, "run_id": run_id},
+            {
+                "eid": eid,
+                "sid": session_id,
+                "content": "calling tool X",
+                "chain": chain_id,
+                "run_id": run_id,
+            },
         )
         db_session.commit()
 
@@ -257,7 +271,9 @@ class TestLegacyPathPreserved:
             {
                 "eid": eid,
                 "sid": session_id,
-                "content": json.dumps({"event_type": "text_delta", "data": {"delta": "hi"}, "stream_event_id": eid}),
+                "content": json.dumps(
+                    {"event_type": "text_delta", "data": {"delta": "hi"}, "stream_event_id": eid}
+                ),
                 "chain": chain_id,
             },
         )
@@ -276,7 +292,9 @@ class TestTimeTravelReplay:
     """Test replay_stream_at and get_stream_state_at."""
 
     @pytest.mark.asyncio
-    async def test_replay_stream_at_filters_by_timestamp(self, db_session, session_id, chain_id, cleanup, run_id):
+    async def test_replay_stream_at_filters_by_timestamp(
+        self, db_session, session_id, chain_id, cleanup, run_id
+    ):
         """Events after the cutoff timestamp are excluded."""
         from datetime import datetime, timezone, timedelta
 
@@ -295,9 +313,17 @@ class TestTimeTravelReplay:
                 "'stream_text_delta', :content, :chain, :ts)"
             ),
             {
-                "eid": eid1, "sid": session_id,
-                "content": json.dumps({"event_type": "text_delta", "data": {"delta": "early"}, "stream_event_id": eid1}),
-                "chain": chain_id, "ts": early,
+                "eid": eid1,
+                "sid": session_id,
+                "content": json.dumps(
+                    {
+                        "event_type": "text_delta",
+                        "data": {"delta": "early"},
+                        "stream_event_id": eid1,
+                    }
+                ),
+                "chain": chain_id,
+                "ts": early,
             },
         )
         eid2 = _uid()
@@ -310,9 +336,13 @@ class TestTimeTravelReplay:
                 "'stream_text_delta', :content, :chain, :ts)"
             ),
             {
-                "eid": eid2, "sid": session_id,
-                "content": json.dumps({"event_type": "text_delta", "data": {"delta": "late"}, "stream_event_id": eid2}),
-                "chain": chain_id, "ts": late,
+                "eid": eid2,
+                "sid": session_id,
+                "content": json.dumps(
+                    {"event_type": "text_delta", "data": {"delta": "late"}, "stream_event_id": eid2}
+                ),
+                "chain": chain_id,
+                "ts": late,
             },
         )
         db_session.commit()
@@ -328,7 +358,9 @@ class TestTimeTravelReplay:
         assert events[0].data["delta"] == "early"
 
     @pytest.mark.asyncio
-    async def test_get_stream_state_at_accumulates_text(self, db_session, session_id, chain_id, cleanup, run_id):
+    async def test_get_stream_state_at_accumulates_text(
+        self, db_session, session_id, chain_id, cleanup, run_id
+    ):
         """get_stream_state_at reconstructs accumulated text."""
         from datetime import datetime, timezone
 
@@ -345,9 +377,17 @@ class TestTimeTravelReplay:
                     "'stream_text_delta', :content, :chain, :ts)"
                 ),
                 {
-                    "eid": eid, "sid": session_id,
-                    "content": json.dumps({"event_type": "text_delta", "data": {"delta": delta}, "stream_event_id": eid}),
-                    "chain": chain_id, "ts": now,
+                    "eid": eid,
+                    "sid": session_id,
+                    "content": json.dumps(
+                        {
+                            "event_type": "text_delta",
+                            "data": {"delta": delta},
+                            "stream_event_id": eid,
+                        }
+                    ),
+                    "chain": chain_id,
+                    "ts": now,
                 },
             )
         db_session.commit()

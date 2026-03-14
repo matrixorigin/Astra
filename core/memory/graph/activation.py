@@ -18,19 +18,19 @@ if TYPE_CHECKING:
 
 # ── Algorithm hyperparameters ─────────────────────────────────────────
 
-DECAY_RATE = 0.5        # δ: retention decay per iteration
+DECAY_RATE = 0.5  # δ: retention decay per iteration
 SPREADING_FACTOR = 0.8  # S: how much activation spreads to neighbors
 INHIBITION_BETA = 0.15  # β: lateral inhibition strength
-INHIBITION_TOP_M = 7    # M: number of top nodes for inhibition
-SIGMOID_GAMMA = 5.0     # γ: sigmoid steepness
-SIGMOID_THETA = 0.1     # θ: sigmoid threshold
+INHIBITION_TOP_M = 7  # M: number of top nodes for inhibition
+SIGMOID_GAMMA = 5.0  # γ: sigmoid steepness
+SIGMOID_THETA = 0.1  # θ: sigmoid threshold
 NUM_ITERATIONS = 3
 
 # §13.1 Task-type edge boosts — applied on top of EDGE_TYPE_MULTIPLIER
 TASK_EDGE_BOOST: dict[str, dict[str, float]] = {
     "code_review": {"causal": 1.5, "temporal": 0.5, "association": 1.0},
-    "debugging":   {"causal": 2.0, "temporal": 1.5, "association": 0.5},
-    "planning":    {"association": 1.2, "causal": 1.0, "temporal": 0.8},
+    "debugging": {"causal": 2.0, "temporal": 1.5, "association": 0.5},
+    "planning": {"association": 1.2, "causal": 1.0, "temporal": 0.8},
 }
 
 
@@ -120,7 +120,9 @@ class SpreadingActivation:
                 if neighbor_act <= 0:
                     continue
                 fan = self._out_degree.get(neighbor_id, 1)
-                spread += SPREADING_FACTOR * _edge_weight(edge, self._task_boost) * neighbor_act / fan
+                spread += (
+                    SPREADING_FACTOR * _edge_weight(edge, self._task_boost) * neighbor_act / fan
+                )
             raw[nid] = retention + spread
 
         # Activate newly reached neighbors (from outgoing, already fetched)
@@ -131,7 +133,12 @@ class SpreadingActivation:
                     neighbor_act = self._activation.get(nid, 0.0)
                     if neighbor_act > 0:
                         fan = self._out_degree.get(nid, 1)
-                        spread_val = SPREADING_FACTOR * _edge_weight(edge, self._task_boost) * neighbor_act / fan
+                        spread_val = (
+                            SPREADING_FACTOR
+                            * _edge_weight(edge, self._task_boost)
+                            * neighbor_act
+                            / fan
+                        )
                         raw[tid] = spread_val
 
         # Lateral inhibition
@@ -153,9 +160,7 @@ class SpreadingActivation:
         result: dict[str, float] = {}
         for nid, val in raw.items():
             inhibition = sum(
-                INHIBITION_BETA * (top_val - val)
-                for top_val in top_m_values
-                if top_val > val
+                INHIBITION_BETA * (top_val - val) for top_val in top_m_values if top_val > val
             )
             result[nid] = max(0.0, val - inhibition)
         return result

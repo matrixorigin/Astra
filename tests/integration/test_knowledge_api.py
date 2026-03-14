@@ -49,10 +49,12 @@ def _insert_entry(db, user_id, *, key_name="lang", value="python", confidence=0.
 
 # ── update_access_tracking ────────────────────────────────────────────────────
 
+
 class TestAccessTracking:
     def test_bumps_access_count(self, db, user_id):
         import threading
         from api.database import SessionLocal
+
         eid = _insert_entry(db, user_id)
         done = threading.Event()
         update_access_tracking(SessionLocal, [eid], _done=done)
@@ -65,6 +67,7 @@ class TestAccessTracking:
     def test_multiple_bumps(self, db, user_id):
         import threading
         from api.database import SessionLocal
+
         eid = _insert_entry(db, user_id)
         d1 = threading.Event()
         update_access_tracking(SessionLocal, [eid], _done=d1)
@@ -81,6 +84,7 @@ class TestAccessTracking:
 
 
 # ── Knowledge Graph ───────────────────────────────────────────────────────────
+
 
 class TestKnowledgeGraph:
     def test_add_and_get_neighbors(self, db, user_id):
@@ -139,19 +143,24 @@ class TestKnowledgeGraph:
 
 # ── KnowledgeExtractor (batch store, decay, quarantine) ──────────────────────
 
+
 class TestKnowledgeExtractor:
     def test_batch_store_creates_entry(self, db, user_id):
         ext = KnowledgeExtractor(db)
-        result = ext._batch_store_knowledge([{
-            "user_id": user_id,
-            "category": "user_preference",
-            "key_name": "editor",
-            "value": "vim",
-            "source_event_ids": ["e1"],
-            "extraction_method": "test",
-            "trust_tier": "T3",
-            "confidence": 0.7,
-        }])
+        result = ext._batch_store_knowledge(
+            [
+                {
+                    "user_id": user_id,
+                    "category": "user_preference",
+                    "key_name": "editor",
+                    "value": "vim",
+                    "source_event_ids": ["e1"],
+                    "extraction_method": "test",
+                    "trust_tier": "T3",
+                    "confidence": 0.7,
+                }
+            ]
+        )
         assert len(result) == 1
         assert result[0]["action"] == "created"
 
@@ -163,16 +172,20 @@ class TestKnowledgeExtractor:
         _insert_entry(db, user_id, key_name="editor", value="vim", confidence=0.7)
 
         ext = KnowledgeExtractor(db)
-        result = ext._batch_store_knowledge([{
-            "user_id": user_id,
-            "category": "user_preference",
-            "key_name": "editor",
-            "value": "vim",
-            "source_event_ids": ["e2"],
-            "extraction_method": "test",
-            "trust_tier": "T3",
-            "confidence": 0.7,
-        }])
+        result = ext._batch_store_knowledge(
+            [
+                {
+                    "user_id": user_id,
+                    "category": "user_preference",
+                    "key_name": "editor",
+                    "value": "vim",
+                    "source_event_ids": ["e2"],
+                    "extraction_method": "test",
+                    "trust_tier": "T3",
+                    "confidence": 0.7,
+                }
+            ]
+        )
         assert result[0]["action"] == "updated"
         assert result[0]["confidence"] == pytest.approx(0.8)  # 0.7 + 0.1
 
@@ -181,32 +194,40 @@ class TestKnowledgeExtractor:
         _insert_entry(db, user_id, key_name="lang", value="JS", confidence=0.7)
 
         ext = KnowledgeExtractor(db)
-        result = ext._batch_store_knowledge([{
-            "user_id": user_id,
-            "category": "user_preference",
-            "key_name": "lang",
-            "value": "javascript",
-            "source_event_ids": ["e3"],
-            "extraction_method": "test",
-            "trust_tier": "T3",
-            "confidence": 0.7,
-        }])
+        result = ext._batch_store_knowledge(
+            [
+                {
+                    "user_id": user_id,
+                    "category": "user_preference",
+                    "key_name": "lang",
+                    "value": "javascript",
+                    "source_event_ids": ["e3"],
+                    "extraction_method": "test",
+                    "trust_tier": "T3",
+                    "confidence": 0.7,
+                }
+            ]
+        )
         assert result[0]["action"] == "updated"
 
     def test_batch_store_contradiction(self, db, user_id):
         eid = _insert_entry(db, user_id, key_name="framework", value="react", confidence=0.8)
 
         ext = KnowledgeExtractor(db)
-        result = ext._batch_store_knowledge([{
-            "user_id": user_id,
-            "category": "user_preference",
-            "key_name": "framework",
-            "value": "vue",
-            "source_event_ids": ["e4"],
-            "extraction_method": "test",
-            "trust_tier": "T3",
-            "confidence": 0.7,
-        }])
+        result = ext._batch_store_knowledge(
+            [
+                {
+                    "user_id": user_id,
+                    "category": "user_preference",
+                    "key_name": "framework",
+                    "value": "vue",
+                    "source_event_ids": ["e4"],
+                    "extraction_method": "test",
+                    "trust_tier": "T3",
+                    "confidence": 0.7,
+                }
+            ]
+        )
         assert result[0]["action"] == "contradiction"
 
         old = db.get(KnowledgeEntry, eid)
@@ -217,10 +238,14 @@ class TestKnowledgeExtractor:
         from datetime import datetime, timedelta
         from sqlalchemy import text as sa_text
 
-        eid = _insert_entry(db, user_id, key_name="old_fact", value="stale", confidence=0.9, trust_tier="T3")
+        eid = _insert_entry(
+            db, user_id, key_name="old_fact", value="stale", confidence=0.9, trust_tier="T3"
+        )
         # Backdate last_validated_at to 90 days ago
         db.execute(
-            sa_text("UPDATE sk_knowledge_entries SET last_validated_at = :ts WHERE entry_id = :eid"),
+            sa_text(
+                "UPDATE sk_knowledge_entries SET last_validated_at = :ts WHERE entry_id = :eid"
+            ),
             {"ts": datetime.now() - timedelta(days=90), "eid": eid},
         )
         db.commit()

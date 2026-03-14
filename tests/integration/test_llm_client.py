@@ -15,12 +15,14 @@ from api.database import get_db_session
 def db(db_session):
     """Database fixture."""
     # Insert test config
-    config_data = json.dumps({
-        "provider": "openai",
-        "model": "gpt-4",
-        "temperature": 0.7,
-        "max_tokens": 2000,
-    })
+    config_data = json.dumps(
+        {
+            "provider": "openai",
+            "model": "gpt-4",
+            "temperature": 0.7,
+            "max_tokens": 2000,
+        }
+    )
     db_session.execute(
         text("""
         INSERT INTO infra_configs (config_id, key_name, scope_type, scope_user_id, value) 
@@ -37,14 +39,22 @@ def db(db_session):
         },
     )
     # Register gpt-4 model in registry (no longer hardcoded)
-    models_json = json.dumps([{
-        "model_name": "gpt-4",
-        "provider": "openai",
-        "context_window": 8192,
-        "pricing": {"prompt": 0.03, "completion": 0.06},
-        "is_active": True,
-    }])
-    db_session.execute(text("DELETE FROM infra_configs WHERE key_name = 'model_registry' AND scope_type = 'global'"))
+    models_json = json.dumps(
+        [
+            {
+                "model_name": "gpt-4",
+                "provider": "openai",
+                "context_window": 8192,
+                "pricing": {"prompt": 0.03, "completion": 0.06},
+                "is_active": True,
+            }
+        ]
+    )
+    db_session.execute(
+        text(
+            "DELETE FROM infra_configs WHERE key_name = 'model_registry' AND scope_type = 'global'"
+        )
+    )
     db_session.execute(
         text("""
         INSERT INTO infra_configs (config_id, key_name, scope_type, scope_user_id, value)
@@ -56,7 +66,11 @@ def db(db_session):
     yield db_session
     # Cleanup
     db_session.execute(text("DELETE FROM eval_llm_call_logs WHERE event_id LIKE 'test_%'"))
-    db_session.execute(text("DELETE FROM infra_configs WHERE config_id IN ('test_llm_config_001', 'test_model_reg')"))
+    db_session.execute(
+        text(
+            "DELETE FROM infra_configs WHERE config_id IN ('test_llm_config_001', 'test_model_reg')"
+        )
+    )
     db_session.commit()
 
 
@@ -71,7 +85,6 @@ def test_load_config(client):
     assert client.config["provider"] == "openai"
     assert client.config["model"] == "gpt-4"  # From database config
     assert client.config["temperature"] == 0.7
-
 
 
 def test_chat_error_logging(client, db):
@@ -92,8 +105,10 @@ def test_calculate_cost(client, db):
     """Test cost calculation."""
     # Register model with known pricing directly in registry
     from core.llm.router import ModelConfig, ModelPricing
+
     client.router.registry._models["gpt-4"] = ModelConfig(
-        model_name="gpt-4", provider="openai",
+        model_name="gpt-4",
+        provider="openai",
         pricing=ModelPricing(prompt=0.03, completion=0.06),
         is_active=True,
     )
@@ -132,7 +147,7 @@ def test_get_call_logs_by_user(client, db):
             "cost_usd": 0.015,
             "latency_ms": 1500,
             "status": "success",
-        }
+        },
     )
     db.commit()
 

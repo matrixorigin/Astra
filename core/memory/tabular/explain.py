@@ -6,7 +6,7 @@ testing, and observability. Stats flow bottom-up through the call chain.
 Usage:
     # Component level
     memories, stats = retriever.retrieve(..., explain=True)
-    
+
     # API level
     POST /chat {"explain": true}
     -> {"response": ..., "explain": {"retrieval": {...}, "pipeline": {...}}}
@@ -34,24 +34,24 @@ class CandidateScore:
 @dataclass
 class RetrievalStats:
     """Phase-level stats for hybrid retrieval."""
-    
+
     # Phase 1: keyword/fallback
     keyword_attempted: bool = False
     keyword_hit: bool = False
     keyword_error: Optional[str] = None
     phase1_candidates: int = 0
-    
+
     # Phase 2: vector
     vector_attempted: bool = False
     vector_hit: bool = False
     vector_error: Optional[str] = None
     phase2_candidates: int = 0
-    
+
     # Phase 3: merge
     merged_candidates: int = 0
     final_count: int = 0
     candidate_scores: list[CandidateScore] = field(default_factory=list)
-    
+
     # Timing (ms)
     phase1_ms: float = 0.0
     phase2_ms: float = 0.0
@@ -62,7 +62,7 @@ class RetrievalStats:
 @dataclass
 class ContradictionStats:
     """Stats for contradiction detection."""
-    
+
     checked: bool = False
     found: bool = False
     superseded_id: Optional[str] = None
@@ -73,7 +73,7 @@ class ContradictionStats:
 @dataclass
 class ObserverStats:
     """Stats for memory observation (extraction + storage)."""
-    
+
     memories_extracted: int = 0
     memories_stored: int = 0
     memories_superseded: int = 0
@@ -84,7 +84,7 @@ class ObserverStats:
 @dataclass
 class GovernanceStats:
     """Stats for governance operations."""
-    
+
     decay_triggered: bool = False
     memories_decayed: int = 0
     quarantine_triggered: bool = False
@@ -97,38 +97,40 @@ class GovernanceStats:
 @dataclass
 class PipelineStats:
     """Stats for the full memory pipeline (observe → governance)."""
-    
+
     observer: Optional[ObserverStats] = None
     governance: Optional[GovernanceStats] = None
     total_ms: float = 0.0
 
 
-@dataclass 
+@dataclass
 class MemoryStats:
     """Top-level stats aggregating all memory operations in a request."""
-    
+
     retrieval: Optional[RetrievalStats] = None
     pipeline: Optional[PipelineStats] = None
-    
+
     def to_dict(self) -> dict:
         """Convert to JSON-serializable dict, omitting None values."""
+
         def _clean(obj):
             if obj is None:
                 return None
-            if hasattr(obj, '__dataclass_fields__'):
+            if hasattr(obj, "__dataclass_fields__"):
                 return {k: _clean(v) for k, v in asdict(obj).items() if v is not None}
             return obj
+
         return _clean(self)
 
 
 @dataclass
 class ExplainResult:
     """Complete EXPLAIN ANALYZE output for a chat request."""
-    
+
     memory: Optional[MemoryStats] = None
     # Future: llm, skill_selection, etc.
     total_ms: float = 0.0
-    
+
     def to_dict(self) -> dict:
         result = {}
         if self.memory:

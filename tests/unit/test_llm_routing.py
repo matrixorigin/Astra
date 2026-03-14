@@ -210,9 +210,7 @@ class TestResolveChain:
             client.router.route.return_value = [
                 ModelConfig(model_name="gpt-4o", provider=LLMProvider.OPENAI)
             ]
-            client._check_model_permission = MagicMock(
-                side_effect=PermissionError("denied")
-            )
+            client._check_model_permission = MagicMock(side_effect=PermissionError("denied"))
 
             with pytest.raises(PermissionError, match="denied"):
                 client._resolve_chain("gpt-4o")
@@ -272,6 +270,7 @@ class TestChatStreamReasoningPassthrough:
 
         class FakeProvider:
             provider = LLMProvider.OPENAI
+
             def complete_stream(self, *a, **kw):
                 yield from chunks
 
@@ -279,14 +278,18 @@ class TestChatStreamReasoningPassthrough:
         client.config = {"temperature": 0.7}
         client.router = MagicMock()
         client.router.resolve_model.return_value = MagicMock(
-            model_name="test", provider=LLMProvider.OPENAI, enable_cache=False,
+            model_name="test",
+            provider=LLMProvider.OPENAI,
+            enable_cache=False,
         )
         client.router.resolve_chain.return_value = [
             MagicMock(model_name="test", provider=LLMProvider.OPENAI, enable_cache=False),
         ]
         client.router.calculate_cost.return_value = 0.0
         client.rate_limiter = MagicMock()
-        client.rate_limiter.get_breaker.return_value = MagicMock(allow_request=MagicMock(return_value=True))
+        client.rate_limiter.get_breaker.return_value = MagicMock(
+            allow_request=MagicMock(return_value=True)
+        )
         client.rate_limiter.wait_and_acquire = MagicMock()
         client._providers = {LLMProvider.OPENAI: FakeProvider()}
         client._spend_usd = 0.0
@@ -294,9 +297,11 @@ class TestChatStreamReasoningPassthrough:
         client._call_log = []
         client._resolve_model = MagicMock(return_value="test")
         client._check_budget = MagicMock()
-        client._resolve_chain = MagicMock(return_value=[
-            MagicMock(model_name="test", provider=LLMProvider.OPENAI, enable_cache=False),
-        ])
+        client._resolve_chain = MagicMock(
+            return_value=[
+                MagicMock(model_name="test", provider=LLMProvider.OPENAI, enable_cache=False),
+            ]
+        )
         client._get_provider = MagicMock(return_value=FakeProvider())
         client._record_spend = MagicMock()
         client._log_call = MagicMock()
@@ -307,5 +312,11 @@ class TestChatStreamReasoningPassthrough:
 
         assert collected[0] == {"type": "reasoning", "content": "thinking..."}
         assert collected[1] == {"type": "text", "content": "answer"}
-        assert collected[2] == {"type": "usage", "prompt": 10, "completion": 5, "cache_read": 0, "cache_creation": 0}
+        assert collected[2] == {
+            "type": "usage",
+            "prompt": 10,
+            "completion": 5,
+            "cache_read": 0,
+            "cache_creation": 0,
+        }
         assert len(collected) == 3  # usage is yielded as final chunk for observability

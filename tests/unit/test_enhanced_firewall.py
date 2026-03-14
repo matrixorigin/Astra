@@ -76,14 +76,10 @@ class TestStructuredVerifier:
 
         verifier = StructuredVerifier(llm_client)
 
-        claim = Claim(
-            type="numeric", value="5 files", context="Changed 5 files", position=10
-        )
+        claim = Claim(type="numeric", value="5 files", context="Changed 5 files", position=10)
 
         snapshot = Mock()
-        snapshot.selected_events = [
-            {"event_id": "evt_1", "content": "I changed 5 files in the PR"}
-        ]
+        snapshot.selected_events = [{"event_id": "evt_1", "content": "I changed 5 files in the PR"}]
         snapshot.code_context = []
         snapshot.documentation = []
 
@@ -133,9 +129,7 @@ class TestStructuredVerifier:
         llm_client = Mock()
         verifier = StructuredVerifier(llm_client)
 
-        claim = Claim(
-            type="numeric", value="100 tests", context="Ran 100 tests", position=5
-        )
+        claim = Claim(type="numeric", value="100 tests", context="Ran 100 tests", position=5)
 
         snapshot = Mock()
         snapshot.selected_events = []
@@ -173,16 +167,12 @@ class TestEnhancedFirewall:
                 ]
             ),
             # Second call: semantic verification
-            json.dumps(
-                {"verified": True, "confidence": 0.95, "reasoning": "Found in events"}
-            ),
+            json.dumps({"verified": True, "confidence": 0.95, "reasoning": "Found in events"}),
         ]
 
         # Mock snapshot
         snapshot = Mock()
-        snapshot.selected_events = [
-            {"event_id": "evt_1", "content": "I merged 3 PRs today"}
-        ]
+        snapshot.selected_events = [{"event_id": "evt_1", "content": "I merged 3 PRs today"}]
         snapshot.code_context = []
         snapshot.documentation = []
 
@@ -270,6 +260,7 @@ class TestEnhancedFirewall:
 
         # Patch thread pool to run synchronously so we can assert
         from unittest.mock import patch
+
         with patch("core.verification.firewall._fw_pool") as mock_pool:
             mock_pool.submit.side_effect = lambda fn, *a, **kw: fn(*a, **kw)
             firewall.log_verification("sess_1", "evt_1", result, "snap_1")

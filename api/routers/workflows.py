@@ -37,10 +37,17 @@ def list_workflows(
     db: Session = Depends(get_db_session),
 ):
     rows = db.query(WorkflowDefinition).filter(WorkflowDefinition.is_active == 1).all()
-    return [WorkflowDefResponse(
-        workflow_id=r.workflow_id, name=r.name, version=r.version,
-        description=r.description, definition=r.definition, is_active=bool(r.is_active),
-    ) for r in rows]
+    return [
+        WorkflowDefResponse(
+            workflow_id=r.workflow_id,
+            name=r.name,
+            version=r.version,
+            description=r.description,
+            definition=r.definition,
+            is_active=bool(r.is_active),
+        )
+        for r in rows
+    ]
 
 
 @router.get("/workflows/runs/{run_id}", response_model=WorkflowRunResponse)
@@ -53,10 +60,14 @@ def get_workflow_run(
     if not row:
         raise HTTPException(status_code=404, detail="Workflow run not found")
     return WorkflowRunResponse(
-        run_id=row.run_id, workflow_id=row.workflow_id,
-        agent_run_id=row.agent_run_id, status=row.status,
-        waiting_for=row.waiting_for, current_step_idx=row.current_step_idx,
-        step_results=row.step_results or {}, error=row.error,
+        run_id=row.run_id,
+        workflow_id=row.workflow_id,
+        agent_run_id=row.agent_run_id,
+        status=row.status,
+        waiting_for=row.waiting_for,
+        current_step_idx=row.current_step_idx,
+        step_results=row.step_results or {},
+        error=row.error,
     )
 
 
@@ -77,6 +88,7 @@ async def resolve_workflow_wait(
         raise HTTPException(status_code=400, detail="No wait handle")
 
     from core.agent.async_tools import resume_workflow
+
     resumed = await resume_workflow(handle, result)
     if not resumed:
         raise HTTPException(status_code=409, detail="Could not resume workflow")

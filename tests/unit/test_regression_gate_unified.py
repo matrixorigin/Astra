@@ -29,6 +29,7 @@ def setup_tables(db_session):
     """Ensure tables exist and provide isolated test uid."""
     from api.database import init_db
     from core.utils.id_generator import generate_id
+
     uid = generate_id()
 
     init_db()
@@ -38,14 +39,12 @@ def setup_tables(db_session):
     yield db_session
 
     # Scoped cleanup — only this test's data
-    db_session.execute(text(
-        "DELETE FROM agent_events WHERE user_id = :uid"
-    ), {"uid": uid})
+    db_session.execute(text("DELETE FROM agent_events WHERE user_id = :uid"), {"uid": uid})
     if db_session._test_gate_ids:
         for gid in db_session._test_gate_ids:
-            db_session.execute(text(
-                "DELETE FROM eval_gate_results WHERE gate_id = :gid"
-            ), {"gid": gid})
+            db_session.execute(
+                text("DELETE FROM eval_gate_results WHERE gate_id = :gid"), {"gid": gid}
+            )
     db_session.commit()
 
 
@@ -66,16 +65,22 @@ def _insert_golden_events(db, uid, session_id, count, quality_score):
     session_id must be <= 36 chars (VARCHAR(36) column).
     """
     from core.events.event_logger import EventLogger
+
     logger = EventLogger.from_session(db)
     for i in range(count):
         event = logger.create_user_query(
-            user_id=uid, session_id=session_id, content=f"query {i}",
+            user_id=uid,
+            session_id=session_id,
+            content=f"query {i}",
         )
-        db.execute(text("""
+        db.execute(
+            text("""
             UPDATE agent_events
             SET quality_score = :qs, training_eligible = 1
             WHERE event_id = :eid
-        """), {"qs": quality_score, "eid": event.event_id})
+        """),
+            {"qs": quality_score, "eid": event.event_id},
+        )
     db.commit()
 
 
@@ -83,7 +88,6 @@ def _insert_golden_events(db, uid, session_id, count, quality_score):
 
 
 class TestGoldenSessionSelection:
-
     def test_empty_returns_no_own_sessions(self, gate, setup_tables):
         uid = setup_tables._test_uid
         sessions = gate._get_golden_sessions(limit=100)
@@ -147,13 +151,15 @@ class TestGoldenSessionSelection:
 
 
 class TestMetricsComputation:
-
     def test_empty(self, gate):
         m = gate._compute_metrics([], [])
         assert m == {
-            "error_rate": 0.0, "score_delta": 0.0,
-            "avg_original_score": 0.0, "avg_replay_score": 0.0,
-            "total_sessions": 0, "failed_sessions": 0,
+            "error_rate": 0.0,
+            "score_delta": 0.0,
+            "avg_original_score": 0.0,
+            "avg_replay_score": 0.0,
+            "total_sessions": 0,
+            "failed_sessions": 0,
         }
 
     def test_all_success(self, gate):
@@ -189,24 +195,29 @@ class TestMetricsComputation:
 
 
 class TestDecisionLogic:
-
     def test_pass(self, gate):
         v, r = gate._make_decision(
-            {"error_rate": 0.02, "score_delta": 0.1}, 0.05, -0.1,
+            {"error_rate": 0.02, "score_delta": 0.1},
+            0.05,
+            -0.1,
         )
         assert v == "pass"
         assert "threshold" in r
 
     def test_fail_error_rate(self, gate):
         v, r = gate._make_decision(
-            {"error_rate": 0.10, "score_delta": 0.1}, 0.05, -0.1,
+            {"error_rate": 0.10, "score_delta": 0.1},
+            0.05,
+            -0.1,
         )
         assert v == "fail"
         assert "error_rate" in r
 
     def test_fail_score_regression(self, gate):
         v, r = gate._make_decision(
-            {"error_rate": 0.02, "score_delta": -0.2}, 0.05, -0.1,
+            {"error_rate": 0.02, "score_delta": -0.2},
+            0.05,
+            -0.1,
         )
         assert v == "fail"
         assert "score_delta" in r
@@ -216,10 +227,9 @@ class TestDecisionLogic:
 
 
 class TestGateExecution:
-
-    @patch.object(RegressionGate, '_get_golden_sessions')
-    @patch.object(RegressionGate, '_create_snapshot')
-    @patch.object(RegressionGate, '_apply_change_to_sandbox')
+    @patch.object(RegressionGate, "_get_golden_sessions")
+    @patch.object(RegressionGate, "_create_snapshot")
+    @patch.object(RegressionGate, "_apply_change_to_sandbox")
     def test_no_golden_sessions_returns_skip(self, _apply, _snap, mock_golden, gate):
         mock_golden.return_value = []
         result = gate.validate_change(
@@ -231,10 +241,10 @@ class TestGateExecution:
         assert result["reason"] == "no_golden_sessions_available"
         assert result["sessions_tested"] == 0
 
-    @patch.object(RegressionGate, '_get_golden_sessions')
-    @patch.object(RegressionGate, '_create_snapshot')
-    @patch.object(RegressionGate, '_apply_change_to_sandbox')
-    @patch('core.evaluation.regression_gate.Sandbox')
+    @patch.object(RegressionGate, "_get_golden_sessions")
+    @patch.object(RegressionGate, "_create_snapshot")
+    @patch.object(RegressionGate, "_apply_change_to_sandbox")
+    @patch("core.evaluation.regression_gate.Sandbox")
     def test_success_flow(self, mock_sb_cls, _apply, _snap, mock_golden, gate):
         mock_golden.return_value = [
             {"session_id": "s1", "user_id": "u1", "avg_score": 4.5, "event_count": 3},
@@ -242,10 +252,11 @@ class TestGateExecution:
         _snap.return_value = "snapshot_123"
         mock_sb_cls.return_value = MagicMock()
 
-        with patch('api.services.replay_service.ReplayService') as mock_rp_cls:
+        with patch("api.services.replay_service.ReplayService") as mock_rp_cls:
             mock_rp = MagicMock()
             mock_rp.replay_session.return_value = {
-                "status": "completed", "events_replayed": 3,
+                "status": "completed",
+                "events_replayed": 3,
                 "result": {"successful": 3, "failed": 0},
             }
             mock_rp_cls.return_value = mock_rp
@@ -327,18 +338,20 @@ class TestGateResultPersistence:
         gate_id = f"fail_{uid[:12]}"
         setup_tables._test_gate_ids.append(gate_id)
 
-        gate._record_gate_result({
-            "gate_id": gate_id,
-            "change_type": "skill",
-            "change_id": "linter@v2",
-            "verdict": "fail",
-            "reason": "error_rate too high",
-            "sessions_tested": 10,
-            "snapshot_id": None,
-            "metrics": {"error_rate": 0.15, "score_delta": -0.3},
-            "replay_results": [],
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        })
+        gate._record_gate_result(
+            {
+                "gate_id": gate_id,
+                "change_type": "skill",
+                "change_id": "linter@v2",
+                "verdict": "fail",
+                "reason": "error_rate too high",
+                "sessions_tested": 10,
+                "snapshot_id": None,
+                "metrics": {"error_rate": 0.15, "score_delta": -0.3},
+                "replay_results": [],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
 
         saved = setup_tables.query(GateResult).filter_by(gate_id=gate_id).first()
         assert saved is not None
@@ -360,14 +373,20 @@ class TestGateResultPersistence:
             (g1, "prompt", "p@v1", 1, 0.01, 0.2),
             (g2, "skill", "s@v2", 0, 0.12, -0.3),
         ]:
-            gate._record_gate_result({
-                "gate_id": gid, "change_type": ct, "change_id": cid,
-                "verdict": "pass" if passed else "fail", "reason": "test",
-                "sessions_tested": 5, "snapshot_id": f"snap_{gid}",
-                "metrics": {"error_rate": er, "score_delta": sd},
-                "replay_results": [],
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            })
+            gate._record_gate_result(
+                {
+                    "gate_id": gid,
+                    "change_type": ct,
+                    "change_id": cid,
+                    "verdict": "pass" if passed else "fail",
+                    "reason": "test",
+                    "sessions_tested": 5,
+                    "snapshot_id": f"snap_{gid}",
+                    "metrics": {"error_rate": er, "score_delta": sd},
+                    "replay_results": [],
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
 
         history = gate.get_gate_history(limit=100)
         own = {h["gate_id"]: h for h in history if h["gate_id"] in (g1, g2)}
@@ -403,9 +422,14 @@ class TestGoldenSessionDBGroundTruth:
         _insert_golden_events(setup_tables, uid, sid, 4, 4.8)
 
         # Verify events exist in DB via ORM
-        count = setup_tables.query(Event).filter(
-            Event.session_id == sid, Event.user_id == uid,
-        ).count()
+        count = (
+            setup_tables.query(Event)
+            .filter(
+                Event.session_id == sid,
+                Event.user_id == uid,
+            )
+            .count()
+        )
         assert count == 4
 
         # Verify golden selection finds them
@@ -433,7 +457,6 @@ class TestGoldenSessionDBGroundTruth:
 
 
 class TestNewChangeTypes:
-
     def test_change_type_context_budget_exists(self):
         assert ChangeType.CONTEXT_BUDGET.value == "context_budget"
 
@@ -445,8 +468,10 @@ class TestNewChangeTypes:
         g = RegressionGate.__new__(RegressionGate)
         g._db_factory = lambda: _mock_db
         g._apply_change_to_sandbox(
-            "test_sb", ChangeType.CONTEXT_BUDGET,
-            "context_budget_ratios", {"debugging": {"logs": 0.50}},
+            "test_sb",
+            ChangeType.CONTEXT_BUDGET,
+            "context_budget_ratios",
+            {"debugging": {"logs": 0.50}},
         )
         sql = _mock_db.execute.call_args[0][0].text
         assert "context_budget_ratios" in sql
@@ -457,8 +482,10 @@ class TestNewChangeTypes:
         g = RegressionGate.__new__(RegressionGate)
         g._db_factory = lambda: _mock_db
         g._apply_change_to_sandbox(
-            "test_sb", ChangeType.KNOWLEDGE,
-            "quarantine_e1", {"entry_id": "e1", "action": "quarantine"},
+            "test_sb",
+            ChangeType.KNOWLEDGE,
+            "quarantine_e1",
+            {"entry_id": "e1", "action": "quarantine"},
         )
         sql = _mock_db.execute.call_args[0][0].text
         assert "confidence = 0.0" in sql
@@ -469,8 +496,10 @@ class TestNewChangeTypes:
         g = RegressionGate.__new__(RegressionGate)
         g._db_factory = lambda: _mock_db
         g._apply_change_to_sandbox(
-            "test_sb", ChangeType.KNOWLEDGE,
-            "restore_e1", {"entry_id": "e1", "action": "restore", "confidence": 0.9},
+            "test_sb",
+            ChangeType.KNOWLEDGE,
+            "restore_e1",
+            {"entry_id": "e1", "action": "restore", "confidence": 0.9},
         )
         params = _mock_db.execute.call_args[0][1]
         assert params["confidence"] == 0.9
@@ -480,18 +509,22 @@ class TestNewChangeTypes:
         g._db_factory = lambda: Mock()
         with pytest.raises(ValueError, match="entry_id"):
             g._apply_change_to_sandbox(
-                "test_sb", ChangeType.KNOWLEDGE, "bad", {"action": "quarantine"},
+                "test_sb",
+                ChangeType.KNOWLEDGE,
+                "bad",
+                {"action": "quarantine"},
             )
 
 
 class TestSkillTableName:
-
     def test_uses_skills_registry_table(self):
         _mock_db = Mock()
         g = RegressionGate.__new__(RegressionGate)
         g._db_factory = lambda: _mock_db
         g._apply_change_to_sandbox(
-            "test_sb", ChangeType.SKILL, "code_review@v2",
+            "test_sb",
+            ChangeType.SKILL,
+            "code_review@v2",
             {"name": "code_review", "version": "2.0.0", "definition": {}},
         )
         sql = _mock_db.execute.call_args[0][0].text
@@ -504,15 +537,16 @@ class TestSkillTableName:
 
 
 class TestSandboxNameValidation:
-
     def test_rejects_sql_injection(self):
         from core.evaluation.regression_gate import _validate_sandbox_name
+
         for bad in ["'; DROP TABLE --", "a b", "foo'bar", "x;y"]:
             with pytest.raises(ValueError, match="Invalid sandbox name"):
                 _validate_sandbox_name(bad)
 
     def test_accepts_valid_names(self):
         from core.evaluation.regression_gate import _validate_sandbox_name
+
         for name in ["gate_abc12345", "test-sb", "my_sandbox"]:
             _validate_sandbox_name(name)
 
@@ -521,7 +555,10 @@ class TestSandboxNameValidation:
         g._db_factory = lambda: Mock()
         with pytest.raises(ValueError, match="Invalid sandbox name"):
             g._apply_change_to_sandbox(
-                "bad name!", ChangeType.PROMPT, "test", {"content": "x"},
+                "bad name!",
+                ChangeType.PROMPT,
+                "test",
+                {"content": "x"},
             )
 
 
@@ -529,10 +566,9 @@ class TestSandboxNameValidation:
 
 
 class TestSandboxCleanup:
-
-    @patch.object(RegressionGate, '_apply_change_to_sandbox')
-    @patch.object(RegressionGate, '_create_snapshot')
-    @patch('core.evaluation.regression_gate.Sandbox')
+    @patch.object(RegressionGate, "_apply_change_to_sandbox")
+    @patch.object(RegressionGate, "_create_snapshot")
+    @patch("core.evaluation.regression_gate.Sandbox")
     def test_deleted_on_failure(self, mock_sb_cls, _snap, _apply, gate, setup_tables):
         uid = setup_tables._test_uid
         _insert_golden_events(setup_tables, uid, _sid(uid, "s1"), 3, 4.5)
@@ -540,18 +576,21 @@ class TestSandboxCleanup:
         mock_sb = MagicMock()
         mock_sb_cls.return_value = mock_sb
 
-        with patch('api.services.replay_service.ReplayService') as mock_rp_cls:
+        with patch("api.services.replay_service.ReplayService") as mock_rp_cls:
             mock_rp_cls.return_value.replay_session.side_effect = Exception("boom")
             with pytest.raises(Exception, match="boom"):
                 gate.validate_change(
-                    ChangeType.PROMPT, "test", {"content": "x"}, golden_session_count=1,
+                    ChangeType.PROMPT,
+                    "test",
+                    {"content": "x"},
+                    golden_session_count=1,
                 )
 
         mock_sb.delete.assert_called_once()
 
-    @patch.object(RegressionGate, '_apply_change_to_sandbox')
-    @patch.object(RegressionGate, '_create_snapshot')
-    @patch('core.evaluation.regression_gate.Sandbox')
+    @patch.object(RegressionGate, "_apply_change_to_sandbox")
+    @patch.object(RegressionGate, "_create_snapshot")
+    @patch("core.evaluation.regression_gate.Sandbox")
     def test_deleted_on_success(self, mock_sb_cls, _snap, _apply, gate, setup_tables):
         uid = setup_tables._test_uid
         _insert_golden_events(setup_tables, uid, _sid(uid, "s1"), 3, 4.5)
@@ -559,13 +598,17 @@ class TestSandboxCleanup:
         mock_sb = MagicMock()
         mock_sb_cls.return_value = mock_sb
 
-        with patch('api.services.replay_service.ReplayService') as mock_rp_cls:
+        with patch("api.services.replay_service.ReplayService") as mock_rp_cls:
             mock_rp_cls.return_value.replay_session.return_value = {
-                "status": "completed", "events_replayed": 3,
+                "status": "completed",
+                "events_replayed": 3,
                 "result": {"successful": 3, "failed": 0},
             }
             gate.validate_change(
-                ChangeType.PROMPT, "test", {"content": "x"}, golden_session_count=1,
+                ChangeType.PROMPT,
+                "test",
+                {"content": "x"},
+                golden_session_count=1,
             )
 
         mock_sb.create.assert_called_once()
@@ -576,24 +619,26 @@ class TestSandboxCleanup:
 
 
 class TestSelectorChangeValidation:
-
-    @patch.object(RegressionGate, '_apply_change_to_sandbox')
-    @patch.object(RegressionGate, '_create_snapshot')
-    @patch('core.evaluation.regression_gate.Sandbox')
+    @patch.object(RegressionGate, "_apply_change_to_sandbox")
+    @patch.object(RegressionGate, "_create_snapshot")
+    @patch("core.evaluation.regression_gate.Sandbox")
     def test_selector_change(self, mock_sb_cls, _snap, _apply, gate, setup_tables):
         uid = setup_tables._test_uid
         _insert_golden_events(setup_tables, uid, _sid(uid, "s1"), 3, 4.5)
         _snap.return_value = "snap"
         mock_sb_cls.return_value = MagicMock()
 
-        with patch('api.services.replay_service.ReplayService') as mock_rp_cls:
+        with patch("api.services.replay_service.ReplayService") as mock_rp_cls:
             mock_rp_cls.return_value.replay_session.return_value = {
-                "status": "completed", "events_replayed": 3,
+                "status": "completed",
+                "events_replayed": 3,
                 "result": {"successful": 3, "failed": 0},
             }
             result = gate.validate_change(
-                ChangeType.SELECTOR, "selector_v2",
-                {"learning_rate": 0.01}, golden_session_count=1,
+                ChangeType.SELECTOR,
+                "selector_v2",
+                {"learning_rate": 0.01},
+                golden_session_count=1,
             )
 
         assert result["verdict"] in ["pass", "fail"]
@@ -606,9 +651,9 @@ class TestSelectorChangeValidation:
 
 
 class TestPollutionGatedQuarantine:
-
     def test_gate_pass(self):
         from core.context.pollution import PollutionDetector
+
         detector = PollutionDetector(lambda: Mock())
         detector.quarantine_entry = Mock(return_value=True)
         with patch("core.evaluation.regression_gate.RegressionGate") as mock_gate:
@@ -619,19 +664,26 @@ class TestPollutionGatedQuarantine:
 
     def test_gate_fail(self):
         from core.context.pollution import PollutionDetector
+
         detector = PollutionDetector(lambda: Mock())
         detector.quarantine_entry = Mock()
         with patch("core.evaluation.regression_gate.RegressionGate") as mock_gate:
-            mock_gate.return_value.validate_change.return_value = {"verdict": "fail", "reason": "regression"}
+            mock_gate.return_value.validate_change.return_value = {
+                "verdict": "fail",
+                "reason": "regression",
+            }
             result = detector.quarantine_with_validation("e1", "high")
         assert result["verdict"] == "fail"
         detector.quarantine_entry.assert_not_called()
 
     def test_gate_unavailable(self):
         from core.context.pollution import PollutionDetector
+
         detector = PollutionDetector(lambda: Mock())
         detector.quarantine_entry = Mock(return_value=True)
-        with patch("core.evaluation.regression_gate.RegressionGate", side_effect=Exception("no gate")):
+        with patch(
+            "core.evaluation.regression_gate.RegressionGate", side_effect=Exception("no gate")
+        ):
             result = detector.quarantine_with_validation("e1", "medium")
         assert result["verdict"] == "skipped"
         detector.quarantine_entry.assert_called_once()

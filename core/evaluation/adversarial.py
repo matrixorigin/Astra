@@ -116,12 +116,19 @@ class AdversarialEvaluator(DbConsumer):
         try:
             # 1. Create isolated clone
             if self.sandbox:
-                self.sandbox.create(clone_name, description=f"adversarial:{attack_type.value}", created_by="adversarial_eval")
+                self.sandbox.create(
+                    clone_name,
+                    description=f"adversarial:{attack_type.value}",
+                    created_by="adversarial_eval",
+                )
                 logger.info(f"Created clone: {clone_name}")
 
             # 2. Execute attack
             success, evidence = self._execute_attack(
-                agent_id, attack_type, attack_prompt, session_id,
+                agent_id,
+                attack_type,
+                attack_prompt,
+                session_id,
             )
 
             # 3. Assess severity
@@ -130,7 +137,9 @@ class AdversarialEvaluator(DbConsumer):
             # 4. Record
             self._record_attack(attack_id, agent_id, attack_type, success, severity, evidence)
 
-            logger.info(f"Attack {attack_id} ({attack_type.value}): success={success}, severity={severity}")
+            logger.info(
+                f"Attack {attack_id} ({attack_type.value}): success={success}, severity={severity}"
+            )
 
             return AttackResult(
                 attack_id=attack_id,
@@ -205,17 +214,22 @@ class AdversarialEvaluator(DbConsumer):
         for pattern in patterns:
             match = re.search(pattern, response_text)
             if match:
-                evidence = json.dumps({
-                    "matched_pattern": pattern,
-                    "matched_text": match.group(0)[:200],
-                    "response_preview": response_text[:500],
-                }, ensure_ascii=False)
+                evidence = json.dumps(
+                    {
+                        "matched_pattern": pattern,
+                        "matched_text": match.group(0)[:200],
+                        "response_preview": response_text[:500],
+                    },
+                    ensure_ascii=False,
+                )
                 return True, evidence
 
         # For edge_case: check if response is empty, error, or nonsensical
         if attack_type == AttackType.EDGE_CASE:
             if not response_text.strip() or len(response_text.strip()) < 5:
-                return True, json.dumps({"reason": "empty_or_minimal_response", "response": response_text[:200]})
+                return True, json.dumps(
+                    {"reason": "empty_or_minimal_response", "response": response_text[:200]}
+                )
 
         return False, None
 
@@ -236,9 +250,7 @@ class AdversarialEvaluator(DbConsumer):
             logger.warning(f"LLM call failed during attack: {e}")
             return None
 
-    def _assess_severity(
-        self, attack_type: AttackType, success: bool, evidence: str | None
-    ) -> str:
+    def _assess_severity(self, attack_type: AttackType, success: bool, evidence: str | None) -> str:
         """Assess severity of attack result."""
         if not success:
             return "low"

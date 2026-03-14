@@ -16,27 +16,27 @@ class TestBudgetAllocation:
         """Default allocation uses query stage."""
         mgr = ContextBudgetManager(max_context_tokens=128000)
         alloc = mgr.allocate()
-        
+
         assert alloc.total > 0
         assert alloc.total <= mgr.available_tokens
 
     def test_stage_affects_allocation(self):
         """Different stages have different allocations."""
         mgr = ContextBudgetManager(max_context_tokens=128000)
-        
+
         query_alloc = mgr.allocate(ConversationStage.QUERY)
         analysis_alloc = mgr.allocate(ConversationStage.ANALYSIS)
-        
+
         # Analysis stage should have more tool_output budget
         assert analysis_alloc.tool_output > query_alloc.tool_output
 
     def test_generation_has_more_code_context(self):
         """Generation stage allocates more to code context."""
         mgr = ContextBudgetManager(max_context_tokens=128000)
-        
+
         query_alloc = mgr.allocate(ConversationStage.QUERY)
         gen_alloc = mgr.allocate(ConversationStage.GENERATION)
-        
+
         assert gen_alloc.code_context > query_alloc.code_context
 
     def test_string_stage_works(self):
@@ -52,10 +52,10 @@ class TestUsageTracking:
     def test_record_usage(self):
         """Can record and retrieve usage."""
         mgr = ContextBudgetManager(max_context_tokens=128000)
-        
+
         mgr.record_usage("history", 1000)
         mgr.record_usage("tool_output", 500)
-        
+
         assert mgr.get_usage("history") == 1000
         assert mgr.get_usage("tool_output") == 500
         assert mgr.used_tokens == 1500
@@ -64,18 +64,18 @@ class TestUsageTracking:
         """Remaining tokens decreases with usage."""
         mgr = ContextBudgetManager(max_context_tokens=128000, reserve_for_output=4000)
         initial = mgr.remaining_tokens
-        
+
         mgr.record_usage("history", 10000)
-        
+
         assert mgr.remaining_tokens == initial - 10000
 
     def test_allocate_remaining(self):
         """allocate_remaining uses remaining budget."""
         mgr = ContextBudgetManager(max_context_tokens=128000)
-        
+
         # Use half the budget
         mgr.record_usage("history", mgr.available_tokens // 2)
-        
+
         alloc = mgr.allocate_remaining()
         assert alloc.total <= mgr.remaining_tokens
 
@@ -83,9 +83,9 @@ class TestUsageTracking:
         """Reset clears all usage."""
         mgr = ContextBudgetManager(max_context_tokens=128000)
         mgr.record_usage("history", 1000)
-        
+
         mgr.reset()
-        
+
         assert mgr.used_tokens == 0
 
 
@@ -96,7 +96,7 @@ class TestToolOutputBudget:
         """get_tool_output_budget returns bytes."""
         mgr = ContextBudgetManager(max_context_tokens=128000)
         budget = mgr.get_tool_output_budget()
-        
+
         # Should be reasonable size (tokens * 4)
         assert budget > 10000
         assert budget < 200000
@@ -104,11 +104,11 @@ class TestToolOutputBudget:
     def test_budget_decreases_with_usage(self):
         """Tool output budget decreases as context fills."""
         mgr = ContextBudgetManager(max_context_tokens=128000)
-        
+
         initial = mgr.get_tool_output_budget()
         mgr.record_usage("history", 50000)
         after = mgr.get_tool_output_budget()
-        
+
         assert after < initial
 
 
@@ -132,7 +132,9 @@ class TestStageClassification:
 
     def test_many_tool_calls_triggers_analysis(self):
         """Many tool calls triggers analysis stage."""
-        assert classify_stage("What's in this file?", tool_calls_count=5) == ConversationStage.ANALYSIS
+        assert (
+            classify_stage("What's in this file?", tool_calls_count=5) == ConversationStage.ANALYSIS
+        )
 
     def test_default_is_query(self):
         """Default stage is query."""

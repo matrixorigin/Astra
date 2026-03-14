@@ -37,9 +37,11 @@ from core.utils.id_generator import generate_id
 # Scripted LLM — supports multi-turn sequences and tool calls
 # ============================================================================
 
+
 @dataclass
 class Turn:
     """One scripted LLM turn. If tool_calls is set, LLM requests tool use."""
+
     content: str = ""
     tool_calls: list[dict] | None = None
 
@@ -85,9 +87,14 @@ class ScriptedLLM:
         if "summarize" in combined.lower():
             content = "Here is a summary of the conversation."
         return LLMResponse(
-            content=content, model="scripted-mock", provider=LLMProvider.OPENAI,
-            tokens_prompt=50, tokens_completion=20, tokens_total=70,
-            latency_ms=10, cost_usd=0.0001,
+            content=content,
+            model="scripted-mock",
+            provider=LLMProvider.OPENAI,
+            tokens_prompt=50,
+            tokens_completion=20,
+            tokens_total=70,
+            latency_ms=10,
+            cost_usd=0.0001,
         )
 
     def chat_with_tools(self, messages, tools=None, tool_choice="auto", **kwargs):
@@ -117,6 +124,7 @@ class ScriptedLLM:
 
 class _FakeRouter:
     """Stub for LLMClient.router used by SkillPipeline embed_fn fallback."""
+
     def calculate_cost(self, *a, **kw):
         return 0.0
 
@@ -124,6 +132,7 @@ class _FakeRouter:
 # ============================================================================
 # Helpers
 # ============================================================================
+
 
 def _make_tool_call(name: str, arguments: dict, call_id: str | None = None) -> dict:
     """Build an OpenAI-format tool_call dict."""
@@ -141,6 +150,7 @@ def _build_patched_chat_loop(llm: ScriptedLLM):
     is real — only the LLM is mocked. Skips heavyweight skill registration
     since these tests don't depend on specific builtin skills.
     """
+
     def patched(db_factory):
         from core.agent.chat_loop import ChatLoop
         from core.agent.executor import AgentExecutor
@@ -174,6 +184,7 @@ def _build_patched_chat_loop(llm: ScriptedLLM):
 
 def _build_patched_chat_loop_with_skills(llm: ScriptedLLM):
     """Same as _build_patched_chat_loop but registers builtin skills (for tool-use tests)."""
+
     def patched(db_factory):
         from core.agent.chat_loop import ChatLoop
         from core.agent.executor import AgentExecutor
@@ -189,11 +200,13 @@ def _build_patched_chat_loop_with_skills(llm: ScriptedLLM):
         event_logger = EventLogger(db_factory)
         skill_catalog = SkillCatalog(lambda: db)
         code_executor = CodeExecutor(
-            runtime=create_runtime(min_isolation=IsolationLevel.PROCESS), db_factory=db_factory,
+            runtime=create_runtime(min_isolation=IsolationLevel.PROCESS),
+            db_factory=db_factory,
         )
         register_builtin_skills(skill_catalog, db_factory, code_executor=code_executor)
         context_manager = ContextManager(db_factory)
         from core.skills.tool_registry import ToolRegistry, ToolSource
+
         tool_registry = ToolRegistry()
         for skill in skill_catalog.list_skills():
             tool_registry.register_skill(skill, source=ToolSource.CLOUD, category="builtin")
@@ -213,8 +226,9 @@ def _build_patched_chat_loop_with_skills(llm: ScriptedLLM):
     return patched
 
 
-def _chat_and_wait(client, headers: dict, message: str,
-                   session_id: str | None = None, timeout: float = 15.0) -> dict:
+def _chat_and_wait(
+    client, headers: dict, message: str, session_id: str | None = None, timeout: float = 15.0
+) -> dict:
     """POST /chat → poll /chat/runs/{run_id} until completed. Returns final status."""
     payload: dict[str, Any] = {"message": message}
     if session_id:
@@ -242,6 +256,7 @@ def _chat_and_wait(client, headers: dict, message: str,
 
 from contextlib import contextmanager
 
+
 @contextmanager
 def mock_llm_for_chat(builder_fn):
     """Context manager that patches both _build_chat_loop call sites.
@@ -250,6 +265,7 @@ def mock_llm_for_chat(builder_fn):
     patch both the module-level reference AND the import inside start_run.
     """
     import core.agent.run_engine as re_mod
+
     original_start = re_mod.RunEngine.start_run
 
     async def patched_start(self_engine, run):
@@ -265,9 +281,11 @@ def mock_llm_for_chat(builder_fn):
 # Fixtures
 # ============================================================================
 
+
 @pytest.fixture
 def client():
     from api.main import app
+
     with TestClient(app) as c:
         yield c
 
@@ -276,9 +294,14 @@ def client():
 def auth_headers(client):
     """Register + login, return auth headers."""
     username = f"real_{generate_id()}"
-    client.post("/auth/register", json={
-        "username": username, "email": f"{username}@test.com", "password": "testpass1234",
-    })
+    client.post(
+        "/auth/register",
+        json={
+            "username": username,
+            "email": f"{username}@test.com",
+            "password": "testpass1234",
+        },
+    )
     resp = client.post("/auth/login", json={"username": username, "password": "testpass1234"})
     return {"Authorization": f"Bearer {resp.json()['access_token']}"}
 
@@ -286,6 +309,7 @@ def auth_headers(client):
 # ============================================================================
 # Scenario A: Multi-turn plain conversation (10 turns)
 # ============================================================================
+
 
 class TestScenarioA_MultiTurnConversation:
     """10-turn conversation through /chat API.
@@ -300,7 +324,7 @@ class TestScenarioA_MultiTurnConversation:
     def test_10_turn_conversation(self, client, auth_headers):
         h = auth_headers
 
-        turns = [Turn(content=f"Answer to question {i+1}.") for i in range(10)]
+        turns = [Turn(content=f"Answer to question {i + 1}.") for i in range(10)]
         llm = ScriptedLLM(turns)
 
         with mock_llm_for_chat(_build_patched_chat_loop(llm)):
@@ -328,7 +352,9 @@ class TestScenarioA_MultiTurnConversation:
         assert resp.status_code == 200
         snapshots = resp.json()
         # At least 1 snapshot per turn (context_manager.save_snapshot is called each turn)
-        snap_count = snapshots.get("total", len(snapshots.get("snapshots", snapshots.get("items", []))))
+        snap_count = snapshots.get(
+            "total", len(snapshots.get("snapshots", snapshots.get("items", [])))
+        )
         assert snap_count >= 10, f"Expected ≥10 snapshots, got {snap_count}"
 
         # Verify: session is queryable (auto-created sessions may lack title,
@@ -340,6 +366,7 @@ class TestScenarioA_MultiTurnConversation:
 # ============================================================================
 # Scenario B: Tool-use conversation (execute_code skill)
 # ============================================================================
+
 
 class TestScenarioB_ToolUseConversation:
     """LLM calls execute_code tool → code runs → LLM synthesizes answer.
@@ -355,9 +382,17 @@ class TestScenarioB_ToolUseConversation:
         h = auth_headers
 
         turns = [
-            Turn(tool_calls=[_make_tool_call("execute_code", {
-                "code": "print(2 + 2)", "language": "python",
-            })]),
+            Turn(
+                tool_calls=[
+                    _make_tool_call(
+                        "execute_code",
+                        {
+                            "code": "print(2 + 2)",
+                            "language": "python",
+                        },
+                    )
+                ]
+            ),
             Turn(content="The result of 2 + 2 is 4."),
         ]
         llm = ScriptedLLM(turns)
@@ -387,6 +422,7 @@ class TestScenarioB_ToolUseConversation:
 # Scenario C: Bulk conversations → evaluation → learning closed loop
 # ============================================================================
 
+
 class TestScenarioC_BulkAndClosedLoop:
     """Run 20 conversations → seed quality scores → trigger evaluation → learning.
 
@@ -410,35 +446,39 @@ class TestScenarioC_BulkAndClosedLoop:
         with mock_llm_for_chat(_build_patched_chat_loop(llm)):
             for i in range(5):
                 llm._cursor = 0
-                result = _chat_and_wait(client, h, f"Conversation {i+1}: explain topic {i+1}")
-                assert result["status"] == "completed", f"Conv {i+1} failed: {result}"
+                result = _chat_and_wait(client, h, f"Conversation {i + 1}: explain topic {i + 1}")
+                assert result["status"] == "completed", f"Conv {i + 1} failed: {result}"
                 session_ids.append(result["_session_id"])
 
         # Phase 2: Seed quality scores on the generated events
         # (In production, auto-scoring does this; here we simulate)
         for sid in session_ids:
-            rows = db_session.execute(text(
-                "SELECT event_id FROM agent_events "
-                "WHERE session_id = :sid AND event_type = 'llm_response'"
-            ), {"sid": sid}).fetchall()
+            rows = db_session.execute(
+                text(
+                    "SELECT event_id FROM agent_events "
+                    "WHERE session_id = :sid AND event_type = 'llm_response'"
+                ),
+                {"sid": sid},
+            ).fetchall()
             for row in rows:
                 # Alternate between low and high quality to create variance
                 score = 2.0 if session_ids.index(sid) < 2 else 4.5
-                db_session.execute(text(
-                    "UPDATE agent_events SET quality_score = :qs WHERE event_id = :eid"
-                ), {"qs": score, "eid": row[0]})
+                db_session.execute(
+                    text("UPDATE agent_events SET quality_score = :qs WHERE event_id = :eid"),
+                    {"qs": score, "eid": row[0]},
+                )
         db_session.commit()
 
         # Phase 3: Query quality trend — should reflect our scores
-        resp = client.get("/api/v1/evaluation/quality/trend",
-                          params={"days": 1}, headers=h)
+        resp = client.get("/api/v1/evaluation/quality/trend", params={"days": 1}, headers=h)
         assert resp.status_code == 200
         trend = resp.json()
         assert trend["total_events"] >= 5, f"Expected ≥5 scored events, got {trend['total_events']}"
 
         # Phase 4: Run closed loop
-        resp = client.post("/api/v1/evaluation/loop",
-                           params={"days": 1, "dry_run": True}, headers=h)
+        resp = client.post(
+            "/api/v1/evaluation/loop", params={"days": 1, "dry_run": True}, headers=h
+        )
         assert resp.status_code == 200
         loop_data = resp.json()
         assert "drift" in loop_data
@@ -448,9 +488,14 @@ class TestScenarioC_BulkAndClosedLoop:
         assert loop_data["loop_id"]  # audit trail exists
 
         # Phase 5: Trigger learning
-        resp = client.post("/api/v1/learning/trigger", json={
-            "days": 1, "signal_types": ["wrong_skill", "slow_execution"],
-        }, headers=h)
+        resp = client.post(
+            "/api/v1/learning/trigger",
+            json={
+                "days": 1,
+                "signal_types": ["wrong_skill", "slow_execution"],
+            },
+            headers=h,
+        )
         assert resp.status_code == 200
         learn = resp.json()
         assert learn["status"] in ("success", "error")
@@ -463,6 +508,7 @@ class TestScenarioC_BulkAndClosedLoop:
 # ============================================================================
 # Scenario D: Cross-session context (session 1 → session 2)
 # ============================================================================
+
 
 class TestScenarioD_CrossSessionContext:
     """Session 1 produces events → Session 2 should have richer context.
@@ -511,6 +557,7 @@ class TestScenarioD_CrossSessionContext:
 # Scenario E: Multi-turn with tool use (3 turns, 2 tool calls)
 # ============================================================================
 
+
 class TestScenarioE_MultiTurnToolUse:
     """3-turn conversation: plain → tool call → plain.
 
@@ -528,10 +575,18 @@ class TestScenarioE_MultiTurnToolUse:
         # Turn 3 script: plain answer
         all_turns = [
             Turn(content="Python is a programming language."),  # Turn 1
-            Turn(tool_calls=[_make_tool_call("execute_code", {  # Turn 2, call 1
-                "code": "import sys; print(sys.version)", "language": "python",
-            })]),
-            Turn(content="You are running Python 3.11."),       # Turn 2, call 2
+            Turn(
+                tool_calls=[
+                    _make_tool_call(
+                        "execute_code",
+                        {  # Turn 2, call 1
+                            "code": "import sys; print(sys.version)",
+                            "language": "python",
+                        },
+                    )
+                ]
+            ),
+            Turn(content="You are running Python 3.11."),  # Turn 2, call 2
             Turn(content="Yes, Python 3.11 has many improvements."),  # Turn 3
         ]
         llm = ScriptedLLM(all_turns)
@@ -543,7 +598,9 @@ class TestScenarioE_MultiTurnToolUse:
             sid = r1["_session_id"]
 
             # Turn 2 (tool use)
-            r2 = _chat_and_wait(client, h, "What Python version am I running? Check it.", session_id=sid)
+            r2 = _chat_and_wait(
+                client, h, "What Python version am I running? Check it.", session_id=sid
+            )
             assert r2["status"] == "completed"
 
             # Turn 3
@@ -567,6 +624,7 @@ class TestScenarioE_MultiTurnToolUse:
 # ============================================================================
 # Scenario F: LLM failure → run status = failed, error event persisted
 # ============================================================================
+
 
 class TestScenarioF_ErrorRecovery:
     """LLM crashes mid-conversation → run transitions to 'failed'.
@@ -639,10 +697,14 @@ class TestScenarioF_ErrorRecovery:
         slow_llm = SlowLLM()
 
         with mock_llm_for_chat(_build_patched_chat_loop(slow_llm)):
-            resp = client.post("/chat", json={
-                "message": "This will timeout",
-                "context": {"run_timeout_seconds": 0.1},
-            }, headers=h)
+            resp = client.post(
+                "/chat",
+                json={
+                    "message": "This will timeout",
+                    "context": {"run_timeout_seconds": 0.1},
+                },
+                headers=h,
+            )
             assert resp.status_code == 200
             run_id = resp.json()["run_id"]
 
@@ -660,13 +722,15 @@ class TestScenarioF_ErrorRecovery:
 
             # Timeout may surface as 'failed' (TimeoutError) or 'cancelled'
             # (CancelledError from asyncio.wait_for internals) — both are correct.
-            assert final_status in ("failed", "cancelled"), \
+            assert final_status in ("failed", "cancelled"), (
                 f"Expected terminal error state, got '{final_status}'"
+            )
 
 
 # ============================================================================
 # Scenario G: Cancel a running task via API
 # ============================================================================
+
 
 class TestScenarioG_CancelRun:
     """Start a long-running chat → cancel via DELETE → verify cancelled status."""
@@ -712,13 +776,13 @@ class TestScenarioG_CancelRun:
                         break
                 time.sleep(0.1)
 
-            assert final_status == "cancelled", \
-                f"Expected 'cancelled', got '{final_status}'"
+            assert final_status == "cancelled", f"Expected 'cancelled', got '{final_status}'"
 
 
 # ============================================================================
 # Scenario H: Concurrent messages on same session
 # ============================================================================
+
 
 class TestScenarioH_ConcurrentMessages:
     """Two messages sent to the same session near-simultaneously.
@@ -735,6 +799,7 @@ class TestScenarioH_ConcurrentMessages:
         # Each run gets its own LLM instance with independent cursor
         class ConcurrentSafeLLM(ScriptedLLM):
             """Each call returns a unique response based on input."""
+
             async def chat_with_tools_stream(self, messages, tools, **kw):
                 # Extract user message to make response unique
                 user_msg = ""
@@ -752,12 +817,22 @@ class TestScenarioH_ConcurrentMessages:
             sid = resp.json()["session_id"]
 
             # Send two messages rapidly
-            resp1 = client.post("/chat", json={
-                "message": "First concurrent message", "session_id": sid,
-            }, headers=h)
-            resp2 = client.post("/chat", json={
-                "message": "Second concurrent message", "session_id": sid,
-            }, headers=h)
+            resp1 = client.post(
+                "/chat",
+                json={
+                    "message": "First concurrent message",
+                    "session_id": sid,
+                },
+                headers=h,
+            )
+            resp2 = client.post(
+                "/chat",
+                json={
+                    "message": "Second concurrent message",
+                    "session_id": sid,
+                },
+                headers=h,
+            )
 
             assert resp1.status_code == 200
             assert resp2.status_code == 200
@@ -778,8 +853,9 @@ class TestScenarioH_ConcurrentMessages:
             for rid in [run_id_1, run_id_2]:
                 resp = client.get(f"/chat/runs/{rid}", headers=h)
                 assert resp.status_code == 200
-                assert resp.json()["status"] == "completed", \
+                assert resp.json()["status"] == "completed", (
                     f"Run {rid} status: {resp.json()['status']}"
+                )
 
             # Verify session has events from both runs
             resp = client.get(f"/events/session/{sid}", headers=h)
@@ -792,6 +868,7 @@ class TestScenarioH_ConcurrentMessages:
 # ============================================================================
 # Scenario I: Event ordering and data integrity under load
 # ============================================================================
+
 
 class TestScenarioI_DataIntegrity:
     """Run 10 rapid-fire conversations → verify no orphaned events, no missing sessions.
@@ -845,5 +922,6 @@ class TestScenarioI_DataIntegrity:
             seen_sessions.add(sid)
             resp = client.get(f"/events/session/{sid}", headers=h)
             assert resp.status_code == 200
-            assert resp.json()["total"] >= 2, \
+            assert resp.json()["total"] >= 2, (
                 f"Session {sid} has only {resp.json()['total']} events"
+            )

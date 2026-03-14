@@ -75,9 +75,17 @@ class TestRunWeekly:
 
 class TestRunCycle:
     def test_calls_all_frequencies(self, scheduler):
-        with patch.object(scheduler, "run_hourly", return_value=GovernanceCycleResult(cleaned_tool_results=1)), \
-             patch.object(scheduler, "run_daily", return_value=GovernanceCycleResult(cleaned_stale=2)), \
-             patch.object(scheduler, "run_weekly", return_value=GovernanceCycleResult(cleaned_snapshots=3)):
+        with (
+            patch.object(
+                scheduler, "run_hourly", return_value=GovernanceCycleResult(cleaned_tool_results=1)
+            ),
+            patch.object(
+                scheduler, "run_daily", return_value=GovernanceCycleResult(cleaned_stale=2)
+            ),
+            patch.object(
+                scheduler, "run_weekly", return_value=GovernanceCycleResult(cleaned_snapshots=3)
+            ),
+        ):
             r = scheduler.run_cycle("u1")
         assert r.cleaned_tool_results == 1
         assert r.cleaned_stale == 2
@@ -125,13 +133,16 @@ class TestVectorIndexHealth:
             wraps=scheduler._check_vector_index_health,
         ), patch("core.memory.tabular.governance.VectorManager", return_value=vm)
 
-    @pytest.mark.parametrize("total_rows,centroids,expected_rebuild", [
-        # < 20k: ratio = rows/centroids must be >= 50
-        (70,  1, False),   # ratio=70 ≥ 50 → healthy
-        (49,  1, True),    # ratio=49 < 50 → needs rebuild
-        (500, 1, False),   # ratio=500 ≥ 50 → healthy
-        (100, 3, True),    # ratio=33 < 50 → needs rebuild
-    ])
+    @pytest.mark.parametrize(
+        "total_rows,centroids,expected_rebuild",
+        [
+            # < 20k: ratio = rows/centroids must be >= 50
+            (70, 1, False),  # ratio=70 ≥ 50 → healthy
+            (49, 1, True),  # ratio=49 < 50 → needs rebuild
+            (500, 1, False),  # ratio=500 ≥ 50 → healthy
+            (100, 3, True),  # ratio=33 < 50 → needs rebuild
+        ],
+    )
     def test_health_small_dataset(self, mock_db, total_rows, centroids, expected_rebuild):
         # Build fake distribution: `centroids` buckets each with total_rows//centroids rows
         per_bucket = total_rows // centroids
@@ -139,13 +150,21 @@ class TestVectorIndexHealth:
         # adjust last bucket for rounding
         counts[-1] += total_rows - sum(counts)
 
-        stats = {"distribution": {"centroid_count": counts, "centroid_id": list(range(centroids)), "centroid_version": [1] * centroids}}
+        stats = {
+            "distribution": {
+                "centroid_count": counts,
+                "centroid_id": list(range(centroids)),
+                "centroid_version": [1] * centroids,
+            }
+        }
         vm = MagicMock()
         vm.get_ivf_stats.return_value = stats
 
         scheduler = self._make_scheduler(mock_db)
-        with patch("core.memory.tabular.governance.VectorManager", return_value=vm), \
-             patch("api.database._mo_client", MagicMock()):
+        with (
+            patch("core.memory.tabular.governance.VectorManager", return_value=vm),
+            patch("api.database._mo_client", MagicMock()),
+        ):
             health = scheduler._check_vector_index_health()
 
         # Both tables use same mock, check mem_memories
@@ -156,13 +175,21 @@ class TestVectorIndexHealth:
     def test_health_large_dataset_needs_1024(self, mock_db):
         # 500k rows, 500 centroids → ratio=1000, boundary of [500,1000) → needs_rebuild (ratio >= 1000)
         counts = [1000] * 500  # 500k rows, 500 centroids
-        stats = {"distribution": {"centroid_count": counts, "centroid_id": list(range(500)), "centroid_version": [1] * 500}}
+        stats = {
+            "distribution": {
+                "centroid_count": counts,
+                "centroid_id": list(range(500)),
+                "centroid_version": [1] * 500,
+            }
+        }
         vm = MagicMock()
         vm.get_ivf_stats.return_value = stats
 
         scheduler = self._make_scheduler(mock_db)
-        with patch("core.memory.tabular.governance.VectorManager", return_value=vm), \
-             patch("api.database._mo_client", MagicMock()):
+        with (
+            patch("core.memory.tabular.governance.VectorManager", return_value=vm),
+            patch("api.database._mo_client", MagicMock()),
+        ):
             health = scheduler._check_vector_index_health()
 
         # ratio=1000 → ratio >= 1000 → needs_rebuild
@@ -178,8 +205,10 @@ class TestVectorIndexHealth:
         vm = MagicMock()
         vm.get_ivf_stats.side_effect = Exception("index not found")
         scheduler = self._make_scheduler(mock_db)
-        with patch("core.memory.tabular.governance.VectorManager", return_value=vm), \
-             patch("api.database._mo_client", MagicMock()):
+        with (
+            patch("core.memory.tabular.governance.VectorManager", return_value=vm),
+            patch("api.database._mo_client", MagicMock()),
+        ):
             health = scheduler._check_vector_index_health()
         assert "error" in health["mem_memories"]
 
@@ -193,13 +222,21 @@ class TestRebuildVectorIndex:
     def test_rebuild_computes_optimal_lists(self, mock_db):
         # 500 rows → lists = max(1, 500//50) = 10
         counts = [50] * 10  # 10 centroids, 50 rows each = 500 total
-        stats = {"distribution": {"centroid_count": counts, "centroid_id": list(range(10)), "centroid_version": [1] * 10}}
+        stats = {
+            "distribution": {
+                "centroid_count": counts,
+                "centroid_id": list(range(10)),
+                "centroid_version": [1] * 10,
+            }
+        }
         vm = MagicMock()
         vm.get_ivf_stats.return_value = stats
 
         scheduler = self._make_scheduler(mock_db)
-        with patch("core.memory.tabular.governance.VectorManager", return_value=vm), \
-             patch("api.database._mo_client", MagicMock()):
+        with (
+            patch("core.memory.tabular.governance.VectorManager", return_value=vm),
+            patch("api.database._mo_client", MagicMock()),
+        ):
             with patch("matrixone.sqlalchemy_ext.vector_index.VectorOpType"):
                 result = scheduler.rebuild_vector_index("mem_memories")
 
@@ -216,13 +253,21 @@ class TestRebuildVectorIndex:
     def test_rebuild_lists_capped_at_1024(self, mock_db):
         # 200k rows → lists = min(200000//50, 1024) = 1024
         counts = [200] * 1000  # 1000 centroids, 200 rows each = 200k total
-        stats = {"distribution": {"centroid_count": counts, "centroid_id": list(range(1000)), "centroid_version": [1] * 1000}}
+        stats = {
+            "distribution": {
+                "centroid_count": counts,
+                "centroid_id": list(range(1000)),
+                "centroid_version": [1] * 1000,
+            }
+        }
         vm = MagicMock()
         vm.get_ivf_stats.return_value = stats
 
         scheduler = self._make_scheduler(mock_db)
-        with patch("core.memory.tabular.governance.VectorManager", return_value=vm), \
-             patch("api.database._mo_client", MagicMock()):
+        with (
+            patch("core.memory.tabular.governance.VectorManager", return_value=vm),
+            patch("api.database._mo_client", MagicMock()),
+        ):
             with patch("matrixone.sqlalchemy_ext.vector_index.VectorOpType"):
                 result = scheduler.rebuild_vector_index("mem_memories")
 

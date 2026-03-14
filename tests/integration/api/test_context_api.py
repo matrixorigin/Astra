@@ -34,7 +34,7 @@ def test_session(client, auth_headers):
         json={"metadata": {}},
     )
     session_id = response.json()["session_id"]
-    
+
     # Create event
     response = client.post(
         "/events",
@@ -46,7 +46,7 @@ def test_session(client, auth_headers):
         },
     )
     event_id = response.json()["event_id"]
-    
+
     return {"session_id": session_id, "event_id": event_id}
 
 
@@ -68,14 +68,14 @@ def test_create_snapshot_success(client, auth_headers, test_session):
                 "token_budget": {"max": 4000},
                 "assembly_time_ms": 50,
                 "relevance_scores": {"score": 0.9},
-                "task_type": "code_review"
-            }
+                "task_type": "code_review",
+            },
         },
     )
 
     if response.status_code != 201:
         print(f"Error: {response.json()}")
-    
+
     assert response.status_code == 201
     data = response.json()
     assert "context_capture_id" in data
@@ -93,10 +93,7 @@ def test_get_snapshot_success(client, auth_headers, test_session):
         json={
             "session_id": test_session["session_id"],
             "event_id": test_session["event_id"],
-            "context_data": {
-                "system_prompt": "test",
-                "task_type": "test"
-            }
+            "context_data": {"system_prompt": "test", "task_type": "test"},
         },
     )
     context_capture_id = create_response.json()["context_capture_id"]
@@ -120,10 +117,7 @@ def test_list_snapshots_success(client, auth_headers, test_session):
             json={
                 "session_id": test_session["session_id"],
                 "event_id": test_session["event_id"],
-                "context_data": {
-                    "system_prompt": f"test {i}",
-                    "task_type": "test"
-                }
+                "context_data": {"system_prompt": f"test {i}", "task_type": "test"},
             },
         )
 

@@ -21,6 +21,7 @@ from core.history_utils import find_tool_call_safe_split
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
+
 def _sys(content: str = "system") -> dict:
     return {"role": "system", "content": content}
 
@@ -39,8 +40,11 @@ def _assistant_tc(tc_ids: list[str]) -> dict:
         "role": "assistant",
         "content": "",
         "tool_calls": [
-            {"id": tc_id, "type": "function",
-             "function": {"name": f"tool_{tc_id}", "arguments": "{}"}}
+            {
+                "id": tc_id,
+                "type": "function",
+                "function": {"name": f"tool_{tc_id}", "arguments": "{}"},
+            }
             for tc_id in tc_ids
         ],
     }
@@ -67,6 +71,7 @@ def _validate_no_orphaned_tools(messages: list[dict]) -> None:
 
 # ── find_tool_call_safe_split unit tests ─────────────────────────────
 
+
 class TestFindToolCallSafeSplit:
     def test_no_tool_calls_returns_naive_split(self):
         msgs = [_sys(), _user("q1"), _assistant("a1"), _user("q2"), _assistant("a2")]
@@ -76,12 +81,12 @@ class TestFindToolCallSafeSplit:
     def test_split_lands_on_tool_message_moves_earlier(self):
         """Naive split at index 3 would orphan tool(tc1). Must move to index 2."""
         msgs = [
-            _sys(),                      # 0
-            _user("q1"),                 # 1
-            _assistant_tc(["tc1"]),      # 2
-            _tool("tc1"),                # 3  ← naive split lands here
-            _assistant("answer"),        # 4
-            _user("q2"),                 # 5
+            _sys(),  # 0
+            _user("q1"),  # 1
+            _assistant_tc(["tc1"]),  # 2
+            _tool("tc1"),  # 3  ← naive split lands here
+            _assistant("answer"),  # 4
+            _user("q2"),  # 5
         ]
         idx = find_tool_call_safe_split(msgs, 3)
         # Naive: 6 - 3 = 3, but msgs[3] is tool → move back to 2
@@ -91,13 +96,13 @@ class TestFindToolCallSafeSplit:
     def test_split_lands_between_multiple_tools(self):
         """Naive split orphans second tool of a parallel tool_call."""
         msgs = [
-            _sys(),                          # 0
-            _user("q1"),                     # 1
-            _assistant_tc(["tc1", "tc2"]),   # 2
-            _tool("tc1"),                    # 3  ← naive split lands here
-            _tool("tc2"),                    # 4
-            _assistant("done"),              # 5
-            _user("q2"),                     # 6
+            _sys(),  # 0
+            _user("q1"),  # 1
+            _assistant_tc(["tc1", "tc2"]),  # 2
+            _tool("tc1"),  # 3  ← naive split lands here
+            _tool("tc2"),  # 4
+            _assistant("done"),  # 5
+            _user("q2"),  # 6
         ]
         idx = find_tool_call_safe_split(msgs, 4)
         # Naive: 7 - 4 = 3, msgs[3] is tool → back to 2
@@ -106,12 +111,12 @@ class TestFindToolCallSafeSplit:
 
     def test_split_on_assistant_is_safe(self):
         msgs = [
-            _sys(),                      # 0
-            _user("q1"),                 # 1
-            _assistant_tc(["tc1"]),      # 2
-            _tool("tc1"),                # 3
-            _assistant("answer"),        # 4  ← naive split lands here
-            _user("q2"),                 # 5
+            _sys(),  # 0
+            _user("q1"),  # 1
+            _assistant_tc(["tc1"]),  # 2
+            _tool("tc1"),  # 3
+            _assistant("answer"),  # 4  ← naive split lands here
+            _user("q2"),  # 5
         ]
         idx = find_tool_call_safe_split(msgs, 2)
         assert idx == 4  # safe, no adjustment needed
@@ -128,7 +133,7 @@ class TestFindToolCallSafeSplit:
     def test_entire_history_is_one_tool_group(self):
         msgs = [
             _assistant_tc(["tc1"]),  # 0
-            _tool("tc1"),            # 1
+            _tool("tc1"),  # 1
         ]
         idx = find_tool_call_safe_split(msgs, 1)
         # Naive: 2 - 1 = 1, msgs[1] is tool → back to 0
@@ -136,6 +141,7 @@ class TestFindToolCallSafeSplit:
 
 
 # ── _build_retrieval_view end-to-end ─────────────────────────────────
+
 
 class TestBuildRetrievalViewToolCallSafety:
     """Reproduce the exact failure: retrieval view orphans tool messages."""
@@ -189,7 +195,10 @@ class TestBuildRetrievalViewToolCallSafety:
 
         with db_factory() as db:
             result, _ = _build_retrieval_view(
-                history, "test-safe-split", current_messages, db,
+                history,
+                "test-safe-split",
+                current_messages,
+                db,
             )
 
         # The critical assertion: no orphaned tool messages
@@ -204,14 +213,19 @@ class TestBuildRetrievalViewToolCallSafety:
 
         with db_factory() as db:
             result, _ = _build_retrieval_view(
-                history, "test-trim", current_messages, db,
+                history,
+                "test-trim",
+                current_messages,
+                db,
             )
 
-        assert len(result) < len(history), \
+        assert len(result) < len(history), (
             f"Should trim: result={len(result)}, history={len(history)}"
+        )
 
 
 # ── _summarize_old_turns end-to-end ──────────────────────────────────
+
 
 class TestSummarizeOldTurnsToolCallSafety:
     """Reproduce the failure in compaction's _summarize_old_turns."""
@@ -223,15 +237,15 @@ class TestSummarizeOldTurnsToolCallSafety:
         # preserve_recent=4 → naive cutoff at index 5
         # But index 5 is tool("tc2"), orphaning it from assistant at index 4
         msgs = [
-            _sys("sys"),                     # 0
-            _user("q1"),                     # 1
-            _assistant("a1"),                # 2
-            _user("q2"),                     # 3
-            _assistant_tc(["tc2"]),          # 4
-            _tool("tc2", "result"),          # 5  ← naive cutoff
-            _assistant("a2"),                # 6
-            _user("q3"),                     # 7
-            _assistant("a3"),                # 8
+            _sys("sys"),  # 0
+            _user("q1"),  # 1
+            _assistant("a1"),  # 2
+            _user("q2"),  # 3
+            _assistant_tc(["tc2"]),  # 4
+            _tool("tc2", "result"),  # 5  ← naive cutoff
+            _assistant("a2"),  # 6
+            _user("q3"),  # 7
+            _assistant("a3"),  # 8
         ]
         result = _summarize_old_turns(msgs, preserve_recent=4)
 
@@ -245,15 +259,15 @@ class TestSummarizeOldTurnsToolCallSafety:
         from core.context.compaction import _summarize_old_turns
 
         msgs = [
-            _sys("sys"),                         # 0
-            _user("q1"),                         # 1
-            _assistant("a1"),                    # 2
-            _assistant_tc(["tc1", "tc2"]),       # 3
-            _tool("tc1"),                        # 4
-            _tool("tc2"),                        # 5  ← naive cutoff for preserve_recent=4
-            _assistant("a2"),                    # 6
-            _user("q2"),                         # 7
-            _assistant("a3"),                    # 8
+            _sys("sys"),  # 0
+            _user("q1"),  # 1
+            _assistant("a1"),  # 2
+            _assistant_tc(["tc1", "tc2"]),  # 3
+            _tool("tc1"),  # 4
+            _tool("tc2"),  # 5  ← naive cutoff for preserve_recent=4
+            _assistant("a2"),  # 6
+            _user("q2"),  # 7
+            _assistant("a3"),  # 8
         ]
         result = _summarize_old_turns(msgs, preserve_recent=4)
         recent = result[2:]
@@ -261,6 +275,7 @@ class TestSummarizeOldTurnsToolCallSafety:
 
 
 # ── compact() end-to-end ─────────────────────────────────────────────
+
 
 class TestCompactToolCallSafety:
     """Full compact() pipeline must not orphan tool messages."""

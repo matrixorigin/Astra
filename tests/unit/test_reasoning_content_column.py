@@ -24,11 +24,17 @@ class TestReasoningContentColumn:
         """reasoning_content from row[3] must appear on the assistant message."""
         rows = [
             _row("user_query", "hello"),
-            _row("tool_call", json.dumps({"tool_call_id": "tc1", "name": "read_file", "arguments": "{}"}),
-                 metadata={"tool_call_id": "tc1", "name": "read_file", "source": "edge"},
-                 reasoning_content="I should read the file first"),
-            _row("tool_result", json.dumps({"result": "file contents"}),
-                 metadata={"tool_call_id": "tc1", "name": "read_file"}),
+            _row(
+                "tool_call",
+                json.dumps({"tool_call_id": "tc1", "name": "read_file", "arguments": "{}"}),
+                metadata={"tool_call_id": "tc1", "name": "read_file", "source": "edge"},
+                reasoning_content="I should read the file first",
+            ),
+            _row(
+                "tool_result",
+                json.dumps({"result": "file contents"}),
+                metadata={"tool_call_id": "tc1", "name": "read_file"},
+            ),
         ]
         history = append_recovered_events([], rows)
 
@@ -48,13 +54,23 @@ class TestReasoningContentColumn:
         """Old metadata-based reasoning_content must NOT be read (migration: column is source of truth)."""
         rows = [
             _row("user_query", "hello"),
-            _row("tool_call", json.dumps({"tool_call_id": "tc1", "name": "fn", "arguments": "{}"}),
-                 # Old format: reasoning_content in metadata
-                 metadata={"tool_call_id": "tc1", "name": "fn", "source": "edge",
-                            "reasoning_content": "old metadata reasoning"},
-                 reasoning_content=None),  # column is None
-            _row("tool_result", json.dumps({"result": "ok"}),
-                 metadata={"tool_call_id": "tc1", "name": "fn"}),
+            _row(
+                "tool_call",
+                json.dumps({"tool_call_id": "tc1", "name": "fn", "arguments": "{}"}),
+                # Old format: reasoning_content in metadata
+                metadata={
+                    "tool_call_id": "tc1",
+                    "name": "fn",
+                    "source": "edge",
+                    "reasoning_content": "old metadata reasoning",
+                },
+                reasoning_content=None,
+            ),  # column is None
+            _row(
+                "tool_result",
+                json.dumps({"result": "ok"}),
+                metadata={"tool_call_id": "tc1", "name": "fn"},
+            ),
         ]
         history = append_recovered_events([], rows)
 
@@ -67,11 +83,17 @@ class TestReasoningContentColumn:
         """Normal models (no reasoning) must not have reasoning_content key on assistant."""
         rows = [
             _row("user_query", "hi"),
-            _row("tool_call", json.dumps({"tool_call_id": "tc1", "name": "fn", "arguments": "{}"}),
-                 metadata={"tool_call_id": "tc1", "name": "fn", "source": "edge"},
-                 reasoning_content=None),
-            _row("tool_result", json.dumps({"result": "done"}),
-                 metadata={"tool_call_id": "tc1", "name": "fn"}),
+            _row(
+                "tool_call",
+                json.dumps({"tool_call_id": "tc1", "name": "fn", "arguments": "{}"}),
+                metadata={"tool_call_id": "tc1", "name": "fn", "source": "edge"},
+                reasoning_content=None,
+            ),
+            _row(
+                "tool_result",
+                json.dumps({"result": "done"}),
+                metadata={"tool_call_id": "tc1", "name": "fn"},
+            ),
         ]
         history = append_recovered_events([], rows)
         asst = history[1]
@@ -81,16 +103,28 @@ class TestReasoningContentColumn:
         """Only the first tool_call row carries reasoning_content; batch must have it once."""
         rows = [
             _row("user_query", "do two things"),
-            _row("tool_call", json.dumps({"tool_call_id": "tc1", "name": "fn1", "arguments": "{}"}),
-                 metadata={"tool_call_id": "tc1", "name": "fn1", "source": "edge"},
-                 reasoning_content="thinking..."),
-            _row("tool_call", json.dumps({"tool_call_id": "tc2", "name": "fn2", "arguments": "{}"}),
-                 metadata={"tool_call_id": "tc2", "name": "fn2", "source": "edge"},
-                 reasoning_content=None),  # second tool_call has no reasoning
-            _row("tool_result", json.dumps({"result": "r1"}),
-                 metadata={"tool_call_id": "tc1", "name": "fn1"}),
-            _row("tool_result", json.dumps({"result": "r2"}),
-                 metadata={"tool_call_id": "tc2", "name": "fn2"}),
+            _row(
+                "tool_call",
+                json.dumps({"tool_call_id": "tc1", "name": "fn1", "arguments": "{}"}),
+                metadata={"tool_call_id": "tc1", "name": "fn1", "source": "edge"},
+                reasoning_content="thinking...",
+            ),
+            _row(
+                "tool_call",
+                json.dumps({"tool_call_id": "tc2", "name": "fn2", "arguments": "{}"}),
+                metadata={"tool_call_id": "tc2", "name": "fn2", "source": "edge"},
+                reasoning_content=None,
+            ),  # second tool_call has no reasoning
+            _row(
+                "tool_result",
+                json.dumps({"result": "r1"}),
+                metadata={"tool_call_id": "tc1", "name": "fn1"},
+            ),
+            _row(
+                "tool_result",
+                json.dumps({"result": "r2"}),
+                metadata={"tool_call_id": "tc2", "name": "fn2"},
+            ),
         ]
         history = append_recovered_events([], rows)
 
@@ -103,9 +137,12 @@ class TestReasoningContentColumn:
         """Trailing tool_calls (no tool_result) must still carry reasoning_content."""
         rows = [
             _row("user_query", "do something"),
-            _row("tool_call", json.dumps({"tool_call_id": "tc1", "name": "fn", "arguments": "{}"}),
-                 metadata={"tool_call_id": "tc1", "name": "fn", "source": "edge"},
-                 reasoning_content="deep thought"),
+            _row(
+                "tool_call",
+                json.dumps({"tool_call_id": "tc1", "name": "fn", "arguments": "{}"}),
+                metadata={"tool_call_id": "tc1", "name": "fn", "source": "edge"},
+                reasoning_content="deep thought",
+            ),
             # No tool_result — simulates API crash mid-execution
         ]
         history = append_recovered_events([], rows)
@@ -120,10 +157,16 @@ class TestReasoningContentColumn:
         """Backward compat: 3-tuple rows (no reasoning_content column) must not crash."""
         rows = [
             ("user_query", "hello", json.dumps({})),
-            ("tool_call", json.dumps({"tool_call_id": "tc1", "name": "fn", "arguments": "{}"}),
-             json.dumps({"tool_call_id": "tc1", "name": "fn", "source": "edge"})),
-            ("tool_result", json.dumps({"result": "ok"}),
-             json.dumps({"tool_call_id": "tc1", "name": "fn"})),
+            (
+                "tool_call",
+                json.dumps({"tool_call_id": "tc1", "name": "fn", "arguments": "{}"}),
+                json.dumps({"tool_call_id": "tc1", "name": "fn", "source": "edge"}),
+            ),
+            (
+                "tool_result",
+                json.dumps({"result": "ok"}),
+                json.dumps({"tool_call_id": "tc1", "name": "fn"}),
+            ),
         ]
         history = append_recovered_events([], rows)
         asst = history[1]
@@ -134,11 +177,17 @@ class TestReasoningContentColumn:
         """Multi-turn: reasoning on tool turn, then plain llm_response."""
         rows = [
             _row("user_query", "turn 1"),
-            _row("tool_call", json.dumps({"tool_call_id": "tc1", "name": "fn", "arguments": "{}"}),
-                 metadata={"tool_call_id": "tc1", "name": "fn", "source": "edge"},
-                 reasoning_content="let me think"),
-            _row("tool_result", json.dumps({"result": "data"}),
-                 metadata={"tool_call_id": "tc1", "name": "fn"}),
+            _row(
+                "tool_call",
+                json.dumps({"tool_call_id": "tc1", "name": "fn", "arguments": "{}"}),
+                metadata={"tool_call_id": "tc1", "name": "fn", "source": "edge"},
+                reasoning_content="let me think",
+            ),
+            _row(
+                "tool_result",
+                json.dumps({"result": "data"}),
+                metadata={"tool_call_id": "tc1", "name": "fn"},
+            ),
             _row("llm_response", "Here is the answer"),
             _row("user_query", "turn 2"),
             _row("llm_response", "Simple reply"),
@@ -158,8 +207,11 @@ class TestReasoningContentColumn:
         """Text-only response with reasoning_content on llm_response event."""
         rows = [
             _row("user_query", "explain something"),
-            _row("llm_response", "Here is my explanation",
-                 reasoning_content="let me reason about this"),
+            _row(
+                "llm_response",
+                "Here is my explanation",
+                reasoning_content="let me reason about this",
+            ),
         ]
         history = append_recovered_events([], rows)
 

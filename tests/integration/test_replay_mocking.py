@@ -107,6 +107,7 @@ class DestructiveSkill(Skill):
 def db():
     """Database fixture"""
     from api.database import get_db_session
+
     session = next(get_db_session())
     yield session
     session.close()
@@ -159,6 +160,7 @@ def setup_recorded_result(db, session_id):
 
     # Cleanup
     from api.models import Event
+
     db.query(Event).filter(Event.session_id == session_id).delete()
     db.commit()
 
@@ -354,8 +356,11 @@ def test_record_result_uses_parent_event_id(db, db_factory, session_id):
     try:
         mock_layer = ToolMockingLayer(MockMode.PRODUCTION, db_factory)
         mock_layer._record_result(
-            "test_read_skill", {"q": "x"}, {"data": "ok"},
-            session_id, parent_event_id=parent_id,
+            "test_read_skill",
+            {"q": "x"},
+            {"data": "ok"},
+            session_id,
+            parent_event_id=parent_id,
         )
         db.refresh(event)
         assert event.event_metadata["skill_result"] == {"data": "ok"}
@@ -367,11 +372,16 @@ def test_record_result_uses_parent_event_id(db, db_factory, session_id):
 def test_record_result_warns_without_parent_event_id(db, session_id, caplog):
     """_record_result without parent_event_id should log a concurrency warning."""
     import logging
+
     caplog.set_level(logging.WARNING)
 
     mock_layer = ToolMockingLayer(MockMode.PRODUCTION, lambda: db)
     mock_layer._record_result(
-        "nonexistent_skill", {}, {}, session_id, parent_event_id=None,
+        "nonexistent_skill",
+        {},
+        {},
+        session_id,
+        parent_event_id=None,
     )
     assert any("not concurrency-safe" in r.message for r in caplog.records)
 
@@ -400,8 +410,13 @@ def test_record_result_stores_skill_version(db, db_factory, session_id):
     try:
         mock_layer = ToolMockingLayer(MockMode.PRODUCTION, db_factory)
         mock_layer._record_result(
-            "test_read_skill", {}, {"data": "v"}, session_id,
-            parent_event_id=None, event_id_override=eid, skill_version="2.1.0",
+            "test_read_skill",
+            {},
+            {"data": "v"},
+            session_id,
+            parent_event_id=None,
+            event_id_override=eid,
+            skill_version="2.1.0",
         )
         db.refresh(event)
         assert event.event_metadata["skill_version"] == "2.1.0"
@@ -447,8 +462,11 @@ def test_get_recorded_result_warns_version_mismatch(db, session_id, caplog):
     try:
         mock_layer = ToolMockingLayer(MockMode.REPLAY, lambda: db, session_id=session_id)
         result = mock_layer._get_recorded_result(
-            "test_read_skill", params, session_id,
-            parent_event_id=None, expected_version="2.0.0",
+            "test_read_skill",
+            params,
+            session_id,
+            parent_event_id=None,
+            expected_version="2.0.0",
         )
         assert result == {"data": "world"}  # Still returns result
         assert any("version mismatch" in r.message.lower() for r in caplog.records)

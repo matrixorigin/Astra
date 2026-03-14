@@ -54,6 +54,7 @@ class GraphMemoryService:
 
         if config is None:
             from core.memory.config import DEFAULT_CONFIG
+
             self._config = DEFAULT_CONFIG
         else:
             self._config = config
@@ -94,7 +95,8 @@ class GraphMemoryService:
     def _candidates(self) -> GraphCandidateProvider:
         if self._graph_candidates is None:
             self._graph_candidates = GraphCandidateProvider(
-                self._db_factory, config=self._config,
+                self._db_factory,
+                config=self._config,
             )
         return self._graph_candidates
 
@@ -109,6 +111,7 @@ class GraphMemoryService:
         """Tabular backend for dual-write and fallback."""
         if self._tabular is None:
             from core.memory.tabular.service import TabularMemoryService
+
             self._tabular = TabularMemoryService(
                 self._db_factory,
                 llm_client=self._llm_client,
@@ -136,16 +139,22 @@ class GraphMemoryService:
         if query_embedding:
             try:
                 activated = self._retriever.retrieve(
-                    user_id, query, query_embedding, top_k=top_k,
+                    user_id,
+                    query,
+                    query_embedding,
+                    top_k=top_k,
                     task_type=task_hint,
                 )
                 if activated:
                     return self._nodes_to_memories(activated)
             except _RECOVERABLE:
-                logger.warning("Activation retrieval failed, falling back to tabular", exc_info=True)
+                logger.warning(
+                    "Activation retrieval failed, falling back to tabular", exc_info=True
+                )
 
         result = self._tabular_delegate.retrieve(
-            user_id, query,
+            user_id,
+            query,
             session_id=session_id,
             query_embedding=query_embedding,
             memory_types=memory_types,
@@ -165,16 +174,18 @@ class GraphMemoryService:
                 tier = TrustTier(node.trust_tier)
             except ValueError:
                 tier = TrustTier.T3_INFERRED
-            memories.append(Memory(
-                memory_id=node.memory_id or node.node_id,
-                user_id=node.user_id,
-                memory_type=MemoryType.SEMANTIC,
-                content=node.content,
-                initial_confidence=node.confidence,
-                embedding=node.embedding,
-                session_id=node.session_id,
-                trust_tier=tier,
-            ))
+            memories.append(
+                Memory(
+                    memory_id=node.memory_id or node.node_id,
+                    user_id=node.user_id,
+                    memory_type=MemoryType.SEMANTIC,
+                    content=node.content,
+                    initial_confidence=node.confidence,
+                    embedding=node.embedding,
+                    session_id=node.session_id,
+                    trust_tier=tier,
+                )
+            )
         return memories
 
     def get_profile(self, user_id: str) -> str | None:
@@ -200,7 +211,8 @@ class GraphMemoryService:
         Programming errors (TypeError, etc.) are NOT caught.
         """
         mem = self._tabular_delegate.store(
-            user_id, content,
+            user_id,
+            content,
             memory_type=memory_type,
             source_event_ids=source_event_ids,
             initial_confidence=initial_confidence,
@@ -213,7 +225,8 @@ class GraphMemoryService:
         except _RECOVERABLE:
             logger.warning(
                 "Graph ingest failed for memory %s, queued for retry",
-                mem.memory_id, exc_info=True,
+                mem.memory_id,
+                exc_info=True,
             )
             self._pending_graph_sync.append(mem.memory_id)
         return mem
@@ -227,7 +240,9 @@ class GraphMemoryService:
     ) -> list[Memory]:
         """Extract memories from a turn and build graph."""
         memories = self._tabular_delegate.observe_turn(
-            user_id, messages, source_event_ids=source_event_ids,
+            user_id,
+            messages,
+            source_event_ids=source_event_ids,
         )
         events = [{"event_id": eid, "event_type": "unknown"} for eid in (source_event_ids or [])]
         try:
@@ -240,7 +255,9 @@ class GraphMemoryService:
         return memories
 
     def _run_opinion_evolution(
-        self, user_id: str, created_nodes: list[Any],
+        self,
+        user_id: str,
+        created_nodes: list[Any],
     ) -> None:
         """Run opinion evolution for newly created nodes with embeddings."""
         from core.memory.graph.opinion import evolve_opinions
@@ -253,8 +270,11 @@ class GraphMemoryService:
                 if result.scenes_evaluated:
                     logger.debug(
                         "Opinion evolution for %s: %d scenes, %d supporting, %d contradicting, %d quarantined",
-                        node.node_id, result.scenes_evaluated,
-                        result.supporting, result.contradicting, result.quarantined,
+                        node.node_id,
+                        result.scenes_evaluated,
+                        result.supporting,
+                        result.contradicting,
+                        result.quarantined,
                     )
             except _RECOVERABLE:
                 logger.warning("Opinion evolution failed for node %s", node.node_id, exc_info=True)
@@ -315,7 +335,8 @@ class GraphMemoryService:
         """Get reflection candidates from graph activation patterns."""
         try:
             candidates = self._candidates.get_reflection_candidates(
-                user_id, since_hours=since_hours,
+                user_id,
+                since_hours=since_hours,
             )
             if candidates:
                 return candidates
@@ -324,7 +345,8 @@ class GraphMemoryService:
 
         # Fallback to tabular candidates
         return self._tabular_delegate._governance_lazy.get_reflection_candidates(
-            user_id, since_hours=since_hours,
+            user_id,
+            since_hours=since_hours,
         )
 
     # ── Graph-specific ────────────────────────────────────────────────

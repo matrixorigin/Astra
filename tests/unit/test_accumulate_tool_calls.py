@@ -28,8 +28,12 @@ class TestTruncationDetection:
 
     def test_truncated_tool_call_has_flag(self):
         chunks = [
-            _make_chunk(delta_tool_calls=[_make_tc_delta(0, id="tc1", name="write_file", type="function")]),
-            _make_chunk(delta_tool_calls=[_make_tc_delta(0, arguments='{"path": "/tmp/x", "content": "hel')]),
+            _make_chunk(
+                delta_tool_calls=[_make_tc_delta(0, id="tc1", name="write_file", type="function")]
+            ),
+            _make_chunk(
+                delta_tool_calls=[_make_tc_delta(0, arguments='{"path": "/tmp/x", "content": "hel')]
+            ),
             _make_chunk(finish_reason="length"),
         ]
         events = list(_accumulate_tool_calls(iter(chunks)))
@@ -39,7 +43,9 @@ class TestTruncationDetection:
 
     def test_normal_tool_call_no_flag(self):
         chunks = [
-            _make_chunk(delta_tool_calls=[_make_tc_delta(0, id="tc1", name="read_file", type="function")]),
+            _make_chunk(
+                delta_tool_calls=[_make_tc_delta(0, id="tc1", name="read_file", type="function")]
+            ),
             _make_chunk(delta_tool_calls=[_make_tc_delta(0, arguments='{"path": "/tmp/x"}')]),
             _make_chunk(finish_reason="stop"),
         ]

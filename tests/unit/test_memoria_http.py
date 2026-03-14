@@ -362,17 +362,29 @@ class TestMemoriaStorageNewMethods:
 
     def test_create_memory(self, storage: MemoriaStorage, mock_http: MagicMock) -> None:
         from core.memory.types import MemoryType, TrustTier
-        mock_http.store.return_value = {"memory_id": "m1", "content": "x", "memory_type": "semantic", "confidence": 0.8}
+
+        mock_http.store.return_value = {
+            "memory_id": "m1",
+            "content": "x",
+            "memory_type": "semantic",
+            "confidence": 0.8,
+        }
         mem = Memory(memory_id="", user_id="u1", content="x", memory_type=MemoryType.SEMANTIC)
         result = storage.create_memory(mem)
         assert result.content == "x"
 
     def test_update_memory_content(self, storage: MemoriaStorage, mock_http: MagicMock) -> None:
-        mock_http.correct.return_value = {"memory_id": "m1", "content": "new", "memory_type": "semantic"}
+        mock_http.correct.return_value = {
+            "memory_id": "m1",
+            "content": "new",
+            "memory_type": "semantic",
+        }
         storage.update_memory_content("m1", "new")
         mock_http.correct.assert_called_once_with("u1", "m1", "new", reason="content update")
 
-    def test_update_memory_embedding_noop(self, storage: MemoriaStorage, mock_http: MagicMock) -> None:
+    def test_update_memory_embedding_noop(
+        self, storage: MemoriaStorage, mock_http: MagicMock
+    ) -> None:
         storage.update_memory_embedding("m1")  # should not raise
 
     def test_invalidate_profile_noop(self, storage: MemoriaStorage) -> None:
@@ -385,7 +397,12 @@ class TestMemoriaStorageNewMethods:
         assert storage.check_and_summarize("u1", "s1", [], 5, None) is None
 
     def test_get_memory_found(self, storage: MemoriaStorage, mock_http: MagicMock) -> None:
-        mock_http.get_memory.return_value = {"memory_id": "m1", "content": "found", "memory_type": "semantic", "confidence": 0.9}
+        mock_http.get_memory.return_value = {
+            "memory_id": "m1",
+            "content": "found",
+            "memory_type": "semantic",
+            "confidence": 0.9,
+        }
         mem = storage.get_memory("m1")
         assert mem is not None
         assert mem.memory_id == "m1"
@@ -395,27 +412,34 @@ class TestMemoriaStorageNewMethods:
         assert storage.get_memory("missing") is None
 
     def test_list_active(self, storage: MemoriaStorage, mock_http: MagicMock) -> None:
-        mock_http.list_memories.return_value = {"items": [
-            {"memory_id": "m1", "content": "a", "memory_type": "semantic", "confidence": 0.8},
-            {"memory_id": "m2", "content": "b", "memory_type": "profile", "confidence": 0.9},
-        ]}
+        mock_http.list_memories.return_value = {
+            "items": [
+                {"memory_id": "m1", "content": "a", "memory_type": "semantic", "confidence": 0.8},
+                {"memory_id": "m2", "content": "b", "memory_type": "profile", "confidence": 0.9},
+            ]
+        }
         mems = storage.list_active("u1")
         assert len(mems) == 2
 
     def test_run_governance(self, storage: MemoriaStorage, mock_http: MagicMock) -> None:
         from core.memory.interfaces import GovernanceReport
+
         mock_http.consolidate.return_value = {"status": "done"}
         report = storage.run_governance("u1")
         assert isinstance(report, GovernanceReport)
 
-    def test_run_governance_failure_is_silent(self, storage: MemoriaStorage, mock_http: MagicMock) -> None:
+    def test_run_governance_failure_is_silent(
+        self, storage: MemoriaStorage, mock_http: MagicMock
+    ) -> None:
         from core.memory.interfaces import GovernanceReport
+
         mock_http.consolidate.side_effect = Exception("network error")
         report = storage.run_governance("u1")
         assert isinstance(report, GovernanceReport)
 
     def test_health_check(self, storage: MemoriaStorage, mock_http: MagicMock) -> None:
         from core.memory.interfaces import HealthReport
+
         mock_http.health_check.return_value = {"status": "ok"}
         report = storage.health_check("u1")
         assert isinstance(report, HealthReport)

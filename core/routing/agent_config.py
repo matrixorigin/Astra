@@ -9,6 +9,7 @@ from core.routing.query_router import AgentType
 
 class AgentConfig(BaseModel):
     """Configuration for a specialized agent."""
+
     agent_type: AgentType
     system_prompt: str
     preferred_tools: List[str]
@@ -18,7 +19,7 @@ class AgentConfig(BaseModel):
 
 class AgentConfigManager:
     """Manages configurations for different agent types."""
-    
+
     def __init__(self):
         self.configs = {
             AgentType.CODE: AgentConfig(
@@ -31,12 +32,17 @@ class AgentConfigManager:
 
 Focus on providing accurate, efficient, and well-documented code solutions.""",
                 preferred_tools=[
-                    "read_file", "write_file", "list_files", "search_files",
-                    "run_command", "git_status", "git_diff", "create_file"
+                    "read_file",
+                    "write_file",
+                    "list_files",
+                    "search_files",
+                    "run_command",
+                    "git_status",
+                    "git_diff",
+                    "create_file",
                 ],
-                temperature=0.3
+                temperature=0.3,
             ),
-            
             AgentType.PLANNING: AgentConfig(
                 agent_type=AgentType.PLANNING,
                 system_prompt="""You are a specialized planning assistant. You excel at:
@@ -47,12 +53,14 @@ Focus on providing accurate, efficient, and well-documented code solutions.""",
 
 Focus on creating clear, actionable plans with realistic timelines and dependencies.""",
                 preferred_tools=[
-                    "create_file", "write_file", "search_files",
-                    "web_search", "analyze_requirements"
+                    "create_file",
+                    "write_file",
+                    "search_files",
+                    "web_search",
+                    "analyze_requirements",
                 ],
-                temperature=0.5
+                temperature=0.5,
             ),
-            
             AgentType.DEBUGGING: AgentConfig(
                 agent_type=AgentType.DEBUGGING,
                 system_prompt="""You are a specialized debugging assistant. You excel at:
@@ -63,12 +71,16 @@ Focus on creating clear, actionable plans with realistic timelines and dependenc
 
 Focus on systematic problem-solving and root cause analysis.""",
                 preferred_tools=[
-                    "read_file", "search_files", "run_command", "check_logs",
-                    "analyze_error", "test_code", "git_log"
+                    "read_file",
+                    "search_files",
+                    "run_command",
+                    "check_logs",
+                    "analyze_error",
+                    "test_code",
+                    "git_log",
                 ],
-                temperature=0.2
+                temperature=0.2,
             ),
-            
             AgentType.GENERAL: AgentConfig(
                 agent_type=AgentType.GENERAL,
                 system_prompt="""You are a helpful general-purpose assistant. You can help with:
@@ -79,21 +91,25 @@ Focus on systematic problem-solving and root cause analysis.""",
 
 Adapt your approach based on the specific needs of each request.""",
                 preferred_tools=[
-                    "web_search", "read_file", "write_file", "create_file",
-                    "run_command", "search_files"
+                    "web_search",
+                    "read_file",
+                    "write_file",
+                    "create_file",
+                    "run_command",
+                    "search_files",
                 ],
-                temperature=0.7
-            )
+                temperature=0.7,
+            ),
         }
-    
+
     def get_config(self, agent_type: AgentType) -> AgentConfig:
         """Get configuration for specified agent type."""
         return self.configs.get(agent_type, self.configs[AgentType.GENERAL])
-    
+
     def get_system_prompt(self, agent_type: AgentType) -> str:
         """Get system prompt for specified agent type."""
         return self.get_config(agent_type).system_prompt
-    
+
     def get_preferred_tools(self, agent_type: AgentType) -> List[str]:
         """Get preferred tools for specified agent type."""
         return self.get_config(agent_type).preferred_tools

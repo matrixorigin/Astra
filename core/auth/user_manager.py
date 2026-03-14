@@ -67,7 +67,7 @@ class UserManager(DbConsumer):
                 password_hash=password_hash,
                 display_name=display_name,
                 is_active=True,
-                created_at=datetime.now(timezone.utc)
+                created_at=datetime.now(timezone.utc),
             )
 
             db.add(user)
@@ -195,7 +195,7 @@ class UserManager(DbConsumer):
                 token_prefix=token[:16],
                 expires_at=expires_at,
                 is_revoked=False,
-                created_at=datetime.now(timezone.utc)
+                created_at=datetime.now(timezone.utc),
             )
             db.add(refresh_token)
             db.commit()
@@ -236,9 +236,7 @@ class UserManager(DbConsumer):
             from core.auth.password import verify_password
 
             candidates = (
-                db.query(RefreshToken)
-                .filter(RefreshToken.token_prefix == token[:16])
-                .all()
+                db.query(RefreshToken).filter(RefreshToken.token_prefix == token[:16]).all()
             )
 
             for rt in candidates:

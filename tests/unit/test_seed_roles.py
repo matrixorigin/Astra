@@ -18,7 +18,9 @@ def test_seed_roles_creates_roles(db_session):
     assert count == len(SEED_ROLES)
 
     # Verify roles exist
-    result = db_session.execute(text("SELECT role_name FROM auth_roles ORDER BY role_name")).fetchall()
+    result = db_session.execute(
+        text("SELECT role_name FROM auth_roles ORDER BY role_name")
+    ).fetchall()
     role_names = [row[0] for row in result]
     assert "mo_agent_admin" in role_names
     assert "mo_agent_user" in role_names
@@ -54,7 +56,7 @@ def test_seed_roles_preserves_existing(db_session):
     # Create one role manually
     db_session.execute(
         text("INSERT INTO auth_roles (role_id, role_name, description) VALUES (:id, :name, :desc)"),
-        {"id": "role-admin", "name": "mo_agent_admin", "desc": "Admin role"}
+        {"id": "role-admin", "name": "mo_agent_admin", "desc": "Admin role"},
     )
     db_session.commit()
 
@@ -71,7 +73,7 @@ def test_first_user_gets_admin_role(db_session):
     """Test that first registered user gets admin role."""
     from api.routers.auth import register, RegisterRequest
     from api.models import User
-    
+
     # Clear users
     db_session.execute(text("DELETE FROM auth_user_roles"))
     db_session.execute(text("DELETE FROM auth_users"))
@@ -85,11 +87,11 @@ def test_first_user_gets_admin_role(db_session):
         username="firstuser",
         email="first@test.com",
         password="password123",
-        display_name="First User"
+        display_name="First User",
     )
-    
+
     user = register(request, db=db_session)
-    
+
     # Verify user has admin role
     result = db_session.execute(
         text("""
@@ -97,9 +99,9 @@ def test_first_user_gets_admin_role(db_session):
             JOIN auth_roles r ON ur.role_id = r.role_id
             WHERE ur.user_id = :user_id
         """),
-        {"user_id": user.user_id}
+        {"user_id": user.user_id},
     ).fetchone()
-    
+
     assert result is not None
     assert result[0] == "mo_agent_admin"
 
@@ -107,7 +109,7 @@ def test_first_user_gets_admin_role(db_session):
 def test_second_user_no_admin_role(db_session):
     """Test that second user does not get admin role."""
     from api.routers.auth import register, RegisterRequest
-    
+
     # Clear users
     db_session.execute(text("DELETE FROM auth_user_roles"))
     db_session.execute(text("DELETE FROM auth_users"))
@@ -121,7 +123,7 @@ def test_second_user_no_admin_role(db_session):
         username="firstuser",
         email="first@test.com",
         password="password123",
-        display_name="First User"
+        display_name="First User",
     )
     register(request1, db=db_session)
 
@@ -130,7 +132,7 @@ def test_second_user_no_admin_role(db_session):
         username="seconduser",
         email="second@test.com",
         password="password123",
-        display_name="Second User"
+        display_name="Second User",
     )
     user2 = register(request2, db=db_session)
 
@@ -141,7 +143,7 @@ def test_second_user_no_admin_role(db_session):
             JOIN auth_roles r ON ur.role_id = r.role_id
             WHERE ur.user_id = :user_id
         """),
-        {"user_id": user2.user_id}
+        {"user_id": user2.user_id},
     ).fetchone()
-    
+
     assert result is None

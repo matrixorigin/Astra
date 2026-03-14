@@ -39,7 +39,8 @@ def _run_persist(session_id, user_id, **kwargs):
     chain_id = kwargs.pop("turn_chain_id", str(uuid7()))
     uq_id = kwargs.pop("user_query_event_id", str(uuid7()))
     _persist_turn_events(
-        user_id, session_id,
+        user_id,
+        session_id,
         messages=kwargs.get("messages", [{"role": "user", "content": "hello"}]),
         tool_results=kwargs.get("tool_results", []),
         full_text=kwargs.get("full_text", "response"),
@@ -98,8 +99,9 @@ class TestReasoningContentPersistence:
         """When tool_calls exist, reasoning is on tool_call, NOT on llm_response."""
         sid, uid = rc_session
         tool_calls = [{"id": "call_aaa", "function": {"name": "fn", "arguments": "{}"}}]
-        _run_persist(sid, uid, tool_calls=tool_calls, full_text="answer",
-                     reasoning_content="deep thought")
+        _run_persist(
+            sid, uid, tool_calls=tool_calls, full_text="answer", reasoning_content="deep thought"
+        )
 
         llm_events = _fetch_events(db, sid, event_type="llm_response")
         assert len(llm_events) >= 1
@@ -113,8 +115,13 @@ class TestReasoningContentPersistence:
     def test_text_only_thinking_stores_reasoning_on_llm_response(self, db, rc_session):
         """Text-only response with reasoning → reasoning_content on llm_response event."""
         sid, uid = rc_session
-        _run_persist(sid, uid, tool_calls=[], full_text="just text",
-                     reasoning_content="thinking but no tools")
+        _run_persist(
+            sid,
+            uid,
+            tool_calls=[],
+            full_text="just text",
+            reasoning_content="thinking but no tools",
+        )
 
         llm_events = _fetch_events(db, sid, event_type="llm_response")
         assert len(llm_events) >= 1
@@ -123,8 +130,7 @@ class TestReasoningContentPersistence:
     def test_text_only_no_reasoning_stores_null(self, db, rc_session):
         """Text-only response without reasoning → NULL on llm_response."""
         sid, uid = rc_session
-        _run_persist(sid, uid, tool_calls=[], full_text="plain answer",
-                     reasoning_content="")
+        _run_persist(sid, uid, tool_calls=[], full_text="plain answer", reasoning_content="")
 
         llm_events = _fetch_events(db, sid, event_type="llm_response")
         assert len(llm_events) >= 1
@@ -141,7 +147,8 @@ class TestEventLoggerReasoningContent:
         sid, uid = rc_session
         el = EventLogger(db_factory)
         ev = el.create_stream_event(
-            user_id=uid, session_id=sid,
+            user_id=uid,
+            session_id=sid,
             event_type="tool_call",
             content=json.dumps({"tool_call_id": "tc1", "name": "fn", "arguments": "{}"}),
             reasoning_content="let me think",
@@ -162,7 +169,8 @@ class TestEventLoggerReasoningContent:
         sid, uid = rc_session
         el = EventLogger(db_factory)
         ev = el.create_stream_event(
-            user_id=uid, session_id=sid,
+            user_id=uid,
+            session_id=sid,
             event_type="tool_call",
             content=json.dumps({"tool_call_id": "tc2", "name": "fn", "arguments": "{}"}),
             reasoning_content=None,
@@ -182,7 +190,8 @@ class TestEventLoggerReasoningContent:
         sid, uid = rc_session
         el = EventLogger(db_factory)
         ev = el.create_stream_event(
-            user_id=uid, session_id=sid,
+            user_id=uid,
+            session_id=sid,
             event_type="tool_call",
             content=json.dumps({"tool_call_id": "tc3", "name": "fn", "arguments": "{}"}),
             reasoning_content="",
@@ -236,7 +245,8 @@ class TestRecoverHistoryReasoningContent:
 
         # Insert a tool_call with reasoning_content
         el.create_stream_event(
-            user_id=uid, session_id=sid,
+            user_id=uid,
+            session_id=sid,
             event_type="tool_call",
             content=json.dumps({"tool_call_id": "tc1", "name": "fn", "arguments": "{}"}),
             metadata={"tool_call_id": "tc1", "name": "fn", "source": "edge"},
@@ -246,8 +256,10 @@ class TestRecoverHistoryReasoningContent:
         # Query the same way _recover_history_from_db does
         rows = (
             db.query(
-                EventModel.event_type, EventModel.content,
-                EventModel.event_metadata, EventModel.reasoning_content,
+                EventModel.event_type,
+                EventModel.content,
+                EventModel.event_metadata,
+                EventModel.reasoning_content,
             )
             .filter(EventModel.session_id == sid)
             .order_by(EventModel.created_at.asc())
@@ -271,29 +283,40 @@ class TestRecoverHistoryReasoningContent:
 
         # Persist: user_query → tool_call (with reasoning) → tool_result
         uq = el.create_stream_event(
-            user_id=uid, session_id=sid, event_type="user_query",
-            content="do something", causal_chain_id=chain,
+            user_id=uid,
+            session_id=sid,
+            event_type="user_query",
+            content="do something",
+            causal_chain_id=chain,
         )
         el.create_stream_event(
-            user_id=uid, session_id=sid, event_type="tool_call",
+            user_id=uid,
+            session_id=sid,
+            event_type="tool_call",
             content=json.dumps({"tool_call_id": "tc1", "name": "fn", "arguments": "{}"}),
             metadata={"tool_call_id": "tc1", "name": "fn", "source": "edge"},
             reasoning_content="let me think about this",
-            parent_event_id=uq.event_id, causal_chain_id=chain,
+            parent_event_id=uq.event_id,
+            causal_chain_id=chain,
         )
         el.create_stream_event(
-            user_id=uid, session_id=sid, event_type="tool_result",
+            user_id=uid,
+            session_id=sid,
+            event_type="tool_result",
             content=json.dumps({"result": "done"}),
             metadata={"tool_call_id": "tc1", "name": "fn"},
-            parent_event_id=uq.event_id, causal_chain_id=chain,
+            parent_event_id=uq.event_id,
+            causal_chain_id=chain,
         )
 
         # Recover from DB
         _event_types = ("user_query", "llm_response", "tool_call", "tool_result")
         rows = (
             db.query(
-                EventModel.event_type, EventModel.content,
-                EventModel.event_metadata, EventModel.reasoning_content,
+                EventModel.event_type,
+                EventModel.content,
+                EventModel.event_metadata,
+                EventModel.reasoning_content,
             )
             .filter(
                 EventModel.session_id == sid,

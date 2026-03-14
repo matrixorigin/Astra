@@ -1,7 +1,12 @@
 """Infrastructure models: LLM, config, repo, sandbox, locks."""
 
 from sqlalchemy import (
-    Column, Integer, SmallInteger, String, Text, UniqueConstraint,
+    Column,
+    Integer,
+    SmallInteger,
+    String,
+    Text,
+    UniqueConstraint,
 )
 from sqlalchemy.sql import func
 
@@ -12,7 +17,7 @@ from api.models._types import DateTime6, NullableJSON as JSON
 class LLMModel(Base):
     __tablename__ = "infra_llm_models"
     __table_args__ = (
-        UniqueConstraint('model_name', 'provider', name='uq_llm_model_name_provider'),
+        UniqueConstraint("model_name", "provider", name="uq_llm_model_name_provider"),
     )
     model_id = Column(String(36), primary_key=True)
     model_name = Column(String(100), nullable=False, index=True)
@@ -38,7 +43,7 @@ class LLMModel(Base):
 class Config(Base):
     __tablename__ = "infra_configs"
     __table_args__ = (
-        UniqueConstraint('key_name', 'scope_type', 'scope_user_id', name='uq_config_scope'),
+        UniqueConstraint("key_name", "scope_type", "scope_user_id", name="uq_config_scope"),
     )
     config_id = Column(String(64), primary_key=True)
     key_name = Column(String(255), nullable=False, index=True)

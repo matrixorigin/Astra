@@ -39,6 +39,7 @@ async def stream_chat(
             user_id = current_user["user_id"]
             session_id = _ensure_session(db, user_id, request.session_id, None)
             from api.database import SessionLocal
+
             loop = _build_chat_loop(SessionLocal)
 
             async for stream_event in loop.run_step_stream(
@@ -61,7 +62,7 @@ async def stream_chat(
             yield f"data: {json.dumps({'type': 'error', 'message': str(e), 'code': 'INTERNAL_ERROR', 'retryable': False})}\n\n"
         finally:
             if loop:
-                _pipeline = getattr(getattr(loop, 'event_logger', None), '_pipeline', None)
+                _pipeline = getattr(getattr(loop, "event_logger", None), "_pipeline", None)
                 if _pipeline:
                     _pipeline.shutdown()
 

@@ -15,19 +15,22 @@ def skills_dir(tmp_path):
 
 def _write_skill_md(skill_dir, name="test_skill", description="A test skill", body="Do stuff."):
     skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / "SKILL.md").write_text(textwrap.dedent(f"""\
+    (skill_dir / "SKILL.md").write_text(
+        textwrap.dedent(f"""\
         ---
         name: {name}
         version: 1.0.0
         description: {description}
         ---
         {body}
-    """))
+    """)
+    )
 
 
 def _write_skill_py(skill_dir, name="test_skill", description="A typed skill"):
     skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / "skill.py").write_text(textwrap.dedent(f"""\
+    (skill_dir / "skill.py").write_text(
+        textwrap.dedent(f"""\
         from core.skills.base import Skill, SkillInput, SkillOutput
         from pydantic import Field
 
@@ -44,7 +47,8 @@ def _write_skill_py(skill_dir, name="test_skill", description="A typed skill"):
 
             async def execute(self, input: TestInput) -> TestOutput:
                 return TestOutput(success=True, answer="real data for: " + input.query)
-    """))
+    """)
+    )
 
 
 class TestSkillLoaderDiscover:
@@ -94,6 +98,7 @@ class TestSkillLoaderDiscover:
 class TestSkillOutputResult:
     def test_result_is_optional(self):
         from core.skills.base import SkillOutput
+
         o = SkillOutput(success=True)
         assert o.result is None
 
@@ -121,9 +126,12 @@ class TestRouterSkillSerialization:
         router = ToolRouter()
         router.register(results[0].skill)
 
-        [r] = await router.execute([ToolCall(id="t1", name="json_skill", arguments={"query": "test"})])
+        [r] = await router.execute(
+            [ToolCall(id="t1", name="json_skill", arguments={"query": "test"})]
+        )
         assert not r.error
         import json
+
         data = json.loads(r.result)
         assert data["success"] is True
         assert data["answer"] == "real data for: test"
@@ -135,7 +143,8 @@ class TestRouterSkillSerialization:
 
         d = skills_dir / "err-skill"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "skill.py").write_text(textwrap.dedent("""\
+        (d / "skill.py").write_text(
+            textwrap.dedent("""\
             from core.skills.base import Skill, SkillInput, SkillOutput
 
             class ErrInput(SkillInput):
@@ -151,7 +160,8 @@ class TestRouterSkillSerialization:
 
                 async def execute(self, input: ErrInput) -> ErrOutput:
                     return ErrOutput(success=False, error="network timeout")
-        """))
+        """)
+        )
         results = SkillLoader.discover([skills_dir])
         router = ToolRouter()
         router.register(results[0].skill)
@@ -160,6 +170,7 @@ class TestRouterSkillSerialization:
         # Should NOT be an exception — error is in the JSON payload
         assert not r.error
         import json
+
         data = json.loads(r.result)
         assert data["success"] is False
         assert "network timeout" in data["error"]

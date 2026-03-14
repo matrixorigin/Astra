@@ -35,7 +35,9 @@ class VectorRetrievalStrategy:
         from core.memory.tabular.retriever import MemoryRetriever
 
         self._retriever = MemoryRetriever(
-            db_factory, config=config, metrics=metrics,
+            db_factory,
+            config=config,
+            metrics=metrics,
         )
 
     @property

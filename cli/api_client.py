@@ -44,9 +44,9 @@ class APIClient:
             profile: Profile name to use. Defaults to current_profile in credentials file
             _transport: Optional httpx transport (e.g. ASGITransport for testing)
         """
-        self.base_url = (
-            base_url or os.getenv("MO_AGENT_API_URL", "http://127.0.0.1:8000")
-        ).rstrip("/")
+        self.base_url = (base_url or os.getenv("MO_AGENT_API_URL", "http://127.0.0.1:8000")).rstrip(
+            "/"
+        )
         self.credentials_path = credentials_path or Path.home() / ".mo-agent" / "credentials.json"
         self.profile = profile or os.getenv("MO_AGENT_PROFILE")
         self._transport = _transport
@@ -70,7 +70,9 @@ class APIClient:
             return {}
         try:
             data = json.loads(path.read_text())
-            name = profile or os.getenv("MO_AGENT_PROFILE") or data.get("current_profile", "default")
+            name = (
+                profile or os.getenv("MO_AGENT_PROFILE") or data.get("current_profile", "default")
+            )
             return data.get("profiles", {}).get(name, {})
         except Exception:
             return {}
@@ -94,6 +96,7 @@ class APIClient:
         if cls._no_proxy_set:
             return
         import os
+
         existing = os.environ.get("NO_PROXY", os.environ.get("no_proxy", ""))
         hosts = {h.strip() for h in existing.split(",") if h.strip()}
         needed = {"localhost", "127.0.0.1"}
@@ -128,7 +131,7 @@ class APIClient:
     async def _save_credentials(self, username: str | None = None) -> None:
         """Save JWT tokens to credentials file (profile-based)."""
         self.credentials_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         # Load existing data
         if self.credentials_path.exists():
             try:
@@ -137,17 +140,19 @@ class APIClient:
                 data = {"current_profile": "default", "profiles": {}}
         else:
             data = {"current_profile": "default", "profiles": {}}
-        
+
         # Determine profile name — use explicit profile, then username, then current
         profile_name = self.profile or username or data.get("current_profile", "default")
-        
+
         # Merge into existing profile to preserve settings not being updated
         existing = data.get("profiles", {}).get(profile_name, {})
-        existing.update({
-            "username": username or self._current_username or existing.get("username"),
-            "access_token": self._access_token,
-            "refresh_token": self._refresh_token,
-        })
+        existing.update(
+            {
+                "username": username or self._current_username or existing.get("username"),
+                "access_token": self._access_token,
+                "refresh_token": self._refresh_token,
+            }
+        )
         # Only write optional fields if they have been loaded or explicitly set.
         # _UNSET means "not touched" — preserve whatever is already in the file.
         if self._default_model is not _UNSET:
@@ -155,11 +160,11 @@ class APIClient:
         if self._last_session_id is not _UNSET:
             existing["last_session_id"] = self._last_session_id
         data.setdefault("profiles", {})[profile_name] = existing
-        
+
         # Update current_profile
         if not self.profile:
             data["current_profile"] = profile_name
-        
+
         self.credentials_path.write_text(json.dumps(data, indent=2))
         self.credentials_path.chmod(0o600)
 
@@ -169,6 +174,7 @@ class APIClient:
             return
         try:
             import jwt as pyjwt
+
             payload = pyjwt.decode(self._access_token, options={"verify_signature": False})
             exp = payload.get("exp")
             if exp and exp - time.time() < 300:  # < 5 min remaining
@@ -234,7 +240,7 @@ class APIClient:
                 request=response.request,
                 response=response,
             )
-        
+
         return response
 
     async def _refresh_access_token(self) -> None:
@@ -285,7 +291,11 @@ class APIClient:
                 headers["Authorization"] = f"Bearer {self._access_token}"
 
             async with aconnect_sse(
-                self._client, method, url, headers=headers, **kwargs,
+                self._client,
+                method,
+                url,
+                headers=headers,
+                **kwargs,
             ) as event_source:
                 first = True
                 async for sse in event_source.aiter_sse():
@@ -335,7 +345,7 @@ class APIClient:
 
     async def ensure_authenticated(self) -> bool | str:
         """Check if user is authenticated.
-        
+
         Returns:
             True if authenticated, False if no credentials,
             or a string describing why authentication failed.
@@ -408,7 +418,7 @@ class APIClient:
         }
         if model:
             payload["model"] = model
-        
+
         response = await self._request(
             "POST",
             "/chat",
@@ -483,7 +493,9 @@ class APIClient:
     async def resume_run(self, run_id: str) -> AsyncIterator[dict[str, Any]]:
         """Resume a RESUME_PENDING run (with auto-refresh)."""
         async for event in self._sse_stream(
-            "POST", "/chat/turn/resume", json={"run_id": run_id},
+            "POST",
+            "/chat/turn/resume",
+            json={"run_id": run_id},
         ):
             yield event
 
@@ -495,7 +507,8 @@ class APIClient:
     async def stream_agent_run_events(self, run_id: str) -> AsyncIterator[dict[str, Any]]:
         """Stream run events (with auto-refresh, supports reconnection)."""
         async for event in self._sse_stream(
-            "GET", f"/chat/runs/{run_id}/stream",
+            "GET",
+            f"/chat/runs/{run_id}/stream",
         ):
             yield event
 
@@ -613,8 +626,10 @@ class APIClient:
     ) -> dict[str, Any]:
         """Set a setting or secret."""
         response = await self._request(
-            "PUT", f"/skills/{skill_name}/config/{setting_name}",
-            json={"value": value}, params={"scope": scope},
+            "PUT",
+            f"/skills/{skill_name}/config/{setting_name}",
+            json={"value": value},
+            params={"scope": scope},
         )
         return response.json()
 
@@ -626,20 +641,25 @@ class APIClient:
     ) -> dict[str, Any]:
         """Delete a setting at a specific scope."""
         response = await self._request(
-            "DELETE", f"/skills/{skill_name}/config/{setting_name}",
+            "DELETE",
+            f"/skills/{skill_name}/config/{setting_name}",
             params={"scope": scope},
         )
         return response.json()
 
     async def validate_skill_config(
-        self, skill_name: str, resource: str | None = None,
+        self,
+        skill_name: str,
+        resource: str | None = None,
     ) -> dict[str, Any]:
         """Validate required config is present."""
         params: dict[str, str] = {}
         if resource:
             params["resource"] = resource
         response = await self._request(
-            "GET", f"/skills/{skill_name}/config/validate", params=params,
+            "GET",
+            f"/skills/{skill_name}/config/validate",
+            params=params,
         )
         return response.json()
 
@@ -649,22 +669,28 @@ class APIClient:
         return response.json()
 
     async def bind_skill_resource(
-        self, skill_name: str, resource_key: str,
+        self,
+        skill_name: str,
+        resource_key: str,
         bindings: dict[str, str | int | float | bool],
     ) -> dict[str, Any]:
         """Bind credentials/config to a resource."""
         response = await self._request(
-            "PUT", f"/skills/{skill_name}/resources/{resource_key}",
+            "PUT",
+            f"/skills/{skill_name}/resources/{resource_key}",
             json={"bindings": bindings},
         )
         return response.json()
 
     async def unbind_skill_resource(
-        self, skill_name: str, resource_key: str,
+        self,
+        skill_name: str,
+        resource_key: str,
     ) -> dict[str, Any]:
         """Remove all bindings for a resource."""
         response = await self._request(
-            "DELETE", f"/skills/{skill_name}/resources/{resource_key}",
+            "DELETE",
+            f"/skills/{skill_name}/resources/{resource_key}",
         )
         return response.json()
 
@@ -1004,8 +1030,14 @@ class APIClient:
     ) -> dict[str, Any]:
         """Explain a memory recall — per-candidate scoring breakdown."""
         response = await self._request(
-            "GET", "/introspection/memory/recall",
-            params={"session_id": session_id, "query": query, "task_hint": task_hint, "limit": limit},
+            "GET",
+            "/introspection/memory/recall",
+            params={
+                "session_id": session_id,
+                "query": query,
+                "task_hint": task_hint,
+                "limit": limit,
+            },
         )
         return response.json()
 
@@ -1024,7 +1056,8 @@ class APIClient:
     ) -> dict[str, Any]:
         """Get token usage trend across recent turns."""
         response = await self._request(
-            "GET", "/introspection/context/trend",
+            "GET",
+            "/introspection/context/trend",
             params={"session_id": session_id, "turns": turns},
         )
         return response.json()
@@ -1034,18 +1067,23 @@ class APIClient:
     ) -> dict[str, Any]:
         """Get retrieval quality trend across recent turns."""
         response = await self._request(
-            "GET", "/introspection/context/retrieval_quality",
+            "GET",
+            "/introspection/context/retrieval_quality",
             params={"session_id": session_id, "turns": turns},
         )
         return response.json()
 
-    async def get_reflect(self, session_id: str, focus: str = "auto", last_n: int = 20, question: str = "") -> dict[str, Any]:
+    async def get_reflect(
+        self, session_id: str, focus: str = "auto", last_n: int = 20, question: str = ""
+    ) -> dict[str, Any]:
         """Get unified diagnostic evidence (reflect + tool selection + history)."""
         params: dict[str, Any] = {"focus": focus, "last_n": last_n}
         if question:
             params["question"] = question
         response = await self._request(
-            "GET", f"/chat/session/{session_id}/reflect", params=params,
+            "GET",
+            f"/chat/session/{session_id}/reflect",
+            params=params,
         )
         return response.json()
 

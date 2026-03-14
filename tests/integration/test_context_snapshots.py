@@ -55,7 +55,12 @@ def test_context_snapshot_save_and_load(db_session, context_manager, event_logge
 
     # Verify snapshot is in database
     from api.models import ContextSnapshot as SnapshotModel
-    row = db_session.query(SnapshotModel).filter(SnapshotModel.context_capture_id == context_capture_id).first()
+
+    row = (
+        db_session.query(SnapshotModel)
+        .filter(SnapshotModel.context_capture_id == context_capture_id)
+        .first()
+    )
     assert row is not None
     assert row.session_id == session_id
     assert row.event_id == event.event_id
@@ -125,7 +130,11 @@ def test_context_snapshot_task_types(db_session, context_manager, event_logger):
         )
 
         context_capture_id = context_manager.save_snapshot(
-            context, session_id, event.event_id, llm_request_id=f"req_{task_type.value}", llm_response_id=f"resp_{task_type.value}"
+            context,
+            session_id,
+            event.event_id,
+            llm_request_id=f"req_{task_type.value}",
+            llm_response_id=f"resp_{task_type.value}",
         )
         assert context_capture_id is not None
 
@@ -161,7 +170,9 @@ def test_context_snapshot_relevance_scores(db_session, context_manager, event_lo
     assert isinstance(loaded.relevance_scores, dict)
 
 
-def test_context_snapshot_update_llm_ids(db_session, test_session_factory, context_manager, event_logger):
+def test_context_snapshot_update_llm_ids(
+    db_session, test_session_factory, context_manager, event_logger
+):
     """Test updating snapshot with LLM request/response IDs."""
     session_id = generate_id()
     user_id = "test_user"
@@ -181,8 +192,10 @@ def test_context_snapshot_update_llm_ids(db_session, test_session_factory, conte
 
     # Update with LLM IDs
     ContextManager.update_snapshot_llm_ids(
-        test_session_factory, context_capture_id,
-        llm_request_id="req_004", llm_response_id="resp_004",
+        test_session_factory,
+        context_capture_id,
+        llm_request_id="req_004",
+        llm_response_id="resp_004",
     )
 
     # Wait for both async writes to complete
@@ -190,9 +203,14 @@ def test_context_snapshot_update_llm_ids(db_session, test_session_factory, conte
 
     # Verify update
     from api.models import ContextSnapshot as SnapshotModel
+
     # Expire session to ensure fresh data
     db_session.expire_all()
-    row = db_session.query(SnapshotModel).filter(SnapshotModel.context_capture_id == context_capture_id).first()
+    row = (
+        db_session.query(SnapshotModel)
+        .filter(SnapshotModel.context_capture_id == context_capture_id)
+        .first()
+    )
     assert row is not None
     assert row.llm_request_id == "req_004"
     assert row.llm_response_id == "resp_004"

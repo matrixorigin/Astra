@@ -67,11 +67,13 @@ class SandboxCleaner(DbConsumer):
         """Sandboxes whose session is CLOSED — should have been cleaned by Tier 1."""
         with self._db() as db:
             try:
-                r = db.execute(text(f"""
+                r = db.execute(
+                    text(f"""
                     SELECT m.sandbox_name FROM {self.source_db}.infra_sandbox_metadata m
                     JOIN agent_sessions s ON m.session_id = s.session_id
                     WHERE m.status = 'active' AND s.status = 'closed'
-                """))
+                """)
+                )
                 return [row._mapping["sandbox_name"] for row in r]
             except Exception:
                 return []
@@ -80,12 +82,15 @@ class SandboxCleaner(DbConsumer):
         """Sandboxes whose session is ACTIVE but has no recent activity."""
         with self._db() as db:
             try:
-                r = db.execute(text(f"""
+                r = db.execute(
+                    text(f"""
                     SELECT m.sandbox_name FROM {self.source_db}.infra_sandbox_metadata m
                     JOIN agent_sessions s ON m.session_id = s.session_id
                     WHERE m.status = 'active' AND s.status = 'active'
                       AND s.updated_at < :cutoff
-                """), {"cutoff": cutoff})
+                """),
+                    {"cutoff": cutoff},
+                )
                 return [row._mapping["sandbox_name"] for row in r]
             except Exception:
                 return []
@@ -94,11 +99,14 @@ class SandboxCleaner(DbConsumer):
         """Sandboxes with no session_id and updated_at older than cutoff."""
         with self._db() as db:
             try:
-                r = db.execute(text(f"""
+                r = db.execute(
+                    text(f"""
                     SELECT sandbox_name FROM {self.source_db}.infra_sandbox_metadata
                     WHERE status = 'active' AND session_id IS NULL
                       AND updated_at < :cutoff
-                """), {"cutoff": cutoff})
+                """),
+                    {"cutoff": cutoff},
+                )
                 return [row._mapping["sandbox_name"] for row in r]
             except Exception:
                 return []
@@ -110,17 +118,16 @@ class SandboxCleaner(DbConsumer):
                 r = db.execute(text("SHOW DATABASES"))
                 all_dbs = [row[0] for row in r]
                 sandbox_dbs = [
-                    d for d in all_dbs
-                    if d.startswith("sandbox_") or d.startswith("code_exec_")
+                    d for d in all_dbs if d.startswith("sandbox_") or d.startswith("code_exec_")
                 ]
                 if not sandbox_dbs:
                     return []
 
                 known = set()
                 try:
-                    r = db.execute(text(
-                        f"SELECT sandbox_name FROM {self.source_db}.infra_sandbox_metadata"
-                    ))
+                    r = db.execute(
+                        text(f"SELECT sandbox_name FROM {self.source_db}.infra_sandbox_metadata")
+                    )
                     known = {row._mapping["sandbox_name"] for row in r}
                 except Exception:
                     pass

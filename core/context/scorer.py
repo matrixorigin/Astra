@@ -26,9 +26,9 @@ class TopicShiftConfig:
     through the standard Observe → Diagnose → Propose → Gate → Deploy loop.
     """
 
-    threshold: float = 0.5       # shift_score below this → no adjustment
-    temporal_floor: float = 0.05 # minimum temporal weight after adjustment
-    causal_floor: float = 0.05   # minimum causal weight after adjustment
+    threshold: float = 0.5  # shift_score below this → no adjustment
+    temporal_floor: float = 0.05  # minimum temporal weight after adjustment
+    causal_floor: float = 0.05  # minimum causal weight after adjustment
     semantic_ceiling: float = 0.8  # maximum semantic weight after adjustment
 
     @staticmethod
@@ -70,7 +70,9 @@ class ScoringWeights:
             raise ValueError(f"Weights must sum to 1.0, got {total}")
 
     def adjust_for_topic_shift(
-        self, shift_score: float, config: TopicShiftConfig | None = None,
+        self,
+        shift_score: float,
+        config: TopicShiftConfig | None = None,
     ) -> "ScoringWeights":
         """Return new weights adjusted for topic shift.
 
@@ -158,13 +160,18 @@ class RelevanceScorer(DbConsumer):
         ToolRegistry selection.
         """
         now = time.monotonic()
-        if self._topic_shift_config is not None and (now - self._topic_shift_config_ts) < self._TOPIC_SHIFT_CONFIG_TTL:
+        if (
+            self._topic_shift_config is not None
+            and (now - self._topic_shift_config_ts) < self._TOPIC_SHIFT_CONFIG_TTL
+        ):
             return self._topic_shift_config
 
         try:
             import json as _json
+
             with self._db() as db:
                 from api.models import Config
+
                 row = db.query(Config.value).filter(Config.key_name == "topic_shift_config").first()
             if row:
                 raw = _json.loads(row[0]) if isinstance(row[0], str) else row[0]
@@ -231,7 +238,12 @@ class RelevanceScorer(DbConsumer):
 
         similarity = cosine_similarity(query_emb, mean_emb)
         shift = max(0.0, 1.0 - similarity)
-        logger.debug("Topic shift score: %.3f (similarity=%.3f, %d recent events)", shift, similarity, len(recent_embs))
+        logger.debug(
+            "Topic shift score: %.3f (similarity=%.3f, %d recent events)",
+            shift,
+            similarity,
+            len(recent_embs),
+        )
         return shift
 
     def _get_stored_embedding(self, event_id: str | None) -> list[float] | None:
@@ -243,12 +255,16 @@ class RelevanceScorer(DbConsumer):
             return None
         try:
             from api.models.context import EventEmbedding
+
             with self._db() as db:
-                row = db.query(EventEmbedding.embedding).filter(
-                    EventEmbedding.event_id == event_id
-                ).first()
+                row = (
+                    db.query(EventEmbedding.embedding)
+                    .filter(EventEmbedding.event_id == event_id)
+                    .first()
+                )
             if row and row[0]:
                 import json
+
                 raw = row[0]
                 if isinstance(raw, str):
                     return json.loads(raw)
@@ -344,17 +360,17 @@ class RelevanceScorer(DbConsumer):
         """Get recent causal chain IDs."""
         from api.models import Event
         from sqlalchemy import func
-        
+
         with self._db() as db:
-            chains = db.query(
-                Event.causal_chain_id,
-                func.max(Event.created_at).label('last_time')
-            ).filter(
-                Event.session_id == session_id
-            ).group_by(Event.causal_chain_id).order_by(
-                func.max(Event.created_at).desc()
-            ).limit(limit).all()
-        
+            chains = (
+                db.query(Event.causal_chain_id, func.max(Event.created_at).label("last_time"))
+                .filter(Event.session_id == session_id)
+                .group_by(Event.causal_chain_id)
+                .order_by(func.max(Event.created_at).desc())
+                .limit(limit)
+                .all()
+            )
+
         return {row.causal_chain_id for row in chains}
 
     def _compute_signals(
@@ -377,6 +393,7 @@ class RelevanceScorer(DbConsumer):
         created_at = candidate["created_at"]
         if isinstance(created_at, str):
             from datetime import datetime
+
             try:
                 created_at = datetime.fromisoformat(created_at)
             except (ValueError, TypeError):
@@ -407,7 +424,9 @@ class RelevanceScorer(DbConsumer):
         }
 
 
-def create_scorer_for_task(db_factory: DbFactory, embeddings, task_type: TaskType) -> RelevanceScorer:
+def create_scorer_for_task(
+    db_factory: DbFactory, embeddings, task_type: TaskType
+) -> RelevanceScorer:
     """Factory function to create task-specific scorer."""
     weights = TASK_WEIGHTS[task_type]
     return RelevanceScorer(db_factory, embeddings, weights)

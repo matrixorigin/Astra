@@ -15,6 +15,7 @@ def _make_row(**kwargs):
 
 # ── add_relation ─────────────────────────────────────────────────
 
+
 class TestAddRelation:
     def test_success(self):
         db = MagicMock()
@@ -42,6 +43,7 @@ class TestAddRelation:
 
 
 # ── get_neighbors ────────────────────────────────────────────────
+
 
 class TestGetNeighbors:
     def test_both_directions(self):
@@ -80,6 +82,7 @@ class TestGetNeighbors:
 
 # ── expand_with_graph ────────────────────────────────────────────
 
+
 class TestExpandWithGraph:
     def test_empty_seeds(self):
         db = MagicMock()
@@ -103,11 +106,13 @@ class TestExpandWithGraph:
 
 # ── HybridRetrieval integration ──────────────────────────────────
 
+
 class TestHybridRetrievalGraphExpansion:
     def test_graph_expansion_wired_in_retrieve_knowledge(self):
         """Verify expand_with_graph is called from retrieve_knowledge."""
         import inspect
         from core.context.hybrid_retrieval import HybridRetriever
+
         source = inspect.getsource(HybridRetriever.retrieve_knowledge)
         assert "expand_with_graph" in source
 
@@ -121,8 +126,14 @@ class TestHybridRetrievalGraphExpansion:
 
         # Simulate: vector query returns 1 entry via ORM chain
         main_row = _make_row(
-            entry_id="e1", category="fact", key_name="k", value="v",
-            confidence=0.9, trust_tier="T1", created_at=None, last_validated_at=None,
+            entry_id="e1",
+            category="fact",
+            key_name="k",
+            value="v",
+            confidence=0.9,
+            trust_tier="T1",
+            created_at=None,
+            last_validated_at=None,
         )
         main_row.sem = 0.8
         main_row.conf = 0.18
@@ -135,6 +146,7 @@ class TestHybridRetrievalGraphExpansion:
         vec_chain.first.return_value = None
 
         call_count = [0]
+
         def query_side_effect(*args, **kwargs):
             nonlocal call_count
             call_count[0] += 1
@@ -154,8 +166,10 @@ class TestHybridRetrievalGraphExpansion:
 
         with patch("skills.knowledge.api.update_access_tracking"):
             entries = hr.retrieve_knowledge(
-                query_text="test", query_embedding=[0.1] * TEST_EMBEDDING_DIM,
-                user_id="u1", limit=5,
+                query_text="test",
+                query_embedding=[0.1] * TEST_EMBEDDING_DIM,
+                user_id="u1",
+                limit=5,
             )
         assert len(entries) >= 1
         assert entries[0]["entry_id"] == "e1"

@@ -67,9 +67,7 @@ def validate_strategy_params(
         validated = schema(**params)
         return validated.model_dump()
     except Exception as e:
-        raise InvalidStrategyParamsError(
-            f"Invalid params for {strategy_key}: {e}"
-        ) from e
+        raise InvalidStrategyParamsError(f"Invalid params for {strategy_key}: {e}") from e
 
 
 def get_default_params(strategy_key: str) -> dict | None:

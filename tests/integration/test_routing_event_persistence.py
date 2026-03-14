@@ -43,13 +43,16 @@ def auth_headers(client, db_session):
         )
         db_session.add(user)
         db_session.commit()
-    resp = client.post("/auth/login", json={"username": "routing_event_user", "password": "password123"})
+    resp = client.post(
+        "/auth/login", json={"username": "routing_event_user", "password": "password123"}
+    )
     return {"Authorization": f"Bearer {resp.json()['access_token']}"}
 
 
 @pytest.fixture(autouse=True)
 def clear_caches():
     from api.routers import chat
+
     chat._session_cache.clear()
     yield
     chat._session_cache.clear()
@@ -57,15 +60,20 @@ def clear_caches():
 
 def _chat_turn(client, auth_headers, message, **extra):
     """Send a /chat/turn request and return (events, response)."""
+
     async def mock_stream(messages, *args, **kwargs):
         async for chunk in fake_stream_gen([{"type": "text", "content": "ok"}]):
             yield chunk
 
     with patch("core.llm.client.LLMClient.chat_stream", side_effect=mock_stream):
-        resp = client.post("/chat/turn", json={
-            "messages": [{"role": "user", "content": message}],
-            **extra,
-        }, headers=auth_headers)
+        resp = client.post(
+            "/chat/turn",
+            json={
+                "messages": [{"role": "user", "content": message}],
+                **extra,
+            },
+            headers=auth_headers,
+        )
     assert resp.status_code == 200
     return parse_sse(resp.text), resp
 
@@ -108,7 +116,11 @@ class TestRoutingEventPersistence:
         assert content["estimated_tokens"] > 0
 
         # Verify metadata
-        meta = json.loads(row.event_metadata) if isinstance(row.event_metadata, str) else row.event_metadata
+        meta = (
+            json.loads(row.event_metadata)
+            if isinstance(row.event_metadata, str)
+            else row.event_metadata
+        )
         assert meta["intent"] == content["intent"]
         assert meta["tier"] == content["tier"]
 

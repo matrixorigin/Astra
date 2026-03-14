@@ -28,7 +28,11 @@ from pathlib import Path
 import urllib.request
 
 from core.runtime import (
-    ExecutionResult, IsolationLevel, ResourceProfile, Runtime, RuntimeCapabilities,
+    ExecutionResult,
+    IsolationLevel,
+    ResourceProfile,
+    Runtime,
+    RuntimeCapabilities,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,7 +85,11 @@ class FirecrackerRuntime(Runtime):
         return ["python"]
 
     def health_check(self) -> bool:
-        return _is_available() and os.path.exists(self.kernel_path) and os.path.exists(self.rootfs_path)
+        return (
+            _is_available()
+            and os.path.exists(self.kernel_path)
+            and os.path.exists(self.rootfs_path)
+        )
 
     def execute(
         self,
@@ -92,8 +100,10 @@ class FirecrackerRuntime(Runtime):
     ) -> ExecutionResult:
         if language not in self.supported_languages:
             return ExecutionResult(
-                stdout="", stderr=f"Unsupported language: {language}",
-                exit_code=1, execution_time_ms=0,
+                stdout="",
+                stderr=f"Unsupported language: {language}",
+                exit_code=1,
+                execution_time_ms=0,
             )
 
         resources = resources or ResourceProfile()
@@ -123,8 +133,10 @@ class FirecrackerRuntime(Runtime):
                 if not self._wait_for_socket(sock_path, timeout=5):
                     fc_proc.kill()
                     return ExecutionResult(
-                        stdout="", stderr="Firecracker socket not ready",
-                        exit_code=1, execution_time_ms=(time.monotonic() - start) * 1000,
+                        stdout="",
+                        stderr="Firecracker socket not ready",
+                        exit_code=1,
+                        execution_time_ms=(time.monotonic() - start) * 1000,
                         started_at=started_at,
                     )
 
@@ -132,22 +144,34 @@ class FirecrackerRuntime(Runtime):
                 vcpu_count = 1
                 mem_mb = resources.max_memory_mb
 
-                self._api_put(sock_path, "/machine-config", {
-                    "vcpu_count": vcpu_count,
-                    "mem_size_mib": mem_mb,
-                })
+                self._api_put(
+                    sock_path,
+                    "/machine-config",
+                    {
+                        "vcpu_count": vcpu_count,
+                        "mem_size_mib": mem_mb,
+                    },
+                )
 
-                self._api_put(sock_path, "/boot-source", {
-                    "kernel_image_path": self.kernel_path,
-                    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off quiet",
-                })
+                self._api_put(
+                    sock_path,
+                    "/boot-source",
+                    {
+                        "kernel_image_path": self.kernel_path,
+                        "boot_args": "console=ttyS0 reboot=k panic=1 pci=off quiet",
+                    },
+                )
 
-                self._api_put(sock_path, "/drives/rootfs", {
-                    "drive_id": "rootfs",
-                    "path_on_host": self.rootfs_path,
-                    "is_root_device": True,
-                    "is_read_only": True,
-                })
+                self._api_put(
+                    sock_path,
+                    "/drives/rootfs",
+                    {
+                        "drive_id": "rootfs",
+                        "path_on_host": self.rootfs_path,
+                        "is_root_device": True,
+                        "is_read_only": True,
+                    },
+                )
 
                 # Network: only configure if enabled
                 if resources.network_enabled:
@@ -181,7 +205,7 @@ class FirecrackerRuntime(Runtime):
 
                 truncated = False
                 if len(stdout.encode()) > resources.max_output_bytes:
-                    stdout = stdout[:resources.max_output_bytes]
+                    stdout = stdout[: resources.max_output_bytes]
                     truncated = True
 
                 return ExecutionResult(
@@ -196,8 +220,10 @@ class FirecrackerRuntime(Runtime):
             except Exception as e:
                 elapsed_ms = (time.monotonic() - start) * 1000
                 return ExecutionResult(
-                    stdout="", stderr=f"Firecracker error: {e}",
-                    exit_code=1, execution_time_ms=round(elapsed_ms, 2),
+                    stdout="",
+                    stderr=f"Firecracker error: {e}",
+                    exit_code=1,
+                    execution_time_ms=round(elapsed_ms, 2),
                     started_at=started_at,
                 )
             finally:

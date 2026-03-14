@@ -75,23 +75,28 @@ class TestStrategyRegistry:
 class TestFactoryStrategyResolution:
     def test_tabular_maps_to_vector_v1(self):
         from core.memory.factory import _resolve_strategy
+
         assert _resolve_strategy(None, None, "tabular", None) == "vector:v1"
 
     def test_graph_maps_to_activation_v1(self):
         from core.memory.factory import _resolve_strategy
+
         assert _resolve_strategy(None, None, "graph", None) == "activation:v1"
 
     def test_explicit_strategy_overrides_backend(self):
         from core.memory.factory import _resolve_strategy
+
         assert _resolve_strategy(None, None, "graph", "vector:v1") == "vector:v1"
 
     def test_env_fallback(self, monkeypatch):
         from core.memory.factory import _resolve_strategy
+
         monkeypatch.setenv("MEM_RETRIEVAL_STRATEGY", "activation:v1")
         assert _resolve_strategy(None, None, None, None) == "activation:v1"
 
     def test_hardcoded_fallback(self, monkeypatch):
         from core.memory.factory import _resolve_strategy
+
         monkeypatch.delenv("MEM_RETRIEVAL_STRATEGY", raising=False)
         assert _resolve_strategy(None, None, None, None) == "activation:v1"
 
@@ -107,8 +112,10 @@ class TestMemoryServiceFacade:
         index_mgr = MagicMock()
 
         mem = Memory(
-            memory_id="m1", user_id="alice",
-            memory_type=MemoryType.SEMANTIC, content="test",
+            memory_id="m1",
+            user_id="alice",
+            memory_type=MemoryType.SEMANTIC,
+            content="test",
         )
         storage.store.return_value = mem
 
@@ -118,7 +125,9 @@ class TestMemoryServiceFacade:
         assert result == mem
         storage.store.assert_called_once()
         index_mgr.on_memories_stored.assert_called_once_with(
-            "alice", [mem], session_id=None,
+            "alice",
+            [mem],
+            session_id=None,
         )
 
     def test_store_without_index_manager(self):
@@ -130,8 +139,10 @@ class TestMemoryServiceFacade:
         retrieval.strategy_key = "vector:v1"
 
         mem = Memory(
-            memory_id="m1", user_id="alice",
-            memory_type=MemoryType.SEMANTIC, content="test",
+            memory_id="m1",
+            user_id="alice",
+            memory_type=MemoryType.SEMANTIC,
+            content="test",
         )
         storage.store.return_value = mem
 
@@ -175,20 +186,24 @@ class TestNodeTypeToMemoryType:
     def test_episodic_maps_to_working(self):
         from core.memory.graph.types import NodeType
         from core.memory.strategy.activation_v1 import _node_type_to_memory_type
+
         assert _node_type_to_memory_type(NodeType.EPISODIC) == MemoryType.WORKING
 
     def test_semantic_maps_to_semantic(self):
         from core.memory.graph.types import NodeType
         from core.memory.strategy.activation_v1 import _node_type_to_memory_type
+
         assert _node_type_to_memory_type(NodeType.SEMANTIC) == MemoryType.SEMANTIC
 
     def test_scene_maps_to_semantic(self):
         from core.memory.graph.types import NodeType
         from core.memory.strategy.activation_v1 import _node_type_to_memory_type
+
         assert _node_type_to_memory_type(NodeType.SCENE) == MemoryType.SEMANTIC
 
     def test_unknown_string_defaults_to_semantic(self):
         from core.memory.strategy.activation_v1 import _node_type_to_memory_type
+
         assert _node_type_to_memory_type("nonexistent") == MemoryType.SEMANTIC
 
 
@@ -209,7 +224,8 @@ class TestReflectionCandidatesProtocol:
 
         assert result == ["candidate_1"]
         index_mgr.get_reflection_candidates.assert_called_once_with(
-            "alice", since_hours=24,
+            "alice",
+            since_hours=24,
         )
         storage.get_reflection_candidates.assert_not_called()
 

@@ -58,7 +58,10 @@ class MCPBridge:
         self._on_tools_changed: Callable[[], None] | None = None
 
     async def connect_stdio(
-        self, name: str, command: str, args: list[str] | None = None,
+        self,
+        name: str,
+        command: str,
+        args: list[str] | None = None,
         env: dict[str, str] | None = None,
     ) -> int:
         """Connect to an MCP server via stdio (subprocess).
@@ -75,7 +78,10 @@ class MCPBridge:
         return await self._register_server(name, session, "stdio")
 
     async def connect_http(
-        self, name: str, url: str, headers: dict[str, str] | None = None,
+        self,
+        name: str,
+        url: str,
+        headers: dict[str, str] | None = None,
     ) -> int:
         """Connect to an MCP server via streamable HTTP.
 
@@ -91,7 +97,10 @@ class MCPBridge:
         return await self._register_server(name, session, "streamable_http")
 
     async def _register_server(
-        self, name: str, session: ClientSession, transport: str,
+        self,
+        name: str,
+        session: ClientSession,
+        transport: str,
     ) -> int:
         """Register a connected server and discover its tools."""
         handle = MCPServerHandle(name, session, transport)
@@ -129,13 +138,15 @@ class MCPBridge:
         for handle in self._servers.values():
             for schema in handle.tools:
                 fn = schema["function"]
-                items.append({
-                    "name": fn["name"],
-                    "version": f"mcp:{handle.transport}",
-                    "description": fn.get("description", ""),
-                    "category": "mcp",
-                    "server": handle.name,
-                })
+                items.append(
+                    {
+                        "name": fn["name"],
+                        "version": f"mcp:{handle.transport}",
+                        "description": fn.get("description", ""),
+                        "category": "mcp",
+                        "server": handle.name,
+                    }
+                )
         return items
 
     def _mcp_tool_to_openai_schema(self, name: str, tool) -> dict[str, Any]:
@@ -165,7 +176,9 @@ class MCPBridge:
         return tool_name in self._tool_to_server
 
     async def call_tool(
-        self, tool_name: str, arguments: dict[str, Any] | None = None,
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
     ) -> str:
         """Call an MCP tool and return the result as a string.
 
@@ -184,7 +197,7 @@ class MCPBridge:
 
         handle = self._servers[server_name]
         # Strip namespace prefix to get original MCP tool name
-        original_name = tool_name[len(server_name) + 2:]  # skip "name__"
+        original_name = tool_name[len(server_name) + 2 :]  # skip "name__"
 
         last_error: Exception | None = None
         for attempt in range(1 + MAX_RETRIES):
@@ -219,7 +232,9 @@ class MCPBridge:
                 logger.error(f"MCP tool '{tool_name}' failed: {e}")
                 return json.dumps({"error": str(e)})
 
-        logger.error(f"MCP tool '{tool_name}' failed after {MAX_RETRIES + 1} attempts: {last_error}")
+        logger.error(
+            f"MCP tool '{tool_name}' failed after {MAX_RETRIES + 1} attempts: {last_error}"
+        )
         return json.dumps({"error": str(last_error)})
 
     @property

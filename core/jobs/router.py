@@ -21,6 +21,7 @@ class JobRouter:
         if os.getenv("RAY_ADDRESS"):
             try:
                 from core.jobs.ray_backend import RayJobBackend
+
                 self.backends["ray"] = RayJobBackend(address=os.environ["RAY_ADDRESS"])
                 logger.info("Ray backend available")
             except ImportError:
@@ -29,6 +30,7 @@ class JobRouter:
         if os.getenv("KUBERNETES_SERVICE_HOST") or Path("~/.kube/config").expanduser().exists():
             try:
                 from core.jobs.k8s_backend import K8sJobBackend
+
                 self.backends["k8s"] = K8sJobBackend()
                 logger.info("K8s backend available")
             except ImportError:

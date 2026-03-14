@@ -55,7 +55,7 @@ class TestEventLoggerStream(unittest.TestCase):
     def setUp(self):
         from unittest.mock import Mock
         from sqlalchemy.orm import Session
-        
+
         self.db = Mock(spec=Session)
         self.db.add = MagicMock()
         self.db.commit = MagicMock()

@@ -34,7 +34,10 @@ class ReadFileTool(EdgeTool):
     parameters = {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "File path (relative to project root or absolute)"},
+            "path": {
+                "type": "string",
+                "description": "File path (relative to project root or absolute)",
+            },
             "start_line": {"type": "integer", "description": "Start line (1-based, optional)"},
             "end_line": {"type": "integer", "description": "End line (inclusive, optional)"},
         },
@@ -42,7 +45,9 @@ class ReadFileTool(EdgeTool):
     }
     side_effect = SideEffect.READ
 
-    async def execute(self, path: str, start_line: int | None = None, end_line: int | None = None, **_: Any) -> str:
+    async def execute(
+        self, path: str, start_line: int | None = None, end_line: int | None = None, **_: Any
+    ) -> str:
         resolved = _resolve_path(path, self._root)
         if not resolved.exists():
             return f"Error: File not found: {path}"
@@ -69,7 +74,10 @@ class WriteFileTool(EdgeTool):
     parameters = {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "File path (must not already exist, use str_replace to edit existing files)"},
+            "path": {
+                "type": "string",
+                "description": "File path (must not already exist, use str_replace to edit existing files)",
+            },
             "content": {"type": "string", "description": "File content"},
         },
         "required": ["path", "content"],
@@ -101,8 +109,14 @@ class StrReplaceTool(EdgeTool):
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "File path"},
-            "old_str": {"type": "string", "description": "Exact string to find (must be unique in file). Include surrounding lines for uniqueness."},
-            "new_str": {"type": "string", "description": "Replacement string. Use empty string to delete the matched text."},
+            "old_str": {
+                "type": "string",
+                "description": "Exact string to find (must be unique in file). Include surrounding lines for uniqueness.",
+            },
+            "new_str": {
+                "type": "string",
+                "description": "Replacement string. Use empty string to delete the matched text.",
+            },
         },
         "required": ["path", "old_str", "new_str"],
     }
@@ -145,7 +159,10 @@ class ListDirTool(EdgeTool):
         "properties": {
             "path": {"type": "string", "description": "Directory path (default: project root)"},
             "depth": {"type": "integer", "description": "Max recursion depth (default: 1)"},
-            "include_ignored": {"type": "boolean", "description": "Include gitignored files (default: false)"},
+            "include_ignored": {
+                "type": "boolean",
+                "description": "Include gitignored files (default: false)",
+            },
         },
     }
     side_effect = SideEffect.READ
@@ -182,7 +199,9 @@ class ListDirTool(EdgeTool):
             pass
         return count
 
-    async def execute(self, path: str = ".", depth: int = 1, include_ignored: bool = False, **_: Any) -> str:
+    async def execute(
+        self, path: str = ".", depth: int = 1, include_ignored: bool = False, **_: Any
+    ) -> str:
         resolved = _resolve_path(path, self._root)
         if not resolved.is_dir():
             return f"Error: Not a directory: {path}"
@@ -196,8 +215,14 @@ class ListDirTool(EdgeTool):
         return "\n".join(entries)
 
     def _walk(
-        self, base: Path, current: Path, project_base: Path,
-        level: int, max_depth: int, include_ignored: bool, out: list[str],
+        self,
+        base: Path,
+        current: Path,
+        project_base: Path,
+        level: int,
+        max_depth: int,
+        include_ignored: bool,
+        out: list[str],
     ) -> None:
         if len(out) >= MAX_LIST_ENTRIES:
             return

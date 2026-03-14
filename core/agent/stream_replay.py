@@ -120,7 +120,9 @@ class StreamReplay(DbConsumer):
                     "event_id": event.event_id,
                     "event_type": event_data.get("event_type"),
                     "timestamp": event.created_at.isoformat(),
-                    "agent_id": event.event_metadata.get("agent_id") if event.event_metadata else None,
+                    "agent_id": event.event_metadata.get("agent_id")
+                    if event.event_metadata
+                    else None,
                 }
             )
 
@@ -142,8 +144,13 @@ class StreamReplay(DbConsumer):
 
     # ── Chunk-level replay (agent_run_events) ───────────────────────
 
-    _TERMINAL_TYPES = ("run_completed", "run_failed", "run_cancelled",
-                       "stream_run_finished", "stream_run_error")
+    _TERMINAL_TYPES = (
+        "run_completed",
+        "run_failed",
+        "run_cancelled",
+        "stream_run_finished",
+        "stream_run_error",
+    )
 
     def _is_run_complete(self, run_id: str) -> bool:
         """Check if run has a terminal event in agent_run_events."""
@@ -192,12 +199,14 @@ class StreamReplay(DbConsumer):
                     # Not a recognized stream event type — include as raw
                     stream_type = StreamEventType.RAW
 
-                events.append(StreamEvent(
-                    event_type=stream_type,
-                    data=data,
-                    event_id=row[2],
-                    agent_id=row[3],
-                ))
+                events.append(
+                    StreamEvent(
+                        event_type=stream_type,
+                        data=data,
+                        event_id=row[2],
+                        agent_id=row[3],
+                    )
+                )
 
             return events
 
@@ -228,9 +237,23 @@ class StreamReplay(DbConsumer):
             events = []
             for row in rows:
                 kwargs = {"event_id": row[0], "agent_id": row[2], "causal_chain_id": row[3]}
-                events.append(StreamEvent(event_type=StreamEventType.TEXT_MESSAGE_START, data={"role": "assistant"}, **kwargs))
-                events.append(StreamEvent(event_type=StreamEventType.TEXT_MESSAGE_CONTENT, data={"delta": row[1] or ""}, **kwargs))
-                events.append(StreamEvent(event_type=StreamEventType.TEXT_MESSAGE_END, data={}, **kwargs))
+                events.append(
+                    StreamEvent(
+                        event_type=StreamEventType.TEXT_MESSAGE_START,
+                        data={"role": "assistant"},
+                        **kwargs,
+                    )
+                )
+                events.append(
+                    StreamEvent(
+                        event_type=StreamEventType.TEXT_MESSAGE_CONTENT,
+                        data={"delta": row[1] or ""},
+                        **kwargs,
+                    )
+                )
+                events.append(
+                    StreamEvent(event_type=StreamEventType.TEXT_MESSAGE_END, data={}, **kwargs)
+                )
             return events
 
     # ── Legacy path (stream_* in agent_events) ─────────
@@ -289,11 +312,7 @@ class StreamReplay(DbConsumer):
             if before_timestamp:
                 conditions.append(Event.created_at <= before_timestamp)
 
-            stmt = (
-                select(Event)
-                .where(and_(*conditions))
-                .order_by(Event.created_at)
-            )
+            stmt = select(Event).where(and_(*conditions)).order_by(Event.created_at)
 
             result = db.execute(stmt)
             return list(result.scalars().all())

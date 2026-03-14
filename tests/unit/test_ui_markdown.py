@@ -369,6 +369,7 @@ class TestCJKBoundary:
         term_lines = 0
         for ch in text:
             from rich.cells import cell_len
+
             cw = cell_len(ch)
             if cw == 2 and clw == width - 1:
                 term_lines += 1
@@ -390,6 +391,7 @@ class TestCodeBlockInstall:
         install_prettier_code_blocks()
         install_prettier_code_blocks()
         from rich.markdown import Markdown
+
         assert Markdown.elements["fence"].__name__ == "SimpleCodeBlock"
 
 

@@ -28,28 +28,25 @@ class SandboxService:
         """
         self._db_factory = db_factory
         from config.settings import get_settings
+
         self.sandbox = Sandbox(db_factory=db_factory, source_db=get_settings().matrixone_database)
         self.audit = AuditLogger(db_factory)
         self.permission = PermissionChecker(db_factory)
 
     def create_sandbox(
-        self,
-        name: str,
-        user_id: str,
-        description: str = "",
-        created_by: str = ""
+        self, name: str, user_id: str, description: str = "", created_by: str = ""
     ) -> dict[str, Any]:
         """创建 sandbox
-        
+
         Args:
             name: Sandbox 名称
             user_id: 用户ID
             description: 描述
             created_by: 创建者
-            
+
         Returns:
             Sandbox 信息
-            
+
         Raises:
             PermissionError: 权限不足
             ValueError: 参数错误
@@ -66,9 +63,7 @@ class SandboxService:
         # 3. 创建 sandbox
         try:
             self.sandbox.create(
-                name=name,
-                description=description,
-                created_by=created_by or user_id
+                name=name, description=description, created_by=created_by or user_id
             )
 
             # 4. 审计日志
@@ -78,7 +73,7 @@ class SandboxService:
                 resource_type="sandbox",
                 resource_id=name,
                 details={"description": description},
-                status="success"
+                status="success",
             )
 
             # 5. 返回结果
@@ -86,7 +81,7 @@ class SandboxService:
                 "sandbox_name": name,
                 "description": description,
                 "created_by": created_by or user_id,
-                "created_at": datetime.now(timezone.utc).isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat(),
             }
 
         except Exception as e:
@@ -97,21 +92,17 @@ class SandboxService:
                 resource_type="sandbox",
                 resource_id=name,
                 details={"error": str(e)},
-                status="failed"
+                status="failed",
             )
             raise
 
-    def list_sandboxes(
-        self,
-        user_id: str,
-        pattern: str = "%"
-    ) -> list[dict[str, Any]]:
+    def list_sandboxes(self, user_id: str, pattern: str = "%") -> list[dict[str, Any]]:
         """列出 sandboxes
-        
+
         Args:
             user_id: 用户ID
             pattern: 过滤模式
-            
+
         Returns:
             Sandbox 列表
         """
@@ -128,17 +119,13 @@ class SandboxService:
 
         return sandboxes
 
-    def delete_sandbox(
-        self,
-        name: str,
-        user_id: str
-    ) -> None:
+    def delete_sandbox(self, name: str, user_id: str) -> None:
         """删除 sandbox
-        
+
         Args:
             name: Sandbox 名称
             user_id: 用户ID
-            
+
         Raises:
             ValueError: Sandbox 不存在
         """
@@ -159,7 +146,7 @@ class SandboxService:
                 resource_type="sandbox",
                 resource_id=name,
                 details={},
-                status="success"
+                status="success",
             )
 
         except Exception as e:
@@ -169,24 +156,20 @@ class SandboxService:
                 resource_type="sandbox",
                 resource_id=name,
                 details={"error": str(e)},
-                status="failed"
+                status="failed",
             )
             raise
 
-    def get_sandbox_info(
-        self,
-        name: str,
-        user_id: str
-    ) -> dict[str, Any]:
+    def get_sandbox_info(self, name: str, user_id: str) -> dict[str, Any]:
         """获取 sandbox 信息
-        
+
         Args:
             name: Sandbox 名称
             user_id: 用户ID
-            
+
         Returns:
             Sandbox 信息
-            
+
         Raises:
             ValueError: Sandbox 不存在
         """

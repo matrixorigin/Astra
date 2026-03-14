@@ -28,12 +28,17 @@ def registry(db_session):
 def cleanup(db_session):
     """Clean up test data."""
     from api.models import Repo, Token
-    db_session.query(Repo).filter(Repo.repo_url.like('%test/repo%')).delete(synchronize_session=False)
-    db_session.query(Token).filter(Token.provider == 'github').delete(synchronize_session=False)
+
+    db_session.query(Repo).filter(Repo.repo_url.like("%test/repo%")).delete(
+        synchronize_session=False
+    )
+    db_session.query(Token).filter(Token.provider == "github").delete(synchronize_session=False)
     db_session.commit()
     yield
-    db_session.query(Repo).filter(Repo.repo_url.like('%test/repo%')).delete(synchronize_session=False)
-    db_session.query(Token).filter(Token.provider == 'github').delete(synchronize_session=False)
+    db_session.query(Repo).filter(Repo.repo_url.like("%test/repo%")).delete(
+        synchronize_session=False
+    )
+    db_session.query(Token).filter(Token.provider == "github").delete(synchronize_session=False)
     db_session.commit()
 
 
@@ -50,7 +55,10 @@ def test_create_token(resolver, db_session):
     assert token.scope_user_id == "user_123"
     assert token.is_active is True
 
-    from api.models import Token; db_session.query(Token).filter(Token.token_id == token.token_id).delete(); db_session.commit()
+    from api.models import Token
+
+    db_session.query(Token).filter(Token.token_id == token.token_id).delete()
+    db_session.commit()
 
 
 def test_resolve_user_default_token(resolver, db_session):
@@ -65,7 +73,10 @@ def test_resolve_user_default_token(resolver, db_session):
     assert resolved is not None
     assert resolved.token_id == token.token_id
 
-    from api.models import Token; db_session.query(Token).filter(Token.token_id == token.token_id).delete(); db_session.commit()
+    from api.models import Token
+
+    db_session.query(Token).filter(Token.token_id == token.token_id).delete()
+    db_session.commit()
 
 
 def test_resolve_repo_specific_token(resolver, registry, db_session):
@@ -96,7 +107,10 @@ def test_resolve_repo_specific_token(resolver, registry, db_session):
     assert resolved.token_id == token.token_id
 
     registry.delete(repo.repo_id)
-    from api.models import Token; db_session.query(Token).filter(Token.token_id == token.token_id).delete(); db_session.commit()
+    from api.models import Token
+
+    db_session.query(Token).filter(Token.token_id == token.token_id).delete()
+    db_session.commit()
 
 
 def test_token_priority_fallback(resolver, db_session):
@@ -119,7 +133,10 @@ def test_token_priority_fallback(resolver, db_session):
     assert resolved is None
 
     from api.models import Token
-    db_session.query(Token).filter(Token.token_id == user_token.token_id).delete(synchronize_session=False)
+
+    db_session.query(Token).filter(Token.token_id == user_token.token_id).delete(
+        synchronize_session=False
+    )
     db_session.commit()
 
 
@@ -135,4 +152,7 @@ def test_deactivate_token(resolver, db_session):
     resolved = resolver.resolve_repo_token(user_id="user_test")
     assert resolved is None
 
-    from api.models import Token; db_session.query(Token).filter(Token.token_id == token.token_id).delete(); db_session.commit()
+    from api.models import Token
+
+    db_session.query(Token).filter(Token.token_id == token.token_id).delete()
+    db_session.commit()

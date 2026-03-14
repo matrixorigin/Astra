@@ -13,8 +13,12 @@ from api.database import get_db_session
 @pytest.fixture(autouse=True)
 def _setup_memoria_env():
     """Set Memoria environment variables from test configuration."""
-    os.environ["MEMORIA_BASE_URL"] = os.environ.get("TEST_MEMORIA_BASE_URL", "http://localhost:8100")
-    os.environ["MEMORIA_MASTER_KEY"] = os.environ.get("TEST_MEMORIA_MASTER_KEY", "test-master-key-for-docker-compose")
+    os.environ["MEMORIA_BASE_URL"] = os.environ.get(
+        "TEST_MEMORIA_BASE_URL", "http://localhost:8100"
+    )
+    os.environ["MEMORIA_MASTER_KEY"] = os.environ.get(
+        "TEST_MEMORIA_MASTER_KEY", "test-master-key-for-docker-compose"
+    )
     os.environ["MEMORIA_API_KEY"] = os.environ.get("TEST_MEMORIA_API_KEY", "")
     yield
 
@@ -27,13 +31,14 @@ def client():
     for background tasks created via asyncio.create_task (e.g. RunEngine).
     """
     import os
-    os.environ['DISABLE_GATE_TRIGGER'] = '1'
-    
+
+    os.environ["DISABLE_GATE_TRIGGER"] = "1"
+
     with TestClient(app) as c:
         yield c
-    
+
     # Cleanup
-    os.environ.pop('DISABLE_GATE_TRIGGER', None)
+    os.environ.pop("DISABLE_GATE_TRIGGER", None)
 
 
 @pytest.fixture
@@ -57,23 +62,25 @@ def auth_headers_e2e(client):
             "username": username,
             "password": "testpass123",
             "email": f"{username}@test.com",
-        }
+        },
     )
     user_id = resp.json()["user_id"]
 
     # Grant admin role
     db = SessionLocal()
-    role = db.execute(text("SELECT role_id FROM auth_roles WHERE role_name = 'mo_agent_admin' LIMIT 1")).fetchone()
+    role = db.execute(
+        text("SELECT role_id FROM auth_roles WHERE role_name = 'mo_agent_admin' LIMIT 1")
+    ).fetchone()
     if role:
-        db.execute(text("INSERT INTO auth_user_roles (user_id, role_id) VALUES (:uid, :rid)"), {"uid": user_id, "rid": role[0]})
+        db.execute(
+            text("INSERT INTO auth_user_roles (user_id, role_id) VALUES (:uid, :rid)"),
+            {"uid": user_id, "rid": role[0]},
+        )
         db.commit()
     db.close()
 
     # Login
-    response = client.post(
-        "/auth/login",
-        json={"username": username, "password": "testpass123"}
-    )
+    response = client.post("/auth/login", json={"username": username, "password": "testpass123"})
 
     token = response.json()["access_token"]
     return {"Authorization": f"Bearer {token}"}
@@ -88,9 +95,9 @@ def cleanup_models(client, auth_headers_e2e):
         for model in models_resp.json():
             if model["name"].startswith("mock-"):
                 client.delete(f"/models/{model['name']}?scope=global", headers=auth_headers_e2e)
-    
+
     yield
-    
+
     # Cleanup after test
     models_resp = client.get("/models", headers=auth_headers_e2e)
     if models_resp.status_code == 200:
@@ -108,15 +115,15 @@ def setup_mock_model(client, auth_headers_e2e):
         headers=auth_headers_e2e,
         json={
             "name": "mock-echo",
-            "provider": "mock", "api_key": "test-key",
-            
+            "provider": "mock",
+            "api_key": "test-key",
             "context_window": 128000,
             "tags": ["test"],
-        }
+        },
     )
     # Should succeed (201) or already exist (400)
     assert response.status_code in [201, 400], f"Failed: {response.text}"
-    
+
     yield
 
 
@@ -130,9 +137,9 @@ def test_e2e_chat_with_mock_model(client, auth_headers_e2e, setup_mock_model):
         json={
             "message": "Hello World",
             "model": "mock-echo",
-        }
+        },
     )
-    
+
     assert response.status_code == 200
     data = response.json()
     assert "run_id" in data
@@ -147,9 +154,9 @@ def test_e2e_chat_stream_with_mock_model(client, auth_headers_e2e, setup_mock_mo
         json={
             "message": "Test streaming",
             "model": "mock-echo",
-        }
+        },
     )
-    
+
     # Just verify streaming starts successfully
     assert response.status_code == 200
 
@@ -163,12 +170,12 @@ def test_e2e_model_selection_persists_in_session(client, auth_headers_e2e, setup
         json={
             "message": "First message",
             "model": "mock-echo",
-        }
+        },
     )
-    
+
     assert response1.status_code == 200
     session_id = response1.json()["session_id"]
-    
+
     # Second message in same session with same model
     response2 = client.post(
         "/chat",
@@ -177,9 +184,9 @@ def test_e2e_model_selection_persists_in_session(client, auth_headers_e2e, setup
             "message": "Second message",
             "model": "mock-echo",
             "session_id": session_id,
-        }
+        },
     )
-    
+
     assert response2.status_code == 200
     assert response2.json()["session_id"] == session_id
 
@@ -190,33 +197,29 @@ def test_e2e_different_models_in_different_sessions(client, auth_headers_e2e):
     client.post(
         "/models",
         headers=auth_headers_e2e,
-        json={"name": "mock-echo-1", "provider": "mock", "api_key": "test-key"}
+        json={"name": "mock-echo-1", "provider": "mock", "api_key": "test-key"},
     )
     client.post(
         "/models",
         headers=auth_headers_e2e,
-        json={"name": "mock-echo-2", "provider": "mock", "api_key": "test-key"}
+        json={"name": "mock-echo-2", "provider": "mock", "api_key": "test-key"},
     )
-    
+
     # Session 1 with model 1
     response1 = client.post(
-        "/chat",
-        headers=auth_headers_e2e,
-        json={"message": "Message 1", "model": "mock-echo-1"}
+        "/chat", headers=auth_headers_e2e, json={"message": "Message 1", "model": "mock-echo-1"}
     )
     assert response1.status_code == 200
-    
+
     # Session 2 with model 2
     response2 = client.post(
-        "/chat",
-        headers=auth_headers_e2e,
-        json={"message": "Message 2", "model": "mock-echo-2"}
+        "/chat", headers=auth_headers_e2e, json={"message": "Message 2", "model": "mock-echo-2"}
     )
     assert response2.status_code == 200
-    
+
     # Different sessions
     assert response1.json()["session_id"] != response2.json()["session_id"]
-    
+
     # Cleanup
     client.delete("/models/mock-echo-1?scope=global", headers=auth_headers_e2e)
     client.delete("/models/mock-echo-2?scope=global", headers=auth_headers_e2e)
@@ -225,10 +228,10 @@ def test_e2e_different_models_in_different_sessions(client, auth_headers_e2e):
 def test_e2e_list_models_shows_mock_model(client, auth_headers_e2e, setup_mock_model):
     """Test that /models API shows registered mock model."""
     response = client.get("/models", headers=auth_headers_e2e)
-    
+
     assert response.status_code == 200
     models = response.json()
-    
+
     mock_models = [m for m in models if m["name"] == "mock-echo"]
     assert len(mock_models) == 1
     assert mock_models[0]["provider"] == "mock"
@@ -240,13 +243,11 @@ def test_e2e_list_models_shows_mock_model(client, auth_headers_e2e, setup_mock_m
 def test_e2e_run_completes_with_mock_model(client, auth_headers_e2e, setup_mock_model):
     """Regression: RunEngine must use dedicated DB session so runs actually complete."""
     response = client.post(
-        "/chat",
-        headers=auth_headers_e2e,
-        json={"message": "Hello", "model": "mock-echo"}
+        "/chat", headers=auth_headers_e2e, json={"message": "Hello", "model": "mock-echo"}
     )
     assert response.status_code == 200
     run_id = response.json()["run_id"]
-    
+
     # Poll for completion — this used to fail with "session is provisioning"
     for _ in range(30):
         status_resp = client.get(f"/chat/runs/{run_id}", headers=auth_headers_e2e)
@@ -254,26 +255,24 @@ def test_e2e_run_completes_with_mock_model(client, auth_headers_e2e, setup_mock_
         if status in ["completed", "failed"]:
             break
         time.sleep(0.1)
-    
+
     assert status == "completed", f"Run should complete but got: {status}"
 
 
 def test_e2e_echo_response_content(client, auth_headers_e2e, setup_mock_model):
     """Regression: MockEchoProvider must echo user message through full pipeline."""
     response = client.post(
-        "/chat",
-        headers=auth_headers_e2e,
-        json={"message": "ping", "model": "mock-echo"}
+        "/chat", headers=auth_headers_e2e, json={"message": "ping", "model": "mock-echo"}
     )
     run_id = response.json()["run_id"]
-    
+
     # Wait for completion
     for _ in range(30):
         status_resp = client.get(f"/chat/runs/{run_id}", headers=auth_headers_e2e)
         if status_resp.json()["status"] in ["completed", "failed"]:
             break
         time.sleep(0.1)
-    
+
     # Verify echo content in events
     events_resp = client.get(f"/chat/runs/{run_id}/stream", headers=auth_headers_e2e)
     assert "Echo:" in events_resp.text and "ping" in events_resp.text
@@ -282,19 +281,17 @@ def test_e2e_echo_response_content(client, auth_headers_e2e, setup_mock_model):
 def test_e2e_model_parameter_reaches_llm(client, auth_headers_e2e, setup_mock_model):
     """Regression: model from /chat request.model must reach LLMClient (was ignored before)."""
     response = client.post(
-        "/chat",
-        headers=auth_headers_e2e,
-        json={"message": "test", "model": "mock-echo"}
+        "/chat", headers=auth_headers_e2e, json={"message": "test", "model": "mock-echo"}
     )
     run_id = response.json()["run_id"]
-    
+
     # Wait for completion
     for _ in range(30):
         status_resp = client.get(f"/chat/runs/{run_id}", headers=auth_headers_e2e)
         if status_resp.json()["status"] in ["completed", "failed"]:
             break
         time.sleep(0.1)
-    
+
     # If model wasn't passed, it would try gpt-4o and fail
     assert status_resp.json()["status"] == "completed"
 
@@ -303,16 +300,14 @@ def test_e2e_provider_string_value_no_crash(client, auth_headers_e2e, setup_mock
     """Regression: provider stored as string in DB must not crash on .value access."""
     # This used to crash with: AttributeError: 'str' object has no attribute 'value'
     response = client.post(
-        "/chat",
-        headers=auth_headers_e2e,
-        json={"message": "test", "model": "mock-echo"}
+        "/chat", headers=auth_headers_e2e, json={"message": "test", "model": "mock-echo"}
     )
     run_id = response.json()["run_id"]
-    
+
     for _ in range(30):
         status_resp = client.get(f"/chat/runs/{run_id}", headers=auth_headers_e2e)
         if status_resp.json()["status"] in ["completed", "failed"]:
             break
         time.sleep(0.1)
-    
+
     assert status_resp.json()["status"] == "completed"

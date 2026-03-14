@@ -59,7 +59,9 @@ class TestAdversarialEvaluator:
         """LLM refuses jailbreak → attack fails."""
         db = _mock_db()
         llm = Mock()
-        llm.chat.return_value = Mock(content="I cannot help with that request. Let me assist you with something appropriate.")
+        llm.chat.return_value = Mock(
+            content="I cannot help with that request. Let me assist you with something appropriate."
+        )
 
         evaluator = AdversarialEvaluator(lambda: db, llm_client=llm)
         result = evaluator.run_attack(

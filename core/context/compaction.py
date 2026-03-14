@@ -36,10 +36,12 @@ MAX_TOOL_RESULT_AUDIT_CHARS = 4000
 
 
 _COMPACT_HISTORY_THRESHOLD = 16000  # chars; trigger lightweight compaction above this
-_COMPACT_TOOL_KEEP_CHARS = 500     # chars to keep from old tool results
+_COMPACT_TOOL_KEEP_CHARS = 500  # chars to keep from old tool results
 
 
-def compact_history_messages(messages: list[dict[str, Any]], max_total_chars: int = _COMPACT_HISTORY_THRESHOLD) -> list[dict[str, Any]]:
+def compact_history_messages(
+    messages: list[dict[str, Any]], max_total_chars: int = _COMPACT_HISTORY_THRESHOLD
+) -> list[dict[str, Any]]:
     """Compact conversation history by shrinking old tool results.
 
     Keeps recent 2 user turns full, compresses older tool results to
@@ -64,8 +66,10 @@ def compact_history_messages(messages: list[dict[str, Any]], max_total_chars: in
             content = m.get("content") or ""
             if len(content) > _COMPACT_TOOL_KEEP_CHARS:
                 # Preserve memory references so LLM can still expand them
-                refs = re.findall(r'\[(?:Full output.*?)?memory:[^\]]+\]', content)
-                kept = content[:_COMPACT_TOOL_KEEP_CHARS] + f"\n... [{len(content)} chars truncated]"
+                refs = re.findall(r"\[(?:Full output.*?)?memory:[^\]]+\]", content)
+                kept = (
+                    content[:_COMPACT_TOOL_KEEP_CHARS] + f"\n... [{len(content)} chars truncated]"
+                )
                 if refs:
                     kept += "\n" + "\n".join(refs)
                 result.append({**m, "content": kept})
@@ -144,22 +148,20 @@ def compact(
 
     # Phase 2: Summarize old conversation turns
     result = _summarize_old_turns(result, preserve_recent, llm_summarize)
-    logger.info(
-        f"Compaction complete: {estimate_tokens(result)} tokens "
-        f"(limit: {token_limit})"
-    )
+    logger.info(f"Compaction complete: {estimate_tokens(result)} tokens (limit: {token_limit})")
     return result
 
 
 def _clear_old_tool_results(
-    messages: list[dict[str, Any]], preserve_recent: int,
+    messages: list[dict[str, Any]],
+    preserve_recent: int,
 ) -> list[dict[str, Any]]:
     """Replace old tool result contents with placeholder.
-    
+
     Preserves [memory:xxx] references so LLM can still expand them.
     """
     import re
-    
+
     if len(messages) <= preserve_recent:
         return messages
 
@@ -169,7 +171,7 @@ def _clear_old_tool_results(
         if m.get("role") == "tool" and m.get("content") and len(m["content"]) > 200:
             content = m["content"]
             # Extract and preserve memory references
-            memory_refs = re.findall(r'\[(?:Full output.*?)?memory:[^\]]+\]', content)
+            memory_refs = re.findall(r"\[(?:Full output.*?)?memory:[^\]]+\]", content)
             if memory_refs:
                 # Keep the reference, clear the rest
                 preserved = "\n".join(memory_refs)
@@ -194,6 +196,7 @@ def _summarize_old_turns(
     start = 1 if system_msg else 0
 
     from core.history_utils import find_tool_call_safe_split
+
     cutoff = find_tool_call_safe_split(messages, preserve_recent)
     # Ensure cutoff is at least past the system message
     if cutoff < start:

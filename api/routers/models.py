@@ -35,6 +35,7 @@ class QuirksSchema(BaseModel):
     IMPORTANT: Every field in core.llm.router.ModelQuirks MUST have a
     corresponding field here.  TestQuirksSchemaParity enforces this at CI.
     """
+
     fixed_temperature: float | None = None
     preserve_reasoning_content: bool = False
     no_parallel_tool_calls: bool = False
@@ -101,6 +102,7 @@ class ModelResponse(BaseModel):
 
 def _require_admin(current_user: dict, db: Session):
     from core.auth.permission_checker import PermissionChecker
+
     if not PermissionChecker(lambda: db).is_admin(current_user["user_id"]):
         raise HTTPException(status_code=403, detail="Admin role required")
 
@@ -112,8 +114,8 @@ def _resolve_base_url(provider: str, explicit: str | None) -> str | None:
 
 def _sanitize_error(msg: str) -> str:
     """Remove potential secrets (API keys, tokens) from error messages."""
-    msg = re.sub(r'(sk-[a-zA-Z0-9-]{0,6})[a-zA-Z0-9-]+', r'\1...', msg)
-    msg = re.sub(r'(?<![a-zA-Z0-9])[a-zA-Z0-9]{32,}(?![a-zA-Z0-9])', '<redacted>', msg)
+    msg = re.sub(r"(sk-[a-zA-Z0-9-]{0,6})[a-zA-Z0-9-]+", r"\1...", msg)
+    msg = re.sub(r"(?<![a-zA-Z0-9])[a-zA-Z0-9]{32,}(?![a-zA-Z0-9])", "<redacted>", msg)
     return msg[:200]
 
 
@@ -121,6 +123,7 @@ def _get_seed_defaults(model_name: str) -> dict:
     """Return preset defaults from seed_models for a known model name, or {}."""
     try:
         from core.llm.seed_models import SEED_MODELS
+
         for m in SEED_MODELS:
             if m["model_name"] == model_name:
                 return m
@@ -129,7 +132,9 @@ def _get_seed_defaults(model_name: str) -> dict:
     return {}
 
 
-def _validate_connectivity(provider: str, model_name: str, api_key: str, base_url: str | None) -> str | None:
+def _validate_connectivity(
+    provider: str, model_name: str, api_key: str, base_url: str | None
+) -> str | None:
     """Quick connectivity check — send a tiny request. Returns None on success, error string on failure."""
     if provider == "mock":
         return None
@@ -142,7 +147,11 @@ def _validate_connectivity(provider: str, model_name: str, api_key: str, base_ur
                     "anthropic-version": "2023-06-01",
                     "content-type": "application/json",
                 },
-                json={"model": model_name, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]},
+                json={
+                    "model": model_name,
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
                 timeout=15.0,
             )
         else:
@@ -150,7 +159,11 @@ def _validate_connectivity(provider: str, model_name: str, api_key: str, base_ur
             r = httpx.post(
                 f"{url}/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": model_name, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]},
+                json={
+                    "model": model_name,
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
                 timeout=15.0,
             )
         if r.status_code < 400:
@@ -170,15 +183,20 @@ def _validate_connectivity(provider: str, model_name: str, api_key: str, base_ur
 
 def _to_response(m: LLMModel, connectivity: str | None = None) -> ModelResponse:
     return ModelResponse(
-        model_id=m.model_id, name=m.model_name, provider=m.provider,
-        base_url=m.base_url, description=m.description, is_active=bool(m.is_active),
+        model_id=m.model_id,
+        name=m.model_name,
+        provider=m.provider,
+        base_url=m.base_url,
+        description=m.description,
+        is_active=bool(m.is_active),
         context_window=m.context_window or 128000,
         max_completion_tokens=m.max_completion_tokens,
         input_modalities=m.input_modalities or ["text"],
         output_modalities=m.output_modalities or ["text"],
         supported_parameters=m.supported_parameters or [],
         pricing=PricingSchema(**(m.pricing or {})),
-        architecture=m.architecture, tags=m.tags or [],
+        architecture=m.architecture,
+        tags=m.tags or [],
         quirks=QuirksSchema(**(m.quirks or {})),
         connectivity=connectivity,
     )
@@ -195,11 +213,18 @@ def create_model(
 ):
     """Register a new model with API key. Validates connectivity."""
     _require_admin(current_user, db)
-    existing = db.query(LLMModel).filter(
-        LLMModel.model_name == request.name, LLMModel.provider == request.provider,
-    ).first()
+    existing = (
+        db.query(LLMModel)
+        .filter(
+            LLMModel.model_name == request.name,
+            LLMModel.provider == request.provider,
+        )
+        .first()
+    )
     if existing:
-        raise HTTPException(status_code=400, detail=f"Model '{request.name}' ({request.provider}) already exists")
+        raise HTTPException(
+            status_code=400, detail=f"Model '{request.name}' ({request.provider}) already exists"
+        )
 
     base_url = _resolve_base_url(request.provider, request.base_url)
     conn_err = _validate_connectivity(request.provider, request.name, request.api_key, base_url)
@@ -209,17 +234,30 @@ def create_model(
     # Explicit caller values always win — even if they match the default.
     seed = _get_seed_defaults(request.name)
     _caller_supplied_quirks = request.quirks is not None
-    _quirks = request.quirks.model_dump(exclude_none=True) if _caller_supplied_quirks else seed.get("quirks", {})
+    _quirks = (
+        request.quirks.model_dump(exclude_none=True)
+        if _caller_supplied_quirks
+        else seed.get("quirks", {})
+    )
 
     model = LLMModel(
-        model_id=str(uuid4()), model_name=request.name, provider=request.provider,
-        api_key_encrypted=encrypt_token(request.api_key), base_url=base_url,
+        model_id=str(uuid4()),
+        model_name=request.name,
+        provider=request.provider,
+        api_key_encrypted=encrypt_token(request.api_key),
+        base_url=base_url,
         description=request.description or seed.get("description"),
         is_active=1 if conn_err is None else 0,
-        context_window=request.context_window if request.context_window is not None else seed.get("context_window", 128000),
+        context_window=request.context_window
+        if request.context_window is not None
+        else seed.get("context_window", 128000),
         max_completion_tokens=request.max_completion_tokens or seed.get("max_completion_tokens"),
-        input_modalities=request.input_modalities if request.input_modalities != ["text"] else seed.get("input_modalities", request.input_modalities),
-        output_modalities=request.output_modalities if request.output_modalities != ["text"] else seed.get("output_modalities", request.output_modalities),
+        input_modalities=request.input_modalities
+        if request.input_modalities != ["text"]
+        else seed.get("input_modalities", request.input_modalities),
+        output_modalities=request.output_modalities
+        if request.output_modalities != ["text"]
+        else seed.get("output_modalities", request.output_modalities),
         supported_parameters=request.supported_parameters or seed.get("supported_parameters", []),
         pricing=request.pricing.model_dump(exclude_none=True) or seed.get("pricing", {}),
         architecture=request.architecture or seed.get("architecture"),
@@ -237,23 +275,23 @@ def create_model(
     # Build response directly from request values (not from db.refresh)
     # because MatrixOne may not re-populate JSON columns after refresh.
     return ModelResponse(
-            model_id=model.model_id,
-            name=request.name,
-            provider=request.provider,
-            base_url=base_url,
-            description=request.description or seed.get("description"),
-            is_active=conn_err is None,
-            context_window=model.context_window or 128000,
-            max_completion_tokens=model.max_completion_tokens,
-            input_modalities=model.input_modalities or ["text"],
-            output_modalities=model.output_modalities or ["text"],
-            supported_parameters=model.supported_parameters or [],
-            pricing=PricingSchema(**(model.pricing or {})),
-            architecture=model.architecture,
-            tags=model.tags or [],
-            quirks=QuirksSchema(**_quirks) if _quirks else QuirksSchema(),
-            connectivity=connectivity,
-        )
+        model_id=model.model_id,
+        name=request.name,
+        provider=request.provider,
+        base_url=base_url,
+        description=request.description or seed.get("description"),
+        is_active=conn_err is None,
+        context_window=model.context_window or 128000,
+        max_completion_tokens=model.max_completion_tokens,
+        input_modalities=model.input_modalities or ["text"],
+        output_modalities=model.output_modalities or ["text"],
+        supported_parameters=model.supported_parameters or [],
+        pricing=PricingSchema(**(model.pricing or {})),
+        architecture=model.architecture,
+        tags=model.tags or [],
+        quirks=QuirksSchema(**_quirks) if _quirks else QuirksSchema(),
+        connectivity=connectivity,
+    )
 
 
 @router.get("", response_model=list[ModelResponse])
@@ -262,6 +300,7 @@ def list_models(
     db: Session = Depends(get_db_session),
 ):
     from core.auth.permission_checker import PermissionChecker
+
     is_admin = PermissionChecker(lambda: db).is_admin(current_user["user_id"])
     query = db.query(LLMModel)
     if not is_admin:
@@ -299,7 +338,9 @@ def update_model(
     if request.api_key is not None:
         model.api_key_encrypted = encrypt_token(request.api_key)
         base_url = request.base_url or model.base_url
-        conn_err = _validate_connectivity(model.provider, model.model_name, request.api_key, base_url)
+        conn_err = _validate_connectivity(
+            model.provider, model.model_name, request.api_key, base_url
+        )
         conn_result = "ok" if conn_err is None else conn_err
         if request.is_active is None:
             model.is_active = 1 if conn_err is None else 0

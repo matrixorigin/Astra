@@ -24,9 +24,12 @@ def _signal(
     delta = current_avg - previous_avg
     severity = DriftDetector._classify(delta, sample_count)
     return DriftSignal(
-        model=model, template_id=template_id,
-        current_avg=current_avg, previous_avg=previous_avg,
-        week_delta=delta, severity=severity,
+        model=model,
+        template_id=template_id,
+        current_avg=current_avg,
+        previous_avg=previous_avg,
+        week_delta=delta,
+        severity=severity,
         sample_count=sample_count,
         detected_at=datetime.now(timezone.utc),
     )
@@ -67,7 +70,7 @@ class TestDriftDetectorQuery:
         db = Mock()
         # Model drift: one row with significant drop
         db.execute.return_value.fetchall.side_effect = [
-            [(  "gpt-4", 3.0, 4.0, 10)],  # model drift
+            [("gpt-4", 3.0, 4.0, 10)],  # model drift
             [],  # template drift
         ]
         detector = DriftDetector(lambda: db)
@@ -100,8 +103,11 @@ class TestDriftDetectorQuery:
         db = Mock()
         detector = DriftDetector(lambda: db)
         sig = detector._build_signal(
-            model="gpt-4", template_id=None,
-            recent_avg=3.2, previous_avg=4.0, sample_count=10,
+            model="gpt-4",
+            template_id=None,
+            recent_avg=3.2,
+            previous_avg=4.0,
+            sample_count=10,
         )
         assert sig.week_delta == pytest.approx(-0.8, abs=0.001)
         assert sig.severity == DriftSeverity.SIGNIFICANT

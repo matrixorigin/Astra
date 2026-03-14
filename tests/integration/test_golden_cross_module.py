@@ -18,8 +18,10 @@ from core.events.models import ConversationEvent, EventType, TokenUsage
 
 FIXTURE_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "golden_sessions"
 
+
 def _load(name: str) -> dict:
     return json.loads((FIXTURE_DIR / f"{name}.json").read_text())
+
 
 def _uid():
     return str(uuid7())
@@ -28,6 +30,7 @@ def _uid():
 @pytest.fixture
 def sid():
     return _uid()
+
 
 @pytest.fixture(autouse=True)
 def cleanup(db_session, sid):
@@ -41,6 +44,7 @@ def cleanup(db_session, sid):
 
 
 # ── 1. EventLogger ────────────────────────────────────────
+
 
 class TestEventLoggerWithGolden:
     """EventLogger correctly persists golden session events."""
@@ -60,7 +64,9 @@ class TestEventLoggerWithGolden:
             event_type=EventType.LLM_RESPONSE,
             content=ev_data["content"],
             metadata=ev_data.get("metadata"),
-            token_usage=TokenUsage(**ev_data["token_usage"]) if ev_data.get("token_usage") else None,
+            token_usage=TokenUsage(**ev_data["token_usage"])
+            if ev_data.get("token_usage")
+            else None,
             causal_chain_id=ev_data["causal_chain_id"],
             parent_event_id=ev_data.get("parent_event_id"),
             llm_model_used=ev_data.get("llm_model_used"),
@@ -104,22 +110,29 @@ class TestEventLoggerWithGolden:
 
 # ── 2. EventReader ────────────────────────────────────────
 
+
 class TestEventReaderWithGolden:
     """EventReader queries golden session events correctly."""
 
     def _seed(self, db, sid, fixture):
         for ev in fixture["events"]:
-            db.add(Event(
-                event_id=ev["event_id"], session_id=sid, user_id=ev["user_id"],
-                event_type=ev["event_type"], content=ev["content"],
-                causal_chain_id=ev["causal_chain_id"],
-                parent_event_id=ev.get("parent_event_id"),
-                skill_name=ev.get("skill_name"), skill_version=ev.get("skill_version"),
-                event_metadata=ev.get("metadata", {}),
-                token_usage=ev.get("token_usage"),
-                llm_model_used=ev.get("llm_model_used"),
-                created_at=datetime.now(timezone.utc),
-            ))
+            db.add(
+                Event(
+                    event_id=ev["event_id"],
+                    session_id=sid,
+                    user_id=ev["user_id"],
+                    event_type=ev["event_type"],
+                    content=ev["content"],
+                    causal_chain_id=ev["causal_chain_id"],
+                    parent_event_id=ev.get("parent_event_id"),
+                    skill_name=ev.get("skill_name"),
+                    skill_version=ev.get("skill_version"),
+                    event_metadata=ev.get("metadata", {}),
+                    token_usage=ev.get("token_usage"),
+                    llm_model_used=ev.get("llm_model_used"),
+                    created_at=datetime.now(timezone.utc),
+                )
+            )
         db.commit()
 
     def test_get_session_events(self, db_session, sid):
@@ -158,6 +171,7 @@ class TestEventReaderWithGolden:
 
 # ── 3. AuditLogger ────────────────────────────────────────
 
+
 class TestAuditLoggerWithGolden:
     """ReplayService replay generates audit log entries."""
 
@@ -171,41 +185,61 @@ class TestAuditLoggerWithGolden:
 
         db_session.add(SessionModel(session_id=sid, user_id=uid, status="active"))
         for ev in fixture["events"]:
-            db_session.add(Event(
-                event_id=ev["event_id"], session_id=sid, user_id=uid,
-                event_type=ev["event_type"], content=ev["content"],
-                causal_chain_id=ev["causal_chain_id"],
-                parent_event_id=ev.get("parent_event_id"),
-                skill_name=ev.get("skill_name"), skill_version=ev.get("skill_version"),
-                event_metadata=ev.get("metadata", {}),
-            ))
+            db_session.add(
+                Event(
+                    event_id=ev["event_id"],
+                    session_id=sid,
+                    user_id=uid,
+                    event_type=ev["event_type"],
+                    content=ev["content"],
+                    causal_chain_id=ev["causal_chain_id"],
+                    parent_event_id=ev.get("parent_event_id"),
+                    skill_name=ev.get("skill_name"),
+                    skill_version=ev.get("skill_version"),
+                    event_metadata=ev.get("metadata", {}),
+                )
+            )
         db_session.commit()
 
         # Count audit logs before
-        before = db_session.query(AuditLog).filter(
-            AuditLog.action == "session_replay",
-            AuditLog.resource_id == sid,
-        ).count()
+        before = (
+            db_session.query(AuditLog)
+            .filter(
+                AuditLog.action == "session_replay",
+                AuditLog.resource_id == sid,
+            )
+            .count()
+        )
 
         svc = ReplayService(lambda: db_session)
         svc.replay_session(session_id=sid, user_id=uid, mock_mode=True)
 
-        after = db_session.query(AuditLog).filter(
-            AuditLog.action == "session_replay",
-            AuditLog.resource_id == sid,
-        ).count()
+        after = (
+            db_session.query(AuditLog)
+            .filter(
+                AuditLog.action == "session_replay",
+                AuditLog.resource_id == sid,
+            )
+            .count()
+        )
 
         assert after == before + 1
 
-        log = db_session.query(AuditLog).filter(
-            AuditLog.action == "session_replay",
-            AuditLog.resource_id == sid,
-        ).order_by(AuditLog.created_at.desc()).first()
+        log = (
+            db_session.query(AuditLog)
+            .filter(
+                AuditLog.action == "session_replay",
+                AuditLog.resource_id == sid,
+            )
+            .order_by(AuditLog.created_at.desc())
+            .first()
+        )
         assert log.user_id == uid
         assert log.details["events_count"] == fixture["event_count"]
 
 
 # ── 4. StreamReplay ───────────────────────────────────────
+
 
 class TestStreamReplayWithGolden:
     """StreamReplay reconstructs stream from golden session events."""
@@ -217,33 +251,48 @@ class TestStreamReplayWithGolden:
 
         for ev in fixture["events"]:
             if ev["event_type"] == "llm_response":
-                content_json = json.dumps({
-                    "event_type": "text_message_content",
-                    "data": {"delta": ev["content"]},
-                })
-                db.add(Event(
-                    event_id=ev["event_id"], session_id=sid, user_id=uid,
-                    event_type="stream_text_done",
-                    content=content_json,
-                    causal_chain_id=chain_id,
-                    parent_event_id=ev.get("parent_event_id"),
-                    event_metadata={"event_type": "text_message_content", "agent_id": "dev-agent"},
-                    created_at=datetime.now(timezone.utc),
-                ))
+                content_json = json.dumps(
+                    {
+                        "event_type": "text_message_content",
+                        "data": {"delta": ev["content"]},
+                    }
+                )
+                db.add(
+                    Event(
+                        event_id=ev["event_id"],
+                        session_id=sid,
+                        user_id=uid,
+                        event_type="stream_text_done",
+                        content=content_json,
+                        causal_chain_id=chain_id,
+                        parent_event_id=ev.get("parent_event_id"),
+                        event_metadata={
+                            "event_type": "text_message_content",
+                            "agent_id": "dev-agent",
+                        },
+                        created_at=datetime.now(timezone.utc),
+                    )
+                )
             elif ev["event_type"] == "tool_call":
-                content_json = json.dumps({
-                    "event_type": "tool_call_start",
-                    "data": {"tool_name": ev.get("skill_name", "unknown")},
-                })
-                db.add(Event(
-                    event_id=ev["event_id"], session_id=sid, user_id=uid,
-                    event_type="stream_tool_call_start",
-                    content=content_json,
-                    causal_chain_id=chain_id,
-                    parent_event_id=ev.get("parent_event_id"),
-                    event_metadata={"event_type": "tool_call_start", "agent_id": "dev-agent"},
-                    created_at=datetime.now(timezone.utc),
-                ))
+                content_json = json.dumps(
+                    {
+                        "event_type": "tool_call_start",
+                        "data": {"tool_name": ev.get("skill_name", "unknown")},
+                    }
+                )
+                db.add(
+                    Event(
+                        event_id=ev["event_id"],
+                        session_id=sid,
+                        user_id=uid,
+                        event_type="stream_tool_call_start",
+                        content=content_json,
+                        causal_chain_id=chain_id,
+                        parent_event_id=ev.get("parent_event_id"),
+                        event_metadata={"event_type": "tool_call_start", "agent_id": "dev-agent"},
+                        created_at=datetime.now(timezone.utc),
+                    )
+                )
         db.commit()
         return chain_id
 
@@ -261,7 +310,9 @@ class TestStreamReplayWithGolden:
             events.append(ev)
 
         assert len(events) > 0
-        types = {e.event_type.value if hasattr(e.event_type, 'value') else e.event_type for e in events}
+        types = {
+            e.event_type.value if hasattr(e.event_type, "value") else e.event_type for e in events
+        }
         # Should have text and tool events
         assert types & {"text_message_content", "tool_call_start"}
 
@@ -275,7 +326,9 @@ class TestStreamReplayWithGolden:
 
         sr = StreamReplay(lambda: db_session)
         state = sr.get_stream_state_at(
-            sid, datetime.now(timezone.utc), causal_chain_id=chain_id,
+            sid,
+            datetime.now(timezone.utc),
+            causal_chain_id=chain_id,
         )
 
         assert state["session_id"] == sid
@@ -283,6 +336,7 @@ class TestStreamReplayWithGolden:
 
 
 # ── 5. Token Cost Statistics ──────────────────────────────
+
 
 class TestTokenCostWithGolden:
     """Verify token usage statistics from golden sessions."""
@@ -313,11 +367,15 @@ class TestTokenCostWithGolden:
         from core.llm.models import LLMProvider
 
         router = ModelRouter()
-        router.register(ModelConfig(
-            model_name="deepseek-chat",
-            provider=LLMProvider.DEEPSEEK,
-            pricing=ModelPricing(prompt=0.00014, completion=0.00028),  # per 1K tokens (DeepSeek V3)
-        ))
+        router.register(
+            ModelConfig(
+                model_name="deepseek-chat",
+                provider=LLMProvider.DEEPSEEK,
+                pricing=ModelPricing(
+                    prompt=0.00014, completion=0.00028
+                ),  # per 1K tokens (DeepSeek V3)
+            )
+        )
 
         fixture = _load("multi_turn_correction")
         total_cost = 0.0
@@ -344,9 +402,13 @@ class TestTokenCostWithGolden:
 
         llm_ev = next(e for e in fixture["events"] if e.get("token_usage"))
         event = ConversationEvent(
-            event_id=_uid(), user_id=llm_ev["user_id"], session_id=sid,
-            agent_id="dev-agent", agent_version="1.0.0",
-            event_type=EventType.LLM_RESPONSE, content=llm_ev["content"],
+            event_id=_uid(),
+            user_id=llm_ev["user_id"],
+            session_id=sid,
+            agent_id="dev-agent",
+            agent_version="1.0.0",
+            event_type=EventType.LLM_RESPONSE,
+            content=llm_ev["content"],
             token_usage=TokenUsage(**llm_ev["token_usage"]),
             causal_chain_id=llm_ev["causal_chain_id"],
         )
@@ -360,6 +422,7 @@ class TestTokenCostWithGolden:
 
 
 # ── 6. Context Snapshot Reconstruction ────────────────────
+
 
 class TestContextSnapshotWithGolden:
     """Reconstruct what the LLM saw at each turn from golden session events."""
@@ -379,7 +442,9 @@ class TestContextSnapshotWithGolden:
                 llm_turn += 1
                 # At this point, `messages` is what the LLM saw
                 assert len(messages) >= 1, f"LLM turn {llm_turn} had no context"
-                assert messages[-1]["role"] == "user", f"LLM turn {llm_turn}: last message should be user"
+                assert messages[-1]["role"] == "user", (
+                    f"LLM turn {llm_turn}: last message should be user"
+                )
                 messages.append({"role": "assistant", "content": ev["content"]})
             elif ev["event_type"] == "tool_result":
                 # Tool results get injected as context for next LLM call
@@ -408,11 +473,12 @@ class TestContextSnapshotWithGolden:
         for i in range(1, len(context_sizes)):
             assert context_sizes[i] > context_sizes[i - 1], (
                 f"Context did not grow: turn {i} saw {context_sizes[i]} msgs, "
-                f"turn {i-1} saw {context_sizes[i-1]}"
+                f"turn {i - 1} saw {context_sizes[i - 1]}"
             )
 
 
 # ── 7. Quality Scoring ────────────────────────────────────
+
 
 class TestQualityScoringWithGolden:
     """Auto-scorer produces consistent scores for golden session LLM responses."""
@@ -447,16 +513,21 @@ class TestQualityScoringWithGolden:
         llm_ev = next(e for e in fixture["events"] if e.get("token_usage"))
         eid = _uid()
         event = ConversationEvent(
-            event_id=eid, user_id=llm_ev["user_id"], session_id=sid,
-            agent_id="dev-agent", agent_version="1.0.0",
-            event_type=EventType.LLM_RESPONSE, content=llm_ev["content"],
+            event_id=eid,
+            user_id=llm_ev["user_id"],
+            session_id=sid,
+            agent_id="dev-agent",
+            agent_version="1.0.0",
+            event_type=EventType.LLM_RESPONSE,
+            content=llm_ev["content"],
             token_usage=TokenUsage(**llm_ev["token_usage"]),
             causal_chain_id=llm_ev["causal_chain_id"],
         )
         logger.log_event(event)
 
         result = compute_auto_score(
-            firewall_passed=True, firewall_confidence=0.85,
+            firewall_passed=True,
+            firewall_confidence=0.85,
             response_tokens=llm_ev["token_usage"]["completion"],
         )
         logger.update_quality_score(eid, result.quality_score, result.training_eligible)
@@ -467,6 +538,7 @@ class TestQualityScoringWithGolden:
 
 
 # ── 8. Hallucination Firewall ─────────────────────────────
+
 
 class TestHallucinationFirewallWithGolden:
     """multi_turn_correction: DeepSeek said 'Read Committed' (wrong),
@@ -502,7 +574,8 @@ class TestHallucinationFirewallWithGolden:
         }
 
         fw = HallucinationFirewall(
-            lambda: db_session, ctx_mgr,
+            lambda: db_session,
+            ctx_mgr,
             use_llm_extraction=False,  # regex only, no LLM needed
         )
         result = fw.verify_response(wrong_response, "fake_capture_id", mode="warn")
@@ -513,6 +586,7 @@ class TestHallucinationFirewallWithGolden:
 
 
 # ── 9. GoldenSelector ────────────────────────────────────
+
 
 class TestGoldenSelectorWithGolden:
     """GoldenSelector picks high-quality sessions from golden data."""
@@ -525,14 +599,19 @@ class TestGoldenSelectorWithGolden:
         # Seed events with high quality scores
         for ev in fixture["events"]:
             eid = ev["event_id"]
-            db_session.add(Event(
-                event_id=eid, session_id=sid, user_id=ev["user_id"],
-                event_type=ev["event_type"], content=ev["content"],
-                causal_chain_id=ev["causal_chain_id"],
-                parent_event_id=ev.get("parent_event_id"),
-                event_metadata=ev.get("metadata", {}),
-                quality_score=4.5 if ev["event_type"] == "llm_response" else None,
-            ))
+            db_session.add(
+                Event(
+                    event_id=eid,
+                    session_id=sid,
+                    user_id=ev["user_id"],
+                    event_type=ev["event_type"],
+                    content=ev["content"],
+                    causal_chain_id=ev["causal_chain_id"],
+                    parent_event_id=ev.get("parent_event_id"),
+                    event_metadata=ev.get("metadata", {}),
+                    quality_score=4.5 if ev["event_type"] == "llm_response" else None,
+                )
+            )
         db_session.commit()
 
         selector = GoldenSessionSelector(lambda: db_session)
@@ -545,6 +624,7 @@ class TestGoldenSelectorWithGolden:
 
 # ── 10. DriftDetector ─────────────────────────────────────
 
+
 class TestDriftDetectorWithGolden:
     """DriftDetector uses quality_score trends — seed with golden data."""
 
@@ -554,13 +634,18 @@ class TestDriftDetectorWithGolden:
 
         fixture = _load("code_review")
         for ev in fixture["events"]:
-            db_session.add(Event(
-                event_id=ev["event_id"], session_id=sid, user_id=ev["user_id"],
-                event_type=ev["event_type"], content=ev["content"],
-                causal_chain_id=ev["causal_chain_id"],
-                quality_score=4.0 if ev["event_type"] == "llm_response" else None,
-                llm_model_used=ev.get("llm_model_used"),
-            ))
+            db_session.add(
+                Event(
+                    event_id=ev["event_id"],
+                    session_id=sid,
+                    user_id=ev["user_id"],
+                    event_type=ev["event_type"],
+                    content=ev["content"],
+                    causal_chain_id=ev["causal_chain_id"],
+                    quality_score=4.0 if ev["event_type"] == "llm_response" else None,
+                    llm_model_used=ev.get("llm_model_used"),
+                )
+            )
         db_session.commit()
 
         detector = DriftDetector(lambda: db_session)
@@ -571,6 +656,7 @@ class TestDriftDetectorWithGolden:
 
 
 # ── 11. LLM Non-Determinism Awareness ────────────────────
+
 
 class TestLLMNonDeterminism:
     """Verify the system's design handles LLM non-determinism correctly.
@@ -602,25 +688,35 @@ class TestLLMNonDeterminism:
 
         db_session.add(SessionModel(session_id=sid, user_id=uid, status="active"))
         for ev in fixture["events"]:
-            db_session.add(Event(
-                event_id=ev["event_id"], session_id=sid, user_id=uid,
-                event_type=ev["event_type"], content=ev["content"],
-                causal_chain_id=ev["causal_chain_id"],
-                parent_event_id=ev.get("parent_event_id"),
-                skill_name=ev.get("skill_name"), skill_version=ev.get("skill_version"),
-                event_metadata=ev.get("metadata", {}),
-            ))
+            db_session.add(
+                Event(
+                    event_id=ev["event_id"],
+                    session_id=sid,
+                    user_id=uid,
+                    event_type=ev["event_type"],
+                    content=ev["content"],
+                    causal_chain_id=ev["causal_chain_id"],
+                    parent_event_id=ev.get("parent_event_id"),
+                    skill_name=ev.get("skill_name"),
+                    skill_version=ev.get("skill_version"),
+                    event_metadata=ev.get("metadata", {}),
+                )
+            )
         db_session.commit()
 
         replay = ToolMockingLayer(
-            mode=MockMode.REPLAY, db_factory=lambda: db_session, session_id=sid,
+            mode=MockMode.REPLAY,
+            db_factory=lambda: db_session,
+            session_id=sid,
         )
 
         # Get the tool_call event
         tc = next(e for e in fixture["events"] if e["event_type"] == "tool_call")
         result = replay.get_mock_result(
-            tc["skill_name"], tc["metadata"]["skill_params"],
-            sid, parent_event_id=tc["event_id"],
+            tc["skill_name"],
+            tc["metadata"]["skill_params"],
+            sid,
+            parent_event_id=tc["event_id"],
         )
         # Result comes from DB, not from any LLM call
         assert result is not None
@@ -646,16 +742,26 @@ class TestLLMNonDeterminism:
         chain1, chain2 = _uid(), _uid()
 
         for sid, chain, text_suffix in [(sid1, chain1, "version A"), (sid2, chain2, "version B")]:
-            db_session.add(Event(
-                event_id=_uid(), session_id=sid, user_id="u",
-                event_type="user_query", content="same question",
-                causal_chain_id=chain,
-            ))
-            db_session.add(Event(
-                event_id=_uid(), session_id=sid, user_id="u",
-                event_type="llm_response", content=f"different answer {text_suffix}",
-                causal_chain_id=chain,
-            ))
+            db_session.add(
+                Event(
+                    event_id=_uid(),
+                    session_id=sid,
+                    user_id="u",
+                    event_type="user_query",
+                    content="same question",
+                    causal_chain_id=chain,
+                )
+            )
+            db_session.add(
+                Event(
+                    event_id=_uid(),
+                    session_id=sid,
+                    user_id="u",
+                    event_type="llm_response",
+                    content=f"different answer {text_suffix}",
+                    causal_chain_id=chain,
+                )
+            )
         db_session.commit()
 
         diff = SemanticDiff(lambda: db_session)
@@ -675,6 +781,7 @@ class TestLLMNonDeterminism:
 
 # ── 12. SemanticDiff Content Similarity (Embeddings) ──────
 
+
 class TestSemanticDiffContentSimilarity:
     """SemanticDiff now compares LLM response CONTENT via embeddings,
     not just event type counts."""
@@ -688,11 +795,16 @@ class TestSemanticDiffContentSimilarity:
         content = "MatrixOne uses Snapshot Isolation by default."
 
         for sid, chain in [(sid1, chain1), (sid2, chain2)]:
-            db_session.add(Event(
-                event_id=_uid(), session_id=sid, user_id="u",
-                event_type="llm_response", content=content,
-                causal_chain_id=chain,
-            ))
+            db_session.add(
+                Event(
+                    event_id=_uid(),
+                    session_id=sid,
+                    user_id="u",
+                    event_type="llm_response",
+                    content=content,
+                    causal_chain_id=chain,
+                )
+            )
         db_session.commit()
 
         diff = SemanticDiff(lambda: db_session)
@@ -700,7 +812,9 @@ class TestSemanticDiffContentSimilarity:
 
         sim = result["content_similarity"]
         assert sim["overall"] is not None
-        assert sim["overall"] > 0.99, f"Identical content should have sim ≈ 1.0, got {sim['overall']}"
+        assert sim["overall"] > 0.99, (
+            f"Identical content should have sim ≈ 1.0, got {sim['overall']}"
+        )
 
         # Cleanup
         for s in (sid1, sid2):
@@ -714,18 +828,26 @@ class TestSemanticDiffContentSimilarity:
         sid1, sid2 = _uid(), _uid()
         chain1, chain2 = _uid(), _uid()
 
-        db_session.add(Event(
-            event_id=_uid(), session_id=sid1, user_id="u",
-            event_type="llm_response",
-            content="MatrixOne uses Snapshot Isolation via TAE engine for MVCC.",
-            causal_chain_id=chain1,
-        ))
-        db_session.add(Event(
-            event_id=_uid(), session_id=sid2, user_id="u",
-            event_type="llm_response",
-            content="To make pancakes, mix flour, eggs, and milk. Cook on a hot griddle.",
-            causal_chain_id=chain2,
-        ))
+        db_session.add(
+            Event(
+                event_id=_uid(),
+                session_id=sid1,
+                user_id="u",
+                event_type="llm_response",
+                content="MatrixOne uses Snapshot Isolation via TAE engine for MVCC.",
+                causal_chain_id=chain1,
+            )
+        )
+        db_session.add(
+            Event(
+                event_id=_uid(),
+                session_id=sid2,
+                user_id="u",
+                event_type="llm_response",
+                content="To make pancakes, mix flour, eggs, and milk. Cook on a hot griddle.",
+                causal_chain_id=chain2,
+            )
+        )
         db_session.commit()
 
         diff = SemanticDiff(lambda: db_session)
@@ -748,11 +870,16 @@ class TestSemanticDiffContentSimilarity:
         fixture = _load("chained_tool_calls")
         sid = _uid()
         for ev in fixture["events"]:
-            db_session.add(Event(
-                event_id=_uid(), session_id=sid, user_id=ev["user_id"],
-                event_type=ev["event_type"], content=ev["content"],
-                causal_chain_id=ev["causal_chain_id"],
-            ))
+            db_session.add(
+                Event(
+                    event_id=_uid(),
+                    session_id=sid,
+                    user_id=ev["user_id"],
+                    event_type=ev["event_type"],
+                    content=ev["content"],
+                    causal_chain_id=ev["causal_chain_id"],
+                )
+            )
         db_session.commit()
 
         diff = SemanticDiff(lambda: db_session)
@@ -773,20 +900,34 @@ class TestSemanticDiffContentSimilarity:
 
         # Original: correct, detailed answer
         for sid, chain, content in [
-            (sid1, chain1, "The SELECT * query on events table is slow because it reads all columns. "
-                           "Add a covering index on (session_id, event_type, created_at) to avoid full table scan."),
+            (
+                sid1,
+                chain1,
+                "The SELECT * query on events table is slow because it reads all columns. "
+                "Add a covering index on (session_id, event_type, created_at) to avoid full table scan.",
+            ),
             (sid2, chain2, "I don't know. Maybe try restarting the database."),
         ]:
-            db_session.add(Event(
-                event_id=_uid(), session_id=sid, user_id="u",
-                event_type="user_query", content="Why is my query slow?",
-                causal_chain_id=chain,
-            ))
-            db_session.add(Event(
-                event_id=_uid(), session_id=sid, user_id="u",
-                event_type="llm_response", content=content,
-                causal_chain_id=chain,
-            ))
+            db_session.add(
+                Event(
+                    event_id=_uid(),
+                    session_id=sid,
+                    user_id="u",
+                    event_type="user_query",
+                    content="Why is my query slow?",
+                    causal_chain_id=chain,
+                )
+            )
+            db_session.add(
+                Event(
+                    event_id=_uid(),
+                    session_id=sid,
+                    user_id="u",
+                    event_type="llm_response",
+                    content=content,
+                    causal_chain_id=chain,
+                )
+            )
         db_session.commit()
 
         diff = SemanticDiff(lambda: db_session)

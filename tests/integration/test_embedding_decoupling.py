@@ -43,7 +43,9 @@ def _drain_worker(worker, db) -> int:
         total += count
         if count == 0:
             return total
-    raise RuntimeError(f"_drain_worker: still processing after 100 iterations ({total} events embedded)")
+    raise RuntimeError(
+        f"_drain_worker: still processing after 100 iterations ({total} events embedded)"
+    )
 
 
 @pytest.fixture
@@ -57,13 +59,16 @@ def cleanup_events(db_session, session_id):
     yield
     try:
         # Delete embeddings first (FK-like dependency)
-        db_session.execute(text(
-            "DELETE FROM ctx_event_embeddings WHERE event_id IN "
-            "(SELECT event_id FROM agent_events WHERE session_id = :sid)"
-        ), {"sid": session_id})
-        db_session.execute(text(
-            "DELETE FROM agent_events WHERE session_id = :sid"
-        ), {"sid": session_id})
+        db_session.execute(
+            text(
+                "DELETE FROM ctx_event_embeddings WHERE event_id IN "
+                "(SELECT event_id FROM agent_events WHERE session_id = :sid)"
+            ),
+            {"sid": session_id},
+        )
+        db_session.execute(
+            text("DELETE FROM agent_events WHERE session_id = :sid"), {"sid": session_id}
+        )
         db_session.commit()
     except Exception:
         db_session.rollback()
@@ -106,6 +111,7 @@ class TestEmbeddingWorker:
         # Run worker synchronously — drain all pending batches so our events
         # are reached even when a backlog of unembedded events exists.
         from api.database import SessionLocal
+
         worker = EmbeddingWorker(SessionLocal, embedding_provider="mock")
         total = _drain_worker(worker, db_session)
         assert total >= 2, f"Should embed at least 2 eligible events, got {total}"
@@ -131,6 +137,7 @@ class TestEmbeddingWorker:
         logger.log_event(ev)
 
         from api.database import SessionLocal
+
         worker = EmbeddingWorker(SessionLocal, embedding_provider="mock")
 
         # Drain all pending events (including any backlog from other tests)
@@ -148,6 +155,7 @@ class TestEmbeddingWorker:
         logger.log_event(ev)
 
         from api.database import SessionLocal
+
         worker = EmbeddingWorker(SessionLocal, embedding_provider="mock", poll_interval=0.1)
         worker.start()
 
@@ -225,7 +233,9 @@ class TestHybridRetrieverJoinPath:
         assert len(results) > 0, "Fulltext fallback must return results when zero embeddings exist"
         assert any("MatrixOne" in r.get("content", "") for r in results)
 
-    def test_event_without_embedding_not_in_vector_results(self, db_session, session_id, cleanup_events):
+    def test_event_without_embedding_not_in_vector_results(
+        self, db_session, session_id, cleanup_events
+    ):
         """Events without embeddings should not appear in vector search results."""
         from core.context.hybrid_retrieval import HybridRetriever
         from core.context.embeddings import EmbeddingService
@@ -234,7 +244,9 @@ class TestHybridRetrieverJoinPath:
 
         # Two events, only one gets an embedding
         ev_with = _make_event(session_id, EventType.USER_QUERY, "embedded event about databases")
-        ev_without = _make_event(session_id, EventType.USER_QUERY, "no embedding event about databases")
+        ev_without = _make_event(
+            session_id, EventType.USER_QUERY, "no embedding event about databases"
+        )
         logger.log_event(ev_with)
         logger.log_event(ev_without)
 
@@ -296,5 +308,6 @@ class TestEndToEndDecoupled:
             session_id=session_id,
         )
 
-        assert any(r["event_id"] == ev.event_id for r in results), \
+        assert any(r["event_id"] == ev.event_id for r in results), (
             "Retriever should find the event via ctx_event_embeddings JOIN"
+        )

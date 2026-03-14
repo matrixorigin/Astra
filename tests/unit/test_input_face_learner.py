@@ -38,7 +38,6 @@ def learner(mock_db, mock_llm):
 
 
 class TestDiagnoseAndFix:
-
     def test_returns_empty_when_no_issues(self, learner):
         results = learner.diagnose_and_fix(days=7)
         assert results == []
@@ -73,7 +72,6 @@ class TestDiagnoseAndFix:
 
 
 class TestPromptFace:
-
     def test_no_action_when_no_low_rated_templates(self, learner, mock_db):
         mock_db.execute.return_value.first.return_value = None
         result = learner._handle_prompt(days=7, dry_run=False)
@@ -86,9 +84,12 @@ class TestPromptFace:
         with patch("core.context.prompt_optimizer.PromptOptimizer") as MockOpt:
             mock_opt = MockOpt.return_value
             mock_opt.optimize.return_value = Mock(
-                old_version="1.0", new_version="1.1",
-                diagnosis="Too vague", activated=True,
-                gate_verdict="pass", error=None,
+                old_version="1.0",
+                new_version="1.1",
+                diagnosis="Too vague",
+                activated=True,
+                gate_verdict="pass",
+                error=None,
             )
             result = learner._handle_prompt(days=7, dry_run=False)
 
@@ -116,9 +117,12 @@ class TestPromptFace:
         with patch("core.context.prompt_optimizer.PromptOptimizer") as MockOpt:
             mock_opt = MockOpt.return_value
             mock_opt.optimize.return_value = Mock(
-                old_version="1.0", new_version="1.1",
-                diagnosis="Needs work", activated=False,
-                gate_verdict="dry_run", error=None,
+                old_version="1.0",
+                new_version="1.1",
+                diagnosis="Needs work",
+                activated=False,
+                gate_verdict="dry_run",
+                error=None,
             )
             result = learner._handle_prompt(days=7, dry_run=True)
 
@@ -127,7 +131,6 @@ class TestPromptFace:
 
 
 class TestContextBudgetFace:
-
     def test_no_action_when_no_truncation(self, learner, mock_db):
         mock_db.execute.return_value.first.return_value = None
         result = learner._handle_context_budget(days=7, dry_run=False)
@@ -191,7 +194,6 @@ class TestContextBudgetFace:
 
 
 class TestKnowledgeFace:
-
     def test_no_action_when_no_stale(self, learner, mock_db):
         mock_db.execute.return_value.first.return_value = (0,)
         result = learner._handle_knowledge(days=7, dry_run=False)
@@ -288,7 +290,6 @@ class TestKnowledgeFace:
 
 
 class TestAuditTrail:
-
     def test_learning_event_recorded(self, learner, mock_db):
         result = DiagnosisResult(
             input_face=InputFace.PROMPT,
@@ -312,5 +313,3 @@ class TestAuditTrail:
         # Should not raise
         learner._record_learning_event(InputFace.KNOWLEDGE, result)
         mock_db.rollback.assert_called()
-
-

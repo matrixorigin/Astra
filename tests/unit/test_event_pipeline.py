@@ -326,9 +326,7 @@ class TestBackpressure:
 
         # Simulate full queue by putting sentinel items
         for _ in range(100_000):
-            pipeline._queue.put_nowait(
-                _make_event(EventType.STREAM_TEXT_DELTA, "x")
-            )
+            pipeline._queue.put_nowait(_make_event(EventType.STREAM_TEXT_DELTA, "x"))
         pipeline.stats["emitted"] = 100_000
 
         # Ephemeral should be dropped
@@ -469,6 +467,7 @@ class TestErrorHandling:
 
         # Simulate a flush_task that's still "running"
         from unittest.mock import MagicMock
+
         mock_task = MagicMock()
         mock_task.done.return_value = False
         pipeline._flush_task = mock_task

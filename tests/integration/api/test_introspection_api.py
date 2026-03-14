@@ -25,6 +25,7 @@ def db():
 # /introspection/skills
 # ============================================================================
 
+
 class TestIntrospectionSkills:
     """Test GET /introspection/skills endpoint."""
 
@@ -41,23 +42,35 @@ class TestIntrospectionSkills:
             ("sum", "Summarize PR changes", "devops"),
         ]:
             name = f"{prefix}_{suffix}"
-            db.execute(text(
-                "INSERT INTO skills_registry (skill_id, skill_name, version, description, is_active, category) "
-                "VALUES (:id, :n, '1.0.0', :d, 1, :c)"
-            ), {"id": f"{name}@1.0.0", "n": name, "d": desc, "c": cat})
+            db.execute(
+                text(
+                    "INSERT INTO skills_registry (skill_id, skill_name, version, description, is_active, category) "
+                    "VALUES (:id, :n, '1.0.0', :d, 1, :c)"
+                ),
+                {"id": f"{name}@1.0.0", "n": name, "d": desc, "c": cat},
+            )
         for i, suffix in enumerate(["ci", "pr"], 1):
             name = f"{prefix}_{suffix}"
-            db.execute(text(
-                "INSERT INTO skill_installations "
-                "(installation_id, user_id, skill_name, skill_version, status, installed_at) "
-                "VALUES (:iid, :uid, :n, '1.0.0', 'installed', NOW())"
-            ), {"iid": str(uuid4()), "uid": user_id, "n": name})
+            db.execute(
+                text(
+                    "INSERT INTO skill_installations "
+                    "(installation_id, user_id, skill_name, skill_version, status, installed_at) "
+                    "VALUES (:iid, :uid, :n, '1.0.0', 'installed', NOW())"
+                ),
+                {"iid": str(uuid4()), "uid": user_id, "n": name},
+            )
         db.commit()
 
         def cleanup():
-            db.execute(text("DELETE FROM skill_installations WHERE user_id = :uid"), {"uid": user_id})
-            db.execute(text("DELETE FROM skills_registry WHERE skill_name LIKE :pat"), {"pat": f"{prefix}%"})
+            db.execute(
+                text("DELETE FROM skill_installations WHERE user_id = :uid"), {"uid": user_id}
+            )
+            db.execute(
+                text("DELETE FROM skills_registry WHERE skill_name LIKE :pat"),
+                {"pat": f"{prefix}%"},
+            )
             db.commit()
+
         return cleanup
 
     def test_returns_installed_and_cloud(self, client, auth_headers, db, test_user):
@@ -113,14 +126,20 @@ class TestIntrospectionSkills:
         """Multiple versions of same skill appear only once in cloud list."""
         prefix = f"a_{test_user.user_id}"
         name = f"{prefix}_multi"
-        db.execute(text(
-            "INSERT INTO skills_registry (skill_id, skill_name, version, description, is_active) "
-            "VALUES (:id, :n, '1.0.0', 'v1', 1)"
-        ), {"id": f"{name}@1.0.0", "n": name})
-        db.execute(text(
-            "INSERT INTO skills_registry (skill_id, skill_name, version, description, is_active) "
-            "VALUES (:id, :n, '2.0.0', 'v2', 1)"
-        ), {"id": f"{name}@2.0.0", "n": name})
+        db.execute(
+            text(
+                "INSERT INTO skills_registry (skill_id, skill_name, version, description, is_active) "
+                "VALUES (:id, :n, '1.0.0', 'v1', 1)"
+            ),
+            {"id": f"{name}@1.0.0", "n": name},
+        )
+        db.execute(
+            text(
+                "INSERT INTO skills_registry (skill_id, skill_name, version, description, is_active) "
+                "VALUES (:id, :n, '2.0.0', 'v2', 1)"
+            ),
+            {"id": f"{name}@2.0.0", "n": name},
+        )
         db.commit()
         try:
             resp = client.get("/introspection/skills", headers=auth_headers)
@@ -149,12 +168,14 @@ class TestIntrospectionSkills:
 # /introspection/memory
 # ============================================================================
 
+
 class TestIntrospectionMemory:
     """Test GET /introspection/memory endpoint."""
 
     def _create_session(self, db, user_id: str) -> "Session":
         """Create a test session via ORM, return the ORM object."""
         from api.models.agent import Session as SessionModel
+
         s = SessionModel(
             session_id=str(uuid4()),
             user_id=user_id,
@@ -170,7 +191,9 @@ class TestIntrospectionMemory:
         """Returns episodic, semantic, procedural — verify every field."""
         s = self._create_session(db, test_user.user_id)
         try:
-            resp = client.get("/introspection/memory", headers=auth_headers, params={"session_id": s.session_id})
+            resp = client.get(
+                "/introspection/memory", headers=auth_headers, params={"session_id": s.session_id}
+            )
             assert resp.status_code == 200
             data = resp.json()
 
@@ -194,13 +217,17 @@ class TestIntrospectionMemory:
             db.commit()
 
     def test_session_not_found(self, client, auth_headers):
-        resp = client.get("/introspection/memory", headers=auth_headers, params={"session_id": "nonexistent"})
+        resp = client.get(
+            "/introspection/memory", headers=auth_headers, params={"session_id": "nonexistent"}
+        )
         assert resp.status_code == 404
 
     def test_other_users_session_denied(self, client, auth_headers, db):
         s = self._create_session(db, "other_user_id")
         try:
-            resp = client.get("/introspection/memory", headers=auth_headers, params={"session_id": s.session_id})
+            resp = client.get(
+                "/introspection/memory", headers=auth_headers, params={"session_id": s.session_id}
+            )
             assert resp.status_code == 404
         finally:
             db.delete(s)
@@ -213,6 +240,7 @@ class TestIntrospectionMemory:
     def test_episodic_derived_signals(self, client, auth_headers, db, test_user):
         """4 events (2 user_query, 1 tool_call, 1 llm_response) → verify derived fields."""
         from api.models.agent import Event
+
         s = self._create_session(db, test_user.user_id)
         chain_id = str(uuid4())
         events = []
@@ -231,7 +259,9 @@ class TestIntrospectionMemory:
             events.append(e)
         db.commit()
         try:
-            resp = client.get("/introspection/memory", headers=auth_headers, params={"session_id": s.session_id})
+            resp = client.get(
+                "/introspection/memory", headers=auth_headers, params={"session_id": s.session_id}
+            )
             ep = resp.json()["episodic"]
             assert ep["total_events"] == 4
             assert ep["turns"] == 2
@@ -250,8 +280,12 @@ class TestIntrospectionMemory:
         import json
         from api.models.agent import Event as EventModel
         from api.models.context import ContextSnapshot
+
         s = self._create_session(db, test_user.user_id)
-        budget = {"history": {"allocated": 1000, "used": 850}, "code": {"allocated": 500, "used": 100}}
+        budget = {
+            "history": {"allocated": 1000, "used": 850},
+            "code": {"allocated": 500, "used": 100},
+        }
         # Insert llm_response so health gets real LLM data
         ev = EventModel(
             event_id=str(uuid4()),
@@ -274,7 +308,9 @@ class TestIntrospectionMemory:
         db.add(snap)
         db.commit()
         try:
-            resp = client.get("/introspection/memory", headers=auth_headers, params={"session_id": s.session_id})
+            resp = client.get(
+                "/introspection/memory", headers=auth_headers, params={"session_id": s.session_id}
+            )
             sem = resp.json()["semantic"]
             assert sem["ctx_snapshots"] == 1
             assert sem["peak_tokens"] == 950
@@ -317,6 +353,7 @@ class TestIntrospectionMemory:
     def test_semantic_no_llm_data_shows_note(self, client, auth_headers, db, test_user):
         """No llm_response events → llm_usage is null with explanatory note."""
         from api.models.context import ContextSnapshot
+
         s = self._create_session(db, test_user.user_id)
         snap = ContextSnapshot(
             context_capture_id=str(uuid4()),
@@ -329,8 +366,9 @@ class TestIntrospectionMemory:
         db.add(snap)
         db.commit()
         try:
-            sem = client.get("/introspection/memory", headers=auth_headers,
-                             params={"session_id": s.session_id}).json()["semantic"]
+            sem = client.get(
+                "/introspection/memory", headers=auth_headers, params={"session_id": s.session_id}
+            ).json()["semantic"]
             # No top-level llm fields when no data
             assert "llm_prompt_tokens" not in sem
             # Health should have llm_usage=None and note
@@ -345,6 +383,7 @@ class TestIntrospectionMemory:
     def test_semantic_zero_tokens_not_dropped(self, client, auth_headers, db, test_user):
         """total_tokens=0 and assembly_time_ms=0 must appear, not be dropped."""
         from api.models.context import ContextSnapshot
+
         s = self._create_session(db, test_user.user_id)
         snap = ContextSnapshot(
             context_capture_id=str(uuid4()),
@@ -357,8 +396,9 @@ class TestIntrospectionMemory:
         db.add(snap)
         db.commit()
         try:
-            sem = client.get("/introspection/memory", headers=auth_headers,
-                             params={"session_id": s.session_id}).json()["semantic"]
+            sem = client.get(
+                "/introspection/memory", headers=auth_headers, params={"session_id": s.session_id}
+            ).json()["semantic"]
             assert sem["context_managed_tokens"] == 0
             assert sem["last_assembly_ms"] == 0
         finally:
@@ -370,8 +410,9 @@ class TestIntrospectionMemory:
         """No snapshots → health/context_managed_tokens/last_assembly_ms must not appear."""
         s = self._create_session(db, test_user.user_id)
         try:
-            sem = client.get("/introspection/memory", headers=auth_headers,
-                             params={"session_id": s.session_id}).json()["semantic"]
+            sem = client.get(
+                "/introspection/memory", headers=auth_headers, params={"session_id": s.session_id}
+            ).json()["semantic"]
             assert sem == {"ctx_snapshots": 0, "peak_tokens": 0}
         finally:
             db.delete(s)
@@ -382,6 +423,7 @@ class TestIntrospectionMemory:
 # Error paths — defensive code in private helper functions
 # ============================================================================
 
+
 class TestIntrospectionErrorPaths:
     """Test graceful degradation when DB queries fail."""
 
@@ -389,15 +431,22 @@ class TestIntrospectionErrorPaths:
         """_get_episodic_stats returns zeros on DB error."""
         from unittest.mock import MagicMock
         from api.routers.introspection import _get_episodic_stats
+
         db = MagicMock()
         db.execute.side_effect = Exception("connection lost")
         result = _get_episodic_stats(db, "any")
-        assert result == {"turns": 0, "total_events": 0, "tool_intensity": "low", "session_depth": "shallow"}
+        assert result == {
+            "turns": 0,
+            "total_events": 0,
+            "tool_intensity": "low",
+            "session_depth": "shallow",
+        }
 
     def test_semantic_stats_db_error(self):
         """_get_semantic_stats returns zeros on DB error."""
         from unittest.mock import MagicMock
         from api.routers.introspection import _get_semantic_stats
+
         db = MagicMock()
         db.execute.side_effect = Exception("connection lost")
         result = _get_semantic_stats(db, "any")
@@ -407,6 +456,7 @@ class TestIntrospectionErrorPaths:
         """_get_procedural_stats returns zeros on DB error."""
         from unittest.mock import MagicMock
         from api.routers.introspection import _get_procedural_stats
+
         db = MagicMock()
         db.execute.side_effect = Exception("connection lost")
         result = _get_procedural_stats(db, "any")
@@ -428,12 +478,17 @@ class TestIntrospectionErrorPaths:
 # New analysis functions — unit tests
 # ============================================================================
 
+
 class TestAnalysisFunctions:
     """Unit tests for the pure computation functions."""
 
     def test_context_health_high_utilization(self):
         from api.routers.introspection import _analyze_context_health
-        budget = {"history": {"allocated": 1000, "used": 900}, "code": {"allocated": 500, "used": 100}}
+
+        budget = {
+            "history": {"allocated": 1000, "used": 900},
+            "code": {"allocated": 500, "used": 100},
+        }
         result = _analyze_context_health(budget, [5000, 4500, 4000])
         assert result["bottleneck"] == "history"
         assert any(z["status"] == "high" for z in result["zones"])
@@ -441,60 +496,77 @@ class TestAnalysisFunctions:
 
     def test_context_health_stable(self):
         from api.routers.introspection import _analyze_context_health
-        budget = {"history": {"allocated": 1000, "used": 300}, "code": {"allocated": 500, "used": 100}}
+
+        budget = {
+            "history": {"allocated": 1000, "used": 300},
+            "code": {"allocated": 500, "used": 100},
+        }
         result = _analyze_context_health(budget, [4000, 3950])
         assert result["trend"] == "stable"
         assert result["recommendation"] == "context healthy"
 
     def test_compaction_forecast_growing(self):
         from api.routers.introspection import _compaction_forecast
+
         result = _compaction_forecast([9000, 8000, 7000], limit=12000)
         assert result["turns_remaining"] == 3
         assert result["growth_rate_per_turn"] == 1000.0
 
     def test_compaction_forecast_shrinking(self):
         from api.routers.introspection import _compaction_forecast
+
         result = _compaction_forecast([5000, 6000, 7000], limit=12000)
         assert result["turns_remaining"] is None
         assert result["growth_rate_per_turn"] == -1000.0
 
     def test_compaction_forecast_insufficient_data(self):
         from api.routers.introspection import _compaction_forecast
+
         result = _compaction_forecast([5000], limit=12000)
         assert result["turns_remaining"] is None
 
     def test_relevance_quality_good(self):
         from api.routers.introspection import _relevance_quality
+
         result = _relevance_quality({"a": 0.9, "b": 0.8, "c": 0.7})
         assert result["quality"] == "good"
         assert result["high"] == 3
 
     def test_relevance_quality_poor(self):
         from api.routers.introspection import _relevance_quality
+
         result = _relevance_quality({"a": 0.1, "b": 0.2})
         assert result["quality"] == "poor"
         assert result["low"] == 2
 
     def test_relevance_quality_empty(self):
         from api.routers.introspection import _relevance_quality
+
         result = _relevance_quality({})
         assert result["mean"] is None
         assert result["total"] == 0
 
     def test_pollution_ratio_clean(self):
         from api.routers.introspection import _pollution_ratio
+
         result = _pollution_ratio({"a": 0.9, "b": 0.8, "c": 0.7})
         assert result["status"] == "clean"
         assert result["pollution_pct"] == 0.0
 
     def test_pollution_ratio_polluted(self):
         from api.routers.introspection import _pollution_ratio
+
         result = _pollution_ratio({"a": 0.1, "b": 0.05, "c": 0.9})
         assert result["status"] == "polluted"
 
     def test_zone_balance_misallocated(self):
         from api.routers.introspection import _zone_balance
-        budget = {"history": {"allocated": 800, "used": 0}, "code": {"allocated": 100, "used": 0}, "memory": {"allocated": 100, "used": 0}}
+
+        budget = {
+            "history": {"allocated": 800, "used": 0},
+            "code": {"allocated": 100, "used": 0},
+            "memory": {"allocated": 100, "used": 0},
+        }
         result = _zone_balance(budget, "code_gen")
         assert result["balanced"] is False
         assert result["misallocated_zone"] is not None
@@ -502,19 +574,26 @@ class TestAnalysisFunctions:
 
     def test_zone_balance_ok(self):
         from api.routers.introspection import _zone_balance
-        budget = {"history": {"allocated": 300, "used": 0}, "code": {"allocated": 400, "used": 0}, "memory": {"allocated": 150, "used": 0}}
+
+        budget = {
+            "history": {"allocated": 300, "used": 0},
+            "code": {"allocated": 400, "used": 0},
+            "memory": {"allocated": 150, "used": 0},
+        }
         result = _zone_balance(budget, "code_gen")
         assert result["balanced"] is True
         assert result["matched_profile"] == "code_gen"
 
     def test_zone_balance_default_profile(self):
         from api.routers.introspection import _zone_balance
+
         budget = {"history": {"allocated": 500, "used": 0}, "code": {"allocated": 300, "used": 0}}
         result = _zone_balance(budget, "unknown_type")
         assert result["matched_profile"] == "default"
 
     def test_compaction_effectiveness_detected(self):
         from api.routers.introspection import _compaction_effectiveness
+
         # newest first: 9000, 5000, 8500 — drop from 8500→5000 is compaction
         result = _compaction_effectiveness([9000, 5000, 8500])
         assert result["compactions_detected"] == 1
@@ -522,6 +601,7 @@ class TestAnalysisFunctions:
 
     def test_compaction_effectiveness_none(self):
         from api.routers.introspection import _compaction_effectiveness
+
         result = _compaction_effectiveness([9000, 8800, 8600])
         assert result["compactions_detected"] == 0
 
@@ -530,7 +610,11 @@ class TestAnalysisFunctions:
     def test_analyze_context_health_nested_format(self):
         """Nested budget {zone: {allocated, used}} — original format."""
         from api.routers.introspection import _analyze_context_health
-        budget = {"history": {"allocated": 1000, "used": 850}, "code": {"allocated": 500, "used": 100}}
+
+        budget = {
+            "history": {"allocated": 1000, "used": 850},
+            "code": {"allocated": 500, "used": 100},
+        }
         result = _analyze_context_health(budget, [8000, 7000, 6000])
         zones = {z["name"]: z for z in result["zones"]}
         assert zones["history"]["utilization"] == 0.85
@@ -541,7 +625,14 @@ class TestAnalysisFunctions:
     def test_analyze_context_health_flat_format(self):
         """Flat budget {zone: int} — real format from context manager."""
         from api.routers.introspection import _analyze_context_health
-        budget = {"constraints": 543, "identity": 23, "memory": 9, "project_context": 23, "self_model": 372}
+
+        budget = {
+            "constraints": 543,
+            "identity": 23,
+            "memory": 9,
+            "project_context": 23,
+            "self_model": 372,
+        }
         result = _analyze_context_health(budget, [4000, 5000, 6000], llm_prompt_tokens=6000)
         zones = {z["name"] for z in result["zones"]}
         assert "constraints" in zones
@@ -559,6 +650,7 @@ class TestAnalysisFunctions:
     def test_analyze_context_health_mixed_format(self):
         """Mixed budget (some nested, some flat) — should not crash."""
         from api.routers.introspection import _analyze_context_health
+
         budget = {"history": {"allocated": 1000, "used": 500}, "memory": 200}
         result = _analyze_context_health(budget, [1200])
         zones = {z["name"]: z for z in result["zones"]}
@@ -568,6 +660,7 @@ class TestAnalysisFunctions:
     def test_zone_balance_flat_format(self):
         """Flat budget {zone: int} — _zone_balance must not crash."""
         from api.routers.introspection import _zone_balance
+
         budget = {"history": 500, "code": 300, "memory": 200}
         result = _zone_balance(budget, "code_gen")
         assert isinstance(result["balanced"], bool)
@@ -576,6 +669,7 @@ class TestAnalysisFunctions:
     def test_zone_balance_ignores_unknown_vals(self):
         """Non-int, non-dict values in budget are skipped gracefully."""
         from api.routers.introspection import _zone_balance
+
         budget = {"history": {"allocated": 500, "used": 0}, "bad_zone": None, "code": 200}
         result = _zone_balance(budget, None)
         assert isinstance(result["balanced"], bool)
@@ -584,8 +678,15 @@ class TestAnalysisFunctions:
         """_summarize_contents receives _SnapshotContentRow (named fields, not tuple)."""
         import json
         from api.routers.introspection import _summarize_contents, _SnapshotContentRow
+
         row = _SnapshotContentRow(
-            selected_events=json.dumps([{"event_type": "user_query"}, {"event_type": "tool_call"}, {"event_type": "user_query"}]),
+            selected_events=json.dumps(
+                [
+                    {"event_type": "user_query"},
+                    {"event_type": "tool_call"},
+                    {"event_type": "user_query"},
+                ]
+            ),
             code_context=json.dumps([{"file": "a.py"}, {"file": "b.py"}]),
             skill_definitions=json.dumps([{"skill_name": "search"}]),
             documentation=json.dumps([{"source": "readme.md"}]),
@@ -601,6 +702,7 @@ class TestAnalysisFunctions:
         """_raw_contents truncates to token budget (TOKEN_CHAR_RATIO=2)."""
         import json
         from api.routers.introspection import _raw_contents, _SnapshotContentRow
+
         row = _SnapshotContentRow(
             selected_events=json.dumps([{"event_type": "user_query", "content": "x" * 500}] * 10),
             code_context=None,
@@ -617,6 +719,7 @@ class TestAnalysisFunctions:
 # New endpoints — integration tests
 # ============================================================================
 
+
 class TestContextTrend:
     """Tests for GET /introspection/context/trend — verify all response fields."""
 
@@ -625,6 +728,7 @@ class TestContextTrend:
         """Insert llm_response events with real token_usage data."""
         from api.models.agent import Session as SessionModel, Event as EventModel
         from datetime import datetime, timezone, timedelta
+
         s = SessionModel(session_id=str(uuid4()), user_id=user_id, status="active", event_count=0)
         db.add(s)
         db.flush()
@@ -649,8 +753,11 @@ class TestContextTrend:
     def test_trend_growing_all_fields(self, client, auth_headers, db, test_user):
         s, events = self._setup(db, test_user.user_id, [7000, 8000, 9000])
         try:
-            resp = client.get("/introspection/context/trend", headers=auth_headers,
-                              params={"session_id": s.session_id})
+            resp = client.get(
+                "/introspection/context/trend",
+                headers=auth_headers,
+                params={"session_id": s.session_id},
+            )
             assert resp.status_code == 200
             data = resp.json()
 
@@ -689,8 +796,11 @@ class TestContextTrend:
         """Token drop > 20% between turns → compaction detected."""
         s, events = self._setup(db, test_user.user_id, [8000, 9000, 5000, 8500])
         try:
-            data = client.get("/introspection/context/trend", headers=auth_headers,
-                              params={"session_id": s.session_id}).json()
+            data = client.get(
+                "/introspection/context/trend",
+                headers=auth_headers,
+                params={"session_id": s.session_id},
+            ).json()
             ch = data["compaction_history"]
             assert ch["compactions_detected"] >= 1
             assert ch["avg_reduction_pct"] > 0
@@ -707,12 +817,16 @@ class TestContextTrend:
 
     def test_trend_other_user_denied(self, client, auth_headers, db):
         from api.models.agent import Session as SessionModel
+
         s = SessionModel(session_id=str(uuid4()), user_id="other", status="active", event_count=0)
         db.add(s)
         db.commit()
         try:
-            resp = client.get("/introspection/context/trend", headers=auth_headers,
-                              params={"session_id": s.session_id})
+            resp = client.get(
+                "/introspection/context/trend",
+                headers=auth_headers,
+                params={"session_id": s.session_id},
+            )
             assert resp.status_code == 404
         finally:
             db.delete(s)
@@ -720,12 +834,18 @@ class TestContextTrend:
 
     def test_trend_no_data(self, client, auth_headers, db, test_user):
         from api.models.agent import Session as SessionModel
-        s = SessionModel(session_id=str(uuid4()), user_id=test_user.user_id, status="active", event_count=0)
+
+        s = SessionModel(
+            session_id=str(uuid4()), user_id=test_user.user_id, status="active", event_count=0
+        )
         db.add(s)
         db.commit()
         try:
-            data = client.get("/introspection/context/trend", headers=auth_headers,
-                              params={"session_id": s.session_id}).json()
+            data = client.get(
+                "/introspection/context/trend",
+                headers=auth_headers,
+                params={"session_id": s.session_id},
+            ).json()
             assert data == {"turns_sampled": 0, "trend": "no_data"}
         finally:
             db.delete(s)
@@ -740,12 +860,19 @@ class TestContextSnapshot:
         import json
         from api.models.agent import Session as SessionModel
         from api.models.context import ContextSnapshot
+
         s = SessionModel(session_id=str(uuid4()), user_id=user_id, status="active", event_count=0)
         db.add(s)
         db.flush()
-        budget = {"history": {"allocated": 1000, "used": 850}, "code": {"allocated": 500, "used": 100}}
+        budget = {
+            "history": {"allocated": 1000, "used": 850},
+            "code": {"allocated": 500, "used": 100},
+        }
         scores = {"e1": 0.9, "e2": 0.15, "e3": 0.8}
-        events_data = [{"event_type": "user_query", "content": "hello"}, {"event_type": "tool_call", "content": "search"}]
+        events_data = [
+            {"event_type": "user_query", "content": "hello"},
+            {"event_type": "tool_call", "content": "search"},
+        ]
         code_data = [{"file": "main.py", "content": "print()"}]
         skills_data = [{"skill_name": "code_search", "description": "search code"}]
         snap = ContextSnapshot(
@@ -769,8 +896,11 @@ class TestContextSnapshot:
         """Default: conclusions only — verify every field in health, relevance, pollution, zone_balance."""
         s, snap = self._setup(db, test_user.user_id)
         try:
-            data = client.get("/introspection/context/snapshot", headers=auth_headers,
-                              params={"session_id": s.session_id}).json()
+            data = client.get(
+                "/introspection/context/snapshot",
+                headers=auth_headers,
+                params={"session_id": s.session_id},
+            ).json()
 
             # Metadata
             assert data["snapshot_id"] == snap.context_capture_id
@@ -796,9 +926,9 @@ class TestContextSnapshot:
             # Relevance — all fields
             rel = data["relevance"]
             assert rel["total"] == 3
-            assert rel["high"] == 2   # 0.9, 0.8
+            assert rel["high"] == 2  # 0.9, 0.8
             assert rel["medium"] == 0
-            assert rel["low"] == 1    # 0.15
+            assert rel["low"] == 1  # 0.15
             assert rel["quality"] == "good"
             assert 0.6 < rel["mean"] < 0.7
 
@@ -825,8 +955,11 @@ class TestContextSnapshot:
         """detail=true → structural summary, verify all sub-fields."""
         s, snap = self._setup(db, test_user.user_id)
         try:
-            data = client.get("/introspection/context/snapshot", headers=auth_headers,
-                              params={"session_id": s.session_id, "detail": True}).json()
+            data = client.get(
+                "/introspection/context/snapshot",
+                headers=auth_headers,
+                params={"session_id": s.session_id, "detail": True},
+            ).json()
 
             c = data["contents"]
             # Events summary
@@ -849,8 +982,11 @@ class TestContextSnapshot:
         """raw=true → actual content within budget."""
         s, snap = self._setup(db, test_user.user_id)
         try:
-            data = client.get("/introspection/context/snapshot", headers=auth_headers,
-                              params={"session_id": s.session_id, "raw": True, "raw_token_budget": 4000}).json()
+            data = client.get(
+                "/introspection/context/snapshot",
+                headers=auth_headers,
+                params={"session_id": s.session_id, "raw": True, "raw_token_budget": 4000},
+            ).json()
 
             assert "contents" in data  # detail implied by raw
             assert "raw" in data
@@ -865,8 +1001,11 @@ class TestContextSnapshot:
         """Tiny budget → content truncated."""
         s, snap = self._setup(db, test_user.user_id)
         try:
-            data = client.get("/introspection/context/snapshot", headers=auth_headers,
-                              params={"session_id": s.session_id, "raw": True, "raw_token_budget": 100}).json()
+            data = client.get(
+                "/introspection/context/snapshot",
+                headers=auth_headers,
+                params={"session_id": s.session_id, "raw": True, "raw_token_budget": 100},
+            ).json()
             raw = data["raw"]
             # With 100 tokens (400 chars), not everything fits
             total_keys = len(raw)
@@ -881,7 +1020,10 @@ class TestContextSnapshot:
         from api.models.agent import Session as SessionModel
         from api.models.context import ContextSnapshot
         from datetime import datetime, timezone, timedelta
-        s = SessionModel(session_id=str(uuid4()), user_id=test_user.user_id, status="active", event_count=0)
+
+        s = SessionModel(
+            session_id=str(uuid4()), user_id=test_user.user_id, status="active", event_count=0
+        )
         db.add(s)
         db.flush()
         now = datetime.now(timezone.utc)
@@ -902,21 +1044,30 @@ class TestContextSnapshot:
         db.commit()
         try:
             # Turn 1 = oldest = 5000 tokens
-            d1 = client.get("/introspection/context/snapshot", headers=auth_headers,
-                            params={"session_id": s.session_id, "turn_index": 1}).json()
+            d1 = client.get(
+                "/introspection/context/snapshot",
+                headers=auth_headers,
+                params={"session_id": s.session_id, "turn_index": 1},
+            ).json()
             assert d1["turn"] == 1
             assert d1["total_turns"] == 3
             assert d1["context_managed_tokens"] == 5000
 
             # Turn 3 = newest = 9000 tokens
-            d3 = client.get("/introspection/context/snapshot", headers=auth_headers,
-                            params={"session_id": s.session_id, "turn_index": 3}).json()
+            d3 = client.get(
+                "/introspection/context/snapshot",
+                headers=auth_headers,
+                params={"session_id": s.session_id, "turn_index": 3},
+            ).json()
             assert d3["turn"] == 3
             assert d3["context_managed_tokens"] == 9000
 
             # Default (no turn_index) = latest
-            dl = client.get("/introspection/context/snapshot", headers=auth_headers,
-                            params={"session_id": s.session_id}).json()
+            dl = client.get(
+                "/introspection/context/snapshot",
+                headers=auth_headers,
+                params={"session_id": s.session_id},
+            ).json()
             assert dl["context_managed_tokens"] == 9000
         finally:
             for snap in snaps:
@@ -926,12 +1077,18 @@ class TestContextSnapshot:
 
     def test_snapshot_not_found(self, client, auth_headers, db, test_user):
         from api.models.agent import Session as SessionModel
-        s = SessionModel(session_id=str(uuid4()), user_id=test_user.user_id, status="active", event_count=0)
+
+        s = SessionModel(
+            session_id=str(uuid4()), user_id=test_user.user_id, status="active", event_count=0
+        )
         db.add(s)
         db.commit()
         try:
-            resp = client.get("/introspection/context/snapshot", headers=auth_headers,
-                              params={"session_id": s.session_id})
+            resp = client.get(
+                "/introspection/context/snapshot",
+                headers=auth_headers,
+                params={"session_id": s.session_id},
+            )
             assert resp.status_code == 404
         finally:
             db.delete(s)
@@ -941,7 +1098,10 @@ class TestContextSnapshot:
         """Flat token_budget {zone: int} — real format written by context manager — must not 500."""
         from api.models.agent import Session as SessionModel, Event as EventModel
         from api.models.context import ContextSnapshot
-        s = SessionModel(session_id=str(uuid4()), user_id=test_user.user_id, status="active", event_count=0)
+
+        s = SessionModel(
+            session_id=str(uuid4()), user_id=test_user.user_id, status="active", event_count=0
+        )
         db.add(s)
         db.flush()
         ev = EventModel(
@@ -958,15 +1118,24 @@ class TestContextSnapshot:
             context_capture_id=str(uuid4()),
             session_id=s.session_id,
             event_id=str(uuid4()),
-            token_budget={"constraints": 543, "identity": 23, "memory": 9, "project_context": 23, "self_model": 372},
+            token_budget={
+                "constraints": 543,
+                "identity": 23,
+                "memory": 9,
+                "project_context": 23,
+                "self_model": 372,
+            },
             total_tokens=970,
             assembly_time_ms=12,
         )
         db.add(snap)
         db.commit()
         try:
-            resp = client.get("/introspection/context/snapshot", headers=auth_headers,
-                              params={"session_id": s.session_id})
+            resp = client.get(
+                "/introspection/context/snapshot",
+                headers=auth_headers,
+                params={"session_id": s.session_id},
+            )
             assert resp.status_code == 200, resp.text
             data = resp.json()
             assert "health" in data
@@ -1012,7 +1181,10 @@ class TestContextSnapshot:
         """When no llm_response exists, health.llm_usage is null and llm_usage_note explains why."""
         from api.models.agent import Session as SessionModel
         from api.models.context import ContextSnapshot
-        s = SessionModel(session_id=str(uuid4()), user_id=test_user.user_id, status="active", event_count=0)
+
+        s = SessionModel(
+            session_id=str(uuid4()), user_id=test_user.user_id, status="active", event_count=0
+        )
         db.add(s)
         db.flush()
         snap = ContextSnapshot(
@@ -1026,8 +1198,11 @@ class TestContextSnapshot:
         db.add(snap)
         db.commit()
         try:
-            resp = client.get("/introspection/context/snapshot", headers=auth_headers,
-                              params={"session_id": s.session_id})
+            resp = client.get(
+                "/introspection/context/snapshot",
+                headers=auth_headers,
+                params={"session_id": s.session_id},
+            )
             assert resp.status_code == 200, resp.text
             data = resp.json()
             h = data["health"]
@@ -1051,6 +1226,7 @@ class TestRetrievalQuality:
         from api.models.agent import Session as SessionModel
         from api.models.context import ContextSnapshot
         from datetime import datetime, timezone, timedelta
+
         s = SessionModel(session_id=str(uuid4()), user_id=user_id, status="active", event_count=0)
         db.add(s)
         db.flush()
@@ -1071,10 +1247,15 @@ class TestRetrievalQuality:
         return s, snaps
 
     def test_good_quality_all_fields(self, client, auth_headers, db, test_user):
-        s, snaps = self._setup(db, test_user.user_id, [{"a": 0.9, "b": 0.8}, {"a": 0.85, "b": 0.75}])
+        s, snaps = self._setup(
+            db, test_user.user_id, [{"a": 0.9, "b": 0.8}, {"a": 0.85, "b": 0.75}]
+        )
         try:
-            data = client.get("/introspection/context/retrieval_quality", headers=auth_headers,
-                              params={"session_id": s.session_id}).json()
+            data = client.get(
+                "/introspection/context/retrieval_quality",
+                headers=auth_headers,
+                params={"session_id": s.session_id},
+            ).json()
             assert data["turns_sampled"] == 2
             assert data["overall_quality"] == "good"
             assert data["mean_relevance"] > 0.7
@@ -1088,8 +1269,11 @@ class TestRetrievalQuality:
     def test_poor_quality(self, client, auth_headers, db, test_user):
         s, snaps = self._setup(db, test_user.user_id, [{"a": 0.1, "b": 0.2}, {"a": 0.15, "b": 0.1}])
         try:
-            data = client.get("/introspection/context/retrieval_quality", headers=auth_headers,
-                              params={"session_id": s.session_id}).json()
+            data = client.get(
+                "/introspection/context/retrieval_quality",
+                headers=auth_headers,
+                params={"session_id": s.session_id},
+            ).json()
             assert data["overall_quality"] == "poor"
             assert "re-retrieval" in data["recommendation"]
         finally:
@@ -1100,12 +1284,18 @@ class TestRetrievalQuality:
 
     def test_no_data(self, client, auth_headers, db, test_user):
         from api.models.agent import Session as SessionModel
-        s = SessionModel(session_id=str(uuid4()), user_id=test_user.user_id, status="active", event_count=0)
+
+        s = SessionModel(
+            session_id=str(uuid4()), user_id=test_user.user_id, status="active", event_count=0
+        )
         db.add(s)
         db.commit()
         try:
-            data = client.get("/introspection/context/retrieval_quality", headers=auth_headers,
-                              params={"session_id": s.session_id}).json()
+            data = client.get(
+                "/introspection/context/retrieval_quality",
+                headers=auth_headers,
+                params={"session_id": s.session_id},
+            ).json()
             assert data["overall_quality"] == "no_data"
         finally:
             db.delete(s)
@@ -1120,31 +1310,42 @@ class TestRetrievalQuality:
 # /introspection/memory/recall
 # ============================================================================
 
+
 class TestMemoryRecallExplain:
     """Test GET /introspection/memory/recall — per-candidate scoring breakdown."""
 
     def _seed_memories(self, db, user_id: str, session_id: str):
         """Insert test memories with varying confidence and timestamps."""
         from datetime import datetime, timezone, timedelta
+
         now = datetime.now(timezone.utc)
         memories = []
-        for i, (content, conf, age_days) in enumerate([
-            ("Python async patterns", 0.9, 1),
-            ("Go concurrency model", 0.7, 10),
-            ("Rust ownership rules", 0.5, 30),
-        ]):
+        for i, (content, conf, age_days) in enumerate(
+            [
+                ("Python async patterns", 0.9, 1),
+                ("Go concurrency model", 0.7, 10),
+                ("Rust ownership rules", 0.5, 30),
+            ]
+        ):
             mid = str(uuid4())
             observed = now - timedelta(days=age_days)
-            db.execute(text(
-                "INSERT INTO mem_memories "
-                "(memory_id, user_id, memory_type, content, initial_confidence, "
-                " trust_tier, is_active, session_id, source_event_ids, observed_at, created_at) "
-                "VALUES (:mid, :uid, 'semantic', :content, :conf, "
-                " 'T3', 1, :sid, '[]', :obs, :obs)"
-            ), {
-                "mid": mid, "uid": user_id, "content": content,
-                "conf": conf, "sid": session_id, "obs": observed,
-            })
+            db.execute(
+                text(
+                    "INSERT INTO mem_memories "
+                    "(memory_id, user_id, memory_type, content, initial_confidence, "
+                    " trust_tier, is_active, session_id, source_event_ids, observed_at, created_at) "
+                    "VALUES (:mid, :uid, 'semantic', :content, :conf, "
+                    " 'T3', 1, :sid, '[]', :obs, :obs)"
+                ),
+                {
+                    "mid": mid,
+                    "uid": user_id,
+                    "content": content,
+                    "conf": conf,
+                    "sid": session_id,
+                    "obs": observed,
+                },
+            )
             memories.append(mid)
         db.commit()
         return memories
@@ -1152,9 +1353,12 @@ class TestMemoryRecallExplain:
     def test_recall_returns_ranking_with_scores(self, client, auth_headers, db, test_user):
         """Recall endpoint returns per-candidate 4-dimension score breakdown."""
         from api.models.agent import Session as SessionModel
+
         session = SessionModel(
-            session_id=str(uuid4()), user_id=test_user.user_id,
-            status="active", event_count=0,
+            session_id=str(uuid4()),
+            user_id=test_user.user_id,
+            status="active",
+            event_count=0,
         )
         db.add(session)
         db.commit()
@@ -1215,17 +1419,21 @@ class TestMemoryRecallExplain:
                 assert a >= b
 
         finally:
-            db.execute(text("DELETE FROM mem_memories WHERE user_id = :uid"),
-                       {"uid": test_user.user_id})
+            db.execute(
+                text("DELETE FROM mem_memories WHERE user_id = :uid"), {"uid": test_user.user_id}
+            )
             db.delete(session)
             db.commit()
 
     def test_recall_empty_session(self, client, auth_headers, db, test_user):
         """Recall on session with no memories returns empty ranking."""
         from api.models.agent import Session as SessionModel
+
         session = SessionModel(
-            session_id=str(uuid4()), user_id=test_user.user_id,
-            status="active", event_count=0,
+            session_id=str(uuid4()),
+            user_id=test_user.user_id,
+            status="active",
+            event_count=0,
         )
         db.add(session)
         db.commit()
@@ -1245,16 +1453,20 @@ class TestMemoryRecallExplain:
             db.commit()
 
     def test_recall_requires_auth(self, client):
-        resp = client.get("/introspection/memory/recall",
-                          params={"session_id": "any", "query": "test"})
+        resp = client.get(
+            "/introspection/memory/recall", params={"session_id": "any", "query": "test"}
+        )
         assert resp.status_code in (401, 403)
 
     def test_recall_other_user_denied(self, client, auth_headers, db, test_user):
         """Cannot explain recall for another user's session."""
         from api.models.agent import Session as SessionModel
+
         other_session = SessionModel(
-            session_id=str(uuid4()), user_id="other-user-id",
-            status="active", event_count=0,
+            session_id=str(uuid4()),
+            user_id="other-user-id",
+            status="active",
+            event_count=0,
         )
         db.add(other_session)
         db.commit()

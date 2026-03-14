@@ -130,7 +130,9 @@ class TypedObserver:
 
         return results
 
-    def persist_with_contradiction_check(self, mem: Memory, explain: bool = False) -> tuple[Memory, Optional[ContradictionStats]]:
+    def persist_with_contradiction_check(
+        self, mem: Memory, explain: bool = False
+    ) -> tuple[Memory, Optional[ContradictionStats]]:
         """Persist a single memory with contradiction detection + opinion evolution. Public API for pipeline."""
         stored, stats = self._store_with_contradiction_check(mem, explain)
         self._evolve_scene_opinions(stored)
@@ -151,11 +153,15 @@ class TypedObserver:
         # Sensitivity filter
         sensitivity = check_sensitivity(content)
         if sensitivity.blocked:
-            logger.warning("Sensitivity filter blocked explicit memory: %s", sensitivity.matched_labels)
+            logger.warning(
+                "Sensitivity filter blocked explicit memory: %s", sensitivity.matched_labels
+            )
             self._metrics.increment("sensitivity_blocked")
             raise ValueError(f"Content blocked by sensitivity filter: {sensitivity.matched_labels}")
         if sensitivity.redacted_content is not None:
-            logger.info("Sensitivity filter redacted explicit memory: %s", sensitivity.matched_labels)
+            logger.info(
+                "Sensitivity filter redacted explicit memory: %s", sensitivity.matched_labels
+            )
             self._metrics.increment("sensitivity_redacted")
             content = sensitivity.redacted_content
 
@@ -184,19 +190,21 @@ class TypedObserver:
     _MAX_EXTRACT_CHARS = 6000
 
     def _extract_via_llm(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        recent = messages[-self._MAX_EXTRACT_MESSAGES:]
+        recent = messages[-self._MAX_EXTRACT_MESSAGES :]
         conv_text = "\n".join(
             f"[{m.get('role', 'unknown')}]: {m.get('content', '')[:500]}"
-            for m in recent if m.get("content")
+            for m in recent
+            if m.get("content")
         )
-        conv_text = conv_text[-self._MAX_EXTRACT_CHARS:]
+        conv_text = conv_text[-self._MAX_EXTRACT_CHARS :]
         try:
             result = self.llm.chat_with_tools(
                 messages=[
                     {"role": "system", "content": OBSERVER_EXTRACTION_PROMPT},
                     {"role": "user", "content": conv_text},
                 ],
-                tools=[], tool_choice="none",
+                tools=[],
+                tool_choice="none",
                 task_hint="memory_extraction",
             )
             return _parse_json_array(result.get("content", ""))
@@ -205,7 +213,11 @@ class TypedObserver:
             return []
 
     def _parse_item(
-        self, item: dict, user_id: str, source_event_ids: list[str], now: datetime,
+        self,
+        item: dict,
+        user_id: str,
+        source_event_ids: list[str],
+        now: datetime,
     ) -> Optional[Memory]:
         if not isinstance(item, dict) or not item.get("content"):
             return None
@@ -227,7 +239,9 @@ class TypedObserver:
             observed_at=now,
         )
 
-    def _store_with_contradiction_check(self, mem: Memory, explain: bool = False) -> tuple[Memory, Optional[ContradictionStats]]:
+    def _store_with_contradiction_check(
+        self, mem: Memory, explain: bool = False
+    ) -> tuple[Memory, Optional[ContradictionStats]]:
         stats = ContradictionStats() if explain else None
 
         if mem.embedding is not None:
@@ -239,7 +253,8 @@ class TypedObserver:
             if contradiction:
                 logger.info(
                     "Contradiction detected: '%s' supersedes '%s'",
-                    mem.content[:60], contradiction.content[:60],
+                    mem.content[:60],
+                    contradiction.content[:60],
                 )
                 if stats:
                     stats.found = True
@@ -248,7 +263,9 @@ class TypedObserver:
 
         return self.store.create(mem), stats
 
-    def _find_contradiction(self, new: Memory, explain: bool = False) -> tuple[Optional[Memory], Optional[ContradictionStats]]:
+    def _find_contradiction(
+        self, new: Memory, explain: bool = False
+    ) -> tuple[Optional[Memory], Optional[ContradictionStats]]:
         stats = ContradictionStats(checked=True) if explain else None
 
         if new.embedding is None or self._db_factory is None:
@@ -266,7 +283,12 @@ class TypedObserver:
         start = time.time() if explain else 0
         try:
             row = (
-                db.query(MemoryRecord.memory_id, MemoryRecord.content, MemoryRecord.initial_confidence, dist_expr)
+                db.query(
+                    MemoryRecord.memory_id,
+                    MemoryRecord.content,
+                    MemoryRecord.initial_confidence,
+                    dist_expr,
+                )
                 .filter(
                     MemoryRecord.user_id == new.user_id,
                     MemoryRecord.is_active == 1,
@@ -321,8 +343,10 @@ class TypedObserver:
         try:
             # Use raw SQL with cosine_similarity for accurate similarity
             from sqlalchemy import text as sa_text
+
             emb_str = "[" + ",".join(str(v) for v in new_mem.embedding) + "]"
-            rows = db.execute(sa_text("""
+            rows = db.execute(
+                sa_text("""
                 SELECT memory_id, content, initial_confidence, trust_tier,
                        cosine_similarity(embedding, :emb) AS cos_sim
                 FROM mem_memories
@@ -332,7 +356,9 @@ class TypedObserver:
                   AND memory_id != :mid
                 ORDER BY cos_sim DESC
                 LIMIT 5
-            """), {"uid": new_mem.user_id, "emb": emb_str, "mid": new_mem.memory_id}).fetchall()
+            """),
+                {"uid": new_mem.user_id, "emb": emb_str, "mid": new_mem.memory_id},
+            ).fetchall()
 
             if not rows:
                 return
@@ -347,7 +373,9 @@ class TypedObserver:
                     memory_type=new_mem.memory_type,
                     content=row.content,
                     initial_confidence=row.initial_confidence,
-                    trust_tier=TrustTier(row.trust_tier) if row.trust_tier else TrustTier.T4_UNVERIFIED,
+                    trust_tier=TrustTier(row.trust_tier)
+                    if row.trust_tier
+                    else TrustTier.T4_UNVERIFIED,
                 )
 
                 update = evolver.evaluate_evidence(similarity, scene)
@@ -360,13 +388,17 @@ class TypedObserver:
                 is_active = None if not update.quarantined else False
 
                 self.store.update_confidence(
-                    update.memory_id, update.new_confidence,
-                    trust_tier=new_tier, is_active=is_active,
+                    update.memory_id,
+                    update.new_confidence,
+                    trust_tier=new_tier,
+                    is_active=is_active,
                 )
                 logger.info(
                     "Opinion evolved: %s %s %.2f→%.2f%s%s",
-                    row.memory_id[:8], update.evidence_type,
-                    update.old_confidence, update.new_confidence,
+                    row.memory_id[:8],
+                    update.evidence_type,
+                    update.old_confidence,
+                    update.new_confidence,
                     " PROMOTED" if update.promoted else "",
                     " QUARANTINED" if update.quarantined else "",
                 )

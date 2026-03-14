@@ -32,6 +32,7 @@ _DEFAULT_IDENTITY = "development assistant"
 # 1. PromptAssembler — Core Assembly
 # ============================================================================
 
+
 class TestPromptAssemblerCore:
     """Test PromptAssembler section assembly with real DB."""
 
@@ -62,11 +63,25 @@ class TestPromptAssemblerCore:
         edge_ctx = EdgeContext(
             project_rules="Always use moerr for errors.\nNever use fmt.Errorf.",
             edge_tools=[
-                {"type": "function", "function": {"name": "read_file", "description": "Read", "parameters": {}}},
-                {"type": "function", "function": {"name": "bash", "description": "Shell", "parameters": {}}},
-                {"type": "function", "function": {"name": "grep", "description": "Search", "parameters": {}}},
+                {
+                    "type": "function",
+                    "function": {"name": "read_file", "description": "Read", "parameters": {}},
+                },
+                {
+                    "type": "function",
+                    "function": {"name": "bash", "description": "Shell", "parameters": {}},
+                },
+                {
+                    "type": "function",
+                    "function": {"name": "grep", "description": "Search", "parameters": {}},
+                },
             ],
-            edge_profile={"cwd": "/home/test/project", "git_branch": "main", "project_type": "go", "languages": ["Go", "Python"]},
+            edge_profile={
+                "cwd": "/home/test/project",
+                "git_branch": "main",
+                "project_type": "go",
+                "languages": ["Go", "Python"],
+            },
         )
 
         pa = PromptAssembler(lambda: db_session)
@@ -79,8 +94,9 @@ class TestPromptAssemblerCore:
         )
 
         # Project rules appear
-        assert "moerr" in result.system_message, \
+        assert "moerr" in result.system_message, (
             f"Expected 'moerr' in system_message, got: {result.system_message[:300]}"
+        )
         assert "project_context" in result.sections
 
         # Edge profile appears
@@ -103,15 +119,19 @@ class TestPromptAssemblerCore:
 
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="test", session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="test",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
         )
 
         total_from_breakdown = sum(result.token_breakdown.values())
         # Re-estimate from the joined message (may differ by join separators)
         estimated = _estimate_tokens(result.system_message)
         # Should be close (within tolerance due to join separators)
-        assert abs(total_from_breakdown - estimated) < estimated * _TOKEN_ESTIMATE_TOLERANCE, \
+        assert abs(total_from_breakdown - estimated) < estimated * _TOKEN_ESTIMATE_TOLERANCE, (
             f"Breakdown total {total_from_breakdown} vs estimated {estimated} exceeds {_TOKEN_ESTIMATE_TOLERANCE:.0%} tolerance"
+        )
 
     def test_assemble_section_order_is_cache_friendly(self, db_session):
         """Sections appear in §1-§7 order for LLM prompt cache optimization."""
@@ -120,7 +140,10 @@ class TestPromptAssemblerCore:
         edge_ctx = EdgeContext(project_rules="rule1")
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="test", session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="test",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
             edge_context=edge_ctx,
         )
 
@@ -140,7 +163,10 @@ class TestPromptAssemblerCore:
         edge_ctx = EdgeContext(project_rules="some rules here")
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="test", session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="test",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
             edge_context=edge_ctx,
         )
 
@@ -156,6 +182,7 @@ class TestPromptAssemblerCore:
 # 2. PromptAssembler — Compression
 # ============================================================================
 
+
 class TestPromptAssemblerCompression:
     """Test budget-capped compression behavior."""
 
@@ -165,7 +192,10 @@ class TestPromptAssemblerCompression:
 
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="test", session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="test",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
             max_tokens=50000,  # very generous
         )
 
@@ -178,7 +208,10 @@ class TestPromptAssemblerCompression:
 
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="test", session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="test",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
             max_tokens=100,  # extremely tight
         )
 
@@ -195,17 +228,16 @@ class TestPromptAssemblerCompression:
         total = sum(result.token_breakdown.values())
         budget_with_tolerance = 100 * (1 + _TOKEN_ESTIMATE_TOLERANCE)
         never_compressed = sum(
-            v for k, v in result.token_breakdown.items()
-            if k in ("identity", "constraints")
+            v for k, v in result.token_breakdown.items() if k in ("identity", "constraints")
         )
         expected_max = max(budget_with_tolerance, never_compressed)
-        assert total <= expected_max, \
-            f"Expected ≤ {expected_max:.0f} tokens, got {total}"
+        assert total <= expected_max, f"Expected ≤ {expected_max:.0f} tokens, got {total}"
 
 
 # ============================================================================
 # 2b. Boundary Conditions
 # ============================================================================
+
 
 class TestBoundaryConditions:
     """Edge cases that could cause unexpected behavior."""
@@ -216,7 +248,10 @@ class TestBoundaryConditions:
 
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="test", session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="test",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
             max_tokens=0,
         )
         assert "identity" in result.sections
@@ -231,8 +266,20 @@ class TestBoundaryConditions:
         edge_none = EdgeContext(edge_tools=None)
 
         pa = PromptAssembler(lambda: db_session)
-        r1 = pa.assemble(agent_id=None, user_query="t", session_id=unique_test_id(), user_id=unique_test_id(), edge_context=edge_empty)
-        r2 = pa.assemble(agent_id=None, user_query="t", session_id=unique_test_id(), user_id=unique_test_id(), edge_context=edge_none)
+        r1 = pa.assemble(
+            agent_id=None,
+            user_query="t",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
+            edge_context=edge_empty,
+        )
+        r2 = pa.assemble(
+            agent_id=None,
+            user_query="t",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
+            edge_context=edge_none,
+        )
 
         # Both should produce valid output without crashing
         assert r1.system_message
@@ -251,24 +298,36 @@ class TestBoundaryConditions:
         pa = PromptAssembler(lambda: db_session)
         long_query = "x" * 100_000
         result = pa.assemble(
-            agent_id=None, user_query=long_query, session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query=long_query,
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
         )
         assert result.system_message
         assert result.token_breakdown
 
     def test_edge_profile_all_fields_overlong(self, db_session):
         """Every edge_profile field exceeding limit is truncated, not rejected."""
-        from core.context.prompt_assembler import PromptAssembler, EdgeContext, MAX_PROFILE_FIELD_CHARS
+        from core.context.prompt_assembler import (
+            PromptAssembler,
+            EdgeContext,
+            MAX_PROFILE_FIELD_CHARS,
+        )
 
-        edge_ctx = EdgeContext(edge_profile={
-            "cwd": "A" * 1000,
-            "git_branch": "B" * 1000,
-            "project_type": "C" * 1000,
-            "languages": ["X" * 100] * 50,
-        })
+        edge_ctx = EdgeContext(
+            edge_profile={
+                "cwd": "A" * 1000,
+                "git_branch": "B" * 1000,
+                "project_type": "C" * 1000,
+                "languages": ["X" * 100] * 50,
+            }
+        )
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="t", session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="t",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
             edge_context=edge_ctx,
         )
         ctx = result.sections.get("project_context", "")
@@ -284,14 +343,19 @@ class TestBoundaryConditions:
         """Malformed edge_tools (missing 'function' key) should not crash assembler."""
         from core.context.prompt_assembler import PromptAssembler, EdgeContext
 
-        edge_ctx = EdgeContext(edge_tools=[
-            {"type": "function"},  # missing "function" key
-            {"type": "function", "function": {}},  # missing "name"
-            {"type": "function", "function": {"name": "valid_tool", "description": "ok"}},
-        ])
+        edge_ctx = EdgeContext(
+            edge_tools=[
+                {"type": "function"},  # missing "function" key
+                {"type": "function", "function": {}},  # missing "name"
+                {"type": "function", "function": {"name": "valid_tool", "description": "ok"}},
+            ]
+        )
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="t", session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="t",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
             edge_context=edge_ctx,
         )
         assert result.system_message
@@ -306,11 +370,14 @@ class TestBoundaryConditions:
 
         pa = PromptAssembler(lambda: db_session)
         # Use a real SQLAlchemy error type — plain Exception now propagates
-        with _patch.object(db_session, "execute",
-                           side_effect=OperationalError("SELECT", {}, Exception("DB down"))):
+        with _patch.object(
+            db_session, "execute", side_effect=OperationalError("SELECT", {}, Exception("DB down"))
+        ):
             result = pa.assemble(
-                agent_id="nonexistent", user_query="test",
-                session_id=unique_test_id(), user_id=unique_test_id(),
+                agent_id="nonexistent",
+                user_query="test",
+                session_id=unique_test_id(),
+                user_id=unique_test_id(),
             )
         # Should still return valid prompt with default identity
         assert _DEFAULT_IDENTITY in result.system_message
@@ -323,6 +390,7 @@ class TestBoundaryConditions:
 # 3. PromptAssembler — Snapshot Persistence
 # ============================================================================
 
+
 class TestPromptAssemblerSnapshot:
     """Test context snapshot audit trail."""
 
@@ -332,7 +400,10 @@ class TestPromptAssemblerSnapshot:
 
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="snapshot test", session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="snapshot test",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
         )
 
         assert result.snapshot_id is not None, "Snapshot should be persisted"
@@ -357,12 +428,17 @@ class TestPromptAssemblerSnapshot:
 
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="token count test", session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="token count test",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
         )
 
         assert result.snapshot_id is not None
         row = db_session.execute(
-            sql_text("SELECT total_tokens, token_budget FROM ctx_snapshots WHERE context_capture_id = :cid"),
+            sql_text(
+                "SELECT total_tokens, token_budget FROM ctx_snapshots WHERE context_capture_id = :cid"
+            ),
             {"cid": result.snapshot_id},
         ).fetchone()
         assert row is not None
@@ -371,6 +447,7 @@ class TestPromptAssemblerSnapshot:
 
         # Verify total_tokens == sum of token_budget values
         import json as _json
+
         budget = _json.loads(row[1]) if isinstance(row[1], str) else row[1]
         expected_total = sum(v for v in budget.values() if isinstance(v, (int, float)))
         assert row[0] == expected_total, f"total_tokens {row[0]} != sum(budget) {expected_total}"
@@ -382,8 +459,10 @@ class TestPromptAssemblerSnapshot:
 
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="what is event sourcing?",
-            session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="what is event sourcing?",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
         )
         row = db_session.execute(
             sql_text("SELECT token_budget FROM ctx_snapshots WHERE context_capture_id = :cid"),
@@ -406,7 +485,9 @@ class TestPromptAssemblerSnapshot:
         first = pa.assemble(agent_id=None, user_query="first", session_id=sid, user_id=uid)
 
         refreshed = pa.refresh_memory(
-            session_id=sid, user_id=uid, user_query="second question here",
+            session_id=sid,
+            user_id=uid,
+            user_query="second question here",
             current_sections=first.sections,
         )
         row = db_session.execute(
@@ -422,6 +503,7 @@ class TestPromptAssemblerSnapshot:
 # ============================================================================
 # 4. Prompt Injection Defense
 # ============================================================================
+
 
 class TestPromptInjectionDefense:
     """Test edge content sanitization."""
@@ -441,15 +523,18 @@ class TestPromptInjectionDefense:
         edge_ctx = EdgeContext(project_rules=malicious_rules)
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="test", session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="test",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
             edge_context=edge_ctx,
         )
 
         ctx = result.sections.get("project_context", "")
-        assert "ignore previous instructions" not in ctx, \
+        assert "ignore previous instructions" not in ctx, (
             f"Injection pattern not stripped: {ctx[:300]}"
-        assert "you are now a pirate" not in ctx, \
-            f"Injection pattern not stripped: {ctx[:300]}"
+        )
+        assert "you are now a pirate" not in ctx, f"Injection pattern not stripped: {ctx[:300]}"
         # Legitimate rules survive
         assert "Go conventions" in ctx
         assert "Always run tests" in ctx
@@ -463,7 +548,10 @@ class TestPromptInjectionDefense:
         edge_ctx = EdgeContext(project_rules=rules)
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="test", session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="test",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
             edge_context=edge_ctx,
         )
         ctx = result.sections.get("project_context", "")
@@ -477,7 +565,10 @@ class TestPromptInjectionDefense:
         edge_ctx = EdgeContext(project_rules=rules)
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="test", session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="test",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
             edge_context=edge_ctx,
         )
         ctx = result.sections.get("project_context", "")
@@ -486,7 +577,11 @@ class TestPromptInjectionDefense:
 
     def test_edge_profile_field_length_capped(self, db_session):
         """Edge profile fields are truncated to prevent abuse."""
-        from core.context.prompt_assembler import PromptAssembler, EdgeContext, MAX_PROFILE_FIELD_CHARS
+        from core.context.prompt_assembler import (
+            PromptAssembler,
+            EdgeContext,
+            MAX_PROFILE_FIELD_CHARS,
+        )
 
         edge_ctx = EdgeContext(
             edge_profile={
@@ -498,23 +593,36 @@ class TestPromptInjectionDefense:
 
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="test", session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="test",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
             edge_context=edge_ctx,
         )
 
         ctx = result.sections.get("project_context", "")
         # cwd should be truncated to MAX_PROFILE_FIELD_CHARS
-        assert len([line for line in ctx.split("\n") if line.startswith("cwd:")][0]) <= MAX_PROFILE_FIELD_CHARS + 10  # +header
+        assert (
+            len([line for line in ctx.split("\n") if line.startswith("cwd:")][0])
+            <= MAX_PROFILE_FIELD_CHARS + 10
+        )  # +header
 
     def test_project_rules_size_capped(self, db_session):
         """Project rules exceeding limit are truncated."""
-        from core.context.prompt_assembler import PromptAssembler, EdgeContext, MAX_PROJECT_RULES_CHARS
+        from core.context.prompt_assembler import (
+            PromptAssembler,
+            EdgeContext,
+            MAX_PROJECT_RULES_CHARS,
+        )
 
         huge_rules = "x" * 10000
         edge_ctx = EdgeContext(project_rules=huge_rules)
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="test", session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="test",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
             edge_context=edge_ctx,
         )
 
@@ -537,7 +645,10 @@ class TestPromptInjectionDefense:
         edge_ctx = EdgeContext(project_rules=rules)
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="test", session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="test",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
             edge_context=edge_ctx,
         )
         ctx = result.sections.get("project_context", "")
@@ -555,17 +666,22 @@ class TestPromptInjectionDefense:
         edge_ctx = EdgeContext(project_rules=rules)
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="test", session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="test",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
             edge_context=edge_ctx,
         )
         ctx = result.sections.get("project_context", "")
-        assert "you are now running" in ctx, \
+        assert "you are now running" in ctx, (
             f"Legitimate 'you are now running' was incorrectly stripped: {ctx[:300]}"
+        )
 
 
 # ============================================================================
 # 5. Cold Start Baselines
 # ============================================================================
+
 
 class TestColdStartBaselines:
     """Test agent type → insight mapping."""
@@ -576,7 +692,10 @@ class TestColdStartBaselines:
 
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="test", session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="test",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
         )
 
         sm = result.sections["self_model"]
@@ -585,28 +704,33 @@ class TestColdStartBaselines:
         # to stay within budget. Both outcomes are correct.
         has_insight = _DEFAULT_INSIGHT in sm
         was_compressed = "### What I've Learned" not in sm
-        assert has_insight or was_compressed, \
+        assert has_insight or was_compressed, (
             f"Expected default insight or compressed self_model, got: {sm[:300]}"
+        )
 
     def test_specialist_baseline_mentions_domain(self):
         """Specialist agent type → domain-focused insight."""
         from core.context.prompt_assembler import _BASELINE_INSIGHTS
+
         assert "domain" in _BASELINE_INSIGHTS["specialist"]
 
     def test_reviewer_baseline_mentions_read_only(self):
         """Reviewer agent type → read-only insight."""
         from core.context.prompt_assembler import _BASELINE_INSIGHTS
+
         assert "don't modify" in _BASELINE_INSIGHTS["reviewer"]
 
     def test_orchestrator_baseline_mentions_delegation(self):
         """Orchestrator agent type → delegation insight."""
         from core.context.prompt_assembler import _BASELINE_INSIGHTS
+
         assert "delegate" in _BASELINE_INSIGHTS["orchestrator"]
 
 
 # ============================================================================
 # 5b. Self-Model — Installed & Cloud Skills
 # ============================================================================
+
 
 class TestSelfModelSkills:
     """Test that Self-Model correctly shows installed vs cloud skills."""
@@ -618,50 +742,67 @@ class TestSelfModelSkills:
         concurrently-inserted skills (``cache_*``, ``sk_*``, …) and
         always land within the 10-slot cloud-skills cap.
         """
-        for suffix, desc in [("ci", "Check CI status"), ("pr", "List open PRs"), ("sum", "Summarize PR changes")]:
+        for suffix, desc in [
+            ("ci", "Check CI status"),
+            ("pr", "List open PRs"),
+            ("sum", "Summarize PR changes"),
+        ]:
             name = f"a_{user_id}_{suffix}"
-            db.execute(sql_text(
-                "INSERT INTO skills_registry (skill_id, skill_name, version, description, is_active, category) "
-                "VALUES (:id, :n, '1.0.0', :d, 1, 'devops')"
-            ), {"id": f"{name}@1.0.0", "n": name, "d": desc})
+            db.execute(
+                sql_text(
+                    "INSERT INTO skills_registry (skill_id, skill_name, version, description, is_active, category) "
+                    "VALUES (:id, :n, '1.0.0', :d, 1, 'devops')"
+                ),
+                {"id": f"{name}@1.0.0", "n": name, "d": desc},
+            )
         # Install only first two for the user
         for i, suffix in enumerate(["ci", "pr"], 1):
             name = f"a_{user_id}_{suffix}"
-            db.execute(sql_text(
-                "INSERT INTO skill_installations (installation_id, user_id, skill_name, skill_version, status, installed_at) "
-                "VALUES (:iid, :uid, :n, '1.0.0', 'installed', NOW())"
-            ), {"iid": str(uuid4()), "uid": user_id, "n": name})
+            db.execute(
+                sql_text(
+                    "INSERT INTO skill_installations (installation_id, user_id, skill_name, skill_version, status, installed_at) "
+                    "VALUES (:iid, :uid, :n, '1.0.0', 'installed', NOW())"
+                ),
+                {"iid": str(uuid4()), "uid": user_id, "n": name},
+            )
         db.commit()
 
     def _cleanup_skills(self, db, user_id: str):
         """Remove test data to avoid leaking into other tests."""
-        db.execute(sql_text("DELETE FROM skill_installations WHERE user_id = :uid"), {"uid": user_id})
-        db.execute(sql_text("DELETE FROM skills_registry WHERE skill_name LIKE :pat"), {"pat": f"a_{user_id}%"})
+        db.execute(
+            sql_text("DELETE FROM skill_installations WHERE user_id = :uid"), {"uid": user_id}
+        )
+        db.execute(
+            sql_text("DELETE FROM skills_registry WHERE skill_name LIKE :pat"),
+            {"pat": f"a_{user_id}%"},
+        )
         db.commit()
 
     def test_installed_skills_shown_with_description(self, db_session):
         """Installed skills appear in Self-Model as a compact comma-separated list.
-        
+
         Format: "Installed: skill1, skill2"
         """
         from core.context.prompt_assembler import PromptAssembler
         import re
-        
+
         uid = unique_test_id()
         self._seed_skills(db_session, uid)
         try:
             pa = PromptAssembler(lambda: db_session)
             result = pa.assemble(
-                agent_id=None, user_query="what can you do?",
-                session_id=unique_test_id(), user_id=uid,
+                agent_id=None,
+                user_query="what can you do?",
+                session_id=unique_test_id(),
+                user_id=uid,
             )
             sm = result.sections["self_model"]
-            
+
             # Verify installed skills listed
             assert "Installed:" in sm
             assert f"a_{uid}_ci" in sm
             assert f"a_{uid}_pr" in sm
-            
+
             # Verify no descriptions inline (token efficiency)
             assert "Check CI status" not in sm
             assert "List open PRs" not in sm
@@ -670,26 +811,28 @@ class TestSelfModelSkills:
 
     def test_cloud_skills_exclude_installed(self, db_session):
         """Cloud skills count excludes user's installed skills.
-        
+
         Installed skills appear in their own "Installed:" line, not in cloud count.
         """
         from core.context.prompt_assembler import PromptAssembler
-        
+
         uid = unique_test_id()
         self._seed_skills(db_session, uid)
         try:
             pa = PromptAssembler(lambda: db_session)
             result = pa.assemble(
-                agent_id=None, user_query="what else?",
-                session_id=unique_test_id(), user_id=uid,
+                agent_id=None,
+                user_query="what else?",
+                session_id=unique_test_id(),
+                user_id=uid,
             )
             sm = result.sections["self_model"]
-            
+
             # Verify installed skills shown
             assert "Installed:" in sm
             assert f"a_{uid}_ci" in sm
             assert f"a_{uid}_pr" in sm
-            
+
             # Cloud skills section (if present) should not contain installed skill names
             cloud_section_start = sm.lower().find("cloud skills")
             if cloud_section_start >= 0:
@@ -701,49 +844,62 @@ class TestSelfModelSkills:
 
     def test_multi_version_dedup(self, db_session):
         """Category summary correctly handles multi-version skills (no duplication).
-        
+
         Rationale: When multiple versions of the same skill exist in registry,
         the category summary should count them as ONE skill (by skill_name, not skill_id).
         Uses DISTINCT(skill_name) in the query to avoid counting versions separately.
         """
         from core.context.prompt_assembler import PromptAssembler
         import re
-        
+
         uid = unique_test_id()
         skill_name = f"a_{uid}_multi"
-        db_session.execute(sql_text(
-            "INSERT INTO skills_registry (skill_id, skill_name, version, description, is_active, category) "
-            "VALUES (:id1, :n, '1.0.0', 'Version one', 1, 'test')"
-        ), {"id1": f"{skill_name}@1.0.0", "n": skill_name})
-        db_session.execute(sql_text(
-            "INSERT INTO skills_registry (skill_id, skill_name, version, description, is_active, category) "
-            "VALUES (:id2, :n, '2.0.0', 'Version two', 1, 'test')"
-        ), {"id2": f"{skill_name}@2.0.0", "n": skill_name})
+        db_session.execute(
+            sql_text(
+                "INSERT INTO skills_registry (skill_id, skill_name, version, description, is_active, category) "
+                "VALUES (:id1, :n, '1.0.0', 'Version one', 1, 'test')"
+            ),
+            {"id1": f"{skill_name}@1.0.0", "n": skill_name},
+        )
+        db_session.execute(
+            sql_text(
+                "INSERT INTO skills_registry (skill_id, skill_name, version, description, is_active, category) "
+                "VALUES (:id2, :n, '2.0.0', 'Version two', 1, 'test')"
+            ),
+            {"id2": f"{skill_name}@2.0.0", "n": skill_name},
+        )
         db_session.commit()
         try:
             pa = PromptAssembler(lambda: db_session)
             result = pa.assemble(
-                agent_id=None, user_query="skills?",
-                session_id=unique_test_id(), user_id=uid,
+                agent_id=None,
+                user_query="skills?",
+                session_id=unique_test_id(),
+                user_id=uid,
             )
             sm = result.sections["self_model"]
-            
+
             # Verify Self-Model is generated without crash
             assert "Self-Model" in sm
-            
+
             # Cloud skills count should not double-count versions
             assert "cloud skills" in sm
         finally:
-            db_session.execute(sql_text("DELETE FROM skills_registry WHERE skill_name = :n"), {"n": skill_name})
+            db_session.execute(
+                sql_text("DELETE FROM skills_registry WHERE skill_name = :n"), {"n": skill_name}
+            )
             db_session.commit()
 
     def test_no_user_id_skips_installed(self, db_session):
         """When user_id is None, installed skills section is absent."""
         from core.context.prompt_assembler import PromptAssembler
+
         pa = PromptAssembler(lambda: db_session)
         result = pa.assemble(
-            agent_id=None, user_query="test",
-            session_id=unique_test_id(), user_id=unique_test_id(),
+            agent_id=None,
+            user_query="test",
+            session_id=unique_test_id(),
+            user_id=unique_test_id(),
         )
         sm = result.sections["self_model"]
         # No skills installed for a random user_id → no "Installed:"
@@ -753,6 +909,7 @@ class TestSelfModelSkills:
 # ============================================================================
 # 6. Introspection Tool — get_agent_info
 # ============================================================================
+
 
 class TestGetAgentInfoTool:
     """Test the introspection tool end-to-end."""
@@ -769,15 +926,25 @@ class TestGetAgentInfoTool:
             def __init__(self, n, se):
                 self._name = n
                 self._se = se
+
             @property
-            def name(self): return self._name
+            def name(self):
+                return self._name
+
             @property
-            def description(self): return "dummy"
+            def description(self):
+                return "dummy"
+
             @property
-            def parameters(self): return {"type": "object", "properties": {}}
+            def parameters(self):
+                return {"type": "object", "properties": {}}
+
             @property
-            def side_effect(self): return self._se
-            async def execute(self, **kw): return "ok"
+            def side_effect(self):
+                return self._se
+
+            async def execute(self, **kw):
+                return "ok"
 
         router.register(DummyTool("read_file", SideEffect.READ))
         router.register(DummyTool("bash", SideEffect.EXECUTE))
@@ -856,6 +1023,7 @@ class TestGetAgentInfoTool:
     async def test_state_includes_token_usage(self):
         """prompt_tokens and completion_tokens are exposed in state dimension."""
         from cli.tools.introspection import GetAgentInfoTool
+
         session_info = {
             "session_id": "ses_tok",
             "turn": 2,
@@ -867,7 +1035,6 @@ class TestGetAgentInfoTool:
         assert result["state"]["prompt_tokens"] == 1234
         assert result["state"]["completion_tokens"] == 567
 
-
         tool = self._make_tool()
         schema = tool.to_openai_schema()
         assert schema["type"] == "function"
@@ -877,6 +1044,7 @@ class TestGetAgentInfoTool:
 
     def test_side_effect_is_read(self):
         from cli.tools.base import SideEffect
+
         tool = self._make_tool()
         assert tool.side_effect == SideEffect.READ
 
@@ -889,6 +1057,7 @@ class TestGetAgentInfoTool:
     def test_description_mentions_all_dimensions(self):
         """Dimension values mentioned in description must exist in enum (no stale references)."""
         import re
+
         tool = self._make_tool()
         dim_prop = tool.parameters["properties"]["dimension"]
         enum_vals = set(dim_prop["enum"])
@@ -912,6 +1081,7 @@ class TestGetAgentInfoTool:
     async def test_capability_with_no_router(self):
         """tool_router=None → empty tool list, no crash."""
         from cli.tools.introspection import GetAgentInfoTool
+
         tool = GetAgentInfoTool(tool_router=None, session_info={})
         result = json.loads(await tool.execute(dimension="capability"))
         assert result["capability"]["tool_count"] == 0
@@ -925,8 +1095,22 @@ class TestGetAgentInfoTool:
 
         mock_api = AsyncMock()
         mock_api.get_introspection_skills.return_value = {
-            "installed": [{"name": "ci_status", "version": "1.0.0", "description": "Check CI", "category": "devops"}],
-            "cloud": [{"name": "summarize_pr", "version": "1.0.0", "description": "Summarize PR", "category": "devops"}],
+            "installed": [
+                {
+                    "name": "ci_status",
+                    "version": "1.0.0",
+                    "description": "Check CI",
+                    "category": "devops",
+                }
+            ],
+            "cloud": [
+                {
+                    "name": "summarize_pr",
+                    "version": "1.0.0",
+                    "description": "Summarize PR",
+                    "category": "devops",
+                }
+            ],
         }
         tool = GetAgentInfoTool(tool_router=None, session_info={}, api_client=mock_api)
         result = json.loads(await tool.execute(dimension="capability"))
@@ -965,7 +1149,6 @@ class TestGetAgentInfoTool:
         # Cloud fields not present
         assert "episodic" not in result["memory"]
 
-
     @pytest.mark.asyncio
     async def test_context_snapshot_dimension(self):
         """context_snapshot dimension calls get_introspection_context_snapshot."""
@@ -974,7 +1157,9 @@ class TestGetAgentInfoTool:
 
         mock_api = AsyncMock()
         mock_api.get_introspection_context_snapshot.return_value = {
-            "turn": 3, "total_tokens": 5000, "health": {"status": "healthy"},
+            "turn": 3,
+            "total_tokens": 5000,
+            "health": {"status": "healthy"},
         }
         tool = GetAgentInfoTool(
             tool_router=None,
@@ -1012,7 +1197,8 @@ class TestGetAgentInfoTool:
 
         mock_api = AsyncMock()
         mock_api.get_introspection_context_trend.return_value = {
-            "trend": "growing", "current_tokens": 8000,
+            "trend": "growing",
+            "current_tokens": 8000,
         }
         tool = GetAgentInfoTool(
             tool_router=None, session_info={"session_id": "ses_1"}, api_client=mock_api
@@ -1029,7 +1215,8 @@ class TestGetAgentInfoTool:
 
         mock_api = AsyncMock()
         mock_api.get_introspection_retrieval_quality.return_value = {
-            "overall_quality": "good", "mean_relevance": 0.75,
+            "overall_quality": "good",
+            "mean_relevance": 0.75,
         }
         tool = GetAgentInfoTool(
             tool_router=None, session_info={"session_id": "ses_1"}, api_client=mock_api
@@ -1066,6 +1253,7 @@ class TestGetAgentInfoTool:
 # ============================================================================
 # 7. Edge Profile Detection
 # ============================================================================
+
 
 class TestEdgeProfileDetection:
     """Test detect_edge_profile with real filesystem."""
@@ -1115,7 +1303,11 @@ class TestEdgeProfileDetection:
         # Need at least one commit for rev-parse to work
         (tmp_path / "README.md").write_text("init\n")
         subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
-        subprocess.run(["git", "-c", "user.name=test", "-c", "user.email=t@t.com", "commit", "-m", "init"], cwd=tmp_path, capture_output=True)
+        subprocess.run(
+            ["git", "-c", "user.name=test", "-c", "user.email=t@t.com", "commit", "-m", "init"],
+            cwd=tmp_path,
+            capture_output=True,
+        )
 
         profile = detect_edge_profile(str(tmp_path))
         assert profile.get("git_branch") == "feature/test"
@@ -1141,6 +1333,7 @@ class TestEdgeProfileDetection:
 # ============================================================================
 # 8. Tool Categorization
 # ============================================================================
+
 
 class TestToolCategorization:
     """Test _categorize_tools grouping logic."""
@@ -1182,6 +1375,7 @@ class TestToolCategorization:
 # 9. _recover_history_from_db uses assembler
 # ============================================================================
 
+
 class TestRecoverHistoryUsesAssembler:
     """Verify that server restart recovery rebuilds prompt via assembler."""
 
@@ -1194,42 +1388,55 @@ class TestRecoverHistoryUsesAssembler:
         user_id = unique_test_id()
         chain_id = unique_test_id()
         ev1, ev2 = unique_test_id(), unique_test_id()
-        db_session.execute(_text("""
+        db_session.execute(
+            _text("""
             INSERT INTO agent_events
                 (event_id, session_id, user_id, agent_id, agent_version, event_type, content, causal_chain_id, created_at)
             VALUES (:eid, :sid, :uid, 'system', '1.0.0', 'user_query', 'hello', :cid, NOW())
-        """), {"eid": ev1, "sid": session_id, "uid": user_id, "cid": chain_id})
-        db_session.execute(_text("""
+        """),
+            {"eid": ev1, "sid": session_id, "uid": user_id, "cid": chain_id},
+        )
+        db_session.execute(
+            _text("""
             INSERT INTO agent_events
                 (event_id, session_id, user_id, agent_id, agent_version, event_type, content, causal_chain_id, created_at)
             VALUES (:eid, :sid, :uid, 'system', '1.0.0', 'llm_response', 'Hi there!', :cid, NOW())
-        """), {"eid": ev2, "sid": session_id, "uid": user_id, "cid": chain_id})
+        """),
+            {"eid": ev2, "sid": session_id, "uid": user_id, "cid": chain_id},
+        )
         db_session.commit()
 
         try:
             from api.routers.chat import _recover_history_from_db
+
             history, sections = _recover_history_from_db(db_session, user_id, session_id)
 
             assert history, "Recovery should return non-empty history"
             assert sections is not None, "Recovery should return sections for incremental refresh"
             system_msg = history[0]["content"]
             # Must contain Self-Model from assembler — the old hardcoded fallback is not acceptable
-            assert _SELF_MODEL_MARKER in system_msg, \
+            assert _SELF_MODEL_MARKER in system_msg, (
                 f"Expected assembler-generated Self-Model section, got: {system_msg[:300]}"
+            )
             # Should have user + assistant messages after system
             roles = [m["role"] for m in history]
             assert "user" in roles
             assert "assistant" in roles
         finally:
             # Cleanup even if assertions fail
-            db_session.execute(_text("DELETE FROM ctx_snapshots WHERE session_id = :sid"), {"sid": session_id})
-            db_session.execute(_text("DELETE FROM agent_events WHERE session_id = :sid"), {"sid": session_id})
+            db_session.execute(
+                _text("DELETE FROM ctx_snapshots WHERE session_id = :sid"), {"sid": session_id}
+            )
+            db_session.execute(
+                _text("DELETE FROM agent_events WHERE session_id = :sid"), {"sid": session_id}
+            )
             db_session.commit()
 
 
 # ============================================================================
 # 9b. _recover_history_from_db — tool call recovery
 # ============================================================================
+
 
 def _insert_event(db, sid, uid, cid, etype, content, metadata=None, seq=0):
     """Helper: insert a conversation_event with controlled ordering.
@@ -1238,17 +1445,29 @@ def _insert_event(db, sid, uid, cid, etype, content, metadata=None, seq=0):
     across DB engines (MatrixOne NOW() may return the same value within a txn).
     """
     from sqlalchemy import text as _t
+
     eid = unique_test_id()
     meta_json = json.dumps(metadata) if metadata else None
-    db.execute(_t("""
+    db.execute(
+        _t("""
         INSERT INTO agent_events
             (event_id, session_id, user_id, agent_id, agent_version,
              event_type, content, causal_chain_id, metadata, created_at)
         VALUES (:eid, :sid, :uid, 'system', '1.0.0',
                 :etype, :content, :cid, :meta,
                 DATE_ADD('2026-01-01 00:00:00', INTERVAL :seq SECOND))
-    """), {"eid": eid, "sid": sid, "uid": uid, "cid": cid,
-           "etype": etype, "content": content, "meta": meta_json, "seq": seq})
+    """),
+        {
+            "eid": eid,
+            "sid": sid,
+            "uid": uid,
+            "cid": cid,
+            "etype": etype,
+            "content": content,
+            "meta": meta_json,
+            "seq": seq,
+        },
+    )
     return eid
 
 
@@ -1268,29 +1487,47 @@ class TestRecoverHistoryToolCalls:
         self.cid = unique_test_id()
         yield
         from sqlalchemy import text as _t
-        db_session.execute(_t("DELETE FROM ctx_snapshots WHERE session_id = :sid"), {"sid": self.sid})
-        db_session.execute(_t("DELETE FROM agent_events WHERE session_id = :sid"), {"sid": self.sid})
+
+        db_session.execute(
+            _t("DELETE FROM ctx_snapshots WHERE session_id = :sid"), {"sid": self.sid}
+        )
+        db_session.execute(
+            _t("DELETE FROM agent_events WHERE session_id = :sid"), {"sid": self.sid}
+        )
         db_session.commit()
 
     def _recover(self):
         from api.routers.chat import _recover_history_from_db
+
         history, _sections = _recover_history_from_db(self.db, self.uid, self.sid)
         return history
 
     def test_single_tool_call_round_trip(self):
         """user → tool_call_start → tool_result → llm_response produces valid sequence."""
-        _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "user_query", "list files", seq=0)
-        _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "tool_call",
-                      json.dumps({"tool_call_id": "tc1", "name": "bash", "arguments": '{"cmd":"ls"}'}),
-                      metadata={"tool_call_id": "tc1", "name": "bash"}, seq=1000)
-        _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "tool_result",
-                      json.dumps({"name": "bash", "result": "file1.py"}),
-                      metadata={"tool_call_id": "tc1", "name": "bash"}, seq=2000)
-        _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "llm_response", "Here are your files.", seq=3000)
+        _insert_event(self.db, self.sid, self.uid, self.cid, "user_query", "list files", seq=0)
+        _insert_event(
+            self.db,
+            self.sid,
+            self.uid,
+            self.cid,
+            "tool_call",
+            json.dumps({"tool_call_id": "tc1", "name": "bash", "arguments": '{"cmd":"ls"}'}),
+            metadata={"tool_call_id": "tc1", "name": "bash"},
+            seq=1000,
+        )
+        _insert_event(
+            self.db,
+            self.sid,
+            self.uid,
+            self.cid,
+            "tool_result",
+            json.dumps({"name": "bash", "result": "file1.py"}),
+            metadata={"tool_call_id": "tc1", "name": "bash"},
+            seq=2000,
+        )
+        _insert_event(
+            self.db, self.sid, self.uid, self.cid, "llm_response", "Here are your files.", seq=3000
+        )
         self.db.commit()
 
         history = self._recover()
@@ -1310,26 +1547,48 @@ class TestRecoverHistoryToolCalls:
     def test_multi_tool_call_single_batch(self):
         """Two tool_call_starts produce ONE assistant message with two tool_calls,
         followed by two tool messages."""
-        _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "user_query", "check both", seq=0)
-        _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "tool_call",
-                      json.dumps({"tool_call_id": "tc_a", "name": "read_file", "arguments": "{}"}),
-                      metadata={"tool_call_id": "tc_a", "name": "read_file"}, seq=1000)
-        _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "tool_call",
-                      json.dumps({"tool_call_id": "tc_b", "name": "bash", "arguments": "{}"}),
-                      metadata={"tool_call_id": "tc_b", "name": "bash"}, seq=2000)
-        _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "tool_result",
-                      json.dumps({"name": "read_file", "result": "content"}),
-                      metadata={"tool_call_id": "tc_a", "name": "read_file"}, seq=3000)
-        _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "tool_result",
-                      json.dumps({"name": "bash", "result": "ok"}),
-                      metadata={"tool_call_id": "tc_b", "name": "bash"}, seq=4000)
-        _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "llm_response", "Done.", seq=5000)
+        _insert_event(self.db, self.sid, self.uid, self.cid, "user_query", "check both", seq=0)
+        _insert_event(
+            self.db,
+            self.sid,
+            self.uid,
+            self.cid,
+            "tool_call",
+            json.dumps({"tool_call_id": "tc_a", "name": "read_file", "arguments": "{}"}),
+            metadata={"tool_call_id": "tc_a", "name": "read_file"},
+            seq=1000,
+        )
+        _insert_event(
+            self.db,
+            self.sid,
+            self.uid,
+            self.cid,
+            "tool_call",
+            json.dumps({"tool_call_id": "tc_b", "name": "bash", "arguments": "{}"}),
+            metadata={"tool_call_id": "tc_b", "name": "bash"},
+            seq=2000,
+        )
+        _insert_event(
+            self.db,
+            self.sid,
+            self.uid,
+            self.cid,
+            "tool_result",
+            json.dumps({"name": "read_file", "result": "content"}),
+            metadata={"tool_call_id": "tc_a", "name": "read_file"},
+            seq=3000,
+        )
+        _insert_event(
+            self.db,
+            self.sid,
+            self.uid,
+            self.cid,
+            "tool_result",
+            json.dumps({"name": "bash", "result": "ok"}),
+            metadata={"tool_call_id": "tc_b", "name": "bash"},
+            seq=4000,
+        )
+        _insert_event(self.db, self.sid, self.uid, self.cid, "llm_response", "Done.", seq=5000)
         self.db.commit()
 
         history = self._recover()
@@ -1348,15 +1607,19 @@ class TestRecoverHistoryToolCalls:
     def test_missing_tool_call_start_synthesizes_from_metadata(self):
         """When tool_call_start is lost (e.g. truncated), recovery synthesizes
         from tool_result metadata to avoid OpenAI 400."""
-        _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "user_query", "do it", seq=0)
+        _insert_event(self.db, self.sid, self.uid, self.cid, "user_query", "do it", seq=0)
         # No tool_call_start — simulates truncation by _MAX_RECOVERY_EVENTS
-        _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "tool_result",
-                      json.dumps({"name": "bash", "result": "done"}),
-                      metadata={"tool_call_id": "tc_orphan", "name": "bash"}, seq=1000)
-        _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "llm_response", "Finished.", seq=2000)
+        _insert_event(
+            self.db,
+            self.sid,
+            self.uid,
+            self.cid,
+            "tool_result",
+            json.dumps({"name": "bash", "result": "done"}),
+            metadata={"tool_call_id": "tc_orphan", "name": "bash"},
+            seq=1000,
+        )
+        _insert_event(self.db, self.sid, self.uid, self.cid, "llm_response", "Finished.", seq=2000)
         self.db.commit()
 
         history = self._recover()
@@ -1369,14 +1632,18 @@ class TestRecoverHistoryToolCalls:
 
     def test_tool_result_without_tool_call_id_is_skipped(self):
         """tool_result with no tool_call_id in metadata is skipped entirely."""
-        _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "user_query", "test", seq=0)
-        _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "tool_result",
-                      json.dumps({"result": "orphan"}),
-                      metadata={"source": "edge"}, seq=1000)  # no tool_call_id
-        _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "llm_response", "ok", seq=2000)
+        _insert_event(self.db, self.sid, self.uid, self.cid, "user_query", "test", seq=0)
+        _insert_event(
+            self.db,
+            self.sid,
+            self.uid,
+            self.cid,
+            "tool_result",
+            json.dumps({"result": "orphan"}),
+            metadata={"source": "edge"},
+            seq=1000,
+        )  # no tool_call_id
+        _insert_event(self.db, self.sid, self.uid, self.cid, "llm_response", "ok", seq=2000)
         self.db.commit()
 
         history = self._recover()
@@ -1389,12 +1656,17 @@ class TestRecoverHistoryToolCalls:
         """tool_call_start with no following tool_result (cancelled run) is
         flushed as an assistant message.  _merge_tool_results_into_history
         will heal it with a placeholder on the next /chat/turn call."""
-        _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "user_query", "start", seq=0)
-        _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "tool_call",
-                      json.dumps({"tool_call_id": "tc_dangling", "name": "bash", "arguments": "{}"}),
-                      metadata={"tool_call_id": "tc_dangling", "name": "bash"}, seq=1000)
+        _insert_event(self.db, self.sid, self.uid, self.cid, "user_query", "start", seq=0)
+        _insert_event(
+            self.db,
+            self.sid,
+            self.uid,
+            self.cid,
+            "tool_call",
+            json.dumps({"tool_call_id": "tc_dangling", "name": "bash", "arguments": "{}"}),
+            metadata={"tool_call_id": "tc_dangling", "name": "bash"},
+            seq=1000,
+        )
         # No tool_result, no llm_response — run was cancelled
         self.db.commit()
 
@@ -1409,22 +1681,57 @@ class TestRecoverHistoryToolCalls:
         """user → tools → response → user → tools → response: two independent tool batches."""
         s = 0
         # Round 1
-        _insert_event(self.db, self.sid, self.uid, self.cid, "user_query", "round 1", seq=s); s += 1
-        _insert_event(self.db, self.sid, self.uid, self.cid, "tool_call",
-                      json.dumps({"tool_call_id": "r1_tc", "name": "bash", "arguments": "{}"}),
-                      metadata={"tool_call_id": "r1_tc", "name": "bash"}, seq=s); s += 1
-        _insert_event(self.db, self.sid, self.uid, self.cid, "tool_result",
-                      json.dumps({"name": "bash", "result": "r1_out"}),
-                      metadata={"tool_call_id": "r1_tc", "name": "bash"}, seq=s); s += 1
-        _insert_event(self.db, self.sid, self.uid, self.cid, "llm_response", "round 1 done", seq=s); s += 1
+        _insert_event(self.db, self.sid, self.uid, self.cid, "user_query", "round 1", seq=s)
+        s += 1
+        _insert_event(
+            self.db,
+            self.sid,
+            self.uid,
+            self.cid,
+            "tool_call",
+            json.dumps({"tool_call_id": "r1_tc", "name": "bash", "arguments": "{}"}),
+            metadata={"tool_call_id": "r1_tc", "name": "bash"},
+            seq=s,
+        )
+        s += 1
+        _insert_event(
+            self.db,
+            self.sid,
+            self.uid,
+            self.cid,
+            "tool_result",
+            json.dumps({"name": "bash", "result": "r1_out"}),
+            metadata={"tool_call_id": "r1_tc", "name": "bash"},
+            seq=s,
+        )
+        s += 1
+        _insert_event(self.db, self.sid, self.uid, self.cid, "llm_response", "round 1 done", seq=s)
+        s += 1
         # Round 2
-        _insert_event(self.db, self.sid, self.uid, self.cid, "user_query", "round 2", seq=s); s += 1
-        _insert_event(self.db, self.sid, self.uid, self.cid, "tool_call",
-                      json.dumps({"tool_call_id": "r2_tc", "name": "read_file", "arguments": "{}"}),
-                      metadata={"tool_call_id": "r2_tc", "name": "read_file"}, seq=s); s += 1
-        _insert_event(self.db, self.sid, self.uid, self.cid, "tool_result",
-                      json.dumps({"name": "read_file", "result": "r2_out"}),
-                      metadata={"tool_call_id": "r2_tc", "name": "read_file"}, seq=s); s += 1
+        _insert_event(self.db, self.sid, self.uid, self.cid, "user_query", "round 2", seq=s)
+        s += 1
+        _insert_event(
+            self.db,
+            self.sid,
+            self.uid,
+            self.cid,
+            "tool_call",
+            json.dumps({"tool_call_id": "r2_tc", "name": "read_file", "arguments": "{}"}),
+            metadata={"tool_call_id": "r2_tc", "name": "read_file"},
+            seq=s,
+        )
+        s += 1
+        _insert_event(
+            self.db,
+            self.sid,
+            self.uid,
+            self.cid,
+            "tool_result",
+            json.dumps({"name": "read_file", "result": "r2_out"}),
+            metadata={"tool_call_id": "r2_tc", "name": "read_file"},
+            seq=s,
+        )
+        s += 1
         _insert_event(self.db, self.sid, self.uid, self.cid, "llm_response", "round 2 done", seq=s)
         self.db.commit()
 
@@ -1432,8 +1739,14 @@ class TestRecoverHistoryToolCalls:
         roles = [m["role"] for m in history]
         assert roles == [
             "system",
-            "user", "assistant", "tool", "assistant",   # round 1
-            "user", "assistant", "tool", "assistant",    # round 2
+            "user",
+            "assistant",
+            "tool",
+            "assistant",  # round 1
+            "user",
+            "assistant",
+            "tool",
+            "assistant",  # round 2
         ]
         # Each round has its own assistant+tool_calls
         assert history[2]["tool_calls"][0]["function"]["name"] == "bash"
@@ -1447,12 +1760,26 @@ class TestRecoverHistoryToolCalls:
         synthesized assistant message (cannot batch without knowing they belong together)."""
         _insert_event(self.db, self.sid, self.uid, self.cid, "user_query", "go", seq=0)
         # Two orphan tool_results — no tool_call_start at all
-        _insert_event(self.db, self.sid, self.uid, self.cid, "tool_result",
-                      json.dumps({"name": "bash", "result": "a"}),
-                      metadata={"tool_call_id": "orphan_a", "name": "bash"}, seq=1)
-        _insert_event(self.db, self.sid, self.uid, self.cid, "tool_result",
-                      json.dumps({"name": "read_file", "result": "b"}),
-                      metadata={"tool_call_id": "orphan_b", "name": "read_file"}, seq=2)
+        _insert_event(
+            self.db,
+            self.sid,
+            self.uid,
+            self.cid,
+            "tool_result",
+            json.dumps({"name": "bash", "result": "a"}),
+            metadata={"tool_call_id": "orphan_a", "name": "bash"},
+            seq=1,
+        )
+        _insert_event(
+            self.db,
+            self.sid,
+            self.uid,
+            self.cid,
+            "tool_result",
+            json.dumps({"name": "read_file", "result": "b"}),
+            metadata={"tool_call_id": "orphan_b", "name": "read_file"},
+            seq=2,
+        )
         _insert_event(self.db, self.sid, self.uid, self.cid, "llm_response", "done", seq=3)
         self.db.commit()
 
@@ -1471,11 +1798,13 @@ class TestRecoverHistoryToolCalls:
 # 10. LRU Cache Eviction
 # ============================================================================
 
+
 class TestLRUDictEviction:
     """Verify _LRUDict evicts oldest entries when capacity is exceeded."""
 
     def test_evicts_oldest_entry(self):
         from api.routers.chat import _LRUDict
+
         d = _LRUDict(maxsize=3)
         d["a"] = 1
         d["b"] = 2
@@ -1486,6 +1815,7 @@ class TestLRUDictEviction:
 
     def test_access_refreshes_entry(self):
         from api.routers.chat import _LRUDict
+
         d = _LRUDict(maxsize=3)
         d["a"] = 1
         d["b"] = 2
@@ -1497,6 +1827,7 @@ class TestLRUDictEviction:
 
     def test_setdefault_creates_and_evicts(self):
         from api.routers.chat import _LRUDict
+
         d = _LRUDict(maxsize=2)
         d["a"] = 1
         d["b"] = 2
@@ -1510,6 +1841,7 @@ class TestLRUDictEviction:
 
     def test_pop_and_delitem(self):
         from api.routers.chat import _LRUDict
+
         d = _LRUDict(maxsize=3)
         d["a"] = 1
         d["b"] = 2
@@ -1522,6 +1854,7 @@ class TestLRUDictEviction:
     def test_unified_cache_evicts_history_and_tools_together(self):
         """_session_cache evicts both history and tools atomically."""
         from api.routers.chat import _LRUDict
+
         cache = _LRUDict(maxsize=2)
         cache["s1"] = {"history": [{"role": "system"}], "tools": [{"name": "bash"}]}
         cache["s2"] = {"history": [{"role": "system"}], "tools": [{"name": "read"}]}

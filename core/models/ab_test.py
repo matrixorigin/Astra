@@ -17,6 +17,7 @@ logger = get_logger(__name__)
 @dataclass
 class ABTestConfig:
     """A/B test configuration."""
+
     experiment_name: str
     control_artifact_id: str  # current active model
     treatment_artifact_id: str  # new candidate model
@@ -40,8 +41,10 @@ class ABTestRouter:
 
     def register(self, config: ABTestConfig) -> None:
         self._experiments[config.experiment_name] = config
-        logger.info(f"Registered A/B test '{config.experiment_name}': "
-                     f"{config.treatment_pct}% → {config.treatment_artifact_id}")
+        logger.info(
+            f"Registered A/B test '{config.experiment_name}': "
+            f"{config.treatment_pct}% → {config.treatment_artifact_id}"
+        )
 
     def remove(self, experiment_name: str) -> bool:
         return self._experiments.pop(experiment_name, None) is not None

@@ -65,7 +65,8 @@ class PromptOptimizer(DbConsumer):
         current = self._get_current_prompt(template_id)
         if not current:
             return OptimizationResult(
-                template_id=template_id, old_version="?",
+                template_id=template_id,
+                old_version="?",
                 error=f"Template '{template_id}' not found",
             )
         old_version, old_content = current
@@ -74,20 +75,25 @@ class PromptOptimizer(DbConsumer):
         cases = self._collect_failure_cases(template_id, rating_threshold)
         if len(cases) < min_cases:
             return OptimizationResult(
-                template_id=template_id, old_version=old_version,
+                template_id=template_id,
+                old_version=old_version,
                 cases_analyzed=len(cases),
                 error=f"Only {len(cases)} low-score cases (need {min_cases})",
             )
 
         # 3. LLM diagnosis + improvement
         diagnosis, new_content = self._generate_improvement(
-            template_id, old_content, cases,
+            template_id,
+            old_content,
+            cases,
         )
 
         if not new_content:
             return OptimizationResult(
-                template_id=template_id, old_version=old_version,
-                diagnosis=diagnosis, cases_analyzed=len(cases),
+                template_id=template_id,
+                old_version=old_version,
+                diagnosis=diagnosis,
+                cases_analyzed=len(cases),
                 error="LLM failed to generate improvement",
             )
 
@@ -140,7 +146,9 @@ class PromptOptimizer(DbConsumer):
             return (row[0], row[1]) if row else None
 
     def _collect_failure_cases(
-        self, template_id: str, threshold: int,
+        self,
+        template_id: str,
+        threshold: int,
     ) -> list[dict[str, Any]]:
         """Get low-rated cases with their context snapshots."""
         with self._db() as db:
@@ -171,7 +179,10 @@ class PromptOptimizer(DbConsumer):
             ]
 
     def _generate_improvement(
-        self, template_id: str, current_prompt: str, cases: list[dict],
+        self,
+        template_id: str,
+        current_prompt: str,
+        cases: list[dict],
     ) -> tuple[str, str | None]:
         """Ask LLM to diagnose and improve the prompt."""
         cases_text = "\n".join(
@@ -235,7 +246,10 @@ IMPROVED_PROMPT:
         return diagnosis, improved
 
     def _validate_with_gate(
-        self, template_id: str, new_version: str, new_content: str,
+        self,
+        template_id: str,
+        new_version: str,
+        new_content: str,
     ) -> str:
         """Validate improvement via regression gate."""
         try:
@@ -254,10 +268,14 @@ IMPROVED_PROMPT:
             return "skipped"
 
     def _activate_prompt(
-        self, template_id: str, version: str, content: str,
+        self,
+        template_id: str,
+        version: str,
+        content: str,
     ) -> None:
         """Register and activate the new prompt version."""
         from core.context.prompts import PromptManager
+
         pm = PromptManager(self._db_factory)
         pm.register_prompt(template_id, version, content, is_active=True)
 

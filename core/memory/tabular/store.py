@@ -135,13 +135,20 @@ class MemoryStore(DbConsumer):
     def update_embedding(self, memory_id: str, embedding: list[float]) -> int:
         """Update embedding of an existing memory. Returns rows affected (0 if not found)."""
         with self._db() as db:
-            rows = db.query(MemoryRecord).filter_by(memory_id=memory_id).update({"embedding": embedding})
+            rows = (
+                db.query(MemoryRecord)
+                .filter_by(memory_id=memory_id)
+                .update({"embedding": embedding})
+            )
             db.commit()
             return rows
 
     def update_confidence(
-        self, memory_id: str, confidence: float,
-        trust_tier: str | None = None, is_active: bool | None = None,
+        self,
+        memory_id: str,
+        confidence: float,
+        trust_tier: str | None = None,
+        is_active: bool | None = None,
     ) -> None:
         """Update confidence (and optionally tier/active) for opinion evolution."""
         with self._db() as db:
@@ -188,9 +195,13 @@ class MemoryStore(DbConsumer):
             new_memory.observed_at = now
 
         with self._db() as db:
-            db.query(MemoryRecord).filter_by(memory_id=old_id).update({
-                "is_active": 0, "superseded_by": new_memory.memory_id, "updated_at": now,
-            })
+            db.query(MemoryRecord).filter_by(memory_id=old_id).update(
+                {
+                    "is_active": 0,
+                    "superseded_by": new_memory.memory_id,
+                    "updated_at": now,
+                }
+            )
 
             row = MemoryRecord(
                 memory_id=new_memory.memory_id,
@@ -214,10 +225,14 @@ class MemoryStore(DbConsumer):
         """Archive all WORKING memories for a session (set is_active=0)."""
         with self._db() as db:
             from sqlalchemy import text as sa_text
-            result = db.execute(sa_text("""
+
+            result = db.execute(
+                sa_text("""
                 UPDATE mem_memories SET is_active = 0, updated_at = NOW()
                 WHERE session_id = :sid AND memory_type = 'working' AND is_active = 1
-            """), {"sid": session_id})
+            """),
+                {"sid": session_id},
+            )
             db.commit()
             return result.rowcount
 

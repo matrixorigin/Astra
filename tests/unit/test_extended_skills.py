@@ -20,6 +20,7 @@ from core.skills.extended import (
 # Issue 1: __init__ accepts github and db_factory without error
 # ---------------------------------------------------------------------------
 
+
 class TestInitParams:
     def test_code_review_accepts_db_factory(self):
         gh = MagicMock()
@@ -49,6 +50,7 @@ class TestInitParams:
 # Issue 2: execute() is async (matches base class)
 # ---------------------------------------------------------------------------
 
+
 class TestAsyncExecute:
     def test_code_review_execute_is_coroutine(self):
         assert inspect.iscoroutinefunction(CodeReviewSkill.execute)
@@ -65,9 +67,13 @@ class TestAsyncExecute:
     @pytest.mark.asyncio
     async def test_code_review_awaitable(self):
         gh = MagicMock()
-        gh.get_pr = AsyncMock(return_value={
-            "changed_files": 3, "additions": 10, "deletions": 5,
-        })
+        gh.get_pr = AsyncMock(
+            return_value={
+                "changed_files": 3,
+                "additions": 10,
+                "deletions": 5,
+            }
+        )
         skill = CodeReviewSkill(github=gh)
         inp = CodeReviewInput(repo_id=1, pr_number=42)
         out = await skill.execute(inp)
@@ -79,6 +85,7 @@ class TestAsyncExecute:
 # ---------------------------------------------------------------------------
 # Issue 1 (bonus): register_extended_skills passes args in correct order
 # ---------------------------------------------------------------------------
+
 
 class TestRegistration:
     def test_register_passes_github_first(self):
@@ -96,6 +103,7 @@ class TestRegistration:
 # ---------------------------------------------------------------------------
 # Issue 3: GitHubClient._check_rate_limit
 # ---------------------------------------------------------------------------
+
 
 class TestRateLimit:
     @pytest.mark.asyncio

@@ -35,7 +35,8 @@ class ContextBudgetTuner(DbConsumer):
         """
         # Aggregate quality by task_type (no token_budget in GROUP BY)
         with self._db() as db:
-            quality_rows = db.execute(text("""
+            quality_rows = db.execute(
+                text("""
                 SELECT
                     cs.task_type,
                     AVG(ce.quality_score) AS avg_quality,
@@ -46,7 +47,9 @@ class ContextBudgetTuner(DbConsumer):
                   AND cs.task_type IS NOT NULL
                   AND ce.created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
                 GROUP BY cs.task_type
-            """), {"days": days}).fetchall()
+            """),
+                {"days": days},
+            ).fetchall()
 
             stats: dict[str, dict[str, Any]] = {}
             for row in quality_rows:
@@ -59,13 +62,16 @@ class ContextBudgetTuner(DbConsumer):
 
             # Collect budget data separately (one row per snapshot)
             if stats:
-                budget_rows = db.execute(text("""
+                budget_rows = db.execute(
+                    text("""
                     SELECT cs.task_type, cs.token_budget
                     FROM ctx_snapshots cs
                     WHERE cs.task_type IS NOT NULL
                       AND cs.token_budget IS NOT NULL
                       AND cs.created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
-                """), {"days": days}).fetchall()
+                """),
+                    {"days": days},
+                ).fetchall()
 
                 for row in budget_rows:
                     task_type = row[0]
@@ -87,12 +93,14 @@ class ContextBudgetTuner(DbConsumer):
             if obs["avg_quality"] < 3.5:
                 # Analyze budget utilization patterns
                 utilization = self._compute_avg_utilization(obs.get("budgets", []))
-                issues.append({
-                    "task_type": obs["task_type"],
-                    "avg_quality": obs["avg_quality"],
-                    "sample_count": obs["sample_count"],
-                    "utilization": utilization,
-                })
+                issues.append(
+                    {
+                        "task_type": obs["task_type"],
+                        "avg_quality": obs["avg_quality"],
+                        "sample_count": obs["sample_count"],
+                        "utilization": utilization,
+                    }
+                )
         return issues
 
     def propose(self, diagnoses: list[dict[str, Any]]) -> dict[str, dict[str, float]] | None:
@@ -123,7 +131,9 @@ class ContextBudgetTuner(DbConsumer):
 
             # Shift budget from underutilized to overutilized sections
             over = [s for s in _TUNABLE_SECTIONS if utilization.get(s, 0) > 0.8 and s in new_ratios]
-            under = [s for s in _TUNABLE_SECTIONS if utilization.get(s, 0) < 0.3 and s in new_ratios]
+            under = [
+                s for s in _TUNABLE_SECTIONS if utilization.get(s, 0) < 0.3 and s in new_ratios
+            ]
 
             if over and under:
                 # Transfer 0.05 per pair
@@ -188,11 +198,14 @@ class ContextBudgetTuner(DbConsumer):
         with self._db() as db:
             value = json.dumps(proposals)
             try:
-                db.execute(text("""
+                db.execute(
+                    text("""
                     INSERT INTO infra_configs (key_name, value, updated_at)
                     VALUES ('context_budget_ratios', :value, NOW())
                     ON DUPLICATE KEY UPDATE value = :value, updated_at = NOW()
-                """), {"value": value})
+                """),
+                    {"value": value},
+                )
                 db.commit()
             except Exception as e:
                 logger.error("Failed to deploy budget ratios: %s", e)
@@ -212,8 +225,4 @@ class ContextBudgetTuner(DbConsumer):
                     used = budget[section].get("used", 0)
                     if alloc > 0:
                         totals.setdefault(section, []).append(used / alloc)
-        return {
-            s: round(sum(vals) / len(vals), 2)
-            for s, vals in totals.items()
-            if vals
-        }
+        return {s: round(sum(vals) / len(vals), 2) for s, vals in totals.items() if vals}

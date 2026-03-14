@@ -7,26 +7,40 @@ import pytest
 pytestmark = pytest.mark.slow
 
 from core.runtime import (
-    Runtime, ExecutionResult, ResourceProfile,
-    PROFILE_LIGHTWEIGHT, PROFILE_DATA_ANALYSIS,
+    Runtime,
+    ExecutionResult,
+    ResourceProfile,
+    PROFILE_LIGHTWEIGHT,
+    PROFILE_DATA_ANALYSIS,
 )
 from core.runtime.subprocess_runtime import SubprocessRuntime
 from core.code_executor.security import (
-    SecurityGuard, SecurityVerdict, SecurityIssue,
-    DEFAULT_DENY_IMPORTS, DEFAULT_ALLOW_IMPORTS, DANGEROUS_CALLS,
-    DANGEROUS_ATTRS, DANGEROUS_NAMES,
+    SecurityGuard,
+    SecurityVerdict,
+    SecurityIssue,
+    DEFAULT_DENY_IMPORTS,
+    DEFAULT_ALLOW_IMPORTS,
+    DANGEROUS_CALLS,
+    DANGEROUS_ATTRS,
+    DANGEROUS_NAMES,
 )
 from core.code_executor.data_context import (
-    DataAccessLevel, DataContext, TableDiff,
+    DataAccessLevel,
+    DataContext,
+    TableDiff,
 )
 from core.code_executor import (
-    CodeExecutor, CodeExecutionRequest, CodeExecutionResult, TimeTravelInfo,
+    CodeExecutor,
+    CodeExecutionRequest,
+    CodeExecutionResult,
+    TimeTravelInfo,
 )
 
 
 # ===========================================================================
 # 1. ResourceProfile
 # ===========================================================================
+
 
 class TestResourceProfile:
     def test_defaults(self):
@@ -54,6 +68,7 @@ class TestResourceProfile:
 # 2. ExecutionResult
 # ===========================================================================
 
+
 class TestExecutionResult:
     def test_defaults(self):
         r = ExecutionResult(stdout="ok", stderr="", exit_code=0, execution_time_ms=10.5)
@@ -61,20 +76,23 @@ class TestExecutionResult:
         assert r.started_at is None
 
     def test_truncated(self):
-        r = ExecutionResult(stdout="x" * 100, stderr="", exit_code=0,
-                            execution_time_ms=1.0, truncated=True)
+        r = ExecutionResult(
+            stdout="x" * 100, stderr="", exit_code=0, execution_time_ms=1.0, truncated=True
+        )
         assert r.truncated is True
 
     def test_started_at(self):
         now = datetime.now(timezone.utc)
-        r = ExecutionResult(stdout="", stderr="", exit_code=0,
-                            execution_time_ms=1.0, started_at=now)
+        r = ExecutionResult(
+            stdout="", stderr="", exit_code=0, execution_time_ms=1.0, started_at=now
+        )
         assert r.started_at == now
 
 
 # ===========================================================================
 # 3. SubprocessRuntime
 # ===========================================================================
+
 
 class TestSubprocessRuntime:
     @pytest.fixture
@@ -115,7 +133,8 @@ class TestSubprocessRuntime:
 
     def test_timeout(self, runtime):
         r = runtime.execute(
-            "import time; time.sleep(100)", "python",
+            "import time; time.sleep(100)",
+            "python",
             ResourceProfile(max_wall_seconds=1),
         )
         assert r.exit_code == 137
@@ -167,7 +186,8 @@ class TestSubprocessRuntime:
 
     def test_timeout_elapsed_time_reasonable(self, runtime):
         r = runtime.execute(
-            "import time; time.sleep(100)", "python",
+            "import time; time.sleep(100)",
+            "python",
             ResourceProfile(max_wall_seconds=1),
         )
         assert r.exit_code == 137
@@ -197,6 +217,7 @@ class TestSubprocessRuntime:
 # ===========================================================================
 # 4. SecurityGuard
 # ===========================================================================
+
 
 class TestSecurityGuard:
     @pytest.fixture
@@ -296,7 +317,10 @@ class TestSecurityGuard:
 
     # --- Extra allowed imports ---
     def test_extra_allowed(self, guard):
-        assert guard.analyze("import pandas\nimport numpy", extra_allowed=["pandas", "numpy"]).safe is True
+        assert (
+            guard.analyze("import pandas\nimport numpy", extra_allowed=["pandas", "numpy"]).safe
+            is True
+        )
 
     def test_extra_allowed_doesnt_override_deny(self, guard):
         assert guard.analyze("import os", extra_allowed=["os"]).safe is False
@@ -378,6 +402,7 @@ class TestSecurityGuard:
 # 5. DataAccessLevel
 # ===========================================================================
 
+
 class TestDataEnums:
     def test_access_levels(self):
         assert DataAccessLevel.NONE.value == "none"
@@ -393,6 +418,7 @@ class TestDataEnums:
 # 6. DataContext (mocked Branch)
 # ===========================================================================
 
+
 class TestDataContext:
     @pytest.fixture
     def mock_branch(self):
@@ -401,25 +427,28 @@ class TestDataContext:
     @pytest.fixture
     def mock_db(self):
         from sqlalchemy.engine import make_url
+
         db = MagicMock()
-        db.get_bind.return_value.url = make_url(
-            "mysql+pymysql://root:111@localhost:6001/test"
-        )
+        db.get_bind.return_value.url = make_url("mysql+pymysql://root:111@localhost:6001/test")
         return db
 
     @pytest.fixture
     def ctx_read(self, mock_branch, mock_db):
         return DataContext(
-            db_factory=lambda: mock_db, branch=mock_branch,
-            sandbox_name="test_sandbox", source_db="dev_agent",
+            db_factory=lambda: mock_db,
+            branch=mock_branch,
+            sandbox_name="test_sandbox",
+            source_db="dev_agent",
             access=DataAccessLevel.READ,
         )
 
     @pytest.fixture
     def ctx_write(self, mock_branch, mock_db):
         return DataContext(
-            db_factory=lambda: mock_db, branch=mock_branch,
-            sandbox_name="test_sandbox", source_db="dev_agent",
+            db_factory=lambda: mock_db,
+            branch=mock_branch,
+            sandbox_name="test_sandbox",
+            source_db="dev_agent",
             access=DataAccessLevel.WRITE,
         )
 
@@ -452,10 +481,12 @@ class TestDataContext:
         ctx_write.ensure_tables(["orders", "products"])
         assert mock_branch.create.call_count == 2
         mock_branch.create.assert_any_call(
-            name="test_sandbox.orders", source="dev_agent.orders",
+            name="test_sandbox.orders",
+            source="dev_agent.orders",
         )
         mock_branch.create.assert_any_call(
-            name="test_sandbox.products", source="dev_agent.products",
+            name="test_sandbox.products",
+            source="dev_agent.products",
         )
 
     def test_ensure_tables_idempotent(self, ctx_write, mock_branch):
@@ -536,6 +567,7 @@ class TestDataContext:
         def merge_side_effect(source, target, on_conflict):
             if "orders" in source:
                 raise Exception("conflict")
+
         mock_branch.merge.side_effect = merge_side_effect
         ctx_write.ensure_created()
         ctx_write.ensure_tables(["orders", "products"])
@@ -555,7 +587,7 @@ class TestDataContext:
         drop_found = False
         for c in mock_db.execute.call_args_list:
             sql_arg = c[0][0]
-            if hasattr(sql_arg, 'text') and "DROP DATABASE" in sql_arg.text:
+            if hasattr(sql_arg, "text") and "DROP DATABASE" in sql_arg.text:
                 drop_found = True
         assert drop_found
 
@@ -573,11 +605,14 @@ class TestDataContext:
 # 7. TimeTravelInfo
 # ===========================================================================
 
+
 class TestTimeTravelInfo:
     def test_fields(self):
         now = datetime.now(timezone.utc)
         tt = TimeTravelInfo(
-            started_at=now, source_db="prod", sandbox_db="sandbox_s1",
+            started_at=now,
+            source_db="prod",
+            sandbox_db="sandbox_s1",
         )
         assert tt.started_at == now
         assert tt.source_db == "prod"
@@ -587,6 +622,7 @@ class TestTimeTravelInfo:
 # ===========================================================================
 # 8. CodeExecutionRequest
 # ===========================================================================
+
 
 class TestCodeExecutionRequest:
     def test_defaults(self):
@@ -600,9 +636,12 @@ class TestCodeExecutionRequest:
 
     def test_write_request(self):
         req = CodeExecutionRequest(
-            code="x", data_access=DataAccessLevel.WRITE,
-            source_db="prod", tables=["orders"],
-            session_id="s1", allowed_imports=["pandas"],
+            code="x",
+            data_access=DataAccessLevel.WRITE,
+            source_db="prod",
+            tables=["orders"],
+            session_id="s1",
+            allowed_imports=["pandas"],
         )
         assert req.source_db == "prod"
         assert req.tables == ["orders"]
@@ -612,12 +651,16 @@ class TestCodeExecutionRequest:
 # 9. CodeExecutor
 # ===========================================================================
 
+
 class TestCodeExecutor:
     @pytest.fixture
     def mock_runtime(self):
         rt = MagicMock(spec=Runtime)
         rt.execute.return_value = ExecutionResult(
-            stdout="42\n", stderr="", exit_code=0, execution_time_ms=10.0,
+            stdout="42\n",
+            stderr="",
+            exit_code=0,
+            execution_time_ms=10.0,
             started_at=datetime(2026, 2, 20, 15, 0, 0, tzinfo=timezone.utc),
         )
         rt.supported_languages = ["python"]
@@ -636,8 +679,10 @@ class TestCodeExecutor:
     @pytest.fixture
     def executor(self, mock_runtime, mock_branch, mock_db):
         return CodeExecutor(
-            runtime=mock_runtime, db_factory=lambda: mock_db,
-            branch=mock_branch, security=SecurityGuard(),
+            runtime=mock_runtime,
+            db_factory=lambda: mock_db,
+            branch=mock_branch,
+            security=SecurityGuard(),
         )
 
     # --- Basic ---
@@ -658,9 +703,12 @@ class TestCodeExecutor:
         assert executor.execute(CodeExecutionRequest(code="eval('1')")).security.safe is False
 
     def test_allowed_imports(self, executor, mock_runtime):
-        r = executor.execute(CodeExecutionRequest(
-            code="import pandas", allowed_imports=["pandas"],
-        ))
+        r = executor.execute(
+            CodeExecutionRequest(
+                code="import pandas",
+                allowed_imports=["pandas"],
+            )
+        )
         assert r.security.safe is True
 
     def test_custom_resources(self, executor, mock_runtime):
@@ -677,51 +725,81 @@ class TestCodeExecutor:
 
     # --- READ access ---
     def test_read_access_passes_source_db(self, executor, mock_runtime):
-        executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.READ, source_db="mydb",
-        ))
+        executor.execute(
+            CodeExecutionRequest(
+                code="print(1)",
+                data_access=DataAccessLevel.READ,
+                source_db="mydb",
+            )
+        )
         assert mock_runtime.execute.call_args[0][3]["MO_DATABASE"] == "mydb"
 
     def test_read_access_no_branch(self, executor, mock_branch):
-        executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.READ, source_db="mydb",
-        ))
+        executor.execute(
+            CodeExecutionRequest(
+                code="print(1)",
+                data_access=DataAccessLevel.READ,
+                source_db="mydb",
+            )
+        )
         mock_branch.create.assert_not_called()
 
     # --- WRITE access ---
     def test_write_requires_session_id(self, executor):
         with pytest.raises(ValueError, match="session_id"):
-            executor.execute(CodeExecutionRequest(
-                code="print(1)", data_access=DataAccessLevel.WRITE,
-                source_db="db", tables=["t"],
-            ))
+            executor.execute(
+                CodeExecutionRequest(
+                    code="print(1)",
+                    data_access=DataAccessLevel.WRITE,
+                    source_db="db",
+                    tables=["t"],
+                )
+            )
 
     def test_write_requires_source_db(self, executor):
         with pytest.raises(ValueError, match="source_db"):
-            executor.execute(CodeExecutionRequest(
-                code="print(1)", data_access=DataAccessLevel.WRITE,
-                session_id="s1", tables=["t"],
-            ))
+            executor.execute(
+                CodeExecutionRequest(
+                    code="print(1)",
+                    data_access=DataAccessLevel.WRITE,
+                    session_id="s1",
+                    tables=["t"],
+                )
+            )
 
     def test_write_requires_tables(self, executor):
         with pytest.raises(ValueError, match="tables"):
-            executor.execute(CodeExecutionRequest(
-                code="print(1)", data_access=DataAccessLevel.WRITE,
-                session_id="s1", source_db="db",
-            ))
+            executor.execute(
+                CodeExecutionRequest(
+                    code="print(1)",
+                    data_access=DataAccessLevel.WRITE,
+                    session_id="s1",
+                    source_db="db",
+                )
+            )
 
     def test_write_branches_tables(self, executor, mock_branch):
-        executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.WRITE,
-            session_id="sess1", source_db="prod", tables=["orders", "products"],
-        ))
+        executor.execute(
+            CodeExecutionRequest(
+                code="print(1)",
+                data_access=DataAccessLevel.WRITE,
+                session_id="sess1",
+                source_db="prod",
+                tables=["orders", "products"],
+            )
+        )
         assert mock_branch.create.call_count == 2
 
     def test_write_returns_time_travel(self, executor):
-        r = executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.WRITE,
-            session_id="sess1", source_db="prod", tables=["orders"],
-        ))
+        r = executor.execute(
+            CodeExecutionRequest(
+                code="print(1)",
+                data_access=DataAccessLevel.WRITE,
+                session_id="sess1",
+                source_db="prod",
+                tables=["orders"],
+            )
+        )
         assert r.time_travel is not None
         assert r.time_travel.source_db == "prod"
         assert "code_exec_" in r.time_travel.sandbox_db
@@ -729,21 +807,34 @@ class TestCodeExecutor:
 
     def test_write_success_returns_diff(self, executor, mock_branch):
         mock_branch.diff.return_value = [{"flag": "INSERT", "a": 1}]
-        r = executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.WRITE,
-            session_id="sess1", source_db="prod", tables=["orders"],
-        ))
+        r = executor.execute(
+            CodeExecutionRequest(
+                code="print(1)",
+                data_access=DataAccessLevel.WRITE,
+                session_id="sess1",
+                source_db="prod",
+                tables=["orders"],
+            )
+        )
         assert r.data_diff is not None
 
     def test_write_failure_no_diff(self, executor, mock_runtime):
         mock_runtime.execute.return_value = ExecutionResult(
-            stdout="", stderr="error", exit_code=1, execution_time_ms=5.0,
+            stdout="",
+            stderr="error",
+            exit_code=1,
+            execution_time_ms=5.0,
             started_at=datetime(2026, 2, 20, 15, 0, 0, tzinfo=timezone.utc),
         )
-        r = executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.WRITE,
-            session_id="sess1", source_db="prod", tables=["orders"],
-        ))
+        r = executor.execute(
+            CodeExecutionRequest(
+                code="print(1)",
+                data_access=DataAccessLevel.WRITE,
+                session_id="sess1",
+                source_db="prod",
+                tables=["orders"],
+            )
+        )
         assert r.data_diff is None
         # time_travel still recorded even on failure
         assert r.time_travel is not None
@@ -751,8 +842,11 @@ class TestCodeExecutor:
     # --- Session reuse ---
     def test_session_reuses_context(self, executor, mock_branch):
         req = CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.WRITE,
-            session_id="sess1", source_db="prod", tables=["orders"],
+            code="print(1)",
+            data_access=DataAccessLevel.WRITE,
+            session_id="sess1",
+            source_db="prod",
+            tables=["orders"],
         )
         executor.execute(req)
         executor.execute(req)
@@ -761,37 +855,57 @@ class TestCodeExecutor:
 
     def test_different_sessions(self, executor, mock_branch):
         for sid in ["sess1", "sess2"]:
-            executor.execute(CodeExecutionRequest(
-                code="print(1)", data_access=DataAccessLevel.WRITE,
-                session_id=sid, source_db="prod", tables=["orders"],
-            ))
+            executor.execute(
+                CodeExecutionRequest(
+                    code="print(1)",
+                    data_access=DataAccessLevel.WRITE,
+                    session_id=sid,
+                    source_db="prod",
+                    tables=["orders"],
+                )
+            )
         assert mock_branch.create.call_count == 2
 
     def test_dynamic_table_addition(self, executor, mock_branch):
         """Second execution adds new table to existing session."""
-        executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.WRITE,
-            session_id="sess1", source_db="prod", tables=["orders"],
-        ))
-        executor.execute(CodeExecutionRequest(
-            code="print(2)", data_access=DataAccessLevel.WRITE,
-            session_id="sess1", source_db="prod", tables=["orders", "products"],
-        ))
+        executor.execute(
+            CodeExecutionRequest(
+                code="print(1)",
+                data_access=DataAccessLevel.WRITE,
+                session_id="sess1",
+                source_db="prod",
+                tables=["orders"],
+            )
+        )
+        executor.execute(
+            CodeExecutionRequest(
+                code="print(2)",
+                data_access=DataAccessLevel.WRITE,
+                session_id="sess1",
+                source_db="prod",
+                tables=["orders", "products"],
+            )
+        )
         # orders branched once, products branched once
         assert mock_branch.create.call_count == 2
 
     # --- Cleanup ---
     def test_cleanup_session(self, executor, mock_branch, mock_db):
-        executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.WRITE,
-            session_id="sess1", source_db="prod", tables=["orders"],
-        ))
+        executor.execute(
+            CodeExecutionRequest(
+                code="print(1)",
+                data_access=DataAccessLevel.WRITE,
+                session_id="sess1",
+                source_db="prod",
+                tables=["orders"],
+            )
+        )
         executor.cleanup_session("sess1")
         mock_branch.delete.assert_called()
         drop_found = False
         for c in mock_db.execute.call_args_list:
             sql_arg = c[0][0]
-            if hasattr(sql_arg, 'text') and "DROP DATABASE" in sql_arg.text:
+            if hasattr(sql_arg, "text") and "DROP DATABASE" in sql_arg.text:
                 drop_found = True
         assert drop_found
 
@@ -807,10 +921,15 @@ class TestCodeExecutor:
 
     def test_runtime_exception_no_destroy(self, executor, mock_runtime):
         mock_runtime.execute.side_effect = RuntimeError("boom")
-        executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.WRITE,
-            session_id="sess1", source_db="prod", tables=["orders"],
-        ))
+        executor.execute(
+            CodeExecutionRequest(
+                code="print(1)",
+                data_access=DataAccessLevel.WRITE,
+                session_id="sess1",
+                source_db="prod",
+                tables=["orders"],
+            )
+        )
         assert "sess1" in executor._session_contexts
 
     def test_security_error_contains_line_number(self, executor):
@@ -822,13 +941,17 @@ class TestCodeExecutor:
 # 10. ExecuteCodeSkill
 # ===========================================================================
 
+
 class TestExecuteCodeSkill:
     @pytest.fixture
     def mock_executor(self):
         executor = MagicMock()
         executor.execute.return_value = CodeExecutionResult(
             execution=ExecutionResult(
-                stdout="result\n", stderr="", exit_code=0, execution_time_ms=15.0,
+                stdout="result\n",
+                stderr="",
+                exit_code=0,
+                execution_time_ms=15.0,
                 started_at=datetime(2026, 2, 20, 15, 0, 0, tzinfo=timezone.utc),
             ),
             security=SecurityVerdict(safe=True),
@@ -838,10 +961,12 @@ class TestExecuteCodeSkill:
     @pytest.fixture
     def skill(self, mock_executor):
         from core.skills.builtin import ExecuteCodeSkill
+
         return ExecuteCodeSkill(mock_executor)
 
     def _input(self, **kwargs):
         from core.skills.builtin import ExecuteCodeInput
+
         defaults = {"code": "print(1)", "user_id": "u1", "session_id": "s1"}
         defaults.update(kwargs)
         return ExecuteCodeInput(**defaults)
@@ -852,6 +977,7 @@ class TestExecuteCodeSkill:
 
     def test_validate_input(self, skill):
         from core.skills.builtin import ExecuteCodeInput
+
         inp = skill.validate_input({"code": "print(1)", "user_id": "u1", "session_id": "s1"})
         assert isinstance(inp, ExecuteCodeInput)
         assert inp.data_access == "none"
@@ -867,7 +993,10 @@ class TestExecuteCodeSkill:
     async def test_execute_failure(self, skill, mock_executor):
         mock_executor.execute.return_value = CodeExecutionResult(
             execution=ExecutionResult(
-                stdout="", stderr="NameError: x", exit_code=1, execution_time_ms=5.0,
+                stdout="",
+                stderr="NameError: x",
+                exit_code=1,
+                execution_time_ms=5.0,
             ),
             security=SecurityVerdict(safe=True),
         )
@@ -879,7 +1008,10 @@ class TestExecuteCodeSkill:
     async def test_execute_with_data_diff(self, skill, mock_executor):
         mock_executor.execute.return_value = CodeExecutionResult(
             execution=ExecutionResult(
-                stdout="done\n", stderr="", exit_code=0, execution_time_ms=20.0,
+                stdout="done\n",
+                stderr="",
+                exit_code=0,
+                execution_time_ms=20.0,
             ),
             security=SecurityVerdict(safe=True),
             data_diff=[TableDiff(table="orders", rows=[{"flag": "INSERT", "a": 1}])],
@@ -893,11 +1025,16 @@ class TestExecuteCodeSkill:
         now = datetime(2026, 2, 20, 15, 0, 0, tzinfo=timezone.utc)
         mock_executor.execute.return_value = CodeExecutionResult(
             execution=ExecutionResult(
-                stdout="done\n", stderr="", exit_code=0, execution_time_ms=20.0,
+                stdout="done\n",
+                stderr="",
+                exit_code=0,
+                execution_time_ms=20.0,
             ),
             security=SecurityVerdict(safe=True),
             time_travel=TimeTravelInfo(
-                started_at=now, source_db="prod", sandbox_db="sandbox_s1",
+                started_at=now,
+                source_db="prod",
+                sandbox_db="sandbox_s1",
             ),
         )
         out = await skill.execute(self._input(data_access="write"))
@@ -912,9 +1049,13 @@ class TestExecuteCodeSkill:
 
     @pytest.mark.asyncio
     async def test_source_db_and_tables_passed(self, skill, mock_executor):
-        await skill.execute(self._input(
-            data_access="write", source_db="prod", tables=["orders"],
-        ))
+        await skill.execute(
+            self._input(
+                data_access="write",
+                source_db="prod",
+                tables=["orders"],
+            )
+        )
         req = mock_executor.execute.call_args[0][0]
         assert req.source_db == "prod"
         assert req.tables == ["orders"]
@@ -933,6 +1074,7 @@ class TestExecuteCodeSkill:
 
     def test_side_effect_profile_is_write(self, skill):
         from core.skills.base import SideEffectCategory
+
         assert skill.side_effect_profile.category == SideEffectCategory.WRITE
 
     @pytest.mark.asyncio

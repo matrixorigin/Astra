@@ -28,48 +28,43 @@ class DecisionRepository:
 
     def get_by_id(self, decision_id: str) -> DecisionModel | None:
         """Get decision by ID."""
-        return self.db.query(DecisionModel).filter(
-            DecisionModel.decision_id == decision_id
-        ).first()
+        return self.db.query(DecisionModel).filter(DecisionModel.decision_id == decision_id).first()
 
     def get_by_id_with_user(self, decision_id: str, user_id: str) -> DecisionModel | None:
         """Get decision with user ownership check via session join."""
         from api.models import Session as SessionModel
-        return self.db.query(DecisionModel).join(
-            SessionModel,
-            DecisionModel.session_id == SessionModel.session_id
-        ).filter(
-            DecisionModel.decision_id == decision_id,
-            SessionModel.user_id == user_id
-        ).first()
+
+        return (
+            self.db.query(DecisionModel)
+            .join(SessionModel, DecisionModel.session_id == SessionModel.session_id)
+            .filter(DecisionModel.decision_id == decision_id, SessionModel.user_id == user_id)
+            .first()
+        )
 
     def list_by_session(
-        self,
-        session_id: str,
-        limit: int = 50,
-        offset: int = 0
+        self, session_id: str, limit: int = 50, offset: int = 0
     ) -> tuple[list[DecisionModel], int]:
         """List decisions by session."""
-        query = self.db.query(DecisionModel).filter(
-            DecisionModel.session_id == session_id
-        )
+        query = self.db.query(DecisionModel).filter(DecisionModel.session_id == session_id)
         total = query.count()
-        return query.order_by(DecisionModel.created_at.desc()).offset(offset).limit(limit).all(), total
+        return query.order_by(DecisionModel.created_at.desc()).offset(offset).limit(
+            limit
+        ).all(), total
 
     def list_by_user(
-        self,
-        user_id: str,
-        decision_type: str | None = None,
-        limit: int = 50,
-        offset: int = 0
+        self, user_id: str, decision_type: str | None = None, limit: int = 50, offset: int = 0
     ) -> tuple[list[DecisionModel], int]:
         """List decisions by user with optional type filter."""
         from api.models import Session as SessionModel
-        query = self.db.query(DecisionModel).join(
-            SessionModel,
-            DecisionModel.session_id == SessionModel.session_id
-        ).filter(SessionModel.user_id == user_id)
+
+        query = (
+            self.db.query(DecisionModel)
+            .join(SessionModel, DecisionModel.session_id == SessionModel.session_id)
+            .filter(SessionModel.user_id == user_id)
+        )
         if decision_type:
             query = query.filter(DecisionModel.decision_type == decision_type)
         total = query.count()
-        return query.order_by(DecisionModel.created_at.desc()).offset(offset).limit(limit).all(), total
+        return query.order_by(DecisionModel.created_at.desc()).offset(offset).limit(
+            limit
+        ).all(), total

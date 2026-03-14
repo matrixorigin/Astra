@@ -9,10 +9,10 @@ from uuid_utils import uuid7
 
 def generate_id(max_length: int = 36) -> str:
     """Generate a unique ID that fits within database constraints.
-    
+
     Args:
         max_length: Maximum length for the ID (default 36 for VARCHAR(36))
-        
+
     Returns:
         A unique ID string that fits within the specified length
     """
@@ -28,11 +28,11 @@ def generate_id(max_length: int = 36) -> str:
 
 def generate_hash_id(data: Any, length: int = 16) -> str:
     """Generate a deterministic hash-based ID from data.
-    
+
     Args:
         data: Data to hash (will be JSON serialized if not string)
         length: Length of the hash ID (default 16)
-        
+
     Returns:
         A hash-based ID string
     """
@@ -46,11 +46,11 @@ def generate_hash_id(data: Any, length: int = 16) -> str:
 
 def generate_display_id(full_id: str, length: int = 8) -> str:
     """Generate a short display ID from a full ID.
-    
+
     Args:
         full_id: Full ID string
         length: Length for display (default 8)
-        
+
     Returns:
         Truncated ID for display purposes
     """

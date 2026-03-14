@@ -14,10 +14,14 @@ from cli.tools.base import EdgeTool, SideEffect
 logger = logging.getLogger(__name__)
 
 _orig_sh_init = logging.StreamHandler.__init__
+
+
 def _sh_init_stderr(self: logging.StreamHandler, stream: Any = None) -> None:
     if stream is sys.stdout:
         stream = sys.stderr
     _orig_sh_init(self, stream)
+
+
 logging.StreamHandler.__init__ = _sh_init_stderr  # type: ignore[method-assign]
 
 
@@ -78,7 +82,11 @@ class MemoryProgramTool(EdgeTool):
         return SideEffect.WRITE
 
     async def execute(self, **kwargs: Any) -> str:
-        user_id: str = kwargs.get("user_id") or self._session.get("user_id") or self._session.get("agent_id", "")
+        user_id: str = (
+            kwargs.get("user_id")
+            or self._session.get("user_id")
+            or self._session.get("agent_id", "")
+        )
         logger.debug("memory_program.execute: user_id=%s session=%s", user_id, self._session)
         if not user_id:
             return json.dumps({"error": "user_id not available in session context"})

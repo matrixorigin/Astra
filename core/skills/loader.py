@@ -19,6 +19,7 @@ MANIFEST_FILENAME = "manifest.yaml"
 @dataclass
 class SkillManifest:
     """Parsed manifest.yaml for a platform skill package."""
+
     name: str
     version: str
     description: str = ""
@@ -62,21 +63,25 @@ def load_manifests(skills_root: Path | None = None) -> list[SkillManifest]:
             if not isinstance(data, dict) or "name" not in data:
                 logger.warning("Invalid manifest: %s", manifest_path)
                 continue
-            manifests.append(SkillManifest(
-                name=data["name"],
-                version=data.get("version", "0.0.0"),
-                description=data.get("description", ""),
-                table_prefix=data.get("table_prefix", ""),
-                tables=data.get("tables", []),
-                settings=data.get("settings", []),
-                secrets=data.get("secrets", []),
-                resources=data.get("resources", {}),
-                requires=data.get("requires", []),
-                depends_on=data.get("depends_on", []),
-                author=data.get("author", ""),
-                path=skill_dir,
-            ))
-            logger.info("Loaded manifest: %s@%s from %s", data["name"], data.get("version"), manifest_path)
+            manifests.append(
+                SkillManifest(
+                    name=data["name"],
+                    version=data.get("version", "0.0.0"),
+                    description=data.get("description", ""),
+                    table_prefix=data.get("table_prefix", ""),
+                    tables=data.get("tables", []),
+                    settings=data.get("settings", []),
+                    secrets=data.get("secrets", []),
+                    resources=data.get("resources", {}),
+                    requires=data.get("requires", []),
+                    depends_on=data.get("depends_on", []),
+                    author=data.get("author", ""),
+                    path=skill_dir,
+                )
+            )
+            logger.info(
+                "Loaded manifest: %s@%s from %s", data["name"], data.get("version"), manifest_path
+            )
         except Exception as e:
             logger.warning("Failed to parse %s: %s", manifest_path, e)
 
@@ -86,6 +91,7 @@ def load_manifests(skills_root: Path | None = None) -> list[SkillManifest]:
 @dataclass
 class LocalSkill:
     """A discovered local skill."""
+
     spec: SkillMd | None
     skill: Any  # MarkdownSkill or typed Skill from skill.py
 
@@ -96,6 +102,7 @@ def _load_skill_py(skill_dir: Path) -> Any | None:
     if not py_path.is_file():
         return None
     import importlib.util
+
     try:
         spec = importlib.util.spec_from_file_location(f"_skill_{skill_dir.name}", py_path)
         if spec is None or spec.loader is None:
@@ -104,9 +111,14 @@ def _load_skill_py(skill_dir: Path) -> Any | None:
         spec.loader.exec_module(mod)
         # Find the Skill subclass (not base classes)
         from core.skills.base import Skill as SkillBase
+
         for attr in vars(mod).values():
-            if (isinstance(attr, type) and issubclass(attr, SkillBase)
-                    and attr is not SkillBase and not attr.__name__.startswith("_")):
+            if (
+                isinstance(attr, type)
+                and issubclass(attr, SkillBase)
+                and attr is not SkillBase
+                and not attr.__name__.startswith("_")
+            ):
                 return attr()
         return None
     except Exception as e:
@@ -139,7 +151,9 @@ class SkillLoader:
                     if typed_skill.name in seen:
                         continue
                     seen[typed_skill.name] = LocalSkill(spec=None, skill=typed_skill)
-                    logger.info("Loaded typed skill: %s from %s/skill.py", typed_skill.name, skill_dir)
+                    logger.info(
+                        "Loaded typed skill: %s from %s/skill.py", typed_skill.name, skill_dir
+                    )
                     continue
 
                 # Fall back to SKILL.md
@@ -154,7 +168,8 @@ class SkillLoader:
                 if spec.name in seen:
                     logger.debug(
                         "Skipping %s from %s (already loaded from higher-priority path)",
-                        spec.name, md_path,
+                        spec.name,
+                        md_path,
                     )
                     continue
 

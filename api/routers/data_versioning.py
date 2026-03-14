@@ -11,6 +11,7 @@ router = APIRouter(prefix="/data-versioning", tags=["data-versioning"])
 
 # ── Request / Response models ──────────────────────────────────────
 
+
 class CreateCheckpointRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=128)
     description: str = ""
@@ -45,6 +46,7 @@ class SandboxCheckpointRequest(BaseModel):
 
 # ── Checkpoints (time-travel) ─────────────────────────────────────
 
+
 @router.post("/checkpoints", response_model=CheckpointResponse, status_code=201)
 def create_checkpoint(
     req: CreateCheckpointRequest,
@@ -52,6 +54,7 @@ def create_checkpoint(
 ):
     """Create a named checkpoint (MatrixOne snapshot) for time-travel queries."""
     from core.replay.time_machine import TimeMachine
+
     tm = TimeMachine(SessionLocal)
     result = tm.create_checkpoint(req.name, req.description)
     return CheckpointResponse(
@@ -67,6 +70,7 @@ def list_checkpoints(
 ):
     """List all available checkpoints."""
     from core.replay.time_machine import TimeMachine
+
     tm = TimeMachine(SessionLocal)
     return [
         CheckpointResponse(
@@ -86,6 +90,7 @@ def get_events_at_checkpoint(
 ):
     """Time-travel query: read events as they were at a checkpoint (read-only)."""
     from core.replay.time_machine import TimeMachine
+
     tm = TimeMachine(SessionLocal)
     try:
         events = tm.get_events_at_checkpoint(name, session_id=session_id, limit=limit)
@@ -105,6 +110,7 @@ def get_events_at_checkpoint(
 
 # ── Lineage ────────────────────────────────────────────────────────
 
+
 @router.get("/lineage/{event_id}/chain", response_model=list[LineageNode])
 def get_causal_chain(
     event_id: str,
@@ -112,6 +118,7 @@ def get_causal_chain(
 ):
     """Get the full causal chain for an event (upstream + downstream)."""
     from core.events.event_reader import EventReader
+
     reader = EventReader(SessionLocal)
 
     # First get the event to find its causal_chain_id
@@ -132,6 +139,7 @@ def trace_upstream(
 ):
     """Trace upstream: walk parent_event_id chain to find all ancestors."""
     from core.events.event_reader import EventReader
+
     reader = EventReader(SessionLocal)
     chain: list[LineageNode] = []
     current_id: str | None = event_id
@@ -150,6 +158,7 @@ def trace_upstream(
 
 # ── Sandbox checkpoint / restore ───────────────────────────────────
 
+
 @router.post("/sandbox/{name}/checkpoint", status_code=201)
 def sandbox_checkpoint(
     name: str,
@@ -158,6 +167,7 @@ def sandbox_checkpoint(
 ):
     """Create a checkpoint within a sandbox."""
     from core.sandbox.sandbox import Sandbox
+
     sb = Sandbox(SessionLocal)
     try:
         sb.snapshot(name, req.checkpoint_name)
@@ -174,6 +184,7 @@ def sandbox_restore(
 ):
     """Restore a sandbox to a previously created checkpoint."""
     from core.sandbox.sandbox import Sandbox
+
     sb = Sandbox(SessionLocal)
     try:
         sb.restore(name, req.checkpoint_name)
@@ -183,6 +194,7 @@ def sandbox_restore(
 
 
 # ── Helpers ────────────────────────────────────────────────────────
+
 
 def _event_to_lineage(ev) -> LineageNode:
     return LineageNode(

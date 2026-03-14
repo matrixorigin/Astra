@@ -26,7 +26,15 @@ class TestSkillRunnerErrors:
     def test_skill_not_found_includes_hint(self):
         """Skill not found error includes diagnostic hint."""
         result = subprocess.run(
-            [sys.executable, "-m", "core.skills.runner", "--skill", "nonexistent_xyz", "--inputs", "{}"],
+            [
+                sys.executable,
+                "-m",
+                "core.skills.runner",
+                "--skill",
+                "nonexistent_xyz",
+                "--inputs",
+                "{}",
+            ],
             capture_output=True,
             text=True,
             timeout=30,
@@ -43,14 +51,14 @@ class TestSkillNotFoundError:
 
     def test_has_hint_attribute(self):
         from core.exceptions import SkillNotFoundError
-        
+
         err = SkillNotFoundError("test_skill")
         assert hasattr(err, "hint")
         assert "diagnose_skills" in err.hint
 
     def test_error_message(self):
         from core.exceptions import SkillNotFoundError
-        
+
         err = SkillNotFoundError("my_skill", version="1.0.0")
         assert "my_skill" in str(err)
         assert "1.0.0" in str(err)

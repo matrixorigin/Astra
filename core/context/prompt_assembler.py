@@ -33,6 +33,7 @@ from core.db_consumer import DbConsumer, DbFactory
 try:
     from core.context.prompt_integration import integrate_compression_into_prompt
     from core.context.zone_budgets import compute_zone_budgets
+
     _COMPRESSION_AVAILABLE = True
 except ImportError:
     _COMPRESSION_AVAILABLE = False
@@ -54,8 +55,8 @@ _INJECTION_PATTERNS_ANYWHERE = [
     "disregard previous",
     "forget everything",
     "new instructions:",
-    "you are now a",       # "you are now a pirate" but not "you are now running on"
-    "you are now in",      # "you are now in DAN mode"
+    "you are now a",  # "you are now a pirate" but not "you are now running on"
+    "you are now in",  # "you are now in DAN mode"
     "override all",
     "override instructions",
     "bypass safety",
@@ -78,7 +79,9 @@ _BASELINE_INSIGHTS: dict[str, str] = {
     "reviewer": "I read and analyze code but don't modify files directly.",
     "orchestrator": "I break down tasks and delegate to specialists rather than solving directly.",
 }
-_DEFAULT_INSIGHT = "I'm still learning about my strengths and weaknesses. I'll improve as we work together."
+_DEFAULT_INSIGHT = (
+    "I'm still learning about my strengths and weaknesses. I'll improve as we work together."
+)
 
 # Budget constants (tokens)
 _FIXED_SELF_MODEL = 600
@@ -105,8 +108,13 @@ _DEFAULT_MAX_TOKENS = 8000
 # Cache-friendly: stable sections first (identity, self_model, project_context)
 # so LLM providers can cache the prefix across turns.
 _SECTION_ORDER = [
-    "identity", "self_model", "project_context", "memory",
-    "working_memory", "history", "constraints",
+    "identity",
+    "self_model",
+    "project_context",
+    "memory",
+    "working_memory",
+    "history",
+    "constraints",
 ]
 
 
@@ -150,6 +158,7 @@ def _sanitize_edge_content(content: str, max_chars: int) -> str:
 @dataclass
 class EdgeContext:
     """Context contributed by the edge on first turn."""
+
     project_rules: str | None = None
     edge_tools: list[dict[str, Any]] | None = None
     edge_profile: dict[str, Any] = field(default_factory=dict)
@@ -158,6 +167,7 @@ class EdgeContext:
 @dataclass
 class AssembledPrompt:
     """Result of prompt assembly."""
+
     system_message: str
     tools_schema: list[dict[str, Any]]
     snapshot_id: str | None = None
@@ -222,19 +232,25 @@ class PromptAssembler(DbConsumer):
                 # Get model context size from edge_context or estimate
                 # NOTE: max_tokens is the BUDGET (e.g., 4000), not the MODEL SIZE (e.g., 128K)
                 # We need the actual model context size to compute zone budgets correctly
-                if edge_context and hasattr(edge_context, 'model_context_size'):
+                if edge_context and hasattr(edge_context, "model_context_size"):
                     model_context_size = edge_context.model_context_size
-                    logger.debug(f"Using model context size from edge_context: {model_context_size}")
+                    logger.debug(
+                        f"Using model context size from edge_context: {model_context_size}"
+                    )
                 else:
                     # Estimate: budget is typically 25% of model size
                     # For GPT-4: 128K context, typical budget 32K
                     # For GPT-3.5: 16K context, typical budget 4K
                     model_context_size = max_tokens * 4
-                    logger.debug(f"Estimating model context size: {model_context_size} (4x budget of {max_tokens})")
+                    logger.debug(
+                        f"Estimating model context size: {model_context_size} (4x budget of {max_tokens})"
+                    )
 
                 zone_budgets = compute_zone_budgets(model_context_size)
-                logger.info(f"Zone budgets computed for {model_context_size} context: "
-                           f"fixed={zone_budgets.fixed}, managed={zone_budgets.managed}, elastic={zone_budgets.elastic}")
+                logger.info(
+                    f"Zone budgets computed for {model_context_size} context: "
+                    f"fixed={zone_budgets.fixed}, managed={zone_budgets.managed}, elastic={zone_budgets.elastic}"
+                )
             except Exception as e:
                 # Log error with full traceback for debugging
                 logger.error(f"Failed to compute zone budgets: {e}", exc_info=True)
@@ -274,7 +290,9 @@ class PromptAssembler(DbConsumer):
             # L0 profile only — skip L1 semantic retrieval
             memory, memory_stats = self._build_memory_profile_only(user_id, explain=explain)
         else:
-            memory, memory_stats = self._build_memory(user_id, session_id, user_query, explain=explain, verbose=verbose)
+            memory, memory_stats = self._build_memory(
+                user_id, session_id, user_query, explain=explain, verbose=verbose
+            )
         _mem_duration_ms = (time.monotonic() - _mem_t0) * 1000
         if memory:
             sections["memory"] = memory
@@ -324,7 +342,11 @@ class PromptAssembler(DbConsumer):
                         truncated = truncated[:last_nl]
                     sections["history"] = truncated + "\n[truncated]"
                     breakdown["history"] = _estimate_tokens(sections["history"])
-                    logger.info("History zone rebalanced: %d → %d tokens", elastic_usage, breakdown["history"])
+                    logger.info(
+                        "History zone rebalanced: %d → %d tokens",
+                        elastic_usage,
+                        breakdown["history"],
+                    )
 
         total = sum(breakdown.values())
         if total > max_tokens:
@@ -345,8 +367,10 @@ class PromptAssembler(DbConsumer):
             breakdown["history"] = _estimate_tokens(sections["history"])
             logger.warning(
                 "History hard-cap triggered: %d → %d tokens (%.0f%% of %d budget)",
-                history_tokens, breakdown["history"],
-                history_tokens / max_tokens * 100, max_tokens,
+                history_tokens,
+                breakdown["history"],
+                history_tokens / max_tokens * 100,
+                max_tokens,
             )
 
         # Assemble in cache-friendly order (see _SECTION_ORDER)
@@ -365,7 +389,9 @@ class PromptAssembler(DbConsumer):
             tools_schema = []
         elif _tier1 and _tier1.pruned_tools is not None:
             pruned_set = set(_tier1.pruned_tools)
-            tools_schema = [t for t in tools_schema if t.get("function", {}).get("name", "") in pruned_set]
+            tools_schema = [
+                t for t in tools_schema if t.get("function", {}).get("name", "") in pruned_set
+            ]
 
         # Build snapshot_breakdown = breakdown + tool_schemas + user_query
         # so ctx_snapshots.token_budget has a complete picture of the prompt.
@@ -429,7 +455,9 @@ class PromptAssembler(DbConsumer):
         breakdown: dict[str, int] = {}
 
         # Refresh memory
-        memory, memory_stats = self._build_memory(user_id, session_id, user_query, explain=explain, verbose=verbose)
+        memory, memory_stats = self._build_memory(
+            user_id, session_id, user_query, explain=explain, verbose=verbose
+        )
         if memory:
             sections["memory"] = memory
         else:
@@ -547,41 +575,41 @@ class PromptAssembler(DbConsumer):
         tools_schema: list[dict[str, Any]] | None,
     ) -> str:
         """Build constraints section with only relevant rules.
-        
+
         Core rules always included. Task-specific rules added based on:
         - Query keywords
         - Available tools (file editing rules only if file tools present)
         """
         parts = [self._CORE_RULES, self._REASONING_PROTOCOL]
-        
+
         if not query:
             # No query context — include all rules
             parts.extend(self._RULE_BLOCKS.values())
             return "".join(parts)
-        
+
         q_lower = query.lower()
         included: set[str] = set()
-        
+
         # Check query keywords
         for block_name, triggers in self._RULE_TRIGGERS.items():
             if any(t in q_lower for t in triggers):
                 included.add(block_name)
-        
+
         # Check available tools
         if tools_schema:
             tool_names = {t.get("function", {}).get("name", "") for t in tools_schema}
             if tool_names & {"write_file", "str_replace", "read_file"}:
                 included.add("file_editing")
-        
+
         # Always include tool_selection if multiple tools available
         if tools_schema and len(tools_schema) > 1:
             included.add("tool_selection")
-        
+
         # Add relevant blocks
         for block_name in included:
             if block_name in self._RULE_BLOCKS:
                 parts.append(self._RULE_BLOCKS[block_name])
-        
+
         return "".join(parts)
 
     def _build_identity(self, agent_id: str | None) -> str:
@@ -596,16 +624,27 @@ class PromptAssembler(DbConsumer):
             if agent_id:
                 try:
                     from api.models import Agent
+
                     row = db.query(Agent.agent_config).filter(Agent.agent_id == agent_id).first()
                     if row and row[0]:
                         raw = row[0]
-                        config = raw if isinstance(raw, dict) else json.loads(raw) if isinstance(raw, str) and raw.strip() else None
+                        config = (
+                            raw
+                            if isinstance(raw, dict)
+                            else json.loads(raw)
+                            if isinstance(raw, str) and raw.strip()
+                            else None
+                        )
                         if config and config.get("system_prompt"):
                             return config["system_prompt"]
                 except (json.JSONDecodeError, KeyError, TypeError) as e:
-                    logger.warning("Failed to load agent %s (%s): %s", agent_id, type(e).__name__, e)
+                    logger.warning(
+                        "Failed to load agent %s (%s): %s", agent_id, type(e).__name__, e
+                    )
                 except SQLAlchemyError as e:
-                    logger.warning("DB error loading agent %s (%s): %s", agent_id, type(e).__name__, e)
+                    logger.warning(
+                        "DB error loading agent %s (%s): %s", agent_id, type(e).__name__, e
+                    )
             return "You are a development assistant. Use tools to solve tasks exactly as asked."
 
     def _get_agent_type(self, agent_id: str | None) -> str:
@@ -614,6 +653,7 @@ class PromptAssembler(DbConsumer):
                 return "default"
             try:
                 from api.models import Agent
+
                 row = db.query(Agent.agent_type).filter(Agent.agent_id == agent_id).first()
                 return row[0] if row and row[0] else "default"
             except SQLAlchemyError:
@@ -636,7 +676,9 @@ class PromptAssembler(DbConsumer):
 
             # Capabilities — compact tool list
             if edge_context and edge_context.edge_tools:
-                tool_names = [t.get("function", {}).get("name", "unknown") for t in edge_context.edge_tools]
+                tool_names = [
+                    t.get("function", {}).get("name", "unknown") for t in edge_context.edge_tools
+                ]
                 parts.append(f"Tools: {', '.join(tool_names)}")
             else:
                 parts.append("Tools: file ops, shell, git, search")
@@ -646,9 +688,13 @@ class PromptAssembler(DbConsumer):
             if user_id:
                 try:
                     from api.models import SkillInstallation
+
                     installed = (
                         db.query(SkillInstallation.skill_name)
-                        .filter(SkillInstallation.user_id == user_id, SkillInstallation.status == "installed")
+                        .filter(
+                            SkillInstallation.user_id == user_id,
+                            SkillInstallation.status == "installed",
+                        )
                         .limit(10)
                         .all()
                     )
@@ -661,16 +707,21 @@ class PromptAssembler(DbConsumer):
             # Cloud skills — single-line count + use find_skills
             skill_count = self._count_cloud_skills(db, installed_names)
             if skill_count:
-                parts.append(f"+{skill_count} cloud skills (use `find_skills` or `get_agent_info` to discover)")
+                parts.append(
+                    f"+{skill_count} cloud skills (use `find_skills` or `get_agent_info` to discover)"
+                )
 
             # Memory hint — always present so the LLM knows it can recall user
             # context via get_agent_info, even on first interaction (~15 tokens).
-            parts.append("Memory: if User Profile is shown above in context, use it directly. Otherwise use `get_agent_info(dimension='memory')` to recall what you know about the user")
+            parts.append(
+                "Memory: if User Profile is shown above in context, use it directly. Otherwise use `get_agent_info(dimension='memory')` to recall what you know about the user"
+            )
 
             # Delegation
             if agent_id:
                 try:
                     from api.models import Agent
+
                     row = db.query(Agent.agent_config).filter(Agent.agent_id == agent_id).first()
                     if row and row[0]:
                         config = row[0] if isinstance(row[0], dict) else json.loads(row[0])
@@ -759,6 +810,7 @@ class PromptAssembler(DbConsumer):
         try:
             from api.models import SkillRegistry
             from sqlalchemy import func as sa_func
+
             query = db.query(sa_func.count(SkillRegistry.skill_name.distinct())).filter(
                 SkillRegistry.is_active == 1,
             )
@@ -773,17 +825,17 @@ class PromptAssembler(DbConsumer):
         """Build skill category summary for Self-Model section.
 
         Design: O(categories) not O(skills) — scales to 1000+ skills without prompt bloat.
-        
+
         Returns a compact summary like:
           "- 42 cloud skills in 5 categories:
              - github (15): list_prs, ci_status, get_pr
              - aws (12): ec2_status, s3_list, lambda_invoke
            - Use find_skills('task') to discover relevant skills"
-        
+
         Args:
             db: Database session
             exclude_names: Set of skill names to exclude (e.g., user's installed skills)
-        
+
         Returns:
             Formatted category summary string, or None if no skills exist
         """
@@ -793,20 +845,20 @@ class PromptAssembler(DbConsumer):
             # Step 1: Count distinct skill names per category
             # (not skill_id, which would count multiple versions as separate skills)
             # Exclude user's installed skills from the count
-            
+
             # Build base query
             query = db.query(
                 SkillRegistry.category,
                 SkillRegistry.skill_name,
             ).filter(SkillRegistry.is_active == 1)
-            
+
             # Exclude installed skills from cloud skills section
             if exclude_names:
                 query = query.filter(~SkillRegistry.skill_name.in_(exclude_names))
-            
+
             # Get all distinct (category, skill_name) pairs
             all_skills = query.distinct().all()
-            
+
             if not all_skills:
                 logger.debug("No active skills found")
                 return None
@@ -815,38 +867,34 @@ class PromptAssembler(DbConsumer):
             category_counts: dict[str, int] = {}
             for cat, _ in all_skills:
                 category_counts[cat or "general"] = category_counts.get(cat or "general", 0) + 1
-            
+
             logger.debug("Category counts: %s", category_counts)
-            
+
             # Sort by count descending, limit to top 10
             sorted_cats = sorted(category_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-            
+
             if not sorted_cats:
                 logger.debug("No categories after sorting")
                 return None
 
             # Step 3: Calculate total
             total = sum(cnt for _, cnt in sorted_cats)
-            
+
             # Step 4: Get top 3 skill examples per category (ordered by priority)
             # Note: MatrixOne requires ORDER BY columns to be in SELECT list when using DISTINCT
             # Also exclude installed skills from examples
             category_examples: dict[str, list[str]] = {}
             for cat, _ in sorted_cats:
-                query = (
-                    db.query(SkillRegistry.skill_name, SkillRegistry.priority)
-                    .filter(
-                        SkillRegistry.is_active == 1,
-                        SkillRegistry.category == cat,
-                    )
+                query = db.query(SkillRegistry.skill_name, SkillRegistry.priority).filter(
+                    SkillRegistry.is_active == 1,
+                    SkillRegistry.category == cat,
                 )
                 # Exclude installed skills from examples too
                 if exclude_names:
                     query = query.filter(~SkillRegistry.skill_name.in_(exclude_names))
-                
+
                 examples = (
-                    query
-                    .order_by(SkillRegistry.priority.desc())  # Top priority skills first
+                    query.order_by(SkillRegistry.priority.desc())  # Top priority skills first
                     .distinct()  # Avoid duplicates from multiple versions
                     .limit(3)
                     .all()
@@ -871,8 +919,12 @@ class PromptAssembler(DbConsumer):
             return None
 
     def _build_memory(
-        self, user_id: str, session_id: str, query: str,
-        explain: bool = False, verbose: bool = False,
+        self,
+        user_id: str,
+        session_id: str,
+        query: str,
+        explain: bool = False,
+        verbose: bool = False,
     ) -> tuple[str | None, dict[str, Any] | None]:
         """§4: Tiered memory (L0 profile + L1 query-relevant) + legacy fallbacks.
 
@@ -893,15 +945,20 @@ class PromptAssembler(DbConsumer):
         try:
             from core.context.tiered_loader import TieredMemoryLoader
             from core.memory import create_memory_service
+
             svc = create_memory_service(self._db_factory, user_id=user_id)
             loader = TieredMemoryLoader(svc)
             tiered_section, tiered_stats = loader.build_section(
-                user_id, session_id, query, explain=explain,
+                user_id,
+                session_id,
+                query,
+                explain=explain,
             )
             if tiered_section:
                 parts.append(tiered_section)
             if explain and tiered_stats:
                 from dataclasses import asdict
+
                 # Flatten: L0 stats at top level, retrieval nested properly
                 stats["l0"] = {
                     "loaded": tiered_stats.l0_loaded,
@@ -925,11 +982,15 @@ class PromptAssembler(DbConsumer):
                     if tiered_stats.retrieval and tiered_stats.retrieval.final_count > 0:
                         # Re-retrieve to get content (already cached in loader)
                         memories, _ = loader.load_l1(
-                            user_id, session_id, query, explain=False,
+                            user_id,
+                            session_id,
+                            query,
+                            explain=False,
                         )
                         if memories:
                             stats["l1"]["previews"] = [
-                                line.strip() for line in memories.split("\n")
+                                line.strip()
+                                for line in memories.split("\n")
                                 if line.strip() and line.strip() != "Relevant Memories:"
                             ][:5]
         except Exception as e:
@@ -940,6 +1001,7 @@ class PromptAssembler(DbConsumer):
         # Few-shot examples
         try:
             from core.context.few_shot import FewShotRetriever
+
             fsr = FewShotRetriever(self._db_factory)
             examples = fsr.retrieve(query)
             few_shot = fsr.format_for_prompt(examples)
@@ -963,7 +1025,6 @@ class PromptAssembler(DbConsumer):
 
         return section, stats if explain else None
 
-
     _COMPRESS_PROMPT = (
         "Compress this context. Keep all facts, preferences, and key details. "
         "Remove filler and redundancy. Output ONLY the compressed text."
@@ -973,6 +1034,7 @@ class PromptAssembler(DbConsumer):
         """Compress memory using cheapest available model. Falls back to original on error."""
         try:
             from core.llm.client import LLMClient
+
             llm = LLMClient(self._db_factory)
             resp = llm.chat(
                 messages=[
@@ -991,14 +1053,18 @@ class PromptAssembler(DbConsumer):
         except Exception as e:
             logger.debug("Memory compression skipped: %s", e)
         return text
+
     def _build_memory_profile_only(
-        self, user_id: str, explain: bool = False,
+        self,
+        user_id: str,
+        explain: bool = False,
     ) -> tuple[str | None, dict[str, Any] | None]:
         """L0 profile memory only — used by preference intent routing."""
         stats: dict[str, Any] | None = {"source": "profile_only"} if explain else None
         try:
             from core.context.tiered_loader import TieredMemoryLoader
             from core.memory import create_memory_service
+
             svc = create_memory_service(self._db_factory, user_id=user_id)
             loader = TieredMemoryLoader(svc)
             l0_text = loader.load_l0(user_id)
@@ -1012,6 +1078,7 @@ class PromptAssembler(DbConsumer):
         """§5: Scratchpad notes."""
         try:
             from core.context.scratchpad import AgentScratchpad
+
             sp = AgentScratchpad(self._db_factory)
             notes = sp.get_active_notes(session_id)
             if notes:
@@ -1021,7 +1088,9 @@ class PromptAssembler(DbConsumer):
             logger.debug("Scratchpad skipped: %s", e)
         return None
 
-    def _build_history(self, session_id: str, max_tokens: int, max_turns: int | None = None) -> str | None:
+    def _build_history(
+        self, session_id: str, max_tokens: int, max_turns: int | None = None
+    ) -> str | None:
         """§6: Budget-capped conversation history with tiered compression.
 
         Compression is enabled by default for token efficiency:
@@ -1070,7 +1139,7 @@ class PromptAssembler(DbConsumer):
         used = 0
         for row in reversed(rows):
             event_type = row[1]
-            if event_type not in ('user_query', 'llm_response'):
+            if event_type not in ("user_query", "llm_response"):
                 continue
             label = "User" if event_type == "user_query" else "Agent"
             content = row[2] or ""
@@ -1130,12 +1199,14 @@ class PromptAssembler(DbConsumer):
                             logger.warning(f"Failed to parse metadata JSON: {e}")
                             meta = {}
 
-                    current_turn["tool_results"].append({
-                        "event_id": event_id,
-                        "tool_name": meta.get("tool_name", "unknown"),
-                        "content": content or "",
-                        "args": meta.get("args", {})
-                    })
+                    current_turn["tool_results"].append(
+                        {
+                            "event_id": event_id,
+                            "tool_name": meta.get("tool_name", "unknown"),
+                            "content": content or "",
+                            "args": meta.get("args", {}),
+                        }
+                    )
 
             # Add last turn
             if current_turn:
@@ -1151,7 +1222,7 @@ class PromptAssembler(DbConsumer):
                 current_turn_response="",  # No current response in history building
                 current_turn_tool_calls=[],
                 elastic_budget=budget_chars // 4,  # Convert chars to tokens
-                enable_compression=True
+                enable_compression=True,
             )
 
         except Exception as e:
@@ -1164,10 +1235,7 @@ class PromptAssembler(DbConsumer):
     # ------------------------------------------------------------------
 
     def _check_zone_overflows(
-        self,
-        breakdown: dict[str, int],
-        zone_budgets,
-        session_id: str
+        self, breakdown: dict[str, int], zone_budgets, session_id: str
     ) -> None:
         """
         Phase 1: Check which zones exceed their budgets and log for observability.
@@ -1197,11 +1265,15 @@ class PromptAssembler(DbConsumer):
 
         if managed_usage > zone_budgets.managed:
             overflow_pct = ((managed_usage - zone_budgets.managed) / zone_budgets.managed) * 100
-            overflows.append(f"managed: {managed_usage}/{zone_budgets.managed} (+{overflow_pct:.1f}%)")
+            overflows.append(
+                f"managed: {managed_usage}/{zone_budgets.managed} (+{overflow_pct:.1f}%)"
+            )
 
         if elastic_usage > zone_budgets.elastic:
             overflow_pct = ((elastic_usage - zone_budgets.elastic) / zone_budgets.elastic) * 100
-            overflows.append(f"elastic: {elastic_usage}/{zone_budgets.elastic} (+{overflow_pct:.1f}%)")
+            overflows.append(
+                f"elastic: {elastic_usage}/{zone_budgets.elastic} (+{overflow_pct:.1f}%)"
+            )
 
         if overflows:
             logger.warning(
@@ -1225,10 +1297,10 @@ class PromptAssembler(DbConsumer):
         """Compress sections to fit budget. Priority: drop least important first."""
         # Compression order (first dropped = least important)
         compress_order = [
-            "memory",          # reduce few-shot first (within memory)
-            "history",         # truncate old turns
+            "memory",  # reduce few-shot first (within memory)
+            "history",  # truncate old turns
             "working_memory",  # keep only active plan
-            "self_model",      # drop "What I've Learned" (available via get_agent_info)
+            "self_model",  # drop "What I've Learned" (available via get_agent_info)
         ]
         # Never compress: identity, constraints
 
@@ -1262,13 +1334,20 @@ class PromptAssembler(DbConsumer):
     # Fixed sections: stable within a session, stored by hash for deduplication.
     # These rarely change between turns, so storing once and referencing by hash
     # reduces storage by ~80% for long sessions.
-    _FIXED_SECTIONS: ClassVar[set[str]] = {"identity", "self_model", "project_context", "constraints"}
+    _FIXED_SECTIONS: ClassVar[set[str]] = {
+        "identity",
+        "self_model",
+        "project_context",
+        "constraints",
+    }
 
     # Variable sections: change every turn, stored inline in snapshot.
     # These must be stored per-snapshot since they differ each turn.
     _VARIABLE_SECTIONS: ClassVar[set[str]] = {"memory", "working_memory", "history"}
 
-    def _save_snapshot(self, session_id: str, sections: dict[str, str], breakdown: dict[str, int]) -> str | None:
+    def _save_snapshot(
+        self, session_id: str, sections: dict[str, str], breakdown: dict[str, int]
+    ) -> str | None:
         """Persist context snapshot with content-addressed deduplication.
 
         Fixed sections (identity, self_model, constraints) are stored once in
@@ -1301,8 +1380,12 @@ class PromptAssembler(DbConsumer):
                             (fragment_hash, content, token_count, fragment_type)
                             VALUES (:hash, :content, :tokens, :ftype)
                         """),
-                        {"hash": hash_val, "content": content,
-                         "tokens": breakdown.get(key, 0), "ftype": key}
+                        {
+                            "hash": hash_val,
+                            "content": content,
+                            "tokens": breakdown.get(key, 0),
+                            "ftype": key,
+                        },
                     )
 
                 # 2. Store variable sections inline
@@ -1323,11 +1406,13 @@ class PromptAssembler(DbConsumer):
                         "cid": capture_id,
                         "sess": session_id,
                         "eid": capture_id,
-                        "prompt": json.dumps({
-                            "fixed_hashes": fixed_hashes,
-                            "variable_sections": variable_sections,
-                            "token_breakdown": breakdown,
-                        }),
+                        "prompt": json.dumps(
+                            {
+                                "fixed_hashes": fixed_hashes,
+                                "variable_sections": variable_sections,
+                                "token_breakdown": breakdown,
+                            }
+                        ),
                         "budget": json.dumps(breakdown),
                         "total": sum(breakdown.values()),
                     },
@@ -1348,6 +1433,7 @@ class PromptAssembler(DbConsumer):
 # Helpers
 # ------------------------------------------------------------------
 
+
 def _categorize_tools(tool_names: list[str]) -> list[str]:
     """Group tool names into human-readable categories for the Self-Model section.
 
@@ -1363,13 +1449,20 @@ def _categorize_tools(tool_names: list[str]) -> list[str]:
     """
     # Exact name → category mapping
     _TOOL_CATEGORIES: dict[str, str] = {
-        "read_file": "file operations", "write_file": "file operations",
-        "list_dir": "file operations", "str_replace": "file operations",
-        "bash": "shell commands", "shell": "shell commands",
-        "git_status": "git operations", "git_diff": "git operations",
-        "git_log": "git operations", "git_commit": "git operations",
-        "grep": "code search", "glob": "code search",
-        "search": "code search", "find": "code search",
+        "read_file": "file operations",
+        "write_file": "file operations",
+        "list_dir": "file operations",
+        "str_replace": "file operations",
+        "bash": "shell commands",
+        "shell": "shell commands",
+        "git_status": "git operations",
+        "git_diff": "git operations",
+        "git_log": "git operations",
+        "git_commit": "git operations",
+        "grep": "code search",
+        "glob": "code search",
+        "search": "code search",
+        "find": "code search",
     }
     _META_TOOLS = {"get_agent_info"}
     categories: set[str] = set()
