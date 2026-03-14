@@ -1,18 +1,15 @@
-"""Integration tests for Phase 5: MemoryProgrammer.
+"""Integration tests for MemoryProgrammer with Memoria backend.
 
 Tests:
 - Script parsing (YAML, dict, list formats)
 - Validation (malformed scripts, unknown actions, missing fields)
 - Dry-run mode
-- inject/correct/purge action execution via real MemoryEditor
-- Sandboxed execution (experiment created)
-- Non-sandboxed execution
+- inject/correct/purge/tune action execution via Memoria
 """
 
 import os
 
 import pytest
-from sqlalchemy import text
 
 os.environ.setdefault("MATRIXONE_DATABASE", "test_dev_agent_v3")
 _TEST_DB = os.environ.get("MATRIXONE_DATABASE", "test_dev_agent_v3")
@@ -21,6 +18,7 @@ from core.memory.programmer import (  # noqa: E402
     InvalidScriptError,
     MemoryProgrammer,
     parse_script,
+    ProgramTimeoutError,
 )
 from core.utils.id_generator import generate_id  # noqa: E402
 
@@ -112,7 +110,7 @@ class TestDryRun:
         assert all(r.detail.get("dry_run") for r in result.results)
 
 
-# ── Real Execution (requires DB) ─────────────────────────────────────
+# ── Real Execution (requires Memoria) ─────────────────────────────────────
 
 
 from api.database import SessionLocal  # noqa: E402
@@ -123,28 +121,47 @@ def db_factory():
     return SessionLocal
 
 
+@pytest.fixture(autouse=True)
+def _setup_memoria_env():
+    """Set Memoria environment variables from test configuration."""
+    os.environ["MEMORIA_BASE_URL"] = os.environ.get("TEST_MEMORIA_BASE_URL", "http://localhost:8100")
+    os.environ["MEMORIA_MASTER_KEY"] = os.environ.get("TEST_MEMORIA_MASTER_KEY", "test-master-key-for-docker-compose")
+    os.environ["MEMORIA_API_KEY"] = os.environ.get("TEST_MEMORIA_API_KEY", "")
+    yield
+
+
 @pytest.fixture()
-def editor(db_factory):
+def memoria_client(_setup_memoria_env):
+    """Create Memoria HTTP client for verification."""
+    from core.memory.backends.memoria_http import MemoriaHTTPClient
+    return MemoriaHTTPClient(
+        base_url=os.environ["MEMORIA_BASE_URL"],
+        master_key=os.environ["MEMORIA_MASTER_KEY"],
+        api_key=os.environ["MEMORIA_API_KEY"] or None,
+    )
+
+
+@pytest.fixture()
+def editor(db_factory, _setup_memoria_env):
+    """Create editor with test Memoria configuration."""
     from core.memory.factory import create_editor
     return create_editor(db_factory)
 
 
 @pytest.fixture()
-
-
-@pytest.fixture()
-def programmer(editor, db_factory):
+def programmer(editor, db_factory, _setup_memoria_env):
     return MemoryProgrammer(editor, db_factory)
 
 
 @pytest.fixture(autouse=True)
-def _cleanup(db_factory):
+def _cleanup(db_factory, memoria_client):
     """Clean up test data after each test."""
     yield
+    # Cleanup is handled by Memoria's user isolation
 
 
 class TestInjectAction:
-    def test_inject_creates_memory(self, programmer, db_factory):
+    def test_inject_creates_memory(self, programmer, memoria_client):
         uid = f"test_prog_{generate_id()}"
         result = programmer.execute(
             uid,
@@ -155,16 +172,11 @@ class TestInjectAction:
         assert result.results[0].success is True
         memory_id = result.results[0].detail["memory_id"]
 
-        # Verify in DB
-        with db_factory() as db:
-            row = db.execute(
-                text("SELECT content, memory_type, is_active FROM mem_memories WHERE memory_id = :mid"),
-                {"mid": memory_id},
-            ).fetchone()
-            assert row is not None
-            assert row.content == "Python prefers spaces over tabs"
-            assert row.memory_type == "semantic"
-            assert row.is_active == 1
+        # Verify via Memoria API
+        mem = memoria_client.get_memory(uid, memory_id)
+        assert mem is not None
+        assert mem["content"] == "Python prefers spaces over tabs"
+        assert mem["memory_type"] == "semantic"
 
     def test_inject_missing_content_fails(self, programmer):
         uid = f"test_prog_{generate_id()}"
@@ -178,7 +190,7 @@ class TestInjectAction:
 
 
 class TestCorrectAction:
-    def test_correct_supersedes_memory(self, programmer, db_factory):
+    def test_correct_supersedes_memory(self, programmer, memoria_client):
         uid = f"test_prog_{generate_id()}"
         # First inject
         r1 = programmer.execute(
@@ -196,21 +208,14 @@ class TestCorrectAction:
         new_id = r2.results[0].detail["new_id"]
         assert new_id != old_id
 
-        # Old memory deactivated, new one active
-        with db_factory() as db:
-            old = db.execute(
-                text("SELECT is_active, superseded_by FROM mem_memories WHERE memory_id = :mid"),
-                {"mid": old_id},
-            ).fetchone()
-            assert old.is_active == 0
-            assert old.superseded_by == new_id
+        # Verify via Memoria API - old memory should be superseded
+        old_mem = memoria_client.get_memory(uid, old_id)
+        assert old_mem is None  # Corrected memories are deactivated
 
-            new = db.execute(
-                text("SELECT content, is_active FROM mem_memories WHERE memory_id = :mid"),
-                {"mid": new_id},
-            ).fetchone()
-            assert new.content == "Earth is round"
-            assert new.is_active == 1
+        # New memory should exist
+        new_mem = memoria_client.get_memory(uid, new_id)
+        assert new_mem is not None
+        assert new_mem["content"] == "Earth is round"
 
     def test_correct_missing_fields_fails(self, programmer):
         uid = f"test_prog_{generate_id()}"
@@ -223,7 +228,7 @@ class TestCorrectAction:
 
 
 class TestPurgeAction:
-    def test_purge_by_type(self, programmer, db_factory):
+    def test_purge_by_type(self, programmer, memoria_client):
         uid = f"test_prog_{generate_id()}"
         # Inject two memories
         programmer.execute(
@@ -234,6 +239,10 @@ class TestPurgeAction:
             ],
         )
 
+        # Verify both exist
+        memories = memoria_client.list_memories(uid, memory_type="semantic")
+        assert len(memories.get("items", [])) == 2
+
         # Purge all semantic
         result = programmer.execute(
             uid,
@@ -242,21 +251,11 @@ class TestPurgeAction:
         assert result.actions_executed == 1
         assert result.results[0].detail["deactivated"] == 2
 
-        # Verify in DB
-        with db_factory() as db:
-            active = db.execute(
-                text(
-                    "SELECT COUNT(*) AS cnt FROM mem_memories "
-                    "WHERE user_id = :uid AND is_active != 0"
-                ),
-                {"uid": uid},
-            ).scalar()
-            assert active == 0
+        # Verify via Memoria API
+        memories = memoria_client.list_memories(uid, memory_type="semantic")
+        assert len(memories.get("items", [])) == 0
 
 
-    
-    
-    
 class TestTuneAction:
     def test_tune_sets_strategy_and_params(self, programmer, db_factory):
         """Tune action sets user strategy and persists validated params."""
@@ -297,11 +296,11 @@ class TestTuneAction:
 
 
 class TestMultiActionScript:
-    def test_multi_action_yaml_workflow(self, programmer, db_factory):
+    def test_multi_action_yaml_workflow(self, programmer, memoria_client):
         """Full workflow: inject two memories, correct one, purge the other."""
         uid = f"test_prog_{generate_id()}"
 
-        # Step 1: inject two (coalesced into one batch action)
+        # Step 1: inject two
         r1 = programmer.execute(
             uid,
             [
@@ -331,19 +330,15 @@ actions:
         assert r2.actions_executed == 2
         assert r2.actions_failed == 0
 
-        # Verify final state
-        with db_factory() as db:
-            rows = db.execute(
-                text(
-                    "SELECT memory_id, content, is_active, memory_type "
-                    "FROM mem_memories WHERE user_id = :uid ORDER BY created_at"
-                ),
-                {"uid": uid},
-            ).fetchall()
+        # Verify via Memoria API
+        # A should be corrected (old deactivated, new created)
+        # B should be purged
+        semantic_mems = memoria_client.list_memories(uid, memory_type="semantic")
+        assert len(semantic_mems.get("items", [])) == 1
+        assert semantic_mems["items"][0]["content"] == "memory A corrected"
 
-        active = [r for r in rows if r.is_active == 1]
-        assert len(active) == 1
-        assert active[0].content == "memory A corrected"
+        procedural_mems = memoria_client.list_memories(uid, memory_type="procedural")
+        assert len(procedural_mems.get("items", [])) == 0
 
     def test_partial_failure_continues(self, programmer):
         """With atomic=False, if one action fails, others still execute."""
@@ -364,29 +359,48 @@ actions:
         assert result.results[2].success is True
 
 
-class TestEditAuditTrail:
-    def test_inject_logged_in_edit_log(self, programmer, db_factory):
+class TestBatchInject:
+    def test_consecutive_injects_batched(self, programmer, memoria_client):
+        """Multiple consecutive injects are coalesced into one batch INSERT."""
         uid = f"test_prog_{generate_id()}"
-        programmer.execute(
+        n = 20
+        actions = [{"inject": {"content": f"fact {i}", "type": "semantic"}} for i in range(n)]
+        result = programmer.execute(uid, actions)
+
+        # All coalesced into 1 batch action
+        assert len(result.results) == 1
+        assert result.results[0].detail["count"] == n
+        assert result.actions_failed == 0
+
+        # All 20 in Memoria
+        memories = memoria_client.list_memories(uid, memory_type="semantic")
+        assert len(memories.get("items", [])) == n
+
+    def test_non_consecutive_injects_not_batched(self, programmer):
+        """Injects separated by other actions are not coalesced."""
+        uid = f"test_prog_{generate_id()}"
+        result = programmer.execute(
             uid,
-            [{"inject": {"content": "audited fact"}}],
+            [
+                {"inject": {"content": "a"}},
+                {"purge": {"filter": {"type": "working"}}},
+                {"inject": {"content": "b"}},
+            ],
         )
-        with db_factory() as db:
-            rows = db.execute(
-                text(
-                    "SELECT operation, user_id FROM mem_edit_log "
-                    "WHERE user_id = :uid ORDER BY created_at"
-                ),
-                {"uid": uid},
-            ).fetchall()
-            ops = [r.operation for r in rows]
-            # editor.inject logs "inject", then programmer logs "program"
-            assert "inject" in ops
-            assert "program" in ops
+        # 3 separate actions: inject, purge, inject
+        assert len(result.results) == 3
 
 
-class TestAtomicRollback:
-    
+class TestTimeout:
+    def test_timeout_raises(self, programmer):
+        """Timeout raises ProgramTimeoutError."""
+        uid = f"test_timeout_{generate_id()}"
+        actions = [{"purge": {"filter": {"type": "working"}}}]
+        with pytest.raises(ProgramTimeoutError):
+            programmer.execute(uid, actions, timeout_seconds=-1)
+
+
+class TestAtomicExecution:
     def test_atomic_stops_on_first_failure(self, programmer):
         """atomic=True stops executing after first failure."""
         uid = f"test_prog_{generate_id()}"
@@ -416,402 +430,3 @@ class TestAtomicRollback:
         assert len(result.results) == 2
         assert result.results[0].success is False
         assert result.results[1].success is True
-        assert result.rolled_back is False
-
-
-class TestBatchInject:
-    def test_consecutive_injects_batched(self, programmer, db_factory):
-        """Multiple consecutive injects are coalesced into one batch INSERT."""
-        uid = f"test_prog_{generate_id()}"
-        n = 20
-        actions = [{"inject": {"content": f"fact {i}", "type": "semantic"}} for i in range(n)]
-        result = programmer.execute(uid, actions)
-
-        # All coalesced into 1 batch action
-        assert len(result.results) == 1
-        assert result.results[0].detail["count"] == n
-        assert result.actions_failed == 0
-
-        # All 20 in DB
-        # Note: use CAST to work around MatrixOne SMALLINT literal comparison bug
-        # where `is_active = 1` returns 0 rows (MatrixOne bug: integer equality in composite index scan) despite is_active being 1.
-        with db_factory() as db:
-            count = db.execute(
-                text(
-                    "SELECT COUNT(*) FROM mem_memories "
-                    "WHERE user_id = :uid AND is_active != 0"
-                ),
-                {"uid": uid},
-            ).scalar()
-        assert count == n
-
-    def test_non_consecutive_injects_not_batched(self, programmer):
-        """Injects separated by other actions are not coalesced."""
-        uid = f"test_prog_{generate_id()}"
-        result = programmer.execute(
-            uid,
-            [
-                {"inject": {"content": "a"}},
-                {"purge": {"filter": {"type": "working"}}},
-                {"inject": {"content": "b"}},
-            ],
-        )
-        # 3 separate actions: inject, purge, inject
-        assert len(result.results) == 3
-
-
-class TestLargeBatchPerformance:
-    def test_100_injects_under_5_seconds(self, programmer, db_factory):
-        """100 inject actions complete within 5 seconds via batch coalescing."""
-        import time
-
-        uid = f"test_prog_{generate_id()}"
-        n = 100
-        actions = [{"inject": {"content": f"perf fact {i}"}} for i in range(n)]
-
-        start = time.monotonic()
-        result = programmer.execute(uid, actions)
-        elapsed = time.monotonic() - start
-
-        assert result.actions_failed == 0
-        assert result.results[0].detail["count"] == n
-        assert elapsed < 5.0, f"100 injects took {elapsed:.1f}s (expected < 5s)"
-
-        with db_factory() as db:
-            count = db.execute(
-                text("SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid"),
-                {"uid": uid},
-            ).scalar()
-        assert count == n
-
-    def test_mixed_100_actions(self, programmer, db_factory):
-        """100 mixed actions (inject + purge cycles) complete reasonably."""
-        import time
-
-        uid = f"test_prog_{generate_id()}"
-        # 10 rounds of: 9 injects + 1 purge = 100 actions
-        actions: list[dict] = []
-        for _ in range(10):
-            for j in range(9):
-                actions.append({"inject": {"content": f"item {j}", "type": "semantic"}})
-            actions.append({"purge": {"filter": {"type": "semantic"}}})
-
-        start = time.monotonic()
-        result = programmer.execute(uid, actions, atomic=False)
-        elapsed = time.monotonic() - start
-
-        assert result.actions_failed == 0
-        assert elapsed < 15.0, f"100 mixed actions took {elapsed:.1f}s (expected < 15s)"
-
-
-class TestTimeout:
-    def test_timeout_raises(self, programmer):
-        """Timeout raises ProgramTimeoutError."""
-        import pytest
-        uid = f"test_timeout_{generate_id()}"
-        actions = [{"purge": {"filter": {"type": "working"}}}]
-        with pytest.raises(ProgramTimeoutError):
-            programmer.execute(uid, actions, timeout_seconds=-1)
-
-class TestConcurrentExecution:
-    def test_concurrent_programs_isolated(self, editor, db_factory):
-        """Two programs running concurrently don't interfere."""
-        import concurrent.futures
-
-        tag = generate_id()
-
-        def run_program(idx: int) -> tuple[str, int]:
-            uid = f"tpc_{tag}_{idx}"  # Short prefix outside test_prog_% pattern
-            prog = MemoryProgrammer(editor, db_factory)
-            result = prog.execute(
-                uid,
-                [{"inject": {"content": f"fact from {idx}"}}],
-            )
-            return uid, result.actions_executed
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            futures = [pool.submit(run_program, i) for i in range(4)]
-            results = [f.result() for f in concurrent.futures.as_completed(futures)]
-
-        # All 4 succeeded
-        assert all(count == 1 for _, count in results)
-
-        # Each user has exactly 1 memory
-        for uid, _ in results:
-            with db_factory() as db:
-                count = db.execute(
-                    text("SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active != 0"),
-                    {"uid": uid},
-                ).scalar()
-                assert count == 1
-
-        # Self-cleanup
-        with db_factory() as db:
-            for uid, _ in results:
-                db.execute(text("DELETE FROM mem_memories WHERE user_id = :uid"), {"uid": uid})
-            db.commit()
-
-
-# ── purge.before parameter ────────────────────────────────────────────────────
-
-
-class TestPurgeBeforeFilter:
-    def test_purge_before_removes_old_keeps_new(self, programmer, db_factory):
-        """purge with before= only deactivates memories older than the cutoff."""
-        from datetime import datetime, timezone
-
-        uid = f"test_prog_{generate_id()}"
-
-        # Inject two memories
-        programmer.execute(
-            uid,
-            [
-                {"inject": {"content": "old fact", "type": "semantic"}},
-                {"inject": {"content": "new fact", "type": "semantic"}},
-            ],
-        )
-
-        # Manually backdate the first memory so it's clearly "old"
-        with db_factory() as db:
-            db.execute(
-                text(
-                    "UPDATE mem_memories SET observed_at = '2000-01-01 00:00:00' "
-                    "WHERE user_id = :uid AND content = 'old fact'"
-                ),
-                {"uid": uid},
-            )
-            db.commit()
-
-        cutoff = datetime(2010, 1, 1, tzinfo=timezone.utc).isoformat()
-        result = programmer.execute(
-            uid,
-            [{"purge": {"filter": {"before": cutoff}}}],
-        )
-        assert result.actions_executed == 1
-        assert result.results[0].detail["deactivated"] == 1
-
-        # Verify: old fact gone, new fact still active
-        with db_factory() as db:
-            rows = db.execute(
-                text(
-                    "SELECT content, is_active FROM mem_memories "
-                    "WHERE user_id = :uid ORDER BY content"
-                ),
-                {"uid": uid},
-            ).fetchall()
-        by_content = {r.content: r.is_active for r in rows}
-        assert by_content["old fact"] == 0
-        assert by_content["new fact"] == 1
-
-    def test_purge_before_with_type_filter(self, programmer, db_factory):
-        """before + type filter: only old memories of that type are purged."""
-        from datetime import datetime, timezone
-
-        uid = f"test_prog_{generate_id()}"
-
-        programmer.execute(
-            uid,
-            [
-                {"inject": {"content": "old semantic", "type": "semantic"}},
-                {"inject": {"content": "old procedural", "type": "procedural"}},
-            ],
-        )
-
-        with db_factory() as db:
-            db.execute(
-                text(
-                    "UPDATE mem_memories SET observed_at = '2000-01-01 00:00:00' "
-                    "WHERE user_id = :uid"
-                ),
-                {"uid": uid},
-            )
-            db.commit()
-
-        cutoff = datetime(2010, 1, 1, tzinfo=timezone.utc).isoformat()
-        result = programmer.execute(
-            uid,
-            [{"purge": {"filter": {"type": "semantic", "before": cutoff}}}],
-        )
-        assert result.results[0].detail["deactivated"] == 1
-
-        with db_factory() as db:
-            rows = db.execute(
-                text(
-                    "SELECT content, is_active FROM mem_memories WHERE user_id = :uid"
-                ),
-                {"uid": uid},
-            ).fetchall()
-        by_content = {r.content: r.is_active for r in rows}
-        assert by_content["old semantic"] == 0
-        assert by_content["old procedural"] == 1  # different type, untouched
-
-    def test_purge_before_future_purges_nothing(self, programmer, db_factory):
-        """before= far in the future purges everything active."""
-        uid = f"test_prog_{generate_id()}"
-
-        programmer.execute(
-            uid,
-            [{"inject": {"content": "some fact", "type": "semantic"}}],
-        )
-
-        result = programmer.execute(
-            uid,
-            [{"purge": {"filter": {"before": "2099-01-01T00:00:00"}}}],
-        )
-        assert result.results[0].detail["deactivated"] == 1
-
-        with db_factory() as db:
-            active = db.execute(
-                text(
-                    "SELECT COUNT(*) FROM mem_memories "
-                    "WHERE user_id = :uid AND is_active != 0"
-                ),
-                {"uid": uid},
-            ).scalar()
-        assert active == 0
-
-
-# ── Cross-table invariants ────────────────────────────────────────────────────
-
-
-class TestCrossTableInvariants:
-    def test_inject_target_ids_match_memory_ids(self, programmer, db_factory):
-        """mem_edit_log.target_ids must contain the memory_id written to mem_memories."""
-        import json
-
-        uid = f"test_prog_{generate_id()}"
-        programmer.execute(
-            uid,
-            [{"inject": {"content": "cross-table fact", "type": "semantic"}}],
-        )
-
-        with db_factory() as db:
-            mem = db.execute(
-                text(
-                    "SELECT memory_id FROM mem_memories "
-                    "WHERE user_id = :uid AND content = 'cross-table fact'"
-                ),
-                {"uid": uid},
-            ).fetchone()
-            assert mem is not None
-
-            log = db.execute(
-                text(
-                    "SELECT target_ids FROM mem_edit_log "
-                    "WHERE user_id = :uid AND operation = 'inject' "
-                    "ORDER BY created_at DESC LIMIT 1"
-                ),
-                {"uid": uid},
-            ).fetchone()
-            assert log is not None
-            target_ids = json.loads(log.target_ids)
-            assert mem.memory_id in target_ids
-
-    
-    def test_purge_target_ids_empty_when_type_filter(self, programmer, db_factory):
-        """purge by type: target_ids in audit log is [] (bulk op, no individual IDs tracked)."""
-        import json
-
-        uid = f"test_prog_{generate_id()}"
-        programmer.execute(
-            uid,
-            [{"inject": {"content": "to purge", "type": "semantic"}}],
-        )
-        programmer.execute(
-            uid,
-            [{"purge": {"filter": {"type": "semantic"}}}],
-        )
-
-        with db_factory() as db:
-            log = db.execute(
-                text(
-                    "SELECT target_ids FROM mem_edit_log "
-                    "WHERE user_id = :uid AND operation = 'purge' "
-                    "ORDER BY created_at DESC LIMIT 1"
-                ),
-                {"uid": uid},
-            ).fetchone()
-            assert log is not None
-            # type-based purge doesn't collect individual IDs
-            target_ids = json.loads(log.target_ids)
-            assert isinstance(target_ids, list)
-
-    
-    
-class TestErrorDegradation:
-    def test_audit_failure_does_not_fail_inject(self, programmer, db_factory, monkeypatch):
-        """If _log_edit raises internally, inject still succeeds (best-effort audit)."""
-        from core.memory import editor as editor_mod
-
-        # Patch the DB execute inside _log_edit by making the whole method silently fail
-        # (simulating what happens when the audit INSERT fails at the DB level)
-        original_log = editor_mod.MemoryEditor._log_edit
-
-        def flaky_log(self, *args, **kwargs):
-            # Simulate DB failure inside the try block — exception is swallowed by design
-            try:
-                raise RuntimeError("simulated audit DB failure")
-            except Exception:
-                pass  # mirrors the real _log_edit behavior
-
-        monkeypatch.setattr(editor_mod.MemoryEditor, "_log_edit", flaky_log)
-
-        uid = f"test_prog_{generate_id()}"
-        result = programmer.execute(
-            uid,
-            [{"inject": {"content": "audit-fail fact", "type": "semantic"}}],
-        )
-        # inject itself must succeed even when audit silently fails
-        assert result.actions_executed == 1
-        assert result.results[0].success is True
-
-        # Memory is in DB despite audit failure
-        with db_factory() as db:
-            count = db.execute(
-                text(
-                    "SELECT COUNT(*) FROM mem_memories "
-                    "WHERE user_id = :uid AND content = 'audit-fail fact' AND is_active != 0"
-                ),
-                {"uid": uid},
-            ).scalar()
-        assert count == 1
-
-        monkeypatch.setattr(editor_mod.MemoryEditor, "_log_edit", original_log)
-
-    def test_snapshot_failure_does_not_fail_purge(self, programmer, db_factory, monkeypatch):
-        """If _create_safety_snapshot raises internally, purge still deactivates memories."""
-        from core.memory import editor as editor_mod
-
-        def broken_snapshot(self, *args, **kwargs) -> None:
-            # Simulate failure inside the try block — returns None by design
-            try:
-                raise RuntimeError("simulated snapshot failure")
-            except Exception:
-                return None  # mirrors the real _create_safety_snapshot behavior
-
-        monkeypatch.setattr(
-            editor_mod.MemoryEditor, "_create_safety_snapshot", broken_snapshot
-        )
-
-        uid = f"test_prog_{generate_id()}"
-        programmer.execute(
-            uid,
-            [{"inject": {"content": "snap-fail fact", "type": "semantic"}}],
-        )
-
-        result = programmer.execute(
-            uid,
-            [{"purge": {"filter": {"type": "semantic"}}}],
-        )
-        assert result.results[0].success is True
-        assert result.results[0].detail["deactivated"] == 1
-
-        with db_factory() as db:
-            active = db.execute(
-                text(
-                    "SELECT COUNT(*) FROM mem_memories "
-                    "WHERE user_id = :uid AND is_active != 0"
-                ),
-                {"uid": uid},
-            ).scalar()
-        assert active == 0

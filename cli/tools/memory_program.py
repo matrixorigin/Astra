@@ -108,8 +108,6 @@ class MemoryProgramTool(EdgeTool):
         }
         if result.dry_run:
             out["dry_run"] = True
-        if result.rolled_back:
-            out["rolled_back"] = True
         if result.timed_out:
             out["timed_out"] = True
 

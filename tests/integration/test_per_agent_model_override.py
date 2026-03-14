@@ -4,6 +4,7 @@ Tests the complete flow: agent config → run engine → chat loop → LLM clien
 Uses mock provider to verify model selection without real API calls.
 """
 
+import os
 import pytest
 import time
 from fastapi.testclient import TestClient
@@ -11,6 +12,15 @@ from sqlalchemy import text
 
 from api.main import app
 from api.database import get_db_session
+
+
+@pytest.fixture(autouse=True)
+def _setup_memoria_env():
+    """Set Memoria environment variables from test configuration."""
+    os.environ["MEMORIA_BASE_URL"] = os.environ.get("TEST_MEMORIA_BASE_URL", "http://localhost:8100")
+    os.environ["MEMORIA_MASTER_KEY"] = os.environ.get("TEST_MEMORIA_MASTER_KEY", "test-master-key-for-docker-compose")
+    os.environ["MEMORIA_API_KEY"] = os.environ.get("TEST_MEMORIA_API_KEY", "")
+    yield
 
 
 @pytest.fixture

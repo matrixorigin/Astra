@@ -256,6 +256,35 @@ class MemoriaStorage:
         )
         return self._to_memory(result, user_id)
 
+    def batch_store(
+        self,
+        memories: list[Memory],
+    ) -> list[Memory]:
+        """Batch store memories via Memoria HTTP API."""
+        if not memories:
+            return []
+
+        # Convert Memory objects to dicts for API
+        memory_dicts = []
+        for mem in memories:
+            mem_dict = {
+                "content": mem.content,
+                "memory_type": mem.memory_type.value if hasattr(mem.memory_type, 'value') else str(mem.memory_type),
+                "trust_tier": mem.trust_tier.value if hasattr(mem.trust_tier, 'value') else str(mem.trust_tier),
+                "initial_confidence": mem.initial_confidence,
+                "source": "batch_inject",
+            }
+            if mem.session_id:
+                mem_dict["session_id"] = mem.session_id
+            memory_dicts.append(mem_dict)
+
+        # Get user_id from first memory
+        user_id = memories[0].user_id
+        results = self.client.batch_store(user_id, memory_dicts)
+
+        # Convert results back to Memory objects
+        return [self._to_memory(r, user_id) for r in results]
+
     def observe_turn(
         self,
         user_id: str,
@@ -367,8 +396,21 @@ class MemoriaStorage:
         return self._to_memory(result, user_id)
 
     def purge(self, user_id: str, memory_ids: Optional[list[str]] = None, **kwargs: Any) -> Any:
-        result = self.client.purge(user_id=user_id, memory_ids=memory_ids, reason=kwargs.get("reason", ""))
-        return type("PurgeResult", (), {"deactivated": result.get("purged", 0)})()
+        # Extract memory_types from kwargs if provided
+        memory_types = kwargs.get("memory_types")
+        if memory_types:
+            # Convert MemoryType enums to strings
+            memory_types = [mt.value if hasattr(mt, 'value') else str(mt) for mt in memory_types]
+
+        result = self.client.purge(
+            user_id=user_id,
+            memory_ids=memory_ids,
+            memory_types=memory_types,
+            reason=kwargs.get("reason", ""),
+        )
+        # Handle different response formats from Memoria API
+        deactivated = result.get("purged") or result.get("deactivated") or result.get("count") or 0
+        return type("PurgeResult", (), {"deactivated": deactivated})()
 
     def run_governance(self, user_id: str) -> GovernanceReport:
         try:
