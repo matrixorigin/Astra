@@ -64,12 +64,6 @@ class ObserveRequest(BaseModel):
     source_event_ids: list[str] | None = None
 
 
-class ExperimentCreateRequest(BaseModel):
-    name: str = Field(..., min_length=1)
-    description: str = ""
-    strategy_key: str | None = None
-
-
 class MemoryResponse(BaseModel):
     memory_id: str
     content: str
@@ -253,50 +247,3 @@ def observe_turn(
         source_event_ids=req.source_event_ids,
     )
     return [_to_response(m) for m in memories]
-
-
-@router.post("/experiments", status_code=status.HTTP_201_CREATED)
-def create_experiment(
-    req: ExperimentCreateRequest,
-    user_id: str = Depends(get_current_user_id),
-    db_factory: DbFactory = Depends(get_db_factory),
-):
-    """Create a memory experiment (sandbox branch)."""
-    from core.memory.experiment import MemoryExperimentManager
-
-    mgr = MemoryExperimentManager(db_factory)
-    info = mgr.create(user_id, req.name, description=req.description, strategy_key=req.strategy_key)
-    return {"experiment_id": info.experiment_id, "name": info.name, "status": info.status}
-
-
-@router.get("/experiments/{experiment_id}")
-def get_experiment(
-    experiment_id: str,
-    user_id: str = Depends(get_current_user_id),
-    db_factory: DbFactory = Depends(get_db_factory),
-):
-    """Get experiment status."""
-    from core.memory.experiment import MemoryExperimentManager
-
-    mgr = MemoryExperimentManager(db_factory)
-    info = mgr.get(experiment_id)
-    if info is None:
-        raise HTTPException(status_code=404, detail="Experiment not found")
-    return {"experiment_id": info.experiment_id, "name": info.name, "status": info.status}
-
-
-@router.post("/experiments/{experiment_id}/commit")
-def commit_experiment(
-    experiment_id: str,
-    user_id: str = Depends(get_current_user_id),
-    db_factory: DbFactory = Depends(get_db_factory),
-):
-    """Commit experiment changes to production."""
-    from core.memory.experiment import MemoryExperimentManager
-
-    mgr = MemoryExperimentManager(db_factory)
-    try:
-        mgr.commit(experiment_id)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"status": "committed"}

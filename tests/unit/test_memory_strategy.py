@@ -1,6 +1,6 @@
 """Tests for the new memory architecture: strategy registry, descriptor, and service facade.
 
-Phase 0 verification: CanonicalStorage + RetrievalStrategy + IndexManager.
+Phase 0 verification: MemoriaStorage + RetrievalStrategy + IndexManager.
 """
 
 from __future__ import annotations

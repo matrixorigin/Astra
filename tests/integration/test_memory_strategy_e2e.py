@@ -2,11 +2,11 @@
 
 Verifies the REAL DB behavior of:
 1. MemoryService facade via create_memory_service() factory
-2. CanonicalStorage → mem_memories field-level correctness
+2. MemoriaStorage → mem_memories field-level correctness
 3. VectorRetrievalStrategy → real SQL hybrid retrieval
 4. ActivationRetrievalStrategy → real graph retrieval + vector fallback
 5. ActivationIndexManager → real graph node/edge creation on store()
-6. Governance → canonical + index manager coordination
+6. Governance → storage + index manager coordination
 """
 
 from uuid import uuid4
@@ -157,10 +157,10 @@ class TestFactoryCreatesRealService:
         assert gnode.is_active == 1
 
 
-# ── 2. CanonicalStorage field-level DB verification ───────────────────
+# ── 2. MemoriaStorage field-level DB verification ───────────────────
 
-class TestCanonicalStorageDB:
-    """CanonicalStorage writes correct fields to mem_memories."""
+class TestMemoriaStorageDB:
+    """MemoriaStorage writes correct fields to mem_memories."""
 
     def test_store_all_fields(self, db_factory, db_session, user_id):
         svc = create_memory_service(db_factory, strategy="vector:v1")

@@ -97,7 +97,6 @@ class TestDryRun:
 
         programmer = MemoryProgrammer(
             editor=MagicMock(),
-            experiments=MagicMock(),
             db_factory=MagicMock(),
         )
         result = programmer.execute(
@@ -117,7 +116,6 @@ class TestDryRun:
 
 
 from api.database import SessionLocal  # noqa: E402
-from core.memory.experiment import MemoryExperimentManager  # noqa: E402
 
 
 @pytest.fixture()
@@ -127,62 +125,22 @@ def db_factory():
 
 @pytest.fixture()
 def editor(db_factory):
-    from core.memory.canonical_storage import CanonicalStorage
-    from core.memory.editor import MemoryEditor
-
-    storage = CanonicalStorage(db_factory)
-    return MemoryEditor(storage, db_factory)
+    from core.memory.factory import create_editor
+    return create_editor(db_factory)
 
 
 @pytest.fixture()
-def experiments(db_factory):
-    return MemoryExperimentManager(db_factory, source_db=_TEST_DB)
 
 
 @pytest.fixture()
-def programmer(editor, experiments, db_factory):
-    return MemoryProgrammer(editor, experiments, db_factory)
+def programmer(editor, db_factory):
+    return MemoryProgrammer(editor, db_factory)
 
 
 @pytest.fixture(autouse=True)
 def _cleanup(db_factory):
     """Clean up test data after each test."""
     yield
-    with db_factory() as db:
-        # Clean experiments
-        rows = db.execute(
-            text(
-                "SELECT branch_db, base_snapshot FROM mem_experiments "
-                "WHERE user_id LIKE 'test_prog_%'"
-            )
-        ).fetchall()
-        branch_dbs = [r.branch_db for r in rows]
-        snap_names = [r.base_snapshot for r in rows if r.base_snapshot]
-        db.execute(text("DELETE FROM mem_experiments WHERE user_id LIKE 'test_prog_%'"))
-        # Clean memories
-        db.execute(text("DELETE FROM mem_memories WHERE user_id LIKE 'test_prog_%'"))
-        # Clean edit log
-        db.execute(text("DELETE FROM mem_edit_log WHERE user_id LIKE 'test_prog_%'"))
-        # Clean user config
-        db.execute(text("DELETE FROM mem_user_memory_config WHERE user_id LIKE 'test_prog_%'"))
-        db.commit()
-
-    for bdb in branch_dbs:
-        try:
-            with db_factory() as db:
-                db.commit()
-                db.execute(text(f"DROP DATABASE IF EXISTS `{bdb}`"))
-                db.commit()
-        except Exception:
-            pass
-    for snap in snap_names:
-        try:
-            with db_factory() as db:
-                db.commit()
-                db.execute(text(f"DROP SNAPSHOT IF EXISTS {snap}"))
-                db.commit()
-        except Exception:
-            pass
 
 
 class TestInjectAction:
@@ -191,7 +149,6 @@ class TestInjectAction:
         result = programmer.execute(
             uid,
             [{"inject": {"content": "Python prefers spaces over tabs", "type": "semantic"}}],
-            sandbox=False,
         )
         assert result.actions_executed == 1
         assert result.actions_failed == 0
@@ -214,7 +171,6 @@ class TestInjectAction:
         result = programmer.execute(
             uid,
             [{"inject": {"type": "semantic"}}],
-            sandbox=False,
         )
         assert result.actions_failed == 1
         assert result.results[0].success is False
@@ -228,7 +184,6 @@ class TestCorrectAction:
         r1 = programmer.execute(
             uid,
             [{"inject": {"content": "Earth is flat", "type": "semantic"}}],
-            sandbox=False,
         )
         old_id = r1.results[0].detail["memory_id"]
 
@@ -236,7 +191,6 @@ class TestCorrectAction:
         r2 = programmer.execute(
             uid,
             [{"correct": {"memory_id": old_id, "new_content": "Earth is round"}}],
-            sandbox=False,
         )
         assert r2.actions_executed == 1
         new_id = r2.results[0].detail["new_id"]
@@ -263,7 +217,6 @@ class TestCorrectAction:
         result = programmer.execute(
             uid,
             [{"correct": {"memory_id": "nonexistent"}}],
-            sandbox=False,
         )
         assert result.results[0].success is False
         assert "new_content" in result.results[0].error
@@ -279,14 +232,12 @@ class TestPurgeAction:
                 {"inject": {"content": "fact 1", "type": "semantic"}},
                 {"inject": {"content": "fact 2", "type": "semantic"}},
             ],
-            sandbox=False,
         )
 
         # Purge all semantic
         result = programmer.execute(
             uid,
             [{"purge": {"filter": {"type": "semantic"}}}],
-            sandbox=False,
         )
         assert result.actions_executed == 1
         assert result.results[0].detail["deactivated"] == 2
@@ -303,106 +254,9 @@ class TestPurgeAction:
             assert active == 0
 
 
-class TestSandboxExecution:
-    def test_sandbox_creates_experiment(self, programmer, db_factory):
-        uid = f"test_prog_{generate_id()}"
-        result = programmer.execute(
-            uid,
-            [{"inject": {"content": "sandboxed fact"}}],
-            sandbox=True,
-            program_name="test_sandbox",
-        )
-        assert result.experiment_id is not None
-
-        # Verify experiment exists in DB
-        with db_factory() as db:
-            row = db.execute(
-                text("SELECT name, status FROM mem_experiments WHERE experiment_id = :eid"),
-                {"eid": result.experiment_id},
-            ).fetchone()
-            assert row is not None
-            assert row.name == "prog_test_sandbox"
-            assert row.status == "active"
-
-    def test_sandbox_inject_isolated(self, programmer, db_factory):
-        """Sandbox inject writes to branch DB, not production."""
-        uid = f"test_prog_{generate_id()}"
-
-        # Count production memories before
-        with db_factory() as db:
-            before = db.execute(
-                text(
-                    "SELECT COUNT(*) AS cnt FROM mem_memories "
-                    "WHERE user_id = :uid AND is_active != 0"
-                ),
-                {"uid": uid},
-            ).scalar()
-
-        result = programmer.execute(
-            uid,
-            [{"inject": {"content": "branch-only fact", "type": "semantic"}}],
-            sandbox=True,
-            program_name="isolation_test",
-        )
-        assert result.actions_executed == 1
-        assert result.experiment_id is not None
-
-        # Production should be unchanged
-        with db_factory() as db:
-            after = db.execute(
-                text(
-                    "SELECT COUNT(*) AS cnt FROM mem_memories "
-                    "WHERE user_id = :uid AND is_active != 0"
-                ),
-                {"uid": uid},
-            ).scalar()
-        assert after == before
-
-    def test_sandbox_commit_applies_changes(self, programmer, experiments, db_factory):
-        """Full workflow: sandbox inject → commit → data appears in production."""
-        uid = f"test_prog_{generate_id()}"
-
-        # Sandbox inject
-        result = programmer.execute(
-            uid,
-            [{"inject": {"content": "will be committed", "type": "semantic"}}],
-            sandbox=True,
-            program_name="commit_test",
-        )
-        assert result.experiment_id is not None
-
-        # Not in production yet
-        with db_factory() as db:
-            prod_before = db.execute(
-                text(
-                    "SELECT COUNT(*) AS cnt FROM mem_memories "
-                    "WHERE user_id = :uid AND content = 'will be committed'"
-                ),
-                {"uid": uid},
-            ).scalar()
-        assert prod_before == 0
-
-        # Commit
-        experiments.commit(result.experiment_id)
-
-        # Now in production
-        with db_factory() as db:
-            prod_after = db.execute(
-                text(
-                    "SELECT content, is_active, memory_type FROM mem_memories "
-                    "WHERE user_id = :uid AND content = 'will be committed'"
-                ),
-                {"uid": uid},
-            ).fetchone()
-        assert prod_after is not None
-        assert prod_after.is_active == 1
-        assert prod_after.memory_type == "semantic"
-
-        # Experiment status is committed
-        info = experiments.get(result.experiment_id)
-        assert info.status == "committed"
-
-
+    
+    
+    
 class TestTuneAction:
     def test_tune_sets_strategy_and_params(self, programmer, db_factory):
         """Tune action sets user strategy and persists validated params."""
@@ -413,7 +267,6 @@ class TestTuneAction:
                 "strategy": "vector:v1",
                 "params": {"semantic_weight": 0.6, "temporal_weight": 0.2},
             }}],
-            sandbox=False,
         )
         assert result.actions_executed == 1
         assert result.results[0].success is True
@@ -438,7 +291,6 @@ class TestTuneAction:
         result = programmer.execute(
             uid,
             [{"tune": {"params": {"semantic_weight": 0.5}}}],
-            sandbox=False,
         )
         assert result.results[0].success is False
         assert "strategy" in result.results[0].error
@@ -456,7 +308,6 @@ class TestMultiActionScript:
                 {"inject": {"content": "memory A", "type": "semantic"}},
                 {"inject": {"content": "memory B", "type": "procedural"}},
             ],
-            sandbox=False,
         )
         assert r1.actions_failed == 0
         # Batch coalesces consecutive injects: 1 batch action, 2 memories
@@ -476,7 +327,7 @@ actions:
         type: procedural
       reason: "cleanup"
 """
-        r2 = programmer.execute(uid, yaml_script, sandbox=False)
+        r2 = programmer.execute(uid, yaml_script)
         assert r2.actions_executed == 2
         assert r2.actions_failed == 0
 
@@ -504,7 +355,6 @@ actions:
                 {"correct": {"memory_id": "nonexistent_id", "new_content": "x"}},
                 {"inject": {"content": "another good one"}},
             ],
-            sandbox=False,
             atomic=False,
         )
         assert result.actions_executed == 2
@@ -520,7 +370,6 @@ class TestEditAuditTrail:
         programmer.execute(
             uid,
             [{"inject": {"content": "audited fact"}}],
-            sandbox=False,
         )
         with db_factory() as db:
             rows = db.execute(
@@ -537,25 +386,7 @@ class TestEditAuditTrail:
 
 
 class TestAtomicRollback:
-    def test_sandbox_atomic_discards_on_failure(self, programmer, experiments, db_factory):
-        """atomic=True (default): failure discards the experiment."""
-        uid = f"test_prog_{generate_id()}"
-        result = programmer.execute(
-            uid,
-            [
-                {"inject": {"content": "will be rolled back"}},
-                {"correct": {"memory_id": "nonexistent", "new_content": "x"}},
-            ],
-            sandbox=True,
-            program_name="atomic_rollback",
-        )
-        assert result.rolled_back is True
-        assert result.actions_failed == 1
-
-        # Experiment should be discarded
-        info = experiments.get(result.experiment_id)
-        assert info.status == "discarded"
-
+    
     def test_atomic_stops_on_first_failure(self, programmer):
         """atomic=True stops executing after first failure."""
         uid = f"test_prog_{generate_id()}"
@@ -565,7 +396,6 @@ class TestAtomicRollback:
                 {"correct": {"memory_id": "bad_id", "new_content": "x"}},
                 {"inject": {"content": "should not run"}},
             ],
-            sandbox=False,
             atomic=True,
         )
         # Only 1 result — second action was skipped
@@ -581,7 +411,6 @@ class TestAtomicRollback:
                 {"correct": {"memory_id": "bad_id", "new_content": "x"}},
                 {"inject": {"content": "runs anyway"}},
             ],
-            sandbox=False,
             atomic=False,
         )
         assert len(result.results) == 2
@@ -596,7 +425,7 @@ class TestBatchInject:
         uid = f"test_prog_{generate_id()}"
         n = 20
         actions = [{"inject": {"content": f"fact {i}", "type": "semantic"}} for i in range(n)]
-        result = programmer.execute(uid, actions, sandbox=False)
+        result = programmer.execute(uid, actions)
 
         # All coalesced into 1 batch action
         assert len(result.results) == 1
@@ -626,7 +455,6 @@ class TestBatchInject:
                 {"purge": {"filter": {"type": "working"}}},
                 {"inject": {"content": "b"}},
             ],
-            sandbox=False,
         )
         # 3 separate actions: inject, purge, inject
         assert len(result.results) == 3
@@ -642,7 +470,7 @@ class TestLargeBatchPerformance:
         actions = [{"inject": {"content": f"perf fact {i}"}} for i in range(n)]
 
         start = time.monotonic()
-        result = programmer.execute(uid, actions, sandbox=False)
+        result = programmer.execute(uid, actions)
         elapsed = time.monotonic() - start
 
         assert result.actions_failed == 0
@@ -669,7 +497,7 @@ class TestLargeBatchPerformance:
             actions.append({"purge": {"filter": {"type": "semantic"}}})
 
         start = time.monotonic()
-        result = programmer.execute(uid, actions, sandbox=False, atomic=False)
+        result = programmer.execute(uid, actions, atomic=False)
         elapsed = time.monotonic() - start
 
         assert result.actions_failed == 0
@@ -677,39 +505,13 @@ class TestLargeBatchPerformance:
 
 
 class TestTimeout:
-    def test_timeout_raises_on_non_sandbox(self, programmer):
-        """Non-sandbox timeout raises ProgramTimeoutError."""
-        from core.memory.programmer import ProgramTimeoutError
-
-        uid = f"test_prog_{generate_id()}"
-        # Many non-coalesced actions with already-expired deadline
-        actions: list[dict] = []
-        for i in range(10):
-            actions.append({"inject": {"content": f"item {i}"}})
-            actions.append({"purge": {"filter": {"type": "working"}}})
-
-        with pytest.raises(ProgramTimeoutError, match="timed out"):
-            programmer.execute(uid, actions, sandbox=False, timeout_seconds=-1)
-
-    def test_timeout_sandbox_atomic_discards(self, programmer, experiments, db_factory):
-        """Sandbox + atomic + timeout → experiment discarded, no raise."""
-        uid = f"test_prog_{generate_id()}"
-        actions: list[dict] = []
-        for i in range(10):
-            actions.append({"inject": {"content": f"item {i}"}})
-            actions.append({"purge": {"filter": {"type": "working"}}})
-
-        result = programmer.execute(
-            uid, actions,
-            sandbox=True,
-            timeout_seconds=-1,
-            program_name="timeout_test",
-        )
-        assert result.timed_out is True
-        assert result.rolled_back is True
-        info = experiments.get(result.experiment_id)
-        assert info.status == "discarded"
-
+    def test_timeout_raises(self, programmer):
+        """Timeout raises ProgramTimeoutError."""
+        import pytest
+        uid = f"test_timeout_{generate_id()}"
+        actions = [{"purge": {"filter": {"type": "working"}}}]
+        with pytest.raises(ProgramTimeoutError):
+            programmer.execute(uid, actions, timeout_seconds=-1)
 
 class TestConcurrentExecution:
     def test_concurrent_programs_isolated(self, editor, db_factory):
@@ -720,12 +522,10 @@ class TestConcurrentExecution:
 
         def run_program(idx: int) -> tuple[str, int]:
             uid = f"tpc_{tag}_{idx}"  # Short prefix outside test_prog_% pattern
-            exp = MemoryExperimentManager(db_factory, source_db=_TEST_DB)
-            prog = MemoryProgrammer(editor, exp, db_factory)
+            prog = MemoryProgrammer(editor, db_factory)
             result = prog.execute(
                 uid,
                 [{"inject": {"content": f"fact from {idx}"}}],
-                sandbox=False,
             )
             return uid, result.actions_executed
 
@@ -769,7 +569,6 @@ class TestPurgeBeforeFilter:
                 {"inject": {"content": "old fact", "type": "semantic"}},
                 {"inject": {"content": "new fact", "type": "semantic"}},
             ],
-            sandbox=False,
         )
 
         # Manually backdate the first memory so it's clearly "old"
@@ -787,7 +586,6 @@ class TestPurgeBeforeFilter:
         result = programmer.execute(
             uid,
             [{"purge": {"filter": {"before": cutoff}}}],
-            sandbox=False,
         )
         assert result.actions_executed == 1
         assert result.results[0].detail["deactivated"] == 1
@@ -817,7 +615,6 @@ class TestPurgeBeforeFilter:
                 {"inject": {"content": "old semantic", "type": "semantic"}},
                 {"inject": {"content": "old procedural", "type": "procedural"}},
             ],
-            sandbox=False,
         )
 
         with db_factory() as db:
@@ -834,7 +631,6 @@ class TestPurgeBeforeFilter:
         result = programmer.execute(
             uid,
             [{"purge": {"filter": {"type": "semantic", "before": cutoff}}}],
-            sandbox=False,
         )
         assert result.results[0].detail["deactivated"] == 1
 
@@ -856,13 +652,11 @@ class TestPurgeBeforeFilter:
         programmer.execute(
             uid,
             [{"inject": {"content": "some fact", "type": "semantic"}}],
-            sandbox=False,
         )
 
         result = programmer.execute(
             uid,
             [{"purge": {"filter": {"before": "2099-01-01T00:00:00"}}}],
-            sandbox=False,
         )
         assert result.results[0].detail["deactivated"] == 1
 
@@ -889,7 +683,6 @@ class TestCrossTableInvariants:
         programmer.execute(
             uid,
             [{"inject": {"content": "cross-table fact", "type": "semantic"}}],
-            sandbox=False,
         )
 
         with db_factory() as db:
@@ -914,30 +707,7 @@ class TestCrossTableInvariants:
             target_ids = json.loads(log.target_ids)
             assert mem.memory_id in target_ids
 
-    def test_sandbox_snapshot_before_matches_experiment_id(
-        self, programmer, experiments, db_factory
-    ):
-        """mem_edit_log.snapshot_before == mem_experiments.experiment_id for sandbox runs."""
-        uid = f"test_prog_{generate_id()}"
-        result = programmer.execute(
-            uid,
-            [{"inject": {"content": "sandbox cross-table", "type": "semantic"}}],
-            sandbox=True,
-            program_name="cross_table_test",
-        )
-        assert result.experiment_id is not None
-
-        with db_factory() as db:
-            log = db.execute(
-                text(
-                    "SELECT snapshot_before FROM mem_edit_log "
-                    "WHERE user_id = :uid ORDER BY created_at DESC LIMIT 1"
-                ),
-                {"uid": uid},
-            ).fetchone()
-            assert log is not None
-            assert log.snapshot_before == result.experiment_id
-
+    
     def test_purge_target_ids_empty_when_type_filter(self, programmer, db_factory):
         """purge by type: target_ids in audit log is [] (bulk op, no individual IDs tracked)."""
         import json
@@ -946,12 +716,10 @@ class TestCrossTableInvariants:
         programmer.execute(
             uid,
             [{"inject": {"content": "to purge", "type": "semantic"}}],
-            sandbox=False,
         )
         programmer.execute(
             uid,
             [{"purge": {"filter": {"type": "semantic"}}}],
-            sandbox=False,
         )
 
         with db_factory() as db:
@@ -968,73 +736,8 @@ class TestCrossTableInvariants:
             target_ids = json.loads(log.target_ids)
             assert isinstance(target_ids, list)
 
-    def test_sandbox_inject_audit_mirrored_to_production(self, programmer, db_factory):
-        """Sandbox inject: production mem_edit_log has both inject and program entries."""
-        import json
-
-        uid = f"test_prog_{generate_id()}"
-        result = programmer.execute(
-            uid,
-            [{"inject": {"content": "sandbox audit fact", "type": "semantic"}}],
-            sandbox=True,
-            program_name="audit_mirror_test",
-        )
-        assert result.experiment_id is not None
-
-        with db_factory() as db:
-            logs = db.execute(
-                text(
-                    "SELECT operation, target_ids, reason, snapshot_before "
-                    "FROM mem_edit_log WHERE user_id = :uid "
-                    "ORDER BY created_at ASC"
-                ),
-                {"uid": uid},
-            ).fetchall()
-
-        ops = [r.operation for r in logs]
-        assert "inject" in ops, f"inject entry missing from production audit log; got {ops}"
-        assert "program" in ops, f"program entry missing from production audit log; got {ops}"
-
-        inject_log = next(r for r in logs if r.operation == "inject")
-        program_log = next(r for r in logs if r.operation == "program")
-
-        # Both reference the same experiment
-        assert inject_log.snapshot_before == result.experiment_id
-        assert program_log.snapshot_before == result.experiment_id
-
-        # inject entry has the memory_id
-        inject_ids = json.loads(inject_log.target_ids)
-        program_ids = json.loads(program_log.target_ids)
-        assert len(inject_ids) > 0
-        assert inject_ids == program_ids  # same memory IDs in both entries
-
-    def test_sandbox_audit_not_duplicated_for_non_sandbox(self, programmer, db_factory):
-        """Non-sandbox run: only one program entry, no duplicate inject entry."""
-        uid = f"test_prog_{generate_id()}"
-        programmer.execute(
-            uid,
-            [{"inject": {"content": "direct fact", "type": "semantic"}}],
-            sandbox=False,
-        )
-
-        with db_factory() as db:
-            logs = db.execute(
-                text(
-                    "SELECT operation FROM mem_edit_log "
-                    "WHERE user_id = :uid ORDER BY created_at ASC"
-                ),
-                {"uid": uid},
-            ).fetchall()
-
-        ops = [r.operation for r in logs]
-        # non-sandbox: inject (from editor) + program (from programmer)
-        assert ops.count("inject") == 1
-        assert ops.count("program") == 1
-
-
-# ── Error degradation paths ───────────────────────────────────────────────────
-
-
+    
+    
 class TestErrorDegradation:
     def test_audit_failure_does_not_fail_inject(self, programmer, db_factory, monkeypatch):
         """If _log_edit raises internally, inject still succeeds (best-effort audit)."""
@@ -1057,7 +760,6 @@ class TestErrorDegradation:
         result = programmer.execute(
             uid,
             [{"inject": {"content": "audit-fail fact", "type": "semantic"}}],
-            sandbox=False,
         )
         # inject itself must succeed even when audit silently fails
         assert result.actions_executed == 1
@@ -1095,13 +797,11 @@ class TestErrorDegradation:
         programmer.execute(
             uid,
             [{"inject": {"content": "snap-fail fact", "type": "semantic"}}],
-            sandbox=False,
         )
 
         result = programmer.execute(
             uid,
             [{"purge": {"filter": {"type": "semantic"}}}],
-            sandbox=False,
         )
         assert result.results[0].success is True
         assert result.results[0].detail["deactivated"] == 1

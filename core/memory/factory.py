@@ -10,7 +10,6 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from core.memory.canonical_storage import CanonicalStorage
 from core.memory.service import MemoryService
 from core.memory.strategy.registry import StrategyDescriptor, StrategyRegistry
 

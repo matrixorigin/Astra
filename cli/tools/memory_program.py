@@ -13,9 +13,6 @@ from cli.tools.base import EdgeTool, SideEffect
 
 logger = logging.getLogger(__name__)
 
-# Patch StreamHandler so any future handler created with stream=stdout
-# (e.g. matrixone client's create_default_logger) goes to stderr instead,
-# keeping CLI subprocess stdout clean for response capture.
 _orig_sh_init = logging.StreamHandler.__init__
 def _sh_init_stderr(self: logging.StreamHandler, stream: Any = None) -> None:
     if stream is sys.stdout:
@@ -29,20 +26,6 @@ class MemoryProgramTool(EdgeTool):
 
     def __init__(self, session_info: dict[str, Any] | None = None) -> None:
         self._session = session_info or {}
-        import os
-        # sandbox=False by default.
-        #
-        # Rationale: sandbox=True requires an explicit commit step to merge the
-        # experiment branch into production. Until a review UI exists in the CLI
-        # or web frontend, the LLM has no way to trigger that commit — so data
-        # written in sandbox mode would silently disappear and memories would
-        # never take effect.
-        #
-        # When a proper review/commit flow is implemented, flip this default to
-        # True and update the tool description to explain the two-step workflow.
-        #
-        # Override via env: MEMORY_PROGRAM_SANDBOX=true (e.g. for manual testing)
-        self._default_sandbox = os.environ.get("MEMORY_PROGRAM_SANDBOX", "false").lower() != "false"
 
     @property
     def name(self) -> str:
@@ -86,14 +69,10 @@ class MemoryProgramTool(EdgeTool):
                     "type": "boolean",
                     "description": "If true, return detailed per-action execution breakdown.",
                 },
-                "commit": {
-                    "type": "string",
-                    "description": "Experiment ID to commit (from a previous sandbox run).",
-                },
             },
             "required": ["actions"],
         }
-        sandbox: bool = kwargs.get("sandbox", False)  # Default false: write directly
+
     @property
     def side_effect(self) -> SideEffect:
         return SideEffect.WRITE
@@ -104,25 +83,18 @@ class MemoryProgramTool(EdgeTool):
         if not user_id:
             return json.dumps({"error": "user_id not available in session context"})
         actions: list[dict] = kwargs["actions"]
-        sandbox: bool = kwargs.get("sandbox", self._default_sandbox)
         dry_run: bool = kwargs.get("dry_run", False)
         explain: bool = kwargs.get("explain", False)
-        commit_id: str | None = kwargs.get("commit")
 
         try:
             programmer = _get_programmer(user_id)
         except Exception as e:
             return json.dumps({"error": f"Failed to initialize: {e}"})
 
-        # Commit a previous sandbox experiment
-        if commit_id:
-            return await self._commit(programmer, commit_id)
-
         try:
             result = programmer.execute(
                 user_id,
                 actions,
-                sandbox=sandbox,
                 dry_run=dry_run,
                 program_name="cli",
                 session_id=self._session.get("session_id"),
@@ -134,10 +106,6 @@ class MemoryProgramTool(EdgeTool):
             "actions_executed": result.actions_executed,
             "actions_failed": result.actions_failed,
         }
-        if result.experiment_id:
-            out["experiment_id"] = result.experiment_id
-            if sandbox and not dry_run and not result.rolled_back:
-                out["hint"] = "Sandbox run. Call with commit=experiment_id to apply."
         if result.dry_run:
             out["dry_run"] = True
         if result.rolled_back:
@@ -156,7 +124,6 @@ class MemoryProgramTool(EdgeTool):
                 for r in result.results
             ]
         else:
-            # Summary only
             out["results"] = [
                 {
                     "action": r.action_type,
@@ -168,23 +135,13 @@ class MemoryProgramTool(EdgeTool):
 
         return json.dumps(out, default=str)
 
-    async def _commit(self, programmer: Any, experiment_id: str) -> str:
-        try:
-            programmer._experiments.commit(experiment_id)
-            return json.dumps({"committed": experiment_id, "success": True})
-        except Exception as e:
-            return json.dumps({"error": f"Commit failed: {e}"})
-
 
 def _get_programmer(user_id: str | None = None):
     """Create MemoryProgrammer with user-aware editor."""
     from api.database import SessionLocal
-    from core.memory.experiment import MemoryExperimentManager
     from core.memory.factory import create_editor
     from core.memory.programmer import MemoryProgrammer
 
     db_factory = SessionLocal
     editor = create_editor(db_factory, user_id=user_id)
-    db_name = SessionLocal.kw["bind"].url.database
-    experiments = MemoryExperimentManager(db_factory, source_db=db_name)
-    return MemoryProgrammer(editor, experiments, db_factory)
+    return MemoryProgrammer(editor, db_factory)
