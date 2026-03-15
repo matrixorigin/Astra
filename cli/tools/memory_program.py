@@ -44,14 +44,18 @@ class MemoryProgramTool(EdgeTool):
                         },
                         "memory_id": {
                             "type": "string",
-                            "description": "Memory ID (required for correct/purge operations)"
+                            "description": "Memory ID (required for correct; optional for purge if topic provided)"
+                        },
+                        "topic": {
+                            "type": "string",
+                            "description": "Keyword for bulk purge — deletes all memories matching this topic"
                         },
                         "reason": {
                             "type": "string",
                             "description": "Reason for correction or purge (optional)"
                         }
                     },
-                    "required": ["operation", "content"]
+                    "required": ["operation"]
                 }
             }
         },
@@ -65,6 +69,7 @@ class MemoryProgramTool(EdgeTool):
             from core.memory.factory import create_editor
             
             user_id = kwargs.get("user_id", "default")
+            session_id = kwargs.get("session_id")
             editor = create_editor(None, user_id=user_id)
             
             results = []
@@ -77,26 +82,32 @@ class MemoryProgramTool(EdgeTool):
                     result = editor.inject(
                         content=content,
                         memory_type=memory_type,
-                        source="memory_program_tool"
+                        source="memory_program_tool",
+                        session_id=session_id,
                     )
                     results.append({"operation": "inject", "status": "success"})
                 
                 elif operation == "correct":
                     memory_id = action.get("memory_id")
+                    content = action.get("content", "")
                     reason = action.get("reason", "")
                     if not memory_id:
                         results.append({"operation": "correct", "status": "error", "error": "memory_id required"})
                         continue
-                    result = editor.correct(memory_id, content, reason)
+                    if not content:
+                        results.append({"operation": "correct", "status": "error", "error": "content required for correct"})
+                        continue
+                    editor.correct(memory_id, content, reason)
                     results.append({"operation": "correct", "status": "success"})
                 
                 elif operation == "purge":
                     memory_id = action.get("memory_id")
+                    topic = action.get("topic")
                     reason = action.get("reason", "")
-                    if not memory_id:
-                        results.append({"operation": "purge", "status": "error", "error": "memory_id required"})
+                    if not memory_id and not topic:
+                        results.append({"operation": "purge", "status": "error", "error": "memory_id or topic required"})
                         continue
-                    result = editor.purge(memory_id=memory_id, reason=reason)
+                    editor.purge(memory_id=memory_id, topic=topic, reason=reason)
                     results.append({"operation": "purge", "status": "success"})
                 
                 else:

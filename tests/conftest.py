@@ -135,6 +135,19 @@ def test_engine():
 
     yield engine
 
+    # Drain background threads BEFORE dropping the worker DB
+    try:
+        import logging
+        from core.agent.turn_hooks import _bg_threads, _shutdown_event
+        _shutdown_event.set()
+        logging.getLogger("httpx").disabled = True
+        for t in list(_bg_threads):
+            if t.is_alive():
+                t.join(timeout=2.0)
+        _bg_threads.clear()
+    except Exception:
+        pass
+
     # Cleanup worker databases on session end
     _cleanup_worker_databases()
     engine.dispose()
@@ -482,3 +495,24 @@ def make_run_engine_mock_init():
         self._run_event_logger = EventLogger(db_factory)
 
     return mock_init
+
+
+@pytest.fixture(autouse=True)
+def drain_turn_hooks_bg_threads():
+    """Wait for TurnHooks background threads after each test.
+
+    Prevents background threads from outliving the test's DB scope,
+    which causes 'no such table' errors in parallel test workers and
+    'I/O operation on closed file' logging errors.
+    """
+    yield
+    try:
+        from core.agent.turn_hooks import _bg_threads, _shutdown_event
+        _shutdown_event.set()
+        for t in list(_bg_threads):
+            if t.is_alive():
+                t.join(timeout=0.5)
+        _bg_threads.clear()
+        _shutdown_event.clear()
+    except Exception:
+        pass

@@ -1,0 +1,49 @@
+name: episodic_recall
+description: "跨 session episodic 记忆：session A 完成任务后生成 episodic 摘要，session B 能通过 L1 检索到并引用"
+requires: [llm]
+
+# Session A: 完成一个具体任务，让 observer 存储记忆
+turns:
+  - user: "帮我记住：我们今天完成了 Memoria 的 G14 修复，把 TieredMemoryLoader 加入了 episodic 类型检索，3个测试全部通过"
+    checks:
+      rules:
+        - tool_called: memory_program
+        - db:
+            table: mem_memories
+            where: "user_id = :uid AND is_active != 0"
+            assert:
+              count: ">=1"
+        - db:
+            table: mem_memories
+            where: "user_id = :uid AND is_active != 0 AND content LIKE '%G14%'"
+            assert:
+              count: ">=1"
+      llm_judge:
+        criteria: "回复应确认已记住 G14 修复的内容，语气自然"
+        pass_threshold: 0.7
+
+  - user: "这个修复的核心改动是什么？"
+    checks:
+      rules:
+        - response_contains_any: ["TieredMemoryLoader", "episodic", "L1"]
+      llm_judge:
+        criteria: "回复应准确描述 G14 修复的核心内容（TieredMemoryLoader 加入 episodic 类型），不编造"
+        pass_threshold: 0.75
+
+# Session B: 新 session，验证跨 session 记忆可被检索
+  - user: "我们之前做了什么关于 Memoria 的工作？"
+    new_session: true
+    checks:
+      rules:
+        - response_contains_any: ["G14", "episodic", "TieredMemoryLoader", "Memoria"]
+      llm_judge:
+        criteria: "回复应引用之前 session 中存储的 Memoria G14 修复信息，说明跨 session 记忆检索有效"
+        pass_threshold: 0.7
+
+final_checks:
+  rules:
+    - db:
+        table: mem_memories
+        where: "user_id = :uid AND is_active != 0"
+        assert:
+          count: ">=1"

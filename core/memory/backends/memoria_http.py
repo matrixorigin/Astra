@@ -112,7 +112,8 @@ class MemoriaHTTPClient:
             headers=self._headers(user_id),
         )
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        return data.get("results", []) if isinstance(data, dict) else data
 
     def list_memories(
         self,
@@ -131,12 +132,17 @@ class MemoriaHTTPClient:
         return resp.json()
 
     def get_memory(self, user_id: str, memory_id: str) -> Optional[dict[str, Any]]:
-        """Get a single memory by ID via list + filter (Memoria has no GET /memories/{id})."""
-        result = self.list_memories(user_id, limit=500)
-        for item in result.get("items", []):
-            if item.get("memory_id") == memory_id:
-                return item
-        return None
+        """Get a single memory by ID via GET /memories/{id}."""
+        try:
+            resp = self.client.get(
+                f"/v1/memories/{memory_id}", headers=self._headers(user_id)
+            )
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            return None
 
     def correct(
         self, user_id: str, memory_id: str, new_content: str, reason: str = ""
@@ -194,13 +200,49 @@ class MemoriaHTTPClient:
         user_id: str,
         messages: list[dict[str, Any]],
         source_event_ids: Optional[list[str]] = None,
+        session_id: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """Extract and store memories from conversation turn. POST /v1/observe"""
         payload: dict[str, Any] = {"messages": messages}
         if source_event_ids:
             payload["source_event_ids"] = source_event_ids
+        if session_id:
+            payload["session_id"] = session_id
         resp = self.client.post("/v1/observe", json=payload, headers=self._headers(user_id))
         resp.raise_for_status()
+        data = resp.json()
+        # API returns {"memories": [...], "warning": "..."}
+        return data.get("memories", []) if isinstance(data, dict) else data
+
+    def create_session_summary(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        messages: Optional[list[dict[str, Any]]] = None,
+        mode: str = "full",
+        sync: bool = False,
+        focus_topics: Optional[list[str]] = None,
+        max_items: int = 5,
+        generate_embedding: bool = True,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "mode": mode,
+            "sync": sync,
+            "max_items": max_items,
+            "generate_embedding": generate_embedding,
+        }
+        if focus_topics:
+            payload["focus_topics"] = focus_topics
+        if messages:
+            payload["messages"] = messages
+        resp = self.client.post(
+            f"/v1/sessions/{session_id}/summary", json=payload, headers=self._headers(user_id)
+        )
+        resp.raise_for_status()
+        content = resp.content.strip()
+        if not content:
+            return {"session_id": session_id}
         return resp.json()
 
     def consolidate(self, user_id: str, force: bool = False) -> dict[str, Any]:
@@ -264,11 +306,6 @@ class MemoriaHTTPClient:
         resp = self.client.get("/health")
         resp.raise_for_status()
         return resp.json()
-
-    def purge_all(self, user_id: str) -> dict:
-        """Purge all memories for a user."""
-        # This is a cleanup method for testing - just return success
-        return {"status": "success", "message": f"All memories purged for user {user_id}"}
 
     def close(self) -> None:
         self.client.close()
@@ -344,9 +381,37 @@ class MemoriaStorage:
         messages: list[dict[str, Any]],
         *,
         source_event_ids: Optional[list[str]] = None,
+        session_id: Optional[str] = None,
     ) -> list[Memory]:
-        results = self.client.observe_turn(user_id, messages, source_event_ids=source_event_ids)
+        results = self.client.observe_turn(
+            user_id, messages,
+            source_event_ids=source_event_ids,
+            session_id=session_id,
+        )
         return [self._to_memory(r, user_id) for r in results]
+
+    def request_session_summary(
+        self,
+        user_id: str,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        *,
+        mode: str = "full",
+        sync: bool = False,
+        focus_topics: Optional[list[str]] = None,
+        max_items: int = 5,
+        generate_embedding: bool = True,
+    ) -> dict[str, Any]:
+        return self.client.create_session_summary(
+            user_id=user_id,
+            session_id=session_id,
+            messages=messages,
+            mode=mode,
+            sync=sync,
+            focus_topics=focus_topics,
+            max_items=max_items,
+            generate_embedding=generate_embedding,
+        )
 
     def run_pipeline(
         self,
@@ -354,9 +419,14 @@ class MemoriaStorage:
         messages: list[dict[str, Any]],
         *,
         source_event_ids: Optional[list[str]] = None,
+        session_id: Optional[str] = None,
         **kwargs: Any,
     ) -> Any:
-        memories = self.observe_turn(user_id, messages, source_event_ids=source_event_ids)
+        memories = self.observe_turn(
+            user_id, messages,
+            source_event_ids=source_event_ids,
+            session_id=session_id,
+        )
         return type(
             "PipelineResult",
             (),
@@ -429,7 +499,7 @@ class MemoriaStorage:
             include_cross_session=include_cross_session,
             explain=explain,
         )
-        memories_data = result["results"]
+        memories_data = result.get("results", []) if isinstance(result, dict) else []
         explain_info = result.get("explain", {"path": "unknown", "count": len(memories_data)})
         explain_info["source"] = "memoria"
         memories = [self._to_memory(r, user_id) for r in memories_data]
@@ -474,12 +544,12 @@ class MemoriaStorage:
         # Extract memory_types from kwargs if provided
         memory_types = kwargs.get("memory_types")
         if memory_types:
-            # Convert MemoryType enums to strings
             memory_types = [mt.value if hasattr(mt, "value") else str(mt) for mt in memory_types]
 
         result = self.client.purge(
             user_id=user_id,
             memory_ids=memory_ids,
+            topic=kwargs.get("topic"),
             memory_types=memory_types,
             reason=kwargs.get("reason", ""),
         )
@@ -555,11 +625,17 @@ class MemoriaStorage:
             initial_confidence=data.get("initial_confidence") or data.get("confidence") or 0.75,
             observed_at=observed_at,
             trust_tier=trust_tier,
+            session_id=data.get("session_id"),
+            retrieval_score=data.get("retrieval_score"),
         )
 
     def purge_all(self, user_id: str) -> dict:
-        """Purge all memories for a user."""
+        """Purge all memories for a user via Memoria API."""
         try:
-            return self.client.purge_all(user_id)
-        except Exception:
-            return {"status": "error", "message": "Failed to purge memories"}
+            result = self.purge(
+                user_id=user_id,
+                reason="purge_all",
+            )
+            return {"status": "success", "purged": getattr(result, "deactivated", 0)}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}

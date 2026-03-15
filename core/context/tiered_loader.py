@@ -78,6 +78,12 @@ class TieredMemoryLoader:
         """Load profile memories."""
         try:
             if self._memoria_client:
+                # Prefer synthesized profile (get_profile) over raw list
+                data = self._memoria_client.get_profile(user_id)
+                profile = data.get("profile") if isinstance(data, dict) else None
+                if profile:
+                    return profile
+                # Fallback: raw profile memories list
                 result = self._memoria_client.list_memories(
                     user_id=user_id,
                     memory_type="profile",
@@ -109,18 +115,20 @@ class TieredMemoryLoader:
         """Load L1 semantic/procedural memories."""
         try:
             if self._memoria_client:
-                # Use Memoria HTTP client
-                memories = self._memoria_client.search(
+                result = self._memoria_client.retrieve(
                     user_id=user_id,
                     query=query,
-                    top_k=limit
+                    top_k=limit,
+                    memory_types=["semantic", "procedural", "episodic"],
+                    session_id=session_id or None,
                 )
+                memories = result.get("results", result.get("memories", [])) if isinstance(result, dict) else result
                 if not memories:
-                    return "", None
+                    return "", {"source": "memoria", "final_count": 0}
                 lines = ["Relevant Memories:"]
                 for m in memories:
                     lines.append(f"- [{m.get('memory_type', 'semantic')}] {m['content']}")
-                return "\n".join(lines), None
+                return "\n".join(lines), {"source": "memoria", "final_count": len(memories)}
             elif self._svc:
                 # Legacy memory service
                 memories, stats = self._svc.retrieve(
@@ -128,7 +136,7 @@ class TieredMemoryLoader:
                     query=query,
                     session_id=session_id,
                     query_embedding=query_embedding,
-                    memory_types=[MemoryType.SEMANTIC, MemoryType.PROCEDURAL],
+                    memory_types=[MemoryType.SEMANTIC, MemoryType.PROCEDURAL, MemoryType.EPISODIC],
                     top_k=limit,
                     task_hint=task_hint,
                     explain=explain,
@@ -190,4 +198,5 @@ class TieredMemoryLoader:
         return result, stats
 
     def invalidate_profile(self, user_id: str) -> None:
-        self._svc.invalidate_profile(user_id)
+        if self._svc is not None:
+            self._svc.invalidate_profile(user_id)

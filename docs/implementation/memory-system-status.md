@@ -1,6 +1,6 @@
 # Memory System — Implementation Status
 
-> **Last Updated**: 2026-02-27 (Phase 3 complete)
+> **Last Updated**: 2026-03-15 (Memoria episodic integration plan)
 > **Design Doc**: [memory-architecture.md](../design/memory-architecture.md)
 > **Phase 1 Plan**: [memory-system-refactoring-2026-02-27.md](../../plans/memory-system-refactoring-2026-02-27.md)
 > **Phase 2 Plan**: [memory-system-phase2-2026-02-27.md](../../plans/memory-system-phase2-2026-02-27.md)
@@ -46,6 +46,31 @@
 | **Created `sensitivity.py`** | Regex-based PII/credential filter |
 
 ---
+
+## Memoria Episodic Integration (2026-03-15)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| **Episodic memory type** | 🔵 Planned | Memoria Phase 1 adds `MemoryType.EPISODIC` with metadata fields |
+| **Session summary API** | 🔵 Planned | `/v1/sessions/{id}/summary` (manual trigger, full mode only) |
+| **Retrieval support** | 🔵 Planned | Use Memoria `retrieve` with episodic types + explain |
+| **Async task status** | 🔵 Planned | `/v1/tasks/{id}` for summary job polling |
+| **Privacy control** | 🔵 Planned | `no_episodic` session metadata + scope=session on sensitive content |
+| **Non-close triggers** | 🔵 Planned | Event threshold + time-based batch + idle detection + user command |
+
+### Cross-Session Continuity Policy (Planned)
+
+| Scenario | Behavior | Data Source | Fallback |
+|----------|----------|-------------|----------|
+| **Same session after relogin** | Show full chat history (or last N turns by UI paging) | `conversation_events` | None |
+| **Different session after relogin** | Show recent episodic topics + key outcomes | Memoria episodic retrieval | Rule-based topic stub if episodic is empty |
+| **Below-threshold sessions** | Always generate a lightweight topic stub | Session metadata + last 5-10 messages | Store as episodic with low confidence |
+
+**Minimum recall guarantee**:
+- Never return “nothing to recall” for user-facing history.
+- If episodic is empty and session is short, store a **topic stub** on chat close or idle:
+  - Example content: "User asked about Memoria CI status"
+  - Metadata: `topic`, `session_id`, `source_event_ids`, `confidence=low`
 
 ## Module Mapping
 
@@ -94,6 +119,8 @@
 | **G7** | Distributed lock not implemented | ✅ Scheduler has `distributed_locks` table + heartbeat; `GovernanceScheduler` wired in |
 | **G11** | Sensitivity filter | ✅ Implemented — block-only, regex, audit logging |
 | **G12** | Session summaries | ✅ Implemented + wired — `SessionSummarizer` called on session close + turn hooks |
+| **G13** | Memoria session summary not wired | 🔵 Memoria backend returns None; API call pending |
+| **G14** | Episodic retrieval not integrated | 🔵 Tiered loader uses Memoria search only |
 
 ---
 
@@ -101,6 +128,10 @@
 
 | Priority | Item | Notes |
 |----------|------|-------|
+| P1 | Wire Memoria session summary API | Call `/v1/sessions/{id}/summary` on session close |
+| P1 | Add episodic retrieval in Tiered loader | Use Memoria retrieve with memory_types |
+| P1 | Add episodic trigger policy | Event count (20-30), time window (30min), idle archive |
+| P2 | Add Memoria task polling | Track summary task status for observability |
 | P2 | Reflector (clustering/promotion) | Design Target — would enable episodic→semantic synthesis |
 | P3 | G4: Episodic compression | Compress old `conversation_events` to summaries |
 | P3 | G5: Cascade impact analysis | Trace contamination graph from polluted memories |

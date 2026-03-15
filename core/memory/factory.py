@@ -49,5 +49,7 @@ def create_editor(
         master_key=memoria_master_key,
     )
 
-    storage = MemoriaStorage(http_client, user_id=user_id or "default")
+    if not user_id:
+        raise ValueError("create_editor requires a non-empty user_id")
+    storage = MemoriaStorage(http_client, user_id=user_id)
     return MemoryEditor(storage, db_factory, index_manager=None, embed_client=embed_client)

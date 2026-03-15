@@ -172,14 +172,6 @@ class ChatLoop:
                 self._few_shot = FewShotRetriever(llm_client._db_factory)
         except Exception:
             pass
-        # Initialize memory service for tool output handling
-        try:
-            from core.memory import create_memory_service
-
-            if hasattr(event_logger, "_db_factory"):
-                self._memory_service = create_memory_service(event_logger._db_factory)
-        except Exception:
-            pass
         # Initialize global context budget manager
         try:
             from core.context.budget_manager import ContextBudgetManager
@@ -467,12 +459,19 @@ class ChatLoop:
             self._turn_budget = TurnBudgetTracker(max_tool_output_tokens=30000)
 
         remaining = self._turn_budget.remaining
+        _mem_svc = getattr(self, "_memory_service", None)
+        if _mem_svc is None and user_id:
+            try:
+                from core.memory.backends import get_memoria_storage
+                _mem_svc = get_memoria_storage(user_id)
+            except Exception:
+                pass
         result_str = process_tool_output(
             output=result_str,
             tool_name=fn_name,
             session_id=session_id,
             user_id=user_id,
-            memory_service=getattr(self, "_memory_service", None),
+            memory_service=_mem_svc,
             turn_event_id=user_event.event_id,
             remaining_tokens=remaining,
         )

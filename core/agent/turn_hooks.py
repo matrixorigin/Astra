@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import atexit
 import logging
+import os
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from core.db_consumer import DbConsumer, DbFactory
@@ -21,6 +23,10 @@ logger = logging.getLogger(__name__)
 _bg_threads: list[threading.Thread] = []
 _shutdown_event = threading.Event()
 
+
+def _log_episodic_error(msg: str, exc: Exception) -> None:
+    """Log episodic errors: debug for schema/table errors (test isolation), warning for others."""
+    from sqlalchemy.exc import ProgrammingError as SAProgrammingError
 
 def _wait_for_bg_threads(timeout: float = 2.0):
     """Wait for background threads to complete during shutdown."""
@@ -44,6 +50,12 @@ _RATING_MAP = {
     "clarification": 3,
     "negative": 1,
 }
+
+_EPISODIC_EVENT_THRESHOLD = int(os.getenv("EPISODIC_EVENT_THRESHOLD", "25"))
+_EPISODIC_MIN_EVENTS = int(os.getenv("EPISODIC_MIN_EVENTS", "8"))
+_EPISODIC_TIME_THRESHOLD_SEC = int(os.getenv("EPISODIC_TIME_THRESHOLD_SEC", "1800"))
+_EPISODIC_STUB_MAX_LEN = int(os.getenv("EPISODIC_STUB_MAX_LEN", "160"))
+_EPISODIC_SUMMARY_MESSAGE_LIMIT = int(os.getenv("EPISODIC_SUMMARY_MESSAGE_LIMIT", "200"))
 
 
 class TurnHooks(DbConsumer):
@@ -180,22 +192,198 @@ class TurnHooks(DbConsumer):
         session_start: Any = None,
     ) -> None:
         """Run TypedObserver in a background thread."""
+        # Skip observe for trivially short turns — no extractable content.
+        # Threshold: combined user+assistant content < 20 chars is greeting/ack.
+        total_content = "".join(m.get("content", "") for m in messages)
+        if len(total_content.strip()) < 20:
+            return
+
         def _bg():
             try:
                 if _shutdown_event.is_set():
                     return
                 svc = get_memoria_storage(user_id)
-                svc.run_pipeline(user_id=user_id, messages=messages)
+                svc.run_pipeline(user_id=user_id, messages=messages, session_id=session_id)
+                self._maybe_trigger_episodic(
+                    svc, session_id, user_id, turn_count=turn_count, session_start=session_start
+                )
             except Exception as e:
                 if not _shutdown_event.is_set():
-                    logger.error("Memory pipeline failed: %s", e)
+                    try:
+                        logger.error("Memory pipeline failed: %s", e)
+                    except Exception:
+                        pass
 
         try:
+            # Prune completed threads to prevent unbounded list growth
+            _bg_threads[:] = [t for t in _bg_threads if t.is_alive()]
             t = threading.Thread(target=_bg, daemon=True)
             _bg_threads.append(t)
             t.start()
         except Exception as e:
             logger.debug("Observer setup skipped: %s", e)
+
+    def _maybe_trigger_episodic(
+        self,
+        svc: Any,
+        session_id: str,
+        user_id: str,
+        *,
+        turn_count: int = 0,
+        session_start: Any = None,
+    ) -> None:
+        from api.models.agent import Event as EventModel, Session as SessionModel
+        from core.memory.types import MemoryType, TrustTier
+
+        now = datetime.now(timezone.utc)
+
+        # Phase 1: read session state — short-lived connection, no HTTP inside
+        with self._db() as db:
+            row = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
+            if not row:
+                return
+            meta = dict(row.session_metadata or {})
+            if meta.get("no_episodic"):
+                return
+            event_count = int(row.event_count or 0)
+            if turn_count and turn_count > event_count:
+                event_count = turn_count
+            last_count = int(meta.get("episodic_last_event_count", 0) or 0)
+            last_at_raw = meta.get("episodic_last_at")
+            last_at = self._parse_iso(last_at_raw) if last_at_raw else None
+
+            stub: str | None = None
+            messages_for_summary: list[dict] | None = None
+
+            if event_count < _EPISODIC_MIN_EVENTS:
+                if meta.get("episodic_stub_written"):
+                    return
+                stub = self._build_topic_stub(db, session_id)
+                if not stub:
+                    return
+            else:
+                by_count = event_count - last_count >= _EPISODIC_EVENT_THRESHOLD
+                by_time = not last_at or (now - last_at).total_seconds() >= _EPISODIC_TIME_THRESHOLD_SEC
+                if not (by_count or by_time):
+                    return
+                events = (
+                    db.query(EventModel)
+                    .filter(
+                        EventModel.session_id == session_id,
+                        EventModel.event_type.in_(["user_query", "llm_response"]),
+                    )
+                    .order_by(EventModel.created_at.desc())
+                    .limit(_EPISODIC_SUMMARY_MESSAGE_LIMIT)
+                    .all()
+                )
+                if not events:
+                    return
+                messages_for_summary = [
+                    {"role": "user" if e.event_type == "user_query" else "assistant", "content": e.content}
+                    for e in reversed(events)
+                ]
+        # DB connection released here — HTTP calls happen outside the connection
+
+        # Phase 2: HTTP calls (no DB connection held)
+        if _shutdown_event.is_set():
+            return
+        task_id: str | None = None
+        if stub is not None:
+            try:
+                svc.store(
+                    user_id=user_id,
+                    content=stub,
+                    memory_type=MemoryType.EPISODIC,
+                    trust_tier=TrustTier.T4,
+                    initial_confidence=0.3,
+                    session_id=session_id,
+                )
+            except Exception as e:
+                try:
+                    logger.warning("Episodic stub store failed: %s", e)
+                except Exception:
+                    pass
+                return
+            meta["episodic_stub_written"] = True
+        else:
+            try:
+                result = svc.request_session_summary(
+                    user_id=user_id,
+                    session_id=session_id,
+                    messages=messages_for_summary,
+                    mode="full",
+                    sync=False,
+                    max_items=5,
+                    generate_embedding=False,
+                )
+                task_id = result.get("task_id") if isinstance(result, dict) else None
+            except Exception as e:
+                try:
+                    logger.warning("Episodic session summary request failed: %s", e)
+                except Exception:
+                    pass
+                return
+
+        # Phase 3: write metadata back — new short-lived connection
+        meta["episodic_last_event_count"] = event_count
+        meta["episodic_last_at"] = now.isoformat()
+        if task_id:
+            meta["episodic_last_task_id"] = task_id
+        if _shutdown_event.is_set():
+            return
+        try:
+            with self._db() as db:
+                db.query(SessionModel).filter(
+                    SessionModel.session_id == session_id
+                ).update({"session_metadata": meta})
+                db.commit()
+        except Exception as e:
+            try:
+                logger.warning("Episodic metadata commit failed: %s", e)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _parse_iso(value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            return value
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _build_topic_stub(db, session_id: str) -> str:
+        from api.models.agent import Event as EventModel
+
+        user_row = (
+            db.query(EventModel)
+            .filter(EventModel.session_id == session_id, EventModel.event_type == "user_query")
+            .order_by(EventModel.created_at.desc())
+            .first()
+        )
+        if user_row and user_row.content:
+            return TurnHooks._trim_topic(user_row.content)
+        assistant_row = (
+            db.query(EventModel)
+            .filter(EventModel.session_id == session_id, EventModel.event_type == "llm_response")
+            .order_by(EventModel.created_at.desc())
+            .first()
+        )
+        if assistant_row and assistant_row.content:
+            return TurnHooks._trim_topic(assistant_row.content)
+        return ""
+
+    @staticmethod
+    def _trim_topic(text: str) -> str:
+        cleaned = " ".join(text.strip().split())
+        if not cleaned:
+            return ""
+        if len(cleaned) > _EPISODIC_STUB_MAX_LEN:
+            cleaned = cleaned[:_EPISODIC_STUB_MAX_LEN]
+        return f"Topic: {cleaned}"
 
     # ── Implicit feedback ─────────────────────────────────────────────
 

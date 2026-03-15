@@ -699,7 +699,7 @@ async def edge_chat_loop(
 
         # Execute approved tools concurrently
         if approved:
-            results = await tool_router.execute(approved, user_id=user_id)
+            results = await tool_router.execute(approved, user_id=user_id, session_id=session_id)
             for tc, r in zip(approved, results):
                 renderer.tool_start(tc.name, tc.arguments)
                 renderer.tool_done(r.name, r.result, r.error)

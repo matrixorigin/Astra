@@ -43,11 +43,12 @@ class TestMemoryProgramToolIntegration:
             # Verify editor was created with correct user_id
             mock_create_editor.assert_called_once_with(None, user_id=test_user_id)
             
-            # Verify inject was called
+            # Verify inject was called with session_id=None (no session in this call)
             mock_editor.inject.assert_called_once_with(
                 content="Test memory content",
                 memory_type="semantic",
-                source="memory_program_tool"
+                source="memory_program_tool",
+                session_id=None,
             )
             
             # Verify result

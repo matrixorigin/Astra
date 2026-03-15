@@ -20,23 +20,31 @@ class MemoryEditor:
     
     def correct(self, memory_id: str, new_content: str, reason: str = "") -> dict:
         """Correct memory via Memoria."""
-        return self.storage.correct(memory_id, new_content, reason)
+        return self.storage.correct(self.storage.user_id, memory_id, new_content, reason=reason)
     
     def purge(self, memory_id: str = None, topic: str = None, reason: str = "") -> dict:
         """Purge memory via Memoria."""
         if memory_id:
-            return self.storage.purge_by_id(memory_id, reason)
+            return self.storage.purge(self.storage.user_id, memory_ids=[memory_id], reason=reason)
         elif topic:
-            return self.storage.purge_by_topic(topic, reason)
+            return self.storage.purge(self.storage.user_id, topic=topic, reason=reason)
         else:
             raise ValueError("Either memory_id or topic must be provided")
     
     def retrieve(self, query: str, top_k: int = 5, **kwargs) -> list:
         """Retrieve memories via Memoria."""
-        return self.storage.retrieve(query, top_k=top_k, **kwargs)
+        memories, _ = self.storage.retrieve(self.storage.user_id, query, top_k=top_k, **kwargs)
+        return memories
     
     def batch_inject(self, user_id: str, memories: list, **kwargs) -> list:
-        """Batch inject memories via Memoria."""
+        """Batch inject memories via Memoria.
+
+        user_id must match the user_id this editor was created for.
+        """
+        if user_id != self.storage.user_id:
+            raise ValueError(
+                f"batch_inject user_id '{user_id}' does not match editor user_id '{self.storage.user_id}'"
+            )
         results = []
         for memory in memories:
             if isinstance(memory, dict):

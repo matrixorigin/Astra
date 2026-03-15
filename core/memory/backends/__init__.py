@@ -10,6 +10,8 @@ __all__ = ["MemoriaHTTPClient", "MemoriaStorage", "get_memoria_storage"]
 
 def get_memoria_storage(user_id: str) -> MemoriaStorage:
     """Create a MemoriaStorage for the given user from environment config."""
+    if not user_id:
+        raise ValueError("get_memoria_storage requires a non-empty user_id")
     base_url = os.environ.get("MEMORIA_BASE_URL", "http://localhost:8000")
     master_key = os.environ.get("MEMORIA_MASTER_KEY")
     api_key = os.environ.get("MEMORIA_API_KEY")

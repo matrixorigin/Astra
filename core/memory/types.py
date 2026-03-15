@@ -13,6 +13,7 @@ class MemoryType(str, Enum):
     PROCEDURAL = "procedural"
     WORKING = "working"
     TOOL_RESULT = "tool_result"
+    EPISODIC = "episodic"
 
 
 class TrustTier(str, Enum):
@@ -38,6 +39,7 @@ class Memory:
     observed_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     initial_confidence: float = 0.75  # Add this field
+    retrieval_score: Optional[float] = None  # Set by retriever
     
     def __post_init__(self):
         if self.source_event_ids is None:
