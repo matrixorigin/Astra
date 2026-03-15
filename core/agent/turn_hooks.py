@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 # Track background threads for graceful shutdown
 _bg_threads: list[threading.Thread] = []
+_bg_threads_lock = threading.Lock()
 _shutdown_event = threading.Event()
 
 
@@ -33,7 +34,9 @@ def _wait_for_bg_threads(timeout: float = 2.0):
     _shutdown_event.set()
     # Disable httpx logging to prevent closed file errors
     logging.getLogger("httpx").disabled = True
-    for t in _bg_threads:
+    with _bg_threads_lock:
+        threads = list(_bg_threads)
+    for t in threads:
         if t.is_alive():
             t.join(timeout=timeout)
 
@@ -216,9 +219,10 @@ class TurnHooks(DbConsumer):
 
         try:
             # Prune completed threads to prevent unbounded list growth
-            _bg_threads[:] = [t for t in _bg_threads if t.is_alive()]
-            t = threading.Thread(target=_bg, daemon=True)
-            _bg_threads.append(t)
+            with _bg_threads_lock:
+                _bg_threads[:] = [t for t in _bg_threads if t.is_alive()]
+                t = threading.Thread(target=_bg, daemon=True)
+                _bg_threads.append(t)
             t.start()
         except Exception as e:
             logger.debug("Observer setup skipped: %s", e)
@@ -324,18 +328,28 @@ class TurnHooks(DbConsumer):
                     pass
                 return
 
-        # Phase 3: write metadata back — new short-lived connection
-        meta["episodic_last_event_count"] = event_count
-        meta["episodic_last_at"] = now.isoformat()
-        if task_id:
-            meta["episodic_last_task_id"] = task_id
+        # Phase 3: write metadata back — CAS to avoid lost-update under concurrent turns
         if _shutdown_event.is_set():
             return
         try:
             with self._db() as db:
-                db.query(SessionModel).filter(
+                # Re-read current metadata and merge our updates on top of it.
+                # This is a best-effort merge: concurrent turns may still race,
+                # but the window is narrow (HTTP round-trip) and the worst case
+                # is a duplicate episodic summary, not data loss.
+                row = db.query(SessionModel).filter(
                     SessionModel.session_id == session_id
-                ).update({"session_metadata": meta})
+                ).first()
+                if row is None:
+                    return
+                current_meta = dict(row.session_metadata or {})
+                current_meta["episodic_last_event_count"] = event_count
+                current_meta["episodic_last_at"] = now.isoformat()
+                if task_id:
+                    current_meta["episodic_last_task_id"] = task_id
+                if stub is not None:
+                    current_meta["episodic_stub_written"] = True
+                row.session_metadata = current_meta
                 db.commit()
         except Exception as e:
             try:

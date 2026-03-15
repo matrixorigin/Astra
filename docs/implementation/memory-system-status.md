@@ -121,6 +121,7 @@
 | **G12** | Session summaries | ✅ Implemented + wired — `SessionSummarizer` called on session close + turn hooks |
 | **G13** | Memoria session summary not wired | 🔵 Memoria backend returns None; API call pending |
 | **G14** | Episodic retrieval not integrated | 🔵 Tiered loader uses Memoria search only |
+| **G15** | Observe cost scales linearly per turn | 🔵 Batch observe requires Memoria batch endpoint |
 
 ---
 
@@ -132,6 +133,16 @@
 | P1 | Add episodic retrieval in Tiered loader | Use Memoria retrieve with memory_types |
 | P1 | Add episodic trigger policy | Event count (20-30), time window (30min), idle archive |
 | P2 | Add Memoria task polling | Track summary task status for observability |
+| P2 | Batch observe pipeline | Every N turns or M minutes, send last K messages; requires Memoria batch observe |
 | P2 | Reflector (clustering/promotion) | Design Target — would enable episodic→semantic synthesis |
 | P3 | G4: Episodic compression | Compress old `conversation_events` to summaries |
 | P3 | G5: Cascade impact analysis | Trace contamination graph from polluted memories |
+
+### Batch Observe Constraints (Multi-user Reality)
+
+- **Low per-session frequency**: single session traffic is sparse, so batching by session alone yields limited savings.
+- **Global scale benefit**: batching matters at thousands+ concurrent users; schedule should aggregate across sessions while preserving session isolation.
+- **Consistency guarantees**:
+  - Per-session monotonic processing with `last_observed_event_id` watermark.
+  - Idempotent batch via `batch_id` to avoid duplicate memories on retries.
+  - Read-your-writes via prompt cache (recent turns stay visible even if observe is delayed).

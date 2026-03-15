@@ -14,7 +14,7 @@ class TestPromptAssemblerMemoryStats:
             retrieval={"final_count": 1, "source": "memoria"},
             total_ms=3.0,
         )
-        loader.build_section.return_value = ("## User Profile\nsome profile", stats)
+        loader.build_section.return_value = ("some profile\n\nRelevant Memories:\n- [semantic] some memory", stats)
         loader.load_l0.return_value = "some profile"
         loader.load_l1.return_value = (f"Relevant Memories:\n{l1_content}", None)
         return loader

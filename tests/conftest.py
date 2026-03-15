@@ -138,13 +138,15 @@ def test_engine():
     # Drain background threads BEFORE dropping the worker DB
     try:
         import logging
-        from core.agent.turn_hooks import _bg_threads, _shutdown_event
+        from core.agent.turn_hooks import _bg_threads, _bg_threads_lock, _shutdown_event
         _shutdown_event.set()
         logging.getLogger("httpx").disabled = True
-        for t in list(_bg_threads):
+        with _bg_threads_lock:
+            threads = list(_bg_threads)
+            _bg_threads.clear()
+        for t in threads:
             if t.is_alive():
                 t.join(timeout=2.0)
-        _bg_threads.clear()
     except Exception:
         pass
 
@@ -507,12 +509,14 @@ def drain_turn_hooks_bg_threads():
     """
     yield
     try:
-        from core.agent.turn_hooks import _bg_threads, _shutdown_event
+        from core.agent.turn_hooks import _bg_threads, _bg_threads_lock, _shutdown_event
         _shutdown_event.set()
-        for t in list(_bg_threads):
+        with _bg_threads_lock:
+            threads = list(_bg_threads)
+            _bg_threads.clear()
+        for t in threads:
             if t.is_alive():
                 t.join(timeout=0.5)
-        _bg_threads.clear()
         _shutdown_event.clear()
     except Exception:
         pass

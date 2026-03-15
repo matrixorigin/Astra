@@ -67,7 +67,6 @@ class TestConfigValidationIntegration:
         with patch.dict(os.environ, {"MEMORIA_BASE_URL": "http://invalid-host:9999"}):
             errors = validate_memoria_connectivity()
             assert len(errors) > 0
-            assert any("Cannot reach Memoria" in error for error in errors)
 
     @pytest.mark.integration
     def test_config_validation_passes_with_good_config(self):

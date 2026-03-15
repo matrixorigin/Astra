@@ -132,17 +132,12 @@ class MemoriaHTTPClient:
         return resp.json()
 
     def get_memory(self, user_id: str, memory_id: str) -> Optional[dict[str, Any]]:
-        """Get a single memory by ID via GET /memories/{id}."""
-        try:
-            resp = self.client.get(
-                f"/v1/memories/{memory_id}", headers=self._headers(user_id)
-            )
-            if resp.status_code == 404:
-                return None
-            resp.raise_for_status()
-            return resp.json()
-        except Exception:
+        """Get a single memory by ID via GET /memories/{id}. Returns None if not found."""
+        resp = self.client.get(f"/v1/memories/{memory_id}", headers=self._headers(user_id))
+        if resp.status_code == 404:
             return None
+        resp.raise_for_status()
+        return resp.json()
 
     def correct(
         self, user_id: str, memory_id: str, new_content: str, reason: str = ""
@@ -513,7 +508,11 @@ class MemoriaStorage:
             return None
 
     def get_memory(self, memory_id: str) -> Optional[Memory]:
-        data = self.client.get_memory(self.user_id, memory_id)
+        try:
+            data = self.client.get_memory(self.user_id, memory_id)
+        except Exception as e:
+            logger.warning("get_memory %s failed: %s", memory_id, e)
+            return None
         return self._to_memory(data, self.user_id) if data else None
 
     def list_active(

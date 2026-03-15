@@ -75,7 +75,7 @@ class TieredMemoryLoader:
                 )
 
     def load_l0(self, user_id: str) -> str:
-        """Load profile memories."""
+        """Load profile memories. Returns raw content without section header."""
         try:
             if self._memoria_client:
                 # Prefer synthesized profile (get_profile) over raw list
@@ -87,18 +87,18 @@ class TieredMemoryLoader:
                 result = self._memoria_client.list_memories(
                     user_id=user_id,
                     memory_type="profile",
-                    limit=10
+                    limit=10,
                 )
-                memories = result.get('items', []) if isinstance(result, dict) else result
+                memories = result.get("items", []) if isinstance(result, dict) else result
                 if memories:
-                    lines = [f"- {m['content']}" for m in memories]
-                    return "\n".join(lines)
+                    return "\n".join(f"- {m['content']}" for m in memories)
                 return ""
             elif self._svc:
                 return self._svc.get_profile(user_id) or ""
             return ""
         except Exception as e:
-            logger.debug("L0 load failed: %s", e, exc_info=True)
+            # L0 is best-effort: any failure (network, auth, parse) degrades gracefully.
+            logger.warning("L0 load failed for user %s: %s", user_id, e)
             self._metrics.increment("tiered_loader_l0_errors")
             return ""
 
@@ -149,7 +149,8 @@ class TieredMemoryLoader:
                 return "\n".join(lines), stats
             return "", None
         except Exception as e:
-            logger.debug("L1 load failed: %s", e, exc_info=True)
+            # L1 is best-effort: any failure (network, auth, parse) degrades gracefully.
+            logger.warning("L1 load failed for user %s: %s", user_id, e)
             self._metrics.increment("tiered_loader_l1_errors")
             return "", None
 
@@ -190,13 +191,11 @@ class TieredMemoryLoader:
             stats.retrieval = retrieval_stats
             stats.total_ms = (time.time() - start) * 1000
 
-        # Add header if we have content
-        if parts:
-            result = "## User Profile\n\n" + "\n\n".join(parts)
-        else:
-            result = ""
-        return result, stats
+        # Return raw content — caller is responsible for section header
+        return "\n\n".join(parts), stats
 
     def invalidate_profile(self, user_id: str) -> None:
         if self._svc is not None:
             self._svc.invalidate_profile(user_id)
+        if self._memoria_client is not None and hasattr(self._memoria_client, "invalidate_profile"):
+            self._memoria_client.invalidate_profile(user_id)
