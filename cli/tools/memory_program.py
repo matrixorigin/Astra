@@ -1,153 +1,116 @@
-"""Memory programming tool — LLM-driven memory manipulation + explain.
-
-Exposes MemoryProgrammer to the edge chat loop so the LLM can
-inject/correct/purge/tune memories and explain execution results.
-"""
+"""Memory program tool - Memoria backend."""
 
 import json
-import logging
-import sys
-from typing import Any
+from typing import Any, Dict, List
 
 from cli.tools.base import EdgeTool, SideEffect
 
-logger = logging.getLogger(__name__)
-
-_orig_sh_init = logging.StreamHandler.__init__
-
-
-def _sh_init_stderr(self: logging.StreamHandler, stream: Any = None) -> None:
-    if stream is sys.stdout:
-        stream = sys.stderr
-    _orig_sh_init(self, stream)
-
-
-logging.StreamHandler.__init__ = _sh_init_stderr  # type: ignore[method-assign]
-
 
 class MemoryProgramTool(EdgeTool):
-    """Execute memory programs (inject/correct/purge/tune) with explain."""
+    """Execute memory operations via Memoria."""
 
-    def __init__(self, session_info: dict[str, Any] | None = None) -> None:
-        self._session = session_info or {}
-
-    @property
-    def name(self) -> str:
-        return "memory_program"
-
-    @property
-    def description(self) -> str:
-        return (
-            "Write-only tool: inject, correct, purge, or tune user memories. "
-            "Use ONLY when user explicitly asks to remember/forget/fix/update a preference. "
-            "Do NOT call this to answer questions or recall what was said — use conversation history instead. "
-            "Actions: inject (add NEW memory), correct (UPDATE existing memory — use when user changes their mind or corrects a previous statement), "
-            "purge (remove by filter), tune (change retrieval strategy). "
-            "user_id is optional — defaults to current user."
-        )
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "actions": {
-                    "type": "array",
-                    "description": (
-                        "List of action objects. Each has exactly one key: "
-                        "inject ({content, type?, trust?}) — add a NEW memory; "
-                        "correct ({memory_id, new_content, reason?}) — update a specific memory by ID (use only if you have the memory_id); "
-                        "purge ({filter: {memory_ids?, type?}, reason?}) — deactivate memories; "
-                        "tune ({strategy, params?}) — change retrieval strategy. "
-                        "To UPDATE a preference (user changes their mind): use purge with type='profile' to remove old, then inject the new one. "
-                        "type must be one of: profile, semantic, procedural. "
-                        "trust must be one of: T1, T2 (default), T3, T4."
-                    ),
-                    "items": {"type": "object"},
-                },
-                "dry_run": {
-                    "type": "boolean",
-                    "description": "If true, validate only without executing.",
-                },
-                "explain": {
-                    "type": "boolean",
-                    "description": "If true, return detailed per-action execution breakdown.",
-                },
-            },
-            "required": ["actions"],
-        }
-
-    @property
-    def side_effect(self) -> SideEffect:
-        return SideEffect.WRITE
-
-    async def execute(self, **kwargs: Any) -> str:
-        user_id: str = (
-            kwargs.get("user_id")
-            or self._session.get("user_id")
-            or self._session.get("agent_id", "")
-        )
-        logger.debug("memory_program.execute: user_id=%s session=%s", user_id, self._session)
-        if not user_id:
-            return json.dumps({"error": "user_id not available in session context"})
-        actions: list[dict] = kwargs["actions"]
-        dry_run: bool = kwargs.get("dry_run", False)
-        explain: bool = kwargs.get("explain", False)
-
-        try:
-            programmer = _get_programmer(user_id)
-        except Exception as e:
-            return json.dumps({"error": f"Failed to initialize: {e}"})
-
-        try:
-            result = programmer.execute(
-                user_id,
-                actions,
-                dry_run=dry_run,
-                program_name="cli",
-                session_id=self._session.get("session_id"),
-            )
-        except Exception as e:
-            return json.dumps({"error": str(e)})
-
-        out: dict[str, Any] = {
-            "actions_executed": result.actions_executed,
-            "actions_failed": result.actions_failed,
-        }
-        if result.dry_run:
-            out["dry_run"] = True
-        if result.timed_out:
-            out["timed_out"] = True
-
-        if explain:
-            out["explain"] = [
-                {
-                    "action": r.action_type,
-                    "success": r.success,
-                    "detail": r.detail,
-                    **({"error": r.error} if r.error else {}),
+    name = "memory_program"
+    description = (
+        "Execute WRITE operations on memory (inject, correct, purge) via Memoria backend. "
+        "Use ONLY when user explicitly wants to STORE/MODIFY/DELETE memories. "
+        "For READING memories (e.g., 'what did I say about X?'), use memory_retrieve instead. "
+        "Examples of when to use this tool: "
+        "'remember that I prefer X', 'update my preference to Y', 'forget about Z'. "
+        "Examples of when NOT to use: "
+        "'what did I say about tests?', 'show me my preferences' (use memory_retrieve)."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "actions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "operation": {
+                            "type": "string",
+                            "enum": ["inject", "correct", "purge"],
+                            "description": "Memory operation type"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Memory content to store or new content for correction"
+                        },
+                        "memory_type": {
+                            "type": "string",
+                            "enum": ["semantic", "profile", "procedural", "working", "tool_result"],
+                            "default": "semantic",
+                            "description": "Type of memory (optional, defaults to semantic)"
+                        },
+                        "memory_id": {
+                            "type": "string",
+                            "description": "Memory ID (required for correct/purge operations)"
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Reason for correction or purge (optional)"
+                        }
+                    },
+                    "required": ["operation", "content"]
                 }
-                for r in result.results
-            ]
-        else:
-            out["results"] = [
-                {
-                    "action": r.action_type,
-                    "success": r.success,
-                    **({"error": r.error} if r.error else {}),
-                }
-                for r in result.results
-            ]
+            }
+        },
+        "required": ["actions"]
+    }
+    side_effect = SideEffect.WRITE
 
-        return json.dumps(out, default=str)
-
-
-def _get_programmer(user_id: str | None = None):
-    """Create MemoryProgrammer with user-aware editor."""
-    from api.database import SessionLocal
-    from core.memory.factory import create_editor
-    from core.memory.programmer import MemoryProgrammer
-
-    db_factory = SessionLocal
-    editor = create_editor(db_factory, user_id=user_id)
-    return MemoryProgrammer(editor, db_factory)
+    async def execute(self, actions: List[Dict[str, Any]], **kwargs) -> str:
+        """Execute memory actions via Memoria."""
+        try:
+            from core.memory.factory import create_editor
+            
+            user_id = kwargs.get("user_id", "default")
+            editor = create_editor(None, user_id=user_id)
+            
+            results = []
+            for action in actions:
+                operation = action.get("operation")
+                content = action.get("content", "")
+                
+                if operation == "inject":
+                    memory_type = action.get("memory_type", "semantic")
+                    result = editor.inject(
+                        content=content,
+                        memory_type=memory_type,
+                        source="memory_program_tool"
+                    )
+                    results.append({"operation": "inject", "status": "success"})
+                
+                elif operation == "correct":
+                    memory_id = action.get("memory_id")
+                    reason = action.get("reason", "")
+                    if not memory_id:
+                        results.append({"operation": "correct", "status": "error", "error": "memory_id required"})
+                        continue
+                    result = editor.correct(memory_id, content, reason)
+                    results.append({"operation": "correct", "status": "success"})
+                
+                elif operation == "purge":
+                    memory_id = action.get("memory_id")
+                    reason = action.get("reason", "")
+                    if not memory_id:
+                        results.append({"operation": "purge", "status": "error", "error": "memory_id required"})
+                        continue
+                    result = editor.purge(memory_id=memory_id, reason=reason)
+                    results.append({"operation": "purge", "status": "success"})
+                
+                else:
+                    results.append({"operation": operation, "status": "error", "error": f"Invalid operation: {operation}"})
+            
+            return json.dumps({
+                "status": "success",
+                "actions_executed": len(results),
+                "results": results
+            })
+            
+        except Exception as e:
+            return json.dumps({
+                "status": "error",
+                "error": str(e),
+                "actions_executed": 0
+            })

@@ -21,6 +21,39 @@ logger = get_logger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
+# Default configuration for trust tiers
+DEFAULT_CONFIG = type('Config', (), {
+    'half_lives': {'T1': 90, 'T2': 60, 'T3': 30, 'T4': 7}
+})()
+
+
+def trust_tier_defaults(tier: str) -> dict[str, Any]:
+    """Get default values for a trust tier."""
+    defaults = {
+        'T1': {'initial_confidence': 0.95, 'decay_rate': 0.01},
+        'T2': {'initial_confidence': 0.85, 'decay_rate': 0.02},
+        'T3': {'initial_confidence': 0.75, 'decay_rate': 0.03},
+        'T4': {'initial_confidence': 0.60, 'decay_rate': 0.05},
+    }
+    return defaults.get(tier, defaults['T3'])
+
+
+def parse_json_array(text: str) -> list[dict[str, Any]]:
+    """Parse JSON array from LLM response, handling markdown code blocks."""
+    text = text.strip()
+    # Remove markdown code blocks
+    if text.startswith('```'):
+        lines = text.split('\n')
+        text = '\n'.join(lines[1:-1] if lines[-1].strip() == '```' else lines[1:])
+        text = text.strip()
+    
+    try:
+        result = json.loads(text)
+        return result if isinstance(result, list) else []
+    except json.JSONDecodeError:
+        return []
+
+
 KNOWLEDGE_EXTRACTION_PROMPT = """\
 You extract structured knowledge from conversations. Output a JSON array ONLY.
 
@@ -344,8 +377,6 @@ class KnowledgeExtractor:
         return stored
 
     def _extract_via_llm(self, events, user_id: str) -> list[dict[str, Any]]:
-        from core.memory.tabular.json_utils import parse_json_array
-        from core.memory.types import trust_tier_defaults
 
         conv_text = "\n".join(f"[{e.event_type}]: {e.content[:500]}" for e in events if e.content)
         event_ids = [e.event_id for e in events]
@@ -409,7 +440,6 @@ class KnowledgeExtractor:
     def _extract_preference(self, event, user_id: str) -> dict[str, Any] | None:
         content = event.content
         if "typescript" in content.lower():
-            from core.memory.types import trust_tier_defaults
 
             defaults = trust_tier_defaults("T3")
             return {
@@ -427,7 +457,6 @@ class KnowledgeExtractor:
     def _extract_pattern(self, event, user_id: str) -> dict[str, Any] | None:
         content = event.content.lower()
         if "dependency injection" in content:
-            from core.memory.types import trust_tier_defaults
 
             defaults = trust_tier_defaults("T3")
             return {
@@ -566,8 +595,6 @@ class KnowledgeExtractor:
     def decay_confidence(self, user_id: str, half_life_days: int = 60) -> int:
         """Apply confidence decay to knowledge entries."""
         from api.models import KnowledgeEntry
-        from core.memory.config import DEFAULT_CONFIG
-        from core.memory.types import TrustTier
 
         entries = (
             self.db.query(KnowledgeEntry)

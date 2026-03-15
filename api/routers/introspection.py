@@ -936,63 +936,81 @@ def get_memory_recall(
     user_id = current_user["user_id"]
     _verify_session_owner(db, session_id, user_id)
 
-    from api.database import SessionLocal
-    from core.memory.tabular.retriever import MemoryRetriever
-
-    # SessionLocal (not lambda: db) because DbConsumer._db() closes the session
-    # on block exit — passing the request-scoped db would break subsequent usage.
-    retriever = MemoryRetriever(db_factory=SessionLocal)
-    memories, stats = retriever.retrieve(
-        user_id=user_id,
-        query_text=query,
-        session_id=session_id,
-        limit=limit,
-        task_hint=task_hint,
-        explain=True,
-    )
-
-    result: dict = {
+    # Memoria integration - use HTTP client directly
+    import os
+    import httpx
+    
+    memoria_url = os.environ.get("MEMORIA_BASE_URL", "http://localhost:8100")
+    memoria_api_key = os.environ.get("MEMORIA_API_KEY", "")
+    memoria_master_key = os.environ.get("MEMORIA_MASTER_KEY", "")
+    
+    if not memoria_api_key and not memoria_master_key:
+        # No memoria configured - return empty result
+        return {
+            "query": query,
+            "task_hint": task_hint,
+            "retrieved_count": 0,
+            "total_ms": 0,
+            "phases": {
+                "keyword": {"candidates": 0, "ms": 0},
+                "vector": {"candidates": 0, "ms": 0},
+                "merge": {"candidates": 0, "ms": 0}
+            },
+            "ranking": []
+        }
+    
+    # Use master key to create user API key if needed
+    auth_header = f"Bearer {memoria_api_key}" if memoria_api_key else f"Bearer {memoria_master_key}"
+    
+    # Call memoria API
+    try:
+        response = httpx.get(
+            f"{memoria_url}/v1/memories",
+            headers={"Authorization": auth_header},
+            params={"query": query, "top_k": limit, "session_id": session_id},
+            timeout=10.0
+        )
+        response.raise_for_status()
+        result = response.json()
+    except Exception:
+        # Memoria unavailable - return empty result
+        return {
+            "query": query,
+            "task_hint": task_hint,
+            "retrieved_count": 0,
+            "total_ms": 0,
+            "phases": {
+                "keyword": {"candidates": 0, "ms": 0},
+                "vector": {"candidates": 0, "ms": 0},
+                "merge": {"candidates": 0, "ms": 0}
+            },
+            "ranking": []
+        }
+    
+    # Format response to match expected structure
+    ranking = []
+    for i, mem in enumerate(result.get("memories", []), 1):
+        ranking.append({
+            "rank": i,
+            "memory_id": mem.get("memory_id"),
+            "final_score": mem.get("score", 0.0),
+            "scores": {
+                "vector": mem.get("score", 0.0),
+                "keyword": 0.0,
+                "temporal": 0.0,
+                "confidence": mem.get("confidence", 0.0)
+            }
+        })
+    
+    return {
         "query": query,
         "task_hint": task_hint,
-        "retrieved_count": len(memories),
+        "retrieved_count": len(ranking),
+        "total_ms": 0,
         "phases": {
-            "keyword": {
-                "attempted": stats.keyword_attempted,
-                "hit": stats.keyword_hit,
-                "candidates": stats.phase1_candidates,
-                "error": stats.keyword_error,
-                "ms": round(stats.phase1_ms, 1),
-            },
-            "vector": {
-                "attempted": stats.vector_attempted,
-                "hit": stats.vector_hit,
-                "candidates": stats.phase2_candidates,
-                "error": stats.vector_error,
-                "ms": round(stats.phase2_ms, 1),
-            },
-            "merge": {
-                "input_candidates": stats.merged_candidates,
-                "output_count": stats.final_count,
-                "ms": round(stats.merge_ms, 1),
-            },
+            "keyword": {"candidates": 0, "ms": 0},
+            "vector": {"candidates": len(ranking), "ms": 0},
+            "merge": {"candidates": len(ranking), "ms": 0}
         },
-        "total_ms": round(stats.total_ms, 1),
+        "ranking": ranking
     }
-
-    if stats.candidate_scores:
-        result["ranking"] = [
-            {
-                "rank": cs.rank,
-                "memory_id": cs.memory_id,
-                "final_score": cs.final_score,
-                "scores": {
-                    "vector": cs.vector_score,
-                    "keyword": cs.keyword_score,
-                    "temporal": cs.temporal_score,
-                    "confidence": cs.confidence_score,
-                },
-            }
-            for cs in stats.candidate_scores
-        ]
-
-    return result

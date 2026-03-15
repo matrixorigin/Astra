@@ -87,7 +87,7 @@ class TestAgentCLI:
             result = runner.invoke(agent_cli, ["session", "list"])
             assert result.exit_code == 0
             assert "s1" in result.output
-            mock_client.list_sessions.assert_called_once_with(limit=20)
+            mock_client.list_sessions.assert_called_once_with(agent_id=None, status=None, limit=20)
 
     def test_session_list_empty(self, runner):
         """Test session list when no sessions."""

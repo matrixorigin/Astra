@@ -16,13 +16,21 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from core.memory.tabular.metrics import MemoryMetrics
 from core.memory.types import MemoryType
 
 if TYPE_CHECKING:
-    from core.memory.tabular.explain import RetrievalStats
+    pass
 
 logger = logging.getLogger(__name__)
+
+
+class MemoryMetrics:
+    """Simple metrics counter."""
+    def __init__(self):
+        self._counters = {}
+    
+    def increment(self, key: str, value: int = 1):
+        self._counters[key] = self._counters.get(key, 0) + value
 
 
 @dataclass
@@ -35,7 +43,7 @@ class TieredLoaderStats:
     l1_tokens: int = 0
     l1_ms: float = 0.0
     l1_error: bool = False
-    retrieval: RetrievalStats | None = None
+    retrieval: dict | None = None  # Simplified from RetrievalStats
     total_ms: float = 0.0
 
 
@@ -45,15 +53,46 @@ class TieredMemoryLoader:
     Uses MemoryService as the sole interface to the memory module.
     """
 
-    def __init__(self, memory_service: Any, metrics: MemoryMetrics | None = None):
+    def __init__(self, memory_service: Any = None, metrics: MemoryMetrics | None = None):
+        """Initialize with optional memory_service (legacy) or use Memoria HTTP."""
         self._svc = memory_service
         self._metrics = metrics or MemoryMetrics()
+        self._memoria_client = None
+        
+        # If no memory_service provided, use Memoria HTTP client
+        if self._svc is None:
+            import os
+            memoria_url = os.environ.get("MEMORIA_BASE_URL")
+            memoria_master_key = os.environ.get("MEMORIA_MASTER_KEY")
+            memoria_api_key = os.environ.get("MEMORIA_API_KEY")
+            
+            if memoria_url and (memoria_master_key or memoria_api_key):
+                from core.memory.backends.memoria_http import MemoriaHTTPClient
+                self._memoria_client = MemoriaHTTPClient(
+                    base_url=memoria_url,
+                    api_key=memoria_api_key,
+                    master_key=memoria_master_key,
+                )
 
     def load_l0(self, user_id: str) -> str:
+        """Load profile memories."""
         try:
-            return self._svc.get_profile(user_id) or ""
+            if self._memoria_client:
+                result = self._memoria_client.list_memories(
+                    user_id=user_id,
+                    memory_type="profile",
+                    limit=10
+                )
+                memories = result.get('items', []) if isinstance(result, dict) else result
+                if memories:
+                    lines = [f"- {m['content']}" for m in memories]
+                    return "\n".join(lines)
+                return ""
+            elif self._svc:
+                return self._svc.get_profile(user_id) or ""
+            return ""
         except Exception as e:
-            logger.debug("L0 load failed: %s", e)
+            logger.debug("L0 load failed: %s", e, exc_info=True)
             self._metrics.increment("tiered_loader_l0_errors")
             return ""
 
@@ -66,26 +105,43 @@ class TieredMemoryLoader:
         task_hint: str | None = None,
         limit: int = 10,
         explain: bool = False,
-    ) -> tuple[str, RetrievalStats | None]:
+    ) -> tuple[str, dict | None]:
+        """Load L1 semantic/procedural memories."""
         try:
-            memories, stats = self._svc.retrieve(
-                user_id=user_id,
-                query=query,
-                session_id=session_id,
-                query_embedding=query_embedding,
-                memory_types=[MemoryType.SEMANTIC, MemoryType.PROCEDURAL],
-                top_k=limit,
-                task_hint=task_hint,
-                explain=explain,
-            )
-            if not memories:
-                return "", stats
-            lines = ["Relevant Memories:"]
-            for m in memories:
-                lines.append(f"- [{m.memory_type.value}] {m.content}")
-            return "\n".join(lines), stats
+            if self._memoria_client:
+                # Use Memoria HTTP client
+                memories = self._memoria_client.search(
+                    user_id=user_id,
+                    query=query,
+                    top_k=limit
+                )
+                if not memories:
+                    return "", None
+                lines = ["Relevant Memories:"]
+                for m in memories:
+                    lines.append(f"- [{m.get('memory_type', 'semantic')}] {m['content']}")
+                return "\n".join(lines), None
+            elif self._svc:
+                # Legacy memory service
+                memories, stats = self._svc.retrieve(
+                    user_id=user_id,
+                    query=query,
+                    session_id=session_id,
+                    query_embedding=query_embedding,
+                    memory_types=[MemoryType.SEMANTIC, MemoryType.PROCEDURAL],
+                    top_k=limit,
+                    task_hint=task_hint,
+                    explain=explain,
+                )
+                if not memories:
+                    return "", stats
+                lines = ["Relevant Memories:"]
+                for m in memories:
+                    lines.append(f"- [{m.memory_type.value}] {m.content}")
+                return "\n".join(lines), stats
+            return "", None
         except Exception as e:
-            logger.debug("L1 load failed: %s", e)
+            logger.debug("L1 load failed: %s", e, exc_info=True)
             self._metrics.increment("tiered_loader_l1_errors")
             return "", None
 
@@ -126,7 +182,12 @@ class TieredMemoryLoader:
             stats.retrieval = retrieval_stats
             stats.total_ms = (time.time() - start) * 1000
 
-        return "\n\n".join(parts), stats
+        # Add header if we have content
+        if parts:
+            result = "## User Profile\n\n" + "\n\n".join(parts)
+        else:
+            result = ""
+        return result, stats
 
     def invalidate_profile(self, user_id: str) -> None:
         self._svc.invalidate_profile(user_id)

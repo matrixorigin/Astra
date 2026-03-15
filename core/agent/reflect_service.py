@@ -5,6 +5,8 @@ from typing import Any, Callable, Literal
 
 from core.db_consumer import DbConsumer, DbFactory
 from core.logging_config import get_logger
+from core.memory.backends import get_memoria_storage
+from core.memory.types import MemoryType
 
 logger = get_logger(__name__)
 
@@ -196,8 +198,6 @@ class ReflectService(DbConsumer):
 
             # 3. Past lessons
             try:
-                from core.memory.backends import get_memoria_storage
-                from core.memory.types import MemoryType
 
                 svc = get_memoria_storage(user_id)
                 memories, _ = svc.retrieve(

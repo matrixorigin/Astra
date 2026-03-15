@@ -496,6 +496,7 @@ async def edge_chat_loop(
     extra_rules: str | None = None,
     explain: bool | str = False,
     routing_strategy: str | None = None,
+    user_id: str | None = None,
 ) -> ChatLoopResult:
     """Run the edge-cloud agentic loop until final answer or MAX_TURNS.
 
@@ -698,7 +699,7 @@ async def edge_chat_loop(
 
         # Execute approved tools concurrently
         if approved:
-            results = await tool_router.execute(approved)
+            results = await tool_router.execute(approved, user_id=user_id)
             for tc, r in zip(approved, results):
                 renderer.tool_start(tc.name, tc.arguments)
                 renderer.tool_done(r.name, r.result, r.error)

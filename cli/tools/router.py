@@ -71,12 +71,12 @@ class ToolRouter:
         """Return OpenAI-compatible tool schemas for all registered tools."""
         return [t.to_openai_schema() for t in self._tools.values()]
 
-    async def execute(self, tool_calls: list[ToolCall]) -> list[ToolResult]:
+    async def execute(self, tool_calls: list[ToolCall], user_id: str = None) -> list[ToolResult]:
         """Execute tool calls concurrently and return results."""
-        tasks = [self._execute_one(tc) for tc in tool_calls]
+        tasks = [self._execute_one(tc, user_id) for tc in tool_calls]
         return await asyncio.gather(*tasks)
 
-    async def _execute_one(self, tc: ToolCall) -> ToolResult:
+    async def _execute_one(self, tc: ToolCall, user_id: str = None) -> ToolResult:
         tool = self._tools.get(tc.name)
         if not tool:
             return ToolResult(
@@ -137,7 +137,11 @@ class ToolRouter:
                 else:
                     result = str(output.result) if hasattr(output, "result") else str(output)
             else:
-                result = await tool.execute(**tc.arguments)
+                # Add user_id to kwargs for EdgeTools that need it
+                kwargs = tc.arguments.copy()
+                if user_id:
+                    kwargs["user_id"] = user_id
+                result = await tool.execute(**kwargs)
             elapsed = int((time.monotonic() - t0) * 1000)
             if self._hook:
                 self._hook.on_tool_executed(tc.name, elapsed, True)

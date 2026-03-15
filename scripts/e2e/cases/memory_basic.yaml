@@ -1,5 +1,5 @@
 name: memory_basic
-description: "记忆注入和召回：agent 应该调用 memory 工具存储偏好，然后能召回"
+description: "记忆注入和召回：observer 自动存储偏好，然后能召回"
 requires: [llm]
 check_graph_activation: true
 
@@ -7,7 +7,6 @@ turns:
   - user: "记住我喜欢用 Python 做数据分析"
     checks:
       rules:
-        - tool_called: memory_program
         - db:
             table: mem_memories
             where: "user_id = :uid"

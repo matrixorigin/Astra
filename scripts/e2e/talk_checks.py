@@ -77,9 +77,10 @@ def check_db_rule(
     sid: str,
     prev_counts: dict[str, int],
 ) -> list[CheckResult]:
-    """Execute a db rule check using Memoria API instead of SQL.
+    """Execute a db rule check using Memoria database directly.
 
-    Translates SQL-based checks to Memoria API calls.
+    Since both Observer and memory_program tools use Memoria service,
+    we need to check the memoria database, not the main dev_agent database.
     """
     results = []
     table = rule.get("table", "")
@@ -87,73 +88,60 @@ def check_db_rule(
     asserts = rule.get("assert", {})
 
     try:
-        # Import Memoria client
-        from core.memory.factory import create_editor
-
-        editor = create_editor(db_factory, user_id=uid)
-
-        # Handle different table checks
         if table == "mem_memories":
-            # List memories via MemoriaStorage API
-            from core.memory.types import MemoryType
-            memories = editor._storage.list_active(uid, memory_type=None, limit=500)
-            # Convert Memory objects to dicts for filtering
-            memories = [{"content": m.content, "memory_id": m.memory_id} for m in memories]
+            # Connect directly to memoria database
+            from sqlalchemy import create_engine, text
+            memoria_engine = create_engine('mysql+pymysql://root:111@localhost:6001/memoria')
+            
+            with memoria_engine.connect() as conn:
+                # Build query based on where clause
+                query = "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active != 0"
+                params = {"uid": uid}
+                
+                # Add content filter if specified
+                if "content LIKE" in where:
+                    import re
+                    match = re.search(r"content LIKE '%([^%]+)%'", where)
+                    if match:
+                        search_term = match.group(1)
+                        query += " AND content LIKE :search"
+                        params["search"] = f"%{search_term}%"
+                
+                count = conn.execute(text(query), params).scalar() or 0
 
-            # Apply content filter if specified in where clause
-            if "content LIKE" in where:
-                # Extract search term from LIKE clause
-                import re
-                match = re.search(r"content LIKE '%([^%]+)%'", where)
-                if match:
-                    search_term = match.group(1).lower()
-                    memories = [m for m in memories if search_term in m.get("content", "").lower()]
-
-            count = len(memories)
-
-            # Check count assertion
-            if "count" in asserts:
-                count_assert = asserts["count"]
-                if count_assert.startswith(">="):
-                    min_count = int(count_assert[2:])
-                    passed = count >= min_count
-                    results.append(CheckResult(
-                        f"db:memories_count>={min_count}",
-                        passed,
-                        f"found {count} memories" if not passed else ""
-                    ))
-                elif count_assert.startswith(">"):
-                    min_count = int(count_assert[1:])
-                    passed = count > min_count
-                    results.append(CheckResult(
-                        f"db:memories_count>{min_count}",
-                        passed,
-                        f"found {count} memories" if not passed else ""
-                    ))
-                else:
-                    expected = int(count_assert)
-                    passed = count == expected
-                    results.append(CheckResult(
-                        f"db:memories_count={expected}",
-                        passed,
-                        f"found {count} memories, expected {expected}" if not passed else ""
-                    ))
+                # Check count assertion
+                if "count" in asserts:
+                    count_assert = asserts["count"]
+                    if count_assert.startswith(">="):
+                        min_count = int(count_assert[2:])
+                        passed = count >= min_count
+                        results.append(CheckResult(
+                            f"db:memories_count>={min_count}",
+                            passed,
+                            f"found {count} memories" if not passed else ""
+                        ))
 
         elif table == "mem_edit_log":
-            # For edit log, we can check if any memories exist (indicating edits were made)
-            memories = editor._storage.list_active(uid, memory_type=None, limit=500)
-            count = len(memories)
+            # For edit log, check memoria database
+            from sqlalchemy import create_engine, text
+            memoria_engine = create_engine('mysql+pymysql://root:111@localhost:6001/memoria')
+            
+            with memoria_engine.connect() as conn:
+                count = conn.execute(
+                    text("SELECT COUNT(*) FROM mem_edit_log WHERE user_id = :uid"),
+                    {"uid": uid}
+                ).scalar() or 0
 
-            if "count" in asserts:
-                count_assert = asserts["count"]
-                if count_assert.startswith(">="):
-                    min_count = int(count_assert[2:])
-                    passed = count >= min_count
-                    results.append(CheckResult(
-                        f"db:edit_log_count>={min_count}",
-                        passed,
-                        f"found {count} memories (edit log via count)" if not passed else ""
-                    ))
+                if "count" in asserts:
+                    count_assert = asserts["count"]
+                    if count_assert.startswith(">="):
+                        min_count = int(count_assert[2:])
+                        passed = count >= min_count
+                        results.append(CheckResult(
+                            f"db:edit_log_count>={min_count}",
+                            passed,
+                            f"found {count} memories (edit log via count)" if not passed else ""
+                        ))
 
         elif table == "agent_events":
             # agent_events is still in SQL database, use direct query

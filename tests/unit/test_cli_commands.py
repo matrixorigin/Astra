@@ -109,7 +109,7 @@ class TestAgentCLIToAPI:
         result = runner.invoke(agent_cli, ["session", "list"])
 
         assert result.exit_code == 0
-        mock_api_client.list_sessions.assert_called_once_with(limit=20)
+        mock_api_client.list_sessions.assert_called_once_with(agent_id=None, status=None, limit=20)
         assert "sess-1" in result.output
         assert "sess-2" in result.output
 

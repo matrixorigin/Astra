@@ -310,9 +310,9 @@ class RunEngine(DbConsumer):
             )
             raise
         finally:
-            self._flush_agent_run_events()
-            # Shutdown EventPipeline
             try:
+                self._flush_agent_run_events()
+                # Shutdown EventPipeline
                 _pipeline = (
                     getattr(getattr(loop, "event_logger", None), "_pipeline", None)
                     if loop
@@ -325,28 +325,26 @@ class RunEngine(DbConsumer):
                             await asyncio.wait_for(_shutdown_task, timeout=2.0)
                         except (asyncio.CancelledError, asyncio.TimeoutError):
                             pass
-            except Exception:
-                pass
-            # Wait for GateTrigger daemon threads (run in executor to avoid blocking the event loop)
-            try:
+                # Wait for GateTrigger daemon threads
                 gt = getattr(loop, "_gate_trigger", None) if loop else None
                 if gt and hasattr(gt, "wait_all"):
                     await asyncio.get_running_loop().run_in_executor(None, gt.wait_all, 5.0)
             except Exception:
-                pass
-            _run_tasks.pop(run.run_id, None)
-            _run_waiters.get(run.run_id, asyncio.Event()).set()
-            if (
-                run.parent_run_id
-                and run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED)
-                and not getattr(run, "_cancelled_externally", False)
-            ):
-                try:
-                    await self._check_fan_in(run.parent_run_id)
-                except Exception:
-                    pass
-            if run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
-                self._maybe_gc()
+                pass  # Suppress all cleanup errors during shutdown
+            finally:
+                _run_tasks.pop(run.run_id, None)
+                _run_waiters.get(run.run_id, asyncio.Event()).set()
+                if (
+                    run.parent_run_id
+                    and run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED)
+                    and not getattr(run, "_cancelled_externally", False)
+                ):
+                    try:
+                        await self._check_fan_in(run.parent_run_id)
+                    except Exception:
+                        pass
+                if run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
+                    self._maybe_gc()
 
     async def _consume_stream(self, loop, run: AgentRun) -> None:
         """Consume ChatLoop stream, parking on wait_for signals.

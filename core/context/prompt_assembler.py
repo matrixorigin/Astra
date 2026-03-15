@@ -711,10 +711,12 @@ class PromptAssembler(DbConsumer):
                     f"+{skill_count} cloud skills (use `find_skills` or `get_agent_info` to discover)"
                 )
 
-            # Memory hint — always present so the LLM knows it can recall user
-            # context via get_agent_info, even on first interaction (~15 tokens).
+            # Memory hint — always present so the LLM knows memory is already loaded
+            # in the User Profile section above (~20 tokens).
             parts.append(
-                "Memory: if User Profile is shown above in context, use it directly. Otherwise use `get_agent_info(dimension='memory')` to recall what you know about the user"
+                "Memory: User Profile above contains all relevant memories (preferences, facts, history). "
+                "Use it directly to answer questions like 'what did I say about X?'. "
+                "Do NOT use memory_program to store user questions — only use it when user explicitly asks to remember something new."
             )
 
             # Delegation
@@ -944,10 +946,9 @@ class PromptAssembler(DbConsumer):
         # Primary: tiered memory system (L0 + L1)
         try:
             from core.context.tiered_loader import TieredMemoryLoader
-            from core.memory import create_memory_service
 
-            svc = create_memory_service(self._db_factory, user_id=user_id)
-            loader = TieredMemoryLoader(svc)
+            # TieredMemoryLoader will auto-detect Memoria from env vars
+            loader = TieredMemoryLoader()
             tiered_section, tiered_stats = loader.build_section(
                 user_id,
                 session_id,
@@ -1063,10 +1064,8 @@ class PromptAssembler(DbConsumer):
         stats: dict[str, Any] | None = {"source": "profile_only"} if explain else None
         try:
             from core.context.tiered_loader import TieredMemoryLoader
-            from core.memory import create_memory_service
 
-            svc = create_memory_service(self._db_factory, user_id=user_id)
-            loader = TieredMemoryLoader(svc)
+            loader = TieredMemoryLoader()
             l0_text = loader.load_l0(user_id)
             if l0_text:
                 return l0_text, stats

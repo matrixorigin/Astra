@@ -51,12 +51,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Database init skipped (tables may already exist): {e}")
 
-    # Start memory governance scheduler
-    from core.context.scheduler import MemoryGovernanceScheduler
-
-    scheduler = MemoryGovernanceScheduler()
-    await scheduler.start()
-
     # Restore workflows that were waiting when process died
     from core.agent.async_tools import cleanup_stale_workflows, restore_waiting_workflows
 
@@ -164,6 +158,18 @@ async def lifespan(app: FastAPI):
 
     trigger_task = asyncio.create_task(_trigger_loop())
 
+    # Start governance scheduler for sandbox cleanup and SLO monitoring
+    scheduler = None
+    try:
+        from core.context.scheduler import MemoryGovernanceScheduler
+        from api.database import get_db_context
+        
+        scheduler = MemoryGovernanceScheduler(get_db_context)
+        await scheduler.start()
+        logger.info("Governance scheduler started")
+    except Exception as e:
+        logger.warning(f"Governance scheduler start failed (non-fatal): {e}")
+
     # Start embedding worker — generates embeddings for agent_events
     # so HybridRetriever can do retrieval-based history on Turn 3+.
     embedding_worker = None
@@ -185,7 +191,8 @@ async def lifespan(app: FastAPI):
             stop_task.cancel()
     cleanup_task.cancel()
     trigger_task.cancel()
-    await scheduler.stop()
+    if scheduler:
+        await scheduler.stop()
 
     # Graceful job backend shutdown — wait for subprocess cleanup
     from api.routers.jobs import _router as job_router

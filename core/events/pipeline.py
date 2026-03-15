@@ -42,6 +42,7 @@ DURABLE_TYPES = {
 
 def _to_ce_values(e: ConversationEvent) -> dict[str, Any]:
     """Convert event to agent_events column dict (no embedding)."""
+    import json
     metadata = e.metadata or {}
     return {
         "event_id": e.event_id,
@@ -54,11 +55,11 @@ def _to_ce_values(e: ConversationEvent) -> dict[str, Any]:
         "parent_event_id": e.parent_event_id,
         "causal_chain_id": e.causal_chain_id,
         "created_at": e.created_at,
-        "metadata": metadata if metadata else None,
-        "token_usage": e.token_usage.model_dump() if e.token_usage else None,
-        "context_snapshot": e.context_snapshot.model_dump() if e.context_snapshot else None,
+        "metadata": json.dumps(metadata) if metadata else None,
+        "token_usage": json.dumps(e.token_usage.model_dump()) if e.token_usage else None,
+        "context_snapshot": json.dumps(e.context_snapshot.model_dump()) if e.context_snapshot else None,
         "llm_model_used": e.llm_model_used,
-        "llm_params": e.llm_params,
+        "llm_params": json.dumps(e.llm_params) if e.llm_params else None,
         "skill_name": e.skill_name,
         "skill_version": e.skill_version,
         "run_id": metadata.get("run_id"),
@@ -69,12 +70,13 @@ def _to_ce_values(e: ConversationEvent) -> dict[str, Any]:
 
 def _to_re_values(e: ConversationEvent, run_id: str, idx: int) -> dict[str, Any]:
     """Convert event to agent_run_events column dict."""
+    import json
     et = e.event_type if isinstance(e.event_type, str) else e.event_type.value
     return {
         "run_id": run_id,
         "idx": idx,
         "event_type": et,
-        "data": {"content": e.content, "metadata": e.metadata},
+        "data": json.dumps({"content": e.content, "metadata": e.metadata}),
         "event_id": e.event_id,
         "agent_id": e.agent_id,
     }

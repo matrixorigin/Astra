@@ -121,12 +121,12 @@ class TalkSession:
         cmd = [PYTHON, str(CLI_SCRIPT), "--api-url", self.api_url, "--profile", self.profile, *args]
 
         env = os.environ.copy()
-        env.pop("http_proxy", None)
-        env.pop("https_proxy", None)
-        env.pop("HTTP_PROXY", None)
-        env.pop("HTTPS_PROXY", None)
+        # Remove all proxy settings to avoid connection issues
+        for proxy_var in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"]:
+            env.pop(proxy_var, None)
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
+        env["NO_PROXY"] = "localhost,127.0.0.1,::1"
         result = subprocess.run(
             cmd,
             capture_output=True,

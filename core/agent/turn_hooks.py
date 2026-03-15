@@ -6,14 +6,33 @@ observer, implicit feedback) so both code paths stay in sync.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import threading
 import time
 from typing import Any
 
 from core.db_consumer import DbConsumer, DbFactory
+from core.memory.backends import get_memoria_storage
 
 logger = logging.getLogger(__name__)
+
+# Track background threads for graceful shutdown
+_bg_threads: list[threading.Thread] = []
+_shutdown_event = threading.Event()
+
+
+def _wait_for_bg_threads(timeout: float = 2.0):
+    """Wait for background threads to complete during shutdown."""
+    _shutdown_event.set()
+    # Disable httpx logging to prevent closed file errors
+    logging.getLogger("httpx").disabled = True
+    for t in _bg_threads:
+        if t.is_alive():
+            t.join(timeout=timeout)
+
+
+atexit.register(_wait_for_bg_threads)
 
 # Implicit-feedback rating map (signal_type → 1-5 rating).
 # Keys must cover all non-neutral signal types from ImplicitFeedbackDetector.
@@ -161,21 +180,20 @@ class TurnHooks(DbConsumer):
         session_start: Any = None,
     ) -> None:
         """Run TypedObserver in a background thread."""
-        llm = self._llm_client
-        db_factory = self._db_factory
-        embed_fn = self._embed_fn
-
         def _bg():
             try:
-                from core.memory.backends import get_memoria_storage
-
+                if _shutdown_event.is_set():
+                    return
                 svc = get_memoria_storage(user_id)
                 svc.run_pipeline(user_id=user_id, messages=messages)
             except Exception as e:
-                logger.error("Memory pipeline failed: %s", e)
+                if not _shutdown_event.is_set():
+                    logger.error("Memory pipeline failed: %s", e)
 
         try:
-            threading.Thread(target=_bg, daemon=True).start()
+            t = threading.Thread(target=_bg, daemon=True)
+            _bg_threads.append(t)
+            t.start()
         except Exception as e:
             logger.debug("Observer setup skipped: %s", e)
 
@@ -262,8 +280,6 @@ class TurnHooks(DbConsumer):
             f"Context: {reflect_evidence[:200]}"
         )
         try:
-            from core.memory.backends import get_memoria_storage
-            from core.memory.types import MemoryType, TrustTier
 
             svc = get_memoria_storage(user_id)
             svc.store(

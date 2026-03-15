@@ -2,6 +2,7 @@
 
 import os
 import pytest
+import httpx
 from uuid import uuid4
 
 from api.repositories.user_repository import UserRepository
@@ -12,6 +13,13 @@ def _get_worker_suffix():
     """Get unique suffix for parallel test workers."""
     worker_id = os.getenv("PYTEST_XDIST_WORKER", "master")
     return f"_{worker_id}" if worker_id != "master" else ""
+
+
+@pytest.fixture
+def http_client():
+    """Create httpx client that ignores proxy settings for localhost tests."""
+    with httpx.Client(trust_env=False) as client:
+        yield client
 
 
 @pytest.fixture
