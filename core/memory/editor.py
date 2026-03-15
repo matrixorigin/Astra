@@ -37,7 +37,7 @@ class MemoryEditor:
         return memories
     
     def batch_inject(self, user_id: str, memories: list, **kwargs) -> list:
-        """Batch inject memories via Memoria.
+        """Batch inject memories via Memoria batch API (single HTTP request).
 
         user_id must match the user_id this editor was created for.
         """
@@ -45,11 +45,18 @@ class MemoryEditor:
             raise ValueError(
                 f"batch_inject user_id '{user_id}' does not match editor user_id '{self.storage.user_id}'"
             )
-        results = []
-        for memory in memories:
-            if isinstance(memory, dict):
-                result = self.inject(memory.get("content", ""), memory.get("memory_type", "semantic"), **kwargs)
+        if not memories:
+            return []
+
+        # Use the HTTP client's batch_store directly (accepts list of dicts)
+        memory_dicts = []
+        for m in memories:
+            if isinstance(m, dict):
+                memory_dicts.append({
+                    "content": m.get("content", ""),
+                    "memory_type": m.get("memory_type", "semantic"),
+                })
             else:
-                result = self.inject(str(memory), "semantic", **kwargs)
-            results.append(result)
-        return results
+                memory_dicts.append({"content": str(m), "memory_type": "semantic"})
+
+        return self.storage.client.batch_store(user_id, memory_dicts)

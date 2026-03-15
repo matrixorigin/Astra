@@ -22,7 +22,7 @@ class MemoriaHTTPClient:
 
     def __init__(
         self,
-        base_url: str = "http://localhost:8000",
+        base_url: str = "http://localhost:8100",
         api_key: Optional[str] = None,
         master_key: Optional[str] = None,
         timeout: float = 30.0,

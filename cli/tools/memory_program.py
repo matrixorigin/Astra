@@ -64,64 +64,68 @@ class MemoryProgramTool(EdgeTool):
     side_effect = SideEffect.WRITE
 
     async def execute(self, actions: List[Dict[str, Any]], **kwargs) -> str:
-        """Execute memory actions via Memoria."""
-        try:
-            from core.memory.factory import create_editor
-            
-            user_id = kwargs.get("user_id", "default")
-            session_id = kwargs.get("session_id")
-            editor = create_editor(None, user_id=user_id)
-            
-            results = []
-            for action in actions:
-                operation = action.get("operation")
-                content = action.get("content", "")
-                
-                if operation == "inject":
-                    memory_type = action.get("memory_type", "semantic")
-                    result = editor.inject(
-                        content=content,
-                        memory_type=memory_type,
-                        source="memory_program_tool",
-                        session_id=session_id,
-                    )
-                    results.append({"operation": "inject", "status": "success"})
-                
-                elif operation == "correct":
-                    memory_id = action.get("memory_id")
+        """Execute memory actions via Memoria (sync HTTP wrapped in asyncio.to_thread)."""
+        import asyncio
+
+        def _run_sync() -> str:
+            try:
+                from core.memory.factory import create_editor
+
+                user_id = kwargs.get("user_id", "default")
+                session_id = kwargs.get("session_id")
+                editor = create_editor(None, user_id=user_id)
+
+                results = []
+                for action in actions:
+                    operation = action.get("operation")
                     content = action.get("content", "")
-                    reason = action.get("reason", "")
-                    if not memory_id:
-                        results.append({"operation": "correct", "status": "error", "error": "memory_id required"})
-                        continue
-                    if not content:
-                        results.append({"operation": "correct", "status": "error", "error": "content required for correct"})
-                        continue
-                    editor.correct(memory_id, content, reason)
-                    results.append({"operation": "correct", "status": "success"})
-                
-                elif operation == "purge":
-                    memory_id = action.get("memory_id")
-                    topic = action.get("topic")
-                    reason = action.get("reason", "")
-                    if not memory_id and not topic:
-                        results.append({"operation": "purge", "status": "error", "error": "memory_id or topic required"})
-                        continue
-                    editor.purge(memory_id=memory_id, topic=topic, reason=reason)
-                    results.append({"operation": "purge", "status": "success"})
-                
-                else:
-                    results.append({"operation": operation, "status": "error", "error": f"Invalid operation: {operation}"})
-            
-            return json.dumps({
-                "status": "success",
-                "actions_executed": len(results),
-                "results": results
-            })
-            
-        except Exception as e:
-            return json.dumps({
-                "status": "error",
-                "error": str(e),
-                "actions_executed": 0
-            })
+
+                    if operation == "inject":
+                        memory_type = action.get("memory_type", "semantic")
+                        editor.inject(
+                            content=content,
+                            memory_type=memory_type,
+                            source="memory_program_tool",
+                            session_id=session_id,
+                        )
+                        results.append({"operation": "inject", "status": "success"})
+
+                    elif operation == "correct":
+                        memory_id = action.get("memory_id")
+                        reason = action.get("reason", "")
+                        if not memory_id:
+                            results.append({"operation": "correct", "status": "error", "error": "memory_id required"})
+                            continue
+                        if not content:
+                            results.append({"operation": "correct", "status": "error", "error": "content required for correct"})
+                            continue
+                        editor.correct(memory_id, content, reason)
+                        results.append({"operation": "correct", "status": "success"})
+
+                    elif operation == "purge":
+                        memory_id = action.get("memory_id")
+                        topic = action.get("topic")
+                        reason = action.get("reason", "")
+                        if not memory_id and not topic:
+                            results.append({"operation": "purge", "status": "error", "error": "memory_id or topic required"})
+                            continue
+                        editor.purge(memory_id=memory_id, topic=topic, reason=reason)
+                        results.append({"operation": "purge", "status": "success"})
+
+                    else:
+                        results.append({"operation": operation, "status": "error", "error": f"Invalid operation: {operation}"})
+
+                return json.dumps({
+                    "status": "success",
+                    "actions_executed": len(results),
+                    "results": results,
+                })
+
+            except Exception as e:
+                return json.dumps({
+                    "status": "error",
+                    "error": str(e),
+                    "actions_executed": 0,
+                })
+
+        return await asyncio.to_thread(_run_sync)

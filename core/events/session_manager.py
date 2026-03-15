@@ -194,11 +194,8 @@ class SessionManager:
                 except Exception as e:
                     logger.error(f"on_close callback failed for session {session_id}: {e}")
 
-            # Generate full session summary (memories table) — reuse events already loaded
+            # Generate full session summary via Memoria — reuse events already loaded
             try:
-                from api.database import SessionLocal
-                from core.memory import create_memory_service
-
                 messages = [
                     {
                         "role": "user" if e.event_type == "user_query" else "assistant",
@@ -206,9 +203,12 @@ class SessionManager:
                     }
                     for e in events
                 ]
-                if messages:
-                    svc = create_memory_service(SessionLocal, user_id=db_session.user_id)
-                    svc.generate_session_summary(db_session.user_id, session_id, messages)
+                if messages and db_session.user_id:
+                    from core.memory.backends import get_memoria_storage
+                    svc = get_memoria_storage(db_session.user_id)
+                    svc.request_session_summary(
+                        db_session.user_id, session_id, messages, sync=False
+                    )
             except Exception as e:
                 logger.debug("Session summary generation failed (non-fatal): %s", e)
 

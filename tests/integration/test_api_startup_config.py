@@ -61,10 +61,13 @@ class TestConfigValidationIntegration:
     @pytest.mark.integration
     def test_config_validation_detects_memoria_issues(self):
         """Test that config validation detects real Memoria connectivity issues."""
+        from core import config as cfg_mod
         from core.config_validation import validate_memoria_connectivity
         
-        # Test with invalid URL
-        with patch.dict(os.environ, {"MEMORIA_BASE_URL": "http://invalid-host:9999"}):
+        # Clear test env detection so our invalid URL is actually used
+        cfg_mod.reset_config()
+        with patch.dict(os.environ, {"MEMORIA_BASE_URL": "http://invalid-host:9999"}, clear=False):
+            os.environ.pop("PYTEST_CURRENT_TEST", None)
             errors = validate_memoria_connectivity()
             assert len(errors) > 0
 

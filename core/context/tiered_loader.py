@@ -58,21 +58,21 @@ class TieredMemoryLoader:
         self._svc = memory_service
         self._metrics = metrics or MemoryMetrics()
         self._memoria_client = None
-        
+
         # If no memory_service provided, use Memoria HTTP client
         if self._svc is None:
-            import os
-            memoria_url = os.environ.get("MEMORIA_BASE_URL")
-            memoria_master_key = os.environ.get("MEMORIA_MASTER_KEY")
-            memoria_api_key = os.environ.get("MEMORIA_API_KEY")
-            
-            if memoria_url and (memoria_master_key or memoria_api_key):
-                from core.memory.backends.memoria_http import MemoriaHTTPClient
-                self._memoria_client = MemoriaHTTPClient(
-                    base_url=memoria_url,
-                    api_key=memoria_api_key,
-                    master_key=memoria_master_key,
-                )
+            try:
+                from core.config import get_memoria_config
+                cfg = get_memoria_config()
+                if cfg.base_url and cfg.auth_key:
+                    from core.memory.backends.memoria_http import MemoriaHTTPClient
+                    self._memoria_client = MemoriaHTTPClient(
+                        base_url=cfg.base_url,
+                        api_key=cfg.api_key,
+                        master_key=cfg.master_key,
+                    )
+            except Exception:
+                pass  # Memoria not configured — tiered loader will return empty
 
     def load_l0(self, user_id: str) -> str:
         """Load profile memories. Returns raw content without section header."""

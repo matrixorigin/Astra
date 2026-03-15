@@ -124,24 +124,27 @@ class TestMemoryEditorRetrieve:
 class TestMemoryEditorBatchInject:
     def test_batch_inject_dict_memories(self):
         editor, storage = _make_editor(user_id="user1")
-        from core.memory.types import Memory
-        storage.store.return_value = MagicMock(spec=Memory)
+        storage.client = MagicMock()
+        storage.client.batch_store.return_value = [{"memory_id": "m1"}, {"memory_id": "m2"}]
 
         editor.batch_inject("user1", [
             {"content": "fact 1", "memory_type": "semantic"},
             {"content": "fact 2", "memory_type": "procedural"},
         ])
 
-        assert storage.store.call_count == 2
+        # Must use batch API — single call, not N individual store calls
+        storage.client.batch_store.assert_called_once()
+        storage.store.assert_not_called()
 
     def test_batch_inject_string_memories(self):
         editor, storage = _make_editor(user_id="user1")
-        from core.memory.types import Memory
-        storage.store.return_value = MagicMock(spec=Memory)
+        storage.client = MagicMock()
+        storage.client.batch_store.return_value = [{"memory_id": "m1"}, {"memory_id": "m2"}]
 
         editor.batch_inject("user1", ["fact 1", "fact 2"])
 
-        assert storage.store.call_count == 2
+        storage.client.batch_store.assert_called_once()
+        storage.store.assert_not_called()
 
     def test_batch_inject_wrong_user_id_raises(self):
         """Bug 9 regression: batch_inject must reject mismatched user_id."""
@@ -154,12 +157,12 @@ class TestMemoryEditorBatchInject:
 
     def test_batch_inject_correct_user_id_succeeds(self):
         editor, storage = _make_editor(user_id="alice")
-        from core.memory.types import Memory
-        storage.store.return_value = MagicMock(spec=Memory)
+        storage.client = MagicMock()
+        storage.client.batch_store.return_value = [{"memory_id": "m1"}]
 
         editor.batch_inject("alice", [{"content": "test", "memory_type": "semantic"}])
 
-        storage.store.assert_called_once()
+        storage.client.batch_store.assert_called_once()
     def test_purge_passes_topic_to_client(self):
         """MemoriaStorage.purge must forward topic kwarg to client.purge."""
         from core.memory.backends.memoria_http import MemoriaStorage

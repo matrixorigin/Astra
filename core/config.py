@@ -98,19 +98,25 @@ def get_app_config() -> AppConfig:
     )
 
 
-# Global config instance (lazy loaded)
+# Global config instance (lazy loaded, thread-safe)
+import threading
+
 _config: Optional[AppConfig] = None
+_config_lock = threading.Lock()
 
 
 def get_config() -> AppConfig:
-    """Get global configuration instance."""
+    """Get global configuration instance (thread-safe)."""
     global _config
     if _config is None:
-        _config = get_app_config()
+        with _config_lock:
+            if _config is None:  # double-checked locking
+                _config = get_app_config()
     return _config
 
 
-def reset_config():
-    """Reset global configuration (for testing)."""
+def reset_config() -> None:
+    """Reset global configuration. For testing only."""
     global _config
-    _config = None
+    with _config_lock:
+        _config = None
