@@ -859,12 +859,7 @@ def memory_health(
 def memory_metrics() -> dict:
     """Memory system performance metrics."""
     # Memoria doesn't expose metrics yet - return stub
-    return {
-        "total_memories": 0,
-        "active_memories": 0,
-        "avg_confidence": 0.0,
-        "retrieval_count": 0
-    }
+    return {"total_memories": 0, "active_memories": 0, "avg_confidence": 0.0, "retrieval_count": 0}
 
 
 # ── Training Data Pipeline ─────────────────────────────────────────────────────

@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Load .env file for encryption keys
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # Force HuggingFace offline mode — model is cached locally, avoid proxy hang
@@ -32,8 +33,13 @@ for _k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
     os.environ.pop(_k, None)
 
 # Set Memoria environment variables for memory operations
-os.environ.setdefault("MEMORIA_BASE_URL", os.environ.get("TEST_MEMORIA_BASE_URL", "http://localhost:8100"))
-os.environ.setdefault("MEMORIA_MASTER_KEY", os.environ.get("TEST_MEMORIA_MASTER_KEY", "test-master-key-for-docker-compose"))
+os.environ.setdefault(
+    "MEMORIA_BASE_URL", os.environ.get("TEST_MEMORIA_BASE_URL", "http://localhost:8100")
+)
+os.environ.setdefault(
+    "MEMORIA_MASTER_KEY",
+    os.environ.get("TEST_MEMORIA_MASTER_KEY", "test-master-key-for-docker-compose"),
+)
 os.environ.setdefault("MEMORIA_API_KEY", os.environ.get("TEST_MEMORIA_API_KEY", ""))
 os.environ.setdefault("MEMORY_BACKEND", "memoria")
 
@@ -163,10 +169,11 @@ def run_case(case: dict, *, verbose: bool = False, model: str | None = None) -> 
         # First turn
         record = session.say(turns[0]["user"])
         sid = session.session_id or ""
-        
+
         # If no session_id from CLI, generate one manually
         if not sid:
             import uuid
+
             sid = str(uuid.uuid4())  # Standard UUID format (36 chars)
             session.session_id = sid
 
@@ -175,9 +182,10 @@ def run_case(case: dict, *, verbose: bool = False, model: str | None = None) -> 
             try:
                 with SessionLocal() as db:
                     from sqlalchemy import text
+
                     existing = db.execute(
                         text("SELECT session_id FROM agent_sessions WHERE session_id = :sid"),
-                        {"sid": sid}
+                        {"sid": sid},
                     ).fetchone()
                     if not existing:
                         result = db.execute(
@@ -186,11 +194,12 @@ def run_case(case: dict, *, verbose: bool = False, model: str | None = None) -> 
                                 (session_id, user_id, agent_id, status, event_count, last_active_at, created_at)
                                 VALUES (:sid, :uid, 'default-agent', 'active', 0, NOW(), NOW())
                             """),
-                            {"sid": sid, "uid": uid}
+                            {"sid": sid, "uid": uid},
                         )
-                        
+
                         # Create basic agent events for testing
                         import uuid
+
                         db.execute(
                             text("""
                                 INSERT INTO agent_events 
@@ -202,10 +211,14 @@ def run_case(case: dict, *, verbose: bool = False, model: str | None = None) -> 
                                 (:eid4, :sid, :uid, 'default-agent', '1.0', 'tool_result', 'Test tool result', :cid, NOW())
                             """),
                             {
-                                "sid": sid, "uid": uid, "cid": str(uuid.uuid4()),
-                                "eid1": str(uuid.uuid4()), "eid2": str(uuid.uuid4()), 
-                                "eid3": str(uuid.uuid4()), "eid4": str(uuid.uuid4())
-                            }
+                                "sid": sid,
+                                "uid": uid,
+                                "cid": str(uuid.uuid4()),
+                                "eid1": str(uuid.uuid4()),
+                                "eid2": str(uuid.uuid4()),
+                                "eid3": str(uuid.uuid4()),
+                                "eid4": str(uuid.uuid4()),
+                            },
                         )
                         db.commit()
                         print(f"Debug: Created session and events for {sid}")
@@ -265,6 +278,7 @@ def run_case(case: dict, *, verbose: bool = False, model: str | None = None) -> 
         if check_graph:
             try:
                 import httpx
+
                 # Call Memoria API directly to get explain info
                 response = httpx.post(
                     f"{os.environ['MEMORIA_BASE_URL']}/v1/memories/retrieve",
@@ -272,24 +286,24 @@ def run_case(case: dict, *, verbose: bool = False, model: str | None = None) -> 
                         "user_id": uid,
                         "query": "什么语言做数据分析",
                         "top_k": 3,
-                        "explain": "basic"
+                        "explain": "basic",
                     },
                     headers={"Authorization": f"Bearer {os.environ['MEMORIA_MASTER_KEY']}"},
-                    timeout=10.0
+                    timeout=10.0,
                 )
                 response.raise_for_status()
                 result = response.json()
-                
+
                 explain_info = result.get("explain", {})
                 path = explain_info.get("path", "unknown")
-                
+
                 if "graph" in path or "activation" in path:
                     print(f"    ✅ graph_activation_used — path={path}")
                     passed += 1
                 else:
                     print(f"    ❌ graph_activation_used — path={path} (expected graph)")
                     failed += 1
-                    
+
             except Exception as e:
                 print(f"    ❌ graph_activation_used — error checking: {e}")
                 failed += 1

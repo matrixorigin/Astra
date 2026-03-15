@@ -972,13 +972,19 @@ class PromptAssembler(DbConsumer):
                     "error": tiered_stats.l1_error,
                 }
                 if tiered_stats.retrieval:
-                    stats["retrieval"] = tiered_stats.retrieval if isinstance(tiered_stats.retrieval, dict) else vars(tiered_stats.retrieval)
+                    stats["retrieval"] = (
+                        tiered_stats.retrieval
+                        if isinstance(tiered_stats.retrieval, dict)
+                        else vars(tiered_stats.retrieval)
+                    )
                 stats["total_ms"] = round(tiered_stats.total_ms, 1)
                 # Verbose: add content previews
                 if verbose:
                     l0_text = loader.load_l0(user_id)
                     stats["l0"]["preview"] = l0_text[:200] if l0_text else None
-                    retrieval_count = (tiered_stats.retrieval or {}).get("final_count") or tiered_stats.l1_count
+                    retrieval_count = (tiered_stats.retrieval or {}).get(
+                        "final_count"
+                    ) or tiered_stats.l1_count
                     if retrieval_count > 0:
                         # Re-retrieve to get content (already cached in loader)
                         memories, _ = loader.load_l1(

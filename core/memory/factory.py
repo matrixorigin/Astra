@@ -23,6 +23,7 @@ def create_editor(
         embed_client = None
         try:
             from core.embedding import get_embedding_client
+
             embed_client = get_embedding_client()
         except Exception:
             logger.warning(

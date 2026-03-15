@@ -30,36 +30,36 @@ class MemoryProgramTool(EdgeTool):
                         "operation": {
                             "type": "string",
                             "enum": ["inject", "correct", "purge"],
-                            "description": "Memory operation type"
+                            "description": "Memory operation type",
                         },
                         "content": {
                             "type": "string",
-                            "description": "Memory content to store or new content for correction"
+                            "description": "Memory content to store or new content for correction",
                         },
                         "memory_type": {
                             "type": "string",
                             "enum": ["semantic", "profile", "procedural", "working", "tool_result"],
                             "default": "semantic",
-                            "description": "Type of memory (optional, defaults to semantic)"
+                            "description": "Type of memory (optional, defaults to semantic)",
                         },
                         "memory_id": {
                             "type": "string",
-                            "description": "Memory ID (required for correct; optional for purge if topic provided)"
+                            "description": "Memory ID (required for correct; optional for purge if topic provided)",
                         },
                         "topic": {
                             "type": "string",
-                            "description": "Keyword for bulk purge — deletes all memories matching this topic"
+                            "description": "Keyword for bulk purge — deletes all memories matching this topic",
                         },
                         "reason": {
                             "type": "string",
-                            "description": "Reason for correction or purge (optional)"
-                        }
+                            "description": "Reason for correction or purge (optional)",
+                        },
                     },
-                    "required": ["operation"]
-                }
+                    "required": ["operation"],
+                },
             }
         },
-        "required": ["actions"]
+        "required": ["actions"],
     }
     side_effect = SideEffect.WRITE
 
@@ -94,10 +94,22 @@ class MemoryProgramTool(EdgeTool):
                         memory_id = action.get("memory_id")
                         reason = action.get("reason", "")
                         if not memory_id:
-                            results.append({"operation": "correct", "status": "error", "error": "memory_id required"})
+                            results.append(
+                                {
+                                    "operation": "correct",
+                                    "status": "error",
+                                    "error": "memory_id required",
+                                }
+                            )
                             continue
                         if not content:
-                            results.append({"operation": "correct", "status": "error", "error": "content required for correct"})
+                            results.append(
+                                {
+                                    "operation": "correct",
+                                    "status": "error",
+                                    "error": "content required for correct",
+                                }
+                            )
                             continue
                         editor.correct(memory_id, content, reason)
                         results.append({"operation": "correct", "status": "success"})
@@ -107,25 +119,41 @@ class MemoryProgramTool(EdgeTool):
                         topic = action.get("topic")
                         reason = action.get("reason", "")
                         if not memory_id and not topic:
-                            results.append({"operation": "purge", "status": "error", "error": "memory_id or topic required"})
+                            results.append(
+                                {
+                                    "operation": "purge",
+                                    "status": "error",
+                                    "error": "memory_id or topic required",
+                                }
+                            )
                             continue
                         editor.purge(memory_id=memory_id, topic=topic, reason=reason)
                         results.append({"operation": "purge", "status": "success"})
 
                     else:
-                        results.append({"operation": operation, "status": "error", "error": f"Invalid operation: {operation}"})
+                        results.append(
+                            {
+                                "operation": operation,
+                                "status": "error",
+                                "error": f"Invalid operation: {operation}",
+                            }
+                        )
 
-                return json.dumps({
-                    "status": "success",
-                    "actions_executed": len(results),
-                    "results": results,
-                })
+                return json.dumps(
+                    {
+                        "status": "success",
+                        "actions_executed": len(results),
+                        "results": results,
+                    }
+                )
 
             except Exception as e:
-                return json.dumps({
-                    "status": "error",
-                    "error": str(e),
-                    "actions_executed": 0,
-                })
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": str(e),
+                        "actions_executed": 0,
+                    }
+                )
 
         return await asyncio.to_thread(_run_sync)

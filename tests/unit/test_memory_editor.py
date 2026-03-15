@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 def _make_editor(user_id="user1"):
     from core.memory.editor import MemoryEditor
+
     storage = MagicMock()
     storage.user_id = user_id
     return MemoryEditor(storage), storage
@@ -22,6 +23,7 @@ class TestMemoryEditorInject:
     def test_inject_calls_storage_store(self):
         editor, storage = _make_editor()
         from core.memory.types import MemoryType, Memory
+
         storage.store.return_value = MagicMock(spec=Memory)
 
         editor.inject("hello world", memory_type="semantic")
@@ -34,6 +36,7 @@ class TestMemoryEditorInject:
     def test_inject_passes_session_id(self):
         editor, storage = _make_editor()
         from core.memory.types import Memory
+
         storage.store.return_value = MagicMock(spec=Memory)
 
         editor.inject("test", memory_type="semantic", session_id="sess-abc")
@@ -47,17 +50,17 @@ class TestMemoryEditorCorrect:
         """Bug 7 regression: correct must pass user_id as first arg to storage.correct."""
         editor, storage = _make_editor(user_id="alice")
         from core.memory.types import Memory
+
         storage.correct.return_value = MagicMock(spec=Memory)
 
         editor.correct("mem-123", "new content", reason="updated")
 
-        storage.correct.assert_called_once_with(
-            "alice", "mem-123", "new content", reason="updated"
-        )
+        storage.correct.assert_called_once_with("alice", "mem-123", "new content", reason="updated")
 
     def test_correct_without_reason(self):
         editor, storage = _make_editor()
         from core.memory.types import Memory
+
         storage.correct.return_value = MagicMock(spec=Memory)
 
         editor.correct("mem-123", "new content")
@@ -74,9 +77,7 @@ class TestMemoryEditorPurge:
 
         editor.purge(memory_id="mem-123", reason="done")
 
-        storage.purge.assert_called_once_with(
-            "alice", memory_ids=["mem-123"], reason="done"
-        )
+        storage.purge.assert_called_once_with("alice", memory_ids=["mem-123"], reason="done")
 
     def test_purge_by_topic_calls_storage_purge_with_topic(self):
         """Bug 7 regression: purge by topic must call storage.purge with topic kwarg."""
@@ -85,9 +86,7 @@ class TestMemoryEditorPurge:
 
         editor.purge(topic="old project", reason="cleanup")
 
-        storage.purge.assert_called_once_with(
-            "alice", topic="old project", reason="cleanup"
-        )
+        storage.purge.assert_called_once_with("alice", topic="old project", reason="cleanup")
 
     def test_purge_requires_id_or_topic(self):
         editor, storage = _make_editor()
@@ -112,6 +111,7 @@ class TestMemoryEditorRetrieve:
 
     def test_retrieve_returns_memory_list(self):
         from core.memory.types import Memory, MemoryType
+
         editor, storage = _make_editor()
         m = MagicMock(spec=Memory)
         storage.retrieve.return_value = ([m], None)
@@ -127,10 +127,13 @@ class TestMemoryEditorBatchInject:
         storage.client = MagicMock()
         storage.client.batch_store.return_value = [{"memory_id": "m1"}, {"memory_id": "m2"}]
 
-        editor.batch_inject("user1", [
-            {"content": "fact 1", "memory_type": "semantic"},
-            {"content": "fact 2", "memory_type": "procedural"},
-        ])
+        editor.batch_inject(
+            "user1",
+            [
+                {"content": "fact 1", "memory_type": "semantic"},
+                {"content": "fact 2", "memory_type": "procedural"},
+            ],
+        )
 
         # Must use batch API — single call, not N individual store calls
         storage.client.batch_store.assert_called_once()
@@ -163,6 +166,7 @@ class TestMemoryEditorBatchInject:
         editor.batch_inject("alice", [{"content": "test", "memory_type": "semantic"}])
 
         storage.client.batch_store.assert_called_once()
+
     def test_purge_passes_topic_to_client(self):
         """MemoriaStorage.purge must forward topic kwarg to client.purge."""
         from core.memory.backends.memoria_http import MemoriaStorage

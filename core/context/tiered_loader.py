@@ -26,9 +26,10 @@ logger = logging.getLogger(__name__)
 
 class MemoryMetrics:
     """Simple metrics counter."""
+
     def __init__(self):
         self._counters = {}
-    
+
     def increment(self, key: str, value: int = 1):
         self._counters[key] = self._counters.get(key, 0) + value
 
@@ -63,9 +64,11 @@ class TieredMemoryLoader:
         if self._svc is None:
             try:
                 from core.config import get_memoria_config
+
                 cfg = get_memoria_config()
                 if cfg.base_url and cfg.auth_key:
                     from core.memory.backends.memoria_http import MemoriaHTTPClient
+
                     self._memoria_client = MemoriaHTTPClient(
                         base_url=cfg.base_url,
                         api_key=cfg.api_key,
@@ -122,7 +125,11 @@ class TieredMemoryLoader:
                     memory_types=["semantic", "procedural", "episodic"],
                     session_id=session_id or None,
                 )
-                memories = result.get("results", result.get("memories", [])) if isinstance(result, dict) else result
+                memories = (
+                    result.get("results", result.get("memories", []))
+                    if isinstance(result, dict)
+                    else result
+                )
                 if not memories:
                     return "", {"source": "memoria", "final_count": 0}
                 lines = ["Relevant Memories:"]

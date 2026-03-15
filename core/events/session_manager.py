@@ -205,6 +205,7 @@ class SessionManager:
                 ]
                 if messages and db_session.user_id:
                     from core.memory.backends import get_memoria_storage
+
                     svc = get_memoria_storage(db_session.user_id)
                     svc.request_session_summary(
                         db_session.user_id, session_id, messages, sync=False

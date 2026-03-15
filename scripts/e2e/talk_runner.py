@@ -122,7 +122,14 @@ class TalkSession:
 
         env = os.environ.copy()
         # Remove all proxy settings to avoid connection issues
-        for proxy_var in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"]:
+        for proxy_var in [
+            "http_proxy",
+            "https_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "all_proxy",
+            "ALL_PROXY",
+        ]:
             env.pop(proxy_var, None)
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"

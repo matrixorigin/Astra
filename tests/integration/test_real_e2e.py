@@ -1013,7 +1013,11 @@ class TestSkillManagementRealE2E:
 
         # Should succeed or fail gracefully
         # Output should contain skill-related content or error message
-        assert "skill" in result.output.lower() or "error" in result.output.lower() or "no skills" in result.output.lower()
+        assert (
+            "skill" in result.output.lower()
+            or "error" in result.output.lower()
+            or "no skills" in result.output.lower()
+        )
 
 
 class TestReplayRealE2E:

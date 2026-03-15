@@ -939,11 +939,11 @@ def get_memory_recall(
     # Memoria integration - use HTTP client directly
     import os
     import httpx
-    
+
     memoria_url = os.environ.get("MEMORIA_BASE_URL", "http://localhost:8100")
     memoria_api_key = os.environ.get("MEMORIA_API_KEY", "")
     memoria_master_key = os.environ.get("MEMORIA_MASTER_KEY", "")
-    
+
     if not memoria_api_key and not memoria_master_key:
         # No memoria configured - return empty result
         return {
@@ -954,21 +954,21 @@ def get_memory_recall(
             "phases": {
                 "keyword": {"candidates": 0, "ms": 0},
                 "vector": {"candidates": 0, "ms": 0},
-                "merge": {"candidates": 0, "ms": 0}
+                "merge": {"candidates": 0, "ms": 0},
             },
-            "ranking": []
+            "ranking": [],
         }
-    
+
     # Use master key to create user API key if needed
     auth_header = f"Bearer {memoria_api_key}" if memoria_api_key else f"Bearer {memoria_master_key}"
-    
+
     # Call memoria API
     try:
         response = httpx.get(
             f"{memoria_url}/v1/memories",
             headers={"Authorization": auth_header},
             params={"query": query, "top_k": limit, "session_id": session_id},
-            timeout=10.0
+            timeout=10.0,
         )
         response.raise_for_status()
         result = response.json()
@@ -982,26 +982,28 @@ def get_memory_recall(
             "phases": {
                 "keyword": {"candidates": 0, "ms": 0},
                 "vector": {"candidates": 0, "ms": 0},
-                "merge": {"candidates": 0, "ms": 0}
+                "merge": {"candidates": 0, "ms": 0},
             },
-            "ranking": []
+            "ranking": [],
         }
-    
+
     # Format response to match expected structure
     ranking = []
     for i, mem in enumerate(result.get("memories", []), 1):
-        ranking.append({
-            "rank": i,
-            "memory_id": mem.get("memory_id"),
-            "final_score": mem.get("score", 0.0),
-            "scores": {
-                "vector": mem.get("score", 0.0),
-                "keyword": 0.0,
-                "temporal": 0.0,
-                "confidence": mem.get("confidence", 0.0)
+        ranking.append(
+            {
+                "rank": i,
+                "memory_id": mem.get("memory_id"),
+                "final_score": mem.get("score", 0.0),
+                "scores": {
+                    "vector": mem.get("score", 0.0),
+                    "keyword": 0.0,
+                    "temporal": 0.0,
+                    "confidence": mem.get("confidence", 0.0),
+                },
             }
-        })
-    
+        )
+
     return {
         "query": query,
         "task_hint": task_hint,
@@ -1010,7 +1012,7 @@ def get_memory_recall(
         "phases": {
             "keyword": {"candidates": 0, "ms": 0},
             "vector": {"candidates": len(ranking), "ms": 0},
-            "merge": {"candidates": len(ranking), "ms": 0}
+            "merge": {"candidates": len(ranking), "ms": 0},
         },
-        "ranking": ranking
+        "ranking": ranking,
     }

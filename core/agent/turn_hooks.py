@@ -29,6 +29,7 @@ def _log_episodic_error(msg: str, exc: Exception) -> None:
     """Log episodic errors: debug for schema/table errors (test isolation), warning for others."""
     from sqlalchemy.exc import ProgrammingError as SAProgrammingError
 
+
 def _wait_for_bg_threads(timeout: float = 2.0):
     """Wait for background threads to complete during shutdown."""
     _shutdown_event.set()
@@ -267,7 +268,9 @@ class TurnHooks(DbConsumer):
                     return
             else:
                 by_count = event_count - last_count >= _EPISODIC_EVENT_THRESHOLD
-                by_time = not last_at or (now - last_at).total_seconds() >= _EPISODIC_TIME_THRESHOLD_SEC
+                by_time = (
+                    not last_at or (now - last_at).total_seconds() >= _EPISODIC_TIME_THRESHOLD_SEC
+                )
                 if not (by_count or by_time):
                     return
                 events = (
@@ -283,7 +286,10 @@ class TurnHooks(DbConsumer):
                 if not events:
                     return
                 messages_for_summary = [
-                    {"role": "user" if e.event_type == "user_query" else "assistant", "content": e.content}
+                    {
+                        "role": "user" if e.event_type == "user_query" else "assistant",
+                        "content": e.content,
+                    }
                     for e in reversed(events)
                 ]
         # DB connection released here — HTTP calls happen outside the connection
@@ -337,9 +343,7 @@ class TurnHooks(DbConsumer):
                 # This is a best-effort merge: concurrent turns may still race,
                 # but the window is narrow (HTTP round-trip) and the worst case
                 # is a duplicate episodic summary, not data loss.
-                row = db.query(SessionModel).filter(
-                    SessionModel.session_id == session_id
-                ).first()
+                row = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
                 if row is None:
                     return
                 current_meta = dict(row.session_metadata or {})
@@ -482,7 +486,6 @@ class TurnHooks(DbConsumer):
             f"Context: {reflect_evidence[:200]}"
         )
         try:
-
             svc = get_memoria_storage(user_id)
             svc.store(
                 user_id=user_id,

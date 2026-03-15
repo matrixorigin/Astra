@@ -106,9 +106,11 @@ class TestObserveTurnSessionId:
             t.start = lambda: captured_fn["fn"]()
             return t
 
-        with patch("core.agent.turn_hooks.get_memoria_storage", return_value=svc), \
-             patch("core.agent.turn_hooks._shutdown_event") as mock_shutdown, \
-             patch("threading.Thread", side_effect=fake_thread):
+        with (
+            patch("core.agent.turn_hooks.get_memoria_storage", return_value=svc),
+            patch("core.agent.turn_hooks._shutdown_event") as mock_shutdown,
+            patch("threading.Thread", side_effect=fake_thread),
+        ):
             mock_shutdown.is_set.return_value = False
             hooks.run_observer(
                 session_id="sess-123",

@@ -2218,7 +2218,9 @@ def _get_cloud_skill_schemas(registry) -> list[dict[str, Any]]:
     return schemas
 
 
-async def _execute_cloud_skill(registry, tc_name: str, tc_args: dict[str, Any], current_user=None) -> str:
+async def _execute_cloud_skill(
+    registry, tc_name: str, tc_args: dict[str, Any], current_user=None
+) -> str:
     """Execute a cloud skill server-side and return result as string."""
     from core.exceptions import SkillNotFoundError
 
@@ -2228,9 +2230,9 @@ async def _execute_cloud_skill(registry, tc_name: str, tc_args: dict[str, Any], 
         return json.dumps({"error": f"Cloud skill '{tc_name}' not found"})
     try:
         # Add current_user_id to kwargs for tools that need it
-        if current_user and hasattr(current_user, 'user_id'):
+        if current_user and hasattr(current_user, "user_id"):
             tc_args = {**tc_args, "user_id": current_user.user_id}
-        
+
         if hasattr(skill, "_input_cls") and skill._input_cls is not None:
             validated = skill.validate_input(tc_args)
             output = await skill.execute(validated)
@@ -2899,7 +2901,9 @@ async def chat_turn(
 
                         yield f"data: {json.dumps({'type': 'tool_call_start', 'name': tc_name})}\n\n"
                         _skill_start = time.monotonic()
-                        cloud_result = await _execute_cloud_skill(cloud_registry, tc_name, tc_args, current_user)
+                        cloud_result = await _execute_cloud_skill(
+                            cloud_registry, tc_name, tc_args, current_user
+                        )
                         if request.explain:
                             _explain_steps.append(
                                 {

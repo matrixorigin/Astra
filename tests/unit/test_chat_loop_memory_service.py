@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 class TestChatLoopMemoryServiceUserID:
     def _make_chat_loop(self):
         from core.agent.chat_loop import ChatLoop
+
         mock_llm = MagicMock()
         mock_llm.config = {}
         mock_logger = MagicMock()
@@ -34,10 +35,16 @@ class TestChatLoopMemoryServiceUserID:
         mock_storage = MagicMock(spec=MemoriaStorage)
         mock_storage.user_id = "alice"
 
-        with patch("core.memory.backends.get_memoria_storage", return_value=mock_storage) as mock_get, \
-             patch.dict(os.environ, {"MEMORIA_BASE_URL": "http://localhost:8100", "MEMORIA_MASTER_KEY": "k"}):
-
+        with (
+            patch(
+                "core.memory.backends.get_memoria_storage", return_value=mock_storage
+            ) as mock_get,
+            patch.dict(
+                os.environ, {"MEMORIA_BASE_URL": "http://localhost:8100", "MEMORIA_MASTER_KEY": "k"}
+            ),
+        ):
             from core.memory.backends import get_memoria_storage
+
             svc = get_memoria_storage("alice")
 
         mock_get.assert_called_once_with("alice")

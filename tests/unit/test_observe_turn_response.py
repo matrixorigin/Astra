@@ -10,6 +10,7 @@ class TestObserveTurnResponseParsing:
 
     def _make_client(self, response_body):
         from core.memory.backends.memoria_http import MemoriaHTTPClient
+
         client = MemoriaHTTPClient.__new__(MemoriaHTTPClient)
         client.api_key = "key"
         client.master_key = None
@@ -22,12 +23,18 @@ class TestObserveTurnResponseParsing:
 
     def test_extracts_memories_from_dict_response(self):
         """observe_turn must return the 'memories' list, not the wrapper dict."""
-        client = self._make_client({
-            "memories": [
-                {"memory_id": "m1", "content": "User prefers Python", "memory_type": "semantic"},
-            ],
-            "warning": "LLM not configured",
-        })
+        client = self._make_client(
+            {
+                "memories": [
+                    {
+                        "memory_id": "m1",
+                        "content": "User prefers Python",
+                        "memory_type": "semantic",
+                    },
+                ],
+                "warning": "LLM not configured",
+            }
+        )
         result = client.observe_turn("user1", [{"role": "user", "content": "I prefer Python"}])
         assert isinstance(result, list)
         assert len(result) == 1
@@ -40,9 +47,9 @@ class TestObserveTurnResponseParsing:
 
     def test_list_response_passthrough(self):
         """If API ever returns a list directly, it should still work."""
-        client = self._make_client([
-            {"memory_id": "m1", "content": "test", "memory_type": "semantic"}
-        ])
+        client = self._make_client(
+            [{"memory_id": "m1", "content": "test", "memory_type": "semantic"}]
+        )
         result = client.observe_turn("user1", [{"role": "user", "content": "test"}])
         assert isinstance(result, list)
         assert len(result) == 1

@@ -139,6 +139,7 @@ def test_engine():
     try:
         import logging
         from core.agent.turn_hooks import _bg_threads, _bg_threads_lock, _shutdown_event
+
         _shutdown_event.set()
         logging.getLogger("httpx").disabled = True
         with _bg_threads_lock:
@@ -510,6 +511,7 @@ def drain_turn_hooks_bg_threads():
     yield
     try:
         from core.agent.turn_hooks import _bg_threads, _bg_threads_lock, _shutdown_event
+
         _shutdown_event.set()
         with _bg_threads_lock:
             threads = list(_bg_threads)

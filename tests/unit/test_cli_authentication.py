@@ -14,9 +14,9 @@ class TestCLISessionInfo:
             "session_id": "test-session",
             "agent_id": "test-agent",
             "model": "test-model",
-            "turn": 0
+            "turn": 0,
         }
-        
+
         # The code should extract user_id from session_info
         jwt_user_id = session_info.get("user_id", "")
         assert jwt_user_id == "test-user-123"
@@ -25,7 +25,7 @@ class TestCLISessionInfo:
         """Test that jwt_user_id is created when session_info is None."""
         user_id = "provided-user-id"
         agent_id = None
-        
+
         # When session_info is None, should use provided user_id
         jwt_user_id = user_id or agent_id or ""
         assert jwt_user_id == "provided-user-id"
@@ -34,7 +34,7 @@ class TestCLISessionInfo:
         """Test that jwt_user_id falls back to agent_id when user_id is None."""
         user_id = None
         agent_id = "fallback-agent-id"
-        
+
         jwt_user_id = user_id or agent_id or ""
         assert jwt_user_id == "fallback-agent-id"
 
@@ -42,6 +42,6 @@ class TestCLISessionInfo:
         """Test that jwt_user_id is empty string when both are None."""
         user_id = None
         agent_id = None
-        
+
         jwt_user_id = user_id or agent_id or ""
         assert jwt_user_id == ""

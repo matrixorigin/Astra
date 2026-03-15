@@ -1458,11 +1458,11 @@ def cli(ctx, api_url, profile):
     # Load .env file for environment variables (e.g., MEMORIA_BASE_URL)
     from pathlib import Path
     from dotenv import load_dotenv
-    
+
     env_path = Path.cwd() / ".env"
     if env_path.exists():
         load_dotenv(env_path)
-    
+
     ctx.ensure_object(dict)
     ctx.obj["client"] = SyncAPIClient(api_url, profile=profile)
     ctx.obj["profile"] = profile
@@ -1556,10 +1556,10 @@ def chat(
 
     # --- Auth ---
     # For testing: skip auth check if user_id is provided (verify mode)
-    if user_id and user_id.startswith('__verify_'):
+    if user_id and user_id.startswith("__verify_"):
         # For test users, try to login directly with the actual username
         try:
-            client.login(user_id, 'verify_pass_123!')
+            client.login(user_id, "verify_pass_123!")
         except Exception as e:
             console.print(f"[red]Test user login failed: {e}[/red]")
             sys.exit(1)
@@ -1649,11 +1649,11 @@ def chat(
                 )
             )
             # Force output for single message mode
-            if loop_result and hasattr(loop_result, 'text') and loop_result.text:
+            if loop_result and hasattr(loop_result, "text") and loop_result.text:
                 sys.stdout.write(loop_result.text)
                 sys.stdout.flush()
             # Always print newline to indicate completion
-            sys.stdout.write('\n')
+            sys.stdout.write("\n")
             sys.stdout.flush()
         except Exception as e:
             if debug:
@@ -1932,8 +1932,8 @@ def whoami(ctx):
         click.echo(f"User: {user.get('username', 'N/A')}")
         click.echo(f"Email: {user.get('email', 'N/A')}")
         click.echo(f"User ID: {user.get('user_id', 'N/A')}")
-        if user.get('roles'):
-            roles = ', '.join(user['roles'])
+        if user.get("roles"):
+            roles = ", ".join(user["roles"])
             click.echo(f"Roles: {roles}")
     except Exception as e:
         click.echo(f"❌ Error: {e}")
@@ -2125,9 +2125,10 @@ def skill_register(ctx, skill_file):
 
     try:
         import json
+
         with open(skill_file) as f:
             skill_data = json.load(f)
-        
+
         result = client.register_skill(skill_data)
         skill_name = result.get("skill_name", "skill")
         version = result.get("version", "")
@@ -2150,4 +2151,3 @@ def require_auth(client):
 
 if __name__ == "__main__":
     cli()
-

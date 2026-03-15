@@ -83,9 +83,9 @@ def run_case(case: dict, *, verbose: bool = False, model: str | None = None) -> 
                         VALUES (:sid, :uid, 'default-agent', 'active', 4, NOW(), NOW())
                         ON DUPLICATE KEY UPDATE event_count = 4, status = 'active'
                     """),
-                    {"sid": sid, "uid": uid}
+                    {"sid": sid, "uid": uid},
                 )
-                
+
                 # Create agent events
                 db.execute(
                     text("""
@@ -99,10 +99,13 @@ def run_case(case: dict, *, verbose: bool = False, model: str | None = None) -> 
                         ON DUPLICATE KEY UPDATE content = VALUES(content)
                     """),
                     {
-                        "sid": sid, "uid": uid,
-                        "eid1": f"{sid}-1", "eid2": f"{sid}-2", 
-                        "eid3": f"{sid}-3", "eid4": f"{sid}-4"
-                    }
+                        "sid": sid,
+                        "uid": uid,
+                        "eid1": f"{sid}-1",
+                        "eid2": f"{sid}-2",
+                        "eid3": f"{sid}-3",
+                        "eid4": f"{sid}-4",
+                    },
                 )
                 db.commit()
             except:
@@ -188,7 +191,9 @@ def _check_turn(
     # Rule checks
     rules = turn_def.get("rules", [])
     if rules:
-        results = run_rule_checks(rules, record.response, record.tool_calls, SessionLocal, uid, sid, prev_counts)
+        results = run_rule_checks(
+            rules, record.response, record.tool_calls, SessionLocal, uid, sid, prev_counts
+        )
         for r in results:
             status = "✅" if r.passed else "❌"
             print(f"    {status} {r.name}")
@@ -205,7 +210,9 @@ def _check_turn(
             threshold = judge.get("threshold", 0.7)
             judge_passed = score >= threshold
             status = "✅" if judge_passed else "❌"
-            print(f"    🤖{status} score={score:.2f}, threshold={threshold} — {judge.get('criteria', 'No criteria')}")
+            print(
+                f"    🤖{status} score={score:.2f}, threshold={threshold} — {judge.get('criteria', 'No criteria')}"
+            )
             if judge_passed:
                 passed += 1
             else:
@@ -220,10 +227,10 @@ def _check_turn(
 def _run_llm_judge(response: str, judge_config: dict, model: str) -> float:
     """Run LLM judge on response."""
     from core.llm.client import LLMClient
-    
+
     llm = LLMClient(SessionLocal)
     criteria = judge_config.get("criteria", "Rate the response quality")
-    
+
     prompt = f"""Rate this response on a scale of 0.0 to 1.0 based on: {criteria}
 
 Response to judge: {response}
@@ -234,7 +241,8 @@ Return only a number between 0.0 and 1.0."""
         result = llm.chat(prompt, user_id="judge", model=model)
         # Extract number from response
         import re
-        match = re.search(r'(\d+\.?\d*)', result)
+
+        match = re.search(r"(\d+\.?\d*)", result)
         if match:
             score = float(match.group(1))
             return min(1.0, max(0.0, score))
@@ -246,12 +254,9 @@ Return only a number between 0.0 and 1.0."""
 def _init_prev_counts(case: dict, uid: str, sid: str, prev_counts: dict, uid_only: bool = False):
     """Initialize previous counts for comparison."""
     # This is a simplified version - just set defaults
-    prev_counts.update({
-        "memories_count": 0,
-        "edit_log_count": 0,
-        "agent_events_count": 0,
-        "turn_count": 0
-    })
+    prev_counts.update(
+        {"memories_count": 0, "edit_log_count": 0, "agent_events_count": 0, "turn_count": 0}
+    )
 
 
 def _seed_graph_nodes(user_id: str, count: int = 50) -> None:
@@ -292,14 +297,14 @@ def main():
     for case_file in case_files:
         with open(case_file) as f:
             case = yaml.safe_load(f)
-        
+
         passed, failed = run_case(case, verbose=args.verbose, model=model)
         total_passed += passed
         total_failed += failed
 
     print(f"\n{'=' * 60}")
     print(f"Total: {total_passed} passed, {total_failed} failed")
-    
+
     return 0 if total_failed == 0 else 1
 
 

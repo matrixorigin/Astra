@@ -8,8 +8,9 @@ from dataclasses import dataclass
 
 class MemoryType(str, Enum):
     """Memory type enumeration."""
+
     SEMANTIC = "semantic"
-    PROFILE = "profile" 
+    PROFILE = "profile"
     PROCEDURAL = "procedural"
     WORKING = "working"
     TOOL_RESULT = "tool_result"
@@ -18,6 +19,7 @@ class MemoryType(str, Enum):
 
 class TrustTier(str, Enum):
     """Trust tier enumeration."""
+
     T1 = "T1"  # Highest trust
     T2 = "T2"
     T3 = "T3"  # Default
@@ -28,6 +30,7 @@ class TrustTier(str, Enum):
 @dataclass
 class Memory:
     """Memory data structure."""
+
     memory_id: str
     user_id: str
     content: str
@@ -40,7 +43,7 @@ class Memory:
     created_at: Optional[datetime] = None
     initial_confidence: float = 0.75  # Add this field
     retrieval_score: Optional[float] = None  # Set by retriever
-    
+
     def __post_init__(self):
         if self.source_event_ids is None:
             self.source_event_ids = []
@@ -53,6 +56,7 @@ class Memory:
 @dataclass
 class RetrievalWeights:
     """Weights for memory retrieval scoring."""
+
     semantic: float = 1.0
     keyword: float = 0.5
     temporal: float = 0.3
@@ -65,10 +69,4 @@ def _utcnow() -> datetime:
 
 
 # Trust tier defaults for compatibility
-trust_tier_defaults = {
-    "T1": 0.95,
-    "T2": 0.85, 
-    "T3": 0.75,
-    "T4": 0.65,
-    "T5": 0.55
-}
+trust_tier_defaults = {"T1": 0.95, "T2": 0.85, "T3": 0.75, "T4": 0.65, "T5": 0.55}

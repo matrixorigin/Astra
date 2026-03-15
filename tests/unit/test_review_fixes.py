@@ -19,11 +19,13 @@ from unittest.mock import MagicMock, patch, call
 
 # ── Fix 1: Default port is 8100 ──────────────────────────────────────────────
 
+
 class TestDefaultPort:
     def test_memoria_http_client_default_port(self):
         """MemoriaHTTPClient default base_url must use port 8100."""
         from core.memory.backends.memoria_http import MemoriaHTTPClient
         import inspect
+
         sig = inspect.signature(MemoriaHTTPClient.__init__)
         default = sig.parameters["base_url"].default
         assert "8100" in default, f"Expected port 8100 in default, got: {default}"
@@ -41,14 +43,17 @@ class TestDefaultPort:
             os.environ.pop("TESTING", None)
             # Reset config cache
             from core import config as cfg_mod
+
             cfg_mod.reset_config()
             from core.config import get_memoria_config
+
             cfg = get_memoria_config()
             assert "8100" in cfg.base_url, f"Expected 8100 in base_url, got: {cfg.base_url}"
             cfg_mod.reset_config()
 
 
 # ── Fix 2: async MemoryProgramTool wraps sync HTTP ───────────────────────────
+
 
 class TestMemoryProgramToolAsync:
     def test_execute_uses_asyncio_to_thread(self):
@@ -168,10 +173,12 @@ class TestMemoryProgramToolAsync:
 
 # ── Fix 3: Thread-safe config singleton ──────────────────────────────────────
 
+
 class TestConfigThreadSafety:
     def test_get_config_thread_safe(self):
         """Concurrent get_config() calls must all return the same instance."""
         from core import config as cfg_mod
+
         cfg_mod.reset_config()
 
         results = []
@@ -198,6 +205,7 @@ class TestConfigThreadSafety:
     def test_reset_config_clears_singleton(self):
         """reset_config() must allow a fresh instance to be created."""
         from core import config as cfg_mod
+
         cfg_mod.reset_config()
         c1 = cfg_mod.get_config()
         cfg_mod.reset_config()
@@ -208,10 +216,12 @@ class TestConfigThreadSafety:
 
 # ── Fix 4: get_memoria_storage uses core/config.py ───────────────────────────
 
+
 class TestGetMemoriaStorageUsesConfig:
     def test_uses_test_memoria_env_vars_in_test(self):
         """In test env, get_memoria_storage must use TEST_MEMORIA_* variables."""
         from core import config as cfg_mod
+
         cfg_mod.reset_config()
 
         env_overrides = {
@@ -230,6 +240,7 @@ class TestGetMemoriaStorageUsesConfig:
     def test_raises_without_auth(self):
         """get_memoria_storage must raise RuntimeError when no auth key configured."""
         from core import config as cfg_mod
+
         cfg_mod.reset_config()
 
         env = {
@@ -241,8 +252,10 @@ class TestGetMemoriaStorageUsesConfig:
         with patch.dict(os.environ, env):
             cfg_mod.reset_config()
             import pytest
+
             with pytest.raises(RuntimeError, match="authentication"):
                 from core.memory.backends import get_memoria_storage
+
                 get_memoria_storage("alice")
 
         cfg_mod.reset_config()
@@ -250,16 +263,20 @@ class TestGetMemoriaStorageUsesConfig:
     def test_raises_for_empty_user_id(self):
         """get_memoria_storage must raise ValueError for empty user_id."""
         import pytest
+
         with pytest.raises(ValueError, match="user_id"):
             from core.memory.backends import get_memoria_storage
+
             get_memoria_storage("")
 
 
 # ── Fix 5: batch_inject uses batch API ───────────────────────────────────────
 
+
 class TestBatchInjectUsesBatchAPI:
     def _make_editor(self, user_id="alice"):
         from core.memory.editor import MemoryEditor
+
         storage = MagicMock()
         storage.user_id = user_id
         return MemoryEditor(storage), storage
@@ -291,6 +308,7 @@ class TestBatchInjectUsesBatchAPI:
     def test_batch_inject_wrong_user_id_raises(self):
         """batch_inject with mismatched user_id must raise ValueError."""
         import pytest
+
         editor, _ = self._make_editor(user_id="alice")
         with pytest.raises(ValueError, match="user_id"):
             editor.batch_inject("bob", [{"content": "test"}])
@@ -313,6 +331,7 @@ class TestBatchInjectUsesBatchAPI:
 
 # ── Fix 6: session_manager uses real request_session_summary ─────────────────
 
+
 class TestSessionManagerSummary:
     def test_close_session_calls_request_session_summary(self):
         """close_session must call request_session_summary, not the no-op generate_session_summary."""
@@ -330,7 +349,9 @@ class TestSessionManagerSummary:
         mock_event.content = "hello"
 
         mock_db.query.return_value.filter_by.return_value.first.return_value = mock_session
-        mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [mock_event]
+        mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
+            mock_event
+        ]
 
         mgr = SessionManager.__new__(SessionManager)
         mgr._db = mock_db
@@ -338,7 +359,9 @@ class TestSessionManagerSummary:
 
         mock_storage = MagicMock()
 
-        with patch("core.memory.backends.get_memoria_storage", return_value=mock_storage) as mock_get:
+        with patch(
+            "core.memory.backends.get_memoria_storage", return_value=mock_storage
+        ) as mock_get:
             with patch.object(mgr, "_get_session", return_value=mock_db):
                 try:
                     mgr.close_session("sess-1")
@@ -354,10 +377,12 @@ class TestSessionManagerSummary:
 
 # ── Fix 7: TieredMemoryLoader uses core/config.py ────────────────────────────
 
+
 class TestTieredMemoryLoaderUsesConfig:
     def test_uses_get_memoria_config_not_raw_env(self):
         """TieredMemoryLoader must use get_memoria_config(), not raw os.environ."""
         from core import config as cfg_mod
+
         cfg_mod.reset_config()
 
         with patch("core.config.get_memoria_config") as mock_cfg:
@@ -370,6 +395,7 @@ class TestTieredMemoryLoaderUsesConfig:
             with patch("core.memory.backends.memoria_http.MemoriaHTTPClient") as MockClient:
                 MockClient.return_value = MagicMock()
                 from core.context.tiered_loader import TieredMemoryLoader
+
                 loader = TieredMemoryLoader()
                 if loader._memoria_client is not None:
                     mock_cfg.assert_called()
@@ -379,10 +405,12 @@ class TestTieredMemoryLoaderUsesConfig:
     def test_no_crash_when_memoria_not_configured(self):
         """TieredMemoryLoader must not crash when Memoria is not configured."""
         from core import config as cfg_mod
+
         cfg_mod.reset_config()
 
         with patch("core.config.get_memoria_config", side_effect=RuntimeError("not configured")):
             from core.context.tiered_loader import TieredMemoryLoader
+
             loader = TieredMemoryLoader()
             assert loader._memoria_client is None
 
@@ -391,6 +419,7 @@ class TestTieredMemoryLoaderUsesConfig:
     def test_load_l0_returns_empty_string_when_no_client(self):
         """load_l0 must return '' when no memory service or client configured."""
         from core.context.tiered_loader import TieredMemoryLoader
+
         loader = TieredMemoryLoader.__new__(TieredMemoryLoader)
         loader._svc = None
         loader._memoria_client = None
@@ -402,10 +431,12 @@ class TestTieredMemoryLoaderUsesConfig:
 
 # ── Fix 1 (extra): interfaces.py uses field(default_factory=...) ─────────────
 
+
 class TestInterfacesDataclassDefaults:
     def test_governance_report_actions_taken_not_shared(self):
         """GovernanceReport instances must not share the same actions_taken list."""
         from core.memory.interfaces import GovernanceReport
+
         r1 = GovernanceReport()
         r2 = GovernanceReport()
         r1.actions_taken.append("action")
@@ -414,6 +445,7 @@ class TestInterfacesDataclassDefaults:
     def test_health_report_details_not_shared(self):
         """HealthReport instances must not share the same details dict."""
         from core.memory.interfaces import HealthReport
+
         r1 = HealthReport()
         r2 = HealthReport()
         r1.details["key"] = "value"

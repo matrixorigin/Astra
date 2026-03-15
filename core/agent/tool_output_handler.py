@@ -278,7 +278,6 @@ def process_tool_output(
     # 1. Store full output in mo-memoria
     import uuid
 
-
     source_events = [turn_event_id] if turn_event_id else []
     try:
         mem_obj = Memory(

@@ -9,6 +9,7 @@ class TestCreateMemoryServiceImport:
     def test_importable(self):
         """Bug 19: from core.memory import create_memory_service must not raise ImportError."""
         from core.memory import create_memory_service
+
         assert callable(create_memory_service)
 
     def test_returns_memoria_storage(self):
@@ -16,10 +17,13 @@ class TestCreateMemoryServiceImport:
         from core.memory import create_memory_service
         from core.memory.backends.memoria_http import MemoriaStorage
 
-        with patch.dict(os.environ, {
-            "MEMORIA_BASE_URL": "http://localhost:8100",
-            "MEMORIA_MASTER_KEY": "test-key",
-        }):
+        with patch.dict(
+            os.environ,
+            {
+                "MEMORIA_BASE_URL": "http://localhost:8100",
+                "MEMORIA_MASTER_KEY": "test-key",
+            },
+        ):
             svc = create_memory_service(db_factory=None, user_id="alice")
 
         assert isinstance(svc, MemoriaStorage)
@@ -30,10 +34,13 @@ class TestCreateMemoryServiceImport:
         from core.memory import create_memory_service
 
         sentinel = object()  # not a real db_factory
-        with patch.dict(os.environ, {
-            "MEMORIA_BASE_URL": "http://localhost:8100",
-            "MEMORIA_MASTER_KEY": "test-key",
-        }):
+        with patch.dict(
+            os.environ,
+            {
+                "MEMORIA_BASE_URL": "http://localhost:8100",
+                "MEMORIA_MASTER_KEY": "test-key",
+            },
+        ):
             svc = create_memory_service(sentinel, user_id="bob")
 
         assert svc.user_id == "bob"

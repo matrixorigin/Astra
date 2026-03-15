@@ -198,7 +198,6 @@ class ReflectService(DbConsumer):
 
             # 3. Past lessons
             try:
-
                 svc = get_memoria_storage(user_id)
                 memories, _ = svc.retrieve(
                     user_id,

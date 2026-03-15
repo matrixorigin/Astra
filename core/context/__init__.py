@@ -10,7 +10,7 @@ from core.context.scorer import RelevanceScorer
 
 __all__ = [
     "Context",
-    "ContextFragment", 
+    "ContextFragment",
     "ContextManager",
     "EmbeddingService",
     "HybridRetriever",

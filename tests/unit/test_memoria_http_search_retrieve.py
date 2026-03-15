@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 def _make_client():
     from core.memory.backends.memoria_http import MemoriaHTTPClient
+
     c = MemoriaHTTPClient.__new__(MemoriaHTTPClient)
     c.client = MagicMock()
     c.api_key = None
@@ -15,6 +16,7 @@ def _make_client():
 
 def _make_storage():
     from core.memory.backends.memoria_http import MemoriaStorage
+
     s = MemoriaStorage.__new__(MemoriaStorage)
     s.client = MagicMock()
     s.user_id = "u1"
@@ -48,6 +50,7 @@ class TestRetrieveKeyErrorBug17:
     def test_retrieve_no_keyerror_on_unexpected_format(self):
         """Bug 17: retrieve() must not raise KeyError if API returns unexpected format."""
         from core.memory.types import MemoryType
+
         s = _make_storage()
         s.client.retrieve.return_value = {"unexpected_key": []}  # no "results"
 
@@ -57,10 +60,18 @@ class TestRetrieveKeyErrorBug17:
     def test_retrieve_reads_results_key(self):
         """retrieve() must read from 'results' key."""
         from core.memory.types import MemoryType
+
         s = _make_storage()
         s.client.retrieve.return_value = {
-            "results": [{"memory_id": "m1", "content": "hello", "memory_type": "semantic",
-                         "trust_tier": "T3", "initial_confidence": 0.8}]
+            "results": [
+                {
+                    "memory_id": "m1",
+                    "content": "hello",
+                    "memory_type": "semantic",
+                    "trust_tier": "T3",
+                    "initial_confidence": 0.8,
+                }
+            ]
         }
 
         memories, _ = s.retrieve("u1", "query", memory_types=[MemoryType.SEMANTIC])

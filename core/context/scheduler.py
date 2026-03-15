@@ -49,7 +49,7 @@ class SchedulerBackend(ABC):
 
 class GovernanceTaskRunner:
     """Executes governance tasks with distributed locking.
-    
+
     Uses infra_distributed_locks table for coordination across multiple instances.
     """
 
@@ -85,7 +85,7 @@ class GovernanceTaskRunner:
         """Try to acquire distributed lock."""
         now = datetime.now()
         expires_at = now + timedelta(seconds=LOCK_TTL)
-        
+
         try:
             # Try INSERT (new lock)
             db.execute(
@@ -93,7 +93,13 @@ class GovernanceTaskRunner:
                     INSERT INTO infra_distributed_locks (lock_name, instance_id, acquired_at, expires_at, task_name)
                     VALUES (:name, :holder, :now, :expires, :task)
                 """),
-                {"name": lock_name, "holder": self._instance_id, "now": now, "expires": expires_at, "task": lock_name}
+                {
+                    "name": lock_name,
+                    "holder": self._instance_id,
+                    "now": now,
+                    "expires": expires_at,
+                    "task": lock_name,
+                },
             )
             db.commit()
             return True
@@ -105,7 +111,7 @@ class GovernanceTaskRunner:
                     SET instance_id = :holder, acquired_at = :now, expires_at = :expires
                     WHERE lock_name = :name AND expires_at < :now
                 """),
-                {"name": lock_name, "holder": self._instance_id, "now": now, "expires": expires_at}
+                {"name": lock_name, "holder": self._instance_id, "now": now, "expires": expires_at},
             )
             db.commit()
             return result.rowcount > 0
@@ -113,8 +119,10 @@ class GovernanceTaskRunner:
     def _release(self, db: Session, lock_name: str) -> None:
         """Release distributed lock."""
         db.execute(
-            text("DELETE FROM infra_distributed_locks WHERE lock_name = :name AND instance_id = :holder"),
-            {"name": lock_name, "holder": self._instance_id}
+            text(
+                "DELETE FROM infra_distributed_locks WHERE lock_name = :name AND instance_id = :holder"
+            ),
+            {"name": lock_name, "holder": self._instance_id},
         )
         db.commit()
 
@@ -122,12 +130,12 @@ class GovernanceTaskRunner:
         """Execute the actual governance task."""
         if task_name == "eval_daily":
             return self._run_eval_daily(db)
-        
+
         from core.context.lifecycle import MemoryGovernanceEngine
-        
+
         # Get db_factory from context manager
         engine = MemoryGovernanceEngine(db_factory=lambda: db)
-        
+
         if task_name == "hourly":
             return engine.run_hourly_tasks()
         elif task_name == "daily":
@@ -186,10 +194,14 @@ class AsyncIOBackend(SchedulerBackend):
 class MemoryGovernanceScheduler:
     """Facade for governance scheduling."""
 
-    def __init__(self, db_context_factory: Callable | None = None, backend: SchedulerBackend | None = None):
+    def __init__(
+        self, db_context_factory: Callable | None = None, backend: SchedulerBackend | None = None
+    ):
         self._enabled = GOVERNANCE_ENABLED
         self._runner = GovernanceTaskRunner(db_context_factory) if db_context_factory else None
-        self._backend = backend or (AsyncIOBackend(self._runner) if self._enabled and self._runner else None)
+        self._backend = backend or (
+            AsyncIOBackend(self._runner) if self._enabled and self._runner else None
+        )
 
     async def start(self) -> None:
         """Start the scheduler."""

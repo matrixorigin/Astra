@@ -10,6 +10,7 @@ from enum import Enum
 
 class DatasetStatus(Enum):
     """Status of dataset extraction."""
+
     PENDING = "pending"
     EXTRACTING = "extracting"
     READY = "ready"
@@ -19,6 +20,7 @@ class DatasetStatus(Enum):
 @dataclass
 class DatasetConfig:
     """Configuration for dataset extraction."""
+
     dataset_id: str
     name: str
     description: str
@@ -29,6 +31,7 @@ class DatasetConfig:
 @dataclass
 class DatasetMetadata:
     """Metadata for extracted dataset."""
+
     dataset_id: str
     config: DatasetConfig
     status: DatasetStatus
@@ -39,6 +42,7 @@ class DatasetMetadata:
 @dataclass
 class DatasetLineage:
     """Lineage tracking for dataset."""
+
     dataset_id: str
     source_branch: str
     source_table: str
@@ -51,6 +55,7 @@ class DatasetLineage:
 @dataclass
 class TrainingExample:
     """Single training example."""
+
     example_id: str
     session_id: str
     event_id: str
@@ -63,10 +68,10 @@ class TrainingExample:
 
 class TrainingDataPipeline:
     """Extracts training data with versioning."""
-    
+
     def __init__(self, db_factory):
         self.db_factory = db_factory
-    
+
     def extract(self, config: DatasetConfig) -> DatasetMetadata:
         """Extract dataset with given config."""
         # Stub implementation
@@ -75,6 +80,5 @@ class TrainingDataPipeline:
             config=config,
             status=DatasetStatus.PENDING,
             row_count=0,
-            snapshot_id="stub"
+            snapshot_id="stub",
         )
-

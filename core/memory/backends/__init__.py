@@ -14,6 +14,7 @@ def get_memoria_storage(user_id: str) -> MemoriaStorage:
     if not user_id:
         raise ValueError("get_memoria_storage requires a non-empty user_id")
     from core.config import get_memoria_config
+
     cfg = get_memoria_config()
     if not cfg.auth_key:
         raise RuntimeError(

@@ -8,6 +8,7 @@ import pytest
 class TestPurgeAll:
     def _make_storage(self):
         from core.memory.backends.memoria_http import MemoriaStorage
+
         s = MemoriaStorage.__new__(MemoriaStorage)
         s.client = MagicMock()
         s.user_id = "user1"

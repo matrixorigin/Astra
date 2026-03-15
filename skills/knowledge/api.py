@@ -22,31 +22,29 @@ logger = get_logger(__name__)
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 # Default configuration for trust tiers
-DEFAULT_CONFIG = type('Config', (), {
-    'half_lives': {'T1': 90, 'T2': 60, 'T3': 30, 'T4': 7}
-})()
+DEFAULT_CONFIG = type("Config", (), {"half_lives": {"T1": 90, "T2": 60, "T3": 30, "T4": 7}})()
 
 
 def trust_tier_defaults(tier: str) -> dict[str, Any]:
     """Get default values for a trust tier."""
     defaults = {
-        'T1': {'initial_confidence': 0.95, 'decay_rate': 0.01},
-        'T2': {'initial_confidence': 0.85, 'decay_rate': 0.02},
-        'T3': {'initial_confidence': 0.75, 'decay_rate': 0.03},
-        'T4': {'initial_confidence': 0.60, 'decay_rate': 0.05},
+        "T1": {"initial_confidence": 0.95, "decay_rate": 0.01},
+        "T2": {"initial_confidence": 0.85, "decay_rate": 0.02},
+        "T3": {"initial_confidence": 0.75, "decay_rate": 0.03},
+        "T4": {"initial_confidence": 0.60, "decay_rate": 0.05},
     }
-    return defaults.get(tier, defaults['T3'])
+    return defaults.get(tier, defaults["T3"])
 
 
 def parse_json_array(text: str) -> list[dict[str, Any]]:
     """Parse JSON array from LLM response, handling markdown code blocks."""
     text = text.strip()
     # Remove markdown code blocks
-    if text.startswith('```'):
-        lines = text.split('\n')
-        text = '\n'.join(lines[1:-1] if lines[-1].strip() == '```' else lines[1:])
+    if text.startswith("```"):
+        lines = text.split("\n")
+        text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
         text = text.strip()
-    
+
     try:
         result = json.loads(text)
         return result if isinstance(result, list) else []
@@ -440,7 +438,6 @@ class KnowledgeExtractor:
     def _extract_preference(self, event, user_id: str) -> dict[str, Any] | None:
         content = event.content
         if "typescript" in content.lower():
-
             defaults = trust_tier_defaults("T3")
             return {
                 "user_id": user_id,
@@ -457,7 +454,6 @@ class KnowledgeExtractor:
     def _extract_pattern(self, event, user_id: str) -> dict[str, Any] | None:
         content = event.content.lower()
         if "dependency injection" in content:
-
             defaults = trust_tier_defaults("T3")
             return {
                 "user_id": user_id,

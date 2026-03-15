@@ -37,12 +37,13 @@ async def lifespan(app: FastAPI):
     logger.info("Validating startup configuration...")
     try:
         from core.config_validation import check_startup_config
+
         check_startup_config(fail_on_warnings=False)
     except Exception as e:
         logger.error(f"Configuration validation failed: {e}")
         # Don't fail startup on config warnings, but log them
         logger.warning("Continuing startup despite configuration issues")
-    
+
     # Startup
     logger.info("Initializing database...")
     try:
@@ -163,7 +164,7 @@ async def lifespan(app: FastAPI):
     try:
         from core.context.scheduler import MemoryGovernanceScheduler
         from api.database import get_db_context
-        
+
         scheduler = MemoryGovernanceScheduler(get_db_context)
         await scheduler.start()
         logger.info("Governance scheduler started")

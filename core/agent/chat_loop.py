@@ -463,6 +463,7 @@ class ChatLoop:
         if _mem_svc is None and user_id:
             try:
                 from core.memory.backends import get_memoria_storage
+
                 _mem_svc = get_memoria_storage(user_id)
             except Exception:
                 pass

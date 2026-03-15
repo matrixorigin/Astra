@@ -7,6 +7,7 @@ from typing import Any, Dict, List
 @dataclass
 class GovernanceReport:
     """Governance report from memory system."""
+
     total_memories: int = 0
     active_memories: int = 0
     quarantined_memories: int = 0
@@ -17,6 +18,7 @@ class GovernanceReport:
 @dataclass
 class HealthReport:
     """Health report from memory system."""
+
     status: str = "healthy"
     total_memories: int = 0
     needs_rebuild: bool = False

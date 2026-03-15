@@ -8,6 +8,7 @@ import pytest
 class TestGetMemoryEndpoint:
     def _make_client(self):
         from core.memory.backends.memoria_http import MemoriaHTTPClient
+
         c = MemoriaHTTPClient.__new__(MemoriaHTTPClient)
         c.api_key = "key"
         c.master_key = None
@@ -20,7 +21,9 @@ class TestGetMemoryEndpoint:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.json.return_value = {
-            "memory_id": "m1", "content": "test", "memory_type": "semantic"
+            "memory_id": "m1",
+            "content": "test",
+            "memory_type": "semantic",
         }
         mock_resp.raise_for_status = MagicMock()
         client.client.get.return_value = mock_resp

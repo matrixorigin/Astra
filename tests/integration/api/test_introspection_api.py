@@ -1364,7 +1364,9 @@ class TestMemoryRecallExplain:
         db.commit()
         return memories
 
-    def test_recall_returns_ranking_with_scores(self, client, auth_headers, db, test_user, http_client):
+    def test_recall_returns_ranking_with_scores(
+        self, client, auth_headers, db, test_user, http_client
+    ):
         """Recall endpoint returns per-candidate 4-dimension score breakdown."""
         from api.models.agent import Session as SessionModel
         import os
@@ -1378,21 +1380,23 @@ class TestMemoryRecallExplain:
         )
         db.add(session)
         db.commit()
-        
+
         # Seed memories via memoria API
         memoria_url = os.environ.get("MEMORIA_BASE_URL", "http://localhost:8100")
-        memoria_master_key = os.environ.get("MEMORIA_MASTER_KEY", "test-master-key-for-docker-compose")
-        
+        memoria_master_key = os.environ.get(
+            "MEMORIA_MASTER_KEY", "test-master-key-for-docker-compose"
+        )
+
         # Create API key for test user
         key_resp = http_client.post(
             f"{memoria_url}/auth/keys",
             headers={"Authorization": f"Bearer {memoria_master_key}"},
             json={"user_id": test_user.user_id, "name": "test key"},
-            timeout=5.0
+            timeout=5.0,
         )
         key_resp.raise_for_status()
         api_key = key_resp.json()["raw_key"]
-    
+
         # Store test memories
         for content in ["Python async patterns", "Go concurrency model", "Rust ownership rules"]:
             http_client.post(
@@ -1401,11 +1405,11 @@ class TestMemoryRecallExplain:
                 json={
                     "content": content,
                     "memory_type": "semantic",
-                    "session_id": session.session_id
+                    "session_id": session.session_id,
                 },
-                timeout=5.0
+                timeout=5.0,
             )
-        
+
         try:
             resp = client.get(
                 "/introspection/memory/recall",

@@ -51,7 +51,7 @@ def _make_hooks(session_row, events=None):
     # Make second query() call return event_query
     db.query.side_effect = [
         db.query.return_value,  # first call: SessionModel
-        event_query,            # second call: EventModel
+        event_query,  # second call: EventModel
     ]
 
     db_factory = MagicMock()
@@ -107,9 +107,7 @@ class TestMaybeTriggerEpisodicShortSession:
         db.query.side_effect = [
             db.query.return_value,  # SessionModel
             MagicMock(  # EventModel for stub (user_query)
-                **{
-                    "filter.return_value.order_by.return_value.first.return_value": user_event
-                }
+                **{"filter.return_value.order_by.return_value.first.return_value": user_event}
             ),
         ]
 
@@ -145,8 +143,8 @@ class TestMaybeTriggerEpisodicShortSession:
         )
         db.query.side_effect = [
             db.query.return_value,  # SessionModel
-            no_event_query,         # EventModel user_query → None
-            no_event_query,         # EventModel llm_response → None
+            no_event_query,  # EventModel user_query → None
+            no_event_query,  # EventModel llm_response → None
         ]
 
         svc = MagicMock()
@@ -196,7 +194,8 @@ class TestMaybeTriggerEpisodicLongSession:
             "sess1",
             event_count=_EPISODIC_MIN_EVENTS + 5,
             metadata={
-                "episodic_last_event_count": _EPISODIC_MIN_EVENTS + 4,  # count delta = 1 (below threshold)
+                "episodic_last_event_count": _EPISODIC_MIN_EVENTS
+                + 4,  # count delta = 1 (below threshold)
                 "episodic_last_at": old_time,
             },
         )
@@ -276,16 +275,19 @@ class TestMaybeTriggerEpisodicLongSession:
 class TestTrimTopic:
     def test_trim_adds_prefix(self):
         from core.agent.turn_hooks import TurnHooks
+
         assert TurnHooks._trim_topic("hello world") == "Topic: hello world"
 
     def test_trim_truncates_long_text(self):
         from core.agent.turn_hooks import TurnHooks, _EPISODIC_STUB_MAX_LEN
+
         long = "x" * (_EPISODIC_STUB_MAX_LEN + 50)
         result = TurnHooks._trim_topic(long)
         assert len(result) <= len("Topic: ") + _EPISODIC_STUB_MAX_LEN
 
     def test_trim_empty_returns_empty(self):
         from core.agent.turn_hooks import TurnHooks
+
         assert TurnHooks._trim_topic("") == ""
         assert TurnHooks._trim_topic("   ") == ""
 
@@ -303,9 +305,9 @@ class TestMaybeTriggerEpisodicErrorHandling:
         user_event = _make_event("user_query", "test query long enough")
         db.query.side_effect = [
             db.query.return_value,
-            MagicMock(**{
-                "filter.return_value.order_by.return_value.first.return_value": user_event
-            }),
+            MagicMock(
+                **{"filter.return_value.order_by.return_value.first.return_value": user_event}
+            ),
         ]
         # Phase 3 opens a new db context — make it raise on commit
         write_db = MagicMock()
@@ -387,9 +389,9 @@ class TestMaybeTriggerEpisodicErrorHandling:
         user_event = _make_event("user_query", "test")
         db.query.side_effect = [
             db.query.return_value,
-            MagicMock(**{
-                "filter.return_value.order_by.return_value.first.return_value": user_event
-            }),
+            MagicMock(
+                **{"filter.return_value.order_by.return_value.first.return_value": user_event}
+            ),
         ]
 
         svc = MagicMock()

@@ -325,7 +325,7 @@ class MemoriaStorage:
         initial_confidence: float = 0.75,
         trust_tier: TrustTier = TrustTier.T3,
         session_id: Optional[str] = None,
-        **kwargs  # Accept additional arguments
+        **kwargs,  # Accept additional arguments
     ) -> Memory:
         result = self.client.store(
             user_id=user_id,
@@ -379,7 +379,8 @@ class MemoriaStorage:
         session_id: Optional[str] = None,
     ) -> list[Memory]:
         results = self.client.observe_turn(
-            user_id, messages,
+            user_id,
+            messages,
             source_event_ids=source_event_ids,
             session_id=session_id,
         )
@@ -418,7 +419,8 @@ class MemoriaStorage:
         **kwargs: Any,
     ) -> Any:
         memories = self.observe_turn(
-            user_id, messages,
+            user_id,
+            messages,
             source_event_ids=source_event_ids,
             session_id=session_id,
         )

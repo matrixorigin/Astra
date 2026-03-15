@@ -91,22 +91,24 @@ def check_db_rule(
         if table == "mem_memories":
             # Connect directly to memoria database
             from sqlalchemy import create_engine, text
-            memoria_engine = create_engine('mysql+pymysql://root:111@localhost:6001/memoria')
-            
+
+            memoria_engine = create_engine("mysql+pymysql://root:111@localhost:6001/memoria")
+
             with memoria_engine.connect() as conn:
                 # Build query based on where clause
                 query = "SELECT COUNT(*) FROM mem_memories WHERE user_id = :uid AND is_active != 0"
                 params = {"uid": uid}
-                
+
                 # Add content filter if specified
                 if "content LIKE" in where:
                     import re
+
                     match = re.search(r"content LIKE '%([^%]+)%'", where)
                     if match:
                         search_term = match.group(1)
                         query += " AND content LIKE :search"
                         params["search"] = f"%{search_term}%"
-                
+
                 count = conn.execute(text(query), params).scalar() or 0
 
                 # Check count assertion
@@ -115,33 +117,42 @@ def check_db_rule(
                     if count_assert.startswith(">="):
                         min_count = int(count_assert[2:])
                         passed = count >= min_count
-                        results.append(CheckResult(
-                            f"db:memories_count>={min_count}",
-                            passed,
-                            f"found {count} memories" if not passed else ""
-                        ))
+                        results.append(
+                            CheckResult(
+                                f"db:memories_count>={min_count}",
+                                passed,
+                                f"found {count} memories" if not passed else "",
+                            )
+                        )
 
         elif table == "mem_edit_log":
             # For edit log, check memoria database
             from sqlalchemy import create_engine, text
-            memoria_engine = create_engine('mysql+pymysql://root:111@localhost:6001/memoria')
-            
+
+            memoria_engine = create_engine("mysql+pymysql://root:111@localhost:6001/memoria")
+
             with memoria_engine.connect() as conn:
-                count = conn.execute(
-                    text("SELECT COUNT(*) FROM mem_edit_log WHERE user_id = :uid"),
-                    {"uid": uid}
-                ).scalar() or 0
+                count = (
+                    conn.execute(
+                        text("SELECT COUNT(*) FROM mem_edit_log WHERE user_id = :uid"), {"uid": uid}
+                    ).scalar()
+                    or 0
+                )
 
                 if "count" in asserts:
                     count_assert = asserts["count"]
                     if count_assert.startswith(">="):
                         min_count = int(count_assert[2:])
                         passed = count >= min_count
-                        results.append(CheckResult(
-                            f"db:edit_log_count>={min_count}",
-                            passed,
-                            f"found {count} memories (edit log via count)" if not passed else ""
-                        ))
+                        results.append(
+                            CheckResult(
+                                f"db:edit_log_count>={min_count}",
+                                passed,
+                                f"found {count} memories (edit log via count)"
+                                if not passed
+                                else "",
+                            )
+                        )
 
         elif table == "agent_events":
             # agent_events is still in SQL database, use direct query
@@ -152,7 +163,7 @@ def check_db_rule(
                 if "session_id = :sid" in where:
                     row = db.execute(
                         text("SELECT COUNT(*) FROM agent_events WHERE session_id = :sid"),
-                        {"sid": sid}
+                        {"sid": sid},
                     ).scalar()
                     count = row or 0
 
@@ -161,15 +172,23 @@ def check_db_rule(
                         if count_assert.startswith(">="):
                             min_count = int(count_assert[2:])
                             passed = count >= min_count
-                            results.append(CheckResult(
-                                f"db:agent_events_count>={min_count}",
-                                passed,
-                                f"found {count} events" if not passed else ""
-                            ))
+                            results.append(
+                                CheckResult(
+                                    f"db:agent_events_count>={min_count}",
+                                    passed,
+                                    f"found {count} events" if not passed else "",
+                                )
+                            )
                 else:
-                    results.append(CheckResult("db:agent_events", True, "Skipped - no session filter", skipped=True))
+                    results.append(
+                        CheckResult(
+                            "db:agent_events", True, "Skipped - no session filter", skipped=True
+                        )
+                    )
         else:
-            results.append(CheckResult(f"db:{table}", True, f"Unknown table: {table}", skipped=True))
+            results.append(
+                CheckResult(f"db:{table}", True, f"Unknown table: {table}", skipped=True)
+            )
 
     except Exception as e:
         results.append(CheckResult("db:memoria_api", False, f"Memoria API error: {e}"))
@@ -191,19 +210,19 @@ def check_session_integrity(db_factory: Any, sid: str) -> list[CheckResult]:
         with db_factory() as db:
             # Check session exists
             row = db.execute(
-                text("SELECT COUNT(*) FROM agent_sessions WHERE session_id = :sid"),
-                {"sid": sid}
+                text("SELECT COUNT(*) FROM agent_sessions WHERE session_id = :sid"), {"sid": sid}
             ).scalar()
 
             if row and row > 0:
                 results.append(CheckResult("session_integrity:exists", True, ""))
             else:
-                results.append(CheckResult("session_integrity:exists", False, f"Session {sid} not found"))
+                results.append(
+                    CheckResult("session_integrity:exists", False, f"Session {sid} not found")
+                )
 
             # Check events count
             row = db.execute(
-                text("SELECT COUNT(*) FROM agent_events WHERE session_id = :sid"),
-                {"sid": sid}
+                text("SELECT COUNT(*) FROM agent_events WHERE session_id = :sid"), {"sid": sid}
             ).scalar()
             count = row or 0
             results.append(CheckResult("session_integrity:events", True, f"{count} events"))
@@ -230,7 +249,7 @@ def run_rule_checks(
         # - {type: "tool_called", tool: "memory"}
         # - {tool_called: "memory"}
         rt = rule.get("type")
-        
+
         # If no type field, infer from other keys
         if rt is None:
             if "tool_called" in rule:
@@ -263,9 +282,13 @@ def run_rule_checks(
             elif "turn_count_increases" in rule:
                 rt = "turn_count_increases"
                 # This is checked at the case level, skip here
-                results.append(CheckResult("turn_count_increases", True, "Checked at case level", skipped=True))
+                results.append(
+                    CheckResult("turn_count_increases", True, "Checked at case level", skipped=True)
+                )
             else:
-                results.append(CheckResult(f"unknown:{rule}", False, f"unknown rule format: {rule}"))
+                results.append(
+                    CheckResult(f"unknown:{rule}", False, f"unknown rule format: {rule}")
+                )
         else:
             # Original format with type field
             if rt == "tool_called":
@@ -331,7 +354,7 @@ def llm_judge(
             temperature=0.0,
             task_hint="llm_judge",
         )
-        
+
         content = result.content if hasattr(result, "content") else str(result)
 
         # Parse score from response
