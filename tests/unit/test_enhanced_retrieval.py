@@ -168,6 +168,90 @@ class TestRetrieveEvents:
         )
         assert events == []
 
+    def test_query_with_single_quotes_does_not_raise(self, retriever, mock_db):
+        """Query containing single quotes must not cause SQL syntax errors.
+
+        Regression test for: MATCH(...) AGAINST('+it's a test' IN BOOLEAN MODE)
+        The SDK inlines query_text without escaping, so we must escape before
+        calling .must().
+        """
+        vec_chain = _make_chain([])
+        ft_chain = _make_chain([_make_ft_row("e1")])
+        mock_db.query.side_effect = [vec_chain, ft_chain]
+
+        # Should not raise; single quotes must be escaped before reaching SDK
+        events = retriever.retrieve_events(
+            query_text="You called 'list_dir' 4 times",
+            query_embedding=[0.1] * TEST_EMBEDDING_DIM,
+            session_id="sess_1",
+        )
+        assert len(events) == 1
+        assert events[0]["event_id"] == "e1"
+
+    def test_query_with_multiple_single_quotes(self, retriever, mock_db):
+        """Multiple single quotes in query are all escaped."""
+        vec_chain = _make_chain([])
+        ft_chain = _make_chain([_make_ft_row("e2")])
+        mock_db.query.side_effect = [vec_chain, ft_chain]
+
+        events = retriever.retrieve_events(
+            query_text="it's Alice's code",
+            query_embedding=[0.1] * TEST_EMBEDDING_DIM,
+            session_id="sess_1",
+        )
+        assert len(events) == 1
+
+    def test_empty_query_text(self, retriever, mock_db):
+        """Empty query string returns empty list without error."""
+        vec_chain = _make_chain([])
+        ft_chain = _make_chain([])
+        mock_db.query.side_effect = [vec_chain, ft_chain]
+
+        events = retriever.retrieve_events(
+            query_text="",
+            query_embedding=[0.1] * TEST_EMBEDDING_DIM,
+            session_id="sess_1",
+        )
+        assert events == []
+
+    def test_fulltext_failure_does_not_suppress_vector_results(self, retriever, mock_db):
+        """Fulltext failure should not discard already-found vector results."""
+        vec_chain = _make_chain([_make_event_row("e1", sem=0.5, temp=0.1)])
+        call_count = 0
+
+        def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return vec_chain
+            raise RuntimeError("fulltext down")
+
+        mock_db.query.side_effect = side_effect
+
+        events = retriever.retrieve_events(
+            query_text="test",
+            query_embedding=[0.1] * TEST_EMBEDDING_DIM,
+            session_id="sess_1",
+        )
+        assert len(events) == 1
+        assert events[0]["event_id"] == "e1"
+        # Only vector score, no keyword contribution
+        assert events[0]["relevance_score"] == pytest.approx(0.60, abs=0.01)
+
+    def test_ft_score_zero_does_not_contribute(self, retriever, mock_db):
+        """ft_score=0 row should not inflate relevance_score."""
+        vec_chain = _make_chain([])
+        ft_chain = _make_chain([_make_ft_row("e1", ft_score=0.0)])
+        mock_db.query.side_effect = [vec_chain, ft_chain]
+
+        events = retriever.retrieve_events(
+            query_text="test",
+            query_embedding=[0.1] * TEST_EMBEDDING_DIM,
+            session_id="sess_1",
+        )
+        assert len(events) == 1
+        assert events[0]["relevance_score"] == pytest.approx(0.0, abs=0.001)
+
     def test_internal_scores_removed_from_output(self, retriever, mock_db):
         """Output dicts should not contain vector_score or keyword_score."""
         vec_chain = _make_chain([_make_event_row("e1")])

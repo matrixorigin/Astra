@@ -108,11 +108,12 @@ class HybridRetriever(DbConsumer):
             try:
                 from matrixone.sqlalchemy_ext import boolean_match
 
-                ft = boolean_match("content", "session_id").must(query_text)
-                # compile() returns a complete SQL literal with the query text
-                # inlined by the SDK — no bind-parameter placeholders.  Escaping
-                # is the SDK's responsibility; manual format()+replace() would be
-                # the classic SQL-injection anti-pattern.
+                # SDK inlines query_text directly into the SQL string without
+                # escaping single quotes, causing a syntax error when the query
+                # contains apostrophes (e.g. "it's" or "'list_dir'").
+                # Escape single quotes before passing to the SDK.
+                safe_query = query_text.replace("'", "\\'")
+                ft = boolean_match("content", "session_id").must(safe_query)
                 ft_sql = ft.compile()
                 assert ft_sql.startswith("MATCH("), f"Unexpected ft.compile() output: {ft_sql!r}"
                 ft_score_col = literal_column(ft_sql).label("ft_score")
@@ -322,9 +323,8 @@ class HybridRetriever(DbConsumer):
                 try:
                     from matrixone.sqlalchemy_ext import boolean_match
 
-                    ft = boolean_match("value").must(query_text)
-                    # compile() returns a complete SQL literal — see events
-                    # retrieval comment above for rationale.
+                    safe_query = query_text.replace("'", "\\'")
+                    ft = boolean_match("value").must(safe_query)
                     ft_sql = ft.compile()
                     assert ft_sql.startswith("MATCH("), (
                         f"Unexpected ft.compile() output: {ft_sql!r}"
