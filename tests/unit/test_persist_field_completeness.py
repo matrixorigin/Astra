@@ -647,3 +647,150 @@ class TestSessionActivityUpdate:
         update_params = update_call[1][0] if update_call[1] else update_call[0][1]
         assert update_params["n"] == 2
         assert update_params["sid"] == "s1"
+
+
+    def test_last_event_id_updated_after_persist(self):
+        """Phase 5 UPDATE must include last_event_id = COALESCE(:last_eid, last_event_id)."""
+        mock_db = MagicMock()
+
+        with (
+            patch("api.routers.chat.SessionLocal", return_value=mock_db),
+            patch("core.events.event_logger.EventLogger") as mock_el_cls,
+            patch("core.agent.turn_hooks.TurnHooks"),
+        ):
+            mock_el = MagicMock()
+            llm_ev = MagicMock()
+            llm_ev.event_id = "ev-llm-42"
+            mock_el.create_user_query.return_value = MagicMock(
+                event_id="ev-user-1", causal_chain_id="cc1"
+            )
+            mock_el.create_llm_response.return_value = llm_ev
+            mock_el.create_stream_event.return_value = MagicMock()
+            mock_el_cls.return_value = mock_el
+
+            from api.routers.chat import _persist_turn_events
+
+            _persist_turn_events(
+                "u1",
+                "s1",
+                [{"role": "user", "content": "hi"}],
+                None,
+                "response",
+                [],
+            )
+
+        all_calls = mock_db.execute.call_args_list
+        update_call = all_calls[-1]
+        update_params = update_call[1][0] if update_call[1] else update_call[0][1]
+        assert "last_eid" in update_params, "Phase 5 must pass last_eid to UPDATE"
+        assert update_params["last_eid"] is not None, "last_eid must not be None when LLM responded"
+        # The SQL must reference last_event_id
+        sql_text = str(update_call[0][0])
+        assert "last_event_id" in sql_text
+
+
+class TestGetMemoriaStorageImpersonation:
+    """get_memoria_storage must reject api_key-only config (cannot impersonate user_id)."""
+
+    def test_api_key_only_raises(self):
+        """MEMORIA_API_KEY without MEMORIA_MASTER_KEY must raise RuntimeError."""
+        from core.memory.backends import get_memoria_storage
+        from core.config import MemoriaConfig
+
+        cfg = MemoriaConfig(base_url="http://localhost:8100", api_key="sk-test", master_key=None)
+        with patch("core.config.get_memoria_config", return_value=cfg):
+            with pytest.raises(RuntimeError, match="MEMORIA_MASTER_KEY"):
+                get_memoria_storage("alice")
+
+    def test_master_key_succeeds(self):
+        """MEMORIA_MASTER_KEY must allow creating storage without error."""
+        from core.memory.backends import get_memoria_storage
+        from core.config import MemoriaConfig
+
+        cfg = MemoriaConfig(
+            base_url="http://localhost:8100", master_key="mk-test", api_key=None
+        )
+        with patch("core.config.get_memoria_config", return_value=cfg):
+            svc = get_memoria_storage("alice")
+        assert svc is not None
+
+    def test_no_auth_raises(self):
+        """No auth key at all must raise RuntimeError."""
+        from core.memory.backends import get_memoria_storage
+        from core.config import MemoriaConfig
+
+        cfg = MemoriaConfig(base_url="http://localhost:8100", master_key=None, api_key=None)
+        with patch("core.config.get_memoria_config", return_value=cfg):
+            with pytest.raises(RuntimeError):
+                get_memoria_storage("alice")
+
+
+class TestCloseSessionSummaryFields:
+    """close_session must write summary_status and summary_job_id to DB."""
+
+    def _run_close(self, session_row, mock_svc):
+        """Run close_session with all side-effects patched except the summary path."""
+        from core.events.session_manager import SessionManager
+
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = session_row
+        # events query (order_by chain)
+        user_ev = MagicMock()
+        user_ev.event_type = "user_query"
+        user_ev.content = "hello"
+        user_ev.causal_chain_id = "cc1"
+        llm_ev = MagicMock()
+        llm_ev.event_type = "llm_response"
+        llm_ev.content = "world"
+        llm_ev.causal_chain_id = "cc1"
+        db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [
+            user_ev,
+            llm_ev,
+        ]
+
+        with (
+            patch("core.memory.backends.get_memoria_storage", return_value=mock_svc),
+            patch("core.evaluation.multi_level_scorer.score_session"),
+            patch("skills.knowledge.api.KnowledgeExtractor"),
+            patch("core.events.event_logger.EventLogger.from_session"),
+        ):
+            mgr = SessionManager.__new__(SessionManager)
+            mgr._db_session = db
+            mgr._get_session = lambda: db
+            mgr._owns_session = False
+            mgr.close_session("sess1")
+
+        return session_row, db
+
+    def test_summary_status_set_to_pending_on_close(self):
+        """close_session must set summary_status='pending' after requesting summary."""
+        session_row = MagicMock()
+        session_row.session_id = "sess1"
+        session_row.user_id = "alice"
+        session_row.summary_status = None
+        session_row.summary_job_id = None
+
+        mock_svc = MagicMock()
+        mock_svc.request_session_summary.return_value = {"task_id": "task-999"}
+
+        row, db = self._run_close(session_row, mock_svc)
+
+        assert row.summary_status == "pending"
+        assert row.summary_job_id == "task-999"
+        db.commit.assert_called()
+
+    def test_summary_job_id_none_when_no_task_id(self):
+        """If Memoria returns no task_id, summary_job_id stays None but status is pending."""
+        session_row = MagicMock()
+        session_row.session_id = "sess1"
+        session_row.user_id = "alice"
+        session_row.summary_status = None
+        session_row.summary_job_id = None
+
+        mock_svc = MagicMock()
+        mock_svc.request_session_summary.return_value = {}  # no task_id
+
+        row, db = self._run_close(session_row, mock_svc)
+
+        assert row.summary_status == "pending"
+        assert row.summary_job_id is None

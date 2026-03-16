@@ -207,9 +207,14 @@ class SessionManager:
                     from core.memory.backends import get_memoria_storage
 
                     svc = get_memoria_storage(db_session.user_id)
-                    svc.request_session_summary(
+                    result = svc.request_session_summary(
                         db_session.user_id, session_id, messages, sync=False
                     )
+                    task_id = result.get("task_id") if isinstance(result, dict) else None
+                    db_session.summary_status = "pending"
+                    if task_id:
+                        db_session.summary_job_id = task_id
+                    db.commit()
             except Exception as e:
                 logger.debug("Session summary generation failed (non-fatal): %s", e)
 

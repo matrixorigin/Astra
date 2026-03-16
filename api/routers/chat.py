@@ -2061,13 +2061,20 @@ def _persist_turn_events(
         try:
             from sqlalchemy import text as _text
 
+            _last_eid = llm_response_event_id or parent_event_id
             _sdb.execute(
                 _text("""
                     UPDATE agent_sessions
-                    SET event_count = event_count + :n, last_active_at = :now, updated_at = :now
+                    SET event_count = event_count + :n, last_active_at = :now, updated_at = :now,
+                        last_event_id = COALESCE(:last_eid, last_event_id)
                     WHERE session_id = :sid
                 """),
-                {"n": _n_events, "sid": session_id, "now": datetime.now(timezone.utc)},
+                {
+                    "n": _n_events,
+                    "sid": session_id,
+                    "now": datetime.now(timezone.utc),
+                    "last_eid": _last_eid,
+                },
             )
             _sdb.commit()
         finally:

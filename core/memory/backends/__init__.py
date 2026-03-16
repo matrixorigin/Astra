@@ -20,6 +20,12 @@ def get_memoria_storage(user_id: str) -> MemoriaStorage:
         raise RuntimeError(
             "Memoria requires authentication. Set MEMORIA_MASTER_KEY or MEMORIA_API_KEY."
         )
+    if not cfg.master_key and cfg.api_key:
+        raise RuntimeError(
+            "Memoria requires MEMORIA_MASTER_KEY for multi-user writes. "
+            "MEMORIA_API_KEY alone cannot impersonate user_id — data would be written "
+            "to the API key's own user, not the intended user_id."
+        )
     client = MemoriaHTTPClient(
         base_url=cfg.base_url,
         api_key=cfg.api_key,
