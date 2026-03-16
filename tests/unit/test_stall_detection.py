@@ -144,3 +144,36 @@ class TestDetectStall:
         loop._record_round_tools([_make_tc("get_agent_info")])
         loop._record_round_tools([_make_tc("skill_config_wizard")])
         assert loop._detect_stall() is True
+
+
+class TestFindSkillsLoop:
+    """find_skills repeated calls must be detected as a stall.
+
+    Regression for session 019cf42f: agent called find_skills("list_prs") 3 times
+    in a row after already receiving the result, never calling list_prs directly.
+    The stall detector must catch this via the no-progress heuristic.
+    """
+
+    def test_find_skills_repeated_same_args_is_stall(self, loop):
+        """Identical find_skills calls across 3 rounds → stall detected."""
+        tc = _make_tc("find_skills", '{"query": "list_prs", "limit": 1}')
+        for _ in range(3):
+            loop._record_round_tools([tc], text="")
+        assert loop._detect_stall(), (
+            "Repeated find_skills with identical args should be detected as stall"
+        )
+
+    def test_find_skills_no_progress_text_is_stall(self, loop):
+        """find_skills with different args but no text output → no-progress stall."""
+        queries = ["GitHub PR list", "list_prs", "list_prs"]
+        for q in queries:
+            loop._record_round_tools([_make_tc("find_skills", f'{{"query": "{q}"}}')], text="")
+        assert loop._detect_stall(), (
+            "find_skills with no text output across 3 rounds should be detected as stall"
+        )
+
+    def test_find_skills_then_real_call_no_stall(self, loop):
+        """find_skills followed by actual list_prs call is NOT a stall."""
+        loop._record_round_tools([_make_tc("find_skills", '{"query": "list_prs"}')], text="")
+        loop._record_round_tools([_make_tc("list_prs", '{"repo": "matrixorigin/matrixone"}')], text="Here are the PRs...")
+        assert not loop._detect_stall()

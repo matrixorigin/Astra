@@ -1138,7 +1138,7 @@ def register_builtin_skills(
         (
             "find_skills",
             "1.0.0",
-            "Discover available skills and their capabilities.",
+            "Search for additional skills by task description. Use only when you need a capability not in your current tool list. Once you find a matching skill, call it directly by name — do NOT call find_skills again.",
             "system",
             "discovery",
             ["skills", "capabilities", "what can"],

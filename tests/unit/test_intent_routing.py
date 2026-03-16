@@ -355,3 +355,51 @@ class TestRoutingDecisionFields:
         assert rd.max_tool_rounds == 3
         assert rd.task_type == TaskType.DEBUGGING
         assert rd.topic_shift_score == 0.5
+
+
+# ============================================================================
+# Regression: short clarification reply with history must NOT be "command"
+# Bug: chat_loop called classify(user_input) without history_len, so short
+# replies like "是matrixorigin" were classified as "command" (load_history=False),
+# causing the LLM to lose conversation context and start wandering.
+# Fix: chat_loop now passes history_len=len(selected_events) to classify().
+# ============================================================================
+
+
+class TestShortReplyWithHistory:
+    """Short clarification replies must not be classified as 'command' when history exists."""
+
+    def test_short_reply_no_history_is_command(self):
+        """First turn, short non-question → heuristic classifies as command (expected)."""
+        engine = Tier0Engine()
+        result = engine.classify("是matrixorigin", history_len=0)
+        assert result.intent == "command"
+
+    def test_short_reply_with_history_is_not_command(self):
+        """With conversation history, short clarification reply must NOT be command.
+
+        Regression for session 019cf42f: user said '是matrixorigin' to clarify
+        a previous question. With history_len=0 (the bug), this was classified
+        as 'command' → load_history=False → LLM lost context → started wandering.
+        """
+        engine = Tier0Engine()
+        result = engine.classify("是matrixorigin", history_len=2)
+        # Must not be command — command plan has load_history=False which breaks context
+        assert result.intent != "command", (
+            f"Short clarification with history should not be 'command', got '{result.intent}'. "
+            "This causes load_history=False and LLM loses conversation context."
+        )
+
+    def test_short_english_clarification_with_history(self):
+        """English short clarification with history must not be command."""
+        engine = Tier0Engine()
+        result = engine.classify("matrixorigin", history_len=3)
+        assert result.intent != "command"
+
+    def test_command_plan_has_no_history(self):
+        """Confirm that command plan has load_history=False — the root cause of the bug."""
+        assert INTENT_PLANS["command"].load_history is False
+
+    def test_question_plan_has_history(self):
+        """Confirm that question/fallback plan has load_history=True."""
+        assert INTENT_PLANS["question"].load_history is True

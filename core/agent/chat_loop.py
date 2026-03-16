@@ -825,7 +825,8 @@ class ChatLoop:
         _tier0 = self._tier0
         _tool_filter, _max_rounds = _tier0.classify_tool_filter(user_input)
         _task_type = _tier0.classify_task_type(user_input)
-        _tier0_result = _tier0.classify(user_input)
+        _history_len = len(merged_ctx.get("selected_events") or [])
+        _tier0_result = _tier0.classify(user_input, history_len=_history_len)
         _routing = RoutingDecision(
             plan=INTENT_PLANS.get(_tier0_result.intent, _FALLBACK_PLAN)
             if _tier0_result.intent
