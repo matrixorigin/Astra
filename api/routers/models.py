@@ -101,9 +101,9 @@ class ModelResponse(BaseModel):
 
 
 def _require_admin(current_user: dict, db: Session):
-    from core.auth.permission_checker import PermissionChecker
+    from core.auth.permission_checker import has_role_in_session
 
-    if not PermissionChecker(lambda: db).is_admin(current_user["user_id"]):
+    if not has_role_in_session(db, current_user["user_id"], "mo_agent_admin"):
         raise HTTPException(status_code=403, detail="Admin role required")
 
 
@@ -267,7 +267,6 @@ def create_model(
     )
     db.add(model)
     db.commit()
-    db.refresh(model)
 
     connectivity = "ok" if conn_err is None else conn_err
     if conn_err:
@@ -299,9 +298,9 @@ def list_models(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db_session),
 ):
-    from core.auth.permission_checker import PermissionChecker
+    from core.auth.permission_checker import has_role_in_session
 
-    is_admin = PermissionChecker(lambda: db).is_admin(current_user["user_id"])
+    is_admin = has_role_in_session(db, current_user["user_id"], "mo_agent_admin")
     query = db.query(LLMModel)
     if not is_admin:
         query = query.filter(LLMModel.is_active == 1)
@@ -371,7 +370,6 @@ def update_model(
         model.is_active = 1 if request.is_active else 0
 
     db.commit()
-    db.refresh(model)
     return _to_response(model, connectivity=conn_result)
 
 
@@ -404,5 +402,4 @@ def check_model(
     conn_err = _validate_connectivity(model.provider, model.model_name, api_key, model.base_url)
     model.is_active = 1 if conn_err is None else 0
     db.commit()
-    db.refresh(model)
     return _to_response(model, connectivity="ok" if conn_err is None else conn_err)

@@ -458,13 +458,21 @@ test:
 		exit 1; \
 	fi
 	@python -m pytest tests/ -n auto --dist loadscope -v -m "not slow and not benchmark and not local_embedding"
-	@python -m pytest memoria/tests/test_e2e.py -n auto --dist loadscope -v
+	@if [ -f memoria/tests/test_e2e.py ]; then \
+		python -m pytest memoria/tests/test_e2e.py -n auto --dist loadscope -v; \
+	else \
+		echo "Skipping Memoria E2E tests: memoria/tests/test_e2e.py not found"; \
+	fi
 
 .PHONY: test-cloud
 test-cloud:
 	@echo "Running Memoria Docker regression tests..."
 	@echo "Requires: make cloud-start"
-	@python -m pytest memoria/tests/test_docker.py -v
+	@if [ -f memoria/tests/test_docker.py ]; then \
+		python -m pytest memoria/tests/test_docker.py -v; \
+	else \
+		echo "Skipping Memoria Docker regression tests: memoria/tests/test_docker.py not found"; \
+	fi
 
 .PHONY: cloud-start
 cloud-start:
@@ -494,10 +502,17 @@ cloud-clean:
 .PHONY: ci-test
 ci-test:
 	@echo "Running CI test suite (excludes local_embedding, slow, benchmark)..."
-	@set -a && [ -f memoria/.env ] && . memoria/.env; set +a; \
-	python -m pytest tests/ memoria/tests/ \
-		-n auto --dist loadgroup -v --tb=short \
-		-m "not slow and not benchmark and not local_embedding"
+	@if [ -d memoria/tests ]; then \
+		set -a && [ -f memoria/.env ] && . memoria/.env; set +a; \
+		python -m pytest tests/ memoria/tests/ \
+			-n auto --dist loadgroup -v --tb=short \
+			-m "not slow and not benchmark and not local_embedding"; \
+	else \
+		python -m pytest tests/ \
+			-n auto --dist loadgroup -v --tb=short \
+			-m "not slow and not benchmark and not local_embedding"; \
+		echo "Skipping Memoria test suite: memoria/tests/ not found"; \
+	fi
 
 .PHONY: test-unit
 test-unit:

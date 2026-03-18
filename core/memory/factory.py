@@ -1,6 +1,5 @@
-"""Memory factory - Memoria backend only."""
+"""Memory factory - backend-aware editor creation."""
 
-import os
 from typing import Any
 
 from core.logging_config import get_logger
@@ -31,26 +30,15 @@ def create_editor(
                 exc_info=True,
             )
 
-    # Create Memoria HTTP client
-    memoria_url = os.environ.get("MEMORIA_BASE_URL")
-    memoria_master_key = os.environ.get("MEMORIA_MASTER_KEY")
-    memoria_api_key = os.environ.get("MEMORIA_API_KEY")
-
-    if not memoria_url or not (memoria_master_key or memoria_api_key):
-        raise RuntimeError(
-            "Memoria is required. Set MEMORIA_BASE_URL and MEMORIA_MASTER_KEY "
-            "(or MEMORIA_API_KEY) environment variables."
-        )
-
-    from core.memory.backends.memoria_http import MemoriaHTTPClient, MemoriaStorage
-
-    http_client = MemoriaHTTPClient(
-        base_url=memoria_url,
-        api_key=memoria_api_key,
-        master_key=memoria_master_key,
-    )
-
     if not user_id:
         raise ValueError("create_editor requires a non-empty user_id")
-    storage = MemoriaStorage(http_client, user_id=user_id)
+    from core.memory.backends import create_memory_storage, get_memory_backend_capabilities
+
+    capabilities = get_memory_backend_capabilities()
+    if not capabilities.supports_tool("memory_store"):
+        raise RuntimeError(
+            f"Configured memory backend '{capabilities.backend_name}' does not support writes"
+        )
+
+    storage = create_memory_storage(user_id)
     return MemoryEditor(storage, db_factory, index_manager=None, embed_client=embed_client)

@@ -9,6 +9,8 @@ import argparse
 import json
 import sys
 
+from core.skills.runner_index import runner_skill_exists
+
 DIAGNOSE_HINT = "Run 'diagnose_skills' to check skill health"
 
 
@@ -22,6 +24,18 @@ def main() -> None:
         inputs = json.loads(args.inputs)
     except (json.JSONDecodeError, ValueError) as e:
         print(json.dumps({"error": f"Invalid JSON inputs: {e}"}), file=sys.stderr)
+        sys.exit(1)
+
+    if not runner_skill_exists(args.skill):
+        print(
+            json.dumps(
+                {
+                    "error": f"Skill '{args.skill}' not found",
+                    "hint": DIAGNOSE_HINT,
+                }
+            ),
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     try:

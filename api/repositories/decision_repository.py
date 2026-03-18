@@ -23,8 +23,10 @@ class DecisionRepository:
         decision = DecisionModel(**decision_data)
         db.add(decision)
         db.commit()
-        db.refresh(decision)
-        return decision
+        return (
+            db.query(DecisionModel).filter(DecisionModel.decision_id == decision.decision_id).first()
+            or decision
+        )
 
     def get_by_id(self, decision_id: str) -> DecisionModel | None:
         """Get decision by ID."""

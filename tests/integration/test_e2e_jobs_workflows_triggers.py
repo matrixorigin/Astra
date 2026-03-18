@@ -31,6 +31,10 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
+from api.database import get_db_session
+from api.models import User
+from core.auth.jwt_manager import create_access_token
+from core.auth.password import hash_password
 from core.jobs.backend import JobResult, JobStatus
 from core.jobs.local import LocalJobBackend
 from core.utils.id_generator import generate_id
@@ -71,38 +75,43 @@ def _no_real_subprocesses():
 
 
 @pytest.fixture
-def client():
+def client(db_session):
     from api.main import app
 
-    return TestClient(app)
+    def override_get_db():
+        try:
+            yield db_session
+        finally:
+            pass
+
+    app.dependency_overrides[get_db_session] = override_get_db
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.pop(get_db_session, None)
 
 
-def _make_user(client, suffix=""):
-    """Register + login, return auth headers."""
+def _make_user(client, db_session, suffix=""):
+    """Create a user in the current test session and return auth headers."""
     uid = generate_id()
     # Keep username ≤ 50 chars (VARCHAR(50) constraint)
     username = f"jwt_{uid}{suffix}"[:50]
-    client.post(
-        "/auth/register",
-        json={
-            "username": username,
-            "email": f"{uid}@test.com",
-            "password": "testpass1234",
-        },
+    user = User(
+        user_id=uid,
+        username=username,
+        email=f"{uid}@test.com",
+        password_hash=hash_password("testpass1234"),
+        is_active=1,
     )
-    resp = client.post(
-        "/auth/login",
-        json={
-            "username": username,
-            "password": "testpass1234",
-        },
-    )
-    return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+    db_session.add(user)
+    db_session.commit()
+    token = create_access_token({"sub": user.user_id, "username": user.username})
+    return {"Authorization": f"Bearer {token}"}
 
 
 @pytest.fixture
-def auth_headers(client):
-    return _make_user(client)
+def auth_headers(client, db_session):
+    return _make_user(client, db_session)
 
 
 # ============================================================================
@@ -481,9 +490,9 @@ class TestT3_TriggerFireAuth:
 class TestT4_TriggerOwnership:
     """User A cannot delete user B's trigger."""
 
-    def test_cross_user_delete_forbidden(self, client):
-        h_a = _make_user(client, "_a")
-        h_b = _make_user(client, "_b")
+    def test_cross_user_delete_forbidden(self, client, db_session):
+        h_a = _make_user(client, db_session, "_a")
+        h_b = _make_user(client, db_session, "_b")
 
         resp = client.post(
             "/triggers",

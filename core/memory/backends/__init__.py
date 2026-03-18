@@ -1,34 +1,30 @@
 """Memory backends — pluggable storage implementations."""
 
+from core.memory.backends.factory import (
+    MemoryBackendCapabilities,
+    create_memory_client,
+    create_memory_storage,
+    get_memory_backend_capabilities,
+    get_memory_backend_name,
+    resolve_memory_context_mode,
+    resolve_memory_tool_name,
+)
 from core.memory.backends.memoria_http import MemoriaHTTPClient, MemoriaStorage
 
-__all__ = ["MemoriaHTTPClient", "MemoriaStorage", "get_memoria_storage"]
+__all__ = [
+    "MemoryBackendCapabilities",
+    "MemoriaHTTPClient",
+    "MemoriaStorage",
+    "create_memory_client",
+    "create_memory_storage",
+    "get_memory_backend_capabilities",
+    "get_memory_backend_name",
+    "get_memoria_storage",
+    "resolve_memory_context_mode",
+    "resolve_memory_tool_name",
+]
 
 
 def get_memoria_storage(user_id: str) -> MemoriaStorage:
-    """Create a MemoriaStorage for the given user from environment config.
-
-    Uses core.config.get_memoria_config() so TEST_MEMORIA_* env vars are
-    respected in test environments.
-    """
-    if not user_id:
-        raise ValueError("get_memoria_storage requires a non-empty user_id")
-    from core.config import get_memoria_config
-
-    cfg = get_memoria_config()
-    if not cfg.auth_key:
-        raise RuntimeError(
-            "Memoria requires authentication. Set MEMORIA_MASTER_KEY or MEMORIA_API_KEY."
-        )
-    if not cfg.master_key and cfg.api_key:
-        raise RuntimeError(
-            "Memoria requires MEMORIA_MASTER_KEY for multi-user writes. "
-            "MEMORIA_API_KEY alone cannot impersonate user_id — data would be written "
-            "to the API key's own user, not the intended user_id."
-        )
-    client = MemoriaHTTPClient(
-        base_url=cfg.base_url,
-        api_key=cfg.api_key,
-        master_key=cfg.master_key,
-    )
-    return MemoriaStorage(client, user_id=user_id)
+    """Compatibility shim for the configured memory backend."""
+    return create_memory_storage(user_id)

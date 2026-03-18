@@ -219,6 +219,7 @@ class ToolRegistry:
         self,
         user_query: str = "",
         messages: list[dict[str, Any]] | None = None,
+        preferred_names: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Select tools for one LLM request. Returns list of OpenAI tool schemas.
 
@@ -227,11 +228,20 @@ class ToolRegistry:
         3. Embedding retrieval top-K from dynamic pool
         4. Token budget enforcement
         """
+        preferred_names = preferred_names or []
+        protected_names = set(preferred_names)
         pinned = self.pinned_tools()
-        dynamic_pool = self.dynamic_tools()
+        preferred = [
+            t
+            for name in preferred_names
+            if (t := self.get(name)) is not None and t not in pinned
+        ]
+        dynamic_pool = [
+            t for t in self.dynamic_tools() if t.name not in protected_names
+        ]
 
         if not dynamic_pool:
-            return [t.schema for t in pinned]
+            return self._enforce_budget(pinned + preferred, protected_names=protected_names)
 
         # Step 1: Intent-based filtering
         dynamic_pool = self._intent_filter(user_query, dynamic_pool)
@@ -247,8 +257,8 @@ class ToolRegistry:
             dynamic_pool = dynamic_pool[: self._max_dynamic]
 
         # Step 4: Merge and enforce token budget
-        selected = pinned + dynamic_pool
-        return self._enforce_budget(selected)
+        selected = pinned + preferred + dynamic_pool
+        return self._enforce_budget(selected, protected_names=protected_names)
 
     def get_all_schemas(self) -> list[dict[str, Any]]:
         """Return all tool schemas (no filtering). For backward compat."""
@@ -351,14 +361,17 @@ class ToolRegistry:
                 except Exception as e:
                     logger.debug("Embedding failed for %s: %s", entry.name, e)
 
-    def _enforce_budget(self, selected: list[ToolEntry]) -> list[dict[str, Any]]:
-        """Enforce token budget. Pinned tools are never dropped."""
+    def _enforce_budget(
+        self, selected: list[ToolEntry], protected_names: set[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Enforce token budget. Pinned and protected tools are never dropped."""
         schemas: list[dict[str, Any]] = []
         total_tokens = 0
+        protected_names = protected_names or set()
         for entry in selected:
             tokens = entry.schema_tokens
-            if entry.pinned:
-                # Pinned always included
+            if entry.pinned or entry.name in protected_names:
+                # Pinned/protected always included
                 schemas.append(entry.schema)
                 total_tokens += tokens
             elif total_tokens + tokens <= self._max_tokens:

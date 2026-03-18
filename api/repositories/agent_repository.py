@@ -30,8 +30,7 @@ class AgentRepository:
         agent = AgentModel(**agent_data)
         db.add(agent)
         db.commit()
-        db.refresh(agent)
-        return agent
+        return db.query(AgentModel).filter(AgentModel.agent_id == agent.agent_id).first() or agent
 
     def get_by_id(self, agent_id: str, owner_user_id: str | None = None) -> AgentModel | None:
         """Get agent by ID with optional ownership filter (pushed to DB)."""
@@ -69,8 +68,7 @@ class AgentRepository:
         for key, value in updates.items():
             setattr(agent, key, value)
         db.commit()
-        db.refresh(agent)
-        return agent
+        return db.query(AgentModel).filter(AgentModel.agent_id == agent.agent_id).first() or agent
 
     def delete(self, agent_id: str, owner_user_id: str) -> bool:
         """Delete agent with ownership verification at DB level."""

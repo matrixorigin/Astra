@@ -85,6 +85,37 @@ adaptive_threshold_value = Gauge(
     "adaptive_threshold_value", "Current adaptive threshold, target 0.80-0.90"
 )
 
+# Memory metrics
+memory_context_loads_total = Counter(
+    "memory_context_loads_total",
+    "Total memory context load decisions",
+    ["mode", "source"],
+)
+
+memory_context_load_duration_seconds = Histogram(
+    "memory_context_load_duration_seconds",
+    "Memory context load duration in seconds",
+    ["mode"],
+)
+
+memory_tool_hints_total = Counter(
+    "memory_tool_hints_total",
+    "Memory tool hints emitted by policy",
+    ["tool_name", "mode", "runtime"],
+)
+
+memory_preferred_tool_total = Counter(
+    "memory_preferred_tool_total",
+    "Preferred memory tool availability after selection",
+    ["tool_name", "status", "runtime"],
+)
+
+memory_execution_guard_total = Counter(
+    "memory_execution_guard_total",
+    "Execution-stage memory guard decisions",
+    ["preferred_tool", "actual_tool", "outcome", "runtime"],
+)
+
 
 async def metrics_endpoint() -> Response:
     """Prometheus metrics endpoint."""

@@ -23,8 +23,10 @@ class SessionRepository:
         session = SessionModel(**session_data)
         db.add(session)
         db.commit()
-        db.refresh(session)
-        return session
+        return (
+            db.query(SessionModel).filter(SessionModel.session_id == session.session_id).first()
+            or session
+        )
 
     def get_by_id(self, session_id: str, user_id: str | None = None) -> SessionModel | None:
         """Get session with optional ownership filter pushed to DB."""
@@ -64,8 +66,10 @@ class SessionRepository:
             return None
         session.status = status
         db.commit()
-        db.refresh(session)
-        return session
+        return (
+            db.query(SessionModel).filter(SessionModel.session_id == session.session_id).first()
+            or session
+        )
 
     def update(self, session_id: str, update_data: dict) -> SessionModel | None:
         """Update session with data."""
@@ -76,8 +80,10 @@ class SessionRepository:
         for key, value in update_data.items():
             setattr(session, key, value)
         db.commit()
-        db.refresh(session)
-        return session
+        return (
+            db.query(SessionModel).filter(SessionModel.session_id == session.session_id).first()
+            or session
+        )
 
     def delete(self, session_id: str) -> bool:
         """Delete session."""

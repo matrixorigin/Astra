@@ -23,8 +23,7 @@ class EventRepository:
         event = EventModel(**event_data)
         db.add(event)
         db.commit()
-        db.refresh(event)
-        return event
+        return db.query(EventModel).filter(EventModel.event_id == event.event_id).first() or event
 
     def get_by_id(self, event_id: str, user_id: str | None = None) -> EventModel | None:
         """Get event with optional ownership filter."""

@@ -2,9 +2,11 @@
 
 import json
 import logging
+import time
 from contextlib import contextmanager
 from decimal import Decimal
 
+import pymysql
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -56,19 +58,51 @@ def _visit_create_index(self, create, **kw):
 
 _MySQLDDLCompiler.visit_create_index = _visit_create_index
 
-# Ensure database exists before connecting
-_bootstrap = _MoClient(
-    host=settings.matrixone_host,
-    port=settings.matrixone_port,
-    user=settings.matrixone_user,
-    password=settings.matrixone_password,
-    database="mo_catalog",
-    sql_log_mode="off",
-)
-with _bootstrap._engine.connect() as _c:
-    _c.execute(text(f"CREATE DATABASE IF NOT EXISTS `{settings.matrixone_database}`"))
-    _c.execute(text("COMMIT"))
-_bootstrap._engine.dispose()
+def _ensure_database_ready() -> None:
+    """Create the configured database and wait until new connections can see it.
+
+    MatrixOne may acknowledge ``CREATE DATABASE`` before the new database is
+    immediately visible to fresh connections under parallel load. Waiting here
+    avoids startup races where the first real connection still gets
+    ``Unknown database``.
+    """
+
+    bootstrap = _MoClient(
+        host=settings.matrixone_host,
+        port=settings.matrixone_port,
+        user=settings.matrixone_user,
+        password=settings.matrixone_password,
+        database="mo_catalog",
+        sql_log_mode="off",
+    )
+    try:
+        with bootstrap._engine.connect() as conn:
+            conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{settings.matrixone_database}`"))
+            conn.execute(text("COMMIT"))
+    finally:
+        bootstrap._engine.dispose()
+
+    for attempt in range(10):
+        try:
+            ready_conn = pymysql.connect(
+                host=settings.matrixone_host,
+                port=settings.matrixone_port,
+                user=settings.matrixone_user,
+                password=settings.matrixone_password,
+                database=settings.matrixone_database,
+                charset="utf8mb4",
+                connect_timeout=2,
+            )
+            ready_conn.close()
+            return
+        except pymysql.err.OperationalError as exc:
+            if exc.args and exc.args[0] == 1049 and attempt < 9:
+                time.sleep(0.3)
+                continue
+            raise
+
+
+_ensure_database_ready()
 
 # Use MatrixOne client's engine (supports vecf32/vecf64 and FulltextIndex DDL)
 _mo_client = _MoClient(

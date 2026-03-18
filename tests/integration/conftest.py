@@ -6,6 +6,7 @@ import httpx
 from uuid import uuid4
 
 from api.repositories.user_repository import UserRepository
+from core.auth.jwt_manager import create_access_token
 from core.auth.password import hash_password
 
 
@@ -24,24 +25,14 @@ def http_client():
 
 @pytest.fixture
 def test_user(db_session):
-    """Create a test user for API tests (worker-isolated)."""
+    """Create a test user for API tests (worker + test isolated)."""
     repo = UserRepository(lambda: db_session)
 
-    # Use worker-specific username/email to avoid conflicts
+    # Use worker+fixture-specific username/email to avoid any cross-test bleed.
     worker_suffix = _get_worker_suffix()
-    username = f"testuser{worker_suffix}"
-    email = f"test{worker_suffix}@example.com"
-
-    # Clean up any existing test user
-    existing = repo.get_by_username(username)
-    if existing:
-        from sqlalchemy import text as _text
-
-        db_session.execute(
-            _text("DELETE FROM auth_user_roles WHERE user_id = :uid"), {"uid": existing.user_id}
-        )
-        repo.delete(existing.user_id)
-        db_session.commit()
+    unique_suffix = uuid4().hex[:8]
+    username = f"testuser{worker_suffix}_{unique_suffix}"
+    email = f"test{worker_suffix}_{unique_suffix}@example.com"
 
     # Create new test user
     user_data = {
@@ -71,50 +62,62 @@ def test_user(db_session):
 
 
 @pytest.fixture
+def admin_user(db_session):
+    """Create a dedicated admin user for API tests."""
+    from sqlalchemy import text as _text
+    from api.models import Role, User, UserRole
+
+    worker_suffix = _get_worker_suffix()
+    unique_suffix = uuid4().hex[:8]
+    username = f"admin{worker_suffix}_{unique_suffix}"
+    email = f"admin{worker_suffix}_{unique_suffix}@example.com"
+
+    admin_role = db_session.query(Role).filter(Role.role_name == "mo_agent_admin").first()
+    if not admin_role:
+        admin_role = Role(
+            role_id="role-admin",
+            role_name="mo_agent_admin",
+            description="Administrator with full system access",
+        )
+        db_session.add(admin_role)
+        db_session.flush()
+
+    user = User(
+        user_id=str(uuid4()),
+        username=username,
+        email=email,
+        password_hash=hash_password("testpass123"),
+        is_active=True,
+    )
+    db_session.add(user)
+    db_session.flush()
+    db_session.add(UserRole(user_id=user.user_id, role_id=admin_role.role_id))
+    db_session.commit()
+
+    yield user
+
+    try:
+        db_session.execute(
+            _text("DELETE FROM auth_user_roles WHERE user_id = :uid"), {"uid": user.user_id}
+        )
+        db_session.execute(_text("DELETE FROM auth_refresh_tokens WHERE user_id = :uid"), {"uid": user.user_id})
+        db_session.execute(_text("DELETE FROM auth_users WHERE user_id = :uid"), {"uid": user.user_id})
+        db_session.commit()
+    except:
+        db_session.rollback()
+
+
+@pytest.fixture
 def auth_headers(client, test_user):
     """Get authentication headers (worker-isolated)."""
-    # Login with the worker-specific username
-    response = client.post(
-        "/auth/login",
-        json={
-            "username": test_user.username,
-            "password": "testpass123",
-        },
-    )
-
-    token = response.json()["access_token"]
+    token = create_access_token({"sub": test_user.user_id, "username": test_user.username})
     return {"Authorization": f"Bearer {token}"}
 
 
 @pytest.fixture
-def admin_headers(client, test_user, db_session):
+def admin_headers(client, admin_user):
     """Get admin authentication headers."""
-    from sqlalchemy import text
-    from core.auth.seed_roles import seed_roles
-
-    # Ensure roles exist (may not be seeded yet in parallel runs)
-    seed_roles(db_session)
-
-    role = db_session.execute(
-        text("SELECT role_id FROM auth_roles WHERE role_name = 'mo_agent_admin' LIMIT 1")
-    ).fetchone()
-    if role:
-        existing = db_session.execute(
-            text("SELECT 1 FROM auth_user_roles WHERE user_id = :uid AND role_id = :rid"),
-            {"uid": test_user.user_id, "rid": role[0]},
-        ).fetchone()
-        if not existing:
-            db_session.execute(
-                text("INSERT INTO auth_user_roles (user_id, role_id) VALUES (:uid, :rid)"),
-                {"uid": test_user.user_id, "rid": role[0]},
-            )
-            db_session.commit()
-
-    response = client.post(
-        "/auth/login",
-        json={"username": test_user.username, "password": "testpass123"},
-    )
-    token = response.json()["access_token"]
+    token = create_access_token({"sub": admin_user.user_id, "username": admin_user.username})
     return {"Authorization": f"Bearer {token}"}
 
 

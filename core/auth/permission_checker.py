@@ -1,8 +1,23 @@
 """Permission checker using App-Layer RBAC."""
 
+from sqlalchemy.orm import Session
+
 from core.db_consumer import DbConsumer, DbFactory
 
 from api.models import Role, User, UserRole
+
+
+def has_role_in_session(db: Session, user_id: str, role_name: str) -> bool:
+    """Check role membership using an existing request-scoped session."""
+    query = (
+        db.query(UserRole)
+        .join(Role, UserRole.role_id == Role.role_id)
+        .join(User, UserRole.user_id == User.user_id)
+        .filter(Role.role_name == role_name)
+    )
+
+    query = query.filter((User.user_id == user_id) | (User.username == user_id))
+    return query.count() > 0
 
 
 class PermissionChecker(DbConsumer):
@@ -19,17 +34,7 @@ class PermissionChecker(DbConsumer):
             role_name: Role name (e.g., 'mo_agent_admin')
         """
         with self._db() as db:
-            query = (
-                db.query(UserRole)
-                .join(Role, UserRole.role_id == Role.role_id)
-                .join(User, UserRole.user_id == User.user_id)
-                .filter(Role.role_name == role_name)
-            )
-
-            # Support both UUID (user_id) and Username
-            query = query.filter((User.user_id == user_id) | (User.username == user_id))
-
-            return query.count() > 0
+            return has_role_in_session(db, user_id, role_name)
 
     def is_admin(self, user_id: str) -> bool:
         """Check if user is mo_agent_admin."""

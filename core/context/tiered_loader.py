@@ -64,16 +64,11 @@ class TieredMemoryLoader:
         if self._svc is None:
             try:
                 from core.config import get_memoria_config
+                from core.memory.backends import create_memory_client
 
                 cfg = get_memoria_config()
                 if cfg.base_url and cfg.auth_key:
-                    from core.memory.backends.memoria_http import MemoriaHTTPClient
-
-                    self._memoria_client = MemoriaHTTPClient(
-                        base_url=cfg.base_url,
-                        api_key=cfg.api_key,
-                        master_key=cfg.master_key,
-                    )
+                    self._memoria_client = create_memory_client()
             except Exception:
                 pass  # Memoria not configured — tiered loader will return empty
 
@@ -113,16 +108,18 @@ class TieredMemoryLoader:
         query_embedding: list[float] | None = None,
         task_hint: str | None = None,
         limit: int = 10,
+        memory_types: list[str] | None = None,
         explain: bool = False,
     ) -> tuple[str, dict | None]:
         """Load L1 semantic/procedural memories."""
         try:
+            resolved_types = memory_types or ["semantic", "procedural", "episodic"]
             if self._memoria_client:
                 result = self._memoria_client.retrieve(
                     user_id=user_id,
                     query=query,
                     top_k=limit,
-                    memory_types=["semantic", "procedural", "episodic"],
+                    memory_types=resolved_types,
                     session_id=session_id or None,
                 )
                 memories = (
@@ -143,7 +140,9 @@ class TieredMemoryLoader:
                     query=query,
                     session_id=session_id,
                     query_embedding=query_embedding,
-                    memory_types=[MemoryType.SEMANTIC, MemoryType.PROCEDURAL, MemoryType.EPISODIC],
+                    memory_types=[
+                        MemoryType(mt) if isinstance(mt, str) else mt for mt in resolved_types
+                    ],
                     top_k=limit,
                     task_hint=task_hint,
                     explain=explain,
@@ -158,6 +157,31 @@ class TieredMemoryLoader:
         except Exception as e:
             # L1 is best-effort: any failure (network, auth, parse) degrades gracefully.
             logger.warning("L1 load failed for user %s: %s", user_id, e)
+            self._metrics.increment("tiered_loader_l1_errors")
+            return "", None
+
+    def load_search(
+        self,
+        user_id: str,
+        query: str,
+        limit: int = 8,
+    ) -> tuple[str, dict | None]:
+        """Load indexed memory search results for broad browse-style context."""
+        try:
+            if self._memoria_client:
+                results = self._memoria_client.search(user_id=user_id, query=query, top_k=limit)
+            elif self._svc and hasattr(self._svc, "client"):
+                results = self._svc.client.search(user_id=user_id, query=query, top_k=limit)
+            else:
+                return "", None
+            if not results:
+                return "", {"source": "memoria_search", "final_count": 0}
+            lines = ["Indexed Memories:"]
+            for m in results:
+                lines.append(f"- [{m.get('memory_type', 'semantic')}] {m['content']}")
+            return "\n".join(lines), {"source": "memoria_search", "final_count": len(results)}
+        except Exception as e:
+            logger.warning("Search memory load failed for user %s: %s", user_id, e)
             self._metrics.increment("tiered_loader_l1_errors")
             return "", None
 
@@ -199,6 +223,57 @@ class TieredMemoryLoader:
             stats.total_ms = (time.time() - start) * 1000
 
         # Return raw content — caller is responsible for section header
+        return "\n\n".join(parts), stats
+
+    def build_section_from_plan(
+        self,
+        user_id: str,
+        session_id: str,
+        plan: Any,
+        explain: bool = False,
+    ) -> tuple[str, TieredLoaderStats | None]:
+        """Load memory according to a policy-derived context plan."""
+        from core.memory.policy import MemoryContextMode
+
+        start = time.time() if explain else 0
+        stats = TieredLoaderStats() if explain else None
+        parts = []
+
+        if getattr(plan, "include_profile", False):
+            l0_start = time.time() if explain else 0
+            l0 = self.load_l0(user_id)
+            if l0:
+                parts.append(l0)
+            if stats:
+                stats.l0_loaded = bool(l0)
+                stats.l0_tokens = len(l0.split()) if l0 else 0
+                stats.l0_ms = (time.time() - l0_start) * 1000
+
+        l1_start = time.time() if explain else 0
+        retrieval_stats = None
+        l1 = ""
+        if plan.mode == MemoryContextMode.RETRIEVE:
+            l1, retrieval_stats = self.load_l1(
+                user_id=user_id,
+                session_id=session_id,
+                query=plan.query,
+                limit=plan.top_k,
+                memory_types=list(plan.memory_types),
+                explain=explain,
+            )
+        elif plan.mode == MemoryContextMode.SEARCH:
+            l1, retrieval_stats = self.load_search(user_id=user_id, query=plan.query, limit=plan.top_k)
+        if l1:
+            parts.append(l1)
+        if stats:
+            stats.l1_loaded = bool(l1)
+            stats.l1_count = len(l1.split("\n")) - 1 if l1 else 0
+            stats.l1_tokens = len(l1.split()) if l1 else 0
+            stats.l1_ms = (time.time() - l1_start) * 1000
+            stats.l1_error = plan.mode != MemoryContextMode.PROFILE_ONLY and not l1 and retrieval_stats is None
+            stats.retrieval = retrieval_stats
+            stats.total_ms = (time.time() - start) * 1000
+
         return "\n\n".join(parts), stats
 
     def invalidate_profile(self, user_id: str) -> None:

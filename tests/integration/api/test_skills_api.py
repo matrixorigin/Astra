@@ -9,42 +9,41 @@ from api.database import get_db_session
 
 
 @pytest.fixture(autouse=True)
-def cleanup_skills():
+def cleanup_skills(db_session):
     """Clean up test skills before and after each test."""
-    from sqlalchemy.orm import Session
     from sqlalchemy import text
     from api.routers.skills import reset_catalog
 
-    db = next(get_db_session())
-
     # Clean before
     reset_catalog()
-    db.execute(
+    db_session.execute(
         text('DELETE FROM skills_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"')
     )
-    db.commit()
+    db_session.commit()
 
     yield
 
     # Clean after
     reset_catalog()
-    db.execute(
+    db_session.execute(
         text('DELETE FROM skills_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"')
     )
-    db.commit()
-    db.close()
+    db_session.commit()
 
 
 @pytest.fixture
-def client():
-    return TestClient(app)
+def client(db_session):
+    def override_get_db():
+        try:
+            yield db_session
+        finally:
+            pass
 
-
-@pytest.fixture
-def db_session():
-    session = next(get_db_session())
-    yield session
-    session.close()
+    app.dependency_overrides[get_db_session] = override_get_db
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.pop(get_db_session, None)
 
 
 # auth_headers fixture now provided by tests/integration/conftest.py

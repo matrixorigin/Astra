@@ -2104,8 +2104,18 @@ def _get_session_tool_registry(
 
     embed_fn = _get_shared_embed_fn()
     registry = ToolRegistry(embed_fn=embed_fn)
-    # memory_program is a core edge tool — always pin it so cloud skills don't crowd it out
-    _EDGE_PINNED = frozenset({"memory_program"})
+    # Core memory edge tools are pinned so cloud skills don't crowd them out.
+    _EDGE_PINNED = frozenset(
+        {
+            "memory_program",
+            "memory_retrieve",
+            "memory_search",
+            "memory_profile",
+            "memory_store",
+            "memory_correct",
+            "memory_purge",
+        }
+    )
     for schema in edge_tools or []:
         name = schema.get("function", {}).get("name", "")
         registry.register_schema(schema, ToolSource.EDGE, pinned=(name in _EDGE_PINNED))
@@ -2381,6 +2391,8 @@ async def chat_turn(
                 if _prev_entry:
                     _prev_entry.pop("tool_sigs", None)
 
+            yield f"data: {json.dumps({'type': 'session_info', 'session_id': session_id})}\n\n"
+
             # ── Unified Tool Registry ────────────────────────────────────
             # All tools (edge + cloud) go into one registry. Selection is
             # handled by the registry: pinned tools always included, dynamic
@@ -2477,31 +2489,11 @@ async def chat_turn(
 
             import asyncio
 
-            # ── Tool selection via unified registry ──────────────────────
-            _cached_entry = _peek_session_entry(session_id)
-            _cached_history = (_cached_entry or {}).get("history") if _cached_entry else None
-
-            if request.tool_results and not user_query:
-                # Tool-result turn: keep only tools already in use.
-                # Fallback to select() (budget-enforced) — never get_all_schemas()
-                # which would leak all 10k+ cloud skills into the LLM context.
-                used_names = {tr.get("name", "") for tr in request.tool_results if tr.get("name")}
-                effective_tools_schema = [
-                    t.schema for t in _turn_registry.all_tools() if t.name in used_names
-                ] or _turn_registry.select(
-                    user_query=user_query,
-                    messages=_cached_history or request.messages,
-                )
-            else:
-                effective_tools_schema = _turn_registry.select(
-                    user_query=user_query,
-                    messages=_cached_history or request.messages,
-                )
-            _high_confidence_skill = None
-
             # ── Intent Routing (Tier 0 → Tier 1 → fallback) ─────────────
             _routing_decision = None
             _routing_meta: dict[str, Any] = {}  # persisted as event + explain
+            _cached_entry = _peek_session_entry(session_id)
+            _cached_history = (_cached_entry or {}).get("history") if _cached_entry else None
             if request.model:
                 # model_override → bypass routing entirely (design doc §Error Handling)
                 logger.debug("Model override '%s' → skip intent routing", request.model)
@@ -2517,6 +2509,9 @@ async def chat_turn(
                     from core.metrics import (
                         adaptive_threshold_value,
                         intent_correction_total,
+                        memory_execution_guard_total,
+                        memory_preferred_tool_total,
+                        memory_tool_hints_total,
                         routing_cache_hit_total,
                         routing_confidence,
                         routing_efficiency_ratio,
@@ -2535,9 +2530,7 @@ async def chat_turn(
                     _history_len = (
                         len((_cached_entry or {}).get("history") or []) if _cached_entry else 0
                     )
-                    _routing_tool_names = [
-                        t.get("function", {}).get("name", "") for t in (tools_schema or [])
-                    ]
+                    _routing_tool_names = [t.name for t in _turn_registry.all_tools()]
 
                     _routing_t0 = time.monotonic()
                     _routing_decision = await _ir.route(
@@ -2569,6 +2562,11 @@ async def chat_turn(
                             if skip
                         ],
                         "estimated_tokens": _routing_decision.plan.estimated_tokens,
+                        "memory_policy": (
+                            _routing_decision.memory_policy.as_dict()
+                            if _routing_decision.memory_policy
+                            else None
+                        ),
                     }
                     if _routing_decision.tier1_result:
                         _routing_meta["tier1"] = {
@@ -2599,6 +2597,75 @@ async def chat_turn(
                 except Exception as _routing_err:
                     logger.debug("Intent routing skipped: %s", _routing_err)
                     _routing_meta = {"skipped": True, "reason": str(_routing_err)}
+
+            _preferred_tool_names: list[str] = []
+            _preferred = None
+            _available_turn_tools: set[str] = set()
+            try:
+                _available_turn_tools = {t.name for t in _turn_registry.all_tools()}
+            except Exception:
+                pass
+            try:
+                from core.memory.backends import resolve_memory_tool_name
+
+                _preferred = (
+                    resolve_memory_tool_name(_routing_decision.memory_policy.tool_hint.tool_name)
+                    if _routing_decision and _routing_decision.memory_policy
+                    else None
+                )
+                if _preferred:
+                    _mode = (
+                        _routing_decision.memory_policy.context_plan.mode.value
+                        if _routing_decision and _routing_decision.memory_policy
+                        else "none"
+                    )
+                    memory_tool_hints_total.labels(
+                        tool_name=_preferred,
+                        mode=_mode,
+                        runtime="cloud",
+                    ).inc()
+                if _preferred and _turn_registry.get(_preferred):
+                    _preferred_tool_names = [_preferred]
+                    _routing_meta["preferred_tools"] = _preferred_tool_names
+            except Exception:
+                pass
+
+            # ── Tool selection via unified registry ──────────────────────
+            if request.tool_results and not user_query:
+                # Tool-result turn: keep only tools already in use.
+                used_names = {tr.get("name", "") for tr in request.tool_results if tr.get("name")}
+                effective_tools_schema = [
+                    t.schema for t in _turn_registry.all_tools() if t.name in used_names
+                ] or _turn_registry.select(
+                    user_query=user_query,
+                    messages=_cached_history or request.messages,
+                    preferred_names=_preferred_tool_names,
+                )
+            else:
+                effective_tools_schema = _turn_registry.select(
+                    user_query=user_query,
+                    messages=_cached_history or request.messages,
+                    preferred_names=_preferred_tool_names,
+                )
+            _final_tool_names = {
+                t.get("function", {}).get("name", "")
+                for t in effective_tools_schema
+                if t.get("function", {}).get("name")
+            }
+            if _preferred:
+                _preferred_status = "selected" if _preferred in _final_tool_names else "filtered"
+                if _preferred not in _available_turn_tools:
+                    _preferred_status = "unavailable"
+                try:
+                    memory_preferred_tool_total.labels(
+                        tool_name=_preferred,
+                        status=_preferred_status,
+                        runtime="cloud",
+                    ).inc()
+                except Exception:
+                    logger.debug("Failed to record cloud memory selection metrics", exc_info=True)
+                _routing_meta.setdefault("memory_selection", {})["status"] = _preferred_status
+            _high_confidence_skill = None
 
             def _build_sync():
                 db = SessionLocal()
@@ -2633,8 +2700,6 @@ async def chat_turn(
             task_hint = _classify_task(request.messages)
             # Build fingerprints once per turn — used later to detect prompt leakage.
             _prompt_fingerprints = _build_prompt_fingerprints(llm_messages, effective_tools_schema)
-
-            yield f"data: {json.dumps({'type': 'session_info', 'session_id': session_id})}\n\n"
 
             # ── Quality Badge SSE (§5.4) — emit before LLM response ──────
             if _TOOL_QUALITY_ENABLED:
@@ -2816,6 +2881,96 @@ async def chat_turn(
 
                     if _timed_out:
                         return
+
+                    if _loop_tool_calls and _routing_decision and _routing_decision.memory_policy:
+                        from core.memory.policy import (
+                            build_memory_guard_payload,
+                            evaluate_memory_tool_call,
+                        )
+
+                        _guarded_calls: list[tuple[dict[str, Any], dict[str, object], Any]] = []
+                        for tc in _loop_tool_calls:
+                            tc_name = tc.get("function", {}).get("name", "")
+                            _guard = evaluate_memory_tool_call(
+                                actual_tool=tc_name,
+                                tool_hint=_routing_decision.memory_policy.tool_hint,
+                                available_tools=_final_tool_names,
+                            )
+                            try:
+                                if _guard.preferred_tool and _guard.actual_tool and _guard.outcome:
+                                    memory_execution_guard_total.labels(
+                                        preferred_tool=_guard.preferred_tool,
+                                        actual_tool=_guard.actual_tool,
+                                        outcome=_guard.outcome,
+                                        runtime="cloud",
+                                    ).inc()
+                            except Exception:
+                                logger.debug(
+                                    "Failed to record cloud memory execution metrics",
+                                    exc_info=True,
+                                )
+                            if not _guard.allow:
+                                _guarded_calls.append(
+                                    (tc, build_memory_guard_payload(_guard), _guard)
+                                )
+
+                        if _guarded_calls:
+                            _blocked_entries = [
+                                {
+                                    "id": tc.get("id", ""),
+                                    "type": "function",
+                                    "function": tc.get("function", {}),
+                                }
+                                for tc, _, _ in _guarded_calls
+                            ]
+                            _assistant_guard_msg: dict[str, Any] = {
+                                "role": "assistant",
+                                "content": _loop_text or None,
+                                "tool_calls": _blocked_entries,
+                            }
+                            if _loop_reasoning:
+                                _assistant_guard_msg["reasoning_content"] = _loop_reasoning
+                            _current_llm_messages = _current_llm_messages + [_assistant_guard_msg]
+                            _history_guard_msg: dict[str, Any] = {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": _blocked_entries,
+                            }
+                            if _loop_reasoning:
+                                _history_guard_msg["reasoning_content"] = _loop_reasoning
+                            _cloud_loop_history.append(_history_guard_msg)
+
+                            for tc, payload, _guard in _guarded_calls:
+                                tc_name = tc.get("function", {}).get("name", "?")
+                                tc_id = tc.get("id", "")
+                                result_str = json.dumps(payload, ensure_ascii=False)
+                                yield f"data: {json.dumps({'type': 'tool_call_start', 'name': tc_name})}\n\n"
+                                yield f"data: {json.dumps({'type': 'cloud_tool_result', 'name': tc_name, 'result': result_str[:500], 'blocked': True})}\n\n"
+                                _current_llm_messages = _current_llm_messages + [
+                                    {
+                                        "role": "tool",
+                                        "tool_call_id": tc_id,
+                                        "content": result_str,
+                                    },
+                                    {
+                                        "role": "system",
+                                        "content": str(payload.get("guidance", "")),
+                                    },
+                                ]
+                                _cloud_loop_history.extend(
+                                    [
+                                        {
+                                            "role": "tool",
+                                            "tool_call_id": tc_id,
+                                            "content": result_str,
+                                        },
+                                        {
+                                            "role": "system",
+                                            "content": str(payload.get("guidance", "")),
+                                        },
+                                    ]
+                                )
+                            continue
 
                     if not _loop_tool_calls:
                         # No tool calls — final answer, exit loop.

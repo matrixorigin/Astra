@@ -24,15 +24,23 @@ def _setup_memoria_env():
 
 
 @pytest.fixture
-def client():
-    return TestClient(app)
+def client(db_session):
+    def override_get_db():
+        try:
+            yield db_session
+        finally:
+            pass
+
+    app.dependency_overrides[get_db_session] = override_get_db
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.pop(get_db_session, None)
 
 
 @pytest.fixture
-def db():
-    session = next(get_db_session())
-    yield session
-    session.close()
+def db(db_session):
+    return db_session
 
 
 # ============================================================================
@@ -1332,6 +1340,25 @@ class TestMemoryRecallExplain:
         """Insert test memories with varying confidence and timestamps."""
         from datetime import datetime, timezone, timedelta
 
+        db.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS mem_memories (
+                    memory_id VARCHAR(36) PRIMARY KEY,
+                    user_id VARCHAR(36),
+                    memory_type VARCHAR(20),
+                    content TEXT,
+                    initial_confidence DOUBLE,
+                    trust_tier VARCHAR(10),
+                    is_active TINYINT,
+                    session_id VARCHAR(36),
+                    source_event_ids JSON,
+                    observed_at DATETIME(6),
+                    created_at DATETIME(6)
+                )
+                """
+            )
+        )
         now = datetime.now(timezone.utc)
         memories = []
         for i, (content, conf, age_days) in enumerate(
@@ -1364,13 +1391,9 @@ class TestMemoryRecallExplain:
         db.commit()
         return memories
 
-    def test_recall_returns_ranking_with_scores(
-        self, client, auth_headers, db, test_user, http_client
-    ):
+    def test_recall_returns_ranking_with_scores(self, client, auth_headers, db, test_user):
         """Recall endpoint returns per-candidate 4-dimension score breakdown."""
         from api.models.agent import Session as SessionModel
-        import os
-        import httpx
 
         session = SessionModel(
             session_id=str(uuid4()),
@@ -1381,34 +1404,7 @@ class TestMemoryRecallExplain:
         db.add(session)
         db.commit()
 
-        # Seed memories via memoria API
-        memoria_url = os.environ.get("MEMORIA_BASE_URL", "http://localhost:8100")
-        memoria_master_key = os.environ.get(
-            "MEMORIA_MASTER_KEY", "test-master-key-for-docker-compose"
-        )
-
-        # Create API key for test user
-        key_resp = http_client.post(
-            f"{memoria_url}/auth/keys",
-            headers={"Authorization": f"Bearer {memoria_master_key}"},
-            json={"user_id": test_user.user_id, "name": "test key"},
-            timeout=5.0,
-        )
-        key_resp.raise_for_status()
-        api_key = key_resp.json()["raw_key"]
-
-        # Store test memories
-        for content in ["Python async patterns", "Go concurrency model", "Rust ownership rules"]:
-            http_client.post(
-                f"{memoria_url}/v1/memories",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "content": content,
-                    "memory_type": "semantic",
-                    "session_id": session.session_id,
-                },
-                timeout=5.0,
-            )
+        memory_ids = self._seed_memories(db, test_user.user_id, session.session_id)
 
         try:
             resp = client.get(
@@ -1433,8 +1429,17 @@ class TestMemoryRecallExplain:
             # Phase stats present
             assert "phases" in data
             assert "ranking" in data
+            assert len(data["ranking"]) > 0
+            assert data["ranking"][0]["memory_id"] in memory_ids
+            assert {"vector", "keyword", "temporal", "confidence"} == set(
+                data["ranking"][0]["scores"].keys()
+            )
 
         finally:
+            db.execute(
+                text("DELETE FROM mem_memories WHERE memory_id IN :mids"),
+                {"mids": tuple(memory_ids)},
+            )
             db.delete(session)
             db.commit()
 

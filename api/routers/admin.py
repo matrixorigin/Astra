@@ -122,7 +122,9 @@ class UserRoleResponse(BaseModel):
 
 def _check_admin(user_id: str, db: Session):
     """Raise 403 if user is not admin."""
-    if not PermissionChecker(lambda: db).is_admin(user_id):
+    from core.auth.permission_checker import has_role_in_session
+
+    if not has_role_in_session(db, user_id, "mo_agent_admin"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required")
 
 
@@ -168,14 +170,14 @@ def create_token(
     )
     db.add(token)
     db.commit()
-    db.refresh(token)
+    persisted = db.query(Token).filter(Token.token_id == token_id).first() or token
     return TokenResponse(
-        token_id=token.token_id,
-        token_type=token.type,
-        provider=token.provider,
+        token_id=persisted.token_id,
+        token_type=persisted.type,
+        provider=persisted.provider,
         scope=request.scope,
-        scope_id=token.scope_user_id or token.scope_repo,
-        created_at=token.created_at,
+        scope_id=persisted.scope_user_id or persisted.scope_repo,
+        created_at=persisted.created_at,
     )
 
 

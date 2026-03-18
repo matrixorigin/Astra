@@ -6,6 +6,7 @@ Callers (LLM) receive conclusions, not raw data.
 
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
@@ -74,6 +75,105 @@ def _parse_token_usage(raw: object) -> dict | None:
         return json.loads(raw)  # type: ignore[arg-type]
     except (ValueError, TypeError):
         return None
+
+
+def _empty_memory_recall(query: str, task_hint: str) -> dict:
+    return {
+        "query": query,
+        "task_hint": task_hint,
+        "retrieved_count": 0,
+        "total_ms": 0,
+        "phases": {
+            "keyword": {"candidates": 0, "ms": 0},
+            "vector": {"candidates": 0, "ms": 0},
+            "merge": {"candidates": 0, "ms": 0},
+        },
+        "ranking": [],
+    }
+
+
+def _db_memory_recall(
+    db: Session,
+    *,
+    user_id: str,
+    session_id: str,
+    query: str,
+    task_hint: str,
+    limit: int,
+) -> dict:
+    terms = [t.lower() for t in query.split() if t.strip()]
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT memory_id, content, initial_confidence, observed_at, created_at
+                FROM mem_memories
+                WHERE user_id = :uid
+                  AND is_active = 1
+                  AND (:sid = '' OR session_id = :sid)
+                ORDER BY COALESCE(observed_at, created_at) DESC
+                LIMIT 200
+                """
+            ),
+            {"uid": user_id, "sid": session_id},
+        ).fetchall()
+    except SQLAlchemyError as exc:
+        logger.debug("DB-backed recall unavailable: %s", exc)
+        return _empty_memory_recall(query, task_hint)
+    if not rows:
+        return _empty_memory_recall(query, task_hint)
+
+    now = datetime.now(timezone.utc)
+    ranking = []
+    for row in rows:
+        content = row[1] or ""
+        content_lower = content.lower()
+        if terms:
+            matches = sum(1 for term in terms if term in content_lower)
+            keyword = matches / len(terms)
+        else:
+            keyword = 0.0
+        confidence = float(row[2] or 0.0)
+        observed_at = row[3] or row[4]
+        if observed_at and getattr(observed_at, "tzinfo", None) is None:
+            observed_at = observed_at.replace(tzinfo=timezone.utc)
+        if observed_at:
+            age_days = max((now - observed_at).total_seconds() / 86400.0, 0.0)
+            temporal = max(0.0, 1.0 - min(age_days / 30.0, 1.0))
+        else:
+            temporal = 0.5
+        vector = keyword
+        final_score = round(vector * 0.6 + temporal * 0.2 + confidence * 0.2, 4)
+        ranking.append(
+            {
+                "memory_id": row[0],
+                "final_score": final_score,
+                "scores": {
+                    "vector": round(vector, 4),
+                    "keyword": round(keyword, 4),
+                    "temporal": round(temporal, 4),
+                    "confidence": round(confidence, 4),
+                },
+            }
+        )
+
+    ranking.sort(key=lambda item: item["final_score"], reverse=True)
+    ranking = ranking[:limit]
+    for idx, item in enumerate(ranking, 1):
+        item["rank"] = idx
+
+    return {
+        "query": query,
+        "task_hint": task_hint,
+        "retrieved_count": len(ranking),
+        "total_ms": 0,
+        "phases": {
+            "keyword": {"candidates": len(rows), "ms": 0},
+            "vector": {"candidates": len(rows), "ms": 0},
+            "merge": {"candidates": len(ranking), "ms": 0},
+        },
+        "ranking": ranking,
+    }
 
 
 def _compute_trend(token_history: list[int]) -> str:
@@ -945,19 +1045,14 @@ def get_memory_recall(
     memoria_master_key = os.environ.get("MEMORIA_MASTER_KEY", "")
 
     if not memoria_api_key and not memoria_master_key:
-        # No memoria configured - return empty result
-        return {
-            "query": query,
-            "task_hint": task_hint,
-            "retrieved_count": 0,
-            "total_ms": 0,
-            "phases": {
-                "keyword": {"candidates": 0, "ms": 0},
-                "vector": {"candidates": 0, "ms": 0},
-                "merge": {"candidates": 0, "ms": 0},
-            },
-            "ranking": [],
-        }
+        return _db_memory_recall(
+            db,
+            user_id=user_id,
+            session_id=session_id,
+            query=query,
+            task_hint=task_hint,
+            limit=limit,
+        )
 
     # Use master key to create user API key if needed
     auth_header = f"Bearer {memoria_api_key}" if memoria_api_key else f"Bearer {memoria_master_key}"
@@ -972,20 +1067,16 @@ def get_memory_recall(
         )
         response.raise_for_status()
         result = response.json()
-    except Exception:
-        # Memoria unavailable - return empty result
-        return {
-            "query": query,
-            "task_hint": task_hint,
-            "retrieved_count": 0,
-            "total_ms": 0,
-            "phases": {
-                "keyword": {"candidates": 0, "ms": 0},
-                "vector": {"candidates": 0, "ms": 0},
-                "merge": {"candidates": 0, "ms": 0},
-            },
-            "ranking": [],
-        }
+    except Exception as exc:
+        logger.debug("Memoria recall unavailable, falling back to DB-backed recall: %s", exc)
+        return _db_memory_recall(
+            db,
+            user_id=user_id,
+            session_id=session_id,
+            query=query,
+            task_hint=task_hint,
+            limit=limit,
+        )
 
     # Format response to match expected structure
     ranking = []

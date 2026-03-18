@@ -12,6 +12,7 @@ from sqlalchemy import text
 
 from api.main import app
 from api.database import get_db_session
+from core.auth.jwt_manager import create_access_token
 
 
 @pytest.fixture(autouse=True)
@@ -28,7 +29,7 @@ def _setup_memoria_env():
 
 
 @pytest.fixture
-def client():
+def client(db_session):
     """Test client with gate trigger disabled.
 
     Uses context manager so the event loop persists across requests — required
@@ -36,53 +37,56 @@ def client():
     """
     import os
 
+    def override_get_db():
+        try:
+            yield db_session
+        finally:
+            pass
+
     os.environ["DISABLE_GATE_TRIGGER"] = "1"
-    with TestClient(app) as c:
-        yield c
-    os.environ.pop("DISABLE_GATE_TRIGGER", None)
+    app.dependency_overrides[get_db_session] = override_get_db
+    try:
+        with TestClient(app) as c:
+            yield c
+    finally:
+        app.dependency_overrides.pop(get_db_session, None)
+        os.environ.pop("DISABLE_GATE_TRIGGER", None)
 
 
 @pytest.fixture
-def auth_headers(client):
+def auth_headers(client, db_session):
     """Create admin user and return auth headers."""
     import uuid
-    from core.auth.seed_roles import seed_roles
+    from core.auth.password import hash_password
+    from api.models import Role, User, UserRole
 
     username = f"agent_model_test_{uuid.uuid4().hex}"
+    user_id = uuid.uuid4().hex
+    email = f"{username}@test.com"
 
-    db = next(get_db_session())
-    seed_roles(db)
-    db.close()
-
-    # Register
-    resp = client.post(
-        "/auth/register",
-        json={
-            "username": username,
-            "password": "testpass123",
-            "email": f"{username}@test.com",
-        },
-    )
-    assert resp.status_code in [200, 201], resp.text
-    user_id = resp.json()["user_id"]
-
-    # Grant admin role
-    db = next(get_db_session())
-    role = db.execute(
+    role = db_session.execute(
         text("SELECT role_id FROM auth_roles WHERE role_name = 'mo_agent_admin' LIMIT 1")
     ).fetchone()
-    if role:
-        db.execute(
-            text("INSERT INTO auth_user_roles (user_id, role_id) VALUES (:uid, :rid)"),
-            {"uid": user_id, "rid": role[0]},
-        )
-        db.commit()
-    db.close()
+    if role is None:
+        db_session.add(Role(role_id="role_admin", role_name="mo_agent_admin", description="Admin"))
+        db_session.flush()
+        role_id = "role_admin"
+    else:
+        role_id = role[0]
 
-    # Login
-    resp = client.post("/auth/login", json={"username": username, "password": "testpass123"})
-    token = resp.json()["access_token"]
+    user = User(
+        user_id=user_id,
+        username=username,
+        email=email,
+        password_hash=hash_password("testpass123"),
+        is_active=1,
+    )
+    db_session.add(user)
+    db_session.flush()
+    db_session.add(UserRole(user_id=user_id, role_id=role_id))
+    db_session.commit()
 
+    token = create_access_token({"sub": user_id, "username": username})
     yield {"Authorization": f"Bearer {token}", "user_id": user_id}
 
 

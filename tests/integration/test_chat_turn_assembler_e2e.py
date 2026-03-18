@@ -22,8 +22,10 @@ from sqlalchemy import text as sql_text
 os.environ.setdefault("TOKEN_ENCRYPTION_KEY", "test-key-" + "x" * 32)
 os.environ.setdefault("JWT_SECRET_KEY", "test-jwt-secret-" + "x" * 32)
 
+from api.database import get_db_session
 from api.main import app
 from api.models import User
+from core.auth.jwt_manager import create_access_token
 from core.auth.password import hash_password
 
 
@@ -47,8 +49,18 @@ from tests.conftest import flush_persist_threads
 
 
 @pytest.fixture
-def client():
-    return TestClient(app)
+def client(db_session):
+    def override_get_db():
+        try:
+            yield db_session
+        finally:
+            pass
+
+    app.dependency_overrides[get_db_session] = override_get_db
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.pop(get_db_session, None)
 
 
 @pytest.fixture
@@ -63,10 +75,8 @@ def auth_headers(client, db_session):
         )
         db_session.add(user)
         db_session.commit()
-    resp = client.post(
-        "/auth/login", json={"username": "assembler_test_user", "password": "password123"}
-    )
-    return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+    token = create_access_token({"sub": user.user_id, "username": user.username})
+    return {"Authorization": f"Bearer {token}"}
 
 
 @pytest.fixture(autouse=True)

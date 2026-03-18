@@ -32,8 +32,7 @@ class UserRepository:
         user = UserModel(**user_data)
         db.add(user)
         db.commit()
-        db.refresh(user)
-        return user
+        return db.query(UserModel).filter(UserModel.user_id == user.user_id).first() or user
 
     def get_by_id(self, user_id: str) -> UserModel | None:
         """Get user by ID."""

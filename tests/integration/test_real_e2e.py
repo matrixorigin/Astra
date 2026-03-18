@@ -8,10 +8,13 @@ This catches real integration bugs that mocked tests miss.
 
 import pytest
 import os
+from contextlib import contextmanager, nullcontext
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
 from sqlalchemy import delete
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+from uuid import uuid4
 
 from tests.conftest import parse_sse_events
 
@@ -25,18 +28,39 @@ from api.database import get_db_session
 from api.models import User, Session, Token, AuditLog, UserRole, Role
 from cli.mo_agent_api import cli as agent_cli
 from cli.mo_admin_api import cli as admin_cli
+from core.auth.jwt_manager import create_access_token, create_refresh_token
+
+
+def _get_worker_suffix() -> str:
+    worker_id = os.getenv("PYTEST_XDIST_WORKER", "master")
+    return f"_{worker_id}" if worker_id != "master" else ""
+
+
+def _unique_suffix() -> str:
+    return f"{_get_worker_suffix()}_{uuid4().hex[:8]}"
 
 
 @pytest.fixture
-def client():
-    """FastAPI test client."""
-    return TestClient(app)
+def client(db_session):
+    """FastAPI test client bound to the current test session."""
+
+    def override_get_db():
+        try:
+            yield db_session
+        finally:
+            pass
+
+    app.dependency_overrides[get_db_session] = override_get_db
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.pop(get_db_session, None)
 
 
 @pytest.fixture
-def db():
+def db(db_session):
     """Get test database session with cleanup."""
-    session = next(get_db_session())
+    session = db_session
 
     # Clean up before test
     try:
@@ -73,8 +97,6 @@ def db():
         session.commit()
     except Exception:
         session.rollback()
-
-    session.close()
 
 
 @pytest.fixture
@@ -116,27 +138,29 @@ def isolated_runner(tmp_path, monkeypatch):
 def authenticated_runner(isolated_runner, client, test_user):
     """Runner with authenticated session.
 
-    Note: Must be used with mock_httpx_with_testclient fixture in test.
+    Login is tested separately; most CLI E2E tests only need valid stored creds.
     """
-    print(f"\n[FIXTURE] authenticated_runner: Starting login for user {test_user.username}")
+    creds_file = os.path.expanduser("~/.mo-agent/credentials.json")
+    os.makedirs(os.path.dirname(creds_file), exist_ok=True)
+    access_token = create_access_token({"sub": test_user.user_id, "username": test_user.username})
+    refresh_token = create_refresh_token({"sub": test_user.user_id})
+    with open(creds_file, "w") as f:
+        import json
 
-    # Login (will use mocked httpx from test, isolated_runner has isolated home)
-    result = isolated_runner.invoke(
-        agent_cli, ["--api-url", "http://test", "login"], input="testuser\npassword123\n"
-    )
-    print(f"[FIXTURE] Login result: exit_code={result.exit_code}, output={result.output}")
-
-    if result.exit_code != 0:
-        print(f"[FIXTURE] Login failed: {result.output}")
-        if result.exception:
-            import traceback
-
-            traceback.print_exception(
-                type(result.exception), result.exception, result.exception.__traceback__
-            )
-    assert result.exit_code == 0, f"Login failed: {result.output}"
-
-    print(f"[FIXTURE] Login successful, credentials saved")
+        json.dump(
+            {
+                "current_profile": test_user.username,
+                "profiles": {
+                    test_user.username: {
+                        "username": test_user.username,
+                        "access_token": access_token,
+                        "refresh_token": refresh_token,
+                    }
+                },
+            },
+            f,
+            indent=2,
+        )
     return isolated_runner
 
 
@@ -144,21 +168,29 @@ def authenticated_runner(isolated_runner, client, test_user):
 def authenticated_admin_runner(isolated_runner, client, admin_user):
     """Runner with authenticated admin session.
 
-    Note: Must be used with mock_httpx_with_testclient fixture in test.
+    Login is tested separately; most admin CLI E2E tests only need valid stored creds.
     """
-    # Login as admin (will use mocked httpx from test, isolated_runner has isolated home)
-    result = isolated_runner.invoke(
-        admin_cli, ["--api-url", "http://test", "login"], input="admin\nadmin123\n"
-    )
-    if result.exit_code != 0:
-        print(f"Admin login failed: {result.output}")
-        if result.exception:
-            import traceback
+    creds_file = os.path.expanduser("~/.mo-agent/credentials.json")
+    os.makedirs(os.path.dirname(creds_file), exist_ok=True)
+    access_token = create_access_token({"sub": admin_user.user_id, "username": admin_user.username})
+    refresh_token = create_refresh_token({"sub": admin_user.user_id})
+    with open(creds_file, "w") as f:
+        import json
 
-            traceback.print_exception(
-                type(result.exception), result.exception, result.exception.__traceback__
-            )
-    assert result.exit_code == 0, f"Admin login failed: {result.output}"
+        json.dump(
+            {
+                "current_profile": admin_user.username,
+                "profiles": {
+                    admin_user.username: {
+                        "username": admin_user.username,
+                        "access_token": access_token,
+                        "refresh_token": refresh_token,
+                    }
+                },
+            },
+            f,
+            indent=2,
+        )
     return isolated_runner
 
 
@@ -167,16 +199,22 @@ def test_user(db):
     """Create test user in database."""
     from core.auth.password import hash_password
 
+    unique_suffix = _unique_suffix()
+    username = f"testuser{unique_suffix}"
+    email = f"test{unique_suffix}@example.com"
+
     user = User(
-        user_id="test_user",
-        username="testuser",
-        email="test@example.com",
+        user_id=str(uuid4()),
+        username=username,
+        email=email,
         password_hash=hash_password("password123"),
+        is_active=1,
     )
     db.add(user)
+    db.flush()
+    user_id = user.user_id
     db.commit()
-    db.refresh(user)
-    return user
+    return SimpleNamespace(user_id=user_id, username=username, email=email)
 
 
 @pytest.fixture
@@ -185,6 +223,10 @@ def admin_user(db):
     from core.auth.password import hash_password
     from api.models import Role, UserRole
     from uuid_utils import uuid7
+
+    unique_suffix = _unique_suffix()
+    username = f"admin{unique_suffix}"
+    email = f"admin{unique_suffix}@example.com"
 
     # Create admin role if not exists (must be "mo_agent_admin" for permission checks)
     admin_role = db.query(Role).filter(Role.role_name == "mo_agent_admin").first()
@@ -197,20 +239,21 @@ def admin_user(db):
 
     # Create user
     user = User(
-        user_id="admin_user",
-        username="admin",
-        email="admin@example.com",
+        user_id=str(uuid4()),
+        username=username,
+        email=email,
         password_hash=hash_password("admin123"),
+        is_active=1,
     )
     db.add(user)
     db.flush()
+    user_id = user.user_id
 
     # Assign admin role
     user_role = UserRole(user_id=user.user_id, role_id=admin_role.role_id)
     db.add(user_role)
     db.commit()
-    db.refresh(user)
-    return user
+    return SimpleNamespace(user_id=user_id, username=username, email=email)
 
 
 @pytest.fixture(autouse=True)
@@ -310,7 +353,7 @@ class TestAgentCLIRealE2E:
         result = isolated_runner.invoke(
             agent_cli,
             ["--api-url", "http://test", "login"],
-            input="testuser\npassword123\n",  # Use username, not email
+            input=f"{test_user.username}\npassword123\n",  # Use username, not email
         )
 
         print(f"Exit code: {result.exit_code}")
@@ -330,7 +373,9 @@ class TestAgentCLIRealE2E:
     def test_login_with_invalid_credentials_fails(self, runner, test_user):
         """Test that invalid credentials are rejected by API."""
         result = runner.invoke(
-            agent_cli, ["--api-url", "http://test", "login"], input="testuser\nwrongpassword\n"
+            agent_cli,
+            ["--api-url", "http://test", "login"],
+            input=f"{test_user.username}\nwrongpassword\n",
         )
 
         assert result.exit_code != 0
@@ -440,7 +485,9 @@ class TestAdminCLIRealE2E:
     def test_admin_login_with_admin_role(self, runner, admin_user):
         """Test admin can login successfully."""
         result = runner.invoke(
-            admin_cli, ["--api-url", "http://test", "login"], input="admin\nadmin123\n"
+            admin_cli,
+            ["--api-url", "http://test", "login"],
+            input=f"{admin_user.username}\nadmin123\n",
         )
 
         assert result.exit_code == 0
@@ -538,7 +585,9 @@ class TestAdminCLIRealE2E:
         """Test that non-admin users cannot access admin commands."""
         # Login as regular user
         runner.invoke(
-            admin_cli, ["--api-url", "http://test", "login"], input="testuser\npassword123\n"
+            admin_cli,
+            ["--api-url", "http://test", "login"],
+            input=f"{test_user.username}\npassword123\n",
         )
 
         # Try to list tokens (admin only)
@@ -595,23 +644,33 @@ class TestDataConsistencyRealE2E:
 class TestChatTurnRealE2E:
     """Real E2E tests for /chat/turn edge-cloud endpoint."""
 
-    def _get_auth_headers(self, client, db):
-        """Register + login, return auth headers."""
+    def _get_auth_context(self, client, db):
+        """Ensure edge test user exists, then login and return (headers, user)."""
         from core.auth.password import hash_password
 
-        # Ensure user exists
-        user = db.query(User).filter(User.username == "edgeuser").first()
-        if not user:
-            user = User(
-                user_id="edge_user",
-                username="edgeuser",
-                email="edge@test.com",
-                password_hash=hash_password("password123"),
-            )
-            db.add(user)
-            db.commit()
-        resp = client.post("/auth/login", json={"username": "edgeuser", "password": "password123"})
-        return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+        unique_suffix = _unique_suffix()
+        username = f"edgeuser{unique_suffix}"
+        email = f"edge{unique_suffix}@test.com"
+        user = User(
+            user_id=f"edge_user{unique_suffix}",
+            username=username,
+            email=email,
+            password_hash=hash_password("password123"),
+            is_active=1,
+        )
+        db.add(user)
+        db.flush()
+        user_id = user.user_id
+        db.commit()
+        token = create_access_token({"sub": user_id, "username": username})
+        return {"Authorization": f"Bearer {token}"}, SimpleNamespace(
+            user_id=user_id, username=username, email=email
+        )
+
+    def _get_auth_headers(self, client, db):
+        """Register + login, return auth headers."""
+        headers, _ = self._get_auth_context(client, db)
+        return headers
 
     def _parse_sse(self, response_text):
         """Parse SSE events from response text."""
@@ -625,14 +684,12 @@ class TestChatTurnRealE2E:
         """First event is always session_info with session_id."""
         headers = self._get_auth_headers(client, db)
 
-        with patch(
-            "core.llm.client.LLMClient.chat_stream",
-            return_value=_fake_stream(
-                [
-                    {"type": "text", "content": "Hello!"},
-                ]
-            ),
-        ):
+        fake_llm = _fake_shared_llm(
+            [
+                {"type": "text", "content": "Hello!"},
+            ]
+        )
+        with patch("api.routers.chat._get_shared_llm_client", return_value=fake_llm):
             resp = client.post(
                 "/chat/turn",
                 json={
@@ -640,9 +697,10 @@ class TestChatTurnRealE2E:
                 },
                 headers=headers,
             )
+            resp_text = resp.text
 
         assert resp.status_code == 200
-        events = self._parse_sse(resp.text)
+        events = self._parse_sse(resp_text)
         assert events[0]["type"] == "session_info"
         assert "session_id" in events[0]
 
@@ -650,15 +708,13 @@ class TestChatTurnRealE2E:
         """Text chunks arrive as text_delta events."""
         headers = self._get_auth_headers(client, db)
 
-        with patch(
-            "core.llm.client.LLMClient.chat_stream",
-            return_value=_fake_stream(
-                [
-                    {"type": "text", "content": "Hello"},
-                    {"type": "text", "content": " world"},
-                ]
-            ),
-        ):
+        fake_llm = _fake_shared_llm(
+            [
+                {"type": "text", "content": "Hello"},
+                {"type": "text", "content": " world"},
+            ]
+        )
+        with patch("api.routers.chat._get_shared_llm_client", return_value=fake_llm):
             resp = client.post(
                 "/chat/turn",
                 json={
@@ -666,8 +722,9 @@ class TestChatTurnRealE2E:
                 },
                 headers=headers,
             )
+            resp_text = resp.text
 
-        events = self._parse_sse(resp.text)
+        events = self._parse_sse(resp_text)
         text_events = [e for e in events if e["type"] == "text_delta"]
         assert len(text_events) == 2
         assert text_events[0]["content"] == "Hello"
@@ -681,22 +738,20 @@ class TestChatTurnRealE2E:
         """Tool calls from LLM are returned as tool_call events."""
         headers = self._get_auth_headers(client, db)
 
-        with patch(
-            "core.llm.client.LLMClient.chat_with_tools_stream",
-            return_value=_fake_stream(
-                [
-                    {"type": "text", "content": "Let me read that."},
-                    {
-                        "type": "tool_call",
-                        "data": {
-                            "id": "tc_001",
-                            "type": "function",
-                            "function": {"name": "read_file", "arguments": '{"path": "README.md"}'},
-                        },
+        fake_llm = _fake_shared_llm(
+            [
+                {"type": "text", "content": "Let me read that."},
+                {
+                    "type": "tool_call",
+                    "data": {
+                        "id": "tc_001",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path": "README.md"}'},
                     },
-                ]
-            ),
-        ):
+                },
+            ]
+        )
+        with patch("api.routers.chat._get_shared_llm_client", return_value=fake_llm):
             resp = client.post(
                 "/chat/turn",
                 json={
@@ -717,8 +772,9 @@ class TestChatTurnRealE2E:
                 },
                 headers=headers,
             )
+            resp_text = resp.text
 
-        events = self._parse_sse(resp.text)
+        events = self._parse_sse(resp_text)
         tc_events = [e for e in events if e["type"] == "tool_call"]
         assert len(tc_events) == 1
         assert tc_events[0]["name"] == "read_file"
@@ -730,21 +786,19 @@ class TestChatTurnRealE2E:
         headers = self._get_auth_headers(client, db)
 
         # Turn 1: get tool call
-        with patch(
-            "core.llm.client.LLMClient.chat_with_tools_stream",
-            return_value=_fake_stream(
-                [
-                    {
-                        "type": "tool_call",
-                        "data": {
-                            "id": "tc_1",
-                            "type": "function",
-                            "function": {"name": "read_file", "arguments": '{"path": "a.py"}'},
-                        },
+        fake_llm_turn1 = _fake_shared_llm(
+            [
+                {
+                    "type": "tool_call",
+                    "data": {
+                        "id": "tc_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path": "a.py"}'},
                     },
-                ]
-            ),
-        ):
+                },
+            ]
+        )
+        with patch("api.routers.chat._get_shared_llm_client", return_value=fake_llm_turn1):
             r1 = client.post(
                 "/chat/turn",
                 json={
@@ -765,17 +819,16 @@ class TestChatTurnRealE2E:
                 },
                 headers=headers,
             )
-        session_id = self._parse_sse(r1.text)[0]["session_id"]
+            r1_text = r1.text
+        session_id = self._parse_sse(r1_text)[0]["session_id"]
 
         # Turn 2: send tool results back
-        with patch(
-            "core.llm.client.LLMClient.chat_with_tools_stream",
-            return_value=_fake_stream(
-                [
-                    {"type": "text", "content": "The file contains a function."},
-                ]
-            ),
-        ):
+        fake_llm_turn2 = _fake_shared_llm(
+            [
+                {"type": "text", "content": "The file contains a function."},
+            ]
+        )
+        with patch("api.routers.chat._get_shared_llm_client", return_value=fake_llm_turn2):
             r2 = client.post(
                 "/chat/turn",
                 json={
@@ -787,43 +840,44 @@ class TestChatTurnRealE2E:
                 },
                 headers=headers,
             )
+            r2_text = r2.text
 
-        events = self._parse_sse(r2.text)
+        events = self._parse_sse(r2_text)
         text_events = [e for e in events if e["type"] == "text_delta"]
         assert text_events[0]["content"] == "The file contains a function."
         assert events[-1]["has_tool_calls"] is False
 
     def test_chat_turn_persists_events(self, client, db):
         """Events are persisted to agent_events table."""
-        headers = self._get_auth_headers(client, db)
+        headers, user = self._get_auth_context(client, db)
         from sqlalchemy import text as sql_text
 
         # Count events before
         before = db.execute(
-            sql_text("SELECT COUNT(*) FROM agent_events WHERE user_id = 'edge_user'")
+            sql_text("SELECT COUNT(*) FROM agent_events WHERE user_id = :uid"),
+            {"uid": user.user_id},
         ).scalar()
 
-        with patch(
-            "core.llm.client.LLMClient.chat_stream",
-            return_value=_fake_stream(
-                [
-                    {"type": "text", "content": "Done."},
-                ]
-            ),
-        ):
+        fake_llm = _fake_shared_llm(
+            [
+                {"type": "text", "content": "Done."},
+            ]
+        )
+        with patch("api.routers.chat._get_shared_llm_client", return_value=fake_llm):
             client.post(
                 "/chat/turn",
                 json={
                     "messages": [{"role": "user", "content": "test persist"}],
                 },
                 headers=headers,
-            )
+            ).text
 
         from api.routers.chat import _flush_persist_threads
 
         _flush_persist_threads()
         after = db.execute(
-            sql_text("SELECT COUNT(*) FROM agent_events WHERE user_id = 'edge_user'")
+            sql_text("SELECT COUNT(*) FROM agent_events WHERE user_id = :uid"),
+            {"uid": user.user_id},
         ).scalar()
         assert after > before, f"Expected new events: before={before}, after={after}"
 
@@ -842,21 +896,19 @@ class TestChatTurnRealE2E:
         ]
 
         # Turn 1: send edge_tools
-        with patch(
-            "core.llm.client.LLMClient.chat_with_tools_stream",
-            return_value=_fake_stream(
-                [
-                    {
-                        "type": "tool_call",
-                        "data": {
-                            "id": "tc_1",
-                            "type": "function",
-                            "function": {"name": "bash", "arguments": '{"command": "ls"}'},
-                        },
+        fake_llm_turn1 = _fake_shared_llm(
+            [
+                {
+                    "type": "tool_call",
+                    "data": {
+                        "id": "tc_1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": '{"command": "ls"}'},
                     },
-                ]
-            ),
-        ):
+                },
+            ]
+        )
+        with patch("api.routers.chat._get_shared_llm_client", return_value=fake_llm_turn1):
             r1 = client.post(
                 "/chat/turn",
                 json={
@@ -865,17 +917,16 @@ class TestChatTurnRealE2E:
                 },
                 headers=headers,
             )
-        session_id = self._parse_sse(r1.text)[0]["session_id"]
+            r1_text = r1.text
+        session_id = self._parse_sse(r1_text)[0]["session_id"]
 
         # Turn 2: no edge_tools — should still use tools (chat_with_tools_stream, not chat_stream)
-        with patch(
-            "core.llm.client.LLMClient.chat_with_tools_stream",
-            return_value=_fake_stream(
-                [
-                    {"type": "text", "content": "Here are the files."},
-                ]
-            ),
-        ) as mock_tools_stream:
+        fake_llm_turn2 = _fake_shared_llm(
+            [
+                {"type": "text", "content": "Here are the files."},
+            ]
+        )
+        with patch("api.routers.chat._get_shared_llm_client", return_value=fake_llm_turn2):
             r2 = client.post(
                 "/chat/turn",
                 json={
@@ -887,7 +938,8 @@ class TestChatTurnRealE2E:
                 },
                 headers=headers,
             )
-        mock_tools_stream.assert_called_once()
+            _ = r2.text
+        fake_llm_turn2.chat_with_tools_stream.assert_called_once()
 
     def test_chat_turn_requires_auth(self, client):
         """Unauthenticated requests return SSE error (SSE endpoints always return 200)."""
@@ -909,15 +961,32 @@ def _fake_stream(chunks):
     return _fake_stream_gen(chunks)
 
 
+def _fake_shared_llm(chunks):
+    @contextmanager
+    def _aux_calls():
+        yield []
+
+    llm = Mock()
+    llm.config = {"temperature": 0.7}
+    llm.chat_stream.return_value = _fake_stream(chunks)
+    llm.chat_with_tools_stream.return_value = _fake_stream(chunks)
+    llm.request_context.return_value = nullcontext()
+    llm.track_auxiliary_calls.side_effect = _aux_calls
+    llm.resolve_model_name.return_value = "gpt-4o"
+    return llm
+
+
 class TestChatStreamingRealE2E:
     """Test chat command integration with real API."""
 
-    def test_chat_without_session_creates_session(self, authenticated_runner, db):
+    def test_chat_without_session_creates_session(self, authenticated_runner, db, test_user):
         """Test that chat without session ID attempts to create one."""
         from api.models import Session as SessionModel
 
         # Count sessions before
-        sessions_before = db.query(SessionModel).filter(SessionModel.user_id == "test_user").count()
+        sessions_before = (
+            db.query(SessionModel).filter(SessionModel.user_id == test_user.user_id).count()
+        )
 
         # Try to start chat (will fail at LLM call, but should create session first)
         result = authenticated_runner.invoke(
@@ -926,7 +995,9 @@ class TestChatStreamingRealE2E:
 
         # May fail at LLM call, but should have attempted session creation
         # Check if session was created
-        sessions_after = db.query(SessionModel).filter(SessionModel.user_id == "test_user").count()
+        sessions_after = (
+            db.query(SessionModel).filter(SessionModel.user_id == test_user.user_id).count()
+        )
 
         # If session creation worked, we should see increase
         # If it failed, we should see error message about session creation
@@ -984,7 +1055,7 @@ class TestUserRegistrationRealE2E:
         result = runner.invoke(
             agent_cli,
             ["--api-url", "http://test", "register"],
-            input="testuser\nother@example.com\npassword123\n",
+            input=f"{test_user.username}\nother@example.com\npassword123\n",
         )
 
         # Should fail with error
@@ -999,7 +1070,7 @@ class TestWhoamiRealE2E:
         result = authenticated_runner.invoke(agent_cli, ["--api-url", "http://test", "whoami"])
 
         assert result.exit_code == 0, f"Failed: {result.output}"
-        assert "testuser" in result.output or "test_user" in result.output
+        assert "testuser" in result.output or "test_" in result.output
 
 
 class TestSkillManagementRealE2E:
@@ -1023,18 +1094,21 @@ class TestSkillManagementRealE2E:
 class TestReplayRealE2E:
     """Test session replay with real API."""
 
-    def test_replay_with_valid_session(self, authenticated_runner, db):
+    def test_replay_with_valid_session(self, authenticated_runner, db, test_user):
         """Test replay with valid session ID."""
         from api.models import Session as SessionModel
 
         # Get or create a session
-        session = db.query(SessionModel).filter(SessionModel.user_id == "test_user").first()
+        session = db.query(SessionModel).filter(SessionModel.user_id == test_user.user_id).first()
         if not session:
             # Create one via API
             from uuid_utils import uuid7
 
             session = SessionModel(
-                session_id=str(uuid7()), user_id="test_user", agent_id="test-agent", status="active"
+                session_id=str(uuid7()),
+                user_id=test_user.user_id,
+                agent_id="test-agent",
+                status="active",
             )
             db.add(session)
             db.commit()

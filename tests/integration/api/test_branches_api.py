@@ -5,12 +5,24 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
+from api.database import get_db_session
+
 
 @pytest.fixture
-def client():
+def client(db_session):
     from api.main import app
 
-    return TestClient(app)
+    def override_get_db():
+        try:
+            yield db_session
+        finally:
+            pass
+
+    app.dependency_overrides[get_db_session] = override_get_db
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.pop(get_db_session, None)
 
 
 @pytest.fixture(autouse=True)

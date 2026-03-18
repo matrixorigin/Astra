@@ -158,6 +158,8 @@ class ChatLoop:
         self._escalated_model: str | None | object = _UNSET  # SLO escalation cache
         self._memory_service: Any = None  # MemoryService facade
         self._budget_manager = None  # Global context budget manager
+        self._current_memory_policy = None
+        self._current_tool_names: set[str] = set()
         # Circuit breaker state (per-turn, reset on each run_step call)
         self._tool_failures: dict[str, list[str]] = {}
         self._blocked_tools: set[str] = set()
@@ -172,6 +174,82 @@ class ChatLoop:
                 self._few_shot = FewShotRetriever(llm_client._db_factory)
         except Exception:
             pass
+
+    def _record_memory_hint_metrics(self, runtime: str, memory_policy: Any | None) -> None:
+        tool_hint = getattr(memory_policy, "tool_hint", None)
+        context_plan = getattr(memory_policy, "context_plan", None)
+        tool_name = getattr(tool_hint, "tool_name", None)
+        if not tool_name:
+            return
+        try:
+            from core.metrics import memory_tool_hints_total
+
+            mode = getattr(getattr(context_plan, "mode", None), "value", "none")
+            memory_tool_hints_total.labels(
+                tool_name=tool_name,
+                mode=mode,
+                runtime=runtime,
+            ).inc()
+        except Exception:
+            logger.debug("Failed to record memory tool hint metrics", exc_info=True)
+
+    def _record_memory_selection_metrics(
+        self,
+        runtime: str,
+        preferred_tool: str | None,
+        available_tool_names: set[str] | None,
+        final_tool_names: set[str],
+    ) -> None:
+        if not preferred_tool:
+            return
+        try:
+            from core.metrics import memory_preferred_tool_total
+
+            status = "selected" if preferred_tool in final_tool_names else "filtered"
+            if available_tool_names is not None and preferred_tool not in available_tool_names:
+                status = "unavailable"
+            memory_preferred_tool_total.labels(
+                tool_name=preferred_tool,
+                status=status,
+                runtime=runtime,
+            ).inc()
+        except Exception:
+            logger.debug("Failed to record memory selection metrics", exc_info=True)
+
+    def _evaluate_memory_execution_guard(self, fn_name: str):
+        try:
+            from core.memory.policy import evaluate_memory_tool_call
+
+            memory_policy = getattr(self, "_current_memory_policy", None)
+            tool_hint = getattr(memory_policy, "tool_hint", None)
+            return evaluate_memory_tool_call(
+                actual_tool=fn_name,
+                tool_hint=tool_hint,
+                available_tools=getattr(self, "_current_tool_names", set()),
+            )
+        except Exception:
+            logger.debug("Memory execution guard evaluation failed", exc_info=True)
+            return None
+
+    def _record_memory_execution_metrics(self, runtime: str, guard_decision: Any | None) -> None:
+        if guard_decision is None:
+            return
+        preferred = getattr(guard_decision, "preferred_tool", None)
+        actual = getattr(guard_decision, "actual_tool", None)
+        outcome = getattr(guard_decision, "outcome", None)
+        if not preferred or not actual or not outcome:
+            return
+        try:
+            from core.metrics import memory_execution_guard_total
+
+            memory_execution_guard_total.labels(
+                preferred_tool=preferred,
+                actual_tool=actual,
+                outcome=outcome,
+                runtime=runtime,
+            ).inc()
+        except Exception:
+            logger.debug("Failed to record memory execution metrics", exc_info=True)
         # Initialize global context budget manager
         try:
             from core.context.budget_manager import ContextBudgetManager
@@ -324,6 +402,21 @@ class ChatLoop:
 
         _t0 = time.monotonic()
         result_str = ""
+        _guard_decision = self._evaluate_memory_execution_guard(fn_name)
+        self._record_memory_execution_metrics("edge", _guard_decision)
+        _blocked_by_memory_policy = bool(_guard_decision and not _guard_decision.allow)
+        if _blocked_by_memory_policy:
+            from core.memory.policy import build_memory_guard_payload
+
+            logger.info(
+                "Memory execution guard blocked tool %s in favor of %s",
+                fn_name,
+                _guard_decision.preferred_tool,
+            )
+            result_str = json.dumps(
+                build_memory_guard_payload(_guard_decision),
+                ensure_ascii=False,
+            )
         try:
             params = json.loads(tc["function"]["arguments"])
 
@@ -333,90 +426,91 @@ class ChatLoop:
 
             from core.verification.cot_audit import audit_tool_call
 
-            audit = audit_tool_call(
-                user_query=user_input,
-                tool_name=fn_name,
-                tool_args=params,
-                assistant_reasoning=full_text,
-                llm_client=self.llm,
-            )
-            if not audit.safe:
-                logger.warning("CoT audit blocked tool %s: %s", fn_name, audit.reason)
-                result_str = json.dumps({"error": f"Blocked by CoT audit: {audit.reason}"})
-            else:
-                hitl_ok, hitl_msg = self._evaluate_hitl(fn_name, params)
-                if not hitl_ok:
-                    result_str = hitl_msg
-                elif _async_registry.is_async_tool(fn_name):
-                    result = await _async_registry.execute(
-                        fn_name, params, run_id=getattr(self, "_current_run_id", None)
-                    )
-                    result_str = json.dumps(result, default=str)
-                    if self.hitl_policy:
-                        self.hitl_policy.record_outcome(fn_name, success=True)
-                    if result.get("wait_for"):
-                        yield StreamEvent(
-                            event_type=StreamEventType.TOOL_RESULT,
-                            data={
-                                "call_id": tc["id"],
-                                "result": result_str[:500],
-                                "wait_for": result["wait_for"],
-                            },
-                            event_id=user_event.event_id,
-                            causal_chain_id=user_event.causal_chain_id,
-                            agent_id=self.agent_id,
-                        )
-                        messages.append(
-                            {"role": "tool", "tool_call_id": tc["id"], "content": result_str}
-                        )
-                        return
-                elif fn_name == "delegate_task":
-                    delegated_agent_id = params.get("agent_id", "unknown")
-                    result_text = ""
-                    has_output = False
-                    async for delegated_event in self.executor.execute_skill_stream(
-                        skill_name=fn_name,
-                        params=params,
-                        session_id=session_id,
-                        parent_event_id=user_event.event_id,
-                    ):
-                        yield delegated_event
-                        if delegated_event.event_type == StreamEventType.TEXT_DONE:
-                            result_text = delegated_event.data.get("full_text", "")
-                            has_output = True
-                    result_str = (
-                        result_text
-                        if has_output
-                        else f"Agent '{delegated_agent_id}' completed with no text output"
-                    )
-                    if self.hitl_policy:
-                        self.hitl_policy.record_outcome(fn_name, success=True)
+            if not _blocked_by_memory_policy:
+                audit = audit_tool_call(
+                    user_query=user_input,
+                    tool_name=fn_name,
+                    tool_args=params,
+                    assistant_reasoning=full_text,
+                    llm_client=self.llm,
+                )
+                if not audit.safe:
+                    logger.warning("CoT audit blocked tool %s: %s", fn_name, audit.reason)
+                    result_str = json.dumps({"error": f"Blocked by CoT audit: {audit.reason}"})
                 else:
-                    if fn_name.startswith("scratchpad_") and self.scratchpad:
-                        result = self._handle_scratchpad_tool(fn_name, params, session_id, user_id)
-                    elif self.mcp_bridge and self.mcp_bridge.is_mcp_tool(fn_name):
-                        result = await asyncio.wait_for(
-                            self.mcp_bridge.call_tool(fn_name, params),
-                            timeout=TOOL_TIMEOUT_SECONDS,
+                    hitl_ok, hitl_msg = self._evaluate_hitl(fn_name, params)
+                    if not hitl_ok:
+                        result_str = hitl_msg
+                    elif _async_registry.is_async_tool(fn_name):
+                        result = await _async_registry.execute(
+                            fn_name, params, run_id=getattr(self, "_current_run_id", None)
                         )
+                        result_str = json.dumps(result, default=str)
+                        if self.hitl_policy:
+                            self.hitl_policy.record_outcome(fn_name, success=True)
+                        if result.get("wait_for"):
+                            yield StreamEvent(
+                                event_type=StreamEventType.TOOL_RESULT,
+                                data={
+                                    "call_id": tc["id"],
+                                    "result": result_str[:500],
+                                    "wait_for": result["wait_for"],
+                                },
+                                event_id=user_event.event_id,
+                                causal_chain_id=user_event.causal_chain_id,
+                                agent_id=self.agent_id,
+                            )
+                            messages.append(
+                                {"role": "tool", "tool_call_id": tc["id"], "content": result_str}
+                            )
+                            return
+                    elif fn_name == "delegate_task":
+                        delegated_agent_id = params.get("agent_id", "unknown")
+                        result_text = ""
+                        has_output = False
+                        async for delegated_event in self.executor.execute_skill_stream(
+                            skill_name=fn_name,
+                            params=params,
+                            session_id=session_id,
+                            parent_event_id=user_event.event_id,
+                        ):
+                            yield delegated_event
+                            if delegated_event.event_type == StreamEventType.TEXT_DONE:
+                                result_text = delegated_event.data.get("full_text", "")
+                                has_output = True
+                        result_str = (
+                            result_text
+                            if has_output
+                            else f"Agent '{delegated_agent_id}' completed with no text output"
+                        )
+                        if self.hitl_policy:
+                            self.hitl_policy.record_outcome(fn_name, success=True)
                     else:
-                        result = await asyncio.wait_for(
-                            asyncio.to_thread(
-                                self.executor.execute_skill_with_feedback,
-                                skill_name=fn_name,
-                                params=params,
-                                session_id=session_id,
-                                parent_event_id=user_event.event_id,
-                                selection_event_id=None,
-                            ),
-                            timeout=TOOL_TIMEOUT_SECONDS,
+                        if fn_name.startswith("scratchpad_") and self.scratchpad:
+                            result = self._handle_scratchpad_tool(fn_name, params, session_id, user_id)
+                        elif self.mcp_bridge and self.mcp_bridge.is_mcp_tool(fn_name):
+                            result = await asyncio.wait_for(
+                                self.mcp_bridge.call_tool(fn_name, params),
+                                timeout=TOOL_TIMEOUT_SECONDS,
+                            )
+                        else:
+                            result = await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    self.executor.execute_skill_with_feedback,
+                                    skill_name=fn_name,
+                                    params=params,
+                                    session_id=session_id,
+                                    parent_event_id=user_event.event_id,
+                                    selection_event_id=None,
+                                ),
+                                timeout=TOOL_TIMEOUT_SECONDS,
+                            )
+                        result_str = (
+                            json.dumps(result, default=str) if not isinstance(result, str) else result
                         )
-                    result_str = (
-                        json.dumps(result, default=str) if not isinstance(result, str) else result
-                    )
-                    self._record_tool_success(fn_name)
-                    if self.hitl_policy:
-                        self.hitl_policy.record_outcome(fn_name, success=True)
+                        self._record_tool_success(fn_name)
+                        if self.hitl_policy:
+                            self.hitl_policy.record_outcome(fn_name, success=True)
         except Exception as e:
             logger.error(f"Tool {fn_name} failed: {e}")
             result_str = json.dumps({"error": str(e)})
@@ -441,15 +535,30 @@ class ChatLoop:
                 "duration_ms": _tool_elapsed_ms,
                 "result_size_bytes": _result_size_bytes,
                 "result_size_tokens": _result_size_tokens,
+                "blocked_by_memory_policy": _blocked_by_memory_policy,
+                "memory_policy": _guard_decision.as_dict() if _guard_decision else None,
             },
         )
         yield StreamEvent(
             event_type=StreamEventType.TOOL_RESULT,
-            data={"call_id": tc["id"], "result": result_str[:500]},
+            data={
+                "call_id": tc["id"],
+                "result": result_str[:500],
+                "blocked": _blocked_by_memory_policy,
+            },
             event_id=tool_result_event.event_id,
             causal_chain_id=user_event.causal_chain_id,
             agent_id=self.agent_id,
         )
+        if _blocked_by_memory_policy:
+            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
+            try:
+                _parsed = json.loads(result_str)
+                if isinstance(_parsed, dict) and _parsed.get("guidance"):
+                    messages.append({"role": "system", "content": _parsed["guidance"]})
+            except Exception:
+                pass
+            return
         # Process tool output unconditionally: large results → summarize (+ store if memory available)
         from core.agent.tool_output_handler import process_tool_output
 
@@ -586,8 +695,70 @@ class ChatLoop:
                 messages[-1]["content"] += f"\n\n[{hint}]"
             logger.debug("Parameter extraction: %s", extracted_params)
 
+        # Unified intent routing — single pass for tool filtering + task type + memory preference.
+        from core.context.intent_routing import (
+            Tier0Engine,
+            ToolFilter,
+            LOCAL_TOOLS,
+            RoutingDecision,
+            RoutingResult,
+            INTENT_PLANS,
+            _FALLBACK_PLAN,
+        )
+        from core.memory.policy import MemoryPolicy
+
+        # Tier0Engine is stateless — reuse a single instance across calls
+        if not hasattr(self, "_tier0"):
+            self._tier0 = Tier0Engine()
+        _tier0 = self._tier0
+        _tool_filter, _max_rounds = _tier0.classify_tool_filter(user_input)
+        _task_type = _tier0.classify_task_type(user_input)
+        _history_len = len(merged_ctx.get("selected_events") or [])
+        _tier0_result = _tier0.classify(user_input, history_len=_history_len)
+        _routing = RoutingDecision(
+            plan=INTENT_PLANS.get(_tier0_result.intent, _FALLBACK_PLAN)
+            if _tier0_result.intent
+            else _FALLBACK_PLAN,
+            routing_result=_tier0_result,
+            tool_filter=_tool_filter,
+            max_tool_rounds=_max_rounds,
+            task_type=_task_type,
+            memory_policy=MemoryPolicy().decide(
+                query=user_input,
+                load_memory=(
+                    INTENT_PLANS.get(_tier0_result.intent, _FALLBACK_PLAN).load_memory
+                    if _tier0_result.intent
+                    else _FALLBACK_PLAN.load_memory
+                ),
+            ),
+        )
+        self._current_memory_policy = _routing.memory_policy
+        self._record_memory_hint_metrics("edge", self._current_memory_policy)
+
+        _preferred_tool_names: list[str] = []
+        _preferred = None
+        _available_registry_tool_names: set[str] = set()
+        try:
+            _available_registry_tool_names = {t.name for t in self._tool_registry.all_tools()}
+        except Exception:
+            pass
+        try:
+            from core.memory.backends import resolve_memory_tool_name
+
+            _preferred = (
+                resolve_memory_tool_name(_routing.memory_policy.tool_hint.tool_name)
+                if _routing.memory_policy
+                else None
+            )
+            if _preferred and self._tool_registry.get(_preferred):
+                _preferred_tool_names = [_preferred]
+        except Exception:
+            pass
+
         # 5. Get available tools schema
-        tools_schema = self._tool_registry.select(user_input, messages)
+        tools_schema = self._tool_registry.select(
+            user_input, messages, preferred_names=_preferred_tool_names
+        )
 
         if self.scratchpad:
             tools_schema = list(tools_schema) + _SCRATCHPAD_TOOLS
@@ -611,6 +782,29 @@ class ChatLoop:
                 t for t in tools_schema if t.get("function", {}).get("name") in allowed_set
             ]
 
+        _effective_max_rounds = _routing.max_tool_rounds
+        if _routing.tool_filter == ToolFilter.LOCAL_BLOCKED and tools_schema:
+            tools_schema = [
+                t for t in tools_schema if t.get("function", {}).get("name") not in LOCAL_TOOLS
+            ]
+            logger.info(
+                "Intent router: LOCAL_BLOCKED — filtered to %d tools, max %d rounds",
+                len(tools_schema),
+                _effective_max_rounds,
+            )
+
+        self._current_tool_names = {
+            t.get("function", {}).get("name", "")
+            for t in tools_schema
+            if t.get("function", {}).get("name")
+        }
+        self._record_memory_selection_metrics(
+            "edge",
+            _preferred,
+            _available_registry_tool_names,
+            self._current_tool_names,
+        )
+
         # Log RUN_STARTED event
         run_started_event = self.event_logger.create_stream_event(
             user_id=user_id,
@@ -629,6 +823,31 @@ class ChatLoop:
             event_id=run_started_event.event_id,
             causal_chain_id=user_event.causal_chain_id,
             agent_id=self.agent_id,
+        )
+
+        # Log unified routing_decision event (replaces the old stream_intent_classification
+        # event — contains all three classification dimensions in one event).
+        self.event_logger.create_stream_event(
+            user_id=user_id,
+            session_id=session_id,
+            event_type="routing_decision",
+            content=json.dumps(
+                {
+                    "intent": _routing.routing_result.intent,
+                    "confidence": _routing.routing_result.confidence,
+                    "tier": _routing.routing_result.tier,
+                    "tool_filter": _routing.tool_filter.value,
+                    "max_tool_rounds": _routing.max_tool_rounds,
+                    "task_type": _routing.task_type.value,
+                    "threshold_used": _routing.threshold_used,
+                    "preferred_tools": _preferred_tool_names,
+                    "memory_policy": (
+                        _routing.memory_policy.as_dict() if _routing.memory_policy else None
+                    ),
+                }
+            ),
+            parent_event_id=user_event.event_id,
+            causal_chain_id=user_event.causal_chain_id,
         )
 
         if not tools_schema:
@@ -662,7 +881,6 @@ class ChatLoop:
                     }
                     continue
                 if chunk_msg["type"] == "reasoning":
-                    # Emit reasoning event for CoT audit trail
                     yield StreamEvent(
                         event_type=StreamEventType.REASONING_MESSAGE_CONTENT,
                         data={"content": chunk_msg["content"]},
@@ -698,7 +916,6 @@ class ChatLoop:
                         agent_id=self.agent_id,
                     )
 
-            # Flush remaining buffer + pending sentences
             for warning in sv.flush():
                 sv.full_text += warning
                 yield StreamEvent(
@@ -710,8 +927,6 @@ class ChatLoop:
                 )
 
             full_text = sv.full_text
-
-            # Response guard: detect prompt leakage / repetition before persisting.
             _guard_reason = _is_degenerate_response(full_text)
             if _guard_reason:
                 logger.error(
@@ -731,7 +946,6 @@ class ChatLoop:
                 )
                 return
 
-            # Post-stream: full response-level verification for audit record
             verification = self.firewall.verify_response(
                 full_text, context_capture_id, mode=self.firewall_mode
             )
@@ -740,10 +954,6 @@ class ChatLoop:
             )
 
             if not verification.safe_to_deliver:
-                logger.warning(
-                    f"[stream/plain] Firewall: confidence={verification.confidence_score:.2f}, "
-                    f"failed={verification.claims_failed}"
-                )
                 warning = (
                     f"\n\n⚠️ Warning: Low confidence ({verification.confidence_score:.0%}). "
                     f"{verification.claims_failed} unverified claims."
@@ -802,77 +1012,8 @@ class ChatLoop:
 
         # Multi-turn tool use loop with streaming
         last_skill_name: str | None = None
-        # Reset turn budget tracker and circuit breaker for this turn
         self._turn_budget = None
         self._reset_breaker()
-
-        # Unified intent routing — single pass for tool filtering + task type + intent
-        # Edge path uses Tier 0 only (<1ms, no LLM call) for tool filtering and task type.
-        # The full Tier 0→1 cascade runs in the cloud path (api/routers/chat.py).
-        from core.context.intent_routing import (
-            Tier0Engine,
-            ToolFilter,
-            LOCAL_TOOLS,
-            RoutingDecision,
-            RoutingResult,
-            INTENT_PLANS,
-            _FALLBACK_PLAN,
-        )
-
-        # Tier0Engine is stateless — reuse a single instance across calls
-        if not hasattr(self, "_tier0"):
-            self._tier0 = Tier0Engine()
-        _tier0 = self._tier0
-        _tool_filter, _max_rounds = _tier0.classify_tool_filter(user_input)
-        _task_type = _tier0.classify_task_type(user_input)
-        _history_len = len(merged_ctx.get("selected_events") or [])
-        _tier0_result = _tier0.classify(user_input, history_len=_history_len)
-        _routing = RoutingDecision(
-            plan=INTENT_PLANS.get(_tier0_result.intent, _FALLBACK_PLAN)
-            if _tier0_result.intent
-            else _FALLBACK_PLAN,
-            routing_result=_tier0_result,
-            tool_filter=_tool_filter,
-            max_tool_rounds=_max_rounds,
-            task_type=_task_type,
-        )
-
-        _effective_max_rounds = _routing.max_tool_rounds
-        # Filter tools by routing decision. This runs in the streaming path
-        # (run_step_stream). The pipeline path (execute_turn → RouteStage) has
-        # its own filtering — the two paths are mutually exclusive, not redundant.
-        # If tools_schema becomes empty after filtering, the existing
-        # `if not tools_schema:` branch above handles it (plain-chat path).
-        if _routing.tool_filter == ToolFilter.LOCAL_BLOCKED and tools_schema:
-            tools_schema = [
-                t for t in tools_schema if t.get("function", {}).get("name") not in LOCAL_TOOLS
-            ]
-            logger.info(
-                "Intent router: LOCAL_BLOCKED — filtered to %d tools, max %d rounds",
-                len(tools_schema),
-                _effective_max_rounds,
-            )
-
-        # Log unified routing_decision event (replaces the old stream_intent_classification
-        # event — contains all three classification dimensions in one event).
-        self.event_logger.create_stream_event(
-            user_id=user_id,
-            session_id=session_id,
-            event_type="routing_decision",
-            content=json.dumps(
-                {
-                    "intent": _routing.routing_result.intent,
-                    "confidence": _routing.routing_result.confidence,
-                    "tier": _routing.routing_result.tier,
-                    "tool_filter": _routing.tool_filter.value,
-                    "max_tool_rounds": _routing.max_tool_rounds,
-                    "task_type": _routing.task_type.value,
-                    "threshold_used": _routing.threshold_used,
-                }
-            ),
-            parent_event_id=user_event.event_id,
-            causal_chain_id=user_event.causal_chain_id,
-        )
 
         for _round in range(_effective_max_rounds):
             # Compact if approaching context limit

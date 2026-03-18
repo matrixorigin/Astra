@@ -163,6 +163,20 @@ class TestSelect:
             assert "function" in schema
             assert "name" in schema["function"]
 
+    def test_select_force_includes_preferred_dynamic_tool(self, registry):
+        result = registry.select("hello", preferred_names=["list_prs"])
+        names = [t["function"]["name"] for t in result]
+        assert "list_prs" in names
+
+    def test_select_preferred_tool_survives_budget(self):
+        r = ToolRegistry(max_tokens=1)
+        r.register(_entry("bash", pinned=True))
+        r.register(_entry("memory_retrieve"))
+        result = r.select("what did i say about tests", preferred_names=["memory_retrieve"])
+        names = {t["function"]["name"] for t in result}
+        assert "bash" in names
+        assert "memory_retrieve" in names
+
 
 # ── Token Budget ─────────────────────────────────────────────────
 

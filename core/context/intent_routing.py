@@ -101,6 +101,7 @@ class RoutingDecision:
     # Task type + topic shift (absorbed from ContextManager.classify_task)
     task_type: TaskType = TaskType.GENERAL
     topic_shift_score: float = 0.0
+    memory_policy: Any | None = None
 
 
 # Intent → ContextLoadingPlan (from doc "Context Loading by Intent" table)
@@ -622,6 +623,19 @@ class IntentRouter:
         self._tier0 = Tier0Engine()
         self._tier1 = Tier1Engine(db_factory)
 
+    @staticmethod
+    def _attach_memory_policy(query: str, decision: RoutingDecision) -> RoutingDecision:
+        try:
+            from core.memory.policy import MemoryPolicy
+
+            decision.memory_policy = MemoryPolicy().decide(
+                query=query,
+                load_memory=decision.plan.load_memory,
+            )
+        except Exception as e:
+            logger.debug("Memory policy skipped: %s", e)
+        return decision
+
     async def route(
         self,
         query: str,
@@ -648,13 +662,16 @@ class IntentRouter:
             if force_intent == "preference":
                 tool_filter = ToolFilter.ALL_BLOCKED
                 max_tool_rounds = 0
-            return RoutingDecision(
+            return self._attach_memory_policy(
+                query,
+                RoutingDecision(
                 plan=INTENT_PLANS[force_intent],
                 routing_result=result,
                 threshold_used=threshold,
                 tool_filter=tool_filter,
                 max_tool_rounds=max_tool_rounds,
                 task_type=task_type,
+                ),
             )
 
         # Tier 0: intent dimension
@@ -670,13 +687,16 @@ class IntentRouter:
             if tier0.intent == "preference":
                 tool_filter = ToolFilter.ALL_BLOCKED
                 max_tool_rounds = 0
-            return RoutingDecision(
+            return self._attach_memory_policy(
+                query,
+                RoutingDecision(
                 plan=INTENT_PLANS[tier0.intent],
                 routing_result=tier0,
                 threshold_used=threshold,
                 tool_filter=tool_filter,
                 max_tool_rounds=max_tool_rounds,
                 task_type=task_type,
+                ),
             )
 
         # Tier 1
@@ -687,13 +707,16 @@ class IntentRouter:
             fallback = RoutingResult(
                 intent="question", confidence=0.0, tier=1, matched_by="fallback"
             )
-            return RoutingDecision(
+            return self._attach_memory_policy(
+                query,
+                RoutingDecision(
                 plan=_FALLBACK_PLAN,
                 routing_result=fallback,
                 threshold_used=threshold,
                 tool_filter=tool_filter,
                 max_tool_rounds=max_tool_rounds,
                 task_type=task_type,
+                ),
             )
 
         if tier1.routing and tier1.routing.intent and tier1.routing.confidence >= threshold:
@@ -704,7 +727,9 @@ class IntentRouter:
             if tier1.routing.intent == "preference":
                 tool_filter = ToolFilter.ALL_BLOCKED
                 max_tool_rounds = 0
-            return RoutingDecision(
+            return self._attach_memory_policy(
+                query,
+                RoutingDecision(
                 plan=plan,
                 routing_result=tier1.routing,
                 tier1_result=tier1,
@@ -712,11 +737,14 @@ class IntentRouter:
                 tool_filter=tool_filter,
                 max_tool_rounds=max_tool_rounds,
                 task_type=task_type,
+                ),
             )
 
         # Fallback — full context
         fallback = RoutingResult(intent="question", confidence=0.0, tier=1, matched_by="fallback")
-        return RoutingDecision(
+        return self._attach_memory_policy(
+            query,
+            RoutingDecision(
             plan=_FALLBACK_PLAN,
             routing_result=fallback,
             tier1_result=tier1,
@@ -724,6 +752,7 @@ class IntentRouter:
             tool_filter=tool_filter,
             max_tool_rounds=max_tool_rounds,
             task_type=task_type,
+            ),
         )
 
     def route_sync(self, **kwargs) -> RoutingDecision:

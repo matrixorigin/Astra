@@ -163,7 +163,9 @@ def _resolve_scope(
 ) -> tuple[str, str | None]:
     """Return (scope_type, scope_id) and enforce admin for global scope."""
     if scope == "global":
-        if not PermissionChecker(lambda: db).is_admin(user_id):
+        from core.auth.permission_checker import has_role_in_session
+
+        if not has_role_in_session(db, user_id, "mo_agent_admin"):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Admin role required for global scope",

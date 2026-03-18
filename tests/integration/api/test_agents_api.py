@@ -5,28 +5,43 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
+from api.database import get_db_session
+from api.main import app
+from api.models import User
+from core.auth.jwt_manager import create_access_token
+from core.auth.password import hash_password
+
 
 @pytest.fixture
-def client():
+def client(db_session):
     """Create test client."""
-    from api.main import app
+    def override_get_db():
+        try:
+            yield db_session
+        finally:
+            pass
 
-    return TestClient(app)
+    app.dependency_overrides[get_db_session] = override_get_db
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.pop(get_db_session, None)
 
 
 @pytest.fixture
-def auth_token(client):
-    """Get auth token by registering and logging in."""
-    # Register
+def auth_token(db_session):
+    """Create a test user in the current session and return a JWT."""
     username = f"testuser_{pytest.test_id}"
-    client.post(
-        "/auth/register",
-        json={"username": username, "email": f"{username}@test.com", "password": "testpass123"},
+    user = User(
+        user_id=str(uuid.uuid4()),
+        username=username,
+        email=f"{username}@test.com",
+        password_hash=hash_password("testpass123"),
+        is_active=1,
     )
-
-    # Login
-    response = client.post("/auth/login", json={"username": username, "password": "testpass123"})
-    return response.json()["access_token"]
+    db_session.add(user)
+    db_session.commit()
+    return create_access_token({"sub": user.user_id, "username": user.username})
 
 
 @pytest.fixture(autouse=True)

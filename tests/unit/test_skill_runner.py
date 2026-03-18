@@ -46,6 +46,15 @@ class TestSkillRunnerErrors:
         assert "diagnose_skills" in error["hint"]
 
 
+class TestSkillRunnerIndex:
+    def test_runner_skill_index_finds_known_skills(self):
+        from core.skills.runner_index import runner_skill_exists
+
+        assert runner_skill_exists("introspection")
+        assert runner_skill_exists("feedback_classifier")
+        assert not runner_skill_exists("nonexistent_xyz")
+
+
 class TestSkillNotFoundError:
     """Test SkillNotFoundError has hint attribute."""
 

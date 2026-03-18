@@ -1405,10 +1405,18 @@ async def _run_edge_turn(
     router.register(ReflectTool(api_client=api_client, session_info=session_info))
     register_skill_config_tools(router, api_client)
 
-    # Memory programming tool (inject/correct/purge/tune + explain)
+    # Memory tools: MCP-style interface + legacy compatibility tool
+    from core.memory.backends import get_memory_backend_capabilities
+    from cli.tools.memory_mcp import register_memory_mcp_tools
     from cli.tools.memory_program import MemoryProgramTool
 
-    router.register(MemoryProgramTool())
+    _memory_caps = get_memory_backend_capabilities()
+    register_memory_mcp_tools(router)
+    if any(
+        _memory_caps.supports_tool(name)
+        for name in ("memory_store", "memory_correct", "memory_purge")
+    ):
+        router.register(MemoryProgramTool())
 
     # Skill discovery — fallback for skills not in current tool list
     from cli.tools.skill_discovery import FindSkillsTool

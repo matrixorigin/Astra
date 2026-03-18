@@ -418,6 +418,12 @@ class TestCLIEdgeMode:
             "get_agent_info",
             "reflect",
             "find_skills",
+            "memory_retrieve",
+            "memory_search",
+            "memory_profile",
+            "memory_store",
+            "memory_correct",
+            "memory_purge",
             "memory_program",
             "skill_config_wizard",
             "set_skill_setting",
@@ -429,6 +435,41 @@ class TestCLIEdgeMode:
         assert captured["kwargs"]["session_id"] == "ses_1"
         assert captured["kwargs"]["model"] == "gpt-4"
         assert captured["kwargs"]["agent_id"] == "agent-1"
+
+    def test_run_edge_turn_filters_memory_tools_by_backend_capabilities(self):
+        from unittest.mock import AsyncMock, patch
+
+        from cli.mo_agent_api import _run_edge_turn
+        from core.memory.backends.factory import MemoryBackendCapabilities
+
+        captured = {}
+
+        async def fake_edge_chat_loop(user_input, api, router, perms, **kwargs):
+            captured["tools"] = list(router._tools.keys())
+
+        mock_api = AsyncMock()
+        mock_api.get_current_user = AsyncMock(
+            return_value={"user_id": "test-user-id", "username": "testuser"}
+        )
+        mock_api.get_introspection_skills = AsyncMock(return_value={"cloud": [], "installed": []})
+        capabilities = MemoryBackendCapabilities(
+            backend_name="test",
+            supported_tools=("memory_retrieve", "memory_profile"),
+            supported_context_modes=("profile_only", "retrieve"),
+        )
+
+        with (
+            patch("cli.edge_chat_loop.edge_chat_loop", fake_edge_chat_loop),
+            patch("core.skills.loader.SkillLoader.discover", return_value=[]),
+            patch("core.memory.backends.get_memory_backend_capabilities", return_value=capabilities),
+        ):
+            asyncio.run(_run_edge_turn("test", mock_api, "ses_1", "gpt-4", "agent-1", True))
+
+        assert "memory_retrieve" in captured["tools"]
+        assert "memory_profile" in captured["tools"]
+        assert "memory_search" not in captured["tools"]
+        assert "memory_store" not in captured["tools"]
+        assert "memory_program" not in captured["tools"]
 
     def test_chat_uses_edge_path(self, runner):
         """Chat always uses _run_edge_turn."""

@@ -18,7 +18,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, ClassVar
 
@@ -276,22 +276,22 @@ class PromptAssembler(DbConsumer):
             breakdown["project_context"] = _estimate_tokens(project_ctx)
 
         # §4 Memory (continuity + observations + few-shot)
-        # Routing: skip if plan.load_memory is False, L0-only if "profile"
-        _skip_memory = _plan and _plan.load_memory is False
-        _profile_only = _plan and _plan.load_memory == "profile"
+        _memory_policy = routing_decision.memory_policy if routing_decision else None
+        _memory_plan = _memory_policy.context_plan if _memory_policy else None
         _mem_t0 = time.monotonic()
-        if _skip_memory:
-            memory, memory_stats = None, None
-        elif _tier1 and _tier1.compressed_memory:
+        if _tier1 and _tier1.compressed_memory:
             # Use Tier 1 pre-compressed memory
             memory = _tier1.compressed_memory
             memory_stats = {"source": "tier1_compressed"} if explain else None
-        elif _profile_only:
-            # L0 profile only — skip L1 semantic retrieval
-            memory, memory_stats = self._build_memory_profile_only(user_id, explain=explain)
         else:
             memory, memory_stats = self._build_memory(
-                user_id, session_id, user_query, explain=explain, verbose=verbose
+                user_id,
+                session_id,
+                user_query,
+                explain=explain,
+                verbose=verbose,
+                memory_context_plan=_memory_plan,
+                routing_load=_plan.load_memory if _plan else None,
             )
         _mem_duration_ms = (time.monotonic() - _mem_t0) * 1000
         if memory:
@@ -319,7 +319,7 @@ class PromptAssembler(DbConsumer):
 
         # §7 Constraints - load only relevant rules based on task type
         edge_tools = (edge_context.edge_tools or []) if edge_context else []
-        constraints = self._build_constraints(user_query, edge_tools)
+        constraints = self._build_constraints(user_query, edge_tools, memory_policy=_memory_policy)
         sections["constraints"] = constraints
         breakdown["constraints"] = _estimate_tokens(constraints)
 
@@ -512,8 +512,12 @@ class PromptAssembler(DbConsumer):
         "2. If uncertain → say so explicitly. NEVER fabricate data.\n"
         "3. Do ONLY what the user asked. When done → STOP and report.\n"
         "4. User preference statement (e.g. 'tests need -n auto', 'I use vim', '记住…', 'remember…') "
-        "→ MUST call memory_program tool to persist it. memory_program is always available — do NOT use find_skills to look for it. Do NOT just acknowledge verbally.\n"
-        "5. If the answer is already in the current conversation history → answer directly. Do NOT call any tool to look it up."
+        "→ MUST call memory_store (or legacy memory_program if memory_store is unavailable) to persist it. "
+        "Do NOT just acknowledge verbally.\n"
+        "5. If the user asks what you remember, use memory_profile for 'about me/preferences', "
+        "memory_retrieve for relevant recall, and memory_search for broad topic browsing.\n"
+        "6. If the answer is already in the current conversation history → answer directly. "
+        "Do NOT call any tool to look it up."
     )
 
     # Reasoning protocol — injected after core rules
@@ -573,6 +577,7 @@ class PromptAssembler(DbConsumer):
         self,
         query: str | None,
         tools_schema: list[dict[str, Any]] | None,
+        memory_policy: Any | None = None,
     ) -> str:
         """Build constraints section with only relevant rules.
 
@@ -609,6 +614,25 @@ class PromptAssembler(DbConsumer):
         for block_name in included:
             if block_name in self._RULE_BLOCKS:
                 parts.append(self._RULE_BLOCKS[block_name])
+
+        if memory_policy and getattr(memory_policy, "tool_hint", None):
+            from core.memory.backends import resolve_memory_tool_name
+
+            tool_name = resolve_memory_tool_name(memory_policy.tool_hint.tool_name)
+            if tool_name:
+                parts.append(
+                    "\n\n## Memory Guidance\n"
+                    f"- Memory is part of system context and lives in external indexed storage.\n"
+                    f"- For this turn, if memory tool use is needed, prefer `{tool_name}`.\n"
+                    f"- Reason: {memory_policy.tool_hint.reason}\n"
+                )
+            elif memory_policy.tool_hint.tool_name:
+                parts.append(
+                    "\n\n## Memory Guidance\n"
+                    "- Memory is part of system context and lives in external indexed storage.\n"
+                    "- The current memory backend does not expose a compatible memory tool for this intent.\n"
+                    "- Use already loaded memory context only; do not invent a substitute tool call.\n"
+                )
 
         return "".join(parts)
 
@@ -927,6 +951,8 @@ class PromptAssembler(DbConsumer):
         query: str,
         explain: bool = False,
         verbose: bool = False,
+        memory_context_plan: Any | None = None,
+        routing_load: bool | str | None = None,
     ) -> tuple[str | None, dict[str, Any] | None]:
         """§4: Tiered memory (L0 profile + L1 query-relevant) + legacy fallbacks.
 
@@ -940,8 +966,60 @@ class PromptAssembler(DbConsumer):
             (section_text, stats) — stats is None when explain=False, otherwise a dict
             with flat keys: l0, retrieval, few_shot. verbose adds content previews.
         """
+        from core.memory.policy import MemoryContextMode, MemoryPolicy
+        from core.memory.backends import (
+            get_memory_backend_capabilities,
+            resolve_memory_context_mode,
+        )
+        from core.metrics import (
+            memory_context_load_duration_seconds,
+            memory_context_loads_total,
+        )
+
         parts = []
         stats: dict[str, Any] = {} if explain else {}
+        resolved_plan = memory_context_plan or MemoryPolicy().decide(
+            query=query,
+            load_memory=routing_load,
+        ).context_plan
+        capabilities = get_memory_backend_capabilities()
+        _effective_mode = resolve_memory_context_mode(resolved_plan.mode.value)
+        _capability_fallback = _effective_mode != resolved_plan.mode.value
+        if _capability_fallback:
+            resolved_plan = replace(
+                resolved_plan,
+                mode=MemoryContextMode(_effective_mode),
+                source=f"{resolved_plan.source}:capability_fallback",
+                reason=(
+                    f"{resolved_plan.reason}; backend '{capabilities.backend_name}' "
+                    f"does not support mode '{resolved_plan.mode.value}', "
+                    f"using '{_effective_mode}'"
+                ),
+            )
+        _load_started = time.monotonic()
+        _used_legacy_loader = False
+        if explain:
+            stats["policy"] = resolved_plan.as_dict()
+            stats["load"] = {
+                "mode": resolved_plan.mode.value,
+                "source": resolved_plan.source,
+                "reason": resolved_plan.reason,
+                "used_legacy_loader": False,
+                "capability_fallback": _capability_fallback,
+                "backend": capabilities.as_dict(),
+            }
+        if resolved_plan.mode == MemoryContextMode.NONE:
+            try:
+                memory_context_loads_total.labels(
+                    mode=resolved_plan.mode.value,
+                    source=resolved_plan.source,
+                ).inc()
+                memory_context_load_duration_seconds.labels(
+                    mode=resolved_plan.mode.value
+                ).observe(time.monotonic() - _load_started)
+            except Exception:
+                logger.debug("Failed to record memory context metrics", exc_info=True)
+            return None, stats if explain else None
 
         # Primary: tiered memory system (L0 + L1)
         try:
@@ -949,12 +1027,21 @@ class PromptAssembler(DbConsumer):
 
             # TieredMemoryLoader will auto-detect Memoria from env vars
             loader = TieredMemoryLoader()
-            tiered_section, tiered_stats = loader.build_section(
-                user_id,
-                session_id,
-                query,
-                explain=explain,
-            )
+            try:
+                tiered_section, tiered_stats = loader.build_section_from_plan(
+                    user_id=user_id,
+                    session_id=session_id,
+                    plan=resolved_plan,
+                    explain=explain,
+                )
+            except Exception:
+                _used_legacy_loader = True
+                tiered_section, tiered_stats = loader.build_section(
+                    user_id,
+                    session_id,
+                    resolved_plan.query or query,
+                    explain=explain,
+                )
             if tiered_section:
                 parts.append(tiered_section)
             if explain and tiered_stats:
@@ -977,7 +1064,10 @@ class PromptAssembler(DbConsumer):
                         if isinstance(tiered_stats.retrieval, dict)
                         else vars(tiered_stats.retrieval)
                     )
+                    if isinstance(stats["retrieval"], dict):
+                        stats["retrieval"].setdefault("mode", resolved_plan.mode.value)
                 stats["total_ms"] = round(tiered_stats.total_ms, 1)
+                stats["load"]["used_legacy_loader"] = _used_legacy_loader
                 # Verbose: add content previews
                 if verbose:
                     l0_text = loader.load_l0(user_id)
@@ -986,13 +1076,21 @@ class PromptAssembler(DbConsumer):
                         "final_count"
                     ) or tiered_stats.l1_count
                     if retrieval_count > 0:
-                        # Re-retrieve to get content (already cached in loader)
-                        memories, _ = loader.load_l1(
-                            user_id,
-                            session_id,
-                            query,
-                            explain=False,
-                        )
+                        if resolved_plan.mode == MemoryContextMode.SEARCH:
+                            memories, _ = loader.load_search(
+                                user_id=user_id,
+                                query=resolved_plan.query,
+                                limit=resolved_plan.top_k,
+                            )
+                        else:
+                            memories, _ = loader.load_l1(
+                                user_id=user_id,
+                                session_id=session_id,
+                                query=resolved_plan.query,
+                                limit=resolved_plan.top_k,
+                                memory_types=list(resolved_plan.memory_types),
+                                explain=False,
+                            )
                         if memories:
                             stats["l1"]["previews"] = [
                                 line.strip()
@@ -1020,6 +1118,17 @@ class PromptAssembler(DbConsumer):
             if explain:
                 stats["few_shot"] = {"error": str(e)}
 
+        try:
+            memory_context_loads_total.labels(
+                mode=resolved_plan.mode.value,
+                source=resolved_plan.source,
+            ).inc()
+            memory_context_load_duration_seconds.labels(mode=resolved_plan.mode.value).observe(
+                time.monotonic() - _load_started
+            )
+        except Exception:
+            logger.debug("Failed to record memory context metrics", exc_info=True)
+
         # Return None for stats when explain=False, otherwise the populated dict
         section = "\n\n".join(parts) if parts else None
 
@@ -1028,6 +1137,9 @@ class PromptAssembler(DbConsumer):
         _COMPRESS_THRESHOLD = 300  # tokens; below this, overhead > savings
         if section and _estimate_tokens(section) > _COMPRESS_THRESHOLD:
             section = self._compress_memory_with_llm(section)
+
+        if explain:
+            stats["load"]["used_legacy_loader"] = _used_legacy_loader
 
         return section, stats if explain else None
 
@@ -1066,14 +1178,32 @@ class PromptAssembler(DbConsumer):
         explain: bool = False,
     ) -> tuple[str | None, dict[str, Any] | None]:
         """L0 profile memory only — used by preference intent routing."""
-        stats: dict[str, Any] | None = {"source": "profile_only"} if explain else None
+        from core.memory.backends import get_memory_backend_capabilities, resolve_memory_context_mode
+
+        capabilities = get_memory_backend_capabilities()
+        mode = resolve_memory_context_mode("profile_only")
+        stats: dict[str, Any] | None = (
+            {
+                "source": "profile_only",
+                "backend": capabilities.as_dict(),
+                "resolved_mode": mode,
+            }
+            if explain
+            else None
+        )
         try:
+            from core.memory.policy import MemoryContextMode, MemoryContextPlan
             from core.context.tiered_loader import TieredMemoryLoader
 
             loader = TieredMemoryLoader()
-            l0_text = loader.load_l0(user_id)
-            if l0_text:
-                return l0_text, stats
+            section, _ = loader.build_section_from_plan(
+                user_id=user_id,
+                session_id="",
+                plan=MemoryContextPlan(mode=MemoryContextMode(mode), include_profile=True),
+                explain=explain,
+            )
+            if section:
+                return section, stats
         except Exception as e:
             logger.debug("Profile-only memory skipped: %s", e)
         return None, stats

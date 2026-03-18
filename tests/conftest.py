@@ -196,6 +196,14 @@ def test_session_factory(test_engine):
 def db_session(test_session_factory):
     """Provide isolated database session for each test."""
     session = test_session_factory()
+    real_close = session.close
+
+    # Many integration tests pass `lambda: db_session` into DbConsumer-based
+    # services. Those services call `close()` on exit, but for the shared
+    # per-test session that would prematurely end the test's view of the DB.
+    # Keep close() as a no-op during the test; perform the real close in
+    # fixture teardown.
+    session.close = lambda: None  # type: ignore[method-assign]
     try:
         yield session
         # Commit if test succeeded (may fail if session is in bad state)
@@ -214,6 +222,7 @@ def db_session(test_session_factory):
             pass
         raise
     finally:
+        session.close = real_close
         # Expire all to prevent stale data in next test
         try:
             session.expire_all()
@@ -221,7 +230,7 @@ def db_session(test_session_factory):
             pass
         # Always close to release locks
         try:
-            session.close()
+            real_close()
         except Exception:
             pass
 
@@ -260,6 +269,8 @@ def patch_db_engine(test_engine):
 @pytest.fixture(autouse=True)
 def override_db_dependency(db_session, monkeypatch):
     """Override get_db_session dependency for all tests."""
+    import sys
+
     from api.database import get_db_session as original_get_db_session
 
     def mock_get_db_session():
@@ -277,6 +288,17 @@ def override_db_dependency(db_session, monkeypatch):
         monkeypatch.setattr(api.dependencies, "get_db_session", mock_get_db_session)
     except (ImportError, AttributeError):
         pass
+
+    # Patch any already-imported module that captured a direct reference via
+    # `from api.database import get_db_session`, including test modules.
+    patched_modules = []
+    for mod in sys.modules.values():
+        if getattr(mod, "get_db_session", None) is original_get_db_session:
+            try:
+                monkeypatch.setattr(mod, "get_db_session", mock_get_db_session)
+                patched_modules.append(mod.__name__)
+            except (AttributeError, TypeError):
+                pass
 
     # Override FastAPI dependency (only if app is imported)
     try:
