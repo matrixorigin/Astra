@@ -35,6 +35,7 @@ from core.code_executor import (
     CodeExecutionResult,
     TimeTravelInfo,
 )
+from core.sandbox.sandbox import Sandbox
 
 
 # ===========================================================================
@@ -417,6 +418,13 @@ class TestDataEnums:
 # ===========================================================================
 # 6. DataContext (mocked Branch)
 # ===========================================================================
+
+
+@pytest.fixture(autouse=True)
+def _stub_visibility_waits(monkeypatch):
+    """Visibility polling is covered in dedicated sandbox tests."""
+    monkeypatch.setattr(Sandbox, "wait_until_database_visible", lambda *args, **kwargs: None)
+    monkeypatch.setattr(Sandbox, "wait_until_table_visible", lambda *args, **kwargs: None)
 
 
 class TestDataContext:

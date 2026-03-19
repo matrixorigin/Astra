@@ -1497,10 +1497,15 @@ class TestRecoverHistoryToolCalls:
         db_session.commit()
 
     def _recover(self):
+        from api.database import SessionLocal
         from api.routers.chat import _recover_history_from_db
 
-        history, _sections = _recover_history_from_db(self.db, self.uid, self.sid)
-        return history
+        fresh_db = SessionLocal()
+        try:
+            history, _sections = _recover_history_from_db(fresh_db, self.uid, self.sid)
+            return history
+        finally:
+            fresh_db.close()
 
     def test_single_tool_call_round_trip(self):
         """user → tool_call_start → tool_result → llm_response produces valid sequence."""

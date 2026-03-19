@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 from uuid_utils import uuid7
 
 from core.logging_config import get_logger
@@ -31,15 +31,19 @@ def score_chain(db: Session, causal_chain_id: str, session_id: str) -> dict[str,
 
     Returns dict with score, step_count, failure_count, details — or None if no scored steps.
     """
-    rows = db.execute(
-        text("""
-            SELECT event_id, quality_score
-            FROM agent_events
-            WHERE causal_chain_id = :cid AND quality_score IS NOT NULL
-            ORDER BY created_at ASC
-        """),
-        {"cid": causal_chain_id},
-    ).fetchall()
+    db.expire_all()
+    rows = _fetchall_with_fresh_session_retry(
+        db,
+        """
+        SELECT event_id, quality_score
+        FROM agent_events
+        WHERE session_id = :sid
+          AND causal_chain_id = :cid
+          AND quality_score IS NOT NULL
+        ORDER BY created_at ASC
+        """,
+        {"sid": session_id, "cid": causal_chain_id},
+    )
 
     if not rows:
         return None
@@ -77,15 +81,17 @@ def score_session(db: Session, session_id: str) -> dict[str, Any] | None:
 
     Returns dict with score, chain_count, details — or None if no chain assessments.
     """
-    rows = db.execute(
-        text("""
-            SELECT target_id, score, step_count, failure_count
-            FROM eval_quality_assessments
-            WHERE session_id = :sid AND level = 'chain'
-            ORDER BY created_at ASC
-        """),
+    db.expire_all()
+    rows = _fetchall_with_fresh_session_retry(
+        db,
+        """
+        SELECT target_id, score, step_count, failure_count
+        FROM eval_quality_assessments
+        WHERE session_id = :sid AND level = 'chain'
+        ORDER BY created_at ASC
+        """,
         {"sid": session_id},
-    ).fetchall()
+    )
 
     if not rows:
         return None
@@ -179,6 +185,24 @@ def _upsert_assessment(
             },
         )
     db.commit()
+    db.expire_all()
+
+
+def _fetchall_with_fresh_session_retry(
+    db: Session, query: str, params: dict[str, Any]
+) -> list[Any]:
+    rows = db.execute(text(query), params).fetchall()
+    if rows or not isinstance(db, Session):
+        return rows
+
+    fresh_db = sessionmaker(bind=db.get_bind(), expire_on_commit=False)()
+    try:
+        fresh_rows = fresh_db.execute(text(query), params).fetchall()
+        if fresh_rows:
+            logger.debug("Recovered empty evaluation query via fresh session retry")
+        return fresh_rows
+    finally:
+        fresh_db.close()
 
 
 def _json_dumps(obj: Any) -> str | None:

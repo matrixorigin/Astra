@@ -9,17 +9,20 @@ from api.repositories import UserRepository
 
 
 @pytest.fixture
-def client():
-    """Create test client."""
-    return TestClient(app)
+def client(db_session):
+    """Create test client bound to the shared test DB session."""
 
+    def override_get_db():
+        try:
+            yield db_session
+        finally:
+            pass
 
-@pytest.fixture
-def db_session():
-    """Get database session."""
-    session = next(get_db_session())
-    yield session
-    session.close()
+    app.dependency_overrides[get_db_session] = override_get_db
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.pop(get_db_session, None)
 
 
 # auth_headers fixture now provided by tests/integration/conftest.py

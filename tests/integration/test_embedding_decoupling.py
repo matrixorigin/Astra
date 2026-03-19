@@ -281,10 +281,15 @@ class TestEndToEndDecoupled:
         logger.log_event(ev)
 
         # Verify no embedding in agent_events
-        row = db_session.execute(
-            text("SELECT embedding FROM agent_events WHERE event_id = :eid"),
-            {"eid": ev.event_id},
-        ).fetchone()
+        fresh_db = SessionLocal()
+        try:
+            row = fresh_db.execute(
+                text("SELECT embedding FROM agent_events WHERE event_id = :eid"),
+                {"eid": ev.event_id},
+            ).fetchone()
+        finally:
+            fresh_db.close()
+        assert row is not None, "Event should be persisted"
         assert row[0] is None, "agent_events.embedding should be NULL"
 
         # 2. Worker generates embedding into ctx_event_embeddings
@@ -293,10 +298,14 @@ class TestEndToEndDecoupled:
         assert count >= 1
 
         # Verify embedding in ctx_event_embeddings
-        emb_row = db_session.execute(
-            text("SELECT model_name FROM ctx_event_embeddings WHERE event_id = :eid"),
-            {"eid": ev.event_id},
-        ).fetchone()
+        fresh_db = SessionLocal()
+        try:
+            emb_row = fresh_db.execute(
+                text("SELECT model_name FROM ctx_event_embeddings WHERE event_id = :eid"),
+                {"eid": ev.event_id},
+            ).fetchone()
+        finally:
+            fresh_db.close()
         assert emb_row is not None, "ctx_event_embeddings should have the embedding"
 
         # 3. Retriever finds it via JOIN

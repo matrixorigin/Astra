@@ -6,15 +6,14 @@ Tests the full Step → Chain → Session scoring pipeline and the evaluation AP
 import pytest
 from sqlalchemy import text
 
-from api.database import get_db_session
 from core.evaluation.auto_scorer import compute_auto_score
 from core.evaluation.multi_level_scorer import score_chain, score_session
 from core.utils.id_generator import generate_id
 
 
 @pytest.fixture
-def db():
-    return next(get_db_session())
+def db(db_session):
+    return db_session
 
 
 @pytest.fixture

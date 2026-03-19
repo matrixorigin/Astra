@@ -98,6 +98,36 @@ class TestScoreChain:
         score_chain(db, "chain1", "sess1")
         db.commit.assert_called()
 
+    def test_retries_empty_query_with_fresh_session(self):
+        class FakeSession:
+            pass
+
+        db = FakeSession()
+        db.expire_all = MagicMock()
+        db.get_bind = MagicMock(return_value=object())
+        db.commit = MagicMock()
+        db.execute = MagicMock(
+            side_effect=[
+                MagicMock(fetchall=MagicMock(return_value=[])),
+                MagicMock(fetchone=MagicMock(return_value=None)),
+                MagicMock(),
+            ]
+        )
+
+        fresh_db = MagicMock()
+        fresh_db.execute.return_value.fetchall.return_value = [_make_row(event_id="e1", quality_score=4.0)]
+
+        with (
+            patch("core.evaluation.multi_level_scorer.Session", FakeSession),
+            patch("core.evaluation.multi_level_scorer.sessionmaker") as mock_sessionmaker,
+        ):
+            mock_sessionmaker.return_value.return_value = fresh_db
+            result = score_chain(db, "chain1", "sess1")
+
+        assert result is not None
+        assert result["step_count"] == 1
+        fresh_db.close.assert_called_once()
+
 
 # ── Session-level tests ──────────────────────────────────────────
 

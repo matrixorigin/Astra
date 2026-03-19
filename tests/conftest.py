@@ -1,6 +1,7 @@
 """Test configuration and fixtures."""
 
 import os
+import time
 
 # Must be set BEFORE any app imports so database.py uses test DB on first import
 # os.environ takes priority over .env file in pydantic-settings
@@ -403,8 +404,15 @@ def get_auth_headers(
         )
         db.add(user)
         db.commit()
-    resp = client.post("/auth/login", json={"username": username, "password": password})
-    return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+    last_resp = None
+    for attempt in range(10):
+        resp = client.post("/auth/login", json={"username": username, "password": password})
+        if resp.status_code == 200 and "access_token" in resp.json():
+            return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+        last_resp = resp
+        time.sleep(0.1 * (attempt + 1))
+    detail = last_resp.text if last_resp is not None else "no response"
+    raise AssertionError(f"Failed to login test user {username}: {detail}")
 
 
 def flush_persist_threads():

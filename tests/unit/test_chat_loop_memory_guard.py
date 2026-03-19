@@ -68,3 +68,43 @@ class TestChatLoopMemoryGuard:
         assert "memory_store" in messages[0]["content"]
         assert messages[1]["role"] == "system"
         assert "memory_store" in messages[1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_blocked_tool_keeps_guard_payload_when_arguments_are_invalid_json(self):
+        loop = _make_loop()
+        loop._current_memory_policy = MemoryPolicy().decide("remember that I use vim by default")
+        loop._current_tool_names = {"memory_store", "bash"}
+
+        tc = {
+            "id": "call_2",
+            "function": {
+                "name": "bash",
+                "arguments": "{not-json",
+            },
+        }
+        user_event = MagicMock(event_id="user_evt", causal_chain_id="chain_1")
+        messages: list[dict] = []
+
+        events = []
+        async for event in loop._execute_single_tool(
+            tc=tc,
+            fn_name="bash",
+            user_id="u1",
+            session_id="s1",
+            user_input="remember that I use vim by default",
+            full_text="I'll store that.",
+            user_event=user_event,
+            messages=messages,
+        ):
+            events.append(event)
+
+        assert any(
+            e.event_type == StreamEventType.TOOL_RESULT and e.data.get("blocked") is True
+            for e in events
+        )
+        loop.executor.execute_skill_with_feedback.assert_not_called()
+        assert messages[0]["role"] == "tool"
+        assert "memory_store" in messages[0]["content"]
+        assert "not-json" not in messages[0]["content"]
+        assert messages[1]["role"] == "system"
+        assert "memory_store" in messages[1]["content"]

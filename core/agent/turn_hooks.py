@@ -151,6 +151,7 @@ class TurnHooks(DbConsumer):
                     )
                 )
                 db.commit()
+                db.expire_all()
             return event_id
         except Exception as e:
             logger.debug("Skill selection event skipped: %s", e)
@@ -182,6 +183,7 @@ class TurnHooks(DbConsumer):
                     row.execution_time_ms = elapsed_ms or 0
                     row.execution_success = 1
                     db.commit()
+                    db.expire_all()
         except Exception as e:
             logger.debug("Backfill selection metrics skipped: %s", e)
 

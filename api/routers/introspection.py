@@ -13,7 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal, get_db_session
 from api.dependencies import get_current_user
 from core.logging_config import get_logger
 
@@ -61,6 +61,15 @@ def _verify_session_owner(db: Session, session_id: str, user_id: str) -> None:
         text("SELECT user_id FROM agent_sessions WHERE session_id = :sid"),
         {"sid": session_id},
     ).fetchone()
+    if not row:
+        fresh_db = SessionLocal()
+        try:
+            row = fresh_db.execute(
+                text("SELECT user_id FROM agent_sessions WHERE session_id = :sid"),
+                {"sid": session_id},
+            ).fetchone()
+        finally:
+            fresh_db.close()
     if not row or row[0] != user_id:
         raise HTTPException(status_code=404, detail="Session not found")
 

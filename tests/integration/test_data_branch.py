@@ -8,6 +8,7 @@ Requires: MatrixOne running on localhost:6001.
 
 import pytest
 import pytest
+from textwrap import dedent
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 import os
@@ -45,12 +46,19 @@ def engine():
 def db(engine) -> Session:
     S = sessionmaker(bind=engine)
     session = S()
+    real_close = session.close
     # Create database if it doesn't exist, then use it
     session.execute(text(f"CREATE DATABASE IF NOT EXISTS `{TEST_DB}`"))
     session.commit()
     session.execute(text(f"USE `{TEST_DB}`"))
-    yield session
-    session.close()
+    # Branch/DataContext use DbConsumer and may call close() on the shared fixture
+    # session; keep it open until fixture teardown so the selected DB is stable.
+    session.close = lambda: None  # type: ignore[method-assign]
+    try:
+        yield session
+    finally:
+        session.close = real_close
+        session.close()
 
 
 SANDBOX_DB = f"{TEST_DB}_sandbox"
@@ -399,22 +407,32 @@ class TestCodeExecutorWrite:
         # Code that inserts into sandbox
         # Retry connect: MatrixOne CREATE DATABASE is async, new connections
         # may not see it immediately under parallel test load.
-        code = f"""
-import pymysql, time
-for _ in range(10):
-    try:
-        conn = pymysql.connect(host='127.0.0.1', port=6001, user='root', password='111', database='{expected_sandbox}')
-        break
-    except pymysql.err.OperationalError:
-        time.sleep(0.3)
-else:
-    raise RuntimeError('sandbox DB not visible after retries')
-cur = conn.cursor()
-cur.execute('INSERT INTO t1 VALUES(10, 10)')
-conn.commit()
-conn.close()
-print('inserted')
-"""
+        code = dedent(
+            f"""
+            import pymysql, time
+
+            for attempt in range(20):
+                try:
+                    conn = pymysql.connect(
+                        host='127.0.0.1',
+                        port=6001,
+                        user='root',
+                        password='111',
+                        database='{expected_sandbox}',
+                    )
+                    break
+                except pymysql.err.OperationalError:
+                    time.sleep(0.2 * (attempt + 1))
+            else:
+                raise RuntimeError('sandbox DB not visible after retries')
+
+            cur = conn.cursor()
+            cur.execute('INSERT INTO t1 VALUES(10, 10)')
+            conn.commit()
+            conn.close()
+            print('inserted')
+            """
+        )
         result = executor.execute(
             CodeExecutionRequest(
                 code=code,

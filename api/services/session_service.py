@@ -65,18 +65,7 @@ class SessionService:
             }
 
             session = self.session_repo.create(session_data)
-
-            # 审计日志
-            self.audit.log(
-                user_id=user_id,
-                action="session_create",
-                resource_type="session",
-                resource_id=session.session_id,
-                details={"title": title, "agent_id": agent_id},
-                status="success",
-            )
-
-            return {
+            result = {
                 "session_id": session.session_id,
                 "user_id": session.user_id,
                 "agent_id": session.agent_id,
@@ -88,6 +77,18 @@ class SessionService:
                 "updated_at": session.updated_at.isoformat() if session.updated_at else None,
                 "ended_at": session.ended_at.isoformat() if session.ended_at else None,
             }
+
+            # 审计日志
+            self.audit.log(
+                user_id=user_id,
+                action="session_create",
+                resource_type="session",
+                resource_id=session.session_id,
+                details={"title": title, "agent_id": agent_id},
+                status="success",
+            )
+
+            return result
 
         except Exception as e:
             # 审计失败

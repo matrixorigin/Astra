@@ -25,9 +25,17 @@ def _session_local():
 @pytest.fixture
 def db_session():
     db = _session_local()()
-    yield db
-    db.rollback()
-    db.close()
+    real_close = db.close
+    db.close = lambda: None  # type: ignore[method-assign]
+    try:
+        yield db
+    finally:
+        db.close = real_close
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        real_close()
 
 
 # ── P1: Selector Pipeline Feedback Closedloop ──────────────────────
@@ -62,13 +70,17 @@ class TestGovernanceStructuredOutputs:
 
         engine._quarantine_low_confidence(threshold=0.3)
 
-        row = db_session.execute(
-            text("""
-            SELECT content FROM agent_events
-            WHERE event_type = 'governance_quarantine'
-            ORDER BY created_at DESC LIMIT 1
-        """)
-        ).fetchone()
+        fresh_db = _session_local()()
+        try:
+            row = fresh_db.execute(
+                text("""
+                SELECT content FROM agent_events
+                WHERE event_type = 'governance_quarantine'
+                ORDER BY created_at DESC LIMIT 1
+            """)
+            ).fetchone()
+        finally:
+            fresh_db.close()
         assert row is not None
         data = json.loads(row[0])
         assert eid in data["entry_ids"]

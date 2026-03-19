@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from typing import TYPE_CHECKING
 
 from sqlalchemy import text
@@ -14,6 +15,23 @@ from core.db_consumer import DbConsumer, DbFactory
 
 if TYPE_CHECKING:
     from datetime import datetime
+
+
+def _visibility_session_factory():
+    from api.database import SessionLocal
+
+    return SessionLocal()
+
+
+def _show_rows_contain_name(rows, expected: str) -> bool:
+    for row in rows:
+        mapping = getattr(row, "_mapping", None)
+        if mapping:
+            if expected in mapping.values():
+                return True
+        elif row and expected in row:
+            return True
+    return False
 
 
 class Sandbox(DbConsumer):
@@ -29,6 +47,74 @@ class Sandbox(DbConsumer):
         self.source_db = source_db
         self.account = account
         self.branch = Branch(self._db_factory, database=source_db)
+
+    def wait_until_database_visible(
+        self,
+        name: str,
+        *,
+        attempts: int = 10,
+        base_delay_s: float = 0.05,
+        session_factory=None,
+    ) -> None:
+        """Wait until a freshly opened session can see the database."""
+        validate_identifier(name)
+        session_factory = session_factory or _visibility_session_factory
+        last_error: Exception | None = None
+
+        for attempt in range(attempts):
+            fresh_db = session_factory()
+            try:
+                rows = fresh_db.execute(text("SHOW DATABASES")).fetchall()
+                if _show_rows_contain_name(rows, name):
+                    return
+            except Exception as exc:
+                last_error = exc
+            finally:
+                try:
+                    fresh_db.close()
+                except Exception:
+                    pass
+
+            time.sleep(base_delay_s * (attempt + 1))
+
+        detail = f": {last_error}" if last_error else ""
+        raise RuntimeError(f"Database {name} was not visible after {attempts} retries{detail}")
+
+    def wait_until_table_visible(
+        self,
+        database: str,
+        table: str,
+        *,
+        attempts: int = 10,
+        base_delay_s: float = 0.05,
+        session_factory=None,
+    ) -> None:
+        """Wait until a freshly opened session can see the table."""
+        validate_identifier(database)
+        validate_identifier(table)
+        session_factory = session_factory or _visibility_session_factory
+        last_error: Exception | None = None
+
+        for attempt in range(attempts):
+            fresh_db = session_factory()
+            try:
+                rows = fresh_db.execute(text(f"SHOW TABLES FROM {database}")).fetchall()
+                if _show_rows_contain_name(rows, table):
+                    return
+            except Exception as exc:
+                last_error = exc
+            finally:
+                try:
+                    fresh_db.close()
+                except Exception:
+                    pass
+
+            time.sleep(base_delay_s * (attempt + 1))
+
+        detail = f": {last_error}" if last_error else ""
+        raise RuntimeError(
+            f"Table {database}.{table} was not visible after {attempts} retries{detail}"
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -64,11 +150,13 @@ class Sandbox(DbConsumer):
             db.commit()
             db.execute(text(f"CREATE DATABASE {name}"))
             db.commit()
+            self.wait_until_database_visible(name)
 
             # 2. Branch tables (zero-copy)
             if tables:
                 for t in tables:
                     self.branch.create(f"{name}.{t}", f"{self.source_db}.{t}")
+                    self.wait_until_table_visible(name, t)
 
             # 3. Create PITR for sandbox database
             pitr_name = f"{name}__pitr"

@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy import text
+from sqlalchemy.orm import Session, sessionmaker
 
 from core.sandbox import Sandbox, Branch
 from core.db_consumer import DbConsumer, DbFactory
@@ -206,6 +208,8 @@ class PromptExperiment(DbConsumer):
                 },
             )
             db.commit()
+            self.sandbox.wait_until_table_visible(exp_id, "experiment_config")
+            self.sandbox.wait_until_table_visible(exp_id, "variant_results")
 
             return exp_id
 
@@ -298,7 +302,42 @@ class PromptExperiment(DbConsumer):
                 )
                 db.execute(text(sql), params)
             db.commit()
+            db.expire_all()
+            self._wait_until_variant_results_visible(db, experiment_id, len(results))
             return len(results)
+
+    @staticmethod
+    def _wait_until_variant_results_visible(
+        db: Session,
+        experiment_id: str,
+        expected_rows: int,
+        *,
+        attempts: int = 10,
+        base_delay_s: float = 0.05,
+    ) -> None:
+        if expected_rows <= 0:
+            return
+
+        fresh_db_factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            fresh_db = fresh_db_factory()
+            try:
+                row = fresh_db.execute(
+                    text(f"SELECT COUNT(*) FROM {experiment_id}.variant_results")
+                ).fetchone()
+                if row and int(row[0]) >= expected_rows:
+                    return
+            except Exception as exc:
+                last_error = exc
+            finally:
+                fresh_db.close()
+            time.sleep(base_delay_s * (attempt + 1))
+
+        detail = f": {last_error}" if last_error else ""
+        raise RuntimeError(
+            f"Variant results for {experiment_id} were not visible after {attempts} retries{detail}"
+        )
 
     def get_experiment_results(self, experiment_id: str) -> dict[str, ExperimentResult]:
         """Get aggregated results with statistical significance testing.

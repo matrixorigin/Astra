@@ -91,7 +91,8 @@ def load_breaker_state(db: Session, user_id: str) -> dict[str, BreakerRecord]:
 
     Returns {tool_name: BreakerRecord}.
     """
-    rows = db.query(ToolBreakerState).filter_by(user_id=user_id).all()
+    db.expire_all()
+    rows = db.query(ToolBreakerState).populate_existing().filter_by(user_id=user_id).all()
     return {
         r.tool_name: BreakerRecord(
             user_id=r.user_id,
@@ -129,6 +130,7 @@ def flush_breaker_state(db: Session, records: dict[str, BreakerRecord]) -> int:
             )
         )
     db.commit()
+    db.expire_all()
     # Clear dirty only AFTER successful commit — if commit fails, retry will re-write
     for rec in dirty:
         rec.dirty = False

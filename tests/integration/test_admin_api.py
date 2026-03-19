@@ -24,19 +24,28 @@ def setup_database(test_session_factory):
 
     with test_session_factory() as db:
         # Ensure admin role exists
-        exists = db.execute(
-            text("SELECT 1 FROM auth_roles WHERE role_id = 'mo-agent-admin-role'")
-        ).scalar()
-        if not exists:
+        admin_role = db.execute(
+            text("SELECT role_id FROM auth_roles WHERE role_name = 'mo_agent_admin' LIMIT 1")
+        ).fetchone()
+        admin_role_id = admin_role[0] if admin_role else "mo-agent-admin-role"
+        if not admin_role:
             db.execute(
                 text("""
                 INSERT INTO auth_roles (role_id, role_name, description)
-                VALUES ('mo-agent-admin-role', 'mo_agent_admin', 'Administrator role')
-            """)
+                VALUES (:role_id, 'mo_agent_admin', 'Administrator role')
+            """),
+                {"role_id": admin_role_id},
             )
 
         # Insert a sentinel user so regular_user is never the "first user" and won't auto-get admin
         sentinel_id = str(uuid.uuid4())
+        db.execute(
+            text(
+                "DELETE FROM auth_user_roles WHERE user_id IN "
+                "(SELECT user_id FROM auth_users WHERE username = '__sentinel__')"
+            )
+        )
+        db.execute(text("DELETE FROM auth_users WHERE username = '__sentinel__'"))
         db.execute(
             text("""
             INSERT INTO auth_users (user_id, username, email, password_hash, is_active, created_at)
@@ -48,9 +57,9 @@ def setup_database(test_session_factory):
         db.execute(
             text("""
             INSERT INTO auth_user_roles (user_id, role_id)
-            VALUES (:uid, 'mo-agent-admin-role')
+            VALUES (:uid, :role_id)
         """),
-            {"uid": sentinel_id},
+            {"uid": sentinel_id, "role_id": admin_role_id},
         )
         db.commit()
 

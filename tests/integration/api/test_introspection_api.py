@@ -206,8 +206,13 @@ class TestIntrospectionMemory:
         )
         db.add(s)
         db.commit()
-        db.refresh(s)
-        return s
+        db.expire_all()
+        return (
+            db.query(SessionModel)
+            .populate_existing()
+            .filter(SessionModel.session_id == s.session_id)
+            .one()
+        )
 
     def test_returns_memory_stats(self, client, auth_headers, db, test_user):
         """Returns episodic, semantic, procedural — verify every field."""

@@ -2,13 +2,13 @@
 
 from sqlalchemy.orm import Session
 
+from api.database import SessionLocal
 from core.db_consumer import DbConsumer, DbFactory
 
 from api.models import Role, User, UserRole
 
 
-def has_role_in_session(db: Session, user_id: str, role_name: str) -> bool:
-    """Check role membership using an existing request-scoped session."""
+def _has_role_query(db: Session, user_id: str, role_name: str) -> bool:
     query = (
         db.query(UserRole)
         .join(Role, UserRole.role_id == Role.role_id)
@@ -18,6 +18,23 @@ def has_role_in_session(db: Session, user_id: str, role_name: str) -> bool:
 
     query = query.filter((User.user_id == user_id) | (User.username == user_id))
     return query.count() > 0
+
+
+def has_role_in_session(db: Session, user_id: str, role_name: str) -> bool:
+    """Check role membership using an existing request-scoped session.
+
+    MatrixOne can briefly expose stale reads across sessions right after a
+    commit. If the request-scoped session misses, retry once on a fresh
+    session before denying access.
+    """
+    if _has_role_query(db, user_id, role_name):
+        return True
+
+    fresh_db = SessionLocal()
+    try:
+        return _has_role_query(fresh_db, user_id, role_name)
+    finally:
+        fresh_db.close()
 
 
 class PermissionChecker(DbConsumer):

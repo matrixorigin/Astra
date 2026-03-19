@@ -5,8 +5,9 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
-from api.database import SessionLocal
+from api.database import SessionLocal, get_db_session
 from api.dependencies import get_current_user
 from api.services.session_service import SessionService
 
@@ -65,11 +66,13 @@ class SessionListResponse(BaseModel):
     description="创建一个新的会话",
 )
 async def create_session(
-    request: CreateSessionRequest, current_user: dict = Depends(get_current_user)
+    request: CreateSessionRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
     """创建 Session"""
     try:
-        service = SessionService(SessionLocal)
+        service = SessionService(lambda: db)
         result = service.create_session(
             user_id=current_user["user_id"],
             agent_id=request.agent_id,
@@ -97,10 +100,11 @@ async def list_sessions(
     limit: int = Query(50, ge=1, le=100, description="限制数量"),
     offset: int = Query(0, ge=0, description="偏移量"),
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
     """列出 Sessions"""
     try:
-        service = SessionService(SessionLocal)
+        service = SessionService(lambda: db)
         result = service.list_sessions(
             user_id=current_user["user_id"],
             agent_id=agent_id,
@@ -121,10 +125,14 @@ async def list_sessions(
     summary="获取 Session",
     description="获取指定会话的详细信息",
 )
-async def get_session(session_id: str, current_user: dict = Depends(get_current_user)):
+async def get_session(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
     """获取 Session"""
     try:
-        service = SessionService(SessionLocal)
+        service = SessionService(lambda: db)
         result = service.get_session(session_id=session_id, user_id=current_user["user_id"])
         return result
     except ValueError as e:
@@ -142,11 +150,14 @@ async def get_session(session_id: str, current_user: dict = Depends(get_current_
     description="更新指定会话的信息",
 )
 async def update_session(
-    session_id: str, request: UpdateSessionRequest, current_user: dict = Depends(get_current_user)
+    session_id: str,
+    request: UpdateSessionRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
     """更新 Session"""
     try:
-        service = SessionService(SessionLocal)
+        service = SessionService(lambda: db)
         result = service.update_session(
             session_id=session_id,
             user_id=current_user["user_id"],
@@ -169,10 +180,14 @@ async def update_session(
     summary="删除 Session",
     description="删除指定的会话",
 )
-async def delete_session(session_id: str, current_user: dict = Depends(get_current_user)):
+async def delete_session(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
     """删除 Session"""
     try:
-        service = SessionService(SessionLocal)
+        service = SessionService(lambda: db)
         service.delete_session(session_id=session_id, user_id=current_user["user_id"])
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -188,10 +203,14 @@ async def delete_session(session_id: str, current_user: dict = Depends(get_curre
     summary="关闭 Session",
     description="关闭指定的会话",
 )
-async def close_session(session_id: str, current_user: dict = Depends(get_current_user)):
+async def close_session(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
     """关闭 Session"""
     try:
-        service = SessionService(SessionLocal)
+        service = SessionService(lambda: db)
         result = service.update_session(
             session_id=session_id, user_id=current_user["user_id"], status="closed"
         )

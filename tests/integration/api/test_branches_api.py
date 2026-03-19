@@ -117,12 +117,11 @@ class TestBranchLifecycle:
     BRANCH_NAME = "branch_api_test_br"
 
     @pytest.fixture(autouse=True)
-    def _setup_table(self, client, headers):
+    def _setup_table(self, client, headers, db_session):
         """Create a temp source table, yield, then clean up."""
-        from api.database import get_db_session
         from sqlalchemy import text
 
-        db = next(get_db_session())
+        db = db_session
         try:
             db.execute(text(f"DROP TABLE IF EXISTS {self.BRANCH_TABLE}"))
             db.execute(

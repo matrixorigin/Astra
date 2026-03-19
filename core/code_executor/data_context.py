@@ -13,6 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from core.sandbox.branch import Branch
+from core.sandbox.sandbox import Sandbox
 from core.db_consumer import DbConsumer, DbFactory
 
 
@@ -82,6 +83,9 @@ class DataContext(DbConsumer):
             db.commit()
             db.execute(text(f"CREATE DATABASE IF NOT EXISTS {self.sandbox_name}"))
             db.commit()
+            Sandbox(self._db_factory, source_db=self.source_db).wait_until_database_visible(
+                self.sandbox_name
+            )
             # Register in infra_sandbox_metadata for cleanup tracking
             try:
                 import json
@@ -113,12 +117,14 @@ class DataContext(DbConsumer):
 
         Uses `data branch create table` — kernel tracks LCA automatically.
         """
+        visibility = Sandbox(self._db_factory, source_db=self.source_db)
         for table in tables:
             if table not in self._branched_tables:
                 self.branch.create(
                     name=f"{self.sandbox_name}.{table}",
                     source=f"{self.source_db}.{table}",
                 )
+                visibility.wait_until_table_visible(self.sandbox_name, table)
                 self._branched_tables.add(table)
 
     def diff(self, tables: list[str] | None = None) -> list[TableDiff]:

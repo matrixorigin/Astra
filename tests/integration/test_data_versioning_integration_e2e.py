@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from core.data_versioning import (
     ExperimentConfig,
     ExperimentStatus,
@@ -21,8 +21,8 @@ TEST_DB = os.environ["MATRIXONE_DATABASE"]
 
 
 @pytest.fixture
-def db():
-    return next(get_db_session())
+def db(db_session):
+    return db_session
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +184,13 @@ class TestExperimentGateIntegration:
             inserted = exp.record_variant_results_batch(exp_id, results)
             assert inserted == 150
 
-            row = db.execute(text(f"SELECT COUNT(*) FROM {exp_id}.variant_results")).fetchone()
+            fresh_db = SessionLocal()
+            try:
+                row = fresh_db.execute(
+                    text(f"SELECT COUNT(*) FROM {exp_id}.variant_results")
+                ).fetchone()
+            finally:
+                fresh_db.close()
             assert row[0] == 150
         finally:
             exp.cleanup_experiment(exp_id)

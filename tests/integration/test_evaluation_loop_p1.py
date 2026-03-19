@@ -21,15 +21,6 @@ from core.evaluation.quality_scorer import (
 from core.evaluation.golden_selector import GoldenSessionSelector
 from core.events.event_logger import EventLogger
 from core.events.session_manager import SessionManager
-from api.database import get_db_session
-
-
-@pytest.fixture
-def db_session():
-    """Get database session."""
-    session = next(get_db_session())
-    yield session
-    session.close()
 
 
 @pytest.fixture

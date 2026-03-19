@@ -17,20 +17,27 @@ class SessionRepository:
     def db(self) -> DBSession:
         return self._db_factory()
 
+    @staticmethod
+    def _query(db: DBSession):
+        """Use populate_existing so request-scoped sessions don't reuse stale rows."""
+        return db.query(SessionModel).populate_existing()
+
     def create(self, session_data: dict) -> SessionModel:
         """Create session."""
         db = self.db
         session = SessionModel(**session_data)
         db.add(session)
         db.commit()
+        db.expire_all()
         return (
-            db.query(SessionModel).filter(SessionModel.session_id == session.session_id).first()
-            or session
+            self._query(db).filter(SessionModel.session_id == session.session_id).first() or session
         )
 
     def get_by_id(self, session_id: str, user_id: str | None = None) -> SessionModel | None:
         """Get session with optional ownership filter pushed to DB."""
-        query = self.db.query(SessionModel).filter(SessionModel.session_id == session_id)
+        db = self.db
+        db.expire_all()
+        query = self._query(db).filter(SessionModel.session_id == session_id)
         if user_id:
             query = query.filter(SessionModel.user_id == user_id)
         return query.first()
@@ -44,7 +51,9 @@ class SessionRepository:
         offset: int = 0,
     ) -> tuple[list[SessionModel], int]:
         """List sessions with filters pushed to database."""
-        query = self.db.query(SessionModel).filter(SessionModel.user_id == user_id)
+        db = self.db
+        db.expire_all()
+        query = self._query(db).filter(SessionModel.user_id == user_id)
         if agent_id:
             query = query.filter(SessionModel.agent_id == agent_id)
         if status:
@@ -58,7 +67,7 @@ class SessionRepository:
         """Update session status with ownership check at DB level."""
         db = self.db
         session = (
-            db.query(SessionModel)
+            self._query(db)
             .filter(SessionModel.session_id == session_id, SessionModel.user_id == user_id)
             .first()
         )
@@ -66,31 +75,32 @@ class SessionRepository:
             return None
         session.status = status
         db.commit()
+        db.expire_all()
         return (
-            db.query(SessionModel).filter(SessionModel.session_id == session.session_id).first()
-            or session
+            self._query(db).filter(SessionModel.session_id == session.session_id).first() or session
         )
 
     def update(self, session_id: str, update_data: dict) -> SessionModel | None:
         """Update session with data."""
         db = self.db
-        session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
+        session = self._query(db).filter(SessionModel.session_id == session_id).first()
         if not session:
             return None
         for key, value in update_data.items():
             setattr(session, key, value)
         db.commit()
+        db.expire_all()
         return (
-            db.query(SessionModel).filter(SessionModel.session_id == session.session_id).first()
-            or session
+            self._query(db).filter(SessionModel.session_id == session.session_id).first() or session
         )
 
     def delete(self, session_id: str) -> bool:
         """Delete session."""
         db = self.db
-        session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
+        session = self._query(db).filter(SessionModel.session_id == session_id).first()
         if not session:
             return False
         db.delete(session)
         db.commit()
+        db.expire_all()
         return True

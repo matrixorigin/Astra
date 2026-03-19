@@ -341,6 +341,7 @@ class PromptFeedback(DbConsumer):
                 )
             )
             db.commit()
+            db.expire_all()
 
         logger.info(
             f"Recorded feedback: {prompt_template_id}@{prompt_version} rating={user_rating}"

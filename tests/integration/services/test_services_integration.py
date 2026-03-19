@@ -89,6 +89,7 @@ class TestSessionService:
 
         session = session_service.create_session(user_id=user_id)
         assert session["user_id"] == user_id
+        assert session["created_at"] is not None
 
         retrieved = session_service.get_session(session["session_id"], user_id)
         assert retrieved["session_id"] == session["session_id"]

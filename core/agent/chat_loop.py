@@ -417,16 +417,16 @@ class ChatLoop:
                 build_memory_guard_payload(_guard_decision),
                 ensure_ascii=False,
             )
-        try:
-            params = json.loads(tc["function"]["arguments"])
+        if not _blocked_by_memory_policy:
+            try:
+                params = json.loads(tc["function"]["arguments"])
 
-            from core.agent.async_tools import get_async_tool_registry
+                from core.agent.async_tools import get_async_tool_registry
 
-            _async_registry = get_async_tool_registry()
+                _async_registry = get_async_tool_registry()
 
-            from core.verification.cot_audit import audit_tool_call
+                from core.verification.cot_audit import audit_tool_call
 
-            if not _blocked_by_memory_policy:
                 audit = audit_tool_call(
                     user_query=user_input,
                     tool_name=fn_name,
@@ -511,14 +511,12 @@ class ChatLoop:
                         self._record_tool_success(fn_name)
                         if self.hitl_policy:
                             self.hitl_policy.record_outcome(fn_name, success=True)
-        except Exception as e:
-            logger.error(f"Tool {fn_name} failed: {e}")
-            result_str = json.dumps({"error": str(e)})
-            self._record_tool_failure(fn_name, str(e))
-            if self.hitl_policy:
-                self.hitl_policy.record_outcome(fn_name, success=False)
-        finally:
-            pass
+            except Exception as e:
+                logger.error(f"Tool {fn_name} failed: {e}")
+                result_str = json.dumps({"error": str(e)})
+                self._record_tool_failure(fn_name, str(e))
+                if self.hitl_policy:
+                    self.hitl_policy.record_outcome(fn_name, success=False)
 
         _tool_elapsed_ms = (time.monotonic() - _t0) * 1000
         _result_size_bytes = len(result_str.encode("utf-8", errors="replace")) if result_str else 0

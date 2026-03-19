@@ -2,8 +2,9 @@
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
-from api.database import SessionLocal
+from api.database import get_db_session
 from api.dependencies import get_current_user
 from api.services.exceptions import PermissionDeniedError, ResourceNotFoundError
 from api.services.replay_service import ReplayService
@@ -51,11 +52,14 @@ class ComparisonResponse(BaseModel):
     description="在沙箱环境中重放会话，用于测试和验证",
 )
 async def replay_session(
-    session_id: str, request: ReplaySessionRequest, current_user: dict = Depends(get_current_user)
+    session_id: str,
+    request: ReplaySessionRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
     """重放会话"""
     try:
-        service = ReplayService(SessionLocal)
+        service = ReplayService(lambda: db)
         result = service.replay_session(
             session_id=session_id,
             user_id=current_user["user_id"],
@@ -79,13 +83,17 @@ async def replay_session(
     summary="对比重放结果",
     description="对比原始会话和重放结果的差异",
 )
-async def compare_replay(session_id: str, current_user: dict = Depends(get_current_user)):
+async def compare_replay(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
     """对比重放结果
 
     注意：这是简化版本，实际需要先执行重放再对比
     """
     try:
-        service = ReplayService(SessionLocal)
+        service = ReplayService(lambda: db)
 
         # 先执行重放
         replay_result = service.replay_session(

@@ -226,6 +226,63 @@ class TestToolMockingLayer:
         assert result1["result"] == "first"
         assert result2["result"] == "second"
 
+    def test_parent_event_lookup_is_scoped_to_session(self, db):
+        """Parent-event replay lookup must not return another session's result."""
+        from uuid_utils import uuid7
+
+        parent_event_id = str(uuid7())
+
+        db.add_all(
+            [
+                Event(
+                    event_id=str(uuid7()),
+                    session_id="sess_a",
+                    event_type="tool_result",
+                    content="a",
+                    event_metadata={
+                        "skill_params": {"param": "value"},
+                        "skill_result": {"status": "wrong-session"},
+                    },
+                    user_id="user_001",
+                    skill_name="test_skill",
+                    skill_version="1.0.0",
+                    skill_result={"status": "wrong-session"},
+                    parent_event_id=parent_event_id,
+                    causal_chain_id=str(uuid7()),
+                ),
+                Event(
+                    event_id=str(uuid7()),
+                    session_id="sess_b",
+                    event_type="tool_result",
+                    content="b",
+                    event_metadata={
+                        "skill_params": {"param": "value"},
+                        "skill_result": {"status": "expected"},
+                    },
+                    user_id="user_001",
+                    skill_name="test_skill",
+                    skill_version="1.0.0",
+                    skill_result={"status": "expected"},
+                    parent_event_id=parent_event_id,
+                    causal_chain_id=str(uuid7()),
+                ),
+            ]
+        )
+        db.commit()
+
+        mocker = ToolMockingLayer(
+            mode=ExecutionMode.REPLAY, db_factory=lambda: db, session_id="sess_b"
+        )
+
+        result = mocker.get_mock_result(
+            "test_skill",
+            {"param": "value"},
+            "sess_b",
+            parent_event_id=parent_event_id,
+        )
+
+        assert result == {"status": "expected"}
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

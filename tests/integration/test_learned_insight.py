@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import pytest
 from uuid_utils import uuid7
 
+from api.database import SessionLocal
 from api.models.skill import SkillSelectionEvent
 from core.context.prompt_assembler import PromptAssembler
 
@@ -296,6 +297,19 @@ class TestSkillSelectionEventFields:
 class TestTurnHooksAgentId:
     """Verify turn_hooks writes agent_id to skill_selection_events."""
 
+    @staticmethod
+    def _load_skill_selection_event(event_id: str) -> SkillSelectionEvent:
+        fresh_db = SessionLocal()
+        try:
+            return (
+                fresh_db.query(SkillSelectionEvent)
+                .populate_existing()
+                .filter(SkillSelectionEvent.event_id == event_id)
+                .one()
+            )
+        finally:
+            fresh_db.close()
+
     def test_record_skill_selection_with_agent_id(self, db_factory, db_session):
         from core.agent.turn_hooks import TurnHooks
 
@@ -310,9 +324,7 @@ class TestTurnHooksAgentId:
         )
 
         assert eid is not None
-        row = (
-            db_session.query(SkillSelectionEvent).filter(SkillSelectionEvent.event_id == eid).one()
-        )
+        row = self._load_skill_selection_event(eid)
 
         assert row.agent_id == "dev-agent"
         assert row.session_id == "sess-hook-test"
@@ -334,9 +346,7 @@ class TestTurnHooksAgentId:
         )
 
         assert eid is not None
-        row = (
-            db_session.query(SkillSelectionEvent).filter(SkillSelectionEvent.event_id == eid).one()
-        )
+        row = self._load_skill_selection_event(eid)
 
         assert row.agent_id is None
         assert row.skill_name == "search"
@@ -356,9 +366,7 @@ class TestTurnHooksAgentId:
         )
         hooks.backfill_selection_metrics("sess-backfill", tool_calls, elapsed_ms=250)
 
-        row = (
-            db_session.query(SkillSelectionEvent).filter(SkillSelectionEvent.event_id == eid).one()
-        )
+        row = self._load_skill_selection_event(eid)
 
         assert row.execution_success == 1
         assert row.execution_time_ms == 250
@@ -378,12 +386,8 @@ class TestTurnHooksAgentId:
         # Backfill should target eid2 (latest with execution_time_ms=NULL)
         hooks.backfill_selection_metrics("sess-multi", tc, elapsed_ms=200)
 
-        row1 = (
-            db_session.query(SkillSelectionEvent).filter(SkillSelectionEvent.event_id == eid1).one()
-        )
-        row2 = (
-            db_session.query(SkillSelectionEvent).filter(SkillSelectionEvent.event_id == eid2).one()
-        )
+        row1 = self._load_skill_selection_event(eid1)
+        row2 = self._load_skill_selection_event(eid2)
 
         assert row1.execution_time_ms == 100
         assert row2.execution_time_ms == 200

@@ -15,7 +15,7 @@ from click.testing import CliRunner
 from sqlalchemy import text, delete
 import json
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from api.models import Token, AuditLog, UserFeedback, Session as SessionModel
 from cli.mo_agent_api import cli as agent_cli
 from cli.mo_admin_api import cli as admin_cli
@@ -27,26 +27,23 @@ def runner():
 
 
 @pytest.fixture
-def db():
+def db(db_session):
     """Get test database session with cleanup."""
-    session = next(get_db_session())
-
     # Clean up before test
-    session.execute(delete(UserFeedback))
-    session.execute(delete(AuditLog))
-    session.execute(delete(Token))
-    session.execute(delete(SessionModel))
-    session.commit()
+    db_session.execute(delete(UserFeedback))
+    db_session.execute(delete(AuditLog))
+    db_session.execute(delete(Token))
+    db_session.execute(delete(SessionModel))
+    db_session.commit()
 
-    yield session
+    yield db_session
 
     # Clean up after test
-    session.execute(delete(UserFeedback))
-    session.execute(delete(AuditLog))
-    session.execute(delete(Token))
-    session.execute(delete(SessionModel))
-    session.commit()
-    session.close()
+    db_session.execute(delete(UserFeedback))
+    db_session.execute(delete(AuditLog))
+    db_session.execute(delete(Token))
+    db_session.execute(delete(SessionModel))
+    db_session.commit()
 
 
 class TestDatabasePersistence:
@@ -380,7 +377,12 @@ class TestDataConsistency:
         db.commit()
 
         # Retrieve and decrypt
-        result = db.query(Token).first()
+        fresh_db = SessionLocal()
+        try:
+            result = fresh_db.query(Token).filter(Token.token_id == token.token_id).first()
+        finally:
+            fresh_db.close()
+        assert result is not None
         retrieved_decrypted = decrypt_token(result.encrypted_value)
 
         assert retrieved_decrypted == original_value

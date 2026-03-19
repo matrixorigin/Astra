@@ -2,15 +2,14 @@
 
 import pytest
 
+from api.database import SessionLocal
 from core.context.prompts import PromptFeedback
-from sqlalchemy.orm import Session
-from api.database import get_db_session
 
 
 @pytest.fixture
-def db():
+def db(db_session):
     """Database fixture."""
-    return next(get_db_session())
+    return db_session
 
 
 @pytest.fixture
@@ -25,6 +24,7 @@ def feedback(db):
 
     db.execute(text("DELETE FROM eval_llm_feedback WHERE prompt_template_id LIKE 'system_test%'"))
     db.execute(text("DELETE FROM eval_llm_feedback WHERE prompt_template_id = 'system_compare'"))
+    db.execute(text("DELETE FROM eval_llm_feedback WHERE prompt_template_id = 'system_general'"))
     db.commit()
 
 
@@ -44,11 +44,14 @@ def test_record_feedback(db, feedback):
     # Verify stored
     from sqlalchemy import text
 
-    result = db.execute(
-        text("SELECT * FROM eval_llm_feedback WHERE feedback_id = :feedback_id"),
-        {"feedback_id": feedback_id},
-    )
-    row = result.first()
+    fresh_db = SessionLocal()
+    try:
+        row = fresh_db.execute(
+            text("SELECT * FROM eval_llm_feedback WHERE feedback_id = :feedback_id"),
+            {"feedback_id": feedback_id},
+        ).first()
+    finally:
+        fresh_db.close()
 
     assert row.rating == 5
     assert row.comment == "Excellent response!"

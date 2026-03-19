@@ -6,7 +6,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import text
 
-from api.database import get_db_session
+from api.database import SessionLocal, get_db_session
 from api.dependencies import get_current_user
 from pydantic import BaseModel, EmailStr, Field
 
@@ -46,6 +46,19 @@ class UserResponse(BaseModel):
 
 
 router = APIRouter(tags=["authentication"])
+
+
+def _load_user_for_login(username: str, db: "Session"):
+    repo = UserRepository(lambda: db)
+    user = repo.get_by_username(username)
+    if user is not None:
+        return user
+
+    fresh_db = SessionLocal()
+    try:
+        return UserRepository(lambda: fresh_db).get_by_username(username)
+    finally:
+        fresh_db.close()
 
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
@@ -102,7 +115,7 @@ def login(request: LoginRequest, db: "Session" = Depends(get_db_session)):
 
     repo = UserRepository(lambda: db)
 
-    user = repo.get_by_username(request.username)
+    user = _load_user_for_login(request.username, db)
     if not user or not verify_password(request.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid username or password")
     if not user.is_active:

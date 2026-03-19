@@ -244,10 +244,12 @@ class ToolMockingLayer(DbConsumer):
                     event = (
                         session.query(EventModel)
                         .filter(
+                            EventModel.session_id == session_id,
                             EventModel.parent_event_id == parent_event_id,
                             EventModel.skill_name == skill_name,
                             EventModel.event_type.in_(["tool_result", "stream_tool_result"]),
                         )
+                        .order_by(EventModel.created_at.desc())
                         .first()
                     )
                 else:

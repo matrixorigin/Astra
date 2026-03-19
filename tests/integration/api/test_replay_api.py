@@ -5,13 +5,25 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 
 from api.main import app
+from api.database import get_db_session
 from api.repositories.user_repository import UserRepository
 
 
 @pytest.fixture
-def client():
-    """Create test client."""
-    return TestClient(app)
+def client(db_session):
+    """Create test client bound to the shared test DB session."""
+
+    def override_get_db():
+        try:
+            yield db_session
+        finally:
+            pass
+
+    app.dependency_overrides[get_db_session] = override_get_db
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.pop(get_db_session, None)
 
 
 # auth_headers fixture now provided by tests/integration/conftest.py
@@ -26,6 +38,7 @@ def test_session(client, auth_headers):
         headers=auth_headers,
         json={"metadata": {}},
     )
+    assert response.status_code == 201, response.text
     session_id = response.json()["session_id"]
 
     # Create some events
@@ -120,6 +133,7 @@ class TestReplaySession:
             headers=other_headers,
             json={"metadata": {}},
         )
+        assert session_response.status_code == 201, session_response.text
         session_id = session_response.json()["session_id"]
 
         # Try to replay as first user

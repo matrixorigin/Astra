@@ -5,7 +5,6 @@ import json
 import pytest
 from uuid_utils import uuid7
 
-from api.database import get_db_session
 from api.models import KnowledgeEntry
 from skills.knowledge.api import (
     KnowledgeExtractor,
@@ -18,8 +17,8 @@ from skills.knowledge.api import (
 
 
 @pytest.fixture
-def db():
-    return next(get_db_session())
+def db(db_session):
+    return db_session
 
 
 @pytest.fixture

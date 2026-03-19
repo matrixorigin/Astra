@@ -392,7 +392,9 @@ class TestTimeTravelReplay:
             )
         db_session.commit()
 
-        replay = StreamReplay(lambda: db_session)
+        from api.database import SessionLocal
+
+        replay = StreamReplay(SessionLocal)
         state = replay.get_stream_state_at(session_id, now)
 
         assert state["text_accumulated"] == "Hello world!"

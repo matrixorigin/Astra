@@ -7,8 +7,9 @@ from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import AfterValidator, BaseModel, Field
+from sqlalchemy.orm import Session
 
-from api.database import SessionLocal
+from api.database import SessionLocal, get_db_session
 from api.dependencies import get_current_user
 from core.logging_config import get_logger
 
@@ -90,11 +91,11 @@ class CostEstimateResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _get_branch():
+def _get_branch(db_factory=None):
     from api.database import settings
     from core.sandbox.branch import Branch
 
-    return Branch(database=settings.matrixone_database, db_factory=SessionLocal)
+    return Branch(database=settings.matrixone_database, db_factory=db_factory or SessionLocal)
 
 
 # ---------------------------------------------------------------------------
@@ -106,10 +107,11 @@ def _get_branch():
 def create_branch(
     request: CreateBranchRequest,
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
     """Create a zero-copy branch from source."""
     try:
-        _get_branch().create(
+        _get_branch(lambda: db).create(
             name=request.name,
             source=request.source,
             snapshot=request.snapshot,
@@ -124,10 +126,11 @@ def create_branch(
 def diff_branch(
     request: DiffRequest,
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
     """Three-way diff between two tables/snapshots."""
     try:
-        rows = _get_branch().diff(
+        rows = _get_branch(lambda: db).diff(
             target=request.target,
             source=request.source,
             output=request.output,
@@ -143,10 +146,11 @@ def diff_branch(
 def merge_branch(
     request: MergeRequest,
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
     """Merge source into target with conflict strategy."""
     try:
-        _get_branch().merge(
+        _get_branch(lambda: db).merge(
             source=request.source,
             target=request.target,
             on_conflict=request.on_conflict,
@@ -160,10 +164,11 @@ def merge_branch(
 def delete_branch(
     request: DeleteBranchRequest,
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
     """Delete a branch."""
     try:
-        _get_branch().delete(name=request.name, is_database=request.is_database)
+        _get_branch(lambda: db).delete(name=request.name, is_database=request.is_database)
         return {"status": "deleted", "name": request.name}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

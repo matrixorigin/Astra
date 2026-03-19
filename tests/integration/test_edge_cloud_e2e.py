@@ -21,6 +21,7 @@ os.environ.setdefault("TOKEN_ENCRYPTION_KEY", "test-key-" + "x" * 32)
 os.environ.setdefault("JWT_SECRET_KEY", "test-jwt-secret-" + "x" * 32)
 
 from api.main import app
+from api.database import SessionLocal
 from tests.conftest import (
     parse_sse_events,
     fake_llm_stream,
@@ -457,16 +458,20 @@ class TestSessionStateUpdate:
         sid = next(e["session_id"] for e in parse_sse_events(r.text) if e["type"] == "session_info")
         flush_persist_threads()
 
-        row = (
-            db.execute(
-                sql_text(
-                    "SELECT event_count, last_active_at FROM agent_sessions WHERE session_id = :sid"
-                ),
-                {"sid": sid},
+        fresh_db = SessionLocal()
+        try:
+            row = (
+                fresh_db.execute(
+                    sql_text(
+                        "SELECT event_count, last_active_at FROM agent_sessions WHERE session_id = :sid"
+                    ),
+                    {"sid": sid},
+                )
+                .mappings()
+                .first()
             )
-            .mappings()
-            .first()
-        )
+        finally:
+            fresh_db.close()
 
         assert row is not None
         assert row["event_count"] >= 2  # user_query + llm_response
