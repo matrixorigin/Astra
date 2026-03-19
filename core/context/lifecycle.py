@@ -8,11 +8,16 @@ and session summaries are handled by SessionSummarizer.
 The `memories` table governance is handled by core.memory.governance.GovernanceScheduler.
 """
 
+import time
 from datetime import datetime
 from typing import Any
+
 from sqlalchemy import case, func
-from core.logging_config import get_logger
+from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.orm import sessionmaker
+
 from core.db_consumer import DbConsumer, DbFactory
+from core.logging_config import get_logger
 
 logger = get_logger(__name__)
 
@@ -246,9 +251,41 @@ class MemoryGovernanceEngine(DbConsumer):
                     },
                 )
                 db.commit()
+                self._wait_for_governance_event(db, eid)
             except Exception as e:
                 logger.debug("governance event write failed: %s", e)
                 db.rollback()
+
+    @staticmethod
+    def _wait_for_governance_event(
+        db,
+        event_id: str,
+        *,
+        attempts: int = 6,
+        delay_seconds: float = 0.03,
+    ) -> bool:
+        if not hasattr(db, "get_bind"):
+            return False
+        bind = db.get_bind()
+        if not isinstance(bind, (Engine, Connection)):
+            return False
+
+        from sqlalchemy import text
+
+        for attempt in range(attempts):
+            fresh_db = sessionmaker(bind=bind, expire_on_commit=False)()
+            try:
+                row = fresh_db.execute(
+                    text("SELECT 1 FROM agent_events WHERE event_id = :eid"),
+                    {"eid": event_id},
+                ).fetchone()
+            finally:
+                fresh_db.close()
+            if row is not None:
+                return True
+            if attempt < attempts - 1:
+                time.sleep(delay_seconds * (attempt + 1))
+        return False
 
     def _generate_health_reports(self) -> int:
         with self._db() as db:

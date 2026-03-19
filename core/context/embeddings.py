@@ -4,7 +4,11 @@ The actual embedding generation is delegated to EmbeddingClient (core/embedding/
 This module adds store_embedding() and search_similar() which need DB access.
 """
 
+import time
 from typing import Any
+
+from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.orm import sessionmaker
 
 from config.settings import get_settings
 from core.db_consumer import DbConsumer, DbFactory
@@ -112,27 +116,44 @@ class EmbeddingService(DbConsumer):
         sim_expr = (1.0 / (1.0 + dist)).label("similarity")
 
         with self._db() as db:
-            query = db.query(
-                Event.event_id,
-                Event.session_id,
-                Event.content,
-                Event.event_type,
-                Event.created_at,
-                dist_expr,
-                sim_expr,
-            ).join(EventEmbedding, Event.event_id == EventEmbedding.event_id)
-            if session_id:
-                query = query.filter(Event.session_id == session_id)
-            if filters:
-                from matrixone.sqlalchemy_ext import json_extract_string
+            def _build_query(query_db):
+                query = query_db.query(
+                    Event.event_id,
+                    Event.session_id,
+                    Event.content,
+                    Event.event_type,
+                    Event.created_at,
+                    dist_expr,
+                    sim_expr,
+                ).join(EventEmbedding, Event.event_id == EventEmbedding.event_id)
+                if session_id:
+                    query = query.filter(Event.session_id == session_id)
+                if filters:
+                    from matrixone.sqlalchemy_ext import json_extract_string
 
-                for key, value in filters.items():
-                    if key == "event_type":
-                        query = query.filter(Event.event_type == value)
-                    else:
-                        query = query.filter(
-                            json_extract_string(EventEmbedding.embedding_metadata, f"$.{key}")
-                            == value
-                        )
-            query = query.order_by("distance").limit(limit)
-            return [dict(row._mapping) for row in query.all()]
+                    for key, value in filters.items():
+                        if key == "event_type":
+                            query = query.filter(Event.event_type == value)
+                        else:
+                            query = query.filter(
+                                json_extract_string(EventEmbedding.embedding_metadata, f"$.{key}")
+                                == value
+                            )
+                return query.order_by("distance").limit(limit)
+
+            query = _build_query(db)
+            results = [dict(row._mapping) for row in query.all()]
+
+            bind = db.get_bind()
+            if isinstance(bind, (Engine, Connection)):
+                for attempt in range(3):
+                    fresh_db = sessionmaker(bind=bind, expire_on_commit=False)()
+                    try:
+                        fresh_results = [dict(row._mapping) for row in _build_query(fresh_db).all()]
+                    finally:
+                        fresh_db.close()
+                    if len(fresh_results) > len(results):
+                        results = fresh_results
+                    if attempt < 2:
+                        time.sleep(0.03 * (attempt + 1))
+            return results

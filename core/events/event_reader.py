@@ -4,9 +4,12 @@ Provides methods to retrieve and query events from the database.
 """
 
 import json
+import time
 
 from sqlalchemy import text
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Query
+from sqlalchemy.orm import sessionmaker
 
 from api.models.agent import Event
 from core.events.models import ContextSnapshot, ConversationEvent, TokenUsage
@@ -132,17 +135,35 @@ class EventReader(DbConsumer):
             list[ConversationEvent]: List of events
         """
         with self._db() as db:
-            q = (
-                db.query(*_LIST_COLUMNS)
-                .filter(
-                    Event.session_id == session_id,
-                )
-                .order_by(Event.created_at.desc())
-            )
-            if limit:
-                q = q.limit(limit)
-            rows = q.all()
+            rows = self._query_session_events(db, session_id, limit)
+            bind = db.get_bind() if hasattr(db, "get_bind") else None
+            if isinstance(bind, (Engine, Connection)):
+                best_rows = rows
+                for attempt in range(3):
+                    fresh_db = sessionmaker(bind=bind, expire_on_commit=False)()
+                    try:
+                        fresh_rows = self._query_session_events(fresh_db, session_id, limit)
+                    finally:
+                        fresh_db.close()
+                    if len(fresh_rows) > len(best_rows):
+                        best_rows = fresh_rows
+                    if attempt < 2:
+                        time.sleep(0.03 * (attempt + 1))
+                rows = best_rows
             return [self._row_to_event(self._orm_row_to_dict(r)) for r in rows]
+
+    @staticmethod
+    def _query_session_events(db, session_id: str, limit: int | None = None):
+        q = (
+            db.query(*_LIST_COLUMNS)
+            .filter(
+                Event.session_id == session_id,
+            )
+            .order_by(Event.created_at.asc())
+        )
+        if limit:
+            q = q.limit(limit)
+        return q.all()
 
     def get_user_events(self, user_id: str, limit: int | None = 100) -> list[ConversationEvent]:
         """Get all events for a user across sessions.

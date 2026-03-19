@@ -94,18 +94,51 @@ def test_engine():
             # this as a safety net for test DBs that predate the migration.
             from sqlalchemy import text as sa_text
 
-            for ddl in [
-                "ALTER TABLE agent_events MODIFY COLUMN created_at DATETIME(6) NOT NULL",
-                "ALTER TABLE ctx_snapshots MODIFY COLUMN created_at DATETIME(6) NOT NULL",
-                "ALTER TABLE skill_selection_events MODIFY COLUMN created_at DATETIME(6)",
-                "ALTER TABLE skills_registry ADD COLUMN tags JSON",
-            ]:
+            def _column_meta(table_name: str, column_name: str):
+                with engine.connect() as c:
+                    row = c.execute(
+                        sa_text(f"SHOW COLUMNS FROM {table_name} LIKE :column_name"),
+                        {"column_name": column_name},
+                    ).fetchone()
+                    return dict(row._mapping) if row else None
+
+            ddl_checks = [
+                (
+                    "ALTER TABLE agent_events MODIFY COLUMN created_at DATETIME(6) NOT NULL",
+                    lambda: not (_column_meta("agent_events", "created_at") or {})
+                    .get("Type", "")
+                    .lower()
+                    .startswith("datetime(6)"),
+                ),
+                (
+                    "ALTER TABLE ctx_snapshots MODIFY COLUMN created_at DATETIME(6) NOT NULL",
+                    lambda: not (_column_meta("ctx_snapshots", "created_at") or {})
+                    .get("Type", "")
+                    .lower()
+                    .startswith("datetime(6)"),
+                ),
+                (
+                    "ALTER TABLE skill_selection_events MODIFY COLUMN created_at DATETIME(6)",
+                    lambda: not (_column_meta("skill_selection_events", "created_at") or {})
+                    .get("Type", "")
+                    .lower()
+                    .startswith("datetime(6)"),
+                ),
+                (
+                    "ALTER TABLE skills_registry ADD COLUMN tags JSON",
+                    lambda: _column_meta("skills_registry", "tags") is None,
+                ),
+            ]
+
+            for ddl, should_run in ddl_checks:
                 try:
+                    if not should_run():
+                        continue
                     with engine.connect() as c:
                         c.execute(sa_text(ddl))
                         c.commit()
                 except Exception:
-                    pass  # Column already DATETIME(6), or table created with correct type
+                    pass  # Best-effort schema safety net for legacy test DBs
 
             # Register edge tool metadata so tests can verify DB state.
             try:

@@ -1,10 +1,13 @@
 """Audit logger for tracking admin operations."""
 
+import time
 from datetime import datetime
 from typing import Any
 
 from sqlalchemy import text
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session
+from sqlalchemy.orm import sessionmaker
 
 from core.db_consumer import DbFactory
 from core.utils.id_generator import generate_log_id
@@ -56,6 +59,23 @@ class AuditLogger:
             )
         )
         db.commit()
+        db.expire_all()
+        bind = db.get_bind()
+        if isinstance(bind, (Engine, Connection)):
+            for attempt in range(6):
+                fresh_db = sessionmaker(bind=bind, expire_on_commit=False)()
+                try:
+                    row = (
+                        fresh_db.query(AuditLog.log_id)
+                        .filter(AuditLog.log_id == log_id)
+                        .first()
+                    )
+                finally:
+                    fresh_db.close()
+                if row is not None:
+                    break
+                if attempt < 5:
+                    time.sleep(0.03 * (attempt + 1))
 
     def log_model_add(self, user_id: str, model_name: str, scope: str, scope_id: str | None = None):
         """Log model addition."""
@@ -146,5 +166,21 @@ class AuditLogger:
         LIMIT {limit}
         """)
 
-        result = self.db.execute(query, params)
-        return [dict(row._mapping) for row in result] if result else []
+        db = self.db
+        result = db.execute(query, params)
+        logs = [dict(row._mapping) for row in result] if result else []
+
+        bind = db.get_bind()
+        if isinstance(bind, (Engine, Connection)):
+            for attempt in range(3):
+                fresh_db = sessionmaker(bind=bind, expire_on_commit=False)()
+                try:
+                    fresh_result = fresh_db.execute(query, params)
+                    fresh_logs = [dict(row._mapping) for row in fresh_result] if fresh_result else []
+                finally:
+                    fresh_db.close()
+                if len(fresh_logs) > len(logs):
+                    logs = fresh_logs
+                if attempt < 2:
+                    time.sleep(0.03 * (attempt + 1))
+        return logs

@@ -1,6 +1,9 @@
 """Branch manager for Git-like data workflows using MatrixOne's native data branch."""
 
+import time
+
 from sqlalchemy import text
+
 from core.db_consumer import DbConsumer, DbFactory
 
 
@@ -20,6 +23,32 @@ class Branch(DbConsumer):
             return f"{self.database}.{name}"
         return name
 
+    def _wait_until_table_visible(
+        self,
+        qualified_name: str,
+        *,
+        attempts: int = 10,
+        base_delay_s: float = 0.05,
+    ) -> None:
+        database, table = qualified_name.split(".", 1)
+        from api.database import SessionLocal
+
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            fresh_db = SessionLocal()
+            try:
+                rows = fresh_db.execute(text(f"SHOW TABLES FROM {database}")).fetchall()
+                values = [next(iter(row._mapping.values())) for row in rows if getattr(row, "_mapping", None)]
+                if table in values:
+                    return
+            except Exception as exc:
+                last_error = exc
+            finally:
+                fresh_db.close()
+            time.sleep(base_delay_s * (attempt + 1))
+        detail = f": {last_error}" if last_error else ""
+        raise RuntimeError(f"Table {qualified_name} was not visible after {attempts} retries{detail}")
+
     def create(
         self, name: str, source: str, snapshot: str | None = None, is_database: bool = False
     ) -> None:
@@ -35,10 +64,13 @@ class Branch(DbConsumer):
             if not is_database:
                 name = self._qualify(name)
                 source = self._qualify(source)
+                self._wait_until_table_visible(source)
 
             src = f'{source}{{snapshot="{snapshot}"}}' if snapshot else source
             db.execute(text(f"data branch create {entity} {name} from {src}"))
             db.commit()
+            if not is_database:
+                self._wait_until_table_visible(name)
 
     def diff(
         self,

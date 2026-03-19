@@ -4,9 +4,12 @@ Handles system prompts, user prompts, and template management.
 Supports versioning and feedback collection for prompt optimization.
 """
 
+import time
 from typing import Any
 
 from sqlalchemy import text
+from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.orm import sessionmaker
 
 from core.db_consumer import DbConsumer, DbFactory
 from core.logging_config import get_logger
@@ -340,8 +343,25 @@ class PromptFeedback(DbConsumer):
                     feedback_metadata=metadata or {},
                 )
             )
+            db.flush()
             db.commit()
             db.expire_all()
+            bind = db.get_bind()
+            if isinstance(bind, (Engine, Connection)):
+                for attempt in range(6):
+                    fresh_db = sessionmaker(bind=bind, expire_on_commit=False)()
+                    try:
+                        row = (
+                            fresh_db.query(LLMFeedback.feedback_id)
+                            .filter(LLMFeedback.feedback_id == feedback_id)
+                            .first()
+                        )
+                    finally:
+                        fresh_db.close()
+                    if row is not None:
+                        break
+                    if attempt < 5:
+                        time.sleep(0.03 * (attempt + 1))
 
         logger.info(
             f"Recorded feedback: {prompt_template_id}@{prompt_version} rating={user_rating}"

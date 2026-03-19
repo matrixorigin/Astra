@@ -7,9 +7,12 @@ Implements the token resolution priority from design doc:
 """
 
 import json
+import time
 from datetime import datetime, timezone
 
 from sqlalchemy import text
+from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.orm import sessionmaker
 from uuid_utils import uuid7
 
 from api.database import get_db_session
@@ -86,7 +89,23 @@ class TokenResolver(DbConsumer):
             )
             db.add(token_model)
             db.commit()
-            db.refresh(token_model)
+            bind = db.get_bind()
+            if isinstance(bind, (Engine, Connection)):
+                fresh_factory = sessionmaker(bind=bind, expire_on_commit=False)
+                for attempt in range(6):
+                    fresh_db = fresh_factory()
+                    try:
+                        visible = (
+                            fresh_db.query(TokenModel)
+                            .filter(TokenModel.token_id == token_id)
+                            .first()
+                        )
+                    finally:
+                        fresh_db.close()
+                    if visible is not None:
+                        break
+                    if attempt < 5:
+                        time.sleep(0.03 * (attempt + 1))
 
             return Token(
                 token_id=token_id,
@@ -122,6 +141,19 @@ class TokenResolver(DbConsumer):
             )
             db.commit()
             db.expire_all()  # Clear session cache
+            bind = db.get_bind()
+            if isinstance(bind, (Engine, Connection)):
+                fresh_factory = sessionmaker(bind=bind, expire_on_commit=False)
+                for attempt in range(6):
+                    fresh_db = fresh_factory()
+                    try:
+                        row = fresh_db.query(TokenModel).filter(TokenModel.token_id == token_id).first()
+                    finally:
+                        fresh_db.close()
+                    if row is None or not row.is_active:
+                        break
+                    if attempt < 5:
+                        time.sleep(0.03 * (attempt + 1))
 
     def _get_repo_specific_token(
         self, repo_id: str | None, repo_url: str | None, user_id: str

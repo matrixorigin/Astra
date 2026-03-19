@@ -14,6 +14,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy import text
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from core.sandbox import Sandbox, Branch
@@ -121,6 +122,36 @@ class PromptExperiment(DbConsumer):
         self.branch = Branch(database=source_db, db_factory=db_factory)
         self.source_db = source_db
 
+    def _wait_for_experiment_status(
+        self,
+        db: Session,
+        experiment_id: str,
+        expected_status: str,
+        *,
+        attempts: int = 8,
+        base_delay_s: float = 0.03,
+    ) -> None:
+        bind = db.get_bind() if hasattr(db, "get_bind") else None
+        if not isinstance(bind, (Engine, Connection)):
+            return
+
+        query = text(f"""
+            SELECT status FROM {experiment_id}.experiment_config
+            WHERE experiment_id = :exp_id
+        """)
+        for attempt in range(attempts):
+            fresh_db = sessionmaker(bind=bind, expire_on_commit=False)()
+            try:
+                row = fresh_db.execute(query, {"exp_id": experiment_id}).fetchone()
+            except Exception:
+                row = None
+            finally:
+                fresh_db.close()
+            if row and row[0] == expected_status:
+                return
+            if attempt < attempts - 1:
+                time.sleep(base_delay_s * (attempt + 1))
+
     def create_experiment(self, config: ExperimentConfig) -> str:
         """Create new experiment with sandbox and branched agent_events.
 
@@ -208,6 +239,7 @@ class PromptExperiment(DbConsumer):
                 },
             )
             db.commit()
+            self._wait_for_experiment_status(db, exp_id, ExperimentStatus.DRAFT.value)
             self.sandbox.wait_until_table_visible(exp_id, "experiment_config")
             self.sandbox.wait_until_table_visible(exp_id, "variant_results")
 
@@ -557,21 +589,24 @@ class PromptExperiment(DbConsumer):
             Winner variant_id or None if no clear winner
         """
         with self._db() as db:
-            results = self.get_experiment_results(experiment_id)
+            results = None
+            config_row = None
+            for attempt in range(4):
+                results = self.get_experiment_results(experiment_id)
+                if results:
+                    config_row = db.execute(
+                        text(f"""
+                        SELECT baseline_variant FROM {experiment_id}.experiment_config
+                        WHERE experiment_id = :exp_id
+                    """),
+                        {"exp_id": experiment_id},
+                    ).fetchone()
+                    if config_row:
+                        break
+                if attempt < 3:
+                    time.sleep(0.05 * (attempt + 1))
 
-            if not results:
-                return None
-
-            # Get baseline
-            config_row = db.execute(
-                text(f"""
-                SELECT baseline_variant FROM {experiment_id}.experiment_config
-                WHERE experiment_id = :exp_id
-            """),
-                {"exp_id": experiment_id},
-            ).fetchone()
-
-            if not config_row:
+            if not results or not config_row:
                 return None
 
             baseline_config = json.loads(config_row[0])
@@ -665,6 +700,7 @@ class PromptExperiment(DbConsumer):
                         {"exp_id": experiment_id},
                     )
                     db.commit()
+                    self._wait_for_experiment_status(db, experiment_id, "gate_failed")
                     return "gate_failed"
 
             db.execute(
@@ -681,6 +717,7 @@ class PromptExperiment(DbConsumer):
             )
 
             db.commit()
+            self._wait_for_experiment_status(db, experiment_id, ExperimentStatus.COMPLETED.value)
             return winner_id
 
     def cleanup_experiment(self, experiment_id: str) -> None:

@@ -1,8 +1,11 @@
 """Decision repository for ORM-based data access."""
 
 from collections.abc import Callable
+import time
 
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session as DBSession
+from sqlalchemy.orm import sessionmaker
 
 from api.models import DecisionAudit as DecisionModel
 
@@ -23,10 +26,34 @@ class DecisionRepository:
         decision = DecisionModel(**decision_data)
         db.add(decision)
         db.commit()
-        return (
-            db.query(DecisionModel).filter(DecisionModel.decision_id == decision.decision_id).first()
-            or decision
-        )
+        row = db.query(DecisionModel).filter(DecisionModel.decision_id == decision.decision_id).first()
+        if row is not None:
+            return row
+        bind = db.get_bind()
+        if isinstance(bind, (Engine, Connection)):
+            fresh_factory = sessionmaker(bind=bind, expire_on_commit=False)
+            for attempt in range(6):
+                fresh_db = fresh_factory()
+                try:
+                    visible = (
+                        fresh_db.query(DecisionModel)
+                        .filter(DecisionModel.decision_id == decision.decision_id)
+                        .first()
+                    )
+                finally:
+                    fresh_db.close()
+                if visible is not None:
+                    db.expire_all()
+                    row = (
+                        db.query(DecisionModel)
+                        .filter(DecisionModel.decision_id == decision.decision_id)
+                        .first()
+                    )
+                    if row is not None:
+                        return row
+                if attempt < 5:
+                    time.sleep(0.03 * (attempt + 1))
+        return decision
 
     def get_by_id(self, decision_id: str) -> DecisionModel | None:
         """Get decision by ID."""

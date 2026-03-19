@@ -170,20 +170,52 @@ class TurnHooks(DbConsumer):
             from api.models.skill import SkillSelectionEvent
 
             with self._db() as db:
-                row = (
-                    db.query(SkillSelectionEvent)
-                    .filter(
-                        SkillSelectionEvent.session_id == session_id,
-                        SkillSelectionEvent.execution_time_ms.is_(None),
+                row = None
+                for attempt in range(6):
+                    row = (
+                        db.query(SkillSelectionEvent)
+                        .populate_existing()
+                        .filter(
+                            SkillSelectionEvent.session_id == session_id,
+                            SkillSelectionEvent.execution_time_ms.is_(None),
+                        )
+                        .order_by(SkillSelectionEvent.created_at.desc())
+                        .first()
                     )
-                    .order_by(SkillSelectionEvent.created_at.desc())
-                    .first()
-                )
+                    if row is not None:
+                        break
+                    if attempt < 5:
+                        import time
+
+                        time.sleep(0.03 * (attempt + 1))
                 if row:
+                    event_id = row.event_id
                     row.execution_time_ms = elapsed_ms or 0
                     row.execution_success = 1
                     db.commit()
                     db.expire_all()
+                    bind = db.get_bind() if hasattr(db, "get_bind") else None
+                    if bind is not None:
+                        from sqlalchemy.engine import Connection, Engine
+                        from sqlalchemy.orm import sessionmaker
+
+                        if isinstance(bind, (Engine, Connection)):
+                            import time
+
+                            for attempt in range(6):
+                                fresh_db = sessionmaker(bind=bind, expire_on_commit=False)()
+                                try:
+                                    fresh_row = (
+                                        fresh_db.query(SkillSelectionEvent)
+                                        .filter(SkillSelectionEvent.event_id == event_id)
+                                        .first()
+                                    )
+                                finally:
+                                    fresh_db.close()
+                                if fresh_row and fresh_row.execution_success == 1:
+                                    break
+                                if attempt < 5:
+                                    time.sleep(0.03 * (attempt + 1))
         except Exception as e:
             logger.debug("Backfill selection metrics skipped: %s", e)
 

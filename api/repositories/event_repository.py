@@ -1,8 +1,11 @@
 """Optimized event repository."""
 
 from collections.abc import Callable
+import time
 
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session as DBSession
+from sqlalchemy.orm import sessionmaker
 
 from api.models import Event as EventModel
 
@@ -17,13 +20,28 @@ class EventRepository:
     def db(self) -> DBSession:
         return self._db_factory()
 
+    @staticmethod
+    def _query(db: DBSession):
+        return db.query(EventModel).populate_existing()
+
     def create(self, event_data: dict) -> EventModel:
         """Create event."""
         db = self.db
         event = EventModel(**event_data)
         db.add(event)
+        db.flush()
         db.commit()
-        return db.query(EventModel).filter(EventModel.event_id == event.event_id).first() or event
+        row = self._query(db).filter(EventModel.event_id == event.event_id).first()
+        if row is not None:
+            return row
+        bind = db.get_bind()
+        if isinstance(bind, (Engine, Connection)):
+            fresh_db = sessionmaker(bind=bind, expire_on_commit=False)()
+            try:
+                return self._query(fresh_db).filter(EventModel.event_id == event.event_id).first() or event
+            finally:
+                fresh_db.close()
+        return event
 
     def get_by_id(self, event_id: str, user_id: str | None = None) -> EventModel | None:
         """Get event with optional ownership filter."""
@@ -41,12 +59,38 @@ class EventRepository:
         offset: int = 0,
     ) -> list[EventModel]:
         """List events with filters and pagination pushed to database."""
-        query = self.db.query(EventModel).filter(
-            EventModel.session_id == session_id, EventModel.user_id == user_id
-        )
+        db = self.db
+        query = self._query(db).filter(EventModel.session_id == session_id, EventModel.user_id == user_id)
         if event_type:
             query = query.filter(EventModel.event_type == event_type)
-        return query.order_by(EventModel.created_at.asc()).offset(offset).limit(limit).all()
+        rows = query.order_by(EventModel.created_at.asc()).offset(offset).limit(limit).all()
+
+        bind = db.get_bind()
+        if isinstance(bind, (Engine, Connection)):
+            best_rows = rows
+            for attempt in range(3):
+                fresh_db = sessionmaker(bind=bind, expire_on_commit=False)()
+                try:
+                    fresh_query = self._query(fresh_db).filter(
+                        EventModel.session_id == session_id,
+                        EventModel.user_id == user_id,
+                    )
+                    if event_type:
+                        fresh_query = fresh_query.filter(EventModel.event_type == event_type)
+                    fresh_rows = (
+                        fresh_query.order_by(EventModel.created_at.asc())
+                        .offset(offset)
+                        .limit(limit)
+                        .all()
+                    )
+                finally:
+                    fresh_db.close()
+                if len(fresh_rows) > len(best_rows):
+                    best_rows = fresh_rows
+                if attempt < 2:
+                    time.sleep(0.03 * (attempt + 1))
+            rows = best_rows
+        return rows
 
     def count_by_session(self, session_id: str) -> int:
         """Count events for session."""

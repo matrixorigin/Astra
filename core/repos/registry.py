@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from uuid_utils import uuid7
 
 from sqlalchemy import text
+from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.orm import sessionmaker
 
 from api.database import get_db_session
 from core.repos.models import AccessScope, OwnerType, Repo, RepoType
@@ -62,8 +64,28 @@ class RepoRegistry(DbConsumer):
             )
 
             db.add(repo_model)
+            db.flush()
             db.commit()
-            db.refresh(repo_model)
+            row = (
+                db.query(RepoModel)
+                .populate_existing()
+                .filter(RepoModel.repo_id == repo_id)
+                .first()
+            )
+            if row is None:
+                bind = db.get_bind()
+                if isinstance(bind, (Engine, Connection)):
+                    fresh_db = sessionmaker(bind=bind, expire_on_commit=False)()
+                    try:
+                        row = (
+                            fresh_db.query(RepoModel)
+                            .populate_existing()
+                            .filter(RepoModel.repo_id == repo_id)
+                            .first()
+                        )
+                    finally:
+                        fresh_db.close()
+            repo_model = row or repo_model
 
             return self._to_model(repo_model)
 

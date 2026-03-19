@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import datetime
 from typing import Any
 
 from sqlalchemy import text
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session
+from sqlalchemy.orm import sessionmaker
 from uuid_utils import uuid7
 
 from core.logging_config import get_logger
@@ -122,6 +125,24 @@ def update_access_tracking(
                     {"ids": tuple(entry_ids)},
                 )
                 db.commit()
+                bind = db.get_bind() if hasattr(db, "get_bind") else None
+                if isinstance(bind, (Engine, Connection)):
+                    for attempt in range(6):
+                        fresh_db = sessionmaker(bind=bind, expire_on_commit=False)()
+                        try:
+                            count = fresh_db.execute(
+                                text(
+                                    "SELECT COUNT(*) FROM sk_knowledge_entries "
+                                    "WHERE entry_id IN :ids AND access_count > 0"
+                                ),
+                                {"ids": tuple(entry_ids)},
+                            ).scalar() or 0
+                        finally:
+                            fresh_db.close()
+                        if count >= len(entry_ids):
+                            break
+                        if attempt < 5:
+                            time.sleep(0.03 * (attempt + 1))
         except Exception as e:
             logger.warning("Access tracking update failed: %s", e)
         finally:
@@ -486,6 +507,7 @@ class KnowledgeExtractor:
         existing_entries = {}
         if keys_to_check:
             from sqlalchemy import or_, and_
+            import time
 
             conditions = [
                 and_(
@@ -495,9 +517,16 @@ class KnowledgeExtractor:
                 )
                 for user_id, category, key_name in keys_to_check
             ]
-            existing = self.db.query(KnowledgeEntry).filter(or_(*conditions)).all()
-            for e in existing:
-                existing_entries[(e.user_id, e.category, e.key_name)] = e
+            for attempt in range(4):
+                self.db.expire_all()
+                existing = (
+                    self.db.query(KnowledgeEntry).populate_existing().filter(or_(*conditions)).all()
+                )
+                for e in existing:
+                    existing_entries[(e.user_id, e.category, e.key_name)] = e
+                if existing_entries or attempt == 3:
+                    break
+                time.sleep(0.03 * (attempt + 1))
 
         for key, entry in entries_by_key.items():
             source_ids = entry.get("source_event_ids", [])
@@ -586,6 +615,7 @@ class KnowledgeExtractor:
                 )
 
         self.db.commit()
+        self.db.expire_all()
         return stored
 
     def decay_confidence(self, user_id: str, half_life_days: int = 60) -> int:
@@ -620,6 +650,7 @@ class KnowledgeExtractor:
                 count += 1
 
         self.db.commit()
+        self.db.expire_all()
         logger.info("Applied confidence decay to %d entries for user %s", count, user_id)
         return count
 

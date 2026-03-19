@@ -5,9 +5,11 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from api.database import SessionLocal, get_db_session
 from api.dependencies import get_current_user
+from api.models import User
 from pydantic import BaseModel, EmailStr, Field
 
 from api.repositories.user_repository import UserRepository
@@ -71,20 +73,20 @@ def register(request: RegisterRequest, db: "Session" = Depends(get_db_session)):
     if repo.get_by_email(request.email):
         raise HTTPException(status_code=400, detail="Email already exists")
 
-    user = repo.create(
-        {
-            "user_id": str(uuid4()),
-            "username": request.username,
-            "email": request.email,
-            "password_hash": hash_password(request.password),
-            "display_name": request.display_name,
-            "is_active": 1,
-        }
+    user = User(
+        user_id=str(uuid4()),
+        username=request.username,
+        email=request.email,
+        password_hash=hash_password(request.password),
+        display_name=request.display_name,
+        is_active=1,
     )
-
-    # Atomically assign admin role if no admin exists yet.
-    # INSERT ... SELECT ensures only one concurrent registration wins.
     try:
+        db.add(user)
+        db.flush()
+
+        # Atomically assign admin role if no admin exists yet.
+        # INSERT ... SELECT ensures only one concurrent registration wins.
         db.execute(
             text(
                 "INSERT INTO auth_user_roles (user_id, role_id) "
@@ -95,10 +97,17 @@ def register(request: RegisterRequest, db: "Session" = Depends(get_db_session)):
             ),
             {"uid": user.user_id},
         )
-    except Exception:
-        pass  # Race condition: another registration won — not an error
 
-    db.commit()
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        message = str(exc.orig) if getattr(exc, "orig", None) else str(exc)
+        if "Duplicate entry" in message:
+            if request.username in message:
+                raise HTTPException(status_code=400, detail="Username already exists") from exc
+            if request.email in message:
+                raise HTTPException(status_code=400, detail="Email already exists") from exc
+        raise
 
     return UserResponse(
         user_id=user.user_id,

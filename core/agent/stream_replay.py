@@ -9,6 +9,7 @@ Falls back to full-text when chunks are missing or run is incomplete.
 """
 
 import json
+import time
 from collections.abc import AsyncIterator
 from datetime import datetime
 
@@ -158,14 +159,17 @@ class StreamReplay(DbConsumer):
             placeholders = ", ".join(f":t{i}" for i in range(len(self._TERMINAL_TYPES)))
             params = {f"t{i}": t for i, t in enumerate(self._TERMINAL_TYPES)}
             params["run_id"] = run_id
-            row = db.execute(
-                text(
-                    f"SELECT 1 FROM agent_run_events "
-                    f"WHERE run_id = :run_id AND event_type IN ({placeholders}) LIMIT 1"
-                ),
-                params,
-            ).fetchone()
-            return row is not None
+            query = text(
+                f"SELECT 1 FROM agent_run_events "
+                f"WHERE run_id = :run_id AND event_type IN ({placeholders}) LIMIT 1"
+            )
+            for attempt in range(4):
+                row = db.execute(query, params).fetchone()
+                if row is not None:
+                    return True
+                if attempt < 3:
+                    time.sleep(0.05 * (attempt + 1))
+            return False
 
     def _load_run_chunks(self, run_id: str) -> list[StreamEvent] | None:
         """Load chunk-level events from agent_run_events.
@@ -186,6 +190,18 @@ class StreamReplay(DbConsumer):
                 ),
                 {"run_id": run_id},
             ).fetchall()
+            if not rows:
+                for attempt in range(3):
+                    time.sleep(0.05 * (attempt + 1))
+                    rows = db.execute(
+                        text(
+                            "SELECT event_type, data, event_id, agent_id FROM agent_run_events "
+                            "WHERE run_id = :run_id AND idx >= 0 ORDER BY idx"
+                        ),
+                        {"run_id": run_id},
+                    ).fetchall()
+                    if rows:
+                        break
 
             events = []
             for row in rows:

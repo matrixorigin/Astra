@@ -12,7 +12,10 @@ import inspect
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session
+from sqlalchemy.orm import sessionmaker
+import time
 
 from api.models import SkillRegistry as SkillModel
 from core.db_consumer import DbConsumer, DbFactory
@@ -374,6 +377,30 @@ class SkillCatalog(DbConsumer):
                     )
                 )
             db.commit()
+            db.expire_all()
+
+            bind = db.get_bind()
+            if isinstance(bind, (Engine, Connection)):
+                for attempt in range(6):
+                    fresh_db = sessionmaker(bind=bind, expire_on_commit=False)()
+                    try:
+                        row = (
+                            fresh_db.query(SkillModel)
+                            .populate_existing()
+                            .filter(SkillModel.skill_id == skill_id)
+                            .first()
+                        )
+                    finally:
+                        fresh_db.close()
+                    if (
+                        row is not None
+                        and row.category == category
+                        and row.status == status
+                        and row.is_active == (1 if is_active else 0)
+                    ):
+                        break
+                    if attempt < 5:
+                        time.sleep(0.03 * (attempt + 1))
 
     def _compute_embedding(
         self,
@@ -1140,6 +1167,7 @@ class SkillCatalog(DbConsumer):
                 .update({"is_active": 0, "status": "orphaned"}, synchronize_session="fetch")
             )
             db.commit()
+            db.expire_all()
 
         self._invalidate_cache()
         logger.info("Marked %d skills as orphaned: %s", count, skill_ids)

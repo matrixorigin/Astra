@@ -1552,6 +1552,7 @@ class PromptAssembler(DbConsumer):
                     },
                 )
                 db.commit()
+                db.expire_all()
                 return capture_id
             except IntegrityError:
                 db.rollback()

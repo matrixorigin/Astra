@@ -116,6 +116,44 @@ class Sandbox(DbConsumer):
             f"Table {database}.{table} was not visible after {attempts} retries{detail}"
         )
 
+    def wait_until_metadata_visible(
+        self,
+        name: str,
+        *,
+        attempts: int = 10,
+        base_delay_s: float = 0.05,
+        session_factory=None,
+    ) -> None:
+        """Wait until a freshly opened session can see sandbox metadata."""
+        validate_identifier(name)
+        session_factory = session_factory or _visibility_session_factory
+        last_error: Exception | None = None
+
+        for attempt in range(attempts):
+            fresh_db = session_factory()
+            try:
+                row = fresh_db.execute(
+                    text(
+                        f"SELECT 1 FROM {self.source_db}.infra_sandbox_metadata "
+                        "WHERE sandbox_name = :name"
+                    ),
+                    {"name": name},
+                ).fetchone()
+                if row is not None:
+                    return
+            except Exception as exc:
+                last_error = exc
+            finally:
+                try:
+                    fresh_db.close()
+                except Exception:
+                    pass
+
+            time.sleep(base_delay_s * (attempt + 1))
+
+        detail = f": {last_error}" if last_error else ""
+        raise RuntimeError(f"Sandbox metadata {name} was not visible after {attempts} retries{detail}")
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -195,6 +233,7 @@ class Sandbox(DbConsumer):
                 },
             )
             db.commit()
+            self.wait_until_metadata_visible(name)
 
     def delete(self, name: str, force: bool = False) -> None:
         """Delete sandbox: branch metadata + snapshots + PITR + database.

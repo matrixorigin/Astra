@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal, get_db_session
 from api.dependencies import get_current_user
 
 router = APIRouter(prefix="/triggers")
@@ -31,10 +31,10 @@ async def create_trigger(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db_session),
 ):
-    from core.agent.triggers import create_trigger
+    from core.agent.triggers import create_trigger, wait_for_trigger_visibility
 
     try:
-        return create_trigger(
+        result = create_trigger(
             db,
             user_id=current_user["user_id"],
             agent_id=request.agent_id,
@@ -45,6 +45,8 @@ async def create_trigger(
             cron_expr=request.cron_expr,
             session_id=request.session_id,
         )
+        wait_for_trigger_visibility(SessionLocal, result["trigger_id"], should_exist=True)
+        return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -65,7 +67,7 @@ async def delete_trigger(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db_session),
 ):
-    from core.agent.triggers import delete_trigger, get_trigger
+    from core.agent.triggers import delete_trigger, get_trigger, wait_for_trigger_visibility
 
     trig = get_trigger(db, trigger_id)
     if not trig:
@@ -73,6 +75,7 @@ async def delete_trigger(
     if trig["user_id"] != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     delete_trigger(db, trigger_id)
+    wait_for_trigger_visibility(SessionLocal, trigger_id, should_exist=False)
     return {"trigger_id": trigger_id, "deleted": True}
 
 
@@ -83,8 +86,14 @@ async def fire_webhook(
     db: Session = Depends(get_db_session),
 ):
     """Fire a webhook trigger. No auth header needed — uses secret instead."""
-    from core.agent.triggers import fire_trigger, get_trigger, verify_secret
+    from core.agent.triggers import (
+        fire_trigger,
+        get_trigger,
+        verify_secret,
+        wait_for_trigger_visibility,
+    )
 
+    wait_for_trigger_visibility(SessionLocal, trigger_id, should_exist=True)
     trig = get_trigger(db, trigger_id)
     if not trig:
         raise HTTPException(status_code=404, detail="Trigger not found")
@@ -93,8 +102,6 @@ async def fire_webhook(
     if not trig.get("secret") or not verify_secret(request.secret, trig["secret"]):
         raise HTTPException(status_code=403, detail="Invalid secret")
     try:
-        from api.database import SessionLocal
-
         return fire_trigger(SessionLocal, trigger_id, payload=request.payload)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

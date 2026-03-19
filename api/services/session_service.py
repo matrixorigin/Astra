@@ -27,6 +27,12 @@ class SessionService:
     def db_session(self) -> Session:
         return self._db_factory()
 
+    def _try_audit_log(self, **kwargs) -> None:
+        try:
+            self.audit.log(**kwargs)
+        except Exception as e:
+            self._logger.warning("Audit log failed (non-fatal): %s", e)
+
     def create_session(
         self,
         user_id: str,
@@ -79,7 +85,7 @@ class SessionService:
             }
 
             # 审计日志
-            self.audit.log(
+            self._try_audit_log(
                 user_id=user_id,
                 action="session_create",
                 resource_type="session",
@@ -92,7 +98,7 @@ class SessionService:
 
         except Exception as e:
             # 审计失败
-            self.audit.log(
+            self._try_audit_log(
                 user_id=user_id,
                 action="session_create",
                 resource_type="session",
@@ -242,7 +248,7 @@ class SessionService:
             updated_session = self.session_repo.update(session_id, update_data)
 
             # 审计日志
-            self.audit.log(
+            self._try_audit_log(
                 user_id=user_id,
                 action="session_update",
                 resource_type="session",
@@ -270,7 +276,7 @@ class SessionService:
 
         except Exception as e:
             # 审计失败
-            self.audit.log(
+            self._try_audit_log(
                 user_id=user_id,
                 action="session_update",
                 resource_type="session",
@@ -303,7 +309,7 @@ class SessionService:
             self.session_repo.delete(session_id)
 
             # 审计日志
-            self.audit.log(
+            self._try_audit_log(
                 user_id=user_id,
                 action="session_delete",
                 resource_type="session",
@@ -314,7 +320,7 @@ class SessionService:
 
         except Exception as e:
             # 审计失败
-            self.audit.log(
+            self._try_audit_log(
                 user_id=user_id,
                 action="session_delete",
                 resource_type="session",

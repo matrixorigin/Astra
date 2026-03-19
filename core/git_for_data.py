@@ -3,8 +3,13 @@
 Provides snapshot, restore, and time-travel capabilities.
 """
 
+import json
+import time
+
 from sqlalchemy import text
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session
+from sqlalchemy.orm import sessionmaker
 
 from core.validation import validate_identifier, QueryRequest
 from core.db_consumer import DbConsumer, DbFactory
@@ -19,6 +24,74 @@ class GitForData(DbConsumer):
 
     def __init__(self, db_factory: DbFactory) -> None:
         super().__init__(db_factory)
+
+    def _wait_until_snapshot_visible(
+        self, db: Session, snapshot_name: str, *, attempts: int = 8, delay_s: float = 0.05
+    ) -> None:
+        bind = db.get_bind() if hasattr(db, "get_bind") else None
+        if not isinstance(bind, (Engine, Connection)):
+            return
+        query = text("SHOW SNAPSHOTS")
+        for attempt in range(attempts):
+            fresh_db = sessionmaker(bind=bind, expire_on_commit=False)()
+            try:
+                rows = fresh_db.execute(query).fetchall()
+            finally:
+                fresh_db.close()
+            names = [row._mapping["SNAPSHOT_NAME"] for row in rows]
+            if snapshot_name in names:
+                return
+            if attempt < attempts - 1:
+                time.sleep(delay_s * (attempt + 1))
+
+    def _list_snapshots_with_db(self, db: Session) -> list[dict]:
+        db.commit()
+        result = db.execute(text("SHOW SNAPSHOTS"))
+        return [
+            {
+                "snapshot_name": row._mapping["SNAPSHOT_NAME"],
+                "timestamp": row._mapping["TIMESTAMP"],
+                "snapshot_level": row._mapping["SNAPSHOT_LEVEL"],
+                "account_name": row._mapping["ACCOUNT_NAME"],
+                "database_name": row._mapping.get("DATABASE_NAME"),
+                "table_name": row._mapping.get("TABLE_NAME"),
+                "ts": row._mapping.get("TIMESTAMP"),
+            }
+            for row in result
+        ]
+
+    def _wait_until_table_matches_snapshot(
+        self,
+        db: Session,
+        table_name: str,
+        snapshot_name: str,
+        *,
+        attempts: int = 8,
+        delay_s: float = 0.05,
+    ) -> None:
+        bind = db.get_bind() if hasattr(db, "get_bind") else None
+        if not isinstance(bind, (Engine, Connection)):
+            return
+
+        safe_table = validate_identifier(table_name)
+        safe_snapshot = validate_identifier(snapshot_name)
+        current_query = text(f"SELECT * FROM {safe_table}")
+        snapshot_query = text(f"SELECT * FROM {safe_table} {{SNAPSHOT = '{safe_snapshot}'}}")
+
+        def _normalized_rows(rows) -> list[str]:
+            return sorted(json.dumps(dict(row._mapping), sort_keys=True, default=str) for row in rows)
+
+        for attempt in range(attempts):
+            fresh_db = sessionmaker(bind=bind, expire_on_commit=False)()
+            try:
+                current_rows = _normalized_rows(fresh_db.execute(current_query).fetchall())
+                snapshot_rows = _normalized_rows(fresh_db.execute(snapshot_query).fetchall())
+            finally:
+                fresh_db.close()
+            if current_rows == snapshot_rows:
+                return
+            if attempt < attempts - 1:
+                time.sleep(delay_s * (attempt + 1))
 
     def create_snapshot(self, snapshot_name: str, account: str = "sys") -> dict:
         """Create a snapshot of the current database state.
@@ -44,9 +117,11 @@ class GitForData(DbConsumer):
 
             query = f"CREATE SNAPSHOT {safe_snapshot} FOR ACCOUNT {safe_account}"
             db.execute(text(query))
+            db.commit()
+            self._wait_until_snapshot_visible(db, safe_snapshot)
 
             # Get snapshot info
-            snapshots = self.list_snapshots()
+            snapshots = self._list_snapshots_with_db(db)
             snapshot_info = next(
                 (s for s in snapshots if s["snapshot_name"] == snapshot_name), None
             )
@@ -174,7 +249,7 @@ class GitForData(DbConsumer):
             db.commit()  # Ensure clean transaction state
 
             # Step 1: Get snapshot timestamp
-            snapshots = self.list_snapshots()
+            snapshots = self._list_snapshots_with_db(db)
             snapshot_info = next(
                 (s for s in snapshots if s["snapshot_name"] == safe_snapshot), None
             )
@@ -195,6 +270,8 @@ class GitForData(DbConsumer):
                 """
                 db.execute(text(insert_query))
                 db.commit()
+                db.expire_all()
+                self._wait_until_table_matches_snapshot(db, safe_table, safe_snapshot)
             except Exception as e:
                 db.rollback()
                 raise

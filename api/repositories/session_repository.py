@@ -1,8 +1,11 @@
 """Optimized session repository."""
 
 from collections.abc import Callable
+import time
 
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session as DBSession
+from sqlalchemy.orm import sessionmaker
 
 from api.models import Session as SessionModel
 
@@ -27,11 +30,31 @@ class SessionRepository:
         db = self.db
         session = SessionModel(**session_data)
         db.add(session)
+        db.flush()
         db.commit()
-        db.expire_all()
-        return (
-            self._query(db).filter(SessionModel.session_id == session.session_id).first() or session
-        )
+        row = self._query(db).filter(SessionModel.session_id == session.session_id).first()
+        if row is not None:
+            return row
+
+        bind = db.get_bind()
+        if isinstance(bind, (Engine, Connection)):
+            fresh_factory = sessionmaker(bind=bind, expire_on_commit=False)
+            for attempt in range(6):
+                fresh_db = fresh_factory()
+                try:
+                    visible = (
+                        self._query(fresh_db).filter(SessionModel.session_id == session.session_id).first()
+                    )
+                finally:
+                    fresh_db.close()
+                if visible is not None:
+                    db.expire_all()
+                    row = self._query(db).filter(SessionModel.session_id == session.session_id).first()
+                    if row is not None:
+                        return row
+                if attempt < 5:
+                    time.sleep(0.03 * (attempt + 1))
+        return session
 
     def get_by_id(self, session_id: str, user_id: str | None = None) -> SessionModel | None:
         """Get session with optional ownership filter pushed to DB."""

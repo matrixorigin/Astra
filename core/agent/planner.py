@@ -642,6 +642,9 @@ def restore_plan_from_events(db, goal_id: str) -> Plan | None:
     """
     from sqlalchemy import text
 
+    if hasattr(db, "expire_all"):
+        db.expire_all()
+
     # Query the latest plan for this goal
     result = db.execute(
         text("""

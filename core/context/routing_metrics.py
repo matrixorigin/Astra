@@ -65,18 +65,26 @@ def monthly_budget_remaining(db_factory=None) -> float:
     if db_factory:
         try:
             from sqlalchemy import text
+            from sqlalchemy.engine import Connection, Engine
+            from sqlalchemy.orm import sessionmaker
 
             first_of_month = datetime.now(timezone.utc).replace(
                 day=1, hour=0, minute=0, second=0, microsecond=0
             )
             db = db_factory()
             try:
-                row = db.execute(
-                    text(
-                        "SELECT COALESCE(SUM(cost_usd), 0) FROM eval_llm_call_logs WHERE created_at >= :since"
-                    ),
-                    {"since": first_of_month},
-                ).fetchone()
+                query = text(
+                    "SELECT COALESCE(SUM(cost_usd), 0) FROM eval_llm_call_logs WHERE created_at >= :since"
+                )
+                bind = db.get_bind() if hasattr(db, "get_bind") else None
+                if isinstance(bind, (Engine, Connection)):
+                    fresh_db = sessionmaker(bind=bind, expire_on_commit=False)()
+                    try:
+                        row = fresh_db.execute(query, {"since": first_of_month}).fetchone()
+                    finally:
+                        fresh_db.close()
+                else:
+                    row = db.execute(query, {"since": first_of_month}).fetchone()
                 spent = float(row[0]) if row else 0.0
             finally:
                 db.close()

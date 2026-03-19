@@ -8,6 +8,8 @@ from decimal import Decimal
 
 import pymysql
 from sqlalchemy import text
+from sqlalchemy.engine import Connection as _SAConnection
+from sqlalchemy.engine import Engine as _SAEngine
 from sqlalchemy.orm import Session, sessionmaker
 
 from config.settings import get_settings
@@ -133,6 +135,83 @@ def _handle_disconnect_errors(context):
         msg = str(context.original_exception)
         if any(p in msg for p in _DISCONNECT_PATTERNS):
             context.is_disconnect = True
+
+
+@_sa_event.listens_for(Session, "before_flush")
+def _track_new_agent_sessions(session, flush_context, instances):
+    try:
+        from api.models.auth import AuditLog as AuditLogModel
+        from api.models.auth import Token as TokenModel
+        from api.models.agent import Session as AgentSessionModel
+    except Exception:
+        return
+
+    pending_agent_ids = session.info.setdefault("_pending_agent_session_ids", set())
+    pending_token_ids = session.info.setdefault("_pending_auth_token_ids", set())
+    pending_audit_ids = session.info.setdefault("_pending_auth_audit_log_ids", set())
+    for obj in session.new:
+        if isinstance(obj, AgentSessionModel) and getattr(obj, "session_id", None):
+            pending_agent_ids.add(obj.session_id)
+        elif isinstance(obj, TokenModel) and getattr(obj, "token_id", None):
+            pending_token_ids.add(obj.token_id)
+        elif isinstance(obj, AuditLogModel) and getattr(obj, "log_id", None):
+            pending_audit_ids.add(obj.log_id)
+
+
+@_sa_event.listens_for(Session, "after_commit")
+def _wait_for_new_agent_sessions(session):
+    pending_agent_ids = set(session.info.pop("_pending_agent_session_ids", set()))
+    pending_token_ids = set(session.info.pop("_pending_auth_token_ids", set()))
+    pending_audit_ids = set(session.info.pop("_pending_auth_audit_log_ids", set()))
+    if not pending_agent_ids and not pending_token_ids and not pending_audit_ids:
+        return
+
+    try:
+        bind = session.get_bind()
+    except Exception:
+        return
+    if not isinstance(bind, (_SAEngine, _SAConnection)):
+        return
+
+    try:
+        from api.models.auth import AuditLog as AuditLogModel
+        from api.models.auth import Token as TokenModel
+        from api.models.agent import Session as AgentSessionModel
+    except Exception:
+        return
+
+    fresh_session = sessionmaker(bind=bind, expire_on_commit=False)
+    remaining_specs = [
+        (pending_agent_ids, AgentSessionModel, AgentSessionModel.session_id),
+        (pending_token_ids, TokenModel, TokenModel.token_id),
+        (pending_audit_ids, AuditLogModel, AuditLogModel.log_id),
+    ]
+    for attempt in range(6):
+        all_visible = True
+        for remaining, model, column in remaining_specs:
+            if not remaining:
+                continue
+            db = fresh_session()
+            try:
+                visible = {
+                    row[0] for row in db.query(column).filter(column.in_(tuple(remaining))).all()
+                }
+            finally:
+                db.close()
+            remaining -= visible
+            if remaining:
+                all_visible = False
+        if all_visible:
+            return
+        if attempt < 5:
+            time.sleep(0.03 * (attempt + 1))
+
+
+@_sa_event.listens_for(Session, "after_rollback")
+def _clear_pending_agent_sessions(session):
+    session.info.pop("_pending_agent_session_ids", None)
+    session.info.pop("_pending_auth_token_ids", None)
+    session.info.pop("_pending_auth_audit_log_ids", None)
 
 
 # Session factory

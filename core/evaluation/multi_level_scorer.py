@@ -9,10 +9,12 @@ Session-level: aggregate chain scores within a session
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import text
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session, sessionmaker
 from uuid_utils import uuid7
 
@@ -186,23 +188,72 @@ def _upsert_assessment(
         )
     db.commit()
     db.expire_all()
+    _wait_for_assessment_visibility(db, level, target_id)
 
 
 def _fetchall_with_fresh_session_retry(
     db: Session, query: str, params: dict[str, Any]
 ) -> list[Any]:
     rows = db.execute(text(query), params).fetchall()
-    if rows or not isinstance(db, Session):
+    if not isinstance(db, Session):
         return rows
 
-    fresh_db = sessionmaker(bind=db.get_bind(), expire_on_commit=False)()
-    try:
-        fresh_rows = fresh_db.execute(text(query), params).fetchall()
-        if fresh_rows:
-            logger.debug("Recovered empty evaluation query via fresh session retry")
-        return fresh_rows
-    finally:
-        fresh_db.close()
+    bind = db.get_bind()
+    attempts = 4 if _supports_fresh_session_retry(bind) else 1
+    best_rows = rows
+    for attempt in range(attempts):
+        fresh_db = sessionmaker(bind=bind, expire_on_commit=False)()
+        try:
+            fresh_rows = fresh_db.execute(text(query), params).fetchall()
+        finally:
+            fresh_db.close()
+        if len(fresh_rows) > len(best_rows):
+            best_rows = fresh_rows
+        if attempt < attempts - 1:
+            time.sleep(0.03 * (attempt + 1))
+    if len(best_rows) > len(rows):
+        logger.debug(
+            "Recovered evaluation query via fresh session retry (%d -> %d rows)",
+            len(rows),
+            len(best_rows),
+        )
+    return best_rows
+
+
+def _wait_for_assessment_visibility(
+    db: Session,
+    level: str,
+    target_id: str,
+    *,
+    attempts: int = 6,
+    delay_seconds: float = 0.03,
+) -> bool:
+    if not isinstance(db, Session):
+        return False
+    bind = db.get_bind()
+    if not _supports_fresh_session_retry(bind):
+        return False
+    for attempt in range(attempts):
+        fresh_db = sessionmaker(bind=bind, expire_on_commit=False)()
+        try:
+            row = fresh_db.execute(
+                text(
+                    "SELECT 1 FROM eval_quality_assessments "
+                    "WHERE level = :lvl AND target_id = :tid"
+                ),
+                {"lvl": level, "tid": target_id},
+            ).fetchone()
+        finally:
+            fresh_db.close()
+        if row is not None:
+            return True
+        if attempt < attempts - 1:
+            time.sleep(delay_seconds * (attempt + 1))
+    return False
+
+
+def _supports_fresh_session_retry(bind: Any) -> bool:
+    return isinstance(bind, (Engine, Connection))
 
 
 def _json_dumps(obj: Any) -> str | None:

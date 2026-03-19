@@ -8,6 +8,7 @@ Triggers are persisted in the `wf_triggers` table. Each trigger defines:
 
 import hmac
 import json
+import time
 from datetime import datetime, timezone
 from typing import Callable
 from uuid import uuid4
@@ -110,6 +111,28 @@ def list_triggers(db: Session, user_id: str, limit: int = 100) -> list[dict]:
         .all()
     )
     return [{c.name: getattr(r, c.name) for c in r.__table__.columns} for r in rows]
+
+
+def wait_for_trigger_visibility(
+    db_factory: Callable[[], Session],
+    trigger_id: str,
+    *,
+    should_exist: bool,
+    attempts: int = 8,
+    delay_seconds: float = 0.05,
+) -> bool:
+    """Wait until a trigger becomes visible (or invisible) across DB sessions."""
+    for attempt in range(attempts):
+        db = db_factory()
+        try:
+            is_visible = get_trigger(db, trigger_id) is not None
+        finally:
+            db.close()
+        if is_visible == should_exist:
+            return True
+        if attempt < attempts - 1:
+            time.sleep(delay_seconds * (attempt + 1))
+    return False
 
 
 def delete_trigger(db: Session, trigger_id: str) -> bool:

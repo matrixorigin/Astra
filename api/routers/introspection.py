@@ -704,34 +704,44 @@ def get_introspection_skills(
     """Return user-installed skills and available cloud skills."""
     user_id = current_user["user_id"]
     try:
-        installed_rows = db.execute(
-            text("""
-                SELECT i.skill_name, i.skill_version, r.description, r.category
-                FROM skill_installations i
-                LEFT JOIN skills_registry r
-                    ON r.skill_name = i.skill_name
-                    AND r.version = i.skill_version
-                    AND r.is_active = 1
-                WHERE i.user_id = :uid AND i.status = 'installed'
-                LIMIT 50
-            """),
-            {"uid": user_id},
-        ).fetchall()
+        installed_query = text("""
+            SELECT i.skill_name, i.skill_version, r.description, r.category
+            FROM skill_installations i
+            LEFT JOIN skills_registry r
+                ON r.skill_name = i.skill_name
+                AND r.version = i.skill_version
+                AND r.is_active = 1
+            WHERE i.user_id = :uid AND i.status = 'installed'
+            LIMIT 50
+        """)
+        cloud_query = text("""
+            SELECT skill_name, version, description, category
+            FROM skills_registry
+            WHERE is_active = 1
+            ORDER BY skill_name, version DESC
+            LIMIT 200
+        """)
+
+        installed_rows = db.execute(installed_query, {"uid": user_id}).fetchall()
+        cloud_rows = db.execute(cloud_query).fetchall()
+
+        if not installed_rows:
+            fresh_db = SessionLocal()
+            try:
+                fresh_installed = fresh_db.execute(installed_query, {"uid": user_id}).fetchall()
+                fresh_cloud = fresh_db.execute(cloud_query).fetchall()
+            finally:
+                fresh_db.close()
+            if len(fresh_installed) > len(installed_rows):
+                installed_rows = fresh_installed
+            if len(fresh_cloud) > len(cloud_rows):
+                cloud_rows = fresh_cloud
+
         installed = [
             {"name": r[0], "version": r[1], "description": r[2] or "", "category": r[3] or ""}
             for r in installed_rows
         ]
         installed_names = {r[0] for r in installed_rows}
-
-        cloud_rows = db.execute(
-            text("""
-                SELECT skill_name, version, description, category
-                FROM skills_registry
-                WHERE is_active = 1
-                ORDER BY skill_name, version DESC
-                LIMIT 200
-            """),
-        ).fetchall()
         seen: set[str] = set()
         cloud = []
         for r in cloud_rows:

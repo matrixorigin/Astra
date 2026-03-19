@@ -718,6 +718,9 @@ class ContextManager(DbConsumer):
             snapshot = SnapshotModel(**payload)
             db.add(snapshot)
             db.commit()
+            ContextManager._wait_for_snapshot(
+                db_factory, payload["context_capture_id"], should_exist=True
+            )
         except Exception:
             db.rollback()
             _logging.getLogger(__name__).exception(
@@ -753,6 +756,7 @@ class ContextManager(DbConsumer):
                 )
                 db.commit()
                 if rows_updated > 0:
+                    ContextManager._wait_for_snapshot(db_factory, context_capture_id, should_exist=True)
                     return
                 # Row not yet visible — INSERT may still be in-flight
                 delay = 0.05 * (attempt + 1)
@@ -823,12 +827,18 @@ class ContextManager(DbConsumer):
         """
         from api.models import ContextSnapshot as SnapshotModel
 
-        with self._db() as db:
-            row = (
-                db.query(SnapshotModel)
-                .filter(SnapshotModel.context_capture_id == context_capture_id)
-                .first()
-            )
+        row = None
+        for attempt in range(8):
+            with self._db() as db:
+                row = (
+                    db.query(SnapshotModel)
+                    .filter(SnapshotModel.context_capture_id == context_capture_id)
+                    .first()
+                )
+            if row is not None:
+                break
+            if attempt < 7:
+                time.sleep(0.05 * (attempt + 1))
 
         if not row:
             raise ContextError(f"Context capture not found: {context_capture_id}")
@@ -853,3 +863,32 @@ class ContextManager(DbConsumer):
             task_type=TaskType(row.task_type) if row.task_type else TaskType.GENERAL,
             retrieved_events=retrieved_events,
         )
+
+    @staticmethod
+    def _wait_for_snapshot(
+        db_factory: DbFactory,
+        context_capture_id: str,
+        *,
+        should_exist: bool,
+        attempts: int = 8,
+        delay_seconds: float = 0.05,
+    ) -> bool:
+        """Wait until a snapshot becomes visible across database sessions."""
+        from api.models import ContextSnapshot as SnapshotModel
+
+        for attempt in range(attempts):
+            db = db_factory()
+            try:
+                is_visible = (
+                    db.query(SnapshotModel)
+                    .filter(SnapshotModel.context_capture_id == context_capture_id)
+                    .first()
+                    is not None
+                )
+            finally:
+                db.close()
+            if is_visible == should_exist:
+                return True
+            if attempt < attempts - 1:
+                time.sleep(delay_seconds * (attempt + 1))
+        return False
