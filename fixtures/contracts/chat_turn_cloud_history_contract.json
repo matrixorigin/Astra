@@ -1,0 +1,36 @@
+{
+  "cases": [
+    {
+      "input": {
+        "history": [
+          {"role": "tool", "content": "123456789012"},
+          {"role": "assistant", "content": "mid"},
+          {"role": "tool", "content": "abcdef"},
+          {"role": "tool", "content": "uvwxyz"}
+        ],
+        "keep_chars": 5,
+        "keep_recent": 2
+      },
+      "expected": [
+        {"role": "tool", "content": "12345\n...[compacted]"},
+        {"role": "assistant", "content": "mid"},
+        {"role": "tool", "content": "abcdef"},
+        {"role": "tool", "content": "uvwxyz"}
+      ]
+    },
+    {
+      "input": {
+        "history": [
+          {"role": "tool", "content": "short"},
+          {"role": "tool", "content": "newest"}
+        ],
+        "keep_chars": 5,
+        "keep_recent": 2
+      },
+      "expected": [
+        {"role": "tool", "content": "short"},
+        {"role": "tool", "content": "newest"}
+      ]
+    }
+  ]
+}

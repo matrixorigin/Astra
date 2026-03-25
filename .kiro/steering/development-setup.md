@@ -6,506 +6,54 @@ inclusion: always
 
 ## Prerequisites
 
-### Required Software
-- **Python 3.11** (exact version required)
-- **Conda** (for environment management)
-- **Poetry** (for dependency management)
-- **Docker & Docker Compose** (for MatrixOne + Redis)
-- **Make** (for build commands)
-- **Git** (for version control)
+- Rust toolchain
+- Docker
+- Make
+- Git
 
-### System Requirements
-- **OS**: Linux or macOS (Windows via WSL2)
-- **RAM**: 8GB minimum, 16GB recommended
-- **Disk**: 10GB free space
-- **Ports**: 6001 (MatrixOne), 6379 (Redis), 8000 (API)
+Repo development is Rust-first. Do **not** set up a Python virtualenv just to work on the server.
+The only Python-specific path that still exists is the published CLI installer in `scripts/install.sh`.
 
----
-
-## 🚀 Quick Start (Copy-Paste This)
-
-**New to the project? Run these commands in order:**
+## Quick Start
 
 ```bash
-# 1. Clone and enter project
 git clone <repo-url>
 cd mo-dev-agent
-
-# 2. Create Python environment
-conda create -n dev-agent python=3.11 -y
-conda activate dev-agent
-
-# 3. Install Poetry (if not installed)
-pip install poetry
-
-# 4. One-command setup (installs deps, generates keys, creates .env)
 make dev-init
-
-# 5. Start all services (MatrixOne + Redis + API)
 make dev-start
-
-# 6. Verify everything works
 make dev-status
-
-# 7. Run tests to confirm setup
-pytest tests/unit/test_events.py -n auto
-
-# 8. E2E verification (real DB writes + assertions)
-make verify
-
-# 9. (Optional) Set up LLM for full verification
-cp config/models.example.yaml .models.yaml
-# Edit .models.yaml — fill in API keys
-mo-admin model load .models.yaml
-make verify-llm                        # auto-selects cheapest model
-make verify-llm MODEL=deepseek-chat    # or specify explicitly
-
-# 10. Visit API docs
-# Open http://localhost:8000/docs in browser
 ```
 
-**Total time: ~3 minutes** (mostly Docker image download on first run)
+Open `http://localhost:8000/docs` when the API is running.
 
-### If Something Goes Wrong
+## Daily Workflow
 
 ```bash
-# Nuclear option: clean everything and start over
-make dev-reset
-```
-
----
-
-## Initial Setup (First Time Only)
-
-### 1. Clone Repository
-```bash
-git clone https://github.com/your-org/mo-dev-agent.git
-cd mo-dev-agent
-```
-
-### 2. Create Python Environment
-```bash
-# Create conda environment with Python 3.11
-conda create -n dev-agent python=3.11
-conda activate dev-agent
-```
-
-### 3. Initialize Development Environment
-```bash
-# One command to set up everything
-make dev-init
-
-# This will:
-# - Install Python dependencies
-# - Generate encryption keys
-# - Create .env file
-# - Start MatrixOne + Redis
-# - Initialize database schema
-# - Verify setup
-```
-
-### 4. Verify Setup
-```bash
-# Check all services are running
-make dev-status
-
-# Expected output:
-# ✅ MatrixOne: Running on port 6001
-# ✅ Redis: Running on port 6379
-# ✅ API Server: Running on port 8000
-
-# Visit API docs
-open http://localhost:8000/docs
-```
-
----
-
-## Daily Development Workflow
-
-### Start Your Day
-```bash
-# 1. Activate environment
-conda activate dev-agent
-
-# 2. Check configuration (optional but recommended)
-make dev-config-check
-
-# 3. Start all services (< 10 seconds)
 make dev-start
-
-# 4. Verify everything is running
-make dev-status
-```
-
-### During Development
-```bash
-# API server auto-reloads on code changes (hot reload enabled)
-# Just edit code and test immediately
-
-# Restart API if needed (after dependency changes)
 make dev-api-restart
-
-# View API logs
-make dev-api-logs
-
-# Connect to database
-make dev-db-connect
-```
-
-### End Your Day
-```bash
-# Stop all services
+make dev-status
 make dev-stop
-
-# Or keep services running (faster next start)
-# Just close terminal
 ```
 
----
-
-## Common Development Tasks
-
-### Running Tests
-
-**⚠️ CRITICAL: Follow incremental testing workflow**
+## Validation Workflow
 
 ```bash
-# 1. Debug Phase - Run specific test
-pytest tests/unit/test_skill_manager.py::test_install_skill -v
-
-# 2. Verify Fix - Run test file
-pytest tests/unit/test_skill_manager.py -n auto
-
-# 3. Expand Scope - Run module tests
-pytest tests/unit/ -k "skill" -n auto
-
-# 4. Final Verification - Run full suite
-make dev-test-keep
-
-# Other test commands
-make dev-test-unit              # Unit tests only
-make dev-test-integration       # Integration tests only
-pytest --cov=core --cov-report=html -n auto  # With coverage
+make format-check
+make type-check
+make lint
+make test
+make test-integration
 ```
 
-### Code Quality Checks
+Use direct cargo commands when you need a narrower loop:
 
 ```bash
-# Run all checks (required before commit)
-make check          # Runs lint + type-check
-
-# Individual checks
-make lint           # Ruff linter
-make lint-fix       # Auto-fix linting issues
-make type-check     # Mypy type checker
-make format         # Format code
+cargo test --manifest-path rust/Cargo.toml -p mo-agent-runtime --test http_contract
+cargo check --manifest-path rust/Cargo.toml
 ```
-
-### Database Operations
-
-```bash
-# Connect to MatrixOne CLI
-make dev-db-connect
-
-# Inside MatrixOne CLI:
-USE dev_agent_v3;
-SHOW TABLES;
-SELECT COUNT(*) FROM conversation_events;
-DESCRIBE conversation_events;
-
-# View database logs
-make dev-deps-logs-db
-
-# Reset database (WARNING: destructive!)
-make dev-deps-clean
-make dev-init
-```
-
-### Viewing Logs
-
-```bash
-# API server logs
-make dev-api-logs
-
-# All dependency logs
-make dev-deps-logs
-
-# Specific service logs
-make dev-deps-logs-db      # MatrixOne
-make dev-deps-logs-redis   # Redis
-
-# Clear Docker logs
-make dev-logs-clean
-```
-
----
-
-## Environment Variables
-
-### Required Variables (.env file)
-
-```bash
-# Auto-generated by make dev-init
-TOKEN_ENCRYPTION_KEY=<auto-generated>
-JWT_SECRET_KEY=<auto-generated>
-
-# Database (default values)
-MATRIXONE_HOST=localhost
-MATRIXONE_PORT=6001
-MATRIXONE_USER=root
-MATRIXONE_PASSWORD=111
-MATRIXONE_DATABASE=dev_agent_v3
-
-# Redis (default values)
-REDIS_HOST=localhost
-REDIS_PORT=6379
-
-# LLM Provider (configure based on your setup)
-LLM_PROVIDER=openai  # or anthropic, azure, etc.
-OPENAI_API_KEY=<your-key>
-
-# Embedding Provider
-EMBEDDING_PROVIDER=openai
-EMBEDDING_MODEL=text-embedding-3-small
-```
-
-### Optional Variables
-
-```bash
-# API Server
-API_HOST=0.0.0.0
-API_PORT=8000
-API_WORKERS=4
-
-# Logging
-LOG_LEVEL=INFO
-LOG_FORMAT=json
-
-# Testing
-TEST_MATRIXONE_DATABASE=test_dev_agent_v3
-```
-
----
 
 ## Troubleshooting
 
-### Services Won't Start
-
-```bash
-# Check if ports are already in use
-lsof -i :6001  # MatrixOne
-lsof -i :6379  # Redis
-lsof -i :8000  # API
-
-# Kill processes if needed
-kill -9 <PID>
-
-# Clean and restart
-make dev-stop
-make dev-deps-clean
-make dev-init
-```
-
-### Database Connection Errors
-
-```bash
-# Verify MatrixOne is running
-make dev-deps-status
-
-# Check MatrixOne logs
-make dev-deps-logs-db
-
-# Reconnect to database
-make dev-db-connect
-
-# If still failing, reset database
-make dev-deps-clean
-make dev-init
-```
-
-### Tests Failing
-
-```bash
-# Ensure test database is clean
-pytest --create-db
-
-# Run with verbose output
-pytest -vv -s
-
-# Check for port conflicts
-ps aux | grep pytest
-
-# Reset test database
-make dev-deps-clean
-make dev-init
-```
-
-### Import Errors
-
-```bash
-# Verify environment is activated
-conda activate dev-agent
-
-# Reinstall dependencies
-pip install -e .
-
-# Check Python version
-python --version  # Should be 3.11.x
-```
-
-### Hot Reload Not Working
-
-```bash
-# Restart API server
-make dev-api-restart
-
-# Check if watchfiles is installed
-pip list | grep watchfiles
-
-# View API logs for errors
-make dev-api-logs
-```
-
----
-
-## Development Tools
-
-### Recommended IDE Setup
-
-**VS Code Extensions:**
-- Python (Microsoft)
-- Pylance (Microsoft)
-- Ruff (Astral Software)
-- Even Better TOML
-- Docker
-
-**VS Code Settings (.vscode/settings.json):**
-```json
-{
-  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
-  "python.linting.enabled": true,
-  "python.linting.ruffEnabled": true,
-  "python.formatting.provider": "black",
-  "python.testing.pytestEnabled": true,
-  "python.testing.pytestArgs": ["-n", "auto"],
-  "editor.formatOnSave": true,
-  "editor.codeActionsOnSave": {
-    "source.organizeImports": true
-  }
-}
-```
-
-### Useful Aliases
-
-Add to your `~/.bashrc` or `~/.zshrc`:
-
-```bash
-# Quick activation
-alias dev='conda activate dev-agent && cd ~/projects/mo-dev-agent'
-
-# Common commands
-alias dev-start='make dev-start'
-alias dev-stop='make dev-stop'
-alias dev-test='pytest -n auto -W error'
-alias dev-check='make check'
-
-# Quick test
-alias test-one='pytest -v'
-alias test-file='pytest -n auto'
-```
-
----
-
-## Docker Mode (Alternative)
-
-If you prefer running API in Docker:
-
-```bash
-# Build Docker image
-make dev-api-docker-build
-
-# Start all services (Docker mode)
-make dev-start-docker
-
-# View logs
-make dev-api-docker-logs
-
-# Scale API servers
-make dev-api-docker-scale REPLICAS=3
-
-# Stop
-make dev-api-docker-down
-```
-
----
-
-## Performance Tips
-
-### Faster Test Execution
-
-```bash
-# Always use parallel execution
-pytest -n auto
-
-# Use pytest-xdist for parallel testing
-pip install pytest-xdist
-
-# Cache test results
-pytest --cache-clear  # Clear cache if needed
-```
-
-### Faster Database Operations
-
-```bash
-# Use connection pooling (already configured)
-# Check pool settings in api/database.py
-
-# Monitor connection pool
-# Add to code:
-from api.database import engine
-print(engine.pool.status())
-```
-
-### Faster API Startup
-
-```bash
-# Use uvicorn with reload
-# Already configured in make dev-api-start
-
-# Reduce workers for development
-export API_WORKERS=1
-```
-
----
-
-## Pre-Commit Checklist
-
-Before every commit:
-- [ ] Environment activated: `conda activate dev-agent`
-- [ ] Services running: `make dev-status`
-- [ ] Tests pass: `pytest -n auto -W error`
-- [ ] Linting passes: `make lint`
-- [ ] Type checking passes: `make type-check`
-- [ ] No debug print statements
-- [ ] No commented-out code
-
----
-
-## Getting Help
-
-### Documentation
-- **API Docs**: http://localhost:8000/docs
-- **README**: [README.md](../README.md)
-- **Architecture**: [docs/design/ARCHITECTURE.md](../docs/design/ARCHITECTURE.md)
-- **Testing Guide**: [docs/guides/testing.md](../docs/guides/testing.md)
-
-### Common Issues
-- **Port conflicts**: Check `lsof -i :<port>`
-- **Database errors**: Run `make dev-deps-clean && make dev-init`
-- **Import errors**: Verify `conda activate dev-agent`
-- **Test failures**: Check `.kiro/steering/testing-rules.md`
-
-### Team Communication
-- Ask in team chat before making architectural changes
-- Create GitHub issue for bugs
-- Open PR for code review
+- If `cargo` is missing, install the Rust toolchain first.
+- If services fail to start, check Docker and `make dev-status`.
+- If a change touches API-shell behavior, prefer contract tests in `rust/crates/api-shell/tests/`.

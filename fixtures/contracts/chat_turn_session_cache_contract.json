@@ -1,0 +1,62 @@
+{
+  "evicts_history_and_tools_together": {
+    "maxsize": 2,
+    "ttl": 9999,
+    "writes": [
+      {
+        "time": 100.0,
+        "key": "s1",
+        "value": {"history": [{"role": "system"}], "tools": [{"t": 1}]}
+      },
+      {
+        "time": 101.0,
+        "key": "s2",
+        "value": {"history": [{"role": "system"}], "tools": [{"t": 2}]}
+      },
+      {
+        "time": 102.0,
+        "key": "s3",
+        "value": {"history": [{"role": "system"}], "tools": [{"t": 3}]}
+      }
+    ],
+    "reads": [
+      {"time": 103.0, "key": "s1", "expected": null},
+      {
+        "time": 103.0,
+        "key": "s2",
+        "expected": {"history": [{"role": "system"}], "tools": [{"t": 2}]}
+      }
+    ]
+  },
+  "ttl_expiry": {
+    "maxsize": 100,
+    "ttl": 1,
+    "writes": [
+      {
+        "time": 100.0,
+        "key": "s1",
+        "value": {"history": ["h"], "tools": ["t"]}
+      }
+    ],
+    "reads": [
+      {"time": 100.5, "key": "s1", "expected": {"history": ["h"], "tools": ["t"]}},
+      {"time": 101.6, "key": "s1", "expected": null}
+    ]
+  },
+  "access_refreshes_ttl": {
+    "maxsize": 100,
+    "ttl": 2,
+    "writes": [
+      {
+        "time": 100.0,
+        "key": "s1",
+        "value": {"history": ["h"], "tools": ["t"]}
+      }
+    ],
+    "reads": [
+      {"time": 101.0, "key": "s1", "expected": {"history": ["h"], "tools": ["t"]}},
+      {"time": 102.0, "key": "s1", "expected": {"history": ["h"], "tools": ["t"]}},
+      {"time": 104.1, "key": "s1", "expected": null}
+    ]
+  }
+}

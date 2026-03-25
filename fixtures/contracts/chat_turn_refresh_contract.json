@@ -1,0 +1,69 @@
+{
+  "extract_first_user_query_cases": [
+    {
+      "messages": [
+        {"role": "assistant", "content": "hello"}
+      ],
+      "expected": ""
+    },
+    {
+      "messages": [
+        {"role": "assistant", "content": "hello"},
+        {"role": "user", "content": "first query"},
+        {"role": "user", "content": "later query"}
+      ],
+      "expected": "first query"
+    }
+  ],
+  "plan_memory_refresh_cases": [
+    {
+      "messages": [
+        {"role": "assistant", "content": "hello"}
+      ],
+      "tool_results": [],
+      "history": [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "prior query"}
+      ],
+      "expected": null
+    },
+    {
+      "messages": [
+        {"role": "user", "content": "new query"}
+      ],
+      "tool_results": [],
+      "history": [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "prior query"}
+      ],
+      "expected": "new query"
+    },
+    {
+      "messages": [
+        {"role": "assistant", "content": "continuation"}
+      ],
+      "tool_results": [
+        {"tool_call_id": "tc1", "name": "bash", "result": "ok"}
+      ],
+      "history": [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "prior query"},
+        {"role": "assistant", "content": "a1"}
+      ],
+      "expected": "prior query"
+    },
+    {
+      "messages": [
+        {"role": "assistant", "content": "continuation"}
+      ],
+      "tool_results": [
+        {"tool_call_id": "tc1", "name": "bash", "result": "ok"}
+      ],
+      "history": [
+        {"role": "system", "content": "sys"},
+        {"role": "assistant", "content": "a1"}
+      ],
+      "expected": null
+    }
+  ]
+}

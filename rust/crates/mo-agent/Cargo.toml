@@ -1,0 +1,36 @@
+[package]
+name = "mo-agent-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mo-agent"
+path = "src/main.rs"
+
+[dependencies]
+mo-agent-core.workspace = true
+mo-agent-services.workspace = true
+mo-agent-runtime.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+chrono.workspace = true
+clap = { version = "4.5.38", features = ["derive"] }
+crossterm = "0.27"
+dirs = "6.0.0"
+dotenvy.workspace = true
+futures-util.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+rpassword = "7.4"
+rustyline = { version = "14", features = ["with-file-history"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml = "0.9.34"
+sha2.workspace = true
+sqlx.workspace = true
+termimad = "0.23"
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

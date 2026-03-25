@@ -4,9 +4,8 @@ on:
   pull_request:
     paths:
       - 'prompts/**'
-      - 'skills/**'
       - 'config/**'
-      - 'core/skills/**'
+      - 'rust/**'
 
 jobs:
   regression-gate:
@@ -37,21 +36,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      
-      - name: Install Poetry
-        run: pipx install poetry
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Poetry
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cache/pypoetry
-          key: ${{ runner.os }}-poetry-dev-${{ hashFiles('poetry.lock') }}
-          restore-keys: ${{ runner.os }}-poetry-dev-
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-gate-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-gate-
 
       # Single source of truth for dev dependencies — see Makefile.
       - name: Install dependencies
@@ -82,27 +78,20 @@ jobs:
       
       - name: Run regression gate
         id: gate
-        env:
-          DATABASE_URL: mysql://root:111@localhost:6001/mo_agent
-          REDIS_URL: redis://localhost:6379/0
         run: |
-          poetry run python -m core.evaluation.gate_cli run \
-            --change-type ${{ steps.detect-change.outputs.change_type }} \
-            --change-id ${{ steps.detect-change.outputs.change_id }} \
-            --change-file change.json \
-            --sessions 50 \
-            --error-threshold 0.05 \
-            --score-threshold -0.1 \
-            --output gate_result.json
+          if cargo test --manifest-path rust/Cargo.toml -p mo-agent-runtime --test evaluation_contract; then
+            echo '{"verdict":"pass","summary":"Rust evaluation contracts passed"}' > gate_result.json
+          else
+            echo '{"verdict":"fail","summary":"Rust evaluation contracts failed"}' > gate_result.json
+          fi
         continue-on-error: true
       
       - name: Generate report
         if: always()
         run: |
-          poetry run python -m core.evaluation.gate_cli report \
-            --input gate_result.json \
-            --format github-comment \
-            --output gate_comment.md
+          echo "## Regression Gate Result" > gate_comment.md
+          echo "" >> gate_comment.md
+          jq -r '.summary' gate_result.json >> gate_comment.md
       
       - name: Comment on PR
         if: always()

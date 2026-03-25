@@ -1,0 +1,36 @@
+{
+  "should_run_cases": [
+    {
+      "full_text": "",
+      "has_tool_calls": false,
+      "expected": false
+    },
+    {
+      "full_text": "Let me read the file first.",
+      "has_tool_calls": true,
+      "expected": false
+    },
+    {
+      "full_text": "Final answer",
+      "has_tool_calls": false,
+      "expected": true
+    }
+  ],
+  "build_messages_cases": [
+    {
+      "user_content": "What is event sourcing?",
+      "full_text": "Event sourcing is a pattern...",
+      "expected": [
+        {"role": "user", "content": "What is event sourcing?"},
+        {"role": "assistant", "content": "Event sourcing is a pattern..."}
+      ]
+    },
+    {
+      "user_content": null,
+      "full_text": "The file contains configuration settings.",
+      "expected": [
+        {"role": "assistant", "content": "The file contains configuration settings."}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,194 @@
+{
+  "auth_error": {
+    "status": 401,
+    "json": {
+      "detail": "Not authenticated"
+    }
+  },
+  "create_session": {
+    "request": {
+      "agent_id": "contract-agent-created",
+      "title": "Contract Created Session",
+      "metadata": {
+        "source": "contract",
+        "kind": "created"
+      }
+    },
+    "status": 201,
+    "json": {
+      "user_id": "contract-session-user-id",
+      "agent_id": "contract-agent-created",
+      "title": "Contract Created Session",
+      "metadata": {
+        "source": "contract",
+        "kind": "created"
+      },
+      "status": "active",
+      "event_count": 0,
+      "ended_at": null
+    }
+  },
+  "list_sessions": {
+    "status": 200,
+    "json": {
+      "sessions": [
+        {
+          "session_id": "contract-session-closed",
+          "user_id": "contract-session-user-id",
+          "agent_id": "contract-agent-beta",
+          "title": "Contract Session Beta",
+          "metadata": {
+            "source": "contract",
+            "topic": "beta"
+          },
+          "status": "closed",
+          "event_count": 2,
+          "created_at": "2026-01-03T09:30:00",
+          "updated_at": "2026-01-03T10:00:00",
+          "ended_at": null
+        },
+        {
+          "session_id": "contract-session-active",
+          "user_id": "contract-session-user-id",
+          "agent_id": "contract-agent-alpha",
+          "title": "Contract Session Alpha",
+          "metadata": {
+            "source": "contract",
+            "topic": "alpha"
+          },
+          "status": "active",
+          "event_count": 1,
+          "created_at": "2026-01-02T08:00:00",
+          "updated_at": "2026-01-02T08:15:00",
+          "ended_at": null
+        }
+      ],
+      "total": 2,
+      "limit": 50,
+      "offset": 0
+    }
+  },
+  "list_sessions_filtered": {
+    "status": 200,
+    "json": {
+      "sessions": [
+        {
+          "session_id": "contract-session-active",
+          "user_id": "contract-session-user-id",
+          "agent_id": "contract-agent-alpha",
+          "title": "Contract Session Alpha",
+          "metadata": {
+            "source": "contract",
+            "topic": "alpha"
+          },
+          "status": "active",
+          "event_count": 1,
+          "created_at": "2026-01-02T08:00:00",
+          "updated_at": "2026-01-02T08:15:00",
+          "ended_at": null
+        }
+      ],
+      "total": 1,
+      "limit": 1,
+      "offset": 0
+    }
+  },
+  "get_session": {
+    "status": 200,
+    "json": {
+      "session_id": "contract-session-active",
+      "user_id": "contract-session-user-id",
+      "agent_id": "contract-agent-alpha",
+      "title": "Contract Session Alpha",
+      "metadata": {
+        "source": "contract",
+        "topic": "alpha"
+      },
+      "status": "active",
+      "event_count": 1,
+      "created_at": "2026-01-02T08:00:00",
+      "updated_at": "2026-01-02T08:15:00",
+      "ended_at": null
+    }
+  },
+  "get_session_not_found": {
+    "status": 404,
+    "json": {
+      "detail": "Session contract-missing-session 不存在"
+    }
+  },
+  "get_session_unauthorized": {
+    "status": 404,
+    "json": {
+      "detail": "无权限访问 Session contract-foreign-session"
+    }
+  },
+  "update_session": {
+    "request": {
+      "title": "Updated Contract Session",
+      "metadata": {
+        "source": "contract",
+        "updated": true
+      }
+    },
+    "status": 200,
+    "json": {
+      "session_id": "contract-session-active",
+      "user_id": "contract-session-user-id",
+      "agent_id": "contract-agent-alpha",
+      "title": "Updated Contract Session",
+      "metadata": {
+        "source": "contract",
+        "updated": true
+      },
+      "status": "active",
+      "event_count": 1,
+      "created_at": "2026-01-02T08:00:00",
+      "ended_at": null
+    }
+  },
+  "update_session_not_found": {
+    "request": {
+      "title": "Updated Contract Session"
+    },
+    "status": 404,
+    "json": {
+      "detail": "Session contract-missing-session 不存在"
+    }
+  },
+  "update_session_unauthorized": {
+    "request": {
+      "title": "Updated Contract Session"
+    },
+    "status": 404,
+    "json": {
+      "detail": "无权限修改 Session contract-foreign-session"
+    }
+  },
+  "delete_session": {
+    "status": 204
+  },
+  "delete_session_not_found": {
+    "status": 404,
+    "json": {
+      "detail": "Session contract-missing-session 不存在"
+    }
+  },
+  "close_session": {
+    "status": 200,
+    "json": {
+      "session_id": "contract-session-active",
+      "user_id": "contract-session-user-id",
+      "agent_id": "contract-agent-alpha",
+      "title": "Contract Session Alpha",
+      "metadata": {
+        "source": "contract",
+        "topic": "alpha"
+      },
+      "status": "closed",
+      "event_count": 1,
+      "created_at": "2026-01-02T08:00:00",
+      "ended_at": null
+    }
+  }
+}

@@ -1,0 +1,248 @@
+{
+  "auth_error": {
+    "status": 401,
+    "json": {
+      "detail": "Not authenticated"
+    }
+  },
+  "admin_forbidden": {
+    "status": 403,
+    "json": {
+      "detail": "Admin role required"
+    }
+  },
+  "admin_init": {
+    "status": 200,
+    "json": {
+      "message": "Database initialized successfully",
+      "tables_created": 0
+    }
+  },
+  "admin_token_create": {
+    "request": {
+      "token_type": "llm",
+      "provider": "openai",
+      "scope": "global",
+      "token_value": "sk-contract-secret"
+    },
+    "status": 201,
+    "json": {
+      "token_type": "llm",
+      "provider": "openai",
+      "scope": "global",
+      "scope_id": null
+    }
+  },
+  "admin_prompt_optimize": {
+    "request": {
+      "agent_id": "test-agent",
+      "optimization_type": "compression"
+    },
+    "status": 200,
+    "json": {
+      "status": "queued",
+      "message": "Prompt optimization job queued for agent test-agent"
+    }
+  },
+  "admin_feedback_export": {
+    "request": {
+      "format": "jsonl"
+    },
+    "status": 200,
+    "json": {
+      "status": "queued",
+      "download_url": null
+    }
+  },
+  "admin_feedback_stats": {
+    "status": 200,
+    "json": {
+      "total_feedback": 3,
+      "positive_feedback": 1,
+      "negative_feedback": 1,
+      "avg_rating": 3.0,
+      "feedback_by_type": {
+        "wrong_skill": 2,
+        "low_satisfaction": 1
+      }
+    }
+  },
+  "admin_feedback_stats_filtered": {
+    "status": 200,
+    "json": {
+      "total_feedback": 2,
+      "positive_feedback": 1,
+      "negative_feedback": 1,
+      "avg_rating": 3.0,
+      "feedback_by_type": {
+        "wrong_skill": 1,
+        "low_satisfaction": 1
+      }
+    }
+  },
+  "admin_role_grant": {
+    "request": {
+      "username": "contract-grant-user",
+      "role_name": "contract_role"
+    },
+    "status": 200,
+    "json": {
+      "username": "contract-grant-user",
+      "role_name": "contract_role",
+      "message": "Role granted successfully"
+    }
+  },
+  "admin_role_grant_existing": {
+    "request": {
+      "username": "contract-existing-user",
+      "role_name": "contract_role"
+    },
+    "status": 200,
+    "json": {
+      "username": "contract-existing-user",
+      "role_name": "contract_role",
+      "message": "User already has this role"
+    }
+  },
+  "admin_role_grant_user_not_found": {
+    "request": {
+      "username": "contract-missing-user",
+      "role_name": "contract_role"
+    },
+    "status": 404,
+    "json": {
+      "detail": "User not found"
+    }
+  },
+  "admin_role_grant_role_not_found": {
+    "request": {
+      "username": "contract-grant-user",
+      "role_name": "contract_missing_role"
+    },
+    "status": 404,
+    "json": {
+      "detail": "Role not found"
+    }
+  },
+  "admin_role_revoke": {
+    "request": {
+      "username": "contract-revoke-user",
+      "role_name": "contract_role"
+    },
+    "status": 200,
+    "json": {
+      "username": "contract-revoke-user",
+      "role_name": "contract_role",
+      "message": "Role revoked successfully"
+    }
+  },
+  "admin_role_revoke_missing": {
+    "request": {
+      "username": "contract-without-role-user",
+      "role_name": "contract_role"
+    },
+    "status": 200,
+    "json": {
+      "username": "contract-without-role-user",
+      "role_name": "contract_role",
+      "message": "User does not have this role"
+    }
+  },
+  "admin_role_revoke_user_not_found": {
+    "request": {
+      "username": "contract-missing-user",
+      "role_name": "contract_role"
+    },
+    "status": 404,
+    "json": {
+      "detail": "User not found"
+    }
+  },
+  "admin_role_revoke_role_not_found": {
+    "request": {
+      "username": "contract-revoke-user",
+      "role_name": "contract_missing_role"
+    },
+    "status": 404,
+    "json": {
+      "detail": "Role not found"
+    }
+  },
+  "admin_tokens": {
+    "status": 200,
+    "json": [
+      {
+        "token_id": "contract-user-token",
+        "token_type": "api",
+        "provider": "github",
+        "scope": "user",
+        "scope_id": "contract-user-123",
+        "created_at": "2026-01-02T09:30:00"
+      },
+      {
+        "token_id": "contract-global-token",
+        "token_type": "llm",
+        "provider": "openai",
+        "scope": "global",
+        "scope_id": null,
+        "created_at": "2026-01-01T12:00:00"
+      }
+    ]
+  },
+  "admin_tokens_llm_global": {
+    "status": 200,
+    "json": [
+      {
+        "token_id": "contract-global-token",
+        "token_type": "llm",
+        "provider": "openai",
+        "scope": "global",
+        "scope_id": null,
+        "created_at": "2026-01-01T12:00:00"
+      }
+    ]
+  },
+  "admin_audit": {
+    "status": 200,
+    "json": [
+      {
+        "log_id": "contract-log-2",
+        "user_id": "contract-audit-user",
+        "action": "revoke_role",
+        "resource_type": "role",
+        "resource_id": "mo_agent_admin",
+        "timestamp": "2026-01-03T10:00:00",
+        "details": {
+          "username": "alice"
+        }
+      },
+      {
+        "log_id": "contract-log-1",
+        "user_id": "contract-audit-user",
+        "action": "create_token",
+        "resource_type": "token",
+        "resource_id": "llm_openai",
+        "timestamp": "2026-01-02T08:00:00",
+        "details": {
+          "scope": "global"
+        }
+      }
+    ]
+  },
+  "admin_audit_user_filtered": {
+    "status": 200,
+    "json": [
+      {
+        "log_id": "contract-log-2",
+        "user_id": "contract-audit-user",
+        "action": "revoke_role",
+        "resource_type": "role",
+        "resource_id": "mo_agent_admin",
+        "timestamp": "2026-01-03T10:00:00",
+        "details": {
+          "username": "alice"
+        }
+      }
+    ]
+  }
+}

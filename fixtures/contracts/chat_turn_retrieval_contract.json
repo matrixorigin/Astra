@@ -1,0 +1,55 @@
+{
+  "format_retrieved_events_cases": [
+    {
+      "name": "skips_recent_and_unknown_types",
+      "events": [
+        {"event_type": "user_query", "content": "Repeated in recent block"},
+        {"event_type": "llm_response", "content": "Fresh assistant context"},
+        {"event_type": "unknown", "content": "ignored"},
+        {"event_type": "tool_result", "content": "Tool output"}
+      ],
+      "recent_contents": ["Repeated in recent block"],
+      "budget_chars": 8000,
+      "expected": "[Earlier relevant context from this session]\nAssistant: Fresh assistant context\nTool result: Tool output"
+    },
+    {
+      "name": "stops_when_budget_would_overflow",
+      "events": [
+        {"event_type": "user_query", "content": "short"},
+        {"event_type": "llm_response", "content": "this line would exceed a tiny budget"}
+      ],
+      "recent_contents": [],
+      "budget_chars": 10,
+      "expected": null
+    }
+  ],
+  "rule_based_extraction_cases": [
+    {
+      "name": "prefers_high_overlap_old_messages_and_skips_recent",
+      "full_history": [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "deploy rust service"},
+        {"role": "assistant", "content": "let us deploy rust service carefully"},
+        {"role": "tool", "content": "build rust artifacts"},
+        {"role": "assistant", "content": "recent response should be skipped"}
+      ],
+      "recent_messages": [
+        {"role": "assistant", "content": "recent response should be skipped"}
+      ],
+      "user_query": "deploy rust artifacts",
+      "budget_chars": 8000,
+      "expected": "[Earlier relevant context from this session]\nUser: deploy rust service\nAssistant: let us deploy rust service carefully\nTool result: build rust artifacts"
+    },
+    {
+      "name": "returns_none_for_empty_query_words",
+      "full_history": [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "deploy rust service"}
+      ],
+      "recent_messages": [],
+      "user_query": "   ",
+      "budget_chars": 8000,
+      "expected": null
+    }
+  ]
+}

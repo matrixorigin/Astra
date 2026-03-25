@@ -1,0 +1,38 @@
+{
+  "cases": [
+    {
+      "name": "returns_none_without_user_content",
+      "messages": [{"role": "assistant", "content": "hello"}],
+      "expected": null
+    },
+    {
+      "name": "uses_last_user_message_in_tool_loop",
+      "messages": [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "working"},
+        {"role": "user", "content": "compare the options"}
+      ],
+      "expected": "reasoning"
+    },
+    {
+      "name": "detects_code_from_fenced_block",
+      "messages": [{"role": "user", "content": "please fix ```python\nprint(1)\n```"}],
+      "expected": "code"
+    },
+    {
+      "name": "detects_code_from_file_extension_boundary",
+      "messages": [{"role": "user", "content": "look at .rs and .py files"}],
+      "expected": "code"
+    },
+    {
+      "name": "reasoning_keywords_need_word_boundaries",
+      "messages": [{"role": "user", "content": "classic choices only"}],
+      "expected": null
+    },
+    {
+      "name": "returns_reasoning_for_explain",
+      "messages": [{"role": "user", "content": "Explain why this fails"}],
+      "expected": "reasoning"
+    }
+  ]
+}

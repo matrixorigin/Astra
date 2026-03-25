@@ -16,11 +16,15 @@ fi
 export $(cat .env.production | grep -v '^#' | xargs)
 
 # 3. Run tests
-echo "Running tests..."
-python -m pytest tests/ -q || {
-    echo "❌ Tests failed. Aborting deployment."
-    exit 1
-}
+echo "Running repository validation..."
+if command -v cargo >/dev/null 2>&1 && [ -f rust/Cargo.toml ]; then
+    make check && make test || {
+        echo "❌ Validation failed. Aborting deployment."
+        exit 1
+    }
+else
+    echo "⚠️  cargo not available on this host; ensure artifacts were validated in CI before deployment."
+fi
 
 # 4. Database migration (if needed)
 echo "Checking database..."
@@ -32,10 +36,7 @@ echo "  Host: ${API_HOST:-0.0.0.0}"
 echo "  Port: ${API_PORT:-8000}"
 echo "  Workers: ${API_WORKERS:-4}"
 
-uvicorn api.main:app \
-    --host ${API_HOST:-0.0.0.0} \
-    --port ${API_PORT:-8000} \
-    --workers ${API_WORKERS:-4} \
-    --log-level ${LOG_LEVEL:-info}
+RUST_API_ADDR="${API_HOST:-0.0.0.0}:${API_PORT:-8000}" \
+    mo-agent-server
 
 echo "✅ Deployment complete!"

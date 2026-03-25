@@ -57,7 +57,7 @@ Do NOT call `memory_store` for:
 ## 🟡 Correction workflow (prefer correct over store+purge)
 When the user contradicts a previously stored fact:
 1. **Always use `memory_correct`** — not `memory_store` + `memory_purge`. This preserves the audit trail.
-2. **Prefer query-based correction**: `memory_correct(query="formatting tool", new_content="Uses ruff for formatting", reason="switched from black")` — no need to look up memory_id first.
+2. **Prefer query-based correction**: `memory_correct(query="formatting tool", new_content="Uses cargo fmt for formatting", reason="switched from black")` — no need to look up memory_id first.
 3. **Only use `memory_purge`** when the user explicitly asks to forget something entirely, not when updating a fact.
 
 ## 🟡 Deduplication before storing
@@ -93,7 +93,7 @@ Before storing a new memory, consider:
 |------|---------|---------|
 | `semantic` | Project facts, technical decisions (default) | "Uses MatrixOne as primary DB", "API follows REST conventions" |
 | `profile` | User/agent identity and preferences | "Prefers concise answers", "Works on mo-dev-agent project" |
-| `procedural` | How-to knowledge, workflows | "Deploy with: make dev-start", "Run tests with pytest -n auto" |
+| `procedural` | How-to knowledge, workflows | "Deploy with: make dev-start", "Run tests with make test" |
 | `working` | Temporary context for current task | "Currently debugging embedding issue" |
 | `tool_result` | Tool execution results worth caching | "Last CI run: 126 passed, 0 failed" |
 

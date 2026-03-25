@@ -57,10 +57,10 @@ mo-agent-engine/
 
 ```bash
 # Development
-uvicorn api.main:app --reload --port 8000
+RUST_API_ADDR=0.0.0.0:8000 mo-agent-server
 
 # Production
-uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 4
+RUST_API_ADDR=0.0.0.0:8000 mo-agent-server
 ```
 
 Features: structured JSON logging, JWT auth, rate limiting (60 req/min), health checks, Prometheus metrics.

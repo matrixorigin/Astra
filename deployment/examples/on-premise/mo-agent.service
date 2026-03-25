@@ -9,7 +9,8 @@ User=mo-agent
 Group=mo-agent
 WorkingDirectory=/opt/mo-agent
 EnvironmentFile=/opt/mo-agent/.env
-ExecStart=/usr/bin/python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 4
+Environment=RUST_API_ADDR=0.0.0.0:8000
+ExecStart=/usr/local/bin/mo-agent-rs-api-shell
 Restart=always
 RestartSec=10
 StandardOutput=journal

@@ -1,0 +1,37 @@
+{
+  "collect_skill_version_names_cases": [
+    {
+      "tool_results": [
+        {"name": "bash"},
+        {"name": "read_file"},
+        {"name": ""}
+      ],
+      "tool_calls": [
+        {"function": {"name": "read_file"}},
+        {"function": {"name": "grep"}},
+        {"function": {"name": ""}}
+      ],
+      "expected": ["bash", "grep", "read_file"]
+    }
+  ],
+  "routing_decision_event_cases": [
+    {
+      "routing_meta": {
+        "intent": "question",
+        "tier": 1,
+        "estimated_tokens": 1234
+      },
+      "expected": {
+        "content": {
+          "intent": "question",
+          "tier": 1,
+          "estimated_tokens": 1234
+        },
+        "metadata": {
+          "intent": "question",
+          "tier": 1
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+use std::{net::SocketAddr, sync::Arc};
+
+use axum::{
+    Json, Router,
+    body::Bytes,
+    extract::{Path, Query, State},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
+    response::Response,
+    routing::{delete, get, post},
+};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE};
+use chrono::Utc;
+use uuid::Uuid;
+
+use super::*;
+
+mod admin_handlers;
+mod auth_handlers;
+mod bridge_prep;
+mod chat_handlers;
+mod http_helpers;
+mod http_types;
+mod learning_handlers;
+mod meta_handlers;
+mod reflect_handlers;
+mod router_builder;
+mod run_handlers;
+mod session_handlers;
+mod state_builder;
+
+use self::{
+    bridge_prep::prepare_chat_turn_bridge_body,
+    chat_route::{ChatRouteResponse, classify_chat_route},
+    http_helpers::*,
+    http_types::*,
+};
+
+mod chat_route;
+
+pub fn build_app(state: AppState) -> Router {
+    router_builder::build_router(state)
+}
+
+pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let settings = AppSettings::from_env()?;
+    let state = state_builder::build_server_state(settings).await?;
+
+    axum::serve(listener, build_app(state)).await?;
+    Ok(())
+}

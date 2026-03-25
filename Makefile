@@ -7,8 +7,7 @@ help:
 	@echo "=================================="
 	@echo ""
 	@echo "Quick Start:"
-	@echo "  make dev-start          - Start all (deps + API source mode) [MOST USED]"
-	@echo "  make dev-start-docker   - Start all (deps + API Docker mode)"
+	@echo "  make dev-start          - Start all (deps + API server)"
 	@echo "  make dev-stop           - Stop all services"
 	@echo "  make dev-status         - Show all service status"
 	@echo "  make dev-init           - Initialize development environment"
@@ -19,60 +18,40 @@ help:
 	@echo "  make dev-deps-clean     - Stop and remove all data (WARNING: destructive!)"
 	@echo "  make dev-deps-status    - Show dependency status"
 	@echo "  make dev-deps-logs      - Show all dependency logs"
-	@echo "  make dev-deps-logs-db   - Show MatrixOne logs only"
-	@echo "  make dev-deps-logs-redis - Show Redis logs only"
 	@echo "  make dev-db-connect     - Connect to MatrixOne CLI"
 	@echo ""
-	@echo "Logging:"
-	@echo "  make dev-logs-clean     - Clear Docker logs"
-	@echo ""
-	@echo "API Server (Source Code Mode):"
-	@echo "  make dev-api-start      - Start API server (hot reload)"
+	@echo "API Server:"
+	@echo "  make dev-api-start      - Start API server"
 	@echo "  make dev-api-stop       - Stop API server"
 	@echo "  make dev-api-restart    - Restart API server"
 	@echo "  make dev-api-logs       - Show API server logs"
 	@echo "  make dev-api-status     - Show API server status"
 	@echo ""
-	@echo "API Server (Docker Mode):"
-	@echo "  make dev-api-docker-build - Build API server image"
-	@echo "  make dev-api-docker-up  - Start API server container"
-	@echo "  make dev-api-docker-down - Stop API server container"
-	@echo "  make dev-api-docker-logs - Show container logs"
-	@echo "  make dev-api-docker-scale REPLICAS=N - Scale API server"
-	@echo ""
 	@echo "Testing:"
-	@echo "  make test               - Run all tests"
-	@echo "  make test-unit          - Run unit tests only"
-	@echo "  make test-integration   - Run integration tests only"
-	@echo "  make verify             - E2E verification (real CLI + API + LLM)"
-	@echo "  make verify-talk        - Talk verification (real CLI + API + LLM)"
-	@echo ""
-	@echo "Environment Setup:"
-	@echo "  make dev-init           - Complete initialization (setup + deps + config)"
-	@echo "  make dev-setup-demo     - Interactive demo setup (admin + model + user)"
-	@echo "  make setup              - Copy .env.example → .env (one-time, no deps)"
-	@echo "  make install-dev-deps   - Install all dependencies (runtime + dev + test)"
-	@echo "  make install-check-deps - Install check dependencies (lint + type-check, lighter)"
+	@echo "  make test               - Run all Rust tests"
+	@echo "  make test-integration   - Run integration contract tests"
 	@echo ""
 	@echo "Code Quality:"
-	@echo "  make check              - Run all static checks"
-	@echo "  make ci                 - Run all CI checks (check + test)"
-	@echo "  make lint               - Run linters"
-	@echo "  make lint-fix           - Auto-fix linting issues"
+	@echo "  make check              - Run all static checks (lint + format + type)"
+	@echo "  make ci                 - Run CI checks (check + test, no Docker required)"
+	@echo "  make lint               - Run clippy (warnings are errors)"
+	@echo "  make lint-fix           - Auto-format code"
+	@echo "  make format             - Format code"
+	@echo "  make format-check       - Check formatting"
 	@echo ""
-	@echo "Memoria Lite (MCP Memory Server):"
-	@echo "  make bump-memoria-version BUMP=patch  - Bump version (patch/minor/major)"
-	@echo "  make build-memoria     - Build wheel distribution"
-	@echo "  make publish-memoria   - Publish to PyPI"
-	@echo "  make publish-memoria-test - Publish to TestPyPI"
+	@echo "Build:"
+	@echo "  make rust-build         - Build the Rust workspace"
+	@echo "  make rust-build-release - Build the Rust workspace in release mode"
+	@echo "  make cli-build          - Build CLI/API binaries in debug mode"
+	@echo "  make cli-build-release  - Build CLI/API binaries in release mode"
+	@echo "  make print-bin-paths    - Show debug/release binary paths"
+	@echo "  make check-runtime      - Verify runtime environment"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make dev-start                    # Daily development"
 	@echo "  make dev-api-restart              # After code changes"
 	@echo "  make test                         # Run all tests"
-	@echo "  make test-unit                    # Run unit tests only"
-	@echo "  make dev-api-docker-scale REPLICAS=4  # Test load balancing"
-	@echo "  make bump-memoria-version BUMP=minor # Bump 0.2.3 → 0.3.0"
+	@echo "  make check                        # Static analysis"
 
 # ============================================================================
 # Environment Setup
@@ -81,7 +60,7 @@ help:
 .PHONY: dev-init
 dev-init: setup install-dev-deps
 	@echo "Initializing development environment..."
-	@python3 scripts/dev/init.py
+	@bash scripts/dev/init.sh
 	@echo ""
 	@echo "✅ Development environment initialized!"
 	@echo ""
@@ -103,21 +82,14 @@ setup:
 
 .PHONY: install-dev-deps
 install-dev-deps:
-	@echo "Installing all dependencies (runtime + dev + test)..."
-	@# pyproject.toml is the single source of truth for all dependencies.
-	@# --with dev includes test deps (sentence-transformers, freezegun, etc.)
-	@# -E local-embedding installs optional extras for full test coverage.
-	@command -v poetry >/dev/null 2>&1 || { echo "❌ Poetry not found. Install: pip install poetry"; exit 1; }
-	@poetry install --with dev -E local-embedding
-	@echo "✅ All dependencies installed"
+	@echo "Installing Rust workspace dependencies..."
+	@cargo fetch --manifest-path rust/Cargo.toml
+	@echo "✅ Rust dependencies ready"
 
-# Lighter install for static checks (lint, type-check) — skips sentence-transformers.
+# Alias for compatibility.
 .PHONY: install-check-deps
 install-check-deps:
-	@echo "Installing check dependencies (runtime + dev, no extras)..."
-	@command -v poetry >/dev/null 2>&1 || { echo "❌ Poetry not found. Install: pip install poetry"; exit 1; }
-	@poetry install --with dev
-	@echo "✅ Check dependencies installed"
+	@$(MAKE) install-dev-deps
 
 .PHONY: install-runtime
 install-runtime:
@@ -206,8 +178,8 @@ check-runtime:
 		echo "   ❌ Not installed"; \
 	fi
 	@echo ""
-	@echo "3. Python runtime module:"
-	@python3 -c "from core.runtime import create_runtime; print('   ✅ Runtime module OK')" 2>/dev/null || echo "   ❌ Runtime module error"
+	@echo "3. Rust API binary:"
+	@cargo build -q --manifest-path rust/Cargo.toml -p mo-agent-runtime --bin mo-agent-server && echo "   ✅ Rust binary build OK"
 
 # ============================================================================
 # Development - Dependency Services (MatrixOne + Redis)
@@ -427,11 +399,12 @@ dev-reset: dev-clean
 .PHONY: dev-config-check dev-config-check-strict
 dev-config-check: ## Check development configuration
 	@echo "Checking development configuration..."
-	@python core/config_validation.py
+	@cargo test --manifest-path rust/Cargo.toml -p mo-agent-runtime --test config_contract
 
 dev-config-check-strict: ## Check development configuration (strict mode)
 	@echo "Checking development configuration (strict mode)..."
-	@python core/config_validation.py --strict
+	@cargo test --manifest-path rust/Cargo.toml -p mo-agent-runtime --test config_contract
+	@cargo check --manifest-path rust/Cargo.toml --all-targets
 
 # Aliases: README uses dev-start/dev-stop, Makefile defines dev-up/dev-down
 .PHONY: dev-start dev-stop dev-start-docker
@@ -450,29 +423,29 @@ dev-test-integration: test-integration
 # Development - Testing
 # ============================================================================
 
-.PHONY: test
-test:
-	@echo "Running all tests..."
-	@if ! docker ps | grep -q matrixone; then \
-		echo "❌ Error: MatrixOne is not running. Start services with 'make dev-start'"; \
-		exit 1; \
-	fi
-	@python -m pytest tests/ -n auto --dist loadscope -v -m "not slow and not benchmark and not local_embedding"
-	@if [ -f memoria/tests/test_e2e.py ]; then \
-		python -m pytest memoria/tests/test_e2e.py -n auto --dist loadscope -v; \
-	else \
-		echo "Skipping Memoria E2E tests: memoria/tests/test_e2e.py not found"; \
-	fi
+CARGO_MANIFEST := rust/Cargo.toml
+CARGO := cargo
+CARGO_MANIFEST_FLAG := --manifest-path $(CARGO_MANIFEST)
+API_SHELL_PKG := -p mo-agent-runtime
+API_SHELL_TESTS := $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --tests
+RUST_TARGET_DIR := rust/target
+RUST_DEBUG_BIN_DIR := $(RUST_TARGET_DIR)/debug
+RUST_RELEASE_BIN_DIR := $(RUST_TARGET_DIR)/release
+API_SERVER_BIN := mo-agent-server
+CLI_BINS := mo-agent mo-admin
+ALL_BINS := $(API_SERVER_BIN) $(CLI_BINS)
 
-.PHONY: test-cloud
-test-cloud:
-	@echo "Running Memoria Docker regression tests..."
-	@echo "Requires: make cloud-start"
-	@if [ -f memoria/tests/test_docker.py ]; then \
-		python -m pytest memoria/tests/test_docker.py -v; \
-	else \
-		echo "Skipping Memoria Docker regression tests: memoria/tests/test_docker.py not found"; \
-	fi
+.PHONY: test test-cloud ci-test test-unit test-integration verify verify-talk
+test:
+	@echo "Running Rust workspace tests..."
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG)
+
+test-cloud ci-test test-unit verify verify-talk: test
+	@:
+
+test-integration:
+	@echo "Running Rust API-shell integration contracts..."
+	@$(API_SHELL_TESTS)
 
 .PHONY: cloud-start
 cloud-start:
@@ -499,34 +472,48 @@ cloud-clean:
 	@rm -rf memoria/data/
 	@echo "Done."
 
-.PHONY: ci-test
-ci-test:
-	@echo "Running CI test suite (excludes local_embedding, slow, benchmark)..."
-	@if [ -d memoria/tests ]; then \
-		set -a && [ -f memoria/.env ] && . memoria/.env; set +a; \
-		python -m pytest tests/ memoria/tests/ \
-			-n auto --dist loadgroup -v --tb=short \
-			-m "not slow and not benchmark and not local_embedding"; \
-	else \
-		python -m pytest tests/ \
-			-n auto --dist loadgroup -v --tb=short \
-			-m "not slow and not benchmark and not local_embedding"; \
-		echo "Skipping Memoria test suite: memoria/tests/ not found"; \
-	fi
+.PHONY: rust-build
+rust-build:
+	@echo "Building Rust workspace (debug profile)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG)
+	@echo "✅ Debug artifacts: $(RUST_DEBUG_BIN_DIR)/"
 
-.PHONY: test-unit
-test-unit:
-	@echo "Running unit tests..."
-	@python -m pytest tests/unit/ -n auto --dist loadscope -v
+.PHONY: rust-build-release
+rust-build-release:
+	@echo "Building Rust workspace (release profile)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) --release
+	@echo "✅ Release artifacts: $(RUST_RELEASE_BIN_DIR)/"
 
-.PHONY: test-integration
-test-integration:
-	@echo "Running integration tests..."
-	@if ! docker ps | grep -q matrixone; then \
-		echo "❌ Error: MatrixOne is not running. Start services with 'make dev-start'"; \
-		exit 1; \
-	fi
-	@python -m pytest tests/integration/ -n auto --dist loadscope -v
+.PHONY: cli-build
+cli-build:
+	@echo "Building CLI/API binaries (debug profile)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) $(foreach bin,$(ALL_BINS),--bin $(bin))
+	@$(MAKE) print-bin-paths
+
+.PHONY: cli-build-release
+cli-build-release:
+	@echo "Building CLI/API binaries (release profile)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --release $(foreach bin,$(ALL_BINS),--bin $(bin))
+	@$(MAKE) print-bin-paths
+
+.PHONY: print-bin-paths
+print-bin-paths:
+	@echo "Debug binaries:"
+	@for bin in $(ALL_BINS); do echo "  $(RUST_DEBUG_BIN_DIR)/$$bin"; done
+	@echo "Release binaries:"
+	@for bin in $(ALL_BINS); do echo "  $(RUST_RELEASE_BIN_DIR)/$$bin"; done
+
+.PHONY: rust-test
+rust-test: test
+	@:
+
+.PHONY: migration-contract-test
+migration-contract-test:
+	@echo "Running Rust HTTP contract tests..."
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --test http_contract
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --test admin_contract
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --test auth_contract
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --test config_contract
 
 # ============================================================================
 # Legacy Aliases (Removed - Use dev-* commands instead)
@@ -567,16 +554,6 @@ db-reset:
 # E2E Verification
 # ============================================================================
 
-.PHONY: verify verify-talk
-verify:
-	@echo "Running E2E verification (talk-based)..."
-	@set -a && . ./.env && set +a && http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 MEMORIA_BASE_URL=http://localhost:8100 MEMORIA_MASTER_KEY=test-master-key-for-docker-compose python scripts/e2e/verify_talk.py $(if $(VERBOSE),-v) $(if $(CASE),--case $(CASE)) $(if $(MODEL),--model $(MODEL))
-
-verify-talk:
-	@echo "Running talk verification (requires API server + LLM)..."
-	@set -a && . ./.env && set +a && http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 MEMORIA_BASE_URL=http://localhost:8100 MEMORIA_MASTER_KEY=test-master-key-for-docker-compose python scripts/e2e/verify_talk.py $(if $(VERBOSE),-v) $(if $(CASE),--case $(CASE)) $(if $(MODEL),--model $(MODEL))
-
-
 # ============================================================================
 # Testing
 # ============================================================================
@@ -585,43 +562,30 @@ verify-talk:
 
 .PHONY: test-cleanup
 test-cleanup:
-	@echo "Cleaning up test databases..."
-	@python scripts/dev/cleanup_test_dbs.py
+	@echo "No extra test DB cleanup needed in Rust-only mode."
 
 .PHONY: test-api
 test-api:
-	@echo "Running API integration tests..."
-	@python -m pytest tests/integration/api/ -v
+	@echo "Running Rust API integration contract tests..."
+	@$(API_SHELL_TESTS)
 
 .PHONY: test-e2e
 test-e2e:
-	@echo "Running end-to-end tests..."
-	@set -a && . ./.env && set +a && python -m pytest tests/e2e/ -v
+	@echo "Running Rust end-to-end contract subset..."
+	@$(API_SHELL_TESTS)
 
 .PHONY: test-runtime
-test-runtime:
-	@echo "Running runtime tests..."
-	@echo ""
-	@echo "Testing Docker runtime..."
-	@pytest tests/unit/test_docker_runtime.py -v
-	@echo ""
-	@echo "Testing Firecracker runtime..."
-	@pytest tests/unit/test_firecracker_runtime.py -v
-	@echo ""
-	@echo "Testing Subprocess runtime..."
-	@pytest tests/unit/test_subprocess_runtime.py -v 2>/dev/null || echo "⚠️  Subprocess runtime tests not found"
-	@echo ""
+test-runtime: test
 	@echo "✅ Runtime tests complete"
 
 # ============================================================================
 # Code Quality
 # ============================================================================
 
-# Check if poetry environment is set up
+# Rust check environment
 .PHONY: check-env
 check-env:
-	@poetry --version >/dev/null 2>&1 || (echo "❌ Error: poetry not found. Install it first: https://python-poetry.org/docs/#installation" && exit 1)
-	@poetry run python --version >/dev/null 2>&1 || (echo "❌ Error: Poetry environment not set up. Run 'make install' first." && exit 1)
+	@cargo --version >/dev/null 2>&1 || (echo "❌ Error: cargo not found. Install Rust toolchain first." && exit 1)
 
 .PHONY: check
 check: check-env lint format-check type-check
@@ -630,63 +594,36 @@ check: check-env lint format-check type-check
 .PHONY: lint
 lint:
 	@echo "Running linters..."
-	@poetry run ruff check .
+	@$(CARGO) clippy $(CARGO_MANIFEST_FLAG) --all-targets -- -D warnings
 
 .PHONY: lint-fix
 lint-fix:
-	@echo "Running linters with auto-fix..."
-	@poetry run ruff check --fix .
+	@echo "Rust lint auto-fix via cargo fmt..."
+	@$(CARGO) fmt $(CARGO_MANIFEST_FLAG) --all
 
 .PHONY: type-check
 type-check:
-	@echo "Running type checker..."
-	@poetry run mypy sdk/ core/ api/
+	@echo "Running Rust compile checks..."
+	@$(CARGO) check $(CARGO_MANIFEST_FLAG) --all-targets
 
 .PHONY: format
 format:
 	@echo "Formatting code..."
-	@poetry run ruff format .
+	@$(CARGO) fmt $(CARGO_MANIFEST_FLAG) --all
 
 .PHONY: format-check
 format-check:
 	@echo "Checking code formatting..."
-	@poetry run ruff format --check .
+	@$(CARGO) fmt $(CARGO_MANIFEST_FLAG) --all -- --check
 
 .PHONY: pre-commit
 .PHONY: ci
-ci: dev-deps-up dev-deps-wait check test dev-deps-down
+ci: check test
 	@echo "✅ All CI checks passed!"
 
 # ── Memoria Lite publish ─────────────────────────────────────────────
 
-BUMP ?= patch
-.PHONY: bump-memoria-version
-bump-memoria-version:
-	@python scripts/bump_memoria_version.py $(BUMP)
-
-MEMORIA_DIST = dist/memoria
-
-.PHONY: build-memoria
-build-memoria:
-	@echo "Building memoria-lite..."
-	@rm -rf $(MEMORIA_DIST)
-	@mkdir -p $(MEMORIA_DIST)
-	@cp pyproject.toml pyproject.toml.bak
-	@cp pyproject.memoria.toml pyproject.toml
-	@python -m build --wheel --outdir $(MEMORIA_DIST)
-	@mv pyproject.toml.bak pyproject.toml
-	@echo "✅ Built: $$(ls $(MEMORIA_DIST)/*.whl)"
-
-.PHONY: publish-memoria
-publish-memoria: build-memoria
-	@echo "Publishing memoria-lite to PyPI..."
-	@pip install --quiet twine 2>/dev/null || true
-	@twine upload $(MEMORIA_DIST)/*
-	@echo "✅ Published memoria-lite to PyPI"
-
-.PHONY: publish-memoria-test
-publish-memoria-test: build-memoria
-	@echo "Publishing memoria-lite to TestPyPI..."
-	@pip install --quiet twine 2>/dev/null || true
-	@twine upload --repository testpypi $(MEMORIA_DIST)/*
-	@echo "✅ Published memoria-lite to TestPyPI"
+.PHONY: bump-memoria-version build-memoria publish-memoria publish-memoria-test
+bump-memoria-version build-memoria publish-memoria publish-memoria-test:
+	@echo "❌ Deprecated in Rust-only mode"
+	@exit 1

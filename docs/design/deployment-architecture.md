@@ -11,7 +11,7 @@ mo-agent-engine consists of these runtime components:
 
 | Component | Process | Stateless? | Scalable? | Description |
 |-----------|---------|-----------|-----------|-------------|
-| **API Server** | `uvicorn api.main:app` | ✅ Yes | Horizontal | REST API, JWT auth, rate limiting |
+| **API Server** | `mo-agent-server` | ✅ Yes | Horizontal | REST API, JWT auth, rate limiting |
 | **CLI (mo-agent)** | `mo-agent chat` | ✅ Yes | Per-user | Interactive chat, skill execution |
 | **CLI (mo-admin)** | `mo-admin init/prompt/...` | ✅ Yes | Single | Admin operations |
 | **MatrixOne** | `mo-service` | ❌ Stateful | Cluster | HTAP database, time-travel, branching |
@@ -293,7 +293,7 @@ Sync model:
 ```bash
 conda activate agent-engine
 make dev-up                          # MatrixOne + Redis in Docker
-uvicorn api.main:app --port 8000     # API server (required, unless --local)
+RUST_API_ADDR=0.0.0.0:8000 mo-agent-server  # API server (required, unless --local)
 mo-admin init                        # Init DB (via API after migration)
 mo-agent chat                        # CLI → API Server → DB
 # OR: mo-agent --local chat          # Dev shortcut: CLI → DB directly
@@ -889,7 +889,7 @@ spec:
       containers:
       - name: api
         image: mo-agent:latest
-        command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+        command: ["mo-agent-server"]
         ports:
         - containerPort: 8000
         resources:
@@ -1232,7 +1232,7 @@ class DeploymentDetector:
 # Before: 手动启动各组件
 make dev-up          # MatrixOne + Redis
 mo-admin init        # Init DB
-uvicorn api.main:app # API
+RUST_API_ADDR=0.0.0.0:8000 mo-agent-server # API
 
 # After: 一键全部拉起
 docker-compose up -d

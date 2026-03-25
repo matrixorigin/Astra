@@ -1,0 +1,100 @@
+{
+  "root": {
+    "status": 200,
+    "json": {
+      "name": "Agent Engine API",
+      "version": "0.1.0",
+      "docs": "/docs"
+    }
+  },
+  "health": {
+    "healthy": {
+      "status": 200,
+      "json": {
+        "status": "healthy",
+        "database": "connected",
+        "persist_ok": 0,
+        "persist_fail": 0
+      }
+    },
+    "unhealthy": {
+      "status": 200,
+      "json": {
+        "status": "unhealthy",
+        "database": "disconnected",
+        "persist_ok": 0,
+        "persist_fail": 0
+      }
+    }
+  },
+  "learning_health": {
+    "status": 200,
+    "json": {
+      "status": "healthy",
+      "service": "learning",
+      "version": "1.0.0"
+    },
+    "timestamp_timezone": "+00:00"
+  },
+  "auth_error": {
+    "status": 401,
+    "json": {
+      "detail": "Not authenticated"
+    }
+  },
+  "learning_signals": {
+    "status": 200,
+    "json": {
+      "signal_types": [
+        "wrong_skill",
+        "slow_execution",
+        "high_cost",
+        "low_satisfaction"
+      ],
+      "descriptions": {
+        "wrong_skill": "Incorrect skill selection",
+        "slow_execution": "Execution time exceeds threshold",
+        "high_cost": "Execution cost exceeds budget",
+        "low_satisfaction": "User satisfaction below threshold"
+      }
+    }
+  },
+  "learning_stats": {
+    "status": 200,
+    "json": {
+      "total_learnings": 0,
+      "high_confidence": 0,
+      "low_confidence": 0,
+      "avg_confidence": 0.0,
+      "by_signal_type": {},
+      "weights": {},
+      "weights_per_signal": {},
+      "decay": {},
+      "total_gates": 0,
+      "passed_gates": 0,
+      "failed_gates": 0,
+      "pass_rate": 0.0,
+      "avg_improvement_pct": 0.0,
+      "per_skill": {},
+      "last_learning_time": null
+    }
+  },
+  "learning_trigger": {
+    "request": {
+      "days": 7,
+      "force": false
+    },
+    "status": 200,
+    "json": {
+      "status": "error",
+      "learned": 0,
+      "signals_by_type": null,
+      "gate_verdict": null,
+      "improvement_pct": null,
+      "test_count": null,
+      "error": "Learning pipeline removed in skill system cleanup",
+      "message": null,
+      "model_version": "v1.0"
+    }
+  }
+}

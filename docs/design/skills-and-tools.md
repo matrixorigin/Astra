@@ -1593,7 +1593,7 @@ mo-admin skill scaffold skill.yaml
 - Required config keys have no missing defaults
 - Action side-effect categories match manifest declarations
 
-Optional: `--generate-tests` flag auto-generates a pytest skeleton per action (happy path + missing-required-config error case).
+Optional: `--generate-tests` flag auto-generates a `unittest` skeleton per action (happy path + missing-required-config error case).
 
 ### Web YAML Editor (P2, Optional)
 

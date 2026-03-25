@@ -26,11 +26,13 @@ spec:
       - name: api
         image: "{{ .Values.api.image.repository }}:{{ .Values.api.image.tag }}"
         imagePullPolicy: {{ .Values.api.image.pullPolicy }}
-        command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "{{ .Values.api.port }}", "--workers", "{{ .Values.api.workers }}"]
+        command: ["mo-agent-server"]
         ports:
         - containerPort: {{ .Values.api.port }}
           name: http
         env:
+        - name: RUST_API_ADDR
+          value: "0.0.0.0:{{ .Values.api.port }}"
         {{- if .Values.matrixone.enabled }}
         - name: MATRIXONE_HOST
           value: "{{ .Release.Name }}-matrixone.{{ .Values.namespace }}.svc.cluster.local"

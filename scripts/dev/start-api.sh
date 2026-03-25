@@ -5,6 +5,7 @@ set -e
 
 PID_FILE="api_server.pid"
 LOG_FILE="api_server.log"
+BIN_PATH="rust/target/debug/mo-agent-server"
 
 echo "Starting API server..."
 
@@ -14,15 +15,13 @@ if [ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null; then
     exit 0
 fi
 
-# Clean up old process
+# Clean up old process record
 rm -f "$PID_FILE"
-pkill -f "python -m uvicorn api.main:app" 2>/dev/null || true
-sleep 1
 
 # Wait for database to be ready (retry up to 30 seconds)
 echo "Waiting for database..."
 for i in {1..15}; do
-    if python3 -c "import pymysql; pymysql.connect(host='127.0.0.1', port=6001, user='root', password='111')" >/dev/null 2>&1; then
+    if bash -c 'echo >/dev/tcp/127.0.0.1/6001' 2>/dev/null; then
         echo "✅ Database ready"
         break
     fi
@@ -35,24 +34,59 @@ for i in {1..15}; do
     fi
 done
 
-# Load .env into environment (pydantic-settings reads .env into Settings objects,
-# but modules like encryption.py use os.getenv directly)
+# Load .env into environment
 if [ -f .env ]; then
     set -a; source .env; set +a
 fi
 
+echo "Building debug API binary..."
+cargo build -q --manifest-path rust/Cargo.toml -p mo-agent-runtime --bin mo-agent-server
+echo "✅ Using $BIN_PATH"
+
+# Best-effort bridge autodiscovery for local dev.
+# Keeps explicit CHAT_TURN_BRIDGE_URL untouched when already configured.
+if [ -z "${CHAT_TURN_BRIDGE_URL:-}" ]; then
+    echo "Detecting chat turn bridge endpoint..."
+    for candidate in \
+        "http://127.0.0.1:3001/internal/chat/turn" \
+        "http://127.0.0.1:3001/api/chat/turn" \
+        "http://127.0.0.1:18100/internal/chat/turn"; do
+        resp_file=$(mktemp)
+        header_file=$(mktemp)
+        code=$(curl -s --noproxy '*' -m 2 -D "$header_file" -o "$resp_file" -w '%{http_code}' \
+            -X POST "$candidate" \
+            -H 'content-type: application/json' \
+            -H "x-mo-bridge-secret: ${CHAT_TURN_BRIDGE_SECRET:-dev-bridge-secret-change-me}" \
+            -d '{"messages":[{"role":"user","content":"ping"}]}' || true)
+        ctype=$(grep -i '^content-type:' "$header_file" | head -1 | tr -d '\r' | cut -d' ' -f2- | tr '[:upper:]' '[:lower:]')
+        body=$(cat "$resp_file" 2>/dev/null)
+        rm -f "$header_file" "$resp_file"
+        # Reject HTML responses and non-bridge JSON services (e.g. Grafana returns messageId field)
+        if [[ "$ctype" == text/html* ]]; then
+            continue
+        fi
+        if echo "$body" | grep -q '"messageId"'; then
+            continue
+        fi
+        if [ "$code" = "200" ] || [ "$code" = "401" ] || [ "$code" = "403" ] || [ "$code" = "422" ]; then
+            export CHAT_TURN_BRIDGE_URL="$candidate"
+            echo "✅ CHAT_TURN_BRIDGE_URL auto-set to $CHAT_TURN_BRIDGE_URL (probe status: $code, content-type: ${ctype:-unknown})"
+            break
+        fi
+    done
+    if [ -z "${CHAT_TURN_BRIDGE_URL:-}" ]; then
+        echo "⚠️  No local chat-turn bridge detected; chat will return actionable bridge-disabled error."
+    fi
+fi
+
 # Start server in new session (setsid) so it's immune to Ctrl+C from parent
-# Clear proxy env vars so LLM API calls go directly (not through corporate proxy)
-# Set HF offline mode so SentenceTransformer loads from cache without network hang
+# Default Rust API address keeps external port 8000 behavior
 setsid env http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= \
-    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
-    python -m uvicorn api.main:app --port 8000 >> "$LOG_FILE" 2>&1 &
+    RUST_API_ADDR=0.0.0.0:8000 \
+    "$BIN_PATH" >> "$LOG_FILE" 2>&1 &
 SETSID_PID=$!
 sleep 1
-# setsid forks a new session; the actual uvicorn process may have a different PID.
-# Use pgrep to find the real uvicorn PID, fall back to $! if not found yet.
-PID=$(pgrep -f "uvicorn api.main:app" | head -1)
-PID=${PID:-$SETSID_PID}
+PID=$SETSID_PID
 echo $PID > "$PID_FILE"
 
 # Wait and check
@@ -65,7 +99,7 @@ else
     echo "Troubleshooting:"
     echo "  1. Check if port 8000 is in use: lsof -i :8000"
     echo "  2. View error log: tail -50 $LOG_FILE"
-    echo "  3. Kill stuck processes: pkill -f 'python -m uvicorn'"
+    echo "  3. Stop via script: make dev-api-stop"
     echo "  4. Check database: make dev-status"
     exit 1
 fi

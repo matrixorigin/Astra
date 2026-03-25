@@ -1,0 +1,58 @@
+{
+  "cases": [
+    {
+      "name": "bare_word_value",
+      "tc_name": "stock_assistant",
+      "raw": "{\"query\": \"test\", \"analysis_type\": advice, \"period\": \"1mo\"}",
+      "expected": {"query": "test", "analysis_type": "advice", "period": "1mo"}
+    },
+    {
+      "name": "preserve_json_literals",
+      "tc_name": "test",
+      "raw": "{\"enabled\": true, \"disabled\": false, \"missing\": null}",
+      "expected": {"enabled": true, "disabled": false, "missing": null}
+    },
+    {
+      "name": "trailing_comma",
+      "tc_name": "test",
+      "raw": "{\"path\": \"/tmp\",}",
+      "expected": {"path": "/tmp"}
+    },
+    {
+      "name": "single_quotes",
+      "tc_name": "list_files",
+      "raw": "{'path': '/home/user', 'recursive': true}",
+      "expected": {"path": "/home/user", "recursive": true}
+    },
+    {
+      "name": "control_chars_in_string",
+      "tc_name": "note_tool",
+      "raw": "{\"note\": \"line1\nline2\tindent\rreturn\"}",
+      "expected": {"note": "line1\nline2\tindent\rreturn"}
+    },
+    {
+      "name": "truncated_open_string",
+      "tc_name": "search",
+      "raw": "{\"query\": \"unfinished",
+      "expected": {"query": "unfinished"}
+    },
+    {
+      "name": "multiple_bare_words",
+      "tc_name": "planner",
+      "raw": "{\"mode\": advice, \"style\": concise, \"limit\": 3}",
+      "expected": {"mode": "advice", "style": "concise", "limit": 3}
+    },
+    {
+      "name": "empty_string",
+      "tc_name": "test",
+      "raw": "",
+      "expected": null
+    },
+    {
+      "name": "unrecoverable",
+      "tc_name": "test",
+      "raw": "this is not json at all",
+      "expected": null
+    }
+  ]
+}

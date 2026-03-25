@@ -1,0 +1,136 @@
+{
+  "tool_result_cases": [
+    {
+      "name": "edge_get_agent_info_sets_introspection_and_truncates",
+      "tool_result": {
+        "tool_call_id": "tc-edge",
+        "name": "get_agent_info",
+        "result": "abcdefghijklmnopqrstuvwxyz"
+      },
+      "source": "edge",
+      "audit_chars": 10,
+      "expected": {
+        "content": {"name": "get_agent_info", "result": "abcdefghij"},
+        "metadata": {
+          "source": "edge",
+          "tool_call_id": "tc-edge",
+          "name": "get_agent_info",
+          "introspection": true
+        },
+        "skill_name": "get_agent_info",
+        "reasoning_content": null
+      }
+    },
+    {
+      "name": "cloud_tool_result_uses_cloud_source_without_introspection",
+      "tool_result": {
+        "tool_call_id": "tc-cloud",
+        "name": "search_code",
+        "result": "done"
+      },
+      "source": "cloud",
+      "audit_chars": 20,
+      "expected": {
+        "content": {"name": "search_code", "result": "done"},
+        "metadata": {
+          "source": "cloud",
+          "tool_call_id": "tc-cloud",
+          "name": "search_code"
+        },
+        "skill_name": "search_code",
+        "reasoning_content": null
+      }
+    }
+  ],
+  "tool_call_cases": [
+    {
+      "name": "edge_tool_call_keeps_reasoning_on_first_call_only",
+      "tool_call": {
+        "id": "tc1",
+        "function": {
+          "name": "read_file",
+          "arguments": "{\"path\":\"a.txt\"}"
+        }
+      },
+      "index": 0,
+      "reasoning_content": "think first",
+      "expected": {
+        "content": {
+          "tool_call_id": "tc1",
+          "name": "read_file",
+          "arguments": "{\"path\":\"a.txt\"}"
+        },
+        "metadata": {
+          "tool_call_id": "tc1",
+          "name": "read_file",
+          "source": "edge"
+        },
+        "skill_name": "read_file",
+        "reasoning_content": "think first"
+      }
+    },
+    {
+      "name": "cloud_tool_call_marks_cloud_source_in_content",
+      "tool_call": {
+        "id": "tc2",
+        "_source": "cloud",
+        "function": {
+          "name": "bash",
+          "arguments": "{\"cmd\":\"ls\"}"
+        }
+      },
+      "index": 1,
+      "reasoning_content": "think first",
+      "expected": {
+        "content": {
+          "tool_call_id": "tc2",
+          "name": "bash",
+          "arguments": "{\"cmd\":\"ls\"}",
+          "source": "cloud"
+        },
+        "metadata": {
+          "tool_call_id": "tc2",
+          "name": "bash",
+          "source": "cloud"
+        },
+        "skill_name": "bash",
+        "reasoning_content": null
+      }
+    }
+  ],
+  "llm_response_cases": [
+    {
+      "name": "tool_call_turn_strips_text_and_suppresses_reasoning",
+      "full_text": " \n  ",
+      "has_tool_calls": true,
+      "reasoning_content": "deep thought",
+      "expected": {
+        "should_persist": true,
+        "content": "",
+        "reasoning_content": null
+      }
+    },
+    {
+      "name": "text_only_turn_keeps_reasoning",
+      "full_text": "  answer  ",
+      "has_tool_calls": false,
+      "reasoning_content": "deep thought",
+      "expected": {
+        "should_persist": true,
+        "content": "answer",
+        "reasoning_content": "deep thought"
+      }
+    },
+    {
+      "name": "empty_text_without_tool_calls_skips_persist",
+      "full_text": "   ",
+      "has_tool_calls": false,
+      "reasoning_content": "",
+      "expected": {
+        "should_persist": false,
+        "content": "",
+        "reasoning_content": null
+      }
+    }
+  ]
+}

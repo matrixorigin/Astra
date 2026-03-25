@@ -1,0 +1,119 @@
+{
+  "new_session_entry": {
+    "created_at": "2026-03-20T00:00:00+00:00",
+    "expected": {
+      "history": null,
+      "tools": [],
+      "sections": null,
+      "spend_usd": 0.0,
+      "turn_count": 0,
+      "created_at": "2026-03-20T00:00:00+00:00"
+    }
+  },
+  "normalize_bridge_cache_entry": {
+    "entry": {
+      "history": [
+        {"role": "system", "content": "You are helpful"},
+        {"role": "assistant", "content": "Done."}
+      ],
+      "turn_count": 2,
+      "created_at": "2026-03-20T00:00:00+00:00"
+    },
+    "expected": {
+      "history": [
+        {"role": "system", "content": "You are helpful"},
+        {"role": "assistant", "content": "Done."}
+      ],
+      "sections": null,
+      "tool_quality_assessments": [],
+      "turn_count": 2,
+      "created_at": "2026-03-20T00:00:00Z"
+    }
+  },
+  "normalize_bridge_cache_entry_created_at_only": {
+    "entry": {
+      "created_at": "2026-03-20T00:00:00+00:00"
+    },
+    "expected": {
+      "history": null,
+      "sections": null,
+      "tool_quality_assessments": [],
+      "turn_count": 0,
+      "created_at": "2026-03-20T00:00:00Z"
+    }
+  },
+  "normalize_bridge_cache_entry_without_seed_state": {
+    "entry": {
+      "tools": []
+    },
+    "expected": null
+  },
+  "continuation_reuses_previous_ids": {
+    "messages": [],
+    "has_tool_results": true,
+    "prev_entry": {
+      "turn_chain_id": "existing-chain",
+      "user_query_event_id": "existing-event",
+      "tool_sigs": [
+        ["read_file:{\"path\":\"a.py\"}"]
+      ]
+    },
+    "new_turn_chain_id": "new-chain",
+    "new_user_query_event_id": "new-event",
+    "expected_ids": ["existing-chain", "existing-event"],
+    "expected_prev_entry": {
+      "turn_chain_id": "existing-chain",
+      "user_query_event_id": "existing-event",
+      "tool_sigs": [
+        ["read_file:{\"path\":\"a.py\"}"]
+      ]
+    }
+  },
+  "continuation_missing_ids_uses_fallbacks": {
+    "messages": [],
+    "has_tool_results": true,
+    "prev_entry": {
+      "tool_sigs": [
+        ["read_file:{\"path\":\"a.py\"}"]
+      ]
+    },
+    "new_turn_chain_id": "fallback-chain",
+    "new_user_query_event_id": "fallback-event",
+    "expected_ids": ["fallback-chain", "fallback-event"],
+    "expected_prev_entry": {
+      "tool_sigs": [
+        ["read_file:{\"path\":\"a.py\"}"]
+      ]
+    }
+  },
+  "new_user_turn_resets_tool_sigs": {
+    "messages": [
+      {"role": "user", "content": "continue"}
+    ],
+    "has_tool_results": false,
+    "prev_entry": {
+      "turn_chain_id": "existing-chain",
+      "user_query_event_id": "existing-event",
+      "tool_sigs": [
+        ["read_file:{\"path\":\"a.py\"}"],
+        ["read_file:{\"path\":\"a.py\"}"]
+      ]
+    },
+    "new_turn_chain_id": "fresh-chain",
+    "new_user_query_event_id": "fresh-event",
+    "expected_ids": ["fresh-chain", "fresh-event"],
+    "expected_prev_entry": {
+      "turn_chain_id": "existing-chain",
+      "user_query_event_id": "existing-event"
+    }
+  },
+  "no_prev_entry_uses_new_ids": {
+    "messages": [],
+    "has_tool_results": false,
+    "prev_entry": null,
+    "new_turn_chain_id": "new-chain",
+    "new_user_query_event_id": "new-event",
+    "expected_ids": ["new-chain", "new-event"],
+    "expected_prev_entry": null
+  }
+}

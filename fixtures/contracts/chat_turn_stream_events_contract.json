@@ -1,0 +1,89 @@
+{
+  "tool_call_cases": [
+    {
+      "input": {
+        "id": "tc1",
+        "function": {"name": "read_file", "arguments": "{\"path\":\"a.py\"}"}
+      },
+      "expected": {
+        "type": "tool_call",
+        "id": "tc1",
+        "name": "read_file",
+        "arguments": {"path": "a.py"}
+      }
+    },
+    {
+      "input": {
+        "id": "tc2",
+        "_truncated": true,
+        "function": {"name": "write_file", "arguments": "{\"path\":\"a.py\",\"content\":\"x"}
+      },
+      "expected": {
+        "type": "tool_call",
+        "id": "tc2",
+        "name": "write_file",
+        "arguments": {
+          "_parse_error": "Your output was truncated by max_tokens before the tool_call arguments were complete. The JSON is cut off and cannot be parsed. Please retry with a shorter approach — for example, write smaller sections of code at a time instead of the entire file at once."
+        }
+      }
+    },
+    {
+      "input": {
+        "id": "tc3",
+        "function": {"name": "stock_assistant", "arguments": "{\"query\": \"test\", \"analysis_type\": advice, \"period\": \"1mo\"}"}
+      },
+      "expected": {
+        "type": "tool_call",
+        "id": "tc3",
+        "name": "stock_assistant",
+        "arguments": {"query": "test", "analysis_type": "advice", "period": "1mo"}
+      }
+    },
+    {
+      "input": {
+        "id": "tc4",
+        "function": {"name": "bash", "arguments": "not json at all"}
+      },
+      "expected": {
+        "type": "tool_call",
+        "id": "tc4",
+        "name": "bash",
+        "arguments": {"_parse_error": "Malformed arguments JSON: not json at all"}
+      }
+    }
+  ],
+  "warning_cases": [
+    {
+      "claims_failed": 2,
+      "expected": {
+        "type": "warning",
+        "message": "Response may contain unverified claims",
+        "claims_failed": 2
+      }
+    }
+  ],
+  "error_cases": [
+    {
+      "message": "Model returned invalid response (prompt leakage). Please retry.",
+      "code": "PROMPT_LEAK",
+      "retryable": true,
+      "expected": {
+        "type": "error",
+        "message": "Model returned invalid response (prompt leakage). Please retry.",
+        "code": "PROMPT_LEAK",
+        "retryable": true
+      }
+    },
+    {
+      "message": "Model returned invalid response (repetition loop). Please retry or switch models.",
+      "code": "MODEL_DEGRADED",
+      "retryable": false,
+      "expected": {
+        "type": "error",
+        "message": "Model returned invalid response (repetition loop). Please retry or switch models.",
+        "code": "MODEL_DEGRADED",
+        "retryable": false
+      }
+    }
+  ]
+}

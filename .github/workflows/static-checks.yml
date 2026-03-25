@@ -11,44 +11,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install Poetry
-        run: pipx install poetry
-      - name: Cache Poetry
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cache/pypoetry
-          key: ${{ runner.os }}-poetry-check-${{ hashFiles('poetry.lock') }}
-          restore-keys: ${{ runner.os }}-poetry-check-
-      # Static checks don't need sentence-transformers — use lighter install.
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-check-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-check-
       - name: Install dependencies
         run: make install-check-deps
-      - name: Run ruff
-        run: poetry run ruff check .
+      - name: Run clippy
+        run: cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings
       - name: Check formatting
-        run: poetry run ruff format --check .
+        run: cargo fmt --manifest-path rust/Cargo.toml --all -- --check
 
   type-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install Poetry
-        run: pipx install poetry
-      - name: Cache Poetry
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cache/pypoetry
-          key: ${{ runner.os }}-poetry-check-${{ hashFiles('poetry.lock') }}
-          restore-keys: ${{ runner.os }}-poetry-check-
-      # Static checks don't need sentence-transformers — use lighter install.
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-check-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-check-
       - name: Install dependencies
         run: make install-check-deps
-      - name: Run mypy
-        run: poetry run mypy sdk/ core/ api/
+      - name: Run cargo check
+        run: cargo check --manifest-path rust/Cargo.toml --all-targets

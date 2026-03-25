@@ -1,0 +1,43 @@
+{
+  "snapshot_link_cases": [
+    {
+      "context_capture_id": null,
+      "parent_event_id": "ev1",
+      "llm_response_event_id": "ev_llm",
+      "expected": null
+    },
+    {
+      "context_capture_id": "snap1",
+      "parent_event_id": null,
+      "llm_response_event_id": "ev_llm",
+      "expected": null
+    },
+    {
+      "context_capture_id": "snap1",
+      "parent_event_id": "ev1",
+      "llm_response_event_id": "ev_llm",
+      "expected": {
+        "context_capture_id": "snap1",
+        "llm_request_id": "ev1",
+        "llm_response_id": "ev_llm"
+      }
+    }
+  ],
+  "same_turn_backfill_cases": [
+    {
+      "tool_results_len": 0,
+      "tool_calls_len": 1,
+      "expected": false
+    },
+    {
+      "tool_results_len": 1,
+      "tool_calls_len": 0,
+      "expected": false
+    },
+    {
+      "tool_results_len": 1,
+      "tool_calls_len": 2,
+      "expected": true
+    }
+  ]
+}

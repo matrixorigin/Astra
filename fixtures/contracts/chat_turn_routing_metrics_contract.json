@@ -1,0 +1,46 @@
+{
+  "cases": [
+    {
+      "input": {
+        "confidence": 0.88,
+        "threshold": 0.82,
+        "matched_by": "fallback",
+        "tier": 0,
+        "has_tier1": false,
+        "forced": "question",
+        "intent": "command",
+        "estimated_tokens": 400,
+        "full_question_tokens": 2400
+      },
+      "expected": {
+        "confidence": 0.88,
+        "threshold": 0.82,
+        "record_fallback": true,
+        "record_cache_hit": true,
+        "record_correction": true,
+        "efficiency_ratio": 0.8333333333333334
+      }
+    },
+    {
+      "input": {
+        "confidence": 0.91,
+        "threshold": 0.85,
+        "matched_by": "llm",
+        "tier": 1,
+        "has_tier1": true,
+        "forced": null,
+        "intent": "question",
+        "estimated_tokens": 2400,
+        "full_question_tokens": 2400
+      },
+      "expected": {
+        "confidence": 0.91,
+        "threshold": 0.85,
+        "record_fallback": false,
+        "record_cache_hit": false,
+        "record_correction": false,
+        "efficiency_ratio": null
+      }
+    }
+  ]
+}

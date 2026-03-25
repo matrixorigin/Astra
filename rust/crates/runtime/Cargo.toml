@@ -1,0 +1,31 @@
+[package]
+name = "mo-agent-runtime"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mo-agent-server"
+path = "src/main.rs"
+
+[dependencies]
+mo-agent-core.workspace = true
+mo-agent-services.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+chrono.workspace = true
+dotenvy.workspace = true
+futures-util.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tower.workspace = true

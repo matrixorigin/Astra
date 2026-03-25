@@ -1,0 +1,11 @@
+[package]
+name = "mo-agent-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+axum.workspace = true
+dotenvy.workspace = true
+serde.workspace = true
+sqlx.workspace = true
+tokio.workspace = true

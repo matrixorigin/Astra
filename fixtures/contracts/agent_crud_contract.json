@@ -1,0 +1,80 @@
+{
+  "auth_error": {
+    "status": 401,
+    "json": { "detail": "Not authenticated" }
+  },
+  "create_agent": {
+    "request": { "name": "Test Agent", "agent_config": {"model": "gpt-4"}, "data_source": {"type": "matrixone"} },
+    "status": 201,
+    "json": {
+      "agent_id": "<<DYNAMIC>>",
+      "name": "Test Agent",
+      "agent_type": "general",
+      "owner_user_id": "contract-agent-user-id",
+      "agent_config": {"model": "gpt-4"},
+      "data_source": {"type": "matrixone"},
+      "is_active": true,
+      "created_at": "2026-01-01T00:00:00",
+      "updated_at": null
+    }
+  },
+  "list_agents": {
+    "status": 200,
+    "json": {
+      "agents": [
+        {
+          "agent_id": "contract-agent-1",
+          "name": "Alpha Agent",
+          "agent_type": "general",
+          "owner_user_id": "contract-agent-user-id",
+          "agent_config": {"model": "gpt-4"},
+          "data_source": {"type": "matrixone"},
+          "is_active": true,
+          "created_at": "2026-01-01T00:00:00",
+          "updated_at": "2026-01-01T00:05:00"
+        }
+      ],
+      "total": 1
+    }
+  },
+  "get_agent": {
+    "status": 200,
+    "json": {
+      "agent_id": "contract-agent-1",
+      "name": "Alpha Agent",
+      "agent_type": "general",
+      "owner_user_id": "contract-agent-user-id",
+      "agent_config": {"model": "gpt-4"},
+      "data_source": {"type": "matrixone"},
+      "is_active": true,
+      "created_at": "2026-01-01T00:00:00",
+      "updated_at": "2026-01-01T00:05:00"
+    }
+  },
+  "get_agent_not_found": {
+    "status": 404,
+    "json": { "detail": "Agent nonexistent not found" }
+  },
+  "update_agent": {
+    "request": { "name": "Updated Agent" },
+    "status": 200,
+    "json": {
+      "agent_id": "contract-agent-1",
+      "name": "Updated Agent",
+      "agent_type": "general",
+      "owner_user_id": "contract-agent-user-id",
+      "agent_config": {"model": "gpt-4"},
+      "data_source": {"type": "matrixone"},
+      "is_active": true,
+      "created_at": "2026-01-01T00:00:00",
+      "updated_at": "2026-01-01T00:10:00"
+    }
+  },
+  "delete_agent": {
+    "status": 204
+  },
+  "delete_agent_not_found": {
+    "status": 404,
+    "json": { "detail": "Agent nonexistent not found" }
+  }
+}

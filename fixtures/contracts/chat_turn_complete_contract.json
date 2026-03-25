@@ -1,0 +1,39 @@
+{
+  "cases": [
+    {
+      "input": {
+        "has_tool_calls": true,
+        "stall_detected": false,
+        "execution_state": null
+      },
+      "expected": {
+        "type": "turn_complete",
+        "has_tool_calls": true
+      }
+    },
+    {
+      "input": {
+        "has_tool_calls": true,
+        "stall_detected": true,
+        "execution_state": null
+      },
+      "expected": {
+        "type": "turn_complete",
+        "has_tool_calls": false,
+        "stall_detected": true
+      }
+    },
+    {
+      "input": {
+        "has_tool_calls": false,
+        "stall_detected": false,
+        "execution_state": {"status": "RUNNING", "max_rounds": 5}
+      },
+      "expected": {
+        "type": "turn_complete",
+        "has_tool_calls": false,
+        "execution_state": {"status": "RUNNING", "max_rounds": 5}
+      }
+    }
+  ]
+}

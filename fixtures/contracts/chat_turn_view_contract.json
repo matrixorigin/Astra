@@ -1,0 +1,122 @@
+{
+  "extract_latest_user_query_cases": [
+    {
+      "messages": [
+        {"role": "assistant", "content": "hello"}
+      ],
+      "expected": ""
+    },
+    {
+      "messages": [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "working"},
+        {"role": "user", "content": ""},
+        {"role": "user", "content": "latest query"}
+      ],
+      "expected": "latest query"
+    }
+  ],
+  "build_recent_retrieval_tail_cases": [
+    {
+      "history": [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q1"},
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {"id": "tc1", "type": "function", "function": {"name": "tool_tc1", "arguments": "{}"}}
+          ]
+        },
+        {"role": "tool", "tool_call_id": "tc1", "content": "result1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {"id": "tc2", "type": "function", "function": {"name": "tool_tc2", "arguments": "{}"}},
+            {"id": "tc3", "type": "function", "function": {"name": "tool_tc3", "arguments": "{}"}}
+          ]
+        },
+        {"role": "tool", "tool_call_id": "tc2", "content": "result2"},
+        {"role": "tool", "tool_call_id": "tc3", "content": "result3"},
+        {"role": "assistant", "content": "a2"},
+        {"role": "user", "content": "q3"},
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {"id": "tc4", "type": "function", "function": {"name": "tool_tc4", "arguments": "{}"}}
+          ]
+        },
+        {"role": "tool", "tool_call_id": "tc4", "content": "result4"},
+        {"role": "assistant", "content": "a3"},
+        {"role": "user", "content": "q4"}
+      ],
+      "recent_messages_keep": 8,
+      "expected": [
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {"id": "tc2", "type": "function", "function": {"name": "tool_tc2", "arguments": "{}"}},
+            {"id": "tc3", "type": "function", "function": {"name": "tool_tc3", "arguments": "{}"}}
+          ]
+        },
+        {"role": "tool", "tool_call_id": "tc2", "content": "result2"},
+        {"role": "tool", "tool_call_id": "tc3", "content": "result3"},
+        {"role": "assistant", "content": "a2"},
+        {"role": "user", "content": "q3"},
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {"id": "tc4", "type": "function", "function": {"name": "tool_tc4", "arguments": "{}"}}
+          ]
+        },
+        {"role": "tool", "tool_call_id": "tc4", "content": "result4"},
+        {"role": "assistant", "content": "a3"},
+        {"role": "user", "content": "q4"}
+      ]
+    },
+    {
+      "history": [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"}
+      ],
+      "recent_messages_keep": 10,
+      "expected": [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"}
+      ]
+    }
+  ],
+  "compose_retrieval_view_cases": [
+    {
+      "system_message": {"role": "system", "content": "sys"},
+      "retrieved_block": "[Earlier relevant context from this session]\nUser: old question",
+      "recent_messages": [
+        {"role": "user", "content": "new question"},
+        {"role": "assistant", "content": "new answer"}
+      ],
+      "expected": [
+        {"role": "system", "content": "sys"},
+        {"role": "system", "content": "[Earlier relevant context from this session]\nUser: old question"},
+        {"role": "user", "content": "new question"},
+        {"role": "assistant", "content": "new answer"}
+      ]
+    },
+    {
+      "system_message": null,
+      "retrieved_block": null,
+      "recent_messages": [
+        {"role": "user", "content": "only recent"}
+      ],
+      "expected": [
+        {"role": "user", "content": "only recent"}
+      ]
+    }
+  ]
+}

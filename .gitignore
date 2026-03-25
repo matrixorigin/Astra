@@ -42,6 +42,9 @@ yarn-error.log*
 .npm
 .yarn-integrity
 
+# Rust
+rust/target/
+
 # IDE / OS
 .idea/
 .vscode/

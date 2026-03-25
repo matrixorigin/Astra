@@ -1,0 +1,105 @@
+{
+  "auth_error": {
+    "status": 401,
+    "json": {
+      "detail": "Not authenticated"
+    }
+  },
+  "auth_register": {
+    "request": {
+      "username": "contract-auth-user",
+      "email": "contract-auth-user@test.com",
+      "password": "password123",
+      "display_name": "Contract Auth User"
+    },
+    "status": 201,
+    "json": {
+      "username": "contract-auth-user",
+      "email": "contract-auth-user@test.com",
+      "display_name": "Contract Auth User",
+      "access_token": "contract-access-token",
+      "refresh_token": "contract-refresh-token",
+      "token_type": "bearer",
+      "expires_in": 3600
+    }
+  },
+  "auth_register_duplicate_username": {
+    "request": {
+      "username": "contract-existing-username",
+      "email": "contract-existing-username-new@test.com",
+      "password": "password123"
+    },
+    "status": 400,
+    "json": {
+      "detail": "Username already exists"
+    }
+  },
+  "auth_register_duplicate_email": {
+    "request": {
+      "username": "contract-new-username",
+      "email": "contract-existing-email@test.com",
+      "password": "password123"
+    },
+    "status": 400,
+    "json": {
+      "detail": "Email already exists"
+    }
+  },
+  "auth_login": {
+    "request": {
+      "username": "contract-login-user",
+      "password": "password123"
+    },
+    "status": 200,
+    "json": {
+      "token_type": "bearer",
+      "expires_in": 3600
+    }
+  },
+  "auth_login_invalid": {
+    "request": {
+      "username": "contract-login-user",
+      "password": "wrongpassword"
+    },
+    "status": 401,
+    "json": {
+      "detail": "Invalid username or password"
+    }
+  },
+  "auth_refresh": {
+    "status": 200,
+    "json": {
+      "token_type": "bearer",
+      "expires_in": 3600
+    }
+  },
+  "auth_refresh_invalid": {
+    "request": {
+      "refresh_token": "invalid_token"
+    },
+    "status": 401,
+    "json": {
+      "detail": "Invalid token"
+    }
+  },
+  "auth_refresh_wrong_type": {
+    "status": 401,
+    "json": {
+      "detail": "Invalid token type"
+    }
+  },
+  "auth_logout": {
+    "status": 200,
+    "json": {
+      "message": "Logged out successfully"
+    }
+  },
+  "auth_me": {
+    "status": 200,
+    "json": {
+      "username": "contract-me-user",
+      "email": "contract-me-user@test.com",
+      "display_name": null
+    }
+  }
+}

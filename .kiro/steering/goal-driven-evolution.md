@@ -176,5 +176,5 @@ Before proposing any approach, always `memory_search("CORRECTION ANTIPATTERN [go
 - **Never repeat corrected mistakes**: Search for CORRECTION and ANTIPATTERN logs before acting
 - **User corrections override all**: If user corrects something, that correction has highest priority in all future iterations
 - **Accumulate, don't replace**: Each iteration builds on previous lessons, never discard history
-- **Be specific in insights**: "Tests failed" is useless; "pytest fixtures don't work with async DB connections, use factory pattern instead" is valuable
+- **Be specific in insights**: "Tests failed" is useless; "over-coupled async DB setup made contract tests brittle, use injected factories or helpers instead" is valuable
 - **Tag everything**: Use emoji prefixes (🎯📋✅❌🔄💡🔧👍⚠️) for easy retrieval and scanning

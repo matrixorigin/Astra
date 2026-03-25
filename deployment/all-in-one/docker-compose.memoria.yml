@@ -84,7 +84,7 @@ services:
   init:
     build:
       context: ../..
-    command: ["python", "-m", "cli.mo_admin", "init"]
+    command: ["mo-admin", "init"]
     environment:
       - MATRIXONE_HOST=matrixone
       - MATRIXONE_PORT=6001
@@ -108,9 +108,11 @@ services:
     build:
       context: ../..
     hostname: api
+    command: ["mo-agent-server"]
     ports:
       - "${API_PORT:-8000}:8000"
     environment:
+      - RUST_API_ADDR=0.0.0.0:8000
       - ENVIRONMENT=${ENVIRONMENT:-production}
       - MATRIXONE_HOST=matrixone
       - MATRIXONE_PORT=6001

@@ -1,0 +1,43 @@
+{
+  "cases": [
+    {
+      "name": "english_query_ranks_issue_tools",
+      "user_query": "show me the latest issues",
+      "edge_tool_names": ["bash", "read_file"],
+      "max_candidates": 3,
+      "cloud_schemas": [
+        {"type": "function", "function": {"name": "list_issues", "description": "List issues from GitHub"}},
+        {"type": "function", "function": {"name": "create_issue", "description": "Create a new issue"}},
+        {"type": "function", "function": {"name": "execute_code", "description": "Execute code"}}
+      ],
+      "expected_selected_names": ["list_issues", "create_issue", "execute_code"],
+      "expected_cloud_skill_names": ["create_issue", "execute_code", "list_issues"]
+    },
+    {
+      "name": "mixed_language_query_uses_reverse_match",
+      "user_query": "matrixone的最新的一个issue?",
+      "edge_tool_names": ["read_file"],
+      "max_candidates": 2,
+      "cloud_schemas": [
+        {"type": "function", "function": {"name": "list_issues", "description": "List issues"}},
+        {"type": "function", "function": {"name": "create_issue", "description": "Create issue"}},
+        {"type": "function", "function": {"name": "list_prs", "description": "List pull requests"}}
+      ],
+      "expected_selected_names": ["list_issues", "create_issue"],
+      "expected_cloud_skill_names": ["create_issue", "list_issues", "list_prs"]
+    },
+    {
+      "name": "zero_score_fallback_keeps_original_order_and_excludes_edge_duplicates",
+      "user_query": "最新的问题是什么",
+      "edge_tool_names": ["bash", "list_issues"],
+      "max_candidates": 2,
+      "cloud_schemas": [
+        {"type": "function", "function": {"name": "list_issues", "description": "List issues from GitHub"}},
+        {"type": "function", "function": {"name": "ci_status", "description": "Check CI status"}},
+        {"type": "function", "function": {"name": "reflect", "description": "Self reflection"}}
+      ],
+      "expected_selected_names": ["ci_status", "reflect"],
+      "expected_cloud_skill_names": ["ci_status", "reflect"]
+    }
+  ]
+}

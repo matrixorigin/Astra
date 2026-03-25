@@ -61,34 +61,30 @@ CREDS_FILE="$HOME/.mo-agent/credentials.json"
 ADMIN_PROFILE=""  # set by step_admin, used by step_models
 
 db_reachable() {
-    python3 -c "
-import pymysql
-pymysql.connect(host='127.0.0.1', port=6001, user='root', password='111')
-" >/dev/null 2>&1
+    mysql -N -s -h127.0.0.1 -P6001 -uroot -p111 -e "SELECT 1" >/dev/null 2>&1
 }
 
 api_reachable() {
     curl -sf http://localhost:8000/health >/dev/null 2>&1
 }
 
+matrixone_db_name() {
+    if [ -f .env ]; then
+        grep -E '^MATRIXONE_DATABASE=' .env | tail -1 | cut -d'=' -f2- | tr -d '' || true
+    fi
+}
+
 _db_query() {
-    # Run a single-expression DB query, suppress matrixone client logs
-    python3 -c "
-import sys, os, logging
-os.environ['MO_SQL_LOG_MODE'] = 'off'
-for _n in ['matrixone','matrixone.client']:
-    _l = logging.getLogger(_n); _l.setLevel(99); _l.propagate = False; _l.handlers = [logging.NullHandler()]
-sys.path.insert(0,'.')
-from api.database import get_db_session
-from sqlalchemy import text
-db = next(get_db_session())
-$1
-db.close()
-" 2>/dev/null || echo "${2:-0}"
+    local sql=$1
+    local fallback=${2:-0}
+    local db_name
+    db_name=$(matrixone_db_name)
+    db_name=${db_name:-mo_dev_agent}
+    mysql -N -s -h127.0.0.1 -P6001 -uroot -p111 "$db_name" -e "$sql" 2>/dev/null || echo "$fallback"
 }
 
 user_count() {
-    _db_query "print(db.execute(text('SELECT COUNT(*) FROM users')).fetchone()[0])"
+    _db_query "SELECT COUNT(*) FROM auth_users"
 }
 
 has_admin() {
@@ -102,13 +98,7 @@ print(n)
 }
 
 model_count() {
-    _db_query "
-try:
-    n = db.execute(text('SELECT COUNT(*) FROM llm_models WHERE is_active=1')).fetchone()[0]
-    print(n)
-except:
-    print(0)
-"
+    _db_query "SELECT COUNT(*) FROM infra_llm_models WHERE is_active = 1"
 }
 
 has_llm_token() {
@@ -123,24 +113,15 @@ profile_logged_in() {
 }
 
 current_profile() {
-    python3 -c "
-import json, pathlib
-p = pathlib.Path('$CREDS_FILE')
-if p.exists():
-    d = json.loads(p.read_text())
-    print(d.get('current_profile',''))
-" 2>/dev/null
+    if [ -f "$CREDS_FILE" ]; then
+        grep -E '"current_profile"' "$CREDS_FILE" | head -1 | sed -E 's/.*"current_profile"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' || true
+    fi
 }
 
 saved_profiles() {
-    python3 -c "
-import json, pathlib
-p = pathlib.Path('$CREDS_FILE')
-if p.exists():
-    d = json.loads(p.read_text())
-    for name in d.get('profiles', {}):
-        print(name)
-" 2>/dev/null
+    if [ -f "$CREDS_FILE" ]; then
+        sed -n '/"profiles"[[:space:]]*:/,/}/p' "$CREDS_FILE" | grep -E '^[[:space:]]*"[^"]+"[[:space:]]*:[[:space:]]*\{' | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/' || true
+    fi
 }
 
 # ── Register + login helper (returns 0 on success) ─────────────
