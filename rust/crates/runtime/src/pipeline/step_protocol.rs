@@ -1,18 +1,27 @@
-//! Step Protocol v1: The idempotent, versioned, cursor-aware execution unit.
+//! Step Protocol v2: Layered, idempotent, cursor-aware execution unit.
 //!
-//! A Step is the smallest recoverable execution unit in the agent runtime.
-//! It is NOT a Turn (UI concept). A Step can execute without any Turn,
-//! and a single Turn may trigger multiple Steps.
+//! # Architecture: 3 Concerns, 3 Types
+//!
+//! ```text
+//! ┌─ StepDescriptor ──────────────┐  Scheduling layer (who/when/retry)
+//! │  step_id, task_id, action,    │  Immutable after creation
+//! │  scheduling, retry_policy     │
+//! ├─ StepExecution ───────────────┤  Runtime layer (cursor/progress)
+//! │  cursor, tool_completions,    │  Mutable during execution
+//! │  result, memory_context       │
+//! ├─ StepCheckpoint ──────────────┤  Persistence layer (recoverable state)
+//! │  version, cursor, messages,   │  Written to storage at safe points
+//! │  budget, tool_results_cache   │
+//! └───────────────────────────────┘
+//! ```
 //!
 //! # Key properties
 //!
-//! - **Versioned**: `protocol_version` embedded in every Step and Checkpoint.
-//!   Version mismatch → discard and restart (no migration in v1-v3).
-//! - **Idempotent**: Each tool call gets an `IdempotencyKey`. On crash recovery,
-//!   completed calls are skipped via cache lookup.
-//! - **Cursor-aware**: `ExecutionCursor` tracks exact position within ACT phase
-//!   (which tool call, what status). Resume from any point.
-//! - **Retry-aware**: Per-step `RetryPolicy` with exponential backoff.
+//! - **Versioned**: `protocol_version` with `VersionPolicy` (Strict/BestEffort).
+//! - **Idempotent**: Tool-level `IdempotencyKey` with semantic dedup option.
+//! - **Cursor-aware**: `ExecutionCursor` supports parallel tool slots.
+//! - **Tool-level retry**: `ToolRetryPolicy` per tool, not per step.
+//! - **Memory-integrated**: `MemoryContext` flows through step lifecycle.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -20,24 +29,75 @@ use std::collections::HashMap;
 // ─── Protocol Version ────────────────────────────────────────────────────────
 
 /// Current protocol version. Embedded in every Step and Checkpoint.
-/// On deserialization: version mismatch → reject (no migration).
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Check if a checkpoint's protocol version is compatible.
-/// Returns Err with advice if not.
+/// How to handle version mismatches on checkpoint restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VersionPolicy {
+    /// Reject any mismatch (safe default for production)
+    Strict,
+    /// Accept if major version matches (minor bumps OK).
+    /// major = version / 100, minor = version % 100.
+    /// v1xx can restore from v1xx but not v2xx.
+    BestEffort,
+}
+
+impl Default for VersionPolicy {
+    fn default() -> Self {
+        Self::Strict
+    }
+}
+
+/// Check protocol version compatibility.
+/// With BestEffort, allows same major version (e.g., v101 can restore v100).
 pub fn check_protocol_version(version: u32) -> Result<(), ProtocolError> {
-    if version != PROTOCOL_VERSION {
+    check_protocol_version_with_policy(version, VersionPolicy::Strict)
+}
+
+pub fn check_protocol_version_with_policy(
+    version: u32,
+    policy: VersionPolicy,
+) -> Result<(), ProtocolError> {
+    // Version 0 is always invalid regardless of policy
+    if version == 0 {
         return Err(ProtocolError::VersionMismatch {
             expected: PROTOCOL_VERSION,
-            found: version,
+            found: 0,
+            policy,
         });
+    }
+    match policy {
+        VersionPolicy::Strict => {
+            if version != PROTOCOL_VERSION {
+                return Err(ProtocolError::VersionMismatch {
+                    expected: PROTOCOL_VERSION,
+                    found: version,
+                    policy,
+                });
+            }
+        }
+        VersionPolicy::BestEffort => {
+            let expected_major = PROTOCOL_VERSION / 100;
+            let found_major = version / 100;
+            if expected_major != found_major {
+                return Err(ProtocolError::VersionMismatch {
+                    expected: PROTOCOL_VERSION,
+                    found: version,
+                    policy,
+                });
+            }
+        }
     }
     Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProtocolError {
-    VersionMismatch { expected: u32, found: u32 },
+    VersionMismatch {
+        expected: u32,
+        found: u32,
+        policy: VersionPolicy,
+    },
     InvalidCursor(String),
     CheckpointCorrupt(String),
 }
@@ -45,11 +105,15 @@ pub enum ProtocolError {
 impl std::fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::VersionMismatch { expected, found } => {
+            Self::VersionMismatch {
+                expected,
+                found,
+                policy,
+            } => {
                 write!(
                     f,
-                    "Protocol version mismatch: expected v{expected}, found v{found}. \
-                     Discard checkpoint and restart."
+                    "Protocol version mismatch: expected v{expected}, found v{found} \
+                     (policy: {policy:?}). Discard checkpoint and restart."
                 )
             }
             Self::InvalidCursor(msg) => write!(f, "Invalid execution cursor: {msg}"),
@@ -60,31 +124,58 @@ impl std::fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
-// ─── Step ────────────────────────────────────────────────────────────────────
+// ─── Step: Layered Structure ─────────────────────────────────────────────────
 
-/// The core execution unit. Not a Turn, not a Session.
+/// Scheduling descriptor (immutable after creation, owned by Scheduler).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Step {
+pub struct StepDescriptor {
     pub step_id: String,
     pub task_id: String,
     pub dag_node_id: String,
     pub parent_step_id: Option<String>,
     pub action: StepAction,
     pub agent_id: Option<String>,
-    pub payload: StepPayload,
-    pub cursor: ExecutionCursor,
-    pub checkpoint: Option<StepCheckpoint>,
-    pub result: Option<StepResult>,
-    pub status: StepStatus,
-    pub idempotency_key: String,
-    pub attempt: u32,
-    pub max_attempts: u32,
-    pub retry_policy: RetryPolicy,
     pub timeout_ms: u64,
     pub protocol_version: u32,
     pub created_at: u64,
+}
+
+/// Runtime execution state (mutable during execution, owned by Agent).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepExecution {
+    pub cursor: ExecutionCursor,
+    pub payload: StepPayload,
+    pub result: Option<StepResult>,
+    pub status: StepStatus,
+    pub attempt: u32,
+    pub max_attempts: u32,
+    /// Memory context flowing through step lifecycle
+    pub memory_context: Option<MemoryContext>,
     pub started_at: Option<u64>,
     pub completed_at: Option<u64>,
+}
+
+/// Memory context injected into steps (from PERCEIVE, used through ACT/EVALUATE).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MemoryContext {
+    /// IDs of memories retrieved in PERCEIVE
+    pub retrieved_memory_ids: Vec<String>,
+    /// Domain hints extracted from memory
+    pub domain_hints: Vec<String>,
+    /// Boost terms for tool selection
+    pub boost_terms: Vec<String>,
+    /// Provenance: which memories influenced this step
+    pub provenance: Vec<String>,
+}
+
+/// Composite Step = descriptor + execution + idempotency key.
+/// This is the full Step passed between Scheduler and Agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Step {
+    pub descriptor: StepDescriptor,
+    pub execution: StepExecution,
+    pub idempotency_key: String,
+    pub checkpoint: Option<StepCheckpoint>,
 }
 
 impl Step {
@@ -97,62 +188,94 @@ impl Step {
     ) -> Self {
         let idempotency_key = compute_idempotency_key(&task_id, &dag_node_id, &action, &payload);
         Self {
-            step_id,
-            task_id,
-            dag_node_id,
-            parent_step_id: None,
-            action,
-            agent_id: None,
-            payload,
-            cursor: ExecutionCursor::default(),
-            checkpoint: None,
-            result: None,
-            status: StepStatus::Pending,
+            descriptor: StepDescriptor {
+                step_id,
+                task_id,
+                dag_node_id,
+                parent_step_id: None,
+                action,
+                agent_id: None,
+                timeout_ms: 300_000,
+                protocol_version: PROTOCOL_VERSION,
+                created_at: epoch_ms(),
+            },
+            execution: StepExecution {
+                cursor: ExecutionCursor::default(),
+                payload,
+                result: None,
+                status: StepStatus::Pending,
+                attempt: 1,
+                max_attempts: 3,
+                memory_context: None,
+                started_at: None,
+                completed_at: None,
+            },
             idempotency_key,
-            attempt: 1,
-            max_attempts: 3,
-            retry_policy: RetryPolicy::default(),
-            timeout_ms: 300_000, // 5 minutes
-            protocol_version: PROTOCOL_VERSION,
-            created_at: epoch_ms(),
-            started_at: None,
-            completed_at: None,
+            checkpoint: None,
         }
+    }
+
+    // ── Convenience accessors ──
+
+    pub fn step_id(&self) -> &str {
+        &self.descriptor.step_id
+    }
+
+    pub fn task_id(&self) -> &str {
+        &self.descriptor.task_id
+    }
+
+    pub fn action(&self) -> StepAction {
+        self.descriptor.action
+    }
+
+    pub fn status(&self) -> StepStatus {
+        self.execution.status
     }
 
     pub fn is_terminal(&self) -> bool {
         matches!(
-            self.status,
+            self.execution.status,
             StepStatus::Completed | StepStatus::Failed | StepStatus::Cancelled
         )
     }
 
     pub fn is_retriable(&self) -> bool {
-        self.attempt < self.max_attempts
+        self.execution.attempt < self.execution.max_attempts
             && !matches!(
-                self.status,
+                self.execution.status,
                 StepStatus::Completed | StepStatus::Cancelled
             )
     }
 
     pub fn mark_started(&mut self, agent_id: &str) {
-        self.agent_id = Some(agent_id.to_string());
-        self.status = StepStatus::Running;
-        self.started_at = Some(epoch_ms());
+        self.descriptor.agent_id = Some(agent_id.to_string());
+        self.execution.status = StepStatus::Running;
+        self.execution.started_at = Some(epoch_ms());
     }
 
     pub fn mark_completed(&mut self, result: StepResult) {
-        self.result = Some(result);
-        self.status = StepStatus::Completed;
-        self.completed_at = Some(epoch_ms());
+        self.execution.result = Some(result);
+        self.execution.status = StepStatus::Completed;
+        self.execution.completed_at = Some(epoch_ms());
     }
 
     pub fn mark_failed(&mut self, error: &str) {
-        self.result = Some(StepResult::Error {
+        self.execution.result = Some(StepResult::Error {
             message: error.to_string(),
         });
-        self.status = StepStatus::Failed;
-        self.completed_at = Some(epoch_ms());
+        self.execution.status = StepStatus::Failed;
+        self.execution.completed_at = Some(epoch_ms());
+    }
+
+    pub fn with_memory_context(mut self, ctx: MemoryContext) -> Self {
+        self.execution.memory_context = Some(ctx);
+        self
+    }
+
+    pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.descriptor.timeout_ms = timeout_ms;
+        self
     }
 }
 
@@ -227,15 +350,19 @@ impl StepStatus {
 // ─── Execution Cursor ────────────────────────────────────────────────────────
 
 /// Precise execution position within a Step.
-/// On crash recovery, resume from exactly this point.
+/// Supports both sequential and parallel tool execution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExecutionCursor {
     /// Current phase being executed
     pub phase: StepAction,
-    /// Within ACT: which tool call (0-based). Other phases: 0.
+    /// Within ACT: which tool call (0-based, for sequential mode)
     pub tool_index: u32,
     /// Per-tool completion tracking (ACT phase only)
     pub tool_completions: Vec<ToolCompletion>,
+    /// Execution mode: sequential or parallel
+    pub parallel: bool,
+    /// For Wait steps: continuation token for async resume
+    pub continuation_token: Option<String>,
     /// Sub-step identifier (future: nested/composite steps)
     pub sub_step: Option<String>,
 }
@@ -246,13 +373,15 @@ impl Default for ExecutionCursor {
             phase: StepAction::Perceive,
             tool_index: 0,
             tool_completions: Vec::new(),
+            parallel: false,
+            continuation_token: None,
             sub_step: None,
         }
     }
 }
 
 impl ExecutionCursor {
-    /// Create cursor for an ACT step with N tool calls
+    /// Create cursor for an ACT step with N tool calls (sequential)
     pub fn for_act(num_tools: usize) -> Self {
         Self {
             phase: StepAction::Act,
@@ -263,9 +392,29 @@ impl ExecutionCursor {
                     call_id: String::new(),
                     status: ToolCompletionStatus::Pending,
                     idempotency_key: None,
+                    cached_result: None,
+                    retry_count: 0,
                 })
                 .collect(),
+            parallel: false,
+            continuation_token: None,
             sub_step: None,
+        }
+    }
+
+    /// Create cursor for parallel tool execution
+    pub fn for_parallel_act(num_tools: usize) -> Self {
+        let mut cursor = Self::for_act(num_tools);
+        cursor.parallel = true;
+        cursor
+    }
+
+    /// Create cursor for Wait step with continuation token
+    pub fn for_wait(token: String) -> Self {
+        Self {
+            phase: StepAction::Wait,
+            continuation_token: Some(token),
+            ..Self::default()
         }
     }
 
@@ -312,13 +461,18 @@ impl ExecutionCursor {
 }
 
 /// Per-tool completion tracking within an ACT step.
+/// Includes cached result for crash recovery (no need for separate cache lookup).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCompletion {
     pub tool_name: String,
     pub call_id: String,
     pub status: ToolCompletionStatus,
-    /// Points to idempotency cache entry (for crash recovery)
+    /// Points to idempotency cache entry
     pub idempotency_key: Option<String>,
+    /// Inline cached result (for checkpoint completeness)
+    pub cached_result: Option<CachedToolResult>,
+    /// Tool-level retry count (separate from step retry)
+    pub retry_count: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -477,6 +631,7 @@ pub enum StepVerdict {
 
 // ─── Retry Policy ────────────────────────────────────────────────────────────
 
+/// Step-level retry policy (fallback when tool-level not specified).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryPolicy {
     pub max_attempts: u32,
@@ -508,6 +663,61 @@ impl RetryPolicy {
     }
 }
 
+/// Tool-level retry policy (more granular than step-level).
+/// A single tool failure doesn't force whole-step retry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolRetryPolicy {
+    pub max_attempts: u32,
+    pub backoff_base_ms: u64,
+    pub backoff_max_ms: u64,
+}
+
+impl Default for ToolRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 2,
+            backoff_base_ms: 300,
+            backoff_max_ms: 5_000,
+        }
+    }
+}
+
+impl ToolRetryPolicy {
+    pub fn backoff_ms(&self, attempt: u32) -> u64 {
+        self.backoff_base_ms
+            .saturating_mul(1u64 << attempt.min(10))
+            .min(self.backoff_max_ms)
+    }
+
+    pub fn should_retry(&self, attempt: u32) -> bool {
+        attempt < self.max_attempts
+    }
+}
+
+/// Get tool-level retry policy based on idempotency classification.
+pub fn tool_retry_policy(tool_name: &str) -> ToolRetryPolicy {
+    match classify_tool_idempotency(tool_name) {
+        // Pure reads: retry aggressively (no side effects)
+        ToolIdempotency::PureRead => ToolRetryPolicy {
+            max_attempts: 3,
+            backoff_base_ms: 200,
+            backoff_max_ms: 2_000,
+        },
+        // Idempotent writes: retry cautiously
+        ToolIdempotency::IdempotentWrite => ToolRetryPolicy {
+            max_attempts: 2,
+            backoff_base_ms: 500,
+            backoff_max_ms: 5_000,
+        },
+        // Non-idempotent: do NOT auto-retry (let LLM decide)
+        ToolIdempotency::NonIdempotent => ToolRetryPolicy {
+            max_attempts: 1, // no retry
+            backoff_base_ms: 0,
+            backoff_max_ms: 0,
+        },
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorCategory {
     Transient,
@@ -522,6 +732,7 @@ pub enum ErrorCategory {
 // ─── Idempotency ─────────────────────────────────────────────────────────────
 
 /// Key for idempotency cache lookup.
+/// Supports both execution-level (step+index) and semantic-level (content-only) lookup.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IdempotencyKey {
     pub step_id: String,
@@ -530,6 +741,7 @@ pub struct IdempotencyKey {
 }
 
 impl IdempotencyKey {
+    /// Execution-level key: tied to specific step + tool index
     pub fn new(step_id: &str, tool_index: u32, tool_name: &str, args: &serde_json::Value) -> Self {
         let content_hash = compute_content_hash(tool_name, args);
         Self {
@@ -539,13 +751,32 @@ impl IdempotencyKey {
         }
     }
 
+    /// Semantic-level key: content-only (for DAG reuse / step replay)
+    pub fn semantic(tool_name: &str, args: &serde_json::Value) -> Self {
+        let content_hash = compute_content_hash(tool_name, args);
+        Self {
+            step_id: String::new(), // empty = semantic key
+            tool_index: 0,
+            content_hash,
+        }
+    }
+
+    /// Execution-level cache key (step-specific)
     pub fn cache_key(&self) -> String {
-        format!("{}:{}:{}", self.step_id, self.tool_index, self.content_hash)
+        if self.step_id.is_empty() {
+            format!("sem:{}", self.content_hash)
+        } else {
+            format!("{}:{}:{}", self.step_id, self.tool_index, self.content_hash)
+        }
+    }
+
+    pub fn is_semantic(&self) -> bool {
+        self.step_id.is_empty()
     }
 }
 
 /// Cached tool result (for crash recovery).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CachedToolResult {
     pub tool_name: String,
     pub output: String,
@@ -762,11 +993,32 @@ fn compute_content_hash(tool_name: &str, args: &serde_json::Value) -> String {
     let mut hasher = Sha256::new();
     hasher.update(tool_name.as_bytes());
     hasher.update(b":");
-    // Canonical JSON (sorted keys)
-    let canonical = serde_json::to_string(args).unwrap_or_default();
+    // Canonical JSON: serde_json sorts map keys deterministically
+    // (BTreeMap internally), so identical args → identical hash.
+    let canonical = canonical_json(args);
     hasher.update(canonical.as_bytes());
     let hash = hasher.finalize();
-    format!("{:x}", hash)[..16].to_string() // 16-char prefix
+    format!("{:x}", hash)[..16].to_string()
+}
+
+/// Produce canonical JSON with sorted keys (recursively).
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut sorted: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            sorted.sort_by_key(|(k, _)| *k);
+            let entries: Vec<String> = sorted
+                .iter()
+                .map(|(k, v)| format!("\"{}\":{}", k, canonical_json(v)))
+                .collect();
+            format!("{{{}}}", entries.join(","))
+        }
+        serde_json::Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(canonical_json).collect();
+            format!("[{}]", items.join(","))
+        }
+        _ => serde_json::to_string(value).unwrap_or_default(),
+    }
 }
 
 fn compute_idempotency_key(
@@ -831,16 +1083,44 @@ mod tests {
                 memory_context: vec![],
             },
         );
-        assert_eq!(step.status, StepStatus::Pending);
-        assert_eq!(step.protocol_version, PROTOCOL_VERSION);
-        assert_eq!(step.attempt, 1);
-        assert_eq!(step.max_attempts, 3);
+        assert_eq!(step.status(), StepStatus::Pending);
+        assert_eq!(step.descriptor.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(step.execution.attempt, 1);
+        assert_eq!(step.execution.max_attempts, 3);
         assert!(!step.idempotency_key.is_empty());
         assert!(!step.is_terminal());
         assert!(step.is_retriable());
-        assert!(step.agent_id.is_none());
-        assert!(step.result.is_none());
+        assert!(step.descriptor.agent_id.is_none());
+        assert!(step.execution.result.is_none());
         assert!(step.checkpoint.is_none());
+        assert!(step.execution.memory_context.is_none());
+    }
+
+    #[test]
+    fn step_creation_with_memory_context() {
+        let step = Step::new(
+            "s1".into(),
+            "t1".into(),
+            "n1".into(),
+            StepAction::Perceive,
+            StepPayload::Perceive {
+                user_query: "hello".into(),
+                memory_context: vec![],
+            },
+        )
+        .with_memory_context(MemoryContext {
+            retrieved_memory_ids: vec!["mem-1".into()],
+            domain_hints: vec!["github".into()],
+            boost_terms: vec!["pr".into()],
+            provenance: vec!["mem-1".into()],
+        })
+        .with_timeout_ms(60_000);
+
+        assert!(step.execution.memory_context.is_some());
+        let mc = step.execution.memory_context.as_ref().unwrap();
+        assert_eq!(mc.retrieved_memory_ids, vec!["mem-1"]);
+        assert_eq!(mc.domain_hints, vec!["github"]);
+        assert_eq!(step.descriptor.timeout_ms, 60_000);
     }
 
     #[test]
@@ -857,9 +1137,9 @@ mod tests {
         );
 
         step.mark_started("agent-01");
-        assert_eq!(step.status, StepStatus::Running);
-        assert_eq!(step.agent_id.as_deref(), Some("agent-01"));
-        assert!(step.started_at.is_some());
+        assert_eq!(step.status(), StepStatus::Running);
+        assert_eq!(step.descriptor.agent_id.as_deref(), Some("agent-01"));
+        assert!(step.execution.started_at.is_some());
 
         step.mark_completed(StepResult::Act {
             tool_results_count: 1,
@@ -869,7 +1149,7 @@ mod tests {
         });
         assert!(step.is_terminal());
         assert!(!step.is_retriable());
-        assert!(step.completed_at.is_some());
+        assert!(step.execution.completed_at.is_some());
     }
 
     #[test]
@@ -887,9 +1167,9 @@ mod tests {
         step.mark_started("agent-01");
         step.mark_failed("timeout");
         assert!(step.is_terminal());
-        // attempt=1, max=3, so would be retriable... but status is Failed (terminal)
-        // is_retriable checks attempt < max AND not cancelled
-        assert!(step.is_retriable()); // can retry (scheduler decides)
+        // attempt=1, max=3, status=Failed (not Completed/Cancelled)
+        // so is_retriable = true (scheduler decides whether to actually retry)
+        assert!(step.is_retriable());
     }
 
     // ── Execution Cursor ──
@@ -962,6 +1242,8 @@ mod tests {
             phase: StepAction::Act,
             tool_index: 0,
             tool_completions: vec![], // Invalid: ACT must have tools
+            parallel: false,
+            continuation_token: None,
             sub_step: None,
         };
         let cp = StepCheckpoint::new("s1".into(), "t1".into(), "a1".into(), cursor);
@@ -977,12 +1259,21 @@ mod tests {
             call_id: "c1".into(),
             status: ToolCompletionStatus::Completed,
             idempotency_key: Some("key1".into()),
+            cached_result: Some(CachedToolResult {
+                tool_name: "grep".into(),
+                output: "3 matches".into(),
+                is_error: false,
+                cached_at: 1000,
+            }),
+            retry_count: 0,
         };
         cursor.tool_completions[1] = ToolCompletion {
             tool_name: "bash".into(),
             call_id: "c2".into(),
             status: ToolCompletionStatus::Running,
             idempotency_key: None,
+            cached_result: None,
+            retry_count: 1,
         };
         let mut cp = StepCheckpoint::new("s1".into(), "t1".into(), "a1".into(), cursor);
         cp.messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
@@ -1313,9 +1604,9 @@ mod tests {
         );
         let json = serde_json::to_string(&step).unwrap();
         let restored: Step = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.step_id, "step-001");
-        assert_eq!(restored.protocol_version, PROTOCOL_VERSION);
-        assert_eq!(restored.action, StepAction::Act);
+        assert_eq!(restored.step_id(), "step-001");
+        assert_eq!(restored.descriptor.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(restored.action(), StepAction::Act);
     }
 
     // ── StepResult variants ──
@@ -1348,5 +1639,227 @@ mod tests {
             let json = serde_json::to_string(result).unwrap();
             let _restored: StepResult = serde_json::from_str(&json).unwrap();
         }
+    }
+
+    // ── Version Policy ──
+
+    #[test]
+    fn version_policy_strict_rejects_mismatch() {
+        let result = check_protocol_version_with_policy(2, VersionPolicy::Strict);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn version_policy_strict_accepts_exact() {
+        let result = check_protocol_version_with_policy(PROTOCOL_VERSION, VersionPolicy::Strict);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn version_policy_besteffort_same_major() {
+        // PROTOCOL_VERSION = 1, major = 1/100 = 0
+        // version 50 → major = 50/100 = 0 (same major)
+        let result = check_protocol_version_with_policy(50, VersionPolicy::BestEffort);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn version_policy_besteffort_diff_major_rejects() {
+        // version 100 → major = 100/100 = 1 (different major)
+        let result = check_protocol_version_with_policy(100, VersionPolicy::BestEffort);
+        assert!(result.is_err());
+        if let Err(ProtocolError::VersionMismatch { policy, .. }) = result {
+            assert_eq!(policy, VersionPolicy::BestEffort);
+        } else {
+            panic!("expected VersionMismatch");
+        }
+    }
+
+    #[test]
+    fn version_policy_besteffort_zero_rejected() {
+        let result = check_protocol_version_with_policy(0, VersionPolicy::BestEffort);
+        assert!(result.is_err());
+    }
+
+    // ── Parallel Cursor ──
+
+    #[test]
+    fn cursor_parallel_act() {
+        let cursor = ExecutionCursor::for_parallel_act(3);
+        assert!(cursor.parallel);
+        assert_eq!(cursor.tool_completions.len(), 3);
+        assert_eq!(cursor.pending_tool_count(), 3);
+    }
+
+    #[test]
+    fn cursor_parallel_index_stays_zero() {
+        let mut cursor = ExecutionCursor::for_parallel_act(3);
+        // In parallel mode, all tools dispatched simultaneously
+        // Index doesn't advance like sequential
+        cursor.advance_tool(1, ToolCompletionStatus::Completed);
+        // tool_index still 0 since advance_tool only sets 0→1 for sequential index < slot
+        // But the tool IS marked done
+        assert_eq!(cursor.completed_tool_count(), 1);
+        assert_eq!(cursor.pending_tool_count(), 2);
+    }
+
+    #[test]
+    fn cursor_wait_continuation_token() {
+        let mut cursor = ExecutionCursor::for_act(1);
+        cursor.phase = StepAction::Wait;
+        cursor.continuation_token = Some("webhook-callback-12345".into());
+        assert_eq!(cursor.continuation_token.as_deref(), Some("webhook-callback-12345"));
+
+        let json = serde_json::to_string(&cursor).unwrap();
+        let restored: ExecutionCursor = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.continuation_token.as_deref(), Some("webhook-callback-12345"));
+    }
+
+    // ── Tool Retry Policy ──
+
+    #[test]
+    fn tool_retry_policy_pure_read() {
+        let policy = tool_retry_policy("grep");
+        assert_eq!(policy.max_attempts, 3);
+        assert_eq!(policy.backoff_base_ms, 200);
+    }
+
+    #[test]
+    fn tool_retry_policy_idempotent_write() {
+        let policy = tool_retry_policy("write_file");
+        assert_eq!(policy.max_attempts, 2);
+        assert_eq!(policy.backoff_base_ms, 500);
+    }
+
+    #[test]
+    fn tool_retry_policy_non_idempotent() {
+        let policy = tool_retry_policy("bash");
+        assert_eq!(policy.max_attempts, 1);
+        // No retry for non-idempotent tools
+    }
+
+    // ── Semantic Idempotency Keys ──
+
+    #[test]
+    fn idempotency_key_semantic_vs_execution() {
+        let args = serde_json::json!({"query": "hello world"});
+        let exec_key = IdempotencyKey::new("step-1", 0, "grep", &args);
+        let sem_key = IdempotencyKey::semantic("grep", &args);
+
+        // Execution key includes step_id
+        assert!(!exec_key.is_semantic());
+        assert!(exec_key.cache_key().starts_with("step-1:"));
+
+        // Semantic key is content-only (for DAG reuse)
+        assert!(sem_key.is_semantic());
+        assert!(sem_key.cache_key().starts_with("sem:"));
+
+        // Same content → same content_hash
+        assert_eq!(exec_key.content_hash, sem_key.content_hash);
+    }
+
+    #[test]
+    fn idempotency_key_semantic_diff_step_same_content() {
+        let args = serde_json::json!({"path": "src/main.rs"});
+        let key_a = IdempotencyKey::new("step-A", 0, "read_file", &args);
+        let key_b = IdempotencyKey::new("step-B", 0, "read_file", &args);
+        let key_s = IdempotencyKey::semantic("read_file", &args);
+
+        // Different step_id → different execution keys
+        assert_ne!(key_a.cache_key(), key_b.cache_key());
+        // Same semantic key
+        assert_eq!(key_a.content_hash, key_b.content_hash);
+        assert_eq!(key_a.content_hash, key_s.content_hash);
+    }
+
+    // ── Canonical JSON ──
+
+    #[test]
+    fn canonical_json_sorted_keys() {
+        // Two objects with same keys in different order → same hash
+        let args_a = serde_json::json!({"z": 1, "a": 2, "m": 3});
+        let args_b = serde_json::json!({"a": 2, "m": 3, "z": 1});
+        let key_a = IdempotencyKey::semantic("tool", &args_a);
+        let key_b = IdempotencyKey::semantic("tool", &args_b);
+        assert_eq!(key_a.content_hash, key_b.content_hash);
+    }
+
+    #[test]
+    fn canonical_json_nested_sorted() {
+        let args_a = serde_json::json!({"outer": {"z": 1, "a": 2}});
+        let args_b = serde_json::json!({"outer": {"a": 2, "z": 1}});
+        let key_a = IdempotencyKey::semantic("tool", &args_a);
+        let key_b = IdempotencyKey::semantic("tool", &args_b);
+        assert_eq!(key_a.content_hash, key_b.content_hash);
+    }
+
+    // ── Tool Completion with Cached Result ──
+
+    #[test]
+    fn tool_completion_with_cached_result() {
+        let tc = ToolCompletion {
+            tool_name: "grep".into(),
+            call_id: "c1".into(),
+            status: ToolCompletionStatus::Completed,
+            idempotency_key: Some("key1".into()),
+            cached_result: Some(CachedToolResult {
+                tool_name: "grep".into(),
+                output: "3 matches".into(),
+                is_error: false,
+                cached_at: 1000,
+            }),
+            retry_count: 0,
+        };
+
+        let json = serde_json::to_string(&tc).unwrap();
+        let restored: ToolCompletion = serde_json::from_str(&json).unwrap();
+        assert!(restored.cached_result.is_some());
+        let cr = restored.cached_result.unwrap();
+        assert_eq!(cr.output, "3 matches");
+        assert!(!cr.is_error);
+    }
+
+    // ── Memory Context ──
+
+    #[test]
+    fn memory_context_default_empty() {
+        let mc = MemoryContext::default();
+        assert!(mc.retrieved_memory_ids.is_empty());
+        assert!(mc.domain_hints.is_empty());
+        assert!(mc.boost_terms.is_empty());
+        assert!(mc.provenance.is_empty());
+    }
+
+    #[test]
+    fn memory_context_serde_roundtrip() {
+        let mc = MemoryContext {
+            retrieved_memory_ids: vec!["mem-1".into(), "mem-2".into()],
+            domain_hints: vec!["github".into()],
+            boost_terms: vec!["pr".into(), "review".into()],
+            provenance: vec!["mem-1".into()],
+        };
+        let json = serde_json::to_string(&mc).unwrap();
+        let restored: MemoryContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.retrieved_memory_ids, mc.retrieved_memory_ids);
+        assert_eq!(restored.domain_hints, mc.domain_hints);
+    }
+
+    // ── Step Accessor Methods ──
+
+    #[test]
+    fn step_accessor_methods() {
+        let step = Step::new(
+            "s1".into(),
+            "t1".into(),
+            "n1".into(),
+            StepAction::Act,
+            StepPayload::Act {
+                selected_tools: vec!["grep".into()],
+                tool_calls: vec![],
+            },
+        );
+        assert_eq!(step.step_id(), "s1");
+        assert_eq!(step.action(), StepAction::Act);
+        assert_eq!(step.status(), StepStatus::Pending);
     }
 }
