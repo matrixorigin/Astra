@@ -1,5 +1,4 @@
 # mo-agent-engine Makefile
-# Inspired by MatrixOne's development workflow
 
 .PHONY: help
 help:
@@ -12,12 +11,12 @@ help:
 	@echo "  make dev-status         - Show all service status"
 	@echo "  make dev-init           - Initialize development environment"
 	@echo ""
-	@echo "Dependency Services (MatrixOne + Redis):"
+	@echo "Dependencies (MatrixOne + Redis):"
 	@echo "  make dev-deps-up        - Start dependency services"
 	@echo "  make dev-deps-down      - Stop dependency services"
-	@echo "  make dev-deps-clean     - Stop and remove all data (WARNING: destructive!)"
+	@echo "  make dev-deps-clean     - Stop and remove all data (destructive!)"
 	@echo "  make dev-deps-status    - Show dependency status"
-	@echo "  make dev-deps-logs      - Show all dependency logs"
+	@echo "  make dev-deps-logs      - Show dependency logs"
 	@echo "  make dev-db-connect     - Connect to MatrixOne CLI"
 	@echo ""
 	@echo "API Server:"
@@ -28,30 +27,49 @@ help:
 	@echo "  make dev-api-status     - Show API server status"
 	@echo ""
 	@echo "Testing:"
-	@echo "  make test               - Run all Rust tests"
-	@echo "  make test-integration   - Run integration contract tests"
+	@echo "  make test               - Run all Rust workspace tests"
+	@echo "  make test-contract      - Run contract tests (http/admin/auth/config)"
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  make check              - Run all static checks (lint + format + type)"
-	@echo "  make ci                 - Run CI checks (check + test, no Docker required)"
+	@echo "  make ci                 - Run CI checks (check + test)"
 	@echo "  make lint               - Run clippy (warnings are errors)"
-	@echo "  make lint-fix           - Auto-format code"
 	@echo "  make format             - Format code"
 	@echo "  make format-check       - Check formatting"
 	@echo ""
 	@echo "Build:"
-	@echo "  make rust-build         - Build the Rust workspace"
-	@echo "  make rust-build-release - Build the Rust workspace in release mode"
-	@echo "  make cli-build          - Build CLI/API binaries in debug mode"
-	@echo "  make cli-build-release  - Build CLI/API binaries in release mode"
-	@echo "  make print-bin-paths    - Show debug/release binary paths"
-	@echo "  make check-runtime      - Verify runtime environment"
+	@echo "  make build              - Build entire Rust workspace (debug)"
+	@echo "  make build-release      - Build entire Rust workspace (release)"
+	@echo "  make build-server       - Build mo-agent-server (debug)"
+	@echo "  make build-server-release - Build mo-agent-server (release)"
+	@echo "  make build-cli          - Build mo-agent + mo-admin (debug)"
+	@echo "  make build-cli-release  - Build mo-agent + mo-admin (release)"
 	@echo ""
-	@echo "Examples:"
-	@echo "  make dev-start                    # Daily development"
-	@echo "  make dev-api-restart              # After code changes"
-	@echo "  make test                         # Run all tests"
-	@echo "  make check                        # Static analysis"
+	@echo "Memoria (Memory Service):"
+	@echo "  make memoria-start      - Start Memoria service"
+	@echo "  make memoria-stop       - Stop Memoria service"
+	@echo "  make memoria-logs       - Show Memoria logs"
+	@echo "  make memoria-status     - Show Memoria status"
+	@echo "  make memoria-clean      - Stop and remove Memoria data"
+	@echo ""
+	@echo "Docker API (alternative to source mode):"
+	@echo "  make dev-start-docker   - Start deps + API in Docker"
+	@echo "  make dev-api-docker-up  - Start API server in Docker"
+	@echo "  make dev-api-docker-down - Stop API server Docker container"
+
+# ============================================================================
+# Variables
+# ============================================================================
+
+CARGO_MANIFEST := rust/Cargo.toml
+CARGO := cargo
+CARGO_MANIFEST_FLAG := --manifest-path $(CARGO_MANIFEST)
+API_SHELL_PKG := -p mo-agent-runtime
+RUST_TARGET_DIR := rust/target
+RUST_DEBUG_BIN_DIR := $(RUST_TARGET_DIR)/debug
+RUST_RELEASE_BIN_DIR := $(RUST_TARGET_DIR)/release
+API_SERVER_BIN := mo-agent-server
+CLI_BINS := mo-agent mo-admin
 
 # ============================================================================
 # Environment Setup
@@ -63,12 +81,7 @@ dev-init: setup install-dev-deps
 	@bash scripts/dev/init.sh
 	@echo ""
 	@echo "✅ Development environment initialized!"
-	@echo ""
 	@echo "Next: make dev-start"
-
-.PHONY: dev-setup-demo
-dev-setup-demo:
-	@bash scripts/setup/demo-init.sh
 
 .PHONY: setup
 setup:
@@ -86,63 +99,6 @@ install-dev-deps:
 	@cargo fetch --manifest-path rust/Cargo.toml
 	@echo "✅ Rust dependencies ready"
 
-# Alias for compatibility.
-.PHONY: install-check-deps
-install-check-deps:
-	@$(MAKE) install-dev-deps
-
-.PHONY: install-runtime
-install-runtime:
-	@echo "Installing runtime dependencies..."
-	@echo ""
-	@echo "Checking Docker..."
-	@if command -v docker >/dev/null 2>&1; then \
-		echo "✅ Docker installed: $$(docker --version)"; \
-	else \
-		echo "❌ Docker not found"; \
-		echo "   Install: https://docs.docker.com/get-docker/"; \
-	fi
-	@echo ""
-	@echo "Checking Firecracker environment..."
-	@if [ "$$(uname)" != "Linux" ]; then \
-		echo "⚠️  Firecracker only supports Linux (current: $$(uname))"; \
-		echo "   Skipping Firecracker installation"; \
-	elif ! grep -qE "vmx|svm" /proc/cpuinfo; then \
-		echo "❌ CPU doesn't support virtualization"; \
-		echo "   Firecracker requires Intel VT-x or AMD-V"; \
-	elif [ ! -e /dev/kvm ]; then \
-		echo "❌ /dev/kvm not found"; \
-		echo "   Install KVM: sudo apt install qemu-kvm (Ubuntu/Debian)"; \
-	else \
-		echo "✅ KVM device available"; \
-		if groups | grep -q kvm; then \
-			echo "✅ User in kvm group"; \
-		else \
-			echo "⚠️  User not in kvm group"; \
-			echo "   Run: sudo usermod -aG kvm $$USER"; \
-			echo "   Then: newgrp kvm (or re-login)"; \
-		fi; \
-		if command -v firecracker >/dev/null 2>&1; then \
-			echo "✅ Firecracker installed: $$(firecracker --version 2>&1 | head -1)"; \
-		else \
-			echo "⚠️  Firecracker not installed"; \
-			echo "   Installing Firecracker..."; \
-			bash -c 'set -e; \
-				ARCH=$$(uname -m); \
-				RELEASE_URL="https://github.com/firecracker-microvm/firecracker/releases"; \
-				LATEST=$$(basename $$(curl -fsSLI -o /dev/null -w %{url_effective} $${RELEASE_URL}/latest)); \
-				echo "   Downloading $${LATEST}..."; \
-				curl -sL $${RELEASE_URL}/download/$${LATEST}/firecracker-$${LATEST}-$${ARCH}.tgz | tar -xz; \
-				sudo mv release-$${LATEST}-$${ARCH}/firecracker-$${LATEST}-$${ARCH} /usr/local/bin/firecracker; \
-				sudo chmod +x /usr/local/bin/firecracker; \
-				rm -rf release-$${LATEST}-$${ARCH}; \
-				echo "✅ Firecracker installed: $$(firecracker --version 2>&1 | head -1)"'; \
-		fi; \
-	fi
-	@echo ""
-	@echo "✅ Runtime dependency check complete"
-	@echo "   Run 'make check-runtime' to verify"
-
 .PHONY: check-runtime
 check-runtime:
 	@echo "Checking runtime environment..."
@@ -159,30 +115,11 @@ check-runtime:
 		echo "   ❌ Not installed"; \
 	fi
 	@echo ""
-	@echo "2. Firecracker:"
-	@if [ "$$(uname)" != "Linux" ]; then \
-		echo "   ⚠️  Not supported on $$(uname)"; \
-	elif command -v firecracker >/dev/null 2>&1; then \
-		echo "   ✅ $$(firecracker --version 2>&1 | head -1)"; \
-		if [ -e /dev/kvm ]; then \
-			echo "   ✅ /dev/kvm exists"; \
-			if groups | grep -q kvm; then \
-				echo "   ✅ User in kvm group"; \
-			else \
-				echo "   ❌ User not in kvm group"; \
-			fi; \
-		else \
-			echo "   ❌ /dev/kvm not found"; \
-		fi; \
-	else \
-		echo "   ❌ Not installed"; \
-	fi
-	@echo ""
-	@echo "3. Rust API binary:"
+	@echo "2. Rust API binary:"
 	@cargo build -q --manifest-path rust/Cargo.toml -p mo-agent-runtime --bin mo-agent-server && echo "   ✅ Rust binary build OK"
 
 # ============================================================================
-# Development - Dependency Services (MatrixOne + Redis)
+# Dependencies (MatrixOne + Redis)
 # ============================================================================
 
 .PHONY: dev-deps-up
@@ -191,7 +128,7 @@ dev-deps-up:
 	@if [ -d deployment/all-in-one/data ] && [ "$$(stat -c '%u' deployment/all-in-one/data 2>/dev/null || stat -f '%u' deployment/all-in-one/data 2>/dev/null)" != "$$(id -u)" ]; then \
 		echo "❌ Error: Data directory owned by root"; \
 		echo "   Run: make dev-clean (to delete data)"; \
-		echo "   Or:  sudo chown -R $$(id -u):$$(id -g) deployment/all-in-one/data (to fix permissions)"; \
+		echo "   Or:  sudo chown -R $$(id -u):$$(id -g) deployment/all-in-one/data"; \
 		exit 1; \
 	fi
 	@mkdir -p deployment/all-in-one/data/matrixone deployment/all-in-one/data/matrixone/logs deployment/all-in-one/data/redis
@@ -233,21 +170,6 @@ dev-deps-status:
 dev-deps-logs:
 	@cd deployment/all-in-one && docker compose logs -f matrixone redis
 
-.PHONY: dev-deps-logs-db
-dev-deps-logs-db:
-	@cd deployment/all-in-one && docker compose logs -f matrixone
-
-.PHONY: dev-deps-logs-redis
-dev-deps-logs-redis:
-	@cd deployment/all-in-one && docker compose logs -f redis
-
-.PHONY: dev-logs-clean
-dev-logs-clean:
-	@echo "⚠️  Clearing Docker logs..."
-	@docker logs --tail 0 all-in-one-matrixone-1 2>/dev/null || true
-	@docker logs --tail 0 all-in-one-redis-1 2>/dev/null || true
-	@echo "✅ Docker logs cleared"
-
 .PHONY: dev-deps-wait
 dev-deps-wait:
 	@echo "Waiting for dependency services (max 20s)..."
@@ -260,7 +182,7 @@ dev-deps-wait:
 		sleep 2; \
 	done; \
 	echo "❌ Dependency services not ready after 20s"; \
-	echo "   Tip: Services may still be starting. Check with 'make dev-deps-status'"; \
+	echo "   Tip: Check with 'make dev-deps-status'"; \
 	exit 1
 
 .PHONY: dev-db-connect
@@ -268,7 +190,7 @@ dev-db-connect:
 	@mysql -h127.0.0.1 -P6001 -uroot -p111
 
 # ============================================================================
-# Development - API Server (Source Code Mode)
+# API Server (Source Code Mode)
 # ============================================================================
 
 .PHONY: dev-api-start
@@ -309,7 +231,7 @@ dev-api-status:
 	fi
 
 # ============================================================================
-# Development - API Server (Docker Mode)
+# API Server (Docker Mode)
 # ============================================================================
 
 .PHONY: dev-api-docker-build
@@ -345,40 +267,35 @@ dev-api-docker-scale:
 	@echo "✅ Scaled to $(REPLICAS) replicas"
 
 # ============================================================================
-# Development - Composite Commands (Most Used)
+# Composite Commands
 # ============================================================================
 
-.PHONY: dev-up
-dev-up: dev-deps-up dev-deps-wait dev-api-start
+.PHONY: dev-start
+dev-start: dev-deps-up dev-deps-wait dev-api-start
 	@echo ""
 	@echo "✅ Development environment started!"
 	@echo "   API: http://localhost:8000"
-	@echo "   Docs: http://localhost:8000/docs"
-	@echo ""
-	@echo "⚠️  Note: Dependencies may still be starting. Check status with:"
-	@echo "   make dev-status"
 	@echo ""
 	@echo "Next steps:"
 	@echo "  mo-agent register"
 	@echo "  mo-agent login"
 	@echo "  mo-agent chat"
 
-.PHONY: dev-up-docker
-dev-up-docker: dev-deps-up dev-deps-wait dev-api-docker-up
+.PHONY: dev-start-docker
+dev-start-docker: dev-deps-up dev-deps-wait dev-api-docker-up
 	@sleep 3
 	@echo ""
 	@echo "✅ Development environment ready (Docker mode)!"
 	@echo "   API: http://localhost:8000"
-	@echo "   Docs: http://localhost:8000/docs"
 
-.PHONY: dev-down
-dev-down: dev-api-stop dev-deps-down
+.PHONY: dev-stop
+dev-stop: dev-api-stop dev-deps-down
 	@echo "✅ All services stopped"
 
 .PHONY: dev-restart
-dev-restart: dev-down
+dev-restart: dev-stop
 	@sleep 1
-	@$(MAKE) dev-up
+	@$(MAKE) dev-start
 
 .PHONY: dev-status
 dev-status:
@@ -387,7 +304,8 @@ dev-status:
 	@echo ""
 	@$(MAKE) dev-api-status
 
-dev-clean: dev-api-stop dev-deps-clean dev-logs-clean
+.PHONY: dev-clean
+dev-clean: dev-api-stop dev-deps-clean
 	@echo "✅ Development environment cleaned"
 
 .PHONY: dev-reset
@@ -395,139 +313,136 @@ dev-reset: dev-clean
 	@$(MAKE) dev-init
 	@echo "✅ Development environment reset"
 
-# Configuration validation
-.PHONY: dev-config-check dev-config-check-strict
-dev-config-check: ## Check development configuration
-	@echo "Checking development configuration..."
-	@cargo test --manifest-path rust/Cargo.toml -p mo-agent-runtime --test config_contract
-
-dev-config-check-strict: ## Check development configuration (strict mode)
-	@echo "Checking development configuration (strict mode)..."
-	@cargo test --manifest-path rust/Cargo.toml -p mo-agent-runtime --test config_contract
-	@cargo check --manifest-path rust/Cargo.toml --all-targets
-
-# Aliases: README uses dev-start/dev-stop, Makefile defines dev-up/dev-down
-.PHONY: dev-start dev-stop dev-start-docker
-dev-start: dev-up
-dev-stop: dev-down
-dev-start-docker: dev-up-docker
-
-# Test aliases: README uses dev-test-*, Makefile defines test-*
-.PHONY: dev-test dev-test-keep dev-test-unit dev-test-integration
-dev-test: test
-dev-test-keep: test
-dev-test-unit: test-unit
-dev-test-integration: test-integration
+.PHONY: dev-setup-demo
+dev-setup-demo:
+	@bash scripts/setup/demo-init.sh
 
 # ============================================================================
-# Development - Testing
+# Build
 # ============================================================================
 
-CARGO_MANIFEST := rust/Cargo.toml
-CARGO := cargo
-CARGO_MANIFEST_FLAG := --manifest-path $(CARGO_MANIFEST)
-API_SHELL_PKG := -p mo-agent-runtime
-API_SHELL_TESTS := $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --tests
-RUST_TARGET_DIR := rust/target
-RUST_DEBUG_BIN_DIR := $(RUST_TARGET_DIR)/debug
-RUST_RELEASE_BIN_DIR := $(RUST_TARGET_DIR)/release
-API_SERVER_BIN := mo-agent-server
-CLI_BINS := mo-agent mo-admin
-ALL_BINS := $(API_SERVER_BIN) $(CLI_BINS)
+.PHONY: build
+build:
+	@echo "Building Rust workspace (debug)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG)
+	@echo "✅ Debug artifacts: $(RUST_DEBUG_BIN_DIR)/"
 
-.PHONY: test test-cloud ci-test test-unit test-integration verify verify-talk
+.PHONY: build-release
+build-release:
+	@echo "Building Rust workspace (release)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) --release
+	@echo "✅ Release artifacts: $(RUST_RELEASE_BIN_DIR)/"
+
+.PHONY: build-cli
+build-cli:
+	@echo "Building mo-agent + mo-admin (debug)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p mo-agent-cli -p mo-admin-cli
+	@echo "Binaries:"
+	@for bin in $(CLI_BINS); do echo "  $(RUST_DEBUG_BIN_DIR)/$$bin"; done
+
+.PHONY: build-cli-release
+build-cli-release:
+	@echo "Building mo-agent + mo-admin (release)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p mo-agent-cli -p mo-admin-cli --release
+	@echo "Binaries:"
+	@for bin in $(CLI_BINS); do echo "  $(RUST_RELEASE_BIN_DIR)/$$bin"; done
+
+.PHONY: build-server
+build-server:
+	@echo "Building mo-agent-server (debug)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --bin $(API_SERVER_BIN)
+	@echo "Binary: $(RUST_DEBUG_BIN_DIR)/$(API_SERVER_BIN)"
+
+.PHONY: build-server-release
+build-server-release:
+	@echo "Building mo-agent-server (release)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --release --bin $(API_SERVER_BIN)
+	@echo "Binary: $(RUST_RELEASE_BIN_DIR)/$(API_SERVER_BIN)"
+
+# ============================================================================
+# Testing
+# ============================================================================
+
+.PHONY: test
 test:
 	@echo "Running Rust workspace tests..."
 	@$(CARGO) test $(CARGO_MANIFEST_FLAG)
 
-test-cloud ci-test test-unit verify verify-talk: test
-	@:
-
-test-integration:
-	@echo "Running Rust API-shell integration contracts..."
-	@$(API_SHELL_TESTS)
-
-.PHONY: cloud-start
-cloud-start:
-	@echo "Starting Memoria..."
-	@docker compose -f memoria/docker-compose.yml up -d
-	@echo "API: http://localhost:8100  Swagger: http://localhost:8100/docs"
-
-.PHONY: cloud-stop
-cloud-stop:
-	@docker compose -f memoria/docker-compose.yml down
-
-.PHONY: cloud-logs
-cloud-logs:
-	@docker compose -f memoria/docker-compose.yml logs -f api
-
-.PHONY: cloud-status
-cloud-status:
-	@docker compose -f memoria/docker-compose.yml ps
-
-.PHONY: cloud-clean
-cloud-clean:
-	@echo "Stopping and removing Memoria (including data)..."
-	@docker compose -f memoria/docker-compose.yml down
-	@rm -rf memoria/data/
-	@echo "Done."
-
-.PHONY: rust-build
-rust-build:
-	@echo "Building Rust workspace (debug profile)..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG)
-	@echo "✅ Debug artifacts: $(RUST_DEBUG_BIN_DIR)/"
-
-.PHONY: rust-build-release
-rust-build-release:
-	@echo "Building Rust workspace (release profile)..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) --release
-	@echo "✅ Release artifacts: $(RUST_RELEASE_BIN_DIR)/"
-
-.PHONY: cli-build
-cli-build:
-	@echo "Building CLI/API binaries (debug profile)..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) $(foreach bin,$(ALL_BINS),--bin $(bin))
-	@$(MAKE) print-bin-paths
-
-.PHONY: cli-build-release
-cli-build-release:
-	@echo "Building CLI/API binaries (release profile)..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --release $(foreach bin,$(ALL_BINS),--bin $(bin))
-	@$(MAKE) print-bin-paths
-
-.PHONY: print-bin-paths
-print-bin-paths:
-	@echo "Debug binaries:"
-	@for bin in $(ALL_BINS); do echo "  $(RUST_DEBUG_BIN_DIR)/$$bin"; done
-	@echo "Release binaries:"
-	@for bin in $(ALL_BINS); do echo "  $(RUST_RELEASE_BIN_DIR)/$$bin"; done
-
-.PHONY: rust-test
-rust-test: test
-	@:
-
-.PHONY: migration-contract-test
-migration-contract-test:
-	@echo "Running Rust HTTP contract tests..."
+.PHONY: test-contract
+test-contract:
+	@echo "Running contract tests (http/admin/auth/config)..."
 	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --test http_contract
 	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --test admin_contract
 	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --test auth_contract
 	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --test config_contract
 
 # ============================================================================
-# Legacy Aliases (Removed - Use dev-* commands instead)
+# Code Quality
 # ============================================================================
 
-.PHONY: db-init-agent
-db-init-agent:
-	@echo "❌ Deprecated: Use 'make dev-init' instead"
-	@exit 1
+.PHONY: check
+check: lint format-check type-check
+	@echo "✅ All static checks passed!"
 
-.PHONY: db-connect
-db-connect:
-	@echo "❌ Deprecated: Use 'make dev-db-connect' instead"
-	@exit 1
+.PHONY: ci
+ci: check test
+	@echo "✅ All CI checks passed!"
+
+.PHONY: lint
+lint:
+	@echo "Running clippy..."
+	@$(CARGO) clippy $(CARGO_MANIFEST_FLAG) --all-targets -- -D warnings
+
+.PHONY: lint-fix
+lint-fix:
+	@$(CARGO) fmt $(CARGO_MANIFEST_FLAG) --all
+
+.PHONY: format
+format:
+	@$(CARGO) fmt $(CARGO_MANIFEST_FLAG) --all
+
+.PHONY: format-check
+format-check:
+	@echo "Checking formatting..."
+	@$(CARGO) fmt $(CARGO_MANIFEST_FLAG) --all -- --check
+
+.PHONY: type-check
+type-check:
+	@echo "Running compile checks..."
+	@$(CARGO) check $(CARGO_MANIFEST_FLAG) --all-targets
+
+# ============================================================================
+# Memoria (Memory Service)
+# ============================================================================
+
+.PHONY: memoria-start
+memoria-start:
+	@echo "Starting Memoria..."
+	@docker compose -f memoria/docker-compose.yml up -d
+	@echo "API: http://localhost:8100  Swagger: http://localhost:8100/docs"
+
+.PHONY: memoria-stop
+memoria-stop:
+	@docker compose -f memoria/docker-compose.yml down
+
+.PHONY: memoria-logs
+memoria-logs:
+	@docker compose -f memoria/docker-compose.yml logs -f api
+
+.PHONY: memoria-status
+memoria-status:
+	@docker compose -f memoria/docker-compose.yml ps
+
+.PHONY: memoria-clean
+memoria-clean:
+	@echo "Stopping and removing Memoria (including data)..."
+	@docker compose -f memoria/docker-compose.yml down
+	@rm -rf memoria/data/
+	@echo "Done."
+
+# ============================================================================
+# Database
+# ============================================================================
 
 .PHONY: db-reset
 db-reset:
@@ -544,86 +459,7 @@ db-reset:
 		mysql -h127.0.0.1 -P6001 -uroot -p111 -e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;" 2>/dev/null || \
 		mysql -h127.0.0.1 -P6001 -uroot -p111 --skip-ssl -e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;" 2>/dev/null || \
 		mysql -h127.0.0.1 -P6001 -uroot -p111 --skip_ssl -e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
-		$(MAKE) db-init; \
 		echo "✅ Database reset complete"; \
 	else \
 		echo "Cancelled"; \
 	fi
-
-# ============================================================================
-# E2E Verification
-# ============================================================================
-
-# ============================================================================
-# Testing
-# ============================================================================
-
-
-
-.PHONY: test-cleanup
-test-cleanup:
-	@echo "No extra test DB cleanup needed in Rust-only mode."
-
-.PHONY: test-api
-test-api:
-	@echo "Running Rust API integration contract tests..."
-	@$(API_SHELL_TESTS)
-
-.PHONY: test-e2e
-test-e2e:
-	@echo "Running Rust end-to-end contract subset..."
-	@$(API_SHELL_TESTS)
-
-.PHONY: test-runtime
-test-runtime: test
-	@echo "✅ Runtime tests complete"
-
-# ============================================================================
-# Code Quality
-# ============================================================================
-
-# Rust check environment
-.PHONY: check-env
-check-env:
-	@cargo --version >/dev/null 2>&1 || (echo "❌ Error: cargo not found. Install Rust toolchain first." && exit 1)
-
-.PHONY: check
-check: check-env lint format-check type-check
-	@echo "✅ All static checks passed!"
-
-.PHONY: lint
-lint:
-	@echo "Running linters..."
-	@$(CARGO) clippy $(CARGO_MANIFEST_FLAG) --all-targets -- -D warnings
-
-.PHONY: lint-fix
-lint-fix:
-	@echo "Rust lint auto-fix via cargo fmt..."
-	@$(CARGO) fmt $(CARGO_MANIFEST_FLAG) --all
-
-.PHONY: type-check
-type-check:
-	@echo "Running Rust compile checks..."
-	@$(CARGO) check $(CARGO_MANIFEST_FLAG) --all-targets
-
-.PHONY: format
-format:
-	@echo "Formatting code..."
-	@$(CARGO) fmt $(CARGO_MANIFEST_FLAG) --all
-
-.PHONY: format-check
-format-check:
-	@echo "Checking code formatting..."
-	@$(CARGO) fmt $(CARGO_MANIFEST_FLAG) --all -- --check
-
-.PHONY: pre-commit
-.PHONY: ci
-ci: check test
-	@echo "✅ All CI checks passed!"
-
-# ── Memoria Lite publish ─────────────────────────────────────────────
-
-.PHONY: bump-memoria-version build-memoria publish-memoria publish-memoria-test
-bump-memoria-version build-memoria publish-memoria publish-memoria-test:
-	@echo "❌ Deprecated in Rust-only mode"
-	@exit 1

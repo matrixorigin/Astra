@@ -42,7 +42,7 @@ make format-check
 make type-check
 make lint
 make test
-make test-integration
+make test-contract
 ```
 
 Use direct cargo commands when you need a narrower loop:

@@ -1,18 +1,50 @@
 use super::*;
 
 impl ToolExecutor {
+    /// Resolve a tool-provided path, enforcing sandbox boundary when active.
     pub(crate) fn resolve(&self, path: &str) -> PathBuf {
         let p = Path::new(path);
-        if p.is_absolute() {
+        let resolved = if p.is_absolute() {
             p.to_path_buf()
         } else {
             self.project_root.join(p)
+        };
+
+        // If sandbox is active (non-Permissive), validate the path
+        if let Some(ref policy) = self.sandbox_policy
+            && !matches!(policy.mode, SandboxMode::Permissive)
+        {
+            match validate_path(policy, path) {
+                Ok(safe) => return safe,
+                Err(_) => return resolved, // let the caller handle the error naturally
+            }
         }
+        resolved
+    }
+
+    /// Resolve path with explicit error when sandbox blocks it.
+    pub(crate) fn resolve_checked(&self, path: &str) -> Result<PathBuf, String> {
+        let p = Path::new(path);
+        let resolved = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.project_root.join(p)
+        };
+
+        if let Some(ref policy) = self.sandbox_policy
+            && !matches!(policy.mode, SandboxMode::Permissive)
+        {
+            return validate_path(policy, path).map_err(|e| format!("Sandbox: {e}"));
+        }
+        Ok(resolved)
     }
 
     pub(crate) fn read_file(&self, args: &Value) -> String {
         let path = match args.get("path").and_then(Value::as_str) {
-            Some(p) => self.resolve(p),
+            Some(p) => match self.resolve_checked(p) {
+                Ok(safe) => safe,
+                Err(e) => return e,
+            },
             None => return "Error: missing 'path'".to_string(),
         };
         let content = match fs::read_to_string(&path) {
@@ -38,20 +70,28 @@ impl ToolExecutor {
         let lines: Vec<&str> = content.lines().collect();
         let s = start.unwrap_or(1).saturating_sub(1);
         let e = end.unwrap_or(lines.len()).min(lines.len());
-        lines[s..e].join("\n")
+        truncate_output(lines[s..e].join("\n"), GLOBAL_OUTPUT_LIMIT)
     }
 
     pub(crate) fn write_file(&self, args: &Value) -> String {
         let path = match args.get("path").and_then(Value::as_str) {
-            Some(p) => self.resolve(p),
+            Some(p) => match self.resolve_checked(p) {
+                Ok(safe) => safe,
+                Err(e) => return e,
+            },
             None => return "Error: missing 'path'".to_string(),
         };
         let content = match args.get("content").and_then(Value::as_str) {
             Some(c) => c,
             None => return "Error: missing 'content'".to_string(),
         };
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+        if let Some(parent) = path.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            return format!(
+                "Error: failed to create parent directory {}: {e}",
+                parent.display()
+            );
         }
         match fs::write(&path, content) {
             Ok(_) => format!("Written {} bytes to {}", content.len(), path.display()),
@@ -61,7 +101,10 @@ impl ToolExecutor {
 
     pub(crate) fn str_replace(&self, args: &Value) -> String {
         let path = match args.get("path").and_then(Value::as_str) {
-            Some(p) => self.resolve(p),
+            Some(p) => match self.resolve_checked(p) {
+                Ok(safe) => safe,
+                Err(e) => return e,
+            },
             None => return "Error: missing 'path'".to_string(),
         };
         let old_str = match args.get("old_str").and_then(Value::as_str) {
@@ -85,7 +128,28 @@ impl ToolExecutor {
         }
         let new_content = content.replacen(old_str, new_str, 1);
         match fs::write(&path, &new_content) {
-            Ok(_) => "Replaced successfully".to_string(),
+            Ok(_) => {
+                // Build a compact diff preview for the LLM and user
+                let old_lines: Vec<&str> = old_str.lines().collect();
+                let new_lines: Vec<&str> = new_str.lines().collect();
+                let diff_lines = old_lines.len().max(new_lines.len());
+                if diff_lines <= 10 {
+                    let mut diff = String::from("Replaced successfully\n");
+                    for l in &old_lines {
+                        diff.push_str(&format!("- {l}\n"));
+                    }
+                    for l in &new_lines {
+                        diff.push_str(&format!("+ {l}\n"));
+                    }
+                    diff
+                } else {
+                    format!(
+                        "Replaced successfully ({} lines → {} lines)",
+                        old_lines.len(),
+                        new_lines.len()
+                    )
+                }
+            }
             Err(e) => format!("Error writing file: {e}"),
         }
     }
@@ -102,7 +166,7 @@ impl ToolExecutor {
         if out.is_empty() {
             "(empty)".to_string()
         } else {
-            out
+            truncate_output(out, DEFAULT_TOOL_OUTPUT_LIMIT)
         }
     }
 

@@ -44,7 +44,7 @@ fn count_inprocess_persisted_events(
 fn render_sse(event: &Value) -> Bytes {
     Bytes::from(format!(
         "data: {}\n\n",
-        serde_json::to_string(event).unwrap()
+        serde_json::to_string(event).expect("Value always serializable to JSON")
     ))
 }
 
@@ -53,16 +53,28 @@ fn render_sse_map(event: &Map<String, Value>) -> Bytes {
 }
 
 /// Resolve the first active model from DB, returning (model_name, api_key, base_url, provider).
+///
+/// Accepts an optional shared pool. When `None`, creates an ephemeral single-connection
+/// pool (fallback for contexts where AppState is unavailable).
 async fn resolve_active_model(
     matrixone: &MatrixOneSettings,
     encryptor: &FernetTokenEncryptor,
     preferred: Option<&str>,
+    pool: Option<&sqlx::Pool<sqlx::MySql>>,
 ) -> Result<(String, String, String, String), String> {
-    let pool = sqlx::mysql::MySqlPoolOptions::new()
-        .max_connections(1)
-        .connect(&matrixone.database_url())
-        .await
-        .map_err(|e| format!("DB connect: {e}"))?;
+    // Use shared pool if available; otherwise create ephemeral one
+    let ephemeral;
+    let pool: &sqlx::Pool<sqlx::MySql> = match pool {
+        Some(p) => p,
+        None => {
+            ephemeral = sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(1)
+                .connect(&matrixone.database_url())
+                .await
+                .map_err(|e| format!("DB connect: {e}"))?;
+            &ephemeral
+        }
+    };
 
     let row = if let Some(name) = preferred {
         sqlx::query(
@@ -70,7 +82,7 @@ async fn resolve_active_model(
              FROM infra_llm_models WHERE model_name = ? AND is_active = 1 LIMIT 1",
         )
         .bind(name)
-        .fetch_optional(&pool)
+        .fetch_optional(pool)
         .await
         .map_err(|e| format!("DB query: {e}"))?
     } else {
@@ -82,7 +94,7 @@ async fn resolve_active_model(
             "SELECT model_name, api_key_encrypted, base_url, provider \
              FROM infra_llm_models WHERE is_active = 1 ORDER BY model_name LIMIT 1",
         )
-        .fetch_optional(&pool)
+        .fetch_optional(pool)
         .await
         .map_err(|e| format!("DB query fallback: {e}"))?
     } else {
@@ -139,9 +151,146 @@ fn parse_sse_chunks(
     }
 }
 
+/// Maximum retries for transient LLM errors (429, 5xx, network).
+const LLM_MAX_RETRIES: u32 = 3;
+/// Base delay between retries (doubles each attempt: 1s, 2s, 4s).
+const LLM_RETRY_BASE_MS: u64 = 1000;
+
+// ── System Prompt Cache ──────────────────────────────────────────────────────
+// The system prompt is ~1.2K tokens and identical for most turns within a session
+// (same tool set, same task type). Cache by (tool_names_hash, task_type, confidence_bucket).
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+fn prompt_cache() -> &'static Mutex<HashMap<u64, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn prompt_cache_key(tool_names: &[&str], task_type: Option<&str>, confidence: f64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for name in tool_names {
+        name.hash(&mut hasher);
+    }
+    task_type.unwrap_or("none").hash(&mut hasher);
+    // Bucket confidence: 0.0-0.3 = "low", 0.3-1.0 = "normal"
+    let bucket = if confidence < 0.3 { "low" } else { "normal" };
+    bucket.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn cached_system_prompt(
+    tool_names: &[&str],
+    profile_desc: &str,
+    confidence: f64,
+    task_type: Option<&str>,
+) -> String {
+    let key = prompt_cache_key(tool_names, task_type, confidence);
+    if let Ok(cache) = prompt_cache().lock()
+        && let Some(cached) = cache.get(&key)
+    {
+        return cached.clone();
+    }
+    let prompt = prompts::build_main_system_prompt(tool_names, profile_desc, confidence, task_type);
+    if let Ok(mut cache) = prompt_cache().lock() {
+        // Cap cache size to avoid unbounded growth
+        if cache.len() > 32 {
+            cache.clear();
+        }
+        cache.insert(key, prompt.clone());
+    }
+    prompt
+}
+
+/// Prune tool schemas under token pressure to reduce context size.
+/// - TrimSchemas tier: truncate descriptions to first sentence
+/// - CompactHistory tier: truncate descriptions to first sentence
+/// - AggressivePrune tier: truncate + remove optional parameters
+fn prune_tool_schemas(tools: &[Value], tier: crate::prompts::CompactionTier) -> Vec<Value> {
+    use crate::prompts::CompactionTier;
+    match tier {
+        CompactionTier::Normal => tools.to_vec(),
+        CompactionTier::TrimSchemas
+        | CompactionTier::CompactHistory
+        | CompactionTier::AggressivePrune => {
+            tools
+                .iter()
+                .map(|tool| {
+                    let mut t = tool.clone();
+                    if let Some(func) = t.get_mut("function") {
+                        if let Some(desc) = func.get("description").and_then(Value::as_str) {
+                            let truncated = truncate_to_first_sentence(desc).to_string();
+                            if let Some(obj) = func.as_object_mut() {
+                                obj.insert("description".to_string(), json!(truncated));
+                            }
+                        }
+                        // In AggressivePrune, also strip optional parameters
+                        if matches!(tier, CompactionTier::AggressivePrune) {
+                            strip_optional_params(func);
+                        }
+                    }
+                    t
+                })
+                .collect()
+        }
+    }
+}
+
+/// Truncate a description to the first sentence (period/newline boundary).
+fn truncate_to_first_sentence(desc: &str) -> &str {
+    // Find first sentence end: period followed by space or end of string
+    if let Some(pos) = desc.find(". ") {
+        &desc[..pos + 1]
+    } else if let Some(pos) = desc.find(".\n") {
+        &desc[..pos + 1]
+    } else if desc.len() > 200 {
+        // Long description with no clear sentence break — hard-truncate
+        let boundary = desc
+            .char_indices()
+            .take_while(|&(i, _)| i < 200)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(200);
+        &desc[..boundary]
+    } else {
+        desc
+    }
+}
+
+/// Remove optional parameters from a JSON Schema function definition.
+fn strip_optional_params(func: &mut Value) {
+    if let Some(params) = func.get_mut("parameters").and_then(Value::as_object_mut) {
+        let required: Vec<String> = params
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if let Some(props) = params.get_mut("properties").and_then(Value::as_object_mut) {
+            let keys_to_remove: Vec<String> = props
+                .keys()
+                .filter(|k| !required.contains(k))
+                .cloned()
+                .collect();
+            for key in keys_to_remove {
+                props.remove(&key);
+            }
+        }
+    }
+}
+
 /// Call LLM streaming API, yield SSE bytes.
 /// Emits: text_delta, reasoning_delta, tool_call_start, usage SSE events,
 /// then a final `_inprocess_summary` event with full_text/tool_calls/usage/model_used.
+///
+/// Retries up to LLM_MAX_RETRIES times on transient errors (429/5xx/network)
+/// with exponential backoff.
 async fn call_llm_stream(
     messages: &[Value],
     tools: &[Value],
@@ -149,6 +298,7 @@ async fn call_llm_stream(
     api_key: &str,
     base_url: &str,
     provider: &str,
+    max_output_tokens: Option<usize>,
 ) -> Result<impl futures_util::Stream<Item = Bytes> + Send + 'static, String> {
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -163,6 +313,18 @@ async fn call_llm_stream(
         "stream_options": {"include_usage": true},
     });
 
+    // Set max output tokens to prevent generation cutoff.
+    // Use provider-appropriate field name.
+    if let Some(max_out) = max_output_tokens {
+        if provider == "anthropic" || model_name.contains("claude") {
+            body["max_tokens"] = json!(max_out);
+        } else {
+            // OpenAI, DeepSeek, Qwen, etc. use max_completion_tokens (newer)
+            // or max_tokens (legacy). Prefer max_completion_tokens.
+            body["max_completion_tokens"] = json!(max_out);
+        }
+    }
+
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools.to_vec());
         body["tool_choice"] = Value::String("auto".to_string());
@@ -170,157 +332,183 @@ async fn call_llm_stream(
 
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
-    let mut req = client.post(&url).header("content-type", "application/json");
-
-    if provider == "anthropic" {
-        req = req
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01");
-    } else {
-        req = req.header("authorization", format!("Bearer {api_key}"));
-    }
-
-    let response = req
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("LLM request failed: {e}"))?;
-
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let text = response.text().await.unwrap_or_default();
-        return Err(format!("LLM error {status}: {text}"));
-    }
-
-    let byte_stream = response.bytes_stream();
-    let model_name = model_name.to_string();
-
-    let out = stream! {
-        let mut full_text = String::new();
-        let mut reasoning = String::new();
-        let mut tool_calls_map: std::collections::HashMap<usize, Map<String, Value>> =
-            std::collections::HashMap::new();
-        let mut usage = Map::new();
-
-        let sse = parse_sse_chunks(byte_stream);
-        tokio::pin!(sse);
-
-        while let Some(chunk) = sse.next().await {
-            // Some providers attach usage to a chunk that also contains choices,
-            // so parse usage first on every chunk.
-            if let Some(u) = chunk.get("usage").and_then(Value::as_object) {
-                let prompt = u.get("prompt_tokens").and_then(Value::as_i64);
-                let completion = u.get("completion_tokens").and_then(Value::as_i64);
-                if prompt.is_some() || completion.is_some() {
-                    let mut usage_map = Map::new();
-                    if let Some(value) = prompt {
-                        usage_map.insert("prompt".to_string(), Value::from(value));
-                    }
-                    if let Some(value) = completion {
-                        usage_map.insert("completion".to_string(), Value::from(value));
-                    }
-                    if let (Some(p), Some(c)) = (prompt, completion) {
-                        usage_map.insert("total".to_string(), Value::from(p + c));
-                    }
-                    usage = usage_map;
-                    yield render_sse(&json!({
-                        "type": "usage",
-                        "prompt_tokens": prompt,
-                        "completion_tokens": completion,
-                        "cache_read_tokens": u.get("prompt_tokens_details")
-                            .and_then(|d| d.get("cached_tokens"))
-                            .and_then(Value::as_i64),
-                    }));
-                }
-            }
-
-            let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
-                continue;
-            };
-
-            let Some(delta) = choices.first()
-                .and_then(|c| c.get("delta"))
-                .and_then(Value::as_object)
-            else { continue };
-
-            // Text content
-            if let Some(content) = delta.get("content").and_then(Value::as_str)
-                && !content.is_empty() {
-                    full_text.push_str(content);
-                    yield render_sse(&json!({"type": "text_delta", "content": content}));
-                }
-
-            // Reasoning (DeepSeek / o1 style)
-            if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str)
-                && !r.is_empty() {
-                    reasoning.push_str(r);
-                    yield render_sse(&json!({"type": "reasoning_delta", "content": r}));
-                }
-
-            // Tool calls (streaming accumulation)
-            if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
-                for tc in tcs {
-                    let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    let entry = tool_calls_map.entry(idx).or_insert_with(|| {
-                        Map::from_iter([
-                            ("id".to_string(), Value::String(String::new())),
-                            ("type".to_string(), Value::String("function".to_string())),
-                            ("function".to_string(), json!({"name": "", "arguments": ""})),
-                        ])
-                    });
-                    if let Some(id) = tc.get("id").and_then(Value::as_str)
-                        && !id.is_empty() {
-                            entry.insert("id".to_string(), Value::String(id.to_string()));
-                        }
-                    if let Some(func) = tc.get("function").and_then(Value::as_object) {
-                        let f = entry
-                            .entry("function".to_string())
-                            .or_insert_with(|| json!({}))
-                            .as_object_mut()
-                            .unwrap();
-                        if let Some(name) = func.get("name").and_then(Value::as_str)
-                            && !name.is_empty() {
-                                let is_new = f.get("name").and_then(Value::as_str).unwrap_or("").is_empty();
-                                f.insert("name".to_string(), Value::String(name.to_string()));
-                                if is_new {
-                                    yield render_sse(&json!({"type": "tool_call_start", "name": name}));
-                                }
-                            }
-                        if let Some(args) = func.get("arguments").and_then(Value::as_str) {
-                            let existing = f
-                                .entry("arguments".to_string())
-                                .or_insert_with(|| Value::String(String::new()));
-                            if let Value::String(s) = existing {
-                                s.push_str(args);
-                            }
-                        }
-                    }
-                }
-            }
+    // Retry loop for transient errors (429 rate limit, 5xx server errors, network)
+    let mut last_err = String::new();
+    for attempt in 0..=LLM_MAX_RETRIES {
+        if attempt > 0 {
+            let delay = LLM_RETRY_BASE_MS * (1 << (attempt - 1));
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
         }
 
-        // Emit final summary as a special internal event (not forwarded to client)
-        let mut sorted_tcs: Vec<_> = tool_calls_map.into_iter().collect();
-        sorted_tcs.sort_by_key(|(idx, _)| *idx);
-        let tool_calls: Vec<Value> = sorted_tcs.into_iter().map(|(_, v)| Value::Object(v)).collect();
+        let mut req = client.post(&url).header("content-type", "application/json");
 
-        yield render_sse(&json!({
-            "type": "_inprocess_summary",
-            "full_text": full_text,
-            "reasoning": reasoning,
-            "tool_calls": tool_calls,
-            "usage": usage,
-            "model_used": model_name,
-        }));
-    };
+        if provider == "anthropic" {
+            req = req
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01");
+        } else {
+            req = req.header("authorization", format!("Bearer {api_key}"));
+        }
 
-    Ok(out)
+        let response = match req.json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("LLM request failed: {e}");
+                // Network errors are always retryable
+                continue;
+            }
+        };
+
+        let status = response.status().as_u16();
+        if response.status().is_success() {
+            // Success — return the stream
+            let byte_stream = response.bytes_stream();
+            let model_name = model_name.to_string();
+
+            let out = stream! {
+                let mut full_text = String::new();
+                let mut reasoning = String::new();
+                let mut tool_calls_map: std::collections::HashMap<usize, Map<String, Value>> =
+                    std::collections::HashMap::new();
+                let mut usage = Map::new();
+
+                let sse = parse_sse_chunks(byte_stream);
+                tokio::pin!(sse);
+
+                while let Some(chunk) = sse.next().await {
+                    // Some providers attach usage to a chunk that also contains choices,
+                    // so parse usage first on every chunk.
+                    if let Some(u) = chunk.get("usage").and_then(Value::as_object) {
+                        let prompt = u.get("prompt_tokens").and_then(Value::as_i64);
+                        let completion = u.get("completion_tokens").and_then(Value::as_i64);
+                        if prompt.is_some() || completion.is_some() {
+                            let mut usage_map = Map::new();
+                            if let Some(value) = prompt {
+                                usage_map.insert("prompt".to_string(), Value::from(value));
+                            }
+                            if let Some(value) = completion {
+                                usage_map.insert("completion".to_string(), Value::from(value));
+                            }
+                            if let (Some(p), Some(c)) = (prompt, completion) {
+                                usage_map.insert("total".to_string(), Value::from(p + c));
+                            }
+                            usage = usage_map;
+                            yield render_sse(&json!({
+                                "type": "usage",
+                                "prompt_tokens": prompt,
+                                "completion_tokens": completion,
+                                "cache_read_tokens": u.get("prompt_tokens_details")
+                                    .and_then(|d| d.get("cached_tokens"))
+                                    .and_then(Value::as_i64),
+                            }));
+                        }
+                    }
+
+                    let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
+                        continue;
+                    };
+
+                    let Some(delta) = choices.first()
+                        .and_then(|c| c.get("delta"))
+                        .and_then(Value::as_object)
+                    else { continue };
+
+                    // Text content
+                    if let Some(content) = delta.get("content").and_then(Value::as_str)
+                        && !content.is_empty() {
+                            full_text.push_str(content);
+                            yield render_sse(&json!({"type": "text_delta", "content": content}));
+                        }
+
+                    // Reasoning (DeepSeek / o1 style)
+                    if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str)
+                        && !r.is_empty() {
+                            reasoning.push_str(r);
+                            yield render_sse(&json!({"type": "reasoning_delta", "content": r}));
+                        }
+
+                    // Tool calls (streaming accumulation)
+                    if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
+                        for tc in tcs {
+                            let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                            let entry = tool_calls_map.entry(idx).or_insert_with(|| {
+                                Map::from_iter([
+                                    ("id".to_string(), Value::String(String::new())),
+                                    ("type".to_string(), Value::String("function".to_string())),
+                                    ("function".to_string(), json!({"name": "", "arguments": ""})),
+                                ])
+                            });
+                            if let Some(id) = tc.get("id").and_then(Value::as_str)
+                                && !id.is_empty() {
+                                    entry.insert("id".to_string(), Value::String(id.to_string()));
+                                }
+                            if let Some(func) = tc.get("function").and_then(Value::as_object) {
+                                let f = entry
+                                    .entry("function".to_string())
+                                    .or_insert_with(|| json!({}));
+                                let Some(f) = f.as_object_mut() else { continue; };
+                                if let Some(name) = func.get("name").and_then(Value::as_str)
+                                    && !name.is_empty() {
+                                        let is_new = f.get("name").and_then(Value::as_str).unwrap_or("").is_empty();
+                                        f.insert("name".to_string(), Value::String(name.to_string()));
+                                        if is_new {
+                                            yield render_sse(&json!({"type": "tool_call_start", "name": name}));
+                                        }
+                                    }
+                                if let Some(args) = func.get("arguments").and_then(Value::as_str) {
+                                    let existing = f
+                                        .entry("arguments".to_string())
+                                        .or_insert_with(|| Value::String(String::new()));
+                                    if let Value::String(s) = existing {
+                                        s.push_str(args);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Emit final summary as a special internal event (not forwarded to client)
+                let mut sorted_tcs: Vec<_> = tool_calls_map.into_iter().collect();
+                sorted_tcs.sort_by_key(|(idx, _)| *idx);
+                let tool_calls: Vec<Value> = sorted_tcs.into_iter().map(|(_, v)| Value::Object(v)).collect();
+
+                yield render_sse(&json!({
+                    "type": "_inprocess_summary",
+                    "full_text": full_text,
+                    "reasoning": reasoning,
+                    "tool_calls": tool_calls,
+                    "usage": usage,
+                    "model_used": model_name,
+                }));
+            };
+
+            return Ok(out);
+        }
+
+        // Non-success: check if retryable (429 rate limit, 5xx server error)
+        let text = response.text().await.unwrap_or_default();
+        last_err = format!("LLM error {status}: {text}");
+        if status == 429 || status >= 500 {
+            continue; // Retryable
+        }
+        // 4xx (except 429) is not retryable — fail immediately
+        return Err(last_err);
+    }
+
+    // All retries exhausted
+    Err(format!("{last_err} (after {} retries)", LLM_MAX_RETRIES))
 }
 
 #[derive(Clone)]
 pub struct InProcessChatTurnBridge {
     pub matrixone: MatrixOneSettings,
     pub encryptor: Arc<FernetTokenEncryptor>,
+    /// Shared DB pool — avoids creating a new connection per turn.
+    /// When `None`, falls back to ephemeral single-connection pool.
+    pub shared_pool: Option<Arc<sqlx::Pool<sqlx::MySql>>>,
+    /// Pipeline learning writer — auto-updates EntityGraph/PatternLibrary/Calibrator.
+    pub turn_learning_writer: Option<Arc<dyn crate::TurnLearningWriter>>,
 }
 
 impl InProcessChatTurnBridge {
@@ -328,7 +516,19 @@ impl InProcessChatTurnBridge {
         Self {
             matrixone,
             encryptor,
+            shared_pool: None,
+            turn_learning_writer: None,
         }
+    }
+
+    pub fn with_pool(mut self, pool: Arc<sqlx::Pool<sqlx::MySql>>) -> Self {
+        self.shared_pool = Some(pool);
+        self
+    }
+
+    pub fn with_learning_writer(mut self, writer: Arc<dyn crate::TurnLearningWriter>) -> Self {
+        self.turn_learning_writer = Some(writer);
+        self
     }
 }
 
@@ -372,6 +572,10 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let selection_confidence = payload
+            .get("selection_confidence")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0); // Default: high confidence (backward compat)
         let edge_profile = payload
             .get("edge_profile")
             .and_then(Value::as_object)
@@ -392,6 +596,8 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
 
         let matrixone = self.matrixone.clone();
         let encryptor = self.encryptor.clone();
+        let shared_pool = self.shared_pool.clone();
+        let turn_learning_writer = self.turn_learning_writer.clone();
 
         let stream = stream! {
             let turn_started = Instant::now();
@@ -399,8 +605,9 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             yield render_sse(&json!({"type": "session_info", "session_id": session_id}));
 
             // Resolve LLM model
+            let pool_ref = shared_pool.as_deref();
             let (model_name, api_key, base_url, provider) =
-                match resolve_active_model(&matrixone, &encryptor, model_override.as_deref()).await {
+                match resolve_active_model(&matrixone, &encryptor, model_override.as_deref(), pool_ref).await {
                     Ok(m) => m,
                     Err(e) => {
                         yield render_sse_map(&build_stream_error_event(&e, "MODEL_NOT_AVAILABLE", false));
@@ -471,23 +678,64 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     }
                 })
                 .unwrap_or_default();
-            let system_prompt_content = prompts::build_main_system_prompt(
+            // ── Extract user query for signal detection ──
+            let user_content_for_signal = messages
+                .iter()
+                .rev()
+                .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+                .and_then(|m| m.get("content").and_then(Value::as_str))
+                .unwrap_or("");
+
+            let task_type = prompts::detect_task_type(user_content_for_signal);
+
+            let system_prompt_content = cached_system_prompt(
                 &tool_names,
                 &format!("{profile_desc}{skill_hint}"),
+                selection_confidence,
+                task_type,
             );
+
+            // ── Memory lifecycle: detect tracking/store signals in user input ──
+            // Injects a priority hint into the system prompt so the LLM stores
+            // the user's interest immediately rather than exploring the codebase.
+            // This wires the Rust-side detect_store_signal into the live pipeline.
+            let memory_signal_hint = if let Some(category) =
+                crate::prompts::memory_lifecycle::detect_store_signal(user_content_for_signal)
+            {
+                let ns = crate::prompts::memory_lifecycle::suggest_namespace(category);
+                format!(
+                    "\n\n⚡ MEMORY SIGNAL DETECTED: category=\"{category}\", namespace=\"{ns}\". \
+                     Store the user's intent with memory_store BEFORE doing anything else."
+                )
+            } else {
+                String::new()
+            };
+
             llm_messages.push(json!({
                 "role": "system",
-                "content": system_prompt_content
+                "content": format!("{system_prompt_content}{memory_signal_hint}")
             }));
 
             // Merge tool results into messages (handle continuation turns)
             // Client sends complete message history including tool role messages,
             // so we just use messages directly.
-            let merged_messages = {
+            let (merged_messages, tier) = {
                 let raw = messages.clone();
-                // Apply server-side compaction: truncate large tool results if
-                // total context exceeds budget (120k chars ≈ 30k tokens).
-                crate::compact_cloud_loop_messages(&raw, 120_000, 2_000)
+                // Compute model budget for tier-aware compaction using cache-aware estimation.
+                // Tool schemas are cache-eligible (stable prefix), so we estimate their cost.
+                let budget = crate::prompts::budget_for_model(Some(&model_name));
+                let tool_schema_tokens: usize = edge_tools.iter()
+                    .map(|t| serde_json::to_string(t).map(|s| crate::prompts::estimate_str_tokens(&s)).unwrap_or(50))
+                    .sum();
+                // Combine system prompt (llm_messages) + conversation (raw) for estimation
+                let mut all_msgs = llm_messages.clone();
+                all_msgs.extend(raw.iter().cloned());
+                let cache_est = crate::prompts::estimate_tokens_cache_aware(&all_msgs, tool_schema_tokens);
+                let tier = budget.compaction_tier(cache_est.total_tokens);
+                // Use effective input limit as char budget (×4 for char-to-token ratio)
+                let budget_chars = budget.effective_input_limit() * 4;
+                let merged = crate::compact_tiered(&raw, budget_chars, 2_000, tier, budget.keep_recent_turns);
+                (merged, tier)
             };
 
             llm_messages.extend(merged_messages);
@@ -502,14 +750,20 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             let mut llm_steps: Vec<Value> = Vec::new();
 
             let llm_started = Instant::now();
+            // Compute max output tokens from model budget
+            let budget = crate::prompts::budget_for_model(Some(&model_name));
+            let max_output_tokens = (budget.model_limit as f64 * budget.output_reserve_ratio) as usize;
+            // Prune tool schemas under token pressure
+            let pruned_tools = prune_tool_schemas(&edge_tools, tier);
             {
                 let llm_stream = match call_llm_stream(
                     &llm_messages,
-                    &edge_tools,
+                    &pruned_tools,
                     &model_name,
                     &api_key,
                     &base_url,
                     &provider,
+                    Some(max_output_tokens),
                 )
                 .await
                 {
@@ -697,17 +951,24 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 .unwrap_or(0);
 
             tokio::spawn(async move {
+                let persist_start = std::time::Instant::now();
                 let core_outcome = match writer.persist(persist_plan).await {
                     Ok(outcome) => outcome,
                     Err(e) => {
-                        eprintln!("InProcessChatTurnBridge: persist failed: {e}");
+                        eprintln!(
+                            "PERSIST_FAIL session={} core_events={} tool_events={} elapsed={:?} error={}",
+                            sid, core_event_count, tool_event_count, persist_start.elapsed(), e
+                        );
                         return;
                     }
                 };
                 let tool_events_persisted = match tool_event_plan {
                     Some(plan) => {
                         if let Err(e) = tool_writer.persist(plan).await {
-                            eprintln!("InProcessChatTurnBridge: tool event persist failed: {e}");
+                            eprintln!(
+                                "PERSIST_FAIL session={} stage=tool_events count={} elapsed={:?} error={}",
+                                sid, tool_event_count, persist_start.elapsed(), e
+                            );
                             false
                         } else {
                             true
@@ -731,7 +992,10 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     last_event_id,
                 };
                 if let Err(e) = sa_writer.update_session_activity(&sid, plan).await {
-                    eprintln!("InProcessChatTurnBridge: session activity update failed: {e}");
+                    eprintln!(
+                        "PERSIST_FAIL session={} stage=activity elapsed={:?} error={}",
+                        sid, persist_start.elapsed(), e
+                    );
                 }
             });
 
@@ -761,6 +1025,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     turn_reflection_state_store.clone(),
                     turn_reflection_lesson_writer.clone(),
                     turn_observer_worker.clone(),
+                    turn_learning_writer.clone(),
                 );
             }
 
@@ -785,7 +1050,10 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         reasoning_content: None,
                     };
                     if let Err(e) = aux_writer.persist_events(vec![routing_event]).await {
-                        eprintln!("InProcessChatTurnBridge: auxiliary event persist failed: {e}");
+                        eprintln!(
+                            "PERSIST_FAIL session={} stage=auxiliary error={}",
+                            aux_sid, e
+                        );
                     }
                 });
             }
@@ -885,7 +1153,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             .header("cache-control", "no-cache")
             .header("x-accel-buffering", "no")
             .body(body)
-            .unwrap())
+            .expect("valid SSE response builder"))
     }
 }
 
@@ -935,12 +1203,21 @@ pub async fn prefetch_memories(
     }
     let started = Instant::now();
     let entity_query = extract_entity_tokens(user_msg);
-    let full_result = fetch_memories(mem_url, mem_key, user_msg.trim(), user_id).await;
-    let entity_result = if !entity_query.is_empty() && entity_query != user_msg.trim() {
-        fetch_memories(mem_url, mem_key, &entity_query, user_id).await
-    } else {
-        String::new()
-    };
+    let trimmed_msg = user_msg.trim();
+
+    // Parallel fetch: full message retrieval + entity-keyword retrieval via tokio::join!
+    // Saves one round-trip latency (~50-200ms) compared to sequential.
+    let do_entity = !entity_query.is_empty() && entity_query != trimmed_msg;
+    let (full_result, entity_result) = tokio::join!(
+        fetch_memories(mem_url, mem_key, trimmed_msg, user_id),
+        async {
+            if do_entity {
+                fetch_memories(mem_url, mem_key, &entity_query, user_id).await
+            } else {
+                String::new()
+            }
+        }
+    );
     let merged = merge_memory_results(&[&full_result, &entity_result]);
     let fetch_ms = started.elapsed().as_millis() as i64;
     let preview = merged.iter().take(3).map(|l| l.to_string()).collect();
@@ -1025,7 +1302,7 @@ async fn fetch_memories(base_url: &str, api_key: &str, query: &str, user_id: &st
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[memory] fetch error: {e}");
+            eprintln!("[memory] fetch error: {e:#}");
             return String::new();
         }
     };
@@ -1045,6 +1322,7 @@ async fn fetch_memories(base_url: &str, api_key: &str, query: &str, user_id: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompts::CompactionTier;
 
     #[test]
     fn extract_entity_tokens_from_mixed_language() {
@@ -1150,5 +1428,125 @@ mod tests {
     fn count_inprocess_persisted_events_skips_failed_tool_events() {
         assert_eq!(count_inprocess_persisted_events(2, 3, false), 2);
         assert_eq!(count_inprocess_persisted_events(2, 3, true), 5);
+    }
+
+    // ── Schema pruning tests ──
+
+    fn make_tool_schema(name: &str, desc: &str, optional_param: bool) -> Value {
+        let mut props = serde_json::Map::new();
+        props.insert("command".to_string(), json!({"type": "string"}));
+        if optional_param {
+            props.insert("timeout".to_string(), json!({"type": "number"}));
+        }
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": desc,
+                "parameters": {
+                    "type": "object",
+                    "properties": props,
+                    "required": ["command"]
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn prune_normal_tier_no_changes() {
+        let tools = vec![make_tool_schema(
+            "bash",
+            "Execute shell commands. Supports all standard Unix tools.",
+            true,
+        )];
+        let result = super::prune_tool_schemas(&tools, CompactionTier::Normal);
+        assert_eq!(result, tools, "Normal tier should not modify schemas");
+    }
+
+    #[test]
+    fn prune_trim_schemas_truncates_descriptions() {
+        let tools = vec![make_tool_schema(
+            "bash",
+            "Execute shell commands. Supports all standard Unix tools and build systems.",
+            true,
+        )];
+        let result = super::prune_tool_schemas(&tools, CompactionTier::TrimSchemas);
+        let desc = result[0]["function"]["description"].as_str().unwrap();
+        assert_eq!(
+            desc, "Execute shell commands.",
+            "TrimSchemas should truncate to first sentence"
+        );
+        // Optional params should still be present (only stripped in AggressivePrune)
+        assert!(
+            result[0]["function"]["parameters"]["properties"]
+                .get("timeout")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn prune_compact_history_truncates_descriptions() {
+        let tools = vec![make_tool_schema(
+            "bash",
+            "Execute shell commands. Supports all standard Unix tools.",
+            true,
+        )];
+        let result = super::prune_tool_schemas(&tools, CompactionTier::CompactHistory);
+        let desc = result[0]["function"]["description"].as_str().unwrap();
+        assert_eq!(desc, "Execute shell commands.");
+        assert!(
+            result[0]["function"]["parameters"]["properties"]
+                .get("timeout")
+                .is_some(),
+            "CompactHistory should NOT strip optional params"
+        );
+    }
+
+    #[test]
+    fn prune_aggressive_strips_optional_params() {
+        let tools = vec![make_tool_schema(
+            "bash",
+            "Execute shell commands. Supports all standard Unix tools.",
+            true,
+        )];
+        let result = super::prune_tool_schemas(&tools, CompactionTier::AggressivePrune);
+        let desc = result[0]["function"]["description"].as_str().unwrap();
+        assert_eq!(desc, "Execute shell commands.");
+        assert!(
+            result[0]["function"]["parameters"]["properties"]
+                .get("timeout")
+                .is_none(),
+            "AggressivePrune should strip optional params"
+        );
+        // Required params should remain
+        assert!(
+            result[0]["function"]["parameters"]["properties"]
+                .get("command")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn prune_trim_schemas_saves_tokens_vs_normal() {
+        let tools: Vec<Value> = (0..5)
+            .map(|i| {
+                make_tool_schema(
+                    &format!("tool_{i}"),
+                    "A very long description that explains everything the tool does. \
+                 It handles multiple scenarios and edge cases.",
+                    true,
+                )
+            })
+            .collect();
+        let normal = super::prune_tool_schemas(&tools, CompactionTier::Normal);
+        let trimmed = super::prune_tool_schemas(&tools, CompactionTier::TrimSchemas);
+        let normal_bytes: usize = normal.iter().map(|t| t.to_string().len()).sum();
+        let trimmed_bytes: usize = trimmed.iter().map(|t| t.to_string().len()).sum();
+        assert!(
+            trimmed_bytes < normal_bytes,
+            "TrimSchemas should reduce total bytes: {} < {}",
+            trimmed_bytes,
+            normal_bytes
+        );
     }
 }

@@ -38,7 +38,7 @@
       ],
       "user_query": "deploy rust artifacts",
       "budget_chars": 8000,
-      "expected": "[Earlier relevant context from this session]\nUser: deploy rust service\nAssistant: let us deploy rust service carefully\nTool result: build rust artifacts"
+      "expected": "[Earlier relevant context from this session]\nTool result: build rust artifacts\nUser: deploy rust service\nAssistant: let us deploy rust service carefully"
     },
     {
       "name": "returns_none_for_empty_query_words",

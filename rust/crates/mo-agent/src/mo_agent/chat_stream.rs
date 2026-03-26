@@ -2,6 +2,86 @@ use super::*;
 
 const MAX_TURNS: usize = 25;
 
+/// Tools that are idempotent reads — safe to cache across turns.
+/// Side-effectful tools (bash, write_file, mo_query, etc.) must NOT be in this list.
+const CACHEABLE_TOOLS: &[&str] = &[
+    "read_file",
+    "list_dir",
+    "grep",
+    "glob",
+    "git_status",
+    "git_diff",
+    "git_log",
+    "git_blame",
+    "git_file_history",
+    "git_contributors",
+    "git_log_search",
+    "github_list_prs",
+    "github_get_pr",
+    "github_ci_status",
+    "github_list_issues",
+    "github_get_issue",
+    "get_agent_info",
+];
+
+/// Determine whether a tool result string indicates an error.
+///
+/// For structured JSON results (our tools), checks `"ok": false` or a non-null
+/// `"error"` field. For plain-text results, falls back to `starts_with("error")`.
+/// This avoids false positives from `"error": null` in success responses.
+fn is_tool_error(result_str: &str) -> bool {
+    // Try JSON-aware detection first
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(result_str) {
+        // Structured response with boolean "ok" field (our GitHub/MO tools)
+        if let Some(ok_val) = v.get("ok").and_then(|o| o.as_bool()) {
+            return !ok_val;
+        }
+        // JSON with explicit non-null "error" field
+        if let Some(err) = v.get("error") {
+            return !err.is_null() && err.as_str() != Some("");
+        }
+    }
+    // Plain-text fallback: "Error: ..." or "error ..."
+    result_str.to_lowercase().starts_with("error")
+}
+
+/// Normalize a tool call signature for cache key matching.
+/// - Strips trailing slashes from path-like string args
+/// - Sorts object keys for deterministic hashing
+/// - Normalizes whitespace in string args
+fn normalize_call_sig(name: &str, args: &serde_json::Value) -> String {
+    let normalized = normalize_args(args);
+    format!(
+        "{}:{}",
+        name,
+        serde_json::to_string(&normalized).unwrap_or_default()
+    )
+}
+
+fn normalize_args(val: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match val {
+        Value::String(s) => {
+            // Normalize paths: strip trailing slashes, collapse double slashes
+            let trimmed = s.trim();
+            let normalized = trimmed.trim_end_matches('/');
+            Value::String(normalized.to_string())
+        }
+        Value::Object(map) => {
+            // Sort keys for deterministic serialization
+            let mut sorted: serde_json::Map<String, Value> = serde_json::Map::new();
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            for k in keys {
+                sorted.insert(k.clone(), normalize_args(&map[k]));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(normalize_args).collect()),
+        other => other.clone(),
+    }
+}
+
 fn print_explain_report(turns: &[serde_json::Value], verbose: bool) {
     eprintln!("\n{}", "── EXPLAIN ─────────────────────────────".dim());
     let mut total_ms = 0i64;
@@ -295,6 +375,53 @@ fn print_explain_report(turns: &[serde_json::Value], verbose: bool) {
     eprintln!("{}", "─────────────────────────────────────────────".dim());
 }
 
+/// Print TurnGuard verdict details in explain mode.
+fn print_verdict_report(verdict_events: &[VerdictEvent], verbose: bool) {
+    if verdict_events.is_empty() {
+        return;
+    }
+    eprintln!("\n{}", "── TURN GUARD ──────────────────────────".dim());
+    for ve in verdict_events {
+        let icon = match ve.severity.as_str() {
+            "critical" => "🛑",
+            "warning" => "⚠",
+            _ => "ℹ",
+        };
+        eprintln!(
+            "{}",
+            format!(
+                "T{} {} {}  nudges={}  errors={}  deprioritized={}{}",
+                ve.turn,
+                icon,
+                ve.severity,
+                ve.nudge_count,
+                ve.total_errors,
+                ve.deprioritized_count,
+                if ve.force_stop { "  FORCE_STOP" } else { "" },
+            )
+            .dim()
+        );
+        if !ve.avoid_tools.is_empty() {
+            eprintln!(
+                "{}",
+                format!("  ├─ avoid: [{}]", ve.avoid_tools.join(", ")).dim()
+            );
+        }
+        if verbose {
+            for (i, inj) in ve.injections.iter().enumerate() {
+                let preview: String = inj.chars().take(120).collect();
+                eprintln!("{}", format!("  ├─ injection[{}]: {}…", i, preview).dim());
+            }
+        } else if !ve.injections.is_empty() {
+            eprintln!(
+                "{}",
+                format!("  └─ {} injection(s)", ve.injections.len()).dim()
+            );
+        }
+    }
+    eprintln!("{}", "─────────────────────────────────────────────".dim());
+}
+
 /// Parameters for a single agentic chat turn — groups the many arguments
 /// to `stream_chat_sse` into a named struct to reduce cognitive load.
 pub(super) struct ChatTurnParams<'a> {
@@ -376,17 +503,36 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     let mut explain_turns: Vec<serde_json::Value> = Vec::new();
     // Track first-turn selection report and all unique tools actually used
     let mut first_selection_report: Option<tool_registry::SelectionReport> = None;
+    let mut first_budget_pressure: f64 = 0.0;
     let mut all_tools_used: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    let mut turn_sigs: Vec<std::collections::HashSet<String>> = Vec::new();
+    let mut turn_sigs: Vec<std::collections::BTreeSet<String>> = Vec::new();
     let mut turn_tool_names: Vec<std::collections::HashSet<String>> = Vec::new();
-    let mut nudge_count: usize = 0;
-    const STALL_WINDOW: usize = 3;
-    const TOOL_NAME_STALL_WINDOW: usize = 4;
-    const MAX_NUDGES: usize = 2;
+    let mut forced_factual_retry = false;
+    const TOOL_NAME_STALL_WINDOW: usize = 3;
     let mut current_run_id: Option<String> = None;
+    let mut stall_events: Vec<(String, u32)> = Vec::new();
+    let mut verdict_events: Vec<VerdictEvent> = Vec::new();
+    let mut tool_call_records: Vec<mo_agent_services::session_journal::ToolCallRecord> = Vec::new();
+    // Cross-turn dedup: track (tool_name, args_hash) → result across all turns
+    let mut cross_turn_cache: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    // Semantic near-duplicate tracker (Tier 2: param-aware, Tier 3: output similarity)
+    let mut semantic_dedup = mo_agent_runtime::semantic_dedup::SemanticDedup::new(
+        mo_agent_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
+    );
+    // Unified non-happy-path guard: stall + divergence + tool health + error recovery + escalation
+    let mut turn_guard = mo_agent_runtime::turn::turn_guard::TurnGuard::new();
+    // Stall enforcement: tools restricted from schema after nudge-ignore
+    let mut restricted_tools: HashSet<String> = HashSet::new();
+    // Dynamic turn budget: each stall/divergence costs turns to prevent runaway sessions
+    let mut remaining_turns: usize = MAX_TURNS;
 
     for _turn in 0..MAX_TURNS {
+        if remaining_turns == 0 {
+            return Err("Turn budget exhausted due to repeated stalls. Aborting.".to_string());
+        }
+        remaining_turns = remaining_turns.saturating_sub(1);
         // Build request payload
         let git_branch = std::process::Command::new("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -396,7 +542,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         let memoria_url = std::env::var("MEMORIA_BASE_URL")
-            .unwrap_or_else(|_| "http://localhost:8100".to_string());
+            .unwrap_or_else(|_| mo_agent_core::config::DEFAULT_MEMORIA_URL.to_string());
         let memoria_key = std::env::var("MEMORIA_API_KEY")
             .ok()
             .or_else(|| std::env::var("MEMORIA_MASTER_KEY").ok())
@@ -431,18 +577,120 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         // Tool selection via pluggable ToolSelector strategy.
         // First turn: selector decides which tools. Follow-up turns: also pin
         // tools the LLM already invoked so they remain available.
-        let (turn_schemas, selection_report) = if tool_results.is_empty() {
+
+        // ── Budget pressure: pre-estimate token usage to reduce tool count ──
+        // When context is filling up, select fewer dynamic tools to save tokens.
+        let budget_pressure = {
+            let estimated = mo_agent_runtime::prompts::estimate_tokens(&messages);
+            let budget = mo_agent_runtime::prompts::budget_for_model(model);
+            let tier = budget.compaction_tier(estimated);
+            match tier {
+                mo_agent_runtime::prompts::CompactionTier::Normal => 0.0,
+                mo_agent_runtime::prompts::CompactionTier::TrimSchemas => 0.3,
+                mo_agent_runtime::prompts::CompactionTier::CompactHistory => 0.6,
+                mo_agent_runtime::prompts::CompactionTier::AggressivePrune => 0.9,
+            }
+        };
+
+        // Phase 7.5: Memory-augmented boost terms.
+        // Step 1: Extract domain keywords from session history (sync, always works).
+        let mut boost_terms =
+            mo_agent_runtime::turn::retrieval::extract_boost_terms_from_pairs(history, message);
+        // Step 2: Augment with memory service (async, best-effort, 2s timeout).
+        // On cold-start (no relevant history), memory may still have stored
+        // domain hints (e.g., "matrixorigin is a GitHub org") that improve
+        // tool selection. This closes the cold-start gap in entity-rich queries.
+        //
+        // Memory results are re-ranked by TF-IDF cosine similarity to filter
+        // irrelevant memories before boost term extraction (Phase A.2).
+        {
+            let memory_contents = executor.memory_boost_search(message, 5).await;
+            if !memory_contents.is_empty() {
+                // Bridge memory→preferred_repos: extract owner/repo references
+                // from memory content so tool executor can resolve bare repo names.
+                for content in &memory_contents {
+                    for repo in extract_repos_from_memory(content) {
+                        executor.add_preferred_repo(&repo);
+                    }
+                }
+
+                // Re-rank by TF-IDF similarity; filter below threshold.
+                let ranked = mo_agent_runtime::turn::retrieval::rank_memory_results(
+                    message,
+                    &memory_contents,
+                );
+                if !ranked.is_empty() {
+                    // Use only relevant memories for boost term extraction.
+                    let virtual_history: Vec<(String, String)> = ranked
+                        .into_iter()
+                        .map(|(content, _score)| ("memory".to_string(), content))
+                        .collect();
+                    let memory_terms =
+                        mo_agent_runtime::turn::retrieval::extract_boost_terms_from_pairs(
+                            &virtual_history,
+                            message,
+                        );
+                    let existing: std::collections::HashSet<String> =
+                        boost_terms.iter().cloned().collect();
+                    for term in memory_terms {
+                        if !existing.contains(&term) {
+                            boost_terms.push(term);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Extract memory domain hints from boost terms ──
+        // Map detected boost term keywords → DomainHint for gate softening.
+        // General: boost_terms containing domain-related keywords map to hints.
+        let memory_domain_hints = {
+            use mo_agent_runtime::pipeline::routing::DomainHint;
+            let mut hints = Vec::new();
+            let terms_lower: Vec<String> = boost_terms.iter().map(|t| t.to_lowercase()).collect();
+            let has = |kw: &str| terms_lower.iter().any(|t| t.contains(kw));
+            if has("github") || has("repo") || has("pr") || has("issue") || has("pull") {
+                hints.push(DomainHint::GitHub);
+            }
+            if has("git") || has("commit") || has("branch") || has("diff") || has("log") {
+                hints.push(DomainHint::Git);
+            }
+            if has("code") || has("file") || has("edit") || has("read") || has("write") {
+                hints.push(DomainHint::Code);
+            }
+            if has("memory") || has("store") || has("remember") || has("preference") {
+                hints.push(DomainHint::Memory);
+            }
+            hints
+        };
+
+        // Proactively seed restricted_tools with deprioritized tools from health tracker.
+        // This ensures cross-session deprioritized tools are excluded BEFORE scoring.
+        for tool in turn_guard.health.deprioritized_tools() {
+            restricted_tools.insert(tool.to_string());
+        }
+        let restricted_vec: Vec<String> = restricted_tools.iter().cloned().collect();
+
+        let (turn_schemas, selection_report, selection_confidence) = if tool_results.is_empty() {
             let turn_count = history.len() as u32 + 1;
             let sel_ctx = tool_selector::SelectionContext {
                 query: message,
                 turn_count,
                 recent_tools,
                 budget_tokens: registry.default_budget(),
+                boost_terms: boost_terms.clone(),
+                budget_pressure,
+                memory_domain_hints: memory_domain_hints.clone(),
+                restricted_tools: restricted_vec.clone(),
             };
             let sel_result = selector.select(&sel_ctx).await;
-            let (schemas, report) =
-                tool_selector::resolve_schemas(&registry, &sel_result.tool_names);
-            (schemas, report)
+            let conf = sel_result.confidence;
+            let (schemas, report) = tool_selector::resolve_schemas_with_pressure(
+                &registry,
+                &sel_result.tool_names,
+                budget_pressure,
+            );
+            (schemas, report, conf)
         } else {
             // Follow-up turn: use 2x budget, then pin tools already invoked.
             let turn_count = history.len() as u32 + 1;
@@ -451,10 +699,18 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 turn_count,
                 recent_tools,
                 budget_tokens: registry.default_budget() * 2,
+                boost_terms,
+                budget_pressure,
+                memory_domain_hints,
+                restricted_tools: restricted_vec,
             };
             let sel_result = selector.select(&sel_ctx).await;
-            let (mut selected, mut report) =
-                tool_selector::resolve_schemas(&registry, &sel_result.tool_names);
+            let conf = sel_result.confidence;
+            let (mut selected, mut report) = tool_selector::resolve_schemas_with_pressure(
+                &registry,
+                &sel_result.tool_names,
+                budget_pressure,
+            );
             // Add any tools the LLM invoked that aren't already selected
             let selected_names: std::collections::HashSet<String> = selected
                 .iter()
@@ -480,12 +736,88 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     report.selected_count += 1;
                 }
             }
-            (selected, report)
+            (selected, report, conf)
         };
         if first_selection_report.is_none() {
             first_selection_report = Some(selection_report);
+            first_budget_pressure = budget_pressure;
         }
-        payload["edge_tools"] = serde_json::Value::Array(turn_schemas);
+
+        // ── Tool guidance hint: when the selector is confident, tell the server
+        // which dynamic tools scored highest. The server can inject this as a
+        // system prompt hint, biasing the LLM toward the right tools.
+        // Only emitted when confidence >= 0.4 and there are dynamic tools.
+        {
+            use mo_agent_runtime::tool_registry::TOOL_CATALOG;
+            let dynamic_tools: Vec<&str> = first_selection_report
+                .as_ref()
+                .map(|r| {
+                    r.tools_selected
+                        .iter()
+                        .filter(|n| {
+                            !TOOL_CATALOG
+                                .iter()
+                                .any(|t| t.pinned && t.name == n.as_str())
+                        })
+                        .map(|s| s.as_str())
+                        .take(3) // Top 3 dynamic tools (already in score order)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if selection_confidence >= 0.4 && !dynamic_tools.is_empty() {
+                payload["edge_profile"]["recommended_tools"] = serde_json::json!(dynamic_tools);
+                payload["edge_profile"]["selection_confidence"] =
+                    serde_json::json!(selection_confidence);
+            }
+        }
+        // Dynamic schema restriction: remove tools that were stall-restricted
+        let final_schemas = if restricted_tools.is_empty() {
+            turn_schemas
+        } else {
+            turn_schemas
+                .into_iter()
+                .filter(|s| {
+                    let name = s
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("");
+                    !restricted_tools.contains(name)
+                })
+                .collect()
+        };
+        payload["edge_tools"] = serde_json::Value::Array(final_schemas);
+        if explain != ExplainMode::Off && !restricted_tools.is_empty() {
+            eprintln!(
+                "{}",
+                format!(
+                    "  ├─ restricted: {} tool(s) filtered [{}]",
+                    restricted_tools.len(),
+                    restricted_tools
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+                .dim()
+            );
+        }
+        if explain != ExplainMode::Off
+            && let Some(recommended) = payload["edge_profile"]["recommended_tools"].as_array()
+        {
+            let names: Vec<&str> = recommended.iter().filter_map(|v| v.as_str()).collect();
+            if !names.is_empty() {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "  ├─ guidance: {} (confidence: {:.2})",
+                        names.join(", "),
+                        selection_confidence
+                    )
+                    .dim()
+                );
+            }
+        }
         if !tool_results.is_empty() {
             payload["tool_results"] = serde_json::Value::Array(tool_results.clone());
         }
@@ -549,12 +881,35 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         }
 
         if !turn_result.has_tool_calls {
+            if should_force_factual_tool_retry(
+                message,
+                recent_tools,
+                total_tool_calls,
+                forced_factual_retry,
+            ) {
+                forced_factual_retry = true;
+                if !quiet {
+                    eprintln!(
+                        "{}",
+                        "  ↻ No tool call on a live-data query; forcing one corrective retry…"
+                            .yellow()
+                    );
+                }
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": factual_tool_retry_message(message),
+                }));
+                final_text.clear();
+                continue;
+            }
             break;
         }
 
-        // Stall detection
+        // Stall & divergence detection via unified TurnGuard
         {
-            let sig_set: HashSet<String> = turn_result
+            use std::collections::BTreeSet;
+
+            let sig_set: BTreeSet<String> = turn_result
                 .tool_calls
                 .iter()
                 .map(|tc| {
@@ -578,30 +933,19 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 })
                 .collect();
             turn_sigs.push(sig_set);
-            turn_tool_names.push(name_set);
+            turn_tool_names.push(name_set.clone());
 
-            let sig_stall = turn_sigs.len() >= STALL_WINDOW
-                && turn_sigs[turn_sigs.len() - STALL_WINDOW..]
-                    .windows(2)
-                    .all(|w| w[0] == w[1]);
+            // Feed tool call signatures into TurnGuard
+            turn_guard.record_tool_calls(&turn_result.tool_calls);
+
+            // Name-based stall detection (complementary to TurnGuard's signature stall)
             let name_stall = turn_tool_names.len() >= TOOL_NAME_STALL_WINDOW
                 && turn_tool_names[turn_tool_names.len() - TOOL_NAME_STALL_WINDOW..]
                     .windows(2)
                     .all(|w| w[0] == w[1]);
 
-            if sig_stall || name_stall {
-                if nudge_count >= MAX_NUDGES {
-                    return Err(
-                        "Agent stuck in loop — same tools called repeatedly. Aborting.".to_string(),
-                    );
-                }
-                nudge_count += 1;
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": prompts::STALL_NUDGE
-                }));
-                tool_results = Vec::new();
-                continue;
+            if name_stall {
+                stall_events.push(("name_stall".to_string(), _turn as u32));
             }
         }
 
@@ -633,7 +977,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         }
         messages.push(assistant_tc_msg);
 
-        // Deduplicate tool calls within this turn — skip exact (name, args) repeats
+        // Deduplicate tool calls — skip exact (name, args) repeats within AND across turns
+        // Only cache idempotent read-only tools; side-effectful tools always re-execute
         let mut seen_calls: HashSet<String> = HashSet::new();
 
         for tc_event in &turn_result.tool_calls {
@@ -653,13 +998,9 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 .unwrap_or(serde_json::Value::Object(Default::default()));
 
             // Skip exact duplicate (same tool + same args) within this turn
-            let call_sig = format!(
-                "{}:{}",
-                name,
-                serde_json::to_string(&args).unwrap_or_default()
-            );
-            if !seen_calls.insert(call_sig) {
-                // Already ran this exact call; feed back a cached-result marker
+            let call_sig = normalize_call_sig(&name, &args);
+            if !seen_calls.insert(call_sig.clone()) {
+                // Already ran this exact call this turn
                 let cached_tr = serde_json::json!({
                     "tool_call_id": id,
                     "name": name,
@@ -671,6 +1012,30 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     "content": "(duplicate call — result same as previous identical call this turn)",
                 }));
                 tool_results.push(cached_tr);
+                continue;
+            }
+
+            // Cross-turn dedup: for idempotent tools, return cached result from earlier turn
+            if CACHEABLE_TOOLS.contains(&name.as_str())
+                && let Some(cached_result) = cross_turn_cache.get(&call_sig)
+            {
+                let cached_note = format!(
+                    "(cached from earlier turn — identical call)\n{}",
+                    cached_result
+                );
+                if !quiet {
+                    eprintln!("{}", format!("  ↻ {name} (cached)").dim());
+                }
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": cached_note,
+                }));
+                tool_results.push(serde_json::json!({
+                    "tool_call_id": id,
+                    "name": name,
+                    "result": cached_note,
+                }));
                 continue;
             }
 
@@ -766,7 +1131,75 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 }
             }
             let tool_elapsed = tool_start.elapsed();
-            let is_err = result_str.to_lowercase().starts_with("error");
+            let is_err = is_tool_error(&result_str);
+
+            // Error recovery: classify, retry transient errors, track via TurnGuard
+            if is_err {
+                use mo_agent_runtime::turn::error_recovery::{
+                    build_recovery_message, classify_error, should_retry,
+                };
+                let category = classify_error(&result_str);
+                turn_guard.errors.record_error(category);
+
+                // Automatic retry for transient errors (network, timeout, rate limit)
+                let mut retried_ok = false;
+                if matches!(
+                    category,
+                    mo_agent_runtime::turn::error_recovery::ErrorCategory::Transient
+                ) {
+                    for attempt in 0..mo_agent_runtime::turn::error_recovery::MAX_TOOL_RETRIES {
+                        if let Some(delay_ms) = should_retry(category, attempt) {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            let retry_result = executor.execute(&name, &args).await;
+                            if !is_tool_error(&retry_result) {
+                                result_str = retry_result;
+                                retried_ok = true;
+                                turn_guard.errors.record_retry(true);
+                                if !quiet {
+                                    eprintln!(
+                                        "{}",
+                                        format!("  ↻ {name} retry #{} succeeded", attempt + 1)
+                                            .green()
+                                    );
+                                }
+                                break;
+                            }
+                            turn_guard.errors.record_retry(false);
+                        }
+                    }
+                }
+
+                if !retried_ok {
+                    // Inject structured recovery message with alternatives
+                    let deprioritized = turn_guard.health.deprioritized_tools();
+                    let recovery_msg =
+                        build_recovery_message(&name, &result_str, category, &deprioritized);
+                    result_str.push_str(&format!("\n{recovery_msg}"));
+                }
+            }
+
+            // Record result in TurnGuard (handles health tracking + quality classification)
+            let result_quality = turn_guard.record_tool_result(&name, &result_str);
+
+            // Inject immediate feedback for empty/truncated results
+            if let Some(feedback) = turn_guard.result_feedback(&name, result_quality) {
+                result_str.push_str(&format!("\n{feedback}"));
+            }
+
+            // Record per-tool-call audit entry
+            tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
+                name: name.clone(),
+                ok: !is_err,
+                ms: tool_elapsed.as_millis() as u64,
+                error: if is_err {
+                    result_str
+                        .lines()
+                        .next()
+                        .map(|l| l.chars().take(200).collect())
+                } else {
+                    None
+                },
+            });
 
             // Stop spinner, print final status with duration
             if let Some(spinner) = spinner {
@@ -803,6 +1236,24 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 }
             }
 
+            // Cache successful idempotent tool results for cross-turn dedup
+            if !is_err && CACHEABLE_TOOLS.contains(&name.as_str()) {
+                cross_turn_cache.insert(call_sig, result_str.clone());
+                // Record in semantic tracker for near-duplicate detection in future turns
+                if let Some((prev_turn, reason)) =
+                    semantic_dedup.check_and_record(&name, &args, &result_str, _turn)
+                {
+                    // Inject a hint so the LLM knows it's re-fetching similar data
+                    let hint = format!(
+                        "\n⚠ Note: this result is similar to a previous {} call (turn {}, {}). \
+                         Avoid re-fetching the same information.",
+                        name,
+                        prev_turn + 1,
+                        reason
+                    );
+                    result_str.push_str(&hint);
+                }
+            }
             let tr = serde_json::json!({
                 "tool_call_id": id,
                 "name": name,
@@ -816,10 +1267,82 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             }));
             tool_results.push(tr);
         }
+
+        // ── TurnGuard: unified non-happy-path evaluation ──
+        // Evaluate AFTER all tool results recorded, BEFORE next LLM call.
+        {
+            use mo_agent_runtime::turn::turn_guard::VerdictSeverity;
+
+            let verdict = turn_guard.evaluate();
+
+            // ── Audit: collect non-Healthy verdict events ──
+            if verdict.severity > VerdictSeverity::Healthy {
+                let severity_str = match verdict.severity {
+                    VerdictSeverity::Critical => "critical",
+                    VerdictSeverity::Warning => "warning",
+                    VerdictSeverity::Info => "info",
+                    VerdictSeverity::Healthy => unreachable!(),
+                };
+                verdict_events.push(VerdictEvent {
+                    turn: _turn as u32,
+                    severity: severity_str.to_string(),
+                    injections: verdict.injections.clone(),
+                    avoid_tools: verdict.avoid_tools.clone(),
+                    force_stop: verdict.force_stop,
+                    nudge_count: turn_guard.nudge_count,
+                    total_errors: turn_guard.errors.total_errors,
+                    deprioritized_count: turn_guard.health.deprioritized_tools().len(),
+                });
+            }
+
+            // Inject all verdict messages (stall nudge, divergence correction,
+            // tool health warnings, escalation messages, nudge-ignore warnings)
+            for injection in &verdict.injections {
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": injection
+                }));
+            }
+
+            // Restrict tools that TurnGuard says to avoid
+            for tool in &verdict.avoid_tools {
+                restricted_tools.insert(tool.clone());
+            }
+
+            // Apply turn budget penalties based on severity
+            match verdict.severity {
+                VerdictSeverity::Critical => {
+                    remaining_turns = remaining_turns.saturating_sub(5);
+                    stall_events.push(("critical_escalation".to_string(), _turn as u32));
+                }
+                VerdictSeverity::Warning => {
+                    remaining_turns = remaining_turns.saturating_sub(2);
+                    stall_events.push(("warning".to_string(), _turn as u32));
+                }
+                _ => {}
+            }
+
+            // Force stop on critical verdict
+            if verdict.force_stop {
+                return Err(
+                    "Agent escalated to critical — too many errors and stalls. Aborting."
+                        .to_string(),
+                );
+            }
+
+            // If verdict injected stall messages, skip to next LLM call (don't re-process results)
+            if !verdict.injections.is_empty() && verdict.severity >= VerdictSeverity::Warning {
+                tool_results = Vec::new();
+                continue;
+            }
+        }
     }
 
     if explain != ExplainMode::Off && !explain_turns.is_empty() && !quiet {
         print_explain_report(&explain_turns, explain == ExplainMode::Verbose);
+    }
+    if explain != ExplainMode::Off && !verdict_events.is_empty() && !quiet {
+        print_verdict_report(&verdict_events, explain == ExplainMode::Verbose);
     }
 
     let elapsed = start.elapsed().as_secs_f64();
@@ -874,7 +1397,11 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         tool_calls_count: total_tool_calls,
         tools_selected: report.tools_selected,
         tools_used: all_tools_used.into_iter().collect(),
+        tool_call_records,
         budget_used: report.budget_used,
+        budget_pressure: first_budget_pressure,
+        stall_events,
+        verdict_events,
     })
 }
 
@@ -892,16 +1419,37 @@ pub(super) fn looks_like_factual_query(input: &str) -> bool {
         "pr",
         "pull request",
         "issue",
+        "拉取请求",
+        "问题",
         "commit",
+        "提交",
         "ci ",
+        " ci?",
+        "ci状态",
+        "最新的一个ci",
         "workflow",
+        "工作流",
         "pipeline",
         "merge",
         "branch",
+        "分支",
         "release",
         "tag",
+        "star",
+        "stars",
+        "多少star",
     ];
     let has_github = github_keywords.iter().any(|kw| q.contains(kw));
+    let memory_keywords = ["记忆", "memory", "memories", "存了什么", "记住了什么"];
+    let has_memory = memory_keywords.iter().any(|kw| q.contains(kw));
+    let git_live_keywords = [
+        "git status",
+        "git diff",
+        "改了什么",
+        "有哪些修改",
+        "当前有哪些修改",
+    ];
+    let has_git_live = git_live_keywords.iter().any(|kw| q.contains(kw));
     // File/code queries
     let code_keywords = [
         "read file",
@@ -914,7 +1462,124 @@ pub(super) fn looks_like_factual_query(input: &str) -> bool {
     // Web/API queries
     let web_keywords = ["http", "url", "api ", "endpoint", "fetch", "download"];
     let has_web = web_keywords.iter().any(|kw| q.contains(kw));
-    has_github || has_code || has_web
+    has_github || has_memory || has_git_live || has_code || has_web
+}
+
+fn recent_tools_imply_live_domain(recent_tools: &[String]) -> bool {
+    recent_tools.iter().any(|tool| {
+        tool.starts_with("github_")
+            || tool.starts_with("memory_")
+            || matches!(tool.as_str(), "git_status" | "git_diff")
+    })
+}
+
+pub(super) fn looks_like_live_query_with_context(input: &str, recent_tools: &[String]) -> bool {
+    if looks_like_factual_query(input) {
+        return true;
+    }
+
+    if !recent_tools_imply_live_domain(recent_tools) {
+        return false;
+    }
+
+    let q = input.trim().to_lowercase();
+    let is_short_followup = q.chars().count() <= 12;
+    if !is_short_followup {
+        return false;
+    }
+
+    [
+        "最新",
+        "latest",
+        "那",
+        "呢",
+        "还有",
+        "然后",
+        "继续",
+        "what about",
+        "how about",
+    ]
+    .iter()
+    .any(|kw| q.contains(kw))
+}
+
+fn should_force_factual_tool_retry(
+    input: &str,
+    recent_tools: &[String],
+    total_tool_calls: u32,
+    already_retried: bool,
+) -> bool {
+    !already_retried
+        && total_tool_calls == 0
+        && looks_like_live_query_with_context(input, recent_tools)
+}
+
+fn factual_tool_retry_message(original_query: &str) -> String {
+    format!(
+        "Runtime correction: your previous draft answered a live/factual query without using tools. Retry this turn from scratch and call at least one tool before answering.\n\
+\n\
+- For GitHub live data prefer github_ci_status / github_list_prs / github_list_issues / github_repo_stats.\n\
+- For memory contents use memory_search or memory_profile.\n\
+- For workspace change status use git_status or git_diff.\n\
+- Do NOT fall back to bash when a dedicated GitHub or memory tool exists.\n\
+- If repo was omitted before, infer it from the user's text or recent conversation. Bare names like 'memoria' and 'matrixone' are allowed.\n\
+\n\
+Original user query: {original_query}"
+    )
+}
+
+/// Extract `owner/repo` patterns from memory text.
+///
+/// Matches GitHub-style references like "matrixorigin/Memoria", "user/project-name".
+/// Also recognizes org names from patterns like "follows {org}" or "tracks {org}/{repo}".
+/// Returns deduplicated Vec of "owner/repo" strings.
+fn extract_repos_from_memory(text: &str) -> Vec<String> {
+    let mut repos = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let mut add = |owner: &str, repo: &str| {
+        let full = format!("{owner}/{repo}");
+        let key = full.to_lowercase();
+        if seen.insert(key) {
+            repos.push(full);
+        }
+    };
+
+    // 1. Extract from GitHub URLs: github.com/{owner}/{repo}
+    let url_re =
+        regex::Regex::new(r"(?i)github\.com/([a-zA-Z0-9][\w-]{0,38})/([a-zA-Z0-9][\w.-]{0,99})")
+            .expect("github url regex");
+    for cap in url_re.captures_iter(text) {
+        add(&cap[1], &cap[2]);
+    }
+
+    // 2. Match bare owner/repo patterns (e.g., "matrixorigin/Memoria")
+    let re = regex::Regex::new(r"(?i)\b([a-zA-Z0-9][\w-]{0,38})/([a-zA-Z0-9][\w.-]{0,99})\b")
+        .expect("repo regex");
+    for cap in re.captures_iter(text) {
+        let owner = &cap[1];
+        let repo = &cap[2];
+        // Skip protocols, paths, domains
+        if [
+            "http", "https", "ftp", "ssh", "git", "usr", "etc", "var", "tmp", "home",
+        ]
+        .contains(&owner.to_lowercase().as_str())
+        {
+            continue;
+        }
+        if owner.contains('.') {
+            continue;
+        }
+        // Skip tag-like patterns (e.g., "@pref/active")
+        // cap.get(0) always succeeds — group 0 is the full match from captures_iter
+        let match_start = cap.get(0).expect("group 0 always exists").start();
+        if text[..match_start].ends_with('@') {
+            continue;
+        }
+        add(owner, repo);
+    }
+
+    repos
 }
 
 #[cfg(test)]
@@ -930,6 +1595,9 @@ mod tests {
         assert!(looks_like_factual_query("check CI status"));
         assert!(looks_like_factual_query("what's in the commit?"));
         assert!(looks_like_factual_query("workflow status"));
+        assert!(looks_like_factual_query("最新的一个ci?"));
+        assert!(looks_like_factual_query("多少star了？"));
+        assert!(looks_like_factual_query("pr呢？"));
     }
 
     #[test]
@@ -946,11 +1614,59 @@ mod tests {
     }
 
     #[test]
+    fn factual_query_detects_memory_and_git_live_queries() {
+        assert!(looks_like_factual_query("我有哪些记忆？"));
+        assert!(looks_like_factual_query("当前有哪些修改？"));
+        assert!(looks_like_factual_query("改了什么，看一眼"));
+    }
+
+    #[test]
     fn factual_query_rejects_general_questions() {
         assert!(!looks_like_factual_query("what is Rust?"));
         assert!(!looks_like_factual_query("explain monads"));
         assert!(!looks_like_factual_query("write a function"));
         assert!(!looks_like_factual_query("hello"));
+    }
+
+    #[test]
+    fn force_retry_only_for_first_zero_tool_factual_answer() {
+        let none: Vec<String> = vec![];
+        assert!(should_force_factual_tool_retry(
+            "最新的一个ci?",
+            &none,
+            0,
+            false
+        ));
+        assert!(!should_force_factual_tool_retry(
+            "最新的一个ci?",
+            &none,
+            1,
+            false
+        ));
+        assert!(!should_force_factual_tool_retry(
+            "最新的一个ci?",
+            &none,
+            0,
+            true
+        ));
+        assert!(!should_force_factual_tool_retry("hello", &none, 0, false));
+    }
+
+    #[test]
+    fn contextual_live_query_detects_short_followup() {
+        let recent = vec!["github_ci_status".to_string()];
+        assert!(looks_like_live_query_with_context("最新的", &recent));
+        assert!(looks_like_live_query_with_context("pr呢？", &recent));
+        assert!(!looks_like_live_query_with_context("hello", &recent));
+    }
+
+    #[test]
+    fn factual_retry_message_guides_toward_dedicated_tools() {
+        let msg = factual_tool_retry_message("memoria 最新的一个ci?");
+        assert!(msg.contains("github_ci_status"));
+        assert!(msg.contains("github_repo_stats"));
+        assert!(msg.contains("memoria"));
+        assert!(msg.contains("Do NOT fall back to bash"));
     }
 
     // ── is_session_not_found_error ────────────────────────────────────────────
@@ -961,5 +1677,268 @@ mod tests {
         assert!(is_session_not_found_error("error: SESSION NOT FOUND"));
         assert!(!is_session_not_found_error("authentication failed"));
         assert!(!is_session_not_found_error(""));
+    }
+
+    // ── is_tool_error ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn tool_error_success_with_null_error_is_not_error() {
+        // GitHub tool success response: "error": null should NOT be an error
+        let result = r#"{"ok":true,"tool":"github_list_prs","error":null,"count":6}"#;
+        assert!(!is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_ok_false_is_error() {
+        let result = r#"{"ok":false,"tool":"github_ci_status","error":"missing repo"}"#;
+        assert!(is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_non_null_error_field_is_error() {
+        // JSON without "ok" field but with non-null error
+        let result = r#"{"error":"connection refused"}"#;
+        assert!(is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_plain_text_error() {
+        assert!(is_tool_error("Error: command not found"));
+        assert!(is_tool_error("error reading file"));
+    }
+
+    #[test]
+    fn tool_error_plain_text_success() {
+        assert!(!is_tool_error("file contents here"));
+        assert!(!is_tool_error("{}"));
+        assert!(!is_tool_error("[]"));
+    }
+
+    #[test]
+    fn tool_error_empty_error_string_is_not_error() {
+        let result = r#"{"error":""}"#;
+        assert!(!is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_ok_true_with_error_string_trusts_ok_field() {
+        // If "ok" is present, it takes precedence
+        let result = r#"{"ok":true,"error":"leftover field"}"#;
+        assert!(!is_tool_error(result));
+    }
+
+    // ── is_tool_error edge cases ──
+
+    #[test]
+    fn tool_error_nested_error_key_is_not_error() {
+        // Only top-level "error" matters — nested doesn't trigger
+        let result = r#"{"ok":true,"data":{"error":"some inner issue"}}"#;
+        assert!(!is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_array_response_is_not_error() {
+        let result = r#"[{"name":"pr1"},{"name":"pr2"}]"#;
+        assert!(!is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_error_count_field_is_not_error() {
+        // Field named "error_count" shouldn't trigger; only "error" exactly
+        let result = r#"{"error_count":0,"status":"ok"}"#;
+        assert!(!is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_html_error_page() {
+        // HTTP 5xx returning HTML
+        let result = "<html><body>error 502 Bad Gateway</body></html>";
+        assert!(!is_tool_error(result)); // doesn't start with "error"
+    }
+
+    #[test]
+    fn tool_error_unicode_error_message() {
+        let result = r#"{"ok":false,"error":"连接被拒绝"}"#;
+        assert!(is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_ok_as_string_not_boolean() {
+        // "ok": "false" (string, not boolean) — should still check as false
+        let result = r#"{"ok":"false","error":"something"}"#;
+        // ok field is not a boolean — should fall through to error field check
+        assert!(is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_empty_string_is_not_error() {
+        assert!(!is_tool_error(""));
+    }
+
+    #[test]
+    fn tool_error_whitespace_is_not_error() {
+        assert!(!is_tool_error("   \n\t  "));
+    }
+
+    // ── Cross-turn dedup: CACHEABLE_TOOLS constant ──
+
+    #[test]
+    fn cacheable_tools_are_all_read_only() {
+        // Ensure no side-effectful tools are in the cacheable list
+        const SIDE_EFFECTFUL: &[&str] = &[
+            "bash",
+            "write_file",
+            "str_replace",
+            "github_create_issue",
+            "mo_query",
+            "mo_snapshot",
+            "mo_branch",
+            "memory_store",
+            "memory_purge",
+            "memory_correct",
+        ];
+        for tool in CACHEABLE_TOOLS {
+            assert!(
+                !SIDE_EFFECTFUL.contains(tool),
+                "CACHEABLE_TOOLS must not contain side-effectful tool: {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn cacheable_tools_covers_git_and_github_reads() {
+        // All read-only git/github tools should be cacheable
+        for expected in &[
+            "git_status",
+            "git_diff",
+            "git_log",
+            "git_blame",
+            "read_file",
+            "grep",
+            "glob",
+            "list_dir",
+            "github_list_prs",
+            "github_get_pr",
+        ] {
+            assert!(
+                CACHEABLE_TOOLS.contains(expected),
+                "missing cacheable tool: {expected}"
+            );
+        }
+    }
+
+    // ── extract_repos_from_memory ───────────────────────────────────────────
+
+    #[test]
+    fn extract_repos_explicit_owner_repo() {
+        let text = "user follows matrixorigin/Memoria and wants to track their projects";
+        let repos = extract_repos_from_memory(text);
+        assert_eq!(repos, vec!["matrixorigin/Memoria"]);
+    }
+
+    #[test]
+    fn extract_repos_multiple() {
+        let text = "tracks matrixorigin/Memoria and also watches rust-lang/rust";
+        let repos = extract_repos_from_memory(text);
+        assert_eq!(repos.len(), 2);
+        assert!(repos.contains(&"matrixorigin/Memoria".to_string()));
+        assert!(repos.contains(&"rust-lang/rust".to_string()));
+    }
+
+    #[test]
+    fn extract_repos_dedup() {
+        let text = "matrixorigin/Memoria and MATRIXORIGIN/memoria again";
+        let repos = extract_repos_from_memory(text);
+        assert_eq!(repos.len(), 1, "should deduplicate case-insensitively");
+    }
+
+    #[test]
+    fn extract_repos_skips_tag_namespaces() {
+        let text = "[@pref/active] user follows matrixorigin/Memoria";
+        let repos = extract_repos_from_memory(text);
+        assert_eq!(repos, vec!["matrixorigin/Memoria"]);
+        assert!(
+            !repos.iter().any(|r| r.contains("pref")),
+            "should not extract @pref/active as a repo"
+        );
+    }
+
+    #[test]
+    fn extract_repos_skips_protocols() {
+        let text = "see https://github.com/matrixorigin/Memoria for details";
+        let repos = extract_repos_from_memory(text);
+        // Should extract matrixorigin/Memoria but NOT https/github.com
+        assert!(repos.iter().any(|r| r == "matrixorigin/Memoria"));
+        assert!(!repos.iter().any(|r| r.to_lowercase().contains("http")));
+    }
+
+    #[test]
+    fn extract_repos_empty_for_no_repos() {
+        let text = "user prefers concise responses and dark mode";
+        let repos = extract_repos_from_memory(text);
+        assert!(repos.is_empty());
+    }
+
+    #[test]
+    fn extract_repos_handles_hyphen() {
+        let text = "watching my-org/my-project and also some-user/cool-lib";
+        let repos = extract_repos_from_memory(text);
+        assert!(repos.iter().any(|r| r == "my-org/my-project"));
+        assert!(repos.iter().any(|r| r == "some-user/cool-lib"));
+    }
+
+    // ── Argument normalization tests ──
+
+    #[test]
+    fn normalize_call_sig_strips_trailing_slash() {
+        let args = serde_json::json!({"path": "src/", "pattern": "*.rs"});
+        let sig1 = normalize_call_sig("glob", &args);
+        let args2 = serde_json::json!({"path": "src", "pattern": "*.rs"});
+        let sig2 = normalize_call_sig("glob", &args2);
+        assert_eq!(sig1, sig2, "trailing slash should be normalized");
+    }
+
+    #[test]
+    fn normalize_call_sig_sorts_keys() {
+        let args1 = serde_json::json!({"b": "2", "a": "1"});
+        let args2 = serde_json::json!({"a": "1", "b": "2"});
+        let sig1 = normalize_call_sig("test", &args1);
+        let sig2 = normalize_call_sig("test", &args2);
+        assert_eq!(sig1, sig2, "key order should not affect signature");
+    }
+
+    #[test]
+    fn normalize_call_sig_preserves_distinct_args() {
+        let args1 = serde_json::json!({"file": "a.rs"});
+        let args2 = serde_json::json!({"file": "b.rs"});
+        let sig1 = normalize_call_sig("read_file", &args1);
+        let sig2 = normalize_call_sig("read_file", &args2);
+        assert_ne!(sig1, sig2, "different args should produce different sigs");
+    }
+
+    #[test]
+    fn normalize_call_sig_trims_whitespace() {
+        let args1 = serde_json::json!({"query": " hello world "});
+        let args2 = serde_json::json!({"query": "hello world"});
+        let sig1 = normalize_call_sig("search", &args1);
+        let sig2 = normalize_call_sig("search", &args2);
+        assert_eq!(sig1, sig2, "whitespace should be normalized");
+    }
+
+    #[test]
+    fn normalize_args_handles_nested_objects() {
+        let args = serde_json::json!({"outer": {"z": 1, "a": 2}});
+        let norm = normalize_args(&args);
+        // Keys should be sorted even in nested objects
+        let keys: Vec<&String> = norm["outer"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec!["a", "z"]);
+    }
+
+    #[test]
+    fn normalize_args_preserves_numbers_and_bools() {
+        let args = serde_json::json!({"count": 5, "verbose": true});
+        let norm = normalize_args(&args);
+        assert_eq!(norm["count"], 5);
+        assert_eq!(norm["verbose"], true);
     }
 }

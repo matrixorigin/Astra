@@ -1,4 +1,7 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
     Json, Router,
@@ -27,6 +30,7 @@ mod router_builder;
 mod run_handlers;
 mod session_handlers;
 mod state_builder;
+mod ws_handler;
 
 use self::{
     bridge_prep::prepare_chat_turn_bridge_body,

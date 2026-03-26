@@ -122,7 +122,10 @@ impl JobService for InMemoryJobService {
             error: None,
             progress: 0.0,
         };
-        self.jobs.lock().unwrap().insert(job_id, record.clone());
+        self.jobs
+            .lock()
+            .expect("jobs mutex")
+            .insert(job_id, record.clone());
         Ok(record)
     }
 
@@ -142,7 +145,7 @@ impl JobService for InMemoryJobService {
         &self,
         job_id: String,
     ) -> Result<JobRecord, (StatusCode, Json<ErrorResponse>)> {
-        let mut jobs = self.jobs.lock().unwrap();
+        let mut jobs = self.jobs.lock().expect("jobs mutex");
         let job = jobs
             .get(&job_id)
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Job not found"))?;
@@ -164,7 +167,7 @@ impl JobService for InMemoryJobService {
         &self,
         payload: JobWebhookData,
     ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
-        let mut jobs = self.jobs.lock().unwrap();
+        let mut jobs = self.jobs.lock().expect("jobs mutex");
         if let Some(job) = jobs.get_mut(&payload.job_id) {
             job.status = payload.status;
             job.result = payload.result;

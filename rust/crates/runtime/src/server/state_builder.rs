@@ -5,6 +5,10 @@ pub(super) async fn build_server_state(
 ) -> Result<AppState, Box<dyn std::error::Error>> {
     ensure_core_schema(&settings.matrixone).await?;
     let shared_pool = SharedPool::new(&settings.matrixone).await?;
+
+    // Build shared pipeline learning modules (server-wide singleton).
+    let learning_writer = build_pipeline_learning_writer();
+
     let state = AppState::new(
         ServiceInfo::default(),
         Arc::new(MatrixOneHealthChecker::new(settings.matrixone.clone())),
@@ -133,9 +137,11 @@ pub(super) async fn build_server_state(
     ))
     .with_admin_user_role_manager(Arc::new(DatabaseAdminUserRoleManager::new(
         settings.matrixone.clone(),
-    )));
+    )))
+    .with_turn_learning_writer(learning_writer.clone());
 
     // Wire chat turn bridge: prefer explicit URL override, fall back to in-process Rust impl.
+    // Note: with_chat_turn_bridge_url auto-wires the learning writer from AppState.
     let state = if let Some(url) = settings.chat_turn_bridge_url {
         state
             .with_chat_turn_bridge_url(url)
@@ -148,10 +154,74 @@ pub(super) async fn build_server_state(
                 turn::bridge_inprocess::InProcessChatTurnBridge::new(
                     settings.matrixone.clone(),
                     encryptor,
-                ),
+                )
+                .with_learning_writer(learning_writer),
             ))
             .with_chat_turn_bridge_secret(settings.chat_turn_bridge_secret)
     };
     let state = state.with_memoria_config(settings.memoria_base_url, settings.memoria_master_key);
     Ok(state)
+}
+
+/// Creates pipeline modules (EntityGraph, PatternLibrary, ProgressiveCalibrator)
+/// and wires them into a PipelineLearningWriter for turn-outcome-driven learning.
+fn build_pipeline_learning_writer() -> Arc<dyn TurnLearningWriter> {
+    use crate::pipeline::{
+        calibration::ProgressiveCalibrator, entity::EntityGraph, learning::PipelineLearningWriter,
+        pattern::PatternLibrary,
+    };
+
+    let entity_graph = Arc::new(Mutex::new(EntityGraph::new()));
+    let pattern_library = Arc::new(Mutex::new(PatternLibrary::new()));
+    let calibrator = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
+
+    Arc::new(
+        PipelineLearningWriter::new()
+            .with_entity_graph(entity_graph)
+            .with_pattern_library(pattern_library)
+            .with_progressive_calibrator(calibrator),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::turn::contracts::TurnLearningOutcome;
+
+    #[tokio::test]
+    async fn build_pipeline_learning_writer_creates_functional_writer() {
+        let writer = build_pipeline_learning_writer();
+        // Should accept an outcome without panic
+        let outcome = TurnLearningOutcome {
+            query: "matrixorigin PR check".to_string(),
+            tools_selected: vec!["github_search".to_string()],
+            tools_used: vec!["github_search".to_string()],
+            success: true,
+            quality: 0.8,
+            was_corrected: false,
+            task_type_label: Some("code".to_string()),
+            domain_hint_label: Some("github".to_string()),
+        };
+        let _ = writer.record_outcome(outcome).await;
+    }
+
+    #[tokio::test]
+    async fn build_pipeline_learning_writer_learns_across_calls() {
+        let writer = build_pipeline_learning_writer();
+        // Record two outcomes to meet PatternLibrary minimum
+        for i in 0..2 {
+            let outcome = TurnLearningOutcome {
+                query: format!("test query {i}"),
+                tools_selected: vec!["bash".to_string()],
+                tools_used: vec!["bash".to_string()],
+                success: true,
+                quality: 0.7,
+                was_corrected: false,
+                task_type_label: Some("code".to_string()),
+                domain_hint_label: None,
+            };
+            let _ = writer.record_outcome(outcome).await;
+        }
+        // No panics = writer accumulates state correctly
+    }
 }

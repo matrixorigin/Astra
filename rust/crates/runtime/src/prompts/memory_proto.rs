@@ -22,7 +22,6 @@
 use super::memory_ns;
 
 /// Protocol version tag for forward compatibility.
-#[allow(dead_code)]
 pub const VERSION: &str = "v1";
 
 // ── Namespace short names (used in tags) ─────────────────────────
@@ -65,7 +64,6 @@ pub const SRC_COMPACT: &str = "compact";
 pub const SRC_AUTO_COMPACT: &str = "auto_compact";
 pub const SRC_EXTRACTED: &str = "extracted";
 pub const SRC_SYNTHESIS: &str = "synthesis";
-#[allow(dead_code)]
 pub const SRC_SYSTEM: &str = "system";
 
 /// Provenance metadata attached to memory entries.
@@ -149,7 +147,6 @@ impl MemoryEntry {
     ///
     /// Without provenance metadata — use `to_store_payload_with_meta()` when
     /// session context is available.
-    #[allow(dead_code)]
     pub fn to_store_payload(&self) -> serde_json::Value {
         serde_json::json!({
             "content": self.encode(),
@@ -178,7 +175,6 @@ impl MemoryEntry {
     }
 
     /// Build a JSON payload for purging entries by namespace + status.
-    #[allow(dead_code)]
     pub fn purge_ns_status_payload(ns: &str, status: &str) -> serde_json::Value {
         serde_json::json!({
             "topic": format!("[@{}/{}]", ns, status),
@@ -278,7 +274,6 @@ impl MemoryEntry {
     }
 
     /// Check if this entry has the given status.
-    #[allow(dead_code)]
     pub fn is_status(&self, status: &str) -> bool {
         self.status == status
     }
@@ -325,7 +320,6 @@ pub fn filter_ns(contents: &[&str], ns: &str) -> Vec<MemoryEntry> {
 }
 
 /// Filter entries by namespace and status.
-#[allow(dead_code)]
 pub fn filter_ns_status(contents: &[&str], ns: &str, status: &str) -> Vec<MemoryEntry> {
     contents
         .iter()
@@ -338,7 +332,6 @@ pub fn filter_ns_status(contents: &[&str], ns: &str, status: &str) -> Vec<Memory
 ///
 /// Returns `(structured_entries, unstructured_texts)`.
 /// Unstructured texts are memory strings that don't match any protocol format.
-#[allow(dead_code)]
 pub fn partition_memories(contents: &[&str]) -> (Vec<MemoryEntry>, Vec<String>) {
     let mut structured = Vec::new();
     let mut unstructured = Vec::new();
@@ -355,7 +348,6 @@ pub fn partition_memories(contents: &[&str]) -> (Vec<MemoryEntry>, Vec<String>) 
 /// Format memory entries for injection into the LLM system prompt.
 ///
 /// Groups entries by namespace and formats them readably.
-#[allow(dead_code)]
 pub fn format_for_llm(contents: &[&str]) -> String {
     let (entries, unstructured) = partition_memories(contents);
     let mut sections: Vec<String> = Vec::new();

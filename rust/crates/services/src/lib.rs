@@ -6,6 +6,7 @@ pub mod context;
 pub mod data_versioning;
 pub mod decisions;
 pub mod evaluation;
+pub mod event_ingestion;
 pub mod events;
 pub mod introspection;
 pub mod jobs;
@@ -16,11 +17,16 @@ pub mod reflect;
 pub mod replay;
 pub mod runs;
 pub mod sandbox;
+pub mod session_checkpoint;
 pub mod session_journal;
+pub mod session_restore;
+pub mod session_workspace;
 pub mod skill_config;
 pub mod skills;
+pub mod state_sync;
 pub mod storage;
 pub mod streaming;
+pub mod task_orchestrator;
 pub mod triggers;
 pub mod workflows;
 
@@ -92,11 +98,19 @@ pub use skill_config::{
     DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,
 };
 pub use skills::{DatabaseSkillService, SkillRecord, SkillService, UnconfiguredSkillService};
+pub use state_sync::{
+    LocalOnlySyncService, MatrixOneSyncService, StateSyncService, SyncDirection, SyncOrchestrator,
+    SyncResult, SyncStatus,
+};
 pub use storage::{
     database_user_from_row, ensure_core_schema, log_session_audit, resolve_active_skill_versions,
     session_record_from_row, update_turn_skill_selection_version,
 };
 pub use streaming::{DatabaseStreamingService, StreamingService, UnconfiguredStreamingService};
+pub use task_orchestrator::{
+    LocalTaskService, MatrixOneTaskService, SubtaskPlan, TaskCheckpoint, TaskCreateRequest,
+    TaskPlan, TaskRecord, TaskService, TaskStatus,
+};
 pub use triggers::{
     DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService,
 };

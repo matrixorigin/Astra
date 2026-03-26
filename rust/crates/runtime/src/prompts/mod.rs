@@ -6,18 +6,25 @@
 
 mod context;
 mod extraction;
+pub mod memory_lifecycle;
 pub mod memory_ns;
 pub mod memory_proto;
 mod skills;
 mod system;
 
-pub use context::{ContextBudget, budget_for_model, estimate_tokens};
+pub use context::{
+    CacheAwareEstimate, CompactionTier, ContextBudget, budget_for_model, estimate_str_tokens,
+    estimate_tokens, estimate_tokens_cache_aware,
+};
 pub use extraction::{COMPACT_SUMMARY_REQUEST, MEMORY_EXTRACTOR_PROMPT, parse_extracted_facts};
 pub use skills::{
     SystemSkill, build_skill_dev_prefix, build_skill_instructions, builtin_concise_skill,
     builtin_markdown_skill, builtin_system_skills,
 };
-pub use system::{STALL_NUDGE, SYSTEM_PROMPT_BASE, build_main_system_prompt};
+pub use system::{
+    LOW_CONFIDENCE_THRESHOLD, STALL_NUDGE, SYSTEM_PROMPT_BASE, build_main_system_prompt,
+    detect_task_type,
+};
 
 #[cfg(test)]
 mod tests {
@@ -25,7 +32,7 @@ mod tests {
 
     #[test]
     fn build_main_system_prompt_no_tools_warns_no_tools() {
-        let p = build_main_system_prompt(&[], "");
+        let p = build_main_system_prompt(&[], "", 1.0, None);
         assert!(p.contains(SYSTEM_PROMPT_BASE), "should include base");
         assert!(
             p.contains("NO tools available"),
@@ -39,19 +46,24 @@ mod tests {
 
     #[test]
     fn build_main_system_prompt_includes_tool_names() {
-        let p = build_main_system_prompt(&["read_file", "write_file"], "");
+        let p = build_main_system_prompt(&["read_file", "write_file"], "", 1.0, None);
         assert!(p.contains("read_file, write_file"), "should list tools");
         assert!(p.contains("Core Rules"), "should include rules");
         assert!(
-            p.contains("ANTI-HALLUCINATION"),
-            "should include anti-hallucination section"
+            p.contains("NEVER fabricate"),
+            "should include anti-fabrication rule"
+        );
+        assert!(
+            p.contains("check conversation history"),
+            "should include history awareness"
         );
         assert!(p.contains("Reasoning Protocol"), "should include protocol");
     }
 
     #[test]
     fn build_main_system_prompt_includes_profile() {
-        let p = build_main_system_prompt(&["tool_a"], "\n\n## User Memories\nprefers Rust");
+        let p =
+            build_main_system_prompt(&["tool_a"], "\n\n## User Memories\nprefers Rust", 1.0, None);
         assert!(p.contains("prefers Rust"), "profile should be appended");
     }
 
@@ -108,8 +120,11 @@ mod tests {
 
     #[test]
     fn memory_rules_include_negative_examples() {
-        let p = build_main_system_prompt(&["memory_store"], "");
-        assert!(p.contains("DO NOT store"), "should have negative guidance");
+        let p = build_main_system_prompt(&["memory_store"], "", 1.0, None);
+        assert!(
+            p.contains("SKIP:"),
+            "should have negative guidance (SKIP list)"
+        );
     }
 
     // ── Conditional prompt sections ──
@@ -118,7 +133,7 @@ mod tests {
     /// This enforces: "prompt mentions tool X ⟹ tool X is available".
     #[test]
     fn no_memory_tools_omits_memory_section() {
-        let p = build_main_system_prompt(&["bash", "read_file"], "");
+        let p = build_main_system_prompt(&["bash", "read_file"], "", 1.0, None);
         assert!(
             !p.contains("memory_store"),
             "should NOT mention memory_store when no memory tools selected"
@@ -127,15 +142,15 @@ mod tests {
             !p.contains("Memory rules"),
             "should NOT include Memory section when no memory tools selected"
         );
-        // Core rules and anti-hallucination still present
+        // Core rules still present
         assert!(p.contains("Core Rules"));
-        assert!(p.contains("ANTI-HALLUCINATION"));
+        assert!(p.contains("NEVER fabricate"));
     }
 
     /// When no GitHub tools are selected, GitHub-specific rules must be omitted.
     #[test]
     fn no_github_tools_omits_github_rules() {
-        let p = build_main_system_prompt(&["bash", "memory_store"], "");
+        let p = build_main_system_prompt(&["bash", "memory_store"], "", 1.0, None);
         assert!(
             !p.contains("github_list_prs"),
             "should NOT mention github_list_prs when no GitHub tools selected"
@@ -145,7 +160,7 @@ mod tests {
     /// When GitHub tools are selected, GitHub rules are included.
     #[test]
     fn github_tools_include_github_rules() {
-        let p = build_main_system_prompt(&["github_list_prs", "github_get_pr"], "");
+        let p = build_main_system_prompt(&["github_list_prs", "github_get_pr"], "", 1.0, None);
         assert!(
             p.contains("github_list_prs"),
             "should mention github_list_prs when GitHub tools selected"
@@ -155,10 +170,64 @@ mod tests {
     /// Implicit preference instruction is present when memory tools available.
     #[test]
     fn memory_rules_include_store_guidance() {
-        let p = build_main_system_prompt(&["memory_store", "memory_search"], "");
+        let p = build_main_system_prompt(&["memory_store", "memory_search"], "", 1.0, None);
         assert!(
             p.contains("memory_store"),
             "should mention memory_store when memory tools available"
+        );
+    }
+
+    /// History awareness rule prevents re-reading data already in context.
+    #[test]
+    fn prompt_includes_history_awareness() {
+        let p = build_main_system_prompt(&["read_file"], "", 1.0, None);
+        assert!(
+            p.contains("check conversation history"),
+            "should instruct checking history before calling tools"
+        );
+    }
+
+    /// Tool selection guidance: prefer specific tools over bash.
+    #[test]
+    fn git_tools_get_bash_avoidance_rule() {
+        let p = build_main_system_prompt(&["git_diff", "git_log", "bash"], "", 1.0, None);
+        assert!(
+            p.contains("NOT bash"),
+            "should guide away from bash for git queries"
+        );
+    }
+
+    #[test]
+    fn no_git_tools_omits_bash_avoidance() {
+        let p = build_main_system_prompt(&["bash", "read_file"], "", 1.0, None);
+        assert!(
+            !p.contains("NOT bash"),
+            "should NOT include bash avoidance when no git tools selected"
+        );
+    }
+
+    /// Compressed prompt is shorter than the old version.
+    #[test]
+    fn compressed_prompt_under_token_budget() {
+        let p = build_main_system_prompt(
+            &[
+                "read_file",
+                "bash",
+                "memory_store",
+                "github_list_prs",
+                "git_diff",
+            ],
+            "",
+            1.0,
+            None,
+        );
+        // Full prompt with all sections should be under 1200 chars (~300 tokens)
+        // Old version was ~1350 tokens. New should be ~1080.
+        // Char count: expect < 5000 chars (was ~5500)
+        assert!(
+            p.len() < 5000,
+            "compressed prompt should be under 5000 chars, got {}",
+            p.len()
         );
     }
 
@@ -280,9 +349,10 @@ mod tests {
     #[test]
     fn context_budget_should_compact() {
         let b = ContextBudget::default();
-        // 75% of 128k = 96k
-        assert!(!b.should_compact(90_000));
-        assert!(b.should_compact(100_000));
+        // effective_input_limit = 128K * (1 - 0.15) = 108,800
+        // compact_trigger = 108,800 * 0.75 = 81,600
+        assert!(!b.should_compact(75_000));
+        assert!(b.should_compact(85_000));
     }
 
     #[test]
@@ -658,5 +728,122 @@ mod tests {
         let entry = MemoryEntry::new(NS_FACT, ST_ACTIVE, "Rust is fast");
         let payload = entry.to_store_payload();
         assert!(payload.get("metadata").is_none());
+    }
+
+    // ── Task type detection tests ──
+
+    #[test]
+    fn detect_task_type_code_review_english() {
+        assert_eq!(detect_task_type("review this PR"), Some("code_review"));
+        assert_eq!(detect_task_type("code review please"), Some("code_review"));
+        assert_eq!(
+            detect_task_type("check the pull request"),
+            Some("code_review")
+        );
+        assert_eq!(detect_task_type("show me the diff"), Some("code_review"));
+    }
+
+    #[test]
+    fn detect_task_type_code_review_chinese() {
+        assert_eq!(detect_task_type("评审一下这个PR"), Some("code_review"));
+        assert_eq!(detect_task_type("代码审查"), Some("code_review"));
+    }
+
+    #[test]
+    fn detect_task_type_debugging_english() {
+        assert_eq!(detect_task_type("debug this error"), Some("debugging"));
+        assert_eq!(
+            detect_task_type("there's a bug in the code"),
+            Some("debugging")
+        );
+        assert_eq!(detect_task_type("exception on line 42"), Some("debugging"));
+        assert_eq!(detect_task_type("the server crashed"), Some("debugging"));
+    }
+
+    #[test]
+    fn detect_task_type_debugging_chinese() {
+        assert_eq!(detect_task_type("帮我调试一下"), Some("debugging"));
+        assert_eq!(detect_task_type("代码报错了"), Some("debugging"));
+    }
+
+    #[test]
+    fn detect_task_type_general_returns_none() {
+        // Queries that match newly added task types should be detected
+        assert_eq!(
+            detect_task_type("how does this function work?"),
+            Some("exploration")
+        );
+        assert_eq!(
+            detect_task_type("explain the architecture"),
+            Some("exploration")
+        );
+        // "write a new feature" doesn't match "write code" or "add feature"
+        assert_eq!(detect_task_type("write a new feature"), None);
+        // Truly ambiguous queries should still return None
+        assert_eq!(detect_task_type(""), None);
+        assert_eq!(detect_task_type("hello there"), None);
+        assert_eq!(detect_task_type("thanks"), None);
+    }
+
+    #[test]
+    fn detect_task_type_disambiguates_best_match() {
+        // "review" alone → code_review
+        assert_eq!(detect_task_type("review"), Some("code_review"));
+        // "error" alone → debugging
+        assert_eq!(detect_task_type("got an error"), Some("debugging"));
+    }
+
+    // ── Task-type specific prompt content tests ──
+
+    #[test]
+    fn prompt_includes_code_review_strategy_when_task_type_set() {
+        let p = build_main_system_prompt(&["bash", "git_diff"], "", 1.0, Some("code_review"));
+        assert!(
+            p.contains("Code Review Strategy"),
+            "code_review task_type should inject review strategy"
+        );
+        assert!(
+            p.contains("git_diff ONCE"),
+            "review strategy should mention single diff call"
+        );
+    }
+
+    #[test]
+    fn prompt_includes_debugging_strategy_when_task_type_set() {
+        let p = build_main_system_prompt(&["bash", "read_file"], "", 1.0, Some("debugging"));
+        assert!(
+            p.contains("Debugging Strategy"),
+            "debugging task_type should inject debugging strategy"
+        );
+        assert!(
+            p.contains("hypothesis"),
+            "debugging strategy should mention hypothesis"
+        );
+    }
+
+    #[test]
+    fn prompt_omits_task_strategy_for_general() {
+        let p = build_main_system_prompt(&["bash", "read_file"], "", 1.0, None);
+        assert!(
+            !p.contains("Code Review Strategy"),
+            "general should not have review strategy"
+        );
+        assert!(
+            !p.contains("Debugging Strategy"),
+            "general should not have debugging strategy"
+        );
+    }
+
+    #[test]
+    fn prompt_omits_task_strategy_for_unknown_type() {
+        let p = build_main_system_prompt(&["bash"], "", 1.0, Some("planning"));
+        assert!(
+            !p.contains("Code Review Strategy"),
+            "planning should not have review strategy"
+        );
+        assert!(
+            !p.contains("Debugging Strategy"),
+            "planning should not have debugging strategy"
+        );
     }
 }

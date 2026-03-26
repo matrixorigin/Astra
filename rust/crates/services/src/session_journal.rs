@@ -9,6 +9,20 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Per-tool-call audit record, embedded in turn events for granular tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallRecord {
+    /// Tool name.
+    pub name: String,
+    /// Whether the call succeeded.
+    pub ok: bool,
+    /// Execution time in milliseconds.
+    pub ms: u64,
+    /// Error message if the call failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// A single journal event (one line in the JSONL file).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEvent {
@@ -65,9 +79,21 @@ pub struct JournalEvent {
     /// Tool names actually called by the LLM (for turn events).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools_used: Option<Vec<String>>,
+    /// Per-tool-call detail: [{name, ok, ms, error?}] for granular audit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallRecord>>,
     /// Token budget used by selected dynamic tools.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_used: Option<u32>,
+    /// Token budget pressure (0.0 = normal, 0.3 = trim, 0.6 = compact, 0.9 = aggressive).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_pressure: Option<f64>,
+    /// Stall type (for stall_detected events): "sig_stall", "name_stall", "divergence".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stall_type: Option<String>,
+    /// Flexible metadata for event-specific data (JSON object).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Event type discriminator.
@@ -88,6 +114,12 @@ pub enum JournalEventType {
     Error,
     /// Session ended.
     SessionEnd,
+    /// Stall or divergence detected (non-happy path).
+    StallDetected,
+    /// Session checkpoint saved.
+    Checkpoint,
+    /// TurnGuard verdict emitted (unified non-happy-path audit).
+    TurnGuardVerdict,
 }
 
 /// Writer that appends events to a session journal file.
@@ -251,7 +283,11 @@ impl JournalEvent {
             facts_stored: None,
             tools_selected: None,
             tools_used: None,
+            tool_calls: None,
             budget_used: None,
+            budget_pressure: None,
+            stall_type: None,
+            metadata: None,
         }
     }
 
@@ -328,7 +364,6 @@ impl JournalEvent {
     }
 
     /// Error event (non-turn).
-    #[allow(dead_code)]
     pub fn error(session_id: Option<&str>, error: &str) -> Self {
         let mut evt = Self::base(JournalEventType::Error, session_id);
         evt.error = Some(truncate(error, 500));
@@ -353,6 +388,90 @@ impl JournalEvent {
         self.tools_used = Some(tools_used);
         self.budget_used = Some(budget_used);
         self
+    }
+
+    /// Attach budget pressure to a turn event (0.0-0.9 from compaction tier).
+    pub fn with_budget_pressure(mut self, pressure: f64) -> Self {
+        self.budget_pressure = Some(pressure);
+        self
+    }
+
+    /// Attach per-tool-call audit records to a turn event.
+    pub fn with_tool_calls(mut self, records: Vec<ToolCallRecord>) -> Self {
+        if !records.is_empty() {
+            self.tool_calls = Some(records);
+        }
+        self
+    }
+
+    /// Stall detection event.
+    pub fn stall_detected(
+        session_id: Option<&str>,
+        turn: u32,
+        stall_type: &str,
+        nudge_count: u32,
+        confidence: f64,
+        avoid_tools: &[String],
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::StallDetected, session_id);
+        evt.turn = Some(turn);
+        evt.stall_type = Some(stall_type.to_string());
+        evt.metadata = Some(serde_json::json!({
+            "nudge_count": nudge_count,
+            "confidence": confidence,
+            "avoid_tools": avoid_tools,
+        }));
+        evt
+    }
+
+    /// Session checkpoint event.
+    pub fn checkpoint(
+        session_id: Option<&str>,
+        turn: u32,
+        summary: &str,
+        total_tokens: u64,
+        tools_used_count: usize,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::Checkpoint, session_id);
+        evt.turn = Some(turn);
+        evt.metadata = Some(serde_json::json!({
+            "summary": truncate(summary, 500),
+            "total_tokens": total_tokens,
+            "tools_used_count": tools_used_count,
+        }));
+        evt
+    }
+
+    /// TurnGuard verdict event — records unified non-happy-path decisions.
+    ///
+    /// Only emitted for non-Healthy verdicts (Info, Warning, Critical).
+    /// Captures severity, injected messages, avoided tools, and force_stop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn turn_guard_verdict(
+        session_id: Option<&str>,
+        turn: u32,
+        severity: &str,
+        injections: &[String],
+        avoid_tools: &[String],
+        force_stop: bool,
+        nudge_count: usize,
+        total_errors: usize,
+        deprioritized_count: usize,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::TurnGuardVerdict, session_id);
+        evt.turn = Some(turn);
+        evt.stall_type = Some(severity.to_string());
+        evt.metadata = Some(serde_json::json!({
+            "severity": severity,
+            "injections": injections.len(),
+            "injection_preview": injections.first().map(|s| truncate(s, 200)),
+            "avoid_tools": avoid_tools,
+            "force_stop": force_stop,
+            "nudge_count": nudge_count,
+            "total_errors": total_errors,
+            "deprioritized_tools": deprioritized_count,
+        }));
+        evt
     }
 }
 
@@ -506,12 +625,14 @@ mod tests {
             vec!["bash".into(), "github_list_prs".into(), "read_file".into()],
             vec!["github_list_prs".into()],
             45,
-        );
+        )
+        .with_budget_pressure(0.6);
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tools_selected.as_ref().unwrap().len(), 3);
         assert_eq!(parsed.tools_used.as_ref().unwrap(), &["github_list_prs"]);
         assert_eq!(parsed.budget_used, Some(45));
+        assert_eq!(parsed.budget_pressure, Some(0.6));
     }
 
     #[test]
@@ -528,6 +649,10 @@ mod tests {
         );
         assert!(
             !json.contains("budget_used"),
+            "should omit None fields: {json}"
+        );
+        assert!(
+            !json.contains("budget_pressure"),
             "should omit None fields: {json}"
         );
     }
@@ -563,7 +688,8 @@ mod tests {
                     vec!["bash".into(), "github_list_prs".into()],
                     vec!["github_list_prs".into()],
                     35,
-                ),
+                )
+                .with_budget_pressure(0.3),
             )
             .unwrap();
         writer
@@ -583,11 +709,12 @@ mod tests {
         assert_eq!(turn.tools_selected.as_ref().unwrap().len(), 2);
         assert_eq!(turn.tools_used.as_ref().unwrap(), &["github_list_prs"]);
         assert_eq!(turn.budget_used, Some(35));
+        assert_eq!(turn.budget_pressure, Some(0.3));
     }
 
     #[test]
     fn backward_compat_old_events_missing_selection_fields() {
-        // Old journal events won't have tools_selected/tools_used/budget_used.
+        // Old journal events won't have tools_selected/tools_used/budget_used/budget_pressure.
         // Verify serde handles missing fields gracefully.
         let old_json = r#"{"type":"turn","ts":"2025-01-01T00:00:00Z","session_id":"s","turn":1,"tool_count":0,"tokens_in":10,"tokens_out":5,"duration_ms":100}"#;
         let evt: JournalEvent = serde_json::from_str(old_json).unwrap();
@@ -595,6 +722,146 @@ mod tests {
         assert!(evt.tools_selected.is_none());
         assert!(evt.tools_used.is_none());
         assert!(evt.budget_used.is_none());
+        assert!(evt.budget_pressure.is_none());
+        assert!(evt.tool_calls.is_none());
+    }
+
+    // ── Per-tool-call audit records ──
+
+    #[test]
+    fn tool_call_record_serialization_round_trip() {
+        let record = ToolCallRecord {
+            name: "github_list_prs".into(),
+            ok: true,
+            ms: 761,
+            error: None,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"ok\":true"));
+        assert!(!json.contains("\"error\""), "None error should be omitted");
+        let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name, "github_list_prs");
+        assert!(parsed.ok);
+        assert_eq!(parsed.ms, 761);
+        assert!(parsed.error.is_none());
+    }
+
+    #[test]
+    fn tool_call_record_with_error() {
+        let record = ToolCallRecord {
+            name: "github_ci_status".into(),
+            ok: false,
+            ms: 587,
+            error: Some("missing repo parameter".into()),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"ok\":false"));
+        assert!(json.contains("missing repo"));
+        let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.ok);
+        assert_eq!(parsed.error.as_deref(), Some("missing repo parameter"));
+    }
+
+    #[test]
+    fn turn_event_with_tool_calls_round_trip() {
+        let evt = JournalEvent::turn(
+            Some("s1"),
+            3,
+            Some("gpt-4"),
+            "pr呢？",
+            "Here are PRs...",
+            1,
+            300,
+            150,
+            800,
+        )
+        .with_tool_selection(
+            vec!["github_list_prs".into()],
+            vec!["github_list_prs".into()],
+            20,
+        )
+        .with_tool_calls(vec![ToolCallRecord {
+            name: "github_list_prs".into(),
+            ok: true,
+            ms: 761,
+            error: None,
+        }]);
+        let json = serde_json::to_string(&evt).unwrap();
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+        let calls = parsed.tool_calls.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "github_list_prs");
+        assert!(calls[0].ok);
+        assert_eq!(calls[0].ms, 761);
+    }
+
+    #[test]
+    fn with_tool_calls_empty_omits_field() {
+        let evt = JournalEvent::turn(Some("s1"), 1, None, "hi", "hello", 0, 10, 5, 50)
+            .with_tool_calls(vec![]);
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(
+            !json.contains("tool_calls"),
+            "empty tool_calls should be omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn backward_compat_old_events_missing_tool_calls() {
+        // Old events without tool_calls field should deserialize fine.
+        let old_json = r#"{"type":"turn","ts":"2025-01-01T00:00:00Z","turn":1,"tool_count":2,"tokens_in":100,"tokens_out":50,"duration_ms":500,"tools_used":["bash","read_file"]}"#;
+        let evt: JournalEvent = serde_json::from_str(old_json).unwrap();
+        assert!(evt.tool_calls.is_none());
+        assert_eq!(evt.tools_used.as_ref().unwrap().len(), 2);
+    }
+
+    // ── ToolCallRecord edge cases ──
+
+    #[test]
+    fn tool_call_record_bulk_array() {
+        let records: Vec<ToolCallRecord> = (0..100)
+            .map(|i| ToolCallRecord {
+                name: format!("tool_{i}"),
+                ok: i % 2 == 0,
+                ms: i as u64 * 100,
+                error: if i % 3 == 0 {
+                    Some(format!("err_{i}"))
+                } else {
+                    None
+                },
+            })
+            .collect();
+        let json = serde_json::to_string(&records).unwrap();
+        let parsed: Vec<ToolCallRecord> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), 100);
+        assert_eq!(parsed[99].name, "tool_99");
+        assert_eq!(parsed[0].ms, 0);
+    }
+
+    #[test]
+    fn tool_call_record_unicode_error() {
+        let record = ToolCallRecord {
+            name: "github_list_prs".into(),
+            ok: false,
+            ms: 500,
+            error: Some("连接超时: タイムアウト 🚫".into()),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.error.unwrap(), "连接超时: タイムアウト 🚫");
+    }
+
+    #[test]
+    fn tool_call_record_max_ms_value() {
+        let record = ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            ms: u64::MAX,
+            error: None,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.ms, u64::MAX);
     }
 
     #[test]
@@ -636,5 +903,81 @@ mod tests {
         let err = resolve_session_id_from_list("missing", &sessions).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(err.to_string().contains("no session journal matches"));
+    }
+
+    #[test]
+    fn turn_guard_verdict_event_serializes() {
+        let evt = JournalEvent::turn_guard_verdict(
+            Some("sess-1"),
+            3,
+            "warning",
+            &["Stall detected: repeated bash calls".to_string()],
+            &["bash".to_string()],
+            false,
+            1,
+            2,
+            1,
+        );
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(json.contains("\"type\":\"turn_guard_verdict\""));
+        assert!(json.contains("\"turn\":3"));
+        // stall_type field reused for severity
+        assert!(json.contains("\"stall_type\":\"warning\""));
+
+        // Metadata should contain verdict details
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.event_type, JournalEventType::TurnGuardVerdict);
+        let meta = parsed.metadata.unwrap();
+        assert_eq!(meta["severity"], "warning");
+        assert_eq!(meta["injections"], 1);
+        assert_eq!(meta["avoid_tools"][0], "bash");
+        assert_eq!(meta["force_stop"], false);
+        assert_eq!(meta["nudge_count"], 1);
+        assert_eq!(meta["total_errors"], 2);
+        assert_eq!(meta["deprioritized_tools"], 1);
+    }
+
+    #[test]
+    fn turn_guard_verdict_critical_force_stop() {
+        let evt = JournalEvent::turn_guard_verdict(
+            Some("sess-1"),
+            5,
+            "critical",
+            &[
+                "CRITICAL: multiple stalls".to_string(),
+                "Tool health degraded".to_string(),
+            ],
+            &["bash".to_string(), "grep".to_string()],
+            true,
+            3,
+            5,
+            2,
+        );
+        let json = serde_json::to_string(&evt).unwrap();
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+        let meta = parsed.metadata.unwrap();
+        assert_eq!(meta["severity"], "critical");
+        assert_eq!(meta["force_stop"], true);
+        assert_eq!(meta["injections"], 2);
+        assert_eq!(meta["nudge_count"], 3);
+        // injection_preview should truncate to first injection
+        assert!(
+            meta["injection_preview"]
+                .as_str()
+                .unwrap()
+                .contains("CRITICAL")
+        );
+    }
+
+    #[test]
+    fn turn_guard_verdict_info_minimal() {
+        let evt = JournalEvent::turn_guard_verdict(None, 1, "info", &[], &[], false, 0, 1, 0);
+        let json = serde_json::to_string(&evt).unwrap();
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.event_type, JournalEventType::TurnGuardVerdict);
+        let meta = parsed.metadata.unwrap();
+        assert_eq!(meta["injections"], 0);
+        assert!(meta["injection_preview"].is_null());
+        assert_eq!(meta["force_stop"], false);
     }
 }

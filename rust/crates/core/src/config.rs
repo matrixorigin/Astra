@@ -1,5 +1,10 @@
 use std::{collections::HashMap, env, error::Error, fmt};
 
+/// Default Memoria base URL. Uses `127.0.0.1` instead of `localhost` because
+/// Memoria binds to `0.0.0.0` (IPv4 only) and `localhost` may resolve to `::1`
+/// on dual-stack systems, causing connection failures.
+pub const DEFAULT_MEMORIA_URL: &str = "http://127.0.0.1:8100";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppSettings {
     pub matrixone: MatrixOneSettings,
@@ -53,11 +58,7 @@ impl AppSettings {
             jwt: JwtSettings::from_lookup(&lookup)?,
             embedding: EmbeddingSettings::from_lookup(&lookup)?,
             github_token: optional_value(&lookup, "GITHUB_TOKEN"),
-            memoria_base_url: value_or_default(
-                &lookup,
-                "MEMORIA_BASE_URL",
-                "http://localhost:8100",
-            ),
+            memoria_base_url: value_or_default(&lookup, "MEMORIA_BASE_URL", DEFAULT_MEMORIA_URL),
             memoria_master_key: optional_value(&lookup, "MEMORIA_MASTER_KEY"),
             chat_turn_bridge_url: optional_value(&lookup, "CHAT_TURN_BRIDGE_URL"),
             chat_turn_bridge_secret: value_or_default(

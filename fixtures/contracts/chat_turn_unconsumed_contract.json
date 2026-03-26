@@ -26,7 +26,7 @@
       "consumed": ["tc1"],
       "allowed_tool_call_ids": ["tc1", "tc2"],
       "expected": [
-        {"role": "tool", "tool_call_id": "tc2", "content": "{\"x\":1}"}
+        {"role": "tool", "tool_call_id": "tc2", "content": "[TOOL OUTPUT]\n{\"x\":1}\n[/TOOL OUTPUT]"}
       ]
     }
   ]

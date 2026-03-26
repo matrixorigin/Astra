@@ -24,6 +24,7 @@ use mo_agent_runtime::{prompts, tool_registry, tool_selector};
 use mo_agent_services::session_journal;
 
 mod edge_tools;
+mod manifest_loader;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use rustyline::{
     Cmd as RlCmd, CompletionType, ConditionalEventHandler, Config, Context, Editor,
@@ -71,13 +72,13 @@ mod stream_render;
 
 use auth_flow::{clear_profile_last_session, do_login, do_register};
 use chat_stream::{
-    ChatTurnParams, is_session_not_found_error, looks_like_factual_query, stream_chat_sse,
+    ChatTurnParams, is_session_not_found_error, looks_like_live_query_with_context, stream_chat_sse,
 };
 use cli_utils::{
     Profile, auth_headers, capitalize, compact_or_raw, get_profile_and_token, interactive_select,
     load_credentials, print_json_or_raw, print_markdown, profile_name, prompt_or,
-    prompt_password_masked, read_api_error, save_credentials, tool_call_detail, truncate_str,
-    urlencoding,
+    prompt_password_masked, read_api_error, resumable_last_session_id, save_credentials,
+    tool_call_detail, truncate_str, urlencoding,
 };
 use command_router::execute_cli_command;
 use permission_manager::PermissionManager;
@@ -86,8 +87,8 @@ use stream_render::{Spinner, consume_turn_sse};
 use stream_render::{StreamRenderState, TurnResult, dispatch_turn_event_block};
 
 use repl_runtime::{
-    build_repl_editor, create_tool_selector, current_access_token, ensure_repl_authenticated,
-    initialize_repl_state, print_repl_banner,
+    build_repl_editor, create_tool_selector, create_tool_selector_with_quality,
+    current_access_token, ensure_repl_authenticated, initialize_repl_state, print_repl_banner,
 };
 use repl_turn::{ReplTurnContext, handle_chat_input};
 use repl_ui::{
@@ -285,8 +286,30 @@ struct StreamResult {
     tools_selected: Vec<String>,
     /// Tool names actually invoked by LLM across all turns.
     tools_used: Vec<String>,
+    /// Per-tool-call audit records: name, ok, ms, error.
+    tool_call_records: Vec<mo_agent_services::session_journal::ToolCallRecord>,
     /// Token budget used by selected dynamic tools.
     budget_used: u32,
+    /// Token budget pressure (0.0-0.9) from compaction tier.
+    budget_pressure: f64,
+    /// Stall events that occurred during the agentic loop (stall_type, turn_number).
+    stall_events: Vec<(String, u32)>,
+    /// TurnGuard verdict events (severity, turn, injections, avoid_tools, force_stop,
+    /// nudge_count, total_errors, deprioritized_count). Only non-Healthy verdicts.
+    verdict_events: Vec<VerdictEvent>,
+}
+
+/// Structured audit record for a TurnGuard verdict.
+#[derive(Debug, Clone)]
+struct VerdictEvent {
+    turn: u32,
+    severity: String,
+    injections: Vec<String>,
+    avoid_tools: Vec<String>,
+    force_stop: bool,
+    nudge_count: usize,
+    total_errors: usize,
+    deprioritized_count: usize,
 }
 
 // ══════════════════════════════════════════════════════════ REPL State ════
@@ -492,8 +515,8 @@ async fn handle_slash_command(
 
         "/session" => handle_session_command(arg, state),
 
-        "/history" | "/copy" | "/doctor" | "/context" | "/version" => {
-            handle_info_command(cmd, client, base, state, token).await?;
+        "/history" | "/copy" | "/doctor" | "/context" | "/version" | "/rewind" => {
+            handle_info_command(cmd, arg, client, base, state, token).await?;
         }
 
         "/skill" | "/skill list" | "/skill new" | "/skill test" | "/skill dev"
@@ -559,7 +582,7 @@ async fn run_chat_repl(
     initial_model: Option<&str>,
 ) -> Result<(), String> {
     if let Err(e) = ensure_repl_authenticated(client, base, profile).await {
-        if e == "repl exited before authentication" {
+        if e.contains("cancelled") || e.contains("exited before authentication") {
             return Ok(());
         }
         return Err(e);
@@ -567,7 +590,36 @@ async fn run_chat_repl(
 
     let (mut editor, hist_path) = build_repl_editor()?;
     let mut state = initialize_repl_state(profile, initial_model);
-    let selector = create_tool_selector(client, base, profile);
+    // Session-scoped quality tracker: tools that work well get boosted over time
+    let quality_tracker = std::sync::Arc::new(std::sync::Mutex::new(
+        tool_registry::ToolQualityTracker::new(),
+    ));
+    // Session-scoped confidence calibrator: thresholds adapt to correction rates
+    let confidence_calibrator = std::sync::Arc::new(
+        mo_agent_runtime::turn::routing_metrics::ConfidenceCalibrator::default(),
+    );
+    let (selector, pipeline_modules) = create_tool_selector_with_quality(
+        client,
+        base,
+        profile,
+        Some(quality_tracker),
+        Some(confidence_calibrator),
+    );
+
+    // Load cross-session learning state (entity graph, patterns, calibration)
+    {
+        let profile_name = profile.unwrap_or("default");
+        let loaded = mo_agent_runtime::pipeline::persistence::load_learning_state(
+            profile_name,
+            &pipeline_modules.entity_graph,
+            &pipeline_modules.pattern_library,
+            &pipeline_modules.calibrator,
+        );
+        if loaded {
+            eprintln!("{}", "  ✓ Loaded learning state from prior sessions".dim());
+        }
+    }
+
     print_repl_banner(profile, &state);
 
     // ── Main loop ─────────────────────────────────────────────────────────────
@@ -585,7 +637,14 @@ async fn run_chat_repl(
         match readline {
             Ok(line) => {
                 clear_slash_overlay();
-                let line = line.trim().to_string();
+                // Multi-line: strip continuation backslashes and join lines
+                let line = line
+                    .lines()
+                    .map(|l| l.strip_suffix('\\').unwrap_or(l))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .trim()
+                    .to_string();
                 if line.is_empty() {
                     continue;
                 }
@@ -634,6 +693,9 @@ async fn run_chat_repl(
                         state.turn,
                     ));
                 }
+                if state.session_id.is_some() {
+                    let _ = clear_profile_last_session(profile);
+                }
                 break;
             }
             Err(e) => {
@@ -641,6 +703,22 @@ async fn run_chat_repl(
                 eprintln!("{}", format!("readline error: {}", e).red());
                 break;
             }
+        }
+    }
+
+    // Save cross-session learning state
+    {
+        let profile_name = profile.unwrap_or("default");
+        if let Err(e) = mo_agent_runtime::pipeline::persistence::save_learning_state(
+            profile_name,
+            &pipeline_modules.entity_graph,
+            &pipeline_modules.pattern_library,
+            &pipeline_modules.calibrator,
+        ) {
+            eprintln!(
+                "{}",
+                format!("  ⚠ Failed to save learning state: {e}").yellow()
+            );
         }
     }
 

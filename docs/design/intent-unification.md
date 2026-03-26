@@ -327,7 +327,7 @@ Each phase is independently deployable and backward-compatible:
 - Phase 4: Dead code removal → pure cleanup
 - Phase 5: Event schema change → old events still readable (superset of old fields)
 
-Tests at each phase: run full suite (`make dev-test-keep`), verify no regressions.
+Tests at each phase: run full suite (`make test`), verify no regressions.
 
 ---
 

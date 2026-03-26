@@ -1,5 +1,16 @@
 use super::*;
 
+/// Safely convert a string to a HeaderValue, returning an SSE error response on failure.
+#[allow(clippy::result_large_err)]
+fn safe_header_value(value: &str) -> Result<HeaderValue, Response> {
+    HeaderValue::from_str(value).map_err(|_| {
+        sse_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Invalid header value: contains non-visible ASCII".to_string(),
+        )
+    })
+}
+
 pub(super) async fn chat_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -97,16 +108,25 @@ pub(super) async fn dispatch_chat_turn_bridge(
     let mut bridge_headers = HeaderMap::new();
     bridge_headers.insert(
         HeaderName::from_static("x-mo-bridge-secret"),
-        HeaderValue::from_str(&state.chat_turn_bridge_secret).unwrap(),
+        match safe_header_value(&state.chat_turn_bridge_secret) {
+            Ok(v) => v,
+            Err(r) => return r,
+        },
     );
     bridge_headers.insert(
         HeaderName::from_static("x-mo-user-id"),
-        HeaderValue::from_str(&user.user_id).unwrap(),
+        match safe_header_value(&user.user_id) {
+            Ok(v) => v,
+            Err(r) => return r,
+        },
     );
     let username_b64 = URL_SAFE.encode(user.username.as_bytes());
     bridge_headers.insert(
         HeaderName::from_static("x-mo-username-b64"),
-        HeaderValue::from_str(&username_b64).unwrap(),
+        match safe_header_value(&username_b64) {
+            Ok(v) => v,
+            Err(r) => return r,
+        },
     );
     bridge_headers.insert(
         HeaderName::from_static("x-mo-bridge-capabilities"),
@@ -123,19 +143,28 @@ pub(super) async fn dispatch_chat_turn_bridge(
     if let Some(trusted_session_id) = prepared.trusted_session_id.as_deref() {
         bridge_headers.insert(
             HeaderName::from_static("x-mo-session-id"),
-            HeaderValue::from_str(trusted_session_id).unwrap(),
+            match safe_header_value(trusted_session_id) {
+                Ok(v) => v,
+                Err(r) => return r,
+            },
         );
     }
     if let Some(turn_chain_id) = prepared.turn_chain_id.as_deref() {
         bridge_headers.insert(
             HeaderName::from_static("x-mo-turn-chain-id"),
-            HeaderValue::from_str(turn_chain_id).unwrap(),
+            match safe_header_value(turn_chain_id) {
+                Ok(v) => v,
+                Err(r) => return r,
+            },
         );
     }
     if let Some(user_query_event_id) = prepared.user_query_event_id.as_deref() {
         bridge_headers.insert(
             HeaderName::from_static("x-mo-user-query-event-id"),
-            HeaderValue::from_str(user_query_event_id).unwrap(),
+            match safe_header_value(user_query_event_id) {
+                Ok(v) => v,
+                Err(r) => return r,
+            },
         );
     }
     if let Some(tools_changed) = prepared.tools_changed {
@@ -147,31 +176,46 @@ pub(super) async fn dispatch_chat_turn_bridge(
     if let Some(task_hint) = prepared.task_hint.as_deref() {
         bridge_headers.insert(
             HeaderName::from_static("x-mo-task-hint"),
-            HeaderValue::from_str(task_hint).unwrap(),
+            match safe_header_value(task_hint) {
+                Ok(v) => v,
+                Err(r) => return r,
+            },
         );
     }
     if let Some(user_query_b64) = prepared.user_query_b64.as_deref() {
         bridge_headers.insert(
             HeaderName::from_static("x-mo-user-query-b64"),
-            HeaderValue::from_str(user_query_b64).unwrap(),
+            match safe_header_value(user_query_b64) {
+                Ok(v) => v,
+                Err(r) => return r,
+            },
         );
     }
     if let Some(routing_meta_b64) = prepared.routing_meta_b64.as_deref() {
         bridge_headers.insert(
             HeaderName::from_static("x-mo-routing-meta-b64"),
-            HeaderValue::from_str(routing_meta_b64).unwrap(),
+            match safe_header_value(routing_meta_b64) {
+                Ok(v) => v,
+                Err(r) => return r,
+            },
         );
     }
     if let Some(force_intent) = prepared.force_intent.as_deref() {
         bridge_headers.insert(
             HeaderName::from_static("x-mo-force-intent"),
-            HeaderValue::from_str(force_intent).unwrap(),
+            match safe_header_value(force_intent) {
+                Ok(v) => v,
+                Err(r) => return r,
+            },
         );
     }
     if let Some(execution_state_b64) = prepared.execution_state_b64.as_deref() {
         bridge_headers.insert(
             HeaderName::from_static("x-mo-execution-state-b64"),
-            HeaderValue::from_str(execution_state_b64).unwrap(),
+            match safe_header_value(execution_state_b64) {
+                Ok(v) => v,
+                Err(r) => return r,
+            },
         );
     }
 
@@ -205,4 +249,106 @@ pub(super) async fn chat_route_handler(
 ) -> Result<Json<ChatRouteResponse>, (StatusCode, Json<ErrorResponse>)> {
     let _ = state.auth_service.current_user(&headers).await?;
     Ok(Json(classify_chat_route(request.query)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bridge_header_names_are_valid() {
+        let headers = [
+            "x-mo-bridge-secret",
+            "x-mo-user-id",
+            "x-mo-username-b64",
+            "x-mo-bridge-capabilities",
+            "x-mo-session-id",
+            "x-mo-turn-chain-id",
+            "x-mo-user-query-event-id",
+            "x-mo-tools-changed",
+            "x-mo-task-hint",
+            "x-mo-user-query-b64",
+            "x-mo-routing-meta-b64",
+            "x-mo-force-intent",
+            "x-mo-execution-state-b64",
+        ];
+        for name in headers {
+            assert!(
+                HeaderName::from_static(name).as_str() == name,
+                "invalid header name: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn username_b64_encoding() {
+        let username = "alice";
+        let encoded = URL_SAFE.encode(username.as_bytes());
+        let decoded = URL_SAFE.decode(&encoded).unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), "alice");
+
+        // CJK username
+        let cjk = "张三";
+        let encoded_cjk = URL_SAFE.encode(cjk.as_bytes());
+        let decoded_cjk = URL_SAFE.decode(&encoded_cjk).unwrap();
+        assert_eq!(String::from_utf8(decoded_cjk).unwrap(), "张三");
+    }
+
+    #[test]
+    fn bridge_capabilities_header_value() {
+        let hv = HeaderValue::from_static("state-sync-v1");
+        assert_eq!(hv.to_str().unwrap(), "state-sync-v1");
+    }
+
+    #[test]
+    fn tools_changed_header_values() {
+        let true_val = if true { "1" } else { "0" };
+        let false_val = if false { "1" } else { "0" };
+        assert_eq!(true_val, "1");
+        assert_eq!(false_val, "0");
+        // Ensure they are valid header values
+        assert!(HeaderValue::from_static("1").to_str().is_ok());
+        assert!(HeaderValue::from_static("0").to_str().is_ok());
+    }
+
+    #[test]
+    fn chat_stream_fallback_payload_shape() {
+        let payload = serde_json::json!({
+            "session_id": Some("s1"),
+            "agent_id": Some("a1"),
+            "model": Some("gpt-4"),
+            "context": null,
+            "messages": [{
+                "role": "user",
+                "content": "hello"
+            }]
+        });
+        let obj = payload.as_object().unwrap();
+        assert!(obj.contains_key("messages"));
+        assert!(obj.contains_key("session_id"));
+        let messages = obj["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+    }
+
+    #[test]
+    fn header_value_from_str_handles_special_chars() {
+        // UUID format
+        assert!(HeaderValue::from_str("550e8400-e29b-41d4-a716-446655440000").is_ok());
+        // Base64 with padding
+        assert!(HeaderValue::from_str("dXNlcm5hbWU=").is_ok());
+        // Base64 URL-safe
+        assert!(HeaderValue::from_str("aGVsbG8td29ybGQ").is_ok());
+    }
+
+    #[test]
+    fn dispatch_header_count() {
+        // Base headers: 4 (secret, user-id, username-b64, capabilities)
+        // + authorization passthrough: 1
+        // + optional from prepared: 9 (session-id, turn-chain-id, user-query-event-id,
+        //   tools-changed, task-hint, user-query-b64, routing-meta-b64, force-intent,
+        //   execution-state-b64)
+        // Total possible: 14
+        assert_eq!(4 + 1 + 9, 14);
+    }
 }

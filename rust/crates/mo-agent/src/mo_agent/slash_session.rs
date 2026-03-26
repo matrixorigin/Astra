@@ -120,6 +120,25 @@ pub(super) fn handle_session_command(arg: &str, state: &ReplState) {
                                     evt.tokens_out.unwrap_or(0),
                                     evt.tool_count.unwrap_or(0),
                                 );
+                                // Show any failed tool calls for auditability
+                                if let Some(calls) = &evt.tool_calls {
+                                    for tc in calls.iter().filter(|c| !c.ok) {
+                                        let err_preview = tc
+                                            .error
+                                            .as_deref()
+                                            .unwrap_or("unknown")
+                                            .chars()
+                                            .take(80)
+                                            .collect::<String>();
+                                        eprintln!(
+                                            "    {} {} ({}ms) {}",
+                                            "✗".red(),
+                                            tc.name,
+                                            tc.ms,
+                                            err_preview.dim(),
+                                        );
+                                    }
+                                }
                             }
                             session_journal::JournalEventType::TurnError => {
                                 eprintln!(
@@ -162,6 +181,62 @@ pub(super) fn handle_session_command(arg: &str, state: &ReplState) {
                                     ts_short.dim(),
                                     "■".dim(),
                                     evt.turn.unwrap_or(0),
+                                );
+                            }
+                            session_journal::JournalEventType::StallDetected => {
+                                eprintln!(
+                                    "  {} {} T{} stall: {}",
+                                    ts_short.dim(),
+                                    "⚠".yellow(),
+                                    evt.turn.unwrap_or(0),
+                                    evt.stall_type.as_deref().unwrap_or("unknown").yellow(),
+                                );
+                            }
+                            session_journal::JournalEventType::Checkpoint => {
+                                let summary = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("summary"))
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("checkpoint");
+                                eprintln!(
+                                    "  {} {} T{} checkpoint: {}",
+                                    ts_short.dim(),
+                                    "📌".green(),
+                                    evt.turn.unwrap_or(0),
+                                    summary,
+                                );
+                            }
+                            session_journal::JournalEventType::TurnGuardVerdict => {
+                                let severity = evt.stall_type.as_deref().unwrap_or("info");
+                                let icon = match severity {
+                                    "critical" => "🛑",
+                                    "warning" => "⚠",
+                                    _ => "ℹ",
+                                };
+                                let details = evt
+                                    .metadata
+                                    .as_ref()
+                                    .map(|m| {
+                                        let avoid = m
+                                            .get("avoid_tools")
+                                            .and_then(|v| v.as_array())
+                                            .map(|a| a.len())
+                                            .unwrap_or(0);
+                                        let inj = m
+                                            .get("injections")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0);
+                                        format!("{inj} nudges, {avoid} tools restricted")
+                                    })
+                                    .unwrap_or_default();
+                                eprintln!(
+                                    "  {} {} T{} verdict[{}]: {}",
+                                    ts_short.dim(),
+                                    icon.yellow(),
+                                    evt.turn.unwrap_or(0),
+                                    severity.yellow(),
+                                    details,
                                 );
                             }
                         }

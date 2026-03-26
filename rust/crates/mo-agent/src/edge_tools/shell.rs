@@ -10,14 +10,35 @@ impl ToolExecutor {
         command: &str,
         timeout_secs: f64,
     ) -> Result<std::process::Output, String> {
-        let mut child = Command::new("bash")
+        // If sandbox is active, wrap command with resource limits
+        let effective_command = if let Some(ref policy) = self.sandbox_policy {
+            if !matches!(policy.mode, SandboxMode::Permissive) {
+                wrap_command_with_limits(policy, command)
+            } else {
+                command.to_string()
+            }
+        } else {
+            command.to_string()
+        };
+
+        let mut child_cmd = Command::new("bash");
+        child_cmd
             .arg("-c")
-            .arg(command)
+            .arg(&effective_command)
             .current_dir(&self.project_root)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Error: {e}"))?;
+            .stderr(Stdio::piped());
+
+        // Apply sandbox environment filtering
+        if let Some(ref policy) = self.sandbox_policy
+            && !matches!(policy.mode, SandboxMode::Permissive)
+            && let Err(e) = sandbox_command(policy, &mut child_cmd)
+        {
+            eprintln!("[sandbox] failed to apply policy: {e}");
+            return Err(format!("Error: sandbox policy application failed: {e}"));
+        }
+
+        let mut child = child_cmd.spawn().map_err(|e| format!("Error: {e}"))?;
 
         let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout_secs);
         loop {
@@ -25,7 +46,9 @@ impl ToolExecutor {
                 Ok(Some(_)) => break,
                 Ok(None) => {
                     if std::time::Instant::now() > deadline {
-                        let _ = child.kill();
+                        if let Err(e) = child.kill() {
+                            eprintln!("[shell] failed to kill timed-out child: {e}");
+                        }
                         return Err(format!("Error: command timed out after {timeout_secs}s"));
                     }
                     std::thread::sleep(Duration::from_millis(50));
@@ -200,6 +223,102 @@ impl ToolExecutor {
         let n = args.get("n").and_then(Value::as_u64).unwrap_or(10);
         self.git_run(&["log", "--oneline", &format!("-{n}")])
     }
+
+    /// Show a specific commit's diff, message, and metadata.
+    pub(crate) fn git_show(&self, args: &Value) -> String {
+        let commit = match args.get("commit").and_then(Value::as_str) {
+            Some(c) => c.to_string(),
+            None => return "Error: missing 'commit' (SHA, branch, or tag)".to_string(),
+        };
+        // Validate: no shell metacharacters
+        if commit.contains(|c: char| {
+            !c.is_alphanumeric()
+                && c != '-'
+                && c != '_'
+                && c != '.'
+                && c != '/'
+                && c != '~'
+                && c != '^'
+        }) {
+            return "Error: invalid commit reference".to_string();
+        }
+        let stat_only = args
+            .get("stat_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let file = args.get("file").and_then(Value::as_str);
+
+        let mut cmd_args = vec!["show", "--no-color"];
+        if stat_only {
+            cmd_args.push("--stat");
+        }
+        cmd_args.push(&commit);
+        // Optionally scope to a specific file
+        if let Some(f) = file {
+            cmd_args.push("--");
+            cmd_args.push(f);
+        }
+        let out = self.git_run(&cmd_args);
+        // Auto-truncate large diffs
+        if out.len() > 30_000 {
+            let mut t = out[..30_000].to_string();
+            t.push_str("\n[truncated — use stat_only:true or file param to narrow]");
+            t
+        } else {
+            out
+        }
+    }
+
+    /// Fetch a URL and return its content (text or HTML→text).
+    pub(crate) fn web_fetch(&self, args: &Value) -> String {
+        let url = match args.get("url").and_then(Value::as_str) {
+            Some(u) => u,
+            None => return "Error: missing 'url'".to_string(),
+        };
+        // Basic URL validation
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return "Error: url must start with http:// or https://".to_string();
+        }
+        let max_bytes = args
+            .get("max_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(10_000) as usize;
+        let timeout_secs = args.get("timeout").and_then(Value::as_u64).unwrap_or(10);
+
+        let output = Command::new("curl")
+            .args([
+                "-sS",
+                "-L",
+                "--max-time",
+                &timeout_secs.to_string(),
+                "--max-filesize",
+                &(max_bytes * 2).to_string(), // allow 2x for pre-truncation
+                "-H",
+                "User-Agent: mo-agent/0.1",
+                url,
+            ])
+            .current_dir(&self.project_root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+        match output {
+            Ok(out) => {
+                let status = out.status;
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !status.success() && stdout.is_empty() {
+                    return format!("Error: {stderr}");
+                }
+                let mut result = stdout.to_string();
+                if result.len() > max_bytes {
+                    result.truncate(max_bytes);
+                    result.push_str("\n[truncated]");
+                }
+                result
+            }
+            Err(e) => format!("Error: curl not available — {e}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -283,5 +402,129 @@ mod tests {
         let result = executor.git_log(&serde_json::json!({"n": 3}));
         // May or may not be in a git repo, just verify no panic
         assert!(!result.is_empty());
+    }
+
+    // ── str_replace diff preview ─────────────────────────────────────────────
+
+    #[test]
+    fn str_replace_shows_diff_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        std::fs::write(
+            dir.path().join("code.rs"),
+            "fn main() {\n    println!(\"old\");\n}\n",
+        )
+        .unwrap();
+
+        let result = executor.str_replace(&serde_json::json!({
+            "path": "code.rs",
+            "old_str": "println!(\"old\")",
+            "new_str": "println!(\"new\")"
+        }));
+        assert!(result.contains("Replaced successfully"), "got: {result}");
+        assert!(result.contains("- "), "should have - line: {result}");
+        assert!(result.contains("+ "), "should have + line: {result}");
+        assert!(result.contains("old"), "should show old text: {result}");
+        assert!(result.contains("new"), "should show new text: {result}");
+    }
+
+    #[test]
+    fn str_replace_large_diff_shows_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        // Create a file with many lines
+        let old_block: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        let new_block: String = (0..25).map(|i| format!("new_line {i}\n")).collect();
+        let content = format!("header\n{old_block}footer\n");
+        std::fs::write(dir.path().join("big.txt"), &content).unwrap();
+
+        let result = executor.str_replace(&serde_json::json!({
+            "path": "big.txt",
+            "old_str": old_block.trim_end(),
+            "new_str": new_block.trim_end()
+        }));
+        assert!(result.contains("Replaced successfully"), "got: {result}");
+        assert!(
+            result.contains("lines →"),
+            "large diff should show summary: {result}"
+        );
+    }
+
+    // ── resolve_checked sandbox ──────────────────────────────────────────────
+
+    #[test]
+    fn resolve_checked_without_sandbox_allows_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        // No sandbox policy → all paths allowed
+        let result = executor.resolve_checked("/etc/passwd");
+        assert!(result.is_ok(), "should allow without sandbox: {result:?}");
+    }
+
+    #[test]
+    fn resolve_checked_with_sandbox_blocks_escape() {
+        use mo_agent_runtime::tool_sandbox::SandboxPolicy;
+        let dir = tempfile::tempdir().unwrap();
+        let mut executor = ToolExecutor::new(dir.path());
+        let mut policy = SandboxPolicy::strict(dir.path());
+        policy.allowed_paths.clear();
+        executor.sandbox_policy = Some(policy);
+
+        let result = executor.resolve_checked("/etc/passwd");
+        assert!(result.is_err(), "should block path escape: {result:?}");
+        assert!(
+            result.unwrap_err().contains("Sandbox"),
+            "should mention sandbox"
+        );
+    }
+
+    // ── git_show ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn git_show_missing_commit_returns_error() {
+        let executor = test_executor();
+        let result = executor.git_show(&serde_json::json!({}));
+        assert!(result.contains("Error"), "got: {result}");
+    }
+
+    #[test]
+    fn git_show_invalid_ref_returns_error() {
+        let executor = test_executor();
+        let result = executor.git_show(&serde_json::json!({"commit": "abc; rm -rf /"}));
+        assert!(result.contains("invalid"), "got: {result}");
+    }
+
+    #[test]
+    fn git_show_head_returns_content() {
+        // Run in actual repo
+        let executor =
+            ToolExecutor::new(std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
+        let result = executor.git_show(&serde_json::json!({"commit": "HEAD"}));
+        // Either shows commit info or git error (if not in repo)
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn git_show_stat_only() {
+        let executor =
+            ToolExecutor::new(std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
+        let result = executor.git_show(&serde_json::json!({"commit": "HEAD", "stat_only": true}));
+        assert!(!result.is_empty());
+    }
+
+    // ── web_fetch ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn web_fetch_missing_url_returns_error() {
+        let executor = test_executor();
+        let result = executor.web_fetch(&serde_json::json!({}));
+        assert!(result.contains("Error"), "got: {result}");
+    }
+
+    #[test]
+    fn web_fetch_invalid_scheme_returns_error() {
+        let executor = test_executor();
+        let result = executor.web_fetch(&serde_json::json!({"url": "ftp://example.com"}));
+        assert!(result.contains("http"), "got: {result}");
     }
 }

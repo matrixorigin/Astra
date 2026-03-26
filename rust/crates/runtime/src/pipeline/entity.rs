@@ -1,0 +1,736 @@
+//! Entity Knowledge Graph — persistent entity→domain→tools mapping.
+//!
+//! Learns entity associations from successful tool interactions and
+//! uses them to improve routing confidence on subsequent queries.
+//!
+//! # Learning flow
+//!
+//! 1. User says "我关注matrixorigin" → extract_entities() → ["matrixorigin"]
+//! 2. First encounter: EntityGraph has no knowledge → low confidence
+//! 3. Agent uses GitHub tools successfully → learn("matrixorigin", GitHub, ["github_search"])
+//! 4. Next query about "matrixorigin" → domain_for() → Some(GitHub) → high confidence
+//!
+//! # Cross-session persistence
+//!
+//! The EntityGraph can be serialized/deserialized for storage in Memoria or
+//! other persistence layers. At session start, merge previous knowledge.
+//! At session end, export learned knowledge.
+
+use super::routing::DomainHint;
+use std::collections::HashMap;
+
+// ─── Entity Knowledge ────────────────────────────────────────────────────────
+
+/// Knowledge about a single entity, learned from successful interactions.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EntityKnowledge {
+    /// Canonical entity name (lowercased).
+    pub name: String,
+    /// Known aliases (e.g., "mo" → "matrixorigin").
+    pub aliases: Vec<String>,
+    /// Domain this entity belongs to.
+    pub domain: Option<DomainHint>,
+    /// Tools that successfully handled queries about this entity.
+    pub associated_tools: Vec<String>,
+    /// Confidence in this knowledge (0.0–1.0), increases with observations.
+    pub confidence: f64,
+    /// Number of times this entity was observed in successful interactions.
+    pub observation_count: u32,
+}
+
+impl EntityKnowledge {
+    fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            aliases: Vec::new(),
+            domain: None,
+            associated_tools: Vec::new(),
+            confidence: 0.0,
+            observation_count: 0,
+        }
+    }
+}
+
+// ─── Entity Graph ────────────────────────────────────────────────────────────
+
+/// In-memory entity knowledge graph.
+///
+/// Maps entity names to their known domains, tools, and confidence.
+/// Designed to be populated from memory service at session start and
+/// exported at session end.
+#[derive(Debug, Clone, Default)]
+pub struct EntityGraph {
+    /// Entity name (lowercased) → knowledge.
+    entities: HashMap<String, EntityKnowledge>,
+    /// Alias → canonical name mapping.
+    alias_index: HashMap<String, String>,
+}
+
+impl EntityGraph {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Learn from a successful tool interaction.
+    ///
+    /// Called after the Evaluate stage confirms good progress.
+    /// Strengthens the association between entity, domain, and tools.
+    pub fn learn(&mut self, entity: &str, domain: DomainHint, tools_used: &[String]) {
+        let key = entity.to_lowercase();
+        let entry = self
+            .entities
+            .entry(key.clone())
+            .or_insert_with(|| EntityKnowledge::new(&key));
+
+        entry.domain = Some(domain);
+        entry.observation_count += 1;
+
+        // Add new tools (dedup)
+        for tool in tools_used {
+            if !entry.associated_tools.contains(tool) {
+                entry.associated_tools.push(tool.clone());
+            }
+        }
+
+        // Confidence grows with observations (asymptotic to 1.0)
+        entry.confidence = 1.0 - 1.0 / (1.0 + entry.observation_count as f64);
+    }
+
+    /// Register an alias for an entity.
+    pub fn add_alias(&mut self, alias: &str, canonical: &str) {
+        let alias_lower = alias.to_lowercase();
+        let canonical_lower = canonical.to_lowercase();
+        self.alias_index.insert(alias_lower, canonical_lower);
+    }
+
+    /// Look up domain hint for an entity.
+    pub fn domain_for(&self, entity: &str) -> Option<DomainHint> {
+        let key = self.resolve(entity);
+        self.entities.get(&key).and_then(|e| e.domain)
+    }
+
+    /// Get boost terms for routing based on entity knowledge.
+    ///
+    /// Returns domain keywords + associated tool names.
+    pub fn boost_for(&self, entity: &str) -> Vec<String> {
+        let key = self.resolve(entity);
+        let entry = match self.entities.get(&key) {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+
+        let mut terms = Vec::new();
+
+        // Domain keywords
+        if let Some(domain) = &entry.domain {
+            match domain {
+                DomainHint::GitHub => {
+                    terms.extend(
+                        ["github", "repository", "pr", "issue"]
+                            .iter()
+                            .map(|s| s.to_string()),
+                    );
+                }
+                DomainHint::Git => {
+                    terms.extend(
+                        ["git", "commit", "branch", "diff"]
+                            .iter()
+                            .map(|s| s.to_string()),
+                    );
+                }
+                DomainHint::Code => {
+                    terms.extend(["code", "file", "source"].iter().map(|s| s.to_string()));
+                }
+                DomainHint::Memory => {
+                    terms.extend(
+                        ["memory", "store", "retrieve"]
+                            .iter()
+                            .map(|s| s.to_string()),
+                    );
+                }
+                DomainHint::Web => {
+                    terms.extend(["web", "http", "url"].iter().map(|s| s.to_string()));
+                }
+                DomainHint::System => {
+                    terms.extend(["system", "process", "file"].iter().map(|s| s.to_string()));
+                }
+                DomainHint::Database => {
+                    terms.extend(
+                        ["database", "sql", "query", "table", "matrixone"]
+                            .iter()
+                            .map(|s| s.to_string()),
+                    );
+                }
+            }
+        }
+
+        // Associated tool names as terms
+        terms.extend(entry.associated_tools.iter().cloned());
+
+        terms
+    }
+
+    /// Get the full knowledge for an entity (if any).
+    pub fn get(&self, entity: &str) -> Option<&EntityKnowledge> {
+        let key = self.resolve(entity);
+        self.entities.get(&key)
+    }
+
+    /// Get confidence for an entity (0.0 if unknown).
+    pub fn confidence_for(&self, entity: &str) -> f64 {
+        let key = self.resolve(entity);
+        self.entities.get(&key).map(|e| e.confidence).unwrap_or(0.0)
+    }
+
+    /// Merge knowledge from persistent storage.
+    ///
+    /// For each incoming entity, if we have higher observation count,
+    /// keep ours; otherwise, take the stored version.
+    pub fn merge(&mut self, entries: &[EntityKnowledge]) {
+        for entry in entries {
+            let key = entry.name.to_lowercase();
+            let existing = self.entities.get(&key);
+            if existing.is_none_or(|e| e.observation_count < entry.observation_count) {
+                self.entities.insert(key.clone(), entry.clone());
+            }
+            // Also index aliases
+            for alias in &entry.aliases {
+                self.alias_index.insert(alias.to_lowercase(), key.clone());
+            }
+        }
+    }
+
+    /// Export all entity knowledge for persistence.
+    pub fn export(&self) -> Vec<EntityKnowledge> {
+        self.entities.values().cloned().collect()
+    }
+
+    /// Number of known entities.
+    pub fn len(&self) -> usize {
+        self.entities.len()
+    }
+
+    /// Whether the graph is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entities.is_empty()
+    }
+
+    /// Resolve an entity name through the alias index.
+    fn resolve(&self, entity: &str) -> String {
+        let lower = entity.to_lowercase();
+        self.alias_index.get(&lower).cloned().unwrap_or(lower)
+    }
+}
+
+// ─── Entity Extraction ───────────────────────────────────────────────────────
+
+/// Common stop words to filter out during entity extraction.
+const STOP_WORDS: &[&str] = &[
+    // English
+    "the",
+    "a",
+    "an",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "have",
+    "has",
+    "had",
+    "do",
+    "does",
+    "did",
+    "will",
+    "would",
+    "could",
+    "should",
+    "may",
+    "might",
+    "can",
+    "shall",
+    "must",
+    "need",
+    "i",
+    "me",
+    "my",
+    "you",
+    "your",
+    "he",
+    "she",
+    "it",
+    "we",
+    "they",
+    "this",
+    "that",
+    "these",
+    "those",
+    "what",
+    "which",
+    "who",
+    "whom",
+    "how",
+    "when",
+    "where",
+    "why",
+    "if",
+    "then",
+    "else",
+    "so",
+    "but",
+    "and",
+    "or",
+    "not",
+    "no",
+    "yes",
+    "all",
+    "any",
+    "some",
+    "every",
+    "in",
+    "on",
+    "at",
+    "to",
+    "for",
+    "of",
+    "with",
+    "from",
+    "by",
+    "about",
+    "up",
+    "out",
+    "off",
+    "over",
+    "under",
+    "into",
+    "through",
+    "show",
+    "list",
+    "get",
+    "set",
+    "run",
+    "make",
+    "let",
+    "put",
+    "help",
+    "want",
+    "please",
+    "just",
+    "now",
+    "here",
+    "there",
+    // Chinese functional words
+    "的",
+    "了",
+    "吗",
+    "吧",
+    "啊",
+    "呢",
+    "把",
+    "被",
+    "给",
+    "从",
+    "在",
+    "和",
+    "与",
+    "或",
+    "也",
+    "都",
+    "还",
+    "就",
+    "才",
+    "又",
+    "我",
+    "你",
+    "他",
+    "她",
+    "它",
+    "们",
+    "这",
+    "那",
+    "哪",
+    "什么",
+    "怎么",
+    "如何",
+    "为什么",
+    "是",
+    "有",
+    "没有",
+    "不",
+    "要",
+    "可以",
+    "能",
+    "会",
+    "想",
+    "看看",
+    "帮",
+    "帮我",
+];
+
+/// Extract entity candidates from a query.
+///
+/// Uses heuristics:
+/// - Tokens longer than 2 chars that aren't stop words
+/// - CJK sequences (treated as potential proper nouns)
+/// - Mixed-case tokens (e.g., "MatrixOrigin")
+///
+/// Intentionally permissive — better to extract too many candidates
+/// and filter via the EntityGraph than to miss entities.
+pub fn extract_entities(query: &str) -> Vec<String> {
+    let mut entities = Vec::new();
+
+    // Tokenize: split on whitespace and punctuation, keeping CJK as individual sequences
+    for token in tokenize_for_entities(query) {
+        let lower = token.to_lowercase();
+
+        // Skip stop words
+        if STOP_WORDS.contains(&lower.as_str()) {
+            continue;
+        }
+
+        // Skip very short tokens (< 2 chars for ASCII, < 1 for CJK)
+        let is_cjk = token.chars().any(is_cjk_char);
+        if !is_cjk && token.len() < 3 {
+            continue;
+        }
+        if is_cjk && token.chars().count() < 2 {
+            continue;
+        }
+
+        // Skip pure numbers
+        if token.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        entities.push(lower);
+    }
+
+    // Dedup while preserving order
+    let mut seen = std::collections::HashSet::new();
+    entities.retain(|e| seen.insert(e.clone()));
+
+    entities
+}
+
+/// Simple tokenizer for entity extraction.
+fn tokenize_for_entities(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_cjk = false;
+
+    for ch in text.chars() {
+        let cjk = is_cjk_char(ch);
+
+        if cjk {
+            // Flush ASCII token
+            if !current.is_empty() && !in_cjk {
+                tokens.push(std::mem::take(&mut current));
+            }
+            current.push(ch);
+            in_cjk = true;
+        } else if ch.is_alphanumeric() || ch == '_' || ch == '-' {
+            // Flush CJK token
+            if !current.is_empty() && in_cjk {
+                tokens.push(std::mem::take(&mut current));
+            }
+            current.push(ch);
+            in_cjk = false;
+        } else {
+            // Separator — flush whatever we have
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+                in_cjk = false;
+            }
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn is_cjk_char(c: char) -> bool {
+    matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{F900}'..='\u{FAFF}')
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── EntityGraph basics ───────────────────────────────────────────────
+
+    #[test]
+    fn learn_and_query() {
+        let mut graph = EntityGraph::new();
+        assert!(graph.is_empty());
+
+        graph.learn(
+            "matrixorigin",
+            DomainHint::GitHub,
+            &["github_search".into()],
+        );
+        assert_eq!(graph.len(), 1);
+        assert_eq!(graph.domain_for("matrixorigin"), Some(DomainHint::GitHub));
+        assert_eq!(graph.domain_for("MatrixOrigin"), Some(DomainHint::GitHub)); // case-insensitive
+    }
+
+    #[test]
+    fn unknown_entity_returns_none() {
+        let graph = EntityGraph::new();
+        assert_eq!(graph.domain_for("unknown"), None);
+        assert_eq!(graph.confidence_for("unknown"), 0.0);
+    }
+
+    #[test]
+    fn confidence_increases_with_observations() {
+        let mut graph = EntityGraph::new();
+
+        graph.learn("mo", DomainHint::GitHub, &["gh_search".into()]);
+        let conf1 = graph.confidence_for("mo");
+
+        graph.learn("mo", DomainHint::GitHub, &["gh_list_prs".into()]);
+        let conf2 = graph.confidence_for("mo");
+
+        graph.learn("mo", DomainHint::GitHub, &["gh_issues".into()]);
+        let conf3 = graph.confidence_for("mo");
+
+        assert!(
+            conf2 > conf1,
+            "Confidence should grow: {} > {}",
+            conf2,
+            conf1
+        );
+        assert!(
+            conf3 > conf2,
+            "Confidence should grow: {} > {}",
+            conf3,
+            conf2
+        );
+        assert!(conf3 <= 1.0, "Confidence should be capped: {}", conf3);
+    }
+
+    #[test]
+    fn tools_deduplicated() {
+        let mut graph = EntityGraph::new();
+        graph.learn("mo", DomainHint::GitHub, &["gh_search".into()]);
+        graph.learn(
+            "mo",
+            DomainHint::GitHub,
+            &["gh_search".into(), "gh_prs".into()],
+        );
+
+        let entry = graph.get("mo").unwrap();
+        assert_eq!(entry.associated_tools.len(), 2); // gh_search + gh_prs (deduplicated)
+    }
+
+    // ── Aliases ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn alias_resolves_to_canonical() {
+        let mut graph = EntityGraph::new();
+        graph.learn("matrixorigin", DomainHint::GitHub, &["gh_search".into()]);
+        graph.add_alias("mo", "matrixorigin");
+
+        assert_eq!(graph.domain_for("mo"), Some(DomainHint::GitHub));
+        assert_eq!(graph.domain_for("MO"), Some(DomainHint::GitHub)); // case-insensitive
+    }
+
+    // ── Boost Terms ──────────────────────────────────────────────────────
+
+    #[test]
+    fn boost_for_known_entity() {
+        let mut graph = EntityGraph::new();
+        graph.learn(
+            "matrixorigin",
+            DomainHint::GitHub,
+            &["github_search_repos".into()],
+        );
+
+        let terms = graph.boost_for("matrixorigin");
+        assert!(!terms.is_empty());
+        assert!(terms.contains(&"github".to_string()));
+        assert!(terms.contains(&"github_search_repos".to_string()));
+    }
+
+    #[test]
+    fn boost_for_unknown_entity_empty() {
+        let graph = EntityGraph::new();
+        assert!(graph.boost_for("unknown").is_empty());
+    }
+
+    // ── Merge ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn merge_takes_higher_observation_count() {
+        let mut graph = EntityGraph::new();
+        graph.learn("mo", DomainHint::GitHub, &["gh_search".into()]);
+
+        // External entry with higher observation count
+        let external = EntityKnowledge {
+            name: "mo".into(),
+            aliases: vec!["matrixorigin".into()],
+            domain: Some(DomainHint::GitHub),
+            associated_tools: vec!["gh_search".into(), "gh_prs".into()],
+            confidence: 0.8,
+            observation_count: 10,
+        };
+        graph.merge(&[external]);
+
+        let entry = graph.get("mo").unwrap();
+        assert_eq!(entry.observation_count, 10);
+        assert_eq!(entry.associated_tools.len(), 2);
+    }
+
+    #[test]
+    fn merge_keeps_local_if_higher() {
+        let mut graph = EntityGraph::new();
+        // Local with 5 observations
+        for _ in 0..5 {
+            graph.learn("mo", DomainHint::GitHub, &["gh_search".into()]);
+        }
+
+        // External with only 2 observations
+        let external = EntityKnowledge {
+            name: "mo".into(),
+            aliases: vec![],
+            domain: Some(DomainHint::Git),
+            associated_tools: vec!["git_log".into()],
+            confidence: 0.5,
+            observation_count: 2,
+        };
+        graph.merge(&[external]);
+
+        // Should keep local (5 > 2)
+        let entry = graph.get("mo").unwrap();
+        assert_eq!(entry.observation_count, 5);
+        assert_eq!(entry.domain, Some(DomainHint::GitHub));
+    }
+
+    #[test]
+    fn merge_indexes_aliases() {
+        let mut graph = EntityGraph::new();
+        let external = EntityKnowledge {
+            name: "matrixorigin".into(),
+            aliases: vec!["mo".into(), "matrixone".into()],
+            domain: Some(DomainHint::GitHub),
+            associated_tools: vec![],
+            confidence: 0.5,
+            observation_count: 3,
+        };
+        graph.merge(&[external]);
+
+        assert_eq!(graph.domain_for("mo"), Some(DomainHint::GitHub));
+        assert_eq!(graph.domain_for("matrixone"), Some(DomainHint::GitHub));
+    }
+
+    // ── Export ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn export_all_entities() {
+        let mut graph = EntityGraph::new();
+        graph.learn("mo", DomainHint::GitHub, &[]);
+        graph.learn("linux", DomainHint::System, &[]);
+
+        let exported = graph.export();
+        assert_eq!(exported.len(), 2);
+    }
+
+    // ── Entity Extraction ────────────────────────────────────────────────
+
+    #[test]
+    fn extract_english_entities() {
+        let entities = extract_entities("show me matrixorigin PRs");
+        assert!(entities.contains(&"matrixorigin".to_string()));
+        // "show" and "PRs" might be filtered
+    }
+
+    #[test]
+    fn extract_mixed_cn_en() {
+        let entities = extract_entities("我关注matrixorigin");
+        assert!(entities.contains(&"matrixorigin".to_string()));
+        // "关注" is a stop word in our list
+    }
+
+    #[test]
+    fn extract_filters_stop_words() {
+        let entities = extract_entities("show me the latest status");
+        // All common words should be filtered
+        assert!(!entities.contains(&"the".to_string()));
+        assert!(!entities.contains(&"me".to_string()));
+        assert!(!entities.contains(&"show".to_string()));
+    }
+
+    #[test]
+    fn extract_deduplicates() {
+        let entities = extract_entities("matrixorigin and matrixorigin again");
+        let mo_count = entities.iter().filter(|e| *e == "matrixorigin").count();
+        assert_eq!(mo_count, 1);
+    }
+
+    #[test]
+    fn extract_handles_empty() {
+        assert!(extract_entities("").is_empty());
+    }
+
+    #[test]
+    fn extract_preserves_hyphenated() {
+        let entities = extract_entities("check mo-dev-agent status");
+        assert!(entities.contains(&"mo-dev-agent".to_string()));
+    }
+
+    // ── Integration: EntityGraph + RoutingEngine ─────────────────────────
+
+    #[test]
+    fn entity_graph_improves_routing() {
+        use super::super::routing::RoutingEngine;
+
+        // Without entity knowledge
+        let d1 = RoutingEngine::analyze("check matrixorigin", 1, &[], &[], vec![]);
+
+        // With entity knowledge providing boost terms
+        let mut graph = EntityGraph::new();
+        graph.learn(
+            "matrixorigin",
+            DomainHint::GitHub,
+            &["github_search".into()],
+        );
+        let boost = graph.boost_for("matrixorigin");
+
+        let d2 = RoutingEngine::analyze("check matrixorigin", 1, &[], &[], boost);
+
+        // With entity boost terms, should have higher confidence or better classification
+        // At minimum, boost_terms should be non-empty
+        assert!(d2.boost_terms.len() > d1.boost_terms.len());
+    }
+
+    #[test]
+    fn learning_cycle_simulation() {
+        // Simulate: query → learn → query again → improved
+        let mut graph = EntityGraph::new();
+
+        // Turn 1: unknown entity
+        let entities = extract_entities("我关注matrixorigin");
+        assert!(entities.contains(&"matrixorigin".to_string()));
+        assert_eq!(graph.domain_for("matrixorigin"), None);
+
+        // Agent uses GitHub tools successfully → learn
+        graph.learn(
+            "matrixorigin",
+            DomainHint::GitHub,
+            &["github_search_repos".into(), "github_list_issues".into()],
+        );
+
+        // Turn 2: known entity → domain hint available
+        assert_eq!(graph.domain_for("matrixorigin"), Some(DomainHint::GitHub));
+        let boost = graph.boost_for("matrixorigin");
+        assert!(boost.contains(&"github".to_string()));
+        assert!(boost.contains(&"github_search_repos".to_string()));
+
+        // Confidence should be meaningful
+        assert!(graph.confidence_for("matrixorigin") > 0.3);
+    }
+}

@@ -12,7 +12,7 @@ mo-agent-services = { path = "crates/services" }
 mo-agent-runtime = { path = "crates/runtime" }
 async-stream = "0.3.6"
 async-trait = "0.1.89"
-axum = "0.8.6"
+axum = { version = "0.8.6", features = ["ws"] }
 base64 = "0.22.1"
 bcrypt = "0.17.1"
 chrono = { version = "0.4.42", features = ["clock"] }

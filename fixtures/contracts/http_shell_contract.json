@@ -4,7 +4,7 @@
     "json": {
       "name": "Agent Engine API",
       "version": "0.1.0",
-      "docs": "/docs"
+      "docs": ""
     }
   },
   "health": {

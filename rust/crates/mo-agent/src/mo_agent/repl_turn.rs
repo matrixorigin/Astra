@@ -8,7 +8,7 @@ pub(super) struct ReplTurnContext<'a> {
 }
 
 enum TurnAttempt {
-    Completed(Result<StreamResult, String>),
+    Completed(Box<Result<StreamResult, String>>),
     Interrupted,
 }
 
@@ -39,34 +39,45 @@ pub(super) async fn handle_chat_input(
     let session_id = state.session_id.clone();
     match run_chat_turn(state, &ctx, token, &effective_line, session_id.as_deref()).await {
         TurnAttempt::Interrupted => return Ok(()),
-        TurnAttempt::Completed(Ok(result)) => {
-            apply_turn_success(state, ctx.profile, &line, result, turn_start);
-            return Ok(());
-        }
-        TurnAttempt::Completed(Err(error)) => {
-            if is_session_not_found_error(&error) && state.session_id.is_some() {
-                let _ = clear_profile_last_session(ctx.profile);
-                state.session_id = None;
-                eprintln!(
-                    "{}",
-                    "  Session not found. Creating a new session…".yellow()
-                );
+        TurnAttempt::Completed(result) => match *result {
+            Ok(result) => {
+                apply_turn_success(state, ctx.selector, ctx.profile, &line, result, turn_start);
+                return Ok(());
+            }
+            Err(error) => {
+                if is_session_not_found_error(&error) && state.session_id.is_some() {
+                    let _ = clear_profile_last_session(ctx.profile);
+                    state.session_id = None;
+                    eprintln!(
+                        "{}",
+                        "  Session not found. Creating a new session…".yellow()
+                    );
 
-                match run_chat_turn(state, &ctx, token, &effective_line, None).await {
-                    TurnAttempt::Interrupted => return Ok(()),
-                    TurnAttempt::Completed(Ok(result)) => {
-                        apply_turn_success(state, ctx.profile, &line, result, turn_start);
-                        return Ok(());
-                    }
-                    TurnAttempt::Completed(Err(retry_error)) => {
-                        report_turn_error(state, &line, &retry_error, turn_start);
-                        return Ok(());
+                    match run_chat_turn(state, &ctx, token, &effective_line, None).await {
+                        TurnAttempt::Interrupted => return Ok(()),
+                        TurnAttempt::Completed(result) => match *result {
+                            Ok(result) => {
+                                apply_turn_success(
+                                    state,
+                                    ctx.selector,
+                                    ctx.profile,
+                                    &line,
+                                    result,
+                                    turn_start,
+                                );
+                                return Ok(());
+                            }
+                            Err(retry_error) => {
+                                report_turn_error(state, &line, &retry_error, turn_start);
+                                return Ok(());
+                            }
+                        },
                     }
                 }
-            }
 
-            report_turn_error(state, &line, &error, turn_start);
-        }
+                report_turn_error(state, &line, &error, turn_start);
+            }
+        },
     }
 
     Ok(())
@@ -240,7 +251,7 @@ async fn run_chat_turn(
             quiet: false,
             selector: ctx.selector,
             recent_tools: &state.recent_tools,
-        }) => TurnAttempt::Completed(result),
+        }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             eprintln!("\n{}", "  Interrupted.".dim());
             TurnAttempt::Interrupted
@@ -250,6 +261,7 @@ async fn run_chat_turn(
 
 fn apply_turn_success(
     state: &mut ReplState,
+    selector: &dyn tool_selector::ToolSelector,
     profile: Option<&str>,
     line: &str,
     result: StreamResult,
@@ -288,11 +300,104 @@ fn apply_turn_success(
                 result.tools_selected.clone(),
                 result.tools_used.clone(),
                 result.budget_used,
-            ),
+            )
+            .with_tool_calls(result.tool_call_records.clone())
+            .with_budget_pressure(result.budget_pressure),
+        );
+
+        // Update workspace metadata per-turn
+        if let Some(sid) = state.session_id.as_deref()
+            && let Ok(mut ws) = mo_agent_services::session_workspace::read_workspace(sid)
+        {
+            ws.record_turn(result.prompt_tokens, result.completion_tokens);
+
+            // Check if checkpoint is due
+            if mo_agent_services::session_checkpoint::should_checkpoint(
+                ws.turn_count,
+                mo_agent_services::session_checkpoint::CHECKPOINT_INTERVAL,
+            ) {
+                ws.record_checkpoint();
+                let cp = mo_agent_services::session_checkpoint::Checkpoint {
+                    number: ws.checkpoints.len() as u32,
+                    turn: ws.turn_count,
+                    title: format!("Turn {} checkpoint", ws.turn_count),
+                    summary: format!(
+                        "Accumulated {} tokens ({} in, {} out). Tools: {}",
+                        ws.total_tokens_in + ws.total_tokens_out,
+                        ws.total_tokens_in,
+                        ws.total_tokens_out,
+                        result.tools_used.join(", "),
+                    ),
+                    tools_used: result.tools_used.clone(),
+                    total_tokens: ws.total_tokens_in + ws.total_tokens_out,
+                    had_stalls: false,
+                    error_count: 0,
+                };
+                let _ = mo_agent_services::session_checkpoint::write_checkpoint(sid, &cp);
+                let _ = journal.append(&session_journal::JournalEvent::checkpoint(
+                    Some(sid),
+                    ws.turn_count,
+                    &cp.summary,
+                    cp.total_tokens,
+                    cp.tools_used.len(),
+                ));
+            }
+
+            let _ = mo_agent_services::session_workspace::write_workspace(&ws);
+        }
+
+        // Log stall events to journal
+        for (stall_type, turn_num) in &result.stall_events {
+            let _ = journal.append(&session_journal::JournalEvent::stall_detected(
+                state.session_id.as_deref(),
+                *turn_num,
+                stall_type,
+                0, // nudge_count not tracked per-event; stall_type conveys severity
+                0.0,
+                &[],
+            ));
+        }
+
+        // Log TurnGuard verdict events to journal (non-Healthy only)
+        for ve in &result.verdict_events {
+            let _ = journal.append(&session_journal::JournalEvent::turn_guard_verdict(
+                state.session_id.as_deref(),
+                ve.turn,
+                &ve.severity,
+                &ve.injections,
+                &ve.avoid_tools,
+                ve.force_stop,
+                ve.nudge_count,
+                ve.total_errors,
+                ve.deprioritized_count,
+            ));
+        }
+    }
+
+    // Record turn outcome for pipeline learning (entity graph, patterns, calibration)
+    {
+        use mo_agent_runtime::pipeline::routing::RoutingEngine;
+        let routing = RoutingEngine::analyze(line, state.turn, &state.recent_tools, &[], vec![]);
+        let is_live_query = looks_like_live_query_with_context(line, &state.recent_tools);
+        let success = result.tool_calls_count > 0 || !is_live_query;
+        let quality = if result.tool_calls_count > 0 {
+            0.7
+        } else {
+            0.3
+        };
+        selector.record_outcome(
+            line,
+            &result.tools_used,
+            routing.task_type,
+            routing.domain_hint,
+            success,
+            quality,
+            false,
         );
     }
 
-    if result.tool_calls_count == 0 && looks_like_factual_query(line) {
+    if result.tool_calls_count == 0 && looks_like_live_query_with_context(line, &state.recent_tools)
+    {
         eprintln!(
             "{}",
             "  ⚠ Warning: This answer was generated without tool calls. Data may be hallucinated."
@@ -321,6 +426,13 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
             state.model.as_deref(),
         ));
     }
+
+    // Initialize workspace metadata alongside journal
+    let ws = mo_agent_services::session_workspace::WorkspaceMetadata::new(
+        session_id,
+        state.model.as_deref().unwrap_or("default"),
+    );
+    let _ = mo_agent_services::session_workspace::write_workspace(&ws);
 }
 
 fn report_turn_error(state: &ReplState, line: &str, error: &str, turn_start: Instant) {

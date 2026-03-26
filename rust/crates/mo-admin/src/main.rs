@@ -397,6 +397,10 @@ async fn main() -> Result<(), String> {
                 let status = resp.status();
                 let body = resp.text().await.map_err(|e| e.to_string())?;
                 if !status.is_success() {
+                    if body.contains("already exists") {
+                        println!("skipped (already exists): {model_name}");
+                        continue;
+                    }
                     return Err(read_api_error(status, &body));
                 }
                 println!("loaded model: {model_name}");

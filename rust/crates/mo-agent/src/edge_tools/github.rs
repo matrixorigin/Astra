@@ -1,5 +1,7 @@
 use super::*;
 
+const GITHUB_MISSING_REPO_ERROR: &str = "Error: missing 'repo' — infer repo from current user text or recent conversation; bare names like 'memoria' are allowed";
+
 impl ToolExecutor {
     async fn github_request(
         &self,
@@ -49,10 +51,27 @@ impl ToolExecutor {
 
     async fn github_resolve_repo(&self, repo: &str) -> Result<GithubRepoResolution, String> {
         if repo.contains('/') {
+            // Learn from explicit owner/repo for future bare-name lookups
+            self.add_preferred_repo(repo);
             return Ok(GithubRepoResolution {
                 resolved_repo: repo.to_string(),
                 resolved_by_search: false,
             });
+        }
+
+        // Check preferred repos first — if any preferred repo's name matches,
+        // use it directly without hitting the GitHub search API.
+        let preferred = self.get_preferred_repos();
+        let repo_lower = repo.to_lowercase();
+        for pref in &preferred {
+            if let Some(name) = pref.rsplit('/').next()
+                && name == repo_lower
+            {
+                return Ok(GithubRepoResolution {
+                    resolved_repo: pref.clone(),
+                    resolved_by_search: false,
+                });
+            }
         }
 
         let response = self
@@ -68,7 +87,9 @@ impl ToolExecutor {
             return Err(format!("Could not resolve repo '{repo}'"));
         };
 
-        let resolved_repo = github_pick_resolved_repo(repo, items)?;
+        let resolved_repo = github_pick_resolved_repo(repo, items, &preferred)?;
+        // Learn from successful resolution
+        self.add_preferred_repo(&resolved_repo);
         Ok(GithubRepoResolution {
             resolved_repo,
             resolved_by_search: true,
@@ -85,7 +106,7 @@ impl ToolExecutor {
                     Some(GithubDetail::Brief),
                     None,
                     None,
-                    "Error: missing 'repo'",
+                    GITHUB_MISSING_REPO_ERROR,
                 );
             }
         };
@@ -183,7 +204,7 @@ impl ToolExecutor {
                     Some(GithubDetail::Brief),
                     None,
                     None,
-                    "Error: missing 'repo'",
+                    GITHUB_MISSING_REPO_ERROR,
                 );
             }
         };
@@ -391,7 +412,7 @@ impl ToolExecutor {
                     Some(GithubDetail::Brief),
                     None,
                     None,
-                    "Error: missing 'repo'",
+                    GITHUB_MISSING_REPO_ERROR,
                 );
             }
         };
@@ -552,7 +573,7 @@ impl ToolExecutor {
                     Some(GithubDetail::Brief),
                     None,
                     None,
-                    "Error: missing 'repo'",
+                    GITHUB_MISSING_REPO_ERROR,
                 );
             }
         };
@@ -658,7 +679,7 @@ impl ToolExecutor {
                     Some(GithubDetail::Brief),
                     None,
                     None,
-                    "Error: missing 'repo'",
+                    GITHUB_MISSING_REPO_ERROR,
                 );
             }
         };
@@ -802,6 +823,130 @@ impl ToolExecutor {
         }))
     }
 
+    pub(crate) async fn github_repo_stats(&self, args: &Value) -> String {
+        let repo = match args.get("repo").and_then(Value::as_str) {
+            Some(r) => r.to_string(),
+            None => {
+                return github_error_response(
+                    "github_repo_stats",
+                    "repository",
+                    Some(GithubDetail::Brief),
+                    None,
+                    None,
+                    GITHUB_MISSING_REPO_ERROR,
+                );
+            }
+        };
+        let detail = match GithubDetail::parse(args.get("detail").and_then(Value::as_str)) {
+            Ok(detail) => detail,
+            Err(error) => {
+                return github_error_response(
+                    "github_repo_stats",
+                    "repository",
+                    Some(GithubDetail::Brief),
+                    Some(&repo),
+                    None,
+                    error,
+                );
+            }
+        };
+
+        let resolution = match self.github_resolve_repo(&repo).await {
+            Ok(resolution) => resolution,
+            Err(error) => {
+                return github_error_response(
+                    "github_repo_stats",
+                    "repository",
+                    Some(detail),
+                    Some(&repo),
+                    None,
+                    error,
+                );
+            }
+        };
+
+        let response = match self
+            .github_request(
+                Method::GET,
+                &format!("https://api.github.com/repos/{}", resolution.resolved_repo),
+                None,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return github_error_response(
+                    "github_repo_stats",
+                    "repository",
+                    Some(detail),
+                    Some(&repo),
+                    Some(&resolution),
+                    error,
+                );
+            }
+        };
+
+        if !response.is_object() {
+            return github_error_response(
+                "github_repo_stats",
+                "repository",
+                Some(detail),
+                Some(&repo),
+                Some(&resolution),
+                "Error: unexpected GitHub response",
+            );
+        }
+
+        let mut repository = json!({
+            "name": json_value_at_path(&response, &["name"]).and_then(Value::as_str).unwrap_or(""),
+            "full_name": json_value_at_path(&response, &["full_name"]).and_then(Value::as_str).unwrap_or(""),
+            "owner": json_value_at_path(&response, &["owner", "login"]).and_then(Value::as_str).unwrap_or(""),
+            "description": github_excerpt(
+                json_value_at_path(&response, &["description"]).and_then(Value::as_str).unwrap_or(""),
+                Some(detail.body_limit().max(120)),
+            ),
+            "stars": json_u64(&response, &["stargazers_count"]),
+            "forks": json_u64(&response, &["forks_count"]),
+            "watchers": json_u64(&response, &["subscribers_count"])
+                .or_else(|| json_u64(&response, &["watchers_count"])),
+            "open_issues": json_u64(&response, &["open_issues_count"]),
+            "language": json_value_at_path(&response, &["language"]).and_then(Value::as_str),
+            "default_branch": json_value_at_path(&response, &["default_branch"]).and_then(Value::as_str),
+            "pushed_at": github_timestamp(json_value_at_path(&response, &["pushed_at"]).and_then(Value::as_str)),
+            "updated_at": github_timestamp(json_value_at_path(&response, &["updated_at"]).and_then(Value::as_str)),
+            "created_at": github_timestamp(json_value_at_path(&response, &["created_at"]).and_then(Value::as_str)),
+            "homepage": json_value_at_path(&response, &["homepage"]).and_then(Value::as_str),
+            "html_url": json_value_at_path(&response, &["html_url"]).and_then(Value::as_str).unwrap_or(""),
+            "archived": json_value_at_path(&response, &["archived"]).and_then(Value::as_bool).unwrap_or(false),
+            "fork": json_value_at_path(&response, &["fork"]).and_then(Value::as_bool).unwrap_or(false),
+        });
+
+        if !matches!(detail, GithubDetail::Brief) {
+            repository["topics"] = serde_json::Value::Array(
+                json_value_at_path(&response, &["topics"])
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            repository["license"] = json_value_at_path(&response, &["license", "spdx_id"])
+                .or_else(|| json_value_at_path(&response, &["license", "name"]))
+                .cloned()
+                .unwrap_or(Value::Null);
+        }
+
+        github_response_string(json!({
+            "ok": true,
+            "tool": "github_repo_stats",
+            "detail": detail.as_str(),
+            "requested_repo": repo,
+            "resolved_repo": resolution_output_repo(&resolution),
+            "resolved_by_search": resolution.resolved_by_search,
+            "count": 1,
+            "repository": repository,
+            "error": Value::Null,
+        }))
+    }
+
     pub(crate) async fn github_create_issue(&self, args: &Value) -> String {
         let repo = match args.get("repo").and_then(Value::as_str) {
             Some(r) => r.to_string(),
@@ -812,7 +957,7 @@ impl ToolExecutor {
                     None,
                     None,
                     None,
-                    "Error: missing 'repo'",
+                    GITHUB_MISSING_REPO_ERROR,
                 );
             }
         };
@@ -1342,7 +1487,11 @@ fn github_normalize_name(value: &str) -> String {
         .collect()
 }
 
-fn github_pick_resolved_repo(repo: &str, items: &[Value]) -> Result<String, String> {
+fn github_pick_resolved_repo(
+    repo: &str,
+    items: &[Value],
+    preferred_repos: &[String],
+) -> Result<String, String> {
     let normalized_repo = github_normalize_name(repo);
     let exact_name_matches = items
         .iter()
@@ -1359,6 +1508,15 @@ fn github_pick_resolved_repo(repo: &str, items: &[Value]) -> Result<String, Stri
         .collect::<Vec<_>>();
 
     if exact_name_matches.len() > 1 {
+        // Multiple exact matches — check if one is preferred
+        for candidate in &exact_name_matches {
+            if preferred_repos
+                .iter()
+                .any(|pref| pref.eq_ignore_ascii_case(candidate))
+            {
+                return Ok(candidate.to_string());
+            }
+        }
         return Err(format!(
             "Error: repo name '{repo}' is ambiguous. Use owner/repo, e.g. {}",
             exact_name_matches.join(", ")
@@ -1621,7 +1779,7 @@ mod tests {
             json!({"name": "Memoria", "full_name": "MatrixOrigin/Memoria"}),
         ];
         assert_eq!(
-            github_pick_resolved_repo("memoria", &items).unwrap(),
+            github_pick_resolved_repo("memoria", &items, &[]).unwrap(),
             "MatrixOrigin/Memoria"
         );
 
@@ -1629,6 +1787,392 @@ mod tests {
             json!({"name": "memoriax", "full_name": "someone/memoriax"}),
             json!({"name": "memory", "full_name": "else/memory"}),
         ];
-        assert!(github_pick_resolved_repo("memoria", &unsafe_items).is_err());
+        assert!(github_pick_resolved_repo("memoria", &unsafe_items, &[]).is_err());
+    }
+
+    #[test]
+    fn github_repo_resolution_prefers_preferred_repo_on_ambiguity() {
+        // Two exact name matches — normally ambiguous
+        let items = vec![
+            json!({"name": "Memoria", "full_name": "Albeoris/Memoria"}),
+            json!({"name": "Memoria", "full_name": "MatrixOrigin/Memoria"}),
+        ];
+        // Without preferred → ambiguous error
+        assert!(github_pick_resolved_repo("memoria", &items, &[]).is_err());
+
+        // With preferred → picks the preferred one
+        let preferred = vec!["matrixorigin/memoria".to_string()];
+        assert_eq!(
+            github_pick_resolved_repo("memoria", &items, &preferred).unwrap(),
+            "MatrixOrigin/Memoria"
+        );
+    }
+
+    #[test]
+    fn extract_github_owner_repo_ssh() {
+        let line = "origin\tgit@github.com:MatrixOrigin/Memoria.git (fetch)";
+        assert_eq!(
+            super::extract_github_owner_repo(line),
+            Some("MatrixOrigin/Memoria".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_github_owner_repo_https() {
+        let line = "origin\thttps://github.com/matrixorigin/mo-dev-agent.git (push)";
+        assert_eq!(
+            super::extract_github_owner_repo(line),
+            Some("matrixorigin/mo-dev-agent".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_github_owner_repo_non_github() {
+        let line = "origin\thttps://gitlab.com/someone/project.git (fetch)";
+        assert_eq!(super::extract_github_owner_repo(line), None);
+    }
+
+    // ── github_pick_resolved_repo edge cases ──
+
+    #[test]
+    fn pick_resolved_repo_empty_items() {
+        let result = github_pick_resolved_repo("something", &[], &[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Could not resolve"));
+    }
+
+    #[test]
+    fn pick_resolved_repo_no_exact_name_match() {
+        let items = vec![
+            json!({"name": "memoria-fork", "full_name": "someone/memoria-fork"}),
+            json!({"name": "memoria-v2", "full_name": "other/memoria-v2"}),
+        ];
+        let result = github_pick_resolved_repo("memoria", &items, &[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("did not resolve safely"));
+    }
+
+    #[test]
+    fn pick_resolved_repo_normalized_name_match() {
+        // "mo-dev-agent" normalized matches "modevagent"
+        let items = vec![json!({"name": "mo-dev-agent", "full_name": "org/mo-dev-agent"})];
+        assert_eq!(
+            github_pick_resolved_repo("mo_dev_agent", &items, &[]).unwrap(),
+            "org/mo-dev-agent"
+        );
+    }
+
+    #[test]
+    fn pick_resolved_repo_missing_full_name_field() {
+        // Malformed response — item without full_name
+        let items = vec![
+            json!({"name": "memoria"}), // no full_name
+        ];
+        let result = github_pick_resolved_repo("memoria", &items, &[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pick_resolved_repo_case_insensitive_preference() {
+        let items = vec![
+            json!({"name": "Memoria", "full_name": "Albeoris/Memoria"}),
+            json!({"name": "Memoria", "full_name": "MatrixOrigin/Memoria"}),
+        ];
+        // Preference is lowercased
+        let preferred = vec!["MATRIXORIGIN/MEMORIA".to_lowercase()];
+        assert_eq!(
+            github_pick_resolved_repo("memoria", &items, &preferred).unwrap(),
+            "MatrixOrigin/Memoria"
+        );
+    }
+
+    #[test]
+    fn pick_resolved_repo_single_exact_match_ignores_preferences() {
+        // Only one exact match — preferences don't matter
+        let items = vec![json!({"name": "Memoria", "full_name": "Albeoris/Memoria"})];
+        let preferred = vec!["matrixorigin/memoria".to_string()];
+        // The single exact match wins regardless of preference
+        assert_eq!(
+            github_pick_resolved_repo("memoria", &items, &preferred).unwrap(),
+            "Albeoris/Memoria"
+        );
+    }
+
+    #[test]
+    pub(crate) fn github_missing_repo_error_guides_recovery() {
+        let response = github_error_response(
+            "github_ci_status",
+            "workflow_runs",
+            Some(GithubDetail::Brief),
+            None,
+            None,
+            GITHUB_MISSING_REPO_ERROR,
+        );
+        assert!(response.contains("missing 'repo'"));
+        assert!(response.contains("recent conversation"));
+        assert!(response.contains("memoria"));
+    }
+
+    // ── Helper function correctness ──
+
+    #[test]
+    fn github_detail_parse_all_valid_levels() {
+        assert_eq!(
+            GithubDetail::parse(Some("brief")).unwrap(),
+            GithubDetail::Brief
+        );
+        assert_eq!(
+            GithubDetail::parse(Some("normal")).unwrap(),
+            GithubDetail::Normal
+        );
+        assert_eq!(
+            GithubDetail::parse(Some("detailed")).unwrap(),
+            GithubDetail::Detailed
+        );
+        assert_eq!(
+            GithubDetail::parse(Some("full")).unwrap(),
+            GithubDetail::Full
+        );
+        assert_eq!(GithubDetail::parse(None).unwrap(), GithubDetail::Brief);
+    }
+
+    #[test]
+    fn github_detail_parse_invalid_returns_error() {
+        let err = GithubDetail::parse(Some("verbose")).unwrap_err();
+        assert!(err.contains("brief"), "should suggest valid options: {err}");
+    }
+
+    #[test]
+    fn github_detail_list_caps() {
+        // Brief should have tighter limits than Full
+        assert!(GithubDetail::Brief.list_cap() <= GithubDetail::Normal.list_cap());
+        assert!(GithubDetail::Normal.list_cap() <= GithubDetail::Full.list_cap());
+    }
+
+    #[test]
+    fn github_requested_limit_respects_cap() {
+        // Requesting 1000 but brief cap is much lower
+        let result = github_requested_limit(Some(1000), GithubDetail::Brief, 10);
+        assert!(result <= GithubDetail::Brief.list_cap());
+    }
+
+    #[test]
+    fn github_requested_limit_uses_default() {
+        assert_eq!(github_requested_limit(None, GithubDetail::Brief, 10), 10);
+        assert_eq!(github_requested_limit(None, GithubDetail::Brief, 5), 5);
+    }
+
+    #[test]
+    fn github_timestamp_valid_rfc3339() {
+        let result = github_timestamp(Some("2025-01-15T10:30:00Z"));
+        assert!(
+            result.contains("2025-01-15"),
+            "should format date: {result}"
+        );
+    }
+
+    #[test]
+    fn github_timestamp_invalid_returns_question_mark() {
+        assert_eq!(github_timestamp(Some("not-a-date")), "?");
+        assert_eq!(github_timestamp(None), "?");
+    }
+
+    #[test]
+    fn github_duration_seconds_valid() {
+        let d = github_duration_seconds(Some("2025-01-01T00:00:00Z"), Some("2025-01-01T00:05:00Z"));
+        assert_eq!(d, Some(300));
+    }
+
+    #[test]
+    fn github_duration_seconds_invalid_returns_none() {
+        assert_eq!(
+            github_duration_seconds(None, Some("2025-01-01T00:00:00Z")),
+            None
+        );
+        assert_eq!(
+            github_duration_seconds(Some("bad"), Some("2025-01-01T00:00:00Z")),
+            None
+        );
+    }
+
+    #[test]
+    fn github_excerpt_truncates_long_text() {
+        let long = "a ".repeat(100);
+        let result = github_excerpt(&long, Some(10));
+        assert!(result.contains("[truncated]"));
+        assert!(result.len() < long.len());
+    }
+
+    #[test]
+    fn github_excerpt_no_limit_preserves_all() {
+        let text = "hello world  foo   bar";
+        assert_eq!(github_excerpt(text, None), "hello world foo bar");
+    }
+
+    #[test]
+    fn github_normalize_name_strips_special_chars() {
+        assert_eq!(github_normalize_name("Mo-Dev-Agent"), "modevagent");
+        assert_eq!(github_normalize_name("Memoria"), "memoria");
+        assert_eq!(github_normalize_name("my_repo-v2.0"), "myrepov20");
+    }
+
+    #[test]
+    fn github_normalize_conclusion_all_states() {
+        assert_eq!(
+            github_normalize_conclusion(Some("success"), None),
+            "success"
+        );
+        assert_eq!(
+            github_normalize_conclusion(Some("failure"), None),
+            "failure"
+        );
+        assert_eq!(
+            github_normalize_conclusion(Some("timed_out"), None),
+            "failure"
+        );
+        assert_eq!(
+            github_normalize_conclusion(Some("cancelled"), None),
+            "cancelled"
+        );
+        assert_eq!(
+            github_normalize_conclusion(Some("skipped"), None),
+            "skipped"
+        );
+        assert_eq!(
+            github_normalize_conclusion(Some("neutral"), None),
+            "skipped"
+        );
+        assert_eq!(github_normalize_conclusion(Some("queued"), None), "pending");
+        assert_eq!(
+            github_normalize_conclusion(Some("in_progress"), None),
+            "pending"
+        );
+        assert_eq!(github_normalize_conclusion(None, None), "pending");
+        assert_eq!(
+            github_normalize_conclusion(Some("something_else"), None),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn github_normalize_conclusion_status_fallback() {
+        // When conclusion is None, falls back to status
+        assert_eq!(
+            github_normalize_conclusion(None, Some("success")),
+            "success"
+        );
+        assert_eq!(github_normalize_conclusion(None, Some("error")), "failure");
+    }
+
+    #[test]
+    fn github_pr_state_merged() {
+        let pr = json!({"state": "closed", "merged_at": "2025-01-01T00:00:00Z"});
+        assert_eq!(github_pr_state(&pr), "merged");
+    }
+
+    #[test]
+    fn github_pr_state_not_merged() {
+        let pr = json!({"state": "open", "merged_at": null});
+        assert_eq!(github_pr_state(&pr), "open");
+    }
+
+    // ── Error response format ──
+
+    #[test]
+    fn github_error_response_structure() {
+        let response = github_error_response(
+            "github_list_prs",
+            "pull_requests",
+            Some(GithubDetail::Brief),
+            Some("matrixorigin/memoria"),
+            None,
+            "some error message",
+        );
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["ok"], json!(false));
+        assert_eq!(parsed["tool"], "github_list_prs");
+        assert_eq!(parsed["error"], "some error message");
+        assert_eq!(parsed["count"], 0);
+        assert!(
+            parsed["pull_requests"].is_null(),
+            "payload key should be null"
+        );
+    }
+
+    #[test]
+    fn github_error_response_with_resolution() {
+        let resolution = GithubRepoResolution {
+            resolved_repo: "MatrixOrigin/Memoria".into(),
+            resolved_by_search: true,
+        };
+        let response = github_error_response(
+            "github_ci_status",
+            "workflow_runs",
+            Some(GithubDetail::Normal),
+            Some("memoria"),
+            Some(&resolution),
+            "API failure",
+        );
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["resolved_repo"], "MatrixOrigin/Memoria");
+        assert_eq!(parsed["resolved_by_search"], true);
+    }
+
+    // ── Item formatting ──
+
+    #[test]
+    fn github_pr_list_item_brief() {
+        let pr = json!({
+            "number": 42,
+            "title": "Fix bug in parser",
+            "user": {"login": "alice"},
+            "state": "open",
+            "merged_at": null,
+            "created_at": "2025-06-01T10:00:00Z",
+            "body": "This fixes the parser",
+            "html_url": "https://github.com/org/repo/pull/42"
+        });
+        let item = github_pr_list_item(&pr, GithubDetail::Brief);
+        assert_eq!(item["number"], 42);
+        assert_eq!(item["author"], "alice");
+        assert_eq!(item["state"], "open");
+        // Brief mode should not include body
+        assert_eq!(item["body_summary"], "");
+    }
+
+    #[test]
+    fn github_pr_list_item_normal_includes_body() {
+        let pr = json!({
+            "number": 1,
+            "title": "Feat",
+            "user": {"login": "bob"},
+            "state": "closed",
+            "merged_at": "2025-06-02T00:00:00Z",
+            "created_at": "2025-06-01T10:00:00Z",
+            "body": "Detailed description here",
+            "html_url": "https://github.com/org/repo/pull/1"
+        });
+        let item = github_pr_list_item(&pr, GithubDetail::Normal);
+        assert_eq!(item["state"], "merged"); // has merged_at
+        assert!(!item["body_summary"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn github_issue_list_item_structure() {
+        let issue = json!({
+            "number": 10,
+            "title": "Feature request",
+            "state": "open",
+            "user": {"login": "carol"},
+            "created_at": "2025-05-01T00:00:00Z",
+            "body": "Please add X",
+            "comments": 3,
+            "labels": [{"name": "enhancement"}],
+            "html_url": "https://github.com/org/repo/issues/10"
+        });
+        let item = github_issue_list_item(&issue, GithubDetail::Brief);
+        assert_eq!(item["number"], 10);
+        assert_eq!(item["state"], "open");
+        assert_eq!(item["author"], "carol");
     }
 }

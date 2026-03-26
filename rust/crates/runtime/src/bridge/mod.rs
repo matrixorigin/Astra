@@ -9,8 +9,16 @@ use self::side_effects::{
     take_bridge_tail_update_args, take_bridge_warning_event,
 };
 
-mod sse_events;
+pub mod circuit_breaker;
+pub mod sse_events;
 
+use self::circuit_breaker::{BridgeHealthMetrics, CircuitBreaker};
+
+/// Header allow-list predicate: only `x-mo-*` and `authorization` headers
+/// are forwarded to the upstream bridge.
+pub(crate) fn is_allowed_bridge_header(name: &str) -> bool {
+    name.starts_with("x-mo-") || name == "authorization"
+}
 use self::sse_events::{
     bridge_state_tool_signatures, build_cloud_loop_progress_event_from_frame,
     build_cloud_tool_result_event_from_frame, build_error_event_from_frame,
@@ -22,7 +30,12 @@ use self::sse_events::{
     parse_bridge_state_frame, render_sse_json,
 };
 
+use crate::turn::routing::MAX_TOOL_ROUNDS;
+
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
+/// Safety limit for SSE frame buffer. Prevents OOM if a client is slow or a
+/// response is unexpectedly large. 16 MB accommodates any realistic SSE stream.
+const MAX_SSE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
 #[async_trait]
 pub trait ChatTurnBridge: Send + Sync {
@@ -42,11 +55,23 @@ pub trait ChatTurnBridge: Send + Sync {
     ) -> Result<Response, (StatusCode, String)>;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct HttpChatTurnBridge {
     url: String,
     client: reqwest::Client,
     cache: Arc<tokio::sync::Mutex<SessionCache>>,
+    circuit_breaker: Arc<CircuitBreaker>,
+    health_metrics: Arc<BridgeHealthMetrics>,
+    turn_learning_writer: Option<Arc<dyn TurnLearningWriter>>,
+}
+
+impl std::fmt::Debug for HttpChatTurnBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpChatTurnBridge")
+            .field("url", &self.url)
+            .field("has_learning_writer", &self.turn_learning_writer.is_some())
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -88,10 +113,26 @@ impl HttpChatTurnBridge {
             url,
             client: reqwest::Client::builder()
                 .no_proxy()
+                .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("chat turn bridge client should build"),
             cache,
+            circuit_breaker: Arc::new(CircuitBreaker::with_defaults()),
+            health_metrics: Arc::new(BridgeHealthMetrics::new()),
+            turn_learning_writer: None,
         }
+    }
+
+    /// Set the pipeline learning writer for this bridge.
+    pub(crate) fn with_learning_writer(mut self, writer: Arc<dyn TurnLearningWriter>) -> Self {
+        self.turn_learning_writer = Some(writer);
+        self
+    }
+
+    /// Get a snapshot of bridge health metrics.
+    #[cfg(test)]
+    pub(crate) fn health_snapshot(&self) -> circuit_breaker::BridgeHealthSnapshot {
+        self.health_metrics.snapshot()
     }
 }
 
@@ -140,19 +181,44 @@ impl ChatTurnBridge for HttpChatTurnBridge {
             .post(&self.url)
             .header("content-type", "application/json");
         for (header_name, value) in headers.iter() {
-            let allowed_header = header_name.as_str().starts_with("x-mo-")
-                || header_name.as_str() == "authorization";
-            if allowed_header && let Ok(value_str) = value.to_str() {
+            if is_allowed_bridge_header(header_name.as_str())
+                && let Ok(value_str) = value.to_str()
+            {
                 bridge_headers.insert(header_name.clone(), value.clone());
                 request = request.header(header_name.as_str(), value_str);
             }
         }
         request = request.body(body.to_vec());
 
-        let response = request
-            .send()
-            .await
-            .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))?;
+        // Circuit breaker: fast-reject if bridge is in open state
+        if !self.circuit_breaker.allow_request() {
+            let metrics = self.circuit_breaker.metrics();
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "Bridge circuit breaker is open (consecutive failures: {}, state: {}). Retry after recovery timeout.",
+                    metrics.consecutive_failures, metrics.state
+                ),
+            ));
+        }
+
+        let request_start = std::time::Instant::now();
+        let response = match request.send().await {
+            Ok(resp) => {
+                let latency_ms = request_start.elapsed().as_millis() as u64;
+                self.circuit_breaker.record_success();
+                self.health_metrics.record_request(latency_ms, true, false);
+                resp
+            }
+            Err(error) => {
+                let latency_ms = request_start.elapsed().as_millis() as u64;
+                let is_timeout = error.is_timeout();
+                self.circuit_breaker.record_failure();
+                self.health_metrics
+                    .record_request(latency_ms, false, is_timeout);
+                return Err((StatusCode::BAD_GATEWAY, error.to_string()));
+            }
+        };
         let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::OK);
         let content_type = response
             .headers()
@@ -255,6 +321,7 @@ impl ChatTurnBridge for HttpChatTurnBridge {
             turn_observer_worker,
             turn_auxiliary_event_writer,
             turn_session_activity_writer,
+            self.turn_learning_writer.clone(),
         );
         Ok(sse_stream_response(
             status,
@@ -306,6 +373,7 @@ fn filter_bridge_state_events<S>(
     turn_observer_worker: Arc<dyn TurnObserverWorker>,
     turn_auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
     turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
+    turn_learning_writer: Option<Arc<dyn TurnLearningWriter>>,
 ) -> impl futures_util::stream::Stream<Item = Result<Bytes, std::io::Error>>
 where
     S: futures_util::stream::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
@@ -323,10 +391,19 @@ where
         let mut pending_explain_event: Option<serde_json::Map<String, serde_json::Value>> = None;
         let mut latest_token_usage: Option<serde_json::Value> = None;
         let mut suppress_next_turn_complete = false;
+        let mut tool_rounds: i64 = 0;
+        let mut received_turn_complete = false;
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(chunk) => {
                     buffer.extend_from_slice(&chunk);
+                    if buffer.len() > MAX_SSE_BUFFER_BYTES {
+                        yield Err(std::io::Error::other(format!(
+                            "SSE buffer exceeded {} bytes — possible slow client or malformed stream",
+                            MAX_SSE_BUFFER_BYTES
+                        )));
+                        return;
+                    }
                     while let Some(end) = find_sse_frame_end(&buffer) {
                         let frame = buffer.drain(..end + 2).collect::<Vec<_>>();
                         if is_session_info_frame(&frame) {
@@ -400,11 +477,27 @@ where
                                         turn_reflection_state_store.clone(),
                                         turn_reflection_lesson_writer.clone(),
                                         turn_observer_worker.clone(),
+                                        turn_learning_writer.clone(),
                                     );
                                 }
                             pending_bridge_state = Some(synced_bridge_state);
                             pending_warning_event = warning_event;
                             pending_explain_event = explain_event;
+
+                            // Track tool rounds from bridge_state frames
+                            if let Some(sigs) = pending_bridge_state.as_ref().and_then(bridge_state_tool_signatures)
+                                && !sigs.is_empty() {
+                                    tool_rounds += 1;
+                                    if tool_rounds > MAX_TOOL_ROUNDS {
+                                        eprintln!("Turn exceeded MAX_TOOL_ROUNDS ({}), forcing completion", MAX_TOOL_ROUNDS);
+                                        yield Ok(Bytes::from(render_sse_json(serde_json::json!({
+                                            "type": "turn_complete",
+                                            "has_tool_calls": false,
+                                            "max_rounds_exceeded": true,
+                                        }))));
+                                        return;
+                                    }
+                                }
                         } else if pending_bridge_state.is_some() {
                             if let Some(text_delta_event) = build_text_delta_event_from_frame(&frame) {
                                 yield Ok(Bytes::from(render_sse_json(
@@ -477,6 +570,7 @@ where
                                         ),
                                     ),
                                 )));
+                                received_turn_complete = true;
                                 pending_bridge_state = None;
                                 pending_warning_event = None;
                                 pending_explain_event = None;
@@ -604,6 +698,7 @@ where
                                 turn_reflection_state_store.clone(),
                                 turn_reflection_lesson_writer.clone(),
                                 turn_observer_worker.clone(),
+                                turn_learning_writer.clone(),
                             );
                         }
                     pending_bridge_state = Some(synced_bridge_state);
@@ -631,6 +726,11 @@ where
                     trusted_execution_state.as_ref(),
                 ),
             ))));
+            received_turn_complete = true;
+        }
+
+        if !received_turn_complete {
+            eprintln!("SSE stream ended without turn_complete frame — possible interruption");
         }
     }
 }
@@ -644,4 +744,61 @@ pub(crate) fn sse_stream_response(status: StatusCode, body: Body) -> Response {
         .header("x-accel-buffering", "no")
         .body(body)
         .unwrap()
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Phase 6.6: Header filtering security tests ──
+
+    #[test]
+    fn allows_x_mo_headers() {
+        assert!(is_allowed_bridge_header("x-mo-session-id"));
+        assert!(is_allowed_bridge_header("x-mo-user-id"));
+        assert!(is_allowed_bridge_header("x-mo-routing-meta-b64"));
+    }
+
+    #[test]
+    fn allows_authorization() {
+        assert!(is_allowed_bridge_header("authorization"));
+    }
+
+    #[test]
+    fn blocks_dangerous_headers() {
+        assert!(!is_allowed_bridge_header("cookie"));
+        assert!(!is_allowed_bridge_header("set-cookie"));
+        assert!(!is_allowed_bridge_header("host"));
+        assert!(!is_allowed_bridge_header("x-forwarded-for"));
+        assert!(!is_allowed_bridge_header("x-real-ip"));
+        assert!(!is_allowed_bridge_header("origin"));
+        assert!(!is_allowed_bridge_header("referer"));
+    }
+
+    #[test]
+    fn blocks_content_type_override() {
+        assert!(!is_allowed_bridge_header("content-type"));
+    }
+
+    #[test]
+    fn blocks_prefix_spoof() {
+        // "x-mobile" starts with "x-mo" but not "x-mo-"
+        assert!(!is_allowed_bridge_header("x-mobile"));
+        assert!(is_allowed_bridge_header("x-mo-"));
+    }
+
+    // ── BridgeHealthMetrics wiring test ──
+
+    #[test]
+    fn http_bridge_has_health_metrics() {
+        use tokio::sync::Mutex;
+        let cache = Arc::new(Mutex::new(SessionCache::default()));
+        let bridge = HttpChatTurnBridge::new("http://localhost:9999".to_string(), cache);
+        let snap = bridge.health_snapshot();
+        assert_eq!(snap.total_requests, 0);
+        assert_eq!(snap.total_failures, 0);
+        assert_eq!(snap.failure_rate, 0.0);
+    }
 }

@@ -107,6 +107,7 @@ pub fn run_bridge_hook_side_effects(
     turn_reflection_state_store: Arc<dyn TurnReflectionStateStore>,
     turn_reflection_lesson_writer: Arc<dyn TurnReflectionLessonWriter>,
     turn_observer_worker: Arc<dyn TurnObserverWorker>,
+    turn_learning_writer: Option<Arc<dyn TurnLearningWriter>>,
 ) {
     let Some(payload) = payload else {
         return;
@@ -137,6 +138,14 @@ pub fn run_bridge_hook_side_effects(
             && let Err(error) = turn_observer_worker.run(observer_request).await
         {
             record_persist_failure("observer_run", &error);
+        }
+        // Pipeline learning: extract turn outcome and update EntityGraph/PatternLibrary/Calibrator
+        if let Some(writer) = turn_learning_writer
+            && let Some(outcome) =
+                crate::pipeline::learning::build_learning_outcome_from_payload(&payload)
+            && let Err(error) = writer.record_outcome(outcome).await
+        {
+            record_persist_failure("pipeline_learning", &error);
         }
         record_persist_ok();
     });

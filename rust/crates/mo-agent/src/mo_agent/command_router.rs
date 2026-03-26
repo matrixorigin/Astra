@@ -15,9 +15,8 @@ pub(super) async fn execute_cli_command(
         // Inline message: mo-agent "what is the answer to life?"
         Some(Command::Message(words)) => {
             let message = words.join(" ");
-            let (mut creds, name, profile_entry, token) =
-                get_profile_and_token(profile.as_deref())?;
-            let session_id = profile_entry.last_session_id.clone();
+            let (mut creds, name, _, token) = get_profile_and_token(profile.as_deref())?;
+            let session_id = resumable_last_session_id(profile.as_deref());
             let selector = create_tool_selector(client, base, profile.as_deref());
             let mut pm = PermissionManager::new(false);
             let sr = match stream_chat_sse(ChatTurnParams {
@@ -33,7 +32,7 @@ pub(super) async fn execute_cli_command(
                 perm_manager: &mut pm,
                 verbose_mode: true,
                 quiet: false,
-                selector: &*selector,
+                selector: &*selector.0,
                 recent_tools: &[],
             })
             .await
@@ -54,7 +53,7 @@ pub(super) async fn execute_cli_command(
                         perm_manager: &mut pm,
                         verbose_mode: true,
                         quiet: false,
-                        selector: &*selector,
+                        selector: &*selector.0,
                         recent_tools: &[],
                     })
                     .await?
@@ -234,9 +233,10 @@ pub(super) async fn execute_cli_command(
                 return run_chat_repl(client, base, profile.as_deref(), args.model.as_deref())
                     .await;
             };
-            let (mut creds, name, profile_entry, token) =
-                get_profile_and_token(profile.as_deref())?;
-            let session_id = args.session_id.or(profile_entry.last_session_id.clone());
+            let (mut creds, name, _, token) = get_profile_and_token(profile.as_deref())?;
+            let session_id = args
+                .session_id
+                .or_else(|| resumable_last_session_id(profile.as_deref()));
             let is_tty = terminal::size().is_ok();
             let selector = create_tool_selector(client, base, profile.as_deref());
             let mut pm = PermissionManager::new(args.auto_approve);
@@ -258,7 +258,7 @@ pub(super) async fn execute_cli_command(
                 perm_manager: &mut pm,
                 verbose_mode: true,
                 quiet: false,
-                selector: &*selector,
+                selector: &*selector.0,
                 recent_tools: &[],
             })
             .await
@@ -279,7 +279,7 @@ pub(super) async fn execute_cli_command(
                         perm_manager: &mut pm,
                         verbose_mode: true,
                         quiet: false,
-                        selector: &*selector,
+                        selector: &*selector.0,
                         recent_tools: &[],
                     })
                     .await?
@@ -375,7 +375,7 @@ pub(super) async fn execute_cli_command(
         }
 
         Some(Command::Session(SessionCmd::Close(args))) => {
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let (creds, name, _, token) = get_profile_and_token(profile.as_deref())?;
             let resp = client
                 .post(format!("{base}/sessions/{}/close", args.session_id))
                 .headers(auth_headers(&token)?)
@@ -387,12 +387,20 @@ pub(super) async fn execute_cli_command(
             if !status.is_success() {
                 return Err(read_api_error(status, &body));
             }
+            if creds
+                .profiles
+                .get(&name)
+                .and_then(|profile| profile.last_session_id.as_deref())
+                == Some(args.session_id.as_str())
+            {
+                let _ = clear_profile_last_session(profile.as_deref());
+            }
             print_json_or_raw(&body);
             Ok(())
         }
 
         Some(Command::Session(SessionCmd::Delete(args))) => {
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let (creds, name, _, token) = get_profile_and_token(profile.as_deref())?;
             let resp = client
                 .delete(format!("{base}/sessions/{}", args.session_id))
                 .headers(auth_headers(&token)?)
@@ -403,6 +411,14 @@ pub(super) async fn execute_cli_command(
             let body = resp.text().await.map_err(|e| e.to_string())?;
             if !status.is_success() {
                 return Err(read_api_error(status, &body));
+            }
+            if creds
+                .profiles
+                .get(&name)
+                .and_then(|profile| profile.last_session_id.as_deref())
+                == Some(args.session_id.as_str())
+            {
+                let _ = clear_profile_last_session(profile.as_deref());
             }
             if body.is_empty() {
                 println!("deleted");

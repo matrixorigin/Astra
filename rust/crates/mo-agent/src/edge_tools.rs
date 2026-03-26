@@ -1,7 +1,9 @@
 //! Edge tool definitions and execution for the mo-agent CLI.
 //!
 //! Tools: bash, read_file, write_file, str_replace, list_dir, grep, glob,
-//!        git_status, git_diff, git_log
+//!        git_status, git_diff, git_log, git_show, git_blame, git_file_history,
+//!        git_contributors, git_log_search, web_fetch,
+//!        mo_query, mo_snapshot, mo_branch
 
 use std::{
     env, fs,
@@ -11,13 +13,20 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use mo_agent_runtime::tool_sandbox::{
+    SandboxMode, SandboxPolicy, sandbox_command, validate_path, wrap_command_with_limits,
+};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
 
 #[path = "edge_tools/fs.rs"]
 mod fs_tools;
+#[path = "edge_tools/git_deep.rs"]
+mod git_deep;
 #[path = "edge_tools/github.rs"]
 mod github;
+#[path = "edge_tools/mo_tools.rs"]
+mod mo_tools;
 #[path = "edge_tools/shell.rs"]
 mod shell;
 
@@ -44,7 +53,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read file contents. Use to inspect code, configs, or any text file.",
+                "description": "Read file contents with optional line range. ALWAYS use start_line/end_line for large files instead of reading the whole file. Prefer targeted reads over full file reads.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -146,7 +155,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "git_diff",
-                "description": "Show git diff. Optionally diff against a ref or show staged changes.",
+                "description": "Show git diff of WORKING TREE changes. For reviewing a specific commit, use git_show instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -168,6 +177,129 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "n": {"type": "integer", "description": "Number of commits (default 10)"}
                     },
                     "required": []
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git_show",
+                "description": "Show a specific commit's full diff, message, author, and date. Use to review commits by SHA, inspect what a commit changed, or compare file changes in a specific commit. For working tree changes use git_diff instead.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "commit": {"type": "string", "description": "Commit SHA, branch, tag, or ref (e.g. HEAD, HEAD~1, abc1234)"},
+                        "stat_only": {"type": "boolean", "description": "Show only file-level stats (no diff content). Default false."},
+                        "file": {"type": "string", "description": "Scope output to a specific file path (optional)"}
+                    },
+                    "required": ["commit"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git_blame",
+                "description": "Show who last modified each line of a file, with commit info and dates. Use to understand code ownership and change history for specific lines.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file": {"type": "string", "description": "File path relative to project root"},
+                        "line_start": {"type": "integer", "description": "Start line number (optional)"},
+                        "line_end": {"type": "integer", "description": "End line number (optional)"}
+                    },
+                    "required": ["file"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git_file_history",
+                "description": "Show change history for a specific file: who changed it, when, and why. Follows file renames.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file": {"type": "string", "description": "File path relative to project root"},
+                        "n": {"type": "integer", "description": "Number of commits (default 10)"}
+                    },
+                    "required": ["file"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git_contributors",
+                "description": "Analyze repository contributors, hot files (most changed), and recent activity. Provides structured insights about the team and codebase evolution.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Limit analysis to a subdirectory (optional)"},
+                        "since": {"type": "string", "description": "Time range e.g. '30 days ago', '2024-01-01' (optional)"}
+                    },
+                    "required": []
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git_log_search",
+                "description": "Semantic search on commit messages. Find commits by meaning, not just keywords — uses TF-IDF with CJK support. Example: 'when was auth refactored?' or '认证模块什么时候改的?'",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Natural language search query"},
+                        "n": {"type": "integer", "description": "Max commits to search (default 200)"}
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        // ── MatrixOne tools ─────────────────────────────────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "mo_query",
+                "description": "Execute a SQL query against MatrixOne database. Returns formatted table results. Use for data exploration, schema inspection, and analytics queries.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "sql": {"type": "string", "description": "SQL query to execute"},
+                        "database": {"type": "string", "description": "Database name (default: from MATRIXONE_DATABASE env)"}
+                    },
+                    "required": ["sql"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "mo_snapshot",
+                "description": "Manage MatrixOne data snapshots for point-in-time recovery and experiment isolation. Actions: create (name a checkpoint), list (show all), drop (remove), restore (rollback to snapshot).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["create", "list", "drop", "restore"], "description": "Snapshot operation"},
+                        "name": {"type": "string", "description": "Snapshot name (required for create/drop/restore)"}
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "mo_branch",
+                "description": "Coordinate git branches with MatrixOne data branches. Creates data snapshots aligned with git branches for experiment isolation. Actions: list (show git + data branches), create (create data branch), sync (check alignment).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list", "create", "sync"], "description": "Branch operation"},
+                        "name": {"type": "string", "description": "Branch/snapshot name (optional for create — auto-generates from git branch)"}
+                    },
+                    "required": ["action"]
                 }
             }
         }),
@@ -257,6 +389,21 @@ pub fn all_tool_schemas() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "github_repo_stats",
+                "description": "Get repository statistics and metadata from GitHub. Use for stars, forks, watchers, open issues, last push time, language, project overview, or repo stats. repo can be 'owner/repo' or a bare project name that will be auto-resolved when safe. detail: 'brief' (default) returns stars/forks/open_issues/language/pushed_at; 'normal' adds watchers/default_branch/topics/license; 'detailed' and 'full' keep the same fields with larger text budgets for description.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "repo": {"type": "string", "description": "Repository as 'owner/repo' or bare project name"},
+                        "detail": {"type": "string", "enum": ["brief", "normal", "detailed", "full"], "description": "Output detail level: brief (default), normal, detailed, or full"}
+                    },
+                    "required": ["repo"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "github_create_issue",
                 "description": "Create a new GitHub issue. Use when user explicitly asks to create/file/open an issue. Requires repo in 'owner/repo' form and a configured GITHUB_TOKEN.",
                 "parameters": {
@@ -319,6 +466,50 @@ pub fn all_tool_schemas() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "memory_correct",
+                "description": "Correct or update an existing memory. Use when user says a stored memory is wrong or needs updating.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "ID of the memory to correct"},
+                        "new_content": {"type": "string", "description": "Updated content for the memory"},
+                        "reason": {"type": "string", "description": "Reason for the correction"}
+                    },
+                    "required": ["memory_id", "new_content"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "memory_profile",
+                "description": "Retrieve user profile, preferences, and habits stored in memory. Use when user asks about their preferences or you need to personalize behavior.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "web_fetch",
+                "description": "Fetch a URL and return its content. Use for reading web pages, APIs, documentation, or any HTTP resource. Safer and simpler than bash+curl.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "URL to fetch (http:// or https://)"},
+                        "max_bytes": {"type": "integer", "description": "Max response size in bytes (default 10000)"},
+                        "timeout": {"type": "integer", "description": "Timeout in seconds (default 10)"}
+                    },
+                    "required": ["url"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "get_agent_info",
                 "description": "Query agent runtime diagnostics: token budget, context window breakdown, what model is being used, agent capabilities, available tools, memory retrieval scores (why a memory was or wasn't retrieved), context trend across turns. DO NOT use this for memory store/recall — use memory tools instead.",
                 "parameters": {
@@ -365,6 +556,62 @@ pub fn all_tool_schemas() -> Vec<Value> {
 
 // ─── Tool execution ───────────────────────────────────────────────────────────
 
+/// Global output size limit (50KB). Individual tools may have tighter limits.
+const GLOBAL_OUTPUT_LIMIT: usize = 50_000;
+/// Per-tool default output limit for tools without explicit truncation.
+const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 20_000;
+
+/// Truncate tool output to `max_bytes`, appending a marker if truncated.
+fn truncate_output(mut output: String, max_bytes: usize) -> String {
+    if output.len() > max_bytes {
+        output.truncate(max_bytes);
+        output.push_str("\n[truncated]");
+    }
+    output
+}
+
+/// Parse content strings from a Memoria search/retrieve response.
+///
+/// Handles common Memoria response shapes:
+/// - `{ "memories": [ { "content": "..." }, ... ] }`
+/// - `[ { "content": "..." }, ... ]`
+/// - `{ "results": [ { "content": "..." }, ... ] }`
+///
+/// Returns empty vec on parse failure or error responses (graceful degradation).
+pub fn parse_memory_search_contents(raw: &str) -> Vec<String> {
+    let Ok(val) = serde_json::from_str::<Value>(raw) else {
+        return vec![];
+    };
+    // Error response from memoria
+    if val.get("error").is_some() {
+        return vec![];
+    }
+    // Try common response shapes
+    let items = val
+        .get("memories")
+        .or_else(|| val.get("results"))
+        .and_then(Value::as_array)
+        .or_else(|| val.as_array());
+
+    let Some(arr) = items else {
+        // Single object with content?
+        if let Some(c) = val.get("content").and_then(Value::as_str) {
+            return vec![c.to_string()];
+        }
+        return vec![];
+    };
+
+    arr.iter()
+        .filter_map(|item| {
+            item.get("content")
+                .or_else(|| item.get("text"))
+                .and_then(Value::as_str)
+                .map(|s| s.to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 pub struct ToolExecutor {
     pub project_root: PathBuf,
     /// Cloud API base URL — used to proxy memory tool calls through the server
@@ -376,12 +623,68 @@ pub struct ToolExecutor {
     pub github_token: Option<String>,
     /// Shared async GitHub client for edge tools.
     pub github_client: Client,
+    /// Security sandbox policy for tool execution (None = Permissive/legacy).
+    pub sandbox_policy: Option<SandboxPolicy>,
+    /// Preferred repos for disambiguation (owner/repo format, lowercased).
+    /// Populated from: git remote origin, recent tool results, memory.
+    /// When a bare repo name like "memoria" matches multiple GitHub repos,
+    /// the resolver prefers repos whose owner/name is in this list.
+    /// Uses Mutex to allow learning from resolved repos without &mut self.
+    preferred_repos: std::sync::Mutex<Vec<String>>,
+}
+
+/// Extract owner/repo from git remote URLs in the given directory.
+/// Returns lowercased "owner/repo" strings for all GitHub remotes.
+fn detect_git_remote_repos(project_root: &Path) -> Vec<String> {
+    let output = Command::new("git")
+        .args(["remote", "-v"])
+        .current_dir(project_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut repos = Vec::new();
+    for line in stdout.lines() {
+        if let Some(repo) = extract_github_owner_repo(line) {
+            let lower = repo.to_lowercase();
+            if !repos.contains(&lower) {
+                repos.push(lower);
+            }
+        }
+    }
+    repos
+}
+
+/// Parse owner/repo from a GitHub remote URL (SSH or HTTPS).
+fn extract_github_owner_repo(remote_line: &str) -> Option<String> {
+    // SSH:   git@github.com:MatrixOrigin/Memoria.git (fetch)
+    // HTTPS: https://github.com/MatrixOrigin/Memoria.git (fetch)
+    let parts: Vec<&str> = remote_line.split_whitespace().collect();
+    let url = parts.get(1)?;
+    let path = if let Some(rest) = url.strip_prefix("git@github.com:") {
+        rest
+    } else if url.contains("://github.com/") {
+        url.rsplit_once("github.com/")?.1
+    } else {
+        return None;
+    };
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    if path.contains('/') && !path.contains(' ') {
+        Some(path.to_string())
+    } else {
+        None
+    }
 }
 
 impl ToolExecutor {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
+        let root: PathBuf = project_root.into();
+        let preferred_repos = detect_git_remote_repos(&root);
         Self {
-            project_root: project_root.into(),
+            project_root: root,
             cloud_base: None,
             cloud_token: None,
             github_token: env::var("GITHUB_TOKEN")
@@ -393,6 +696,8 @@ impl ToolExecutor {
                 .user_agent(format!("mo-agent/{}", env!("CARGO_PKG_VERSION")))
                 .build()
                 .expect("failed to create GitHub HTTP client"),
+            sandbox_policy: None,
+            preferred_repos: std::sync::Mutex::new(preferred_repos),
         }
     }
 
@@ -403,7 +708,44 @@ impl ToolExecutor {
         self
     }
 
-    #[allow(dead_code)]
+    /// Add a preferred repo for disambiguation (e.g. from memory or recent usage).
+    pub fn add_preferred_repo(&self, owner_repo: &str) {
+        let normalized = owner_repo.to_lowercase();
+        match self.preferred_repos.lock() {
+            Ok(mut repos) => {
+                if !repos.iter().any(|r| r == &normalized) {
+                    repos.push(normalized);
+                }
+            }
+            Err(poisoned) => {
+                // Recover from poisoned mutex — clear and re-add
+                eprintln!("[preferred_repos] recovering from poisoned mutex");
+                let mut repos = poisoned.into_inner();
+                repos.clear();
+                repos.push(normalized);
+            }
+        }
+    }
+
+    /// Get current preferred repos (for use in repo resolution).
+    fn get_preferred_repos(&self) -> Vec<String> {
+        match self.preferred_repos.lock() {
+            Ok(r) => r.clone(),
+            Err(poisoned) => {
+                eprintln!("[preferred_repos] recovering from poisoned mutex on read");
+                poisoned.into_inner().clone()
+            }
+        }
+    }
+
+    /// Configure security sandbox for tool execution.
+    #[allow(dead_code)] // Public builder API for library consumers
+    pub fn with_sandbox(mut self, policy: SandboxPolicy) -> Self {
+        self.sandbox_policy = Some(policy);
+        self
+    }
+
+    #[allow(dead_code)] // Public builder API for library consumers
     pub fn with_github_token(mut self, token: impl Into<String>) -> Self {
         let token = token.into();
         let token = token.trim().to_string();
@@ -412,7 +754,7 @@ impl ToolExecutor {
     }
 
     pub async fn execute(&self, name: &str, args: &Value) -> String {
-        match name {
+        let output = match name {
             "bash" => self.bash(args),
             "read_file" => self.read_file(args),
             "write_file" => self.write_file(args),
@@ -420,19 +762,34 @@ impl ToolExecutor {
             "list_dir" => self.list_dir(args),
             "grep" => self.grep(args),
             "glob" => self.glob(args),
-            "git_status" => self.git_run(&["status", "--short", "--branch"]),
+            "git_status" => truncate_output(
+                self.git_run(&["status", "--short", "--branch"]),
+                DEFAULT_TOOL_OUTPUT_LIMIT,
+            ),
             "git_diff" => self.git_diff(args),
             "git_log" => self.git_log(args),
+            "git_show" => self.git_show(args),
+            "git_blame" => self.git_blame(args),
+            "git_file_history" => self.git_file_history(args),
+            "git_contributors" => self.git_contributors(args),
+            "git_log_search" => self.git_log_search(args),
+            "mo_query" => self.mo_query(args),
+            "mo_snapshot" => self.mo_snapshot(args),
+            "mo_branch" => self.mo_branch(args),
             "github_list_prs" => self.github_list_prs(args).await,
             "github_get_pr" => self.github_get_pr(args).await,
             "github_ci_status" => self.github_ci_status(args).await,
             "github_list_issues" => self.github_list_issues(args).await,
             "github_get_issue" => self.github_get_issue(args).await,
+            "github_repo_stats" => self.github_repo_stats(args).await,
             "github_create_issue" => self.github_create_issue(args).await,
+            "web_fetch" => self.web_fetch(args),
             "memory_retrieve" => self.memoria_call("retrieve", args).await,
             "memory_store" => self.memoria_call("store", args).await,
             "memory_search" => self.memoria_call("search", args).await,
             "memory_purge" => self.memoria_call("purge", args).await,
+            "memory_correct" => self.memoria_call("correct", args).await,
+            "memory_profile" => self.memoria_call("profile", args).await,
             "get_agent_info" => {
                 let dimension = args
                     .get("dimension")
@@ -480,7 +837,9 @@ impl ToolExecutor {
                 }).to_string()
             }
             _ => format!("Unknown tool: {name}"),
-        }
+        };
+        // Global safety net: no tool output exceeds 50KB
+        truncate_output(output, GLOBAL_OUTPUT_LIMIT)
     }
 
     fn tool_names(&self) -> Vec<String> {
@@ -499,7 +858,32 @@ impl ToolExecutor {
         all_tool_schemas().len()
     }
 
+    /// Lightweight memory search for tool-selection boost terms.
+    ///
+    /// Returns content strings from matching memories. Uses a short timeout (2s)
+    /// because this is a best-effort optimization on the critical path before tool
+    /// selection — the system works without it (just with lower accuracy for
+    /// cold-start entity queries).
+    pub async fn memory_boost_search(&self, query: &str, top_k: u64) -> Vec<String> {
+        if query.trim().is_empty() {
+            return vec![];
+        }
+        let result = self
+            .memoria_call_with_timeout(
+                "search",
+                &json!({"query": query, "top_k": top_k}),
+                Duration::from_secs(2),
+            )
+            .await;
+        parse_memory_search_contents(&result)
+    }
+
     async fn memoria_call(&self, op: &str, args: &Value) -> String {
+        self.memoria_call_with_timeout(op, args, Duration::from_secs(10))
+            .await
+    }
+
+    async fn memoria_call_with_timeout(&self, op: &str, args: &Value, timeout: Duration) -> String {
         // Build endpoint and payload
         let (endpoint, payload, auth_header) = if let (Some(cloud_base), Some(token)) =
             (&self.cloud_base, &self.cloud_token)
@@ -511,7 +895,7 @@ impl ToolExecutor {
             )
         } else {
             let base = std::env::var("MEMORIA_BASE_URL")
-                .unwrap_or_else(|_| "http://localhost:8100".to_string());
+                .unwrap_or_else(|_| mo_agent_core::config::DEFAULT_MEMORIA_URL.to_string());
             let key = match std::env::var("MEMORIA_API_KEY")
                 .ok()
                 .or_else(|| std::env::var("MEMORIA_MASTER_KEY").ok())
@@ -565,13 +949,29 @@ impl ToolExecutor {
                         json!({"topic": topic, "reason": reason}),
                     )
                 }
+                "correct" => {
+                    let memory_id = args.get("memory_id").and_then(Value::as_str).unwrap_or("");
+                    let new_content = args
+                        .get("new_content")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let reason = args
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("correction");
+                    (
+                        format!("{base}/v1/memories/correct"),
+                        json!({"memory_id": memory_id, "new_content": new_content, "reason": reason}),
+                    )
+                }
+                "profile" => (format!("{base}/v1/memories/profile"), json!({})),
                 _ => return format!("Unknown memoria op: {op}"),
             };
             (ep, pl, format!("Bearer {key}"))
         };
 
         match reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(timeout)
             .no_proxy()
             .build()
         {
@@ -657,7 +1057,15 @@ mod tests {
             "grep",
             "glob",
             "git_status",
+            "git_blame",
+            "git_file_history",
+            "git_contributors",
+            "git_log_search",
+            "mo_query",
+            "mo_snapshot",
+            "mo_branch",
             "github_ci_status",
+            "github_repo_stats",
             "memory_store",
             "memory_search",
             "reflect",
@@ -836,5 +1244,187 @@ mod tests {
         let result =
             executor.read_file(&json!({"path": "lines.txt", "start_line": 2, "end_line": 3}));
         assert_eq!(result, "line2\nline3");
+    }
+
+    // ── parse_memory_search_contents ──────────────────────────────────────────
+
+    #[test]
+    fn parse_memory_memories_array() {
+        let raw = r#"{"memories":[{"content":"matrixorigin is a GitHub org","score":0.9},{"content":"user prefers Rust","score":0.7}]}"#;
+        let result = parse_memory_search_contents(raw);
+        assert_eq!(
+            result,
+            vec!["matrixorigin is a GitHub org", "user prefers Rust"]
+        );
+    }
+
+    #[test]
+    fn parse_memory_results_array() {
+        let raw = r#"{"results":[{"content":"mo is a database company"},{"content":"user likes dark mode"}]}"#;
+        let result = parse_memory_search_contents(raw);
+        assert_eq!(
+            result,
+            vec!["mo is a database company", "user likes dark mode"]
+        );
+    }
+
+    #[test]
+    fn parse_memory_top_level_array() {
+        let raw = r#"[{"content":"matrixorigin = GitHub org"},{"text":"user follows MO"}]"#;
+        let result = parse_memory_search_contents(raw);
+        assert_eq!(result, vec!["matrixorigin = GitHub org", "user follows MO"]);
+    }
+
+    #[test]
+    fn parse_memory_error_response() {
+        let raw = r#"{"error":"Memory unavailable: not connected"}"#;
+        let result = parse_memory_search_contents(raw);
+        assert!(result.is_empty(), "error response should return empty");
+    }
+
+    #[test]
+    fn parse_memory_invalid_json() {
+        assert!(parse_memory_search_contents("not json").is_empty());
+        assert!(parse_memory_search_contents("").is_empty());
+    }
+
+    #[test]
+    fn parse_memory_empty_content_filtered() {
+        let raw = r#"{"memories":[{"content":""},{"content":"valid memory"}]}"#;
+        let result = parse_memory_search_contents(raw);
+        assert_eq!(result, vec!["valid memory"]);
+    }
+
+    #[test]
+    fn parse_memory_single_object() {
+        let raw = r#"{"content":"single memory result"}"#;
+        let result = parse_memory_search_contents(raw);
+        assert_eq!(result, vec!["single memory result"]);
+    }
+
+    #[test]
+    fn parse_memory_no_content_field() {
+        let raw = r#"{"memories":[{"summary":"no content field"}]}"#;
+        let result = parse_memory_search_contents(raw);
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_boost_search_empty_query() {
+        let executor = test_executor();
+        let result = executor.memory_boost_search("", 5).await;
+        assert!(result.is_empty(), "empty query should return empty");
+    }
+
+    #[tokio::test]
+    async fn memory_boost_search_whitespace_query() {
+        let executor = test_executor();
+        let result = executor.memory_boost_search("   ", 5).await;
+        assert!(result.is_empty(), "whitespace query should return empty");
+    }
+
+    // ── extract_github_owner_repo edge cases ──
+
+    #[test]
+    fn extract_github_owner_repo_without_git_suffix() {
+        let line = "origin\thttps://github.com/MatrixOrigin/Memoria (fetch)";
+        assert_eq!(
+            super::extract_github_owner_repo(line),
+            Some("MatrixOrigin/Memoria".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_github_owner_repo_malformed_url() {
+        assert_eq!(super::extract_github_owner_repo("origin"), None);
+        assert_eq!(super::extract_github_owner_repo(""), None);
+        assert_eq!(
+            super::extract_github_owner_repo("origin\thttps://not-github.com/a/b.git (fetch)"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_github_owner_repo_ssh_no_dot_git() {
+        let line = "upstream\tgit@github.com:org/repo (push)";
+        assert_eq!(
+            super::extract_github_owner_repo(line),
+            Some("org/repo".to_string())
+        );
+    }
+
+    // ── detect_git_remote_repos ──
+
+    #[test]
+    fn detect_git_remote_repos_from_current_dir() {
+        // This test runs in the actual repo — should find at least one remote
+        let repos = super::detect_git_remote_repos(std::path::Path::new("."));
+        // We're in the mo-dev-agent repo, so at least one GitHub remote should exist
+        // (unless running in a non-git context, in which case empty is acceptable)
+        for repo in &repos {
+            assert!(repo.contains('/'), "repo should be owner/name: {repo}");
+            assert_eq!(repo, &repo.to_lowercase(), "should be lowercased: {repo}");
+        }
+    }
+
+    #[test]
+    fn detect_git_remote_repos_nonexistent_dir() {
+        let repos = super::detect_git_remote_repos(std::path::Path::new("/nonexistent/path"));
+        assert!(repos.is_empty());
+    }
+
+    #[test]
+    fn detect_git_remote_repos_deduplicates() {
+        // The same remote appears for both fetch and push — should be deduplicated
+        // This is an implicit invariant; verify by checking no duplicates
+        let repos = super::detect_git_remote_repos(std::path::Path::new("."));
+        let mut seen = std::collections::HashSet::new();
+        for repo in &repos {
+            assert!(
+                seen.insert(repo.as_str()),
+                "duplicate preferred repo: {repo}"
+            );
+        }
+    }
+
+    // ── add_preferred_repo / get_preferred_repos ──
+
+    #[test]
+    fn add_preferred_repo_deduplicates() {
+        let exec = test_executor();
+        exec.add_preferred_repo("MatrixOrigin/Memoria");
+        exec.add_preferred_repo("MatrixOrigin/Memoria");
+        exec.add_preferred_repo("matrixorigin/memoria"); // same after lowercasing
+        let repos = exec.get_preferred_repos();
+        let memoria_count = repos
+            .iter()
+            .filter(|r| r == &"matrixorigin/memoria")
+            .count();
+        assert_eq!(
+            memoria_count, 1,
+            "should deduplicate case-insensitively: {repos:?}"
+        );
+    }
+
+    #[test]
+    fn add_preferred_repo_normalizes_case() {
+        let exec = test_executor();
+        exec.add_preferred_repo("MatrixOrigin/Memoria");
+        let repos = exec.get_preferred_repos();
+        assert!(
+            repos.contains(&"matrixorigin/memoria".to_string()),
+            "should lowercase: {repos:?}"
+        );
+    }
+
+    #[test]
+    fn preferred_repos_initialized_from_git_remote() {
+        // test_executor uses "." as root; if in a git repo, should have remotes
+        let exec = test_executor();
+        let repos = exec.get_preferred_repos();
+        // Can't assert specific content, but structure should be valid
+        for repo in &repos {
+            assert!(repo.contains('/'), "malformed: {repo}");
+        }
     }
 }

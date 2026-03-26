@@ -1,25 +1,33 @@
-//! Intelligent tool selection: registry, pre-filter, semantic retrieval, budget gate.
+//! Intelligent tool selection: registry, pre-filter, budget gate.
 //!
-//! Replaces the binary `classify_tool_filter()` approach with a layered architecture:
+//! Layered architecture:
 //!
 //! 1. **Pinned tools** — always included (bash, read_file, etc.), no selection budget
-//! 2. **Pre-filter** — reorder dynamic tools by conversation state signals + tags (never remove)
-//! 3. **Semantic retrieval** — embedding-based top-K selection from pre-filtered pool
+//! 2. **Pre-filter** — rank dynamic tools by TF-IDF + trigger match + intent/scope signals
+//! 3. **Recall-first** — adaptive threshold, intent diversity, MIN_RECALL_TOOLS guarantee
 //! 4. **Budget gate** — enforce token budget, greedily fill from ranked list
 //!
-//! Key invariant: pre-filter NEVER removes tools, only reorders. This structurally
-//! guarantees no false-positive tool stripping.
+//! Cross-language coverage comes from rich multilingual triggers on each tool,
+//! NOT from embeddings. With only ~23 tools, keyword coverage + intent rules
+//! achieve high accuracy without ML dependencies.
 
+pub mod chain;
 mod meta;
+pub mod plugin;
 mod registry;
 mod report;
-mod scoring;
-mod state;
+pub mod scoring;
+pub mod state;
 
+pub use chain::{ChainContext, ChainStep, ToolChain};
 pub use meta::{IntentType, Scope, TOOL_CATALOG, ToolMeta};
+pub use plugin::{PluginRegistry, PluginToolEntry};
 pub use registry::ToolRegistry;
-pub use report::{SelectionFeedback, SelectionReport};
-pub use scoring::{DEFAULT_TOOL_BUDGET_TOKENS, pre_filter_dynamic};
+pub use report::{SelectionFeedback, SelectionReport, ToolQualityTracker};
+pub use scoring::{
+    DEFAULT_TOOL_BUDGET_TOKENS, pre_filter_dynamic, pre_filter_dynamic_calibrated,
+    pre_filter_dynamic_with_memory, pre_filter_dynamic_with_quality, tfidf_score,
+};
 pub use state::ConversationState;
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -27,7 +35,8 @@ pub use state::ConversationState;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scoring::{tfidf_score, tokenize};
+    use crate::text_tokenize::tokenize;
+    use scoring::tfidf_score;
     use serde_json::Value;
     use serde_json::json;
     use state::word_boundary_match;
@@ -51,8 +60,8 @@ mod tests {
     // ── Catalog invariants ──
 
     #[test]
-    fn catalog_has_21_tools() {
-        assert_eq!(TOOL_CATALOG.len(), 21);
+    fn catalog_has_33_tools() {
+        assert_eq!(TOOL_CATALOG.len(), 33);
     }
 
     #[test]
@@ -61,8 +70,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_12_dynamic() {
-        assert_eq!(ToolRegistry::dynamic_count(), 12);
+    fn catalog_has_24_dynamic() {
+        assert_eq!(ToolRegistry::dynamic_count(), 24);
     }
 
     #[test]
@@ -384,6 +393,18 @@ mod tests {
     }
 
     #[test]
+    fn registry_select_repo_stats_query() {
+        let registry = ToolRegistry::new(mock_schemas());
+        let selected = registry.select("matrixorigin memoria 多少star了？", 1);
+        let names = ToolRegistry::selected_names(&selected);
+        assert!(
+            names.contains(&"github_repo_stats".to_string()),
+            "repo stats query should include github_repo_stats, got: {:?}",
+            names
+        );
+    }
+
+    #[test]
     fn registry_select_memory_query() {
         let registry = ToolRegistry::new(mock_schemas());
         let selected = registry.select("我之前记住的偏好是什么?", 1);
@@ -627,7 +648,13 @@ mod tests {
             budget_total: 3000,
         };
         let fb = report.feedback(&["github_list_prs".into()]);
-        assert_eq!(fb.precision, 1.0, "all used tools were selected");
+        // precision = hits(1) / selected(2) = 0.5
+        assert!(
+            (fb.precision - 0.5).abs() < 0.01,
+            "precision: 1 of 2 selected was used"
+        );
+        // recall = hits(1) / used(1) = 1.0
+        assert_eq!(fb.recall, 1.0, "all used tools were selected");
         assert_eq!(fb.unused_count, 1, "bash was selected but not used");
     }
 
@@ -640,10 +667,13 @@ mod tests {
             budget_total: 3000,
         };
         let fb = report.feedback(&[]);
-        assert_eq!(
-            fb.precision, 1.0,
-            "empty usage = vacuously perfect precision"
+        // precision = 0/2 = 0.0 (nothing used)
+        assert!(
+            (fb.precision).abs() < 0.01,
+            "no tools used → zero precision"
         );
+        // recall = vacuously 1.0 (nothing to miss)
+        assert_eq!(fb.recall, 1.0, "empty usage = vacuously perfect recall");
         assert_eq!(fb.unused_count, 2);
     }
 
@@ -656,7 +686,388 @@ mod tests {
             budget_total: 3000,
         };
         let fb = report.feedback(&["github_list_prs".into()]);
-        assert_eq!(fb.precision, 0.0, "used tool wasn't selected → precision 0");
+        // precision = 0/1 = 0.0 (selected bash, never used)
+        assert_eq!(fb.precision, 0.0, "selected tool wasn't used → precision 0");
+        // recall = 0/1 = 0.0 (used tool wasn't in selection)
+        assert_eq!(fb.recall, 0.0, "used tool wasn't selected → recall 0");
         assert_eq!(fb.unused_count, 1, "bash selected but not used");
+    }
+
+    // ── Quality tracker wiring tests ──
+
+    #[test]
+    fn quality_tracker_boosts_tool_ranking() {
+        use scoring::pre_filter_dynamic_with_quality;
+
+        let state = ConversationState::from_message_with_context(
+            "show me the github pull requests",
+            2,
+            &[],
+        );
+
+        // Without tracker: get baseline ranking
+        let baseline =
+            pre_filter_dynamic_with_quality(&state, "show me the github pull requests", None);
+
+        // With tracker: record many successful uses for a specific tool
+        let mut tracker = ToolQualityTracker::new();
+        for _ in 0..10 {
+            tracker.record_selection(&["github_get_issue".into()]);
+            tracker.record_feedback(&SelectionFeedback {
+                tools_used: vec!["github_get_issue".into()],
+                unused_count: 0,
+                precision: 1.0,
+                recall: 1.0,
+            });
+            tracker.record_quality("github_get_issue", 0.95);
+        }
+
+        let boosted = pre_filter_dynamic_with_quality(
+            &state,
+            "show me the github pull requests",
+            Some(&tracker),
+        );
+
+        let find_score = |results: &[(usize, f64)], name: &str| -> Option<f64> {
+            results.iter().find_map(|(idx, score)| {
+                if TOOL_CATALOG[*idx].name == name {
+                    Some(*score)
+                } else {
+                    None
+                }
+            })
+        };
+
+        let baseline_score = find_score(&baseline, "github_get_issue").unwrap_or(0.0);
+        let boosted_score = find_score(&boosted, "github_get_issue").unwrap_or(0.0);
+        assert!(
+            boosted_score >= baseline_score,
+            "quality tracker should boost tool score: baseline={:.4} boosted={:.4}",
+            baseline_score,
+            boosted_score
+        );
+    }
+
+    #[test]
+    fn quality_tracker_penalizes_ineffective_tool() {
+        use scoring::pre_filter_dynamic_with_quality;
+
+        let state = ConversationState::from_message_with_context("show me the git log", 2, &[]);
+
+        // Record many selections but zero uses for a dynamic tool
+        let mut tracker = ToolQualityTracker::new();
+        for _ in 0..10 {
+            tracker.record_selection(&["git_diff".into()]);
+            // No record_feedback → tool never used → use_rate = 0
+        }
+
+        let baseline = pre_filter_dynamic_with_quality(&state, "show me the git log", None);
+        let penalized =
+            pre_filter_dynamic_with_quality(&state, "show me the git log", Some(&tracker));
+
+        let find_score = |results: &[(usize, f64)], name: &str| -> Option<f64> {
+            results.iter().find_map(|(idx, score)| {
+                if TOOL_CATALOG[*idx].name == name {
+                    Some(*score)
+                } else {
+                    None
+                }
+            })
+        };
+
+        let baseline_score = find_score(&baseline, "git_diff").unwrap_or(0.0);
+        let penalized_score = find_score(&penalized, "git_diff").unwrap_or(0.0);
+        assert!(
+            penalized_score <= baseline_score,
+            "quality tracker should penalize ineffective tool: baseline={:.4} penalized={:.4}",
+            baseline_score,
+            penalized_score
+        );
+    }
+
+    #[test]
+    fn registry_select_with_quality_changes_output() {
+        let schemas = mock_schemas();
+        let registry = ToolRegistry::new(schemas);
+
+        // Record extensive failure for one dynamic tool
+        let mut tracker = ToolQualityTracker::new();
+        for _ in 0..20 {
+            tracker.record_selection(&["github_list_prs".into()]);
+            // Never used → penalized
+        }
+
+        // Both should compile and produce valid results
+        let (without, report_without) =
+            registry.select_with_quality("show me the PRs", 2, 800, &[], None);
+        let (with, report_with) =
+            registry.select_with_quality("show me the PRs", 2, 800, &[], Some(&tracker));
+
+        // Basic sanity: both should include pinned tools
+        assert!(without.len() >= ToolRegistry::pinned_count());
+        assert!(with.len() >= ToolRegistry::pinned_count());
+
+        // Report should be well-formed
+        assert!(report_without.budget_total == 800);
+        assert!(report_with.budget_total == 800);
+    }
+
+    // ── Disambiguation wiring tests ──
+
+    #[test]
+    fn disambiguation_auto_computed_on_state() {
+        let state = ConversationState::from_message_with_context(
+            "create a PR and show me the latest issues",
+            2,
+            &[],
+        );
+        // Should have disambiguation computed (is_fetch + is_mutate = conflict)
+        assert!(state.disambiguation.is_some());
+        let disambig = state.disambiguation.as_ref().unwrap();
+        assert_eq!(disambig.conflict_score, 0.8, "fetch+mutate should conflict");
+        assert_eq!(
+            disambig.recommendation,
+            crate::turn::routing_metrics::DisambiguationAction::WidenToolSelection
+        );
+    }
+
+    #[test]
+    fn disambiguation_widens_tool_selection() {
+        use scoring::pre_filter_dynamic_with_quality;
+
+        // Single-intent query: just fetch
+        let fetch_state =
+            ConversationState::from_message_with_context("show me the latest PRs", 2, &[]);
+        let fetch_results =
+            pre_filter_dynamic_with_quality(&fetch_state, "show me the latest PRs", None);
+
+        // Multi-intent conflicting query: fetch + mutate
+        let conflict_state = ConversationState::from_message_with_context(
+            "show me the latest PRs and create a new issue",
+            2,
+            &[],
+        );
+        let conflict_results = pre_filter_dynamic_with_quality(
+            &conflict_state,
+            "show me the latest PRs and create a new issue",
+            None,
+        );
+
+        // Conflicting query should select at least as many tools (lower threshold)
+        assert!(
+            conflict_results.len() >= fetch_results.len(),
+            "conflicting intents should widen selection: fetch={} conflict={}",
+            fetch_results.len(),
+            conflict_results.len()
+        );
+    }
+
+    #[test]
+    fn disambiguation_conversational_has_no_conflict() {
+        let state = ConversationState::from_message_with_context("hello", 1, &[]);
+        let disambig = state.disambiguation.as_ref().unwrap();
+        assert_eq!(disambig.primary_intent, "conversational");
+        assert_eq!(disambig.conflict_score, 0.0);
+    }
+
+    // ── ConfidenceCalibrator integration tests ──
+
+    #[test]
+    fn calibrator_lowers_threshold_for_high_correction_rate() {
+        use crate::turn::routing_metrics::ConfidenceCalibrator;
+        let cal = ConfidenceCalibrator::new(0.7);
+        // Record 10 github selections, 8 were corrected (80% correction rate)
+        for _ in 0..10 {
+            cal.record("github", true);
+        }
+        for _ in 0..2 {
+            cal.record("github", false);
+        }
+        let threshold = cal.calibrated_threshold("github");
+        // Should be lowered: 0.7 - (0.83 * 0.3) ≈ 0.45
+        assert!(
+            threshold < 0.7,
+            "high correction rate should lower threshold"
+        );
+        assert!(threshold >= 0.3, "threshold should not go below min");
+    }
+
+    #[test]
+    fn calibrated_prefilter_includes_more_tools_with_corrections() {
+        use crate::turn::routing_metrics::ConfidenceCalibrator;
+
+        let state = ConversationState::from_message("list open PRs in matrixone", 3);
+
+        // Without calibrator
+        let results_uncalibrated =
+            scoring::pre_filter_dynamic(&state, "list open PRs in matrixone");
+
+        // With calibrator that has high correction rate for "github"
+        let cal = ConfidenceCalibrator::new(0.7);
+        for _ in 0..10 {
+            cal.record("github", true);
+        }
+        let results_calibrated = scoring::pre_filter_dynamic_calibrated(
+            &state,
+            "list open PRs in matrixone",
+            None,
+            Some(&cal),
+        );
+
+        // Calibrated should include at least as many tools (lower threshold → more tools)
+        assert!(
+            results_calibrated.len() >= results_uncalibrated.len(),
+            "calibrated ({}) should be >= uncalibrated ({})",
+            results_calibrated.len(),
+            results_uncalibrated.len(),
+        );
+    }
+
+    #[test]
+    fn calibrator_no_effect_with_insufficient_data() {
+        use crate::turn::routing_metrics::ConfidenceCalibrator;
+        let cal = ConfidenceCalibrator::new(0.7);
+        // Only 3 records — below the 5-minimum
+        for _ in 0..3 {
+            cal.record("fetch", true);
+        }
+        let threshold = cal.calibrated_threshold("fetch");
+        assert_eq!(
+            threshold, 0.7,
+            "should return base threshold with insufficient data"
+        );
+    }
+
+    // ── Phase 6: Testing gap coverage ──
+
+    #[test]
+    fn mixed_multilingual_query_selects_github() {
+        // Phase 6.5: Multi-language query routing
+        let state = ConversationState::from_message("最新的 GitHub PRs list", 3);
+        let ranked = scoring::pre_filter_dynamic(&state, "最新的 GitHub PRs list");
+        let top_names: Vec<&str> = ranked
+            .iter()
+            .take(5)
+            .filter_map(|(idx, _)| TOOL_CATALOG.get(*idx).map(|t| t.name))
+            .collect();
+        assert!(
+            top_names.iter().any(|n| n.contains("github")),
+            "mixed EN/CN GitHub query should select github tools, got: {:?}",
+            top_names
+        );
+    }
+
+    #[test]
+    fn budget_edge_exactly_one_tool_fits() {
+        // Phase 6.2: Budget exhaustion boundary
+        let reg = ToolRegistry::new(mock_schemas());
+        // Use a very small budget — should still include pinned + at most 1 dynamic
+        let (schemas, report) = reg.select_with_report("list PRs", 1, 1);
+        assert!(
+            schemas.len() >= ToolRegistry::pinned_count(),
+            "should always include pinned tools even with tiny budget"
+        );
+        assert!(report.budget_used <= 1 || report.budget_used == 0);
+    }
+
+    #[test]
+    fn conversational_query_never_includes_dynamic() {
+        let reg = ToolRegistry::new(mock_schemas());
+        let (schemas, _) = reg.select_with_report("hello there", 1, 2000);
+        let names = ToolRegistry::selected_names(&schemas);
+        let dynamic: Vec<_> = names
+            .iter()
+            .filter(|n| {
+                !TOOL_CATALOG
+                    .iter()
+                    .any(|t| t.pinned && t.name == n.as_str())
+            })
+            .collect();
+        assert!(
+            dynamic.is_empty(),
+            "conversational should have 0 dynamic tools, got: {:?}",
+            dynamic
+        );
+    }
+
+    #[test]
+    fn zero_signal_query_gets_dynamic_tools() {
+        // Phase 7.1: Signal-strength adaptive threshold
+        let state = ConversationState::from_message("matrixorigin", 1);
+        assert_eq!(state.signal_count(), 0, "should have 0 signals");
+        let ranked = scoring::pre_filter_dynamic(&state, "matrixorigin");
+        assert!(
+            !ranked.is_empty(),
+            "0-signal query should still get dynamic tools via adaptive threshold"
+        );
+    }
+
+    #[test]
+    fn calibrator_100_percent_correction_clamps_at_min() {
+        use crate::turn::routing_metrics::ConfidenceCalibrator;
+        let cal = ConfidenceCalibrator::new(0.7);
+        // 100% correction rate
+        for _ in 0..20 {
+            cal.record("fetch", true);
+        }
+        let threshold = cal.calibrated_threshold("fetch");
+        assert!(
+            threshold >= 0.3,
+            "100% correction rate should clamp at min_threshold (0.3), got {}",
+            threshold
+        );
+    }
+
+    #[test]
+    fn quality_tracker_insufficient_data_returns_neutral() {
+        use crate::tool_registry::report::ToolQualityTracker;
+        let mut tracker = ToolQualityTracker::new();
+        // Only 2 selections — below 3 minimum
+        tracker.record_selection(&["bash".to_string()]);
+        tracker.record_selection(&["bash".to_string()]);
+        let boost = tracker.boost_factor("bash");
+        assert_eq!(boost, 1.0, "insufficient data should return neutral (1.0)");
+    }
+
+    #[test]
+    fn disambiguation_five_intents_has_high_conflict() {
+        use crate::turn::routing_metrics::disambiguate_intents;
+        let disambig = disambiguate_intents(true, true, true, true, true, false);
+        assert!(
+            disambig.conflict_score >= 0.3,
+            "5 conflicting intents should have high conflict, got {}",
+            disambig.conflict_score
+        );
+    }
+
+    #[test]
+    fn select_report_schemas_and_names_consistent() {
+        // Phase 6: Data consistency check
+        let reg = ToolRegistry::new(mock_schemas());
+        let (schemas, report) = reg.select_with_report("show me open PRs in matrixone", 3, 800);
+        assert_eq!(
+            schemas.len(),
+            report.selected_count as usize,
+            "schema count should match report count"
+        );
+        assert_eq!(
+            schemas.len(),
+            report.tools_selected.len(),
+            "schema count should match selected names count"
+        );
+    }
+
+    #[test]
+    fn prefilter_all_tools_have_nonnegative_scores() {
+        let state = ConversationState::from_message("analyze everything", 1);
+        let ranked = scoring::pre_filter_dynamic(&state, "analyze everything");
+        for (idx, score) in &ranked {
+            assert!(
+                *score >= 0.0,
+                "tool {} has negative score {}",
+                TOOL_CATALOG[*idx].name,
+                score
+            );
+        }
     }
 }

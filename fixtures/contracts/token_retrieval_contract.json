@@ -1,0 +1,157 @@
+{
+  "context_budget_cases": [
+    {
+      "name": "gpt-4o default budget",
+      "model": "gpt-4o",
+      "expected_model_limit": 128000,
+      "expected_output_reserve_min": 0.10,
+      "expected_output_reserve_max": 0.15
+    },
+    {
+      "name": "claude large context",
+      "model": "claude-3.5-sonnet",
+      "expected_model_limit": 200000,
+      "expected_output_reserve_min": 0.18,
+      "expected_output_reserve_max": 0.22
+    },
+    {
+      "name": "deepseek budget",
+      "model": "deepseek-coder",
+      "expected_model_limit": 64000,
+      "expected_output_reserve_min": 0.13,
+      "expected_output_reserve_max": 0.17
+    },
+    {
+      "name": "gemini 1M context",
+      "model": "gemini-2.0-pro",
+      "expected_model_limit": 1000000,
+      "expected_output_reserve_min": 0.05,
+      "expected_output_reserve_max": 0.12
+    },
+    {
+      "name": "unknown model defaults",
+      "model": "some-unknown-model",
+      "expected_model_limit": 128000,
+      "expected_output_reserve_min": 0.13,
+      "expected_output_reserve_max": 0.17
+    }
+  ],
+  "compaction_tier_cases": [
+    {
+      "name": "normal — well under threshold",
+      "usage_ratio": 0.3,
+      "expected_tier": "Normal"
+    },
+    {
+      "name": "trim schemas — approaching threshold",
+      "usage_ratio": 0.65,
+      "expected_tier": "TrimSchemas"
+    },
+    {
+      "name": "compact history — standard compaction",
+      "usage_ratio": 0.80,
+      "expected_tier": "CompactHistory"
+    },
+    {
+      "name": "aggressive prune — critical",
+      "usage_ratio": 0.90,
+      "expected_tier": "AggressivePrune"
+    }
+  ],
+  "token_estimation_cases": [
+    {
+      "name": "empty messages",
+      "messages": [],
+      "expected_min": 2500,
+      "expected_max": 3500
+    },
+    {
+      "name": "single short message",
+      "messages": [
+        {"role": "user", "content": "hello world"}
+      ],
+      "expected_min": 3000,
+      "expected_max": 3100
+    },
+    {
+      "name": "mixed EN/CN message",
+      "messages": [
+        {"role": "user", "content": "帮我分析这个仓库的代码结构"},
+        {"role": "assistant", "content": "好的，让我来分析一下这个仓库的结构。"}
+      ],
+      "expected_min": 3010,
+      "expected_max": 3100
+    },
+    {
+      "name": "message with tool calls",
+      "messages": [
+        {"role": "assistant", "content": "Let me check.", "tool_calls": [
+          {"function": {"name": "bash", "arguments": "{\"command\": \"ls -la\"}"}}
+        ]}
+      ],
+      "expected_min": 3010,
+      "expected_max": 3100
+    }
+  ],
+  "retrieval_cases": [
+    {
+      "name": "CJK query retrieves relevant CJK history",
+      "query": "帮我分析仓库",
+      "history": [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "这个仓库的结构是什么样的？"},
+        {"role": "assistant", "content": "这个仓库包含了多个Rust crate，主要分析结构如下..."},
+        {"role": "user", "content": "今天天气怎么样？"},
+        {"role": "assistant", "content": "抱歉，我无法查看天气信息。"}
+      ],
+      "recent_count": 2,
+      "expect_retrieval": true,
+      "expect_contains": "仓库"
+    },
+    {
+      "name": "English query retrieves relevant English history",
+      "query": "show me the test results",
+      "history": [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "run the test suite please"},
+        {"role": "assistant", "content": "All 524 tests passed with 0 failures."},
+        {"role": "user", "content": "what's for lunch?"},
+        {"role": "assistant", "content": "I can't help with meal planning."}
+      ],
+      "recent_count": 2,
+      "expect_retrieval": true,
+      "expect_contains": "test"
+    },
+    {
+      "name": "empty query returns nothing",
+      "query": "",
+      "history": [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "hello"}
+      ],
+      "recent_count": 1,
+      "expect_retrieval": false,
+      "expect_contains": null
+    }
+  ],
+  "adaptive_budget_cases": [
+    {
+      "name": "short query gets small budget",
+      "query": "hi",
+      "expected_min": 3000,
+      "expected_max": 5000
+    },
+    {
+      "name": "medium query gets standard budget",
+      "query": "show me the latest pull requests for the matrixorigin repository",
+      "expected_min": 7000,
+      "expected_max": 9000
+    },
+    {
+      "name": "complex query gets large budget",
+      "query": "analyze the code in rust/crates/runtime/src/bridge/mod.rs and explain how the SSE event processing works, including the side effect dispatch pipeline and the circuit breaker pattern that we need to implement",
+      "expected_min": 10000,
+      "expected_max": 13000
+    }
+  ]
+}

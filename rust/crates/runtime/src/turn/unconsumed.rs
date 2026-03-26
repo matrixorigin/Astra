@@ -48,10 +48,14 @@ pub fn build_unconsumed_tool_messages(
             {
                 return None;
             }
-            let content = object.get("result").map(|value| match value {
+            let raw_content = object.get("result").map(|value| match value {
                 Value::String(text) => text.clone(),
                 other => json_stringify(other),
             })?;
+            // Prompt injection guard: delimit tool output so the LLM treats
+            // it as data, not instructions.  Any injected "system" directives
+            // inside tool output are contained within these markers.
+            let content = format!("[TOOL OUTPUT]\n{}\n[/TOOL OUTPUT]", raw_content);
             Some(Map::from_iter([
                 ("role".to_string(), Value::from("tool")),
                 ("tool_call_id".to_string(), Value::from(tool_call_id)),

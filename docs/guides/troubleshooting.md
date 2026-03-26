@@ -32,7 +32,7 @@ make type-check
 ## Test Failures After Refactor
 
 ```bash
-make test-integration
+make test-contract
 make test
 make check
 ```

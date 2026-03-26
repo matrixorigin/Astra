@@ -8,6 +8,7 @@ name = "mo-agent-server"
 path = "src/main.rs"
 
 [dependencies]
+dirs = "6.0.0"
 mo-agent-core.workspace = true
 mo-agent-services.workspace = true
 async-stream.workspace = true
@@ -27,5 +28,10 @@ tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
 tower.workspace = true
+
+[[bench]]
+name = "hot_paths"
+harness = false

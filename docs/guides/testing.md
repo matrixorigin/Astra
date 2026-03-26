@@ -9,8 +9,10 @@ This repository is validated through Rust-first checks and contract tests.
 make test
 
 # API-shell integration contracts
-make test-integration
-make test-api
+make test-contract
+
+# Specific contract tests (http/admin/auth/config)
+make test-contract
 
 # Static validation
 make check
@@ -38,7 +40,7 @@ cargo check --manifest-path rust/Cargo.toml
 cargo test --manifest-path rust/Cargo.toml -p mo-agent-runtime --test auth_contract
 
 # 2. Expand to the API-shell contract suite
-make test-integration
+make test-contract
 
 # 3. Finish with full workspace + static checks
 make check

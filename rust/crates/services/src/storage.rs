@@ -303,6 +303,140 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .execute(&pool)
     .await?;
 
+    // ── Learning state convergence (Phase F) ──
+
+    query(
+        "CREATE TABLE IF NOT EXISTS learning_snapshots (
+            snapshot_id VARCHAR(36) PRIMARY KEY,
+            user_id VARCHAR(36) NOT NULL,
+            profile_name VARCHAR(100) NOT NULL,
+            snapshot_json LONGTEXT NOT NULL,
+            entity_count INT NOT NULL DEFAULT 0,
+            pattern_count INT NOT NULL DEFAULT 0,
+            has_calibration SMALLINT NOT NULL DEFAULT 0,
+            version INT NOT NULL DEFAULT 1,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY idx_learning_user_profile (user_id, profile_name),
+            INDEX idx_learning_updated (updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS user_preferences (
+            pref_id VARCHAR(36) PRIMARY KEY,
+            user_id VARCHAR(36) NOT NULL,
+            pref_key VARCHAR(100) NOT NULL,
+            pref_value LONGTEXT NOT NULL,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY idx_prefs_user_key (user_id, pref_key)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS session_sync_log (
+            sync_id VARCHAR(36) PRIMARY KEY,
+            user_id VARCHAR(36) NOT NULL,
+            session_id VARCHAR(36) NOT NULL,
+            sync_type VARCHAR(50) NOT NULL,
+            sync_direction VARCHAR(10) NOT NULL DEFAULT 'push',
+            payload_size INT NOT NULL DEFAULT 0,
+            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            error_message TEXT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_sync_user_session (user_id, session_id),
+            INDEX idx_sync_status (status)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Skills registry — master catalog for registered/marketplace skills.
+    query(
+        "CREATE TABLE IF NOT EXISTS skills_registry (
+            skill_id VARCHAR(36) PRIMARY KEY,
+            skill_name VARCHAR(255) NOT NULL,
+            version VARCHAR(64) NOT NULL,
+            description TEXT NULL,
+            skill_definition JSON NULL,
+            code_hash VARCHAR(128) NULL,
+            triggers JSON NULL,
+            dependencies JSON NULL,
+            manifest JSON NULL,
+            category VARCHAR(64) NULL,
+            priority INT NULL,
+            is_active SMALLINT NOT NULL DEFAULT 1,
+            status VARCHAR(20) NOT NULL DEFAULT 'active',
+            source VARCHAR(50) NOT NULL DEFAULT 'user',
+            is_public SMALLINT NOT NULL DEFAULT 0,
+            created_by VARCHAR(36) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_skill_name (skill_name),
+            INDEX idx_skill_active (is_active, status),
+            INDEX idx_skill_source (source)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Long-task orchestration (Phase H) ──
+
+    query(
+        "CREATE TABLE IF NOT EXISTS agent_tasks (
+            task_id VARCHAR(36) PRIMARY KEY,
+            user_id VARCHAR(36) NOT NULL,
+            session_id VARCHAR(36) NULL,
+            parent_task_id VARCHAR(36) NULL,
+            title VARCHAR(500) NOT NULL,
+            description LONGTEXT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            progress_pct INT NOT NULL DEFAULT 0,
+            items_done INT NOT NULL DEFAULT 0,
+            items_total INT NOT NULL DEFAULT 0,
+            plan_json LONGTEXT NULL,
+            checkpoint_json LONGTEXT NULL,
+            error_message TEXT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            completed_at DATETIME(6) NULL,
+            INDEX idx_tasks_user_id (user_id),
+            INDEX idx_tasks_session_id (session_id),
+            INDEX idx_tasks_parent (parent_task_id),
+            INDEX idx_tasks_status (status),
+            CONSTRAINT fk_tasks_user FOREIGN KEY (user_id) REFERENCES auth_users(user_id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS session_checkpoints (
+            checkpoint_id VARCHAR(36) PRIMARY KEY,
+            session_id VARCHAR(36) NOT NULL,
+            user_id VARCHAR(36) NOT NULL,
+            number INT NOT NULL,
+            turn INT NOT NULL,
+            title VARCHAR(500) NULL,
+            summary LONGTEXT NULL,
+            tools_json JSON NULL,
+            state_json LONGTEXT NULL,
+            total_tokens BIGINT NOT NULL DEFAULT 0,
+            had_stalls SMALLINT NOT NULL DEFAULT 0,
+            error_count INT NOT NULL DEFAULT 0,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY idx_ckpt_session_number (session_id, number),
+            INDEX idx_ckpt_user (user_id),
+            INDEX idx_ckpt_created (created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     Ok(())
 }
 

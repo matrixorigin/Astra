@@ -292,7 +292,7 @@ Sync model:
 **How to run**:
 ```bash
 conda activate agent-engine
-make dev-up                          # MatrixOne + Redis in Docker
+make dev-start                       # MatrixOne + Redis in Docker
 RUST_API_ADDR=0.0.0.0:8000 mo-agent-server  # API server (required, unless --local)
 mo-admin init                        # Init DB (via API after migration)
 mo-agent chat                        # CLI → API Server → DB
@@ -1142,7 +1142,7 @@ class DistributedFeedbackTrainer:
 
 | Dimension | Single Machine | Docker Compose | Kubernetes |
 |-----------|---------------|----------------|------------|
-| **启动命令** | `conda + make dev-up` | `docker-compose up -d` | `helm install` |
+| **启动命令** | `make dev-start` | `docker-compose up -d` | `helm install` |
 | **MatrixOne** | Docker container | 内置 container | [opt] StatefulSet 或外部 |
 | **Redis** | Docker container | 内置 container | [opt] StatefulSet 或外部 |
 | **API scaling** | 1 process | 2-4 workers (uvicorn) | HPA 2-10 pods |
@@ -1230,7 +1230,7 @@ class DeploymentDetector:
 
 ```bash
 # Before: 手动启动各组件
-make dev-up          # MatrixOne + Redis
+make dev-start       # MatrixOne + Redis
 mo-admin init        # Init DB
 RUST_API_ADDR=0.0.0.0:8000 mo-agent-server # API
 

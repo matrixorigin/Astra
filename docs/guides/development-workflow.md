@@ -38,16 +38,14 @@ make dev-stop
 | `make dev-deps-clean` | Delete all data (⚠️ destructive) |
 | `make dev-deps-status` | Show dependency status |
 | `make dev-deps-logs` | Tail all dependency logs |
-| `make dev-deps-logs-db` | Tail MatrixOne logs only |
-| `make dev-deps-logs-redis` | Tail Redis logs only |
-| `make dev-deps-wait` | Wait for dependencies (max 10s) |
+| `make dev-deps-wait` | Wait for dependencies (max 20s) |
 | `make dev-db-connect` | Connect to MatrixOne CLI |
 
 ### API Server (Source Code Mode)
 
 | Command | Description |
 |---------|-------------|
-| `make dev-api-start` | Start API server (hot reload) |
+| `make dev-api-start` | Start API server |
 | `make dev-api-stop` | Stop API server |
 | `make dev-api-restart` | Restart API server |
 | `make dev-api-logs` | Tail API server logs |
@@ -67,10 +65,9 @@ make dev-stop
 
 | Command | Description |
 |---------|-------------|
-| `make dev-test` | Run all tests (auto cleanup) |
-| `make dev-test-keep` | Run all tests (keep deps) |
-| `make dev-test-unit` | Run unit tests only |
-| `make dev-test-integration` | Run integration tests |
+| `make test` | Run all Rust workspace tests |
+| `make test-contract` | Run API-shell integration contracts |
+| `make test-contract` | Run specific contract tests (http/admin/auth/config) |
 
 ## Typical Workflows
 
@@ -84,7 +81,7 @@ make dev-status         # Verify ready
 # Development loop
 # ... edit code ...
 make dev-api-restart    # Restart API after changes
-make dev-test-keep      # Run tests
+make test               # Run tests
 
 # Evening
 make dev-stop           # Stop everything
@@ -93,14 +90,14 @@ make dev-stop           # Stop everything
 ### Testing Changes
 
 ```bash
-# Quick test (auto cleanup)
-make dev-test
+# Quick: run all tests
+make test
 
-# Repeated testing (keep deps running)
-make dev-deps-up
-make dev-test-unit      # Fast unit tests
-make dev-test-integration  # Integration tests
-make dev-deps-down
+# Targeted: run integration contracts only
+make test-contract
+
+# Specific: run individual contract suites
+make test-contract
 ```
 
 ### Docker Mode (Multi-replica Testing)
@@ -139,15 +136,8 @@ The `dev-init` command automatically:
 
 ## Proxy Configuration
 
-If you're behind a corporate proxy, prefix commands with `NO_PROXY`:
+If you're behind a corporate proxy:
 
-```bash
-NO_PROXY=localhost mo-agent register
-NO_PROXY=localhost mo-agent login
-NO_PROXY=localhost mo-agent chat
-```
-
-Or add to your shell profile:
 ```bash
 export NO_PROXY=localhost,127.0.0.1
 ```
@@ -156,17 +146,15 @@ export NO_PROXY=localhost,127.0.0.1
 
 ### Dependencies not ready after dev-start
 
-Dependencies (especially MatrixOne) may take 30-60s to fully start. Check status:
+Dependencies (especially MatrixOne) may take 30-60s to fully start:
 
 ```bash
 make dev-status
-# Wait a bit, then check again
 make dev-deps-status
 ```
 
 ### API server won't start
 
-Check logs:
 ```bash
 make dev-api-logs
 ```
@@ -180,15 +168,5 @@ Common issues:
 Ensure dependencies are running:
 ```bash
 make dev-deps-status
-make dev-deps-wait      # Wait up to 10s
+make dev-deps-wait
 ```
-
-## Migration from Old Commands
-
-| Old Command | New Command | Notes |
-|-------------|-------------|-------|
-| `make dev-up` | `make dev-deps-up` | More explicit |
-| `make dev-full` | `make dev-start-docker` | Clearer intent |
-| `make dev-ps` | `make dev-status` | More comprehensive |
-
-Old commands still work but show deprecation warnings.

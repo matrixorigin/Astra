@@ -395,3 +395,390 @@ fn same_tool_names(left: &[serde_json::Value], right: &[serde_json::Value]) -> b
 
     names(left) == names(right)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tool_value(name: &str) -> serde_json::Value {
+        json!({ "function": { "name": name } })
+    }
+
+    // ── normalize_session_created_at_for_bridge ──────────────────────
+
+    #[test]
+    fn normalize_created_at_rfc3339_with_positive_offset() {
+        let result = normalize_session_created_at_for_bridge("2024-01-15T10:30:00+08:00");
+        assert_eq!(result, Some("2024-01-15T02:30:00Z".to_string()));
+    }
+
+    #[test]
+    fn normalize_created_at_rfc3339_with_z() {
+        let result = normalize_session_created_at_for_bridge("2024-01-15T10:30:00Z");
+        assert_eq!(result, Some("2024-01-15T10:30:00Z".to_string()));
+    }
+
+    #[test]
+    fn normalize_created_at_rfc3339_with_plus_zero_offset() {
+        let result = normalize_session_created_at_for_bridge("2024-01-15T10:30:00+00:00");
+        assert_eq!(result, Some("2024-01-15T10:30:00Z".to_string()));
+    }
+
+    #[test]
+    fn normalize_created_at_rfc3339_with_negative_offset() {
+        let result = normalize_session_created_at_for_bridge("2024-01-15T10:30:00-05:00");
+        assert_eq!(result, Some("2024-01-15T15:30:00Z".to_string()));
+    }
+
+    #[test]
+    fn normalize_created_at_naive_datetime() {
+        let result = normalize_session_created_at_for_bridge("2024-01-15T10:30:00");
+        assert_eq!(result, Some("2024-01-15T10:30:00Z".to_string()));
+    }
+
+    #[test]
+    fn normalize_created_at_empty_string() {
+        assert_eq!(normalize_session_created_at_for_bridge(""), None);
+    }
+
+    #[test]
+    fn normalize_created_at_whitespace_only() {
+        assert_eq!(normalize_session_created_at_for_bridge("  "), None);
+    }
+
+    #[test]
+    fn normalize_created_at_garbage_falls_back_to_raw() {
+        let result = normalize_session_created_at_for_bridge("not-a-date");
+        assert_eq!(result, Some("not-a-date".to_string()));
+    }
+
+    #[test]
+    fn normalize_created_at_leading_trailing_whitespace_trimmed() {
+        let result = normalize_session_created_at_for_bridge("  2024-01-15T10:30:00Z  ");
+        assert_eq!(result, Some("2024-01-15T10:30:00Z".to_string()));
+    }
+
+    // ── normalize_chat_turn_session_error ────────────────────────────
+
+    #[test]
+    fn session_error_not_found_is_normalized() {
+        let input = error_response(StatusCode::NOT_FOUND, "some db error details");
+        let (status, body) = normalize_chat_turn_session_error(input);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0.detail, "Session not found");
+    }
+
+    #[test]
+    fn session_error_internal_passes_through() {
+        let msg = "unexpected failure";
+        let input = error_response(StatusCode::INTERNAL_SERVER_ERROR, msg);
+        let (status, body) = normalize_chat_turn_session_error(input);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.0.detail, msg);
+    }
+
+    #[test]
+    fn session_error_bad_request_passes_through() {
+        let msg = "invalid request body";
+        let input = error_response(StatusCode::BAD_REQUEST, msg);
+        let (status, body) = normalize_chat_turn_session_error(input);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0.detail, msg);
+    }
+
+    // ── same_tool_names ─────────────────────────────────────────────
+
+    #[test]
+    fn same_tools_same_order() {
+        let left = vec![tool_value("bash")];
+        let right = vec![tool_value("bash")];
+        assert!(same_tool_names(&left, &right));
+    }
+
+    #[test]
+    fn same_tools_different_order() {
+        let left = vec![tool_value("bash"), tool_value("grep")];
+        let right = vec![tool_value("grep"), tool_value("bash")];
+        assert!(same_tool_names(&left, &right));
+    }
+
+    #[test]
+    fn different_tools() {
+        let left = vec![tool_value("bash")];
+        let right = vec![tool_value("grep")];
+        assert!(!same_tool_names(&left, &right));
+    }
+
+    #[test]
+    fn extra_tool_means_not_same() {
+        let left = vec![tool_value("bash"), tool_value("grep")];
+        let right = vec![tool_value("bash")];
+        assert!(!same_tool_names(&left, &right));
+    }
+
+    #[test]
+    fn both_empty_arrays() {
+        assert!(same_tool_names(&[], &[]));
+    }
+
+    #[test]
+    fn duplicates_are_deduped() {
+        let left = vec![tool_value("bash"), tool_value("bash")];
+        let right = vec![tool_value("bash")];
+        assert!(same_tool_names(&left, &right));
+    }
+
+    #[test]
+    fn missing_function_field_both_sides() {
+        let left = vec![json!({})];
+        let right = vec![json!({})];
+        assert!(same_tool_names(&left, &right));
+    }
+
+    #[test]
+    fn only_named_tools_count() {
+        let left = vec![json!({}), tool_value("bash")];
+        let right = vec![tool_value("bash")];
+        assert!(same_tool_names(&left, &right));
+    }
+
+    #[test]
+    fn missing_name_in_function() {
+        let left = vec![json!({ "function": {} })];
+        let right = vec![json!({ "function": {} })];
+        assert!(same_tool_names(&left, &right));
+    }
+
+    // ── sync_cached_bridge_field ────────────────────────────────────
+
+    #[test]
+    fn sync_object_has_field_entry_does_not() {
+        let mut entry = serde_json::Map::new();
+        let mut object = serde_json::Map::new();
+        object.insert("project_rules".to_string(), json!("rule-value"));
+
+        sync_cached_bridge_field(&mut entry, &mut object, "project_rules");
+
+        assert_eq!(entry.get("project_rules"), Some(&json!("rule-value")));
+        assert_eq!(object.get("project_rules"), Some(&json!("rule-value")));
+    }
+
+    #[test]
+    fn sync_entry_has_field_object_does_not() {
+        let mut entry = serde_json::Map::new();
+        entry.insert("project_rules".to_string(), json!("cached-value"));
+        let mut object = serde_json::Map::new();
+
+        sync_cached_bridge_field(&mut entry, &mut object, "project_rules");
+
+        assert_eq!(entry.get("project_rules"), Some(&json!("cached-value")));
+        assert_eq!(object.get("project_rules"), Some(&json!("cached-value")));
+    }
+
+    #[test]
+    fn sync_both_have_field_object_wins() {
+        let mut entry = serde_json::Map::new();
+        entry.insert("project_rules".to_string(), json!("old-cached"));
+        let mut object = serde_json::Map::new();
+        object.insert("project_rules".to_string(), json!("new-incoming"));
+
+        sync_cached_bridge_field(&mut entry, &mut object, "project_rules");
+
+        assert_eq!(entry.get("project_rules"), Some(&json!("new-incoming")));
+        assert_eq!(object.get("project_rules"), Some(&json!("new-incoming")));
+    }
+
+    #[test]
+    fn sync_object_has_null_treated_as_absent() {
+        let mut entry = serde_json::Map::new();
+        entry.insert("project_rules".to_string(), json!("cached-value"));
+        let mut object = serde_json::Map::new();
+        object.insert("project_rules".to_string(), serde_json::Value::Null);
+
+        sync_cached_bridge_field(&mut entry, &mut object, "project_rules");
+
+        // null is treated as absent, so entry's cached value is used
+        assert_eq!(entry.get("project_rules"), Some(&json!("cached-value")));
+        assert_eq!(object.get("project_rules"), Some(&json!("cached-value")));
+    }
+
+    #[test]
+    fn sync_neither_has_field() {
+        let mut entry = serde_json::Map::new();
+        let mut object = serde_json::Map::new();
+
+        sync_cached_bridge_field(&mut entry, &mut object, "project_rules");
+
+        assert!(entry.get("project_rules").is_none());
+        assert!(object.get("project_rules").is_none());
+    }
+
+    #[test]
+    fn sync_complex_nested_value_preserved() {
+        let complex = json!({
+            "rules": [{"id": 1, "text": "do this"}, {"id": 2, "text": "do that"}],
+            "meta": {"version": 3}
+        });
+        let mut entry = serde_json::Map::new();
+        let mut object = serde_json::Map::new();
+        object.insert("project_rules".to_string(), complex.clone());
+
+        sync_cached_bridge_field(&mut entry, &mut object, "project_rules");
+
+        assert_eq!(entry.get("project_rules"), Some(&complex));
+    }
+
+    // ── inject_bridge_cache_state ───────────────────────────────────
+
+    #[test]
+    fn inject_empty_entry_does_nothing() {
+        let entry = serde_json::Map::new();
+        let mut object = serde_json::Map::new();
+
+        inject_bridge_cache_state(&entry, &mut object);
+
+        assert!(object.get("bridge_cache_state").is_none());
+    }
+
+    #[test]
+    fn inject_entry_with_seed_state_injects() {
+        let mut entry = serde_json::Map::new();
+        entry.insert("created_at".to_string(), json!("2024-01-15T10:30:00Z"));
+
+        let mut object = serde_json::Map::new();
+        inject_bridge_cache_state(&entry, &mut object);
+
+        let state = object.get("bridge_cache_state");
+        assert!(state.is_some());
+        let state_obj = state.unwrap().as_object().unwrap();
+        assert!(state_obj.contains_key("created_at"));
+    }
+
+    #[test]
+    fn inject_overwrites_existing_bridge_cache_state() {
+        let mut entry = serde_json::Map::new();
+        entry.insert("created_at".to_string(), json!("2024-01-15T10:30:00Z"));
+
+        let mut object = serde_json::Map::new();
+        object.insert("bridge_cache_state".to_string(), json!("old-stuff"));
+
+        inject_bridge_cache_state(&entry, &mut object);
+
+        let state = object.get("bridge_cache_state").unwrap();
+        assert!(state.is_object()); // replaced with the normalized object
+    }
+
+    #[test]
+    fn inject_entry_with_history_seed() {
+        let mut entry = serde_json::Map::new();
+        entry.insert("history".to_string(), json!(["turn1", "turn2"]));
+
+        let mut object = serde_json::Map::new();
+        inject_bridge_cache_state(&entry, &mut object);
+
+        let state = object
+            .get("bridge_cache_state")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(state.get("history"), Some(&json!(["turn1", "turn2"])));
+        assert_eq!(state.get("turn_count"), Some(&json!(0)));
+    }
+
+    // ── trim_edge_tools_for_result_turn ─────────────────────────────
+
+    #[test]
+    fn trim_no_tool_results_returns_early() {
+        let mut object = serde_json::Map::new();
+        object.insert("edge_tools".to_string(), json!([tool_value("bash")]));
+        let original_tools = object.get("edge_tools").cloned();
+
+        trim_edge_tools_for_result_turn(&mut object, "");
+
+        // No tool_results, so edge_tools unchanged
+        assert_eq!(object.get("edge_tools"), original_tools.as_ref());
+    }
+
+    #[test]
+    fn trim_no_edge_tools_returns_early() {
+        let mut object = serde_json::Map::new();
+        object.insert(
+            "tool_results".to_string(),
+            json!([{"name": "bash", "output": "ok"}]),
+        );
+
+        trim_edge_tools_for_result_turn(&mut object, "");
+
+        assert!(object.get("edge_tools").is_none());
+    }
+
+    #[test]
+    fn trim_does_not_panic_on_empty_object() {
+        let mut object = serde_json::Map::new();
+        trim_edge_tools_for_result_turn(&mut object, "some query");
+    }
+
+    #[test]
+    fn trim_with_user_query_skips_filtering() {
+        let mut object = serde_json::Map::new();
+        object.insert(
+            "tool_results".to_string(),
+            json!([{"name": "bash", "output": "ok"}]),
+        );
+        object.insert(
+            "edge_tools".to_string(),
+            json!([tool_value("bash"), tool_value("grep")]),
+        );
+
+        trim_edge_tools_for_result_turn(&mut object, "what happened?");
+
+        // Non-empty user_query means plan_tool_subset_for_result_turn returns None,
+        // so edge_tools stays unchanged
+        let tools = object.get("edge_tools").unwrap().as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn trim_filters_to_used_tools() {
+        let mut object = serde_json::Map::new();
+        object.insert(
+            "tool_results".to_string(),
+            json!([{"name": "bash", "output": "ok"}]),
+        );
+        object.insert(
+            "edge_tools".to_string(),
+            json!([tool_value("bash"), tool_value("grep"), tool_value("view")]),
+        );
+
+        trim_edge_tools_for_result_turn(&mut object, "");
+
+        let tools = object.get("edge_tools").unwrap().as_array().unwrap();
+        // Only "bash" should remain since it was used in tool_results
+        assert_eq!(tools.len(), 1);
+        let name = tools[0]
+            .get("function")
+            .unwrap()
+            .get("name")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(name, "bash");
+    }
+
+    #[test]
+    fn trim_empty_tool_results_array_is_no_op() {
+        let mut object = serde_json::Map::new();
+        object.insert("tool_results".to_string(), json!([]));
+        object.insert(
+            "edge_tools".to_string(),
+            json!([tool_value("bash"), tool_value("grep")]),
+        );
+        let original = object.get("edge_tools").cloned();
+
+        trim_edge_tools_for_result_turn(&mut object, "");
+
+        // Empty tool_results → plan_tool_subset returns None → no filtering
+        assert_eq!(object.get("edge_tools"), original.as_ref());
+    }
+}

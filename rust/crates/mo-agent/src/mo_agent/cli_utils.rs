@@ -88,6 +88,37 @@ pub(super) fn get_profile_and_token(
     Ok((creds, name, profile, token))
 }
 
+pub(super) fn session_is_resumable(session_id: &str) -> bool {
+    match session_journal::read_journal(session_id) {
+        Ok(events) if events.is_empty() => true,
+        Ok(events) => {
+            let last_start = events.iter().rposition(|event| {
+                event.event_type == session_journal::JournalEventType::SessionStart
+            });
+            let last_end = events.iter().rposition(|event| {
+                event.event_type == session_journal::JournalEventType::SessionEnd
+            });
+            match (last_start, last_end) {
+                (Some(start_idx), Some(end_idx)) => start_idx > end_idx,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => true,
+            }
+        }
+        Err(_) => true,
+    }
+}
+
+pub(super) fn resumable_last_session_id(cli_profile: Option<&str>) -> Option<String> {
+    let creds = load_credentials();
+    let name = profile_name(cli_profile, &creds);
+    creds
+        .profiles
+        .get(&name)
+        .and_then(|profile| profile.last_session_id.clone())
+        .filter(|session_id| session_is_resumable(session_id))
+}
+
 pub(super) fn read_api_error(status: reqwest::StatusCode, body: &str) -> String {
     format!("request failed ({}): {}", status, compact_or_raw(body))
 }
@@ -419,6 +450,7 @@ pub(super) fn urlencoding(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     // ── truncate_str ──────────────────────────────────────────────────────────
 
@@ -553,5 +585,58 @@ mod tests {
     fn profile_name_falls_back_to_default() {
         let creds = CredentialsFile::default();
         assert_eq!(profile_name(None, &creds), "default");
+    }
+
+    #[test]
+    fn session_is_not_resumable_after_clean_end() {
+        let sid = format!("test-ended-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_end(Some(&sid), 0))
+            .unwrap();
+
+        assert!(!session_is_resumable(&sid));
+    }
+
+    #[test]
+    fn resumable_last_session_id_filters_ended_sessions() {
+        let creds_dir = tempdir().unwrap();
+        unsafe {
+            std::env::set_var("MO_AGENT_CREDENTIALS_DIR", creds_dir.path());
+        }
+
+        let sid = format!("test-profile-ended-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_end(Some(&sid), 0))
+            .unwrap();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                last_session_id: Some(sid),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        assert_eq!(resumable_last_session_id(None), None);
+
+        unsafe {
+            std::env::remove_var("MO_AGENT_CREDENTIALS_DIR");
+        }
     }
 }

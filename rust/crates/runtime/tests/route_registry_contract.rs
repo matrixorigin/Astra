@@ -118,6 +118,13 @@ async fn route_chat_route() {
     assert_route_registered(s, "POST", "/chat/route");
 }
 
+#[tokio::test]
+async fn route_chat_ws() {
+    // WebSocket upgrade requires GET — should not be 404 or 405
+    let s = route_status(build_test_app(), "GET", "/chat/ws").await;
+    assert_route_registered(s, "GET", "/chat/ws");
+}
+
 // ── Reflect / decision-trace (newly added) ───────────────────────────────────
 
 #[tokio::test]

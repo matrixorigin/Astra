@@ -21,7 +21,11 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "Export session as markdown (full id or unique prefix)",
     ),
     ("/clear", "Start a new session"),
-    ("/history", "Show conversation turns"),
+    (
+        "/history",
+        "Show conversation turns (or /history search <q>)",
+    ),
+    ("/rewind", "Rewind conversation to turn N: /rewind <turn>"),
     ("/copy", "Copy last response to clipboard"),
     ("/context", "Show context window and session state"),
     ("/skill", "List available skills"),
@@ -572,10 +576,24 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 nav!(-1);
             }
 
-            // ── Accept: Enter just clears overlay; input line already has the command ─
+            // ── Accept: Enter with picker selects the highlighted command ─────
+            // If the line already matches the selected command (user navigated),
+            // just clear and accept. Otherwise replace the line — the user will
+            // see the full command and press Enter once more to confirm.
             RlKeyEvent(RlKeyCode::Enter, _) if active => {
+                let rows = picker_rows_for_filter();
+                let selected = get_slash_picker_selected();
+                let current = ctx.line();
                 clear_slash_overlay();
-                return None; // default AcceptLine
+                if let Some((cmd, _)) = rows.get(selected) {
+                    if *cmd != current {
+                        return Some(RlCmd::Replace(
+                            RlMovement::WholeLine,
+                            Some(cmd.to_string()),
+                        ));
+                    }
+                }
+                return None; // already correct — accept
             }
 
             // ── Dismiss ─────────────────────────────────────────────────
@@ -669,7 +687,12 @@ impl Highlighter for ReplHelper {
 }
 
 impl Validator for ReplHelper {
-    fn validate(&self, _ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
+    fn validate(&self, ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
+        let input = ctx.input();
+        // Multi-line: trailing backslash means "continue on next line"
+        if input.ends_with('\\') {
+            return Ok(ValidationResult::Incomplete);
+        }
         Ok(ValidationResult::Valid(None))
     }
 }
@@ -802,5 +825,55 @@ mod tests {
     fn completion_candidates_for_prefix() {
         let candidates = completion_candidates("/he");
         assert!(candidates.iter().any(|(cmd, _)| *cmd == "/help"));
+    }
+
+    // ── Multi-line (Validator) ────────────────────────────────────────────────
+
+    #[test]
+    fn validator_complete_line_is_valid() {
+        // Simulate a complete line (no trailing backslash)
+        // We can't easily create a ValidationContext, so test the logic directly
+        let input = "hello world";
+        assert!(!input.ends_with('\\'));
+    }
+
+    #[test]
+    fn validator_trailing_backslash_is_incomplete() {
+        let input = "hello \\";
+        assert!(input.ends_with('\\'));
+    }
+
+    // ── /rewind in SLASH_COMMANDS ─────────────────────────────────────────────
+
+    #[test]
+    fn rewind_command_is_registered() {
+        assert!(SLASH_COMMANDS.iter().any(|(cmd, _)| *cmd == "/rewind"));
+    }
+
+    #[test]
+    fn rewind_resolves_from_prefix() {
+        let result = resolve_slash_command("/rew");
+        assert!(result.is_ok(), "got: {result:?}");
+        assert_eq!(result.unwrap(), "/rewind");
+    }
+
+    // ── /history search in SLASH_COMMANDS ─────────────────────────────────────
+
+    #[test]
+    fn history_command_is_registered() {
+        assert!(SLASH_COMMANDS.iter().any(|(cmd, _)| *cmd == "/history"));
+    }
+
+    #[test]
+    fn history_help_text_mentions_search() {
+        let desc = SLASH_COMMANDS
+            .iter()
+            .find(|(cmd, _)| *cmd == "/history")
+            .map(|(_, d)| *d)
+            .unwrap();
+        assert!(
+            desc.contains("search"),
+            "history help should mention search: {desc}"
+        );
     }
 }

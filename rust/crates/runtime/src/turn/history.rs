@@ -401,3 +401,398 @@ fn parsed_metadata(metadata: Option<Value>) -> Map<String, Value> {
         _ => Map::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── helpers ──────────────────────────────────────────────────────
+
+    fn user_msg(content: &str) -> Value {
+        json!({ "role": "user", "content": content })
+    }
+
+    fn assistant_msg(content: &str) -> Value {
+        json!({ "role": "assistant", "content": content })
+    }
+
+    fn assistant_with_tool_calls(tool_call_ids: &[&str]) -> Value {
+        let calls: Vec<Value> = tool_call_ids
+            .iter()
+            .map(|id| {
+                json!({
+                    "id": *id,
+                    "type": "function",
+                    "function": { "name": "some_tool", "arguments": "{}" }
+                })
+            })
+            .collect();
+        json!({ "role": "assistant", "content": "", "tool_calls": calls })
+    }
+
+    fn tool_msg(tool_call_id: &str, content: &str) -> Value {
+        json!({ "role": "tool", "tool_call_id": tool_call_id, "content": content })
+    }
+
+    fn tool_result(tool_call_id: &str, result: &str) -> Value {
+        json!({ "tool_call_id": tool_call_id, "result": result })
+    }
+
+    // ── find_tool_call_safe_split ───────────────────────────────────
+
+    #[test]
+    fn safe_split_basic() {
+        // user, assistant+tool_calls, tool, user, assistant
+        let msgs = vec![
+            user_msg("hi"),
+            assistant_with_tool_calls(&["c1"]),
+            tool_msg("c1", "ok"),
+            user_msg("thanks"),
+            assistant_msg("bye"),
+        ];
+        // target_tail=2 → naive split at index 3 (user "thanks"); no tool
+        // role there, so split stays at 3.
+        assert_eq!(find_tool_call_safe_split(&msgs, 2), 3);
+    }
+
+    #[test]
+    fn safe_split_no_tool_calls() {
+        let msgs = vec![
+            user_msg("a"),
+            assistant_msg("b"),
+            user_msg("c"),
+            assistant_msg("d"),
+        ];
+        // No tool messages anywhere; every naive split point is safe.
+        assert_eq!(find_tool_call_safe_split(&msgs, 2), 2);
+        assert_eq!(find_tool_call_safe_split(&msgs, 1), 3);
+    }
+
+    #[test]
+    fn safe_split_tool_call_at_boundary() {
+        // user, assistant+tool_calls, tool, tool, user
+        let msgs = vec![
+            user_msg("q"),
+            assistant_with_tool_calls(&["c1", "c2"]),
+            tool_msg("c1", "r1"),
+            tool_msg("c2", "r2"),
+            user_msg("next"),
+        ];
+        // target_tail=3 → naive idx=2 (tool "r1"), back up past tools → idx=1
+        assert_eq!(find_tool_call_safe_split(&msgs, 3), 1);
+        // target_tail=1 → naive idx=4 (user "next"), safe already
+        assert_eq!(find_tool_call_safe_split(&msgs, 1), 4);
+    }
+
+    #[test]
+    fn safe_split_target_zero_returns_zero() {
+        let msgs = vec![user_msg("a"), assistant_msg("b")];
+        assert_eq!(find_tool_call_safe_split(&msgs, 0), 0);
+    }
+
+    #[test]
+    fn safe_split_target_ge_len_returns_zero() {
+        let msgs = vec![user_msg("a")];
+        assert_eq!(find_tool_call_safe_split(&msgs, 1), 0);
+        assert_eq!(find_tool_call_safe_split(&msgs, 5), 0);
+    }
+
+    #[test]
+    fn safe_split_single_message() {
+        let msgs = vec![user_msg("only")];
+        assert_eq!(find_tool_call_safe_split(&msgs, 1), 0);
+        assert_eq!(find_tool_call_safe_split(&msgs, 0), 0);
+    }
+
+    // ── merge_tool_results_into_history ─────────────────────────────
+
+    #[test]
+    fn merge_basic() {
+        let mut history = vec![
+            user_msg("q"),
+            assistant_with_tool_calls(&["c1"]),
+            // no tool result yet
+        ];
+        let results = vec![tool_result("c1", "answer")];
+        let consumed = merge_tool_results_into_history(&mut history, Some(&results));
+
+        assert!(consumed.contains("c1"));
+        // A tool message should have been inserted after the assistant msg
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[2]["role"], "tool");
+        assert_eq!(history[2]["tool_call_id"], "c1");
+        assert_eq!(history[2]["content"], "answer");
+    }
+
+    #[test]
+    fn merge_empty_tool_results() {
+        let mut history = vec![user_msg("q"), assistant_with_tool_calls(&["c1"])];
+        let original_len = history.len();
+
+        // None case
+        let consumed = merge_tool_results_into_history(&mut history, None);
+        assert!(consumed.is_empty());
+        // Healing should add placeholder for missing c1
+        assert_eq!(history.len(), original_len + 1);
+        assert!(
+            history[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("not executed")
+        );
+
+        // Empty slice case
+        let mut history2 = vec![user_msg("q"), assistant_with_tool_calls(&["c1"])];
+        let consumed2 = merge_tool_results_into_history(&mut history2, Some(&[]));
+        assert!(consumed2.is_empty());
+        // Healing again
+        assert!(
+            history2[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("not executed")
+        );
+    }
+
+    #[test]
+    fn merge_results_for_nonexistent_tool_calls() {
+        let mut history = vec![user_msg("q"), assistant_msg("no tool calls here")];
+        let results = vec![tool_result("nonexistent", "data")];
+        let consumed = merge_tool_results_into_history(&mut history, Some(&results));
+
+        // Nothing matched, nothing consumed
+        assert!(consumed.is_empty());
+        assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn merge_replaces_placeholder() {
+        let mut history = vec![
+            user_msg("q"),
+            assistant_with_tool_calls(&["c1"]),
+            json!({
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": "[not executed -- edge disconnected]"
+            }),
+        ];
+        let results = vec![tool_result("c1", "real answer")];
+        let consumed = merge_tool_results_into_history(&mut history, Some(&results));
+
+        assert!(consumed.contains("c1"));
+        // Placeholder replaced in-place, no extra message
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[2]["content"], "real answer");
+    }
+
+    #[test]
+    fn merge_heals_missing_tool_results() {
+        // Two tool calls but only one result provided
+        let mut history = vec![
+            user_msg("q"),
+            assistant_with_tool_calls(&["c1", "c2"]),
+            tool_msg("c1", "ok"),
+        ];
+        let consumed = merge_tool_results_into_history(&mut history, None);
+        assert!(consumed.is_empty());
+
+        // c2 should get a healing placeholder
+        assert_eq!(history.len(), 4);
+        let healed = &history[3];
+        assert_eq!(healed["role"], "tool");
+        assert_eq!(healed["tool_call_id"], "c2");
+        assert!(healed["content"].as_str().unwrap().contains("not executed"));
+    }
+
+    #[test]
+    fn merge_multiple_assistant_blocks() {
+        // Two separate assistant messages, each with one tool call
+        let mut history = vec![
+            user_msg("q1"),
+            assistant_with_tool_calls(&["c1"]),
+            tool_msg("c1", "placeholder"),
+            user_msg("q2"),
+            assistant_with_tool_calls(&["c2"]),
+        ];
+        let results = vec![tool_result("c2", "res2")];
+        let consumed = merge_tool_results_into_history(&mut history, Some(&results));
+
+        assert!(consumed.contains("c2"));
+        // c2 result inserted after second assistant block
+        assert_eq!(history[5]["role"], "tool");
+        assert_eq!(history[5]["tool_call_id"], "c2");
+        assert_eq!(history[5]["content"], "res2");
+    }
+
+    // ── append_recovered_events ─────────────────────────────────────
+
+    #[test]
+    fn append_basic() {
+        let mut history = Vec::new();
+        let rows = vec![
+            RecoveredEventRow {
+                event_type: "user_query".to_string(),
+                content: Some("hello".to_string()),
+                metadata: None,
+                reasoning_content: None,
+            },
+            RecoveredEventRow {
+                event_type: "llm_response".to_string(),
+                content: Some("hi there".to_string()),
+                metadata: None,
+                reasoning_content: None,
+            },
+        ];
+
+        append_recovered_events(&mut history, &rows);
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["role"], "user");
+        assert_eq!(history[0]["content"], "hello");
+        assert_eq!(history[1]["role"], "assistant");
+        assert_eq!(history[1]["content"], "hi there");
+    }
+
+    #[test]
+    fn append_empty_input() {
+        let mut history = vec![user_msg("existing")];
+        append_recovered_events(&mut history, &[]);
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn append_tool_call_then_result() {
+        let mut history = Vec::new();
+        let rows = vec![
+            RecoveredEventRow {
+                event_type: "tool_call".to_string(),
+                content: Some(
+                    r#"{"tool_call_id":"c1","name":"bash","arguments":"{\"cmd\":\"ls\"}"}"#
+                        .to_string(),
+                ),
+                metadata: None,
+                reasoning_content: Some("let me check".to_string()),
+            },
+            RecoveredEventRow {
+                event_type: "tool_result".to_string(),
+                content: Some(r#"{"result":"file1 file2"}"#.to_string()),
+                metadata: Some(json!({"tool_call_id": "c1", "name": "bash"})),
+                reasoning_content: None,
+            },
+        ];
+
+        append_recovered_events(&mut history, &rows);
+
+        // Should produce: assistant (with tool_calls + reasoning), tool result
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["role"], "assistant");
+        assert!(history[0]["tool_calls"].is_array());
+        assert_eq!(history[0]["reasoning_content"], "let me check");
+        assert_eq!(history[0]["tool_calls"][0]["id"], "c1");
+        assert_eq!(history[1]["role"], "tool");
+        assert_eq!(history[1]["tool_call_id"], "c1");
+        assert_eq!(history[1]["content"], "file1 file2");
+    }
+
+    #[test]
+    fn append_llm_response_with_reasoning() {
+        let mut history = Vec::new();
+        let rows = vec![RecoveredEventRow {
+            event_type: "llm_response".to_string(),
+            content: Some("The answer is 42".to_string()),
+            metadata: None,
+            reasoning_content: Some("thinking hard".to_string()),
+        }];
+
+        append_recovered_events(&mut history, &rows);
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["content"], "The answer is 42");
+        assert_eq!(history[0]["reasoning_content"], "thinking hard");
+    }
+
+    #[test]
+    fn append_flushes_pending_tool_calls_at_end() {
+        let mut history = Vec::new();
+        let rows = vec![RecoveredEventRow {
+            event_type: "tool_call".to_string(),
+            content: Some(r#"{"tool_call_id":"c1","name":"search","arguments":"{}"}"#.to_string()),
+            metadata: None,
+            reasoning_content: None,
+        }];
+
+        append_recovered_events(&mut history, &rows);
+
+        // Pending tool call flushed as an assistant message
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["role"], "assistant");
+        assert!(history[0]["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn append_tool_result_without_prior_tool_call_synthesizes_assistant() {
+        let mut history = Vec::new();
+        let rows = vec![RecoveredEventRow {
+            event_type: "tool_result".to_string(),
+            content: Some(r#"{"result":"orphan result"}"#.to_string()),
+            metadata: Some(json!({"tool_call_id": "c99", "name": "grep"})),
+            reasoning_content: None,
+        }];
+
+        append_recovered_events(&mut history, &rows);
+
+        // Should synthesize an assistant msg with tool_calls, then tool result
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["role"], "assistant");
+        assert_eq!(history[0]["tool_calls"][0]["id"], "c99");
+        assert_eq!(history[1]["role"], "tool");
+        assert_eq!(history[1]["content"], "orphan result");
+    }
+
+    // ── edge cases ──────────────────────────────────────────────────
+
+    #[test]
+    fn single_message_history_merge() {
+        let mut history = vec![user_msg("only")];
+        let consumed = merge_tool_results_into_history(&mut history, None);
+        assert!(consumed.is_empty());
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn all_assistant_with_single_tool_calls_healed() {
+        // Multiple assistant messages each with one tool call, no results
+        let mut history = vec![
+            user_msg("q"),
+            assistant_with_tool_calls(&["a1"]),
+            assistant_with_tool_calls(&["b1"]),
+        ];
+
+        let consumed = merge_tool_results_into_history(&mut history, None);
+        assert!(consumed.is_empty());
+
+        // Healing should add placeholders for a1 and b1
+        let tool_msgs: Vec<_> = history
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+            .collect();
+        assert_eq!(tool_msgs.len(), 2);
+        for tm in &tool_msgs {
+            assert!(tm["content"].as_str().unwrap().contains("not executed"));
+        }
+    }
+
+    #[test]
+    fn safe_split_all_tools_backs_up_to_zero() {
+        // Degenerate: all messages are tool role (shouldn't happen in
+        // practice but exercises the while-loop boundary).
+        let msgs = vec![
+            tool_msg("c1", "r1"),
+            tool_msg("c2", "r2"),
+            tool_msg("c3", "r3"),
+        ];
+        // target_tail=1 → naive idx=2 (tool), backs up to 0
+        assert_eq!(find_tool_call_safe_split(&msgs, 1), 0);
+    }
+}

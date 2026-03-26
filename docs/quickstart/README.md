@@ -32,5 +32,5 @@ make dev-status
 ```bash
 make check
 make test
-make test-integration
+make test-contract
 ```

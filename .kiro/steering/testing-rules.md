@@ -21,7 +21,7 @@ single contract test -> affected contract group -> full API-shell suite -> full 
 
 ```bash
 cargo test --manifest-path rust/Cargo.toml -p mo-agent-runtime --test auth_contract
-make test-integration
+make test-contract
 make test
 make check
 ```

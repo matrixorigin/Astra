@@ -143,6 +143,7 @@ async fn hook_persists_decision_audit_and_skill_selection_for_tool_calls() {
         Arc::new(reflection_store),
         Arc::new(lesson_writer),
         Arc::new(observer),
+        None, // turn_learning_writer
     );
 
     // Allow spawned task to complete
@@ -185,6 +186,7 @@ async fn hook_persists_response_generation_audit_without_skill_selection() {
         Arc::new(reflection_store),
         Arc::new(lesson_writer),
         Arc::new(observer),
+        None, // turn_learning_writer
     );
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -245,6 +247,7 @@ async fn hook_marks_reflection_state_when_reflect_tool_called() {
         Arc::new(reflection_store.clone()),
         Arc::new(lesson_writer),
         Arc::new(observer),
+        None, // turn_learning_writer
     );
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -273,6 +276,7 @@ async fn hook_noop_on_none_payload() {
         Arc::new(reflection_store),
         Arc::new(lesson_writer),
         Arc::new(observer),
+        None, // turn_learning_writer
     );
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -318,6 +322,7 @@ async fn hook_persists_implicit_feedback_on_negative_signal() {
         Arc::new(reflection_store),
         Arc::new(lesson_writer),
         Arc::new(observer),
+        None, // turn_learning_writer
     );
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;

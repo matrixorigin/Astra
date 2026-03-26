@@ -178,3 +178,34 @@ pub struct TurnAuxiliaryEventRecord {
     pub metadata: Option<serde_json::Value>,
     pub reasoning_content: Option<String>,
 }
+
+// ─── Pipeline Learning ──────────────────────────────────────────────────────────
+
+/// Outcome of a completed turn, used to update pipeline learning modules
+/// (EntityGraph, PatternLibrary, ProgressiveCalibrator).
+#[derive(Clone, Debug)]
+pub struct TurnLearningOutcome {
+    /// The user's query text for this turn.
+    pub query: String,
+    /// Tool names that were selected for the LLM.
+    pub tools_selected: Vec<String>,
+    /// Tool names actually invoked by the LLM.
+    pub tools_used: Vec<String>,
+    /// Whether the turn completed successfully (no errors, tools ran).
+    pub success: bool,
+    /// Aggregate quality score (0.0–1.0), derived from tool quality assessments.
+    pub quality: f64,
+    /// Whether the user corrected the agent's behavior in a follow-up.
+    pub was_corrected: bool,
+    /// Routing metadata: task_type label from RoutingDecision.
+    pub task_type_label: Option<String>,
+    /// Routing metadata: domain_hint label from RoutingDecision.
+    pub domain_hint_label: Option<String>,
+}
+
+/// Trait for recording turn outcomes into pipeline learning modules.
+/// Implementations update EntityGraph, PatternLibrary, and ProgressiveCalibrator.
+#[async_trait]
+pub trait TurnLearningWriter: Send + Sync {
+    async fn record_outcome(&self, outcome: TurnLearningOutcome) -> Result<(), String>;
+}

@@ -13,7 +13,7 @@ Current runnable examples for this repository are:
 ```bash
 make dev-init
 make dev-start
-make test-integration
+make test-contract
 ```
 
 Then try:

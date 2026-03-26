@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use mo_agent_runtime::build_turn_complete_event;
+use mo_agent_runtime::{DivergenceStatus, build_turn_complete_event};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -40,6 +40,7 @@ fn turn_complete_event_matches_shared_contract() {
             build_turn_complete_event(
                 case.input.has_tool_calls,
                 case.input.stall_detected,
+                &DivergenceStatus::Healthy,
                 case.input.execution_state,
             ),
             case.expected

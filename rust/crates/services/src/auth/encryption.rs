@@ -43,3 +43,108 @@ fn derive_fernet_key(secret_key: &str) -> String {
     let digest = Sha256::digest(secret_key.as_bytes());
     URL_SAFE.encode(digest)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_encryptor(key: &str) -> FernetTokenEncryptor {
+        FernetTokenEncryptor::new(key).expect("failed to create encryptor")
+    }
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let enc = make_encryptor("my-secret-key");
+        let plaintext = "hello world";
+        let ciphertext = enc.encrypt(plaintext).unwrap();
+        assert_ne!(ciphertext, plaintext);
+        assert_eq!(enc.decrypt(&ciphertext).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn decrypt_with_wrong_key_fails() {
+        let enc1 = make_encryptor("key-one");
+        let enc2 = make_encryptor("key-two");
+        let ciphertext = enc1.encrypt("secret data").unwrap();
+        let result = enc2.decrypt(&ciphertext);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("decryption failed"));
+    }
+
+    #[test]
+    fn encrypt_decrypt_empty_plaintext() {
+        let enc = make_encryptor("some-key");
+        let ciphertext = enc.encrypt("").unwrap();
+        assert_eq!(enc.decrypt(&ciphertext).unwrap(), "");
+    }
+
+    #[test]
+    fn encrypt_decrypt_unicode_and_cjk() {
+        let enc = make_encryptor("unicode-key");
+        for text in &[
+            "你好世界",
+            "日本語テスト",
+            "한국어",
+            "émojis: 🚀🔥✅",
+            "café résumé",
+        ] {
+            let ciphertext = enc.encrypt(text).unwrap();
+            assert_eq!(enc.decrypt(&ciphertext).unwrap(), *text);
+        }
+    }
+
+    #[test]
+    fn decrypt_invalid_ciphertext_fails() {
+        let enc = make_encryptor("any-key");
+        let result = enc.decrypt("not-a-valid-fernet-token");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sha256_hex_produces_correct_digest() {
+        // Known SHA-256 of "hello"
+        let digest = sha256_hex("hello");
+        assert_eq!(
+            digest,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        assert_eq!(digest.len(), 64);
+    }
+
+    #[test]
+    fn derive_fernet_key_is_deterministic() {
+        let key1 = derive_fernet_key("test-secret");
+        let key2 = derive_fernet_key("test-secret");
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn derive_fernet_key_differs_for_different_inputs() {
+        assert_ne!(derive_fernet_key("key-a"), derive_fernet_key("key-b"));
+    }
+
+    #[test]
+    fn same_plaintext_produces_different_ciphertexts() {
+        let enc = make_encryptor("nonce-key");
+        let c1 = enc.encrypt("same").unwrap();
+        let c2 = enc.encrypt("same").unwrap();
+        // Fernet includes a random IV, so ciphertexts should differ
+        assert_ne!(c1, c2);
+        assert_eq!(enc.decrypt(&c1).unwrap(), "same");
+        assert_eq!(enc.decrypt(&c2).unwrap(), "same");
+    }
+
+    #[test]
+    fn non_utf8_decrypt_fails() {
+        // Manually encrypt raw non-UTF-8 bytes via the underlying fernet,
+        // then verify our decrypt wrapper rejects them.
+        let derived = derive_fernet_key("raw-key");
+        let fernet = Fernet::new(&derived).unwrap();
+        let non_utf8: &[u8] = &[0xFF, 0xFE, 0x80];
+        let ciphertext = fernet.encrypt(non_utf8);
+        let enc = make_encryptor("raw-key");
+        let result = enc.decrypt(&ciphertext);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not valid UTF-8"));
+    }
+}

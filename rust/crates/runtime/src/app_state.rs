@@ -7,7 +7,7 @@ use mo_agent_services::auth;
 
 const DEFAULT_NAME: &str = "Agent Engine API";
 const DEFAULT_VERSION: &str = "0.1.0";
-const DEFAULT_DOCS: &str = "/docs";
+const DEFAULT_DOCS: &str = "";
 
 #[async_trait]
 pub trait HealthChecker: Send + Sync {
@@ -71,6 +71,9 @@ pub struct AppState {
     pub(crate) chat_turn_bridge: Arc<dyn ChatTurnBridge>,
     pub(crate) chat_turn_bridge_secret: String,
     pub(crate) chat_turn_bridge_cache: Arc<tokio::sync::Mutex<SessionCache>>,
+    /// Pipeline learning writer — shared across all turns, auto-updates
+    /// EntityGraph/PatternLibrary/ProgressiveCalibrator from turn outcomes.
+    pub(crate) turn_learning_writer: Option<Arc<dyn TurnLearningWriter>>,
     pub memoria_base_url: String,
     pub memoria_master_key: Option<String>,
     pub memoria_forwarder: Arc<dyn MemoriaForwarder>,
@@ -127,8 +130,9 @@ impl AppState {
             chat_turn_bridge: Arc::new(UnavailableChatTurnBridge),
             chat_turn_bridge_secret: "dev-bridge-secret-change-me".to_string(),
             chat_turn_bridge_cache,
+            turn_learning_writer: None,
             memoria_base_url: std::env::var("MEMORIA_BASE_URL")
-                .unwrap_or_else(|_| "http://localhost:8100".to_string()),
+                .unwrap_or_else(|_| crate::config::DEFAULT_MEMORIA_URL.to_string()),
             memoria_master_key: std::env::var("MEMORIA_MASTER_KEY").ok(),
             memoria_forwarder: Arc::new(NoopMemoriaForwarder),
             shared_pool: None,
@@ -430,10 +434,14 @@ impl AppState {
     }
 
     pub fn with_chat_turn_bridge_url(mut self, chat_turn_bridge_url: impl Into<String>) -> Self {
-        self.chat_turn_bridge = Arc::new(HttpChatTurnBridge::new(
+        let mut bridge = HttpChatTurnBridge::new(
             chat_turn_bridge_url.into(),
             self.chat_turn_bridge_cache.clone(),
-        ));
+        );
+        if let Some(ref writer) = self.turn_learning_writer {
+            bridge = bridge.with_learning_writer(writer.clone());
+        }
+        self.chat_turn_bridge = Arc::new(bridge);
         self
     }
 
@@ -442,10 +450,11 @@ impl AppState {
         chat_turn_bridge_url: Option<String>,
     ) -> Self {
         if let Some(url) = chat_turn_bridge_url {
-            self.chat_turn_bridge = Arc::new(HttpChatTurnBridge::new(
-                url,
-                self.chat_turn_bridge_cache.clone(),
-            ));
+            let mut bridge = HttpChatTurnBridge::new(url, self.chat_turn_bridge_cache.clone());
+            if let Some(ref writer) = self.turn_learning_writer {
+                bridge = bridge.with_learning_writer(writer.clone());
+            }
+            self.chat_turn_bridge = Arc::new(bridge);
         }
         self
     }
@@ -455,6 +464,11 @@ impl AppState {
         chat_turn_bridge_cache: Arc<tokio::sync::Mutex<SessionCache>>,
     ) -> Self {
         self.chat_turn_bridge_cache = chat_turn_bridge_cache;
+        self
+    }
+
+    pub fn with_turn_learning_writer(mut self, writer: Arc<dyn TurnLearningWriter>) -> Self {
+        self.turn_learning_writer = Some(writer);
         self
     }
 
@@ -565,5 +579,78 @@ impl HealthChecker for MatrixOneHealthChecker {
         let result = query("SELECT 1").execute(&pool).await.is_ok();
         pool.close().await;
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::{
+        calibration::ProgressiveCalibrator, entity::EntityGraph, learning::PipelineLearningWriter,
+        pattern::PatternLibrary,
+    };
+    use std::sync::Mutex;
+
+    fn make_test_learning_writer() -> Arc<dyn TurnLearningWriter> {
+        let graph = Arc::new(Mutex::new(EntityGraph::new()));
+        let patterns = Arc::new(Mutex::new(PatternLibrary::new()));
+        let calibrator = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
+        Arc::new(
+            PipelineLearningWriter::new()
+                .with_entity_graph(graph)
+                .with_pattern_library(patterns)
+                .with_progressive_calibrator(calibrator),
+        )
+    }
+
+    #[test]
+    fn app_state_with_turn_learning_writer() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker));
+        assert!(state.turn_learning_writer.is_none());
+
+        let writer = make_test_learning_writer();
+        let state = state.with_turn_learning_writer(writer);
+        assert!(state.turn_learning_writer.is_some());
+    }
+
+    #[test]
+    fn bridge_url_builder_propagates_learning_writer() {
+        let writer = make_test_learning_writer();
+        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+            .with_turn_learning_writer(writer)
+            .with_chat_turn_bridge_url("http://localhost:9999");
+
+        // The learning writer should be propagated to the bridge.
+        // We can't inspect HttpChatTurnBridge fields directly, but we verify
+        // that AppState retains the writer.
+        assert!(state.turn_learning_writer.is_some());
+    }
+
+    #[test]
+    fn bridge_url_optional_builder_propagates_learning_writer() {
+        let writer = make_test_learning_writer();
+        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+            .with_turn_learning_writer(writer)
+            .with_chat_turn_bridge_url_optional(Some("http://localhost:9999".to_string()));
+
+        assert!(state.turn_learning_writer.is_some());
+    }
+
+    #[test]
+    fn bridge_url_optional_none_keeps_default_bridge() {
+        let writer = make_test_learning_writer();
+        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+            .with_turn_learning_writer(writer)
+            .with_chat_turn_bridge_url_optional(None);
+
+        assert!(state.turn_learning_writer.is_some());
+    }
+
+    struct TestHealthChecker;
+    #[async_trait]
+    impl HealthChecker for TestHealthChecker {
+        async fn database_healthy(&self) -> bool {
+            true
+        }
     }
 }

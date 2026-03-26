@@ -7,13 +7,13 @@ Current Rust CLI reference for `mo-agent` and `mo-admin`.
 For day-to-day development builds:
 
 ```bash
-make cli-build
+make build-cli
 ```
 
 For optimized release binaries:
 
 ```bash
-make cli-build-release
+make build-cli-release
 ```
 
 Direct `cargo` equivalents:

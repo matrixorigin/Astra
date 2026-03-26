@@ -4,7 +4,7 @@ Rust-first agent platform for auditable chat runs, session history, replay, skil
 
 ## Highlights
 
-- Rust API surface in `rust/crates/api-shell`
+- Rust API surface in `rust/crates/runtime`
 - Auth, sessions, chat runs, replay, admin, models, skills, and workflow endpoints
 - SSE/chat-turn bridge plumbing with persisted turn events and side effects
 - MatrixOne + Redis integration for durable state and caching
@@ -32,7 +32,7 @@ make dev-start
 make dev-status
 ```
 
-Open `http://localhost:8000/docs` after startup.
+Open `http://localhost:8000/` after startup to verify the server is running.
 
 > Repo development does **not** require creating a Python virtual environment.
 > The only remaining Python requirement is `scripts/install.sh`, which is a published CLI installer path rather than the repo's development workflow.
@@ -61,8 +61,10 @@ make dev-status
 make test
 
 # API-shell integration contract suite
-make test-integration
-make test-api
+make test-contract
+
+# Specific contract tests (http/admin/auth/config)
+make test-contract
 
 # Static checks
 make check
@@ -74,7 +76,7 @@ make type-check
 cargo test --manifest-path rust/Cargo.toml -q
 ```
 
-The Rust contract tests live under `rust/crates/api-shell/tests/`.
+The Rust contract tests live under `rust/crates/runtime/tests/`.
 
 ## CLI Examples
 
@@ -100,7 +102,7 @@ mo-admin audit --limit 20
 
 ```text
 mo-dev-agent/
-├── rust/crates/api-shell/    # Rust HTTP/API crate and contract tests
+├── rust/crates/runtime/      # Rust HTTP/API crate and contract tests
 ├── deployment/               # Docker and deployment assets
 ├── scripts/                  # Dev, setup, install, and ops scripts
 ├── skills/                   # Skill definitions and examples

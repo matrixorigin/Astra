@@ -25,15 +25,59 @@ fn copy_to_clipboard(text: &str) -> bool {
 
 pub(super) async fn handle_info_command(
     cmd: &str,
+    arg: &str,
     client: &reqwest::Client,
     base: &str,
-    state: &ReplState,
+    state: &mut ReplState,
     token: Option<&str>,
 ) -> Result<(), String> {
     match cmd {
         "/history" => {
             if state.history.is_empty() {
                 eprintln!("{}", "  No history yet".dim());
+            } else if arg.starts_with("search ") || arg.starts_with("grep ") {
+                // /history search <query>
+                let query = arg
+                    .split_once(' ')
+                    .map(|x| x.1)
+                    .unwrap_or("")
+                    .to_lowercase();
+                if query.is_empty() {
+                    eprintln!("{}", "  Usage: /history search <query>".yellow());
+                    return Ok(());
+                }
+                let mut found = 0;
+                for (i, (user, asst)) in state.history.iter().enumerate() {
+                    let turn_n = i + 1;
+                    let matches_user = user.to_lowercase().contains(&query);
+                    let matches_asst = asst.to_lowercase().contains(&query);
+                    if matches_user || matches_asst {
+                        found += 1;
+                        eprintln!("  {}", format!("Turn {turn_n}").bold());
+                        if matches_user {
+                            let u = if user.len() > 120 {
+                                format!("{}…", &user[..120])
+                            } else {
+                                user.clone()
+                            };
+                            eprintln!("  {} {}", "❯".cyan(), u);
+                        }
+                        if matches_asst {
+                            let a = if asst.len() > 120 {
+                                format!("{}…", &asst[..120])
+                            } else {
+                                asst.clone()
+                            };
+                            eprintln!("    {}", a.dim());
+                        }
+                        eprintln!();
+                    }
+                }
+                if found == 0 {
+                    eprintln!("{}", format!("  No matches for '{query}'").dim());
+                } else {
+                    eprintln!("{}", format!("  {found} turn(s) matched").dim());
+                }
             } else {
                 eprintln!(
                     "\n{}",
@@ -160,7 +204,7 @@ pub(super) async fn handle_info_command(
                 .is_ok();
             if memoria_key_set {
                 let memoria_base = std::env::var("MEMORIA_BASE_URL")
-                    .unwrap_or_else(|_| "http://localhost:8100".to_string());
+                    .unwrap_or_else(|_| mo_agent_core::config::DEFAULT_MEMORIA_URL.to_string());
                 match client.get(format!("{memoria_base}/health")).send().await {
                     Ok(r) if r.status().is_success() => {
                         rows.push((true, "memoria", format!("reachable at {memoria_base}")));
@@ -296,6 +340,98 @@ pub(super) async fn handle_info_command(
         "/version" => {
             eprintln!("{}", "  mo-agent version 0.1.0 (Rust)".bold());
         }
+
+        "/rewind" => {
+            if arg.is_empty() {
+                // Show available turns
+                if state.history.is_empty() {
+                    eprintln!("{}", "  No history to rewind".dim());
+                } else {
+                    eprintln!("{}", "  Usage: /rewind <turn_number>".yellow());
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "  Current: turn {} ({} exchanges)",
+                            state.turn,
+                            state.history.len()
+                        )
+                        .dim()
+                    );
+                    for (i, (user, _)) in state.history.iter().enumerate() {
+                        let turn_n = i + 1;
+                        let u = if user.len() > 60 {
+                            format!("{}…", &user[..60])
+                        } else {
+                            user.clone()
+                        };
+                        eprintln!(
+                            "  {} {} {}",
+                            format!("{turn_n}").bold(),
+                            "❯".cyan(),
+                            u.dim()
+                        );
+                    }
+                }
+            } else {
+                let target: usize = match arg.parse() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        eprintln!(
+                            "{}",
+                            "  Usage: /rewind <turn_number> (e.g. /rewind 3)".yellow()
+                        );
+                        return Ok(());
+                    }
+                };
+                if target == 0 {
+                    // Rewind to start = clear history
+                    let old_len = state.history.len();
+                    state.history.clear();
+                    state.turn = 0;
+                    state.last_response = None;
+                    if let Some(ref j) = state.journal {
+                        let _ = j.append(&session_journal::JournalEvent::config_change(
+                            state.session_id.as_deref(),
+                            "rewind",
+                            &format!("rewound to start, removed {old_len} turn(s)"),
+                        ));
+                    }
+                    eprintln!(
+                        "{}",
+                        format!("  ✓ Rewound to start. Removed {old_len} turn(s).").green()
+                    );
+                } else if target > state.history.len() {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "  ✗ Turn {target} does not exist (max: {})",
+                            state.history.len()
+                        )
+                        .yellow()
+                    );
+                } else {
+                    let old_len = state.history.len();
+                    let removed = old_len - target;
+                    state.history.truncate(target);
+                    state.turn = target as u32;
+                    state.last_response = state.history.last().map(|(_, a)| a.clone());
+                    if let Some(ref j) = state.journal {
+                        let _ = j.append(&session_journal::JournalEvent::config_change(
+                            state.session_id.as_deref(),
+                            "rewind",
+                            &format!(
+                                "rewound from turn {old_len} to {target}, removed {removed} turn(s)"
+                            ),
+                        ));
+                    }
+                    eprintln!(
+                        "{}",
+                        format!("  ✓ Rewound to turn {target}. Removed {removed} turn(s).").green()
+                    );
+                }
+            }
+        }
+
         _ => unreachable!("unexpected info command: {cmd}"),
     }
 

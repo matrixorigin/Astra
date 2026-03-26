@@ -13,18 +13,8 @@
   },
   "signature_multiple_tools": {
     "tool_calls": [
-      {
-        "function": {
-          "name": "read_file",
-          "arguments": "{\"path\":\"a.py\"}"
-        }
-      },
-      {
-        "function": {
-          "name": "bash",
-          "arguments": "{\"cwd\":\"/tmp\",\"cmd\":\"ls\"}"
-        }
-      }
+      { "function": { "name": "read_file", "arguments": "{\"path\":\"a.py\"}" } },
+      { "function": { "name": "bash", "arguments": "{\"cwd\":\"/tmp\",\"cmd\":\"ls\"}" } }
     ],
     "expected": [
       "bash:{\"cmd\":\"ls\",\"cwd\":\"/tmp\"}",
@@ -33,56 +23,23 @@
   },
   "record_trim_window": {
     "rounds": [
-      [
-        {
-          "function": {
-            "name": "tool_one",
-            "arguments": "{\"x\":1}"
-          }
-        }
-      ],
-      [
-        {
-          "function": {
-            "name": "tool_two",
-            "arguments": "{\"x\":2}"
-          }
-        }
-      ],
-      [
-        {
-          "function": {
-            "name": "tool_three",
-            "arguments": "{\"x\":3}"
-          }
-        }
-      ],
-      [
-        {
-          "function": {
-            "name": "tool_four",
-            "arguments": "{\"x\":4}"
-          }
-        }
-      ]
+      [{ "function": { "name": "tool_one", "arguments": "{\"x\":1}" } }],
+      [{ "function": { "name": "tool_two", "arguments": "{\"x\":2}" } }],
+      [{ "function": { "name": "tool_three", "arguments": "{\"x\":3}" } }],
+      [{ "function": { "name": "tool_four", "arguments": "{\"x\":4}" } }]
     ],
     "expected": [
-      ["tool_two:{\"x\":2}"],
       ["tool_three:{\"x\":3}"],
       ["tool_four:{\"x\":4}"]
     ]
   },
   "record_empty_clears": {
-    "initial": [
-      ["tool_one:{\"x\":1}"],
-      ["tool_one:{\"x\":1}"]
-    ],
+    "initial": [["tool_one:{\"x\":1}"], ["tool_one:{\"x\":1}"]],
     "tool_calls": [],
     "expected": []
   },
   "detect_true": {
     "tool_sigs": [
-      ["read_file:{\"path\":\"a.py\"}"],
       ["read_file:{\"path\":\"a.py\"}"],
       ["read_file:{\"path\":\"a.py\"}"]
     ],
@@ -90,7 +47,6 @@
   },
   "detect_false_below_window": {
     "tool_sigs": [
-      ["read_file:{\"path\":\"a.py\"}"],
       ["read_file:{\"path\":\"a.py\"}"]
     ],
     "expected": false
@@ -98,8 +54,7 @@
   "detect_false_mixed": {
     "tool_sigs": [
       ["read_file:{\"path\":\"a.py\"}"],
-      ["read_file:{\"path\":\"b.py\"}"],
-      ["read_file:{\"path\":\"a.py\"}"]
+      ["read_file:{\"path\":\"b.py\"}"]
     ],
     "expected": false
   }

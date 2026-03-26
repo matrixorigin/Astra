@@ -30,6 +30,8 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route("/chat/stream", post(chat_handlers::chat_stream_handler))
         .route("/chat/turn", post(chat_handlers::chat_turn_handler))
         .route("/chat/route", post(chat_handlers::chat_route_handler))
+        // WebSocket endpoint for browser-based agent access
+        .route("/chat/ws", get(ws_handler::ws_chat_handler))
         .route(
             "/chat/runs/{run_id}",
             get(run_handlers::get_run_status_handler).delete(run_handlers::cancel_run_handler),
@@ -420,4 +422,95 @@ pub(super) fn build_router(state: AppState) -> Router {
             get(introspection::get_memory_recall_handler),
         )
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    /// Regression guard: catch accidental route removal.
+    /// The file currently has 116 `.route(` calls plus 1 in this test = 117 via include_str.
+    #[test]
+    fn route_count_regression() {
+        let source = include_str!("router_builder.rs");
+        let route_count = source.matches(".route(").count();
+        assert!(
+            route_count >= 100,
+            "Expected at least 100 .route( calls, found {route_count}. Was a route accidentally removed?"
+        );
+    }
+
+    #[test]
+    fn critical_route_paths_exist() {
+        let source = include_str!("router_builder.rs");
+        let critical_paths = [
+            "/health",
+            "/auth/register",
+            "/auth/login",
+            "/auth/refresh",
+            "/auth/me",
+            "/chat",
+            "/chat/stream",
+            "/chat/turn",
+            "/chat/route",
+            "/chat/ws",
+            "/sessions",
+            "/admin/init",
+            "/skills",
+            "/evaluation/drift",
+        ];
+        for path in &critical_paths {
+            assert!(
+                source.contains(path),
+                "Critical route {path} missing from router"
+            );
+        }
+    }
+
+    #[test]
+    fn all_api_groups_have_routes() {
+        let source = include_str!("router_builder.rs");
+        let groups: &[(&str, &str)] = &[
+            ("auth", "/auth/"),
+            ("chat", "/chat"),
+            ("sessions", "/sessions"),
+            ("admin", "/admin/"),
+            ("learning", "/api/v1/learning/"),
+            ("agents", "/agents"),
+            ("events", "/events"),
+            ("skills", "/skills"),
+            ("evaluation", "/evaluation/"),
+            ("introspection", "/introspection/"),
+            ("branches", "/branches"),
+            ("marketplace", "/marketplace/"),
+            ("sandbox", "/sandbox"),
+            ("workflows", "/workflows"),
+        ];
+        for (group, prefix) in groups {
+            assert!(
+                source.contains(prefix),
+                "API group '{group}' (prefix: {prefix}) missing from router"
+            );
+        }
+    }
+
+    #[test]
+    fn all_handler_modules_referenced() {
+        let source = include_str!("router_builder.rs");
+        let modules = [
+            "meta_handlers::",
+            "auth_handlers::",
+            "chat_handlers::",
+            "session_handlers::",
+            "admin_handlers::",
+            "learning_handlers::",
+            "run_handlers::",
+            "ws_handler::",
+            "reflect_handlers::",
+        ];
+        for module in &modules {
+            assert!(
+                source.contains(module),
+                "Handler module {module} not referenced in router"
+            );
+        }
+    }
 }

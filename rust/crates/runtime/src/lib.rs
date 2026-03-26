@@ -39,9 +39,12 @@ pub mod marketplace;
 pub(crate) mod models;
 pub mod replay;
 pub mod sandbox;
+pub mod semantic_dedup;
 pub mod skill_config;
 pub mod skills;
 pub mod streaming;
+pub mod text_tokenize;
+pub mod tool_sandbox;
 pub mod triggers;
 pub(crate) mod workflows;
 
@@ -61,6 +64,7 @@ mod app_state;
 pub mod bridge;
 pub mod evaluation;
 pub mod introspection;
+pub mod pipeline;
 pub mod prompts;
 pub mod server;
 pub mod tool_registry;
@@ -179,10 +183,11 @@ pub(crate) use turn::contracts::TurnReflectionLessonRequest;
 pub use turn::contracts::{
     TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnCoreEventRecord, TurnCoreEventWriter,
     TurnCorePersistOutcome, TurnCorePersistPlan, TurnDecisionAuditRecord, TurnHookDbPersistPlan,
-    TurnHookDbWriter, TurnImplicitFeedbackRecord, TurnObserverRequest, TurnObserverWorker,
-    TurnReflectionLessonRecord, TurnReflectionLessonWriter, TurnReflectionMark,
-    TurnReflectionStateStore, TurnSessionActivityWriter, TurnSkillSelectionRecord,
-    TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
+    TurnHookDbWriter, TurnImplicitFeedbackRecord, TurnLearningOutcome, TurnLearningWriter,
+    TurnObserverRequest, TurnObserverWorker, TurnReflectionLessonRecord,
+    TurnReflectionLessonWriter, TurnReflectionMark, TurnReflectionStateStore,
+    TurnSessionActivityWriter, TurnSkillSelectionRecord, TurnToolEventPersistPlan,
+    TurnToolEventRecord, TurnToolEventWriter,
 };
 
 pub use turn::services::{
@@ -194,7 +199,7 @@ pub use turn::{
     activity::{SessionActivityUpdatePlan, build_session_activity_update_plan},
     cache::SessionCache,
     cloud::{
-        compaction::compact_cloud_loop_messages,
+        compaction::{compact_cloud_loop_messages, compact_tiered},
         history::compact_cloud_loop_history,
         iteration::{CloudLoopIterationPlan, plan_cloud_loop_iteration},
         prefilter::{CloudSkillCandidatePlan, plan_cloud_skill_candidates},
@@ -222,7 +227,9 @@ pub use turn::{
     quality::build_tool_result_quality_event_payload,
     refresh::{extract_first_user_query, plan_memory_refresh},
     response_guard::{is_prompt_leaked, is_repetition_loop},
-    retrieval::{RETRIEVAL_BUDGET_CHARS, format_retrieved_events, rule_based_extraction},
+    retrieval::{
+        RETRIEVAL_BUDGET_CHARS, enhanced_extraction, format_retrieved_events, rule_based_extraction,
+    },
     routing::{
         MAX_TOOL_ROUNDS, build_routing_metadata, build_skipped_routing_metadata, detect_correction,
     },
@@ -230,8 +237,9 @@ pub use turn::{
     session_cache::apply_turn_to_session_entry,
     snapshot::{build_session_history_snapshot, should_persist_session_history_snapshot},
     stall::{
-        SERVER_STALL_WINDOW, canonical_tool_args, detect_server_stall,
-        record_server_tool_signatures, server_tool_call_signature,
+        DIVERGENCE_CORRECTION, DivergenceStatus, SERVER_STALL_WINDOW, canonical_tool_args,
+        detect_divergence, detect_server_stall, record_server_tool_signatures,
+        server_tool_call_signature,
     },
     state::{new_session_entry, normalize_bridge_cache_entry, resolve_turn_identifiers},
     stream_events::{

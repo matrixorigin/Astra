@@ -30,5 +30,4 @@ pub fn to_memory_type(ns: &str) -> &'static str {
 }
 
 /// All known namespaces.
-#[allow(dead_code)]
 pub const ALL: &[&str] = &[PREFERENCE, KNOWLEDGE, STAGING, PLAN, TASK, EPISODIC];
