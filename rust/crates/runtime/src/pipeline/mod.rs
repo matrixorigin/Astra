@@ -21,7 +21,9 @@ pub mod persistence;
 pub mod routing;
 pub mod stages;
 pub mod state;
+pub mod step_protocol;
 
 pub use engine::*;
 pub use event::*;
 pub use state::*;
+pub use step_protocol::*;
