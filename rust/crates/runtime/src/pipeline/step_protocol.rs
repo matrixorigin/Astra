@@ -1815,7 +1815,7 @@ mod tests {
     #[test]
     fn checkpoint_wrong_version_rejected() {
         let cursor = ExecutionCursor::for_act(1);
-        let mut cp = match StepCheckpoint::new("s1".into(), "t1".into(), "a1".into(), cursor) {
+        let cp = match StepCheckpoint::new("s1".into(), "t1".into(), "a1".into(), cursor) {
             StepCheckpoint::Heavy(mut h) => {
                 h.light.protocol_version = 999;
                 StepCheckpoint::Heavy(h)

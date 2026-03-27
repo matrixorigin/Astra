@@ -19,11 +19,13 @@ pub mod learning;
 pub mod pattern;
 pub mod persistence;
 pub mod routing;
+pub mod scheduling;
 pub mod stages;
 pub mod state;
 pub mod step_protocol;
 
 pub use engine::*;
 pub use event::*;
+pub use scheduling::*;
 pub use state::*;
 pub use step_protocol::*;
