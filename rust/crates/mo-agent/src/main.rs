@@ -489,12 +489,35 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             state.total_completion_tokens = restored.total_tokens_out;
             state.recent_tools = restored.recent_tools;
 
-            // Merge step checkpoint data if available
-            if let Ok(Some(heavy)) =
+            // Merge step checkpoint data if available (with version validation)
+            if let Ok(Some(step_restored)) =
+                mo_agent_runtime::pipeline::step_restore::restore_session(&restored.session_id)
+            {
+                let summary =
+                    mo_agent_runtime::pipeline::step_restore::restore_summary(&step_restored);
+                // Merge blocked tools from checkpoint into health entries
+                for tool in &step_restored.blocked_tools {
+                    if !state.tool_health_entries.iter().any(|e| e.name == *tool) {
+                        state.tool_health_entries.push(
+                            mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
+                                name: tool.clone(),
+                                total_calls: 3,
+                                total_failures: 3,
+                                failure_rate: 1.0,
+                            },
+                        );
+                    }
+                }
+                if state.recent_tools.is_empty() {
+                    state.recent_tools = step_restored.recent_tools;
+                }
+                eprintln!("  {} {}", "↻".cyan(), summary.dim());
+            } else if let Ok(Some(heavy)) =
                 mo_agent_runtime::pipeline::step_checkpoint::read_latest_heavy_checkpoint(
                     &restored.session_id,
                 )
             {
+                // Fallback to raw checkpoint if step_restore fails (e.g., version mismatch)
                 if state.recent_tools.is_empty() {
                     state.recent_tools = heavy.recent_tools;
                 }

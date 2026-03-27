@@ -1289,7 +1289,13 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     None
                 },
             });
-            step_recorder.complete_tool(&name, is_err, tool_elapsed.as_millis() as u64, false);
+            step_recorder.complete_tool_with_result(
+                &name,
+                is_err,
+                tool_elapsed.as_millis() as u64,
+                false,
+                &result_str,
+            );
 
             // Light checkpoint after each tool completion (best-effort, non-blocking)
             if let Some(ref sid) = current_session_id {
