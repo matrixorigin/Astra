@@ -1622,7 +1622,7 @@ async fn run_chat_repl(
     );
 
     // Load cross-session learning state (entity graph, patterns, calibration, tool health)
-    let mut cross_session_health_entries = Vec::new();
+    let mut cross_session_health_entries;
     {
         let profile_name = profile.unwrap_or("default");
         let loaded = mo_agent_runtime::pipeline::persistence::load_learning_state(

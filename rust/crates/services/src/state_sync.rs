@@ -184,13 +184,6 @@ impl MatrixOneSyncService {
         Self { pool }
     }
 
-    /// Create from a SharedPool (production wiring).
-    pub fn from_shared(shared: &mo_agent_core::SharedPool) -> Self {
-        Self {
-            pool: shared.get().clone(),
-        }
-    }
-
     /// Log a sync operation to the audit table.
     #[allow(clippy::too_many_arguments)]
     async fn log_sync(
@@ -458,121 +451,6 @@ impl StateSyncService for MatrixOneSyncService {
     }
 }
 
-// ─── Sync Orchestrator ──────────────────────────────────────────────────────
-
-/// Orchestrates local-first sync with cloud backup.
-///
-/// Workflow:
-/// 1. On session end: save locally, then async push to cloud
-/// 2. On session start: load locally, then pull from cloud + merge
-/// 3. On preference change: write locally + push to cloud
-pub struct SyncOrchestrator {
-    sync_service: Box<dyn StateSyncService>,
-    user_id: String,
-    profile: String,
-}
-
-impl SyncOrchestrator {
-    pub fn new(
-        sync_service: Box<dyn StateSyncService>,
-        user_id: impl Into<String>,
-        profile: impl Into<String>,
-    ) -> Self {
-        Self {
-            sync_service,
-            user_id: user_id.into(),
-            profile: profile.into(),
-        }
-    }
-
-    /// Save learning state locally then push to cloud.
-    pub async fn save_and_push(
-        &self,
-        snapshot_json: &str,
-        entity_count: u32,
-        pattern_count: u32,
-        has_calibration: bool,
-    ) -> SyncResult {
-        // Local save is handled by caller (persistence.rs)
-        // We only handle the cloud push
-        self.sync_service
-            .push_learning(
-                &self.user_id,
-                &self.profile,
-                snapshot_json,
-                entity_count,
-                pattern_count,
-                has_calibration,
-            )
-            .await
-    }
-
-    /// Pull from cloud and return JSON for merge.
-    pub async fn pull_for_merge(&self) -> Result<Option<String>, String> {
-        self.sync_service
-            .pull_learning(&self.user_id, &self.profile)
-            .await
-    }
-
-    /// Full sync cycle: pull from cloud → merge with local → push back.
-    pub async fn full_sync(
-        &self,
-        local_snapshot_json: &str,
-        entity_count: u32,
-        pattern_count: u32,
-        has_calibration: bool,
-    ) -> Vec<SyncResult> {
-        let mut results = Vec::new();
-
-        // Pull from cloud
-        match self.pull_for_merge().await {
-            Ok(Some(_cloud_json)) => {
-                results.push(SyncResult::ok(SyncDirection::Pull, "learning", 1));
-                // Caller should merge cloud_json into local state
-            }
-            Ok(None) => {
-                results.push(SyncResult::ok(SyncDirection::Pull, "learning", 0));
-            }
-            Err(e) => {
-                results.push(SyncResult::err(SyncDirection::Pull, "learning", e));
-            }
-        }
-
-        // Push local to cloud
-        let push_result = self
-            .save_and_push(
-                local_snapshot_json,
-                entity_count,
-                pattern_count,
-                has_calibration,
-            )
-            .await;
-        results.push(push_result);
-
-        results
-    }
-
-    /// Save a user preference with cloud sync.
-    pub async fn set_preference(&self, key: &str, value: &str) -> SyncResult {
-        self.sync_service
-            .push_preference(&self.user_id, key, value)
-            .await
-    }
-
-    /// Get a user preference (cloud-first, local fallback).
-    pub async fn get_preference(&self, key: &str) -> Result<Option<String>, String> {
-        self.sync_service.pull_preference(&self.user_id, key).await
-    }
-
-    pub fn user_id(&self) -> &str {
-        &self.user_id
-    }
-
-    pub fn profile(&self) -> &str {
-        &self.profile
-    }
-}
-
 // ─── Preference Constants ───────────────────────────────────────────────────
 
 /// Well-known preference keys.
@@ -660,34 +538,6 @@ mod tests {
         assert!(push.success);
         let pull = svc.pull_preference("user1", "key").await;
         assert!(pull.unwrap().is_none());
-    }
-
-    // ── SyncOrchestrator ──
-
-    #[tokio::test]
-    async fn orchestrator_full_sync_cycle() {
-        let orch = SyncOrchestrator::new(Box::new(LocalOnlySyncService), "user1", "default");
-        let results = orch.full_sync("{}", 0, 0, false).await;
-        assert_eq!(results.len(), 2); // pull + push
-        assert!(results.iter().all(|r| r.success));
-    }
-
-    #[tokio::test]
-    async fn orchestrator_save_and_push() {
-        let orch = SyncOrchestrator::new(Box::new(LocalOnlySyncService), "user1", "profile1");
-        let result = orch.save_and_push("{\"entities\":[]}", 0, 0, false).await;
-        assert!(result.success);
-    }
-
-    #[tokio::test]
-    async fn orchestrator_preference_roundtrip() {
-        let orch = SyncOrchestrator::new(Box::new(LocalOnlySyncService), "user1", "default");
-        let set_result = orch.set_preference("model", "gpt-4").await;
-        assert!(set_result.success);
-
-        // LocalOnly returns None (no cloud storage)
-        let get_result = orch.get_preference("model").await;
-        assert!(get_result.unwrap().is_none());
     }
 
     // ── File-based preferences ──
@@ -916,41 +766,5 @@ mod tests {
         assert!(status.last_error.is_none());
         assert_eq!(status.pending_pushes, 0);
         assert!(status.learning_last_push.is_none());
-    }
-
-    #[tokio::test]
-    async fn orchestrator_full_sync_returns_both_directions() {
-        let orch = SyncOrchestrator::new(Box::new(LocalOnlySyncService), "user1", "default");
-
-        let results = orch.full_sync("{}", 0, 0, false).await;
-
-        // Should return pull + push results
-        assert_eq!(results.len(), 2);
-
-        // Both should succeed (LocalOnly)
-        assert!(results.iter().all(|r| r.success));
-    }
-
-    #[tokio::test]
-    async fn orchestrator_save_and_push_with_actual_data() {
-        let orch = SyncOrchestrator::new(Box::new(LocalOnlySyncService), "user1", "profile1");
-
-        let json = r#"{"entities":[{"name":"project_x","observations":10}]}"#;
-        let result = orch.save_and_push(json, 1, 1, true).await;
-
-        assert!(result.success);
-    }
-
-    #[tokio::test]
-    async fn orchestrator_preference_operations() {
-        let orch = SyncOrchestrator::new(Box::new(LocalOnlySyncService), "user1", "default");
-
-        // Set preference
-        let set_result = orch.set_preference("language", "zh-CN").await;
-        assert!(set_result.success);
-
-        // Get returns none (LocalOnly)
-        let get_result = orch.get_preference("language").await;
-        assert!(get_result.unwrap().is_none());
     }
 }
