@@ -202,10 +202,45 @@ impl TurnGuard {
             severity = severity.max(VerdictSeverity::Warning);
         }
 
+        // 4a. Timeout-dominant tool guidance
+        // When most failures are timeouts, give softer guidance (infrastructure issue).
+        let timeout_dominant = self.health.timeout_dominant_tools();
+        if !timeout_dominant.is_empty() {
+            injections.push(format!(
+                "⏱ Tools [{}] are timing out (infrastructure issue, not a bug). \
+                 Consider: (1) trying a simpler/faster alternative, \
+                 (2) breaking large operations into smaller ones, \
+                 (3) retrying later if the issue is transient.",
+                timeout_dominant.join(", ")
+            ));
+            // Don't add to avoid_tools — timeouts are transient, tool might recover
+        }
+
+        // 4b. Cache duplication warning
+        // When the LLM keeps making identical tool calls, flag token waste.
+        let cache_wasteful = self.health.cache_wasteful_tools(3);
+        if !cache_wasteful.is_empty() {
+            let tool_list: Vec<String> = cache_wasteful
+                .iter()
+                .map(|(name, count)| format!("{name} ({count}x)"))
+                .collect();
+            injections.push(format!(
+                "♻ Duplicate calls detected: [{}]. \
+                 You've made identical calls that were served from cache. \
+                 Reuse the earlier results instead of calling again.",
+                tool_list.join(", ")
+            ));
+            severity = severity.max(VerdictSeverity::Warning);
+        }
+
         // 5. Escalation
+        // Discount timeout-only errors: they're infrastructure issues, not agent failures.
+        // Use non-timeout errors for escalation to avoid false critical escalation.
+        let total_timeouts = self.health.total_timeouts();
+        let non_timeout_errors = self.errors.total_errors.saturating_sub(total_timeouts);
         let escalation = error_recovery::escalation_level(
             self.nudge_count,
-            self.errors.total_errors,
+            non_timeout_errors,
             self.health.deprioritized_tools().len(),
         );
         if let Some(msg) = error_recovery::build_escalation_message(

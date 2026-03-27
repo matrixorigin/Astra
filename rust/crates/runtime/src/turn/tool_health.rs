@@ -226,6 +226,38 @@ impl ToolHealthTracker {
             total_errors,
         }
     }
+
+    /// Tools where majority of failures are timeouts (>= 70%).
+    /// These should get softer deprioritization messaging (infrastructure issue, not tool bug).
+    pub fn timeout_dominant_tools(&self) -> Vec<&str> {
+        self.tools
+            .iter()
+            .filter(|(_, h)| {
+                h.deprioritized && h.total_failures > 0 && h.timeout_count as f64 / h.total_failures as f64 >= 0.7
+            })
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    /// Tools with repeated identical calls served from cache (>= threshold).
+    /// This indicates the LLM is making wasteful duplicate calls.
+    pub fn cache_wasteful_tools(&self, threshold: usize) -> Vec<(&str, usize)> {
+        self.tools
+            .iter()
+            .filter(|(_, h)| h.cache_hit_count >= threshold)
+            .map(|(name, h)| (name.as_str(), h.cache_hit_count))
+            .collect()
+    }
+
+    /// Total timeout count across all tools.
+    pub fn total_timeouts(&self) -> usize {
+        self.tools.values().map(|h| h.timeout_count).sum()
+    }
+
+    /// Total cache hits across all tools.
+    pub fn total_cache_hits(&self) -> usize {
+        self.tools.values().map(|h| h.cache_hit_count).sum()
+    }
 }
 
 /// Summary of tool health for diagnostics and logging.

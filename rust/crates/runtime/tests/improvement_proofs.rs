@@ -6498,4 +6498,110 @@ mod turnguard_step_integration_proofs {
         let gh = guard.health.get("grep").unwrap();
         assert_eq!(gh.timeout_count, 1);
     }
+
+    // --- evaluate() verdict integration ---
+
+    #[test]
+    fn timeout_dominant_tool_gets_infrastructure_guidance() {
+        use mo_agent_runtime::turn::turn_guard::VerdictSeverity;
+        let mut guard = TurnGuard::new();
+        // 3 timeouts → deprioritized, all failures are timeouts (100% timeout-dominant)
+        guard.record_tool_timeout("bash");
+        guard.record_tool_timeout("bash");
+        guard.record_tool_timeout("bash");
+
+        let verdict = guard.evaluate();
+        let has_timeout_guidance = verdict.injections.iter().any(|msg| msg.contains("timing out"));
+        assert!(has_timeout_guidance, "Should inject infrastructure timeout guidance");
+        // Should NOT be in avoid_tools (timeouts are transient)
+        assert!(
+            !verdict.avoid_tools.contains(&"bash".to_string())
+                || verdict.injections.iter().any(|msg| msg.contains("timing out")),
+            "Timeout-dominant tools get guidance, not permanent avoidance"
+        );
+    }
+
+    #[test]
+    fn cache_duplication_triggers_warning_at_threshold() {
+        use mo_agent_runtime::turn::turn_guard::VerdictSeverity;
+        let mut guard = TurnGuard::new();
+        // 3 cache hits on the same tool → wasteful
+        guard.record_cache_hit("read_file");
+        guard.record_cache_hit("read_file");
+        guard.record_cache_hit("read_file");
+
+        let verdict = guard.evaluate();
+        let has_cache_warning = verdict.injections.iter().any(|msg| msg.contains("Duplicate calls"));
+        assert!(has_cache_warning, "3+ cache hits should trigger duplication warning");
+        assert!(verdict.severity >= VerdictSeverity::Warning);
+    }
+
+    #[test]
+    fn cache_below_threshold_no_warning() {
+        let mut guard = TurnGuard::new();
+        guard.record_cache_hit("read_file");
+        guard.record_cache_hit("read_file");
+
+        let verdict = guard.evaluate();
+        let has_cache_warning = verdict.injections.iter().any(|msg| msg.contains("Duplicate calls"));
+        assert!(!has_cache_warning, "2 cache hits should not trigger warning");
+    }
+
+    #[test]
+    fn timeout_only_errors_do_not_escalate_to_critical() {
+        use mo_agent_runtime::turn::turn_guard::VerdictSeverity;
+        let mut guard = TurnGuard::new();
+        // 5 timeouts would trigger Critical if counted as regular errors (>= 5 errors)
+        for _ in 0..5 {
+            guard.record_tool_timeout("net_tool");
+        }
+
+        let verdict = guard.evaluate();
+        // Should NOT be critical because all errors are timeouts (discounted)
+        assert!(
+            verdict.severity < VerdictSeverity::Critical || !verdict.force_stop,
+            "Timeout-only errors should not escalate to Critical+force_stop"
+        );
+    }
+
+    #[test]
+    fn mixed_timeout_and_bug_errors_escalate_normally() {
+        use mo_agent_runtime::turn::turn_guard::VerdictSeverity;
+        let mut guard = TurnGuard::new();
+        // 3 real failures (not timeouts)
+        guard.record_tool_result("bash", "error: command not found");
+        guard.record_tool_result("bash", "error: permission denied");
+        guard.record_tool_result("bash", "error: file not found");
+        // Plus 2 timeouts
+        guard.record_tool_timeout("net_tool");
+        guard.record_tool_timeout("net_tool");
+
+        let verdict = guard.evaluate();
+        // non_timeout_errors = total_errors(5) - timeouts(2) = 3 → should be Warning level
+        assert!(
+            verdict.severity >= VerdictSeverity::Warning,
+            "3 real errors should trigger Warning even with timeouts discounted"
+        );
+    }
+
+    #[test]
+    fn evaluate_combines_all_new_signals() {
+        use mo_agent_runtime::turn::turn_guard::VerdictSeverity;
+        let mut guard = TurnGuard::new();
+
+        // Scenario: timeout-dominant tool + cache waste + real error
+        guard.record_tool_timeout("slow_api");
+        guard.record_tool_timeout("slow_api");
+        guard.record_tool_timeout("slow_api");
+        guard.record_cache_hit("read_file");
+        guard.record_cache_hit("read_file");
+        guard.record_cache_hit("read_file");
+        guard.record_tool_result("bash", "error: something broke");
+
+        let verdict = guard.evaluate();
+        let msgs = verdict.injections.join(" ");
+        assert!(msgs.contains("timing out"), "Should have timeout guidance");
+        assert!(msgs.contains("Duplicate calls"), "Should have cache warning");
+        assert!(verdict.severity >= VerdictSeverity::Warning);
+    }
 }
