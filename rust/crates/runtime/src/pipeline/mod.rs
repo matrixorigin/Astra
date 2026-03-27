@@ -26,6 +26,7 @@ pub mod state;
 pub mod step_checkpoint;
 pub mod step_protocol;
 pub mod step_recorder;
+pub mod step_restore;
 
 pub use engine::*;
 pub use event::*;
@@ -35,3 +36,4 @@ pub use state::*;
 pub use step_checkpoint::*;
 pub use step_protocol::*;
 pub use step_recorder::*;
+pub use step_restore::*;

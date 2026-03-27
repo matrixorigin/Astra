@@ -257,7 +257,41 @@ impl StepRecorder {
         elapsed_ms: u64,
         was_cached: bool,
     ) {
+        self.complete_tool_inner(tool_name, is_error, elapsed_ms, was_cached, None);
+    }
+
+    /// Record tool execution result with output for crash recovery cache warming.
+    /// The output is included in the event payload so that `warm_cache_from_events()`
+    /// can reconstruct the idempotency cache on session restore.
+    pub fn complete_tool_with_result(
+        &mut self,
+        tool_name: &str,
+        is_error: bool,
+        elapsed_ms: u64,
+        was_cached: bool,
+        output: &str,
+    ) {
+        self.complete_tool_inner(tool_name, is_error, elapsed_ms, was_cached, Some(output));
+    }
+
+    fn complete_tool_inner(
+        &mut self,
+        tool_name: &str,
+        is_error: bool,
+        elapsed_ms: u64,
+        was_cached: bool,
+        output: Option<&str>,
+    ) {
         let slot_idx = self.slot_counter.saturating_sub(1);
+
+        // Extract idempotency key from slot before mutation
+        let idem_key = self.current_step.as_ref().and_then(|step| {
+            step.execution
+                .cursor
+                .slots
+                .get(slot_idx as usize)
+                .and_then(|s| s.idempotency_key.clone())
+        });
 
         if let Some(ref mut step) = self.current_step {
             let state = if was_cached {
@@ -283,14 +317,20 @@ impl StepRecorder {
             StepEventType::ToolCallCompleted
         };
 
-        self.emit_with_payload(
-            event_type,
-            serde_json::json!({
-                "tool_name": tool_name,
-                "elapsed_ms": elapsed_ms,
-                "cached": was_cached,
-            }),
-        );
+        let mut payload = serde_json::json!({
+            "tool_name": tool_name,
+            "elapsed_ms": elapsed_ms,
+            "cached": was_cached,
+        });
+        if let Some(key) = &idem_key {
+            payload["idempotency_key"] = serde_json::json!(key);
+        }
+        if let Some(out) = output {
+            payload["output"] = serde_json::json!(out);
+            payload["is_error"] = serde_json::json!(is_error);
+        }
+
+        self.emit_with_payload(event_type, payload);
 
         self.tool_timings
             .entry(tool_name.to_string())

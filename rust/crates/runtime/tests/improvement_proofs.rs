@@ -5753,3 +5753,330 @@ mod token_efficiency_deep {
         );
     }
 }
+
+// ─── Step Protocol: Crash Recovery ───────────────────────────────────────────
+
+mod crash_recovery_proofs {
+    use mo_agent_runtime::pipeline::step_protocol::*;
+    use mo_agent_runtime::pipeline::step_restore::*;
+
+    // ── Version validation ──
+
+    #[test]
+    fn checkpoint_version_round_trip_preserves_data() {
+        // A heavy checkpoint with current version should pass validation
+        let heavy = HeavyCheckpoint {
+            light: LightCheckpoint {
+                protocol_version: PROTOCOL_VERSION,
+                cursor: ExecutionCursor::for_act(3),
+                step_id: "s1-turn-5".to_string(),
+                task_id: "task-1".to_string(),
+                agent_id: "agent-1".to_string(),
+                progress: 0.67,
+                total_tokens: 5000,
+                created_at: epoch_ms(),
+            },
+            messages: vec![
+                serde_json::json!({"role": "user", "content": "show me PRs"}),
+                serde_json::json!({"role": "assistant", "content": "Here are 5 PRs..."}),
+            ],
+            budget_remaining_tokens: 40000,
+            budget_remaining_rounds: 3,
+            blocked_tools: vec!["bash".to_string()],
+            recent_tools: vec!["github_list_prs".to_string(), "git_status".to_string()],
+            learning_snapshot_id: Some("snap-abc".to_string()),
+            memory_context: Some(MemoryContext {
+                retrieved_memory_ids: vec!["m1".to_string()],
+                domain_hints: vec!["GitHub".to_string()],
+                boost_terms: vec!["pr".to_string()],
+                provenance: vec!["m1".to_string()],
+                governance_actions: vec![],
+                cluster_insights: vec![],
+                snapshot_id: None,
+            }),
+        };
+
+        // Serialize → deserialize roundtrip
+        let json = serde_json::to_string(&StepCheckpoint::Heavy(Box::new(heavy.clone()))).unwrap();
+        let deserialized: StepCheckpoint = serde_json::from_str(&json).unwrap();
+
+        match deserialized {
+            StepCheckpoint::Heavy(h) => {
+                assert_eq!(h.light.protocol_version, PROTOCOL_VERSION);
+                assert_eq!(h.messages.len(), 2);
+                assert_eq!(h.budget_remaining_tokens, 40000);
+                assert_eq!(h.blocked_tools, vec!["bash"]);
+                assert_eq!(h.recent_tools.len(), 2);
+                assert_eq!(h.learning_snapshot_id, Some("snap-abc".to_string()));
+                assert!(h.memory_context.is_some());
+                let mc = h.memory_context.unwrap();
+                assert_eq!(mc.domain_hints, vec!["GitHub"]);
+            }
+            _ => panic!("Expected Heavy checkpoint"),
+        }
+    }
+
+    #[test]
+    fn completed_slots_correctly_identifies_done_tools() {
+        let mut heavy = HeavyCheckpoint {
+            light: LightCheckpoint {
+                protocol_version: PROTOCOL_VERSION,
+                cursor: ExecutionCursor::for_act(5),
+                step_id: "s1-turn-3".to_string(),
+                task_id: "task-1".to_string(),
+                agent_id: "agent-1".to_string(),
+                progress: 0.6,
+                total_tokens: 3000,
+                created_at: epoch_ms(),
+            },
+            messages: vec![],
+            budget_remaining_tokens: 50000,
+            budget_remaining_rounds: 5,
+            blocked_tools: vec![],
+            recent_tools: vec![],
+            learning_snapshot_id: None,
+            memory_context: None,
+        };
+
+        // Simulate: slots 0,1 completed; slot 2 failed; slot 3 running; slot 4 pending
+        heavy.light.cursor.slots[0].state = SlotState::Completed;
+        heavy.light.cursor.slots[0].tool_name = "read_file".to_string();
+        heavy.light.cursor.slots[1].state = SlotState::Completed;
+        heavy.light.cursor.slots[1].tool_name = "grep".to_string();
+        heavy.light.cursor.slots[2].state = SlotState::Failed;
+        heavy.light.cursor.slots[2].tool_name = "bash".to_string();
+        // slot 3: Pending (default)
+        // slot 4: Pending (default)
+
+        let done = completed_slots(&heavy);
+        assert_eq!(done, vec![0, 1], "Only completed slots should be identified");
+    }
+
+    #[test]
+    fn tool_timeline_captures_parallel_execution() {
+        let events = vec![
+            // Two tools start nearly simultaneously
+            StepEvent {
+                event_id: "e1".to_string(),
+                step_id: "s1".to_string(),
+                event_type: StepEventType::ToolCallStarted,
+                agent_id: None,
+                caused_by: vec![],
+                payload: Some(serde_json::json!({"tool_name": "read_file"})),
+                created_at: 1000,
+            },
+            StepEvent {
+                event_id: "e2".to_string(),
+                step_id: "s1".to_string(),
+                event_type: StepEventType::ToolCallStarted,
+                agent_id: None,
+                caused_by: vec![],
+                payload: Some(serde_json::json!({"tool_name": "grep"})),
+                created_at: 1002,
+            },
+            // grep finishes first
+            StepEvent {
+                event_id: "e3".to_string(),
+                step_id: "s1".to_string(),
+                event_type: StepEventType::ToolCallCompleted,
+                agent_id: None,
+                caused_by: vec!["e2".to_string()],
+                payload: Some(serde_json::json!({"tool_name": "grep", "output": "found"})),
+                created_at: 1020,
+            },
+            // read_file finishes second
+            StepEvent {
+                event_id: "e4".to_string(),
+                step_id: "s1".to_string(),
+                event_type: StepEventType::ToolCallCompleted,
+                agent_id: None,
+                caused_by: vec!["e1".to_string()],
+                payload: Some(serde_json::json!({"tool_name": "read_file", "output": "data"})),
+                created_at: 1050,
+            },
+        ];
+
+        let timeline = extract_tool_timeline(&events);
+        assert_eq!(timeline.len(), 2);
+
+        // grep: 1002→1020 = 18ms
+        assert_eq!(timeline[0].tool_name, "grep");
+        assert_eq!(timeline[0].duration_ms, 18);
+        assert!(!timeline[0].is_error);
+
+        // read_file: 1000→1050 = 50ms
+        assert_eq!(timeline[1].tool_name, "read_file");
+        assert_eq!(timeline[1].duration_ms, 50);
+        assert!(!timeline[1].is_error);
+    }
+
+    #[test]
+    fn restore_summary_includes_all_state() {
+        let mut cache = InMemoryIdempotencyCache::new();
+        let key = IdempotencyKey::semantic("git_status", &serde_json::json!({}));
+        cache.record(
+            &key,
+            CachedToolResult {
+                tool_name: "git_status".to_string(),
+                output: "clean".to_string(),
+                is_error: false,
+                cached_at: epoch_ms(),
+            },
+        );
+
+        let mut completed = std::collections::HashMap::new();
+        completed.insert("git_status".to_string(), vec!["clean".to_string()]);
+        completed.insert(
+            "read_file".to_string(),
+            vec!["content1".to_string(), "content2".to_string()],
+        );
+
+        let restored = RestoredSession {
+            messages: vec![
+                serde_json::json!({"role": "user"}),
+                serde_json::json!({"role": "assistant"}),
+                serde_json::json!({"role": "user"}),
+            ],
+            budget_remaining_tokens: 35000,
+            budget_remaining_rounds: 4,
+            blocked_tools: vec!["bash".to_string(), "str_replace".to_string()],
+            recent_tools: vec!["git_status".to_string()],
+            idempotency_cache: cache,
+            resume_turn: 5,
+            protocol_version: PROTOCOL_VERSION,
+            completed_tool_results: completed,
+            learning_snapshot_id: Some("snap-xyz".to_string()),
+        };
+
+        let summary = restore_summary(&restored);
+        assert!(summary.contains("turn=5"));
+        assert!(summary.contains("messages=3"));
+        assert!(summary.contains("cache=1"));
+        assert!(summary.contains("completed_tools=3")); // 1 + 2
+        assert!(summary.contains("blocked=2"));
+        assert!(summary.contains("budget_tokens=35000"));
+        assert!(summary.contains("budget_rounds=4"));
+    }
+
+    #[test]
+    fn version_policy_compatible_allows_minor_version_drift() {
+        // Simulate a checkpoint from a newer minor version
+        let heavy = HeavyCheckpoint {
+            light: LightCheckpoint {
+                protocol_version: PROTOCOL_VERSION + 5, // v1.5 vs current v1.0
+                cursor: ExecutionCursor::default(),
+                step_id: "s1-turn-1".to_string(),
+                task_id: "task-1".to_string(),
+                agent_id: "agent-1".to_string(),
+                progress: 0.0,
+                total_tokens: 0,
+                created_at: epoch_ms(),
+            },
+            messages: vec![],
+            budget_remaining_tokens: 100000,
+            budget_remaining_rounds: 10,
+            blocked_tools: vec![],
+            recent_tools: vec![],
+            learning_snapshot_id: None,
+            memory_context: None,
+        };
+
+        // Strict should reject
+        let strict_result = check_protocol_version_with_policy(
+            heavy.light.protocol_version,
+            VersionPolicy::Strict,
+        );
+        assert!(strict_result.is_err(), "Strict should reject version drift");
+
+        // Compatible should accept (same major)
+        let compat_result = check_protocol_version_with_policy(
+            heavy.light.protocol_version,
+            VersionPolicy::Compatible,
+        );
+        assert!(
+            compat_result.is_ok(),
+            "Compatible should accept same-major drift"
+        );
+    }
+
+    // ── Recorder emits idempotency keys in events ──
+
+    #[test]
+    fn recorder_complete_tool_with_result_includes_output_in_event() {
+        use mo_agent_runtime::pipeline::step_recorder::StepRecorder;
+
+        let mut rec = StepRecorder::new("test-session", "task-1");
+        rec.begin_turn(1);
+        rec.begin_act(2);
+        rec.begin_tool_with_key("read_file", "call-1", Some("hash-abc"));
+        rec.complete_tool_with_result("read_file", false, 42, false, "file contents here");
+
+        let summary = rec.summary();
+        assert_eq!(summary.total_tools, 1);
+        assert!(summary.total_events > 0);
+
+        // The events should include the output for cache warming
+        let events = rec.events();
+        let completed_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == StepEventType::ToolCallCompleted)
+            .collect();
+        assert_eq!(completed_events.len(), 1);
+
+        let payload = completed_events[0].payload.as_ref().unwrap();
+        assert_eq!(payload["tool_name"], "read_file");
+        assert_eq!(payload["output"], "file contents here");
+        assert_eq!(payload["is_error"], false);
+        assert_eq!(payload["idempotency_key"], "hash-abc");
+    }
+
+    #[test]
+    fn recorder_complete_tool_backward_compatible() {
+        use mo_agent_runtime::pipeline::step_recorder::StepRecorder;
+
+        // Original complete_tool() should still work without output
+        let mut rec = StepRecorder::new("test-session", "task-1");
+        rec.begin_turn(1);
+        rec.begin_act(1);
+        rec.begin_tool("grep", "call-2");
+        rec.complete_tool("grep", false, 15, false);
+
+        let events = rec.events();
+        let completed: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == StepEventType::ToolCallCompleted)
+            .collect();
+        assert_eq!(completed.len(), 1);
+
+        let payload = completed[0].payload.as_ref().unwrap();
+        assert_eq!(payload["tool_name"], "grep");
+        // Output should NOT be present in old-style events
+        assert!(payload.get("output").is_none());
+    }
+
+    #[test]
+    fn restore_error_types_are_distinct() {
+        let no_cp = RestoreError::NoCheckpoint;
+        let version = RestoreError::VersionMismatch {
+            checkpoint_version: 999,
+            current_version: 1000,
+        };
+        let io = RestoreError::IoError("disk full".to_string());
+        let invalid = RestoreError::InvalidCheckpoint("corrupted JSON".to_string());
+
+        // Each should produce unique, informative error messages
+        let msgs: Vec<String> = vec![no_cp, version, io, invalid]
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect();
+
+        assert!(msgs[0].contains("no checkpoint"));
+        assert!(msgs[1].contains("999") && msgs[1].contains("1000"));
+        assert!(msgs[2].contains("disk full"));
+        assert!(msgs[3].contains("corrupted JSON"));
+
+        // No duplicates
+        let unique: std::collections::HashSet<_> = msgs.iter().collect();
+        assert_eq!(unique.len(), 4, "All error messages should be unique");
+    }
+}
