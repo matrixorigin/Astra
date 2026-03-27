@@ -4983,3 +4983,162 @@ mod scheduling_contract_proofs {
         assert!(types.contains(&&StepEventType::StepCompleted));
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Slot integration proofs
+// ═══════════════════════════════════════════════════════════════════════════════
+
+mod slot_integration_proofs {
+    use mo_agent_runtime::pipeline::step_protocol::*;
+    use mo_agent_runtime::pipeline::step_recorder::StepRecorder;
+
+    #[test]
+    fn begin_tool_with_key_populates_idempotency_key() {
+        let mut rec = StepRecorder::new("sess-slot-key", "task-1");
+        rec.begin_turn(0);
+        rec.begin_act(2);
+
+        rec.begin_tool_with_key("read_file", "call-1", Some("sem:abc123"));
+
+        let step = rec.current_step().unwrap();
+        let slot = &step.execution.cursor.slots[0];
+        assert_eq!(slot.tool_name, "read_file");
+        assert_eq!(slot.call_id, "call-1");
+        assert_eq!(slot.state, SlotState::Running);
+        assert_eq!(slot.idempotency_key.as_deref(), Some("sem:abc123"));
+    }
+
+    #[test]
+    fn begin_tool_without_key_leaves_none() {
+        let mut rec = StepRecorder::new("sess-slot-nokey", "task-1");
+        rec.begin_turn(0);
+        rec.begin_act(1);
+
+        rec.begin_tool("bash", "call-1");
+
+        let step = rec.current_step().unwrap();
+        let slot = &step.execution.cursor.slots[0];
+        assert_eq!(slot.tool_name, "bash");
+        assert!(slot.idempotency_key.is_none(), "Side-effectful tools should not have idempotency key");
+    }
+
+    #[test]
+    fn record_cache_hit_sets_slot_state_and_result() {
+        let mut rec = StepRecorder::new("sess-cache-hit", "task-1");
+        rec.begin_turn(0);
+        rec.begin_act(1);
+        rec.begin_tool_with_key("read_file", "call-1", Some("sem:xyz"));
+
+        let cached = CachedToolResult {
+            tool_name: "read_file".to_string(),
+            output: "file contents here".to_string(),
+            is_error: false,
+            cached_at: epoch_ms(),
+        };
+        rec.record_cache_hit("read_file", cached.clone());
+
+        let step = rec.current_step().unwrap();
+        let slot = &step.execution.cursor.slots[0];
+        assert_eq!(slot.state, SlotState::Skipped, "Cache hit should set Skipped");
+        assert!(slot.cached_result.is_some(), "Cache hit should store result on slot");
+        assert_eq!(slot.cached_result.as_ref().unwrap().output, "file contents here");
+    }
+
+    #[test]
+    fn attach_cached_result_after_complete_tool() {
+        let mut rec = StepRecorder::new("sess-attach", "task-1");
+        rec.begin_turn(0);
+        rec.begin_act(1);
+        rec.begin_tool_with_key("glob", "call-1", Some("sem:glob-key"));
+        rec.complete_tool("glob", false, 100, false);
+
+        // Attach cache result after completion (happens when storing in idempotency cache)
+        let cached = CachedToolResult {
+            tool_name: "glob".to_string(),
+            output: "src/main.rs\nsrc/lib.rs".to_string(),
+            is_error: false,
+            cached_at: epoch_ms(),
+        };
+        rec.attach_cached_result(cached);
+
+        let step = rec.current_step().unwrap();
+        let slot = &step.execution.cursor.slots[0];
+        assert_eq!(slot.state, SlotState::Completed);
+        assert!(slot.cached_result.is_some(), "Attached result should be on slot");
+        assert!(slot.cached_result.as_ref().unwrap().output.contains("main.rs"));
+    }
+
+    #[test]
+    fn slot_checkpoint_includes_cached_results() {
+        // Prove that checkpointed slots preserve their cached results
+        let mut rec = StepRecorder::new("sess-slot-ckpt", "task-1");
+        rec.begin_turn(0);
+        rec.begin_act(2);
+
+        // Tool 1: fresh execution with cached result attached
+        rec.begin_tool_with_key("read_file", "c1", Some("sem:key-1"));
+        rec.complete_tool("read_file", false, 50, false);
+        rec.attach_cached_result(CachedToolResult {
+            tool_name: "read_file".to_string(),
+            output: "content A".to_string(),
+            is_error: false,
+            cached_at: epoch_ms(),
+        });
+
+        // Tool 2: cache hit
+        rec.begin_tool_with_key("grep", "c2", Some("sem:key-2"));
+        rec.record_cache_hit("grep", CachedToolResult {
+            tool_name: "grep".to_string(),
+            output: "match line 42".to_string(),
+            is_error: false,
+            cached_at: epoch_ms(),
+        });
+
+        // Build checkpoint and verify slots are preserved
+        let ckpt = rec.build_light_checkpoint();
+        assert!(ckpt.is_some());
+        let light = ckpt.unwrap();
+
+        // Verify via serialization roundtrip
+        let json = serde_json::to_string(&light).unwrap();
+        assert!(json.contains("content A"), "Checkpoint should contain cached result A");
+        assert!(json.contains("match line 42"), "Checkpoint should contain cached result B");
+    }
+
+    #[test]
+    fn mixed_slot_states_in_single_turn() {
+        let mut rec = StepRecorder::new("sess-mixed", "task-1");
+        rec.begin_turn(0);
+        rec.begin_act(4);
+
+        // Tool 1: success
+        rec.begin_tool_with_key("read_file", "c1", Some("sem:k1"));
+        rec.complete_tool("read_file", false, 50, false);
+
+        // Tool 2: failure
+        rec.begin_tool("bash", "c2");
+        rec.complete_tool("bash", true, 200, false);
+
+        // Tool 3: cache hit (skipped)
+        rec.begin_tool_with_key("grep", "c3", Some("sem:k3"));
+        rec.record_cache_hit("grep", CachedToolResult {
+            tool_name: "grep".to_string(),
+            output: "cached".to_string(),
+            is_error: false,
+            cached_at: epoch_ms(),
+        });
+
+        // Tool 4: still pending (not executed)
+        let step = rec.current_step().unwrap();
+        assert_eq!(step.execution.cursor.slots[0].state, SlotState::Completed);
+        assert_eq!(step.execution.cursor.slots[1].state, SlotState::Failed);
+        assert_eq!(step.execution.cursor.slots[2].state, SlotState::Skipped);
+        assert_eq!(step.execution.cursor.slots[3].state, SlotState::Pending);
+
+        // Idempotency keys: only cacheable tools have them
+        assert!(step.execution.cursor.slots[0].idempotency_key.is_some());
+        assert!(step.execution.cursor.slots[1].idempotency_key.is_none()); // bash = not cacheable
+        assert!(step.execution.cursor.slots[2].idempotency_key.is_some());
+        assert!(step.execution.cursor.slots[3].idempotency_key.is_none()); // not started
+    }
+}

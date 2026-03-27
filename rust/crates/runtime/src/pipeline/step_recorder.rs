@@ -177,7 +177,18 @@ impl StepRecorder {
     }
 
     /// Record start of a tool execution (within ACT phase).
+    /// Optionally accepts an idempotency key for cache correlation.
     pub fn begin_tool(&mut self, tool_name: &str, call_id: &str) {
+        self.begin_tool_with_key(tool_name, call_id, None);
+    }
+
+    /// Record start of a tool execution with idempotency key for cache tracking.
+    pub fn begin_tool_with_key(
+        &mut self,
+        tool_name: &str,
+        call_id: &str,
+        idempotency_key: Option<&str>,
+    ) {
         let slot_idx = self.slot_counter;
         self.slot_counter += 1;
 
@@ -187,6 +198,7 @@ impl StepRecorder {
             slot.tool_name = tool_name.to_string();
             slot.call_id = call_id.to_string();
             slot.state = SlotState::Running;
+            slot.idempotency_key = idempotency_key.map(|k| k.to_string());
         }
 
         self.emit_with_payload(
@@ -194,8 +206,47 @@ impl StepRecorder {
             serde_json::json!({
                 "tool_name": tool_name,
                 "slot_index": slot_idx,
+                "idempotency_key": idempotency_key,
             }),
         );
+    }
+
+    /// Record a cache hit on the current slot (sets cached_result + Skipped state).
+    /// Call this instead of complete_tool() when the idempotency cache provides the result.
+    pub fn record_cache_hit(&mut self, tool_name: &str, cached: CachedToolResult) {
+        let slot_idx = self.slot_counter.saturating_sub(1);
+
+        if let Some(ref mut step) = self.current_step {
+            if let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize) {
+                slot.cached_result = Some(cached);
+                slot.state = SlotState::Skipped;
+            }
+            // Track in Act result
+            if let Some(StepResult::Act { ref mut tool_results_count, .. }) = step.execution.result {
+                *tool_results_count += 1;
+            }
+        }
+
+        self.emit_with_payload(
+            StepEventType::ToolCallSkipped,
+            serde_json::json!({
+                "tool_name": tool_name,
+                "reason": "idempotency_cache_hit",
+            }),
+        );
+
+        self.checkpoint_count += 1;
+    }
+
+    /// Attach a cached result to the most recently completed slot.
+    /// Called after `complete_tool()` when the result is stored in the idempotency cache.
+    pub fn attach_cached_result(&mut self, cached: CachedToolResult) {
+        let slot_idx = self.slot_counter.saturating_sub(1);
+        if let Some(ref mut step) = self.current_step
+            && let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize)
+        {
+            slot.cached_result = Some(cached);
+        }
     }
 
     /// Record tool execution result.

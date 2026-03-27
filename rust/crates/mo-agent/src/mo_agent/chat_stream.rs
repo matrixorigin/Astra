@@ -1073,8 +1073,10 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     "name": name,
                     "result": cached_note,
                 }));
-                step_recorder.begin_tool(&name, &id);
-                step_recorder.complete_tool(&name, false, 0, true);
+                // Record cache hit with full slot tracking
+                let cache_key = idem_key.cache_key();
+                step_recorder.begin_tool_with_key(&name, &id, Some(&cache_key));
+                step_recorder.record_cache_hit(&name, cached.clone());
                 continue;
             }
 
@@ -1131,7 +1133,16 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 None
             };
             let tool_start = Instant::now();
-            step_recorder.begin_tool(&name, &id);
+            let tool_idem_key = if CACHEABLE_TOOLS.contains(&name.as_str()) {
+                Some(idem_key.cache_key())
+            } else {
+                None
+            };
+            step_recorder.begin_tool_with_key(
+                &name,
+                &id,
+                tool_idem_key.as_deref(),
+            );
 
             // Enforce per-tool timeout from scheduling contract
             let contract = step_recorder.scheduling();
@@ -1300,12 +1311,14 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
 
             // Cache successful idempotent tool results via IdempotencyCache
             if !is_err && CACHEABLE_TOOLS.contains(&name.as_str()) {
-                idempotency_cache.record(&idem_key, CachedToolResult {
+                let cached_result = CachedToolResult {
                     tool_name: name.clone(),
                     output: result_str.clone(),
                     is_error: false,
                     cached_at: mo_agent_runtime::pipeline::step_protocol::epoch_ms(),
-                });
+                };
+                step_recorder.attach_cached_result(cached_result.clone());
+                idempotency_cache.record(&idem_key, cached_result);
                 // Record in semantic tracker for near-duplicate detection in future turns
                 if let Some((prev_turn, reason)) =
                     semantic_dedup.check_and_record(&name, &args, &result_str, _turn)
