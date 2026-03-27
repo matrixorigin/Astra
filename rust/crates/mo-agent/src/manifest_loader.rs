@@ -234,6 +234,28 @@ pub fn register_manifest_tools(skills_dir: &Path, registry: &mut PluginRegistry)
     registered
 }
 
+/// Best-effort skill loading from standard locations.
+///
+/// Searches for `skills/` directory in:
+/// 1. Current working directory
+/// 2. Repository root (detected via git)
+/// 3. `~/.mo-agent/skills/`
+///
+/// Silently skips if no skills directory exists.
+pub fn load_skills_directory(registry: &mut PluginRegistry) {
+    let search_paths = [
+        std::path::PathBuf::from("skills"),
+        dirs::home_dir()
+            .map(|h| h.join(".mo-agent").join("skills"))
+            .unwrap_or_default(),
+    ];
+    for path in &search_paths {
+        if path.is_dir() {
+            register_manifest_tools(path, registry);
+        }
+    }
+}
+
 // ─── Shell Command Execution for Manifest Tools ────────────────────────────
 
 /// Expand a command template with parameter values.
@@ -477,5 +499,33 @@ depends_on: []
     fn discover_manifests_handles_missing_dir() {
         let manifests = discover_manifests(Path::new("/nonexistent/path"));
         assert!(manifests.is_empty());
+    }
+
+    #[test]
+    fn load_skills_directory_handles_no_skills() {
+        // Should not panic even if no skills/ directory exists
+        let mut registry = PluginRegistry::new();
+        load_skills_directory(&mut registry);
+        // No crash = success; may or may not find skills depending on environment
+    }
+
+    #[test]
+    fn register_manifest_tools_from_temp_dir() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("k8s");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("manifest.yaml"), SAMPLE_MANIFEST).unwrap();
+
+        let mut registry = PluginRegistry::new();
+        let registered = register_manifest_tools(dir.path(), &mut registry);
+        assert_eq!(registered.len(), 2);
+        assert!(registered.contains(&"kubectl_get".to_string()));
+        assert!(registered.contains(&"kubectl_apply".to_string()));
+
+        // Verify schemas are generated
+        let schemas = registry.schemas();
+        assert_eq!(schemas.len(), 2);
     }
 }

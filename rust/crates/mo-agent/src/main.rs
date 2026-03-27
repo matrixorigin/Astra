@@ -749,6 +749,126 @@ fn merge_learning_snapshot(
     }
 }
 
+// ═══════════════════════════════════════════ Cloud Learning Sync ═══════
+
+/// Try to pull learning state from MatrixOne and merge into live modules.
+/// Best-effort: silently skips if cloud is unavailable.
+fn try_cloud_pull(
+    profile_name: &str,
+    entity_graph: &std::sync::Arc<
+        std::sync::Mutex<mo_agent_runtime::pipeline::entity::EntityGraph>,
+    >,
+    pattern_library: &std::sync::Arc<
+        std::sync::Mutex<mo_agent_runtime::pipeline::pattern::PatternLibrary>,
+    >,
+    calibrator: &std::sync::Arc<
+        std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
+    >,
+) {
+    let pool = match try_connect_matrixone_sync() {
+        Some(p) => p,
+        None => return,
+    };
+    let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
+    let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+    let rt = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    match rt.block_on(
+        mo_agent_services::state_sync::StateSyncService::pull_learning(
+            &svc,
+            &user_id,
+            profile_name,
+        ),
+    ) {
+        Ok(Some(json)) => {
+            merge_learning_snapshot(&json, entity_graph, pattern_library, calibrator);
+            eprintln!("{}", "  ✓ Cloud learning merged".dim());
+        }
+        Ok(None) => {} // no cloud state yet
+        Err(e) => {
+            eprintln!("{}", format!("  ⚠ Cloud pull skipped: {e}").dim());
+        }
+    }
+}
+
+/// Try to push learning state to MatrixOne after local save.
+/// Best-effort: silently skips if cloud is unavailable.
+fn try_cloud_push(
+    profile_name: &str,
+    entity_graph: &std::sync::Arc<
+        std::sync::Mutex<mo_agent_runtime::pipeline::entity::EntityGraph>,
+    >,
+    pattern_library: &std::sync::Arc<
+        std::sync::Mutex<mo_agent_runtime::pipeline::pattern::PatternLibrary>,
+    >,
+    calibrator: &std::sync::Arc<
+        std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
+    >,
+) {
+    let pool = match try_connect_matrixone_sync() {
+        Some(p) => p,
+        None => return,
+    };
+    let snapshot = mo_agent_runtime::pipeline::persistence::export_from_modules(
+        entity_graph,
+        pattern_library,
+        calibrator,
+    );
+    let json = match serde_json::to_string(&snapshot) {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+    let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
+    let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+    let rt = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let result = rt.block_on(
+        mo_agent_services::state_sync::StateSyncService::push_learning(
+            &svc,
+            &user_id,
+            profile_name,
+            &json,
+            snapshot.entities.len() as u32,
+            snapshot.patterns.len() as u32,
+            snapshot.calibration.is_some(),
+        ),
+    );
+    if result.success {
+        eprintln!("{}", "  ✓ Learning synced to cloud".dim());
+    } else {
+        eprintln!(
+            "{}",
+            format!("  ⚠ Cloud push skipped: {}", result.message).dim()
+        );
+    }
+}
+
+/// Best-effort MatrixOne pool creation for sync operations.
+fn try_connect_matrixone_sync() -> Option<sqlx::Pool<sqlx::MySql>> {
+    let host = std::env::var("MATRIXONE_HOST").ok()?;
+    let port: u16 = std::env::var("MATRIXONE_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(6001);
+    let user = std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".to_string());
+    let password = std::env::var("MATRIXONE_PASSWORD").unwrap_or_default();
+    let database =
+        std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "mo_agent".to_string());
+    let url = format!("mysql://{user}:{password}@{host}:{port}/{database}");
+    let rt = tokio::runtime::Handle::try_current().ok()?;
+    rt.block_on(
+        sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(std::time::Duration::from_secs(3))
+            .connect(&url),
+    )
+    .ok()
+}
+
 // ═══════════════════════════════════════════════════════ Task Commands ════
 
 async fn handle_task_command(arg: &str, state: &mut ReplState) {
@@ -1170,6 +1290,13 @@ async fn run_chat_repl(
         if loaded {
             eprintln!("{}", "  ✓ Loaded learning state from prior sessions".dim());
         }
+        // Try to merge cloud learning (best-effort)
+        try_cloud_pull(
+            profile_name,
+            &pipeline_modules.entity_graph,
+            &pipeline_modules.pattern_library,
+            &pipeline_modules.calibrator,
+        );
     }
 
     print_repl_banner(profile, &state);
@@ -1287,6 +1414,13 @@ async fn run_chat_repl(
                 format!("  ⚠ Failed to save learning state: {e}").yellow()
             );
         }
+        // Push learning to cloud (best-effort)
+        try_cloud_push(
+            profile_name,
+            &pipeline_modules.entity_graph,
+            &pipeline_modules.pattern_library,
+            &pipeline_modules.calibrator,
+        );
     }
 
     let _ = editor.save_history(&hist_path);

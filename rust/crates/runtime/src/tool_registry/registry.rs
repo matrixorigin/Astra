@@ -513,4 +513,26 @@ impl ToolRegistry {
     pub fn dynamic_count() -> usize {
         TOOL_CATALOG.iter().filter(|t| !t.pinned).count()
     }
+
+    /// Register plugin tools from a PluginRegistry, merging their schemas
+    /// into the active tool set. Rebuilds internal indexes.
+    ///
+    /// This is the bridge between dynamic skill/plugin registration and
+    /// the production tool selection pipeline.
+    pub fn register_plugins(&mut self, plugins: &super::plugin::PluginRegistry) {
+        let plugin_schemas = plugins.schemas();
+        if plugin_schemas.is_empty() {
+            return;
+        }
+        self.all_schemas.extend(plugin_schemas);
+        // Rebuild indexes to include the new schemas
+        self.measured_costs = Self::measure_all_schemas(&self.all_schemas);
+        self.schema_index = Self::build_schema_index(&self.all_schemas);
+        // Pinned schemas don't change (plugins are never pinned in catalog)
+    }
+
+    /// Total tool count (built-in + registered plugins).
+    pub fn total_tool_count(&self) -> usize {
+        self.all_schemas.len()
+    }
 }

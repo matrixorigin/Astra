@@ -33,7 +33,13 @@ pub(super) fn create_tool_selector_with_quality(
     };
 
     let all_schemas = edge_tools::all_tool_schemas();
-    let registry = tool_registry::ToolRegistry::new(all_schemas);
+    let mut registry = tool_registry::ToolRegistry::new(all_schemas);
+
+    // Load skill manifests from skills/ directory and register plugin tools
+    let mut plugin_registry = tool_registry::PluginRegistry::new();
+    manifest_loader::load_skills_directory(&mut plugin_registry);
+    registry.register_plugins(&plugin_registry);
+
     let mut tfidf = tool_selector::TfIdfSelector::new(registry);
     if let Some(qt) = quality_tracker {
         tfidf = tfidf.with_quality_tracker(qt);

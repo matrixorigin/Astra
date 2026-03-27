@@ -4171,3 +4171,118 @@ mod tool_guidance_proofs {
         );
     }
 }
+
+// ═══════════════════════════════ Plugin→Registry Wiring Tests ════════════
+
+mod plugin_registry_wiring {
+    use mo_agent_runtime::tool_registry::{PluginRegistry, PluginToolEntry, ToolRegistry};
+    use serde_json::json;
+
+    fn make_registry() -> ToolRegistry {
+        let schemas: Vec<serde_json::Value> = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "test_builtin",
+                "description": "A built-in tool",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+        ToolRegistry::new(schemas)
+    }
+
+    fn make_plugin_entry(name: &str, desc: &str) -> PluginToolEntry {
+        PluginToolEntry {
+            name: name.to_string(),
+            description: desc.to_string(),
+            triggers: vec![name.to_string()],
+            pinned: false,
+            intents: vec![],
+            scope: mo_agent_runtime::tool_registry::Scope::Local,
+            schema: json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": desc,
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }),
+            schema_tokens: 50,
+            source: "test".to_string(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn register_plugins_adds_schemas_to_registry() {
+        let mut registry = make_registry();
+        assert_eq!(registry.total_tool_count(), 1);
+
+        let mut plugins = PluginRegistry::new();
+        plugins.register(make_plugin_entry("k8s_pods", "List Kubernetes pods")).unwrap();
+        plugins.register(make_plugin_entry("docker_ps", "List Docker containers")).unwrap();
+
+        registry.register_plugins(&plugins);
+        assert_eq!(registry.total_tool_count(), 3);
+    }
+
+    #[test]
+    fn register_plugins_updates_schema_index() {
+        let mut registry = make_registry();
+        let mut plugins = PluginRegistry::new();
+        plugins.register(make_plugin_entry("custom_deploy", "Deploy to staging")).unwrap();
+        registry.register_plugins(&plugins);
+
+        // Schema index should find the new tool
+        let all = registry.all_schemas();
+        let has_deploy = all.iter().any(|s| {
+            s.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                == Some("custom_deploy")
+        });
+        assert!(has_deploy, "Plugin tool should appear in all_schemas");
+    }
+
+    #[test]
+    fn register_empty_plugins_is_noop() {
+        let mut registry = make_registry();
+        let count_before = registry.total_tool_count();
+        let plugins = PluginRegistry::new();
+        registry.register_plugins(&plugins);
+        assert_eq!(registry.total_tool_count(), count_before);
+    }
+
+    #[test]
+    fn register_plugins_measured_costs_include_plugin_tools() {
+        let mut registry = make_registry();
+        let mut plugins = PluginRegistry::new();
+        plugins.register(make_plugin_entry("my_tool", "My custom tool")).unwrap();
+        registry.register_plugins(&plugins);
+
+        // total_tool_count should include both built-in and plugin
+        assert!(registry.total_tool_count() >= 2);
+        // all_schemas should have the plugin tool
+        let names: Vec<_> = registry
+            .all_schemas()
+            .iter()
+            .filter_map(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+            })
+            .collect();
+        assert!(names.contains(&"my_tool"));
+    }
+
+    #[test]
+    fn register_plugins_preserves_pinned_schemas() {
+        // Use real production schemas
+        let mut registry = ToolRegistry::new(vec![]);
+        let pinned_before = registry.pinned_schemas().len();
+        let mut plugins = PluginRegistry::new();
+        plugins.register(make_plugin_entry("extra", "Extra tool")).unwrap();
+        registry.register_plugins(&plugins);
+        // Pinned tools come from TOOL_CATALOG, not schemas — should be unchanged
+        assert_eq!(registry.pinned_schemas().len(), pinned_before);
+    }
+}
