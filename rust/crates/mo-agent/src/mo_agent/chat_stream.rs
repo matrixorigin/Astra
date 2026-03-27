@@ -1,6 +1,9 @@
 use super::*;
 
 use mo_agent_core::RuntimeLimits;
+use mo_agent_runtime::pipeline::step_protocol::{
+    CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache,
+};
 
 /// Tools that are idempotent reads — safe to cache across turns.
 /// Side-effectful tools (bash, write_file, mo_query, etc.) must NOT be in this list.
@@ -514,9 +517,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     let mut stall_events: Vec<(String, u32)> = Vec::new();
     let mut verdict_events: Vec<VerdictEvent> = Vec::new();
     let mut tool_call_records: Vec<mo_agent_services::session_journal::ToolCallRecord> = Vec::new();
-    // Cross-turn dedup: track (tool_name, args_hash) → result across all turns
-    let mut cross_turn_cache: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    // Cross-turn dedup: IdempotencyCache with content-hash keys (Step Protocol)
+    let mut idempotency_cache = InMemoryIdempotencyCache::new();
     // Semantic near-duplicate tracker (Tier 2: param-aware, Tier 3: output similarity)
     let mut semantic_dedup = mo_agent_runtime::semantic_dedup::SemanticDedup::new(
         mo_agent_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
@@ -1038,13 +1040,14 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 continue;
             }
 
-            // Cross-turn dedup: for idempotent tools, return cached result from earlier turn
+            // Cross-turn dedup: for idempotent tools, check IdempotencyCache
+            let idem_key = IdempotencyKey::semantic(&name, &args);
             if CACHEABLE_TOOLS.contains(&name.as_str())
-                && let Some(cached_result) = cross_turn_cache.get(&call_sig)
+                && let Some(cached) = idempotency_cache.check(&idem_key)
             {
                 let cached_note = format!(
                     "(cached from earlier turn — identical call)\n{}",
-                    cached_result
+                    cached.output
                 );
                 if !quiet {
                     eprintln!("{}", format!("  ↻ {name} (cached)").dim());
@@ -1263,9 +1266,14 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 }
             }
 
-            // Cache successful idempotent tool results for cross-turn dedup
+            // Cache successful idempotent tool results via IdempotencyCache
             if !is_err && CACHEABLE_TOOLS.contains(&name.as_str()) {
-                cross_turn_cache.insert(call_sig, result_str.clone());
+                idempotency_cache.record(&idem_key, CachedToolResult {
+                    tool_name: name.clone(),
+                    output: result_str.clone(),
+                    is_error: false,
+                    cached_at: mo_agent_runtime::pipeline::step_protocol::epoch_ms(),
+                });
                 // Record in semantic tracker for near-duplicate detection in future turns
                 if let Some((prev_turn, reason)) =
                     semantic_dedup.check_and_record(&name, &args, &result_str, _turn)

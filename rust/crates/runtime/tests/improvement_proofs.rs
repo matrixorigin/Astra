@@ -4607,3 +4607,120 @@ mod runtime_limits_proofs {
         assert_eq!(mo_agent_core::DEV_MATRIXONE_PASSWORD, "111");
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 14. IDEMPOTENCY CACHE (Step Protocol wiring)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+mod idempotency_cache_proofs {
+    use mo_agent_runtime::pipeline::step_protocol::{
+        CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache, epoch_ms,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn idempotency_key_matches_equivalent_args() {
+        // Previously: normalize_call_sig sorted JSON keys and produced a string.
+        // Now: IdempotencyKey::semantic computes SHA256 over canonical_json.
+        // Prove: same tool + same args (any key order) → same key.
+        let args1 = json!({"path": "src/main.rs", "pattern": "fn main"});
+        let args2 = json!({"pattern": "fn main", "path": "src/main.rs"});
+        let key1 = IdempotencyKey::semantic("grep", &args1);
+        let key2 = IdempotencyKey::semantic("grep", &args2);
+        assert_eq!(key1.cache_key(), key2.cache_key(),
+            "Same args in different order must produce identical cache key");
+    }
+
+    #[test]
+    fn idempotency_key_differs_for_different_args() {
+        let args1 = json!({"path": "src/main.rs"});
+        let args2 = json!({"path": "src/lib.rs"});
+        let key1 = IdempotencyKey::semantic("read_file", &args1);
+        let key2 = IdempotencyKey::semantic("read_file", &args2);
+        assert_ne!(key1.cache_key(), key2.cache_key(),
+            "Different args must produce different cache keys");
+    }
+
+    #[test]
+    fn idempotency_key_differs_for_different_tools() {
+        let args = json!({"path": "src/main.rs"});
+        let key1 = IdempotencyKey::semantic("read_file", &args);
+        let key2 = IdempotencyKey::semantic("list_dir", &args);
+        assert_ne!(key1.cache_key(), key2.cache_key(),
+            "Different tool names must produce different cache keys");
+    }
+
+    #[test]
+    fn cache_hit_returns_stored_result() {
+        let mut cache = InMemoryIdempotencyCache::new();
+        let key = IdempotencyKey::semantic("glob", &json!({"pattern": "**/*.rs"}));
+        let result = CachedToolResult {
+            tool_name: "glob".into(),
+            output: "src/main.rs\nsrc/lib.rs".into(),
+            is_error: false,
+            cached_at: epoch_ms(),
+        };
+        cache.record(&key, result.clone());
+        let hit = cache.check(&key);
+        assert!(hit.is_some(), "Cache must return stored result");
+        assert_eq!(hit.unwrap().output, "src/main.rs\nsrc/lib.rs");
+    }
+
+    #[test]
+    fn cache_miss_returns_none() {
+        let cache = InMemoryIdempotencyCache::new();
+        let key = IdempotencyKey::semantic("glob", &json!({"pattern": "**/*.rs"}));
+        assert!(cache.check(&key).is_none(), "Empty cache must return None");
+    }
+
+    #[test]
+    fn cache_key_is_content_addressable() {
+        // Prove: IdempotencyKey uses SHA256 content hash, not pointer/order dependent.
+        // This is the key improvement over HashMap<String, String>.
+        let key = IdempotencyKey::semantic("git_log", &json!({"count": 10, "branch": "main"}));
+        let cache_key = key.cache_key();
+        assert!(cache_key.starts_with("sem:"), "Cache key format: sem:<hash>");
+        assert!(cache_key.len() > 10, "Cache key should include content hash");
+        // Same computation again must yield same key
+        let key2 = IdempotencyKey::semantic("git_log", &json!({"branch": "main", "count": 10}));
+        assert_eq!(cache_key, key2.cache_key(), "Content-addressable: order-independent");
+    }
+
+    #[test]
+    fn cache_overwrite_updates_result() {
+        let mut cache = InMemoryIdempotencyCache::new();
+        let key = IdempotencyKey::semantic("git_status", &json!({}));
+        cache.record(&key, CachedToolResult {
+            tool_name: "git_status".into(),
+            output: "clean".into(),
+            is_error: false,
+            cached_at: 1000,
+        });
+        cache.record(&key, CachedToolResult {
+            tool_name: "git_status".into(),
+            output: "modified: foo.rs".into(),
+            is_error: false,
+            cached_at: 2000,
+        });
+        let hit = cache.check(&key).unwrap();
+        assert_eq!(hit.output, "modified: foo.rs", "Latest record wins");
+    }
+
+    #[test]
+    fn nested_json_args_produce_stable_keys() {
+        // Real-world: tools with complex nested args
+        let args = json!({
+            "filters": {"status": "open", "labels": ["bug", "critical"]},
+            "repo": "matrixorigin/matrixone"
+        });
+        let key1 = IdempotencyKey::semantic("github_list_issues", &args);
+        // Same structure, different insertion order
+        let args2 = json!({
+            "repo": "matrixorigin/matrixone",
+            "filters": {"labels": ["bug", "critical"], "status": "open"}
+        });
+        let key2 = IdempotencyKey::semantic("github_list_issues", &args2);
+        assert_eq!(key1.cache_key(), key2.cache_key(),
+            "Nested JSON with same content must produce same key");
+    }
+}

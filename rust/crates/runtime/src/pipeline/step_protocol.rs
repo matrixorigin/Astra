@@ -1432,7 +1432,7 @@ impl StepEventStore for StepEventDag {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn epoch_ms() -> u64 {
+pub fn epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
