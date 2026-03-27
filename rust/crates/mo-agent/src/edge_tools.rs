@@ -713,6 +713,7 @@ impl ToolExecutor {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         let root: PathBuf = project_root.into();
         let preferred_repos = detect_git_remote_repos(&root);
+        let sandbox = mo_agent_runtime::tool_sandbox::SandboxPolicy::for_project(&root);
         Self {
             project_root: root,
             cloud_base: None,
@@ -726,7 +727,7 @@ impl ToolExecutor {
                 .user_agent(format!("mo-agent/{}", env!("CARGO_PKG_VERSION")))
                 .build()
                 .expect("failed to create GitHub HTTP client"),
-            sandbox_policy: None,
+            sandbox_policy: Some(sandbox),
             preferred_repos: std::sync::Mutex::new(preferred_repos),
         }
     }
@@ -871,6 +872,14 @@ impl ToolExecutor {
                     args.clone(),
                 ) {
                     Ok(chain) => {
+                        // Validate chain steps reference known tools
+                        let known: Vec<&str> = mo_agent_runtime::tool_registry::TOOL_CATALOG
+                            .iter()
+                            .map(|t| t.name)
+                            .collect();
+                        if let Err(errors) = chain.validate(&known) {
+                            return format!("Error: Invalid chain: {}", errors.join("; "));
+                        }
                         let input = args
                             .get("input")
                             .cloned()
@@ -918,6 +927,7 @@ impl ToolExecutor {
                 let output = self.execute(&step.tool, &resolved).await;
                 let is_err = output.starts_with("Error")
                     || output.starts_with("error")
+                    || output.starts_with("Sandbox:")
                     || output.contains("\"error\":");
 
                 ctx.record_step(
@@ -1260,8 +1270,12 @@ mod tests {
     #[test]
     fn read_file_nonexistent_returns_error() {
         let executor = test_executor();
-        let result = executor.read_file(&json!({"path": "/nonexistent/file.txt"}));
-        assert!(result.contains("Error"), "got: {result}");
+        // Use path within project root (temp_dir) that doesn't exist
+        let result = executor.read_file(&json!({"path": "nonexistent_file_xyz.txt"}));
+        assert!(
+            result.contains("Error") || result.contains("Sandbox"),
+            "got: {result}"
+        );
     }
 
     #[test]
@@ -1584,7 +1598,7 @@ mod tests {
         let chain = ToolChain::new("error_chain", "Read nonexistent then write")
             .step(
                 "read_file",
-                json!({"path": "/definitely/nonexistent/file.txt"}),
+                json!({"path": "definitely_nonexistent_file.txt"}),
             )
             .step(
                 "write_file",
@@ -1658,7 +1672,7 @@ mod tests {
         let mut chain = ToolChain::new("skip_test", "Test skip condition");
         chain.steps.push(ChainStep {
             tool: "read_file".into(),
-            args: json!({"path": "/no/such/file"}),
+            args: json!({"path": "no_such_file_xyz.txt"}),
             output_key: None,
             skip_if_prev_contains: None,
         });

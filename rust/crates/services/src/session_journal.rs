@@ -146,7 +146,15 @@ impl JournalWriter {
             .create(true)
             .append(true)
             .open(&self.path)?;
-        writeln!(file, "{line}")?;
+        if let Err(e) = writeln!(file, "{line}") {
+            if e.kind() == std::io::ErrorKind::Other
+                || e.raw_os_error() == Some(28) // ENOSPC
+                || e.to_string().contains("No space")
+            {
+                eprintln!("[journal] CRITICAL: disk full, journal event lost");
+            }
+            return Err(e);
+        }
         Ok(())
     }
 

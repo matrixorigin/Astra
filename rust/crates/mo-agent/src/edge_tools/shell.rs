@@ -285,8 +285,8 @@ impl ToolExecutor {
             .unwrap_or(10_000) as usize;
         let timeout_secs = args.get("timeout").and_then(Value::as_u64).unwrap_or(10);
 
-        let output = Command::new("curl")
-            .args([
+        let mut cmd = Command::new("curl");
+        cmd.args([
                 "-sS",
                 "-L",
                 "--max-time",
@@ -299,9 +299,17 @@ impl ToolExecutor {
             ])
             .current_dir(&self.project_root)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output();
-        match output {
+            .stderr(Stdio::piped());
+
+        // Apply sandbox environment filtering (same as bash)
+        if let Some(ref policy) = self.sandbox_policy
+            && !matches!(policy.mode, SandboxMode::Permissive)
+            && let Err(e) = sandbox_command(policy, &mut cmd)
+        {
+            return format!("Error: sandbox policy application failed: {e}");
+        }
+
+        match cmd.output() {
             Ok(out) => {
                 let status = out.status;
                 let stdout = String::from_utf8_lossy(&out.stdout);
@@ -453,12 +461,14 @@ mod tests {
     // ── resolve_checked sandbox ──────────────────────────────────────────────
 
     #[test]
-    fn resolve_checked_without_sandbox_allows_all() {
+    fn resolve_checked_with_permissive_sandbox_allows_all() {
+        use mo_agent_runtime::tool_sandbox::SandboxPolicy;
         let dir = tempfile::tempdir().unwrap();
-        let executor = ToolExecutor::new(dir.path());
-        // No sandbox policy → all paths allowed
+        let mut executor = ToolExecutor::new(dir.path());
+        // Permissive policy → all paths allowed
+        executor.sandbox_policy = Some(SandboxPolicy::permissive(dir.path()));
         let result = executor.resolve_checked("/etc/passwd");
-        assert!(result.is_ok(), "should allow without sandbox: {result:?}");
+        assert!(result.is_ok(), "should allow with permissive: {result:?}");
     }
 
     #[test]
