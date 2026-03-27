@@ -264,17 +264,29 @@ impl StateSyncService for MatrixOneSyncService {
         match result {
             Ok(_) => {
                 self.log_sync(
-                    user_id, "", "learning", SyncDirection::Push,
-                    snapshot_json.len(), "success", None,
-                ).await;
+                    user_id,
+                    "",
+                    "learning",
+                    SyncDirection::Push,
+                    snapshot_json.len(),
+                    "success",
+                    None,
+                )
+                .await;
                 SyncResult::ok(SyncDirection::Push, "learning", 1)
             }
             Err(e) => {
                 let msg = format!("push_learning: {e}");
                 self.log_sync(
-                    user_id, "", "learning", SyncDirection::Push,
-                    0, "error", Some(&msg),
-                ).await;
+                    user_id,
+                    "",
+                    "learning",
+                    SyncDirection::Push,
+                    0,
+                    "error",
+                    Some(&msg),
+                )
+                .await;
                 SyncResult::err(SyncDirection::Push, "learning", msg)
             }
         }
@@ -299,9 +311,15 @@ impl StateSyncService for MatrixOneSyncService {
                     .try_get("snapshot_json")
                     .map_err(|e| format!("pull_learning decode: {e}"))?;
                 self.log_sync(
-                    user_id, "", "learning", SyncDirection::Pull,
-                    json.len(), "success", None,
-                ).await;
+                    user_id,
+                    "",
+                    "learning",
+                    SyncDirection::Pull,
+                    json.len(),
+                    "success",
+                    None,
+                )
+                .await;
                 Ok(Some(json))
             }
             None => Ok(None),
@@ -402,18 +420,17 @@ impl StateSyncService for MatrixOneSyncService {
             row.try_get::<String, _>("created_at").ok()
         });
 
-        let pending: u32 = sqlx::query(
-            "SELECT COUNT(*) as cnt FROM session_sync_log WHERE status = 'pending'",
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|row| {
-            use sqlx::Row;
-            row.try_get::<i64, _>("cnt").ok().map(|c| c as u32)
-        })
-        .unwrap_or(0);
+        let pending: u32 =
+            sqlx::query("SELECT COUNT(*) as cnt FROM session_sync_log WHERE status = 'pending'")
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|row| {
+                    use sqlx::Row;
+                    row.try_get::<i64, _>("cnt").ok().map(|c| c as u32)
+                })
+                .unwrap_or(0);
 
         let last_err = sqlx::query(
             "SELECT error_message FROM session_sync_log \
@@ -425,7 +442,9 @@ impl StateSyncService for MatrixOneSyncService {
         .flatten()
         .and_then(|row| {
             use sqlx::Row;
-            row.try_get::<Option<String>, _>("error_message").ok().flatten()
+            row.try_get::<Option<String>, _>("error_message")
+                .ok()
+                .flatten()
         });
 
         SyncStatus {

@@ -13,11 +13,11 @@
 //!   to block on async sqlx calls. This is safe because the caller (chat_stream) is
 //!   already in an async context — the bridge runs the query on the current runtime.
 
+use crate::pipeline::scheduling::CheckpointWriter;
 use crate::pipeline::step_protocol::{
     CachedToolResult, CheckpointTier, CheckpointTrigger, IdempotencyCache, IdempotencyKey,
     LightCheckpoint, Step, StepCheckpoint,
 };
-use crate::pipeline::scheduling::CheckpointWriter;
 use sqlx::{MySql, Pool, Row};
 
 fn epoch_ms() -> u64 {
@@ -151,10 +151,7 @@ impl MatrixOneCheckpointWriter {
     }
 
     /// Async implementation of read_checkpoint.
-    async fn read_checkpoint_async(
-        &self,
-        step_id: &str,
-    ) -> Result<Option<StepCheckpoint>, String> {
+    async fn read_checkpoint_async(&self, step_id: &str) -> Result<Option<StepCheckpoint>, String> {
         let pattern = format!("step:{}:%", step_id);
         let row = sqlx::query(
             "SELECT state_json FROM session_checkpoints \
@@ -323,12 +320,10 @@ impl MatrixOneIdempotencyCache {
 
     /// Async count: local + DB (deduped).
     async fn len_async(&self) -> usize {
-        let db_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM step_idempotency_cache",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+        let db_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM step_idempotency_cache")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
         db_count as usize
     }
 }
@@ -447,10 +442,22 @@ mod tests {
 
     #[test]
     fn checkpoint_tier_from_trigger() {
-        assert_eq!(CheckpointTrigger::SlotCompleted.checkpoint_tier(), CheckpointTier::Light);
-        assert_eq!(CheckpointTrigger::PhaseTransition.checkpoint_tier(), CheckpointTier::Heavy);
-        assert_eq!(CheckpointTrigger::BeforeExpensiveOp.checkpoint_tier(), CheckpointTier::Light);
-        assert_eq!(CheckpointTrigger::Explicit.checkpoint_tier(), CheckpointTier::Heavy);
+        assert_eq!(
+            CheckpointTrigger::SlotCompleted.checkpoint_tier(),
+            CheckpointTier::Light
+        );
+        assert_eq!(
+            CheckpointTrigger::PhaseTransition.checkpoint_tier(),
+            CheckpointTier::Heavy
+        );
+        assert_eq!(
+            CheckpointTrigger::BeforeExpensiveOp.checkpoint_tier(),
+            CheckpointTier::Light
+        );
+        assert_eq!(
+            CheckpointTrigger::Explicit.checkpoint_tier(),
+            CheckpointTier::Heavy
+        );
     }
 
     #[test]
@@ -597,12 +604,11 @@ mod tests {
     fn context_signature_affects_key() {
         let args = serde_json::json!({"path": "z.rs"});
         let key_plain = IdempotencyKey::new("s1", 0, "read_file", &args);
-        let key_ctx = IdempotencyKey::new("s1", 0, "read_file", &args).with_context(
-            ContextSignature {
+        let key_ctx =
+            IdempotencyKey::new("s1", 0, "read_file", &args).with_context(ContextSignature {
                 workspace_version: Some("abc".to_string()),
                 memory_snapshot_id: None,
-            },
-        );
+            });
         // Different context → different cache key
         assert_ne!(key_plain.cache_key(), key_ctx.cache_key());
     }

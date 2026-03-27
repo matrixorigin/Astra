@@ -67,10 +67,7 @@ pub trait SessionRestoreService: Send + Sync {
     async fn restore_session(&self, session_id: &str) -> Result<Option<RestoredSession>, String>;
 
     /// List available checkpoints for a session.
-    async fn list_checkpoints(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<RestoredCheckpoint>, String>;
+    async fn list_checkpoints(&self, session_id: &str) -> Result<Vec<RestoredCheckpoint>, String>;
 
     /// Restore session state to a specific checkpoint.
     async fn restore_to_checkpoint(
@@ -80,10 +77,7 @@ pub trait SessionRestoreService: Send + Sync {
     ) -> Result<Option<RestoredSession>, String>;
 
     /// List resumable sessions for a user (active or paused).
-    async fn list_resumable_sessions(
-        &self,
-        user_id: &str,
-    ) -> Result<Vec<RestoredSession>, String>;
+    async fn list_resumable_sessions(&self, user_id: &str) -> Result<Vec<RestoredSession>, String>;
 }
 
 // ─── Local-First Implementation ─────────────────────────────────────────────
@@ -153,10 +147,7 @@ impl HybridRestoreService {
     }
 
     /// Restore recent tools from the last N events in MatrixOne.
-    async fn restore_recent_tools(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<String>, String> {
+    async fn restore_recent_tools(&self, session_id: &str) -> Result<Vec<String>, String> {
         let pool = match &self.pool {
             Some(p) => p,
             None => return Ok(Vec::new()),
@@ -227,10 +218,7 @@ impl HybridRestoreService {
     }
 
     /// List checkpoints from MatrixOne.
-    async fn cloud_checkpoints(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<RestoredCheckpoint>, String> {
+    async fn cloud_checkpoints(&self, session_id: &str) -> Result<Vec<RestoredCheckpoint>, String> {
         let pool = match &self.pool {
             Some(p) => p,
             None => return Ok(Vec::new()),
@@ -268,13 +256,18 @@ impl SessionRestoreService for HybridRestoreService {
         // Step 1: Try local workspace metadata first
         if let Some(ws) = self.restore_local_workspace(session_id) {
             let recent_tools = if self.pool.is_some() {
-                self.restore_recent_tools(session_id).await.unwrap_or_default()
+                self.restore_recent_tools(session_id)
+                    .await
+                    .unwrap_or_default()
             } else {
                 Vec::new()
             };
 
             // Try local learning file
-            let learning = self.restore_learning("local", "default").await.unwrap_or(None);
+            let learning = self
+                .restore_learning("local", "default")
+                .await
+                .unwrap_or(None);
 
             let ckpt_count = super::session_checkpoint::read_checkpoint_index(session_id)
                 .map(|v| v.len() as u32)
@@ -300,13 +293,10 @@ impl SessionRestoreService for HybridRestoreService {
         self.restore_cloud_session(session_id).await
     }
 
-    async fn list_checkpoints(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<RestoredCheckpoint>, String> {
+    async fn list_checkpoints(&self, session_id: &str) -> Result<Vec<RestoredCheckpoint>, String> {
         // Try local first
-        let local_entries = super::session_checkpoint::read_checkpoint_index(session_id)
-            .unwrap_or_default();
+        let local_entries =
+            super::session_checkpoint::read_checkpoint_index(session_id).unwrap_or_default();
 
         if !local_entries.is_empty() {
             // Parse the index entries (format: "NNN - Turn NN - title")
@@ -351,9 +341,7 @@ impl SessionRestoreService for HybridRestoreService {
 
         // Find the checkpoint
         let checkpoints = self.list_checkpoints(session_id).await?;
-        let target = checkpoints
-            .iter()
-            .find(|c| c.number == checkpoint_number);
+        let target = checkpoints.iter().find(|c| c.number == checkpoint_number);
 
         match target {
             Some(ckpt) => {
@@ -373,10 +361,7 @@ impl SessionRestoreService for HybridRestoreService {
         }
     }
 
-    async fn list_resumable_sessions(
-        &self,
-        user_id: &str,
-    ) -> Result<Vec<RestoredSession>, String> {
+    async fn list_resumable_sessions(&self, user_id: &str) -> Result<Vec<RestoredSession>, String> {
         let pool = match &self.pool {
             Some(p) => p,
             None => return Ok(Vec::new()),
@@ -560,5 +545,51 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_none());
+    }
+
+    // ── Restored session field coverage ──
+
+    #[test]
+    fn restored_session_cloud_flag_distinguishes_source() {
+        let local = RestoredSession {
+            restored_from_cloud: false,
+            ..Default::default()
+        };
+        let cloud = RestoredSession {
+            restored_from_cloud: true,
+            ..Default::default()
+        };
+        assert!(!local.restored_from_cloud);
+        assert!(cloud.restored_from_cloud);
+    }
+
+    #[test]
+    fn restored_checkpoint_ordering() {
+        let ckpts = vec![
+            RestoredCheckpoint {
+                number: 1,
+                turn: 5,
+                title: "First".into(),
+                summary: String::new(),
+                total_tokens: 1000,
+            },
+            RestoredCheckpoint {
+                number: 2,
+                turn: 10,
+                title: "Second".into(),
+                summary: String::new(),
+                total_tokens: 3000,
+            },
+        ];
+        assert!(ckpts[0].turn < ckpts[1].turn);
+        assert!(ckpts[0].total_tokens < ckpts[1].total_tokens);
+    }
+
+    #[tokio::test]
+    async fn local_only_restore_to_checkpoint_session_not_found() {
+        let svc = HybridRestoreService::local_only();
+        // Session doesn't exist → returns Ok(None)
+        let result = svc.restore_to_checkpoint("nonexistent-session-id", 1).await;
+        assert!(matches!(result, Ok(None)));
     }
 }

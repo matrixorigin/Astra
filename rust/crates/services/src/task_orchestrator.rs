@@ -263,12 +263,8 @@ impl MatrixOneTaskService {
             plan,
             checkpoint,
             error_message: row.try_get("error_message").ok().flatten(),
-            created_at: row
-                .try_get::<String, _>("created_at")
-                .unwrap_or_default(),
-            updated_at: row
-                .try_get::<String, _>("updated_at")
-                .unwrap_or_default(),
+            created_at: row.try_get::<String, _>("created_at").unwrap_or_default(),
+            updated_at: row.try_get::<String, _>("updated_at").unwrap_or_default(),
             completed_at: row.try_get("completed_at").ok().flatten(),
         })
     }
@@ -411,8 +407,7 @@ impl TaskService for MatrixOneTaskService {
     }
 
     async fn update_plan(&self, task_id: &str, plan: &TaskPlan) -> Result<(), String> {
-        let plan_json =
-            serde_json::to_string(plan).map_err(|e| format!("serialize plan: {e}"))?;
+        let plan_json = serde_json::to_string(plan).map_err(|e| format!("serialize plan: {e}"))?;
         let progress = plan.progress_pct();
         let done = plan.items_done();
         let total = plan.subtasks.len() as i32;
@@ -890,7 +885,9 @@ mod tests {
             .unwrap();
 
         // Pending → InProgress
-        svc.update_status(&tid, TaskStatus::InProgress).await.unwrap();
+        svc.update_status(&tid, TaskStatus::InProgress)
+            .await
+            .unwrap();
         let t = svc.get_task(&tid).await.unwrap().unwrap();
         assert_eq!(t.status, TaskStatus::InProgress);
 
@@ -1101,7 +1098,9 @@ mod tests {
             .await
             .unwrap();
 
-        svc.update_status(&tid, TaskStatus::InProgress).await.unwrap();
+        svc.update_status(&tid, TaskStatus::InProgress)
+            .await
+            .unwrap();
         svc.save_checkpoint(
             &tid,
             &TaskCheckpoint {
@@ -1110,7 +1109,10 @@ mod tests {
                 session_id: Some("session-1".into()),
                 state: {
                     let mut m = serde_json::Map::new();
-                    m.insert("files_modified".into(), serde_json::json!(["auth.rs", "config.rs"]));
+                    m.insert(
+                        "files_modified".into(),
+                        serde_json::json!(["auth.rs", "config.rs"]),
+                    );
                     m
                 },
             },
@@ -1136,7 +1138,9 @@ mod tests {
         assert_eq!(plan.progress_pct(), 33); // 1/3 completed
 
         // Resume: update status and continue
-        svc.update_status(&tid, TaskStatus::InProgress).await.unwrap();
+        svc.update_status(&tid, TaskStatus::InProgress)
+            .await
+            .unwrap();
         let resumed = svc.get_task(&tid).await.unwrap().unwrap();
         assert_eq!(resumed.status, TaskStatus::InProgress);
     }

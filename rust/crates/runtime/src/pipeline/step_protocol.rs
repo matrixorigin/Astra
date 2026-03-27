@@ -739,7 +739,12 @@ pub enum StepCheckpoint {
 
 impl StepCheckpoint {
     /// Create a light checkpoint
-    pub fn light(step_id: String, task_id: String, agent_id: String, cursor: ExecutionCursor) -> Self {
+    pub fn light(
+        step_id: String,
+        task_id: String,
+        agent_id: String,
+        cursor: ExecutionCursor,
+    ) -> Self {
         Self::Light(LightCheckpoint {
             protocol_version: PROTOCOL_VERSION,
             cursor,
@@ -753,7 +758,12 @@ impl StepCheckpoint {
     }
 
     /// Create a heavy checkpoint (full recovery point)
-    pub fn heavy(step_id: String, task_id: String, agent_id: String, cursor: ExecutionCursor) -> Self {
+    pub fn heavy(
+        step_id: String,
+        task_id: String,
+        agent_id: String,
+        cursor: ExecutionCursor,
+    ) -> Self {
         Self::Heavy(HeavyCheckpoint {
             light: LightCheckpoint {
                 protocol_version: PROTOCOL_VERSION,
@@ -776,7 +786,12 @@ impl StepCheckpoint {
     }
 
     /// v2-compat constructor (creates Heavy by default for backward compat)
-    pub fn new(step_id: String, task_id: String, agent_id: String, cursor: ExecutionCursor) -> Self {
+    pub fn new(
+        step_id: String,
+        task_id: String,
+        agent_id: String,
+        cursor: ExecutionCursor,
+    ) -> Self {
         Self::heavy(step_id, task_id, agent_id, cursor)
     }
 
@@ -1168,14 +1183,22 @@ pub fn classify_tool_idempotency(tool_name: &str) -> ToolIdempotency {
         | "git_blame" | "git_file_history" | "git_contributors" | "git_log_search"
         | "github_list_prs" | "github_get_pr" | "github_list_issues" | "github_get_issue"
         | "github_ci_status" | "github_repo_stats" | "mo_query" | "memory_search"
-        | "memory_profile" | "web_fetch" | "get_agent_info" | "reflect" => ToolIdempotency::PureRead,
+        | "memory_profile" | "web_fetch" | "get_agent_info" | "reflect" => {
+            ToolIdempotency::PureRead
+        }
 
         // Idempotent writes — overwrite semantics
         "write_file" => ToolIdempotency::IdempotentWrite,
 
         // Non-idempotent — must cache result
-        "bash" | "str_replace" | "github_create_issue" | "memory_store" | "memory_purge"
-        | "memory_correct" | "mo_snapshot" | "mo_branch" => ToolIdempotency::NonIdempotent,
+        "bash"
+        | "str_replace"
+        | "github_create_issue"
+        | "memory_store"
+        | "memory_purge"
+        | "memory_correct"
+        | "mo_snapshot"
+        | "mo_branch" => ToolIdempotency::NonIdempotent,
 
         // Unknown tools: treat as non-idempotent (safe default)
         _ => ToolIdempotency::NonIdempotent,
@@ -1348,7 +1371,10 @@ impl StepEventStore for StepEventDag {
     }
 
     fn events_for_step(&self, step_id: &str) -> Vec<&StepEvent> {
-        self.events.iter().filter(|e| e.step_id == step_id).collect()
+        self.events
+            .iter()
+            .filter(|e| e.step_id == step_id)
+            .collect()
     }
 
     fn ancestors(&self, event_id: &str) -> Vec<&StepEvent> {
@@ -1471,8 +1497,7 @@ fn compute_idempotency_key(
     hasher.update(b":");
     // Convert to Value then canonical_json for deterministic output
     let payload_json = serde_json::to_string(payload).unwrap_or_default();
-    let payload_value: serde_json::Value =
-        serde_json::from_str(&payload_json).unwrap_or_default();
+    let payload_value: serde_json::Value = serde_json::from_str(&payload_json).unwrap_or_default();
     hasher.update(canonical_json(&payload_value).as_bytes());
     let hash = hasher.finalize();
     format!("{:x}", hash)[..32].to_string() // 32-char prefix
@@ -1526,7 +1551,10 @@ mod tests {
         // PROTOCOL_VERSION = 1000 (v1.0), major = 1. version 1050 → major = 1 (same)
         let result = check_protocol_version_with_policy(1050, VersionPolicy::Compatible);
         assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), VersionVerdict::CompatibleDecode { found: 1050 }));
+        assert!(matches!(
+            result.unwrap(),
+            VersionVerdict::CompatibleDecode { found: 1050 }
+        ));
     }
 
     #[test]
@@ -1552,7 +1580,10 @@ mod tests {
         // version 1050 → same major (1) → CompatibleDecode
         let result = check_protocol_version_with_policy(1050, VersionPolicy::Migrate);
         assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), VersionVerdict::CompatibleDecode { .. }));
+        assert!(matches!(
+            result.unwrap(),
+            VersionVerdict::CompatibleDecode { .. }
+        ));
     }
 
     #[test]
@@ -1560,7 +1591,10 @@ mod tests {
         // version 50 → major 0, expected major 1 → Migrated
         let result = check_protocol_version_with_policy(50, VersionPolicy::Migrate);
         assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), VersionVerdict::Migrated { from: 50, to: 1000 }));
+        assert!(matches!(
+            result.unwrap(),
+            VersionVerdict::Migrated { from: 50, to: 1000 }
+        ));
     }
 
     #[test]
@@ -1571,7 +1605,11 @@ mod tests {
 
     #[test]
     fn version_exact_match_all_policies() {
-        for policy in [VersionPolicy::Strict, VersionPolicy::Compatible, VersionPolicy::Migrate] {
+        for policy in [
+            VersionPolicy::Strict,
+            VersionPolicy::Compatible,
+            VersionPolicy::Migrate,
+        ] {
             let result = check_protocol_version_with_policy(PROTOCOL_VERSION, policy);
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), VersionVerdict::ExactMatch);
@@ -1583,9 +1621,14 @@ mod tests {
     #[test]
     fn step_creation_defaults() {
         let step = Step::new(
-            "s1".into(), "t1".into(), "n1".into(),
+            "s1".into(),
+            "t1".into(),
+            "n1".into(),
             StepAction::Perceive,
-            StepPayload::Perceive { user_query: "hello".into(), memory_context: vec![] },
+            StepPayload::Perceive {
+                user_query: "hello".into(),
+                memory_context: vec![],
+            },
         );
         assert_eq!(step.status(), StepStatus::Pending);
         assert_eq!(step.descriptor.protocol_version, PROTOCOL_VERSION);
@@ -1603,9 +1646,14 @@ mod tests {
     #[test]
     fn step_creation_with_memory_context() {
         let step = Step::new(
-            "s1".into(), "t1".into(), "n1".into(),
+            "s1".into(),
+            "t1".into(),
+            "n1".into(),
             StepAction::Perceive,
-            StepPayload::Perceive { user_query: "hello".into(), memory_context: vec![] },
+            StepPayload::Perceive {
+                user_query: "hello".into(),
+                memory_context: vec![],
+            },
         )
         .with_memory_context(MemoryContext {
             retrieved_memory_ids: vec!["mem-1".into()],
@@ -1626,9 +1674,14 @@ mod tests {
     #[test]
     fn step_lifecycle_started_completed() {
         let mut step = Step::new(
-            "s1".into(), "t1".into(), "n1".into(),
+            "s1".into(),
+            "t1".into(),
+            "n1".into(),
             StepAction::Act,
-            StepPayload::Act { selected_tools: vec!["grep".into()], tool_calls: vec![] },
+            StepPayload::Act {
+                selected_tools: vec!["grep".into()],
+                tool_calls: vec![],
+            },
         );
         step.mark_started("agent-01");
         assert_eq!(step.status(), StepStatus::Running);
@@ -1636,8 +1689,10 @@ mod tests {
         assert!(step.execution.started_at.is_some());
 
         step.mark_completed(StepResult::Act {
-            tool_results_count: 1, assistant_text: Some("found it".into()),
-            tokens_in: 100, tokens_out: 50,
+            tool_results_count: 1,
+            assistant_text: Some("found it".into()),
+            tokens_in: 100,
+            tokens_out: 50,
         });
         assert!(step.is_terminal());
         assert!(!step.is_retriable());
@@ -1647,9 +1702,14 @@ mod tests {
     #[test]
     fn step_lifecycle_failed_retriable() {
         let mut step = Step::new(
-            "s1".into(), "t1".into(), "n1".into(),
+            "s1".into(),
+            "t1".into(),
+            "n1".into(),
             StepAction::Act,
-            StepPayload::Act { selected_tools: vec![], tool_calls: vec![] },
+            StepPayload::Act {
+                selected_tools: vec![],
+                tool_calls: vec![],
+            },
         );
         step.mark_started("agent-01");
         step.mark_failed("timeout");
@@ -1932,8 +1992,8 @@ mod tests {
     fn idempotency_key_with_context_signature() {
         let args = serde_json::json!({"path": "src/main.rs"});
         let key_no_ctx = IdempotencyKey::new("s1", 0, "read_file", &args);
-        let key_with_ctx = IdempotencyKey::new("s1", 0, "read_file", &args)
-            .with_context(ContextSignature {
+        let key_with_ctx =
+            IdempotencyKey::new("s1", 0, "read_file", &args).with_context(ContextSignature {
                 workspace_version: Some("abc12345deadbeef".into()),
                 memory_snapshot_id: None,
             });
@@ -1947,11 +2007,10 @@ mod tests {
     #[test]
     fn idempotency_key_context_memory_snapshot() {
         let args = serde_json::json!({});
-        let key = IdempotencyKey::semantic("memory_search", &args)
-            .with_context(ContextSignature {
-                workspace_version: None,
-                memory_snapshot_id: Some("snap-20250101".into()),
-            });
+        let key = IdempotencyKey::semantic("memory_search", &args).with_context(ContextSignature {
+            workspace_version: None,
+            memory_snapshot_id: Some("snap-20250101".into()),
+        });
         assert!(key.cache_key().contains(":ms=snap-202"));
     }
 
@@ -1963,10 +2022,15 @@ mod tests {
         let key = IdempotencyKey::new("s1", 0, "grep", &serde_json::json!({}));
         assert!(cache.check(&key).is_none());
 
-        cache.record(&key, CachedToolResult {
-            tool_name: "grep".into(), output: "3 matches".into(),
-            is_error: false, cached_at: epoch_ms(),
-        });
+        cache.record(
+            &key,
+            CachedToolResult {
+                tool_name: "grep".into(),
+                output: "3 matches".into(),
+                is_error: false,
+                cached_at: epoch_ms(),
+            },
+        );
         assert_eq!(cache.len(), 1);
         assert!(cache.check(&key).is_some());
         assert_eq!(cache.check(&key).unwrap().output, "3 matches");
@@ -1979,9 +2043,15 @@ mod tests {
         let k2 = IdempotencyKey::new("step-A", 1, "read_file", &serde_json::json!({}));
         let k3 = IdempotencyKey::new("step-B", 0, "grep", &serde_json::json!({}));
         for key in [&k1, &k2, &k3] {
-            cache.record(key, CachedToolResult {
-                tool_name: "t".into(), output: "r".into(), is_error: false, cached_at: 0,
-            });
+            cache.record(
+                key,
+                CachedToolResult {
+                    tool_name: "t".into(),
+                    output: "r".into(),
+                    is_error: false,
+                    cached_at: 0,
+                },
+            );
         }
         assert_eq!(cache.len(), 3);
         cache.evict_step("step-A");
@@ -1994,28 +2064,60 @@ mod tests {
 
     #[test]
     fn tool_classification_read_tools() {
-        for tool in ["read_file", "grep", "glob", "list_dir", "git_status", "git_log",
-            "git_diff", "git_blame", "github_list_prs", "github_ci_status",
-            "mo_query", "memory_search"] {
-            assert_eq!(classify_tool_idempotency(tool), ToolIdempotency::PureRead, "Expected PureRead for {tool}");
+        for tool in [
+            "read_file",
+            "grep",
+            "glob",
+            "list_dir",
+            "git_status",
+            "git_log",
+            "git_diff",
+            "git_blame",
+            "github_list_prs",
+            "github_ci_status",
+            "mo_query",
+            "memory_search",
+        ] {
+            assert_eq!(
+                classify_tool_idempotency(tool),
+                ToolIdempotency::PureRead,
+                "Expected PureRead for {tool}"
+            );
         }
     }
 
     #[test]
     fn tool_classification_idempotent_write() {
-        assert_eq!(classify_tool_idempotency("write_file"), ToolIdempotency::IdempotentWrite);
+        assert_eq!(
+            classify_tool_idempotency("write_file"),
+            ToolIdempotency::IdempotentWrite
+        );
     }
 
     #[test]
     fn tool_classification_non_idempotent() {
-        for tool in ["bash", "str_replace", "github_create_issue", "memory_store", "memory_purge", "mo_snapshot"] {
-            assert_eq!(classify_tool_idempotency(tool), ToolIdempotency::NonIdempotent, "Expected NonIdempotent for {tool}");
+        for tool in [
+            "bash",
+            "str_replace",
+            "github_create_issue",
+            "memory_store",
+            "memory_purge",
+            "mo_snapshot",
+        ] {
+            assert_eq!(
+                classify_tool_idempotency(tool),
+                ToolIdempotency::NonIdempotent,
+                "Expected NonIdempotent for {tool}"
+            );
         }
     }
 
     #[test]
     fn unknown_tool_defaults_to_non_idempotent() {
-        assert_eq!(classify_tool_idempotency("some_future_tool"), ToolIdempotency::NonIdempotent);
+        assert_eq!(
+            classify_tool_idempotency("some_future_tool"),
+            ToolIdempotency::NonIdempotent
+        );
     }
 
     // ── Retry Policy ──
@@ -2031,7 +2133,10 @@ mod tests {
 
     #[test]
     fn retry_policy_backoff_capped() {
-        let policy = RetryPolicy { backoff_max_ms: 5000, ..RetryPolicy::default() };
+        let policy = RetryPolicy {
+            backoff_max_ms: 5000,
+            ..RetryPolicy::default()
+        };
         assert_eq!(policy.backoff_ms(10), 5000);
     }
 
@@ -2116,11 +2221,18 @@ mod tests {
     fn event_dag_implements_store_trait() {
         let mut dag = StepEventDag::new();
         // Use the trait method (not push)
-        <StepEventDag as StepEventStore>::append(&mut dag, StepEvent {
-            event_id: "e1".into(), step_id: "s1".into(),
-            event_type: StepEventType::StepStarted,
-            agent_id: None, caused_by: vec![], payload: None, created_at: 100,
-        });
+        <StepEventDag as StepEventStore>::append(
+            &mut dag,
+            StepEvent {
+                event_id: "e1".into(),
+                step_id: "s1".into(),
+                event_type: StepEventType::StepStarted,
+                agent_id: None,
+                caused_by: vec![],
+                payload: None,
+                created_at: 100,
+            },
+        );
         assert_eq!(<StepEventDag as StepEventStore>::len(&dag), 1);
     }
 
@@ -2128,19 +2240,31 @@ mod tests {
     fn event_dag_events_for_step() {
         let mut dag = StepEventDag::new();
         dag.push(StepEvent {
-            event_id: "e1".into(), step_id: "s1".into(),
+            event_id: "e1".into(),
+            step_id: "s1".into(),
             event_type: StepEventType::StepStarted,
-            agent_id: None, caused_by: vec![], payload: None, created_at: 100,
+            agent_id: None,
+            caused_by: vec![],
+            payload: None,
+            created_at: 100,
         });
         dag.push(StepEvent {
-            event_id: "e2".into(), step_id: "s2".into(),
+            event_id: "e2".into(),
+            step_id: "s2".into(),
             event_type: StepEventType::StepStarted,
-            agent_id: None, caused_by: vec![], payload: None, created_at: 200,
+            agent_id: None,
+            caused_by: vec![],
+            payload: None,
+            created_at: 200,
         });
         dag.push(StepEvent {
-            event_id: "e3".into(), step_id: "s1".into(),
+            event_id: "e3".into(),
+            step_id: "s1".into(),
             event_type: StepEventType::StepCompleted,
-            agent_id: None, caused_by: vec!["e1".into()], payload: None, created_at: 300,
+            agent_id: None,
+            caused_by: vec!["e1".into()],
+            payload: None,
+            created_at: 300,
         });
         let s1_events = dag.events_for_step("s1");
         assert_eq!(s1_events.len(), 2);
@@ -2152,19 +2276,31 @@ mod tests {
     fn event_dag_single_parent_chain() {
         let mut dag = StepEventDag::new();
         dag.push(StepEvent {
-            event_id: "e1".into(), step_id: "s1".into(),
+            event_id: "e1".into(),
+            step_id: "s1".into(),
             event_type: StepEventType::StepStarted,
-            agent_id: None, caused_by: vec![], payload: None, created_at: 100,
+            agent_id: None,
+            caused_by: vec![],
+            payload: None,
+            created_at: 100,
         });
         dag.push(StepEvent {
-            event_id: "e2".into(), step_id: "s1".into(),
+            event_id: "e2".into(),
+            step_id: "s1".into(),
             event_type: StepEventType::ToolCallStarted,
-            agent_id: None, caused_by: vec!["e1".into()], payload: None, created_at: 200,
+            agent_id: None,
+            caused_by: vec!["e1".into()],
+            payload: None,
+            created_at: 200,
         });
         dag.push(StepEvent {
-            event_id: "e3".into(), step_id: "s1".into(),
+            event_id: "e3".into(),
+            step_id: "s1".into(),
             event_type: StepEventType::ToolCallCompleted,
-            agent_id: None, caused_by: vec!["e2".into()], payload: None, created_at: 300,
+            agent_id: None,
+            caused_by: vec!["e2".into()],
+            payload: None,
+            created_at: 300,
         });
         assert_eq!(dag.len(), 3);
         let leaves = dag.leaves();
@@ -2180,32 +2316,48 @@ mod tests {
     fn event_dag_multi_parent_convergence() {
         let mut dag = StepEventDag::new();
         dag.push(StepEvent {
-            event_id: "start".into(), step_id: "s1".into(),
+            event_id: "start".into(),
+            step_id: "s1".into(),
             event_type: StepEventType::StepStarted,
-            agent_id: None, caused_by: vec![], payload: None, created_at: 100,
+            agent_id: None,
+            caused_by: vec![],
+            payload: None,
+            created_at: 100,
         });
         for (i, tool) in ["grep", "read_file", "git_log"].iter().enumerate() {
             dag.push(StepEvent {
-                event_id: format!("tool_start_{i}"), step_id: "s1".into(),
+                event_id: format!("tool_start_{i}"),
+                step_id: "s1".into(),
                 event_type: StepEventType::ToolCallStarted,
-                agent_id: None, caused_by: vec!["start".into()],
-                payload: Some(serde_json::json!({"tool": tool})), created_at: 200 + i as u64,
+                agent_id: None,
+                caused_by: vec!["start".into()],
+                payload: Some(serde_json::json!({"tool": tool})),
+                created_at: 200 + i as u64,
             });
         }
         for i in 0..3 {
             dag.push(StepEvent {
-                event_id: format!("tool_done_{i}"), step_id: "s1".into(),
+                event_id: format!("tool_done_{i}"),
+                step_id: "s1".into(),
                 event_type: StepEventType::ToolCallCompleted,
-                agent_id: None, caused_by: vec![format!("tool_start_{i}")],
-                payload: None, created_at: 400 + i as u64,
+                agent_id: None,
+                caused_by: vec![format!("tool_start_{i}")],
+                payload: None,
+                created_at: 400 + i as u64,
             });
         }
         dag.push(StepEvent {
-            event_id: "converge".into(), step_id: "s1".into(),
+            event_id: "converge".into(),
+            step_id: "s1".into(),
             event_type: StepEventType::ToolsConverged,
             agent_id: None,
-            caused_by: vec!["tool_done_0".into(), "tool_done_1".into(), "tool_done_2".into()],
-            payload: None, created_at: 500,
+            caused_by: vec![
+                "tool_done_0".into(),
+                "tool_done_1".into(),
+                "tool_done_2".into(),
+            ],
+            payload: None,
+            created_at: 500,
         });
         assert_eq!(dag.len(), 8);
         let leaves = dag.leaves();
@@ -2241,7 +2393,9 @@ mod tests {
     #[test]
     fn step_serde_roundtrip() {
         let step = Step::new(
-            "step-001".into(), "task-001".into(), "node-a".into(),
+            "step-001".into(),
+            "task-001".into(),
+            "node-a".into(),
             StepAction::Act,
             StepPayload::Act {
                 selected_tools: vec!["grep".into(), "bash".into()],
@@ -2267,12 +2421,19 @@ mod tests {
                 memory_matches: 3,
                 boost_terms: vec!["code".into(), "review".into()],
             },
-            StepResult::Plan { selected_tools: vec!["grep".into()], confidence: 0.9 },
-            StepResult::Evaluate {
-                verdict: StepVerdict::Continue, progress: 0.5,
-                should_continue: true, next_action: StepAction::Act,
+            StepResult::Plan {
+                selected_tools: vec!["grep".into()],
+                confidence: 0.9,
             },
-            StepResult::Error { message: "tool timeout".into() },
+            StepResult::Evaluate {
+                verdict: StepVerdict::Continue,
+                progress: 0.5,
+                should_continue: true,
+                next_action: StepAction::Act,
+            },
+            StepResult::Error {
+                message: "tool timeout".into(),
+            },
         ];
         for result in &results {
             let json = serde_json::to_string(result).unwrap();
@@ -2311,9 +2472,14 @@ mod tests {
     #[test]
     fn step_accessor_methods() {
         let step = Step::new(
-            "s1".into(), "t1".into(), "n1".into(),
+            "s1".into(),
+            "t1".into(),
+            "n1".into(),
             StepAction::Act,
-            StepPayload::Act { selected_tools: vec!["grep".into()], tool_calls: vec![] },
+            StepPayload::Act {
+                selected_tools: vec!["grep".into()],
+                tool_calls: vec![],
+            },
         );
         assert_eq!(step.step_id(), "s1");
         assert_eq!(step.action(), StepAction::Act);
@@ -2325,12 +2491,25 @@ mod tests {
     #[test]
     fn memory_governance_action_variants() {
         let actions = vec![
-            MemoryGovernanceAction::Retrieved { memory_id: "m1".into() },
-            MemoryGovernanceAction::Promoted { memory_id: "m2".into(), reason: "confirmed".into() },
-            MemoryGovernanceAction::Purged { memory_id: "m3".into(), reason: "stale".into() },
-            MemoryGovernanceAction::Corrected { memory_id: "m4".into(), reason: "updated".into() },
+            MemoryGovernanceAction::Retrieved {
+                memory_id: "m1".into(),
+            },
+            MemoryGovernanceAction::Promoted {
+                memory_id: "m2".into(),
+                reason: "confirmed".into(),
+            },
+            MemoryGovernanceAction::Purged {
+                memory_id: "m3".into(),
+                reason: "stale".into(),
+            },
+            MemoryGovernanceAction::Corrected {
+                memory_id: "m4".into(),
+                reason: "updated".into(),
+            },
             MemoryGovernanceAction::ClusterAnalyzed { cluster_count: 5 },
-            MemoryGovernanceAction::Reflected { summary: "session productive".into() },
+            MemoryGovernanceAction::Reflected {
+                summary: "session productive".into(),
+            },
         ];
         for action in &actions {
             let json = serde_json::to_string(action).unwrap();
@@ -2347,8 +2526,13 @@ mod tests {
             boost_terms: vec![],
             provenance: vec![],
             governance_actions: vec![
-                MemoryGovernanceAction::Retrieved { memory_id: "m1".into() },
-                MemoryGovernanceAction::Promoted { memory_id: "m1".into(), reason: "useful".into() },
+                MemoryGovernanceAction::Retrieved {
+                    memory_id: "m1".into(),
+                },
+                MemoryGovernanceAction::Promoted {
+                    memory_id: "m1".into(),
+                    reason: "useful".into(),
+                },
             ],
             cluster_insights: vec!["3 clusters found".into()],
             snapshot_id: Some("snap-001".into()),
@@ -2367,12 +2551,15 @@ mod tests {
         let mut cache: Box<dyn IdempotencyCache> = Box::new(InMemoryIdempotencyCache::new());
         let key = IdempotencyKey::new("s1", 0, "grep", &serde_json::json!({"pattern": "test"}));
         assert!(cache.check(&key).is_none());
-        cache.record(&key, CachedToolResult {
-            tool_name: "grep".into(),
-            output: "found".into(),
-            is_error: false,
-            cached_at: 0,
-        });
+        cache.record(
+            &key,
+            CachedToolResult {
+                tool_name: "grep".into(),
+                output: "found".into(),
+                is_error: false,
+                cached_at: 0,
+            },
+        );
         assert!(cache.check(&key).is_some());
         cache.evict_step("s1");
         assert!(cache.check(&key).is_none());
@@ -2382,10 +2569,22 @@ mod tests {
 
     #[test]
     fn checkpoint_trigger_tier_mapping() {
-        assert_eq!(CheckpointTrigger::SlotCompleted.checkpoint_tier(), CheckpointTier::Light);
-        assert_eq!(CheckpointTrigger::BeforeExpensiveOp.checkpoint_tier(), CheckpointTier::Light);
-        assert_eq!(CheckpointTrigger::PhaseTransition.checkpoint_tier(), CheckpointTier::Heavy);
-        assert_eq!(CheckpointTrigger::Explicit.checkpoint_tier(), CheckpointTier::Heavy);
+        assert_eq!(
+            CheckpointTrigger::SlotCompleted.checkpoint_tier(),
+            CheckpointTier::Light
+        );
+        assert_eq!(
+            CheckpointTrigger::BeforeExpensiveOp.checkpoint_tier(),
+            CheckpointTier::Light
+        );
+        assert_eq!(
+            CheckpointTrigger::PhaseTransition.checkpoint_tier(),
+            CheckpointTier::Heavy
+        );
+        assert_eq!(
+            CheckpointTrigger::Explicit.checkpoint_tier(),
+            CheckpointTier::Heavy
+        );
     }
 
     #[test]
@@ -2409,14 +2608,18 @@ mod tests {
     fn compute_idempotency_key_canonical() {
         // Same content, different key order → same idempotency key
         let key1 = compute_idempotency_key(
-            "t1", "n1", &StepAction::Act,
+            "t1",
+            "n1",
+            &StepAction::Act,
             &StepPayload::Act {
                 selected_tools: vec!["grep".into()],
                 tool_calls: vec![serde_json::json!({"a": 1, "b": 2})],
             },
         );
         let key2 = compute_idempotency_key(
-            "t1", "n1", &StepAction::Act,
+            "t1",
+            "n1",
+            &StepAction::Act,
             &StepPayload::Act {
                 selected_tools: vec!["grep".into()],
                 tool_calls: vec![serde_json::json!({"b": 2, "a": 1})],
@@ -2464,7 +2667,9 @@ mod tests {
     #[test]
     fn version_display_strict_says_discard() {
         let err = ProtocolError::VersionMismatch {
-            expected: 1000, found: 999, policy: VersionPolicy::Strict,
+            expected: 1000,
+            found: 999,
+            policy: VersionPolicy::Strict,
         };
         assert!(err.to_string().contains("Discard checkpoint and restart"));
     }
@@ -2472,7 +2677,9 @@ mod tests {
     #[test]
     fn version_display_compatible_says_incompatible() {
         let err = ProtocolError::VersionMismatch {
-            expected: 1000, found: 2000, policy: VersionPolicy::Compatible,
+            expected: 1000,
+            found: 2000,
+            policy: VersionPolicy::Compatible,
         };
         assert!(err.to_string().contains("Incompatible major version"));
     }
@@ -2480,7 +2687,9 @@ mod tests {
     #[test]
     fn version_display_migrate_says_no_path() {
         let err = ProtocolError::VersionMismatch {
-            expected: 2000, found: 50, policy: VersionPolicy::Migrate,
+            expected: 2000,
+            found: 50,
+            policy: VersionPolicy::Migrate,
         };
         assert!(err.to_string().contains("No migration path"));
     }
@@ -2600,14 +2809,22 @@ mod tests {
                 phase: StepAction::Act,
                 slots: vec![
                     ExecutionSlot {
-                        index: 0, tool_name: "grep".into(), call_id: "c1".into(),
-                        state: SlotState::Completed, idempotency_key: None,
-                        cached_result: None, retry_count: 0,
+                        index: 0,
+                        tool_name: "grep".into(),
+                        call_id: "c1".into(),
+                        state: SlotState::Completed,
+                        idempotency_key: None,
+                        cached_result: None,
+                        retry_count: 0,
                     },
                     ExecutionSlot {
-                        index: 1, tool_name: "read_file".into(), call_id: "c2".into(),
-                        state: SlotState::Completed, idempotency_key: None,
-                        cached_result: None, retry_count: 0,
+                        index: 1,
+                        tool_name: "read_file".into(),
+                        call_id: "c2".into(),
+                        state: SlotState::Completed,
+                        idempotency_key: None,
+                        cached_result: None,
+                        retry_count: 0,
                     },
                 ],
                 parallel: false,
@@ -2628,7 +2845,12 @@ mod tests {
 
     #[test]
     fn checkpoint_light_serde_roundtrip() {
-        let cp = StepCheckpoint::light("s1".into(), "t1".into(), "a1".into(), ExecutionCursor::for_act(2));
+        let cp = StepCheckpoint::light(
+            "s1".into(),
+            "t1".into(),
+            "a1".into(),
+            ExecutionCursor::for_act(2),
+        );
         let json = serde_json::to_string(&cp).unwrap();
         let restored: StepCheckpoint = serde_json::from_str(&json).unwrap();
         assert!(!restored.is_heavy());
@@ -2638,7 +2860,12 @@ mod tests {
 
     #[test]
     fn checkpoint_heavy_serde_roundtrip() {
-        let mut cp = StepCheckpoint::heavy("s1".into(), "t1".into(), "a1".into(), ExecutionCursor::default());
+        let mut cp = StepCheckpoint::heavy(
+            "s1".into(),
+            "t1".into(),
+            "a1".into(),
+            ExecutionCursor::default(),
+        );
         if let StepCheckpoint::Heavy(ref mut h) = cp {
             h.messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
             h.budget_remaining_tokens = 2000;
@@ -2665,7 +2892,10 @@ mod tests {
         let key_s1 = IdempotencyKey::new("s1", 0, "grep", &serde_json::json!({"a": 1}));
         let key_s10 = IdempotencyKey::new("s10", 0, "grep", &serde_json::json!({"a": 1}));
         let result = CachedToolResult {
-            tool_name: "grep".into(), output: "ok".into(), is_error: false, cached_at: 0,
+            tool_name: "grep".into(),
+            output: "ok".into(),
+            is_error: false,
+            cached_at: 0,
         };
         cache.record(&key_s1, result.clone());
         cache.record(&key_s10, result);

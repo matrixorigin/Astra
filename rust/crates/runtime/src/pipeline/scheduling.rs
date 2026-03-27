@@ -49,19 +49,11 @@ pub trait StepScheduler {
 
     /// Assign a step to an agent. Transitions Pending → Assigned.
     /// In single-agent mode, this is a no-op (self-assign).
-    fn assign_step(
-        &mut self,
-        step_id: &str,
-        agent_id: &str,
-    ) -> Result<(), Self::Error>;
+    fn assign_step(&mut self, step_id: &str, agent_id: &str) -> Result<(), Self::Error>;
 
     /// Decide whether a failed step should be retried at the step level.
     /// Returns the retry delay in ms, or None to give up.
-    fn should_retry_step(
-        &self,
-        step: &Step,
-        error: &ErrorCategory,
-    ) -> Option<u64>;
+    fn should_retry_step(&self, step: &Step, error: &ErrorCategory) -> Option<u64>;
 
     /// Get the next step to execute (for pull-based scheduling).
     /// Returns None if no steps are ready.
@@ -92,11 +84,7 @@ pub trait StepRunner {
 
     /// Handle tool-level retry (within a single step, per-slot).
     /// Returns true if retried, false if exhausted.
-    fn retry_slot(
-        &mut self,
-        step: &mut Step,
-        slot_index: u32,
-    ) -> Result<bool, Self::Error>;
+    fn retry_slot(&mut self, step: &mut Step, slot_index: u32) -> Result<bool, Self::Error>;
 }
 
 // ─── CheckpointWriter: persists state ────────────────────────────────────────
@@ -116,16 +104,10 @@ pub trait CheckpointWriter {
     ) -> Result<(), Self::Error>;
 
     /// Read the latest checkpoint for a step (for recovery).
-    fn read_checkpoint(
-        &self,
-        step_id: &str,
-    ) -> Result<Option<StepCheckpoint>, Self::Error>;
+    fn read_checkpoint(&self, step_id: &str) -> Result<Option<StepCheckpoint>, Self::Error>;
 
     /// Delete checkpoints for a completed step (cleanup).
-    fn delete_checkpoints(
-        &mut self,
-        step_id: &str,
-    ) -> Result<(), Self::Error>;
+    fn delete_checkpoints(&mut self, step_id: &str) -> Result<(), Self::Error>;
 }
 
 // ─── Observer: receives events ───────────────────────────────────────────────
@@ -216,11 +198,9 @@ where
                     self.emit_event(&step, event_type);
 
                     // Light checkpoint after each slot
-                    let _ = self.writer.write_checkpoint(
-                        &step,
-                        CheckpointTrigger::SlotCompleted,
-                        None,
-                    );
+                    let _ =
+                        self.writer
+                            .write_checkpoint(&step, CheckpointTrigger::SlotCompleted, None);
                     self.emit_checkpoint(step.step_id(), CheckpointTrigger::SlotCompleted);
 
                     // Tool-level retry on failure
@@ -477,7 +457,12 @@ mod tests {
             self.events.push(event.event_type.clone());
         }
 
-        fn on_checkpoint(&mut self, _step_id: &str, trigger: CheckpointTrigger, tier: CheckpointTier) {
+        fn on_checkpoint(
+            &mut self,
+            _step_id: &str,
+            trigger: CheckpointTrigger,
+            tier: CheckpointTier,
+        ) {
             self.checkpoints.push((trigger, tier));
         }
     }
@@ -525,7 +510,9 @@ mod tests {
     #[test]
     fn runner_advance_slots_completes_all() {
         let mut step = Step::new(
-            "s1".into(), "t1".into(), "n1".into(),
+            "s1".into(),
+            "t1".into(),
+            "n1".into(),
             StepAction::Act,
             StepPayload::Act {
                 selected_tools: vec!["grep".into(), "read_file".into()],
@@ -551,7 +538,9 @@ mod tests {
     #[test]
     fn runner_retry_slot_on_failure() {
         let mut step = Step::new(
-            "s1".into(), "t1".into(), "n1".into(),
+            "s1".into(),
+            "t1".into(),
+            "n1".into(),
             StepAction::Act,
             StepPayload::Act {
                 selected_tools: vec!["bash".into()],
@@ -582,26 +571,44 @@ mod tests {
     fn scheduler_retry_decision_transient_only() {
         let sched = MockScheduler::new();
         let mut step = Step::new(
-            "s1".into(), "t1".into(), "n1".into(),
+            "s1".into(),
+            "t1".into(),
+            "n1".into(),
             StepAction::Act,
-            StepPayload::Act { selected_tools: vec![], tool_calls: vec![] },
+            StepPayload::Act {
+                selected_tools: vec![],
+                tool_calls: vec![],
+            },
         );
         step.mark_started("a1");
         step.mark_failed("timeout");
 
         // Transient → retry
-        assert!(sched.should_retry_step(&step, &ErrorCategory::Transient).is_some());
+        assert!(
+            sched
+                .should_retry_step(&step, &ErrorCategory::Transient)
+                .is_some()
+        );
         // InvalidInput → no retry
-        assert!(sched.should_retry_step(&step, &ErrorCategory::InvalidInput).is_none());
+        assert!(
+            sched
+                .should_retry_step(&step, &ErrorCategory::InvalidInput)
+                .is_none()
+        );
     }
 
     #[test]
     fn writer_records_checkpoints_per_trigger() {
         let mut writer = MockWriter::new();
         let step = Step::new(
-            "s1".into(), "t1".into(), "n1".into(),
+            "s1".into(),
+            "t1".into(),
+            "n1".into(),
             StepAction::Act,
-            StepPayload::Act { selected_tools: vec![], tool_calls: vec![] },
+            StepPayload::Act {
+                selected_tools: vec![],
+                tool_calls: vec![],
+            },
         );
 
         writer
@@ -615,8 +622,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(writer.checkpoints_written.len(), 3);
-        assert_eq!(writer.checkpoints_written[0].1, CheckpointTrigger::SlotCompleted);
-        assert_eq!(writer.checkpoints_written[1].1, CheckpointTrigger::PhaseTransition);
+        assert_eq!(
+            writer.checkpoints_written[0].1,
+            CheckpointTrigger::SlotCompleted
+        );
+        assert_eq!(
+            writer.checkpoints_written[1].1,
+            CheckpointTrigger::PhaseTransition
+        );
         assert_eq!(writer.checkpoints_written[2].1, CheckpointTrigger::Explicit);
     }
 
@@ -633,8 +646,16 @@ mod tests {
             created_at: 0,
         };
         obs.on_event(&event);
-        obs.on_checkpoint("s1", CheckpointTrigger::SlotCompleted, CheckpointTier::Light);
-        obs.on_checkpoint("s1", CheckpointTrigger::PhaseTransition, CheckpointTier::Heavy);
+        obs.on_checkpoint(
+            "s1",
+            CheckpointTrigger::SlotCompleted,
+            CheckpointTier::Light,
+        );
+        obs.on_checkpoint(
+            "s1",
+            CheckpointTrigger::PhaseTransition,
+            CheckpointTier::Heavy,
+        );
 
         assert_eq!(obs.events.len(), 1);
         assert_eq!(obs.events[0], StepEventType::StepStarted);
@@ -654,7 +675,9 @@ mod tests {
         lifecycle.add_observer(obs);
 
         let mut step = Step::new(
-            "s1".into(), "t1".into(), "n1".into(),
+            "s1".into(),
+            "t1".into(),
+            "n1".into(),
             StepAction::Act,
             StepPayload::Act {
                 selected_tools: vec!["grep".into(), "read_file".into()],
@@ -673,7 +696,10 @@ mod tests {
         // Verify observer events: Started + 2 Completed + StepCompleted = 4
         assert_eq!(lifecycle.observers[0].events.len(), 4);
         assert_eq!(lifecycle.observers[0].events[0], StepEventType::StepStarted);
-        assert_eq!(lifecycle.observers[0].events[3], StepEventType::StepCompleted);
+        assert_eq!(
+            lifecycle.observers[0].events[3],
+            StepEventType::StepCompleted
+        );
     }
 
     #[test]
@@ -687,7 +713,9 @@ mod tests {
         lifecycle.add_observer(obs);
 
         let mut step = Step::new(
-            "s1".into(), "t1".into(), "n1".into(),
+            "s1".into(),
+            "t1".into(),
+            "n1".into(),
             StepAction::Act,
             StepPayload::Act {
                 selected_tools: vec!["grep".into(), "bash".into()],
@@ -717,7 +745,9 @@ mod tests {
         lifecycle.add_observer(obs);
 
         let mut step = Step::new(
-            "s1".into(), "t1".into(), "n1".into(),
+            "s1".into(),
+            "t1".into(),
+            "n1".into(),
             StepAction::Act,
             StepPayload::Act {
                 selected_tools: vec!["bash".into()],
@@ -733,8 +763,15 @@ mod tests {
 
         // Observer: Started + ToolFailed + RetryScheduled + ToolCompleted + StepCompleted = 5
         assert_eq!(lifecycle.observers[0].events.len(), 5);
-        assert!(lifecycle.observers[0].events.contains(&StepEventType::RetryScheduled));
-        assert_eq!(*lifecycle.observers[0].events.last().unwrap(), StepEventType::StepCompleted);
+        assert!(
+            lifecycle.observers[0]
+                .events
+                .contains(&StepEventType::RetryScheduled)
+        );
+        assert_eq!(
+            *lifecycle.observers[0].events.last().unwrap(),
+            StepEventType::StepCompleted
+        );
     }
 
     #[test]
@@ -748,7 +785,9 @@ mod tests {
         lifecycle.add_observer(obs);
 
         let mut step = Step::new(
-            "s1".into(), "t1".into(), "n1".into(),
+            "s1".into(),
+            "t1".into(),
+            "n1".into(),
             StepAction::Act,
             StepPayload::Act {
                 selected_tools: vec!["grep".into()],
@@ -761,8 +800,14 @@ mod tests {
 
         // Observer checkpoints: SlotCompleted(Light) + Explicit(Heavy)
         assert_eq!(lifecycle.observers[0].checkpoints.len(), 2);
-        assert_eq!(lifecycle.observers[0].checkpoints[0].1, CheckpointTier::Light);
-        assert_eq!(lifecycle.observers[0].checkpoints[1].1, CheckpointTier::Heavy);
+        assert_eq!(
+            lifecycle.observers[0].checkpoints[0].1,
+            CheckpointTier::Light
+        );
+        assert_eq!(
+            lifecycle.observers[0].checkpoints[1].1,
+            CheckpointTier::Heavy
+        );
     }
 
     // ── Contract Property Tests ──
@@ -771,9 +816,14 @@ mod tests {
     fn contract_step_never_skips_running_state() {
         // A step must go through Running before completing
         let mut step = Step::new(
-            "s1".into(), "t1".into(), "n1".into(),
+            "s1".into(),
+            "t1".into(),
+            "n1".into(),
             StepAction::Perceive,
-            StepPayload::Perceive { user_query: "hello".into(), memory_context: vec![] },
+            StepPayload::Perceive {
+                user_query: "hello".into(),
+                memory_context: vec![],
+            },
         );
         assert_eq!(step.status(), StepStatus::Pending);
 
@@ -792,8 +842,13 @@ mod tests {
             (CheckpointTrigger::Explicit, CheckpointTier::Heavy),
         ];
         for (trigger, expected_tier) in pairs {
-            assert_eq!(trigger.checkpoint_tier(), expected_tier,
-                "Trigger {:?} should produce {:?}", trigger, expected_tier);
+            assert_eq!(
+                trigger.checkpoint_tier(),
+                expected_tier,
+                "Trigger {:?} should produce {:?}",
+                trigger,
+                expected_tier
+            );
         }
     }
 
@@ -801,9 +856,14 @@ mod tests {
     fn contract_scheduler_owns_retry_decision() {
         let sched = MockScheduler::new();
         let mut step = Step::new(
-            "s1".into(), "t1".into(), "n1".into(),
+            "s1".into(),
+            "t1".into(),
+            "n1".into(),
             StepAction::Act,
-            StepPayload::Act { selected_tools: vec![], tool_calls: vec![] },
+            StepPayload::Act {
+                selected_tools: vec![],
+                tool_calls: vec![],
+            },
         );
         step.mark_started("a1");
         step.mark_failed("transient error");

@@ -21,8 +21,8 @@ use crossterm::{
     terminal,
 };
 use mo_agent_runtime::{prompts, tool_registry, tool_selector};
-use mo_agent_services::session_journal;
 use mo_agent_services::event_ingestion;
+use mo_agent_services::session_journal;
 
 mod edge_tools;
 mod manifest_loader;
@@ -359,6 +359,8 @@ struct ReplState {
     ingestion_sender: Option<event_ingestion::IngestionSender>,
     /// User ID for event ingestion attribution.
     ingestion_user_id: Option<String>,
+    /// Shared MatrixOne pool for checkpoint push and cloud sync (None if unavailable).
+    matrixone_pool: Option<std::sync::Arc<sqlx::Pool<sqlx::MySql>>>,
 }
 
 impl Default for ReplState {
@@ -384,6 +386,7 @@ impl Default for ReplState {
             perm_manager: PermissionManager::new(false),
             ingestion_sender: None,
             ingestion_user_id: None,
+            matrixone_pool: None,
         }
     }
 }
@@ -697,10 +700,16 @@ async fn run_chat_repl(
                 eprintln!("{}", "\nGoodbye.".dim());
                 // Journal: session end
                 if let Some(ref j) = state.journal {
-                    let _ = j.append(&session_journal::JournalEvent::session_end(
+                    let end_event = session_journal::JournalEvent::session_end(
                         state.session_id.as_deref(),
                         state.turn,
-                    ));
+                    );
+                    let _ = j.append(&end_event);
+                    repl_turn::enqueue_ingestion_pub(&state, &end_event);
+                }
+                // Graceful ingestion shutdown: drop sender so worker flushes remaining buffer
+                if let Some(sender) = state.ingestion_sender.take() {
+                    sender.shutdown();
                 }
                 if state.session_id.is_some() {
                     let _ = clear_profile_last_session(profile);

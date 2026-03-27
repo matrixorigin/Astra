@@ -67,10 +67,7 @@ impl IngestionEvent {
     ///
     /// - `user_id`: the authenticated user (not stored in journal events)
     /// - Generates a unique event_id from session_id + turn + event_type
-    pub fn from_journal_event(
-        event: &crate::session_journal::JournalEvent,
-        user_id: &str,
-    ) -> Self {
+    pub fn from_journal_event(event: &crate::session_journal::JournalEvent, user_id: &str) -> Self {
         let session_id = event
             .session_id
             .clone()
@@ -149,6 +146,12 @@ impl IngestionSender {
     pub async fn enqueue_async(&self, event: IngestionEvent) {
         let _ = self.tx.send(event).await;
     }
+
+    /// Signal the worker to flush remaining events and shut down.
+    /// Dropping the sender closes the channel; the worker drains its buffer on close.
+    pub fn shutdown(self) {
+        drop(self.tx);
+    }
 }
 
 /// Stats about ingestion worker activity.
@@ -197,8 +200,7 @@ impl EventIngestionWorker {
 
     async fn run(mut self) {
         let mut buffer: Vec<IngestionEvent> = Vec::with_capacity(self.config.batch_size);
-        let flush_interval =
-            tokio::time::Duration::from_secs(self.config.flush_interval_secs);
+        let flush_interval = tokio::time::Duration::from_secs(self.config.flush_interval_secs);
 
         loop {
             let deadline = tokio::time::sleep(flush_interval);
@@ -254,7 +256,10 @@ impl EventIngestionWorker {
                     } else {
                         if let Ok(mut s) = self.stats.lock() {
                             s.errors += 1;
-                            s.last_error = Some(format!("batch flush failed after {} retries: {e}", self.config.max_retries));
+                            s.last_error = Some(format!(
+                                "batch flush failed after {} retries: {e}",
+                                self.config.max_retries
+                            ));
                         }
                     }
                 }
@@ -263,27 +268,40 @@ impl EventIngestionWorker {
     }
 
     async fn insert_batch(&self, events: &[IngestionEvent]) -> Result<(), String> {
-        // Build multi-row INSERT IGNORE for idempotency
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        // Multi-row INSERT IGNORE — single round-trip for the whole batch
+        let placeholders: Vec<String> = (0..events.len())
+            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())".to_string())
+            .collect();
+        let sql = format!(
+            "INSERT IGNORE INTO agent_events \
+             (event_id, session_id, user_id, event_type, content, \
+              token_usage, llm_model_used, skill_name, metadata, created_at) \
+             VALUES {}",
+            placeholders.join(", ")
+        );
+
+        let mut query = sqlx::query(&sql);
         for event in events {
-            sqlx::query(
-                "INSERT IGNORE INTO agent_events \
-                 (event_id, session_id, user_id, event_type, content, \
-                  token_usage, llm_model_used, skill_name, metadata, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
-            )
-            .bind(&event.event_id)
-            .bind(&event.session_id)
-            .bind(&event.user_id)
-            .bind(&event.event_type)
-            .bind(&event.content)
-            .bind(event.token_usage.as_ref().map(|v| v.to_string()))
-            .bind(&event.llm_model_used)
-            .bind(&event.skill_name)
-            .bind(event.metadata.as_ref().map(|v| v.to_string()))
+            query = query
+                .bind(&event.event_id)
+                .bind(&event.session_id)
+                .bind(&event.user_id)
+                .bind(&event.event_type)
+                .bind(&event.content)
+                .bind(event.token_usage.as_ref().map(|v| v.to_string()))
+                .bind(&event.llm_model_used)
+                .bind(&event.skill_name)
+                .bind(event.metadata.as_ref().map(|v| v.to_string()));
+        }
+
+        query
             .execute(&self.pool)
             .await
-            .map_err(|e| format!("insert event {}: {e}", event.event_id))?;
-        }
+            .map_err(|e| format!("batch insert ({} events): {e}", events.len()))?;
         Ok(())
     }
 }
@@ -432,9 +450,8 @@ mod tests {
 
     #[test]
     fn transform_session_start_event() {
-        let event = crate::session_journal::JournalEvent::session_start(
-            Some("sess-new"), Some("gpt-4"),
-        );
+        let event =
+            crate::session_journal::JournalEvent::session_start(Some("sess-new"), Some("gpt-4"));
         let ingestion = IngestionEvent::from_journal_event(&event, "user-2");
 
         assert_eq!(ingestion.session_id, "sess-new");
@@ -445,7 +462,12 @@ mod tests {
     #[test]
     fn transform_error_event() {
         let event = crate::session_journal::JournalEvent::turn_error(
-            Some("sess-err"), 2, Some("gpt-4"), "list files", "connection refused", 500,
+            Some("sess-err"),
+            2,
+            Some("gpt-4"),
+            "list files",
+            "connection refused",
+            500,
         );
         let ingestion = IngestionEvent::from_journal_event(&event, "user-3");
 
@@ -474,10 +496,44 @@ mod tests {
     #[test]
     fn transform_stall_event_uses_stall_type_as_content() {
         let event = crate::session_journal::JournalEvent::stall_detected(
-            Some("sess-s"), 5, "sig_stall", 2, 0.6,
+            Some("sess-s"),
+            5,
+            "sig_stall",
+            2,
+            0.6,
             &["github_list_prs".to_string()],
         );
         let ingestion = IngestionEvent::from_journal_event(&event, "u1");
         assert_eq!(ingestion.content.as_deref(), Some("sig_stall"));
+    }
+
+    #[tokio::test]
+    async fn sender_shutdown_closes_channel() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let sender = IngestionSender { tx };
+        sender.enqueue(IngestionEvent {
+            event_id: "e1".into(),
+            session_id: "s1".into(),
+            user_id: "u1".into(),
+            event_type: "test".into(),
+            content: None,
+            token_usage: None,
+            llm_model_used: None,
+            skill_name: None,
+            metadata: None,
+        });
+        sender.shutdown();
+        // After shutdown, recv should drain the one event then return None
+        assert!(rx.recv().await.is_some());
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn transform_session_end_event() {
+        let event = crate::session_journal::JournalEvent::session_end(Some("sess-end"), 10);
+        let ingestion = IngestionEvent::from_journal_event(&event, "u1");
+        assert_eq!(ingestion.session_id, "sess-end");
+        assert!(ingestion.event_type.contains("session"));
+        assert!(ingestion.event_type.contains("end"));
     }
 }

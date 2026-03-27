@@ -587,10 +587,7 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 clear_slash_overlay();
                 if let Some((cmd, _)) = rows.get(selected) {
                     if *cmd != current {
-                        return Some(RlCmd::Replace(
-                            RlMovement::WholeLine,
-                            Some(cmd.to_string()),
-                        ));
+                        return Some(RlCmd::Replace(RlMovement::WholeLine, Some(cmd.to_string())));
                     }
                 }
                 return None; // already correct — accept

@@ -80,7 +80,8 @@ impl StepRecorder {
         );
 
         self.emit(step.step_id(), StepEventType::StepCreated);
-        self.phase_log.push((turn, StepAction::Perceive, epoch_ms()));
+        self.phase_log
+            .push((turn, StepAction::Perceive, epoch_ms()));
         self.current_step = Some(step);
     }
 
@@ -161,12 +162,7 @@ impl StepRecorder {
         self.slot_counter += 1;
 
         if let Some(ref mut step) = self.current_step {
-            if let Some(slot) = step
-                .execution
-                .cursor
-                .slots
-                .get_mut(slot_idx as usize)
-            {
+            if let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize) {
                 slot.tool_name = tool_name.to_string();
                 slot.call_id = call_id.to_string();
                 slot.state = SlotState::Running;
@@ -242,12 +238,7 @@ impl StepRecorder {
         if succeeded {
             let slot_idx = self.slot_counter.saturating_sub(1);
             if let Some(ref mut step) = self.current_step {
-                if let Some(slot) = step
-                    .execution
-                    .cursor
-                    .slots
-                    .get_mut(slot_idx as usize)
-                {
+                if let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize) {
                     slot.retry_count = attempt;
                     slot.state = SlotState::Completed;
                 }
@@ -346,7 +337,11 @@ impl StepRecorder {
             StepEventType::StepRetried
         };
         self.emit(
-            &self.current_step.as_ref().map_or("unknown", |s| s.step_id()).to_string(),
+            &self
+                .current_step
+                .as_ref()
+                .map_or("unknown", |s| s.step_id())
+                .to_string(),
             event_type,
         );
     }
@@ -496,12 +491,7 @@ mod tests {
     fn recorder_plan_phase_transition() {
         let mut rec = StepRecorder::new("sess-1", "task-1");
         rec.begin_turn(0);
-        rec.record_plan(
-            &["github_list_prs".into(), "grep".into()],
-            0.85,
-            0.3,
-            4000,
-        );
+        rec.record_plan(&["github_list_prs".into(), "grep".into()], 0.85, 0.3, 4000);
 
         let step = rec.current_step().unwrap();
         assert_eq!(step.execution.cursor.phase, StepAction::Plan);
@@ -578,7 +568,11 @@ mod tests {
         }
 
         // Should have StallDetected event
-        assert!(rec.events().iter().any(|e| e.event_type == StepEventType::StallDetected));
+        assert!(
+            rec.events()
+                .iter()
+                .any(|e| e.event_type == StepEventType::StallDetected)
+        );
     }
 
     #[test]

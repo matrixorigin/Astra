@@ -10,14 +10,15 @@ pub(super) struct ReplTurnContext<'a> {
 /// Enqueue a journal event for async cloud ingestion (if sender is available).
 fn enqueue_ingestion(state: &ReplState, event: &session_journal::JournalEvent) {
     if let Some(ref sender) = state.ingestion_sender {
-        let user_id = state
-            .ingestion_user_id
-            .as_deref()
-            .unwrap_or("anonymous");
-        let ingestion_event =
-            event_ingestion::IngestionEvent::from_journal_event(event, user_id);
+        let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
+        let ingestion_event = event_ingestion::IngestionEvent::from_journal_event(event, user_id);
         sender.enqueue(ingestion_event);
     }
+}
+
+/// Public wrapper for enqueue_ingestion — used by main.rs for session_end.
+pub(super) fn enqueue_ingestion_pub(state: &ReplState, event: &session_journal::JournalEvent) {
+    enqueue_ingestion(state, event);
 }
 
 enum TurnAttempt {
@@ -298,23 +299,23 @@ fn apply_turn_success(
 
     if let Some(journal) = state.journal.as_ref() {
         let turn_event = session_journal::JournalEvent::turn(
-                state.session_id.as_deref(),
-                state.turn,
-                state.model.as_deref(),
-                line,
-                &result.full_text,
-                result.tool_calls_count,
-                result.prompt_tokens,
-                result.completion_tokens,
-                turn_start.elapsed().as_millis() as u64,
-            )
-            .with_tool_selection(
-                result.tools_selected.clone(),
-                result.tools_used.clone(),
-                result.budget_used,
-            )
-            .with_tool_calls(result.tool_call_records.clone())
-            .with_budget_pressure(result.budget_pressure);
+            state.session_id.as_deref(),
+            state.turn,
+            state.model.as_deref(),
+            line,
+            &result.full_text,
+            result.tool_calls_count,
+            result.prompt_tokens,
+            result.completion_tokens,
+            turn_start.elapsed().as_millis() as u64,
+        )
+        .with_tool_selection(
+            result.tools_selected.clone(),
+            result.tools_used.clone(),
+            result.budget_used,
+        )
+        .with_tool_calls(result.tool_call_records.clone())
+        .with_budget_pressure(result.budget_pressure);
         let _ = journal.append(&turn_event);
         enqueue_ingestion(state, &turn_event);
 
@@ -347,6 +348,24 @@ fn apply_turn_success(
                     error_count: 0,
                 };
                 let _ = mo_agent_services::session_checkpoint::write_checkpoint(sid, &cp);
+
+                // Push checkpoint to MatrixOne for cross-device availability
+                if let Some(ref pool) = state.matrixone_pool {
+                    let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
+                    let pool = pool.clone();
+                    let sid_owned = sid.to_string();
+                    let user_id_owned = user_id.to_string();
+                    let cp_clone = cp.clone();
+                    tokio::spawn(async move {
+                        let _ = mo_agent_services::session_restore::push_checkpoint_to_cloud(
+                            &pool,
+                            &sid_owned,
+                            &user_id_owned,
+                            &cp_clone,
+                        )
+                        .await;
+                    });
+                }
                 let cp_event = session_journal::JournalEvent::checkpoint(
                     Some(sid),
                     ws.turn_count,
@@ -460,10 +479,8 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
 
     state.journal = session_journal::JournalWriter::new(session_id).ok();
     if let Some(journal) = state.journal.as_ref() {
-        let start_event = session_journal::JournalEvent::session_start(
-            Some(session_id),
-            state.model.as_deref(),
-        );
+        let start_event =
+            session_journal::JournalEvent::session_start(Some(session_id), state.model.as_deref());
         let _ = journal.append(&start_event);
         // Note: ingestion sender may not be ready yet on first call;
         // enqueue_ingestion silently skips if sender is None
@@ -506,10 +523,11 @@ fn try_init_ingestion(state: &mut ReplState) {
     handle.spawn(async move {
         match mo_agent_core::connect_matrixone(&settings).await {
             Ok(pool) => {
+                let pool_arc = std::sync::Arc::new(pool);
                 let config = event_ingestion::IngestionConfig::default();
                 let (sender, _stats, _handle) =
-                    event_ingestion::EventIngestionWorker::spawn(pool, config);
-                let _ = tx.send(Some(sender));
+                    event_ingestion::EventIngestionWorker::spawn((*pool_arc).clone(), config);
+                let _ = tx.send(Some((sender, pool_arc)));
             }
             Err(_) => {
                 let _ = tx.send(None);
@@ -518,8 +536,9 @@ fn try_init_ingestion(state: &mut ReplState) {
     });
 
     // Give the pool connection a brief window to complete
-    if let Ok(Some(sender)) = rx.recv_timeout(std::time::Duration::from_secs(3)) {
+    if let Ok(Some((sender, pool))) = rx.recv_timeout(std::time::Duration::from_secs(3)) {
         state.ingestion_sender = Some(sender);
+        state.matrixone_pool = Some(pool);
     }
 }
 
