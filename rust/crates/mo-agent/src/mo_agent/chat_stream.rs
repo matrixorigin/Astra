@@ -1231,6 +1231,18 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             });
             step_recorder.complete_tool(&name, is_err, tool_elapsed.as_millis() as u64, false);
 
+            // Light checkpoint after each tool completion (best-effort, non-blocking)
+            if let Some(ref sid) = current_session_id {
+                if let Some(light) = step_recorder.build_light_checkpoint() {
+                    let cp = mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Light(light);
+                    let _ = mo_agent_runtime::pipeline::step_checkpoint::write_step_checkpoint(
+                        sid,
+                        step_recorder.summary().checkpoints,
+                        &cp,
+                    );
+                }
+            }
+
             // Stop spinner, print final status with duration
             if let Some(spinner) = spinner {
                 spinner.stop_clear();
@@ -1371,6 +1383,31 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 verdict.force_stop,
                 verdict.injections.len(),
             );
+
+            // Heavy checkpoint after verdict (captures full conversation state)
+            if let Some(ref sid) = current_session_id {
+                if let Some(heavy) = step_recorder.build_heavy_checkpoint(
+                    &messages,
+                    0, // budget tokens filled by caller if available
+                    max_turns.saturating_sub(_turn) as u32,
+                    &turn_guard
+                        .health
+                        .deprioritized_tools()
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>(),
+                    &recent_tools,
+                ) {
+                    let cp = mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(
+                        Box::new(heavy),
+                    );
+                    let _ = mo_agent_runtime::pipeline::step_checkpoint::write_step_checkpoint(
+                        sid,
+                        step_recorder.summary().checkpoints,
+                        &cp,
+                    );
+                }
+            }
 
             // Force stop on critical verdict
             if verdict.force_stop {

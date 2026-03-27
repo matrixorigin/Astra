@@ -381,6 +381,54 @@ impl StepRecorder {
         self.current_step.as_ref()
     }
 
+    /// Build a light checkpoint from current recorder state.
+    /// Light checkpoints capture cursor position only — fast, small, frequent.
+    pub fn build_light_checkpoint(&self) -> Option<LightCheckpoint> {
+        let step = self.current_step.as_ref()?;
+        Some(LightCheckpoint {
+            protocol_version: PROTOCOL_VERSION,
+            cursor: step.execution.cursor.clone(),
+            step_id: step.step_id().to_string(),
+            task_id: self.task_id.clone(),
+            agent_id: self.session_id.clone(),
+            progress: step
+                .execution
+                .cursor
+                .slots
+                .iter()
+                .filter(|s| s.state == SlotState::Completed)
+                .count() as f64
+                / step.execution.cursor.slots.len().max(1) as f64,
+            total_tokens: 0, // caller fills in
+            created_at: epoch_ms(),
+        })
+    }
+
+    /// Build a heavy checkpoint with full conversation state for crash recovery.
+    pub fn build_heavy_checkpoint(
+        &self,
+        messages: &[serde_json::Value],
+        budget_remaining_tokens: u64,
+        budget_remaining_rounds: u32,
+        blocked_tools: &[String],
+        recent_tools: &[String],
+    ) -> Option<HeavyCheckpoint> {
+        let light = self.build_light_checkpoint()?;
+        Some(HeavyCheckpoint {
+            light,
+            messages: messages.to_vec(),
+            budget_remaining_tokens,
+            budget_remaining_rounds,
+            blocked_tools: blocked_tools.to_vec(),
+            recent_tools: recent_tools.to_vec(),
+            learning_snapshot_id: None,
+            memory_context: self
+                .current_step
+                .as_ref()
+                .and_then(|s| s.execution.memory_context.clone()),
+        })
+    }
+
     // ── Internal helpers ──
 
     fn transition_phase(&mut self, action: StepAction) {
