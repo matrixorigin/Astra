@@ -46,6 +46,12 @@ pub struct RestoredSession {
     pub title: Option<String>,
     /// Whether restoration was from cloud (true) or local only (false).
     pub restored_from_cloud: bool,
+    /// Conversation messages from Step Protocol heavy checkpoint (for LLM resume).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conversation_messages: Vec<serde_json::Value>,
+    /// Blocked/deprioritized tools from checkpoint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_tools: Vec<String>,
 }
 
 /// A restored checkpoint entry (lightweight, for listing).
@@ -285,6 +291,7 @@ impl SessionRestoreService for HybridRestoreService {
                 model: Some(ws.model),
                 title: None,
                 restored_from_cloud: false,
+                ..Default::default()
             }));
         }
 
@@ -469,6 +476,7 @@ mod tests {
             model: Some("gpt-4".into()),
             title: Some("Refactor session".into()),
             restored_from_cloud: true,
+            ..Default::default()
         };
         let json = serde_json::to_string(&s).unwrap();
         let loaded: RestoredSession = serde_json::from_str(&json).unwrap();
@@ -609,6 +617,7 @@ mod tests {
             model: Some("claude-3".into()),
             title: Some("Implement session resume".into()),
             restored_from_cloud: false,
+            ..Default::default()
         };
         // Verify every field survives serialization
         let json = serde_json::to_string(&s).unwrap();

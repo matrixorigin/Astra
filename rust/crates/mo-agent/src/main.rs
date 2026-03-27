@@ -483,6 +483,18 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             state.total_prompt_tokens = restored.total_tokens_in;
             state.total_completion_tokens = restored.total_tokens_out;
             state.recent_tools = restored.recent_tools;
+
+            // Merge step checkpoint data if available
+            if let Ok(Some(heavy)) =
+                mo_agent_runtime::pipeline::step_checkpoint::read_latest_heavy_checkpoint(
+                    &restored.session_id,
+                )
+            {
+                if state.recent_tools.is_empty() {
+                    state.recent_tools = heavy.recent_tools;
+                }
+            }
+
             if let Some(ref m) = restored.model {
                 state.model = Some(m.clone());
             }
@@ -2483,6 +2495,7 @@ total_tokens_out: 3
             model: Some("gpt-4o".into()),
             title: Some("Test".into()),
             restored_from_cloud: true, // Cloud restore has learning
+            ..Default::default()
         };
 
         // Verify the learning snapshot is present
@@ -2520,6 +2533,7 @@ total_tokens_out: 3
             model: None,
             title: None,
             restored_from_cloud: false,
+            ..Default::default()
         };
 
         assert!(restored.learning_snapshot_json.is_none());
@@ -2646,9 +2660,8 @@ total_tokens_out: 3
             model: Some("claude-3-opus".into()),
             title: Some("Implement session resume".into()),
             restored_from_cloud: true,
+            ..Default::default()
         };
-
-        // Verify all fields
         assert_eq!(restored.session_id, "cloud-sess-123");
         assert_eq!(restored.turn_count, 42);
         assert!(restored.restored_from_cloud);

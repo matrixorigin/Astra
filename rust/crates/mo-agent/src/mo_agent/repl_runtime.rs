@@ -302,6 +302,17 @@ pub(super) fn initialize_repl_state(
         state.recent_tools = restored.recent_tools;
         state.total_prompt_tokens = restored.total_prompt_tokens;
         state.total_completion_tokens = restored.total_completion_tokens;
+
+        // Enrich with step checkpoint data if available (blocked tools, progress)
+        if let Ok(Some(heavy)) =
+            mo_agent_runtime::pipeline::step_checkpoint::read_latest_heavy_checkpoint(sid)
+        {
+            // Merge blocked tools from checkpoint (tools that were deprioritized)
+            if !heavy.blocked_tools.is_empty() && state.recent_tools.is_empty() {
+                // Only use checkpoint's recent_tools as fallback
+                state.recent_tools = heavy.recent_tools;
+            }
+        }
     }
     if let Some(m) = initial_model {
         state.model = Some(m.to_string());
