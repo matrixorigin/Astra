@@ -5312,3 +5312,444 @@ mod hardening_proofs {
         assert!(!cb.allow_request());
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TOKEN EFFICIENCY DEEP OPTIMIZATION PROOFS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+mod token_efficiency_deep {
+    use mo_agent_runtime::prompts::{
+        CompactionTier, estimate_str_tokens, estimate_tokens, estimate_tokens_precise,
+    };
+    use serde_json::json;
+
+    fn msg(content: &str) -> serde_json::Value {
+        json!({"role": "user", "content": content})
+    }
+
+    // ── 1. CJK BPE Rate Accuracy ──
+
+    #[test]
+    fn cjk_bpe_rate_is_1_5x_not_1x() {
+        // GPT-4/Claude BPE tokenizers encode CJK at ~1.5 tokens/char on average.
+        // Verify our estimate reflects this.
+        let pure_cjk = "你好世界测试一下";
+        let tokens = estimate_str_tokens(pure_cjk);
+        let char_count = pure_cjk.chars().count(); // 8
+
+        // With 1.5x rate: 8 * 1.5 = 12
+        assert_eq!(
+            tokens, 12,
+            "8 CJK chars should estimate to 12 tokens (1.5x), got {}",
+            tokens
+        );
+        // Verify it's strictly more than 1:1 (old rate)
+        assert!(
+            tokens > char_count,
+            "CJK tokens ({}) must exceed char count ({}) with BPE rate",
+            tokens,
+            char_count
+        );
+    }
+
+    #[test]
+    fn cjk_rate_triggers_earlier_compaction() {
+        // With 1.5x CJK rate, a Chinese-heavy conversation hits compaction
+        // thresholds sooner — preventing context overflow.
+        let cjk_msg = "这是一个非常长的中文消息用来测试token估算";
+        let tokens_per_msg = estimate_str_tokens(cjk_msg);
+        let chars = cjk_msg.chars().count();
+
+        // Old rate (1:1) would give `chars` tokens; new rate gives more
+        let old_rate_tokens = chars; // what 1:1 would give
+        assert!(
+            tokens_per_msg > old_rate_tokens,
+            "1.5x rate ({}) should exceed 1:1 rate ({})",
+            tokens_per_msg,
+            old_rate_tokens
+        );
+
+        // This means compaction triggers earlier for CJK text
+        let improvement_ratio = tokens_per_msg as f64 / old_rate_tokens as f64;
+        assert!(
+            improvement_ratio >= 1.1,
+            "CJK estimation should be at least 1.1x of old rate, got {}",
+            improvement_ratio
+        );
+    }
+
+    #[test]
+    fn ascii_estimation_unchanged() {
+        // Pure ASCII should be unaffected by CJK rate change
+        let ascii = "The quick brown fox jumps over the lazy dog";
+        let tokens = estimate_str_tokens(ascii);
+        let expected = ascii.len() / 4; // 44/4 = 11
+        assert_eq!(
+            tokens, expected,
+            "ASCII estimation should be bytes/4 = {}, got {}",
+            expected, tokens
+        );
+    }
+
+    // ── 2. Dynamic Overhead vs Hardcoded ──
+
+    #[test]
+    fn precise_estimation_more_accurate_than_fixed() {
+        let messages = vec![msg("分析一下这个项目的代码质量")];
+
+        // Old: hardcoded FIXED_OVERHEAD = 3000 regardless of actual schemas
+        let old_estimate = estimate_tokens(&messages);
+
+        // New: actual schema tokens measured. Typical scenario: 9 pinned tools
+        // (~285 tokens) + 5 dynamic (~165 tokens) = ~450 total schema tokens
+        let small_schema_estimate = estimate_tokens_precise(&messages, 450, 1200);
+        let large_schema_estimate = estimate_tokens_precise(&messages, 1800, 1200);
+
+        // When schemas are small, precise is lower (avoids over-counting)
+        assert!(
+            small_schema_estimate < old_estimate,
+            "With small schemas ({}), precise ({}) should be < fixed ({})",
+            450,
+            small_schema_estimate,
+            old_estimate
+        );
+
+        // When schemas are large, precise is higher (catches under-counting)
+        assert!(
+            large_schema_estimate > old_estimate,
+            "With large schemas ({}), precise ({}) should be > fixed ({})",
+            1800,
+            large_schema_estimate,
+            old_estimate
+        );
+    }
+
+    #[test]
+    fn precise_estimation_responds_to_schema_size() {
+        let messages = vec![msg("list files")];
+
+        let est_small = estimate_tokens_precise(&messages, 200, 0);
+        let est_large = estimate_tokens_precise(&messages, 2000, 0);
+
+        // Larger schema set → higher estimate → earlier compaction trigger
+        assert!(
+            est_large > est_small,
+            "More schemas should increase estimate: {} > {}",
+            est_large,
+            est_small
+        );
+
+        // The difference should be roughly the schema difference
+        let diff = est_large - est_small;
+        assert!(
+            (1700..=1900).contains(&diff),
+            "Estimate difference ({}) should be ~1800 (schema delta)",
+            diff
+        );
+    }
+
+    // ── 3. Progressive Schema Detail Levels ──
+
+    fn make_tool_schema(name: &str, desc: &str) -> serde_json::Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": desc,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File path to operate on"},
+                        "content": {"type": "string", "description": "Content to write"},
+                        "mode": {"type": "string", "description": "Write mode: overwrite or append"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn schema_detail_levels_are_progressively_smaller() {
+        use mo_agent_runtime::turn::bridge_inprocess::bridge_inprocess_test_helpers::prune_tool_schemas_pub;
+
+        let tools: Vec<serde_json::Value> = (0..5)
+            .map(|i| {
+                make_tool_schema(
+                    &format!("tool_{i}"),
+                    "A very long description that explains what this tool does in great detail. \
+                     It handles multiple scenarios, edge cases, and error conditions gracefully.",
+                )
+            })
+            .collect();
+
+        let normal = prune_tool_schemas_pub(&tools, CompactionTier::Normal);
+        let trim = prune_tool_schemas_pub(&tools, CompactionTier::TrimSchemas);
+        let compact = prune_tool_schemas_pub(&tools, CompactionTier::CompactHistory);
+        let aggressive = prune_tool_schemas_pub(&tools, CompactionTier::AggressivePrune);
+
+        let size = |schemas: &[serde_json::Value]| -> usize {
+            schemas.iter().map(|s| s.to_string().len()).sum()
+        };
+
+        let normal_size = size(&normal);
+        let trim_size = size(&trim);
+        let compact_size = size(&compact);
+        let aggressive_size = size(&aggressive);
+
+        // Each level should be strictly smaller than the previous
+        assert!(
+            trim_size < normal_size,
+            "TrimSchemas ({}) should be smaller than Normal ({})",
+            trim_size,
+            normal_size
+        );
+        assert!(
+            compact_size < trim_size,
+            "CompactHistory ({}) should be smaller than TrimSchemas ({})",
+            compact_size,
+            trim_size
+        );
+        assert!(
+            aggressive_size < compact_size,
+            "AggressivePrune ({}) should be smaller than CompactHistory ({})",
+            aggressive_size,
+            compact_size
+        );
+
+        // Aggressive should save at least 40% vs Normal
+        let savings_pct =
+            ((normal_size - aggressive_size) as f64 / normal_size as f64 * 100.0) as usize;
+        assert!(
+            savings_pct >= 40,
+            "AggressivePrune should save >= 40% vs Normal, saved {}%",
+            savings_pct
+        );
+    }
+
+    #[test]
+    fn compact_history_strips_property_descriptions() {
+        use mo_agent_runtime::turn::bridge_inprocess::bridge_inprocess_test_helpers::prune_tool_schemas_pub;
+
+        let tools = vec![make_tool_schema(
+            "write_file",
+            "Write content to a file. Supports multiple modes.",
+        )];
+
+        let compact = prune_tool_schemas_pub(&tools, CompactionTier::CompactHistory);
+
+        // Property descriptions should be stripped
+        let props = &compact[0]["function"]["parameters"]["properties"];
+        assert!(
+            props["path"].get("description").is_none(),
+            "CompactHistory should strip property descriptions"
+        );
+        // But property types should remain
+        assert_eq!(
+            props["path"]["type"].as_str(),
+            Some("string"),
+            "Property types should survive CompactHistory"
+        );
+    }
+
+    // ── 4. Pressure-Aware Tool Filtering ──
+
+    #[test]
+    fn pressure_floor_excludes_marginal_tools() {
+        use mo_agent_runtime::tool_registry::scoring::pre_filter_dynamic_with_pressure;
+        use mo_agent_runtime::tool_registry::state::ConversationState;
+
+        let mut state = ConversationState::default();
+        state.is_fetch = true;
+        state.is_git = true;
+
+        // No pressure: include everything relevant
+        let no_pressure = pre_filter_dynamic_with_pressure(&state, "git status", None, None, &[], 0.0);
+
+        // High pressure: exclude marginal tools
+        let high_pressure =
+            pre_filter_dynamic_with_pressure(&state, "git status", None, None, &[], 0.9);
+
+        assert!(
+            high_pressure.len() <= no_pressure.len(),
+            "High pressure ({}) should include <= tools than no pressure ({})",
+            high_pressure.len(),
+            no_pressure.len()
+        );
+
+        // All surviving tools under high pressure should have strong scores
+        let pressure_floor = 0.9 * 0.9 * 0.22; // ~0.178
+        for &(_, score) in &high_pressure {
+            assert!(
+                score >= pressure_floor - 0.001,
+                "Tool score ({:.3}) should be >= pressure floor ({:.3})",
+                score,
+                pressure_floor
+            );
+        }
+    }
+
+    #[test]
+    fn zero_pressure_matches_unpressured() {
+        use mo_agent_runtime::tool_registry::scoring::{
+            pre_filter_dynamic_with_memory, pre_filter_dynamic_with_pressure,
+        };
+        use mo_agent_runtime::tool_registry::state::ConversationState;
+
+        let mut state = ConversationState::default();
+        state.is_github = true;
+        state.is_fetch = true;
+
+        let unpressured = pre_filter_dynamic_with_memory(&state, "list PRs", None, None, &[]);
+        let zero_pressure =
+            pre_filter_dynamic_with_pressure(&state, "list PRs", None, None, &[], 0.0);
+
+        // Same results when pressure is 0
+        assert_eq!(
+            unpressured.len(),
+            zero_pressure.len(),
+            "Zero pressure should match unpressured: {} vs {}",
+            zero_pressure.len(),
+            unpressured.len()
+        );
+    }
+
+    #[test]
+    fn moderate_pressure_reduces_tools_gradually() {
+        use mo_agent_runtime::tool_registry::scoring::pre_filter_dynamic_with_pressure;
+        use mo_agent_runtime::tool_registry::state::ConversationState;
+
+        let mut state = ConversationState::default();
+        state.is_fetch = true;
+
+        let p0 = pre_filter_dynamic_with_pressure(&state, "show me data", None, None, &[], 0.0);
+        let p3 = pre_filter_dynamic_with_pressure(&state, "show me data", None, None, &[], 0.3);
+        let p6 = pre_filter_dynamic_with_pressure(&state, "show me data", None, None, &[], 0.6);
+        let p9 = pre_filter_dynamic_with_pressure(&state, "show me data", None, None, &[], 0.9);
+
+        // Monotonically non-increasing
+        assert!(
+            p3.len() <= p0.len(),
+            "p=0.3 ({}) should be <= p=0.0 ({})",
+            p3.len(),
+            p0.len()
+        );
+        assert!(
+            p6.len() <= p3.len(),
+            "p=0.6 ({}) should be <= p=0.3 ({})",
+            p6.len(),
+            p3.len()
+        );
+        assert!(
+            p9.len() <= p6.len(),
+            "p=0.9 ({}) should be <= p=0.6 ({})",
+            p9.len(),
+            p6.len()
+        );
+    }
+
+    // ── 5. Assistant Message Compaction ──
+
+    #[test]
+    fn compact_history_truncates_old_assistant_messages() {
+        let long_response = "x".repeat(10_000);
+        let msgs = vec![
+            json!({"role": "user", "content": "question 1"}),
+            json!({"role": "assistant", "content": long_response}),
+            json!({"role": "user", "content": "question 2"}),
+            json!({"role": "assistant", "content": long_response}),
+            json!({"role": "user", "content": "question 3"}),
+            json!({"role": "assistant", "content": "short recent response"}),
+        ];
+
+        let compacted = mo_agent_runtime::turn::cloud::compaction::compact_tiered(
+            &msgs,
+            100, // force compaction by setting very low budget
+            2000,
+            CompactionTier::CompactHistory,
+            2, // keep 2 recent turns
+        );
+
+        // First assistant message (old) should be truncated
+        let first_asst = compacted[1]["content"].as_str().unwrap();
+        assert!(
+            first_asst.len() < 10_000,
+            "Old assistant message should be truncated, got {} chars",
+            first_asst.len()
+        );
+        assert!(
+            first_asst.contains("[earlier response compacted]"),
+            "Should have compaction marker"
+        );
+
+        // Last assistant message (recent) should be preserved
+        let last_asst = compacted
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "assistant")
+            .unwrap();
+        assert_eq!(
+            last_asst["content"].as_str().unwrap(),
+            "short recent response",
+            "Recent assistant message should be preserved in full"
+        );
+    }
+
+    #[test]
+    fn normal_tier_preserves_all_assistant_messages() {
+        let msgs = vec![
+            json!({"role": "user", "content": "q"}),
+            json!({"role": "assistant", "content": "a".repeat(10_000)}),
+        ];
+
+        let result = mo_agent_runtime::turn::cloud::compaction::compact_tiered(
+            &msgs,
+            100,
+            2000,
+            CompactionTier::Normal,
+            4,
+        );
+
+        assert_eq!(
+            result[1]["content"].as_str().unwrap().len(),
+            10_000,
+            "Normal tier should not compact assistant messages"
+        );
+    }
+
+    #[test]
+    fn combined_savings_across_all_mechanisms() {
+        // Simulate a realistic multi-turn Chinese conversation and measure
+        // total token savings from all mechanisms combined.
+        let cjk_query = "帮我检查一下这个项目的CI状态和最新的PR";
+
+        // Old CJK estimation (1:1 rate)
+        let old_cjk_tokens = cjk_query.chars().count(); // 19 CJK chars = 19
+        let new_cjk_tokens = estimate_str_tokens(cjk_query);
+        assert!(
+            new_cjk_tokens > old_cjk_tokens,
+            "New CJK estimation ({}) should be higher than old 1:1 ({})",
+            new_cjk_tokens,
+            old_cjk_tokens
+        );
+
+        // Precise overhead vs fixed
+        let messages = vec![msg(cjk_query)];
+        let fixed = estimate_tokens(&messages);
+        let precise_small = estimate_tokens_precise(&messages, 400, 1200);
+        assert!(
+            precise_small < fixed,
+            "Precise with small schemas ({}) < fixed ({})",
+            precise_small,
+            fixed
+        );
+
+        // Token savings from precise estimation
+        let saved = fixed - precise_small;
+        assert!(
+            saved > 500,
+            "Should save > 500 tokens from precise overhead estimation, saved {}",
+            saved
+        );
+    }
+}

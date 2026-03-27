@@ -26,7 +26,8 @@ pub use registry::ToolRegistry;
 pub use report::{SelectionFeedback, SelectionReport, ToolQualityTracker};
 pub use scoring::{
     DEFAULT_TOOL_BUDGET_TOKENS, pre_filter_dynamic, pre_filter_dynamic_calibrated,
-    pre_filter_dynamic_with_memory, pre_filter_dynamic_with_quality, tfidf_score,
+    pre_filter_dynamic_with_memory, pre_filter_dynamic_with_pressure,
+    pre_filter_dynamic_with_quality, tfidf_score,
 };
 pub use state::ConversationState;
 

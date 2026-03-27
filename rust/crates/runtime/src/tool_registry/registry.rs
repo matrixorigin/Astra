@@ -4,7 +4,8 @@ use super::meta::{TOOL_CATALOG, ToolMeta};
 use super::report::{SelectionReport, ToolQualityTracker};
 use super::scoring::{
     DEFAULT_TOOL_BUDGET_TOKENS, pre_filter_dynamic, pre_filter_dynamic_calibrated,
-    pre_filter_dynamic_with_memory, pre_filter_dynamic_with_quality,
+    pre_filter_dynamic_with_memory, pre_filter_dynamic_with_pressure,
+    pre_filter_dynamic_with_quality,
 };
 use super::state::ConversationState;
 use crate::pipeline::routing::{RoutingDecision, ToolFilter};
@@ -116,6 +117,15 @@ impl ToolRegistry {
     /// Pre-resolved pinned schemas (name, schema) — cloned once at construction.
     pub fn pinned_schemas(&self) -> &[(String, Value)] {
         &self.pinned_schemas
+    }
+
+    /// Total measured token cost of all pinned tool schemas.
+    /// Used for accurate overhead estimation in budget pressure calculation.
+    pub fn total_pinned_token_cost(&self) -> u32 {
+        self.pinned_schemas
+            .iter()
+            .map(|(name, _)| self.token_cost(name))
+            .sum()
     }
 
     /// Get measured token cost for a tool, falling back to catalog estimate.
@@ -365,6 +375,33 @@ impl ToolRegistry {
         calibrator: Option<&ConfidenceCalibrator>,
         memory_domain_hints: &[crate::pipeline::routing::DomainHint],
     ) -> (Vec<Value>, SelectionReport) {
+        self.select_routed_with_pressure(
+            query,
+            routing,
+            budget,
+            extra_boost_terms,
+            quality_tracker,
+            calibrator,
+            memory_domain_hints,
+            0.0,
+        )
+    }
+
+    /// Pressure-aware tool selection.  When `budget_pressure` > 0, the scoring
+    /// pipeline applies a rising minimum-score floor that excludes marginally
+    /// relevant tools, saving schema tokens under token pressure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn select_routed_with_pressure(
+        &self,
+        query: &str,
+        routing: &RoutingDecision,
+        budget: u32,
+        extra_boost_terms: &[String],
+        quality_tracker: Option<&ToolQualityTracker>,
+        calibrator: Option<&ConfidenceCalibrator>,
+        memory_domain_hints: &[crate::pipeline::routing::DomainHint],
+        budget_pressure: f64,
+    ) -> (Vec<Value>, SelectionReport) {
         // Use tool_filter for early conversational detection
         if routing.tool_filter == ToolFilter::Minimal {
             let schemas = self.pinned_only();
@@ -392,13 +429,26 @@ impl ToolRegistry {
 
         // Use the routing's embedded ConversationState for backward-compatible scoring.
         // Pass memory domain hints for gate softening in tool relevance scoring.
-        let ranked = pre_filter_dynamic_with_memory(
-            &routing.conversation_state,
-            &effective_query,
-            quality_tracker,
-            calibrator,
-            memory_domain_hints,
-        );
+        // When budget_pressure > 0, apply pressure-aware filtering to exclude
+        // marginally relevant tools — saving schema tokens.
+        let ranked = if budget_pressure > 0.01 {
+            pre_filter_dynamic_with_pressure(
+                &routing.conversation_state,
+                &effective_query,
+                quality_tracker,
+                calibrator,
+                memory_domain_hints,
+                budget_pressure,
+            )
+        } else {
+            pre_filter_dynamic_with_memory(
+                &routing.conversation_state,
+                &effective_query,
+                quality_tracker,
+                calibrator,
+                memory_domain_hints,
+            )
+        };
         let schemas = self.budget_select_measured(&ranked, budget);
         let names = Self::selected_names(&schemas);
         let selected_count = schemas.len() as u32;

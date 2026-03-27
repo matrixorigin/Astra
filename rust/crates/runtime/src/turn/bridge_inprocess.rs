@@ -216,9 +216,8 @@ fn prune_tool_schemas(tools: &[Value], tier: crate::prompts::CompactionTier) -> 
     use crate::prompts::CompactionTier;
     match tier {
         CompactionTier::Normal => tools.to_vec(),
-        CompactionTier::TrimSchemas
-        | CompactionTier::CompactHistory
-        | CompactionTier::AggressivePrune => {
+        CompactionTier::TrimSchemas => {
+            // Compact: first-sentence descriptions, all params preserved
             tools
                 .iter()
                 .map(|tool| {
@@ -230,10 +229,42 @@ fn prune_tool_schemas(tools: &[Value], tier: crate::prompts::CompactionTier) -> 
                                 obj.insert("description".to_string(), json!(truncated));
                             }
                         }
-                        // In AggressivePrune, also strip optional parameters
-                        if matches!(tier, CompactionTier::AggressivePrune) {
-                            strip_optional_params(func);
+                    }
+                    t
+                })
+                .collect()
+        }
+        CompactionTier::CompactHistory => {
+            // Compact descriptions + strip property descriptions (keep names + types)
+            tools
+                .iter()
+                .map(|tool| {
+                    let mut t = tool.clone();
+                    if let Some(func) = t.get_mut("function") {
+                        if let Some(desc) = func.get("description").and_then(Value::as_str) {
+                            let truncated = truncate_to_first_sentence(desc).to_string();
+                            if let Some(obj) = func.as_object_mut() {
+                                obj.insert("description".to_string(), json!(truncated));
+                            }
                         }
+                        strip_property_descriptions(func);
+                    }
+                    t
+                })
+                .collect()
+        }
+        CompactionTier::AggressivePrune => {
+            // Minimal: no function descriptions, required params only, no param descriptions
+            tools
+                .iter()
+                .map(|tool| {
+                    let mut t = tool.clone();
+                    if let Some(func) = t.get_mut("function") {
+                        if let Some(obj) = func.as_object_mut() {
+                            obj.remove("description");
+                        }
+                        strip_optional_params(func);
+                        strip_property_descriptions(func);
                     }
                     t
                 })
@@ -285,6 +316,24 @@ fn strip_optional_params(func: &mut Value) {
                 .collect();
             for key in keys_to_remove {
                 props.remove(&key);
+            }
+        }
+    }
+}
+
+/// Strip "description" fields from all properties in a JSON Schema.
+/// Keeps property names, types, and enum values — removes the verbose
+/// human-readable descriptions that consume tokens but are redundant
+/// when the LLM already knows the tool from its function name.
+fn strip_property_descriptions(func: &mut Value) {
+    if let Some(props) = func
+        .get_mut("parameters")
+        .and_then(|p| p.get_mut("properties"))
+        .and_then(Value::as_object_mut)
+    {
+        for (_key, prop) in props.iter_mut() {
+            if let Some(obj) = prop.as_object_mut() {
+                obj.remove("description");
             }
         }
     }
@@ -1332,6 +1381,18 @@ async fn fetch_memories(base_url: &str, api_key: &str, query: &str, user_id: &st
         .join("\n")
 }
 
+/// Test-accessible wrapper around private schema pruning — used by integration
+/// tests that need to verify progressive schema detail levels.
+pub mod bridge_inprocess_test_helpers {
+    use super::prune_tool_schemas;
+    use crate::prompts::CompactionTier;
+    use serde_json::Value;
+
+    pub fn prune_tool_schemas_pub(tools: &[Value], tier: CompactionTier) -> Vec<Value> {
+        prune_tool_schemas(tools, tier)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1523,8 +1584,12 @@ mod tests {
             true,
         )];
         let result = super::prune_tool_schemas(&tools, CompactionTier::AggressivePrune);
-        let desc = result[0]["function"]["description"].as_str().unwrap();
-        assert_eq!(desc, "Execute shell commands.");
+        // AggressivePrune removes function description entirely
+        assert!(
+            result[0]["function"].get("description").is_none()
+                || result[0]["function"]["description"].is_null(),
+            "AggressivePrune should remove function description"
+        );
         assert!(
             result[0]["function"]["parameters"]["properties"]
                 .get("timeout")

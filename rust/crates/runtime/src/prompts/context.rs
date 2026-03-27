@@ -1,6 +1,9 @@
 /// CJK-aware token estimation for a string.
-/// CJK characters ≈ 1 token each; ASCII ≈ 4 chars/token (1 byte each).
-/// Mixed EN/CN text is split and counted separately for accuracy.
+///
+/// BPE tokenizers (GPT-4, Claude, etc.) encode CJK characters at ~1.5 tokens
+/// each on average — a single character often splits into 2 BPE tokens, but
+/// common bigrams merge back.  We use 3/2 integer arithmetic for accuracy
+/// without floating-point.  ASCII text averages ~4 bytes per token.
 pub fn estimate_str_tokens(s: &str) -> usize {
     let mut cjk_chars: usize = 0;
     let mut ascii_bytes: usize = 0;
@@ -16,8 +19,8 @@ pub fn estimate_str_tokens(s: &str) -> usize {
             ascii_bytes += ch.len_utf8();
         }
     }
-    // CJK: ~1 token per char. ASCII: ~4 bytes per token.
-    cjk_chars + ascii_bytes / 4
+    // CJK: ~1.5 tokens per char (3*n/2). ASCII: ~4 bytes per token.
+    (cjk_chars * 3 + 1) / 2 + ascii_bytes / 4
 }
 
 /// Approximate token count with CJK-aware estimation.
@@ -33,6 +36,38 @@ pub fn estimate_tokens(messages: &[serde_json::Value]) -> usize {
         .map(|m| estimate_single_message_tokens(m) + PER_MESSAGE_OVERHEAD)
         .sum();
     message_tokens + FIXED_OVERHEAD
+}
+
+/// Precise token estimation using actual overhead measurements instead of the
+/// hardcoded 3,000-token `FIXED_OVERHEAD`.
+///
+/// * `schema_token_total` — sum of measured token costs for all selected tool
+///   schemas (from `ToolRegistry::token_cost`).
+/// * `system_prompt_tokens` — estimated tokens of the system prompt, or 0 to
+///   use the default 1,200 estimate.
+///
+/// This produces more accurate compaction-tier decisions, especially under
+/// CJK-heavy conversations where the old estimate was 50% too low.
+pub fn estimate_tokens_precise(
+    messages: &[serde_json::Value],
+    schema_token_total: usize,
+    system_prompt_tokens: usize,
+) -> usize {
+    const PER_MESSAGE_OVERHEAD: usize = 4;
+    const MODEL_FRAMING: usize = 300; // JSON wrappers, role tokens, separators
+    const DEFAULT_SYSTEM_PROMPT: usize = 1200;
+
+    let sys_tokens = if system_prompt_tokens > 0 {
+        system_prompt_tokens
+    } else {
+        DEFAULT_SYSTEM_PROMPT
+    };
+
+    let message_tokens: usize = messages
+        .iter()
+        .map(|m| estimate_single_message_tokens(m) + PER_MESSAGE_OVERHEAD)
+        .sum();
+    message_tokens + sys_tokens + schema_token_total + MODEL_FRAMING
 }
 
 /// Estimate tokens for a single message (content + tool_calls arguments).
@@ -504,21 +539,21 @@ mod tests {
 
     #[test]
     fn estimate_str_tokens_pure_cjk() {
-        // 4 CJK chars = 4 tokens (1 per char)
-        assert_eq!(estimate_str_tokens("你好世界"), 4);
+        // 4 CJK chars × 1.5 = 6 tokens (BPE rate)
+        assert_eq!(estimate_str_tokens("你好世界"), 6);
     }
 
     #[test]
     fn estimate_str_tokens_mixed_en_cn() {
-        // "我关注matrixorigin" → 3 CJK + "matrixorigin" (12 ASCII bytes)
-        // = 3 + 12/4 = 3 + 3 = 6
-        assert_eq!(estimate_str_tokens("我关注matrixorigin"), 6);
+        // "我关注matrixorigin" → 3 CJK × 1.5 + "matrixorigin" 12 ASCII / 4
+        // = 5 + 3 = 8
+        assert_eq!(estimate_str_tokens("我关注matrixorigin"), 8);
     }
 
     #[test]
     fn estimate_str_tokens_cjk_more_than_old_heuristic() {
         // Old: "你好世界".len() = 12 bytes / 4 = 3 tokens (WRONG)
-        // New: 4 CJK chars = 4 tokens (CORRECT)
+        // New: 4 CJK chars × 1.5 = 6 tokens (BPE-accurate)
         let old_estimate = "你好世界".len() / 4;
         let new_estimate = estimate_str_tokens("你好世界");
         assert!(
@@ -531,7 +566,8 @@ mod tests {
     fn estimate_str_tokens_cjk_punctuation() {
         // CJK punctuation (U+3000-303F, FF00-FFEF) counts as CJK tokens
         // "。" is U+3002, "！" is U+FF01
-        assert_eq!(estimate_str_tokens("你好。"), 3); // 3 CJK chars
+        // 3 CJK chars × 1.5 = 5 tokens (rounded up)
+        assert_eq!(estimate_str_tokens("你好。"), 5);
     }
 
     #[test]
@@ -541,21 +577,20 @@ mod tests {
 
     #[test]
     fn estimate_tokens_cjk_message() {
-        // CJK message: "分析一下这个文件" = 8 CJK chars = 8 tokens + 4 overhead + 3000 fixed
+        // CJK message: "分析一下这个文件" = 8 CJK chars × 1.5 = 12 tokens + 4 overhead + 3000 fixed
         let messages = vec![msg("分析一下这个文件")];
-        assert_eq!(estimate_tokens(&messages), 8 + 4 + 3000);
+        assert_eq!(estimate_tokens(&messages), 12 + 4 + 3000);
     }
 
     // ── Phase 6.1: Mixed EN/CN regression tests ──
 
     #[test]
     fn estimate_str_tokens_mixed_sentence() {
-        // "Hello 你好世界 World" — CJK chars + ASCII tokens
+        // "Hello 你好世界 World" — 4 CJK chars × 1.5 = 6, plus ASCII tokens
         let t = estimate_str_tokens("Hello 你好世界 World");
-        // "Hello" → ~1.3, 3 CJK chars → 3, "World" → ~1.3 ≈ 5-7
         assert!(
-            (4..=10).contains(&t),
-            "mixed EN/CN should be 4-10 tokens, got {}",
+            (6..=12).contains(&t),
+            "mixed EN/CN should be 6-12 tokens, got {}",
             t
         );
     }
@@ -573,9 +608,9 @@ mod tests {
 
     #[test]
     fn estimate_str_tokens_pure_cjk_regression() {
-        // 12 CJK chars → 12 tokens
+        // 12 CJK chars × 1.5 = 18 tokens (BPE-accurate)
         let t = estimate_str_tokens("这是一个长句子测试效果好");
-        assert_eq!(t, 12, "pure CJK 12 chars = 12 tokens");
+        assert_eq!(t, 18, "pure CJK 12 chars × 1.5 = 18 tokens");
     }
 
     #[test]

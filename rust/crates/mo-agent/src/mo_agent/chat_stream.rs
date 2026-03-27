@@ -598,8 +598,14 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
 
         // ── Budget pressure: pre-estimate token usage to reduce tool count ──
         // When context is filling up, select fewer dynamic tools to save tokens.
+        // Uses precise estimation with actual schema token costs when available.
         let budget_pressure = {
-            let estimated = mo_agent_runtime::prompts::estimate_tokens(&messages);
+            let schema_tokens = selector.registry().total_pinned_token_cost();
+            let estimated = mo_agent_runtime::prompts::estimate_tokens_precise(
+                &messages,
+                schema_tokens as usize,
+                0, // use default system prompt estimate
+            );
             let budget = mo_agent_runtime::prompts::budget_for_model(model);
             let tier = budget.compaction_tier(estimated);
             match tier {

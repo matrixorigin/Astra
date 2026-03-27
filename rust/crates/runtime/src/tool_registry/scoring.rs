@@ -365,6 +365,53 @@ pub fn pre_filter_dynamic_with_memory(
     )
 }
 
+/// Pressure-aware pre-filter: applies an additional minimum-score floor that
+/// rises with budget pressure, excluding marginally-relevant tools when token
+/// headroom is scarce.
+///
+/// | pressure | floor   | effect                               |
+/// |----------|---------|--------------------------------------|
+/// | 0.0      | 0.00    | no extra filtering                   |
+/// | 0.3      | 0.05    | exclude noise                        |
+/// | 0.6      | 0.10    | keep only clearly relevant tools     |
+/// | 0.9      | 0.18    | keep only strongly relevant tools    |
+///
+/// Also reduces `min_recall` ceiling so fewer low-scoring tools are force-
+/// included under high pressure.
+pub fn pre_filter_dynamic_with_pressure(
+    state: &ConversationState,
+    query: &str,
+    quality_tracker: Option<&ToolQualityTracker>,
+    calibrator: Option<&ConfidenceCalibrator>,
+    memory_domain_hints: &[crate::pipeline::routing::DomainHint],
+    budget_pressure: f64,
+) -> Vec<(usize, f64)> {
+    let mut result = pre_filter_dynamic_core(
+        state,
+        query,
+        quality_tracker,
+        calibrator,
+        memory_domain_hints,
+    );
+
+    if budget_pressure > 0.01 {
+        // Pressure floor: quadratic ramp so Normal is unaffected and
+        // AggressivePrune (0.9) is aggressive.
+        let pressure_floor = budget_pressure * budget_pressure * 0.22;
+        result.retain(|&(_, score)| score >= pressure_floor);
+
+        // Under high pressure, also cap the minimum recall guarantee.
+        // At 0.9 pressure we allow as few as 1 forced tool; at 0.3, still 3.
+        let max_recall = ((1.0 - budget_pressure) * 5.0).ceil() as usize;
+        let max_recall = max_recall.max(1);
+        if result.len() > max_recall {
+            result.truncate(max_recall);
+        }
+    }
+
+    result
+}
+
 /// Core pre-filter implementation.
 fn pre_filter_dynamic_core(
     state: &ConversationState,

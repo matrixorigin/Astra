@@ -78,6 +78,38 @@ pub fn compact_tiered(
         }
     }
 
+    // CompactHistory+: truncate older assistant messages.
+    // LLM responses can be very verbose (1000+ tokens each).  Keeping full text
+    // from early turns wastes context when only recent answers matter.
+    // We preserve the last `keep_recent_turns` assistant messages in full.
+    if matches!(
+        tier,
+        CompactionTier::CompactHistory | CompactionTier::AggressivePrune
+    ) {
+        let assistant_indices: Vec<usize> = compacted
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| {
+                (m.get("role").and_then(Value::as_str) == Some("assistant")).then_some(i)
+            })
+            .collect();
+        let asst_limit = trunc_limit * 2; // generous limit for assistant text
+        if assistant_indices.len() > keep_recent_turns {
+            let compact_count = assistant_indices.len() - keep_recent_turns;
+            for &index in assistant_indices.iter().take(compact_count) {
+                let content = compacted[index]
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if content.chars().count() > asst_limit {
+                    let truncated: String = content.chars().take(asst_limit).collect();
+                    compacted[index]["content"] =
+                        Value::String(truncated + "\n...[earlier response compacted]");
+                }
+            }
+        }
+    }
+
     // AggressivePrune: also drop old conversation turns
     if tier == CompactionTier::AggressivePrune {
         // Count user/assistant message pairs (excluding system and tool messages)

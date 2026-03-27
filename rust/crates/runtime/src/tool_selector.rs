@@ -89,6 +89,14 @@ pub struct SelectionResult {
 pub trait ToolSelector: Send + Sync {
     async fn select(&self, ctx: &SelectionContext<'_>) -> SelectionResult;
 
+    /// Access the underlying tool registry for schema/cost queries.
+    /// Returns the default registry if the selector doesn't own one.
+    fn registry(&self) -> &ToolRegistry {
+        static DEFAULT: std::sync::LazyLock<ToolRegistry> =
+            std::sync::LazyLock::new(|| ToolRegistry::new(vec![]));
+        &DEFAULT
+    }
+
     /// Record the outcome of a turn for progressive learning.
     /// Default is no-op — only TfIdfSelector (with pipeline modules) learns.
     #[allow(clippy::too_many_arguments)]
@@ -265,6 +273,10 @@ impl TfIdfSelector {
 
 #[async_trait]
 impl ToolSelector for TfIdfSelector {
+    fn registry(&self) -> &ToolRegistry {
+        &self.registry
+    }
+
     async fn select(&self, ctx: &SelectionContext<'_>) -> SelectionResult {
         // ── Phase 1: Gather boost terms from pipeline modules ──
         let entity_boost = self.entity_boost_terms(ctx.query);
@@ -302,7 +314,7 @@ impl ToolSelector for TfIdfSelector {
         let tracker_ref: Option<&ToolQualityTracker> = tracker_guard.as_deref();
         let calibrator_ref = self.confidence_calibrator.as_deref();
 
-        let (_schemas, report) = self.registry.select_routed_with_memory(
+        let (_schemas, report) = self.registry.select_routed_with_pressure(
             ctx.query,
             &routing,
             effective_budget,
@@ -310,6 +322,7 @@ impl ToolSelector for TfIdfSelector {
             tracker_ref,
             calibrator_ref,
             &ctx.memory_domain_hints,
+            ctx.budget_pressure,
         );
         drop(tracker_guard);
 
@@ -614,6 +627,10 @@ impl FallbackSelector {
 
 #[async_trait]
 impl ToolSelector for FallbackSelector {
+    fn registry(&self) -> &ToolRegistry {
+        self.fallback.registry()
+    }
+
     async fn select(&self, ctx: &SelectionContext<'_>) -> SelectionResult {
         let result = self.primary.select(ctx).await;
         if !result.failed && !result.tool_names.is_empty() {
