@@ -32,6 +32,11 @@ pub struct ToolHealth {
     /// Number of times this tool was rehabilitated this session.
     /// Rising rehab count means the tool is flaky — deprioritize more aggressively.
     pub rehabilitation_count: usize,
+    /// Timeout-specific failures (subset of total_failures).
+    /// Tracked separately because timeouts are infrastructure issues, not tool bugs.
+    pub timeout_count: usize,
+    /// Cache hits (neutral — tool didn't actually execute).
+    pub cache_hit_count: usize,
 }
 
 impl ToolHealth {
@@ -94,6 +99,32 @@ impl ToolHealthTracker {
         health.total_calls += 1;
         // Empty results don't increment consecutive_failures or total_failures
         // but they break the success streak
+    }
+
+    /// Record a tool timeout (infrastructure failure, not a tool bug).
+    /// Counts as a failure for health scoring, but tracked separately for diagnostics.
+    /// Timeouts don't trigger the aggressive flaky-tool threshold because
+    /// they're often caused by network/system issues, not the tool itself.
+    pub fn record_timeout(&mut self, tool_name: &str) {
+        let health = self.tools.entry(tool_name.to_string()).or_default();
+        health.total_calls += 1;
+        health.total_failures += 1;
+        health.timeout_count += 1;
+        health.consecutive_failures += 1;
+        // Use standard threshold (not flaky), since timeouts are infrastructure issues
+        if health.consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD {
+            health.deprioritized = true;
+        }
+    }
+
+    /// Record a cache hit (idempotency cache served the result).
+    /// Neutral for health scoring — the tool didn't actually execute.
+    /// Does NOT break the consecutive failure streak (tool wasn't tested).
+    pub fn record_cache_hit(&mut self, tool_name: &str) {
+        let health = self.tools.entry(tool_name.to_string()).or_default();
+        health.cache_hit_count += 1;
+        // Not counted as total_calls — the tool didn't run
+        // Not counted as success or failure — no signal about tool health
     }
 
     /// Check if a tool has been deprioritized due to repeated failures.
@@ -170,6 +201,8 @@ impl ToolHealthTracker {
                     consecutive_failures: 0, // Reset per-session
                     deprioritized,
                     rehabilitation_count: 0,
+                    timeout_count: 0,
+                    cache_hit_count: 0,
                 },
             );
         }

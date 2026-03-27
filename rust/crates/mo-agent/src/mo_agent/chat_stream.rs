@@ -1052,9 +1052,15 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             // Step-level timeout: abort remaining tools if step time exceeded
             let step_elapsed_ms = step_start_time.elapsed().as_millis() as u64;
             if step_elapsed_ms > step_timeout_ms {
-                agent_warn!("step", "Step timeout exceeded: {}ms > {}ms, aborting remaining {} tools",
-                    step_elapsed_ms, step_timeout_ms,
-                    turn_result.tool_calls.len() - tool_results.len());
+                // Collect names of aborted tools for health tracking
+                let aborted_count = turn_result.tool_calls.len() - tool_results.len();
+                let aborted_tools: Vec<String> = turn_result.tool_calls[tool_results.len()..]
+                    .iter()
+                    .filter_map(|tc| tc.get("name").and_then(|v| v.as_str()).map(String::from))
+                    .collect();
+                agent_warn!("step", "Step timeout exceeded: {}ms > {}ms, aborting {} tools: {:?}",
+                    step_elapsed_ms, step_timeout_ms, aborted_count, aborted_tools);
+                turn_guard.record_step_abort(&aborted_tools);
                 break;
             }
 
@@ -1117,6 +1123,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 let cache_key = idem_key.cache_key();
                 step_recorder.begin_tool_with_key(&name, &id, Some(&cache_key));
                 step_recorder.record_cache_hit(&name, cached.clone());
+                turn_guard.record_cache_hit(&name);
                 continue;
             }
 
@@ -1190,12 +1197,17 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             let limits = RuntimeLimits::global();
             let tool_timeout_ms = contract.effective_tool_timeout_ms(tool_count);
             let effective_retries = (contract.max_retries as usize).min(limits.max_tool_retries);
+            let mut tool_timed_out = false;
             let mut result_str = match tokio::time::timeout(
                 std::time::Duration::from_millis(tool_timeout_ms),
                 executor.execute(&name, &args),
             ).await {
                 Ok(r) => r,
-                Err(_) => format!("Tool '{}' timed out after {}ms (scheduling contract limit)", name, tool_timeout_ms),
+                Err(_) => {
+                    tool_timed_out = true;
+                    turn_guard.record_tool_timeout(&name);
+                    format!("Tool '{}' timed out after {}ms (scheduling contract limit)", name, tool_timeout_ms)
+                }
             };
 
             // If the `reflect` tool returned a placeholder, call the server.
@@ -1287,8 +1299,13 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 }
             }
 
-            // Record result in TurnGuard (handles health tracking + quality classification)
-            let result_quality = turn_guard.record_tool_result(&name, &result_str);
+            // Record result in TurnGuard (handles health tracking + quality classification).
+            // Skip if already recorded as timeout — avoid double-counting.
+            let result_quality = if tool_timed_out {
+                mo_agent_runtime::turn::result_quality::ResultQuality::Error
+            } else {
+                turn_guard.record_tool_result(&name, &result_str)
+            };
 
             // Inject immediate feedback for empty/truncated results
             if let Some(feedback) = turn_guard.result_feedback(&name, result_quality) {

@@ -6286,3 +6286,216 @@ mod scheduling_wiring_proofs {
         assert_eq!(c.backoff_ms(3), 500); // capped
     }
 }
+
+// =============================================================================
+// TurnGuard + Step Protocol Integration Proofs
+// Proves: tool_health timeout/cache_hit tracking, turn_guard step-abort,
+//         double-count prevention, health scoring accuracy.
+// =============================================================================
+mod turnguard_step_integration_proofs {
+    use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
+    use mo_agent_runtime::turn::turn_guard::TurnGuard;
+
+    // --- ToolHealth record_timeout ---
+
+    #[test]
+    fn timeout_counts_as_failure_with_separate_tracking() {
+        let mut tracker = ToolHealthTracker::new();
+        tracker.record_timeout("bash");
+        tracker.record_timeout("bash");
+
+        let h = tracker.get("bash").unwrap();
+        assert_eq!(h.total_calls, 2);
+        assert_eq!(h.total_failures, 2);
+        assert_eq!(h.timeout_count, 2);
+        assert_eq!(h.consecutive_failures, 2);
+        assert_eq!(h.timeout_count, h.total_failures);
+    }
+
+    #[test]
+    fn timeout_does_not_use_flaky_threshold() {
+        // Flaky threshold is 2 (for tools with rehabilitation_count >= 2).
+        // Timeouts use standard threshold (3), even if tool was previously flaky.
+        let mut tracker = ToolHealthTracker::new();
+        tracker.record_timeout("net_tool");
+        tracker.record_timeout("net_tool");
+        assert!(
+            !tracker.get("net_tool").unwrap().deprioritized,
+            "2 timeouts should not deprioritize (standard threshold is 3)"
+        );
+        tracker.record_timeout("net_tool");
+        assert!(
+            tracker.get("net_tool").unwrap().deprioritized,
+            "3 timeouts should deprioritize"
+        );
+    }
+
+    #[test]
+    fn success_resets_timeout_consecutive_count() {
+        let mut tracker = ToolHealthTracker::new();
+        tracker.record_timeout("bash");
+        tracker.record_timeout("bash");
+        assert_eq!(tracker.get("bash").unwrap().consecutive_failures, 2);
+
+        tracker.record_success("bash");
+        let h = tracker.get("bash").unwrap();
+        assert_eq!(h.consecutive_failures, 0);
+        assert_eq!(h.timeout_count, 2); // Historic count preserved
+        assert_eq!(h.total_failures, 2); // Historic count preserved
+    }
+
+    // --- ToolHealth record_cache_hit ---
+
+    #[test]
+    fn cache_hit_is_neutral_for_health() {
+        let mut tracker = ToolHealthTracker::new();
+        tracker.record_cache_hit("read_file");
+        tracker.record_cache_hit("read_file");
+        tracker.record_cache_hit("read_file");
+
+        let h = tracker.get("read_file").unwrap();
+        assert_eq!(h.cache_hit_count, 3);
+        assert_eq!(h.total_calls, 0, "Cache hits should NOT count as calls");
+        assert_eq!(h.total_failures, 0);
+        assert_eq!(h.consecutive_failures, 0);
+        assert!(!h.deprioritized);
+    }
+
+    #[test]
+    fn cache_hit_does_not_break_failure_streak() {
+        let mut tracker = ToolHealthTracker::new();
+        tracker.record_failure("bash");
+        tracker.record_failure("bash");
+        tracker.record_cache_hit("bash"); // should NOT reset consecutive_failures
+        assert_eq!(tracker.get("bash").unwrap().consecutive_failures, 2);
+        tracker.record_failure("bash");
+        assert!(
+            tracker.get("bash").unwrap().deprioritized,
+            "3 consecutive failures should deprioritize despite interleaved cache hit"
+        );
+    }
+
+    // --- TurnGuard record_tool_timeout ---
+
+    #[test]
+    fn turn_guard_timeout_records_health_and_error() {
+        let mut guard = TurnGuard::new();
+        guard.record_tool_timeout("bash");
+        guard.record_tool_timeout("bash");
+
+        let h = guard.health.get("bash").unwrap();
+        assert_eq!(h.timeout_count, 2);
+        assert_eq!(h.total_failures, 2);
+        assert!(guard.errors.total_errors >= 2);
+    }
+
+    // --- TurnGuard record_cache_hit ---
+
+    #[test]
+    fn turn_guard_cache_hit_is_purely_neutral() {
+        let mut guard = TurnGuard::new();
+        guard.record_cache_hit("read_file");
+        guard.record_cache_hit("grep");
+
+        assert_eq!(
+            guard.health.get("read_file").unwrap().cache_hit_count,
+            1
+        );
+        assert_eq!(
+            guard.health.get("grep").unwrap().cache_hit_count,
+            1
+        );
+        assert_eq!(guard.errors.total_errors, 0);
+    }
+
+    // --- TurnGuard record_step_abort ---
+
+    #[test]
+    fn step_abort_records_timeout_for_each_aborted_tool() {
+        let mut guard = TurnGuard::new();
+        guard.record_step_abort(&[
+            "bash".into(),
+            "read_file".into(),
+            "write_file".into(),
+        ]);
+
+        assert_eq!(guard.health.get("bash").unwrap().timeout_count, 1);
+        assert_eq!(
+            guard.health.get("read_file").unwrap().timeout_count,
+            1
+        );
+        assert_eq!(
+            guard.health.get("write_file").unwrap().timeout_count,
+            1
+        );
+        assert!(guard.errors.total_errors >= 1);
+    }
+
+    #[test]
+    fn step_abort_with_empty_list_is_noop() {
+        let mut guard = TurnGuard::new();
+        let errors_before = guard.errors.total_errors;
+        guard.record_step_abort(&[]);
+        assert_eq!(guard.errors.total_errors, errors_before);
+    }
+
+    // --- Integration: mixed signals ---
+
+    #[test]
+    fn mixed_signals_produce_correct_health_snapshot() {
+        let mut guard = TurnGuard::new();
+
+        // bash: 2 successes, 1 timeout, 1 cache hit
+        guard.record_tool_result("bash", "file contents here");
+        guard.record_tool_result("bash", "more contents");
+        guard.record_tool_timeout("bash");
+        guard.record_cache_hit("bash");
+
+        let h = guard.health.get("bash").unwrap();
+        assert_eq!(h.total_calls, 3, "2 successes + 1 timeout (cache hit not counted)");
+        assert_eq!(h.total_failures, 1, "1 timeout");
+        assert_eq!(h.timeout_count, 1);
+        assert_eq!(h.cache_hit_count, 1);
+        assert_eq!(h.consecutive_failures, 1, "Timeout was last failure");
+
+        // read_file: only cache hits — completely neutral
+        guard.record_cache_hit("read_file");
+        guard.record_cache_hit("read_file");
+        let rh = guard.health.get("read_file").unwrap();
+        assert_eq!(rh.total_calls, 0);
+        assert_eq!(rh.cache_hit_count, 2);
+        assert!(!rh.deprioritized);
+    }
+
+    #[test]
+    fn timeout_after_success_resets_then_fails() {
+        let mut guard = TurnGuard::new();
+        guard.record_tool_result("bash", "ok");
+        guard.record_tool_result("bash", "ok");
+        let h = guard.health.get("bash").unwrap();
+        assert_eq!(h.consecutive_failures, 0);
+
+        guard.record_tool_timeout("bash");
+        guard.record_tool_timeout("bash");
+        guard.record_tool_timeout("bash");
+        let h = guard.health.get("bash").unwrap();
+        assert_eq!(h.consecutive_failures, 3);
+        assert!(h.deprioritized);
+        assert_eq!(h.timeout_count, 3);
+    }
+
+    #[test]
+    fn step_abort_accumulates_with_individual_timeouts() {
+        let mut guard = TurnGuard::new();
+        guard.record_tool_timeout("bash");
+        guard.record_step_abort(&["bash".into(), "grep".into()]);
+
+        let h = guard.health.get("bash").unwrap();
+        assert_eq!(h.timeout_count, 2, "1 individual + 1 from step abort");
+        assert_eq!(h.total_failures, 2);
+        assert_eq!(h.consecutive_failures, 2);
+
+        let gh = guard.health.get("grep").unwrap();
+        assert_eq!(gh.timeout_count, 1);
+    }
+}

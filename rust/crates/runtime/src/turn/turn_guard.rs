@@ -102,6 +102,32 @@ impl TurnGuard {
         quality
     }
 
+    /// Record a tool timeout (from SchedulingContract enforcement).
+    /// Distinct from generic errors — timeouts are infrastructure issues.
+    pub fn record_tool_timeout(&mut self, tool_name: &str) {
+        self.health.record_timeout(tool_name);
+        self.errors.record_error(error_recovery::ErrorCategory::Transient);
+    }
+
+    /// Record an idempotency cache hit (tool skipped, result served from cache).
+    /// Neutral for health — the tool didn't actually execute.
+    pub fn record_cache_hit(&mut self, tool_name: &str) {
+        self.health.record_cache_hit(tool_name);
+    }
+
+    /// Record that remaining tools were aborted due to step-level timeout.
+    /// This is a systemic signal — the entire step ran out of time,
+    /// not just one tool. Records each skipped tool as a timeout.
+    pub fn record_step_abort(&mut self, aborted_tools: &[String]) {
+        for tool in aborted_tools {
+            self.health.record_timeout(tool);
+        }
+        if !aborted_tools.is_empty() {
+            self.errors
+                .record_error(error_recovery::ErrorCategory::Transient);
+        }
+    }
+
     /// Evaluate the current turn state and produce a verdict.
     ///
     /// Call this AFTER recording all tool calls and results for the turn,
