@@ -34,6 +34,7 @@ pub(super) async fn execute_cli_command(
                 quiet: false,
                 selector: &*selector.0,
                 recent_tools: &[],
+                tool_health_entries: &[],
             })
             .await
             {
@@ -55,6 +56,7 @@ pub(super) async fn execute_cli_command(
                         quiet: false,
                         selector: &*selector.0,
                         recent_tools: &[],
+                tool_health_entries: &[],
                     })
                     .await?
                 }
@@ -260,6 +262,7 @@ pub(super) async fn execute_cli_command(
                 quiet: false,
                 selector: &*selector.0,
                 recent_tools: &[],
+                tool_health_entries: &[],
             })
             .await
             {
@@ -281,6 +284,7 @@ pub(super) async fn execute_cli_command(
                         quiet: false,
                         selector: &*selector.0,
                         recent_tools: &[],
+                tool_health_entries: &[],
                     })
                     .await?
                 }

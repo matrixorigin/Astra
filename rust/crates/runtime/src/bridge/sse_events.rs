@@ -16,8 +16,11 @@ pub fn find_sse_frame_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(2).position(|window| window == b"\n\n")
 }
 
-pub(super) fn render_sse_json(event: serde_json::Value) -> Vec<u8> {
-    format!("data: {}\n\n", serde_json::to_string(&event).unwrap()).into_bytes()
+pub fn render_sse_json(event: serde_json::Value) -> Vec<u8> {
+    match serde_json::to_string(&event) {
+        Ok(json) => format!("data: {json}\n\n").into_bytes(),
+        Err(_) => b"data: {\"type\":\"error\",\"message\":\"serialization failed\"}\n\n".to_vec(),
+    }
 }
 
 pub(super) fn parse_bridge_state_frame(

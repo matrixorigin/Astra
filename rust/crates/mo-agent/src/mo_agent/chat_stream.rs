@@ -1,6 +1,6 @@
 use super::*;
 
-use mo_agent_core::RuntimeLimits;
+use mo_agent_core::{agent_warn, RuntimeLimits};
 use mo_agent_runtime::pipeline::step_protocol::{
     CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache,
 };
@@ -442,6 +442,7 @@ pub(super) struct ChatTurnParams<'a> {
     pub(super) quiet: bool,
     pub(super) selector: &'a dyn tool_selector::ToolSelector,
     pub(super) recent_tools: &'a [String],
+    pub(super) tool_health_entries: &'a [mo_agent_runtime::pipeline::persistence::ToolHealthEntry],
 }
 
 /// Full edge-cloud agentic loop: sends message, executes tools, loops until done.
@@ -462,6 +463,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         quiet,
         selector,
         recent_tools,
+        tool_health_entries,
     } = p;
     let start = Instant::now();
     let term_width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
@@ -524,7 +526,14 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         mo_agent_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
     );
     // Unified non-happy-path guard: stall + divergence + tool health + error recovery + escalation
-    let mut turn_guard = mo_agent_runtime::turn::turn_guard::TurnGuard::new();
+    let mut turn_guard = if tool_health_entries.is_empty() {
+        mo_agent_runtime::turn::turn_guard::TurnGuard::new()
+    } else {
+        let health = mo_agent_runtime::turn::tool_health::ToolHealthTracker::from_entries(
+            tool_health_entries,
+        );
+        mo_agent_runtime::turn::turn_guard::TurnGuard::with_health(health)
+    };
     // Stall enforcement: tools restricted from schema after nudge-ignore
     let mut restricted_tools: HashSet<String> = HashSet::new();
     // Dynamic turn budget: each stall/divergence costs turns to prevent runaway sessions
@@ -894,6 +903,20 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         }
         if !turn_result.full_text.is_empty() {
             final_text = turn_result.full_text.clone();
+
+            // Response guard: detect prompt leakage in LLM output
+            if mo_agent_runtime::turn::response_guard::is_prompt_leaked(&final_text, &[]) {
+                agent_warn!("response_guard", "Prompt leak detected in LLM output, sanitizing");
+                final_text = "I apologize, but I encountered an issue generating that response. Let me try again.".to_string();
+                break;
+            }
+
+            // Response guard: detect repetition loops (LLM stuck repeating same word)
+            if mo_agent_runtime::turn::response_guard::is_repetition_loop(&final_text) {
+                agent_warn!("response_guard", "Repetition loop detected in LLM output, breaking");
+                final_text = "I noticed I was repeating myself. Let me approach this differently.".to_string();
+                break;
+            }
         }
         total_prompt += turn_result.prompt_tokens;
         total_completion += turn_result.completion_tokens;
@@ -1526,6 +1549,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         stall_events,
         verdict_events,
         step_recorder_summary: Some(step_recorder.summary()),
+        tool_health_export: turn_guard.health.export(),
     })
 }
 

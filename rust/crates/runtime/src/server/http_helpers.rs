@@ -16,7 +16,10 @@ pub(super) fn require_bearer_auth(
 pub(super) fn sse_json_response(events: Vec<serde_json::Value>) -> Response {
     let body = events
         .into_iter()
-        .map(|event| format!("data: {}\n\n", serde_json::to_string(&event).unwrap()))
+        .map(|event| match serde_json::to_string(&event) {
+            Ok(json) => format!("data: {json}\n\n"),
+            Err(_) => "data: {\"type\":\"error\",\"message\":\"serialization failed\"}\n\n".to_string(),
+        })
         .collect::<String>();
 
     bridge::sse_stream_response(StatusCode::OK, Body::from(body))

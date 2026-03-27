@@ -160,6 +160,7 @@ async fn maybe_auto_compact(
         quiet: true,
         selector: ctx.selector,
         recent_tools: &[],
+        tool_health_entries: &[],
     })
     .await;
 
@@ -268,6 +269,7 @@ async fn run_chat_turn(
             quiet: false,
             selector: ctx.selector,
             recent_tools: &state.recent_tools,
+            tool_health_entries: &state.tool_health_entries,
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             eprintln!("\n{}", "  Interrupted.".dim());
@@ -299,6 +301,11 @@ fn apply_turn_success(
         .history
         .push((line.to_string(), result.full_text.clone()));
     state.recent_tools = result.tools_used.clone();
+
+    // Persist tool health for cross-session error budgets
+    if !result.tool_health_export.is_empty() {
+        state.tool_health_entries = result.tool_health_export.clone();
+    }
 
     if let Some(journal) = state.journal.as_ref() {
         let turn_event = session_journal::JournalEvent::turn(

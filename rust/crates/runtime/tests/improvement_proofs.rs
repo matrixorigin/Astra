@@ -5142,3 +5142,173 @@ mod slot_integration_proofs {
         assert!(step.execution.cursor.slots[3].idempotency_key.is_none()); // not started
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Runtime hardening proofs
+// ═══════════════════════════════════════════════════════════════════════════════
+
+mod hardening_proofs {
+    use mo_agent_runtime::turn::response_guard::{is_prompt_leaked, is_repetition_loop};
+    use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
+    use mo_agent_runtime::turn::turn_guard::TurnGuard;
+    use mo_agent_runtime::pipeline::persistence::{
+        LearningSnapshot, ToolHealthEntry, load_snapshot_from, save_snapshot_to,
+    };
+
+    // ── Response Guard ──
+
+    #[test]
+    fn prompt_leak_detects_structural_markers() {
+        assert!(is_prompt_leaked("Here is the output:\n## Core Rules\n1. Always...", &[]));
+        assert!(is_prompt_leaked("Some text with File editing rules: important", &[]));
+        assert!(is_prompt_leaked("## Reasoning Protocol should be followed", &[]));
+    }
+
+    #[test]
+    fn prompt_leak_ignores_normal_output() {
+        assert!(!is_prompt_leaked("Here is a normal code review of your PR.", &[]));
+        assert!(!is_prompt_leaked("The function implements a hash map.", &[]));
+        assert!(!is_prompt_leaked("", &[]));
+    }
+
+    #[test]
+    fn prompt_leak_detects_custom_fingerprints() {
+        let fps = vec!["secret_sauce_v2".to_string()];
+        assert!(is_prompt_leaked("Let me explain: SECRET_SAUCE_V2 is...", &fps));
+        assert!(!is_prompt_leaked("Normal text about code", &fps));
+    }
+
+    #[test]
+    fn repetition_loop_detects_stuck_model() {
+        // 8+ consecutive identical words triggers detection
+        let stuck = "the the the the the the the the the the";
+        assert!(is_repetition_loop(stuck));
+
+        // Mixed words don't trigger
+        let normal = "the quick brown fox jumps over the lazy dog";
+        assert!(!is_repetition_loop(normal));
+
+        // Short text never triggers
+        assert!(!is_repetition_loop("hello hello hello"));
+
+        // Empty text safe
+        assert!(!is_repetition_loop(""));
+    }
+
+    // ── Cross-Session Tool Health ──
+
+    #[test]
+    fn tool_health_roundtrip_through_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_health.json");
+
+        // Create snapshot with tool health
+        let snapshot = LearningSnapshot {
+            version: 1,
+            entities: vec![],
+            patterns: vec![],
+            calibration: None,
+            tool_health: vec![
+                ToolHealthEntry {
+                    name: "bash".to_string(),
+                    total_calls: 100,
+                    total_failures: 15,
+                    failure_rate: 0.15,
+                },
+                ToolHealthEntry {
+                    name: "read_file".to_string(),
+                    total_calls: 50,
+                    total_failures: 1,
+                    failure_rate: 0.02,
+                },
+            ],
+        };
+        save_snapshot_to(&path, &snapshot).unwrap();
+
+        // Load and verify
+        let loaded = load_snapshot_from(&path).unwrap();
+        assert_eq!(loaded.tool_health.len(), 2);
+        assert_eq!(loaded.tool_health[0].name, "bash");
+        assert_eq!(loaded.tool_health[0].total_calls, 100);
+        assert!((loaded.tool_health[0].failure_rate - 0.15).abs() < 0.001);
+    }
+
+    #[test]
+    fn turn_guard_with_health_inherits_cross_session_data() {
+        let entries = vec![
+            ToolHealthEntry {
+                name: "flaky_tool".to_string(),
+                total_calls: 10,
+                total_failures: 8,
+                failure_rate: 0.8,
+            },
+        ];
+        let health = ToolHealthTracker::from_entries(&entries);
+        let guard = TurnGuard::with_health(health);
+
+        // Verify the guard knows about the flaky tool
+        let deprioritized = guard.health.deprioritized_tools();
+        assert!(
+            deprioritized.contains(&"flaky_tool"),
+            "Tool with 80% failure rate should be deprioritized on restore"
+        );
+    }
+
+    #[test]
+    fn turn_guard_new_starts_clean() {
+        let guard = TurnGuard::new();
+        assert!(guard.health.deprioritized_tools().is_empty());
+    }
+
+    #[test]
+    fn tool_health_export_captures_session_state() {
+        let mut tracker = ToolHealthTracker::new();
+
+        // Simulate tool usage
+        tracker.record_success("read_file");
+        tracker.record_success("read_file");
+        tracker.record_failure("bash");
+        tracker.record_failure("bash");
+        tracker.record_failure("bash");
+
+        let entries = tracker.export();
+        assert!(entries.len() >= 2, "Should export at least 2 tools");
+
+        let bash_entry = entries.iter().find(|e| e.name == "bash").unwrap();
+        assert_eq!(bash_entry.total_failures, 3);
+        assert!(bash_entry.failure_rate > 0.9, "All bash calls were failures");
+    }
+
+    // ── SSE Error Handling ──
+
+    #[test]
+    fn sse_render_handles_valid_json() {
+        let event = serde_json::json!({"type": "message", "text": "hello"});
+        let bytes = mo_agent_runtime::bridge::sse_events::render_sse_json(event);
+        let output = String::from_utf8(bytes).unwrap();
+        assert!(output.starts_with("data: "));
+        assert!(output.ends_with("\n\n"));
+        assert!(output.contains("\"type\":\"message\""));
+    }
+
+    // ── Circuit Breaker Poison Recovery ──
+
+    #[test]
+    fn circuit_breaker_survives_normal_usage() {
+        let cb = mo_agent_runtime::bridge::circuit_breaker::CircuitBreaker::new(
+            3,
+            std::time::Duration::from_secs(1),
+            1,
+        );
+        assert!(cb.allow_request());
+        cb.record_success();
+        assert!(cb.allow_request());
+
+        // Record failures to trigger open state
+        cb.record_failure();
+        cb.record_failure();
+        cb.record_failure();
+        // Should now be open (blocking requests)
+        assert!(!cb.allow_request());
+    }
+}

@@ -152,11 +152,24 @@ pub fn save_learning_state(
     pattern_library: &Arc<Mutex<PatternLibrary>>,
     calibrator: &Arc<Mutex<ProgressiveCalibrator>>,
 ) -> Result<(), String> {
-    let snapshot = export_from_modules(entity_graph, pattern_library, calibrator);
+    save_learning_state_with_health(profile, entity_graph, pattern_library, calibrator, &[])
+}
+
+/// Save learning state with tool health data included.
+pub fn save_learning_state_with_health(
+    profile: &str,
+    entity_graph: &Arc<Mutex<EntityGraph>>,
+    pattern_library: &Arc<Mutex<PatternLibrary>>,
+    calibrator: &Arc<Mutex<ProgressiveCalibrator>>,
+    tool_health: &[ToolHealthEntry],
+) -> Result<(), String> {
+    let mut snapshot = export_from_modules(entity_graph, pattern_library, calibrator);
+    snapshot.tool_health = tool_health.to_vec();
     // Only save if there's something to persist
     if snapshot.entities.is_empty()
         && snapshot.patterns.is_empty()
         && snapshot.calibration.is_none()
+        && snapshot.tool_health.is_empty()
     {
         return Ok(());
     }
@@ -178,6 +191,14 @@ pub fn load_learning_state(
         }
         None => false,
     }
+}
+
+/// Load tool health entries from a profile's learning snapshot.
+/// Returns empty vec on missing/corrupt file (graceful degradation).
+pub fn load_tool_health(profile: &str) -> Vec<ToolHealthEntry> {
+    load_snapshot(profile)
+        .map(|s| s.tool_health)
+        .unwrap_or_default()
 }
 
 /// Load a snapshot from a custom path (for testing or server-side use).

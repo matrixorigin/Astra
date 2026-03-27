@@ -152,7 +152,7 @@ pub(super) async fn prepare_chat_turn_bridge_body(
         .and_then(serde_json::Value::as_str)
         .map(|_| {
             let meta = serde_json::Value::Object(build_skipped_routing_metadata("model_override"));
-            URL_SAFE.encode(serde_json::to_string(&meta).unwrap().as_bytes())
+            URL_SAFE.encode(serde_json::to_string(&meta).unwrap_or_default().as_bytes())
         });
     let force_intent = detect_correction(&user_query).then_some("question".to_string());
     let request_execution_state = object
@@ -168,7 +168,7 @@ pub(super) async fn prepare_chat_turn_bridge_body(
                 .unwrap_or_else(|| normalize_execution_state(&serde_json::Map::new()))
         })
         .filter(|execution_state| !execution_state.is_empty())
-        .map(|execution_state| URL_SAFE.encode(serde_json::to_string(&execution_state).unwrap()));
+        .map(|execution_state| URL_SAFE.encode(serde_json::to_string(&execution_state).unwrap_or_default()));
 
     serde_json::to_vec(&payload)
         .map(Bytes::from)

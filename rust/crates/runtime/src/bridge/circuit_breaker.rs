@@ -68,7 +68,7 @@ impl CircuitBreaker {
                 let should_try = self
                     .last_failure_time
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .map(|t| t.elapsed() >= self.recovery_timeout)
                     .unwrap_or(false);
 

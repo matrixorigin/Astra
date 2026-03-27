@@ -300,6 +300,8 @@ struct StreamResult {
     verdict_events: Vec<VerdictEvent>,
     /// Step Protocol recorder summary for debugging and audit.
     step_recorder_summary: Option<mo_agent_runtime::pipeline::step_recorder::RecorderSummary>,
+    /// Exported tool health entries from this turn's TurnGuard (for cross-session persistence).
+    tool_health_export: Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry>,
 }
 
 /// Structured audit record for a TurnGuard verdict.
@@ -365,6 +367,8 @@ struct ReplState {
     learning_snapshot: Option<String>,
     /// Local task service for /task commands.
     task_service: Option<std::sync::Arc<mo_agent_services::LocalTaskService>>,
+    /// Cross-session tool health data for error budget persistence.
+    tool_health_entries: Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry>,
 }
 
 impl Default for ReplState {
@@ -393,6 +397,7 @@ impl Default for ReplState {
             matrixone_pool: None,
             learning_snapshot: None,
             task_service: None,
+            tool_health_entries: Vec::new(),
         }
     }
 }
@@ -1366,7 +1371,8 @@ async fn run_chat_repl(
         Some(confidence_calibrator),
     );
 
-    // Load cross-session learning state (entity graph, patterns, calibration)
+    // Load cross-session learning state (entity graph, patterns, calibration, tool health)
+    let mut cross_session_health_entries = Vec::new();
     {
         let profile_name = profile.unwrap_or("default");
         let loaded = mo_agent_runtime::pipeline::persistence::load_learning_state(
@@ -1378,6 +1384,19 @@ async fn run_chat_repl(
         if loaded {
             eprintln!("{}", "  ✓ Loaded learning state from prior sessions".dim());
         }
+        // Load tool health for cross-session error budgets
+        cross_session_health_entries =
+            mo_agent_runtime::pipeline::persistence::load_tool_health(profile_name);
+        if !cross_session_health_entries.is_empty() {
+            eprintln!(
+                "{}",
+                format!(
+                    "  ✓ Restored tool health ({} tools tracked)",
+                    cross_session_health_entries.len()
+                )
+                .dim()
+            );
+        }
         // Try to merge cloud learning (best-effort)
         try_cloud_pull(
             profile_name,
@@ -1388,6 +1407,7 @@ async fn run_chat_repl(
         // Try to pull user preferences from cloud
         try_cloud_pull_preferences(&mut state);
     }
+    state.tool_health_entries = cross_session_health_entries;
 
     print_repl_banner(profile, &state);
 
@@ -1490,14 +1510,15 @@ async fn run_chat_repl(
         }
     }
 
-    // Save cross-session learning state
+    // Save cross-session learning state (including tool health)
     {
         let profile_name = profile.unwrap_or("default");
-        if let Err(e) = mo_agent_runtime::pipeline::persistence::save_learning_state(
+        if let Err(e) = mo_agent_runtime::pipeline::persistence::save_learning_state_with_health(
             profile_name,
             &pipeline_modules.entity_graph,
             &pipeline_modules.pattern_library,
             &pipeline_modules.calibrator,
+            &state.tool_health_entries,
         ) {
             eprintln!(
                 "{}",
@@ -1989,6 +2010,7 @@ mod tests {
             quiet: true,
             selector: &selector,
             recent_tools: &[],
+            tool_health_entries: &[],
         })
         .await
         .unwrap();
@@ -2029,6 +2051,7 @@ mod tests {
             quiet: true,
             selector: &selector,
             recent_tools: &[],
+            tool_health_entries: &[],
         })
         .await;
         assert!(result.is_err());
@@ -2085,6 +2108,7 @@ mod tests {
             quiet: true,
             selector: &selector,
             recent_tools: &[],
+            tool_health_entries: &[],
         })
         .await
         .unwrap();
