@@ -489,9 +489,13 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             state.total_completion_tokens = restored.total_tokens_out;
             state.recent_tools = restored.recent_tools;
 
-            // Merge step checkpoint data if available (with version validation)
+            // Merge step checkpoint data if available (with migration support)
+            let registry = mo_agent_runtime::pipeline::step_protocol::MigrationRegistry::with_defaults();
             if let Ok(Some(step_restored)) =
-                mo_agent_runtime::pipeline::step_restore::restore_session(&restored.session_id)
+                mo_agent_runtime::pipeline::step_restore::restore_session_with_migrations(
+                    &restored.session_id,
+                    &registry,
+                )
             {
                 let summary =
                     mo_agent_runtime::pipeline::step_restore::restore_summary(&step_restored);

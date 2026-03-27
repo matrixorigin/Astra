@@ -26,8 +26,8 @@ use crate::pipeline::step_checkpoint::{
 };
 use crate::pipeline::step_protocol::{
     check_protocol_version_with_policy, CachedToolResult, HeavyCheckpoint, IdempotencyKey,
-    InMemoryIdempotencyCache, SlotState, StepEvent, StepEventType,
-    VersionPolicy, PROTOCOL_VERSION,
+    InMemoryIdempotencyCache, MigrationRegistry, SlotState, StepEvent, StepEventType,
+    VersionPolicy, VersionVerdict, PROTOCOL_VERSION,
 };
 
 /// Restored session state — everything needed to resume execution.
@@ -97,7 +97,37 @@ pub fn restore_session(session_id: &str) -> Result<Option<RestoredSession>, Rest
     restore_session_with_policy(session_id, VersionPolicy::Compatible)
 }
 
-/// Restore with explicit version policy.
+/// Restore with migration support — uses `MigrationRegistry` to upgrade old checkpoints.
+///
+/// This is the recommended production entry point. It:
+/// 1. Loads the checkpoint (serde defaults handle missing fields)
+/// 2. Checks version with `VersionPolicy::Migrate`
+/// 3. If `Migrated` verdict: runs the registered migration function on the JSON representation
+/// 4. Warms idempotency cache from events
+///
+/// ```ignore
+/// let registry = MigrationRegistry::with_defaults();
+/// let restored = restore_session_with_migrations("session-123", &registry)?;
+/// ```
+pub fn restore_session_with_migrations(
+    session_id: &str,
+    registry: &MigrationRegistry,
+) -> Result<Option<RestoredSession>, RestoreError> {
+    // Step 1: Load latest heavy checkpoint
+    let heavy = match read_latest_heavy_checkpoint(session_id) {
+        Ok(Some(h)) => h,
+        Ok(None) => return Ok(None),
+        Err(e) => return Err(RestoreError::IoError(e.to_string())),
+    };
+
+    // Step 2: Version negotiation with migration support
+    let heavy = validate_and_migrate(heavy, registry)?;
+
+    // Step 3: Extract resume turn and warm cache
+    build_restored_session(session_id, heavy)
+}
+
+/// Restore with explicit version policy (no migration).
 pub fn restore_session_with_policy(
     session_id: &str,
     policy: VersionPolicy,
@@ -109,13 +139,19 @@ pub fn restore_session_with_policy(
         Err(e) => return Err(RestoreError::IoError(e.to_string())),
     };
 
-    // Step 2: Validate protocol version
+    // Step 2: Validate protocol version (no migration)
     validate_checkpoint_version(&heavy, policy)?;
 
-    // Step 3: Extract resume turn from cursor
-    let resume_turn = extract_resume_turn(&heavy);
+    // Step 3: Extract resume turn and warm cache
+    build_restored_session(session_id, heavy)
+}
 
-    // Step 4: Replay events to warm idempotency cache
+/// Shared: build RestoredSession from a validated checkpoint.
+fn build_restored_session(
+    session_id: &str,
+    heavy: HeavyCheckpoint,
+) -> Result<Option<RestoredSession>, RestoreError> {
+    let resume_turn = extract_resume_turn(&heavy);
     let (cache, completed_results) = warm_cache_from_events(session_id);
 
     Ok(Some(RestoredSession {
@@ -130,6 +166,75 @@ pub fn restore_session_with_policy(
         completed_tool_results: completed_results,
         learning_snapshot_id: heavy.learning_snapshot_id,
     }))
+}
+
+/// Validate version and run migration if needed.
+///
+/// Uses `VersionPolicy::Migrate`: same major → pass, major N-1 → migrate, older → reject.
+/// When migration is needed:
+/// 1. Serialize checkpoint to JSON (round-trip through serde)
+/// 2. Run registered migration function on the JSON
+/// 3. Deserialize back into HeavyCheckpoint
+fn validate_and_migrate(
+    heavy: HeavyCheckpoint,
+    registry: &MigrationRegistry,
+) -> Result<HeavyCheckpoint, RestoreError> {
+    let cp_version = heavy.light.protocol_version;
+
+    // Special case: version 0 means pre-versioning checkpoint.
+    // check_protocol_version_with_policy rejects v0 unconditionally,
+    // so we handle it here before the general version check.
+    if cp_version == 0 {
+        if !registry.has_migration(0) {
+            return Err(RestoreError::InvalidCheckpoint(
+                "checkpoint has zero protocol version and no migration registered".into(),
+            ));
+        }
+        return run_migration(heavy, 0, registry);
+    }
+
+    match check_protocol_version_with_policy(cp_version, VersionPolicy::Migrate) {
+        Ok(VersionVerdict::ExactMatch) => Ok(heavy),
+        Ok(VersionVerdict::CompatibleDecode { .. }) => Ok(heavy),
+        Ok(VersionVerdict::Migrated { from, .. }) => {
+            if !registry.has_migration(from) {
+                return Err(RestoreError::InvalidCheckpoint(format!(
+                    "migration needed from v{from} but none registered"
+                )));
+            }
+            run_migration(heavy, from, registry)
+        }
+        Err(_) => Err(RestoreError::VersionMismatch {
+            checkpoint_version: cp_version,
+            current_version: PROTOCOL_VERSION,
+        }),
+    }
+}
+
+/// Run a registered migration on a checkpoint (serialize → migrate → deserialize → stamp).
+fn run_migration(
+    heavy: HeavyCheckpoint,
+    from_version: u32,
+    registry: &MigrationRegistry,
+) -> Result<HeavyCheckpoint, RestoreError> {
+    let raw_json = serde_json::to_value(&heavy)
+        .map_err(|e| RestoreError::InvalidCheckpoint(
+            format!("serialization failed: {e}"),
+        ))?;
+
+    let migrated_json = registry.migrate(from_version, &raw_json)
+        .map_err(|e| RestoreError::InvalidCheckpoint(
+            format!("migration v{from_version} failed: {e}"),
+        ))?;
+
+    let mut migrated: HeavyCheckpoint = serde_json::from_value(migrated_json)
+        .map_err(|e| RestoreError::InvalidCheckpoint(
+            format!("post-migration parse failed: {e}"),
+        ))?;
+
+    // Stamp current version so next checkpoint write is up-to-date
+    migrated.light.protocol_version = PROTOCOL_VERSION;
+    Ok(migrated)
 }
 
 /// Validate that the checkpoint's protocol version is compatible.
@@ -614,5 +719,89 @@ mod tests {
         assert!(msg.contains("1000"));
 
         assert_eq!(RestoreError::NoCheckpoint.to_string(), "no checkpoint found");
+    }
+
+    // ── Migration-aware restore ──
+
+    #[test]
+    fn validate_and_migrate_exact_match_passthrough() {
+        let heavy = make_heavy_checkpoint(3, vec![], vec![]);
+        let registry = MigrationRegistry::with_defaults();
+        let result = validate_and_migrate(heavy, &registry).unwrap();
+        assert_eq!(result.light.protocol_version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn validate_and_migrate_same_major_passthrough() {
+        let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
+        heavy.light.protocol_version = PROTOCOL_VERSION + 1; // minor bump
+        let registry = MigrationRegistry::with_defaults();
+        let result = validate_and_migrate(heavy, &registry).unwrap();
+        // CompatibleDecode: keeps the original version (not stamped)
+        assert_eq!(result.light.protocol_version, PROTOCOL_VERSION + 1);
+    }
+
+    #[test]
+    fn validate_and_migrate_v0_runs_migration() {
+        let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
+        heavy.light.protocol_version = 0;
+        let registry = MigrationRegistry::with_defaults();
+
+        // v0 with Migrate policy → Migrated verdict → run migration → stamp PROTOCOL_VERSION
+        let result = validate_and_migrate(heavy, &registry).unwrap();
+        assert_eq!(result.light.protocol_version, PROTOCOL_VERSION);
+        // Data preserved through round-trip
+        assert_eq!(result.recent_tools, vec!["git_status".to_string()]);
+        assert_eq!(result.budget_remaining_tokens, 50000);
+    }
+
+    #[test]
+    fn validate_and_migrate_v0_without_registry_rejects() {
+        let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
+        heavy.light.protocol_version = 0;
+        let registry = MigrationRegistry::new(); // empty, no v0 migration
+
+        let result = validate_and_migrate(heavy, &registry);
+        assert!(matches!(result, Err(RestoreError::InvalidCheckpoint(_))));
+    }
+
+    #[test]
+    fn validate_and_migrate_too_old_rejects() {
+        let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
+        heavy.light.protocol_version = 3000; // major=3, current major=1 → too far
+        let registry = MigrationRegistry::with_defaults();
+
+        let result = validate_and_migrate(heavy, &registry);
+        assert!(matches!(result, Err(RestoreError::VersionMismatch { .. })));
+    }
+
+    #[test]
+    fn validate_and_migrate_preserves_messages_through_roundtrip() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "你好世界"}),
+            serde_json::json!({"role": "assistant", "content": "Hello!"}),
+        ];
+        let mut heavy = make_heavy_checkpoint(5, messages.clone(), vec!["bash".into()]);
+        heavy.light.protocol_version = 0;
+        let registry = MigrationRegistry::with_defaults();
+
+        let result = validate_and_migrate(heavy, &registry).unwrap();
+        assert_eq!(result.messages.len(), 2);
+        assert_eq!(result.messages[0]["content"], "你好世界");
+        assert_eq!(result.blocked_tools, vec!["bash".to_string()]);
+        assert_eq!(result.learning_snapshot_id, Some("snap-123".to_string()));
+    }
+
+    #[test]
+    fn validate_and_migrate_migration_needed_but_not_registered() {
+        let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
+        heavy.light.protocol_version = 500;
+        let registry = MigrationRegistry::new(); // empty
+
+        let result = validate_and_migrate(heavy, &registry);
+        // Migrated verdict but no migration function → InvalidCheckpoint
+        assert!(matches!(result, Err(RestoreError::InvalidCheckpoint(_))));
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("migration needed"));
     }
 }
