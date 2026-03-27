@@ -464,7 +464,11 @@ fn apply_turn_success(
     }
 }
 
-fn persist_last_session_id(profile: Option<&str>, session_id: &str) {
+pub(super) fn initialize_journal_pub(state: &mut ReplState, session_id: &str) {
+    initialize_journal(state, session_id);
+}
+
+pub(super) fn persist_last_session_id(profile: Option<&str>, session_id: &str) {
     let mut creds = load_credentials();
     let name = profile_name(profile, &creds);
     let entry = creds.profiles.entry(name).or_default();

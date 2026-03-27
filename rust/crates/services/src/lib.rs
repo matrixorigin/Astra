@@ -17,6 +17,7 @@ pub mod reflect;
 pub mod replay;
 pub mod runs;
 pub mod sandbox;
+pub mod session_analytics;
 pub mod session_checkpoint;
 pub mod session_journal;
 pub mod session_restore;

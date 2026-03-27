@@ -300,6 +300,16 @@ pub(super) fn initialize_repl_state(
     if let Some(m) = initial_model {
         state.model = Some(m.to_string());
     }
+
+    // Initialize local task service
+    let tasks_dir = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".mo-agent")
+        .join("tasks");
+    state.task_service = Some(std::sync::Arc::new(
+        mo_agent_services::LocalTaskService::new(tasks_dir),
+    ));
+
     state
 }
 
@@ -314,7 +324,6 @@ struct RestoredSessionState {
 
 /// Rebuild `(user_msg, assistant_msg)` history from the session journal.
 /// Only `Turn` events with both user_input and assistant_output are included.
-#[cfg(test)]
 pub(super) fn restore_history_from_journal(session_id: &str) -> Vec<(String, String)> {
     restore_session_state_from_journal(session_id).history
 }

@@ -591,4 +591,146 @@ mod tests {
         let result = svc.restore_to_checkpoint("nonexistent-session-id", 1).await;
         assert!(matches!(result, Ok(None)));
     }
+
+    // ── Restore field completeness ──
+
+    #[test]
+    fn restored_session_all_fields_populated() {
+        let s = RestoredSession {
+            session_id: "s-full".into(),
+            turn_count: 42,
+            total_tokens_in: 100_000,
+            total_tokens_out: 80_000,
+            recent_tools: vec!["bash".into(), "grep".into(), "read_file".into()],
+            learning_snapshot_json: Some(r#"{"entities":["Rust","MatrixOne"]}"#.into()),
+            checkpoint_count: 5,
+            last_status: "active".into(),
+            git_branch: Some("feature/resume".into()),
+            model: Some("claude-3".into()),
+            title: Some("Implement session resume".into()),
+            restored_from_cloud: false,
+        };
+        // Verify every field survives serialization
+        let json = serde_json::to_string(&s).unwrap();
+        let loaded: RestoredSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.session_id, "s-full");
+        assert_eq!(loaded.turn_count, 42);
+        assert_eq!(loaded.total_tokens_in, 100_000);
+        assert_eq!(loaded.total_tokens_out, 80_000);
+        assert_eq!(loaded.recent_tools.len(), 3);
+        assert!(loaded.learning_snapshot_json.is_some());
+        assert_eq!(loaded.checkpoint_count, 5);
+        assert_eq!(loaded.last_status, "active");
+        assert_eq!(loaded.git_branch.as_deref(), Some("feature/resume"));
+        assert_eq!(loaded.model.as_deref(), Some("claude-3"));
+        assert_eq!(loaded.title.as_deref(), Some("Implement session resume"));
+        assert!(!loaded.restored_from_cloud);
+    }
+
+    #[test]
+    fn restored_session_partial_fields_default_safely() {
+        // Simulate a cloud restore with minimal data
+        let s = RestoredSession {
+            session_id: "s-partial".into(),
+            turn_count: 3,
+            last_status: "active".into(),
+            restored_from_cloud: true,
+            ..Default::default()
+        };
+        assert!(s.recent_tools.is_empty());
+        assert!(s.learning_snapshot_json.is_none());
+        assert!(s.git_branch.is_none());
+        assert!(s.model.is_none());
+        assert!(s.title.is_none());
+        assert_eq!(s.total_tokens_in, 0);
+        assert_eq!(s.total_tokens_out, 0);
+        assert_eq!(s.checkpoint_count, 0);
+    }
+
+    // ── HybridRestoreService local_only behavior ──
+
+    #[tokio::test]
+    async fn local_only_learning_restore_returns_none() {
+        let svc = HybridRestoreService::local_only();
+        let result = svc.restore_learning("user1", "default").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn local_only_recent_tools_returns_empty() {
+        let svc = HybridRestoreService::local_only();
+        let tools = svc.restore_recent_tools("nonexistent").await.unwrap();
+        assert!(tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_only_cloud_checkpoints_returns_empty() {
+        let svc = HybridRestoreService::local_only();
+        let ckpts = svc.cloud_checkpoints("nonexistent").await.unwrap();
+        assert!(ckpts.is_empty());
+    }
+
+    // ── Checkpoint convergence ──
+
+    #[test]
+    fn checkpoint_fields_for_cloud_push() {
+        // Verify Checkpoint struct has all fields needed by push_checkpoint_to_cloud
+        let ckpt = crate::session_checkpoint::Checkpoint {
+            number: 3,
+            turn: 15,
+            title: "Phase A done".into(),
+            summary: "Token efficiency implemented".into(),
+            tools_used: vec!["bash".into(), "grep".into()],
+            total_tokens: 50_000,
+            had_stalls: true,
+            error_count: 1,
+        };
+        assert_eq!(ckpt.number, 3);
+        assert_eq!(ckpt.turn, 15);
+        assert!(ckpt.had_stalls);
+        assert_eq!(ckpt.error_count, 1);
+        let tools_json = serde_json::to_string(&ckpt.tools_used).unwrap();
+        assert!(tools_json.contains("bash"));
+    }
+
+    #[test]
+    fn restored_checkpoint_covers_rewind_fields() {
+        let ckpt = RestoredCheckpoint {
+            number: 7,
+            turn: 35,
+            title: "Checkpoint after refactor".into(),
+            summary: "All tests passing after auth refactor".into(),
+            total_tokens: 120_000,
+        };
+        // Verify the fields needed for /rewind from cloud
+        assert_eq!(ckpt.number, 7);
+        assert_eq!(ckpt.turn, 35);
+        assert!(!ckpt.title.is_empty());
+        assert!(!ckpt.summary.is_empty());
+        assert!(ckpt.total_tokens > 0);
+    }
+
+    // ── restore_to_checkpoint semantics ──
+
+    #[test]
+    fn restored_session_rewind_preserves_identity() {
+        // Simulate what restore_to_checkpoint does: rewind turn but keep session_id
+        let original = RestoredSession {
+            session_id: "s-rewind".into(),
+            turn_count: 20,
+            total_tokens_in: 80_000,
+            model: Some("gpt-4".into()),
+            ..Default::default()
+        };
+        let rewound = RestoredSession {
+            turn_count: 10,
+            total_tokens_in: 40_000,
+            checkpoint_count: 3,
+            ..original.clone()
+        };
+        assert_eq!(rewound.session_id, "s-rewind");
+        assert_eq!(rewound.model, Some("gpt-4".into()));
+        assert_eq!(rewound.turn_count, 10);
+        assert!(rewound.turn_count < original.turn_count);
+    }
 }

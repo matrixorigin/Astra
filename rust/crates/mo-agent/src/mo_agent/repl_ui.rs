@@ -79,8 +79,11 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/plan", "Persistent plan: /plan [show|set <text>|clear]"),
     (
         "/task",
-        "Task tracking: /task [list|add <title>|done <id>|clear]",
+        "Task tracking: /task [list|add <title>|done <id>|status <id>]",
     ),
+    ("/resume", "Resume a previous session: /resume [session_id]"),
+    ("/stats", "Session analytics: /stats [history]"),
+    ("/tools", "Tool performance profile: /tools"),
     ("/exit", "Exit the REPL"),
     ("/quit", "Exit the REPL"),
 ];
@@ -872,5 +875,57 @@ mod tests {
             desc.contains("search"),
             "history help should mention search: {desc}"
         );
+    }
+
+    // ── /resume in SLASH_COMMANDS ─────────────────────────────────────────────
+
+    #[test]
+    fn resume_command_is_registered() {
+        assert!(SLASH_COMMANDS.iter().any(|(cmd, _)| *cmd == "/resume"));
+    }
+
+    #[test]
+    fn resume_resolves_from_prefix() {
+        let result = resolve_slash_command("/resu");
+        assert!(result.is_ok(), "got: {result:?}");
+        assert_eq!(result.unwrap(), "/resume");
+    }
+
+    #[test]
+    fn resume_and_rewind_disambiguate() {
+        // /re is ambiguous between /resume, /rewind, /reflect, /register
+        let result = resolve_slash_command("/re");
+        assert!(result.is_err(), "/re should be ambiguous");
+        let candidates = result.unwrap_err();
+        assert!(candidates.len() > 1);
+        assert!(candidates.contains(&"/resume"));
+    }
+
+    // ── /stats in SLASH_COMMANDS ──────────────────────────────────────────────
+
+    #[test]
+    fn stats_command_is_registered() {
+        assert!(SLASH_COMMANDS.iter().any(|(cmd, _)| *cmd == "/stats"));
+    }
+
+    #[test]
+    fn stats_resolves_from_prefix() {
+        let result = resolve_slash_command("/sta");
+        assert!(result.is_ok(), "got: {result:?}");
+        assert_eq!(result.unwrap(), "/stats");
+    }
+
+    // ── /tools in SLASH_COMMANDS ──────────────────────────────────────────
+
+    #[test]
+    fn tools_command_is_registered() {
+        assert!(SLASH_COMMANDS.iter().any(|(cmd, _)| *cmd == "/tools"));
+    }
+
+    #[test]
+    fn tools_resolves_from_prefix() {
+        let result = resolve_slash_command("/tool");
+        assert!(result.is_ok(), "got: {result:?}");
+        assert_eq!(result.unwrap(), "/tools");
     }
 }

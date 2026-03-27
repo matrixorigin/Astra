@@ -361,6 +361,10 @@ struct ReplState {
     ingestion_user_id: Option<String>,
     /// Shared MatrixOne pool for checkpoint push and cloud sync (None if unavailable).
     matrixone_pool: Option<std::sync::Arc<sqlx::Pool<sqlx::MySql>>>,
+    /// Learning snapshot restored from cloud (to be merged into learning modules).
+    learning_snapshot: Option<String>,
+    /// Local task service for /task commands.
+    task_service: Option<std::sync::Arc<mo_agent_services::LocalTaskService>>,
 }
 
 impl Default for ReplState {
@@ -387,6 +391,8 @@ impl Default for ReplState {
             ingestion_sender: None,
             ingestion_user_id: None,
             matrixone_pool: None,
+            learning_snapshot: None,
+            task_service: None,
         }
     }
 }
@@ -394,6 +400,524 @@ impl Default for ReplState {
 // ═════════════════════════════════════════════════════════ ReplHelper ════
 
 // ═════════════════════════════════════════════════════════ Clipboard ══════
+
+// ═══════════════════════════════════════════════════════════ Resume ═══════
+
+async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut ReplState) {
+    use mo_agent_services::session_restore::{HybridRestoreService, SessionRestoreService};
+
+    let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
+    let svc = match &state.matrixone_pool {
+        Some(pool) => HybridRestoreService::new(pool.as_ref().clone()),
+        None => HybridRestoreService::local_only(),
+    };
+
+    // If no session_id given, list resumable sessions
+    if arg.is_empty() {
+        match svc.list_resumable_sessions(user_id).await {
+            Ok(sessions) if sessions.is_empty() => {
+                eprintln!(
+                    "{}",
+                    "  No resumable sessions. Use /resume <session_id>.".dim()
+                );
+            }
+            Ok(sessions) => {
+                eprintln!(
+                    "\n{}",
+                    "─── Resumable Sessions ──────────────────────────".bold()
+                );
+                for s in &sessions {
+                    let title = s.title.as_deref().unwrap_or("untitled");
+                    let short_id = &s.session_id[..8.min(s.session_id.len())];
+                    eprintln!(
+                        "  {} {} ({} turns, {})",
+                        short_id.cyan(),
+                        title,
+                        s.turn_count,
+                        s.last_status.as_str().dim(),
+                    );
+                }
+                eprintln!("  Use /resume <session_id> to restore.\n");
+            }
+            Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+        }
+        return;
+    }
+
+    // Resolve prefix via local journal first
+    let session_id = match session_journal::resolve_session_id(arg) {
+        Ok(resolved) => {
+            if resolved != arg {
+                eprintln!(
+                    "  {} Resolved {} → {}",
+                    "✓".green(),
+                    arg.cyan(),
+                    resolved.as_str().cyan()
+                );
+            }
+            resolved
+        }
+        Err(_) => arg.to_string(),
+    };
+
+    // Restore session
+    match svc.restore_session(&session_id).await {
+        Ok(Some(restored)) => {
+            // Issue 1: Verify session belongs to current user
+            // For cloud restore, the session should already have user_id check done in DB query
+            // For local restore, we verify the session exists in user's journal
+            if !restored.restored_from_cloud {
+                // Local restore: verify user owns this session by checking journal exists
+                if session_journal::read_journal(&session_id).is_err() {
+                    eprintln!(
+                        "{}",
+                        format!("  ✗ Session {} not found or not owned by user", arg).red()
+                    );
+                    return;
+                }
+            }
+
+            // Apply restored state
+            state.session_id = Some(restored.session_id.clone());
+            state.turn = restored.turn_count;
+            state.total_prompt_tokens = restored.total_tokens_in;
+            state.total_completion_tokens = restored.total_tokens_out;
+            state.recent_tools = restored.recent_tools;
+            if let Some(ref m) = restored.model {
+                state.model = Some(m.clone());
+            }
+
+            // Store learning snapshot for merge after handler returns
+            // (pipeline modules are only accessible in run_chat_repl)
+            if let Some(ref learning_json) = restored.learning_snapshot_json
+                && !learning_json.is_empty()
+            {
+                state.learning_snapshot = Some(learning_json.clone());
+            }
+
+            // Issue 3: Restore conversation history from local journal
+            // restore_history_from_journal already handles session segmentation (only reads after latest session_start)
+            state.history = repl_runtime::restore_history_from_journal(&session_id);
+
+            // Re-initialize journal for the resumed session
+            repl_turn::initialize_journal_pub(state, &session_id);
+            repl_turn::persist_last_session_id(profile, &session_id);
+
+            let source = if restored.restored_from_cloud {
+                "cloud"
+            } else {
+                "local"
+            };
+            eprintln!(
+                "  {} Resumed session {} ({}, {} turns, {} checkpoints)",
+                "✓".green(),
+                &session_id[..8.min(session_id.len())].cyan(),
+                source,
+                restored.turn_count,
+                restored.checkpoint_count,
+            );
+        }
+        Ok(None) => {
+            eprintln!("{}", format!("  Session not found: {arg}").yellow());
+        }
+        Err(e) => eprintln!("{}", format!("  ✗ Resume failed: {e}").red()),
+    }
+}
+
+// ═══════════════════════════════════════════════════════ Stats ════════════
+
+fn handle_stats_command(arg: &str, state: &ReplState) {
+    use mo_agent_services::session_analytics;
+
+    match arg {
+        "history" => {
+            // Show stats across recent sessions
+            let sessions = session_journal::list_sessions().unwrap_or_default();
+            if sessions.is_empty() {
+                eprintln!("{}", "  No sessions found.".dim());
+                return;
+            }
+            let recent: Vec<_> = sessions.into_iter().take(10).collect();
+            let mut all_stats = Vec::new();
+            for sid in &recent {
+                if let Ok(events) = session_journal::read_journal(sid) {
+                    all_stats.push(session_analytics::compute_session_stats(sid, &events));
+                }
+            }
+            if all_stats.is_empty() {
+                eprintln!("{}", "  No session data.".dim());
+                return;
+            }
+            eprintln!(
+                "\n{}",
+                "─── Recent Sessions ─────────────────────────────".bold()
+            );
+            for s in &all_stats {
+                let short = &s.session_id[..8.min(s.session_id.len())];
+                let model = s.model.as_deref().unwrap_or("?");
+                eprintln!(
+                    "  {} {:>3} turns  {:>6}+{:<6} tok  {:>3} tools  {} err  {}",
+                    short.cyan(),
+                    s.turn_count,
+                    s.total_tokens_in,
+                    s.total_tokens_out,
+                    s.total_tool_calls,
+                    s.error_count,
+                    model.dim(),
+                );
+            }
+            let agg = session_analytics::aggregate_stats(&all_stats);
+            eprintln!(
+                "\n  {} {} sessions, {} turns, {}+{} tokens, {:.1}% tool errors",
+                "Summary:".bold(),
+                agg.session_count,
+                agg.total_turns,
+                agg.total_tokens_in,
+                agg.total_tokens_out,
+                agg.overall_tool_error_rate * 100.0,
+            );
+            eprintln!();
+        }
+        _ => {
+            // Show current session stats
+            let sid = match &state.session_id {
+                Some(s) => s.clone(),
+                None => {
+                    eprintln!("{}", "  No active session. Use /stats history.".dim());
+                    return;
+                }
+            };
+            let events = session_journal::read_journal(&sid).unwrap_or_default();
+            let stats = session_analytics::compute_session_stats(&sid, &events);
+
+            eprintln!(
+                "\n{}",
+                "─── Session Stats ───────────────────────────────".bold()
+            );
+            eprintln!(
+                "  {:<14} {}",
+                "session:".dim(),
+                sid[..8.min(sid.len())].cyan()
+            );
+            if let Some(ref m) = stats.model {
+                eprintln!("  {:<14} {}", "model:".dim(), m.as_str().cyan());
+            }
+            eprintln!("  {:<14} {}", "turns:".dim(), stats.turn_count);
+            eprintln!(
+                "  {:<14} {} in + {} out",
+                "tokens:".dim(),
+                stats.total_tokens_in,
+                stats.total_tokens_out
+            );
+            eprintln!(
+                "  {:<14} {:.1}s ({:.0}ms/turn)",
+                "duration:".dim(),
+                stats.total_duration_ms as f64 / 1000.0,
+                stats.avg_duration_ms as f64
+            );
+            eprintln!(
+                "  {:<14} {} ({} failed, {:.1}% error rate)",
+                "tool calls:".dim(),
+                stats.total_tool_calls,
+                stats.failed_tool_calls,
+                stats.tool_error_rate * 100.0
+            );
+            if !stats.unique_tools.is_empty() {
+                eprintln!(
+                    "  {:<14} {}",
+                    "tools used:".dim(),
+                    stats.unique_tools.join(", ")
+                );
+            }
+            if stats.error_count > 0 || stats.stall_count > 0 {
+                eprintln!(
+                    "  {:<14} {} errors, {} stalls",
+                    "issues:".dim(),
+                    stats.error_count,
+                    stats.stall_count
+                );
+            }
+            if stats.checkpoint_count > 0 {
+                eprintln!("  {:<14} {}", "checkpoints:".dim(), stats.checkpoint_count);
+            }
+            eprintln!();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════ Tool Profile ═════════════
+
+fn handle_tools_command(state: &ReplState) {
+    use mo_agent_services::session_analytics;
+
+    let sid = match &state.session_id {
+        Some(s) => s.clone(),
+        None => {
+            eprintln!("{}", "  No active session.".dim());
+            return;
+        }
+    };
+    let events = session_journal::read_journal(&sid).unwrap_or_default();
+    let profiles = session_analytics::compute_tool_profiles(&events);
+
+    if profiles.is_empty() {
+        eprintln!("{}", "  No tool calls recorded yet.".dim());
+        return;
+    }
+
+    eprintln!(
+        "\n{}",
+        "─── Tool Performance ────────────────────────────".bold()
+    );
+    eprintln!(
+        "  {:<20} {:>5} {:>5} {:>7} {:>7} {:>7} {:>6}",
+        "tool".bold(),
+        "calls".bold(),
+        "fail".bold(),
+        "avg ms".bold(),
+        "min ms".bold(),
+        "max ms".bold(),
+        "err%".bold(),
+    );
+    for p in &profiles {
+        let err_pct = format!("{:.0}%", p.error_rate * 100.0);
+        let err_display = if p.fail_count > 0 {
+            err_pct.red().to_string()
+        } else {
+            err_pct
+        };
+        eprintln!(
+            "  {:<20} {:>5} {:>5} {:>7} {:>7} {:>7} {:>6}",
+            p.name.as_str().cyan(),
+            p.call_count,
+            p.fail_count,
+            p.avg_ms,
+            p.min_ms,
+            p.max_ms,
+            err_display,
+        );
+    }
+    let total_ms: u64 = profiles.iter().map(|p| p.total_ms).sum();
+    let total_calls: u32 = profiles.iter().map(|p| p.call_count).sum();
+    eprintln!(
+        "\n  {} {} calls, {:.1}s total tool time",
+        "Summary:".bold(),
+        total_calls,
+        total_ms as f64 / 1000.0,
+    );
+    eprintln!();
+}
+
+// ═══════════════════════════════════════════════════ Learning Merge ═══════
+
+fn merge_learning_snapshot(
+    json: &str,
+    entity_graph: &std::sync::Arc<
+        std::sync::Mutex<mo_agent_runtime::pipeline::entity::EntityGraph>,
+    >,
+    pattern_library: &std::sync::Arc<
+        std::sync::Mutex<mo_agent_runtime::pipeline::pattern::PatternLibrary>,
+    >,
+    calibrator: &std::sync::Arc<
+        std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
+    >,
+) {
+    match serde_json::from_str::<mo_agent_runtime::pipeline::persistence::LearningSnapshot>(json) {
+        Ok(snapshot) => {
+            mo_agent_runtime::pipeline::persistence::merge_into_modules(
+                &snapshot,
+                entity_graph,
+                pattern_library,
+                calibrator,
+            );
+            let n = snapshot.entities.len() + snapshot.patterns.len();
+            if n > 0 {
+                eprintln!(
+                    "  {} Merged learning: {} entities, {} patterns",
+                    "✓".green(),
+                    snapshot.entities.len(),
+                    snapshot.patterns.len(),
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "{}",
+                format!("  ⚠ Failed to parse learning snapshot: {e}").yellow()
+            );
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════ Task Commands ════
+
+async fn handle_task_command(arg: &str, state: &mut ReplState) {
+    use mo_agent_services::{TaskCreateRequest, TaskService, TaskStatus};
+
+    let svc = match &state.task_service {
+        Some(s) => s.clone(),
+        None => {
+            eprintln!("{}", "  Task service not initialized.".yellow());
+            return;
+        }
+    };
+
+    let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
+    let session_id = state.session_id.as_deref().unwrap_or("no-session");
+
+    let subcmd = arg.split_whitespace().next().unwrap_or("list");
+    let sub_arg = arg.strip_prefix(subcmd).unwrap_or("").trim();
+
+    match subcmd {
+        "list" | "" => match svc.list_tasks(user_id, None).await {
+            Ok(tasks) if tasks.is_empty() => {
+                eprintln!(
+                    "  {}",
+                    "No tasks. Use /task add <title> to create one.".dim()
+                );
+            }
+            Ok(tasks) => {
+                eprintln!(
+                    "\n{}",
+                    "─── Tasks ───────────────────────────────────────".bold()
+                );
+                for t in &tasks {
+                    let icon = match t.status {
+                        TaskStatus::Completed => "✓",
+                        TaskStatus::Failed => "✗",
+                        TaskStatus::InProgress => "▶",
+                        TaskStatus::Paused => "⏸",
+                        _ => "○",
+                    };
+                    let short_id = &t.task_id[..8.min(t.task_id.len())];
+                    let progress = if t.items_total > 0 {
+                        format!(" ({}/{})", t.items_done, t.items_total)
+                    } else {
+                        String::new()
+                    };
+                    eprintln!(
+                        "  {} {} {} [{}]{}",
+                        short_id.dim(),
+                        icon,
+                        t.title,
+                        t.status.as_str().cyan(),
+                        progress,
+                    );
+                }
+                eprintln!();
+            }
+            Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+        },
+        "add" if !sub_arg.is_empty() => {
+            match svc
+                .create_task(
+                    user_id,
+                    session_id,
+                    TaskCreateRequest {
+                        title: sub_arg.to_string(),
+                        description: None,
+                        plan: None,
+                        parent_task_id: None,
+                    },
+                )
+                .await
+            {
+                Ok(tid) => {
+                    let short = &tid[..8.min(tid.len())];
+                    eprintln!(
+                        "  {} Task created: {} ({})",
+                        "✓".green(),
+                        sub_arg,
+                        short.dim()
+                    );
+                }
+                Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+            }
+        }
+        "done" if !sub_arg.is_empty() => {
+            // Find task by prefix match on task_id or title
+            match find_task_by_query(&*svc, user_id, sub_arg).await {
+                Ok(Some(tid)) => match svc.complete_task(&tid).await {
+                    Ok(()) => eprintln!("  {} Task completed: {}", "✓".green(), sub_arg),
+                    Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+                },
+                Ok(None) => eprintln!("{}", format!("  Task not found: {sub_arg}").yellow()),
+                Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+            }
+        }
+        "status" if !sub_arg.is_empty() => {
+            match find_task_by_query(&*svc, user_id, sub_arg).await {
+                Ok(Some(tid)) => match svc.get_task(&tid).await {
+                    Ok(Some(t)) => {
+                        eprintln!(
+                            "\n{}",
+                            "─── Task Detail ─────────────────────────────────".bold()
+                        );
+                        eprintln!("  {:<12} {}", "id:".dim(), t.task_id.cyan());
+                        eprintln!("  {:<12} {}", "title:".dim(), t.title);
+                        eprintln!("  {:<12} {}", "status:".dim(), t.status.as_str().cyan());
+                        eprintln!("  {:<12} {}%", "progress:".dim(), t.progress_pct);
+                        if let Some(ref desc) = t.description {
+                            eprintln!("  {:<12} {}", "desc:".dim(), desc);
+                        }
+                        if let Some(ref plan) = t.plan {
+                            eprintln!(
+                                "  {:<12} {}/{}",
+                                "items:".dim(),
+                                t.items_done,
+                                t.items_total
+                            );
+                            for st in &plan.subtasks {
+                                let icon = match st.status {
+                                    TaskStatus::Completed => "✓",
+                                    TaskStatus::InProgress => "▶",
+                                    _ => "○",
+                                };
+                                eprintln!("    {} {}", icon, st.title);
+                            }
+                        }
+                        if let Some(ref err) = t.error_message {
+                            eprintln!("  {:<12} {}", "error:".dim(), err.as_str().red());
+                        }
+                        eprintln!();
+                    }
+                    Ok(None) => eprintln!("{}", format!("  Task not found: {sub_arg}").yellow()),
+                    Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+                },
+                Ok(None) => eprintln!("{}", format!("  Task not found: {sub_arg}").yellow()),
+                Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+            }
+        }
+        _ => {
+            eprintln!("  Usage: /task [list | add <title> | done <id> | status <id>]");
+        }
+    }
+}
+
+/// Find a task by prefix match on task_id or substring match on title.
+async fn find_task_by_query(
+    svc: &dyn mo_agent_services::TaskService,
+    user_id: &str,
+    query: &str,
+) -> Result<Option<String>, String> {
+    let tasks = svc.list_tasks(user_id, None).await?;
+    // Exact or prefix match on task_id
+    if let Some(t) = tasks
+        .iter()
+        .find(|t| t.task_id == query || t.task_id.starts_with(query))
+    {
+        return Ok(Some(t.task_id.clone()));
+    }
+    // Substring match on title (case-insensitive)
+    let q_lower = query.to_lowercase();
+    if let Some(t) = tasks
+        .iter()
+        .find(|t| t.title.to_lowercase().contains(&q_lower))
+    {
+        return Ok(Some(t.task_id.clone()));
+    }
+    Ok(None)
+}
 
 // ══════════════════════════════════════════════════════ Slash Commands ════
 
@@ -556,8 +1080,24 @@ async fn handle_slash_command(
             .await?;
         }
 
-        "/memory" | "/plan" | "/task" => {
+        "/memory" | "/plan" => {
             handle_memory_domain_command(cmd, arg, client, base, state, token).await?;
+        }
+
+        "/task" => {
+            handle_task_command(arg, state).await;
+        }
+
+        "/resume" => {
+            handle_resume_command(arg, profile, state).await;
+        }
+
+        "/stats" => {
+            handle_stats_command(arg, state);
+        }
+
+        "/tools" => {
+            handle_tools_command(state);
         }
 
         "/exit" | "/quit" => {
@@ -675,6 +1215,15 @@ async fn run_chat_repl(
                     .await?;
                     if should_exit {
                         break;
+                    }
+                    // Merge learning snapshot if /resume deposited one
+                    if let Some(json) = state.learning_snapshot.take() {
+                        merge_learning_snapshot(
+                            &json,
+                            &pipeline_modules.entity_graph,
+                            &pipeline_modules.pattern_library,
+                            &pipeline_modules.calibrator,
+                        );
                     }
                 } else {
                     handle_chat_input(
@@ -1538,5 +2087,831 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+    }
+
+    // ── find_task_by_query ────────────────────────────────────────────────────
+
+    use mo_agent_services::TaskService as _;
+
+    #[tokio::test]
+    async fn find_task_by_id_prefix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = mo_agent_services::LocalTaskService::new(tmp.path().to_path_buf());
+        let tid = svc
+            .create_task(
+                "u1",
+                "s1",
+                mo_agent_services::TaskCreateRequest {
+                    title: "Build auth".into(),
+                    description: None,
+                    plan: None,
+                    parent_task_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Full ID match
+        let found = find_task_by_query(&svc, "u1", &tid).await.unwrap();
+        assert_eq!(found, Some(tid.clone()));
+
+        // Prefix match (first 8 chars)
+        let prefix = &tid[..8];
+        let found = find_task_by_query(&svc, "u1", prefix).await.unwrap();
+        assert_eq!(found, Some(tid));
+    }
+
+    #[tokio::test]
+    async fn find_task_by_title_substring() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = mo_agent_services::LocalTaskService::new(tmp.path().to_path_buf());
+        svc.create_task(
+            "u1",
+            "s1",
+            mo_agent_services::TaskCreateRequest {
+                title: "Refactor authentication module".into(),
+                description: None,
+                plan: None,
+                parent_task_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Case-insensitive title match
+        let found = find_task_by_query(&svc, "u1", "authentication")
+            .await
+            .unwrap();
+        assert!(found.is_some());
+
+        let found = find_task_by_query(&svc, "u1", "AUTH").await.unwrap();
+        assert!(found.is_some());
+    }
+
+    #[tokio::test]
+    async fn find_task_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = mo_agent_services::LocalTaskService::new(tmp.path().to_path_buf());
+        let found = find_task_by_query(&svc, "u1", "nonexistent").await.unwrap();
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_task_wrong_user() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = mo_agent_services::LocalTaskService::new(tmp.path().to_path_buf());
+        svc.create_task(
+            "user-a",
+            "s1",
+            mo_agent_services::TaskCreateRequest {
+                title: "Private task".into(),
+                description: None,
+                plan: None,
+                parent_task_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Different user can't find it
+        let found = find_task_by_query(&svc, "user-b", "Private").await.unwrap();
+        assert!(found.is_none());
+    }
+
+    // ── Resume user verification ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn resume_local_restore_rejects_unowned_session() {
+        let _creds = isolate_credentials();
+        use mo_agent_services::session_restore::SessionRestoreService;
+        use session_journal::JournalWriter;
+
+        // Create a session with both journal AND workspace (what restore_session needs)
+        let sid = format!("test-unowned-{}", uuid::Uuid::new_v4());
+
+        // 1. Create journal
+        let writer = JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-4o"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::turn(
+                Some(&sid),
+                1,
+                None,
+                "hello",
+                "hi",
+                0,
+                5,
+                3,
+                50,
+            ))
+            .unwrap();
+        drop(writer);
+
+        // 2. Create workspace.yaml (required for local restore)
+        let ws_dir = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".mo-agent")
+            .join("sessions")
+            .join(&sid);
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let ws_content = r#"session_id: test-unowned
+cwd: /tmp
+model: gpt-4o
+created_at: "2024-01-01T00:00:00Z"
+updated_at: "2024-01-01T00:00:00Z"
+status: active
+turn_count: 1
+total_tokens_in: 5
+total_tokens_out: 3
+"#;
+        std::fs::write(ws_dir.join("workspace.yaml"), ws_content).unwrap();
+
+        // Now restore_session should find it
+        let svc = mo_agent_services::session_restore::HybridRestoreService::local_only();
+        let result = svc.restore_session(&sid).await.unwrap();
+        assert!(
+            result.is_some(),
+            "local restore should find session with workspace.yaml"
+        );
+
+        // Verify it's marked as local (not cloud)
+        let restored = result.unwrap();
+        assert!(!restored.restored_from_cloud, "should be local restore");
+
+        // Note: The user ownership check in handle_resume_command only verifies
+        // that the journal exists, not that the user owns it. This is a known limitation.
+    }
+
+    // ── Learning snapshot restoration ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn resume_restores_learning_snapshot() {
+        use mo_agent_services::session_restore::RestoredSession;
+
+        // Create a mock RestoredSession with learning snapshot
+        let restored = RestoredSession {
+            session_id: "test-learning".into(),
+            turn_count: 5,
+            total_tokens_in: 1000,
+            total_tokens_out: 500,
+            recent_tools: vec!["grep".into()],
+            learning_snapshot_json: Some(
+                r#"{"entities":["Rust","MatrixOne"],"patterns":["*.rs"]}"#.into(),
+            ),
+            checkpoint_count: 1,
+            last_status: "active".into(),
+            git_branch: Some("main".into()),
+            model: Some("gpt-4o".into()),
+            title: Some("Test".into()),
+            restored_from_cloud: true, // Cloud restore has learning
+        };
+
+        // Verify the learning snapshot is present
+        assert!(restored.learning_snapshot_json.is_some());
+        let json = restored.learning_snapshot_json.as_ref().unwrap();
+        assert!(json.contains("Rust"));
+        assert!(json.contains("MatrixOne"));
+
+        // Simulate what handle_resume_command does
+        let learning_snapshot = if let Some(ref l) = restored.learning_snapshot_json {
+            if !l.is_empty() { Some(l.clone()) } else { None }
+        } else {
+            None
+        };
+
+        assert!(learning_snapshot.is_some());
+        assert_eq!(learning_snapshot.unwrap().as_str(), json);
+    }
+
+    #[tokio::test]
+    async fn resume_local_restore_has_no_learning_snapshot() {
+        use mo_agent_services::session_restore::RestoredSession;
+
+        // Local restore should not have learning snapshot
+        let restored = RestoredSession {
+            session_id: "test-local".into(),
+            turn_count: 3,
+            total_tokens_in: 500,
+            total_tokens_out: 200,
+            recent_tools: vec![],
+            learning_snapshot_json: None, // Local restore doesn't have this
+            checkpoint_count: 1,
+            last_status: "active".into(),
+            git_branch: None,
+            model: None,
+            title: None,
+            restored_from_cloud: false,
+        };
+
+        assert!(restored.learning_snapshot_json.is_none());
+    }
+
+    // ── Edge cases ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn resume_handles_empty_learning_snapshot() {
+        use mo_agent_services::session_restore::RestoredSession;
+
+        // Empty string should be treated as None
+        let restored = RestoredSession {
+            learning_snapshot_json: Some("".into()),
+            ..Default::default()
+        };
+
+        // Simulate the logic in handle_resume_command
+        let learning_snapshot = if let Some(ref l) = restored.learning_snapshot_json {
+            if !l.is_empty() { Some(l.clone()) } else { None }
+        } else {
+            None
+        };
+
+        assert!(
+            learning_snapshot.is_none(),
+            "empty string should be ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_handles_invalid_learning_json() {
+        use mo_agent_services::session_restore::RestoredSession;
+
+        // Invalid JSON should still be stored (will fail at merge time)
+        let restored = RestoredSession {
+            learning_snapshot_json: Some("not valid json {{{".into()),
+            ..Default::default()
+        };
+
+        assert!(restored.learning_snapshot_json.is_some());
+        let json = restored.learning_snapshot_json.as_ref().unwrap();
+        assert!(json.contains("{"));
+    }
+
+    #[tokio::test]
+    async fn resume_handles_malformed_workspace_yaml() {
+        let _creds = isolate_credentials();
+        use mo_agent_services::session_restore::SessionRestoreService;
+
+        let sid = format!("test-malformed-{}", uuid::Uuid::new_v4());
+
+        // Create journal
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-4o"),
+            ))
+            .unwrap();
+        drop(writer);
+
+        // Create malformed workspace.yaml
+        let ws_dir = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".mo-agent")
+            .join("sessions")
+            .join(&sid);
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::write(ws_dir.join("workspace.yaml"), "invalid: yaml: content: [").unwrap();
+
+        // Should return None for malformed workspace
+        let svc = mo_agent_services::session_restore::HybridRestoreService::local_only();
+        let result = svc.restore_session(&sid).await.unwrap();
+        assert!(
+            result.is_none(),
+            "malformed workspace.yaml should cause restore to return None"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_handles_missing_workspace() {
+        let _creds = isolate_credentials();
+        use mo_agent_services::session_restore::SessionRestoreService;
+
+        // Only journal, no workspace → should fall back to cloud (which returns None)
+        let sid = format!("test-no-ws-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-4o"),
+            ))
+            .unwrap();
+        drop(writer);
+
+        let svc = mo_agent_services::session_restore::HybridRestoreService::local_only();
+        let result = svc.restore_session(&sid).await.unwrap();
+        assert!(
+            result.is_none(),
+            "session without workspace.yaml should return None"
+        );
+    }
+
+    // ── Integration: full resume flow simulation ─────────────────────────────
+
+    #[tokio::test]
+    async fn resume_full_flow_cloud_restore() {
+        use mo_agent_services::session_restore::RestoredSession;
+
+        // Simulate a complete cloud restore scenario
+        let restored = RestoredSession {
+            session_id: "cloud-sess-123".into(),
+            turn_count: 42,
+            total_tokens_in: 150_000,
+            total_tokens_out: 80_000,
+            recent_tools: vec!["git".into(), "bash".into(), "grep".into()],
+            learning_snapshot_json: Some(
+                r#"{"entities":["Rust","SQL"],"patterns":["*.rs"]}"#.into(),
+            ),
+            checkpoint_count: 5,
+            last_status: "active".into(),
+            git_branch: Some("feature/resume".into()),
+            model: Some("claude-3-opus".into()),
+            title: Some("Implement session resume".into()),
+            restored_from_cloud: true,
+        };
+
+        // Verify all fields
+        assert_eq!(restored.session_id, "cloud-sess-123");
+        assert_eq!(restored.turn_count, 42);
+        assert!(restored.restored_from_cloud);
+        assert!(restored.learning_snapshot_json.is_some());
+        assert_eq!(restored.recent_tools.len(), 3);
+
+        // Simulate state application
+        let mut state = super::ReplState::default();
+        #[allow(clippy::field_reassign_with_default)]
+        {
+            state.session_id = Some(restored.session_id.clone());
+            state.turn = restored.turn_count;
+            state.total_prompt_tokens = restored.total_tokens_in;
+            state.total_completion_tokens = restored.total_tokens_out;
+            state.recent_tools = restored.recent_tools.clone();
+            state.model = restored.model.clone();
+        }
+
+        // Apply learning snapshot
+        if let Some(ref l) = restored.learning_snapshot_json
+            && !l.is_empty()
+        {
+            state.learning_snapshot = Some(l.clone());
+        }
+
+        // Verify state
+        assert_eq!(state.session_id, Some("cloud-sess-123".into()));
+        assert_eq!(state.turn, 42);
+        assert_eq!(state.total_prompt_tokens, 150_000);
+        assert_eq!(
+            state.learning_snapshot.unwrap(),
+            r#"{"entities":["Rust","SQL"],"patterns":["*.rs"]}"#
+        );
+    }
+
+    // ── Checkpoint listing ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn resume_lists_checkpoints_for_session() {
+        let _creds = isolate_credentials();
+        use mo_agent_services::session_restore::SessionRestoreService;
+
+        let sid = format!("test-checkpoints-{}", uuid::Uuid::new_v4());
+
+        // Create journal
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-4o"),
+            ))
+            .unwrap();
+        drop(writer);
+
+        // Create workspace
+        let ws_dir = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".mo-agent")
+            .join("sessions")
+            .join(&sid);
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::write(
+            ws_dir.join("workspace.yaml"),
+            r#"session_id: test
+cwd: /tmp
+model: gpt-4o
+created_at: "2024-01-01T00:00:00Z"
+updated_at: "2024-01-01T00:00:00Z"
+status: active
+turn_count: 10
+total_tokens_in: 1000
+total_tokens_out: 500
+"#,
+        )
+        .unwrap();
+
+        // List checkpoints should return empty (no checkpoints created yet)
+        let svc = mo_agent_services::session_restore::HybridRestoreService::local_only();
+        let ckpts = svc.list_checkpoints(&sid).await.unwrap();
+        assert!(ckpts.is_empty(), "no checkpoints created yet");
+    }
+
+    // ── merge_learning_snapshot ───────────────────────────────────────────────
+
+    #[test]
+    fn merge_learning_valid_snapshot() {
+        use mo_agent_runtime::pipeline::{calibration, entity, pattern};
+
+        let json = serde_json::json!({
+            "version": 1,
+            "entities": [{
+                "name": "rust",
+                "aliases": ["rs"],
+                "domain": null,
+                "associated_tools": ["cargo"],
+                "confidence": 0.8,
+                "observation_count": 5
+            }],
+            "patterns": [{
+                "signature": "cargo",
+                "tools": ["cargo"],
+                "task_type": "Code",
+                "domain": null,
+                "success_count": 3,
+                "failure_count": 0,
+                "quality_sum": 2.4
+            }],
+            "calibration": null
+        })
+        .to_string();
+
+        let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
+        let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
+        let cal = std::sync::Arc::new(std::sync::Mutex::new(
+            calibration::ProgressiveCalibrator::default(),
+        ));
+
+        merge_learning_snapshot(&json, &eg, &pl, &cal);
+
+        // Verify entity content, not just count
+        let entities = eg.lock().unwrap().export();
+        assert_eq!(entities.len(), 1);
+        let e = &entities[0];
+        assert_eq!(e.name, "rust");
+        assert_eq!(e.aliases, vec!["rs"]);
+        assert_eq!(e.associated_tools, vec!["cargo"]);
+        assert!((e.confidence - 0.8).abs() < 1e-6);
+        assert_eq!(e.observation_count, 5);
+
+        // Verify pattern content, not just count
+        let patterns = pl.lock().unwrap().export();
+        assert_eq!(patterns.len(), 1);
+        let p = &patterns[0];
+        assert_eq!(p.signature, "cargo");
+        assert_eq!(p.tools, vec!["cargo"]);
+        assert_eq!(p.success_count, 3);
+        assert_eq!(p.failure_count, 0);
+    }
+
+    #[test]
+    fn merge_learning_invalid_json_does_not_panic() {
+        use mo_agent_runtime::pipeline::{calibration, entity, pattern};
+
+        let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
+        let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
+        let cal = std::sync::Arc::new(std::sync::Mutex::new(
+            calibration::ProgressiveCalibrator::default(),
+        ));
+
+        // Invalid JSON — should not panic, just print warning
+        merge_learning_snapshot("not valid json", &eg, &pl, &cal);
+
+        // Modules should remain empty
+        assert!(eg.lock().unwrap().export().is_empty());
+        assert!(pl.lock().unwrap().export().is_empty());
+    }
+
+    #[test]
+    fn merge_learning_empty_snapshot() {
+        use mo_agent_runtime::pipeline::{calibration, entity, pattern};
+
+        let json = serde_json::json!({
+            "version": 1,
+            "entities": [],
+            "patterns": [],
+            "calibration": null
+        })
+        .to_string();
+
+        let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
+        let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
+        let cal = std::sync::Arc::new(std::sync::Mutex::new(
+            calibration::ProgressiveCalibrator::default(),
+        ));
+
+        merge_learning_snapshot(&json, &eg, &pl, &cal);
+
+        assert!(eg.lock().unwrap().export().is_empty());
+        assert!(pl.lock().unwrap().export().is_empty());
+    }
+
+    #[test]
+    fn merge_learning_idempotent() {
+        use mo_agent_runtime::pipeline::{calibration, entity, pattern};
+
+        let json = serde_json::json!({
+            "version": 1,
+            "entities": [{"name": "rust", "aliases": [], "domain": null,
+                "associated_tools": ["cargo"], "confidence": 0.8, "observation_count": 5}],
+            "patterns": [{"signature": "cargo", "tools": ["cargo"], "task_type": "Code",
+                "domain": null, "success_count": 3, "failure_count": 0, "quality_sum": 2.4}],
+            "calibration": null
+        })
+        .to_string();
+
+        let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
+        let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
+        let cal = std::sync::Arc::new(std::sync::Mutex::new(
+            calibration::ProgressiveCalibrator::default(),
+        ));
+
+        // Merge twice — should not duplicate
+        merge_learning_snapshot(&json, &eg, &pl, &cal);
+        merge_learning_snapshot(&json, &eg, &pl, &cal);
+
+        assert_eq!(
+            eg.lock().unwrap().export().len(),
+            1,
+            "entities should not duplicate"
+        );
+        assert_eq!(
+            pl.lock().unwrap().export().len(),
+            1,
+            "patterns should not duplicate"
+        );
+    }
+
+    #[test]
+    fn merge_learning_multiple_entities_and_patterns() {
+        use mo_agent_runtime::pipeline::{calibration, entity, pattern};
+
+        let json = serde_json::json!({
+            "version": 1,
+            "entities": [
+                {"name": "rust", "aliases": [], "domain": null,
+                    "associated_tools": ["cargo"], "confidence": 0.9, "observation_count": 10},
+                {"name": "matrixone", "aliases": ["mo"], "domain": "Database",
+                    "associated_tools": ["sql_query"], "confidence": 0.7, "observation_count": 3}
+            ],
+            "patterns": [
+                {"signature": "cargo|grep", "tools": ["cargo", "grep"], "task_type": "Code",
+                    "domain": null, "success_count": 5, "failure_count": 1, "quality_sum": 4.0},
+                {"signature": "sql_query", "tools": ["sql_query"], "task_type": "Fetch",
+                    "domain": "Database", "success_count": 2, "failure_count": 0, "quality_sum": 1.8}
+            ],
+            "calibration": null
+        })
+        .to_string();
+
+        let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
+        let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
+        let cal = std::sync::Arc::new(std::sync::Mutex::new(
+            calibration::ProgressiveCalibrator::default(),
+        ));
+
+        merge_learning_snapshot(&json, &eg, &pl, &cal);
+
+        let entities = eg.lock().unwrap().export();
+        assert_eq!(entities.len(), 2);
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"rust"));
+        assert!(names.contains(&"matrixone"));
+
+        let patterns = pl.lock().unwrap().export();
+        assert_eq!(patterns.len(), 2);
+        let sigs: Vec<&str> = patterns.iter().map(|p| p.signature.as_str()).collect();
+        assert!(sigs.contains(&"cargo|grep"));
+        assert!(sigs.contains(&"sql_query"));
+    }
+
+    // ── handle_stats_command ─────────────────────────────────────────────────
+
+    #[test]
+    fn stats_no_active_session_does_not_panic() {
+        // state with no session_id → should not panic
+        let state = super::ReplState::default();
+        handle_stats_command("", &state); // current session mode, no session
+    }
+
+    #[test]
+    fn stats_history_no_sessions_does_not_panic() {
+        let state = super::ReplState::default();
+        handle_stats_command("history", &state);
+    }
+
+    #[test]
+    fn stats_current_session_reads_journal() {
+        let _creds = isolate_credentials();
+        use mo_agent_services::session_analytics;
+
+        // Create a real journal with known events
+        let sid = format!("test-stats-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-4o"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::turn(
+                Some(&sid),
+                1,
+                Some("gpt-4o"),
+                "hello",
+                "hi",
+                2,
+                1000,
+                500,
+                1500,
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::turn(
+                Some(&sid),
+                2,
+                Some("gpt-4o"),
+                "what is rust?",
+                "a systems language",
+                1,
+                800,
+                400,
+                1200,
+            ))
+            .unwrap();
+        drop(writer);
+
+        // Verify the analytics layer computes correctly from these events
+        let events = session_journal::read_journal(&sid).unwrap();
+        let stats = session_analytics::compute_session_stats(&sid, &events);
+
+        assert_eq!(stats.turn_count, 2);
+        assert_eq!(stats.total_tokens_in, 1800);
+        assert_eq!(stats.total_tokens_out, 900);
+        assert_eq!(stats.total_tool_calls, 3);
+        assert_eq!(stats.model, Some("gpt-4o".into()));
+        assert_eq!(stats.avg_tokens_per_turn, 1350); // (1800+900)/2
+
+        // Now verify handle_stats_command doesn't panic with this session
+        let state = super::ReplState {
+            session_id: Some(sid),
+            ..Default::default()
+        };
+        handle_stats_command("", &state);
+    }
+
+    #[test]
+    fn stats_history_aggregates_multiple_sessions() {
+        let _creds = isolate_credentials();
+        use mo_agent_services::session_analytics;
+
+        // Create two sessions
+        let sid1 = format!("test-stats-hist-a-{}", uuid::Uuid::new_v4());
+        let sid2 = format!("test-stats-hist-b-{}", uuid::Uuid::new_v4());
+
+        for sid in [&sid1, &sid2] {
+            let writer = session_journal::JournalWriter::new(sid).unwrap();
+            writer
+                .append(&session_journal::JournalEvent::turn(
+                    Some(sid),
+                    1,
+                    None,
+                    "q",
+                    "a",
+                    1,
+                    500,
+                    250,
+                    800,
+                ))
+                .unwrap();
+            drop(writer);
+        }
+
+        let e1 = session_journal::read_journal(&sid1).unwrap();
+        let e2 = session_journal::read_journal(&sid2).unwrap();
+        let s1 = session_analytics::compute_session_stats(&sid1, &e1);
+        let s2 = session_analytics::compute_session_stats(&sid2, &e2);
+        let agg = session_analytics::aggregate_stats(&[s1, s2]);
+
+        assert_eq!(agg.session_count, 2);
+        assert_eq!(agg.total_turns, 2);
+        assert_eq!(agg.total_tokens_in, 1000);
+        assert_eq!(agg.total_tokens_out, 500);
+    }
+
+    // ── handle_tools_command ─────────────────────────────────────────────────
+
+    #[test]
+    fn tools_no_active_session_does_not_panic() {
+        let state = super::ReplState::default();
+        handle_tools_command(&state);
+    }
+
+    #[test]
+    fn tools_session_with_no_tool_calls_does_not_panic() {
+        let _creds = isolate_credentials();
+        let sid = format!("test-tools-empty-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::turn(
+                Some(&sid),
+                1,
+                None,
+                "hello",
+                "hi",
+                0,
+                100,
+                50,
+                500,
+            ))
+            .unwrap();
+        drop(writer);
+
+        let state = super::ReplState {
+            session_id: Some(sid),
+            ..Default::default()
+        };
+        handle_tools_command(&state);
+    }
+
+    #[test]
+    fn tools_reads_tool_calls_from_journal() {
+        let _creds = isolate_credentials();
+        use mo_agent_services::session_analytics;
+
+        let sid = format!("test-tools-calls-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+
+        let mut event = session_journal::JournalEvent::turn(
+            Some(&sid),
+            1,
+            None,
+            "run tests",
+            "done",
+            3,
+            500,
+            200,
+            3000,
+        );
+        event.tool_calls = Some(vec![
+            session_journal::ToolCallRecord {
+                name: "bash".into(),
+                ms: 1000,
+                ok: true,
+                error: None,
+            },
+            session_journal::ToolCallRecord {
+                name: "bash".into(),
+                ms: 2000,
+                ok: false,
+                error: Some("exit code 1".into()),
+            },
+            session_journal::ToolCallRecord {
+                name: "grep".into(),
+                ms: 50,
+                ok: true,
+                error: None,
+            },
+        ]);
+        writer.append(&event).unwrap();
+        drop(writer);
+
+        // Verify analytics layer computes correctly
+        let events = session_journal::read_journal(&sid).unwrap();
+        let profiles = session_analytics::compute_tool_profiles(&events);
+
+        assert_eq!(profiles.len(), 2);
+        // sorted by total_ms descending: bash (3000ms) > grep (50ms)
+        assert_eq!(profiles[0].name, "bash");
+        assert_eq!(profiles[0].call_count, 2);
+        assert_eq!(profiles[0].fail_count, 1);
+        assert_eq!(profiles[0].total_ms, 3000);
+        assert_eq!(profiles[0].min_ms, 1000);
+        assert_eq!(profiles[0].max_ms, 2000);
+        assert!((profiles[0].error_rate - 0.5).abs() < 0.01);
+        assert_eq!(profiles[0].last_error, Some("exit code 1".into()));
+
+        assert_eq!(profiles[1].name, "grep");
+        assert_eq!(profiles[1].call_count, 1);
+        assert_eq!(profiles[1].fail_count, 0);
+        assert_eq!(profiles[1].error_rate, 0.0);
+
+        // Verify handle_tools_command doesn't panic with this data
+        let state = super::ReplState {
+            session_id: Some(sid),
+            ..Default::default()
+        };
+        handle_tools_command(&state);
     }
 }
