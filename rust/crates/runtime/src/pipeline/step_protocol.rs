@@ -1439,103 +1439,6 @@ pub enum StepEventType {
     RetryScheduled,
 }
 
-/// In-memory implementation of StepEventStore (for tests and local development).
-/// Production uses FileBackedEventStore (step_checkpoint.rs).
-///
-/// NOTE: This is test infrastructure — production code should not depend on it.
-/// It provides the reference implementation of DAG traversal (ancestors/descendants/leaves)
-/// which FileBackedEventStore delegates to.
-#[cfg(test)]
-#[derive(Debug, Default)]
-pub struct StepEventDag {
-    events: Vec<StepEvent>,
-}
-
-#[cfg(test)]
-impl StepEventDag {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn push(&mut self, event: StepEvent) {
-        self.events.push(event);
-    }
-
-    pub fn events(&self) -> &[StepEvent] {
-        &self.events
-    }
-}
-
-#[cfg(test)]
-impl StepEventStore for StepEventDag {
-    fn append(&mut self, event: StepEvent) {
-        self.push(event);
-    }
-
-    fn events_for_step(&self, step_id: &str) -> Vec<&StepEvent> {
-        self.events
-            .iter()
-            .filter(|e| e.step_id == step_id)
-            .collect()
-    }
-
-    fn ancestors(&self, event_id: &str) -> Vec<&StepEvent> {
-        let mut result = Vec::new();
-        let mut queue = std::collections::VecDeque::new();
-        let mut visited = std::collections::HashSet::new();
-        queue.push_back(event_id.to_string());
-        visited.insert(event_id.to_string());
-
-        while let Some(current) = queue.pop_front() {
-            if let Some(ev) = self.events.iter().find(|e| e.event_id == current) {
-                if ev.event_id != event_id {
-                    result.push(ev);
-                }
-                for parent in &ev.caused_by {
-                    if visited.insert(parent.clone()) {
-                        queue.push_back(parent.clone());
-                    }
-                }
-            }
-        }
-        result
-    }
-
-    fn descendants(&self, event_id: &str) -> Vec<&StepEvent> {
-        let mut result = Vec::new();
-        let mut queue = std::collections::VecDeque::new();
-        let mut visited = std::collections::HashSet::new();
-        queue.push_back(event_id.to_string());
-        visited.insert(event_id.to_string());
-
-        while let Some(current) = queue.pop_front() {
-            for ev in &self.events {
-                if ev.caused_by.contains(&current) && visited.insert(ev.event_id.clone()) {
-                    result.push(ev);
-                    queue.push_back(ev.event_id.clone());
-                }
-            }
-        }
-        result
-    }
-
-    fn leaves(&self) -> Vec<&StepEvent> {
-        let parents: std::collections::HashSet<&str> = self
-            .events
-            .iter()
-            .flat_map(|e| e.caused_by.iter().map(|s| s.as_str()))
-            .collect();
-        self.events
-            .iter()
-            .filter(|e| !parents.contains(e.event_id.as_str()))
-            .collect()
-    }
-
-    fn len(&self) -> usize {
-        self.events.len()
-    }
-}
-
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 pub fn epoch_ms() -> u64 {
@@ -2317,14 +2220,14 @@ mod tests {
         assert_eq!(restored.cached_result.unwrap().output, "3 matches");
     }
 
-    // ── Event DAG (DB-first) ──
+    // ── Event Store DAG traversal (via FileBackedEventStore) ──
 
     #[test]
-    fn event_dag_implements_store_trait() {
-        let mut dag = StepEventDag::new();
-        // Use the trait method (not push)
-        <StepEventDag as StepEventStore>::append(
-            &mut dag,
+    fn event_store_trait_append_and_len() {
+        use crate::pipeline::step_checkpoint::FileBackedEventStore;
+        let mut store = FileBackedEventStore::empty("test-trait");
+        <FileBackedEventStore as StepEventStore>::append(
+            &mut store,
             StepEvent {
                 event_id: "e1".into(),
                 step_id: "s1".into(),
@@ -2335,13 +2238,14 @@ mod tests {
                 created_at: 100,
             },
         );
-        assert_eq!(<StepEventDag as StepEventStore>::len(&dag), 1);
+        assert_eq!(<FileBackedEventStore as StepEventStore>::len(&store), 1);
     }
 
     #[test]
-    fn event_dag_events_for_step() {
-        let mut dag = StepEventDag::new();
-        dag.push(StepEvent {
+    fn event_store_events_for_step() {
+        use crate::pipeline::step_checkpoint::FileBackedEventStore;
+        let mut store = FileBackedEventStore::empty("test-events-for-step");
+        store.append(StepEvent {
             event_id: "e1".into(),
             step_id: "s1".into(),
             event_type: StepEventType::StepStarted,
@@ -2350,7 +2254,7 @@ mod tests {
             payload: None,
             created_at: 100,
         });
-        dag.push(StepEvent {
+        store.append(StepEvent {
             event_id: "e2".into(),
             step_id: "s2".into(),
             event_type: StepEventType::StepStarted,
@@ -2359,7 +2263,7 @@ mod tests {
             payload: None,
             created_at: 200,
         });
-        dag.push(StepEvent {
+        store.append(StepEvent {
             event_id: "e3".into(),
             step_id: "s1".into(),
             event_type: StepEventType::StepCompleted,
@@ -2368,16 +2272,17 @@ mod tests {
             payload: None,
             created_at: 300,
         });
-        let s1_events = dag.events_for_step("s1");
+        let s1_events = store.events_for_step("s1");
         assert_eq!(s1_events.len(), 2);
-        let s2_events = dag.events_for_step("s2");
+        let s2_events = store.events_for_step("s2");
         assert_eq!(s2_events.len(), 1);
     }
 
     #[test]
-    fn event_dag_single_parent_chain() {
-        let mut dag = StepEventDag::new();
-        dag.push(StepEvent {
+    fn event_store_single_parent_chain() {
+        use crate::pipeline::step_checkpoint::FileBackedEventStore;
+        let mut store = FileBackedEventStore::empty("test-chain");
+        store.append(StepEvent {
             event_id: "e1".into(),
             step_id: "s1".into(),
             event_type: StepEventType::StepStarted,
@@ -2386,7 +2291,7 @@ mod tests {
             payload: None,
             created_at: 100,
         });
-        dag.push(StepEvent {
+        store.append(StepEvent {
             event_id: "e2".into(),
             step_id: "s1".into(),
             event_type: StepEventType::ToolCallStarted,
@@ -2395,7 +2300,7 @@ mod tests {
             payload: None,
             created_at: 200,
         });
-        dag.push(StepEvent {
+        store.append(StepEvent {
             event_id: "e3".into(),
             step_id: "s1".into(),
             event_type: StepEventType::ToolCallCompleted,
@@ -2404,20 +2309,21 @@ mod tests {
             payload: None,
             created_at: 300,
         });
-        assert_eq!(dag.len(), 3);
-        let leaves = dag.leaves();
+        assert_eq!(store.len(), 3);
+        let leaves = store.leaves();
         assert_eq!(leaves.len(), 1);
         assert_eq!(leaves[0].event_id, "e3");
-        let ancestors = dag.ancestors("e3");
+        let ancestors = store.ancestors("e3");
         assert_eq!(ancestors.len(), 2);
-        let desc = dag.descendants("e1");
+        let desc = store.descendants("e1");
         assert_eq!(desc.len(), 2);
     }
 
     #[test]
-    fn event_dag_multi_parent_convergence() {
-        let mut dag = StepEventDag::new();
-        dag.push(StepEvent {
+    fn event_store_multi_parent_convergence() {
+        use crate::pipeline::step_checkpoint::FileBackedEventStore;
+        let mut store = FileBackedEventStore::empty("test-convergence");
+        store.append(StepEvent {
             event_id: "start".into(),
             step_id: "s1".into(),
             event_type: StepEventType::StepStarted,
@@ -2427,7 +2333,7 @@ mod tests {
             created_at: 100,
         });
         for (i, tool) in ["grep", "read_file", "git_log"].iter().enumerate() {
-            dag.push(StepEvent {
+            store.append(StepEvent {
                 event_id: format!("tool_start_{i}"),
                 step_id: "s1".into(),
                 event_type: StepEventType::ToolCallStarted,
@@ -2438,7 +2344,7 @@ mod tests {
             });
         }
         for i in 0..3 {
-            dag.push(StepEvent {
+            store.append(StepEvent {
                 event_id: format!("tool_done_{i}"),
                 step_id: "s1".into(),
                 event_type: StepEventType::ToolCallCompleted,
@@ -2448,7 +2354,7 @@ mod tests {
                 created_at: 400 + i as u64,
             });
         }
-        dag.push(StepEvent {
+        store.append(StepEvent {
             event_id: "converge".into(),
             step_id: "s1".into(),
             event_type: StepEventType::ToolsConverged,
@@ -2461,21 +2367,22 @@ mod tests {
             payload: None,
             created_at: 500,
         });
-        assert_eq!(dag.len(), 8);
-        let leaves = dag.leaves();
+        assert_eq!(store.len(), 8);
+        let leaves = store.leaves();
         assert_eq!(leaves.len(), 1);
         assert_eq!(leaves[0].event_id, "converge");
-        let ancestors = dag.ancestors("converge");
+        let ancestors = store.ancestors("converge");
         assert_eq!(ancestors.len(), 7);
-        let desc = dag.descendants("start");
+        let desc = store.descendants("start");
         assert_eq!(desc.len(), 7);
     }
 
     #[test]
-    fn event_dag_empty() {
-        let dag = StepEventDag::new();
-        assert!(dag.is_empty());
-        assert!(dag.leaves().is_empty());
+    fn event_store_empty() {
+        use crate::pipeline::step_checkpoint::FileBackedEventStore;
+        let store = FileBackedEventStore::empty("test-empty");
+        assert!(store.is_empty());
+        assert!(store.leaves().is_empty());
     }
 
     // ── Step Action Display ──

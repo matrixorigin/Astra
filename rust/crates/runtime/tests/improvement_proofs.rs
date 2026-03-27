@@ -6085,9 +6085,9 @@ mod crash_recovery_proofs {
 mod protocol_hygiene_proofs {
     use mo_agent_runtime::pipeline::step_protocol::*;
 
-    /// StepEventDag is gated behind #[cfg(test)] — production binary
-    /// should NOT contain it. We can't directly test absence, but we
-    /// verify the FileBackedEventStore implements all the same trait methods.
+    /// StepEventDag was deleted — production binary uses FileBackedEventStore only.
+    /// Verify FileBackedEventStore implements the full StepEventStore trait,
+    /// including DAG traversal methods (ancestors/descendants/leaves).
     #[test]
     fn file_event_store_implements_full_trait() {
         use mo_agent_runtime::pipeline::step_checkpoint::FileBackedEventStore;
