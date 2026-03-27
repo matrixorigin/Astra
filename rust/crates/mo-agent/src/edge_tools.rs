@@ -551,6 +551,36 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "run_chain",
+                "description": "Execute a multi-step tool chain. Each step runs a tool and passes its output to the next step via variable substitution ($prev for previous output, $step.{key} for named step output, $input.{key} for original input). Stops on first error. Use for complex multi-tool workflows like: find files → read contents → analyze.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Chain name for logging"},
+                        "description": {"type": "string", "description": "What this chain does"},
+                        "steps": {
+                            "type": "array",
+                            "description": "Ordered list of tool invocations",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "tool": {"type": "string", "description": "Tool name to execute"},
+                                    "args": {"type": "object", "description": "Tool arguments. Use $prev, $step.key, $input.key for variable substitution"},
+                                    "output_key": {"type": "string", "description": "Optional key to reference this step's output later via $step.{key}"},
+                                    "skip_if_prev_contains": {"type": "string", "description": "Skip this step if previous output contains this string"}
+                                },
+                                "required": ["tool", "args"]
+                            }
+                        },
+                        "input": {"type": "object", "description": "Initial input variables accessible via $input.{key}"}
+                    },
+                    "required": ["name", "steps"]
+                }
+            }
+        }),
     ]
 }
 
@@ -836,10 +866,89 @@ impl ToolExecutor {
                     "note": "Reflect data comes from the server API. Use /reflect command for direct access."
                 }).to_string()
             }
+            "run_chain" => {
+                match serde_json::from_value::<mo_agent_runtime::tool_registry::ToolChain>(
+                    args.clone(),
+                ) {
+                    Ok(chain) => {
+                        let input = args
+                            .get("input")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        self.execute_chain(&chain, input).await
+                    }
+                    Err(e) => format!("Error: Invalid chain format: {e}"),
+                }
+            }
             _ => format!("Unknown tool: {name}"),
         };
         // Global safety net: no tool output exceeds 50KB
         truncate_output(output, GLOBAL_OUTPUT_LIMIT)
+    }
+
+    /// Execute a multi-step ToolChain, forwarding each step to self.execute().
+    ///
+    /// Returns a JSON summary with per-step outputs and the final result.
+    /// Execution stops on the first error unless the step has a skip condition.
+    pub fn execute_chain(
+        &self,
+        chain: &mo_agent_runtime::tool_registry::ToolChain,
+        input: Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + '_>> {
+        use mo_agent_runtime::tool_registry::chain::{ChainContext, resolve_args};
+
+        let chain_name = chain.name.clone();
+        let steps = chain.steps.clone();
+
+        Box::pin(async move {
+            let mut ctx = ChainContext::new(input);
+            let mut step_results = Vec::new();
+
+            for (idx, step) in steps.iter().enumerate() {
+                if ctx.should_skip(step) {
+                    step_results.push(serde_json::json!({
+                        "step": idx,
+                        "tool": step.tool,
+                        "skipped": true,
+                    }));
+                    continue;
+                }
+
+                let resolved = resolve_args(&step.args, &ctx);
+                let output = self.execute(&step.tool, &resolved).await;
+                let is_err = output.starts_with("Error")
+                    || output.starts_with("error")
+                    || output.contains("\"error\":");
+
+                ctx.record_step(
+                    idx,
+                    &step.tool,
+                    output.clone(),
+                    step.output_key.as_deref(),
+                    !is_err,
+                );
+
+                step_results.push(serde_json::json!({
+                    "step": idx,
+                    "tool": step.tool,
+                    "output": truncate_output(output.clone(), 4096),
+                    "success": !is_err,
+                }));
+
+                if is_err {
+                    break;
+                }
+            }
+
+            serde_json::json!({
+                "chain": chain_name,
+                "steps_executed": step_results.len(),
+                "steps_total": steps.len(),
+                "final_output": truncate_output(ctx.prev_output, 8192),
+                "steps": step_results,
+            })
+            .to_string()
+        })
     }
 
     fn tool_names(&self) -> Vec<String> {
@@ -1069,6 +1178,7 @@ mod tests {
             "memory_store",
             "memory_search",
             "reflect",
+            "run_chain",
         ] {
             assert!(
                 names.contains(&expected.to_string()),

@@ -2056,8 +2056,8 @@ mod mo_convergence {
     fn catalog_has_33_tools_after_git_show_and_web_fetch() {
         assert_eq!(
             TOOL_CATALOG.len(),
-            33,
-            "Added git_show + web_fetch to the built-in catalog (was 31)"
+            34,
+            "Added git_show + web_fetch + run_chain to the built-in catalog"
         );
     }
 }
@@ -4284,5 +4284,87 @@ mod plugin_registry_wiring {
         registry.register_plugins(&plugins);
         // Pinned tools come from TOOL_CATALOG, not schemas — should be unchanged
         assert_eq!(registry.pinned_schemas().len(), pinned_before);
+    }
+}
+
+// ═══════════════════════════════ ToolChain Catalog Tests ═════════════════
+
+mod tool_chain_catalog {
+    use mo_agent_runtime::tool_registry::TOOL_CATALOG;
+    use mo_agent_runtime::tool_registry::chain::{ChainContext, ChainStep, ToolChain, resolve_args};
+    use serde_json::json;
+
+    #[test]
+    fn run_chain_in_catalog() {
+        assert!(
+            TOOL_CATALOG.iter().any(|t| t.name == "run_chain"),
+            "run_chain should be in TOOL_CATALOG"
+        );
+    }
+
+    #[test]
+    fn run_chain_has_unique_triggers() {
+        let chain_meta = TOOL_CATALOG.iter().find(|t| t.name == "run_chain").unwrap();
+        assert!(chain_meta.triggers.len() >= 4, "run_chain needs enough triggers for TF-IDF");
+    }
+
+    #[test]
+    fn chain_execution_context_propagation() {
+        let chain = ToolChain::new("test_flow", "Find files then analyze")
+            .named_step("files", "list_dir", json!({"path": "$input.dir"}))
+            .step("grep", json!({"pattern": "$input.query", "path": "$step.files"}));
+
+        assert_eq!(chain.steps.len(), 2);
+
+        let mut ctx = ChainContext::new(json!({"dir": "/src", "query": "TODO"}));
+        let resolved = resolve_args(&chain.steps[0].args, &ctx);
+        assert_eq!(resolved["path"], "/src");
+
+        ctx.record_step(0, "list_dir", "file1.rs\nfile2.rs".into(), Some("files"), true);
+        let resolved2 = resolve_args(&chain.steps[1].args, &ctx);
+        assert_eq!(resolved2["path"], "file1.rs\nfile2.rs");
+        assert_eq!(resolved2["pattern"], "TODO");
+    }
+
+    #[test]
+    fn chain_skip_condition_works() {
+        let step = ChainStep {
+            tool: "bash".into(),
+            args: json!({"command": "echo $prev"}),
+            output_key: None,
+            skip_if_prev_contains: Some("error".into()),
+        };
+        let mut ctx = ChainContext::new(json!({}));
+        ctx.record_step(0, "test", "some error occurred".into(), None, false);
+        assert!(ctx.should_skip(&step));
+
+        ctx.record_step(1, "test", "success output".into(), None, true);
+        assert!(!ctx.should_skip(&step));
+    }
+
+    #[test]
+    fn chain_validates_against_known_tools() {
+        let chain = ToolChain::new("test", "desc")
+            .step("bash", json!({}))
+            .step("nonexistent_tool", json!({}));
+
+        let known = vec!["bash", "grep", "list_dir"];
+        let result = chain.validate(&known);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("nonexistent_tool")));
+    }
+
+    #[test]
+    fn chain_json_roundtrip_for_llm_generation() {
+        let chain = ToolChain::new("code_review", "Automated review")
+            .named_step("diff", "git_diff", json!({"target": "$input.branch"}))
+            .step("bash", json!({"command": "echo $step.diff | wc -l"}));
+
+        let json_str = serde_json::to_string(&chain).unwrap();
+        let restored: ToolChain = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(restored.name, "code_review");
+        assert_eq!(restored.steps.len(), 2);
+        assert_eq!(restored.steps[0].output_key, Some("diff".into()));
     }
 }
