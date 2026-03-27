@@ -24,6 +24,14 @@
 //! - **Wait triggers**: `WaitTrigger` (User/Webhook/Timer) with `continuation_token`.
 //! - **DB-first events**: `StepEventStore` trait (in-memory or MatrixOne).
 //! - **Tool-level retry**: `ToolRetryPolicy` per tool classification.
+//!
+//! # Hardening additions
+//!
+//! - **Memory governance**: `MemoryGovernanceAction` enum carried in `MemoryContext` for lifecycle tracking.
+//! - **IdempotencyCache trait**: Abstraction over in-memory and MatrixOne-backed caches.
+//! - **Checkpoint triggers**: `CheckpointTrigger` / `CheckpointTier` for strategy-driven checkpointing.
+//! - **Canonical idempotency keys**: `compute_idempotency_key` uses `canonical_json` for determinism.
+//! - **Migration registry**: `MigrationRegistry` for `VersionPolicy::Migrate` checkpoint upgrades.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -50,6 +58,48 @@ pub enum VersionPolicy {
 impl Default for VersionPolicy {
     fn default() -> Self {
         Self::Strict
+    }
+}
+
+// ─── Migration Registry ──────────────────────────────────────────────────────
+
+/// Type alias for migration functions.
+/// Input: (source_version, checkpoint_json) → Result<migrated_json, error_message>
+pub type MigrationFn = fn(u32, &serde_json::Value) -> Result<serde_json::Value, String>;
+
+/// Registry of version migrations (for VersionPolicy::Migrate).
+#[derive(Debug, Default)]
+pub struct MigrationRegistry {
+    /// Map from source_version → migration function
+    migrations: HashMap<u32, MigrationFn>,
+}
+
+impl MigrationRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&mut self, from_version: u32, f: MigrationFn) {
+        self.migrations.insert(from_version, f);
+    }
+
+    pub fn migrate(
+        &self,
+        from_version: u32,
+        data: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        if let Some(f) = self.migrations.get(&from_version) {
+            f(from_version, data)
+        } else {
+            Err(format!(
+                "No migration registered for version {}",
+                from_version
+            ))
+        }
+    }
+
+    pub fn has_migration(&self, from_version: u32) -> bool {
+        self.migrations.contains_key(&from_version)
     }
 }
 
@@ -205,6 +255,33 @@ pub struct MemoryContext {
     pub boost_terms: Vec<String>,
     /// Provenance: which memories influenced this step
     pub provenance: Vec<String>,
+    /// Memory governance actions triggered during this step
+    #[serde(default)]
+    pub governance_actions: Vec<MemoryGovernanceAction>,
+    /// Cluster analysis results (from reflect/consolidate)
+    #[serde(default)]
+    pub cluster_insights: Vec<String>,
+    /// Memory snapshot ID at step start (for diff detection)
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
+}
+
+/// Memory governance actions carried through the step lifecycle.
+/// Steps can trigger retrieval, promotion, purge, correction, or analysis.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MemoryGovernanceAction {
+    /// Memory retrieved and used (provenance tracking)
+    Retrieved { memory_id: String },
+    /// Memory promoted from working to semantic
+    Promoted { memory_id: String, reason: String },
+    /// Memory purged (with reason)
+    Purged { memory_id: String, reason: String },
+    /// Memory corrected (with old/new summary)
+    Corrected { memory_id: String, reason: String },
+    /// Cluster analysis triggered
+    ClusterAnalyzed { cluster_count: usize },
+    /// Reflection triggered (episodic summary)
+    Reflected { summary: String },
 }
 
 /// Composite Step = descriptor + execution + idempotency key.
@@ -725,6 +802,38 @@ impl StepCheckpoint {
     }
 }
 
+// ─── Checkpoint Trigger Strategy ─────────────────────────────────────────────
+
+/// When to write checkpoints. Enforced by the execution engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CheckpointTrigger {
+    /// After every slot completion → LightCheckpoint
+    SlotCompleted,
+    /// On phase transition (Perceive→Plan→Act→Evaluate) → HeavyCheckpoint
+    PhaseTransition,
+    /// Before expensive operations (LLM call, bash) → LightCheckpoint
+    BeforeExpensiveOp,
+    /// Explicit user/system request → HeavyCheckpoint
+    Explicit,
+}
+
+impl CheckpointTrigger {
+    /// What tier of checkpoint should this trigger produce?
+    pub fn checkpoint_tier(&self) -> CheckpointTier {
+        match self {
+            Self::SlotCompleted | Self::BeforeExpensiveOp => CheckpointTier::Light,
+            Self::PhaseTransition | Self::Explicit => CheckpointTier::Heavy,
+        }
+    }
+}
+
+/// Tier of checkpoint produced by a trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CheckpointTier {
+    Light,
+    Heavy,
+}
+
 // ─── Payload & Result ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1025,6 +1134,22 @@ pub fn classify_tool_idempotency(tool_name: &str) -> ToolIdempotency {
     }
 }
 
+/// Trait for idempotency caches. InMemory for local, MatrixOne for cloud.
+pub trait IdempotencyCache {
+    /// Check if result is cached (returns owned value for trait-object safety)
+    fn check(&self, key: &IdempotencyKey) -> Option<CachedToolResult>;
+    /// Record a tool result
+    fn record(&mut self, key: &IdempotencyKey, result: CachedToolResult);
+    /// Remove all entries for a step (cleanup after step completes)
+    fn evict_step(&mut self, step_id: &str);
+    /// Number of cached entries
+    fn len(&self) -> usize;
+    /// Whether the cache is empty
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// In-memory idempotency cache (v2-v3; v4 uses MatrixOne).
 #[derive(Debug, Default)]
 pub struct InMemoryIdempotencyCache {
@@ -1057,6 +1182,24 @@ impl InMemoryIdempotencyCache {
 
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
+    }
+}
+
+impl IdempotencyCache for InMemoryIdempotencyCache {
+    fn check(&self, key: &IdempotencyKey) -> Option<CachedToolResult> {
+        self.cache.get(&key.cache_key()).cloned()
+    }
+
+    fn record(&mut self, key: &IdempotencyKey, result: CachedToolResult) {
+        self.cache.insert(key.cache_key(), result);
+    }
+
+    fn evict_step(&mut self, step_id: &str) {
+        self.cache.retain(|k, _| !k.starts_with(step_id));
+    }
+
+    fn len(&self) -> usize {
+        self.cache.len()
     }
 }
 
@@ -1118,6 +1261,7 @@ pub enum StepEventType {
 
     MemoryRetrieved,
     MemoryRecorded,
+    MemoryGovernanceApplied,
 
     StallDetected,
     DivergenceDetected,
@@ -1267,8 +1411,11 @@ fn compute_idempotency_key(
     hasher.update(b":");
     hasher.update(action.to_string().as_bytes());
     hasher.update(b":");
+    // Convert to Value then canonical_json for deterministic output
     let payload_json = serde_json::to_string(payload).unwrap_or_default();
-    hasher.update(payload_json.as_bytes());
+    let payload_value: serde_json::Value =
+        serde_json::from_str(&payload_json).unwrap_or_default();
+    hasher.update(canonical_json(&payload_value).as_bytes());
     let hash = hasher.finalize();
     format!("{:x}", hash)[..32].to_string() // 32-char prefix
 }
@@ -1397,6 +1544,7 @@ mod tests {
             domain_hints: vec!["github".into()],
             boost_terms: vec!["pr".into()],
             provenance: vec!["mem-1".into()],
+            ..Default::default()
         })
         .with_timeout_ms(60_000);
 
@@ -2078,6 +2226,7 @@ mod tests {
             domain_hints: vec!["github".into()],
             boost_terms: vec!["pr".into(), "review".into()],
             provenance: vec!["mem-1".into()],
+            ..Default::default()
         };
         let json = serde_json::to_string(&mc).unwrap();
         let restored: MemoryContext = serde_json::from_str(&json).unwrap();
@@ -2097,5 +2246,144 @@ mod tests {
         assert_eq!(step.step_id(), "s1");
         assert_eq!(step.action(), StepAction::Act);
         assert_eq!(step.status(), StepStatus::Pending);
+    }
+
+    // ── Memory Governance ──
+
+    #[test]
+    fn memory_governance_action_variants() {
+        let actions = vec![
+            MemoryGovernanceAction::Retrieved { memory_id: "m1".into() },
+            MemoryGovernanceAction::Promoted { memory_id: "m2".into(), reason: "confirmed".into() },
+            MemoryGovernanceAction::Purged { memory_id: "m3".into(), reason: "stale".into() },
+            MemoryGovernanceAction::Corrected { memory_id: "m4".into(), reason: "updated".into() },
+            MemoryGovernanceAction::ClusterAnalyzed { cluster_count: 5 },
+            MemoryGovernanceAction::Reflected { summary: "session productive".into() },
+        ];
+        for action in &actions {
+            let json = serde_json::to_string(action).unwrap();
+            let restored: MemoryGovernanceAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(&restored, action);
+        }
+    }
+
+    #[test]
+    fn memory_context_governance_fields() {
+        let mc = MemoryContext {
+            retrieved_memory_ids: vec!["m1".into()],
+            domain_hints: vec![],
+            boost_terms: vec![],
+            provenance: vec![],
+            governance_actions: vec![
+                MemoryGovernanceAction::Retrieved { memory_id: "m1".into() },
+                MemoryGovernanceAction::Promoted { memory_id: "m1".into(), reason: "useful".into() },
+            ],
+            cluster_insights: vec!["3 clusters found".into()],
+            snapshot_id: Some("snap-001".into()),
+        };
+        let json = serde_json::to_string(&mc).unwrap();
+        let restored: MemoryContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.governance_actions.len(), 2);
+        assert_eq!(restored.cluster_insights.len(), 1);
+        assert_eq!(restored.snapshot_id.as_deref(), Some("snap-001"));
+    }
+
+    // ── IdempotencyCache Trait ──
+
+    #[test]
+    fn idempotency_cache_trait_inmemory() {
+        let mut cache: Box<dyn IdempotencyCache> = Box::new(InMemoryIdempotencyCache::new());
+        let key = IdempotencyKey::new("s1", 0, "grep", &serde_json::json!({"pattern": "test"}));
+        assert!(cache.check(&key).is_none());
+        cache.record(&key, CachedToolResult {
+            tool_name: "grep".into(),
+            output: "found".into(),
+            is_error: false,
+            cached_at: 0,
+        });
+        assert!(cache.check(&key).is_some());
+        cache.evict_step("s1");
+        assert!(cache.check(&key).is_none());
+    }
+
+    // ── Checkpoint Trigger Strategy ──
+
+    #[test]
+    fn checkpoint_trigger_tier_mapping() {
+        assert_eq!(CheckpointTrigger::SlotCompleted.checkpoint_tier(), CheckpointTier::Light);
+        assert_eq!(CheckpointTrigger::BeforeExpensiveOp.checkpoint_tier(), CheckpointTier::Light);
+        assert_eq!(CheckpointTrigger::PhaseTransition.checkpoint_tier(), CheckpointTier::Heavy);
+        assert_eq!(CheckpointTrigger::Explicit.checkpoint_tier(), CheckpointTier::Heavy);
+    }
+
+    #[test]
+    fn checkpoint_trigger_serde_roundtrip() {
+        let triggers = [
+            CheckpointTrigger::SlotCompleted,
+            CheckpointTrigger::PhaseTransition,
+            CheckpointTrigger::BeforeExpensiveOp,
+            CheckpointTrigger::Explicit,
+        ];
+        for t in &triggers {
+            let json = serde_json::to_string(t).unwrap();
+            let restored: CheckpointTrigger = serde_json::from_str(&json).unwrap();
+            assert_eq!(&restored, t);
+        }
+    }
+
+    // ── Canonical JSON Consistency ──
+
+    #[test]
+    fn compute_idempotency_key_canonical() {
+        // Same content, different key order → same idempotency key
+        let key1 = compute_idempotency_key(
+            "t1", "n1", &StepAction::Act,
+            &StepPayload::Act {
+                selected_tools: vec!["grep".into()],
+                tool_calls: vec![serde_json::json!({"a": 1, "b": 2})],
+            },
+        );
+        let key2 = compute_idempotency_key(
+            "t1", "n1", &StepAction::Act,
+            &StepPayload::Act {
+                selected_tools: vec!["grep".into()],
+                tool_calls: vec![serde_json::json!({"b": 2, "a": 1})],
+            },
+        );
+        // With canonical JSON, these should produce same hash
+        assert_eq!(key1, key2);
+    }
+
+    // ── Migration Registry ──
+
+    #[test]
+    fn migration_registry_basic() {
+        let mut reg = MigrationRegistry::new();
+        assert!(!reg.has_migration(0));
+
+        fn v0_to_v1(_ver: u32, data: &serde_json::Value) -> Result<serde_json::Value, String> {
+            let mut obj = data.clone();
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("protocol_version".into(), serde_json::json!(1));
+            }
+            Ok(obj)
+        }
+
+        reg.register(0, v0_to_v1);
+        assert!(reg.has_migration(0));
+        assert!(!reg.has_migration(99));
+
+        let old_data = serde_json::json!({"cursor": "test"});
+        let migrated = reg.migrate(0, &old_data).unwrap();
+        assert_eq!(migrated["protocol_version"], 1);
+        assert_eq!(migrated["cursor"], "test");
+    }
+
+    #[test]
+    fn migration_registry_missing_version() {
+        let reg = MigrationRegistry::new();
+        let result = reg.migrate(42, &serde_json::json!({}));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("42"));
     }
 }
