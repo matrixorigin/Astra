@@ -5,8 +5,8 @@
 //! emit a [`TurnEvent`] for observability and replay.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 // ─── Agent Phase (typed state machine) ───────────────────────────────────────
@@ -37,7 +37,7 @@ use serde_json::Value;
 ///                          │ Failed   │
 ///                          └──────────┘
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AgentPhase {
     /// Parse intent, extract entities, check memory, detect context shift.
     Perceive,
@@ -80,7 +80,7 @@ impl AgentPhase {
 // ─── TurnOutcome ─────────────────────────────────────────────────────────────
 
 /// Structured outcome of a turn — replaces ad-hoc string returns.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnOutcome {
     pub status: TurnStatus,
     /// Final assistant text (may be empty for tool-only turns).
@@ -91,7 +91,7 @@ pub struct TurnOutcome {
     pub failed_tools: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnStatus {
     Success,
     Failure,
@@ -105,7 +105,7 @@ pub enum TurnStatus {
 ///
 /// Measures whether each round moves the agent closer to the goal.
 /// Progress rate determines budget expansion/contraction.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgressTracker {
     /// Progress scores per round (0.0 = no progress, 1.0 = significant progress).
     pub round_scores: Vec<f64>,
@@ -179,7 +179,7 @@ impl Default for ProgressTracker {
 // ─── Reflection ──────────────────────────────────────────────────────────────
 
 /// Structured self-correction data from the Reflect phase.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reflection {
     /// What happened that triggered reflection.
     pub what_happened: String,
@@ -194,7 +194,7 @@ pub struct Reflection {
 }
 
 /// Adjustments to apply after reflection.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StrategyDelta {
     /// Tools to add to blocked list.
     pub block_tools: Vec<String>,
@@ -214,7 +214,7 @@ pub struct StrategyDelta {
 /// - Good progress → budget.expand(1.5)
 /// - No progress → trigger Reflect
 /// - Regressing → abort
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnBudget {
     /// Maximum rounds allowed (starts at max_rounds, can expand).
     pub max_rounds: u32,
@@ -224,12 +224,19 @@ pub struct TurnBudget {
     pub max_tokens: u64,
     /// Maximum wall-clock time.
     pub max_duration_ms: u64,
-    /// Start time.
-    pub start: Instant,
+    /// Start time as epoch milliseconds (serializable replacement for Instant).
+    pub start_epoch_ms: u64,
     /// Tokens consumed so far.
     pub tokens_consumed: u64,
     /// Current round (0-indexed).
     pub round: u32,
+}
+
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 impl TurnBudget {
@@ -239,24 +246,29 @@ impl TurnBudget {
             base_max_rounds: max_rounds,
             max_tokens,
             max_duration_ms,
-            start: Instant::now(),
+            start_epoch_ms: epoch_ms(),
             tokens_consumed: 0,
             round: 0,
         }
+    }
+
+    /// Elapsed milliseconds since budget start.
+    pub fn elapsed_ms(&self) -> u64 {
+        epoch_ms().saturating_sub(self.start_epoch_ms)
     }
 
     /// Whether any budget dimension is exhausted.
     pub fn is_exhausted(&self) -> bool {
         self.round >= self.max_rounds
             || self.tokens_consumed >= self.max_tokens
-            || self.start.elapsed().as_millis() as u64 >= self.max_duration_ms
+            || self.elapsed_ms() >= self.max_duration_ms
     }
 
     /// Which dimension is closest to exhaustion (for reporting).
     pub fn pressure_dimension(&self) -> &'static str {
         let round_pct = self.round as f64 / self.max_rounds.max(1) as f64;
         let token_pct = self.tokens_consumed as f64 / self.max_tokens.max(1) as f64;
-        let time_pct = self.start.elapsed().as_millis() as f64 / self.max_duration_ms.max(1) as f64;
+        let time_pct = self.elapsed_ms() as f64 / self.max_duration_ms.max(1) as f64;
         if round_pct >= token_pct && round_pct >= time_pct {
             "rounds"
         } else if token_pct >= time_pct {
@@ -291,7 +303,7 @@ impl TurnBudget {
 /// Every field that was previously a local variable in `stream_chat_sse()`
 /// lives here. Phases read and mutate this struct; every mutation can emit
 /// a [`TurnEvent`] via the event log.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TurnState {
     // ── Identity ──
     pub session_id: Option<String>,
@@ -794,5 +806,135 @@ mod tests {
 
         // Empty tool sets don't count as stall (no action is different from repeated action)
         assert!(state.detect_stall().is_none());
+    }
+
+    // ── Serialization roundtrip tests ────────────────────────────────────────
+
+    #[test]
+    fn turn_budget_serde_roundtrip() {
+        let budget = TurnBudget::new(10, 100_000, 30_000);
+        let json = serde_json::to_string(&budget).unwrap();
+        let back: TurnBudget = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.max_rounds, 10);
+        assert_eq!(back.max_tokens, 100_000);
+        assert_eq!(back.max_duration_ms, 30_000);
+        assert_eq!(back.start_epoch_ms, budget.start_epoch_ms);
+        assert_eq!(back.round, 0);
+    }
+
+    #[test]
+    fn turn_budget_elapsed_ms_is_monotonic() {
+        let budget = TurnBudget::new(10, 100_000, 60_000);
+        let t1 = budget.elapsed_ms();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let t2 = budget.elapsed_ms();
+        assert!(t2 >= t1);
+    }
+
+    #[test]
+    fn turn_budget_start_epoch_ms_is_recent() {
+        let budget = TurnBudget::new(10, 100_000, 30_000);
+        let now = super::epoch_ms();
+        // start_epoch_ms should be within 100ms of now
+        assert!(now - budget.start_epoch_ms < 100);
+    }
+
+    #[test]
+    fn agent_phase_serde_roundtrip() {
+        for phase in &[
+            AgentPhase::Perceive,
+            AgentPhase::Plan,
+            AgentPhase::Execute,
+            AgentPhase::Evaluate,
+            AgentPhase::Reflect,
+            AgentPhase::Complete,
+            AgentPhase::Failed,
+        ] {
+            let json = serde_json::to_string(phase).unwrap();
+            let back: AgentPhase = serde_json::from_str(&json).unwrap();
+            assert_eq!(*phase, back);
+        }
+    }
+
+    #[test]
+    fn turn_state_serde_roundtrip() {
+        let mut state = TurnState::new("hello world", vec![], 10, 100_000, 30_000);
+        state.session_id = Some("sess-1".to_string());
+        state.tools_used.insert("bash".to_string());
+        state.total_tool_calls = 5;
+
+        let json = serde_json::to_string(&state).unwrap();
+        let back: TurnState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.user_query, "hello world");
+        assert_eq!(back.session_id, Some("sess-1".to_string()));
+        assert!(back.tools_used.contains("bash"));
+        assert_eq!(back.total_tool_calls, 5);
+        assert_eq!(back.phase, AgentPhase::Perceive);
+        assert_eq!(back.budget.max_rounds, 10);
+    }
+
+    #[test]
+    fn turn_state_with_outcome_serde() {
+        let mut state = TurnState::new("query", vec![], 5, 50_000, 10_000);
+        state.outcome = Some(TurnOutcome {
+            status: TurnStatus::Success,
+            content: "done".to_string(),
+            failure_reason: None,
+            failed_tools: vec![],
+        });
+
+        let json = serde_json::to_string(&state).unwrap();
+        let back: TurnState = serde_json::from_str(&json).unwrap();
+        let outcome = back.outcome.unwrap();
+        assert_eq!(outcome.status, TurnStatus::Success);
+        assert_eq!(outcome.content, "done");
+    }
+
+    #[test]
+    fn turn_state_with_reflections_serde() {
+        let mut state = TurnState::new("test", vec![], 5, 50_000, 10_000);
+        state.reflections.push(Reflection {
+            what_happened: "stall".to_string(),
+            why: "repeated calls".to_string(),
+            what_to_try: "different tool".to_string(),
+            confidence: 0.7,
+            strategy_delta: StrategyDelta {
+                block_tools: vec!["bash".to_string()],
+                add_tools: vec!["grep".to_string()],
+                inject_context: Some("try grep".to_string()),
+                widen_selection: true,
+            },
+        });
+
+        let json = serde_json::to_string(&state).unwrap();
+        let back: TurnState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.reflections.len(), 1);
+        assert_eq!(back.reflections[0].confidence, 0.7);
+        assert_eq!(back.reflections[0].strategy_delta.block_tools, vec!["bash"]);
+    }
+
+    #[test]
+    fn turn_state_with_history_serde() {
+        let history = vec![
+            ("user msg".to_string(), "assistant reply".to_string()),
+            ("follow up".to_string(), "second reply".to_string()),
+        ];
+        let state = TurnState::new("new query", history.clone(), 5, 50_000, 10_000);
+        let json = serde_json::to_string(&state).unwrap();
+        let back: TurnState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.history, history);
+        assert_eq!(back.messages.len(), 5); // 2 pairs + current
+    }
+
+    #[test]
+    fn progress_tracker_serde_roundtrip() {
+        let mut tracker = ProgressTracker::new();
+        tracker.record(0.5);
+        tracker.record(0.8);
+
+        let json = serde_json::to_string(&tracker).unwrap();
+        let back: ProgressTracker = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.round_scores, vec![0.5, 0.8]);
     }
 }

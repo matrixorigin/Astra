@@ -100,7 +100,7 @@ impl PipelineStage for EvaluateStage {
             EventKind::BudgetUpdate {
                 tokens_consumed: state.budget.tokens_consumed,
                 rounds_used: state.budget.round,
-                elapsed_ms: state.budget.start.elapsed().as_millis() as u64,
+                elapsed_ms: state.budget.elapsed_ms(),
             },
             None,
         );
