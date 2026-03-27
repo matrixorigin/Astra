@@ -84,6 +84,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/resume", "Resume a previous session: /resume [session_id]"),
     ("/stats", "Session analytics: /stats [history]"),
     ("/tools", "Tool performance profile: /tools"),
+    ("/health", "Tool health dashboard: /health [detail]"),
     ("/exit", "Exit the REPL"),
     ("/quit", "Exit the REPL"),
 ];
@@ -434,7 +435,6 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
             "/history",
             "/copy",
             "/context",
-            "/doctor",
             "/version",
             "/explain",
             "/verbose",
@@ -455,6 +455,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
         ],
     );
     print_group("Memory", &["/memory", "/plan", "/task"]);
+    print_group("Diagnostics", &["/stats", "/tools", "/health", "/doctor"]);
     print_group(
         "Authentication",
         &["/login", "/register", "/logout", "/memory-setup"],

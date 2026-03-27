@@ -7094,3 +7094,111 @@ mod learning_sync_cloud_proofs {
         assert!(restored.tool_health.is_empty());
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// Health Dashboard Data Proofs
+// ══════════════════════════════════════════════════════════════════════════
+
+mod health_dashboard_proofs {
+    use mo_agent_runtime::pipeline::persistence::ToolHealthEntry;
+    use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
+
+    #[test]
+    fn from_entries_roundtrip_preserves_health_data() {
+        // Simulate what /health does: create tracker from persisted entries
+        let entries = vec![
+            ToolHealthEntry {
+                name: "bash".into(),
+                total_calls: 20,
+                total_failures: 5,
+                failure_rate: 0.25,
+            },
+            ToolHealthEntry {
+                name: "grep".into(),
+                total_calls: 10,
+                total_failures: 0,
+                failure_rate: 0.0,
+            },
+        ];
+        let tracker = ToolHealthTracker::from_entries(&entries);
+        let summary = tracker.summary();
+        assert_eq!(summary.total_tools, 2);
+
+        // from_entries uses failure_rate to reconstruct deprioritization
+        let all = tracker.all();
+        assert!(all.contains_key("bash"));
+        assert!(all.contains_key("grep"));
+    }
+
+    #[test]
+    fn deprioritized_tools_visible_in_dashboard() {
+        let mut tracker = ToolHealthTracker::new();
+        // Force bash to deprioritize (3 consecutive failures)
+        tracker.record_failure("bash");
+        tracker.record_failure("bash");
+        tracker.record_failure("bash");
+        // grep is healthy
+        tracker.record_success("grep");
+
+        let deprioritized = tracker.deprioritized_tools();
+        assert_eq!(deprioritized, vec!["bash"]);
+        assert!(!tracker.is_deprioritized("grep"));
+
+        let summary = tracker.summary();
+        assert_eq!(summary.deprioritized_count, 1);
+        assert_eq!(summary.total_errors, 3);
+    }
+
+    #[test]
+    fn timeout_dominant_highlighted_in_dashboard() {
+        let mut tracker = ToolHealthTracker::new();
+        // bash: 4 timeouts, 1 real failure = 80% timeout-dominant
+        tracker.record_timeout("bash");
+        tracker.record_timeout("bash");
+        tracker.record_timeout("bash");
+        tracker.record_timeout("bash");
+        tracker.record_failure("bash");
+
+        let timeout_tools = tracker.timeout_dominant_tools();
+        assert_eq!(timeout_tools, vec!["bash"]);
+
+        // grep: 1 timeout, 2 real failures = 33% not dominant
+        tracker.record_timeout("grep");
+        tracker.record_failure("grep");
+        tracker.record_failure("grep");
+        let timeout_tools = tracker.timeout_dominant_tools();
+        assert_eq!(timeout_tools, vec!["bash"]);
+    }
+
+    #[test]
+    fn cache_wasteful_detected_in_dashboard() {
+        let mut tracker = ToolHealthTracker::new();
+        tracker.record_cache_hit("bash");
+        tracker.record_cache_hit("bash");
+        tracker.record_cache_hit("bash"); // 3 hits → wasteful at threshold 3
+
+        let wasteful = tracker.cache_wasteful_tools(3);
+        assert_eq!(wasteful.len(), 1);
+        assert_eq!(wasteful[0].0, "bash");
+        assert_eq!(wasteful[0].1, 3);
+    }
+
+    #[test]
+    fn healthy_system_has_no_warnings() {
+        let mut tracker = ToolHealthTracker::new();
+        tracker.record_success("bash");
+        tracker.record_success("grep");
+        tracker.record_success("read_file");
+
+        let summary = tracker.summary();
+        assert_eq!(summary.total_tools, 3);
+        assert_eq!(summary.total_errors, 0);
+        assert_eq!(summary.total_timeouts, 0);
+        assert_eq!(summary.total_cache_hits, 0);
+        assert_eq!(summary.deprioritized_count, 0);
+        assert_eq!(summary.flaky_count, 0);
+        assert!(tracker.deprioritized_tools().is_empty());
+        assert!(tracker.timeout_dominant_tools().is_empty());
+        assert!(tracker.cache_wasteful_tools(3).is_empty());
+    }
+}

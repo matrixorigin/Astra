@@ -821,6 +821,146 @@ fn handle_tools_command(state: &ReplState) {
     eprintln!();
 }
 
+fn handle_health_command(arg: &str, state: &ReplState) {
+    use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
+
+    // Build a live tracker from persisted entries for rich analysis
+    let tracker = ToolHealthTracker::from_entries(&state.tool_health_entries);
+    let summary = tracker.summary();
+    let detail = arg.trim() == "detail";
+
+    if summary.total_tools == 0 {
+        eprintln!("{}", "  No tool health data yet (run some turns first).".dim());
+        return;
+    }
+
+    // Header
+    eprintln!(
+        "\n{}",
+        "─── Tool Health Dashboard ──────────────────────".bold()
+    );
+
+    // Overall status
+    let status = if summary.deprioritized_count > 0 || summary.flaky_count > 0 {
+        "⚠ Degraded".yellow().to_string()
+    } else if summary.total_errors > 0 {
+        "● Minor issues".to_string()
+    } else {
+        "✓ Healthy".green().to_string()
+    };
+    eprintln!("  Status: {status}");
+    eprintln!(
+        "  Tools: {}  Errors: {}  Timeouts: {}  Cache hits: {}",
+        summary.total_tools.to_string().cyan(),
+        if summary.total_errors > 0 {
+            summary.total_errors.to_string().red().to_string()
+        } else {
+            "0".to_string()
+        },
+        if summary.total_timeouts > 0 {
+            summary.total_timeouts.to_string().yellow().to_string()
+        } else {
+            "0".to_string()
+        },
+        summary.total_cache_hits,
+    );
+    if summary.deprioritized_count > 0 {
+        eprintln!(
+            "  {} deprioritized, {} flaky",
+            summary.deprioritized_count.to_string().red(),
+            summary.flaky_count,
+        );
+    }
+    eprintln!();
+
+    if detail {
+        // Per-tool breakdown
+        eprintln!(
+            "  {:<20} {:>5} {:>5} {:>4} {:>5} {:>5}  {}",
+            "tool".bold(),
+            "calls".bold(),
+            "fail".bold(),
+            "TO".bold(),
+            "cache".bold(),
+            "rehab".bold(),
+            "status".bold(),
+        );
+        let all = tracker.all();
+        let mut sorted: Vec<_> = all.iter().collect();
+        sorted.sort_by(|a, b| b.1.total_failures.cmp(&a.1.total_failures));
+        for (name, health) in &sorted {
+            let status_str = if health.deprioritized {
+                "⛔ deprioritized".red().to_string()
+            } else if health.rehabilitation_count >= 2 {
+                "⚠ flaky".yellow().to_string()
+            } else if health.total_failures > 0 {
+                "● recovering".to_string()
+            } else {
+                "✓ healthy".green().to_string()
+            };
+            eprintln!(
+                "  {:<20} {:>5} {:>5} {:>4} {:>5} {:>5}  {}",
+                name.as_str().cyan(),
+                health.total_calls,
+                health.total_failures,
+                health.timeout_count,
+                health.cache_hit_count,
+                health.rehabilitation_count,
+                status_str,
+            );
+        }
+        eprintln!();
+
+        // Timeout-dominant tools
+        let timeout_tools = tracker.timeout_dominant_tools();
+        if !timeout_tools.is_empty() {
+            eprintln!(
+                "  {} Timeout-dominant (≥70% infra): {}",
+                "⏱".bold(),
+                timeout_tools.join(", ").yellow()
+            );
+        }
+        // Cache-wasteful tools
+        let cache_tools = tracker.cache_wasteful_tools(3);
+        if !cache_tools.is_empty() {
+            let names: Vec<String> = cache_tools
+                .iter()
+                .map(|(n, c)| format!("{n}({c}×)"))
+                .collect();
+            eprintln!("  {} Duplicate calls: {}", "♻".bold(), names.join(", "));
+        }
+    } else {
+        // Compact view: only show problematic tools
+        let deprioritized = tracker.deprioritized_tools();
+        if !deprioritized.is_empty() {
+            eprintln!(
+                "  {} {}",
+                "Deprioritized:".red(),
+                deprioritized.join(", ").red()
+            );
+        }
+        let all = tracker.all();
+        let recovering: Vec<&str> = all
+            .iter()
+            .filter(|(_, h)| h.total_failures > 0 && !h.deprioritized)
+            .map(|(n, _)| n.as_str())
+            .collect();
+        if !recovering.is_empty() {
+            eprintln!(
+                "  {} {}",
+                "With errors:".yellow(),
+                recovering.join(", ")
+            );
+        }
+        eprintln!("  {}", "Use /health detail for per-tool breakdown.".dim());
+    }
+    eprintln!(
+        "{}",
+        "────────────────────────────────────────────────".dim()
+    );
+    eprintln!();
+}
+
 // ═══════════════════════════════════════════════════ Learning Merge ═══════
 
 fn merge_learning_snapshot(
@@ -1417,6 +1557,10 @@ async fn handle_slash_command(
 
         "/tools" => {
             handle_tools_command(state);
+        }
+
+        "/health" => {
+            handle_health_command(arg, state);
         }
 
         "/exit" | "/quit" => {
@@ -2376,6 +2520,92 @@ mod tests {
         let mut state = ReplState::default();
         let exit = handle_slash_command(
             "/nonexistent_command_xyz",
+            &client,
+            "http://unused",
+            None,
+            &mut state,
+            None,
+            &selector,
+        )
+        .await
+        .unwrap();
+        assert!(!exit);
+    }
+
+    #[tokio::test]
+    async fn slash_health_does_not_crash_empty() {
+        let client = mock_client();
+        let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
+            edge_tools::all_tool_schemas(),
+        ));
+        let mut state = ReplState::default();
+        // No health entries — should print "no data" gracefully
+        let exit = handle_slash_command(
+            "/health",
+            &client,
+            "http://unused",
+            None,
+            &mut state,
+            None,
+            &selector,
+        )
+        .await
+        .unwrap();
+        assert!(!exit);
+    }
+
+    #[tokio::test]
+    async fn slash_health_with_entries_does_not_crash() {
+        let client = mock_client();
+        let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
+            edge_tools::all_tool_schemas(),
+        ));
+        let mut state = ReplState::default();
+        state.tool_health_entries = vec![
+            mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
+                name: "bash".into(),
+                total_calls: 15,
+                total_failures: 3,
+                failure_rate: 0.2,
+            },
+            mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
+                name: "grep".into(),
+                total_calls: 8,
+                total_failures: 0,
+                failure_rate: 0.0,
+            },
+        ];
+        let exit = handle_slash_command(
+            "/health",
+            &client,
+            "http://unused",
+            None,
+            &mut state,
+            None,
+            &selector,
+        )
+        .await
+        .unwrap();
+        assert!(!exit);
+    }
+
+    #[tokio::test]
+    async fn slash_health_detail_mode() {
+        let client = mock_client();
+        let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
+            edge_tools::all_tool_schemas(),
+        ));
+        let mut state = ReplState::default();
+        state.tool_health_entries = vec![
+            mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
+                name: "bash".into(),
+                total_calls: 10,
+                total_failures: 5,
+                failure_rate: 0.5,
+            },
+        ];
+        let exit = handle_slash_command(
+            "/health detail",
             &client,
             "http://unused",
             None,
