@@ -297,6 +297,8 @@ struct StreamResult {
     /// TurnGuard verdict events (severity, turn, injections, avoid_tools, force_stop,
     /// nudge_count, total_errors, deprioritized_count). Only non-Healthy verdicts.
     verdict_events: Vec<VerdictEvent>,
+    /// Step Protocol recorder summary for debugging and audit.
+    step_recorder_summary: Option<mo_agent_runtime::pipeline::step_recorder::RecorderSummary>,
 }
 
 /// Structured audit record for a TurnGuard verdict.

@@ -372,6 +372,24 @@ fn apply_turn_success(
                 ve.deprioritized_count,
             ));
         }
+
+        // Log Step Protocol recorder summary (audit trail for execution phases)
+        if let Some(ref summary) = result.step_recorder_summary {
+            let summary_text = format!(
+                "step_recorder: turns={} tools={} phases={} time={}ms",
+                summary.turns,
+                summary.total_tools,
+                summary.phase_log.len(),
+                summary.total_time_ms,
+            );
+            let _ = journal.append(&session_journal::JournalEvent::checkpoint(
+                state.session_id.as_deref(),
+                state.turn as u32,
+                &summary_text,
+                result.prompt_tokens + result.completion_tokens,
+                result.tool_calls_count as usize,
+            ));
+        }
     }
 
     // Record turn outcome for pipeline learning (entity graph, patterns, calibration)

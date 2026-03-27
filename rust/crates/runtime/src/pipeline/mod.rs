@@ -23,9 +23,11 @@ pub mod scheduling;
 pub mod stages;
 pub mod state;
 pub mod step_protocol;
+pub mod step_recorder;
 
 pub use engine::*;
 pub use event::*;
 pub use scheduling::*;
 pub use state::*;
 pub use step_protocol::*;
+pub use step_recorder::*;

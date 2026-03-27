@@ -527,12 +527,18 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     let mut restricted_tools: HashSet<String> = HashSet::new();
     // Dynamic turn budget: each stall/divergence costs turns to prevent runaway sessions
     let mut remaining_turns: usize = MAX_TURNS;
+    // Step Protocol recorder: maps implicit chat_stream phases to explicit Step events
+    let mut step_recorder = mo_agent_runtime::pipeline::step_recorder::StepRecorder::new(
+        current_session_id.as_deref().unwrap_or("ephemeral"),
+        &format!("chat-{}", start.elapsed().as_millis()),
+    );
 
     for _turn in 0..MAX_TURNS {
         if remaining_turns == 0 {
             return Err("Turn budget exhausted due to repeated stalls. Aborting.".to_string());
         }
         remaining_turns = remaining_turns.saturating_sub(1);
+        step_recorder.begin_turn(_turn as u32);
         // Build request payload
         let git_branch = std::process::Command::new("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -822,6 +828,20 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             payload["tool_results"] = serde_json::Value::Array(tool_results.clone());
         }
 
+        // Step recorder: mark plan phase (tool selection done, LLM call about to start)
+        {
+            let selected_tool_names: Vec<String> = first_selection_report
+                .as_ref()
+                .map(|r| r.tools_selected.clone())
+                .unwrap_or_default();
+            let bp = first_budget_pressure;
+            let bt = first_selection_report
+                .as_ref()
+                .map(|r| r.budget_used as u64)
+                .unwrap_or(0);
+            step_recorder.record_plan(&selected_tool_names, selection_confidence, bp, bt);
+        }
+
         // HTTP call with retry on 429 (rate limit) — exponential backoff up to 3 attempts.
         let mut resp_result = None;
         for attempt in 0..3u32 {
@@ -980,6 +1000,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         // Deduplicate tool calls — skip exact (name, args) repeats within AND across turns
         // Only cache idempotent read-only tools; side-effectful tools always re-execute
         let mut seen_calls: HashSet<String> = HashSet::new();
+        let tool_count = turn_result.tool_calls.len();
+        step_recorder.begin_act(tool_count);
 
         for tc_event in &turn_result.tool_calls {
             let id = tc_event
@@ -1036,6 +1058,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     "name": name,
                     "result": cached_note,
                 }));
+                step_recorder.begin_tool(&name, &id);
+                step_recorder.complete_tool(&name, false, 0, true);
                 continue;
             }
 
@@ -1092,6 +1116,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 None
             };
             let tool_start = Instant::now();
+            step_recorder.begin_tool(&name, &id);
 
             let mut result_str = executor.execute(&name, &args).await;
 
@@ -1200,6 +1225,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     None
                 },
             });
+            step_recorder.complete_tool(&name, is_err, tool_elapsed.as_millis() as u64, false);
 
             // Stop spinner, print final status with duration
             if let Some(spinner) = spinner {
@@ -1322,8 +1348,24 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 _ => {}
             }
 
+            // Step recorder: record verdict outcome
+            let severity_label = match verdict.severity {
+                VerdictSeverity::Critical => "critical",
+                VerdictSeverity::Warning => "warning",
+                VerdictSeverity::Info => "info",
+                VerdictSeverity::Healthy => "healthy",
+            };
+            step_recorder.record_verdict(
+                severity_label,
+                turn_guard.nudge_count > 0,
+                verdict.force_stop,
+                verdict.force_stop,
+                verdict.injections.len(),
+            );
+
             // Force stop on critical verdict
             if verdict.force_stop {
+                step_recorder.end_turn(true);
                 return Err(
                     "Agent escalated to critical — too many errors and stalls. Aborting."
                         .to_string(),
@@ -1332,10 +1374,12 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
 
             // If verdict injected stall messages, skip to next LLM call (don't re-process results)
             if !verdict.injections.is_empty() && verdict.severity >= VerdictSeverity::Warning {
+                step_recorder.end_turn(false);
                 tool_results = Vec::new();
                 continue;
             }
         }
+        step_recorder.end_turn(false);
     }
 
     if explain != ExplainMode::Off && !explain_turns.is_empty() && !quiet {
@@ -1402,6 +1446,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         budget_pressure: first_budget_pressure,
         stall_events,
         verdict_events,
+        step_recorder_summary: Some(step_recorder.summary()),
     })
 }
 
