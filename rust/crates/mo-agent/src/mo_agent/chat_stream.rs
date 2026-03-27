@@ -1738,6 +1738,20 @@ Original user query: {original_query}"
 /// Also recognizes org names from patterns like "follows {org}" or "tracks {org}/{repo}".
 /// Returns deduplicated Vec of "owner/repo" strings.
 fn extract_repos_from_memory(text: &str) -> Vec<String> {
+    use std::sync::LazyLock;
+
+    static GITHUB_URL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)github\.com/([a-zA-Z0-9][\w-]{0,38})/([a-zA-Z0-9][\w.-]{0,99})",
+        )
+        .expect("github url regex")
+    });
+
+    static BARE_REPO_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\b([a-zA-Z0-9][\w-]{0,38})/([a-zA-Z0-9][\w.-]{0,99})\b")
+            .expect("repo regex")
+    });
+
     let mut repos = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -1750,17 +1764,12 @@ fn extract_repos_from_memory(text: &str) -> Vec<String> {
     };
 
     // 1. Extract from GitHub URLs: github.com/{owner}/{repo}
-    let url_re =
-        regex::Regex::new(r"(?i)github\.com/([a-zA-Z0-9][\w-]{0,38})/([a-zA-Z0-9][\w.-]{0,99})")
-            .expect("github url regex");
-    for cap in url_re.captures_iter(text) {
+    for cap in GITHUB_URL_RE.captures_iter(text) {
         add(&cap[1], &cap[2]);
     }
 
     // 2. Match bare owner/repo patterns (e.g., "matrixorigin/Memoria")
-    let re = regex::Regex::new(r"(?i)\b([a-zA-Z0-9][\w-]{0,38})/([a-zA-Z0-9][\w.-]{0,99})\b")
-        .expect("repo regex");
-    for cap in re.captures_iter(text) {
+    for cap in BARE_REPO_RE.captures_iter(text) {
         let owner = &cap[1];
         let repo = &cap[2];
         // Skip protocols, paths, domains

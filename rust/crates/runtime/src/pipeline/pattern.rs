@@ -269,6 +269,57 @@ impl PatternLibrary {
             }
         }
     }
+
+    /// Compute tool co-occurrence scores: P(next_tool | just_used_tool).
+    ///
+    /// For each tool that appeared in successful patterns alongside `just_used`,
+    /// returns a score (0.0–1.0) representing how frequently they co-occur.
+    /// Used by the scoring pipeline to boost the next likely tool in a chain.
+    pub fn co_occurrence_scores(&self, just_used: &[String]) -> HashMap<String, f64> {
+        if just_used.is_empty() {
+            return HashMap::new();
+        }
+
+        let just_used_set: std::collections::HashSet<&str> =
+            just_used.iter().map(|s| s.as_str()).collect();
+
+        // Count how often each tool appears alongside just_used tools in successful patterns
+        let mut co_counts: HashMap<String, f64> = HashMap::new();
+        let mut total_weight = 0.0;
+
+        for pattern in self.patterns.values() {
+            if pattern.success_count == 0 {
+                continue;
+            }
+            // Does this pattern contain any of the just_used tools?
+            let overlap = pattern
+                .tools
+                .iter()
+                .any(|t| just_used_set.contains(t.as_str()));
+            if !overlap {
+                continue;
+            }
+
+            // Weight by success rate and quality
+            let weight = pattern.success_rate() * (1.0 + pattern.avg_quality());
+
+            for tool in &pattern.tools {
+                if !just_used_set.contains(tool.as_str()) {
+                    *co_counts.entry(tool.clone()).or_default() += weight;
+                }
+            }
+            total_weight += weight;
+        }
+
+        // Normalize to 0.0–1.0
+        if total_weight > 0.0 {
+            for score in co_counts.values_mut() {
+                *score = (*score / total_weight).min(1.0);
+            }
+        }
+
+        co_counts
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -652,5 +703,94 @@ mod tests {
         let terms = lib.boost_terms_for(TaskType::Fetch, Some(DomainHint::GitHub));
         assert!(terms.contains(&"github_search".to_string()));
         assert!(terms.contains(&"github_list_prs".to_string()));
+    }
+
+    // ── Co-occurrence scoring ──
+
+    #[test]
+    fn co_occurrence_empty_library_returns_empty() {
+        let lib = PatternLibrary::new();
+        let scores = lib.co_occurrence_scores(&tools(&["bash"]));
+        assert!(scores.is_empty());
+    }
+
+    #[test]
+    fn co_occurrence_returns_related_tools() {
+        let mut lib = PatternLibrary::new();
+        // Record: grep + read_file + str_replace succeeds together
+        for _ in 0..5 {
+            lib.record_outcome(
+                &tools(&["grep", "read_file", "str_replace"]),
+                TaskType::Code,
+                None,
+                true,
+                0.9,
+            );
+        }
+
+        // Given just_used = [grep], should suggest read_file and str_replace
+        let scores = lib.co_occurrence_scores(&tools(&["grep"]));
+        assert!(scores.contains_key("read_file"), "read_file should be a co-occurrence");
+        assert!(scores.contains_key("str_replace"), "str_replace should be a co-occurrence");
+        assert!(!scores.contains_key("grep"), "grep itself should not appear");
+    }
+
+    #[test]
+    fn co_occurrence_scores_are_normalized() {
+        let mut lib = PatternLibrary::new();
+        for _ in 0..5 {
+            lib.record_outcome(
+                &tools(&["bash", "read_file"]),
+                TaskType::Code,
+                None,
+                true,
+                0.8,
+            );
+        }
+
+        let scores = lib.co_occurrence_scores(&tools(&["bash"]));
+        for (_, score) in &scores {
+            assert!(*score >= 0.0 && *score <= 1.0, "Scores must be 0.0-1.0");
+        }
+    }
+
+    #[test]
+    fn co_occurrence_ignores_failed_patterns() {
+        let mut lib = PatternLibrary::new();
+        // Record only failures for bash + dangerous_tool
+        for _ in 0..5 {
+            lib.record_outcome(
+                &tools(&["bash", "dangerous_tool"]),
+                TaskType::Code,
+                None,
+                false,
+                0.0,
+            );
+        }
+
+        // Should not recommend dangerous_tool (only failures)
+        let scores = lib.co_occurrence_scores(&tools(&["bash"]));
+        assert!(scores.is_empty(), "Failed-only patterns should not produce co-occurrences");
+    }
+
+    #[test]
+    fn co_occurrence_with_empty_just_used_returns_empty() {
+        let mut lib = PatternLibrary::new();
+        lib.record_outcome(
+            &tools(&["bash", "grep"]),
+            TaskType::Fetch,
+            None,
+            true,
+            0.8,
+        );
+        lib.record_outcome(
+            &tools(&["bash", "grep"]),
+            TaskType::Fetch,
+            None,
+            true,
+            0.8,
+        );
+        let scores = lib.co_occurrence_scores(&[]);
+        assert!(scores.is_empty());
     }
 }

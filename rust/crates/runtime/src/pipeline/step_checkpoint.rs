@@ -74,7 +74,17 @@ pub fn read_latest_heavy_checkpoint(session_id: &str) -> std::io::Result<Option<
     }
 
     let mut heavy_files: Vec<_> = std::fs::read_dir(&dir)?
-        .filter_map(|e| e.ok())
+        .filter_map(|e| match e {
+            Ok(entry) => Some(entry),
+            Err(err) => {
+                mo_agent_core::agent_warn!(
+                    "checkpoint",
+                    "Failed to read checkpoint dir entry: {}",
+                    err
+                );
+                None
+            }
+        })
         .filter(|e| {
             e.file_name()
                 .to_string_lossy()
@@ -109,7 +119,17 @@ pub fn read_latest_light_checkpoint(
 
     // Any checkpoint contains cursor info — find the highest numbered file
     let mut all_files: Vec<_> = std::fs::read_dir(&dir)?
-        .filter_map(|e| e.ok())
+        .filter_map(|e| match e {
+            Ok(entry) => Some(entry),
+            Err(err) => {
+                mo_agent_core::agent_warn!(
+                    "checkpoint",
+                    "Failed to read checkpoint dir entry: {}",
+                    err
+                );
+                None
+            }
+        })
         .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
         .collect();
 
@@ -159,7 +179,17 @@ pub fn list_checkpoints(session_id: &str) -> std::io::Result<Vec<(u32, Checkpoin
 /// Remove old light checkpoints, keeping only the most recent MAX_LIGHT_CHECKPOINTS.
 fn prune_light_checkpoints(dir: &Path) -> std::io::Result<()> {
     let mut light_files: Vec<_> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
+        .filter_map(|e| match e {
+            Ok(entry) => Some(entry),
+            Err(err) => {
+                mo_agent_core::agent_warn!(
+                    "checkpoint",
+                    "Failed to read dir entry during prune: {}",
+                    err
+                );
+                None
+            }
+        })
         .filter(|e| {
             e.file_name()
                 .to_string_lossy()

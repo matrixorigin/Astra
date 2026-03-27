@@ -37,9 +37,14 @@ pub fn classify_error(error_str: &str) -> ErrorCategory {
         || lower.contains("timed out")
         || lower.contains("rate limit")
         || lower.contains("429")
-        || lower.contains("503")
+        || lower.contains("500")
         || lower.contains("502")
+        || lower.contains("503")
         || lower.contains("504")
+        || lower.contains("internal server error")
+        || lower.contains("service unavailable")
+        || lower.contains("bad gateway")
+        || lower.contains("gateway timeout")
         || lower.contains("connection refused")
         || lower.contains("connection reset")
         || lower.contains("network")
@@ -426,6 +431,34 @@ mod tests {
         assert_eq!(
             classify_error("something went wrong"),
             ErrorCategory::Unknown
+        );
+    }
+
+    #[test]
+    fn classify_http_500_as_transient() {
+        assert_eq!(
+            classify_error("HTTP 500 Internal Server Error"),
+            ErrorCategory::Transient
+        );
+        assert_eq!(
+            classify_error("internal server error"),
+            ErrorCategory::Transient
+        );
+    }
+
+    #[test]
+    fn classify_http_status_aliases_as_transient() {
+        assert_eq!(
+            classify_error("502 Bad Gateway"),
+            ErrorCategory::Transient
+        );
+        assert_eq!(
+            classify_error("service unavailable"),
+            ErrorCategory::Transient
+        );
+        assert_eq!(
+            classify_error("gateway timeout"),
+            ErrorCategory::Transient
         );
     }
 

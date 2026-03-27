@@ -181,11 +181,6 @@ fn raw_recency_boost(tool: &ToolMeta, state: &ConversationState) -> f64 {
 // language (e.g., TypeScript file open → boost code-edit tools). We currently
 // ignore edge_profile.cwd and file context in scoring. Adding this requires
 // passing file-type hints through SelectionContext into the scoring pipeline.
-//
-// TODO(P2): Tool co-occurrence/composition — Codex learns grep→read_file→str_replace
-// chains. Tools are currently scored independently. A co-occurrence matrix
-// (built from session history) could boost the next likely tool in a chain.
-// This requires recording tool sequences and computing transition probabilities.
 
 fn tool_relevance_score(
     tool: &ToolMeta,
@@ -195,6 +190,7 @@ fn tool_relevance_score(
     query_lower: &str,
     query_chars: &[char],
     memory_domain_hints: &[crate::pipeline::routing::DomainHint],
+    co_occurrence: &HashMap<String, f64>,
 ) -> f64 {
     use crate::pipeline::routing::DomainHint;
 
@@ -308,6 +304,15 @@ fn tool_relevance_score(
         score += recency_raw * gate;
     }
 
+    // ── Phase 5: Tool co-occurrence boost ──
+    // When PatternLibrary has learned that certain tools succeed together,
+    // boost tools that frequently co-occur with recently-used tools.
+    // Max boost: +0.10 — enough to tip marginal tools into selection
+    // but not enough to override strong textual/intent signals.
+    if let Some(&co_score) = co_occurrence.get(tool.name) {
+        score += co_score * 0.10;
+    }
+
     // ── Soft ceiling ──
     // Hard clamp at 1.0 hides rank differences when multiple tools exceed 1.0
     // (e.g., text=0.40 + trigger=0.25 + intent=0.25 + scope=0.10 + recency=0.30 = 1.30).
@@ -322,7 +327,7 @@ fn tool_relevance_score(
 /// Pre-filter: rank dynamic tools by relevance and filter by minimum score threshold.
 /// Returns (catalog_index, score) pairs for dynamic tools, sorted by descending score.
 pub fn pre_filter_dynamic(state: &ConversationState, query: &str) -> Vec<(usize, f64)> {
-    pre_filter_dynamic_core(state, query, None, None, &[])
+    pre_filter_dynamic_core(state, query, None, None, &[], &HashMap::new())
 }
 
 /// Like [`pre_filter_dynamic`] but accepts an optional quality tracker to boost/penalize
@@ -332,7 +337,7 @@ pub fn pre_filter_dynamic_with_quality(
     query: &str,
     quality_tracker: Option<&ToolQualityTracker>,
 ) -> Vec<(usize, f64)> {
-    pre_filter_dynamic_core(state, query, quality_tracker, None, &[])
+    pre_filter_dynamic_core(state, query, quality_tracker, None, &[], &HashMap::new())
 }
 
 /// Full-featured pre-filter with both quality tracking and confidence calibration.
@@ -343,7 +348,7 @@ pub fn pre_filter_dynamic_calibrated(
     quality_tracker: Option<&ToolQualityTracker>,
     calibrator: Option<&ConfidenceCalibrator>,
 ) -> Vec<(usize, f64)> {
-    pre_filter_dynamic_core(state, query, quality_tracker, calibrator, &[])
+    pre_filter_dynamic_core(state, query, quality_tracker, calibrator, &[], &HashMap::new())
 }
 
 /// Full pre-filter with memory domain hints for gate softening.
@@ -362,6 +367,7 @@ pub fn pre_filter_dynamic_with_memory(
         quality_tracker,
         calibrator,
         memory_domain_hints,
+        &HashMap::new(),
     )
 }
 
@@ -386,12 +392,57 @@ pub fn pre_filter_dynamic_with_pressure(
     memory_domain_hints: &[crate::pipeline::routing::DomainHint],
     budget_pressure: f64,
 ) -> Vec<(usize, f64)> {
+    pre_filter_dynamic_with_pressure_and_cooccurrence(
+        state,
+        query,
+        quality_tracker,
+        calibrator,
+        memory_domain_hints,
+        budget_pressure,
+        &HashMap::new(),
+    )
+}
+
+/// Full pre-filter with pressure, memory hints, AND tool co-occurrence learning.
+/// Co-occurrence scores come from PatternLibrary::co_occurrence_scores() and
+/// boost tools that historically succeed alongside recently-used tools.
+pub fn pre_filter_dynamic_with_cooccurrence(
+    state: &ConversationState,
+    query: &str,
+    quality_tracker: Option<&ToolQualityTracker>,
+    calibrator: Option<&ConfidenceCalibrator>,
+    memory_domain_hints: &[crate::pipeline::routing::DomainHint],
+    budget_pressure: f64,
+    co_occurrence: &HashMap<String, f64>,
+) -> Vec<(usize, f64)> {
+    pre_filter_dynamic_with_pressure_and_cooccurrence(
+        state,
+        query,
+        quality_tracker,
+        calibrator,
+        memory_domain_hints,
+        budget_pressure,
+        co_occurrence,
+    )
+}
+
+/// Internal: pressure + co-occurrence combined.
+fn pre_filter_dynamic_with_pressure_and_cooccurrence(
+    state: &ConversationState,
+    query: &str,
+    quality_tracker: Option<&ToolQualityTracker>,
+    calibrator: Option<&ConfidenceCalibrator>,
+    memory_domain_hints: &[crate::pipeline::routing::DomainHint],
+    budget_pressure: f64,
+    co_occurrence: &HashMap<String, f64>,
+) -> Vec<(usize, f64)> {
     let mut result = pre_filter_dynamic_core(
         state,
         query,
         quality_tracker,
         calibrator,
         memory_domain_hints,
+        co_occurrence,
     );
 
     if budget_pressure > 0.01 {
@@ -419,6 +470,7 @@ fn pre_filter_dynamic_core(
     quality_tracker: Option<&ToolQualityTracker>,
     calibrator: Option<&ConfidenceCalibrator>,
     memory_domain_hints: &[crate::pipeline::routing::DomainHint],
+    co_occurrence: &HashMap<String, f64>,
 ) -> Vec<(usize, f64)> {
     // Short-circuit: pure conversational queries don't need dynamic tools.
     if state.is_conversational && !state.is_fetch && !state.is_mutate && !state.is_analytical {
@@ -441,6 +493,7 @@ fn pre_filter_dynamic_core(
                 &query_lower,
                 &query_chars,
                 memory_domain_hints,
+                co_occurrence,
             );
             if let Some(tracker) = quality_tracker {
                 score *= tracker.boost_factor(tool.name);
