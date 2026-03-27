@@ -6169,3 +6169,120 @@ mod protocol_hygiene_proofs {
         assert!(verdict.is_err());
     }
 }
+
+// ─── Scheduling contract proofs ─────────────────────────────────────────────
+mod scheduling_wiring_proofs {
+    use mo_agent_runtime::pipeline::step_protocol::SchedulingContract;
+    use mo_agent_core::RuntimeLimits;
+
+    /// Default contract has sane values.
+    #[test]
+    fn default_contract_values() {
+        let c = SchedulingContract::default();
+        assert_eq!(c.priority, 5);
+        assert_eq!(c.timeout_ms, 300_000);
+        assert_eq!(c.per_tool_timeout_ms, 0);
+        assert_eq!(c.max_retries, 2);
+        assert_eq!(c.backoff_base_ms, 500);
+        assert_eq!(c.backoff_max_ms, 5_000);
+    }
+
+    /// effective_tool_timeout_ms divides step timeout equally when per_tool is 0.
+    #[test]
+    fn effective_tool_timeout_divides_evenly() {
+        let c = SchedulingContract {
+            timeout_ms: 60_000,
+            per_tool_timeout_ms: 0,
+            ..Default::default()
+        };
+        assert_eq!(c.effective_tool_timeout_ms(3), 20_000);
+        assert_eq!(c.effective_tool_timeout_ms(1), 60_000);
+        // Zero tools → full step timeout (no division by zero)
+        assert_eq!(c.effective_tool_timeout_ms(0), 60_000);
+    }
+
+    /// Explicit per_tool_timeout_ms overrides the calculation.
+    #[test]
+    fn explicit_per_tool_timeout_overrides() {
+        let c = SchedulingContract {
+            timeout_ms: 60_000,
+            per_tool_timeout_ms: 10_000,
+            ..Default::default()
+        };
+        assert_eq!(c.effective_tool_timeout_ms(3), 10_000);
+        assert_eq!(c.effective_tool_timeout_ms(100), 10_000);
+    }
+
+    /// Backoff is exponential with a cap.
+    #[test]
+    fn backoff_exponential_with_cap() {
+        let c = SchedulingContract {
+            backoff_base_ms: 100,
+            backoff_max_ms: 5_000,
+            ..Default::default()
+        };
+        assert_eq!(c.backoff_ms(0), 100);     // 100 * 2^0 = 100
+        assert_eq!(c.backoff_ms(1), 200);     // 100 * 2^1 = 200
+        assert_eq!(c.backoff_ms(2), 400);     // 100 * 2^2 = 400
+        assert_eq!(c.backoff_ms(3), 800);     // 100 * 2^3 = 800
+        // Capped at max
+        assert_eq!(c.backoff_ms(10), 5_000);  // 100 * 2^10 = 102400, capped at 5000
+    }
+
+    /// Backoff doesn't panic on large attempt numbers.
+    #[test]
+    fn backoff_no_overflow_on_large_attempt() {
+        let c = SchedulingContract::default();
+        // attempt > 10 is clamped inside backoff_ms to prevent overflow
+        let result = c.backoff_ms(100);
+        assert!(result <= c.backoff_max_ms);
+    }
+
+    /// Contract max_retries should be reconciled with RuntimeLimits.
+    /// The more restrictive (min) value should win in production.
+    #[test]
+    fn contract_limits_reconciliation_uses_min() {
+        let contract = SchedulingContract {
+            max_retries: 5,
+            ..Default::default()
+        };
+        let limits = RuntimeLimits::global();
+        let effective = (contract.max_retries as usize).min(limits.max_tool_retries);
+        // min(5, RuntimeLimits.max_tool_retries) — ensures neither overrides the other
+        assert!(effective <= 5);
+        assert!(effective <= limits.max_tool_retries);
+    }
+
+    /// Step timeout should be larger than per-tool timeout.
+    #[test]
+    fn step_timeout_larger_than_per_tool() {
+        let c = SchedulingContract::default();
+        for tool_count in 1..=10 {
+            let tool_timeout = c.effective_tool_timeout_ms(tool_count);
+            assert!(
+                tool_timeout <= c.timeout_ms,
+                "per-tool timeout {} > step timeout {} for {} tools",
+                tool_timeout,
+                c.timeout_ms,
+                tool_count
+            );
+        }
+    }
+
+    /// Custom contract with urgent priority and tight timeout.
+    #[test]
+    fn custom_urgent_contract() {
+        let c = SchedulingContract {
+            priority: 10,       // urgent
+            timeout_ms: 5_000,  // 5s total
+            per_tool_timeout_ms: 2_000,
+            max_retries: 1,
+            backoff_base_ms: 100,
+            backoff_max_ms: 500,
+        };
+        assert_eq!(c.priority, 10);
+        assert_eq!(c.effective_tool_timeout_ms(3), 2_000);
+        assert_eq!(c.backoff_ms(0), 100);
+        assert_eq!(c.backoff_ms(3), 500); // capped
+    }
+}

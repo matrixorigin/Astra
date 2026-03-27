@@ -1045,8 +1045,19 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         let mut seen_calls: HashSet<String> = HashSet::new();
         let tool_count = turn_result.tool_calls.len();
         step_recorder.begin_act(tool_count);
+        let step_start_time = std::time::Instant::now();
+        let step_timeout_ms = step_recorder.scheduling().timeout_ms;
 
         for tc_event in &turn_result.tool_calls {
+            // Step-level timeout: abort remaining tools if step time exceeded
+            let step_elapsed_ms = step_start_time.elapsed().as_millis() as u64;
+            if step_elapsed_ms > step_timeout_ms {
+                agent_warn!("step", "Step timeout exceeded: {}ms > {}ms, aborting remaining {} tools",
+                    step_elapsed_ms, step_timeout_ms,
+                    turn_result.tool_calls.len() - tool_results.len());
+                break;
+            }
+
             let id = tc_event
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -1173,9 +1184,12 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 tool_idem_key.as_deref(),
             );
 
-            // Enforce per-tool timeout from scheduling contract
+            // Enforce per-tool timeout from scheduling contract,
+            // reconciled with RuntimeLimits for the more restrictive policy.
             let contract = step_recorder.scheduling();
+            let limits = RuntimeLimits::global();
             let tool_timeout_ms = contract.effective_tool_timeout_ms(tool_count);
+            let effective_retries = (contract.max_retries as usize).min(limits.max_tool_retries);
             let mut result_str = match tokio::time::timeout(
                 std::time::Duration::from_millis(tool_timeout_ms),
                 executor.execute(&name, &args),
@@ -1236,11 +1250,17 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     category,
                     mo_agent_runtime::turn::error_recovery::ErrorCategory::Transient
                 ) {
-                    let max_retries = contract.max_retries as usize;
-                    for attempt in 0..max_retries {
+                    for attempt in 0..effective_retries {
                         let backoff_ms = contract.backoff_ms(attempt as u32);
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                        let retry_result = executor.execute(&name, &args).await;
+                        // Retry with same timeout as original attempt
+                        let retry_result = match tokio::time::timeout(
+                            std::time::Duration::from_millis(tool_timeout_ms),
+                            executor.execute(&name, &args),
+                        ).await {
+                            Ok(r) => r,
+                            Err(_) => format!("Tool '{}' retry #{} timed out after {}ms", name, attempt + 1, tool_timeout_ms),
+                        };
                         if !is_tool_error(&retry_result) {
                             result_str = retry_result;
                             retried_ok = true;
