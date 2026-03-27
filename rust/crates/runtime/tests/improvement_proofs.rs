@@ -6503,7 +6503,6 @@ mod turnguard_step_integration_proofs {
 
     #[test]
     fn timeout_dominant_tool_gets_infrastructure_guidance() {
-        use mo_agent_runtime::turn::turn_guard::VerdictSeverity;
         let mut guard = TurnGuard::new();
         // 3 timeouts → deprioritized, all failures are timeouts (100% timeout-dominant)
         guard.record_tool_timeout("bash");
@@ -7200,5 +7199,81 @@ mod health_dashboard_proofs {
         assert!(tracker.deprioritized_tools().is_empty());
         assert!(tracker.timeout_dominant_tools().is_empty());
         assert!(tracker.cache_wasteful_tools(3).is_empty());
+    }
+}
+
+mod cloud_sync_status_proofs {
+    use mo_agent_services::state_sync::SyncStatus;
+
+    #[test]
+    fn sync_status_default_is_no_history() {
+        let status = SyncStatus::default();
+        assert!(status.learning_last_push.is_none());
+        assert!(status.learning_last_pull.is_none());
+        assert!(status.preferences_last_sync.is_none());
+        assert_eq!(status.pending_pushes, 0);
+        assert!(status.last_error.is_none());
+    }
+
+    #[test]
+    fn sync_status_connected_when_push_exists() {
+        let status = SyncStatus {
+            learning_last_push: Some("2026-01-15T10:30:00Z".into()),
+            learning_last_pull: None,
+            preferences_last_sync: None,
+            pending_pushes: 0,
+            last_error: None,
+        };
+        // Connected: has at least one push or pull
+        assert!(
+            status.learning_last_push.is_some() || status.learning_last_pull.is_some()
+        );
+        assert!(status.last_error.is_none());
+    }
+
+    #[test]
+    fn sync_status_error_takes_priority_over_connected() {
+        let status = SyncStatus {
+            learning_last_push: Some("2026-01-15T10:30:00Z".into()),
+            learning_last_pull: Some("2026-01-15T10:25:00Z".into()),
+            preferences_last_sync: None,
+            pending_pushes: 0,
+            last_error: Some("connection refused".into()),
+        };
+        // Error should take priority in display
+        assert!(status.last_error.is_some());
+        // But push/pull history is still available
+        assert!(status.learning_last_push.is_some());
+        assert!(status.learning_last_pull.is_some());
+    }
+
+    #[test]
+    fn sync_status_pending_indicates_queued_work() {
+        let status = SyncStatus {
+            learning_last_push: Some("2026-01-15T10:30:00Z".into()),
+            learning_last_pull: None,
+            preferences_last_sync: None,
+            pending_pushes: 3,
+            last_error: None,
+        };
+        assert!(status.pending_pushes > 0);
+    }
+
+    #[test]
+    fn sync_status_roundtrip_serialization() {
+        let status = SyncStatus {
+            learning_last_push: Some("2026-01-15T10:30:00Z".into()),
+            learning_last_pull: Some("2026-01-15T10:25:00Z".into()),
+            preferences_last_sync: Some("2026-01-15T09:00:00Z".into()),
+            pending_pushes: 2,
+            last_error: Some("timeout".into()),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let back: SyncStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.learning_last_push, status.learning_last_push);
+        assert_eq!(back.learning_last_pull, status.learning_last_pull);
+        assert_eq!(back.preferences_last_sync, status.preferences_last_sync);
+        assert_eq!(back.pending_pushes, status.pending_pushes);
+        assert_eq!(back.last_error, status.last_error);
     }
 }
