@@ -523,9 +523,70 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                     &restored.session_id,
                 )
             {
-                // Fallback to raw checkpoint if step_restore fails (e.g., version mismatch)
+                // Fallback to raw local checkpoint if step_restore fails (e.g., version mismatch)
                 if state.recent_tools.is_empty() {
                     state.recent_tools = heavy.recent_tools;
+                }
+            } else if let Some(ref pool) = state.matrixone_pool {
+                // Cloud fallback: pull heavy checkpoint from MatrixOne
+                // (different device, local files not available)
+                match mo_agent_services::session_restore::pull_step_checkpoint_from_cloud(
+                    pool,
+                    &restored.session_id,
+                )
+                .await
+                {
+                    Ok(Some(state_json)) => {
+                        match serde_json::from_str::<mo_agent_runtime::pipeline::step_protocol::StepCheckpoint>(&state_json) {
+                            Ok(mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(heavy)) => {
+                                for tool in &heavy.blocked_tools {
+                                    if !state.tool_health_entries.iter().any(|e| e.name == *tool) {
+                                        state.tool_health_entries.push(
+                                            mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
+                                                name: tool.clone(),
+                                                total_calls: 3,
+                                                total_failures: 3,
+                                                failure_rate: 1.0,
+                                            },
+                                        );
+                                    }
+                                }
+                                if state.recent_tools.is_empty() {
+                                    state.recent_tools = heavy.recent_tools;
+                                }
+                                // Restore conversation history from cloud checkpoint
+                                if state.history.is_empty() && !heavy.messages.is_empty() {
+                                    // Extract user/assistant pairs from messages for history
+                                    let mut pairs = Vec::new();
+                                    let mut last_user = String::new();
+                                    for msg in &heavy.messages {
+                                        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                                        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                                        match role {
+                                            "user" => last_user = content.to_string(),
+                                            "assistant" if !last_user.is_empty() => {
+                                                pairs.push((last_user.clone(), content.to_string()));
+                                                last_user.clear();
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    if !pairs.is_empty() {
+                                        state.history = pairs;
+                                    }
+                                }
+                                eprintln!("  {} Restored step checkpoint from cloud", "☁".cyan());
+                            }
+                            Ok(_) => {} // Light checkpoint — less useful, skip
+                            Err(e) => {
+                                eprintln!("  {} Cloud checkpoint parse: {}", "⚠".yellow(), e);
+                            }
+                        }
+                    }
+                    Ok(None) => {} // No cloud checkpoint available
+                    Err(e) => {
+                        eprintln!("  {} Cloud checkpoint pull: {}", "⚠".yellow(), e);
+                    }
                 }
             }
 

@@ -6773,4 +6773,102 @@ mod checkpoint_cloud_persistence_proofs {
             _ => panic!("Expected Heavy"),
         }
     }
+
+    // --- Cloud recovery simulation tests ---
+
+    #[test]
+    fn cloud_json_to_heavy_checkpoint_restores_full_state() {
+        // Simulate: push serializes → store as string → pull deserializes
+        let heavy = make_heavy();
+        let cp = StepCheckpoint::Heavy(Box::new(heavy));
+
+        // Push path: serialize to JSON string
+        let state_json = serde_json::to_string(&cp).unwrap();
+
+        // Simulate cloud storage: state_json stored as LONGTEXT in MatrixOne
+        let cloud_stored: String = state_json.clone();
+
+        // Pull path: deserialize from cloud string
+        let restored: StepCheckpoint = serde_json::from_str(&cloud_stored).unwrap();
+        match restored {
+            StepCheckpoint::Heavy(h) => {
+                assert_eq!(h.light.step_id, "step-abc");
+                assert_eq!(h.messages.len(), 2);
+                assert_eq!(h.budget_remaining_tokens, 50000);
+                assert_eq!(h.budget_remaining_rounds, 8);
+                assert_eq!(h.blocked_tools, vec!["bash"]);
+                assert_eq!(h.recent_tools, vec!["grep", "read_file"]);
+                assert_eq!(h.learning_snapshot_id, Some("snap-xyz".to_string()));
+            }
+            _ => panic!("Expected Heavy"),
+        }
+    }
+
+    #[test]
+    fn cloud_recovery_extracts_conversation_history() {
+        let heavy = make_heavy();
+        let cp = StepCheckpoint::Heavy(Box::new(heavy));
+        let state_json = serde_json::to_string(&cp).unwrap();
+        let restored: StepCheckpoint = serde_json::from_str(&state_json).unwrap();
+
+        // Simulate the history extraction logic from main.rs
+        if let StepCheckpoint::Heavy(h) = restored {
+            let mut pairs = Vec::new();
+            let mut last_user = String::new();
+            for msg in &h.messages {
+                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                match role {
+                    "user" => last_user = content.to_string(),
+                    "assistant" if !last_user.is_empty() => {
+                        pairs.push((last_user.clone(), content.to_string()));
+                        last_user.clear();
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(pairs.len(), 1);
+            assert_eq!(pairs[0].0, "Hello");
+            assert_eq!(pairs[0].1, "Hi!");
+        } else {
+            panic!("Expected Heavy");
+        }
+    }
+
+    #[test]
+    fn cloud_recovery_with_tool_messages_skips_them() {
+        let mut heavy = make_heavy();
+        heavy.messages = vec![
+            serde_json::json!({"role": "user", "content": "list files"}),
+            serde_json::json!({"role": "assistant", "content": "I'll use bash"}),
+            serde_json::json!({"role": "tool", "tool_call_id": "tc1", "content": "file1.rs"}),
+            serde_json::json!({"role": "assistant", "content": "Found file1.rs"}),
+        ];
+        let cp = StepCheckpoint::Heavy(Box::new(heavy));
+        let state_json = serde_json::to_string(&cp).unwrap();
+        let restored: StepCheckpoint = serde_json::from_str(&state_json).unwrap();
+
+        if let StepCheckpoint::Heavy(h) = restored {
+            // Messages preserved in full
+            assert_eq!(h.messages.len(), 4);
+            // History extraction only pairs user↔assistant
+            let mut pairs = Vec::new();
+            let mut last_user = String::new();
+            for msg in &h.messages {
+                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                match role {
+                    "user" => last_user = content.to_string(),
+                    "assistant" if !last_user.is_empty() => {
+                        pairs.push((last_user.clone(), content.to_string()));
+                        last_user.clear();
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(pairs.len(), 1, "Tool messages should not create pairs");
+            assert_eq!(pairs[0].0, "list files");
+            assert_eq!(pairs[0].1, "I'll use bash");
+        }
+    }
 }
