@@ -103,7 +103,7 @@ impl MatrixOneCheckpointWriter {
                     learning_snapshot_id: None,
                     memory_context: step.execution.memory_context.clone(),
                 };
-                StepCheckpoint::Heavy(heavy)
+                StepCheckpoint::Heavy(Box::new(heavy))
             }
             CheckpointTier::Light => StepCheckpoint::Light(light),
         };
@@ -521,7 +521,7 @@ mod tests {
             learning_snapshot_id: Some("snap-1".to_string()),
             memory_context: None,
         };
-        let cp = StepCheckpoint::Heavy(heavy);
+        let cp = StepCheckpoint::Heavy(Box::new(heavy));
         let json = serde_json::to_string(&cp).unwrap();
         assert!(json.contains("messages"));
         assert!(json.contains("budget_remaining"));

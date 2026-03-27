@@ -50,7 +50,7 @@ impl TaskStatus {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse_status(s: &str) -> Self {
         match s {
             "pending" => Self::Pending,
             "in_progress" => Self::InProgress,
@@ -256,7 +256,7 @@ impl MatrixOneTaskService {
             parent_task_id: row.try_get("parent_task_id").ok().flatten(),
             title: row.try_get("title").map_err(|e| e.to_string())?,
             description: row.try_get("description").ok().flatten(),
-            status: TaskStatus::from_str(&status_str),
+            status: TaskStatus::parse_status(&status_str),
             progress_pct: row.try_get::<i32, _>("progress_pct").unwrap_or(0) as u32,
             items_done: row.try_get::<i32, _>("items_done").unwrap_or(0) as u32,
             items_total: row.try_get::<i32, _>("items_total").unwrap_or(0) as u32,
@@ -546,20 +546,15 @@ impl TaskService for LocalTaskService {
         let mut tasks = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Ok(data) = std::fs::read_to_string(&path) {
-                    if let Ok(record) = serde_json::from_str::<TaskRecord>(&data) {
-                        if record.user_id == user_id {
-                            if let Some(filter) = &status_filter {
-                                if record.status == *filter {
-                                    tasks.push(record);
-                                }
-                            } else {
-                                tasks.push(record);
-                            }
-                        }
-                    }
-                }
+            if path.extension().map(|e| e == "json").unwrap_or(false)
+                && let Ok(data) = std::fs::read_to_string(&path)
+                && let Ok(record) = serde_json::from_str::<TaskRecord>(&data)
+                && record.user_id == user_id
+                && status_filter
+                    .as_ref()
+                    .is_none_or(|filter| record.status == *filter)
+            {
+                tasks.push(record);
             }
         }
         tasks.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -663,7 +658,7 @@ mod tests {
             TaskStatus::Failed,
             TaskStatus::Cancelled,
         ] {
-            assert_eq!(TaskStatus::from_str(status.as_str()), status);
+            assert_eq!(TaskStatus::parse_status(status.as_str()), status);
         }
     }
 
@@ -679,7 +674,7 @@ mod tests {
 
     #[test]
     fn task_status_unknown_defaults_to_pending() {
-        assert_eq!(TaskStatus::from_str("unknown"), TaskStatus::Pending);
+        assert_eq!(TaskStatus::parse_status("unknown"), TaskStatus::Pending);
     }
 
     // ── TaskPlan ──

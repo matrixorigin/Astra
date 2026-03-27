@@ -161,12 +161,12 @@ impl StepRecorder {
         let slot_idx = self.slot_counter;
         self.slot_counter += 1;
 
-        if let Some(ref mut step) = self.current_step {
-            if let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize) {
-                slot.tool_name = tool_name.to_string();
-                slot.call_id = call_id.to_string();
-                slot.state = SlotState::Running;
-            }
+        if let Some(ref mut step) = self.current_step
+            && let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize)
+        {
+            slot.tool_name = tool_name.to_string();
+            slot.call_id = call_id.to_string();
+            slot.state = SlotState::Running;
         }
 
         self.emit_with_payload(
@@ -237,11 +237,11 @@ impl StepRecorder {
 
         if succeeded {
             let slot_idx = self.slot_counter.saturating_sub(1);
-            if let Some(ref mut step) = self.current_step {
-                if let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize) {
-                    slot.retry_count = attempt;
-                    slot.state = SlotState::Completed;
-                }
+            if let Some(ref mut step) = self.current_step
+                && let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize)
+            {
+                slot.retry_count = attempt;
+                slot.state = SlotState::Completed;
             }
         }
     }
@@ -309,16 +309,15 @@ impl StepRecorder {
 
     /// Record LLM token usage for the turn.
     pub fn record_tokens(&mut self, prompt_tokens: u64, completion_tokens: u64) {
-        if let Some(ref mut step) = self.current_step {
-            if let Some(StepResult::Act {
+        if let Some(ref mut step) = self.current_step
+            && let Some(StepResult::Act {
                 ref mut tokens_in,
                 ref mut tokens_out,
                 ..
             }) = step.execution.result
-            {
-                *tokens_in = prompt_tokens;
-                *tokens_out = completion_tokens;
-            }
+        {
+            *tokens_in = prompt_tokens;
+            *tokens_out = completion_tokens;
         }
     }
 
@@ -336,14 +335,11 @@ impl StepRecorder {
         } else {
             StepEventType::StepRetried
         };
-        self.emit(
-            &self
-                .current_step
-                .as_ref()
-                .map_or("unknown", |s| s.step_id())
-                .to_string(),
-            event_type,
-        );
+        let step_id = self
+            .current_step
+            .as_ref()
+            .map_or("unknown".to_string(), |s| s.step_id().to_string());
+        self.emit(&step_id, event_type);
     }
 
     /// Get the execution summary after all turns complete.

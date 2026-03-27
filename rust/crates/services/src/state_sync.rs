@@ -192,6 +192,7 @@ impl MatrixOneSyncService {
     }
 
     /// Log a sync operation to the audit table.
+    #[allow(clippy::too_many_arguments)]
     async fn log_sync(
         &self,
         user_id: &str,

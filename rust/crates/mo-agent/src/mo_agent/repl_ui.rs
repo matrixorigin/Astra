@@ -585,10 +585,10 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 let selected = get_slash_picker_selected();
                 let current = ctx.line();
                 clear_slash_overlay();
-                if let Some((cmd, _)) = rows.get(selected) {
-                    if *cmd != current {
-                        return Some(RlCmd::Replace(RlMovement::WholeLine, Some(cmd.to_string())));
-                    }
+                if let Some((cmd, _)) = rows.get(selected)
+                    && *cmd != current
+                {
+                    return Some(RlCmd::Replace(RlMovement::WholeLine, Some(cmd.to_string())));
                 }
                 return None; // already correct — accept
             }

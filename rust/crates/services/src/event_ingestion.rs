@@ -237,7 +237,7 @@ impl EventIngestionWorker {
             return;
         }
 
-        let batch: Vec<IngestionEvent> = buffer.drain(..).collect();
+        let batch: Vec<IngestionEvent> = std::mem::take(buffer);
         let count = batch.len();
 
         for attempt in 0..self.config.max_retries {

@@ -422,7 +422,7 @@ fn apply_turn_success(
             );
             let recorder_event = session_journal::JournalEvent::checkpoint(
                 state.session_id.as_deref(),
-                state.turn as u32,
+                state.turn,
                 &summary_text,
                 result.prompt_tokens + result.completion_tokens,
                 result.tool_calls_count as usize,

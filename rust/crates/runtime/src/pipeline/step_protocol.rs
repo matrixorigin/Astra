@@ -50,9 +50,10 @@ pub const PROTOCOL_VERSION: u32 = PROTOCOL_VERSION_MAJOR * 1000 + PROTOCOL_VERSI
 
 /// How to handle version mismatches on checkpoint restore.
 /// Negotiation chain: Strict → Compatible → Migrate → Discard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum VersionPolicy {
     /// Reject any mismatch (safe default for production)
+    #[default]
     Strict,
     /// Accept if major version matches (same major = version / 1000).
     /// E.g., v1.0 (1000) and v1.1 (1001) are compatible.
@@ -60,12 +61,6 @@ pub enum VersionPolicy {
     /// Try compatible decode → try N-1 migration → discard.
     /// Recommended for long-lived deployments with registered MigrationFn.
     Migrate,
-}
-
-impl Default for VersionPolicy {
-    fn default() -> Self {
-        Self::Strict
-    }
 }
 
 // ─── Migration Registry ──────────────────────────────────────────────────────
@@ -734,7 +729,7 @@ pub struct HeavyCheckpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StepCheckpoint {
     Light(LightCheckpoint),
-    Heavy(HeavyCheckpoint),
+    Heavy(Box<HeavyCheckpoint>),
 }
 
 impl StepCheckpoint {
@@ -764,7 +759,7 @@ impl StepCheckpoint {
         agent_id: String,
         cursor: ExecutionCursor,
     ) -> Self {
-        Self::Heavy(HeavyCheckpoint {
+        Self::Heavy(Box::new(HeavyCheckpoint {
             light: LightCheckpoint {
                 protocol_version: PROTOCOL_VERSION,
                 cursor,
@@ -782,7 +777,7 @@ impl StepCheckpoint {
             recent_tools: Vec::new(),
             learning_snapshot_id: None,
             memory_context: None,
-        })
+        }))
     }
 
     /// v2-compat constructor (creates Heavy by default for backward compat)
@@ -848,12 +843,13 @@ impl StepCheckpoint {
         }
 
         // Heavy checkpoint: non-Perceive phases should have messages for LLM resume
-        if let Self::Heavy(h) = self {
-            if h.light.cursor.phase != StepAction::Perceive && h.messages.is_empty() {
-                return Err(ProtocolError::CheckpointCorrupt(
-                    "Heavy checkpoint has no messages for non-Perceive phase".into(),
-                ));
-            }
+        if let Self::Heavy(h) = self
+            && h.light.cursor.phase != StepAction::Perceive
+            && h.messages.is_empty()
+        {
+            return Err(ProtocolError::CheckpointCorrupt(
+                "Heavy checkpoint has no messages for non-Perceive phase".into(),
+            ));
         }
 
         Ok(())
@@ -2752,7 +2748,7 @@ mod tests {
 
     #[test]
     fn validate_heavy_no_messages_for_act_rejects() {
-        let cp = StepCheckpoint::Heavy(HeavyCheckpoint {
+        let cp = StepCheckpoint::Heavy(Box::new(HeavyCheckpoint {
             light: LightCheckpoint {
                 protocol_version: PROTOCOL_VERSION,
                 cursor: ExecutionCursor::for_act(2),
@@ -2770,7 +2766,7 @@ mod tests {
             recent_tools: vec![],
             learning_snapshot_id: None,
             memory_context: None,
-        });
+        }));
         let err = cp.validate().unwrap_err();
         assert!(matches!(err, ProtocolError::CheckpointCorrupt(_)));
         assert!(err.to_string().contains("no messages"));
@@ -2779,7 +2775,7 @@ mod tests {
     #[test]
     fn validate_heavy_perceive_no_messages_ok() {
         // Perceive phase is allowed to have no messages (initial state)
-        let cp = StepCheckpoint::Heavy(HeavyCheckpoint {
+        let cp = StepCheckpoint::Heavy(Box::new(HeavyCheckpoint {
             light: LightCheckpoint {
                 protocol_version: PROTOCOL_VERSION,
                 cursor: ExecutionCursor::default(), // Perceive
@@ -2797,7 +2793,7 @@ mod tests {
             recent_tools: vec![],
             learning_snapshot_id: None,
             memory_context: None,
-        });
+        }));
         assert!(cp.validate().is_ok());
     }
 

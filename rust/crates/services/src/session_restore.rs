@@ -166,16 +166,15 @@ impl HybridRestoreService {
         use sqlx::Row;
         let mut tools = Vec::new();
         for row in &rows {
-            if let Ok(Some(meta_str)) = row.try_get::<Option<String>, _>("metadata") {
-                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
-                    if let Some(used) = meta.get("tools_used").and_then(|v| v.as_array()) {
-                        for t in used {
-                            if let Some(name) = t.as_str() {
-                                if !tools.contains(&name.to_string()) {
-                                    tools.push(name.to_string());
-                                }
-                            }
-                        }
+            if let Ok(Some(meta_str)) = row.try_get::<Option<String>, _>("metadata")
+                && let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str)
+                && let Some(used) = meta.get("tools_used").and_then(|v| v.as_array())
+            {
+                for t in used {
+                    if let Some(name) = t.as_str()
+                        && !tools.contains(&name.to_string())
+                    {
+                        tools.push(name.to_string());
                     }
                 }
             }
@@ -565,7 +564,7 @@ mod tests {
 
     #[test]
     fn restored_checkpoint_ordering() {
-        let ckpts = vec![
+        let ckpts = [
             RestoredCheckpoint {
                 number: 1,
                 turn: 5,
