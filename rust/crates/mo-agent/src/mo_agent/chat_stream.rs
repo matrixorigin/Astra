@@ -531,7 +531,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     let max_turns = RuntimeLimits::global().max_turns;
     let mut remaining_turns: usize = max_turns;
     // Step Protocol recorder: maps implicit chat_stream phases to explicit Step events
-    let mut step_recorder = mo_agent_runtime::pipeline::step_recorder::StepRecorder::new(
+    let mut step_recorder = mo_agent_runtime::pipeline::step_recorder::StepRecorder::with_persistence(
         current_session_id.as_deref().unwrap_or("ephemeral"),
         &format!("chat-{}", start.elapsed().as_millis()),
     );

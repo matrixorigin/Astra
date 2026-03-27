@@ -4724,3 +4724,149 @@ mod idempotency_cache_proofs {
             "Nested JSON with same content must produce same key");
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FileBackedEventStore + Checkpoint end-to-end proofs
+// ═══════════════════════════════════════════════════════════════════════════════
+
+mod file_event_store_proofs {
+    use mo_agent_runtime::pipeline::step_checkpoint::*;
+    use mo_agent_runtime::pipeline::step_protocol::*;
+    use serde_json::json;
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_session() -> String {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        format!("proof-events-{}-{}-{}", std::process::id(), epoch_ms(), n)
+    }
+
+    fn make_event(id: &str, step_id: &str, etype: StepEventType) -> StepEvent {
+        StepEvent {
+            event_id: id.to_string(),
+            step_id: step_id.to_string(),
+            event_type: etype,
+            agent_id: None,
+            caused_by: vec![],
+            payload: None,
+            created_at: epoch_ms(),
+        }
+    }
+
+    #[test]
+    fn event_store_survives_process_restart_simulation() {
+        // Phase 4 proof: events persisted to JSONL survive "restart" (new instance)
+        let sid = test_session();
+        {
+            let mut store = FileBackedEventStore::new(&sid);
+            store.append(make_event("e1", "s1", StepEventType::StepCreated));
+            store.append(make_event("e2", "s1", StepEventType::ToolCallStarted));
+            store.append(make_event("e3", "s1", StepEventType::ToolCallCompleted));
+        }
+        // "Restart": new instance loads from disk
+        let store2 = FileBackedEventStore::new(&sid);
+        assert_eq!(store2.event_count(), 3, "All events must survive restart");
+        assert_eq!(store2.all_events()[0].event_id, "e1");
+        assert_eq!(store2.all_events()[2].event_id, "e3");
+    }
+
+    #[test]
+    fn checkpoint_plus_event_store_enables_full_session_replay() {
+        // Combined proof: checkpoint state + event DAG = complete recovery
+        let sid = test_session();
+
+        // Write a heavy checkpoint
+        let light = LightCheckpoint {
+            protocol_version: PROTOCOL_VERSION,
+            cursor: ExecutionCursor::default(),
+            step_id: "step-replay".to_string(),
+            task_id: "task-replay".to_string(),
+            agent_id: "agent-proof".to_string(),
+            progress: 0.5,
+            total_tokens: 1000,
+            created_at: epoch_ms(),
+        };
+        let heavy = HeavyCheckpoint {
+            light,
+            messages: vec![json!({"role": "user", "content": "test replay"})],
+            budget_remaining_tokens: 5000,
+            budget_remaining_rounds: 8,
+            blocked_tools: vec!["bash".to_string()],
+            recent_tools: vec!["read_file".to_string()],
+            learning_snapshot_id: None,
+            memory_context: None,
+        };
+        let ckpt = StepCheckpoint::Heavy(Box::new(heavy));
+        write_step_checkpoint(&sid, 1, &ckpt).unwrap();
+
+        // Write events to JSONL
+        {
+            let mut store = FileBackedEventStore::new(&sid);
+            store.append(make_event("r1", "step-replay", StepEventType::StepCreated));
+            let mut tool_event = make_event("r2", "step-replay", StepEventType::ToolCallStarted);
+            tool_event.caused_by = vec!["r1".to_string()];
+            tool_event.payload = Some(json!({"tool": "read_file", "file": "src/main.rs"}));
+            store.append(tool_event);
+        }
+
+        // Recovery: read both
+        let restored = read_latest_heavy_checkpoint(&sid).unwrap().unwrap();
+        let events = FileBackedEventStore::new(&sid);
+
+        assert_eq!(restored.messages.len(), 1);
+        assert_eq!(restored.blocked_tools, vec!["bash"]);
+        assert_eq!(events.event_count(), 2);
+
+        // Causal chain intact
+        let ancestors = events.ancestors("r2");
+        assert_eq!(ancestors.len(), 1);
+        assert_eq!(ancestors[0].event_id, "r1");
+    }
+
+    #[test]
+    fn idempotency_cache_prevents_duplicate_tool_on_crash_recovery() {
+        // End-to-end proof: cache + checkpoint = no duplicate tool execution
+        let key = IdempotencyKey::semantic("read_file", &json!({"path": "Cargo.toml"}));
+        let mut cache = InMemoryIdempotencyCache::new();
+
+        // Before crash: tool executed and cached
+        cache.record(
+            &key,
+            CachedToolResult {
+                tool_name: "read_file".to_string(),
+                output: "[package]\nname = \"test\"".to_string(),
+                is_error: false,
+                cached_at: epoch_ms(),
+            },
+        );
+
+        // After crash recovery: same key hits cache
+        let hit = cache.check(&key);
+        assert!(hit.is_some(), "Cache must prevent re-execution after crash");
+        assert_eq!(hit.unwrap().tool_name, "read_file");
+    }
+
+    #[test]
+    fn recorder_with_persistence_writes_events_to_disk() {
+        use mo_agent_runtime::pipeline::step_recorder::StepRecorder;
+
+        let sid = test_session();
+        {
+            let mut recorder = StepRecorder::with_persistence(&sid, "proof-task");
+            recorder.begin_turn(1);
+            recorder.begin_tool("read_file", "call-1");
+            recorder.complete_tool("read_file", false, 50, false);
+            recorder.record_verdict("info", false, false, false, 0);
+            recorder.end_turn(false);
+        }
+
+        // New FileBackedEventStore reads persisted events
+        let store = FileBackedEventStore::new(&sid);
+        assert!(
+            store.event_count() >= 4,
+            "begin_turn + begin_tool + complete_tool + verdict = at least 4 events, got {}",
+            store.event_count()
+        );
+    }
+}

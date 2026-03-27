@@ -28,6 +28,7 @@
 //! let summary = recorder.finalize();
 //! ```
 
+use crate::pipeline::step_checkpoint::FileBackedEventStore;
 use crate::pipeline::step_protocol::*;
 use std::collections::HashMap;
 
@@ -46,6 +47,8 @@ pub struct StepRecorder {
     phase_log: Vec<(u32, StepAction, u64)>,
     /// Light checkpoint after each tool, heavy after each turn
     checkpoint_count: u32,
+    /// Optional file-backed persistence (JSONL) for events
+    file_store: Option<FileBackedEventStore>,
 }
 
 impl StepRecorder {
@@ -60,6 +63,16 @@ impl StepRecorder {
             tool_timings: HashMap::new(),
             phase_log: Vec::new(),
             checkpoint_count: 0,
+            file_store: None,
+        }
+    }
+
+    /// Create with file-backed persistence (events written to JSONL on disk).
+    pub fn with_persistence(session_id: &str, task_id: &str) -> Self {
+        let file_store = FileBackedEventStore::new(session_id);
+        Self {
+            file_store: Some(file_store),
+            ..Self::new(session_id, task_id)
         }
     }
 
@@ -439,7 +452,7 @@ impl StepRecorder {
     }
 
     fn emit(&mut self, step_id: &str, event_type: StepEventType) {
-        self.events.push(StepEvent {
+        let event = StepEvent {
             event_id: format!("evt-{}-{}", self.events.len(), epoch_ms()),
             step_id: step_id.to_string(),
             event_type,
@@ -451,7 +464,11 @@ impl StepRecorder {
             },
             payload: None,
             created_at: epoch_ms(),
-        });
+        };
+        if let Some(ref mut fs) = self.file_store {
+            fs.append(event.clone());
+        }
+        self.events.push(event);
     }
 
     fn emit_with_payload(&mut self, event_type: StepEventType, payload: serde_json::Value) {
@@ -464,7 +481,7 @@ impl StepRecorder {
         } else {
             vec![self.events.last().unwrap().event_id.clone()]
         };
-        self.events.push(StepEvent {
+        let event = StepEvent {
             event_id: format!("evt-{}-{}", self.events.len(), epoch_ms()),
             step_id,
             event_type,
@@ -472,7 +489,11 @@ impl StepRecorder {
             caused_by,
             payload: Some(payload),
             created_at: epoch_ms(),
-        });
+        };
+        if let Some(ref mut fs) = self.file_store {
+            fs.append(event.clone());
+        }
+        self.events.push(event);
     }
 }
 

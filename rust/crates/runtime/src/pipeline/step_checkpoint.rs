@@ -3,6 +3,9 @@
 //! Stores checkpoints at:
 //! `~/.mo-agent/sessions/<session_id>/step_checkpoints/<number>-<tier>.json`
 //!
+//! Also provides a file-backed StepEventStore that writes events as JSONL:
+//! `~/.mo-agent/sessions/<session_id>/step_events.jsonl`
+//!
 //! Light checkpoints (~1KB) written after each tool completion.
 //! Heavy checkpoints (~10-100KB) written after each turn's verdict.
 //! On crash recovery, the latest heavy checkpoint restores full session state.
@@ -10,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use super::step_protocol::{
-    CheckpointTier, HeavyCheckpoint, LightCheckpoint, StepCheckpoint,
+    CheckpointTier, HeavyCheckpoint, LightCheckpoint, StepCheckpoint, StepEvent, StepEventStore,
 };
 
 /// Directory name within session workspace for step checkpoints.
@@ -176,6 +179,165 @@ fn prune_light_checkpoints(dir: &Path) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// File-Backed StepEventStore (JSONL)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// File path for step events JSONL.
+fn events_path_for(session_id: &str) -> PathBuf {
+    session_dir_for(session_id).join("step_events.jsonl")
+}
+
+fn session_dir_for(session_id: &str) -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".mo-agent")
+        .join("sessions")
+        .join(session_id)
+}
+
+/// File-backed event store: in-memory DAG + append-only JSONL on disk.
+/// Writes are immediate (no buffering) for crash safety.
+pub struct FileBackedEventStore {
+    session_id: String,
+    events: Vec<StepEvent>,
+}
+
+impl FileBackedEventStore {
+    /// Create a new store for a session, loading existing events from disk.
+    pub fn new(session_id: &str) -> Self {
+        let events = Self::load_events(session_id).unwrap_or_default();
+        Self {
+            session_id: session_id.to_string(),
+            events,
+        }
+    }
+
+    /// Create empty (for tests or ephemeral sessions).
+    pub fn empty(session_id: &str) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            events: Vec::new(),
+        }
+    }
+
+    /// Load events from JSONL file.
+    fn load_events(session_id: &str) -> std::io::Result<Vec<StepEvent>> {
+        let path = events_path_for(session_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let content = std::fs::read_to_string(&path)?;
+        let mut events = Vec::new();
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(event) = serde_json::from_str::<StepEvent>(line) {
+                events.push(event);
+            }
+            // Skip malformed lines (best-effort)
+        }
+        Ok(events)
+    }
+
+    /// Append a single event to the JSONL file.
+    fn persist_event(&self, event: &StepEvent) -> std::io::Result<()> {
+        let dir = session_dir_for(&self.session_id);
+        std::fs::create_dir_all(&dir)?;
+        let path = events_path_for(&self.session_id);
+        let json = serde_json::to_string(event)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(file, "{}", json)?;
+        Ok(())
+    }
+
+    /// Get all events (for audit/replay).
+    pub fn all_events(&self) -> &[StepEvent] {
+        &self.events
+    }
+
+    /// Event count.
+    pub fn event_count(&self) -> usize {
+        self.events.len()
+    }
+}
+
+impl StepEventStore for FileBackedEventStore {
+    fn append(&mut self, event: StepEvent) {
+        let _ = self.persist_event(&event); // best-effort write
+        self.events.push(event);
+    }
+
+    fn events_for_step(&self, step_id: &str) -> Vec<&StepEvent> {
+        self.events
+            .iter()
+            .filter(|e| e.step_id == step_id)
+            .collect()
+    }
+
+    fn ancestors(&self, event_id: &str) -> Vec<&StepEvent> {
+        let mut result = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        let mut visited = std::collections::HashSet::new();
+        queue.push_back(event_id.to_string());
+        visited.insert(event_id.to_string());
+
+        while let Some(current) = queue.pop_front() {
+            if let Some(ev) = self.events.iter().find(|e| e.event_id == current) {
+                if ev.event_id != event_id {
+                    result.push(ev);
+                }
+                for parent in &ev.caused_by {
+                    if visited.insert(parent.clone()) {
+                        queue.push_back(parent.clone());
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn descendants(&self, event_id: &str) -> Vec<&StepEvent> {
+        let mut result = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        let mut visited = std::collections::HashSet::new();
+        queue.push_back(event_id.to_string());
+        visited.insert(event_id.to_string());
+
+        while let Some(current) = queue.pop_front() {
+            for ev in &self.events {
+                if ev.caused_by.contains(&current) && visited.insert(ev.event_id.clone()) {
+                    result.push(ev);
+                    queue.push_back(ev.event_id.clone());
+                }
+            }
+        }
+        result
+    }
+
+    fn leaves(&self) -> Vec<&StepEvent> {
+        let parent_ids: std::collections::HashSet<&str> = self
+            .events
+            .iter()
+            .flat_map(|e| e.caused_by.iter().map(|s| s.as_str()))
+            .collect();
+        self.events
+            .iter()
+            .filter(|e| !parent_ids.contains(e.event_id.as_str()))
+            .collect()
+    }
+
+    fn len(&self) -> usize {
+        self.events.len()
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -384,5 +546,124 @@ mod tests {
         let result = read_latest_heavy_checkpoint("nonexistent-session-xyz-42");
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    // ── FileBackedEventStore tests ──────────────────────────────────────────
+
+    use crate::pipeline::step_protocol::StepEventType;
+
+    fn make_event(id: &str, step_id: &str, event_type: StepEventType) -> StepEvent {
+        StepEvent {
+            event_id: id.to_string(),
+            step_id: step_id.to_string(),
+            event_type,
+            agent_id: None,
+            caused_by: vec![],
+            payload: None,
+            created_at: 1000,
+        }
+    }
+
+    #[test]
+    fn file_event_store_append_and_count() {
+        let mut store = FileBackedEventStore::empty("test-events-empty");
+        assert_eq!(store.event_count(), 0);
+
+        store.append(make_event("e1", "step-1", StepEventType::StepCreated));
+        store.append(make_event("e2", "step-1", StepEventType::ToolCallStarted));
+        assert_eq!(store.event_count(), 2);
+    }
+
+    #[test]
+    fn file_event_store_events_for_step() {
+        let mut store = FileBackedEventStore::empty("test-events-step");
+        store.append(make_event("e1", "step-1", StepEventType::StepCreated));
+        store.append(make_event("e2", "step-2", StepEventType::StepCreated));
+        store.append(make_event("e3", "step-1", StepEventType::ToolCallCompleted));
+
+        let step1_events = store.events_for_step("step-1");
+        assert_eq!(step1_events.len(), 2);
+        let step2_events = store.events_for_step("step-2");
+        assert_eq!(step2_events.len(), 1);
+    }
+
+    #[test]
+    fn file_event_store_ancestors() {
+        let mut store = FileBackedEventStore::empty("test-events-ancestors");
+        store.append(make_event("root", "s1", StepEventType::StepCreated));
+
+        let mut child = make_event("child", "s1", StepEventType::ToolCallStarted);
+        child.caused_by = vec!["root".to_string()];
+        store.append(child);
+
+        let mut grandchild = make_event("grandchild", "s1", StepEventType::ToolCallCompleted);
+        grandchild.caused_by = vec!["child".to_string()];
+        store.append(grandchild);
+
+        let ancestors = store.ancestors("grandchild");
+        assert_eq!(ancestors.len(), 2);
+        let ids: Vec<&str> = ancestors.iter().map(|e| e.event_id.as_str()).collect();
+        assert!(ids.contains(&"root"));
+        assert!(ids.contains(&"child"));
+    }
+
+    #[test]
+    fn file_event_store_descendants() {
+        let mut store = FileBackedEventStore::empty("test-events-desc");
+        store.append(make_event("root", "s1", StepEventType::StepCreated));
+
+        let mut child = make_event("child", "s1", StepEventType::ToolCallStarted);
+        child.caused_by = vec!["root".to_string()];
+        store.append(child);
+
+        let desc = store.descendants("root");
+        assert_eq!(desc.len(), 1);
+        assert_eq!(desc[0].event_id, "child");
+    }
+
+    #[test]
+    fn file_event_store_leaves() {
+        let mut store = FileBackedEventStore::empty("test-events-leaves");
+        store.append(make_event("root", "s1", StepEventType::StepCreated));
+
+        let mut child = make_event("child", "s1", StepEventType::ToolCallCompleted);
+        child.caused_by = vec!["root".to_string()];
+        store.append(child);
+
+        let leaves = store.leaves();
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0].event_id, "child");
+    }
+
+    #[test]
+    fn file_event_store_persist_and_reload() {
+        let session_id = format!("test-persist-events-{}", std::process::id());
+        let path = events_path_for(&session_id);
+
+        // Clean up from previous runs
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut store = FileBackedEventStore::empty(&session_id);
+            store.append(make_event("e1", "s1", StepEventType::StepCreated));
+            store.append(make_event("e2", "s1", StepEventType::ToolCallCompleted));
+        }
+
+        // Reload from disk
+        let store2 = FileBackedEventStore::new(&session_id);
+        assert_eq!(store2.event_count(), 2);
+        assert_eq!(store2.all_events()[0].event_id, "e1");
+        assert_eq!(store2.all_events()[1].event_id, "e2");
+
+        // Clean up
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(session_dir_for(&session_id));
+    }
+
+    #[test]
+    fn file_event_store_handles_empty_session() {
+        let store = FileBackedEventStore::new("nonexistent-event-session-xyz");
+        assert_eq!(store.event_count(), 0);
+        assert!(store.all_events().is_empty());
     }
 }
