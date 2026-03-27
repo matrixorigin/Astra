@@ -586,10 +586,16 @@ pub fn all_tool_schemas() -> Vec<Value> {
 
 // ─── Tool execution ───────────────────────────────────────────────────────────
 
-/// Global output size limit (50KB). Individual tools may have tighter limits.
-const GLOBAL_OUTPUT_LIMIT: usize = 50_000;
+/// Global output size limit. Individual tools may have tighter limits.
+/// Override with `MO_GLOBAL_OUTPUT_LIMIT` env var.
+fn global_output_limit() -> usize {
+    mo_agent_core::RuntimeLimits::global().global_output_limit
+}
 /// Per-tool default output limit for tools without explicit truncation.
-const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 20_000;
+/// Override with `MO_TOOL_OUTPUT_LIMIT` env var.
+fn tool_output_limit() -> usize {
+    mo_agent_core::RuntimeLimits::global().tool_output_limit
+}
 
 /// Truncate tool output to `max_bytes`, appending a marker if truncated.
 fn truncate_output(mut output: String, max_bytes: usize) -> String {
@@ -795,7 +801,7 @@ impl ToolExecutor {
             "glob" => self.glob(args),
             "git_status" => truncate_output(
                 self.git_run(&["status", "--short", "--branch"]),
-                DEFAULT_TOOL_OUTPUT_LIMIT,
+                tool_output_limit(),
             ),
             "git_diff" => self.git_diff(args),
             "git_log" => self.git_log(args),
@@ -892,7 +898,7 @@ impl ToolExecutor {
             _ => format!("Unknown tool: {name}"),
         };
         // Global safety net: no tool output exceeds 50KB
-        truncate_output(output, GLOBAL_OUTPUT_LIMIT)
+        truncate_output(output, global_output_limit())
     }
 
     /// Execute a multi-step ToolChain, forwarding each step to self.execute().

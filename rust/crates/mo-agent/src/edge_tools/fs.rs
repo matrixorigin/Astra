@@ -70,7 +70,7 @@ impl ToolExecutor {
         let lines: Vec<&str> = content.lines().collect();
         let s = start.unwrap_or(1).saturating_sub(1);
         let e = end.unwrap_or(lines.len()).min(lines.len());
-        truncate_output(lines[s..e].join("\n"), GLOBAL_OUTPUT_LIMIT)
+        truncate_output(lines[s..e].join("\n"), global_output_limit())
     }
 
     pub(crate) fn write_file(&self, args: &Value) -> String {
@@ -166,7 +166,7 @@ impl ToolExecutor {
         if out.is_empty() {
             "(empty)".to_string()
         } else {
-            truncate_output(out, DEFAULT_TOOL_OUTPUT_LIMIT)
+            truncate_output(out, tool_output_limit())
         }
     }
 

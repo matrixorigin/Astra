@@ -1,6 +1,6 @@
 use super::*;
 
-const MAX_TURNS: usize = 25;
+use mo_agent_core::RuntimeLimits;
 
 /// Tools that are idempotent reads — safe to cache across turns.
 /// Side-effectful tools (bash, write_file, mo_query, etc.) must NOT be in this list.
@@ -526,14 +526,15 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     // Stall enforcement: tools restricted from schema after nudge-ignore
     let mut restricted_tools: HashSet<String> = HashSet::new();
     // Dynamic turn budget: each stall/divergence costs turns to prevent runaway sessions
-    let mut remaining_turns: usize = MAX_TURNS;
+    let max_turns = RuntimeLimits::global().max_turns;
+    let mut remaining_turns: usize = max_turns;
     // Step Protocol recorder: maps implicit chat_stream phases to explicit Step events
     let mut step_recorder = mo_agent_runtime::pipeline::step_recorder::StepRecorder::new(
         current_session_id.as_deref().unwrap_or("ephemeral"),
         &format!("chat-{}", start.elapsed().as_millis()),
     );
 
-    for _turn in 0..MAX_TURNS {
+    for _turn in 0..max_turns {
         if remaining_turns == 0 {
             return Err("Turn budget exhausted due to repeated stalls. Aborting.".to_string());
         }

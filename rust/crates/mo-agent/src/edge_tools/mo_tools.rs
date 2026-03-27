@@ -7,7 +7,7 @@
 //!   MATRIXONE_HOST (default: localhost)
 //!   MATRIXONE_PORT (default: 6001)
 //!   MATRIXONE_USER (default: root)
-//!   MATRIXONE_PASSWORD (default: 111)
+//!   MATRIXONE_PASSWORD (default: dev-only; set for production!)
 //!   MATRIXONE_DATABASE (default: dev_agent)
 //!
 //! Uses the `mysql` CLI client (MySQL protocol compatible), same pattern as
@@ -21,10 +21,12 @@ use super::*;
 
 /// Build a mysql Command with connection parameters from environment.
 fn mo_mysql_cmd(database: Option<&str>) -> Command {
+    mo_agent_core::warn_default_credentials_once();
     let host = std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".to_string());
     let port = std::env::var("MATRIXONE_PORT").unwrap_or_else(|_| "6001".to_string());
     let user = std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".to_string());
-    let password = std::env::var("MATRIXONE_PASSWORD").unwrap_or_else(|_| "111".to_string());
+    let password = std::env::var("MATRIXONE_PASSWORD")
+        .unwrap_or_else(|_| mo_agent_core::DEV_MATRIXONE_PASSWORD.to_string());
     let db = database.map(String::from).unwrap_or_else(|| {
         std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "dev_agent".to_string())
     });

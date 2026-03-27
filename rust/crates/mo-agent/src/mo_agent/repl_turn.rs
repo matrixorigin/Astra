@@ -519,7 +519,8 @@ fn try_init_ingestion(state: &mut ReplState) {
             .and_then(|s| s.parse().ok())
             .unwrap_or(6001),
         user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
-        password: std::env::var("MATRIXONE_PASSWORD").unwrap_or_else(|_| "111".into()),
+        password: std::env::var("MATRIXONE_PASSWORD")
+            .unwrap_or_else(|_| mo_agent_core::DEV_MATRIXONE_PASSWORD.into()),
         database: std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "dev_agent".into()),
     };
 

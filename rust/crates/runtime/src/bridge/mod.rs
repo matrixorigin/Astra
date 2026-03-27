@@ -30,7 +30,7 @@ use self::sse_events::{
     parse_bridge_state_frame, render_sse_json,
 };
 
-use crate::turn::routing::MAX_TOOL_ROUNDS;
+use crate::turn::routing::max_tool_rounds;
 
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
 /// Safety limit for SSE frame buffer. Prevents OOM if a client is slow or a
@@ -488,8 +488,8 @@ where
                             if let Some(sigs) = pending_bridge_state.as_ref().and_then(bridge_state_tool_signatures)
                                 && !sigs.is_empty() {
                                     tool_rounds += 1;
-                                    if tool_rounds > MAX_TOOL_ROUNDS {
-                                        eprintln!("Turn exceeded MAX_TOOL_ROUNDS ({}), forcing completion", MAX_TOOL_ROUNDS);
+                                    if tool_rounds > max_tool_rounds() {
+                                        eprintln!("Turn exceeded max_tool_rounds ({}), forcing completion", max_tool_rounds());
                                         yield Ok(Bytes::from(render_sse_json(serde_json::json!({
                                             "type": "turn_complete",
                                             "has_tool_calls": false,

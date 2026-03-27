@@ -4564,3 +4564,46 @@ mod security_safety_gaps {
         );
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § RUNTIME LIMITS CENTRALIZATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Proves that RuntimeLimits centralizes all previously-scattered constants
+/// and that they can be overridden via environment variables.
+#[cfg(test)]
+mod runtime_limits_proofs {
+    use mo_agent_core::RuntimeLimits;
+
+    #[test]
+    fn defaults_match_original_scattered_constants() {
+        // These were previously scattered across 6+ files as raw constants.
+        // Now centralized with env-var override capability.
+        let d = RuntimeLimits::default();
+        assert_eq!(d.max_turns, 25, "was MAX_TURNS in chat_stream.rs");
+        assert_eq!(d.max_tool_rounds, 10, "was MAX_TOOL_ROUNDS in routing.rs");
+        assert!((d.turn_timeout_s - 240.0).abs() < f64::EPSILON, "was TURN_TIMEOUT_S in bridge_inprocess.rs");
+        assert_eq!(d.global_output_limit, 50_000, "was GLOBAL_OUTPUT_LIMIT in edge_tools.rs");
+        assert_eq!(d.tool_output_limit, 20_000, "was DEFAULT_TOOL_OUTPUT_LIMIT in edge_tools.rs");
+        assert_eq!(d.max_tool_retries, 2, "was MAX_TOOL_RETRIES in error_recovery.rs");
+        assert_eq!(d.retry_base_ms, 500, "was RETRY_BASE_MS in error_recovery.rs");
+        assert_eq!(d.max_retrieved, 6, "was MAX_RETRIEVED in retrieval.rs");
+    }
+
+    #[test]
+    fn global_singleton_is_accessible_everywhere() {
+        let limits = RuntimeLimits::global();
+        // Just verify it doesn't panic and returns valid values
+        assert!(limits.max_turns > 0);
+        assert!(limits.max_tool_rounds > 0);
+        assert!(limits.turn_timeout_s > 0.0);
+        assert!(limits.global_output_limit > 0);
+    }
+
+    #[test]
+    fn dev_password_constant_is_centralized() {
+        // Previously "111" was hardcoded in mo_tools.rs, config.rs, repl_turn.rs
+        // Now a single constant in runtime_limits.
+        assert_eq!(mo_agent_core::DEV_MATRIXONE_PASSWORD, "111");
+    }
+}

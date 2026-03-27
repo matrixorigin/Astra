@@ -26,7 +26,9 @@ use crate::{
 
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
 
-const TURN_TIMEOUT_S: f64 = 240.0;
+fn turn_timeout_s() -> f64 {
+    mo_agent_core::RuntimeLimits::global().turn_timeout_s
+}
 
 fn count_inprocess_persisted_events(
     core_event_count: usize,
@@ -305,7 +307,7 @@ async fn call_llm_stream(
 ) -> Result<impl futures_util::Stream<Item = Bytes> + Send + 'static, String> {
     let client = reqwest::Client::builder()
         .no_proxy()
-        .timeout(std::time::Duration::from_secs(TURN_TIMEOUT_S as u64 + 10))
+        .timeout(std::time::Duration::from_secs(turn_timeout_s() as u64 + 10))
         .build()
         .map_err(|e| e.to_string())?;
 

@@ -192,7 +192,7 @@ impl ToolExecutor {
         }
 
         let parsed = parse_blame_porcelain(&output);
-        truncate_output(parsed, DEFAULT_TOOL_OUTPUT_LIMIT)
+        truncate_output(parsed, tool_output_limit())
     }
 
     /// `git_file_history`: change history for a specific file with follow support.
@@ -244,7 +244,7 @@ impl ToolExecutor {
                 lines.len(),
                 lines.join("\n")
             ),
-            DEFAULT_TOOL_OUTPUT_LIMIT,
+            tool_output_limit(),
         )
     }
 
@@ -315,7 +315,7 @@ impl ToolExecutor {
         if parts.is_empty() {
             "No git history found".to_string()
         } else {
-            truncate_output(parts.join("\n\n"), DEFAULT_TOOL_OUTPUT_LIMIT)
+            truncate_output(parts.join("\n\n"), tool_output_limit())
         }
     }
 
@@ -392,7 +392,7 @@ impl ToolExecutor {
             ));
         }
 
-        truncate_output(result, DEFAULT_TOOL_OUTPUT_LIMIT)
+        truncate_output(result, tool_output_limit())
     }
 }
 

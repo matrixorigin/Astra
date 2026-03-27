@@ -15,7 +15,10 @@ const RETRIEVAL_HEADER: &str = "[Earlier relevant context from this session]\n";
 /// Freshness decay base: score *= DECAY_BASE^distance_from_end
 const DECAY_BASE: f64 = 0.95;
 /// Maximum number of top-scored messages to include in retrieval output.
-const MAX_RETRIEVED: usize = 6;
+/// Override with `MO_MAX_RETRIEVED` env var.
+fn max_retrieved() -> usize {
+    mo_agent_core::RuntimeLimits::global().max_retrieved
+}
 
 // ── TF-IDF helpers ───────────────────────────────────────────────────────────
 
@@ -228,7 +231,7 @@ pub fn enhanced_extraction(
 fn assemble_parts(scored: &[(f64, &Map<String, Value>)], budget_chars: usize) -> Option<String> {
     let mut parts = Vec::new();
     let mut used_chars = 0usize;
-    for (_, message) in scored.iter().take(MAX_RETRIEVED) {
+    for (_, message) in scored.iter().take(max_retrieved()) {
         let content = message.get("content").and_then(Value::as_str).unwrap_or("");
         let line = match message.get("role").and_then(Value::as_str).unwrap_or("?") {
             "user" => format!("User: {}", prefix_chars(content, 200)),
