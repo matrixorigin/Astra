@@ -847,6 +847,82 @@ fn try_cloud_push(
     }
 }
 
+/// Pull user preferences from cloud at session start.
+/// Merges cloud preferences into local state (cloud-wins).
+fn try_cloud_pull_preferences(state: &mut ReplState) {
+    let pool = match try_connect_matrixone_sync() {
+        Some(p) => p,
+        None => return,
+    };
+    let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
+    let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+    let rt = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    match rt.block_on(
+        mo_agent_services::state_sync::StateSyncService::pull_all_preferences(&svc, &user_id),
+    ) {
+        Ok(prefs) if !prefs.is_empty() => {
+            use mo_agent_services::state_sync::pref_keys;
+            for (key, value) in &prefs {
+                match key.as_str() {
+                    pref_keys::EXPLAIN_MODE => {
+                        state.explain = match value.as_str() {
+                            "on" => ExplainMode::On,
+                            "verbose" => ExplainMode::Verbose,
+                            _ => ExplainMode::Off,
+                        };
+                    }
+                    _ => {} // other prefs stored but not yet applied
+                }
+            }
+            eprintln!(
+                "{}",
+                format!("  ✓ Pulled {} preferences from cloud", prefs.len()).dim()
+            );
+        }
+        Ok(_) => {} // no cloud prefs yet
+        Err(e) => {
+            eprintln!(
+                "{}",
+                format!("  ⚠ Preference pull skipped: {e}").dim()
+            );
+        }
+    }
+}
+
+/// Push user preferences to cloud at session end.
+fn try_cloud_push_preferences(state: &ReplState) {
+    let pool = match try_connect_matrixone_sync() {
+        Some(p) => p,
+        None => return,
+    };
+    let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
+    let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+    let rt = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    use mo_agent_services::state_sync::{StateSyncService, pref_keys};
+    let prefs = [
+        (pref_keys::EXPLAIN_MODE, state.explain.to_string()),
+    ];
+    let mut synced = 0u32;
+    for (key, value) in &prefs {
+        let result = rt.block_on(svc.push_preference(&user_id, key, value));
+        if result.success {
+            synced += 1;
+        }
+    }
+    if synced > 0 {
+        eprintln!(
+            "{}",
+            format!("  ✓ Synced {synced} preferences to cloud").dim()
+        );
+    }
+}
+
 /// Best-effort MatrixOne pool creation for sync operations.
 fn try_connect_matrixone_sync() -> Option<sqlx::Pool<sqlx::MySql>> {
     let host = std::env::var("MATRIXONE_HOST").ok()?;
@@ -1297,6 +1373,8 @@ async fn run_chat_repl(
             &pipeline_modules.pattern_library,
             &pipeline_modules.calibrator,
         );
+        // Try to pull user preferences from cloud
+        try_cloud_pull_preferences(&mut state);
     }
 
     print_repl_banner(profile, &state);
@@ -1421,6 +1499,8 @@ async fn run_chat_repl(
             &pipeline_modules.pattern_library,
             &pipeline_modules.calibrator,
         );
+        // Push preferences to cloud (best-effort)
+        try_cloud_push_preferences(&state);
     }
 
     let _ = editor.save_history(&hist_path);

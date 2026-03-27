@@ -27,6 +27,8 @@ pub struct ToolRegistry {
     schema_index: std::collections::HashMap<String, usize>,
     /// Pre-resolved pinned tool schemas (cloned once at construction).
     pinned_schemas: Vec<(String, Value)>,
+    /// Plugin tool names (registered dynamically, always included in selection).
+    plugin_tool_names: Vec<String>,
 }
 
 impl ToolRegistry {
@@ -40,6 +42,7 @@ impl ToolRegistry {
             measured_costs,
             schema_index,
             pinned_schemas,
+            plugin_tool_names: Vec::new(),
         }
     }
 
@@ -429,12 +432,14 @@ impl ToolRegistry {
     ) -> Vec<Value> {
         let mut result = Vec::new();
         let mut used_tokens: u32 = 0;
+        let mut included_names = std::collections::HashSet::new();
 
         // Always include pinned tools first (budget-exempt)
         for tool in TOOL_CATALOG.iter() {
             if tool.pinned
                 && let Some(schema) = self.find_schema(tool.name)
             {
+                included_names.insert(tool.name.to_string());
                 result.push(schema);
             }
         }
@@ -447,6 +452,22 @@ impl ToolRegistry {
                 continue;
             }
             if let Some(schema) = self.find_schema(tool.name) {
+                included_names.insert(tool.name.to_string());
+                result.push(schema);
+                used_tokens += cost;
+            }
+        }
+
+        // Include registered plugin tools if budget permits
+        for name in &self.plugin_tool_names {
+            if included_names.contains(name) {
+                continue;
+            }
+            let cost = self.token_cost(name);
+            if used_tokens + cost > budget_tokens {
+                continue;
+            }
+            if let Some(schema) = self.find_schema(name) {
                 result.push(schema);
                 used_tokens += cost;
             }
@@ -523,6 +544,16 @@ impl ToolRegistry {
         let plugin_schemas = plugins.schemas();
         if plugin_schemas.is_empty() {
             return;
+        }
+        // Track plugin tool names for inclusion in selection
+        for schema in &plugin_schemas {
+            if let Some(name) = schema
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+            {
+                self.plugin_tool_names.push(name.to_string());
+            }
         }
         self.all_schemas.extend(plugin_schemas);
         // Rebuild indexes to include the new schemas

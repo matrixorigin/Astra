@@ -4285,6 +4285,54 @@ mod plugin_registry_wiring {
         // Pinned tools come from TOOL_CATALOG, not schemas — should be unchanged
         assert_eq!(registry.pinned_schemas().len(), pinned_before);
     }
+
+    /// PROOF: Plugin tools are included in budget selection.
+    ///
+    /// OLD: budget_select_measured only iterated TOOL_CATALOG indices.
+    ///      Plugin tools existed in all_schemas but were never selected.
+    /// NEW: budget_select_measured includes plugin tools after TOOL_CATALOG
+    ///      tools, respecting budget limits.
+    #[test]
+    fn plugin_tools_included_in_budget_selection() {
+        use mo_agent_runtime::pipeline::routing::RoutingEngine;
+
+        // Create registry with minimal schemas + a plugin
+        let mut registry = ToolRegistry::new(vec![]);
+        let mut plugins = PluginRegistry::new();
+        plugins
+            .register(make_plugin_entry("k8s_pods", "List Kubernetes pods"))
+            .unwrap();
+        registry.register_plugins(&plugins);
+
+        // Analyze query to get a RoutingDecision
+        let routing = RoutingEngine::analyze("show me k8s pods", 1, &[], &[], vec![]);
+
+        let (schemas, report) = registry.select_routed(
+            "show me k8s pods",
+            &routing,
+            10_000, // generous budget
+            &[],
+            None,
+            None,
+        );
+        let names: Vec<&str> = schemas
+            .iter()
+            .filter_map(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+            })
+            .collect();
+
+        assert!(
+            names.contains(&"k8s_pods"),
+            "plugin tool should appear in selection: {names:?}"
+        );
+        assert!(
+            report.tools_selected.iter().any(|n| n == "k8s_pods"),
+            "plugin tool should appear in report"
+        );
+    }
 }
 
 // ═══════════════════════════════ ToolChain Catalog Tests ═════════════════
@@ -4472,5 +4520,47 @@ mod security_safety_gaps {
         assert!(is_error(file_error), "should detect file errors");
         assert!(is_error(json_error), "should detect JSON errors");
         assert!(!is_error(success), "should not flag success output");
+    }
+
+    /// PROOF: Preference constants are well-defined for cloud sync.
+    #[test]
+    fn preference_keys_are_defined() {
+        use mo_agent_services::state_sync::pref_keys;
+        // All preference keys should be non-empty strings
+        assert!(!pref_keys::EXPLAIN_MODE.is_empty());
+        assert!(!pref_keys::DEFAULT_MODEL.is_empty());
+        assert!(!pref_keys::TOOL_BUDGET.is_empty());
+        assert!(!pref_keys::CHECKPOINT_INTERVAL.is_empty());
+        assert!(!pref_keys::FOCUS_ENTITIES.is_empty());
+        assert!(!pref_keys::LANGUAGE.is_empty());
+    }
+
+    /// PROOF: PatternLibrary.suggest() returns relevant patterns.
+    ///
+    /// OLD: suggest() was only tested, never called in production.
+    /// NEW: boost_terms_for() (which calls suggest internally) IS wired
+    ///      in production. This test proves the mechanism works.
+    #[test]
+    fn pattern_library_suggest_returns_relevant() {
+        use mo_agent_runtime::pipeline::pattern::PatternLibrary;
+        use mo_agent_runtime::pipeline::routing::TaskType;
+        let mut lib = PatternLibrary::new();
+        // Record some patterns
+        let tools: Vec<String> = vec!["git_log".into(), "read_file".into(), "bash".into()];
+        lib.record_outcome(&tools, TaskType::Code, None, true, 0.8);
+        lib.record_outcome(&tools, TaskType::Code, None, true, 0.9);
+        lib.record_outcome(&tools, TaskType::Code, None, true, 0.7);
+
+        let suggestions = lib.suggest(TaskType::Code, None, 5);
+        assert!(!suggestions.is_empty(), "should return at least one pattern");
+
+        // boost_terms_for should extract tool names from suggestions
+        let boost = lib.boost_terms_for(TaskType::Code, None);
+        assert!(!boost.is_empty(), "should produce boost terms");
+        // Should contain the tools we recorded
+        assert!(
+            boost.iter().any(|t| t == "git_log" || t == "read_file" || t == "bash"),
+            "boost terms should include recorded tools: {boost:?}"
+        );
     }
 }
