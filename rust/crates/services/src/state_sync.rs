@@ -761,4 +761,196 @@ mod tests {
         assert!(status.last_error.is_none());
         assert_eq!(status.pending_pushes, 0);
     }
+
+    // ── MatrixOneSyncService tests (mock-based) ──
+
+    #[test]
+    fn sync_direction_serializes_correctly() {
+        // Verify JSON serialization of direction (used in sync logs)
+        let push_json = serde_json::to_string(&SyncDirection::Push).unwrap();
+        let pull_json = serde_json::to_string(&SyncDirection::Pull).unwrap();
+
+        assert_ne!(
+            push_json, pull_json,
+            "Push and Pull must serialize differently"
+        );
+
+        let push_back: SyncDirection = serde_json::from_str(&push_json).unwrap();
+        let pull_back: SyncDirection = serde_json::from_str(&pull_json).unwrap();
+
+        assert_eq!(push_back, SyncDirection::Push);
+        assert_eq!(pull_back, SyncDirection::Pull);
+    }
+
+    #[test]
+    fn sync_result_ok_contains_expected_fields() {
+        let result = SyncResult::ok(SyncDirection::Push, "learning", 5);
+
+        assert!(result.success);
+        assert_eq!(result.direction, SyncDirection::Push);
+        assert_eq!(result.sync_type, "learning");
+        assert_eq!(result.items_synced, 5);
+        assert_eq!(result.message, "ok");
+    }
+
+    #[test]
+    fn sync_result_err_contains_error_message() {
+        let result = SyncResult::err(SyncDirection::Pull, "preferences", "connection refused");
+
+        assert!(!result.success);
+        assert_eq!(result.direction, SyncDirection::Pull);
+        assert_eq!(result.sync_type, "preferences");
+        assert_eq!(result.items_synced, 0);
+        assert_eq!(result.message, "connection refused");
+    }
+
+    #[test]
+    fn sync_result_json_roundtrip_preserves_all_fields() {
+        let original = SyncResult {
+            direction: SyncDirection::Push,
+            sync_type: "learning".to_string(),
+            success: true,
+            items_synced: 10,
+            message: "synced 10 entities".to_string(),
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: SyncResult = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.direction, original.direction);
+        assert_eq!(restored.sync_type, original.sync_type);
+        assert_eq!(restored.success, original.success);
+        assert_eq!(restored.items_synced, original.items_synced);
+        assert_eq!(restored.message, original.message);
+    }
+
+    #[test]
+    fn sync_status_default_has_clean_state() {
+        let status = SyncStatus::default();
+
+        assert!(status.learning_last_push.is_none());
+        assert!(status.learning_last_pull.is_none());
+        assert!(status.preferences_last_sync.is_none());
+        assert_eq!(status.pending_pushes, 0);
+        assert!(status.last_error.is_none());
+    }
+
+    #[test]
+    fn sync_status_with_values_roundtrips_through_json() {
+        let original = SyncStatus {
+            learning_last_push: Some("2024-01-01T00:00:00Z".to_string()),
+            learning_last_pull: Some("2024-01-02T00:00:00Z".to_string()),
+            preferences_last_sync: Some("2024-01-03T00:00:00Z".to_string()),
+            pending_pushes: 3,
+            last_error: Some("connection refused".to_string()),
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: SyncStatus = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.learning_last_push, original.learning_last_push);
+        assert_eq!(restored.pending_pushes, original.pending_pushes);
+        assert_eq!(restored.last_error, original.last_error);
+    }
+
+    #[tokio::test]
+    async fn local_only_push_learning_is_noop_but_succeeds() {
+        let svc = LocalOnlySyncService;
+
+        // Push with actual data
+        let result = svc
+            .push_learning(
+                "user1",
+                "default",
+                r#"{"entities":[{"name":"test","count":5}]}"#,
+                1,
+                0,
+                true,
+            )
+            .await;
+
+        // Should succeed (no-op)
+        assert!(result.success, "LocalOnly should always succeed");
+        assert_eq!(result.items_synced, 0, "LocalOnly doesn't actually sync");
+    }
+
+    #[tokio::test]
+    async fn local_only_pull_learning_returns_none_for_any_user() {
+        let svc = LocalOnlySyncService;
+
+        // Try pulling for different users/profiles
+        let result1 = svc.pull_learning("user1", "default").await;
+        let result2 = svc.pull_learning("user2", "work").await;
+
+        assert!(result1.unwrap().is_none());
+        assert!(result2.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn local_only_push_and_pull_preference_roundtrip() {
+        let svc = LocalOnlySyncService;
+
+        // Push preference
+        let push_result = svc.push_preference("user1", "model", "gpt-4").await;
+        assert!(push_result.success);
+
+        // Pull returns none (LocalOnly has no storage)
+        let pull_result = svc.pull_preference("user1", "model").await;
+        assert!(pull_result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn local_only_pull_all_preferences_returns_empty() {
+        let svc = LocalOnlySyncService;
+
+        let result = svc.pull_all_preferences("user1").await;
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_only_status_reflects_no_activity() {
+        let svc = LocalOnlySyncService;
+
+        let status = svc.status().await;
+
+        assert!(status.last_error.is_none());
+        assert_eq!(status.pending_pushes, 0);
+        assert!(status.learning_last_push.is_none());
+    }
+
+    #[tokio::test]
+    async fn orchestrator_full_sync_returns_both_directions() {
+        let orch = SyncOrchestrator::new(Box::new(LocalOnlySyncService), "user1", "default");
+
+        let results = orch.full_sync("{}", 0, 0, false).await;
+
+        // Should return pull + push results
+        assert_eq!(results.len(), 2);
+
+        // Both should succeed (LocalOnly)
+        assert!(results.iter().all(|r| r.success));
+    }
+
+    #[tokio::test]
+    async fn orchestrator_save_and_push_with_actual_data() {
+        let orch = SyncOrchestrator::new(Box::new(LocalOnlySyncService), "user1", "profile1");
+
+        let json = r#"{"entities":[{"name":"project_x","observations":10}]}"#;
+        let result = orch.save_and_push(json, 1, 1, true).await;
+
+        assert!(result.success);
+    }
+
+    #[tokio::test]
+    async fn orchestrator_preference_operations() {
+        let orch = SyncOrchestrator::new(Box::new(LocalOnlySyncService), "user1", "default");
+
+        // Set preference
+        let set_result = orch.set_preference("language", "zh-CN").await;
+        assert!(set_result.success);
+
+        // Get returns none (LocalOnly)
+        let get_result = orch.get_preference("language").await;
+        assert!(get_result.unwrap().is_none());
+    }
 }

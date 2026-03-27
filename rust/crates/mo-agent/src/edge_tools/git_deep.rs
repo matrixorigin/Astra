@@ -644,4 +644,201 @@ filename test.rs
         let result = executor.git_log_search(&serde_json::json!({"query": "fix", "n": 50}));
         assert!(!result.is_empty(), "should return something");
     }
+
+    // ── Additional integration tests for stronger verification ──
+
+    #[test]
+    fn git_tools_all_have_required_params() {
+        let executor = ToolExecutor::new(std::env::temp_dir());
+
+        // git_blame requires file
+        let blame = executor.git_blame(&serde_json::json!({}));
+        assert!(blame.contains("missing"), "blame should require file param");
+
+        // git_file_history requires file
+        let history = executor.git_file_history(&serde_json::json!({}));
+        assert!(
+            history.contains("missing"),
+            "history should require file param"
+        );
+
+        // git_log_search requires query
+        let search = executor.git_log_search(&serde_json::json!({}));
+        assert!(
+            search.contains("missing"),
+            "search should require query param"
+        );
+
+        // git_contributors is optional (no required params)
+        let contrib = executor.git_contributors(&serde_json::json!({}));
+        assert!(
+            !contrib.contains("missing"),
+            "contributors should be optional"
+        );
+    }
+
+    #[test]
+    fn git_blame_with_line_range_respects_bounds() {
+        let root = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+        let executor = ToolExecutor::new(&root);
+
+        // Blame lines 1-3 of Cargo.toml
+        let result = executor.git_blame(&serde_json::json!({
+            "file": "Cargo.toml",
+            "line_start": 1,
+            "line_end": 3
+        }));
+
+        // Parse line numbers from output: format is "L1   hash date [author] content"
+        let line_numbers: Vec<u32> = result
+            .lines()
+            .filter_map(|l| {
+                let trimmed = l.trim_start_matches('L');
+                trimmed.split_whitespace().next()?.parse::<u32>().ok()
+            })
+            .collect();
+
+        // All parsed line numbers must be within 1-3
+        for n in &line_numbers {
+            assert!(
+                *n >= 1 && *n <= 3,
+                "line number {} is outside range 1-3 in output: {}",
+                n,
+                result
+            );
+        }
+
+        // Must have found at least one line
+        assert!(
+            !line_numbers.is_empty(),
+            "should have parsed at least one line number: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn git_log_search_respects_limit() {
+        let root = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+        let executor = ToolExecutor::new(&root);
+
+        // Search with limit of 2
+        let result = executor.git_log_search(&serde_json::json!({
+            "query": "test",
+            "n": 2
+        }));
+
+        // Output format is "hash|author|date|message" per line
+        let commit_lines: Vec<_> = result
+            .lines()
+            .filter(|l| l.contains('|') && !l.starts_with('#'))
+            .collect();
+
+        assert!(
+            commit_lines.len() <= 2,
+            "should return at most 2 results, got {}",
+            commit_lines.len()
+        );
+    }
+
+    #[test]
+    fn git_file_history_returns_structured_output() {
+        let root = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+        let executor = ToolExecutor::new(&root);
+
+        let result = executor.git_file_history(&serde_json::json!({
+            "file": "Cargo.toml",
+            "n": 3
+        }));
+
+        // Should NOT be the "no history" message
+        assert!(
+            !result.contains("No history found"),
+            "should find history for Cargo.toml: {}",
+            result
+        );
+
+        // Output format: "File: <name>\nCommits: <N>\n\n<hash> <date> [<author>] <msg>"
+        assert!(
+            result.contains("File: Cargo.toml"),
+            "should contain file header"
+        );
+        assert!(result.contains("Commits:"), "should contain commit count");
+
+        // Extract commit count and verify it's a positive number
+        let commit_count: usize = result
+            .lines()
+            .find(|l| l.starts_with("Commits:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        assert!(commit_count > 0, "should have at least 1 commit");
+        assert!(
+            commit_count <= 3,
+            "should respect n=3 limit, got {}",
+            commit_count
+        );
+    }
+
+    #[test]
+    fn git_blame_porcelain_parses_author_and_date() {
+        // Test the parsing function directly with known input
+        let raw = "abc1234567890abc1234567890abc1234567890ab 1 1 1\nauthor Alice\nauthor-mail <alice@example.com>\nauthor-time 1700000000\nauthor-tz +0000\nsummary Initial commit\nfilename test.rs\n\tlet x = 42;\n";
+        let result = parse_blame_porcelain(raw);
+
+        // Verify structured output
+        assert!(result.contains("Alice"), "should contain author name");
+        assert!(result.contains("2023"), "should contain parsed date");
+        assert!(result.contains("L1"), "should contain line number");
+        assert!(result.contains("let x = 42"), "should contain code content");
+        assert!(result.contains("1 lines"), "should contain line count");
+        assert!(result.contains("1 authors"), "should contain author count");
+        assert!(result.contains("1 commits"), "should contain commit count");
+    }
+
+    #[test]
+    fn git_blame_porcelain_multi_author_summary() {
+        let raw = "aaaa1234567890aaaa1234567890aaaa12345678 1 1 1\nauthor Alice\nauthor-time 1700000000\nfilename a.rs\n\tline one\nbbbb1234567890bbbb1234567890bbbb12345678 2 2 1\nauthor Bob\nauthor-time 1700100000\nfilename a.rs\n\tline two\n";
+        let result = parse_blame_porcelain(raw);
+
+        assert!(result.contains("2 lines"), "should count 2 lines");
+        assert!(result.contains("2 authors"), "should count 2 authors");
+        assert!(result.contains("2 commits"), "should count 2 commits");
+    }
+
+    #[test]
+    fn git_contributors_returns_top_list() {
+        let root = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+        let executor = ToolExecutor::new(&root);
+
+        let result = executor.git_contributors(&serde_json::json!({}));
+
+        // Should contain Top Contributors section
+        assert!(
+            result.contains("Top Contributors"),
+            "should have Top Contributors section: {}",
+            result
+        );
+
+        // Should contain numbers (commit counts)
+        assert!(
+            result.contains('\t'),
+            "should contain tab-separated counts: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn git_contributors_with_path_filter() {
+        let root = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+        let executor = ToolExecutor::new(&root);
+
+        // Filter to a specific path
+        let result = executor.git_contributors(&serde_json::json!({
+            "path": "Cargo.toml"
+        }));
+
+        // Should still return valid output (even if only 1 contributor)
+        assert!(!result.is_empty());
+        assert!(result.contains("Top Contributors") || result.contains("Hot Files"));
+    }
 }
