@@ -6605,3 +6605,172 @@ mod turnguard_step_integration_proofs {
         assert!(verdict.severity >= VerdictSeverity::Warning);
     }
 }
+
+// =============================================================================
+// Checkpoint Cloud Persistence Proofs
+// Proves: HeavyCheckpoint serialization round-trip, state_json faithfulness,
+//         StepCheckpoint::Heavy carries full conversation state for recovery.
+// =============================================================================
+mod checkpoint_cloud_persistence_proofs {
+    use mo_agent_runtime::pipeline::step_protocol::{
+        ExecutionCursor, StepAction, HeavyCheckpoint, LightCheckpoint, StepCheckpoint,
+    };
+
+    fn make_light() -> LightCheckpoint {
+        LightCheckpoint {
+            protocol_version: 1000,
+            cursor: ExecutionCursor {
+                phase: StepAction::Evaluate,
+                slots: Vec::new(),
+                parallel: false,
+                wait_trigger: None,
+                sub_step: None,
+            },
+            step_id: "step-abc".to_string(),
+            task_id: "task-1".to_string(),
+            agent_id: "agent-1".to_string(),
+            progress: 0.75,
+            total_tokens: 12000,
+            created_at: 1700000000,
+        }
+    }
+
+    fn make_heavy() -> HeavyCheckpoint {
+        HeavyCheckpoint {
+            light: make_light(),
+            messages: vec![
+                serde_json::json!({"role": "user", "content": "Hello"}),
+                serde_json::json!({"role": "assistant", "content": "Hi!"}),
+            ],
+            budget_remaining_tokens: 50000,
+            budget_remaining_rounds: 8,
+            blocked_tools: vec!["bash".to_string()],
+            recent_tools: vec!["grep".to_string(), "read_file".to_string()],
+            learning_snapshot_id: Some("snap-xyz".to_string()),
+            memory_context: None,
+        }
+    }
+
+    #[test]
+    fn heavy_checkpoint_serialization_roundtrip() {
+        let heavy = make_heavy();
+        let cp = StepCheckpoint::Heavy(Box::new(heavy.clone()));
+        let json = serde_json::to_string(&cp).unwrap();
+
+        // Verify it's valid JSON containing key fields
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(json.contains("step-abc"));
+        assert!(json.contains("Hello"));
+        assert!(json.contains("bash"));
+        assert!(parsed.is_object());
+
+        // Roundtrip back
+        let restored: StepCheckpoint = serde_json::from_str(&json).unwrap();
+        match restored {
+            StepCheckpoint::Heavy(boxed) => {
+                assert_eq!(boxed.light.step_id, "step-abc");
+                assert_eq!(boxed.messages.len(), 2);
+                assert_eq!(boxed.budget_remaining_tokens, 50000);
+                assert_eq!(boxed.blocked_tools, vec!["bash"]);
+                assert_eq!(boxed.recent_tools, vec!["grep", "read_file"]);
+                assert_eq!(boxed.learning_snapshot_id, Some("snap-xyz".to_string()));
+            }
+            _ => panic!("Expected Heavy checkpoint"),
+        }
+    }
+
+    #[test]
+    fn state_json_preserves_conversation_messages() {
+        let heavy = make_heavy();
+        let cp = StepCheckpoint::Heavy(Box::new(heavy));
+        let state_json = serde_json::to_string(&cp).unwrap();
+
+        // The state_json must preserve full messages for LLM resume
+        let v: serde_json::Value = serde_json::from_str(&state_json).unwrap();
+        let heavy_obj = v.get("Heavy").expect("StepCheckpoint::Heavy wrapper");
+        let msgs = heavy_obj.get("messages").expect("messages field");
+        assert_eq!(msgs.as_array().unwrap().len(), 2);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[1]["content"], "Hi!");
+    }
+
+    #[test]
+    fn state_json_preserves_protocol_version() {
+        let heavy = make_heavy();
+        let cp = StepCheckpoint::Heavy(Box::new(heavy));
+        let state_json = serde_json::to_string(&cp).unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(&state_json).unwrap();
+        let light = &v["Heavy"]["light"];
+        assert_eq!(light["protocol_version"], 1000);
+    }
+
+    #[test]
+    fn state_json_preserves_execution_cursor() {
+        let heavy = make_heavy();
+        let cp = StepCheckpoint::Heavy(Box::new(heavy));
+        let state_json = serde_json::to_string(&cp).unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(&state_json).unwrap();
+        let cursor = &v["Heavy"]["light"]["cursor"];
+        assert_eq!(cursor["phase"], "Evaluate");
+        // Slot-based cursor: parallel mode and slots array preserved
+        assert_eq!(cursor["parallel"], false);
+        assert!(cursor["slots"].is_array());
+    }
+
+    #[test]
+    fn light_checkpoint_does_not_carry_messages() {
+        let light = make_light();
+        let cp = StepCheckpoint::Light(light);
+        let json = serde_json::to_string(&cp).unwrap();
+        assert!(!json.contains("messages"), "Light checkpoints should NOT have messages");
+        assert!(json.contains("step-abc"));
+    }
+
+    #[test]
+    fn checkpoint_size_reasonable_for_cloud_storage() {
+        let mut heavy = make_heavy();
+        // Simulate a large conversation (100 messages)
+        heavy.messages = (0..100)
+            .map(|i| serde_json::json!({
+                "role": if i % 2 == 0 { "user" } else { "assistant" },
+                "content": format!("Message number {} with some reasonable length content", i),
+            }))
+            .collect();
+
+        let cp = StepCheckpoint::Heavy(Box::new(heavy));
+        let json = serde_json::to_string(&cp).unwrap();
+
+        // Should be well under 1MB for MatrixOne LONGTEXT storage
+        assert!(
+            json.len() < 1_000_000,
+            "100-message checkpoint should be < 1MB, got {} bytes",
+            json.len()
+        );
+    }
+
+    #[test]
+    fn empty_heavy_checkpoint_is_valid() {
+        let cp = StepCheckpoint::Heavy(Box::new(HeavyCheckpoint {
+            light: make_light(),
+            messages: Vec::new(),
+            budget_remaining_tokens: 0,
+            budget_remaining_rounds: 0,
+            blocked_tools: Vec::new(),
+            recent_tools: Vec::new(),
+            learning_snapshot_id: None,
+            memory_context: None,
+        }));
+        let json = serde_json::to_string(&cp).unwrap();
+        let restored: StepCheckpoint = serde_json::from_str(&json).unwrap();
+        match restored {
+            StepCheckpoint::Heavy(h) => {
+                assert!(h.messages.is_empty());
+                assert!(h.blocked_tools.is_empty());
+                assert!(h.learning_snapshot_id.is_none());
+            }
+            _ => panic!("Expected Heavy"),
+        }
+    }
+}

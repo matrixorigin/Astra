@@ -518,6 +518,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     let mut current_run_id: Option<String> = None;
     let mut stall_events: Vec<(String, u32)> = Vec::new();
     let mut verdict_events: Vec<VerdictEvent> = Vec::new();
+    let mut last_heavy_checkpoint: Option<mo_agent_runtime::pipeline::step_protocol::StepCheckpoint> = None;
     let mut tool_call_records: Vec<mo_agent_services::session_journal::ToolCallRecord> = Vec::new();
     // Cross-turn dedup: IdempotencyCache with content-hash keys (Step Protocol)
     let mut idempotency_cache = InMemoryIdempotencyCache::new();
@@ -1511,6 +1512,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                         step_recorder.summary().checkpoints,
                         &cp,
                     );
+                    last_heavy_checkpoint = Some(cp);
                 }
             }
 
@@ -1599,6 +1601,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         verdict_events,
         step_recorder_summary: Some(step_recorder.summary()),
         tool_health_export: turn_guard.health.export(),
+        last_heavy_checkpoint,
     })
 }
 

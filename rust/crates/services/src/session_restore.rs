@@ -444,6 +444,75 @@ pub async fn push_checkpoint_to_cloud(
     Ok(())
 }
 
+/// Push a Step Protocol checkpoint to MatrixOne with full state_json.
+/// Accepts pre-serialized JSON to avoid coupling services crate to runtime types.
+/// The caller serializes the StepCheckpoint; this function stores it.
+pub async fn push_step_checkpoint_to_cloud(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    session_id: &str,
+    user_id: &str,
+    checkpoint_number: u32,
+    turn: u32,
+    tier: &str,
+    title: &str,
+    tools_json: &str,
+    state_json: &str,
+) -> Result<(), String> {
+    let checkpoint_id = uuid::Uuid::new_v4().to_string();
+
+    sqlx::query(
+        "INSERT INTO session_checkpoints \
+         (checkpoint_id, session_id, user_id, number, turn, title, summary, \
+          tools_json, state_json, total_tokens, had_stalls, error_count, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, NOW()) \
+         ON DUPLICATE KEY UPDATE \
+           state_json = VALUES(state_json), tools_json = VALUES(tools_json)",
+    )
+    .bind(&checkpoint_id)
+    .bind(session_id)
+    .bind(user_id)
+    .bind(checkpoint_number as i32)
+    .bind(turn as i32)
+    .bind(title)
+    .bind(tier)
+    .bind(tools_json)
+    .bind(state_json)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("push_step_checkpoint: {e}"))?;
+
+    Ok(())
+}
+
+/// Pull the latest Heavy step checkpoint JSON from MatrixOne for session recovery.
+/// Returns the raw state_json string — caller deserializes to StepCheckpoint.
+pub async fn pull_step_checkpoint_from_cloud(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    session_id: &str,
+) -> Result<Option<String>, String> {
+    use sqlx::Row;
+
+    let row = sqlx::query(
+        "SELECT state_json FROM session_checkpoints \
+         WHERE session_id = ? AND summary = 'heavy' AND state_json IS NOT NULL \
+         ORDER BY number DESC LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("pull_step_checkpoint: {e}"))?;
+
+    match row {
+        Some(row) => {
+            let json: String = row
+                .try_get("state_json")
+                .map_err(|e| format!("read state_json: {e}"))?;
+            Ok(Some(json))
+        }
+        None => Ok(None),
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

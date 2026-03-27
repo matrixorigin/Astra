@@ -302,6 +302,8 @@ struct StreamResult {
     step_recorder_summary: Option<mo_agent_runtime::pipeline::step_recorder::RecorderSummary>,
     /// Exported tool health entries from this turn's TurnGuard (for cross-session persistence).
     tool_health_export: Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry>,
+    /// Last heavy checkpoint built during the agentic loop (for cloud persistence).
+    last_heavy_checkpoint: Option<mo_agent_runtime::pipeline::step_protocol::StepCheckpoint>,
 }
 
 /// Structured audit record for a TurnGuard verdict.
