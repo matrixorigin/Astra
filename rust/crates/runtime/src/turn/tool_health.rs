@@ -169,6 +169,10 @@ impl ToolHealthTracker {
     /// Export tool health data for cross-session persistence.
     /// Only exports tools with at least one call.
     pub fn export(&self) -> Vec<crate::pipeline::persistence::ToolHealthEntry> {
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         self.tools
             .iter()
             .filter(|(_, h)| h.total_calls > 0)
@@ -181,6 +185,7 @@ impl ToolHealthTracker {
                 } else {
                     0.0
                 },
+                last_updated_epoch: now_epoch,
             })
             .collect()
     }
@@ -434,6 +439,7 @@ mod tests {
             total_calls: 10,
             total_failures: 8,
             failure_rate: 0.8,
+            last_updated_epoch: 0,
         }];
         let tracker = ToolHealthTracker::from_entries(&entries);
         let health = tracker.get("bash").unwrap();
@@ -451,6 +457,7 @@ mod tests {
             total_calls: 20,
             total_failures: 2,
             failure_rate: 0.1,
+            last_updated_epoch: 0,
         }];
         let tracker = ToolHealthTracker::from_entries(&entries);
         assert!(!tracker.is_deprioritized("read_file"));

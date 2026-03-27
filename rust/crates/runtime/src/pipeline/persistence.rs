@@ -25,6 +25,10 @@ use std::sync::{Arc, Mutex};
 pub struct LearningSnapshot {
     /// Format version for forward compatibility.
     pub version: u32,
+    /// Epoch seconds when this snapshot was created/exported.
+    /// Used for whole-snapshot conflict resolution in cloud sync.
+    #[serde(default)]
+    pub snapshot_epoch: u64,
     /// Entity knowledge graph entries.
     pub entities: Vec<EntityKnowledge>,
     /// Tool chain patterns.
@@ -46,12 +50,17 @@ pub struct ToolHealthEntry {
     /// Stored failure rate (0.0-1.0) rather than raw consecutive count.
     /// This avoids carrying session-local "consecutive" state across sessions.
     pub failure_rate: f64,
+    /// Epoch seconds when this entry was last updated. Used for conflict resolution:
+    /// most-recently-updated wins when merging local and cloud entries.
+    #[serde(default)]
+    pub last_updated_epoch: u64,
 }
 
 impl Default for LearningSnapshot {
     fn default() -> Self {
         Self {
             version: 1,
+            snapshot_epoch: 0,
             entities: Vec::new(),
             patterns: Vec::new(),
             calibration: None,
@@ -125,9 +134,14 @@ pub fn export_from_modules_with_health(
         .map(|l| l.export())
         .unwrap_or_default();
     let calibration = calibrator.lock().map(|c| c.export()).ok();
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
     LearningSnapshot {
         version: 1,
+        snapshot_epoch: now_epoch,
         entities,
         patterns,
         calibration,
@@ -153,6 +167,59 @@ pub fn merge_into_modules(
     {
         cal.merge(cal_data);
     }
+}
+
+/// Merge two sets of tool health entries using timestamp-based conflict resolution.
+///
+/// Strategy:
+/// - For entries present in both local and cloud: most-recently-updated wins
+///   (by `last_updated_epoch`). If epochs are equal, higher `total_calls` wins.
+///   If both are zero (legacy data without timestamps), local wins.
+/// - Cloud-only entries are always added (new cross-device knowledge).
+/// - Local-only entries are always kept.
+///
+/// Returns the merged set and a count of (cloud_wins, cloud_only_added).
+pub fn merge_tool_health(
+    local: &[ToolHealthEntry],
+    cloud: &[ToolHealthEntry],
+) -> (Vec<ToolHealthEntry>, usize, usize) {
+    use std::collections::HashMap;
+
+    let mut by_name: HashMap<String, ToolHealthEntry> = HashMap::new();
+    for entry in local {
+        by_name.insert(entry.name.clone(), entry.clone());
+    }
+
+    let mut cloud_wins = 0usize;
+    let mut cloud_only = 0usize;
+
+    for cloud_entry in cloud {
+        match by_name.get(&cloud_entry.name) {
+            Some(local_entry) => {
+                // Both exist — timestamp wins, fallback to total_calls, fallback to local
+                let use_cloud = if cloud_entry.last_updated_epoch != local_entry.last_updated_epoch
+                {
+                    cloud_entry.last_updated_epoch > local_entry.last_updated_epoch
+                } else if cloud_entry.total_calls != local_entry.total_calls {
+                    cloud_entry.total_calls > local_entry.total_calls
+                } else {
+                    false // tie → local wins
+                };
+                if use_cloud {
+                    by_name.insert(cloud_entry.name.clone(), cloud_entry.clone());
+                    cloud_wins += 1;
+                }
+            }
+            None => {
+                // Cloud-only → always add
+                by_name.insert(cloud_entry.name.clone(), cloud_entry.clone());
+                cloud_only += 1;
+            }
+        }
+    }
+
+    let merged: Vec<ToolHealthEntry> = by_name.into_values().collect();
+    (merged, cloud_wins, cloud_only)
 }
 
 /// Save learning state from shared modules to disk.
@@ -254,6 +321,7 @@ mod tests {
     fn snapshot_roundtrip_json() {
         let snapshot = LearningSnapshot {
             version: 1,
+            snapshot_epoch: 0,
             entities: vec![],
             patterns: vec![],
             calibration: None,
@@ -461,6 +529,7 @@ mod tests {
     fn tool_health_roundtrip_in_snapshot() {
         let snapshot = LearningSnapshot {
             version: 1,
+            snapshot_epoch: 0,
             entities: vec![],
             patterns: vec![],
             calibration: None,
@@ -470,12 +539,14 @@ mod tests {
                     total_calls: 10,
                     total_failures: 3,
                     failure_rate: 0.3,
+                    last_updated_epoch: 0,
                 },
                 ToolHealthEntry {
                     name: "read_file".to_string(),
                     total_calls: 50,
                     total_failures: 0,
                     failure_rate: 0.0,
+                    last_updated_epoch: 0,
                 },
             ],
         };
@@ -508,6 +579,7 @@ mod tests {
         let path = dir.path().join("test_health.json");
         let snapshot = LearningSnapshot {
             version: 1,
+            snapshot_epoch: 0,
             entities: vec![],
             patterns: vec![],
             calibration: None,
@@ -516,6 +588,7 @@ mod tests {
                 total_calls: 5,
                 total_failures: 4,
                 failure_rate: 0.8,
+                last_updated_epoch: 0,
             }],
         };
         save_snapshot_to(&path, &snapshot).unwrap();

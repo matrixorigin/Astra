@@ -5205,6 +5205,7 @@ mod hardening_proofs {
         // Create snapshot with tool health
         let snapshot = LearningSnapshot {
             version: 1,
+            snapshot_epoch: 0,
             entities: vec![],
             patterns: vec![],
             calibration: None,
@@ -5214,12 +5215,14 @@ mod hardening_proofs {
                     total_calls: 100,
                     total_failures: 15,
                     failure_rate: 0.15,
+                    last_updated_epoch: 0,
                 },
                 ToolHealthEntry {
                     name: "read_file".to_string(),
                     total_calls: 50,
                     total_failures: 1,
                     failure_rate: 0.02,
+                    last_updated_epoch: 0,
                 },
             ],
         };
@@ -5241,6 +5244,7 @@ mod hardening_proofs {
                 total_calls: 10,
                 total_failures: 8,
                 failure_rate: 0.8,
+                last_updated_epoch: 0,
             },
         ];
         let health = ToolHealthTracker::from_entries(&entries);
@@ -7005,12 +7009,14 @@ mod learning_sync_cloud_proofs {
                 total_calls: 10,
                 total_failures: 2,
                 failure_rate: 0.2,
+                last_updated_epoch: 0,
             },
             ToolHealthEntry {
                 name: "grep".to_string(),
                 total_calls: 5,
                 total_failures: 0,
                 failure_rate: 0.0,
+                last_updated_epoch: 0,
             },
         ];
         let snapshot = export_from_modules_with_health(&eg, &pl, &cal, &health);
@@ -7028,6 +7034,7 @@ mod learning_sync_cloud_proofs {
             total_calls: 10,
             total_failures: 3,
             failure_rate: 0.3,
+            last_updated_epoch: 0,
         }];
         let snapshot = export_from_modules_with_health(&eg, &pl, &cal, &health);
         let json = serde_json::to_string(&snapshot).unwrap();
@@ -7039,44 +7046,47 @@ mod learning_sync_cloud_proofs {
     }
 
     #[test]
-    fn health_merge_local_wins_on_conflict() {
-        // Simulate the merge strategy: local entries take precedence
+    fn health_merge_timestamp_based_conflict_resolution() {
+        use mo_agent_runtime::pipeline::persistence::merge_tool_health;
+
+        // Local: bash updated at epoch 1000
         let local = vec![ToolHealthEntry {
             name: "bash".to_string(),
             total_calls: 20,
             total_failures: 1,
             failure_rate: 0.05,
+            last_updated_epoch: 1000,
         }];
+        // Cloud: bash updated at epoch 500 (older), grep is cloud-only
         let cloud = vec![
             ToolHealthEntry {
                 name: "bash".to_string(),
                 total_calls: 10,
                 total_failures: 5,
                 failure_rate: 0.5,
+                last_updated_epoch: 500,
             },
             ToolHealthEntry {
                 name: "grep".to_string(),
                 total_calls: 8,
                 total_failures: 0,
                 failure_rate: 0.0,
+                last_updated_epoch: 800,
             },
         ];
 
-        // Apply the same merge logic as main.rs: local names take precedence
-        let local_names: std::collections::HashSet<String> =
-            local.iter().map(|e| e.name.clone()).collect();
-        let mut merged = local.clone();
-        for entry in cloud {
-            if !local_names.contains(&entry.name) {
-                merged.push(entry);
-            }
-        }
+        let (merged, cloud_wins, cloud_only) = merge_tool_health(&local, &cloud);
 
-        assert_eq!(merged.len(), 2, "bash (local) + grep (cloud)");
-        assert_eq!(merged[0].name, "bash");
-        assert_eq!(merged[0].total_calls, 20, "local bash wins");
-        assert_eq!(merged[1].name, "grep");
-        assert_eq!(merged[1].total_calls, 8, "cloud-only grep added");
+        assert_eq!(merged.len(), 2, "bash + grep");
+        assert_eq!(cloud_wins, 0, "local bash is newer, no cloud wins");
+        assert_eq!(cloud_only, 1, "grep is cloud-only");
+
+        let bash = merged.iter().find(|e| e.name == "bash").unwrap();
+        assert_eq!(bash.total_calls, 20, "local bash wins (newer epoch)");
+        assert_eq!(bash.last_updated_epoch, 1000);
+
+        let grep = merged.iter().find(|e| e.name == "grep").unwrap();
+        assert_eq!(grep.total_calls, 8, "cloud-only grep added");
     }
 
     #[test]
@@ -7111,12 +7121,14 @@ mod health_dashboard_proofs {
                 total_calls: 20,
                 total_failures: 5,
                 failure_rate: 0.25,
+                last_updated_epoch: 0,
             },
             ToolHealthEntry {
                 name: "grep".into(),
                 total_calls: 10,
                 total_failures: 0,
                 failure_rate: 0.0,
+                last_updated_epoch: 0,
             },
         ];
         let tracker = ToolHealthTracker::from_entries(&entries);
@@ -7275,5 +7287,250 @@ mod cloud_sync_status_proofs {
         assert_eq!(back.preferences_last_sync, status.preferences_last_sync);
         assert_eq!(back.pending_pushes, status.pending_pushes);
         assert_eq!(back.last_error, status.last_error);
+    }
+}
+
+mod timestamp_merge_proofs {
+    use mo_agent_runtime::pipeline::persistence::{merge_tool_health, ToolHealthEntry};
+
+    #[test]
+    fn cloud_newer_timestamp_wins_over_local() {
+        let local = vec![ToolHealthEntry {
+            name: "bash".into(),
+            total_calls: 5,
+            total_failures: 2,
+            failure_rate: 0.4,
+            last_updated_epoch: 1000,
+        }];
+        let cloud = vec![ToolHealthEntry {
+            name: "bash".into(),
+            total_calls: 15,
+            total_failures: 1,
+            failure_rate: 0.067,
+            last_updated_epoch: 2000, // newer
+        }];
+
+        let (merged, cloud_wins, cloud_only) = merge_tool_health(&local, &cloud);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(cloud_wins, 1);
+        assert_eq!(cloud_only, 0);
+        let bash = &merged[0];
+        assert_eq!(bash.total_calls, 15, "cloud version won (newer epoch)");
+        assert_eq!(bash.last_updated_epoch, 2000);
+    }
+
+    #[test]
+    fn local_newer_timestamp_wins_over_cloud() {
+        let local = vec![ToolHealthEntry {
+            name: "bash".into(),
+            total_calls: 25,
+            total_failures: 0,
+            failure_rate: 0.0,
+            last_updated_epoch: 3000,
+        }];
+        let cloud = vec![ToolHealthEntry {
+            name: "bash".into(),
+            total_calls: 10,
+            total_failures: 5,
+            failure_rate: 0.5,
+            last_updated_epoch: 1000,
+        }];
+
+        let (merged, cloud_wins, _) = merge_tool_health(&local, &cloud);
+        assert_eq!(cloud_wins, 0);
+        let bash = &merged[0];
+        assert_eq!(bash.total_calls, 25, "local version won (newer epoch)");
+    }
+
+    #[test]
+    fn equal_epoch_higher_calls_wins() {
+        let local = vec![ToolHealthEntry {
+            name: "bash".into(),
+            total_calls: 5,
+            total_failures: 1,
+            failure_rate: 0.2,
+            last_updated_epoch: 1000,
+        }];
+        let cloud = vec![ToolHealthEntry {
+            name: "bash".into(),
+            total_calls: 20,
+            total_failures: 2,
+            failure_rate: 0.1,
+            last_updated_epoch: 1000, // same epoch
+        }];
+
+        let (merged, cloud_wins, _) = merge_tool_health(&local, &cloud);
+        assert_eq!(cloud_wins, 1, "cloud has more calls at same epoch");
+        assert_eq!(merged[0].total_calls, 20);
+    }
+
+    #[test]
+    fn equal_epoch_equal_calls_local_wins() {
+        let local = vec![ToolHealthEntry {
+            name: "bash".into(),
+            total_calls: 10,
+            total_failures: 3,
+            failure_rate: 0.3,
+            last_updated_epoch: 1000,
+        }];
+        let cloud = vec![ToolHealthEntry {
+            name: "bash".into(),
+            total_calls: 10,
+            total_failures: 1,
+            failure_rate: 0.1,
+            last_updated_epoch: 1000,
+        }];
+
+        let (merged, cloud_wins, _) = merge_tool_health(&local, &cloud);
+        assert_eq!(cloud_wins, 0, "tie → local wins");
+        assert_eq!(merged[0].total_failures, 3, "local entry preserved");
+    }
+
+    #[test]
+    fn legacy_zero_epoch_local_wins() {
+        // Both epoch=0 (legacy data without timestamps)
+        let local = vec![ToolHealthEntry {
+            name: "bash".into(),
+            total_calls: 10,
+            total_failures: 2,
+            failure_rate: 0.2,
+            last_updated_epoch: 0,
+        }];
+        let cloud = vec![ToolHealthEntry {
+            name: "bash".into(),
+            total_calls: 8,
+            total_failures: 1,
+            failure_rate: 0.125,
+            last_updated_epoch: 0,
+        }];
+
+        let (merged, cloud_wins, _) = merge_tool_health(&local, &cloud);
+        // epoch=0 == epoch=0, then total_calls 10 > 8 → local wins
+        assert_eq!(cloud_wins, 0);
+        assert_eq!(merged[0].total_calls, 10);
+    }
+
+    #[test]
+    fn cloud_only_entries_always_added() {
+        let local = vec![ToolHealthEntry {
+            name: "bash".into(),
+            total_calls: 10,
+            total_failures: 0,
+            failure_rate: 0.0,
+            last_updated_epoch: 1000,
+        }];
+        let cloud = vec![
+            ToolHealthEntry {
+                name: "grep".into(),
+                total_calls: 5,
+                total_failures: 0,
+                failure_rate: 0.0,
+                last_updated_epoch: 500,
+            },
+            ToolHealthEntry {
+                name: "read_file".into(),
+                total_calls: 3,
+                total_failures: 1,
+                failure_rate: 0.33,
+                last_updated_epoch: 800,
+            },
+        ];
+
+        let (merged, cloud_wins, cloud_only) = merge_tool_health(&local, &cloud);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(cloud_wins, 0);
+        assert_eq!(cloud_only, 2);
+    }
+
+    #[test]
+    fn empty_local_takes_all_cloud() {
+        let cloud = vec![ToolHealthEntry {
+            name: "bash".into(),
+            total_calls: 10,
+            total_failures: 1,
+            failure_rate: 0.1,
+            last_updated_epoch: 1000,
+        }];
+
+        let (merged, cloud_wins, cloud_only) = merge_tool_health(&[], &cloud);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(cloud_wins, 0);
+        assert_eq!(cloud_only, 1);
+    }
+
+    #[test]
+    fn empty_cloud_preserves_local() {
+        let local = vec![ToolHealthEntry {
+            name: "bash".into(),
+            total_calls: 10,
+            total_failures: 1,
+            failure_rate: 0.1,
+            last_updated_epoch: 1000,
+        }];
+
+        let (merged, cloud_wins, cloud_only) = merge_tool_health(&local, &[]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(cloud_wins, 0);
+        assert_eq!(cloud_only, 0);
+    }
+
+    #[test]
+    fn both_empty_returns_empty() {
+        let (merged, cloud_wins, cloud_only) = merge_tool_health(&[], &[]);
+        assert!(merged.is_empty());
+        assert_eq!(cloud_wins, 0);
+        assert_eq!(cloud_only, 0);
+    }
+
+    #[test]
+    fn snapshot_epoch_set_on_export() {
+        use mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator;
+        use mo_agent_runtime::pipeline::entity::EntityGraph;
+        use mo_agent_runtime::pipeline::pattern::PatternLibrary;
+        use mo_agent_runtime::pipeline::persistence::export_from_modules_with_health;
+        use std::sync::{Arc, Mutex};
+
+        let eg = Arc::new(Mutex::new(EntityGraph::new()));
+        let pl = Arc::new(Mutex::new(PatternLibrary::new()));
+        let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.5)));
+
+        let snapshot = export_from_modules_with_health(&eg, &pl, &cal, &[]);
+        assert!(
+            snapshot.snapshot_epoch > 0,
+            "snapshot_epoch should be set to current time"
+        );
+    }
+
+    #[test]
+    fn last_updated_epoch_set_on_health_export() {
+        use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
+
+        let mut tracker = ToolHealthTracker::new();
+        tracker.record_success("bash");
+        tracker.record_failure("bash");
+
+        let entries = tracker.export();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].last_updated_epoch > 0,
+            "last_updated_epoch should be set to current time"
+        );
+    }
+
+    #[test]
+    fn last_updated_epoch_backward_compat_deserialization() {
+        // Old format without last_updated_epoch should deserialize with default 0
+        let json = r#"{"name":"bash","total_calls":5,"total_failures":1,"failure_rate":0.2}"#;
+        let entry: ToolHealthEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.last_updated_epoch, 0, "missing field defaults to 0");
+    }
+
+    #[test]
+    fn snapshot_epoch_backward_compat_deserialization() {
+        // Old format without snapshot_epoch should deserialize with default 0
+        let json = r#"{"version":1,"entities":[],"patterns":[],"calibration":null}"#;
+        let snapshot: mo_agent_runtime::pipeline::persistence::LearningSnapshot =
+            serde_json::from_str(json).unwrap();
+        assert_eq!(snapshot.snapshot_epoch, 0, "missing field defaults to 0");
     }
 }

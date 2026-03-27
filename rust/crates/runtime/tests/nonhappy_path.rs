@@ -241,18 +241,21 @@ mod turn_guard_integration {
                 total_calls: 3,
                 total_failures: 3,
                 failure_rate: 1.0,
+                last_updated_epoch: 0,
             },
             ToolHealthEntry {
                 name: "tool_b".to_string(),
                 total_calls: 10,
                 total_failures: 6,
                 failure_rate: 0.6,
+                last_updated_epoch: 0,
             },
             ToolHealthEntry {
                 name: "tool_c".to_string(),
                 total_calls: 10,
                 total_failures: 4,
                 failure_rate: 0.4,
+                last_updated_epoch: 0,
             },
         ];
 
@@ -908,6 +911,7 @@ mod chat_stream_turnguard_e2e {
             total_calls: 10,
             total_failures: 8,
             failure_rate: 0.8,
+            last_updated_epoch: 0,
         }];
         let tracker = ToolHealthTracker::from_entries(&entries);
         let mut guard = TurnGuard::with_health(tracker);
@@ -1220,6 +1224,7 @@ mod chat_stream_turnguard_e2e {
             total_calls: 20,
             total_failures: 3,
             failure_rate: 0.15,
+            last_updated_epoch: 0,
         }];
         let tracker = ToolHealthTracker::from_entries(&entries);
         assert!(
@@ -1248,6 +1253,7 @@ mod chat_stream_turnguard_e2e {
             total_calls: 3,
             total_failures: 3,
             failure_rate: 1.0,
+            last_updated_epoch: 0,
         }];
         let tracker = ToolHealthTracker::from_entries(&entries);
         // 100% failure but only 3 calls — below CROSS_SESSION_MIN_CALLS (5)
@@ -1265,6 +1271,7 @@ mod chat_stream_turnguard_e2e {
             total_calls: 10,
             total_failures: 8,
             failure_rate: 0.8,
+            last_updated_epoch: 0,
         }];
         let tracker = ToolHealthTracker::from_entries(&entries);
         let mut guard = TurnGuard::with_health(tracker);
@@ -1303,18 +1310,21 @@ mod chat_stream_turnguard_e2e {
                 total_calls: 10,
                 total_failures: 9,
                 failure_rate: 0.9,
+                last_updated_epoch: 0,
             },
             ToolHealthEntry {
                 name: "github_list_prs".to_string(),
                 total_calls: 15,
                 total_failures: 2,
                 failure_rate: 0.133,
+                last_updated_epoch: 0,
             },
             ToolHealthEntry {
                 name: "git_log".to_string(),
                 total_calls: 20,
                 total_failures: 0,
                 failure_rate: 0.0,
+                last_updated_epoch: 0,
             },
         ];
         let tracker = ToolHealthTracker::from_entries(&entries);
@@ -1421,12 +1431,14 @@ mod chat_stream_turnguard_e2e {
                 total_calls: 12,
                 total_failures: 10,
                 failure_rate: 0.833,
+                last_updated_epoch: 0,
             },
             ToolHealthEntry {
                 name: "mo_snapshot".to_string(),
                 total_calls: 8,
                 total_failures: 6,
                 failure_rate: 0.75,
+                last_updated_epoch: 0,
             },
         ];
         let tracker = ToolHealthTracker::from_entries(&entries);

@@ -396,6 +396,7 @@ mod tests {
             total_calls: 3,
             total_failures: 2,
             failure_rate: 0.67,
+            last_updated_epoch: 0,
         }];
         let tracker = ToolHealthTracker::from_entries(&entries);
         assert!(
@@ -411,6 +412,7 @@ mod tests {
             total_calls: 10,
             total_failures: 7,
             failure_rate: 0.7,
+            last_updated_epoch: 0,
         }];
         let tracker = ToolHealthTracker::from_entries(&entries);
         assert!(tracker.is_deprioritized("mo_query"));

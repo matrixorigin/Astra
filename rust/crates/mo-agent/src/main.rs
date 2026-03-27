@@ -516,6 +516,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                                 total_calls: 3,
                                 total_failures: 3,
                                 failure_rate: 1.0,
+                                last_updated_epoch: 0, // synthetic — will be overridden by real data
                             },
                         );
                     }
@@ -553,6 +554,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                                                 total_calls: 3,
                                                 total_failures: 3,
                                                 failure_rate: 1.0,
+                                                last_updated_epoch: 0,
                                             },
                                         );
                                     }
@@ -1785,23 +1787,25 @@ async fn run_chat_repl(
             &pipeline_modules.pattern_library,
             &pipeline_modules.calibrator,
         );
-        // Merge cloud tool health: cloud entries supplement local (local wins on conflict)
+        // Merge cloud tool health: timestamp-based conflict resolution
         if !cloud_health.is_empty() {
-            let local_names: std::collections::HashSet<String> = cross_session_health_entries
-                .iter()
-                .map(|e| e.name.clone())
-                .collect();
-            let mut added = 0usize;
-            for entry in cloud_health {
-                if !local_names.contains(&entry.name) {
-                    cross_session_health_entries.push(entry);
-                    added += 1;
+            let (merged, cloud_wins, cloud_only) =
+                mo_agent_runtime::pipeline::persistence::merge_tool_health(
+                    &cross_session_health_entries,
+                    &cloud_health,
+                );
+            cross_session_health_entries = merged;
+            if cloud_wins > 0 || cloud_only > 0 {
+                let mut parts = Vec::new();
+                if cloud_wins > 0 {
+                    parts.push(format!("{cloud_wins} updated from cloud"));
                 }
-            }
-            if added > 0 {
+                if cloud_only > 0 {
+                    parts.push(format!("{cloud_only} new from cloud"));
+                }
                 eprintln!(
                     "{}",
-                    format!("  ✓ Merged {added} cloud tool health entries").dim()
+                    format!("  ✓ Merged tool health: {}", parts.join(", ")).dim()
                 );
             }
         }
@@ -2698,12 +2702,14 @@ mod tests {
                 total_calls: 15,
                 total_failures: 3,
                 failure_rate: 0.2,
+                last_updated_epoch: 0,
             },
             mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
                 name: "grep".into(),
                 total_calls: 8,
                 total_failures: 0,
                 failure_rate: 0.0,
+                last_updated_epoch: 0,
             },
         ];
         let exit = handle_slash_command(
@@ -2733,6 +2739,7 @@ mod tests {
                 total_calls: 10,
                 total_failures: 5,
                 failure_rate: 0.5,
+                last_updated_epoch: 0,
             },
         ];
         let exit = handle_slash_command(
