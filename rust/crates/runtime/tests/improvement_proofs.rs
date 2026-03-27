@@ -6080,3 +6080,92 @@ mod crash_recovery_proofs {
         assert_eq!(unique.len(), 4, "All error messages should be unique");
     }
 }
+
+// ─── Protocol hygiene proofs ────────────────────────────────────────────────
+mod protocol_hygiene_proofs {
+    use mo_agent_runtime::pipeline::step_protocol::*;
+
+    /// StepEventDag is gated behind #[cfg(test)] — production binary
+    /// should NOT contain it. We can't directly test absence, but we
+    /// verify the FileBackedEventStore implements all the same trait methods.
+    #[test]
+    fn file_event_store_implements_full_trait() {
+        use mo_agent_runtime::pipeline::step_checkpoint::FileBackedEventStore;
+        let mut store = FileBackedEventStore::empty("test-hygiene");
+
+        let e1 = StepEvent {
+            event_id: "e1".into(),
+            step_id: "s1".into(),
+            event_type: StepEventType::ToolCallStarted,
+            agent_id: None,
+            created_at: 1000,
+            payload: Some(serde_json::json!({})),
+            caused_by: vec![],
+        };
+        let e2 = StepEvent {
+            event_id: "e2".into(),
+            step_id: "s1".into(),
+            event_type: StepEventType::ToolCallCompleted,
+            agent_id: None,
+            created_at: 2000,
+            payload: Some(serde_json::json!({})),
+            caused_by: vec!["e1".into()],
+        };
+
+        store.append(e1);
+        store.append(e2);
+
+        // All StepEventStore trait methods work
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.events_for_step("s1").len(), 2);
+        assert_eq!(store.ancestors("e2").len(), 1);
+        assert_eq!(store.descendants("e1").len(), 1);
+        assert_eq!(store.leaves().len(), 1); // e2 is the only leaf
+    }
+
+    /// MigrationRegistry::with_defaults() provides production-ready migrations.
+    #[test]
+    fn default_migrations_cover_legacy_upgrade_path() {
+        let reg = MigrationRegistry::with_defaults();
+
+        // v0 → v1000 is the baseline migration
+        assert!(reg.has_migration(0));
+
+        // A legacy checkpoint with no version field gets upgraded
+        let legacy = serde_json::json!({
+            "cursor": {"current_step": 0, "slots": []},
+        });
+        let result = reg.migrate(0, &legacy).unwrap();
+        assert_eq!(result["protocol_version"], PROTOCOL_VERSION);
+        assert!(result["cursor"].is_object(), "original data preserved");
+    }
+
+    /// Migration + version check compose correctly: migrate then verify.
+    #[test]
+    fn migrate_then_version_check_succeeds() {
+        let reg = MigrationRegistry::with_defaults();
+
+        // Legacy data → migrate
+        let legacy = serde_json::json!({
+            "cursor": {"current_step": 0, "slots": []}
+        });
+        let migrated = reg.migrate(0, &legacy).unwrap();
+
+        // Now version check should pass
+        let found_version = migrated["protocol_version"].as_u64().unwrap() as u32;
+        let verdict =
+            check_protocol_version_with_policy(found_version, VersionPolicy::Compatible);
+        assert!(verdict.is_ok());
+        match verdict.unwrap() {
+            VersionVerdict::ExactMatch => {} // expected
+            other => panic!("Expected ExactMatch, got {:?}", other),
+        }
+    }
+
+    /// Strict policy rejects different versions even after compatible migration.
+    #[test]
+    fn strict_policy_rejects_old_version_without_migration() {
+        let verdict = check_protocol_version_with_policy(999, VersionPolicy::Strict);
+        assert!(verdict.is_err());
+    }
+}

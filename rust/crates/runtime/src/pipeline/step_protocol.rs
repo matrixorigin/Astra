@@ -103,6 +103,48 @@ impl MigrationRegistry {
     pub fn has_migration(&self, from_version: u32) -> bool {
         self.migrations.contains_key(&from_version)
     }
+
+    /// Create a registry with built-in migrations.
+    ///
+    /// Currently registers:
+    /// - v0 → v1000: legacy checkpoint upgrade (adds protocol_version field)
+    pub fn with_defaults() -> Self {
+        let mut reg = Self::new();
+        reg.register(0, migrate_v0_to_v1000);
+        reg
+    }
+}
+
+/// Migration: v0 (pre-versioning) → v1000.
+/// Adds `protocol_version` field if missing.
+fn migrate_v0_to_v1000(
+    _from: u32,
+    data: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut migrated = data.clone();
+    if let Some(obj) = migrated.as_object_mut() {
+        // Add protocol_version to the light checkpoint (or top level)
+        if !obj.contains_key("protocol_version") {
+            obj.insert(
+                "protocol_version".to_string(),
+                serde_json::json!(PROTOCOL_VERSION),
+            );
+        }
+        // If this is a Heavy checkpoint, ensure the inner light has it too
+        if let Some(light) = obj.get_mut("light") {
+            if let Some(light_obj) = light.as_object_mut() {
+                if !light_obj.contains_key("protocol_version") {
+                    light_obj.insert(
+                        "protocol_version".to_string(),
+                        serde_json::json!(PROTOCOL_VERSION),
+                    );
+                }
+            }
+        }
+        Ok(migrated)
+    } else {
+        Err("checkpoint data is not a JSON object".to_string())
+    }
 }
 
 /// Result of version negotiation (for Compatible/Migrate policies).
@@ -1397,13 +1439,19 @@ pub enum StepEventType {
     RetryScheduled,
 }
 
-/// In-memory implementation of StepEventStore (for tests and local mode).
-/// Production uses MatrixOne-backed implementation.
+/// In-memory implementation of StepEventStore (for tests and local development).
+/// Production uses FileBackedEventStore (step_checkpoint.rs).
+///
+/// NOTE: This is test infrastructure — production code should not depend on it.
+/// It provides the reference implementation of DAG traversal (ancestors/descendants/leaves)
+/// which FileBackedEventStore delegates to.
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct StepEventDag {
     events: Vec<StepEvent>,
 }
 
+#[cfg(test)]
 impl StepEventDag {
     pub fn new() -> Self {
         Self::default()
@@ -1418,6 +1466,7 @@ impl StepEventDag {
     }
 }
 
+#[cfg(test)]
 impl StepEventStore for StepEventDag {
     fn append(&mut self, event: StepEvent) {
         self.push(event);
@@ -2713,6 +2762,65 @@ mod tests {
         let result = reg.migrate(42, &serde_json::json!({}));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("42"));
+    }
+
+    #[test]
+    fn migration_registry_with_defaults_has_v0() {
+        let reg = MigrationRegistry::with_defaults();
+        assert!(reg.has_migration(0), "v0→v1000 migration must be registered");
+        assert!(!reg.has_migration(1), "no v1 migration expected");
+        assert!(!reg.has_migration(999), "no v999 migration expected");
+    }
+
+    #[test]
+    fn migrate_v0_adds_protocol_version() {
+        let reg = MigrationRegistry::with_defaults();
+        let legacy = serde_json::json!({
+            "cursor": {"current_step": 0, "slots": []},
+            "turn_state": {"turn": 3}
+        });
+        let migrated = reg.migrate(0, &legacy).unwrap();
+        assert_eq!(migrated["protocol_version"], PROTOCOL_VERSION);
+        // Original fields preserved
+        assert_eq!(migrated["cursor"]["current_step"], 0);
+        assert_eq!(migrated["turn_state"]["turn"], 3);
+    }
+
+    #[test]
+    fn migrate_v0_preserves_existing_version_field() {
+        let reg = MigrationRegistry::with_defaults();
+        let already_versioned = serde_json::json!({
+            "protocol_version": 500,
+            "cursor": {"current_step": 0}
+        });
+        let migrated = reg.migrate(0, &already_versioned).unwrap();
+        // Does NOT overwrite existing protocol_version
+        assert_eq!(migrated["protocol_version"], 500);
+    }
+
+    #[test]
+    fn migrate_v0_heavy_checkpoint_adds_to_inner_light() {
+        let reg = MigrationRegistry::with_defaults();
+        let heavy = serde_json::json!({
+            "light": {
+                "cursor": {"current_step": 2},
+                "turn_state": {"turn": 5}
+            },
+            "full_conversation": []
+        });
+        let migrated = reg.migrate(0, &heavy).unwrap();
+        // Top level gets protocol_version
+        assert_eq!(migrated["protocol_version"], PROTOCOL_VERSION);
+        // Inner light also gets it
+        assert_eq!(migrated["light"]["protocol_version"], PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn migrate_non_object_returns_error() {
+        let reg = MigrationRegistry::with_defaults();
+        let result = reg.migrate(0, &serde_json::json!("not an object"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not a JSON object"));
     }
 
     // ── Version Display per Policy ──

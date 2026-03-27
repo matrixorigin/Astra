@@ -333,7 +333,7 @@ pub struct ToolTimelineEntry {
 mod tests {
     use super::*;
     use crate::pipeline::step_protocol::{
-        epoch_ms, ExecutionCursor, LightCheckpoint, MemoryContext, StepCheckpoint,
+        epoch_ms, ExecutionCursor, LightCheckpoint,
     };
 
     // ── Helper: build a heavy checkpoint for testing ──
