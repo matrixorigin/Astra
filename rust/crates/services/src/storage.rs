@@ -437,6 +437,25 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .execute(&pool)
     .await?;
 
+    // Step Protocol idempotency cache
+    query(
+        "CREATE TABLE IF NOT EXISTS step_idempotency_cache (
+            cache_key VARCHAR(200) PRIMARY KEY,
+            step_id VARCHAR(100) NOT NULL,
+            tool_index INT NOT NULL,
+            content_hash VARCHAR(64) NOT NULL,
+            tool_name VARCHAR(100) NOT NULL,
+            output LONGTEXT NOT NULL,
+            is_error SMALLINT NOT NULL DEFAULT 0,
+            cached_at BIGINT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_idempotency_step (step_id),
+            INDEX idx_idempotency_hash (content_hash)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     Ok(())
 }
 

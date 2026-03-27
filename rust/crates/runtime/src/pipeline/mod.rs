@@ -16,6 +16,7 @@ pub mod engine;
 pub mod entity;
 pub mod event;
 pub mod learning;
+pub mod mo_persistence;
 pub mod pattern;
 pub mod persistence;
 pub mod routing;
@@ -27,6 +28,7 @@ pub mod step_recorder;
 
 pub use engine::*;
 pub use event::*;
+pub use mo_persistence::*;
 pub use scheduling::*;
 pub use state::*;
 pub use step_protocol::*;
