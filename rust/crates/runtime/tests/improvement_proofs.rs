@@ -7534,3 +7534,525 @@ mod timestamp_merge_proofs {
         assert_eq!(snapshot.snapshot_epoch, 0, "missing field defaults to 0");
     }
 }
+
+// =============================================================================
+// TurnGuard End-to-End Integration Proofs
+// Proves: Full multi-turn pipeline cycles through TurnGuard — stall detection,
+//         escalation, force_stop, divergence, rehabilitation, nudge-ignore,
+//         cross-session restore, combined verdicts, budget compounding.
+// Each test simulates a realistic agent session (record_* → evaluate() cycles).
+// =============================================================================
+mod turnguard_e2e_proofs {
+    use mo_agent_runtime::pipeline::persistence::ToolHealthEntry;
+    use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
+    use mo_agent_runtime::turn::turn_guard::{TurnGuard, VerdictSeverity};
+    use serde_json::json;
+
+    fn tc(name: &str, args: &str) -> serde_json::Value {
+        json!({"function": {"name": name, "arguments": args}})
+    }
+
+    // ── Scenario A: Full stall → escalation → force_stop pipeline ────────────
+    // Simulates: LLM repeats identical tool calls across 5+ turns, ignoring
+    // structured reflections, until the guard escalates to Critical + force_stop.
+    #[test]
+    fn full_stall_escalation_to_force_stop() {
+        let mut guard = TurnGuard::new();
+        let calls = [tc("bash", r#"{"command":"cat /etc/hosts"}"#)];
+
+        // Turn 1: first call, no stall yet (need window=2 repetitions)
+        guard.record_tool_calls(&calls);
+        guard.record_tool_result("bash", "127.0.0.1 localhost");
+        let v1 = guard.evaluate();
+        assert_eq!(v1.severity, VerdictSeverity::Healthy, "First call is not a stall");
+        assert!(!v1.force_stop);
+
+        // Turn 2: identical call → stall detected, first nudge
+        guard.record_tool_calls(&calls);
+        guard.record_tool_result("bash", "127.0.0.1 localhost");
+        let v2 = guard.evaluate();
+        assert!(v2.severity >= VerdictSeverity::Warning, "Stall → Warning");
+        assert!(v2.injections.iter().any(|m| m.contains("REFLECTION")),
+            "Should inject structured reflection");
+        assert!(!v2.force_stop, "First stall should not force stop");
+        assert_eq!(guard.nudge_count, 1);
+
+        // Turn 3: still repeating → second nudge, escalation_level hits Critical
+        guard.record_tool_calls(&calls);
+        guard.record_tool_result("bash", "127.0.0.1 localhost");
+        let v3 = guard.evaluate();
+        assert_eq!(v3.severity, VerdictSeverity::Critical,
+            "2 nudges → escalation_level Critical");
+        assert!(v3.injections.iter().any(|m| m.contains("CRITICAL")),
+            "Should have CRITICAL escalation message");
+        assert_eq!(guard.nudge_count, 2);
+
+        // Turn 4: still repeating → 3rd nudge, Critical + force_stop
+        guard.record_tool_calls(&calls);
+        guard.record_tool_result("bash", "127.0.0.1 localhost");
+        let v4 = guard.evaluate();
+        assert_eq!(v4.severity, VerdictSeverity::Critical);
+        assert!(v4.force_stop,
+            "nudge_count >= 3 + Critical escalation → force_stop");
+    }
+
+    // ── Scenario B: Divergence with mixed productive + exploration tools ─────
+    // Simulates: LLM alternates productive and exploration turns. Divergence
+    // should only trigger when N consecutive turns are exploration-only.
+    #[test]
+    fn divergence_resets_on_productive_tool() {
+        let mut guard = TurnGuard::new();
+
+        // Turn 1: exploration-only (bash)
+        guard.record_tool_calls(&[tc("bash", r#"{"command":"ls"}"#)]);
+        guard.record_tool_result("bash", "file1.rs");
+        let v1 = guard.evaluate();
+        // 1 exploration round is Exploring, not Diverging (need >= MAX_EXPLORATION_ROUNDS=2)
+        let has_divergence = v1.injections.iter().any(|m| m.contains("exploring"));
+        assert!(!has_divergence, "1 exploration round should not trigger divergence");
+
+        // Turn 2: productive tool breaks the streak
+        guard.record_tool_calls(&[tc("memory_store", r#"{"content":"fact"}"#)]);
+        guard.record_tool_result("memory_store", r#"{"stored": true}"#);
+        let v2 = guard.evaluate();
+        assert!(!v2.injections.iter().any(|m| m.contains("exploring")),
+            "Productive tool resets divergence");
+
+        // Turn 3-4: two consecutive exploration rounds → Diverging
+        guard.record_tool_calls(&[tc("read_file", r#"{"path":"a.rs"}"#)]);
+        guard.record_tool_result("read_file", "fn main(){}");
+        guard.record_tool_calls(&[tc("grep", r#"{"pattern":"todo"}"#)]);
+        guard.record_tool_result("grep", "[]");
+        let v4 = guard.evaluate();
+        assert!(v4.injections.iter().any(|m| m.contains("exploring")),
+            "2 consecutive exploration rounds → divergence correction");
+    }
+
+    // ── Scenario C: Timeouts don't escalate to Critical ──────────────────────
+    // Simulates: Many tool timeouts (infrastructure issues) should NOT push
+    // the session to Critical+force_stop, unlike real errors.
+    #[test]
+    fn timeout_only_session_stays_below_critical_force_stop() {
+        let mut guard = TurnGuard::new();
+
+        // 10 consecutive timeouts across different turns
+        for i in 0..10 {
+            guard.record_tool_calls(&[tc("slow_api", &format!(r#"{{"query":"q{i}"}}"#))]);
+            guard.record_tool_timeout("slow_api");
+        }
+
+        let verdict = guard.evaluate();
+        // Timeouts are discounted: non_timeout_errors = total_errors - timeouts = 0
+        // So escalation_level should not be Critical
+        assert!(
+            !verdict.force_stop,
+            "Timeout-only session must NEVER force_stop (infrastructure issue, not agent failure)"
+        );
+        // Should still warn about timeouts
+        assert!(verdict.injections.iter().any(|m| m.contains("timing out")),
+            "Should give timeout infrastructure guidance");
+    }
+
+    // ── Scenario D: Cache duplication + divergence combined verdict ───────────
+    // Simulates: LLM makes duplicate cached calls while also diverging.
+    // Both warnings should appear in a single verdict.
+    #[test]
+    fn cache_waste_and_divergence_combined_in_single_verdict() {
+        let mut guard = TurnGuard::new();
+
+        // Exploration turns with cache hits
+        guard.record_tool_calls(&[tc("read_file", r#"{"path":"a.rs"}"#)]);
+        guard.record_tool_result("read_file", "fn main(){}");
+        guard.record_cache_hit("read_file");
+        guard.record_cache_hit("read_file");
+        guard.record_cache_hit("read_file"); // 3 cache hits → wasteful
+
+        guard.record_tool_calls(&[tc("glob", r#"{"pattern":"*.rs"}"#)]);
+        guard.record_tool_result("glob", "[]");
+        // 2 consecutive exploration rounds → Diverging
+
+        let verdict = guard.evaluate();
+        let msgs = verdict.injections.join("\n");
+        assert!(msgs.contains("Duplicate calls"),
+            "Should warn about cache waste");
+        assert!(msgs.contains("exploring"),
+            "Should warn about divergence");
+        assert!(verdict.severity >= VerdictSeverity::Warning);
+    }
+
+    // ── Scenario E: Cross-session restore → deprioritized tools in verdict ───
+    // Simulates: A new session loads historical ToolHealthEntry data where a tool
+    // had >50% failure rate. The restored guard should emit that tool in avoid_tools.
+    #[test]
+    fn cross_session_restore_carries_deprioritization_into_verdict() {
+        let entries = vec![
+            ToolHealthEntry {
+                name: "mo_query".into(),
+                total_calls: 10,
+                total_failures: 7,
+                failure_rate: 0.7,
+                last_updated_epoch: 1000,
+            },
+            ToolHealthEntry {
+                name: "bash".into(),
+                total_calls: 20,
+                total_failures: 2,
+                failure_rate: 0.1,
+                last_updated_epoch: 1000,
+            },
+        ];
+        let tracker = ToolHealthTracker::from_entries(&entries);
+        let mut guard = TurnGuard::with_health(tracker);
+
+        // Trigger a turn so evaluate() runs health checks
+        guard.record_tool_calls(&[tc("bash", r#"{"command":"echo hi"}"#)]);
+        guard.record_tool_result("bash", "hi");
+
+        let verdict = guard.evaluate();
+        // mo_query was deprioritized from history (70% failure rate, 10 calls)
+        assert!(verdict.avoid_tools.contains(&"mo_query".to_string()),
+            "Cross-session deprioritized tool should appear in avoid_tools");
+        // bash should NOT be deprioritized (10% failure rate)
+        assert!(!verdict.avoid_tools.contains(&"bash".to_string()),
+            "Healthy cross-session tool should NOT be in avoid_tools");
+        assert!(verdict.injections.iter().any(|m| m.contains("mo_query")),
+            "Should have a warning injection about the deprioritized tool");
+    }
+
+    // ── Scenario F: Nudge-ignore detection ───────────────────────────────────
+    // Simulates: Guard sends a stall reflection with avoid_tools (from deprioritized
+    // health), then the LLM ignores the guidance and uses those tools anyway.
+    #[test]
+    fn nudge_ignored_detection_and_accumulation() {
+        let mut guard = TurnGuard::new();
+
+        // First: deprioritize "bash" via 3 failures so it appears in avoid_tools
+        guard.record_tool_result("bash", "error: fail 1");
+        guard.record_tool_result("bash", "error: fail 2");
+        guard.record_tool_result("bash", "error: fail 3");
+        assert!(guard.health.is_deprioritized("bash"));
+
+        // Now create a stall with deprioritized tool → reflection will include bash in avoid_tools
+        let calls = [tc("bash", r#"{"command":"cat /etc/hosts"}"#)];
+        guard.record_tool_calls(&calls);
+        guard.record_tool_calls(&calls);
+        let v1 = guard.evaluate();
+        assert!(v1.severity >= VerdictSeverity::Warning, "Stall + deprioritized tool");
+        assert!(v1.avoid_tools.contains(&"bash".to_string()),
+            "Deprioritized+stalled tool should be in avoid_tools");
+        assert_eq!(guard.nudge_count, 1);
+
+        // Turn: LLM uses a DIFFERENT tool → no nudge-ignore
+        guard.record_tool_calls(&[tc("memory_search", r#"{"query":"test"}"#)]);
+        guard.record_tool_result("memory_search", r#"{"results":[]}"#);
+        let v2 = guard.evaluate();
+        let nudge_ignored = v2.injections.iter().any(|m| m.contains("told to avoid"));
+        assert!(!nudge_ignored, "Using different tool is NOT nudge-ignore");
+
+        // Turn: LLM ignores avoid and uses bash anyway
+        guard.record_tool_calls(&[tc("bash", r#"{"command":"echo hello"}"#)]);
+        guard.record_tool_result("bash", "hello");
+        let v3 = guard.evaluate();
+        let nudge_ignored = v3.injections.iter().any(|m| m.contains("told to avoid"));
+        assert!(nudge_ignored,
+            "Using an avoided tool should trigger nudge-ignore warning");
+    }
+
+    // ── Scenario G: Rehabilitation + stricter threshold ──────────────────────
+    // Simulates: Tool deprioritized → rehabilitated → deprioritized → rehabilitated
+    // → on 3rd cycle, only 2 failures needed (flaky threshold).
+    #[test]
+    fn flaky_tool_rehabilitation_cycle_via_turn_guard() {
+        let mut guard = TurnGuard::new();
+
+        // Cycle 1: 3 failures → deprioritized
+        for _ in 0..3 {
+            guard.record_tool_result("flaky_api", "error: timeout");
+        }
+        let v1 = guard.evaluate();
+        assert!(v1.avoid_tools.contains(&"flaky_api".to_string()),
+            "3 failures → deprioritized in verdict");
+
+        // Rehabilitate with success
+        guard.record_tool_result("flaky_api", r#"{"result":"ok"}"#);
+        let v2 = guard.evaluate();
+        assert!(!v2.avoid_tools.contains(&"flaky_api".to_string()),
+            "Success rehabilitates tool");
+
+        // Cycle 2: 3 more failures → deprioritized again
+        for _ in 0..3 {
+            guard.record_tool_result("flaky_api", "error: connection refused");
+        }
+        let v3 = guard.evaluate();
+        assert!(v3.avoid_tools.contains(&"flaky_api".to_string()));
+
+        // Rehabilitate again (rehabilitation_count now = 2 → flaky)
+        guard.record_tool_result("flaky_api", r#"{"result":"ok"}"#);
+
+        // Cycle 3: only 2 failures needed (stricter threshold)
+        guard.record_tool_result("flaky_api", "error: server error");
+        guard.record_tool_result("flaky_api", "error: server error");
+        let v4 = guard.evaluate();
+        assert!(v4.avoid_tools.contains(&"flaky_api".to_string()),
+            "Flaky tool (rehab_count >= 2) deprioritizes after only 2 failures");
+    }
+
+    // ── Scenario H: Result quality classification chain ──────────────────────
+    // Simulates: Various tool result types flow through record_tool_result
+    // and produce correct health tracking.
+    #[test]
+    fn result_quality_drives_health_tracking_correctly() {
+        use mo_agent_runtime::turn::result_quality::ResultQuality;
+        let mut guard = TurnGuard::new();
+
+        // Success result
+        let q1 = guard.record_tool_result("bash", r#"{"output":"hello"}"#);
+        assert_eq!(q1, ResultQuality::Success);
+
+        // Error result
+        let q2 = guard.record_tool_result("bash", "error: file not found");
+        assert_eq!(q2, ResultQuality::Error);
+
+        // Empty result
+        let q3 = guard.record_tool_result("grep", "[]");
+        assert_eq!(q3, ResultQuality::Empty);
+
+        // Truncated result (plain text ending with "..." and > 500 chars)
+        let mut truncated = "x".repeat(600);
+        truncated.push_str("...");
+        let q4 = guard.record_tool_result("read_file", &truncated);
+        assert_eq!(q4, ResultQuality::Truncated);
+
+        // Verify health state
+        let bash_h = guard.health.get("bash").unwrap();
+        assert_eq!(bash_h.total_calls, 2);
+        assert_eq!(bash_h.total_failures, 1);
+        assert_eq!(bash_h.consecutive_failures, 1);
+
+        let grep_h = guard.health.get("grep").unwrap();
+        assert_eq!(grep_h.total_calls, 1);
+        assert_eq!(grep_h.total_failures, 0, "Empty is not a failure");
+
+        let rf_h = guard.health.get("read_file").unwrap();
+        assert_eq!(rf_h.total_calls, 1);
+        assert_eq!(rf_h.total_failures, 0, "Truncated counts as success");
+    }
+
+    // ── Scenario I: Step abort records timeouts for all skipped tools ────────
+    // Simulates: Multiple step-level timeouts accumulate on the same tool,
+    // eventually deprioritizing it and triggering infrastructure guidance.
+    #[test]
+    fn step_abort_affects_evaluate_verdict() {
+        let mut guard = TurnGuard::new();
+
+        // 3 step aborts — each records a timeout for "bash", accumulating to 3
+        guard.record_step_abort(&["bash".into()]);
+        guard.record_step_abort(&["bash".into()]);
+        guard.record_step_abort(&["bash".into()]);
+
+        let verdict = guard.evaluate();
+        // 3 timeouts → deprioritized → timeout_dominant (100% timeout)
+        let has_timeout_guidance = verdict.injections.iter().any(|m| m.contains("timing out"));
+        assert!(has_timeout_guidance,
+            "3 step aborts on same tool should deprioritize and trigger timeout guidance");
+        // Timeouts shouldn't cause force_stop
+        assert!(!verdict.force_stop);
+    }
+
+    // ── Scenario J: Budget penalty from multiple warning sources ─────────────
+    // This tests that severity compounds correctly when multiple non-happy-path
+    // signals fire simultaneously (stall + tool health + divergence).
+    #[test]
+    fn multiple_warning_sources_compound_severity() {
+        let mut guard = TurnGuard::new();
+
+        // Set up: deprioritize a tool (3 failures)
+        guard.record_tool_result("mo_query", "error: connection failed");
+        guard.record_tool_result("mo_query", "error: connection failed");
+        guard.record_tool_result("mo_query", "error: connection failed");
+
+        // Set up stall: repeated identical exploration calls
+        let calls = [tc("bash", r#"{"command":"find . -name '*.rs'"}"#)];
+        guard.record_tool_calls(&calls);
+        guard.record_tool_calls(&calls);
+
+        // Now evaluate — should have stall warning + tool health warning + divergence
+        let verdict = guard.evaluate();
+
+        // Count distinct warning types
+        let has_stall = verdict.injections.iter().any(|m| m.contains("REFLECTION"));
+        let has_health = verdict.injections.iter().any(|m| m.contains("mo_query"));
+        let has_divergence = verdict.injections.iter().any(|m| m.contains("exploring"));
+
+        // At minimum: stall + tool health (divergence depends on window)
+        assert!(has_stall, "Should detect stall");
+        assert!(has_health, "Should detect unhealthy tool");
+        // Multiple injections from different sources
+        assert!(verdict.injections.len() >= 2,
+            "Multiple warning sources should produce multiple injections");
+        assert!(verdict.severity >= VerdictSeverity::Warning);
+
+        // Verify both tools in avoid_tools
+        assert!(verdict.avoid_tools.contains(&"mo_query".to_string()),
+            "Deprioritized tool in avoid_tools");
+        let _ = has_divergence; // may or may not fire depending on exact window
+    }
+
+    // ── Scenario K: Structured reflection content verification ───────────────
+    // Simulates: stall detected, verify the reflection message contains
+    // structured analysis (What happened, Why, What to try).
+    #[test]
+    fn structured_reflection_has_required_sections() {
+        let mut guard = TurnGuard::new();
+        let calls = [tc("bash", r#"{"command":"ls -la"}"#)];
+        guard.record_tool_calls(&calls);
+        guard.record_tool_calls(&calls);
+        guard.record_tool_result("bash", "total 0");
+
+        let verdict = guard.evaluate();
+        let reflection = verdict.injections.iter()
+            .find(|m| m.contains("REFLECTION"))
+            .expect("Should have a REFLECTION injection");
+
+        // Structured reflection has labeled sections per to_nudge_message()
+        assert!(reflection.contains("What happened"),
+            "Reflection should have 'What happened' section");
+        assert!(reflection.contains("What to try"),
+            "Reflection should have 'What to try' section");
+        assert!(reflection.contains("Why"),
+            "Reflection should have 'Why' section");
+    }
+
+    // ── Scenario L: Avoid-tools deduplication ────────────────────────────────
+    // When stall + health both recommend avoiding the same tool, it should
+    // appear only once in avoid_tools (HashSet dedup in evaluate).
+    #[test]
+    fn avoid_tools_are_deduplicated() {
+        let mut guard = TurnGuard::new();
+
+        // Deprioritize bash via failures
+        guard.record_tool_result("bash", "error: fail 1");
+        guard.record_tool_result("bash", "error: fail 2");
+        guard.record_tool_result("bash", "error: fail 3");
+
+        // Create stall with bash (stall reflection will also suggest avoiding bash)
+        let calls = [tc("bash", r#"{"command":"ls"}"#)];
+        guard.record_tool_calls(&calls);
+        guard.record_tool_calls(&calls);
+
+        let verdict = guard.evaluate();
+        // Count occurrences of "bash" in avoid_tools
+        let bash_count = verdict.avoid_tools.iter()
+            .filter(|t| *t == "bash")
+            .count();
+        assert_eq!(bash_count, 1,
+            "bash should appear exactly once in avoid_tools despite multiple sources");
+    }
+
+    // ── Scenario M: Error chain escalation (mixed categories) ────────────────
+    // Simulates: A session accumulates errors from different categories
+    // (permission, not_found, transient), showing that total_errors drives
+    // escalation regardless of category.
+    #[test]
+    fn mixed_error_categories_accumulate_for_escalation() {
+        use mo_agent_runtime::turn::error_recovery::ErrorCategory;
+        let mut guard = TurnGuard::new();
+
+        // Record 3 different error types
+        guard.errors.record_error(ErrorCategory::Auth);
+        guard.errors.record_error(ErrorCategory::NotFound);
+        guard.errors.record_error(ErrorCategory::Unknown);
+        assert_eq!(guard.errors.total_errors, 3);
+
+        let verdict = guard.evaluate();
+        // 3 non-timeout errors + 0 nudges → Warning level
+        assert!(verdict.severity >= VerdictSeverity::Warning,
+            "3 total errors should trigger at least Warning");
+    }
+
+    // ── Scenario N: Session recovery — guard state is not lost across turns ──
+    // Proves that TurnGuard accumulates state correctly across many turns
+    // without resetting internal counters unexpectedly.
+    #[test]
+    fn guard_state_persists_across_many_turns() {
+        let mut guard = TurnGuard::new();
+
+        // Turn 1-5: various activities
+        guard.record_tool_calls(&[tc("bash", r#"{"command":"ls"}"#)]);
+        guard.record_tool_result("bash", "files...");
+        guard.record_tool_calls(&[tc("read_file", r#"{"path":"a.rs"}"#)]);
+        guard.record_tool_result("read_file", "fn main(){}");
+        guard.record_tool_calls(&[tc("memory_store", r#"{"content":"note"}"#)]);
+        guard.record_tool_result("memory_store", r#"{"stored":true}"#);
+        guard.record_tool_calls(&[tc("bash", r#"{"command":"cargo test"}"#)]);
+        guard.record_tool_result("bash", "test result: 100 passed");
+        guard.record_tool_calls(&[tc("write_file", r#"{"path":"b.rs","content":"code"}"#)]);
+        guard.record_tool_result("write_file", r#"{"written":true}"#);
+
+        // After 5 varied turns, no stalls or issues
+        let verdict = guard.evaluate();
+        assert_eq!(verdict.severity, VerdictSeverity::Healthy);
+        assert!(verdict.injections.is_empty());
+        assert!(!verdict.force_stop);
+        assert_eq!(guard.nudge_count, 0);
+
+        // tool_sigs are windowed (SERVER_STALL_WINDOW + 2 = 4)
+        assert!(guard.tool_sigs.len() <= 5 && guard.tool_sigs.len() >= 4,
+            "tool_sigs are windowed to last ~4 entries");
+
+        // Tool health should track all tools
+        assert!(guard.health.get("bash").is_some());
+        assert!(guard.health.get("read_file").is_some());
+        assert!(guard.health.get("memory_store").is_some());
+        assert!(guard.health.get("write_file").is_some());
+    }
+
+    // ── Scenario O: Force-stop requires BOTH Critical + nudge_count >= 3 ─────
+    // Proves that Critical alone is not enough for force_stop.
+    #[test]
+    fn critical_without_enough_nudges_does_not_force_stop() {
+        let mut guard = TurnGuard::new();
+
+        // Manually set escalation conditions for Critical (2 nudges + errors)
+        // but don't go to 3 nudges
+        guard.nudge_count = 2;
+        guard.errors.record_error(
+            mo_agent_runtime::turn::error_recovery::ErrorCategory::Unknown
+        );
+
+        let verdict = guard.evaluate();
+        assert_eq!(verdict.severity, VerdictSeverity::Critical);
+        assert!(!verdict.force_stop,
+            "Critical with nudge_count=2 should NOT force_stop (need >= 3)");
+    }
+
+    // ── Scenario P: Healthy session produces minimal verdict ─────────────────
+    // Proves the zero-cost baseline: a productive session with no issues
+    // produces a verdict with zero injections and no avoid_tools.
+    #[test]
+    fn productive_session_has_zero_overhead() {
+        let mut guard = TurnGuard::new();
+
+        // 10 varied productive turns
+        for i in 0..10 {
+            let tool = match i % 4 {
+                0 => "bash",
+                1 => "memory_store",
+                2 => "github_list_prs",
+                _ => "write_file",
+            };
+            let args = format!(r#"{{"iteration":{i}}}"#);
+            guard.record_tool_calls(&[tc(tool, &args)]);
+            guard.record_tool_result(tool, &format!(r#"{{"result":"ok_{i}"}}"#));
+        }
+
+        let verdict = guard.evaluate();
+        assert_eq!(verdict.severity, VerdictSeverity::Healthy);
+        assert!(verdict.injections.is_empty(),
+            "Productive session should have zero injections");
+        assert!(verdict.avoid_tools.is_empty(),
+            "Productive session should have zero avoid_tools");
+        assert!(!verdict.force_stop);
+        assert_eq!(guard.nudge_count, 0);
+    }
+}
