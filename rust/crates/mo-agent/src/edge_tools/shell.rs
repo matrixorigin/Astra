@@ -4,6 +4,62 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// SSRF protection: check if a URL targets internal/private networks.
+/// Returns Some(reason) if blocked, None if safe.
+fn is_ssrf_target(url: &str) -> Option<&'static str> {
+    // Extract host from URL (simple parsing, handles http://host:port/path)
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = after_scheme.split('/').next()?;
+    // Handle userinfo@ prefix
+    let host_port = authority.split('@').last()?;
+    // Handle IPv6 brackets: [::1]:port → extract [::1]
+    let host = if host_port.starts_with('[') {
+        // IPv6: take everything up to and including the closing bracket
+        host_port.split(']').next().map(|s| format!("{s}]")).unwrap_or_default()
+    } else {
+        host_port.split(':').next().unwrap_or("").to_string()
+    };
+    let lower = host.to_ascii_lowercase();
+
+    // Block localhost variants
+    if lower == "localhost"
+        || lower == "127.0.0.1"
+        || lower == "0.0.0.0"
+        || lower == "::1"
+        || lower == "[::1]"
+        || lower.ends_with(".localhost")
+    {
+        return Some("localhost access blocked");
+    }
+    // Block AWS/cloud metadata endpoints
+    if lower == "169.254.169.254" || lower == "metadata.google.internal" {
+        return Some("cloud metadata endpoint blocked");
+    }
+    // Block private IP ranges (RFC 1918 + link-local)
+    if lower.starts_with("10.")
+        || lower.starts_with("192.168.")
+        || lower.starts_with("172.") && is_private_172(&lower)
+        || lower.starts_with("169.254.")
+        || lower.starts_with("fc")
+        || lower.starts_with("fd")
+    {
+        return Some("private network access blocked");
+    }
+    None
+}
+
+/// Check if a 172.x.x.x address is in the private range 172.16-31.x.x
+fn is_private_172(host: &str) -> bool {
+    if let Some(second) = host.strip_prefix("172.").and_then(|r| r.split('.').next()) {
+        if let Ok(n) = second.parse::<u8>() {
+            return (16..=31).contains(&n);
+        }
+    }
+    false
+}
+
 impl ToolExecutor {
     pub(crate) fn run_shell_output(
         &self,
@@ -49,6 +105,8 @@ impl ToolExecutor {
                         if let Err(e) = child.kill() {
                             eprintln!("[shell] failed to kill timed-out child: {e}");
                         }
+                        // Reap the zombie process to prevent resource leak
+                        let _ = child.wait();
                         return Err(format!("Error: command timed out after {timeout_secs}s"));
                     }
                     std::thread::sleep(Duration::from_millis(50));
@@ -279,6 +337,10 @@ impl ToolExecutor {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return "Error: url must start with http:// or https://".to_string();
         }
+        // SSRF protection: block internal/private IP ranges
+        if let Some(reason) = is_ssrf_target(url) {
+            return format!("Error: blocked URL ({reason})");
+        }
         let max_bytes = args
             .get("max_bytes")
             .and_then(Value::as_u64)
@@ -486,6 +548,41 @@ mod tests {
             result.unwrap_err().contains("Sandbox"),
             "should mention sandbox"
         );
+    }
+
+    // ── SSRF protection ─────────────────────────────────────────────────────
+
+    #[test]
+    fn ssrf_blocks_localhost() {
+        assert!(is_ssrf_target("http://127.0.0.1:8080/secret").is_some());
+        assert!(is_ssrf_target("http://localhost/admin").is_some());
+        assert!(is_ssrf_target("http://0.0.0.0:3000").is_some());
+        assert!(is_ssrf_target("http://[::1]/api").is_some());
+    }
+
+    #[test]
+    fn ssrf_blocks_private_networks() {
+        assert!(is_ssrf_target("http://10.0.0.1/internal").is_some());
+        assert!(is_ssrf_target("http://192.168.1.1/router").is_some());
+        assert!(is_ssrf_target("http://172.16.0.1/service").is_some());
+        assert!(is_ssrf_target("http://172.31.255.1/db").is_some());
+        // 172.15 and 172.32 are NOT private
+        assert!(is_ssrf_target("http://172.15.0.1/ok").is_none());
+        assert!(is_ssrf_target("http://172.32.0.1/ok").is_none());
+    }
+
+    #[test]
+    fn ssrf_blocks_cloud_metadata() {
+        assert!(is_ssrf_target("http://169.254.169.254/latest/meta-data/").is_some());
+        assert!(is_ssrf_target("http://metadata.google.internal/computeMetadata/v1/").is_some());
+    }
+
+    #[test]
+    fn ssrf_allows_public_urls() {
+        assert!(is_ssrf_target("https://github.com/matrixorigin/matrixone").is_none());
+        assert!(is_ssrf_target("https://api.github.com/repos").is_none());
+        assert!(is_ssrf_target("http://example.com").is_none());
+        assert!(is_ssrf_target("https://docs.rs/tokio/latest").is_none());
     }
 
     // ── git_show ──────────────────────────────────────────────────────────────

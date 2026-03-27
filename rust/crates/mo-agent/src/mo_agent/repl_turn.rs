@@ -222,13 +222,16 @@ async fn apply_auto_compact_result(
         state.turn,
         prompts::memory_proto::SRC_AUTO_COMPACT,
     );
-    let _ = ctx
+    if let Err(e) = ctx
         .client
         .post(format!("{}/memory/store", ctx.base))
         .headers(auth_headers(token)?)
         .json(&entry.to_store_payload_with_meta(&meta))
         .send()
-        .await;
+        .await
+    {
+        eprintln!("[repl_turn] warning: failed to persist compacted memory: {e}");
+    }
 
     eprintln!(
         "  {}",
@@ -316,7 +319,9 @@ fn apply_turn_success(
         )
         .with_tool_calls(result.tool_call_records.clone())
         .with_budget_pressure(result.budget_pressure);
-        let _ = journal.append(&turn_event);
+        if let Err(e) = journal.append(&turn_event) {
+            eprintln!("[journal] warning: failed to write turn event: {e}");
+        }
         enqueue_ingestion(state, &turn_event);
 
         // Update workspace metadata per-turn

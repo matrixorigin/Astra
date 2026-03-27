@@ -42,10 +42,13 @@ fn count_inprocess_persisted_events(
 }
 
 fn render_sse(event: &Value) -> Bytes {
-    Bytes::from(format!(
-        "data: {}\n\n",
-        serde_json::to_string(event).expect("Value always serializable to JSON")
-    ))
+    match serde_json::to_string(event) {
+        Ok(s) => Bytes::from(format!("data: {s}\n\n")),
+        Err(e) => {
+            eprintln!("[sse_render] serialization failed: {e}");
+            Bytes::from("event: error\ndata: {\"error\":\"internal serialization failure\"}\n\n")
+        }
+    }
 }
 
 fn render_sse_map(event: &Map<String, Value>) -> Bytes {
