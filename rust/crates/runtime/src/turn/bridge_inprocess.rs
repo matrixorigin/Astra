@@ -47,7 +47,7 @@ fn render_sse(event: &Value) -> Bytes {
     match serde_json::to_string(event) {
         Ok(s) => Bytes::from(format!("data: {s}\n\n")),
         Err(e) => {
-            eprintln!("[sse_render] serialization failed: {e}");
+            mo_agent_core::agent_error!("sse", "serialization failed: {e}");
             Bytes::from("event: error\ndata: {\"error\":\"internal serialization failure\"}\n\n")
         }
     }
@@ -960,9 +960,12 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 let core_outcome = match writer.persist(persist_plan).await {
                     Ok(outcome) => outcome,
                     Err(e) => {
-                        eprintln!(
-                            "PERSIST_FAIL session={} core_events={} tool_events={} elapsed={:?} error={}",
-                            sid, core_event_count, tool_event_count, persist_start.elapsed(), e
+                        mo_agent_core::agent_persist_fail!("bridge",
+                            session = sid,
+                            core_events = core_event_count,
+                            tool_events = tool_event_count,
+                            elapsed = format!("{:?}", persist_start.elapsed()),
+                            error = e
                         );
                         return;
                     }
@@ -970,9 +973,12 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 let tool_events_persisted = match tool_event_plan {
                     Some(plan) => {
                         if let Err(e) = tool_writer.persist(plan).await {
-                            eprintln!(
-                                "PERSIST_FAIL session={} stage=tool_events count={} elapsed={:?} error={}",
-                                sid, tool_event_count, persist_start.elapsed(), e
+                            mo_agent_core::agent_persist_fail!("bridge",
+                                session = sid,
+                                stage = "tool_events",
+                                count = tool_event_count,
+                                elapsed = format!("{:?}", persist_start.elapsed()),
+                                error = e
                             );
                             false
                         } else {
@@ -997,9 +1003,11 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     last_event_id,
                 };
                 if let Err(e) = sa_writer.update_session_activity(&sid, plan).await {
-                    eprintln!(
-                        "PERSIST_FAIL session={} stage=activity elapsed={:?} error={}",
-                        sid, persist_start.elapsed(), e
+                    mo_agent_core::agent_persist_fail!("bridge",
+                        session = sid,
+                        stage = "activity",
+                        elapsed = format!("{:?}", persist_start.elapsed()),
+                        error = e
                     );
                 }
             });
@@ -1307,7 +1315,7 @@ async fn fetch_memories(base_url: &str, api_key: &str, query: &str, user_id: &st
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[memory] fetch error: {e:#}");
+            mo_agent_core::agent_error!("memory", "fetch error: {e:#}");
             return String::new();
         }
     };

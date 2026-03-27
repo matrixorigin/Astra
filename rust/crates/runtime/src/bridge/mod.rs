@@ -489,7 +489,7 @@ where
                                 && !sigs.is_empty() {
                                     tool_rounds += 1;
                                     if tool_rounds > max_tool_rounds() {
-                                        eprintln!("Turn exceeded max_tool_rounds ({}), forcing completion", max_tool_rounds());
+                                        mo_agent_core::agent_warn!("bridge", "Turn exceeded max_tool_rounds ({}), forcing completion", max_tool_rounds());
                                         yield Ok(Bytes::from(render_sse_json(serde_json::json!({
                                             "type": "turn_complete",
                                             "has_tool_calls": false,
@@ -730,7 +730,7 @@ where
         }
 
         if !received_turn_complete {
-            eprintln!("SSE stream ended without turn_complete frame — possible interruption");
+            mo_agent_core::agent_warn!("bridge", "SSE stream ended without turn_complete frame — possible interruption");
         }
     }
 }

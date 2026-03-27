@@ -8,6 +8,7 @@ use serde::Serialize;
 use sqlx::{MySql, Pool, mysql::MySqlPoolOptions};
 
 pub mod config;
+pub mod log;
 pub mod runtime_limits;
 pub use config::*;
 pub use runtime_limits::{RuntimeLimits, DEV_MATRIXONE_PASSWORD, warn_default_credentials_once};

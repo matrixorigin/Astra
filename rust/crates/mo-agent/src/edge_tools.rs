@@ -756,7 +756,7 @@ impl ToolExecutor {
             }
             Err(poisoned) => {
                 // Recover from poisoned mutex — clear and re-add
-                eprintln!("[preferred_repos] recovering from poisoned mutex");
+                mo_agent_core::agent_warn!("preferred_repos", "recovering from poisoned mutex");
                 let mut repos = poisoned.into_inner();
                 repos.clear();
                 repos.push(normalized);
@@ -769,7 +769,7 @@ impl ToolExecutor {
         match self.preferred_repos.lock() {
             Ok(r) => r.clone(),
             Err(poisoned) => {
-                eprintln!("[preferred_repos] recovering from poisoned mutex on read");
+                mo_agent_core::agent_warn!("preferred_repos", "recovering from poisoned mutex on read");
                 poisoned.into_inner().clone()
             }
         }

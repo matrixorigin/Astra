@@ -230,7 +230,7 @@ async fn apply_auto_compact_result(
         .send()
         .await
     {
-        eprintln!("[repl_turn] warning: failed to persist compacted memory: {e}");
+        mo_agent_core::agent_warn!("repl_turn", "failed to persist compacted memory: {e}");
     }
 
     eprintln!(
@@ -320,7 +320,7 @@ fn apply_turn_success(
         .with_tool_calls(result.tool_call_records.clone())
         .with_budget_pressure(result.budget_pressure);
         if let Err(e) = journal.append(&turn_event) {
-            eprintln!("[journal] warning: failed to write turn event: {e}");
+            mo_agent_core::agent_warn!("journal", "failed to write turn event: {e}");
         }
         enqueue_ingestion(state, &turn_event);
 

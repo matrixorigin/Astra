@@ -97,7 +97,7 @@ pub fn warn_default_credentials_once() {
     if std::env::var("MATRIXONE_PASSWORD").is_err() {
         WARNED.call_once(|| {
             eprintln!(
-                "[config] WARNING: using default MatrixOne password. \
+                "[config] WARN: using default MatrixOne password. \
                  Set MATRIXONE_PASSWORD env var for production."
             );
         });
