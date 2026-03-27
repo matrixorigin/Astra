@@ -823,7 +823,7 @@ fn handle_tools_command(state: &ReplState) {
     eprintln!();
 }
 
-fn handle_health_command(arg: &str, state: &ReplState) {
+async fn handle_health_command(arg: &str, state: &ReplState) {
     use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
 
     let detail = arg.trim() == "detail";
@@ -982,21 +982,8 @@ fn handle_health_command(arg: &str, state: &ReplState) {
         Some(pool) => {
             let svc =
                 mo_agent_services::state_sync::MatrixOneSyncService::new(pool.as_ref().clone());
-            match tokio::runtime::Handle::try_current() {
-                Err(_) => {
-                    eprintln!(
-                        "  {} {}",
-                        "○".dim(),
-                        "No async runtime — cannot query sync status".dim()
-                    );
-                }
-                Ok(handle) => {
-                    let sync_status = handle.block_on(
-                        mo_agent_services::state_sync::StateSyncService::status(&svc),
-                    );
-                    display_sync_status(&sync_status);
-                }
-            }
+            let sync_status = mo_agent_services::state_sync::StateSyncService::status(&svc).await;
+            display_sync_status(&sync_status);
         }
     }
 
@@ -1139,7 +1126,7 @@ fn merge_learning_snapshot(
 
 /// Try to pull learning state from MatrixOne and merge into live modules.
 /// Best-effort: silently skips if cloud is unavailable.
-fn try_cloud_pull(
+async fn try_cloud_pull(
     profile_name: &str,
     entity_graph: &std::sync::Arc<
         std::sync::Mutex<mo_agent_runtime::pipeline::entity::EntityGraph>,
@@ -1151,23 +1138,19 @@ fn try_cloud_pull(
         std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
     >,
 ) -> Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry> {
-    let pool = match try_connect_matrixone_sync() {
+    let pool = match try_connect_matrixone().await {
         Some(p) => p,
         None => return Vec::new(),
     };
     let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
     let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
-    let rt = match tokio::runtime::Handle::try_current() {
-        Ok(h) => h,
-        Err(_) => return Vec::new(),
-    };
-    match rt.block_on(
-        mo_agent_services::state_sync::StateSyncService::pull_learning(
-            &svc,
-            &user_id,
-            profile_name,
-        ),
-    ) {
+    match mo_agent_services::state_sync::StateSyncService::pull_learning(
+        &svc,
+        &user_id,
+        profile_name,
+    )
+    .await
+    {
         Ok(Some(json)) => {
             // Parse snapshot to extract tool health before merging entities/patterns
             let cloud_health = serde_json::from_str::<
@@ -1189,7 +1172,7 @@ fn try_cloud_pull(
 
 /// Try to push learning state to MatrixOne after local save.
 /// Best-effort: silently skips if cloud is unavailable.
-fn try_cloud_push(
+async fn try_cloud_push(
     profile_name: &str,
     entity_graph: &std::sync::Arc<
         std::sync::Mutex<mo_agent_runtime::pipeline::entity::EntityGraph>,
@@ -1202,7 +1185,7 @@ fn try_cloud_push(
     >,
     tool_health: &[mo_agent_runtime::pipeline::persistence::ToolHealthEntry],
 ) {
-    let pool = match try_connect_matrixone_sync() {
+    let pool = match try_connect_matrixone().await {
         Some(p) => p,
         None => return,
     };
@@ -1218,21 +1201,16 @@ fn try_cloud_push(
     };
     let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
     let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
-    let rt = match tokio::runtime::Handle::try_current() {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-    let result = rt.block_on(
-        mo_agent_services::state_sync::StateSyncService::push_learning(
-            &svc,
-            &user_id,
-            profile_name,
-            &json,
-            snapshot.entities.len() as u32,
-            snapshot.patterns.len() as u32,
-            snapshot.calibration.is_some(),
-        ),
-    );
+    let result = mo_agent_services::state_sync::StateSyncService::push_learning(
+        &svc,
+        &user_id,
+        profile_name,
+        &json,
+        snapshot.entities.len() as u32,
+        snapshot.patterns.len() as u32,
+        snapshot.calibration.is_some(),
+    )
+    .await;
     if result.success {
         eprintln!("{}", "  ✓ Learning synced to cloud".dim());
     } else {
@@ -1245,20 +1223,16 @@ fn try_cloud_push(
 
 /// Pull user preferences from cloud at session start.
 /// Merges cloud preferences into local state (cloud-wins).
-fn try_cloud_pull_preferences(state: &mut ReplState) {
-    let pool = match try_connect_matrixone_sync() {
+async fn try_cloud_pull_preferences(state: &mut ReplState) {
+    let pool = match try_connect_matrixone().await {
         Some(p) => p,
         None => return,
     };
     let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
     let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
-    let rt = match tokio::runtime::Handle::try_current() {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-    match rt.block_on(
-        mo_agent_services::state_sync::StateSyncService::pull_all_preferences(&svc, &user_id),
-    ) {
+    match mo_agent_services::state_sync::StateSyncService::pull_all_preferences(&svc, &user_id)
+        .await
+    {
         Ok(prefs) if !prefs.is_empty() => {
             use mo_agent_services::state_sync::pref_keys;
             for (key, value) in &prefs {
@@ -1289,24 +1263,20 @@ fn try_cloud_pull_preferences(state: &mut ReplState) {
 }
 
 /// Push user preferences to cloud at session end.
-fn try_cloud_push_preferences(state: &ReplState) {
-    let pool = match try_connect_matrixone_sync() {
+async fn try_cloud_push_preferences(state: &ReplState) {
+    let pool = match try_connect_matrixone().await {
         Some(p) => p,
         None => return,
     };
     let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
     let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
-    let rt = match tokio::runtime::Handle::try_current() {
-        Ok(h) => h,
-        Err(_) => return,
-    };
     use mo_agent_services::state_sync::{StateSyncService, pref_keys};
     let prefs = [
         (pref_keys::EXPLAIN_MODE, state.explain.to_string()),
     ];
     let mut synced = 0u32;
     for (key, value) in &prefs {
-        let result = rt.block_on(svc.push_preference(&user_id, key, value));
+        let result = svc.push_preference(&user_id, key, value).await;
         if result.success {
             synced += 1;
         }
@@ -1320,7 +1290,7 @@ fn try_cloud_push_preferences(state: &ReplState) {
 }
 
 /// Best-effort MatrixOne pool creation for sync operations.
-fn try_connect_matrixone_sync() -> Option<sqlx::Pool<sqlx::MySql>> {
+async fn try_connect_matrixone() -> Option<sqlx::Pool<sqlx::MySql>> {
     let host = std::env::var("MATRIXONE_HOST").ok()?;
     let port: u16 = std::env::var("MATRIXONE_PORT")
         .ok()
@@ -1331,14 +1301,12 @@ fn try_connect_matrixone_sync() -> Option<sqlx::Pool<sqlx::MySql>> {
     let database =
         std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "mo_agent".to_string());
     let url = format!("mysql://{user}:{password}@{host}:{port}/{database}");
-    let rt = tokio::runtime::Handle::try_current().ok()?;
-    rt.block_on(
-        sqlx::mysql::MySqlPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(3))
-            .connect(&url),
-    )
-    .ok()
+    sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(std::time::Duration::from_secs(3))
+        .connect(&url)
+        .await
+        .ok()
 }
 
 // ═══════════════════════════════════════════════════════ Task Commands ════
@@ -1693,7 +1661,7 @@ async fn handle_slash_command(
         }
 
         "/health" => {
-            handle_health_command(arg, state);
+            handle_health_command(arg, state).await;
         }
 
         "/exit" | "/quit" => {
@@ -1786,7 +1754,8 @@ async fn run_chat_repl(
             &pipeline_modules.entity_graph,
             &pipeline_modules.pattern_library,
             &pipeline_modules.calibrator,
-        );
+        )
+        .await;
         // Merge cloud tool health: timestamp-based conflict resolution
         if !cloud_health.is_empty() {
             let (merged, cloud_wins, cloud_only) =
@@ -1810,7 +1779,7 @@ async fn run_chat_repl(
             }
         }
         // Try to pull user preferences from cloud
-        try_cloud_pull_preferences(&mut state);
+        try_cloud_pull_preferences(&mut state).await;
     }
     state.tool_health_entries = cross_session_health_entries;
 
@@ -1896,7 +1865,8 @@ async fn run_chat_repl(
                             &pipeline_modules.pattern_library,
                             &pipeline_modules.calibrator,
                             &state.tool_health_entries,
-                        );
+                        )
+                        .await;
                     }
                 }
             }
@@ -1955,9 +1925,10 @@ async fn run_chat_repl(
             &pipeline_modules.pattern_library,
             &pipeline_modules.calibrator,
             &state.tool_health_entries,
-        );
+        )
+        .await;
         // Push preferences to cloud (best-effort)
-        try_cloud_push_preferences(&state);
+        try_cloud_push_preferences(&state).await;
     }
 
     let _ = editor.save_history(&hist_path);
