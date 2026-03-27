@@ -22,6 +22,7 @@ use crossterm::{
 };
 use mo_agent_runtime::{prompts, tool_registry, tool_selector};
 use mo_agent_services::session_journal;
+use mo_agent_services::event_ingestion;
 
 mod edge_tools;
 mod manifest_loader;
@@ -354,6 +355,10 @@ struct ReplState {
     recent_tools: Vec<String>,
     /// Session-persistent permission manager — "always"/"skip" survives across turns.
     perm_manager: PermissionManager,
+    /// Async event ingestion sender for cloud push (None if MatrixOne unavailable).
+    ingestion_sender: Option<event_ingestion::IngestionSender>,
+    /// User ID for event ingestion attribution.
+    ingestion_user_id: Option<String>,
 }
 
 impl Default for ReplState {
@@ -377,6 +382,8 @@ impl Default for ReplState {
             journal: None,
             recent_tools: Vec::new(),
             perm_manager: PermissionManager::new(false),
+            ingestion_sender: None,
+            ingestion_user_id: None,
         }
     }
 }

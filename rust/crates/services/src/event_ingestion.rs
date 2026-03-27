@@ -62,6 +62,77 @@ pub struct IngestionEvent {
     pub metadata: Option<serde_json::Value>,
 }
 
+impl IngestionEvent {
+    /// Transform a JournalEvent into an IngestionEvent for cloud push.
+    ///
+    /// - `user_id`: the authenticated user (not stored in journal events)
+    /// - Generates a unique event_id from session_id + turn + event_type
+    pub fn from_journal_event(
+        event: &crate::session_journal::JournalEvent,
+        user_id: &str,
+    ) -> Self {
+        let session_id = event
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Deterministic event_id: hash of (session_id, turn, event_type, ts)
+        // This makes re-ingestion idempotent via INSERT IGNORE
+        let event_id = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            session_id.hash(&mut hasher);
+            event.turn.hash(&mut hasher);
+            format!("{:?}", event.event_type).hash(&mut hasher);
+            event.ts.hash(&mut hasher);
+            format!("evt-{:016x}", hasher.finish())
+        };
+
+        let event_type = format!("{:?}", event.event_type)
+            .chars()
+            .flat_map(|c| {
+                if c.is_uppercase() {
+                    vec!['_', c.to_ascii_lowercase()]
+                } else {
+                    vec![c]
+                }
+            })
+            .collect::<String>()
+            .trim_start_matches('_')
+            .to_string();
+
+        // Content: user_input for turns, error for errors, summary for checkpoints
+        let content = event
+            .user_input
+            .clone()
+            .or_else(|| event.error.clone())
+            .or_else(|| event.stall_type.clone());
+
+        // Token usage as JSON
+        let token_usage = match (event.tokens_in, event.tokens_out) {
+            (Some(inp), Some(out)) => Some(serde_json::json!({
+                "input": inp,
+                "output": out,
+                "total": inp + out,
+            })),
+            _ => None,
+        };
+
+        Self {
+            event_id,
+            session_id,
+            user_id: user_id.to_string(),
+            event_type,
+            content,
+            token_usage,
+            llm_model_used: event.model.clone(),
+            skill_name: None,
+            metadata: event.metadata.clone(),
+        }
+    }
+}
+
 /// Handle for sending events to the ingestion worker.
 #[derive(Clone)]
 pub struct IngestionSender {
@@ -308,5 +379,105 @@ mod tests {
             metadata: None,
         });
         // No panic = test passes
+    }
+
+    // ─── Transform tests ───────────────────────────────────────────────
+
+    fn make_turn_event() -> crate::session_journal::JournalEvent {
+        crate::session_journal::JournalEvent {
+            event_type: crate::session_journal::JournalEventType::Turn,
+            ts: "2025-01-15T10:30:00Z".into(),
+            session_id: Some("sess-abc".into()),
+            turn: Some(3),
+            model: Some("gpt-4".into()),
+            user_input: Some("list PRs".into()),
+            assistant_output: Some("Here are the PRs...".into()),
+            tool_count: Some(2),
+            tokens_in: Some(500),
+            tokens_out: Some(200),
+            duration_ms: Some(1200),
+            error: None,
+            config_key: None,
+            config_value: None,
+            turns_compacted: None,
+            facts_stored: None,
+            tools_selected: Some(vec!["github_list_prs".into()]),
+            tools_used: Some(vec!["github_list_prs".into()]),
+            tool_calls: None,
+            budget_used: None,
+            budget_pressure: None,
+            stall_type: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn transform_turn_event() {
+        let journal = make_turn_event();
+        let ingestion = IngestionEvent::from_journal_event(&journal, "user-1");
+
+        assert!(ingestion.event_id.starts_with("evt-"));
+        assert_eq!(ingestion.session_id, "sess-abc");
+        assert_eq!(ingestion.user_id, "user-1");
+        assert!(ingestion.event_type.contains("turn"));
+        assert_eq!(ingestion.content.as_deref(), Some("list PRs"));
+        assert_eq!(ingestion.llm_model_used.as_deref(), Some("gpt-4"));
+
+        // Token usage present
+        let usage = ingestion.token_usage.unwrap();
+        assert_eq!(usage["input"], 500);
+        assert_eq!(usage["output"], 200);
+        assert_eq!(usage["total"], 700);
+    }
+
+    #[test]
+    fn transform_session_start_event() {
+        let event = crate::session_journal::JournalEvent::session_start(
+            Some("sess-new"), Some("gpt-4"),
+        );
+        let ingestion = IngestionEvent::from_journal_event(&event, "user-2");
+
+        assert_eq!(ingestion.session_id, "sess-new");
+        assert!(ingestion.event_type.contains("session"));
+        assert!(ingestion.token_usage.is_none());
+    }
+
+    #[test]
+    fn transform_error_event() {
+        let event = crate::session_journal::JournalEvent::turn_error(
+            Some("sess-err"), 2, Some("gpt-4"), "list files", "connection refused", 500,
+        );
+        let ingestion = IngestionEvent::from_journal_event(&event, "user-3");
+
+        assert_eq!(ingestion.session_id, "sess-err");
+        // Error event: content should be user_input (takes priority) or error
+        assert!(ingestion.content.is_some());
+    }
+
+    #[test]
+    fn transform_deterministic_event_id() {
+        let journal = make_turn_event();
+        let a = IngestionEvent::from_journal_event(&journal, "u1");
+        let b = IngestionEvent::from_journal_event(&journal, "u1");
+        // Same input → same event_id (deterministic for idempotency)
+        assert_eq!(a.event_id, b.event_id);
+    }
+
+    #[test]
+    fn transform_missing_session_id_defaults() {
+        let mut journal = make_turn_event();
+        journal.session_id = None;
+        let ingestion = IngestionEvent::from_journal_event(&journal, "u1");
+        assert_eq!(ingestion.session_id, "unknown");
+    }
+
+    #[test]
+    fn transform_stall_event_uses_stall_type_as_content() {
+        let event = crate::session_journal::JournalEvent::stall_detected(
+            Some("sess-s"), 5, "sig_stall", 2, 0.6,
+            &["github_list_prs".to_string()],
+        );
+        let ingestion = IngestionEvent::from_journal_event(&event, "u1");
+        assert_eq!(ingestion.content.as_deref(), Some("sig_stall"));
     }
 }

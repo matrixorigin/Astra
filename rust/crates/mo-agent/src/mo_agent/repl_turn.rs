@@ -7,6 +7,19 @@ pub(super) struct ReplTurnContext<'a> {
     pub(super) selector: &'a dyn tool_selector::ToolSelector,
 }
 
+/// Enqueue a journal event for async cloud ingestion (if sender is available).
+fn enqueue_ingestion(state: &ReplState, event: &session_journal::JournalEvent) {
+    if let Some(ref sender) = state.ingestion_sender {
+        let user_id = state
+            .ingestion_user_id
+            .as_deref()
+            .unwrap_or("anonymous");
+        let ingestion_event =
+            event_ingestion::IngestionEvent::from_journal_event(event, user_id);
+        sender.enqueue(ingestion_event);
+    }
+}
+
 enum TurnAttempt {
     Completed(Box<Result<StreamResult, String>>),
     Interrupted,
@@ -284,8 +297,7 @@ fn apply_turn_success(
     state.recent_tools = result.tools_used.clone();
 
     if let Some(journal) = state.journal.as_ref() {
-        let _ = journal.append(
-            &session_journal::JournalEvent::turn(
+        let turn_event = session_journal::JournalEvent::turn(
                 state.session_id.as_deref(),
                 state.turn,
                 state.model.as_deref(),
@@ -302,8 +314,9 @@ fn apply_turn_success(
                 result.budget_used,
             )
             .with_tool_calls(result.tool_call_records.clone())
-            .with_budget_pressure(result.budget_pressure),
-        );
+            .with_budget_pressure(result.budget_pressure);
+        let _ = journal.append(&turn_event);
+        enqueue_ingestion(state, &turn_event);
 
         // Update workspace metadata per-turn
         if let Some(sid) = state.session_id.as_deref()
@@ -334,13 +347,15 @@ fn apply_turn_success(
                     error_count: 0,
                 };
                 let _ = mo_agent_services::session_checkpoint::write_checkpoint(sid, &cp);
-                let _ = journal.append(&session_journal::JournalEvent::checkpoint(
+                let cp_event = session_journal::JournalEvent::checkpoint(
                     Some(sid),
                     ws.turn_count,
                     &cp.summary,
                     cp.total_tokens,
                     cp.tools_used.len(),
-                ));
+                );
+                let _ = journal.append(&cp_event);
+                enqueue_ingestion(state, &cp_event);
             }
 
             let _ = mo_agent_services::session_workspace::write_workspace(&ws);
@@ -348,19 +363,21 @@ fn apply_turn_success(
 
         // Log stall events to journal
         for (stall_type, turn_num) in &result.stall_events {
-            let _ = journal.append(&session_journal::JournalEvent::stall_detected(
+            let stall_event = session_journal::JournalEvent::stall_detected(
                 state.session_id.as_deref(),
                 *turn_num,
                 stall_type,
                 0, // nudge_count not tracked per-event; stall_type conveys severity
                 0.0,
                 &[],
-            ));
+            );
+            let _ = journal.append(&stall_event);
+            enqueue_ingestion(state, &stall_event);
         }
 
         // Log TurnGuard verdict events to journal (non-Healthy only)
         for ve in &result.verdict_events {
-            let _ = journal.append(&session_journal::JournalEvent::turn_guard_verdict(
+            let verdict_event = session_journal::JournalEvent::turn_guard_verdict(
                 state.session_id.as_deref(),
                 ve.turn,
                 &ve.severity,
@@ -370,7 +387,9 @@ fn apply_turn_success(
                 ve.nudge_count,
                 ve.total_errors,
                 ve.deprioritized_count,
-            ));
+            );
+            let _ = journal.append(&verdict_event);
+            enqueue_ingestion(state, &verdict_event);
         }
 
         // Log Step Protocol recorder summary (audit trail for execution phases)
@@ -382,13 +401,15 @@ fn apply_turn_success(
                 summary.phase_log.len(),
                 summary.total_time_ms,
             );
-            let _ = journal.append(&session_journal::JournalEvent::checkpoint(
+            let recorder_event = session_journal::JournalEvent::checkpoint(
                 state.session_id.as_deref(),
                 state.turn as u32,
                 &summary_text,
                 result.prompt_tokens + result.completion_tokens,
                 result.tool_calls_count as usize,
-            ));
+            );
+            let _ = journal.append(&recorder_event);
+            enqueue_ingestion(state, &recorder_event);
         }
     }
 
@@ -439,10 +460,19 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
 
     state.journal = session_journal::JournalWriter::new(session_id).ok();
     if let Some(journal) = state.journal.as_ref() {
-        let _ = journal.append(&session_journal::JournalEvent::session_start(
+        let start_event = session_journal::JournalEvent::session_start(
             Some(session_id),
             state.model.as_deref(),
-        ));
+        );
+        let _ = journal.append(&start_event);
+        // Note: ingestion sender may not be ready yet on first call;
+        // enqueue_ingestion silently skips if sender is None
+        enqueue_ingestion(state, &start_event);
+    }
+
+    // Try to spawn the event ingestion worker (async, best-effort)
+    if state.ingestion_sender.is_none() {
+        try_init_ingestion(state);
     }
 
     // Initialize workspace metadata alongside journal
@@ -451,6 +481,46 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
         state.model.as_deref().unwrap_or("default"),
     );
     let _ = mo_agent_services::session_workspace::write_workspace(&ws);
+}
+
+/// Best-effort spawn of the EventIngestionWorker.
+/// Reads MATRIXONE_* env vars; if not set, ingestion is silently disabled.
+fn try_init_ingestion(state: &mut ReplState) {
+    let settings = mo_agent_core::config::MatrixOneSettings {
+        host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".into()),
+        port: std::env::var("MATRIXONE_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6001),
+        user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
+        password: std::env::var("MATRIXONE_PASSWORD").unwrap_or_else(|_| "111".into()),
+        database: std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "dev_agent".into()),
+    };
+
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+
+    // Spawn a task that connects and stores the sender
+    let (tx, rx) = std::sync::mpsc::channel();
+    handle.spawn(async move {
+        match mo_agent_core::connect_matrixone(&settings).await {
+            Ok(pool) => {
+                let config = event_ingestion::IngestionConfig::default();
+                let (sender, _stats, _handle) =
+                    event_ingestion::EventIngestionWorker::spawn(pool, config);
+                let _ = tx.send(Some(sender));
+            }
+            Err(_) => {
+                let _ = tx.send(None);
+            }
+        }
+    });
+
+    // Give the pool connection a brief window to complete
+    if let Ok(Some(sender)) = rx.recv_timeout(std::time::Duration::from_secs(3)) {
+        state.ingestion_sender = Some(sender);
+    }
 }
 
 fn report_turn_error(state: &ReplState, line: &str, error: &str, turn_start: Instant) {
@@ -465,13 +535,15 @@ fn report_turn_error(state: &ReplState, line: &str, error: &str, turn_start: Ins
     }
 
     if let Some(journal) = state.journal.as_ref() {
-        let _ = journal.append(&session_journal::JournalEvent::turn_error(
+        let err_event = session_journal::JournalEvent::turn_error(
             state.session_id.as_deref(),
             state.turn + 1,
             state.model.as_deref(),
             line,
             error,
             turn_start.elapsed().as_millis() as u64,
-        ));
+        );
+        let _ = journal.append(&err_event);
+        enqueue_ingestion(state, &err_event);
     }
 }
