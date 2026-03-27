@@ -680,6 +680,14 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         }
         let restricted_vec: Vec<String> = restricted_tools.iter().cloned().collect();
 
+        // Record PERCEIVE phase: user query + memory context + domain hints
+        step_recorder.record_perceive(
+            message,
+            &[], // memory IDs not yet tracked individually
+            &memory_domain_hints.iter().map(|h| format!("{:?}", h)).collect::<Vec<_>>(),
+            &boost_terms,
+        );
+
         let (turn_schemas, selection_report, selection_confidence) = if tool_results.is_empty() {
             let turn_count = history.len() as u32 + 1;
             let sel_ctx = tool_selector::SelectionContext {
@@ -890,6 +898,9 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         total_prompt += turn_result.prompt_tokens;
         total_completion += turn_result.completion_tokens;
         total_tool_calls += turn_result.tool_calls.len() as u32;
+
+        // Record LLM token usage in step recorder
+        step_recorder.record_tokens(turn_result.prompt_tokens, turn_result.completion_tokens);
         // Track all unique tool names that the LLM actually invoked
         for tc in &turn_result.tool_calls {
             if let Some(name) = tc.get("name").and_then(|v| v.as_str()) {
@@ -1122,7 +1133,16 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             let tool_start = Instant::now();
             step_recorder.begin_tool(&name, &id);
 
-            let mut result_str = executor.execute(&name, &args).await;
+            // Enforce per-tool timeout from scheduling contract
+            let contract = step_recorder.scheduling();
+            let tool_timeout_ms = contract.effective_tool_timeout_ms(tool_count);
+            let mut result_str = match tokio::time::timeout(
+                std::time::Duration::from_millis(tool_timeout_ms),
+                executor.execute(&name, &args),
+            ).await {
+                Ok(r) => r,
+                Err(_) => format!("Tool '{}' timed out after {}ms (scheduling contract limit)", name, tool_timeout_ms),
+            };
 
             // If the `reflect` tool returned a placeholder, call the server.
             if name == "reflect"
@@ -1165,36 +1185,36 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             // Error recovery: classify, retry transient errors, track via TurnGuard
             if is_err {
                 use mo_agent_runtime::turn::error_recovery::{
-                    build_recovery_message, classify_error, should_retry,
+                    build_recovery_message, classify_error,
                 };
                 let category = classify_error(&result_str);
                 turn_guard.errors.record_error(category);
 
-                // Automatic retry for transient errors (network, timeout, rate limit)
+                // Automatic retry for transient errors using scheduling contract
                 let mut retried_ok = false;
                 if matches!(
                     category,
                     mo_agent_runtime::turn::error_recovery::ErrorCategory::Transient
                 ) {
-                    for attempt in 0..mo_agent_runtime::turn::error_recovery::MAX_TOOL_RETRIES {
-                        if let Some(delay_ms) = should_retry(category, attempt) {
-                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                            let retry_result = executor.execute(&name, &args).await;
-                            if !is_tool_error(&retry_result) {
-                                result_str = retry_result;
-                                retried_ok = true;
-                                turn_guard.errors.record_retry(true);
-                                if !quiet {
-                                    eprintln!(
-                                        "{}",
-                                        format!("  ↻ {name} retry #{} succeeded", attempt + 1)
-                                            .green()
-                                    );
-                                }
-                                break;
+                    let max_retries = contract.max_retries as usize;
+                    for attempt in 0..max_retries {
+                        let backoff_ms = contract.backoff_ms(attempt as u32);
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        let retry_result = executor.execute(&name, &args).await;
+                        if !is_tool_error(&retry_result) {
+                            result_str = retry_result;
+                            retried_ok = true;
+                            turn_guard.errors.record_retry(true);
+                            if !quiet {
+                                eprintln!(
+                                    "{}",
+                                    format!("  ↻ {name} retry #{} succeeded", attempt + 1)
+                                        .green()
+                                );
                             }
-                            turn_guard.errors.record_retry(false);
+                            break;
                         }
+                        turn_guard.errors.record_retry(false);
                     }
                 }
 

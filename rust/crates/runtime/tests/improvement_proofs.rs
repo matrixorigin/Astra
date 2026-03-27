@@ -4870,3 +4870,116 @@ mod file_event_store_proofs {
         );
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Scheduling Contract enforcement proofs
+// ═══════════════════════════════════════════════════════════════════════════════
+
+mod scheduling_contract_proofs {
+    use mo_agent_runtime::pipeline::step_protocol::*;
+    use mo_agent_runtime::pipeline::step_recorder::StepRecorder;
+
+    #[test]
+    fn recorder_perceive_populates_step_payload() {
+        let mut rec = StepRecorder::new("sess-perceive", "task-1");
+        rec.begin_turn(0);
+        rec.record_perceive(
+            "show me the PR status",
+            &["mem-1".to_string(), "mem-2".to_string()],
+            &["Github".to_string()],
+            &["pr".to_string(), "status".to_string()],
+        );
+
+        let step = rec.current_step().unwrap();
+        match &step.execution.payload {
+            StepPayload::Perceive { user_query, memory_context } => {
+                assert_eq!(user_query, "show me the PR status");
+                assert_eq!(memory_context.len(), 2);
+            },
+            other => panic!("Expected Perceive, got {:?}", other),
+        }
+        let mc = step.execution.memory_context.as_ref().unwrap();
+        assert_eq!(mc.retrieved_memory_ids, vec!["mem-1", "mem-2"]);
+        assert_eq!(mc.domain_hints, vec!["Github"]);
+        assert_eq!(mc.boost_terms, vec!["pr", "status"]);
+    }
+
+    #[test]
+    fn recorder_tokens_populate_act_result() {
+        let mut rec = StepRecorder::new("sess-tokens", "task-1");
+        rec.begin_turn(0);
+        rec.begin_act(2);
+        rec.begin_tool("read_file", "call-1");
+        rec.complete_tool("read_file", false, 50, false);
+        rec.record_tokens(1500, 800);
+
+        let step = rec.current_step().unwrap();
+        match &step.execution.result {
+            Some(StepResult::Act { tokens_in, tokens_out, tool_results_count, .. }) => {
+                assert_eq!(*tokens_in, 1500);
+                assert_eq!(*tokens_out, 800);
+                assert_eq!(*tool_results_count, 1);
+            },
+            other => panic!("Expected Act result with tokens, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn scheduling_contract_accessible_from_recorder() {
+        let mut rec = StepRecorder::new("sess-contract", "task-1");
+        rec.begin_turn(0);
+
+        let contract = rec.scheduling();
+        assert_eq!(contract.priority, 5);
+        assert_eq!(contract.timeout_ms, 300_000);
+        assert_eq!(contract.max_retries, 2);
+        assert_eq!(contract.effective_tool_timeout_ms(4), 75_000);
+    }
+
+    #[test]
+    fn scheduling_contract_backoff_capped() {
+        let contract = SchedulingContract {
+            backoff_base_ms: 100,
+            backoff_max_ms: 1000,
+            ..Default::default()
+        };
+        assert_eq!(contract.backoff_ms(0), 100);
+        assert_eq!(contract.backoff_ms(1), 200);
+        assert_eq!(contract.backoff_ms(2), 400);
+        assert_eq!(contract.backoff_ms(3), 800);
+        assert_eq!(contract.backoff_ms(4), 1000);
+        assert_eq!(contract.backoff_ms(10), 1000);
+    }
+
+    #[test]
+    fn full_lifecycle_with_scheduling_contract() {
+        let mut rec = StepRecorder::new("sess-lifecycle", "task-1");
+        rec.begin_turn(0);
+
+        // PERCEIVE
+        rec.record_perceive("list open PRs", &[], &["Github".into()], &["pr".into()]);
+
+        // PLAN
+        rec.record_plan(&["github_list_prs".into()], 0.85, 0.1, 50000);
+
+        // ACT
+        rec.begin_act(1);
+        rec.begin_tool("github_list_prs", "call-1");
+        rec.complete_tool("github_list_prs", false, 200, false);
+        rec.record_tokens(2000, 500);
+
+        // EVALUATE
+        rec.record_verdict("healthy", false, false, false, 0);
+        rec.end_turn(true);
+
+        let step = rec.current_step().unwrap();
+        assert_eq!(step.execution.status, StepStatus::Completed);
+
+        let events = rec.events();
+        let types: Vec<&StepEventType> = events.iter().map(|e| &e.event_type).collect();
+        assert!(types.contains(&&StepEventType::StepCreated));
+        assert!(types.contains(&&StepEventType::ToolCallStarted));
+        assert!(types.contains(&&StepEventType::ToolCallCompleted));
+        assert!(types.contains(&&StepEventType::StepCompleted));
+    }
+}

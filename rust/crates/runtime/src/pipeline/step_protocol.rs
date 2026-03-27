@@ -222,6 +222,57 @@ impl std::error::Error for ProtocolError {}
 
 // ─── Step: Layered Structure ─────────────────────────────────────────────────
 
+/// Scheduling contract — immutable policy governing a step's execution.
+/// Attached to StepDescriptor at creation, enforced by the runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulingContract {
+    /// Execution priority (0=background, 5=normal, 10=urgent).
+    /// Higher priority steps execute first when multiple are queued.
+    pub priority: u32,
+    /// Maximum wall-clock time for the entire step (all tools combined).
+    pub timeout_ms: u64,
+    /// Per-tool timeout (0 = inherit from step timeout / tool_count).
+    pub per_tool_timeout_ms: u64,
+    /// Maximum retry attempts for transient failures.
+    pub max_retries: u32,
+    /// Initial backoff delay for retries (exponential: base * 2^attempt).
+    pub backoff_base_ms: u64,
+    /// Maximum backoff delay cap.
+    pub backoff_max_ms: u64,
+}
+
+impl Default for SchedulingContract {
+    fn default() -> Self {
+        Self {
+            priority: 5,
+            timeout_ms: 300_000,
+            per_tool_timeout_ms: 0,
+            max_retries: 2,
+            backoff_base_ms: 500,
+            backoff_max_ms: 5_000,
+        }
+    }
+}
+
+impl SchedulingContract {
+    /// Compute backoff delay for retry attempt N (exponential with cap).
+    pub fn backoff_ms(&self, attempt: u32) -> u64 {
+        let delay = self.backoff_base_ms.saturating_mul(1u64 << attempt.min(10));
+        delay.min(self.backoff_max_ms)
+    }
+
+    /// Effective per-tool timeout: explicit value, or step timeout / tool_count.
+    pub fn effective_tool_timeout_ms(&self, tool_count: usize) -> u64 {
+        if self.per_tool_timeout_ms > 0 {
+            self.per_tool_timeout_ms
+        } else if tool_count > 0 {
+            self.timeout_ms / tool_count as u64
+        } else {
+            self.timeout_ms
+        }
+    }
+}
+
 /// Scheduling descriptor (immutable after creation, owned by Scheduler).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepDescriptor {
@@ -231,7 +282,8 @@ pub struct StepDescriptor {
     pub parent_step_id: Option<String>,
     pub action: StepAction,
     pub agent_id: Option<String>,
-    pub timeout_ms: u64,
+    /// Scheduling contract governing this step's execution policy.
+    pub scheduling: SchedulingContract,
     pub protocol_version: u32,
     pub created_at: u64,
 }
@@ -318,7 +370,7 @@ impl Step {
                 parent_step_id: None,
                 action,
                 agent_id: None,
-                timeout_ms: 300_000,
+                scheduling: SchedulingContract::default(),
                 protocol_version: PROTOCOL_VERSION,
                 created_at: epoch_ms(),
             },
@@ -397,7 +449,12 @@ impl Step {
     }
 
     pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
-        self.descriptor.timeout_ms = timeout_ms;
+        self.descriptor.scheduling.timeout_ms = timeout_ms;
+        self
+    }
+
+    pub fn with_scheduling(mut self, contract: SchedulingContract) -> Self {
+        self.descriptor.scheduling = contract;
         self
     }
 }
@@ -1664,7 +1721,7 @@ mod tests {
         let mc = step.execution.memory_context.as_ref().unwrap();
         assert_eq!(mc.retrieved_memory_ids, vec!["mem-1"]);
         assert_eq!(mc.domain_hints, vec!["github"]);
-        assert_eq!(step.descriptor.timeout_ms, 60_000);
+        assert_eq!(step.descriptor.scheduling.timeout_ms, 60_000);
     }
 
     #[test]
@@ -2973,5 +3030,91 @@ mod tests {
             created_at: 0,
         });
         assert!(cp.validate().is_ok());
+    }
+
+    // ── SchedulingContract tests ─────────────────────────────────────────
+
+    #[test]
+    fn scheduling_contract_defaults() {
+        let c = SchedulingContract::default();
+        assert_eq!(c.priority, 5);
+        assert_eq!(c.timeout_ms, 300_000);
+        assert_eq!(c.per_tool_timeout_ms, 0);
+        assert_eq!(c.max_retries, 2);
+        assert_eq!(c.backoff_base_ms, 500);
+        assert_eq!(c.backoff_max_ms, 5_000);
+    }
+
+    #[test]
+    fn scheduling_contract_backoff_exponential() {
+        let c = SchedulingContract::default();
+        assert_eq!(c.backoff_ms(0), 500);   // 500 * 2^0
+        assert_eq!(c.backoff_ms(1), 1000);  // 500 * 2^1
+        assert_eq!(c.backoff_ms(2), 2000);  // 500 * 2^2
+        assert_eq!(c.backoff_ms(3), 4000);  // 500 * 2^3
+        assert_eq!(c.backoff_ms(4), 5000);  // capped at max
+    }
+
+    #[test]
+    fn scheduling_contract_effective_tool_timeout() {
+        let c = SchedulingContract::default(); // 300s step, 0 per-tool
+        // With 3 tools: 300_000 / 3 = 100_000ms per tool
+        assert_eq!(c.effective_tool_timeout_ms(3), 100_000);
+        // With 1 tool: full step timeout
+        assert_eq!(c.effective_tool_timeout_ms(1), 300_000);
+        // With 0 tools: full step timeout (edge case)
+        assert_eq!(c.effective_tool_timeout_ms(0), 300_000);
+
+        // Explicit per-tool timeout overrides
+        let c2 = SchedulingContract {
+            per_tool_timeout_ms: 30_000,
+            ..Default::default()
+        };
+        assert_eq!(c2.effective_tool_timeout_ms(3), 30_000);
+        assert_eq!(c2.effective_tool_timeout_ms(1), 30_000);
+    }
+
+    #[test]
+    fn scheduling_contract_serde_roundtrip() {
+        let c = SchedulingContract {
+            priority: 8,
+            timeout_ms: 60_000,
+            per_tool_timeout_ms: 10_000,
+            max_retries: 5,
+            backoff_base_ms: 200,
+            backoff_max_ms: 10_000,
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let c2: SchedulingContract = serde_json::from_str(&json).unwrap();
+        assert_eq!(c2.priority, 8);
+        assert_eq!(c2.timeout_ms, 60_000);
+        assert_eq!(c2.max_retries, 5);
+    }
+
+    #[test]
+    fn step_with_scheduling_contract() {
+        let step = Step::new(
+            "step-1".into(), "task-1".into(), "node-1".into(),
+            StepAction::Act,
+            StepPayload::Act { selected_tools: vec![], tool_calls: vec![] },
+        ).with_scheduling(SchedulingContract {
+            priority: 10,
+            timeout_ms: 60_000,
+            ..Default::default()
+        });
+        assert_eq!(step.descriptor.scheduling.priority, 10);
+        assert_eq!(step.descriptor.scheduling.timeout_ms, 60_000);
+        assert_eq!(step.descriptor.scheduling.max_retries, 2); // default
+    }
+
+    #[test]
+    fn step_backward_compat_with_timeout() {
+        // with_timeout_ms still works (sets scheduling.timeout_ms)
+        let step = Step::new(
+            "step-1".into(), "task-1".into(), "node-1".into(),
+            StepAction::Perceive,
+            StepPayload::Perceive { user_query: "test".into(), memory_context: vec![] },
+        ).with_timeout_ms(120_000);
+        assert_eq!(step.descriptor.scheduling.timeout_ms, 120_000);
     }
 }

@@ -166,6 +166,13 @@ impl StepRecorder {
         self.transition_phase(StepAction::Act);
         if let Some(ref mut step) = self.current_step {
             step.execution.cursor = ExecutionCursor::for_act(tool_count);
+            // Initialize Act result so record_tokens() can populate it
+            step.execution.result = Some(StepResult::Act {
+                tool_results_count: 0,
+                assistant_text: None,
+                tokens_in: 0,
+                tokens_out: 0,
+            });
         }
     }
 
@@ -210,6 +217,11 @@ impl StepRecorder {
                 SlotState::Completed
             };
             step.execution.cursor.advance_slot(slot_idx as usize, state);
+
+            // Track completed tool count in Act result
+            if let Some(StepResult::Act { ref mut tool_results_count, .. }) = step.execution.result {
+                *tool_results_count += 1;
+            }
         }
 
         let event_type = if was_cached {
@@ -392,6 +404,15 @@ impl StepRecorder {
     /// Get current step reference.
     pub fn current_step(&self) -> Option<&Step> {
         self.current_step.as_ref()
+    }
+
+    /// Access the scheduling contract for the current step.
+    /// Returns default if no step is active.
+    pub fn scheduling(&self) -> SchedulingContract {
+        self.current_step
+            .as_ref()
+            .map(|s| s.descriptor.scheduling.clone())
+            .unwrap_or_default()
     }
 
     /// Build a light checkpoint from current recorder state.
