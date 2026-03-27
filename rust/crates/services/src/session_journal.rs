@@ -465,6 +465,9 @@ impl JournalEvent {
         nudge_count: usize,
         total_errors: usize,
         deprioritized_count: usize,
+        total_timeouts: usize,
+        total_cache_hits: usize,
+        flaky_count: usize,
     ) -> Self {
         let mut evt = Self::base(JournalEventType::TurnGuardVerdict, session_id);
         evt.turn = Some(turn);
@@ -478,6 +481,9 @@ impl JournalEvent {
             "nudge_count": nudge_count,
             "total_errors": total_errors,
             "deprioritized_tools": deprioritized_count,
+            "total_timeouts": total_timeouts,
+            "total_cache_hits": total_cache_hits,
+            "flaky_tools": flaky_count,
         }));
         evt
     }
@@ -925,6 +931,9 @@ mod tests {
             1,
             2,
             1,
+            0, // total_timeouts
+            0, // total_cache_hits
+            0, // flaky_count
         );
         let json = serde_json::to_string(&evt).unwrap();
         assert!(json.contains("\"type\":\"turn_guard_verdict\""));
@@ -943,6 +952,9 @@ mod tests {
         assert_eq!(meta["nudge_count"], 1);
         assert_eq!(meta["total_errors"], 2);
         assert_eq!(meta["deprioritized_tools"], 1);
+        assert_eq!(meta["total_timeouts"], 0);
+        assert_eq!(meta["total_cache_hits"], 0);
+        assert_eq!(meta["flaky_tools"], 0);
     }
 
     #[test]
@@ -960,6 +972,9 @@ mod tests {
             3,
             5,
             2,
+            2, // total_timeouts
+            1, // total_cache_hits
+            1, // flaky_count
         );
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
@@ -968,6 +983,9 @@ mod tests {
         assert_eq!(meta["force_stop"], true);
         assert_eq!(meta["injections"], 2);
         assert_eq!(meta["nudge_count"], 3);
+        assert_eq!(meta["total_timeouts"], 2);
+        assert_eq!(meta["total_cache_hits"], 1);
+        assert_eq!(meta["flaky_tools"], 1);
         // injection_preview should truncate to first injection
         assert!(
             meta["injection_preview"]
@@ -979,7 +997,7 @@ mod tests {
 
     #[test]
     fn turn_guard_verdict_info_minimal() {
-        let evt = JournalEvent::turn_guard_verdict(None, 1, "info", &[], &[], false, 0, 1, 0);
+        let evt = JournalEvent::turn_guard_verdict(None, 1, "info", &[], &[], false, 0, 1, 0, 0, 0, 0);
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.event_type, JournalEventType::TurnGuardVerdict);

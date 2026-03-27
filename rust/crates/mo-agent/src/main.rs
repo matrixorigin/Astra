@@ -317,6 +317,12 @@ struct VerdictEvent {
     nudge_count: usize,
     total_errors: usize,
     deprioritized_count: usize,
+    /// Timeout-specific failure count (subset of total_errors).
+    total_timeouts: usize,
+    /// Idempotency cache hits (tools skipped, neutral for health).
+    total_cache_hits: usize,
+    /// Number of tools with rehabilitation_count >= 2 (flaky).
+    flaky_count: usize,
 }
 
 // ══════════════════════════════════════════════════════════ REPL State ════

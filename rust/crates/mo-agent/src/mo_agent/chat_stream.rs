@@ -1436,6 +1436,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     VerdictSeverity::Info => "info",
                     VerdictSeverity::Healthy => unreachable!(),
                 };
+                let health_summary = turn_guard.health.summary();
                 verdict_events.push(VerdictEvent {
                     turn: _turn as u32,
                     severity: severity_str.to_string(),
@@ -1444,7 +1445,10 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     force_stop: verdict.force_stop,
                     nudge_count: turn_guard.nudge_count,
                     total_errors: turn_guard.errors.total_errors,
-                    deprioritized_count: turn_guard.health.deprioritized_tools().len(),
+                    deprioritized_count: health_summary.deprioritized_count,
+                    total_timeouts: health_summary.total_timeouts,
+                    total_cache_hits: health_summary.total_cache_hits,
+                    flaky_count: health_summary.flaky_count,
                 });
             }
 

@@ -458,6 +458,9 @@ fn apply_turn_success(
                 ve.nudge_count,
                 ve.total_errors,
                 ve.deprioritized_count,
+                ve.total_timeouts,
+                ve.total_cache_hits,
+                ve.flaky_count,
             );
             let _ = journal.append(&verdict_event);
             enqueue_ingestion(state, &verdict_event);

@@ -6872,3 +6872,95 @@ mod checkpoint_cloud_persistence_proofs {
         }
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// Health Summary Auditability Proofs
+// ══════════════════════════════════════════════════════════════════════════
+
+mod health_summary_auditability_proofs {
+    use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
+
+    #[test]
+    fn summary_includes_timeouts_and_cache_hits() {
+        let mut tracker = ToolHealthTracker::new();
+        tracker.record_timeout("bash");
+        tracker.record_timeout("bash");
+        tracker.record_cache_hit("grep");
+        tracker.record_cache_hit("grep");
+        tracker.record_cache_hit("grep");
+
+        let summary = tracker.summary();
+        assert_eq!(summary.total_timeouts, 2, "should count 2 bash timeouts");
+        assert_eq!(summary.total_cache_hits, 3, "should count 3 grep cache hits");
+        assert_eq!(summary.total_errors, 2, "timeouts are failures");
+        assert_eq!(summary.total_tools, 2, "bash + grep tracked");
+    }
+
+    #[test]
+    fn summary_flaky_count_reflects_rehabilitation_cycles() {
+        let mut tracker = ToolHealthTracker::new();
+        // Drive bash through 2 rehabilitation cycles (flaky threshold)
+        for _ in 0..2 {
+            for _ in 0..3 {
+                tracker.record_failure("bash");
+            }
+            tracker.record_success("bash"); // rehabilitates
+        }
+
+        let summary = tracker.summary();
+        assert_eq!(summary.flaky_count, 1, "bash should be flaky after 2 rehab cycles");
+        assert_eq!(summary.deprioritized_count, 0, "rehabilitated = not deprioritized");
+    }
+
+    #[test]
+    fn summary_zero_when_no_tools_tracked() {
+        let tracker = ToolHealthTracker::new();
+        let summary = tracker.summary();
+        assert_eq!(summary.total_tools, 0);
+        assert_eq!(summary.total_errors, 0);
+        assert_eq!(summary.total_timeouts, 0);
+        assert_eq!(summary.total_cache_hits, 0);
+        assert_eq!(summary.flaky_count, 0);
+        assert_eq!(summary.deprioritized_count, 0);
+    }
+
+    #[test]
+    fn summary_mixed_signals_all_counted() {
+        let mut tracker = ToolHealthTracker::new();
+        // bash: 2 timeouts + 1 real failure = 3 failures total → deprioritized
+        tracker.record_timeout("bash");
+        tracker.record_timeout("bash");
+        tracker.record_failure("bash");
+        // grep: 3 cache hits, 0 failures
+        tracker.record_cache_hit("grep");
+        tracker.record_cache_hit("grep");
+        tracker.record_cache_hit("grep");
+        // read_file: healthy
+        tracker.record_success("read_file");
+
+        let summary = tracker.summary();
+        assert_eq!(summary.total_tools, 3);
+        assert_eq!(summary.total_errors, 3, "2 timeouts + 1 real failure");
+        assert_eq!(summary.total_timeouts, 2);
+        assert_eq!(summary.total_cache_hits, 3);
+        assert_eq!(summary.deprioritized_count, 1, "bash hit threshold");
+    }
+
+    #[test]
+    fn summary_timeouts_are_subset_of_errors() {
+        let mut tracker = ToolHealthTracker::new();
+        tracker.record_timeout("bash");
+        tracker.record_failure("bash");
+        tracker.record_timeout("grep");
+
+        let summary = tracker.summary();
+        assert!(
+            summary.total_timeouts <= summary.total_errors,
+            "timeouts ({}) must be <= total_errors ({})",
+            summary.total_timeouts,
+            summary.total_errors
+        );
+        assert_eq!(summary.total_timeouts, 2);
+        assert_eq!(summary.total_errors, 3);
+    }
+}

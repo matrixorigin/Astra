@@ -219,11 +219,15 @@ impl ToolHealthTracker {
             .filter(|h| h.rehabilitation_count >= 2)
             .count();
         let total_errors: usize = self.tools.values().map(|h| h.total_failures).sum();
+        let total_timeouts: usize = self.tools.values().map(|h| h.timeout_count).sum();
+        let total_cache_hits: usize = self.tools.values().map(|h| h.cache_hit_count).sum();
         ToolHealthSummary {
             total_tools,
             deprioritized_count,
             flaky_count,
             total_errors,
+            total_timeouts,
+            total_cache_hits,
         }
     }
 
@@ -267,6 +271,8 @@ pub struct ToolHealthSummary {
     pub deprioritized_count: usize,
     pub flaky_count: usize,
     pub total_errors: usize,
+    pub total_timeouts: usize,
+    pub total_cache_hits: usize,
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
