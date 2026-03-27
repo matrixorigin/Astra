@@ -980,4 +980,154 @@ mod tests {
         assert!(meta["injection_preview"].is_null());
         assert_eq!(meta["force_stop"], false);
     }
+
+    // ── stall_detected event ──
+
+    #[test]
+    fn stall_detected_event_has_correct_fields() {
+        let evt = JournalEvent::stall_detected(
+            Some("sess-1"),
+            5,
+            "repetition_stall",
+            2,
+            0.7,
+            &["bash".to_string(), "grep".to_string()],
+        );
+
+        assert_eq!(evt.event_type, JournalEventType::StallDetected);
+        assert_eq!(evt.turn, Some(5));
+        assert_eq!(evt.stall_type.as_deref(), Some("repetition_stall"));
+
+        let meta = evt.metadata.unwrap();
+        assert_eq!(meta["nudge_count"], 2);
+        assert_eq!(meta["confidence"], 0.7);
+        assert_eq!(meta["avoid_tools"][0], "bash");
+        assert_eq!(meta["avoid_tools"][1], "grep");
+    }
+
+    #[test]
+    fn stall_detected_event_json_roundtrip() {
+        let evt = JournalEvent::stall_detected(
+            Some("sess-2"),
+            3,
+            "exploration_stall",
+            1,
+            0.5,
+            &["list_dir".to_string()],
+        );
+        let json = serde_json::to_string(&evt).unwrap();
+        let restored: JournalEvent = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.event_type, JournalEventType::StallDetected);
+        assert_eq!(restored.turn, Some(3));
+        let meta = restored.metadata.unwrap();
+        assert_eq!(meta["nudge_count"], 1);
+        assert_eq!(meta["confidence"], 0.5);
+    }
+
+    #[test]
+    fn stall_detected_confidence_range() {
+        // Confidence should be stored as-is (0.0 to 1.0)
+        for confidence in [0.0, 0.5, 0.8, 1.0] {
+            let evt = JournalEvent::stall_detected(Some("s"), 1, "stall", 0, confidence, &[]);
+            let meta = evt.metadata.unwrap();
+            let stored = meta["confidence"].as_f64().unwrap();
+            assert!(
+                (stored - confidence).abs() < 1e-9,
+                "confidence {confidence} should be stored exactly, got {stored}"
+            );
+        }
+    }
+
+    // ── checkpoint event ──
+
+    #[test]
+    fn checkpoint_event_has_correct_fields() {
+        let evt = JournalEvent::checkpoint(
+            Some("sess-1"),
+            10,
+            "Completed token efficiency phase",
+            50_000,
+            15,
+        );
+
+        assert_eq!(evt.event_type, JournalEventType::Checkpoint);
+        assert_eq!(evt.turn, Some(10));
+
+        let meta = evt.metadata.unwrap();
+        assert_eq!(meta["summary"], "Completed token efficiency phase");
+        assert_eq!(meta["total_tokens"], 50_000);
+        assert_eq!(meta["tools_used_count"], 15);
+    }
+
+    #[test]
+    fn checkpoint_event_json_roundtrip() {
+        let evt = JournalEvent::checkpoint(Some("sess-1"), 5, "Phase A done", 10_000, 8);
+        let json = serde_json::to_string(&evt).unwrap();
+        let restored: JournalEvent = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.event_type, JournalEventType::Checkpoint);
+        assert_eq!(restored.turn, Some(5));
+        let meta = restored.metadata.unwrap();
+        assert_eq!(meta["summary"], "Phase A done");
+        assert_eq!(meta["total_tokens"], 10_000);
+        assert_eq!(meta["tools_used_count"], 8);
+    }
+
+    #[test]
+    fn checkpoint_summary_truncated_at_500_chars() {
+        let long_summary = "x".repeat(600);
+        let evt = JournalEvent::checkpoint(Some("s"), 1, &long_summary, 0, 0);
+        let meta = evt.metadata.unwrap();
+        let stored = meta["summary"].as_str().unwrap();
+        // truncate() takes 500 chars then appends '…' (1 char, 3 bytes)
+        assert!(
+            stored.chars().count() <= 501,
+            "summary should be truncated to ~500 chars, got {}",
+            stored.chars().count()
+        );
+        assert!(
+            stored.ends_with('…'),
+            "truncated summary should end with ellipsis"
+        );
+    }
+
+    #[test]
+    fn stall_and_checkpoint_events_written_to_journal() {
+        let sid = format!("test-stall-ckpt-{}", uuid::Uuid::new_v4());
+        let writer = JournalWriter::new(&sid).unwrap();
+
+        writer
+            .append(&JournalEvent::stall_detected(
+                Some(&sid),
+                3,
+                "repetition_stall",
+                1,
+                0.7,
+                &["bash".to_string()],
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::checkpoint(
+                Some(&sid),
+                5,
+                "Midpoint checkpoint",
+                20_000,
+                10,
+            ))
+            .unwrap();
+
+        let events = read_journal(&sid).unwrap();
+        assert_eq!(events.len(), 2);
+
+        let stall = &events[0];
+        assert_eq!(stall.event_type, JournalEventType::StallDetected);
+        assert_eq!(stall.stall_type.as_deref(), Some("repetition_stall"));
+
+        let ckpt = &events[1];
+        assert_eq!(ckpt.event_type, JournalEventType::Checkpoint);
+        let meta = ckpt.metadata.as_ref().unwrap();
+        assert_eq!(meta["summary"], "Midpoint checkpoint");
+        assert_eq!(meta["total_tokens"], 20_000);
+    }
 }
