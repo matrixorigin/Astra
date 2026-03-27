@@ -109,6 +109,16 @@ pub fn export_from_modules(
     pattern_library: &Arc<Mutex<PatternLibrary>>,
     calibrator: &Arc<Mutex<ProgressiveCalibrator>>,
 ) -> LearningSnapshot {
+    export_from_modules_with_health(entity_graph, pattern_library, calibrator, &[])
+}
+
+/// Export all learning modules into a snapshot, including tool health.
+pub fn export_from_modules_with_health(
+    entity_graph: &Arc<Mutex<EntityGraph>>,
+    pattern_library: &Arc<Mutex<PatternLibrary>>,
+    calibrator: &Arc<Mutex<ProgressiveCalibrator>>,
+    tool_health: &[ToolHealthEntry],
+) -> LearningSnapshot {
     let entities = entity_graph.lock().map(|g| g.export()).unwrap_or_default();
     let patterns = pattern_library
         .lock()
@@ -121,7 +131,7 @@ pub fn export_from_modules(
         entities,
         patterns,
         calibration,
-        tool_health: Vec::new(),
+        tool_health: tool_health.to_vec(),
     }
 }
 
@@ -163,8 +173,8 @@ pub fn save_learning_state_with_health(
     calibrator: &Arc<Mutex<ProgressiveCalibrator>>,
     tool_health: &[ToolHealthEntry],
 ) -> Result<(), String> {
-    let mut snapshot = export_from_modules(entity_graph, pattern_library, calibrator);
-    snapshot.tool_health = tool_health.to_vec();
+    let snapshot =
+        export_from_modules_with_health(entity_graph, pattern_library, calibrator, tool_health);
     // Only save if there's something to persist
     if snapshot.entities.is_empty()
         && snapshot.patterns.is_empty()

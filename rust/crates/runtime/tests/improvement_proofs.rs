@@ -6964,3 +6964,133 @@ mod health_summary_auditability_proofs {
         assert_eq!(summary.total_errors, 3);
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// Learning Sync Cloud Roundtrip Proofs
+// ══════════════════════════════════════════════════════════════════════════
+
+mod learning_sync_cloud_proofs {
+    use mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator;
+    use mo_agent_runtime::pipeline::entity::EntityGraph;
+    use mo_agent_runtime::pipeline::pattern::PatternLibrary;
+    use mo_agent_runtime::pipeline::persistence::{
+        export_from_modules, export_from_modules_with_health, LearningSnapshot, ToolHealthEntry,
+    };
+    use std::sync::{Arc, Mutex};
+
+    fn empty_modules() -> (
+        Arc<Mutex<EntityGraph>>,
+        Arc<Mutex<PatternLibrary>>,
+        Arc<Mutex<ProgressiveCalibrator>>,
+    ) {
+        (
+            Arc::new(Mutex::new(EntityGraph::new())),
+            Arc::new(Mutex::new(PatternLibrary::new())),
+            Arc::new(Mutex::new(ProgressiveCalibrator::new(0.5))),
+        )
+    }
+
+    #[test]
+    fn export_without_health_has_empty_tool_health() {
+        let (eg, pl, cal) = empty_modules();
+        let snapshot = export_from_modules(&eg, &pl, &cal);
+        assert!(snapshot.tool_health.is_empty(), "default export should have no health");
+    }
+
+    #[test]
+    fn export_with_health_preserves_entries() {
+        let (eg, pl, cal) = empty_modules();
+        let health = vec![
+            ToolHealthEntry {
+                name: "bash".to_string(),
+                total_calls: 10,
+                total_failures: 2,
+                failure_rate: 0.2,
+            },
+            ToolHealthEntry {
+                name: "grep".to_string(),
+                total_calls: 5,
+                total_failures: 0,
+                failure_rate: 0.0,
+            },
+        ];
+        let snapshot = export_from_modules_with_health(&eg, &pl, &cal, &health);
+        assert_eq!(snapshot.tool_health.len(), 2);
+        assert_eq!(snapshot.tool_health[0].name, "bash");
+        assert_eq!(snapshot.tool_health[1].name, "grep");
+        assert!((snapshot.tool_health[0].failure_rate - 0.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn health_survives_json_roundtrip() {
+        let (eg, pl, cal) = empty_modules();
+        let health = vec![ToolHealthEntry {
+            name: "bash".to_string(),
+            total_calls: 10,
+            total_failures: 3,
+            failure_rate: 0.3,
+        }];
+        let snapshot = export_from_modules_with_health(&eg, &pl, &cal, &health);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let restored: LearningSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.tool_health.len(), 1);
+        assert_eq!(restored.tool_health[0].name, "bash");
+        assert_eq!(restored.tool_health[0].total_calls, 10);
+        assert_eq!(restored.tool_health[0].total_failures, 3);
+    }
+
+    #[test]
+    fn health_merge_local_wins_on_conflict() {
+        // Simulate the merge strategy: local entries take precedence
+        let local = vec![ToolHealthEntry {
+            name: "bash".to_string(),
+            total_calls: 20,
+            total_failures: 1,
+            failure_rate: 0.05,
+        }];
+        let cloud = vec![
+            ToolHealthEntry {
+                name: "bash".to_string(),
+                total_calls: 10,
+                total_failures: 5,
+                failure_rate: 0.5,
+            },
+            ToolHealthEntry {
+                name: "grep".to_string(),
+                total_calls: 8,
+                total_failures: 0,
+                failure_rate: 0.0,
+            },
+        ];
+
+        // Apply the same merge logic as main.rs: local names take precedence
+        let local_names: std::collections::HashSet<String> =
+            local.iter().map(|e| e.name.clone()).collect();
+        let mut merged = local.clone();
+        for entry in cloud {
+            if !local_names.contains(&entry.name) {
+                merged.push(entry);
+            }
+        }
+
+        assert_eq!(merged.len(), 2, "bash (local) + grep (cloud)");
+        assert_eq!(merged[0].name, "bash");
+        assert_eq!(merged[0].total_calls, 20, "local bash wins");
+        assert_eq!(merged[1].name, "grep");
+        assert_eq!(merged[1].total_calls, 8, "cloud-only grep added");
+    }
+
+    #[test]
+    fn empty_health_roundtrip_is_safe() {
+        let (eg, pl, cal) = empty_modules();
+        let snapshot = export_from_modules_with_health(&eg, &pl, &cal, &[]);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        // tool_health is skip_serializing_if = "Vec::is_empty", so it shouldn't appear
+        assert!(
+            !json.contains("tool_health"),
+            "empty health should be omitted from JSON"
+        );
+        let restored: LearningSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(restored.tool_health.is_empty());
+    }
+}

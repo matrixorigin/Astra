@@ -877,16 +877,16 @@ fn try_cloud_pull(
     calibrator: &std::sync::Arc<
         std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
     >,
-) {
+) -> Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry> {
     let pool = match try_connect_matrixone_sync() {
         Some(p) => p,
-        None => return,
+        None => return Vec::new(),
     };
     let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
     let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
     let rt = match tokio::runtime::Handle::try_current() {
         Ok(h) => h,
-        Err(_) => return,
+        Err(_) => return Vec::new(),
     };
     match rt.block_on(
         mo_agent_services::state_sync::StateSyncService::pull_learning(
@@ -896,12 +896,20 @@ fn try_cloud_pull(
         ),
     ) {
         Ok(Some(json)) => {
+            // Parse snapshot to extract tool health before merging entities/patterns
+            let cloud_health = serde_json::from_str::<
+                mo_agent_runtime::pipeline::persistence::LearningSnapshot,
+            >(&json)
+            .map(|s| s.tool_health)
+            .unwrap_or_default();
             merge_learning_snapshot(&json, entity_graph, pattern_library, calibrator);
             eprintln!("{}", "  ✓ Cloud learning merged".dim());
+            cloud_health
         }
-        Ok(None) => {} // no cloud state yet
+        Ok(None) => Vec::new(),
         Err(e) => {
             eprintln!("{}", format!("  ⚠ Cloud pull skipped: {e}").dim());
+            Vec::new()
         }
     }
 }
@@ -919,15 +927,17 @@ fn try_cloud_push(
     calibrator: &std::sync::Arc<
         std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
     >,
+    tool_health: &[mo_agent_runtime::pipeline::persistence::ToolHealthEntry],
 ) {
     let pool = match try_connect_matrixone_sync() {
         Some(p) => p,
         None => return,
     };
-    let snapshot = mo_agent_runtime::pipeline::persistence::export_from_modules(
+    let snapshot = mo_agent_runtime::pipeline::persistence::export_from_modules_with_health(
         entity_graph,
         pattern_library,
         calibrator,
+        tool_health,
     );
     let json = match serde_json::to_string(&snapshot) {
         Ok(j) => j,
@@ -1493,18 +1503,39 @@ async fn run_chat_repl(
                 .dim()
             );
         }
-        // Try to merge cloud learning (best-effort)
-        try_cloud_pull(
+        // Try to merge cloud learning (best-effort, returns cloud tool health)
+        let cloud_health = try_cloud_pull(
             profile_name,
             &pipeline_modules.entity_graph,
             &pipeline_modules.pattern_library,
             &pipeline_modules.calibrator,
         );
+        // Merge cloud tool health: cloud entries supplement local (local wins on conflict)
+        if !cloud_health.is_empty() {
+            let local_names: std::collections::HashSet<String> = cross_session_health_entries
+                .iter()
+                .map(|e| e.name.clone())
+                .collect();
+            let mut added = 0usize;
+            for entry in cloud_health {
+                if !local_names.contains(&entry.name) {
+                    cross_session_health_entries.push(entry);
+                    added += 1;
+                }
+            }
+            if added > 0 {
+                eprintln!(
+                    "{}",
+                    format!("  ✓ Merged {added} cloud tool health entries").dim()
+                );
+            }
+        }
         // Try to pull user preferences from cloud
         try_cloud_pull_preferences(&mut state);
     }
     state.tool_health_entries = cross_session_health_entries;
 
+    let profile_name_str = profile.unwrap_or("default").to_string();
     print_repl_banner(profile, &state);
 
     // ── Main loop ─────────────────────────────────────────────────────────────
@@ -1571,6 +1602,23 @@ async fn run_chat_repl(
                         },
                     )
                     .await?;
+
+                    // Periodic learning sync: push to cloud at checkpoint boundaries
+                    // to prevent data loss on crash (every CHECKPOINT_INTERVAL turns)
+                    if state.matrixone_pool.is_some()
+                        && state.turn > 0
+                        && state.turn
+                            % mo_agent_services::session_checkpoint::CHECKPOINT_INTERVAL
+                            == 0
+                    {
+                        try_cloud_push(
+                            &profile_name_str,
+                            &pipeline_modules.entity_graph,
+                            &pipeline_modules.pattern_library,
+                            &pipeline_modules.calibrator,
+                            &state.tool_health_entries,
+                        );
+                    }
                 }
             }
             Err(ReadlineError::Interrupted) => {
@@ -1621,12 +1669,13 @@ async fn run_chat_repl(
                 format!("  ⚠ Failed to save learning state: {e}").yellow()
             );
         }
-        // Push learning to cloud (best-effort)
+        // Push learning to cloud (best-effort, now includes tool health)
         try_cloud_push(
             profile_name,
             &pipeline_modules.entity_graph,
             &pipeline_modules.pattern_library,
             &pipeline_modules.calibrator,
+            &state.tool_health_entries,
         );
         // Push preferences to cloud (best-effort)
         try_cloud_push_preferences(&state);
