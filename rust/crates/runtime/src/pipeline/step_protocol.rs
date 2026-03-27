@@ -1,4 +1,4 @@
-//! Step Protocol v3: Slot-based execution, tiered checkpoints, DB-first events.
+//! Step Protocol v1: Slot-based execution, tiered checkpoints, DB-first events.
 //!
 //! # Architecture: 3 Concerns, 3 Types
 //!
@@ -15,15 +15,19 @@
 //! └───────────────────────────────┘
 //! ```
 //!
-//! # Key properties (v3 additions)
+//! # Key properties
 //!
-//! - **Versioned**: `VersionPolicy` with negotiation chain: exact → compatible → migrate → discard.
+//! - **Versioned**: compound encoding `major*1000+minor`. `VersionPolicy` with negotiation chain.
 //! - **Slot-based cursor**: `ExecutionSlot` per tool (state machine), not sequential index.
 //! - **Tiered checkpoints**: `LightCheckpoint` (frequent) + `HeavyCheckpoint` (full recovery).
+//! - **Checkpoint strategy**: `CheckpointTrigger` maps events to Light/Heavy tier.
 //! - **Semantic idempotency**: Keys optionally include `workspace_version` + `memory_snapshot_id`.
+//! - **IdempotencyCache trait**: pluggable backends (InMemory, MatrixOne).
 //! - **Wait triggers**: `WaitTrigger` (User/Webhook/Timer) with `continuation_token`.
 //! - **DB-first events**: `StepEventStore` trait (in-memory or MatrixOne).
 //! - **Tool-level retry**: `ToolRetryPolicy` per tool classification.
+//! - **Memory governance**: `MemoryGovernanceAction` for retrieval/promotion/purge tracking.
+//! - **Migration**: `MigrationRegistry` for version upgrade hooks.
 //!
 //! # Hardening additions
 //!
@@ -38,8 +42,11 @@ use std::collections::HashMap;
 
 // ─── Protocol Version ────────────────────────────────────────────────────────
 
-/// Current protocol version. Embedded in every Step and Checkpoint.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Version encoding: major * 1000 + minor. E.g., 1000 = v1.0, 1001 = v1.1, 2000 = v2.0.
+/// This makes Compatible (same major) and Migrate (major N-1) semantics meaningful.
+pub const PROTOCOL_VERSION_MAJOR: u32 = 1;
+pub const PROTOCOL_VERSION_MINOR: u32 = 0;
+pub const PROTOCOL_VERSION: u32 = PROTOCOL_VERSION_MAJOR * 1000 + PROTOCOL_VERSION_MINOR;
 
 /// How to handle version mismatches on checkpoint restore.
 /// Negotiation chain: Strict → Compatible → Migrate → Discard.
@@ -47,11 +54,11 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub enum VersionPolicy {
     /// Reject any mismatch (safe default for production)
     Strict,
-    /// Accept if major version matches (N and N-1 compatible).
-    /// major = version / 100, minor = version % 100.
+    /// Accept if major version matches (same major = version / 1000).
+    /// E.g., v1.0 (1000) and v1.1 (1001) are compatible.
     Compatible,
-    /// Try to decode as compatible, then attempt migration, then discard.
-    /// This is the recommended policy for long-lived deployments.
+    /// Try compatible decode → try N-1 migration → discard.
+    /// Recommended for long-lived deployments with registered MigrationFn.
     Migrate,
 }
 
@@ -139,8 +146,8 @@ pub fn check_protocol_version_with_policy(
             policy,
         }),
         VersionPolicy::Compatible => {
-            let expected_major = PROTOCOL_VERSION / 100;
-            let found_major = version / 100;
+            let expected_major = PROTOCOL_VERSION / 1000;
+            let found_major = version / 1000;
             if expected_major == found_major {
                 Ok(VersionVerdict::CompatibleDecode { found: version })
             } else {
@@ -152,13 +159,13 @@ pub fn check_protocol_version_with_policy(
             }
         }
         VersionPolicy::Migrate => {
-            // Step 1: try compatible decode
-            let expected_major = PROTOCOL_VERSION / 100;
-            let found_major = version / 100;
+            // Step 1: try compatible decode (same major)
+            let expected_major = PROTOCOL_VERSION / 1000;
+            let found_major = version / 1000;
             if expected_major == found_major {
                 return Ok(VersionVerdict::CompatibleDecode { found: version });
             }
-            // Step 2: try migration (N-1 → N). Accept if found_major is one less.
+            // Step 2: try migration (major N-1 → N)
             if found_major + 1 == expected_major {
                 return Ok(VersionVerdict::Migrated {
                     from: version,
@@ -199,10 +206,15 @@ impl std::fmt::Display for ProtocolError {
                 found,
                 policy,
             } => {
+                let action = match policy {
+                    VersionPolicy::Strict => "Discard checkpoint and restart",
+                    VersionPolicy::Compatible => "Incompatible major version, discarding",
+                    VersionPolicy::Migrate => "No migration path, discarding",
+                };
                 write!(
                     f,
                     "Protocol version mismatch: expected v{expected}, found v{found} \
-                     (policy: {policy:?}). Discard checkpoint and restart."
+                     (policy: {policy:?}). {action}."
                 )
             }
             Self::InvalidCursor(msg) => write!(f, "Invalid execution cursor: {msg}"),
@@ -784,15 +796,51 @@ impl StepCheckpoint {
         }
     }
 
-    /// Validate checkpoint before restoring
+    /// Validate checkpoint before restoring. Checks:
+    /// 1. Protocol version compatibility
+    /// 2. ACT phase must have execution slots
+    /// 3. Wait phase must have a wait_trigger
+    /// 4. Running slots are invalid in checkpoint (crash = reset to Pending)
+    /// 5. If Heavy, messages must not be empty for non-Perceive phases
     pub fn validate(&self) -> Result<(), ProtocolError> {
         check_protocol_version(self.protocol_version())?;
         let cursor = self.cursor();
+
+        // ACT phase requires slots
         if cursor.phase == StepAction::Act && cursor.slots.is_empty() {
             return Err(ProtocolError::InvalidCursor(
                 "ACT phase cursor has no execution slots".into(),
             ));
         }
+
+        // Wait phase requires a trigger
+        if cursor.phase == StepAction::Wait && cursor.wait_trigger.is_none() {
+            return Err(ProtocolError::InvalidCursor(
+                "WAIT phase cursor has no wait_trigger".into(),
+            ));
+        }
+
+        // Running slots in checkpoint = crash artifact; must be reset before restore
+        let running_count = cursor
+            .slots
+            .iter()
+            .filter(|s| s.state == SlotState::Running)
+            .count();
+        if running_count > 0 {
+            return Err(ProtocolError::CheckpointCorrupt(format!(
+                "{running_count} slot(s) still in Running state (crash before completion)"
+            )));
+        }
+
+        // Heavy checkpoint: non-Perceive phases should have messages for LLM resume
+        if let Self::Heavy(h) = self {
+            if h.light.cursor.phase != StepAction::Perceive && h.messages.is_empty() {
+                return Err(ProtocolError::CheckpointCorrupt(
+                    "Heavy checkpoint has no messages for non-Perceive phase".into(),
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -1171,9 +1219,12 @@ impl InMemoryIdempotencyCache {
         self.cache.insert(key.cache_key(), result);
     }
 
-    /// Remove all entries for a step (cleanup after step completes)
+    /// Remove all entries for a step (cleanup after step completes).
+    /// Uses delimiter ":" to avoid prefix collisions (e.g., "s1" vs "s10").
     pub fn evict_step(&mut self, step_id: &str) {
-        self.cache.retain(|k, _| !k.starts_with(step_id));
+        let prefix = format!("{}:", step_id);
+        self.cache
+            .retain(|k, _| !k.starts_with(&prefix) && k != step_id);
     }
 
     pub fn len(&self) -> usize {
@@ -1195,7 +1246,9 @@ impl IdempotencyCache for InMemoryIdempotencyCache {
     }
 
     fn evict_step(&mut self, step_id: &str) {
-        self.cache.retain(|k, _| !k.starts_with(step_id));
+        let prefix = format!("{}:", step_id);
+        self.cache
+            .retain(|k, _| !k.starts_with(&prefix) && k != step_id);
     }
 
     fn len(&self) -> usize {
@@ -1378,6 +1431,7 @@ fn compute_content_hash(tool_name: &str, args: &serde_json::Value) -> String {
 }
 
 /// Produce canonical JSON with sorted keys (recursively).
+/// Uses serde_json for key escaping to handle special characters correctly.
 fn canonical_json(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Object(map) => {
@@ -1385,7 +1439,11 @@ fn canonical_json(value: &serde_json::Value) -> String {
             sorted.sort_by_key(|(k, _)| *k);
             let entries: Vec<String> = sorted
                 .iter()
-                .map(|(k, v)| format!("\"{}\":{}", k, canonical_json(v)))
+                .map(|(k, v)| {
+                    // Use serde_json for proper key escaping (handles ", \, etc.)
+                    let escaped_key = serde_json::to_string(k.as_str()).unwrap_or_default();
+                    format!("{}:{}", escaped_key, canonical_json(v))
+                })
                 .collect();
             format!("{{{}}}", entries.join(","))
         }
@@ -1439,6 +1497,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, ProtocolError::VersionMismatch { .. }));
+        // Strict policy → "Discard checkpoint and restart"
         assert!(err.to_string().contains("Discard"));
     }
 
@@ -1451,7 +1510,7 @@ mod tests {
 
     #[test]
     fn version_strict_rejects_mismatch() {
-        let result = check_protocol_version_with_policy(2, VersionPolicy::Strict);
+        let result = check_protocol_version_with_policy(999, VersionPolicy::Strict);
         assert!(result.is_err());
     }
 
@@ -1464,16 +1523,16 @@ mod tests {
 
     #[test]
     fn version_compatible_same_major() {
-        // PROTOCOL_VERSION = 1, major = 0. version 50 → major = 0 (same)
-        let result = check_protocol_version_with_policy(50, VersionPolicy::Compatible);
+        // PROTOCOL_VERSION = 1000 (v1.0), major = 1. version 1050 → major = 1 (same)
+        let result = check_protocol_version_with_policy(1050, VersionPolicy::Compatible);
         assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), VersionVerdict::CompatibleDecode { found: 50 }));
+        assert!(matches!(result.unwrap(), VersionVerdict::CompatibleDecode { found: 1050 }));
     }
 
     #[test]
     fn version_compatible_diff_major_rejects() {
-        // version 100 → major = 1 (different from PROTOCOL_VERSION major = 0)
-        let result = check_protocol_version_with_policy(100, VersionPolicy::Compatible);
+        // version 2000 → major = 2 (different from PROTOCOL_VERSION major = 1)
+        let result = check_protocol_version_with_policy(2000, VersionPolicy::Compatible);
         assert!(result.is_err());
         if let Err(ProtocolError::VersionMismatch { policy, .. }) = result {
             assert_eq!(policy, VersionPolicy::Compatible);
@@ -1490,9 +1549,18 @@ mod tests {
 
     #[test]
     fn version_migrate_same_major_compat() {
-        let result = check_protocol_version_with_policy(50, VersionPolicy::Migrate);
+        // version 1050 → same major (1) → CompatibleDecode
+        let result = check_protocol_version_with_policy(1050, VersionPolicy::Migrate);
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), VersionVerdict::CompatibleDecode { .. }));
+    }
+
+    #[test]
+    fn version_migrate_prev_major() {
+        // version 50 → major 0, expected major 1 → Migrated
+        let result = check_protocol_version_with_policy(50, VersionPolicy::Migrate);
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), VersionVerdict::Migrated { from: 50, to: 1000 }));
     }
 
     #[test]
@@ -1727,9 +1795,13 @@ mod tests {
     #[test]
     fn checkpoint_heavy_creation() {
         let cursor = ExecutionCursor::for_act(2);
-        let cp = StepCheckpoint::heavy("s1".into(), "t1".into(), "a1".into(), cursor);
+        let mut cp = StepCheckpoint::heavy("s1".into(), "t1".into(), "a1".into(), cursor);
         assert!(cp.is_heavy());
         assert_eq!(cp.protocol_version(), PROTOCOL_VERSION);
+        // Heavy checkpoint for non-Perceive phase needs messages to pass validation
+        if let StepCheckpoint::Heavy(ref mut h) = cp {
+            h.messages = vec![serde_json::json!({"role": "user", "content": "test"})];
+        }
         assert!(cp.validate().is_ok());
     }
 
@@ -2385,5 +2457,295 @@ mod tests {
         let result = reg.migrate(42, &serde_json::json!({}));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("42"));
+    }
+
+    // ── Version Display per Policy ──
+
+    #[test]
+    fn version_display_strict_says_discard() {
+        let err = ProtocolError::VersionMismatch {
+            expected: 1000, found: 999, policy: VersionPolicy::Strict,
+        };
+        assert!(err.to_string().contains("Discard checkpoint and restart"));
+    }
+
+    #[test]
+    fn version_display_compatible_says_incompatible() {
+        let err = ProtocolError::VersionMismatch {
+            expected: 1000, found: 2000, policy: VersionPolicy::Compatible,
+        };
+        assert!(err.to_string().contains("Incompatible major version"));
+    }
+
+    #[test]
+    fn version_display_migrate_says_no_path() {
+        let err = ProtocolError::VersionMismatch {
+            expected: 2000, found: 50, policy: VersionPolicy::Migrate,
+        };
+        assert!(err.to_string().contains("No migration path"));
+    }
+
+    // ── Recovery Boundary: validate() hardened ──
+
+    #[test]
+    fn validate_wait_without_trigger_rejects() {
+        let cp = StepCheckpoint::Light(LightCheckpoint {
+            protocol_version: PROTOCOL_VERSION,
+            cursor: ExecutionCursor {
+                phase: StepAction::Wait,
+                slots: vec![],
+                parallel: false,
+                wait_trigger: None, // missing!
+                sub_step: None,
+            },
+            step_id: "s1".into(),
+            task_id: "t1".into(),
+            agent_id: "a1".into(),
+            progress: 0.0,
+            total_tokens: 0,
+            created_at: 0,
+        });
+        let err = cp.validate().unwrap_err();
+        assert!(matches!(err, ProtocolError::InvalidCursor(_)));
+        assert!(err.to_string().contains("wait_trigger"));
+    }
+
+    #[test]
+    fn validate_running_slot_in_checkpoint_rejects() {
+        let cp = StepCheckpoint::Light(LightCheckpoint {
+            protocol_version: PROTOCOL_VERSION,
+            cursor: ExecutionCursor {
+                phase: StepAction::Act,
+                slots: vec![ExecutionSlot {
+                    index: 0,
+                    tool_name: "grep".into(),
+                    call_id: "c1".into(),
+                    state: SlotState::Running, // crash artifact!
+                    idempotency_key: None,
+                    cached_result: None,
+                    retry_count: 0,
+                }],
+                parallel: false,
+                wait_trigger: None,
+                sub_step: None,
+            },
+            step_id: "s1".into(),
+            task_id: "t1".into(),
+            agent_id: "a1".into(),
+            progress: 0.5,
+            total_tokens: 100,
+            created_at: 0,
+        });
+        let err = cp.validate().unwrap_err();
+        assert!(matches!(err, ProtocolError::CheckpointCorrupt(_)));
+        assert!(err.to_string().contains("Running state"));
+    }
+
+    #[test]
+    fn validate_heavy_no_messages_for_act_rejects() {
+        let cp = StepCheckpoint::Heavy(HeavyCheckpoint {
+            light: LightCheckpoint {
+                protocol_version: PROTOCOL_VERSION,
+                cursor: ExecutionCursor::for_act(2),
+                step_id: "s1".into(),
+                task_id: "t1".into(),
+                agent_id: "a1".into(),
+                progress: 0.5,
+                total_tokens: 500,
+                created_at: 0,
+            },
+            messages: vec![], // empty for non-Perceive!
+            budget_remaining_tokens: 1000,
+            budget_remaining_rounds: 5,
+            blocked_tools: vec![],
+            recent_tools: vec![],
+            learning_snapshot_id: None,
+            memory_context: None,
+        });
+        let err = cp.validate().unwrap_err();
+        assert!(matches!(err, ProtocolError::CheckpointCorrupt(_)));
+        assert!(err.to_string().contains("no messages"));
+    }
+
+    #[test]
+    fn validate_heavy_perceive_no_messages_ok() {
+        // Perceive phase is allowed to have no messages (initial state)
+        let cp = StepCheckpoint::Heavy(HeavyCheckpoint {
+            light: LightCheckpoint {
+                protocol_version: PROTOCOL_VERSION,
+                cursor: ExecutionCursor::default(), // Perceive
+                step_id: "s1".into(),
+                task_id: "t1".into(),
+                agent_id: "a1".into(),
+                progress: 0.0,
+                total_tokens: 0,
+                created_at: 0,
+            },
+            messages: vec![],
+            budget_remaining_tokens: 4000,
+            budget_remaining_rounds: 10,
+            blocked_tools: vec![],
+            recent_tools: vec![],
+            learning_snapshot_id: None,
+            memory_context: None,
+        });
+        assert!(cp.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_completed_slots_ok() {
+        let cp = StepCheckpoint::Light(LightCheckpoint {
+            protocol_version: PROTOCOL_VERSION,
+            cursor: ExecutionCursor {
+                phase: StepAction::Act,
+                slots: vec![
+                    ExecutionSlot {
+                        index: 0, tool_name: "grep".into(), call_id: "c1".into(),
+                        state: SlotState::Completed, idempotency_key: None,
+                        cached_result: None, retry_count: 0,
+                    },
+                    ExecutionSlot {
+                        index: 1, tool_name: "read_file".into(), call_id: "c2".into(),
+                        state: SlotState::Completed, idempotency_key: None,
+                        cached_result: None, retry_count: 0,
+                    },
+                ],
+                parallel: false,
+                wait_trigger: None,
+                sub_step: None,
+            },
+            step_id: "s1".into(),
+            task_id: "t1".into(),
+            agent_id: "a1".into(),
+            progress: 1.0,
+            total_tokens: 200,
+            created_at: 0,
+        });
+        assert!(cp.validate().is_ok());
+    }
+
+    // ── Checkpoint Round-Trip ──
+
+    #[test]
+    fn checkpoint_light_serde_roundtrip() {
+        let cp = StepCheckpoint::light("s1".into(), "t1".into(), "a1".into(), ExecutionCursor::for_act(2));
+        let json = serde_json::to_string(&cp).unwrap();
+        let restored: StepCheckpoint = serde_json::from_str(&json).unwrap();
+        assert!(!restored.is_heavy());
+        assert_eq!(restored.protocol_version(), PROTOCOL_VERSION);
+        assert_eq!(restored.cursor().slots.len(), 2);
+    }
+
+    #[test]
+    fn checkpoint_heavy_serde_roundtrip() {
+        let mut cp = StepCheckpoint::heavy("s1".into(), "t1".into(), "a1".into(), ExecutionCursor::default());
+        if let StepCheckpoint::Heavy(ref mut h) = cp {
+            h.messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
+            h.budget_remaining_tokens = 2000;
+            h.blocked_tools = vec!["bash".into()];
+            h.learning_snapshot_id = Some("snap-001".into());
+        }
+        let json = serde_json::to_string(&cp).unwrap();
+        let restored: StepCheckpoint = serde_json::from_str(&json).unwrap();
+        assert!(restored.is_heavy());
+        if let StepCheckpoint::Heavy(h) = restored {
+            assert_eq!(h.messages.len(), 1);
+            assert_eq!(h.budget_remaining_tokens, 2000);
+            assert_eq!(h.blocked_tools, vec!["bash"]);
+            assert_eq!(h.learning_snapshot_id.as_deref(), Some("snap-001"));
+        }
+    }
+
+    // ── Eviction Safety ──
+
+    #[test]
+    fn evict_step_no_prefix_collision() {
+        let mut cache = InMemoryIdempotencyCache::new();
+        // "s1:0:abc" and "s10:0:def" — evicting "s1" must NOT touch "s10"
+        let key_s1 = IdempotencyKey::new("s1", 0, "grep", &serde_json::json!({"a": 1}));
+        let key_s10 = IdempotencyKey::new("s10", 0, "grep", &serde_json::json!({"a": 1}));
+        let result = CachedToolResult {
+            tool_name: "grep".into(), output: "ok".into(), is_error: false, cached_at: 0,
+        };
+        cache.record(&key_s1, result.clone());
+        cache.record(&key_s10, result);
+        assert_eq!(cache.len(), 2);
+
+        cache.evict_step("s1");
+        assert_eq!(cache.len(), 1);
+        // s10 should still be there
+        assert!(cache.check(&key_s10).is_some());
+        // s1 should be gone
+        assert!(cache.check(&key_s1).is_none());
+    }
+
+    // ── Canonical JSON Key Escaping ──
+
+    #[test]
+    fn canonical_json_escapes_special_keys() {
+        let val = serde_json::json!({"key\"with\"quotes": 1, "normal": 2});
+        let result = canonical_json(&val);
+        // Keys must be properly escaped — should contain escaped quotes
+        assert!(result.contains(r#"key\"with\"quotes"#));
+        // Should be valid JSON
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["normal"], 2);
+    }
+
+    // ── Version Scheme Sanity ──
+
+    #[test]
+    fn version_scheme_major_minor_encoding() {
+        assert_eq!(PROTOCOL_VERSION, 1000);
+        assert_eq!(PROTOCOL_VERSION_MAJOR, 1);
+        assert_eq!(PROTOCOL_VERSION_MINOR, 0);
+        assert_eq!(PROTOCOL_VERSION / 1000, PROTOCOL_VERSION_MAJOR);
+        assert_eq!(PROTOCOL_VERSION % 1000, PROTOCOL_VERSION_MINOR);
+    }
+
+    #[test]
+    fn version_migrate_too_old_rejects() {
+        // major 0 → ok (N-1 migration). But if current major were 3, major 0 would be too old.
+        // Simulate: pretend expected major=1, found major=0 → ok for N-1
+        let result = check_protocol_version_with_policy(50, VersionPolicy::Migrate);
+        assert!(result.is_ok()); // major 0 is N-1 of major 1
+
+        // But version in a completely different range (future major 5) is rejected
+        let result = check_protocol_version_with_policy(5000, VersionPolicy::Migrate);
+        assert!(result.is_err()); // major 5 is not same nor N-1
+    }
+
+    #[test]
+    fn version_compatible_rejects_old_versions() {
+        // Old version in major 0 range, current is major 1
+        let result = check_protocol_version_with_policy(500, VersionPolicy::Compatible);
+        assert!(result.is_err()); // major 0 != major 1
+    }
+
+    // ── Wait Trigger Validation ──
+
+    #[test]
+    fn validate_wait_with_trigger_ok() {
+        let cp = StepCheckpoint::Light(LightCheckpoint {
+            protocol_version: PROTOCOL_VERSION,
+            cursor: ExecutionCursor {
+                phase: StepAction::Wait,
+                slots: vec![],
+                parallel: false,
+                wait_trigger: Some(WaitTrigger {
+                    trigger_type: WaitTriggerType::User,
+                    continuation_token: "tok-1".into(),
+                    timeout_ms: None,
+                }),
+                sub_step: None,
+            },
+            step_id: "s1".into(),
+            task_id: "t1".into(),
+            agent_id: "a1".into(),
+            progress: 0.0,
+            total_tokens: 0,
+            created_at: 0,
+        });
+        assert!(cp.validate().is_ok());
     }
 }
