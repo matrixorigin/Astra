@@ -885,9 +885,9 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
             ($delta:expr) => {{
                 let filter = get_slash_filter();
                 let filter_ref = filter.as_deref();
-                if let Some(cmd) = move_picker_selection($delta) {
+                if move_picker_selection($delta).is_some() {
                     render_slash_overlay(filter_ref);
-                    return Some(RlCmd::Replace(RlMovement::WholeLine, Some(cmd.to_string())));
+                    return Some(RlCmd::Noop);
                 }
                 render_slash_overlay(filter_ref);
                 return Some(RlCmd::Noop);
@@ -999,9 +999,8 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
             }
 
             // ── Accept: Enter with picker selects the highlighted command ─────
-            // If the line already matches the selected command (user navigated),
-            // just clear and accept. Otherwise replace the line — the user will
-            // see the full command and press Enter once more to confirm.
+            // Accept the currently selected command against the user's typed query.
+            // Navigation should not rewrite the buffer; Enter is the explicit accept step.
             // Special case: bare "/" should dispatch as the "/" command (show list),
             // not auto-select the first picker item.
             RlKeyEvent(RlKeyCode::Enter, _) if active => {
@@ -1496,6 +1495,22 @@ mod tests {
         assert_eq!(
             accepted_slash_edit("/explain", Some("/explain"), true),
             Some(AcceptedSlashEdit::InsertSuffix(" ".to_string()))
+        );
+    }
+
+    #[test]
+    fn accepted_slash_edit_from_skill_prefix_inserts_only_missing_suffix() {
+        assert_eq!(
+            accepted_slash_edit("/skil", Some("/skill"), false),
+            Some(AcceptedSlashEdit::InsertSuffix("l".to_string()))
+        );
+    }
+
+    #[test]
+    fn accepted_slash_edit_from_skill_subcommand_prefix_inserts_only_missing_suffix() {
+        assert_eq!(
+            accepted_slash_edit("/skill d", Some("/skill dev"), false),
+            Some(AcceptedSlashEdit::InsertSuffix("ev".to_string()))
         );
     }
 
