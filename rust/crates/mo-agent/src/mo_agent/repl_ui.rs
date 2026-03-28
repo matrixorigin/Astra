@@ -390,14 +390,38 @@ fn apply_accepted_slash_edit(edit: AcceptedSlashEdit) -> RlCmd {
 fn render_slash_overlay_row(cmd: &str, desc: &str, selected: bool) -> String {
     if selected {
         format!(
-            "  {} {:<14}  {}",
-            "❯".green().bold(),
+            "{} {} {:<16} {}",
+            "│".cyan(),
+            "▶".green().bold(),
             cmd.green().bold(),
             desc.green().bold()
         )
     } else {
-        format!("    {:<14}  {}", cmd.dim(), desc.dim())
+        format!(
+            "{}   {:<16} {}",
+            "│".cyan().dim(),
+            cmd.dim(),
+            desc.dim()
+        )
     }
+}
+
+fn render_slash_overlay_header(filter: Option<&str>) -> String {
+    let title = if let Some(q) = filter.filter(|q| !q.is_empty()) {
+        format!(" Slash Commands  ·  filter: {q} ")
+    } else {
+        " Slash Commands ".to_string()
+    };
+    format!("{}{}{}", "╭".cyan(), title.cyan().bold(), "╮".cyan())
+}
+
+fn render_slash_overlay_footer(total: usize, start: usize, end: usize) -> String {
+    let summary = if total > 0 {
+        format!(" {}/{} shown  ·  ↑↓ navigate  Tab accept  Enter run  Esc dismiss ", end - start, total)
+    } else {
+        " no matches  ·  Esc dismiss ".to_string()
+    };
+    format!("{}{}{}", "╰".cyan(), summary.dim(), "╯".cyan())
 }
 
 /// Move selection and return the newly selected command name.
@@ -479,14 +503,15 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
 
     let mut printed: u16 = 0;
     let visible_limit = 10usize;
-    println!(
-        "{}",
-        "─ Slash commands (↑/↓ select · Enter run · Esc dismiss) ─".dim()
-    );
+    println!("{}", render_slash_overlay_header(filter));
     printed += 1;
     if rows.is_empty() {
         let label = filter.unwrap_or("");
-        println!("{}", format!("  no commands match '{label}'").yellow());
+        println!(
+            "{} {}",
+            "│".cyan().dim(),
+            format!("no commands match '{label}'").yellow()
+        );
         printed += 1;
     } else {
         let total = rows.len();
@@ -503,10 +528,13 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
             println!("{}", render_slash_overlay_row(cmd, desc, abs == selected));
             printed += 1;
         }
-        if total > visible_limit {
-            println!("{}", format!("  [{}-{} / {}]", start + 1, end, total).dim());
-            printed += 1;
-        }
+        println!("{}", render_slash_overlay_footer(total, start, end));
+        printed += 1;
+    }
+
+    if rows.is_empty() {
+        println!("{}", render_slash_overlay_footer(0, 0, 0));
+        printed += 1;
     }
 
     if let Ok(mut g) = slash_overlay_lines().lock() {
@@ -1415,6 +1443,7 @@ mod tests {
     fn render_selected_slash_row_highlights_command_and_description() {
         let row = render_slash_overlay_row("/ask", "Toggle ask mode", true);
         let plain = strip_ansi_codes(&row);
+        assert!(plain.starts_with("│ ▶ /ask"));
         assert!(plain.contains("/ask"));
         assert!(plain.contains("Toggle ask mode"));
         assert!(row.contains("\u{1b}["));
@@ -1426,8 +1455,34 @@ mod tests {
     fn render_unselected_slash_row_keeps_plain_layout() {
         let row = render_slash_overlay_row("/ask", "Toggle ask mode", false);
         let plain = strip_ansi_codes(&row);
-        assert!(plain.starts_with("    /ask"));
+        assert!(plain.starts_with("│   /ask"));
         assert!(plain.contains("Toggle ask mode"));
+    }
+
+    #[test]
+    fn render_slash_overlay_header_includes_filter_when_present() {
+        let header = render_slash_overlay_header(Some("skill d"));
+        let plain = strip_ansi_codes(&header);
+        assert!(plain.contains("Slash Commands"));
+        assert!(plain.contains("filter: skill d"));
+    }
+
+    #[test]
+    fn render_slash_overlay_footer_shows_navigation_help() {
+        let footer = render_slash_overlay_footer(12, 0, 10);
+        let plain = strip_ansi_codes(&footer);
+        assert!(plain.contains("10/12 shown"));
+        assert!(plain.contains("Tab accept"));
+        assert!(plain.contains("Enter run"));
+        assert!(plain.contains("Esc dismiss"));
+    }
+
+    #[test]
+    fn render_slash_overlay_footer_handles_empty_state() {
+        let footer = render_slash_overlay_footer(0, 0, 0);
+        let plain = strip_ansi_codes(&footer);
+        assert!(plain.contains("no matches"));
+        assert!(plain.contains("Esc dismiss"));
     }
 
     // ── Multi-line validator ──────────────────────────────────────────────
