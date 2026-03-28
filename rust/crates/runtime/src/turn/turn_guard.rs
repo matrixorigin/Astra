@@ -594,4 +594,98 @@ mod tests {
         let v = guard.evaluate();
         assert!(v.force_stop, "3 nudges + Critical should force stop");
     }
+
+    // ── Error counting: single-count per tool result ─────────────────────────
+
+    #[test]
+    fn record_tool_result_error_counts_once() {
+        // Regression test: session 62fee584 had 2 read_file errors counted
+        // as 4 because chat_stream.rs called errors.record_error() explicitly
+        // AND record_tool_result() recorded it again. Now only record_tool_result
+        // should count errors.
+        let mut guard = TurnGuard::new();
+        guard.record_tool_result("read_file", "Error: No such file or directory (os error 2)");
+        guard.record_tool_result("read_file", "Error: No such file or directory (os error 2)");
+
+        assert_eq!(
+            guard.errors.total_errors, 2,
+            "2 errors should count as exactly 2, not 4 (double-counting bug)"
+        );
+    }
+
+    #[test]
+    fn two_errors_do_not_trigger_warning() {
+        // With single-counting, 2 errors should NOT reach Warning threshold (5 errors)
+        let mut guard = TurnGuard::new();
+        guard.record_tool_result("read_file", "Error: No such file or directory");
+        guard.record_tool_result("read_file", "Error: No such file or directory");
+
+        let verdict = guard.evaluate();
+        assert_eq!(
+            verdict.severity,
+            VerdictSeverity::Healthy,
+            "2 errors (single-counted) should not trigger Warning; severity: {:?}",
+            verdict.severity
+        );
+        assert!(!verdict.force_stop);
+    }
+
+    #[test]
+    fn four_errors_spread_across_tools_below_warning() {
+        // 4 errors spread across tools: no consecutive failure deprioritization,
+        // and total_errors(4) < 5 = no Warning from error count
+        let mut guard = TurnGuard::new();
+        guard.record_tool_result("read_file", "Error: file not found");
+        guard.record_tool_result("grep", "Error: bad pattern");
+        guard.record_tool_result("bash", "Error: command failed");
+        guard.record_tool_result("glob", "Error: invalid pattern");
+
+        let verdict = guard.evaluate();
+        assert_eq!(
+            guard.errors.total_errors, 4,
+            "should have exactly 4 errors"
+        );
+        assert_eq!(
+            verdict.severity,
+            VerdictSeverity::Healthy,
+            "4 errors across different tools should not reach Warning threshold of 5"
+        );
+    }
+
+    #[test]
+    fn five_errors_triggers_warning() {
+        let mut guard = TurnGuard::new();
+        for _ in 0..5 {
+            guard.record_tool_result("read_file", "Error: file not found");
+        }
+
+        let verdict = guard.evaluate();
+        assert!(
+            verdict.severity >= VerdictSeverity::Warning,
+            "5 errors should trigger Warning"
+        );
+        assert!(!verdict.force_stop, "5 errors without nudges should not force_stop");
+    }
+
+    #[test]
+    fn mixed_success_and_errors_no_premature_escalation() {
+        // Simulates session 62fee584: 2 errors, 4 successes = healthy
+        let mut guard = TurnGuard::new();
+        guard.record_tool_calls(&[make_tool_call("read_file", r#"{"path":"a"}"#)]);
+        guard.record_tool_result("read_file", "Error: No such file or directory");
+        guard.record_tool_result("read_file", "Error: No such file or directory");
+        guard.record_tool_result("list_dir", "src/\ntests/\nREADME.md");
+        guard.record_tool_result("list_dir", "mod.rs\nlib.rs");
+        guard.record_tool_result("glob", "src/main.rs\nsrc/lib.rs");
+        guard.record_tool_result("glob", "tests/test.rs");
+
+        assert_eq!(guard.errors.total_errors, 2, "only 2 actual errors");
+
+        let verdict = guard.evaluate();
+        assert!(!verdict.force_stop, "should NOT force_stop with 2 errors and 4 successes");
+        assert!(
+            verdict.severity < VerdictSeverity::Critical,
+            "should not reach Critical with only 2 errors"
+        );
+    }
 }

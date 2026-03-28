@@ -49,7 +49,15 @@ impl ToolExecutor {
         };
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
-            Err(e) => return format!("Error: {e}"),
+            Err(e) => {
+                let msg = format!("Error: {e}");
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return format!(
+                        "{msg}. Use list_dir or glob to find the correct path first."
+                    );
+                }
+                return msg;
+            }
         };
 
         // Outline mode: return only definition signatures with line numbers
@@ -865,6 +873,21 @@ type Handler interface {
         assert!(result.contains("truncated"), "should be truncated: last 100 chars: {}", &result[result.len().saturating_sub(100)..]);
         assert!(result.contains("outline") || result.contains("start_line"),
             "should suggest alternatives: last 200 chars: {}", &result[result.len().saturating_sub(200)..]);
+    }
+
+    // ── read_file not-found hints ────────────────────────────────────────────
+
+    #[test]
+    fn read_file_not_found_suggests_alternatives() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
+        let result = executor.read_file(&serde_json::json!({"path": "nonexistent.rs"}));
+
+        assert!(result.contains("Error"), "should be error: {result}");
+        assert!(
+            result.contains("list_dir") || result.contains("glob"),
+            "should suggest list_dir/glob: {result}"
+        );
     }
 
     // ── normalize_ws ─────────────────────────────────────────────────────────

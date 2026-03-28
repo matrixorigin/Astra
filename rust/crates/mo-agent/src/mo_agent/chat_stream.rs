@@ -1364,13 +1364,16 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             let tool_elapsed = tool_start.elapsed();
             let mut is_err = is_tool_error(&result_str);
 
-            // Error recovery: classify, retry transient errors, track via TurnGuard
+            // Error recovery: classify, retry transient errors, track via TurnGuard.
+            // NOTE: error counting and health recording happen in record_tool_result()
+            // below — do NOT call turn_guard.errors.record_error() here to avoid
+            // double-counting (was a bug: 2 errors looked like 4, triggering premature
+            // escalation).
             if is_err {
                 use mo_agent_runtime::turn::error_recovery::{
                     build_recovery_message, classify_error,
                 };
                 let category = classify_error(&result_str);
-                turn_guard.errors.record_error(category);
 
                 // Resource-limit errors: immediately block the tool (the whole
                 // system is constrained — retrying only makes things worse)
