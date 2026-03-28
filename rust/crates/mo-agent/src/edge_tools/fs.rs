@@ -40,19 +40,30 @@ impl ToolExecutor {
     }
 
     pub(crate) fn read_file(&self, args: &Value) -> String {
-        let path = match args.get("path").and_then(Value::as_str) {
-            Some(p) => match self.resolve_checked(p) {
-                Ok(safe) => safe,
-                Err(e) => return e,
-            },
+        let path_str = match args.get("path").and_then(Value::as_str) {
+            Some(p) => p,
             None => return "Error: missing 'path'".to_string(),
+        };
+        let path = match self.resolve_checked(path_str) {
+            Ok(safe) => safe,
+            Err(e) => return e,
         };
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
                 let msg = format!("Error: {e}");
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    return format!("{msg}. Use list_dir or glob to find the correct path first.");
+                    // Try to find similar files
+                    let suggestions = self.find_similar_files(path_str);
+                    let hint = if !suggestions.is_empty() {
+                        format!("\nDid you mean: {}?", suggestions.join(", "))
+                    } else {
+                        String::new()
+                    };
+                    return format!("{msg}. Use list_dir or glob to find the correct path first.{hint}");
+                }
+                if e.kind() == std::io::ErrorKind::IsADirectory {
+                    return format!("{msg}. Use list_dir instead for directories.");
                 }
                 return msg;
             }
@@ -267,6 +278,101 @@ impl ToolExecutor {
             }
         }
     }
+
+    /// Find files with similar names to a missing file.
+    /// Returns up to 3 suggestions based on filename similarity.
+    fn find_similar_files(&self, path_str: &str) -> Vec<String> {
+        let path = Path::new(path_str);
+        
+        // Get the filename we're looking for
+        let target_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_lowercase(),
+            None => return Vec::new(),
+        };
+        
+        // Get the parent directory to search in
+        let search_dir = if path.is_absolute() {
+            path.parent().map(|p| p.to_path_buf())
+        } else {
+            Some(self.project_root.join(path.parent().unwrap_or(Path::new(""))))
+        };
+        
+        let search_dir = match search_dir {
+            Some(d) if d.exists() => d,
+            _ => return Vec::new(),
+        };
+        
+        // Find similar files in the directory
+        let mut candidates: Vec<(String, usize)> = Vec::new();
+        if let Ok(entries) = fs::read_dir(&search_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy().to_lowercase();
+                
+                // Skip directories unless they might be what we want
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if is_dir && !target_name.ends_with('/') {
+                    continue;
+                }
+                
+                // Calculate simple similarity (shared prefix + extension match)
+                let score = similarity_score(&target_name, &name_str);
+                if score > 0 {
+                    let rel_path = entry.path();
+                    let display = rel_path.strip_prefix(&self.project_root)
+                        .unwrap_or(&rel_path)
+                        .display()
+                        .to_string();
+                    candidates.push((display, score));
+                }
+            }
+        }
+        
+        // Sort by score descending and take top 3
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.into_iter()
+            .take(3)
+            .map(|(path, _)| path)
+            .collect()
+    }
+}
+
+/// Calculate similarity score between two filenames.
+/// Higher score = more similar.
+fn similarity_score(target: &str, candidate: &str) -> usize {
+    let mut score = 0;
+    
+    // Exact match (shouldn't happen but handle it)
+    if target == candidate {
+        return 100;
+    }
+    
+    // Shared prefix
+    let common_prefix = target.chars()
+        .zip(candidate.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    score += common_prefix * 3;
+    
+    // Same extension
+    let target_ext = target.rsplit('.').next();
+    let cand_ext = candidate.rsplit('.').next();
+    if target_ext == cand_ext && target_ext.is_some() {
+        score += 5;
+    }
+    
+    // Contains target as substring
+    if candidate.contains(target) || target.contains(candidate) {
+        score += 10;
+    }
+    
+    // Similar length
+    let len_diff = (target.len() as isize - candidate.len() as isize).unsigned_abs();
+    if len_diff < 5 {
+        score += 5 - len_diff;
+    }
+    
+    score
 }
 
 // ─── File outline extraction ────────────────────────────────────────────────
@@ -1092,5 +1198,62 @@ type Handler interface {
             "signature: {:?}",
             defs[0].1
         );
+    }
+
+    // ── read_file: similar file suggestions ──────────────────────────────────
+
+    #[test]
+    fn read_file_not_found_suggests_similar() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create some files with similar names
+        std::fs::write(dir.path().join("config.rs"), "// config").unwrap();
+        std::fs::write(dir.path().join("config.toml"), "# config").unwrap();
+        std::fs::write(dir.path().join("other.rs"), "// other").unwrap();
+
+        let executor = test_executor_in(dir.path());
+        let result = executor.read_file(&serde_json::json!({
+            "path": "confg.rs"  // typo
+        }));
+
+        assert!(
+            result.contains("No such file"),
+            "should report not found: {result}"
+        );
+        assert!(
+            result.contains("config.rs") || result.contains("Did you mean"),
+            "should suggest similar: {result}"
+        );
+    }
+
+    #[test]
+    fn read_file_directory_error_suggests_list_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+
+        let executor = test_executor_in(dir.path());
+        let result = executor.read_file(&serde_json::json!({
+            "path": "subdir"
+        }));
+
+        assert!(
+            result.contains("directory") || result.contains("Is a directory"),
+            "should mention directory: {result}"
+        );
+        assert!(
+            result.contains("list_dir"),
+            "should suggest list_dir: {result}"
+        );
+    }
+
+    #[test]
+    fn similarity_score_exact_match_highest() {
+        assert_eq!(similarity_score("test.rs", "test.rs"), 100);
+    }
+
+    #[test]
+    fn similarity_score_same_extension_bonus() {
+        let with_ext = similarity_score("config.rs", "setting.rs");
+        let without_ext = similarity_score("config.rs", "setting.py");
+        assert!(with_ext > without_ext, "same ext should score higher");
     }
 }
