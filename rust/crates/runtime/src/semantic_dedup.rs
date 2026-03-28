@@ -255,6 +255,119 @@ impl SemanticDedup {
     pub fn output_log_size(&self) -> usize {
         self.output_log.len()
     }
+
+    /// Generate a concise inventory of context already fetched this session.
+    ///
+    /// Returns a human-readable summary suitable for injection into conversation
+    /// to help the LLM avoid re-fetching and plan efficiently.
+    ///
+    /// Example output:
+    /// ```text
+    /// Files read: src/main.rs, src/lib.rs (2 files)
+    /// Searches: grep "error" in src/, glob "*.rs" (2 searches)
+    /// Git: status, diff HEAD~3, log (3 ops)
+    /// GitHub: matrixorigin/mo PRs, CI status (2 ops)
+    /// ```
+    pub fn context_inventory(&self) -> String {
+        if self.param_cache.is_empty() {
+            return String::new();
+        }
+
+        let mut files: Vec<&str> = Vec::new();
+        let mut searches: Vec<String> = Vec::new();
+        let mut git_ops: Vec<&str> = Vec::new();
+        let mut github_ops: Vec<String> = Vec::new();
+        let mut memory_ops: Vec<&str> = Vec::new();
+        let mut other: Vec<String> = Vec::new();
+
+        for (key, (_turn, tool)) in &self.param_cache {
+            match tool.as_str() {
+                "read_file" => {
+                    if let Some(path) = key.strip_prefix("read_file:") {
+                        files.push(path);
+                    }
+                }
+                "grep" => {
+                    if let Some(path) = key.strip_prefix("grep:") {
+                        searches.push(format!("grep in {}", path));
+                    }
+                }
+                "glob" => {
+                    if let Some(rest) = key.strip_prefix("glob:") {
+                        searches.push(format!("glob {}", rest));
+                    }
+                }
+                t if t.starts_with("git_") => {
+                    git_ops.push(t.strip_prefix("git_").unwrap_or(t));
+                }
+                t if t.starts_with("github_") => {
+                    // Extract repo from key if present
+                    if let Some(repo) = key.split(':').nth(1) {
+                        github_ops.push(format!("{} {}", t.strip_prefix("github_").unwrap_or(t), repo));
+                    } else {
+                        github_ops.push(t.strip_prefix("github_").unwrap_or(t).to_string());
+                    }
+                }
+                t if t.starts_with("memory_") => {
+                    memory_ops.push(t.strip_prefix("memory_").unwrap_or(t));
+                }
+                _ => {
+                    other.push(key.clone());
+                }
+            }
+        }
+
+        let mut parts = Vec::new();
+
+        if !files.is_empty() {
+            let count = files.len();
+            let display: Vec<_> = files.iter().take(5).copied().collect();
+            let suffix = if count > 5 {
+                format!(" (+{} more)", count - 5)
+            } else {
+                String::new()
+            };
+            parts.push(format!("Files: {}{}", display.join(", "), suffix));
+        }
+
+        if !searches.is_empty() {
+            parts.push(format!("Searches: {}", searches.join(", ")));
+        }
+
+        if !git_ops.is_empty() {
+            let unique: std::collections::HashSet<_> = git_ops.iter().collect();
+            let ops: Vec<_> = unique.iter().map(|s| **s).collect();
+            parts.push(format!("Git: {}", ops.join(", ")));
+        }
+
+        if !github_ops.is_empty() {
+            parts.push(format!("GitHub: {}", github_ops.join(", ")));
+        }
+
+        if !memory_ops.is_empty() {
+            let unique: std::collections::HashSet<_> = memory_ops.iter().collect();
+            let ops: Vec<_> = unique.iter().map(|s| **s).collect();
+            parts.push(format!("Memory: {}", ops.join(", ")));
+        }
+
+        if parts.is_empty() {
+            return String::new();
+        }
+
+        format!("Context already fetched:\n{}", parts.join("\n"))
+    }
+
+    /// Check if we've already read a specific file (for pre-call planning).
+    pub fn has_file(&self, path: &str) -> bool {
+        let key = format!("read_file:{}", normalize_path(path));
+        self.param_cache.contains_key(&key)
+    }
+
+    /// Check if we've already done a grep in a specific directory.
+    pub fn has_grep_in(&self, path: &str) -> bool {
+        let key = format!("grep:{}", normalize_path(path));
+        self.param_cache.contains_key(&key)
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -468,5 +581,84 @@ mod tests {
             tracker.output_log_size() <= 50,
             "output log should be bounded at 50"
         );
+    }
+
+    // ── Context Inventory ──
+
+    #[test]
+    fn context_inventory_empty_when_no_calls() {
+        let tracker = SemanticDedup::new(0.75);
+        assert!(tracker.context_inventory().is_empty());
+    }
+
+    #[test]
+    fn context_inventory_shows_files() {
+        let mut tracker = SemanticDedup::new(0.75);
+        tracker.check_and_record("read_file", &json!({"path": "src/main.rs"}), "content", 0);
+        tracker.check_and_record("read_file", &json!({"path": "src/lib.rs"}), "content", 1);
+
+        let inv = tracker.context_inventory();
+        assert!(inv.contains("Files:"), "should have Files section");
+        assert!(inv.contains("src/main.rs"));
+        assert!(inv.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn context_inventory_shows_searches() {
+        let mut tracker = SemanticDedup::new(0.75);
+        tracker.check_and_record("grep", &json!({"pattern": "TODO", "path": "src/"}), "match", 0);
+        tracker.check_and_record("glob", &json!({"pattern": "*.rs", "path": "."}), "files", 1);
+
+        let inv = tracker.context_inventory();
+        assert!(inv.contains("Searches:"), "should have Searches section");
+        assert!(inv.contains("grep"));
+        assert!(inv.contains("glob"));
+    }
+
+    #[test]
+    fn context_inventory_shows_git_ops() {
+        let mut tracker = SemanticDedup::new(0.75);
+        tracker.check_and_record("git_status", &json!({}), "clean", 0);
+        tracker.check_and_record("git_diff", &json!({"ref": "HEAD~3"}), "diff", 1);
+
+        let inv = tracker.context_inventory();
+        assert!(inv.contains("Git:"), "should have Git section");
+    }
+
+    #[test]
+    fn context_inventory_truncates_long_file_lists() {
+        let mut tracker = SemanticDedup::new(0.75);
+        for i in 0..10 {
+            tracker.check_and_record(
+                "read_file",
+                &json!({"path": format!("src/file_{i}.rs")}),
+                "content",
+                i,
+            );
+        }
+
+        let inv = tracker.context_inventory();
+        assert!(inv.contains("+5 more"), "should truncate to 5 files with count");
+    }
+
+    #[test]
+    fn has_file_checks_cache() {
+        let mut tracker = SemanticDedup::new(0.75);
+        assert!(!tracker.has_file("src/main.rs"));
+
+        tracker.check_and_record("read_file", &json!({"path": "src/main.rs"}), "content", 0);
+        assert!(tracker.has_file("src/main.rs"));
+        assert!(tracker.has_file("src/main.rs/")); // normalized
+        assert!(!tracker.has_file("src/other.rs"));
+    }
+
+    #[test]
+    fn has_grep_in_checks_cache() {
+        let mut tracker = SemanticDedup::new(0.75);
+        assert!(!tracker.has_grep_in("src/"));
+
+        tracker.check_and_record("grep", &json!({"pattern": "foo", "path": "src/"}), "match", 0);
+        assert!(tracker.has_grep_in("src/"));
+        assert!(!tracker.has_grep_in("tests/"));
     }
 }

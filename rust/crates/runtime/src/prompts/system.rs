@@ -55,6 +55,13 @@ pub fn build_main_system_prompt(
          </think>\n\
          After each tool result, reflect: <reflect>[what I learned] [adjust plan or proceed]</reflect>\n\
          This keeps you on track and prevents exploration spirals.\n\n\
+         ## Context Strategy\n\
+         Before acting, identify WHAT context you need:\n\
+         1. **Plan context needs**: What files/functions/tests must I understand first?\n\
+         2. **Batch the fetch**: Call all needed reads/greps in ONE turn (parallel).\n\
+         3. **Check inventory**: If context was already fetched, use it — don't re-fetch.\n\
+         4. **Then act**: Only after understanding, make your changes.\n\
+         Example: To fix a bug in auth.rs, plan: \"Need auth.rs:50-100, the test file, and git blame on line 75\" → fetch all 3 → then edit.\n\n\
          ## Coding Discipline\n\
          - **Read before write**: understand existing patterns, naming conventions, and imports before editing.\n\
          - **Surgical edits**: change only what's needed. Don't rewrite unrelated code.\n\
@@ -72,7 +79,8 @@ pub fn build_main_system_prompt(
          - Prefer targeted reads (line ranges) over full-file reads.\n\
          - Use glob to narrow candidates before grep.\n\
          - Request only the data you need — avoid fetching entire files when a section suffices.\n\
-         - Summarize findings concisely. Show relevant code, not the whole file.\n",
+         - Summarize findings concisely. Show relevant code, not the whole file.\n\
+         - If you've already fetched something, reference it from history — don't re-fetch.\n",
         tool_names.join(", "),
         profile_desc,
     );

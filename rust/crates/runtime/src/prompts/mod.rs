@@ -221,12 +221,13 @@ mod tests {
             1.0,
             None,
         );
-        // Full prompt with all sections should be under ~1500 tokens
-        // Enhanced prompt adds: Planning Protocol, Coding Discipline, Parallel Tool Calls, Token Efficiency
-        // These extra ~250 tokens pay for themselves in fewer wasted turns.
+        // Full prompt with all sections should be under ~1875 tokens
+        // Enhanced prompt adds: Planning Protocol, Context Strategy, Coding Discipline, 
+        // Parallel Tool Calls, Token Efficiency. These extra ~300 tokens pay for themselves
+        // in fewer wasted turns and better tool batching.
         assert!(
-            p.len() < 7000,
-            "compressed prompt should be under 7000 chars, got {}",
+            p.len() < 7500,
+            "compressed prompt should be under 7500 chars, got {}",
             p.len()
         );
     }
