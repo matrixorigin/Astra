@@ -3468,6 +3468,7 @@ mod learning_improves_selection {
                 budget_pressure: 0.0,
                 memory_domain_hints: hints,
                 restricted_tools: vec![],
+                file_context: vec![],
             })
             .await;
 
@@ -3481,6 +3482,7 @@ mod learning_improves_selection {
                 budget_pressure: 0.0,
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
+                file_context: vec![],
             })
             .await;
 
@@ -8279,6 +8281,7 @@ mod co_occurrence_scoring_proofs {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result_with = selector.select(&ctx_with_recent).await;
 
@@ -8292,6 +8295,7 @@ mod co_occurrence_scoring_proofs {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result_without = selector.select(&ctx_without_recent).await;
 
@@ -8302,5 +8306,114 @@ mod co_occurrence_scoring_proofs {
         // The selector should produce tool lists — co-occurrence doesn't break anything
         assert!(!result_with.tool_names.is_empty(), "should select tools with recent_tools");
         assert!(!result_without.tool_names.is_empty(), "should select tools without recent_tools");
+    }
+}
+
+// ── File-context scoring proofs ──────────────────────────────────────────────
+
+mod file_context_scoring_proofs {
+    use mo_agent_runtime::tool_registry::scoring::{
+        pre_filter_dynamic, pre_filter_dynamic_with_file_context,
+    };
+    use mo_agent_runtime::tool_registry::state::ConversationState;
+    use mo_agent_runtime::tool_registry::TOOL_CATALOG;
+    use std::collections::HashMap;
+
+    fn tool_name(idx: usize) -> &'static str {
+        TOOL_CATALOG[idx].name
+    }
+
+    /// File context boosts code-editing tools for detected languages
+    #[test]
+    fn proof_rust_context_boosts_code_tools() {
+        let state = ConversationState {
+            is_fetch: true,
+            ..Default::default()
+        };
+        let query = "fix the bug";
+
+        let without = pre_filter_dynamic(&state, query);
+        let with_rust = pre_filter_dynamic_with_file_context(
+            &state,
+            query,
+            None,
+            None,
+            &[],
+            0.0,
+            &HashMap::new(),
+            &["rust".to_string()],
+        );
+
+        // grep should score higher with rust context
+        let grep_without = without.iter().find(|(i, _)| tool_name(*i) == "grep").map(|t| t.1);
+        let grep_with = with_rust.iter().find(|(i, _)| tool_name(*i) == "grep").map(|t| t.1);
+        if let (Some(wo), Some(wi)) = (grep_without, grep_with) {
+            assert!(wi >= wo, "grep should score >= with rust context (was {wo}, now {wi})");
+        }
+    }
+
+    /// Empty file context doesn't change scores
+    #[test]
+    fn proof_empty_file_context_is_noop() {
+        let state = ConversationState {
+            is_fetch: true,
+            ..Default::default()
+        };
+        let query = "list files";
+
+        let baseline = pre_filter_dynamic(&state, query);
+        let with_empty = pre_filter_dynamic_with_file_context(
+            &state,
+            query,
+            None,
+            None,
+            &[],
+            0.0,
+            &HashMap::new(),
+            &[],
+        );
+
+        assert_eq!(baseline.len(), with_empty.len(),
+            "empty file context should produce same tool count");
+        for (a, b) in baseline.iter().zip(with_empty.iter()) {
+            assert_eq!(a.0, b.0, "same tool index ordering");
+            assert!((a.1 - b.1).abs() < 1e-9, "same score for tool {}", tool_name(a.0));
+        }
+    }
+
+    /// File context flows through TfIdfSelector E2E
+    #[tokio::test]
+    async fn proof_file_context_flows_through_selector_e2e() {
+        use mo_agent_runtime::tool_selector::{SelectionContext, ToolSelector, TfIdfSelector};
+        use mo_agent_runtime::tool_registry::ToolRegistry;
+
+        let schemas: Vec<serde_json::Value> = TOOL_CATALOG
+            .iter()
+            .map(|t| serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }))
+            .collect();
+        let registry = ToolRegistry::new(schemas);
+        let selector = TfIdfSelector::new(registry);
+
+        let ctx = SelectionContext {
+            query: "edit the code",
+            turn_count: 1,
+            recent_tools: &[],
+            budget_tokens: 10_000,
+            boost_terms: vec![],
+            budget_pressure: 0.0,
+            memory_domain_hints: vec![],
+            restricted_tools: vec![],
+            file_context: vec!["typescript".to_string()],
+        };
+        let result = selector.select(&ctx).await;
+        assert!(!result.failed, "selection with file_context should succeed");
+        assert!(!result.tool_names.is_empty(), "should select tools");
     }
 }

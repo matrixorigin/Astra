@@ -4,7 +4,7 @@ use super::meta::{TOOL_CATALOG, ToolMeta};
 use super::report::{SelectionReport, ToolQualityTracker};
 use super::scoring::{
     DEFAULT_TOOL_BUDGET_TOKENS, pre_filter_dynamic, pre_filter_dynamic_calibrated,
-    pre_filter_dynamic_with_cooccurrence, pre_filter_dynamic_with_memory,
+    pre_filter_dynamic_with_file_context, pre_filter_dynamic_with_memory,
     pre_filter_dynamic_with_quality,
 };
 use super::state::ConversationState;
@@ -385,6 +385,7 @@ impl ToolRegistry {
             memory_domain_hints,
             0.0,
             &std::collections::HashMap::new(),
+            &[],
         )
     }
 
@@ -403,6 +404,7 @@ impl ToolRegistry {
         memory_domain_hints: &[crate::pipeline::routing::DomainHint],
         budget_pressure: f64,
         co_occurrence: &std::collections::HashMap<String, f64>,
+        file_context: &[String],
     ) -> (Vec<Value>, SelectionReport) {
         // Use tool_filter for early conversational detection
         if routing.tool_filter == ToolFilter::Minimal {
@@ -434,8 +436,9 @@ impl ToolRegistry {
         // When budget_pressure > 0 or co-occurrence data exists, apply the full
         // co-occurrence-aware scoring pipeline for maximum selection quality.
         let has_co_occurrence = !co_occurrence.is_empty();
-        let ranked = if budget_pressure > 0.01 || has_co_occurrence {
-            pre_filter_dynamic_with_cooccurrence(
+        let has_file_context = !file_context.is_empty();
+        let ranked = if budget_pressure > 0.01 || has_co_occurrence || has_file_context {
+            pre_filter_dynamic_with_file_context(
                 &routing.conversation_state,
                 &effective_query,
                 quality_tracker,
@@ -443,6 +446,7 @@ impl ToolRegistry {
                 memory_domain_hints,
                 budget_pressure,
                 co_occurrence,
+                file_context,
             )
         } else {
             pre_filter_dynamic_with_memory(

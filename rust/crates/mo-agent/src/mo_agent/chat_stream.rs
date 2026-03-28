@@ -468,6 +468,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     let start = Instant::now();
     let term_width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let file_context = detect_project_languages(&project_root);
     let executor = edge_tools::ToolExecutor::new(&project_root).with_cloud(base, token);
     let all_schemas = edge_tools::all_tool_schemas();
     let registry = tool_registry::ToolRegistry::new(all_schemas.clone());
@@ -715,6 +716,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 budget_pressure,
                 memory_domain_hints: memory_domain_hints.clone(),
                 restricted_tools: restricted_vec.clone(),
+                file_context: file_context.clone(),
             };
             let sel_result = selector.select(&sel_ctx).await;
             let conf = sel_result.confidence;
@@ -736,6 +738,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 budget_pressure,
                 memory_domain_hints,
                 restricted_tools: restricted_vec,
+                file_context: file_context.clone(),
             };
             let sel_result = selector.select(&sel_ctx).await;
             let conf = sel_result.confidence;
@@ -1795,6 +1798,51 @@ fn extract_repos_from_memory(text: &str) -> Vec<String> {
     repos
 }
 
+/// Detect project languages/frameworks from workspace marker files.
+/// Returns tags like "rust", "typescript", "python", "go", "java", etc.
+fn detect_project_languages(root: &std::path::Path) -> Vec<String> {
+    let markers: &[(&str, &str)] = &[
+        ("Cargo.toml", "rust"),
+        ("package.json", "javascript"),
+        ("tsconfig.json", "typescript"),
+        ("pyproject.toml", "python"),
+        ("setup.py", "python"),
+        ("requirements.txt", "python"),
+        ("go.mod", "go"),
+        ("pom.xml", "java"),
+        ("build.gradle", "java"),
+        ("build.gradle.kts", "kotlin"),
+        ("Gemfile", "ruby"),
+        ("mix.exs", "elixir"),
+        ("CMakeLists.txt", "cpp"),
+        ("Makefile", "make"),
+        (".csproj", "csharp"),
+        ("composer.json", "php"),
+        ("Dockerfile", "docker"),
+    ];
+    let mut langs = Vec::new();
+    for &(file, lang) in markers {
+        if root.join(file).exists() {
+            langs.push(lang.to_string());
+        }
+    }
+    // Check for *.csproj in root (glob-style, since filename varies)
+    if langs.iter().all(|l| l != "csharp") {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.ends_with(".csproj") || name.ends_with(".sln") {
+                        langs.push("csharp".to_string());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    langs.dedup();
+    langs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2153,5 +2201,40 @@ mod tests {
         let norm = normalize_args(&args);
         assert_eq!(norm["count"], 5);
         assert_eq!(norm["verbose"], true);
+    }
+
+    // ── detect_project_languages ─────────────────────────────────────────────
+
+    #[test]
+    fn detect_project_languages_finds_cargo_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]").unwrap();
+        let langs = detect_project_languages(tmp.path());
+        assert!(langs.contains(&"rust".to_string()));
+    }
+
+    #[test]
+    fn detect_project_languages_finds_multiple() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package.json"), "{}").unwrap();
+        std::fs::write(tmp.path().join("Dockerfile"), "FROM rust").unwrap();
+        let langs = detect_project_languages(tmp.path());
+        assert!(langs.contains(&"javascript".to_string()));
+        assert!(langs.contains(&"docker".to_string()));
+    }
+
+    #[test]
+    fn detect_project_languages_empty_for_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let langs = detect_project_languages(tmp.path());
+        assert!(langs.is_empty());
+    }
+
+    #[test]
+    fn detect_project_languages_typescript_from_tsconfig() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("tsconfig.json"), "{}").unwrap();
+        let langs = detect_project_languages(tmp.path());
+        assert!(langs.contains(&"typescript".to_string()));
     }
 }

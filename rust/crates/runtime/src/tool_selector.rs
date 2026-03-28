@@ -65,6 +65,10 @@ pub struct SelectionContext<'a> {
     /// TurnGuard health tracker, or stall-restricted). These are filtered out
     /// BEFORE scoring, saving compute and preventing broken tools from being offered.
     pub restricted_tools: Vec<String>,
+    /// Project language/framework hints derived from workspace files.
+    /// e.g., ["rust"] from Cargo.toml, ["typescript"] from tsconfig.json.
+    /// Boosts tools relevant to the detected project type.
+    pub file_context: Vec<String>,
 }
 
 /// Result of tool selection.
@@ -336,6 +340,7 @@ impl ToolSelector for TfIdfSelector {
             &ctx.memory_domain_hints,
             ctx.budget_pressure,
             &co_occurrence,
+            &ctx.file_context,
         );
         drop(tracker_guard);
 
@@ -855,6 +860,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result = selector.select(&ctx).await;
         assert!(
@@ -877,6 +883,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result = selector.select(&ctx).await;
         let dynamic_count = result
@@ -1056,6 +1063,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result = selector.select(&ctx).await;
         assert_eq!(result.strategy, "fixed");
@@ -1104,6 +1112,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result = selector.select(&ctx).await;
         assert_eq!(result.strategy, "tfidf");
@@ -1127,6 +1136,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result = selector.select(&ctx).await;
         assert!(!result.tool_names.is_empty());
@@ -1160,6 +1170,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result = selector.select(&ctx).await;
         assert!(!result.tool_names.is_empty());
@@ -1182,6 +1193,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result_no_boost = selector.select(&ctx_no_boost).await;
 
@@ -1195,6 +1207,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result_boosted = selector.select(&ctx_boosted).await;
 
@@ -1230,6 +1243,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result = selector.select(&ctx).await;
         // Should still work (conversational may or may not include github depending
@@ -1249,6 +1263,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let ctx_empty = SelectionContext {
             query: "check the status",
@@ -1259,6 +1274,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let r1 = selector.select(&ctx_none).await;
         let r2 = selector.select(&ctx_empty).await;
@@ -1281,6 +1297,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let ctx_irrelevant = SelectionContext {
             query: "show git status",
@@ -1291,6 +1308,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let r1 = selector.select(&ctx_no_boost).await;
         let r2 = selector.select(&ctx_irrelevant).await;
@@ -1318,6 +1336,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result = selector.select(&ctx).await;
         let has_git = result.tool_names.iter().any(|n| n.contains("git"));
@@ -1340,6 +1359,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result = selector.select(&ctx).await;
         let has_memory = result.tool_names.iter().any(|n| n.contains("memory"));
@@ -1363,6 +1383,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result = selector.select(&ctx).await;
         assert!(!result.failed, "100 boost terms should not crash");
@@ -1381,6 +1402,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result = selector.select(&ctx).await;
         let has_github = result.tool_names.iter().any(|n| n.contains("github"));
@@ -1403,6 +1425,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result = selector.select(&ctx).await;
         assert!(!result.failed, "CJK boost terms should not cause errors");
@@ -1421,6 +1444,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let r1 = selector.select(&ctx_no_boost).await;
         // With boost → might trigger github signal → higher confidence
@@ -1438,6 +1462,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let r2 = selector.select(&ctx_boosted).await;
         assert!(
@@ -1483,6 +1508,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
 
         let r_baseline = baseline.select(&ctx).await;
@@ -1528,6 +1554,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
 
         let result = selector.select(&ctx).await;
@@ -1617,6 +1644,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
 
         let result = selector.select(&ctx).await;
@@ -1644,6 +1672,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
 
         // First selection: no learned knowledge
@@ -1718,6 +1747,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
 
         let result = selector.select(&ctx).await;
@@ -1775,6 +1805,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
 
         let result = selector.select(&ctx).await;
@@ -1876,6 +1907,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result_normal = selector.select(&ctx_normal).await;
 
@@ -1889,6 +1921,7 @@ mod tests {
             budget_pressure: 0.9,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result_pressure = selector.select(&ctx_pressure).await;
 
@@ -1912,6 +1945,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result = selector.select(&ctx).await;
         // budget_pressure=0.0 should not change behavior at all
@@ -1932,6 +1966,7 @@ mod tests {
             budget_pressure: -0.5,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result_neg = selector.select(&ctx_neg).await;
 
@@ -1945,6 +1980,7 @@ mod tests {
             budget_pressure: 2.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result_over = selector.select(&ctx_over).await;
 
@@ -1968,6 +2004,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result_no_hint = selector.select(&ctx_no_hint).await;
 
@@ -1981,6 +2018,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![DomainHint::GitHub],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result_hint = selector.select(&ctx_hint).await;
 
@@ -2018,6 +2056,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![DomainHint::Git],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result = selector.select(&ctx).await;
         // With Git hint, should include git tools despite vague query
@@ -2041,6 +2080,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result_none = selector.select(&ctx_none).await;
 
@@ -2062,6 +2102,7 @@ mod tests {
             budget_pressure: 0.6,
             memory_domain_hints: vec![DomainHint::GitHub],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result = selector.select(&ctx).await;
         // Should still select some tools (domain hint helps ranking despite pressure)
@@ -2089,6 +2130,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
+                file_context: vec![],
         };
         let result_open = selector.select(&ctx_open).await;
         assert!(
@@ -2109,6 +2151,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec!["github_list_prs".to_string()],
+                file_context: vec![],
         };
         let result_restricted = selector.select(&ctx_restricted).await;
         assert!(
@@ -2134,6 +2177,7 @@ mod tests {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec!["mo_query".to_string()],
+                file_context: vec![],
         };
         let result = selector.select(&ctx).await;
         // github_list_prs should still be selected (mo_query is irrelevant here)

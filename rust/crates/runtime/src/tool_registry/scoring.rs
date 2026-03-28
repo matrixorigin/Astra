@@ -177,10 +177,35 @@ fn raw_recency_boost(tool: &ToolMeta, state: &ConversationState) -> f64 {
     0.0
 }
 
-// TODO(P2): File-context scoring — Codex weights tools by open files / current
-// language (e.g., TypeScript file open → boost code-edit tools). We currently
-// ignore edge_profile.cwd and file context in scoring. Adding this requires
-// passing file-type hints through SelectionContext into the scoring pipeline.
+// File-context scoring: boost tools relevant to detected project languages.
+// Language tags (e.g., "rust", "typescript") come from workspace marker files.
+fn file_context_tool_boost(tool_name: &str, file_context: &[String]) -> f64 {
+    if file_context.is_empty() {
+        return 0.0;
+    }
+    // Tools that benefit from language awareness
+    let boost = file_context.iter().any(|lang| match lang.as_str() {
+        "rust" => matches!(
+            tool_name,
+            "bash" | "grep" | "read_file" | "write_file" | "str_replace" | "glob"
+        ),
+        "typescript" | "javascript" => matches!(
+            tool_name,
+            "bash" | "grep" | "read_file" | "write_file" | "str_replace" | "glob"
+        ),
+        "python" => matches!(
+            tool_name,
+            "bash" | "grep" | "read_file" | "write_file" | "str_replace" | "glob"
+        ),
+        "go" => matches!(
+            tool_name,
+            "bash" | "grep" | "read_file" | "write_file" | "str_replace" | "glob"
+        ),
+        "docker" => matches!(tool_name, "bash" | "read_file" | "write_file"),
+        _ => false,
+    });
+    if boost { 0.05 } else { 0.0 }
+}
 
 fn tool_relevance_score(
     tool: &ToolMeta,
@@ -191,6 +216,7 @@ fn tool_relevance_score(
     query_chars: &[char],
     memory_domain_hints: &[crate::pipeline::routing::DomainHint],
     co_occurrence: &HashMap<String, f64>,
+    file_context: &[String],
 ) -> f64 {
     use crate::pipeline::routing::DomainHint;
 
@@ -313,6 +339,13 @@ fn tool_relevance_score(
         score += co_score * 0.10;
     }
 
+    // ── Phase 6: File-context boost ──
+    // When we detect project languages from workspace marker files (e.g.,
+    // Cargo.toml → "rust"), slightly boost code-editing tools that are
+    // universally useful for that language. Small boost (+0.05) acts as
+    // a tiebreaker, not an override.
+    score += file_context_tool_boost(tool.name, file_context);
+
     // ── Soft ceiling ──
     // Hard clamp at 1.0 hides rank differences when multiple tools exceed 1.0
     // (e.g., text=0.40 + trigger=0.25 + intent=0.25 + scope=0.10 + recency=0.30 = 1.30).
@@ -327,7 +360,7 @@ fn tool_relevance_score(
 /// Pre-filter: rank dynamic tools by relevance and filter by minimum score threshold.
 /// Returns (catalog_index, score) pairs for dynamic tools, sorted by descending score.
 pub fn pre_filter_dynamic(state: &ConversationState, query: &str) -> Vec<(usize, f64)> {
-    pre_filter_dynamic_core(state, query, None, None, &[], &HashMap::new())
+    pre_filter_dynamic_core(state, query, None, None, &[], &HashMap::new(), &[])
 }
 
 /// Like [`pre_filter_dynamic`] but accepts an optional quality tracker to boost/penalize
@@ -337,7 +370,7 @@ pub fn pre_filter_dynamic_with_quality(
     query: &str,
     quality_tracker: Option<&ToolQualityTracker>,
 ) -> Vec<(usize, f64)> {
-    pre_filter_dynamic_core(state, query, quality_tracker, None, &[], &HashMap::new())
+    pre_filter_dynamic_core(state, query, quality_tracker, None, &[], &HashMap::new(), &[])
 }
 
 /// Full-featured pre-filter with both quality tracking and confidence calibration.
@@ -348,7 +381,7 @@ pub fn pre_filter_dynamic_calibrated(
     quality_tracker: Option<&ToolQualityTracker>,
     calibrator: Option<&ConfidenceCalibrator>,
 ) -> Vec<(usize, f64)> {
-    pre_filter_dynamic_core(state, query, quality_tracker, calibrator, &[], &HashMap::new())
+    pre_filter_dynamic_core(state, query, quality_tracker, calibrator, &[], &HashMap::new(), &[])
 }
 
 /// Full pre-filter with memory domain hints for gate softening.
@@ -368,6 +401,7 @@ pub fn pre_filter_dynamic_with_memory(
         calibrator,
         memory_domain_hints,
         &HashMap::new(),
+        &[],
     )
 }
 
@@ -400,6 +434,7 @@ pub fn pre_filter_dynamic_with_pressure(
         memory_domain_hints,
         budget_pressure,
         &HashMap::new(),
+        &[],
     )
 }
 
@@ -423,10 +458,35 @@ pub fn pre_filter_dynamic_with_cooccurrence(
         memory_domain_hints,
         budget_pressure,
         co_occurrence,
+        &[],
     )
 }
 
-/// Internal: pressure + co-occurrence combined.
+/// Full pre-filter with pressure, co-occurrence, AND file-context scoring.
+/// This is the most complete scoring path for production use.
+pub fn pre_filter_dynamic_with_file_context(
+    state: &ConversationState,
+    query: &str,
+    quality_tracker: Option<&ToolQualityTracker>,
+    calibrator: Option<&ConfidenceCalibrator>,
+    memory_domain_hints: &[crate::pipeline::routing::DomainHint],
+    budget_pressure: f64,
+    co_occurrence: &HashMap<String, f64>,
+    file_context: &[String],
+) -> Vec<(usize, f64)> {
+    pre_filter_dynamic_with_pressure_and_cooccurrence(
+        state,
+        query,
+        quality_tracker,
+        calibrator,
+        memory_domain_hints,
+        budget_pressure,
+        co_occurrence,
+        file_context,
+    )
+}
+
+/// Internal: pressure + co-occurrence + file-context combined.
 fn pre_filter_dynamic_with_pressure_and_cooccurrence(
     state: &ConversationState,
     query: &str,
@@ -435,6 +495,7 @@ fn pre_filter_dynamic_with_pressure_and_cooccurrence(
     memory_domain_hints: &[crate::pipeline::routing::DomainHint],
     budget_pressure: f64,
     co_occurrence: &HashMap<String, f64>,
+    file_context: &[String],
 ) -> Vec<(usize, f64)> {
     let mut result = pre_filter_dynamic_core(
         state,
@@ -443,6 +504,7 @@ fn pre_filter_dynamic_with_pressure_and_cooccurrence(
         calibrator,
         memory_domain_hints,
         co_occurrence,
+        file_context,
     );
 
     if budget_pressure > 0.01 {
@@ -471,6 +533,7 @@ fn pre_filter_dynamic_core(
     calibrator: Option<&ConfidenceCalibrator>,
     memory_domain_hints: &[crate::pipeline::routing::DomainHint],
     co_occurrence: &HashMap<String, f64>,
+    file_context: &[String],
 ) -> Vec<(usize, f64)> {
     // Short-circuit: pure conversational queries don't need dynamic tools.
     if state.is_conversational && !state.is_fetch && !state.is_mutate && !state.is_analytical {
@@ -494,6 +557,7 @@ fn pre_filter_dynamic_core(
                 &query_chars,
                 memory_domain_hints,
                 co_occurrence,
+                file_context,
             );
             if let Some(tracker) = quality_tracker {
                 score *= tracker.boost_factor(tool.name);

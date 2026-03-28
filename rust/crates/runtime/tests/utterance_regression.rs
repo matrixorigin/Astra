@@ -2825,6 +2825,7 @@ mod pipeline_integration {
                 budget_pressure: 0.0,
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
+                file_context: vec![],
             })
             .await;
 
@@ -2838,6 +2839,7 @@ mod pipeline_integration {
                 budget_pressure: 0.9,
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
+                file_context: vec![],
             })
             .await;
 
@@ -2862,6 +2864,7 @@ mod pipeline_integration {
                 budget_pressure: 0.9,
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
+                file_context: vec![],
             })
             .await;
         assert!(
@@ -2886,6 +2889,7 @@ mod pipeline_integration {
                 budget_pressure: 0.0,
                 memory_domain_hints: vec![],
                 restricted_tools: vec!["github_ci_status".to_string()],
+                file_context: vec![],
             })
             .await;
         assert!(
@@ -2911,6 +2915,7 @@ mod pipeline_integration {
                 budget_pressure: 0.0,
                 memory_domain_hints: vec![],
                 restricted_tools: vec!["git_log".to_string(), "git_diff".to_string()],
+                file_context: vec![],
             })
             .await;
         assert!(
@@ -2936,6 +2941,7 @@ mod pipeline_integration {
                 budget_pressure: 0.0,
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
+                file_context: vec![],
             })
             .await;
 
@@ -2950,6 +2956,7 @@ mod pipeline_integration {
                 budget_pressure: 0.0,
                 memory_domain_hints: vec![DomainHint::GitHub],
                 restricted_tools: vec![],
+                file_context: vec![],
             })
             .await;
 
@@ -2978,6 +2985,7 @@ mod pipeline_integration {
                 budget_pressure: 0.0,
                 memory_domain_hints: vec![DomainHint::Database],
                 restricted_tools: vec![],
+                file_context: vec![],
             })
             .await;
         let has_db = result
@@ -3006,6 +3014,7 @@ mod pipeline_integration {
                 budget_pressure: 0.0,
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
+                file_context: vec![],
             })
             .await;
         // Recent github_list_prs should boost github tools in followup
@@ -3030,6 +3039,7 @@ mod pipeline_integration {
                 budget_pressure: 0.0,
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
+                file_context: vec![],
             })
             .await;
         let has_git = result.tool_names.iter().any(|n| n.starts_with("git_"));
@@ -3055,6 +3065,7 @@ mod pipeline_integration {
                 budget_pressure: 0.0,
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
+                file_context: vec![],
             })
             .await;
         assert!(
@@ -3077,6 +3088,7 @@ mod pipeline_integration {
                 budget_pressure: 0.0,
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
+                file_context: vec![],
             })
             .await;
         let has_memory = result.tool_names.iter().any(|n| n.contains("memory"));
@@ -3100,6 +3112,7 @@ mod pipeline_integration {
                 budget_pressure: 0.0,
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
+                file_context: vec![],
             })
             .await;
         let has_git = result.tool_names.iter().any(|n| n.starts_with("git_"));
@@ -3125,6 +3138,7 @@ mod pipeline_integration {
                 budget_pressure: 0.6,
                 memory_domain_hints: vec![],
                 restricted_tools: vec!["github_ci_status".to_string()],
+                file_context: vec![],
             })
             .await;
         assert!(
@@ -3152,6 +3166,7 @@ mod pipeline_integration {
                 budget_pressure: 0.6,
                 memory_domain_hints: vec![DomainHint::GitHub],
                 restricted_tools: vec![],
+                file_context: vec![],
             })
             .await;
         let has_github = result.tool_names.iter().any(|n| n.starts_with("github_"));
@@ -3177,6 +3192,7 @@ mod pipeline_integration {
                 budget_pressure: 0.0,
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
+                file_context: vec![],
             })
             .await;
         let vague = selector
@@ -3189,6 +3205,7 @@ mod pipeline_integration {
                 budget_pressure: 0.0,
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
+                file_context: vec![],
             })
             .await;
         assert!(
@@ -3212,6 +3229,7 @@ mod pipeline_integration {
                 budget_pressure: 0.0,
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
+                file_context: vec![],
             })
             .await;
         // Conversational should rely mostly on pinned tools
