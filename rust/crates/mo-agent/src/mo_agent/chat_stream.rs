@@ -1552,26 +1552,46 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
 
             // Build a brief detail from tool args for the └ line
             let detail = tool_call_detail(&name, &args);
+            // Build a brief summary from tool result (line counts, match counts, etc.)
+            let summary = if !is_err {
+                tool_result_summary(&name, &result_str)
+            } else {
+                None
+            };
 
             if is_err {
                 if !quiet {
                     eprintln!("{}", format!("  ✗ {name} ({duration_str})").red());
                 }
                 // Show first line of error on └ line
-                if !quiet && let Some(first_line) = result_str.lines().next() {
-                    let preview = if first_line.len() > 100 {
-                        format!("{}…", &first_line[..100])
-                    } else {
-                        first_line.to_string()
-                    };
-                    eprintln!("  {}", format!("└ {preview}").dim());
+                if !quiet {
+                    if let Some(first_line) = result_str.lines().next() {
+                        let preview = if first_line.len() > 100 {
+                            format!("{}…", &first_line[..100])
+                        } else {
+                            first_line.to_string()
+                        };
+                        eprintln!("  {}", format!("└ Error: {preview}").dim());
+                    }
                 }
             } else {
                 if !quiet {
                     eprintln!("{}", format!("  ✓ {name} ({duration_str})").green());
                 }
-                if !quiet && let Some(d) = &detail {
-                    eprintln!("  {}", format!("└ {d}").dim());
+                // Compose └ line: detail + summary
+                if !quiet {
+                    match (&detail, &summary) {
+                        (Some(d), Some(s)) => {
+                            eprintln!("  {}", format!("└ {d}  →  {s}").dim());
+                        }
+                        (Some(d), None) => {
+                            eprintln!("  {}", format!("└ {d}").dim());
+                        }
+                        (None, Some(s)) => {
+                            eprintln!("  {}", format!("└ {s}").dim());
+                        }
+                        (None, None) => {}
+                    }
                 }
             }
 

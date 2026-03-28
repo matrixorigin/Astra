@@ -79,7 +79,7 @@ use cli_utils::{
     Profile, auth_headers, capitalize, compact_or_raw, get_profile_and_token, interactive_select,
     load_credentials, print_json_or_raw, print_markdown, profile_name, prompt_or,
     prompt_password_masked, read_api_error, resumable_last_session_id, save_credentials,
-    tool_call_detail, truncate_str, urlencoding,
+    tool_call_detail, tool_result_summary, truncate_str, urlencoding,
 };
 use command_router::execute_cli_command;
 use permission_manager::PermissionManager;

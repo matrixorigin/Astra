@@ -861,158 +861,212 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
             None => true,
         }
     };
+
+    let width = 68;
+    let bar = "─".repeat(width);
+
+    // Header
+    eprintln!();
+    if let Some(q) = &filter {
+        eprintln!(
+            "  {} {} {}",
+            "╭".dim(),
+            format!("Command Palette  ·  filter: {q}").bold(),
+            "╮".dim()
+        );
+    } else {
+        eprintln!(
+            "  {} {} {}",
+            "╭".dim(),
+            "Command Palette".bold(),
+            "╮".dim()
+        );
+    }
+    eprintln!("  {}", bar.as_str().dim());
+
     let mut any_results = false;
-    let mut print_group = |title: &str, commands: &[&str]| {
-        let mut printed = false;
+
+    // Icon-decorated groups: (icon, title, commands)
+    let groups: &[(&str, &str, &[&str])] = &[
+        ("⚡", "Core", &["/help", "/model", "/clear", "/exit", "/keys"]),
+        (
+            "📁",
+            "Workspace",
+            &["/search", "/history", "/copy", "/context", "/rewind"],
+        ),
+        (
+            "🤖",
+            "Agent",
+            &["/explain", "/verbose", "/compact", "/reflect"],
+        ),
+        (
+            "📋",
+            "Session",
+            &["/session", "/resume", "/stats", "/tools", "/health"],
+        ),
+        (
+            "🧠",
+            "Skills & Memory",
+            &["/skill", "/memory", "/plan", "/task"],
+        ),
+        ("🔧", "Diagnostics", &["/doctor", "/version"]),
+        (
+            "🔑",
+            "Account",
+            &["/login", "/register", "/logout", "/memory-setup"],
+        ),
+    ];
+
+    for (icon, title, commands) in groups {
         let mut lines = Vec::new();
-        for cmd in commands {
+        for cmd in *commands {
             let desc = lookup_desc(cmd);
             if matches(cmd, desc) {
-                lines.push(format!("    {:<16}  {}", cmd.green(), desc));
+                lines.push(format!(
+                    "    {}  {}",
+                    format!("{:<14}", cmd).green(),
+                    desc.to_string().dim()
+                ));
             }
         }
         if !lines.is_empty() {
             any_results = true;
-            printed = true;
-        }
-        if printed {
-            eprintln!("  {}", title.bold().cyan());
+            eprintln!("  {} {}", icon, title.bold().cyan());
             for line in lines {
                 eprintln!("{line}");
             }
             eprintln!();
         }
-    };
-
-    if let Some(q) = &filter {
-        eprintln!(
-            "\n{} {}",
-            "Command Palette".bold(),
-            format!("(filter: {q})").dim()
-        );
-    } else {
-        eprintln!("\n{}", "Command Palette".bold());
     }
-    eprintln!("{}", "\u{2500}".repeat(62).dim());
-    print_group("Core", &["/help", "/model", "/clear", "/exit", "/keys"]);
-    print_group(
-        "Workspace",
-        &["/search", "/history", "/copy", "/context", "/rewind"],
-    );
-    print_group("Agent", &["/explain", "/verbose", "/compact", "/reflect"]);
-    print_group(
-        "Session",
-        &["/session", "/resume", "/stats", "/tools", "/health"],
-    );
-    print_group("Skills & Memory", &["/skill", "/memory", "/plan", "/task"]);
-    print_group("Diagnostics", &["/doctor", "/version"]);
-    print_group(
-        "Account",
-        &["/login", "/register", "/logout", "/memory-setup"],
-    );
+
+    // Aliases
     let alias_rows = [
-        ("/?", "same as /"),
-        ("/commands", "same as /"),
+        ("/?", "same as /help"),
+        ("/commands", "same as /help"),
         ("/quit", "same as /exit"),
     ];
     let alias_lines: Vec<String> = alias_rows
         .iter()
         .filter(|(cmd, desc)| matches(cmd, desc))
-        .map(|(cmd, desc)| format!("    {:<16}  {}", cmd.green(), desc))
+        .map(|(cmd, desc)| {
+            format!(
+                "    {}  {}",
+                format!("{:<14}", cmd).green(),
+                desc.to_string().dim()
+            )
+        })
         .collect();
     if !alias_lines.is_empty() {
         any_results = true;
-        eprintln!("  {}", "Aliases".bold().cyan());
+        eprintln!("  {} {}", "↪", "Aliases".bold().cyan());
         for line in alias_lines {
             eprintln!("{line}");
         }
+        eprintln!();
     }
+
     if !any_results {
         let label = filter.as_deref().unwrap_or("?");
-        eprintln!("  {}", format!("No commands match '{label}'").yellow());
+        eprintln!("  {}", format!("  No commands match '{label}'").yellow());
+        eprintln!();
     }
-    eprintln!("{}", "\u{2500}".repeat(62).dim());
+
+    eprintln!("  {}", bar.as_str().dim());
     if filter.is_none() {
         eprintln!(
-            "  {}",
-            "Tip: type a parent command + space to see sub-commands (e.g. /skill , /search )".dim()
+            "  {}  {}",
+            "💡".to_string(),
+            "Type / then start typing to filter  ·  Tab to complete  ·  Enter to run".dim()
         );
     }
     eprintln!();
 }
 
 pub(super) fn print_keyboard_shortcuts() {
+    let width = 68;
+    let bar = "─".repeat(width);
+
+    eprintln!();
     eprintln!(
-        "\n{}",
-        "─── Keyboard Shortcuts ──────────────────────────".bold()
+        "  {} {} {}",
+        "╭".dim(),
+        "Keyboard Shortcuts".bold(),
+        "╮".dim()
     );
+    eprintln!("  {}", bar.as_str().dim());
+
     let shortcuts = [
         (
+            "🧭",
             "Navigation",
             &[
-                ("Ctrl+A", "Move to line start"),
-                ("Ctrl+E", "Move to line end"),
-                ("Ctrl+B / ←", "Move back one character"),
-                ("Ctrl+F / →", "Move forward one character"),
-                ("Alt+B", "Move back one word"),
-                ("Alt+F", "Move forward one word"),
+                ("Ctrl+A / Home", "Start of line"),
+                ("Ctrl+E / End", "End of line"),
+                ("← / →", "Move by character"),
+                ("Alt+B / Alt+F", "Move by word"),
             ] as &[(&str, &str)],
         ),
         (
+            "✏️",
             "Editing",
             &[
                 ("Ctrl+W", "Delete word backward"),
                 ("Ctrl+K", "Kill to end of line"),
-                ("Ctrl+U", "Kill from start to cursor"),
-                ("Ctrl+H / Backspace", "Delete previous character"),
-                (
-                    "Ctrl+D",
-                    "Delete character at cursor (or exit on empty line)",
-                ),
+                ("Ctrl+U", "Kill to start of line"),
+                ("Ctrl+D", "Delete char / exit on empty"),
                 ("Ctrl+T", "Transpose characters"),
             ],
         ),
         (
+            "📜",
             "History",
             &[
-                ("↑ / ↓", "Navigate previous/next history"),
-                ("Ctrl+R", "Reverse search history"),
+                ("↑ / ↓", "Previous / next"),
+                ("Ctrl+R", "Search history"),
                 ("Ctrl+G", "Cancel search"),
-                ("Ctrl+P / Ctrl+N", "Previous/next (same as ↑/↓)"),
             ],
         ),
         (
+            "📝",
             "Multi-line",
             &[
-                ("Alt+Enter", "Insert newline (continue input)"),
-                ("\\ (at end)", "Backslash continuation"),
+                ("Alt+Enter", "Insert newline"),
+                ("\\ + Enter", "Line continuation"),
             ],
         ),
         (
+            "⌨️",
+            "Slash Picker",
+            &[
+                ("/", "Open picker"),
+                ("Tab / ↑↓", "Navigate options"),
+                ("Enter", "Execute selected"),
+                ("→ / Space", "Accept + continue"),
+                ("Esc", "Dismiss"),
+            ],
+        ),
+        (
+            "🖥️",
             "Screen",
             &[
                 ("Ctrl+L", "Clear screen"),
-                ("Ctrl+D", "Exit (on empty line)"),
-                ("Ctrl+C", "Cancel current input"),
-            ],
-        ),
-        (
-            "Slash Picker",
-            &[
-                ("/", "Open command picker"),
-                ("↑/↓ or Tab", "Navigate picker items"),
-                ("Enter", "Execute selected command"),
-                ("→/Space", "Accept and continue editing"),
-                ("Esc", "Dismiss picker"),
+                ("Ctrl+C", "Cancel input"),
+                ("Ctrl+D", "Exit (empty line)"),
             ],
         ),
     ];
-    for (section, keys) in shortcuts {
-        eprintln!("  {}", section.cyan().bold());
+    for (icon, section, keys) in shortcuts {
+        eprintln!("  {} {}", icon, section.bold().cyan());
         for (key, desc) in keys.iter() {
-            eprintln!("    {:<22} {}", key.bold(), desc.dim());
+            eprintln!(
+                "    {}  {}",
+                format!("{:<16}", key).bold(),
+                desc.to_string().dim()
+            );
         }
+        eprintln!();
     }
+    eprintln!("  {}", bar.as_str().dim());
     eprintln!();
 }
 
