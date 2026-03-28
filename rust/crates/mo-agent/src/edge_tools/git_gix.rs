@@ -138,7 +138,7 @@ pub(crate) fn git_log(project_root: &Path, args: &Value) -> String {
         Err(e) => return e,
     };
 
-    let n = args.get("n").and_then(Value::as_u64).unwrap_or(10) as usize;
+    let n = args.get("n").and_then(Value::as_u64).unwrap_or(10).min(500) as usize;
 
     let head = match repo.head_id() {
         Ok(h) => h,
@@ -188,7 +188,7 @@ pub(crate) fn git_log(project_root: &Path, args: &Value) -> String {
     if out.is_empty() {
         "No commits found".to_string()
     } else {
-        out
+        truncate_output(out, tool_output_limit())
     }
 }
 
@@ -272,13 +272,30 @@ pub(crate) fn git_show(project_root: &Path, args: &Value) -> String {
     let old_tree = match parent_tree {
         Some(t) => t,
         None => {
-            // Root commit — show added files
+            // Root commit — show added files recursively
             out.push_str("\n[root commit]\n");
-            for entry in new_tree.iter() {
-                if let Ok(e) = entry {
-                    out.push_str(&format!("A {}\n", e.filename()));
+            fn list_tree_entries(tree: &gix::Tree<'_>, prefix: &str, out: &mut String) {
+                for entry in tree.iter() {
+                    if let Ok(e) = entry {
+                        let name = e.filename().to_string();
+                        let full = if prefix.is_empty() {
+                            name
+                        } else {
+                            format!("{prefix}/{name}")
+                        };
+                        if e.mode().is_tree() {
+                            if let Ok(obj) = e.object() {
+                                if let Ok(sub) = obj.try_into_tree() {
+                                    list_tree_entries(&sub, &full, out);
+                                }
+                            }
+                        } else {
+                            out.push_str(&format!("A {full}\n"));
+                        }
+                    }
                 }
             }
+            list_tree_entries(&new_tree, "", &mut out);
             return truncate_show(out);
         }
     };
@@ -691,6 +708,56 @@ fn diff_index_to_head(repo: &gix::Repository) -> String {
         }
     }
 
+    // Detect staged deletions: files in HEAD tree but absent from index
+    {
+        fn collect_tree_paths(
+            tree: &gix::Tree<'_>,
+            prefix: &str,
+            paths: &mut std::collections::HashSet<String>,
+        ) {
+            for entry in tree.iter() {
+                if let Ok(e) = entry {
+                    let name = e.filename().to_string();
+                    let full = if prefix.is_empty() {
+                        name
+                    } else {
+                        format!("{prefix}/{name}")
+                    };
+                    if e.mode().is_tree() {
+                        if let Ok(obj) = e.object() {
+                            if let Ok(sub) = obj.try_into_tree() {
+                                collect_tree_paths(&sub, &full, paths);
+                            }
+                        }
+                    } else {
+                        paths.insert(full);
+                    }
+                }
+            }
+        }
+
+        let mut head_paths = std::collections::HashSet::new();
+        collect_tree_paths(&head_tree, "", &mut head_paths);
+
+        let index_paths: std::collections::HashSet<String> = index
+            .entries()
+            .iter()
+            .map(|e| e.path(&index).to_string())
+            .collect();
+
+        for deleted_path in head_paths.difference(&index_paths) {
+            out.push_str(&format!(
+                "diff --git a/{deleted_path} b/{deleted_path}\n--- a/{deleted_path}\n+++ /dev/null\n"
+            ));
+            out.push_str("# deleted (staged)\n\n");
+            count += 1;
+            if out.len() > DIFF_LIMIT {
+                out.push_str("[truncated]\n");
+                break;
+            }
+        }
+    }
+
     if out.is_empty() {
         "No staged changes".to_string()
     } else {
@@ -814,10 +881,13 @@ pub(crate) fn git_file_history(project_root: &Path, args: &Value) -> String {
     };
 
     let mut lines = Vec::new();
+    let mut walked = 0usize;
+    const MAX_WALK: usize = 50_000;
     for info in walk {
-        if lines.len() >= n {
+        if lines.len() >= n || walked >= MAX_WALK {
             break;
         }
+        walked += 1;
         let info = match info {
             Ok(i) => i,
             Err(_) => break,
@@ -1116,8 +1186,14 @@ pub(crate) fn git_contributors(project_root: &Path, args: &Value) -> String {
     let mut file_freq: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut recent_lines: Vec<String> = Vec::new();
     let mut total_commits = 0u32;
+    let mut walked = 0u32;
+    const MAX_WALK: u32 = 50_000;
 
     for info in walk {
+        if walked >= MAX_WALK {
+            break;
+        }
+        walked += 1;
         let info = match info {
             Ok(i) => i,
             Err(_) => break,

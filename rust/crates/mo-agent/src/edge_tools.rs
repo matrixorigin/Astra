@@ -604,7 +604,8 @@ fn tool_output_limit() -> usize {
 /// Truncate tool output to `max_bytes`, appending a marker if truncated.
 fn truncate_output(mut output: String, max_bytes: usize) -> String {
     if output.len() > max_bytes {
-        output.truncate(max_bytes);
+        let end = output.floor_char_boundary(max_bytes);
+        output.truncate(end);
         output.push_str("\n[truncated]");
     }
     output
