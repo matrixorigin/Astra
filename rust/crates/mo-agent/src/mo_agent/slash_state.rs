@@ -470,7 +470,6 @@ pub(super) async fn handle_state_command(
 /// Render a `ReflectReport` JSON as a compact, colored terminal report.
 fn render_reflect_report(body: &str, session_id: &str) {
     let Ok(report) = serde_json::from_str::<serde_json::Value>(body) else {
-        // Fallback: if the response isn't valid JSON, print raw
         print_json_or_raw(body);
         return;
     };
@@ -485,7 +484,7 @@ fn render_reflect_report(body: &str, session_id: &str) {
     // Header
     eprintln!(
         "{}",
-        format!("📊 Session Reflection — {short_sid}").cyan().bold()
+        format!("🔍 Session Diagnosis — {short_sid}").cyan().bold()
     );
     eprintln!("{}", "─────────────────────────────────────".dim());
 
@@ -516,7 +515,7 @@ fn render_reflect_report(body: &str, session_id: &str) {
         }
     }
 
-    // Errors
+    // Errors summary
     let error_count = overview["error_count"].as_i64().unwrap_or(0);
     let error_rate = overview["error_rate_pct"].as_f64().unwrap_or(0.0);
     if error_count > 0 {
@@ -530,36 +529,75 @@ fn render_reflect_report(body: &str, session_id: &str) {
         }
     }
 
-    // Insights
-    if let Some(insights) = report["insights"].as_array() {
-        if !insights.is_empty() {
+    // ── Diagnoses (primary output — root-cause analysis) ────────────
+    if let Some(diagnoses) = report["diagnoses"].as_array() {
+        if !diagnoses.is_empty() {
             eprintln!();
-        }
-        for insight in insights {
-            let severity = insight["severity"].as_str().unwrap_or("info");
-            let message = insight["message"].as_str().unwrap_or("");
-            let evidence = insight["evidence"].as_str().unwrap_or("");
-            let line = if evidence.is_empty() {
-                message.to_string()
-            } else {
-                format!("{message} — {evidence}")
-            };
-            match severity {
-                "critical" => eprintln!("  {} {}", "🔴".red(), line.red().bold()),
-                "warning" => eprintln!("  {} {}", "⚠".yellow(), line.yellow()),
-                _ => eprintln!("  {} {}", "ℹ".dim(), line.dim()),
+            eprintln!("  {}", "Root-Cause Analysis:".bold());
+            for diag in diagnoses {
+                let severity = diag["severity"].as_str().unwrap_or("info");
+                let summary = diag["summary"].as_str().unwrap_or("");
+                let fix = diag["fix_hint"].as_str().unwrap_or("");
+
+                match severity {
+                    "critical" => eprintln!("  {} {}", "🔴".red(), summary.red().bold()),
+                    "warning" => eprintln!("  {} {}", "⚠️".yellow(), summary.yellow()),
+                    _ => eprintln!("  {} {}", "ℹ️".dim(), summary),
+                }
+
+                // Show sample errors (truncated)
+                if let Some(samples) = diag["samples"].as_array() {
+                    for (i, sample) in samples.iter().enumerate() {
+                        if i >= 2 { break; } // max 2 samples in CLI
+                        if let Some(s) = sample.as_str() {
+                            let truncated: String = s.chars().take(80).collect();
+                            eprintln!("    {} {}", "│".dim(), truncated.dim());
+                        }
+                    }
+                }
+
+                // Fix hint
+                if !fix.is_empty() {
+                    eprintln!("    {} {}", "→".green(), fix.green());
+                }
             }
         }
     }
 
-    // Recommendations
+    // ── Insights (secondary — statistical observations) ─────────────
+    if let Some(insights) = report["insights"].as_array() {
+        let non_trivial: Vec<_> = insights
+            .iter()
+            .filter(|i| i["severity"].as_str() != Some("info"))
+            .collect();
+        if !non_trivial.is_empty() {
+            eprintln!();
+            for insight in non_trivial {
+                let severity = insight["severity"].as_str().unwrap_or("info");
+                let message = insight["message"].as_str().unwrap_or("");
+                let evidence = insight["evidence"].as_str().unwrap_or("");
+                let line = if evidence.is_empty() {
+                    message.to_string()
+                } else {
+                    format!("{message} — {evidence}")
+                };
+                match severity {
+                    "critical" => eprintln!("  {} {}", "🔴", line.red().bold()),
+                    "warning" => eprintln!("  {} {}", "⚠️", line.yellow()),
+                    _ => eprintln!("  {} {}", "ℹ️", line.dim()),
+                }
+            }
+        }
+    }
+
+    // ── Recommendations ─────────────────────────────────────────────
     if let Some(recs) = report["recommendations"].as_array() {
         if !recs.is_empty() {
             eprintln!();
-            eprintln!("  {}", "Recommendations:".bold());
+            eprintln!("  {}", "Fix Actions:".bold());
             for rec in recs {
                 if let Some(r) = rec.as_str() {
-                    eprintln!("    {} {}", "•".dim(), r);
+                    eprintln!("    {} {}", "→".green(), r);
                 }
             }
         }

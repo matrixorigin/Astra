@@ -117,6 +117,7 @@ impl ReflectService for StubReflectService {
                 top_event_types: vec![("tool_call".into(), 1)],
                 top_skills: vec![("code_search".into(), 1)],
             },
+            diagnoses: vec![],
             insights: vec![Insight {
                 severity: "info".into(),
                 category: "performance".into(),

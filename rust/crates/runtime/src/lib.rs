@@ -126,7 +126,8 @@ pub use mo_agent_services::{
         ModelUpdateRequestData, PricingData, QuirksData, UnconfiguredModelService,
     },
     reflect::{
-        DatabaseReflectService, ReflectReport, ReflectService, UnconfiguredReflectService,
+        DatabaseReflectService, Diagnosis, ErrorClass, ReflectReport, ReflectService,
+        UnconfiguredReflectService,
     },
     replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService},
     runs::{

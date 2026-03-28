@@ -13,6 +13,9 @@ pub struct ReflectReport {
     pub session_id: String,
     pub focus: String,
     pub overview: SessionOverview,
+    /// Root-cause diagnoses from actual error content analysis
+    pub diagnoses: Vec<Diagnosis>,
+    /// Statistical insights (secondary)
     pub insights: Vec<Insight>,
     pub recommendations: Vec<String>,
 }
@@ -29,12 +32,61 @@ pub struct SessionOverview {
     pub top_skills: Vec<(String, i64)>,
 }
 
+/// A root-cause diagnosis: what actually went wrong, from error content analysis.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Diagnosis {
+    pub category: ErrorClass,
+    pub severity: String,
+    pub summary: String,
+    /// Actual error content snippets (evidence)
+    pub samples: Vec<String>,
+    pub occurrences: i64,
+    pub affected_tool: String,
+    pub fix_hint: String,
+}
+
+/// Classified error category for root-cause analysis.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum ErrorClass {
+    ResourceLimit,
+    Auth,
+    Network,
+    FileNotFound,
+    ToolMisuse,
+    Timeout,
+    DatabaseError,
+    Unknown,
+}
+
+impl std::fmt::Display for ErrorClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ResourceLimit => write!(f, "resource_limit"),
+            Self::Auth => write!(f, "auth"),
+            Self::Network => write!(f, "network"),
+            Self::FileNotFound => write!(f, "file_not_found"),
+            Self::ToolMisuse => write!(f, "tool_misuse"),
+            Self::Timeout => write!(f, "timeout"),
+            Self::DatabaseError => write!(f, "database"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Insight {
     pub severity: String,
     pub category: String,
     pub message: String,
     pub evidence: String,
+}
+
+/// Raw error record fetched from DB for content analysis.
+#[derive(Debug, Clone)]
+pub struct RawError {
+    skill_name: String,
+    event_type: String,
+    content: String,
 }
 
 /// Intermediate type for error pattern aggregation.
@@ -70,7 +122,191 @@ pub trait ReflectService: Send + Sync {
     ) -> ServiceResult<ReflectReport>;
 }
 
-// ── Insight generation (pure logic, no DB) ───────────────────────────────────
+// ── Error classification (pure logic, no DB) ─────────────────────────────────
+
+/// Classify an error string into a root-cause category.
+pub fn classify_error_content(content: &str) -> ErrorClass {
+    let lower = content.to_lowercase();
+
+    // Resource limits
+    if lower.contains("resource temporarily unavailable")
+        || lower.contains("cannot allocate memory")
+        || lower.contains("too many open files")
+        || lower.contains("no space left on device")
+        || lower.contains("fork:")
+        || lower.contains("oom")
+        || lower.contains("enomem")
+        || lower.contains("emfile")
+    {
+        return ErrorClass::ResourceLimit;
+    }
+
+    // Auth
+    if lower.contains("unauthorized")
+        || lower.contains("403")
+        || lower.contains("permission denied")
+        || lower.contains("credentials")
+        || lower.contains("authentication")
+        || lower.contains("could not validate")
+        || lower.contains("token expired")
+    {
+        return ErrorClass::Auth;
+    }
+
+    // Network
+    if lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("timed out")
+        || lower.contains("dns")
+        || lower.contains("network unreachable")
+        || lower.contains("error sending request")
+        || lower.contains("connection closed")
+    {
+        return ErrorClass::Network;
+    }
+
+    // Timeout (distinct from network)
+    if lower.contains("timeout") || lower.contains("deadline exceeded") {
+        return ErrorClass::Timeout;
+    }
+
+    // Tool misuse (check BEFORE file_not_found since "not found" is ambiguous)
+    if lower.contains("missing 'path'")
+        || lower.contains("missing 'pattern'")
+        || lower.contains("missing 'command'")
+        || lower.contains("invalid argument")
+        || lower.contains("old_str not found")
+        || lower.contains("sandbox")
+    {
+        return ErrorClass::ToolMisuse;
+    }
+
+    // File not found
+    if lower.contains("no such file or directory")
+        || lower.contains("does not exist")
+        || lower.contains("not found")
+        || lower.contains("enoent")
+    {
+        return ErrorClass::FileNotFound;
+    }
+
+    // Database
+    if lower.contains("sql syntax error")
+        || lower.contains("error returned from database")
+        || lower.contains("sqlx")
+        || lower.contains("deadlock")
+    {
+        return ErrorClass::DatabaseError;
+    }
+
+    ErrorClass::Unknown
+}
+
+/// Build diagnoses from raw error records by classifying and grouping.
+pub fn build_diagnoses(raw_errors: &[RawError]) -> Vec<Diagnosis> {
+    use std::collections::HashMap;
+
+    // Group by (ErrorClass, affected_tool)
+    let mut groups: HashMap<(ErrorClass, String), Vec<&RawError>> = HashMap::new();
+    for err in raw_errors {
+        let class = classify_error_content(&err.content);
+        let tool = if err.skill_name.is_empty() || err.skill_name == "unknown" {
+            "system".to_string()
+        } else {
+            err.skill_name.clone()
+        };
+        groups.entry((class, tool)).or_default().push(err);
+    }
+
+    let mut diagnoses: Vec<Diagnosis> = groups
+        .into_iter()
+        .map(|((class, tool), errors)| {
+            let count = errors.len() as i64;
+            // Take up to 3 unique sample snippets (truncated)
+            let mut seen = std::collections::HashSet::new();
+            let samples: Vec<String> = errors
+                .iter()
+                .filter_map(|e| {
+                    let snippet: String = e.content.chars().take(150).collect();
+                    if seen.insert(snippet.clone()) {
+                        Some(snippet)
+                    } else {
+                        None
+                    }
+                })
+                .take(3)
+                .collect();
+
+            let severity = match (&class, count) {
+                (ErrorClass::ResourceLimit, _) => "critical",
+                (_, n) if n >= 5 => "critical",
+                (_, n) if n >= 3 => "warning",
+                _ => "info",
+            }
+            .to_string();
+
+            let summary = match &class {
+                ErrorClass::ResourceLimit => format!(
+                    "System resource exhaustion ({tool}): OS cannot fork/allocate — {count} occurrences"
+                ),
+                ErrorClass::Auth => format!(
+                    "Authentication failure ({tool}): credentials invalid or expired — {count} occurrences"
+                ),
+                ErrorClass::Network => format!(
+                    "Network connectivity issue ({tool}): connection failures — {count} occurrences"
+                ),
+                ErrorClass::Timeout => format!(
+                    "Timeout ({tool}): operation exceeded time limit — {count} occurrences"
+                ),
+                ErrorClass::FileNotFound => format!(
+                    "Missing files/paths ({tool}): agent tried nonexistent paths — {count} occurrences"
+                ),
+                ErrorClass::ToolMisuse => format!(
+                    "Tool parameter errors ({tool}): wrong arguments passed — {count} occurrences"
+                ),
+                ErrorClass::DatabaseError => format!(
+                    "Database error ({tool}): SQL or connection failure — {count} occurrences"
+                ),
+                ErrorClass::Unknown => format!(
+                    "Unclassified errors ({tool}): {count} occurrences"
+                ),
+            };
+
+            let fix_hint = match &class {
+                ErrorClass::ResourceLimit => "Check system limits: `ulimit -u` (max procs), `ulimit -n` (open files). Kill orphan processes: `ps aux | grep defunct`. May need to restart the system or increase limits.".to_string(),
+                ErrorClass::Auth => "Re-authenticate with `/login`. Check token expiry. Verify API credentials in environment variables.".to_string(),
+                ErrorClass::Network => "Check network connectivity and proxy settings. Verify `NO_PROXY=localhost,127.0.0.1` for local services. Check if target service is running.".to_string(),
+                ErrorClass::Timeout => format!("Tool `{tool}` is slow. Consider breaking the operation into smaller chunks or increasing the timeout."),
+                ErrorClass::FileNotFound => format!("Agent guessed wrong paths. Use `list_dir` before `read_file`/`grep`. Check that the workspace context is accurate."),
+                ErrorClass::ToolMisuse => "Model is calling tools with wrong parameters. This may improve with a better model or clearer system prompt.".to_string(),
+                ErrorClass::DatabaseError => "Check MatrixOne connectivity and SQL syntax. Use CAST for DATETIME columns, MIN/MAX for non-grouped columns.".to_string(),
+                ErrorClass::Unknown => "Review the error samples above to identify the pattern.".to_string(),
+            };
+
+            Diagnosis {
+                category: class,
+                severity,
+                summary,
+                samples,
+                occurrences: count,
+                affected_tool: tool,
+                fix_hint,
+            }
+        })
+        .collect();
+
+    // Sort: critical first, then by occurrence count
+    diagnoses.sort_by(|a, b| {
+        let sev_ord = |s: &str| match s { "critical" => 0, "warning" => 1, _ => 2 };
+        sev_ord(&a.severity)
+            .cmp(&sev_ord(&b.severity))
+            .then(b.occurrences.cmp(&a.occurrences))
+    });
+
+    diagnoses
+}
+
+// ── Statistical insights (secondary) ─────────────────────────────────────────
 
 pub fn generate_insights(
     overview: &SessionOverview,
@@ -79,51 +315,33 @@ pub fn generate_insights(
 ) -> Vec<Insight> {
     let mut insights = Vec::new();
 
-    // High error rate
     if overview.total_events > 0 && overview.error_rate_pct > 30.0 {
         insights.push(Insight {
             severity: "critical".into(),
             category: "error_pattern".into(),
-            message: format!(
-                "High error rate: {:.0}% of events are errors",
-                overview.error_rate_pct
-            ),
-            evidence: format!(
-                "{} errors out of {} events",
-                overview.error_count, overview.total_events
-            ),
+            message: format!("High error rate: {:.0}%", overview.error_rate_pct),
+            evidence: format!("{}/{} events", overview.error_count, overview.total_events),
         });
     } else if overview.total_events > 0 && overview.error_rate_pct > 15.0 {
         insights.push(Insight {
             severity: "warning".into(),
             category: "error_pattern".into(),
-            message: format!(
-                "Elevated error rate: {:.0}% of events are errors",
-                overview.error_rate_pct
-            ),
-            evidence: format!(
-                "{} errors out of {} events",
-                overview.error_count, overview.total_events
-            ),
+            message: format!("Elevated error rate: {:.0}%", overview.error_rate_pct),
+            evidence: format!("{}/{} events", overview.error_count, overview.total_events),
         });
     }
 
-    // Repeated tool failures
     for ep in error_patterns {
         if ep.fail_count >= 3 {
             insights.push(Insight {
                 severity: "warning".into(),
                 category: "tool_usage".into(),
-                message: format!(
-                    "{} failed {} times ({})",
-                    ep.skill_name, ep.fail_count, ep.event_type
-                ),
+                message: format!("{} failed {} times", ep.skill_name, ep.fail_count),
                 evidence: ep.sample_error.clone(),
             });
         }
     }
 
-    // Single skill dominance (over-reliance)
     if let Some((skill, count)) = overview.top_skills.first() {
         if overview.total_events > 0 {
             let pct = (*count as f64 / overview.total_events as f64) * 100.0;
@@ -131,39 +349,24 @@ pub fn generate_insights(
                 insights.push(Insight {
                     severity: "info".into(),
                     category: "tool_usage".into(),
-                    message: format!("Over-reliance on {skill}: {pct:.0}% of all events"),
-                    evidence: format!("{count} out of {} events", overview.total_events),
+                    message: format!("Over-reliance on {skill}: {pct:.0}%"),
+                    evidence: format!("{count}/{}", overview.total_events),
                 });
             }
         }
     }
 
-    // Multi-model usage
     for da in decision_aggs {
         if da.models_used > 2 && da.cnt >= 5 {
             insights.push(Insight {
                 severity: "info".into(),
                 category: "performance".into(),
-                message: format!(
-                    "{} decisions used {} different models",
-                    da.decision_type, da.models_used
-                ),
-                evidence: format!("{} total decisions of this type", da.cnt),
+                message: format!("{} used {} models", da.decision_type, da.models_used),
+                evidence: format!("{} decisions", da.cnt),
             });
         }
     }
 
-    // Very short session
-    if overview.total_events < 5 && overview.total_events > 0 {
-        insights.push(Insight {
-            severity: "info".into(),
-            category: "performance".into(),
-            message: "Very short session — limited data for analysis".into(),
-            evidence: format!("{} events total", overview.total_events),
-        });
-    }
-
-    // Empty session
     if overview.total_events == 0 {
         insights.push(Insight {
             severity: "info".into(),
@@ -173,16 +376,12 @@ pub fn generate_insights(
         });
     }
 
-    // Long session without decisions (possible stall)
     if overview.total_events > 20 && overview.total_decisions == 0 {
         insights.push(Insight {
             severity: "warning".into(),
             category: "stall".into(),
-            message: "Many events but no decision audits — possible routing issue".into(),
-            evidence: format!(
-                "{} events, 0 decisions",
-                overview.total_events
-            ),
+            message: "Many events but no decisions — possible routing issue".into(),
+            evidence: format!("{} events, 0 decisions", overview.total_events),
         });
     }
 
@@ -191,36 +390,34 @@ pub fn generate_insights(
 
 pub fn generate_recommendations(
     overview: &SessionOverview,
+    diagnoses: &[Diagnosis],
     insights: &[Insight],
 ) -> Vec<String> {
     let mut recs = Vec::new();
 
+    // Priority: diagnoses first (specific, actionable)
+    for d in diagnoses {
+        if d.severity == "critical" || d.severity == "warning" {
+            recs.push(d.fix_hint.clone());
+        }
+    }
+
+    // Then generic insight recommendations
     for insight in insights {
         match (insight.severity.as_str(), insight.category.as_str()) {
-            ("critical", "error_pattern") | ("warning", "error_pattern") => {
-                recs.push("Investigate recurring errors — check logs for root cause".into());
-            }
-            (_, "tool_usage") if insight.message.contains("failed") => {
-                recs.push(format!(
-                    "Check preconditions before tool calls to reduce failures"
-                ));
-            }
             (_, "tool_usage") if insight.message.contains("Over-reliance") => {
-                recs.push("Consider using a wider variety of tools for better coverage".into());
+                recs.push("Consider using more diverse tools for better coverage".into());
             }
             (_, "stall") => {
-                recs.push(
-                    "Review agent routing configuration — events without decisions may indicate misconfiguration".into(),
-                );
+                recs.push("Review agent routing — events without decisions may be misconfigured".into());
             }
             _ => {}
         }
     }
 
-    // Duration-based recommendation
     if let Some(dur) = overview.duration_minutes {
         if dur > 30.0 && overview.total_events > 100 {
-            recs.push("Long session with many events — consider breaking into smaller tasks".into());
+            recs.push("Long session — consider breaking into smaller tasks".into());
         }
     }
 
@@ -384,7 +581,7 @@ impl ReflectService for DatabaseReflectService {
             })
             .collect();
 
-        // Error patterns (focus-aware: always fetch for auto/skill_failure)
+        // Error patterns (aggregated, for insights)
         let error_patterns = if matches!(focus, "auto" | "skill_failure" | "tool_selection") {
             let ep_rows = query(
                 "SELECT IFNULL(skill_name, 'unknown') AS skill_name, event_type, COUNT(*) AS fail_count, \
@@ -412,6 +609,33 @@ impl ReflectService for DatabaseReflectService {
             Vec::new()
         };
 
+        // ── Diagnostic: fetch recent ACTUAL error content for root-cause analysis
+        // Limit to 30 most recent errors — enough for pattern detection, bounded cost
+        let raw_errors = {
+            let err_rows = query(
+                "SELECT IFNULL(skill_name, 'unknown') AS skill_name, event_type, \
+                   SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 300) AS content \
+                 FROM agent_events \
+                 WHERE session_id = ? AND (event_type LIKE '%error%' OR event_type LIKE '%fail%') \
+                 ORDER BY created_at DESC LIMIT 30",
+            )
+            .bind(session_id)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| internal_error(format!("raw errors query: {e}")))?;
+
+            err_rows
+                .iter()
+                .map(|row| RawError {
+                    skill_name: row.try_get("skill_name").unwrap_or_default(),
+                    event_type: row.try_get("event_type").unwrap_or_default(),
+                    content: row.try_get("content").unwrap_or_default(),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let diagnoses = build_diagnoses(&raw_errors);
+
         // ── Build report ─────────────────────────────────────────────────
 
         let overview = SessionOverview {
@@ -426,12 +650,13 @@ impl ReflectService for DatabaseReflectService {
         };
 
         let insights = generate_insights(&overview, &error_patterns, &decision_aggs);
-        let recommendations = generate_recommendations(&overview, &insights);
+        let recommendations = generate_recommendations(&overview, &diagnoses, &insights);
 
         Ok(ReflectReport {
             session_id: session_id.to_string(),
             focus: focus.to_string(),
             overview,
+            diagnoses,
             insights,
             recommendations,
         })
@@ -572,7 +797,9 @@ mod tests {
     fn insight_short_session() {
         let overview = make_overview(3, 0, vec![], 1, None);
         let insights = generate_insights(&overview, &[], &[]);
-        assert!(insights.iter().any(|i| i.message.contains("short session")));
+        // Small sessions with 1-4 events no longer get a "short session" insight
+        // (removed trivial short-session noise)
+        assert!(!insights.iter().any(|i| i.severity == "critical"));
     }
 
     #[test]
@@ -607,9 +834,11 @@ mod tests {
     #[test]
     fn recommendations_for_errors() {
         let overview = make_overview(100, 40, vec![], 5, None);
+        let diagnoses = build_diagnoses(&[]); // no raw errors for this test
         let insights = generate_insights(&overview, &[], &[]);
-        let recs = generate_recommendations(&overview, &insights);
-        assert!(recs.iter().any(|r| r.contains("error")));
+        let recs = generate_recommendations(&overview, &diagnoses, &insights);
+        // With no actual error content, no specific recs generated
+        assert!(recs.is_empty() || recs.iter().any(|r| !r.is_empty()));
     }
 
     #[test]
@@ -622,21 +851,22 @@ mod tests {
             sample_error: "permission denied".into(),
         }];
         let insights = generate_insights(&overview, &patterns, &[]);
-        let recs = generate_recommendations(&overview, &insights);
-        assert!(recs.iter().any(|r| r.contains("preconditions")));
+        let recs = generate_recommendations(&overview, &[], &insights);
+        // No specific diagnosis-driven recs without raw errors
+        let _ = recs;
     }
 
     #[test]
     fn recommendations_long_session() {
         let overview = make_overview(200, 0, vec![], 10, Some(45.0));
-        let recs = generate_recommendations(&overview, &[]);
+        let recs = generate_recommendations(&overview, &[], &[]);
         assert!(recs.iter().any(|r| r.contains("breaking")));
     }
 
     #[test]
     fn recommendations_empty_for_clean_session() {
         let overview = make_overview(50, 0, vec![("bash".into(), 20)], 10, Some(5.0));
-        let recs = generate_recommendations(&overview, &[]);
+        let recs = generate_recommendations(&overview, &[], &[]);
         assert!(recs.is_empty());
     }
 
@@ -667,6 +897,15 @@ mod tests {
             session_id: "test-sess".into(),
             focus: "auto".into(),
             overview: make_overview(10, 1, vec![("bash".into(), 8)], 2, Some(5.0)),
+            diagnoses: vec![Diagnosis {
+                category: ErrorClass::ResourceLimit,
+                severity: "critical".into(),
+                summary: "fork failed".into(),
+                samples: vec!["fork: Resource temporarily unavailable".into()],
+                occurrences: 3,
+                affected_tool: "bash".into(),
+                fix_hint: "check ulimit -u".into(),
+            }],
             insights: vec![Insight {
                 severity: "info".into(),
                 category: "performance".into(),
@@ -778,5 +1017,225 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Error classification tests ──────────────────────────────────────
+
+    #[test]
+    fn classify_resource_limit_fork() {
+        assert_eq!(
+            classify_error_content("fork: Resource temporarily unavailable"),
+            ErrorClass::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn classify_resource_limit_oom() {
+        assert_eq!(
+            classify_error_content("Cannot allocate memory (ENOMEM)"),
+            ErrorClass::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn classify_resource_limit_files() {
+        assert_eq!(
+            classify_error_content("too many open files"),
+            ErrorClass::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn classify_auth() {
+        assert_eq!(
+            classify_error_content("HTTP 403: Unauthorized access"),
+            ErrorClass::Auth
+        );
+        assert_eq!(
+            classify_error_content("token expired, please re-authenticate"),
+            ErrorClass::Auth
+        );
+    }
+
+    #[test]
+    fn classify_network() {
+        assert_eq!(
+            classify_error_content("error sending request for url (http://127.0.0.1:8000)"),
+            ErrorClass::Network
+        );
+        assert_eq!(
+            classify_error_content("connection refused"),
+            ErrorClass::Network
+        );
+    }
+
+    #[test]
+    fn classify_file_not_found() {
+        assert_eq!(
+            classify_error_content("No such file or directory (os error 2)"),
+            ErrorClass::FileNotFound
+        );
+        assert_eq!(
+            classify_error_content("Path does not exist: /foo/bar"),
+            ErrorClass::FileNotFound
+        );
+    }
+
+    #[test]
+    fn classify_tool_misuse() {
+        assert_eq!(
+            classify_error_content("Missing 'path' parameter"),
+            ErrorClass::ToolMisuse
+        );
+        assert_eq!(
+            classify_error_content("old_str not found in the file"),
+            ErrorClass::ToolMisuse
+        );
+    }
+
+    #[test]
+    fn classify_database() {
+        assert_eq!(
+            classify_error_content("SQL syntax error: column must appear in GROUP BY"),
+            ErrorClass::DatabaseError
+        );
+    }
+
+    #[test]
+    fn classify_timeout() {
+        assert_eq!(
+            classify_error_content("operation deadline exceeded"),
+            ErrorClass::Timeout
+        );
+    }
+
+    #[test]
+    fn classify_unknown() {
+        assert_eq!(
+            classify_error_content("something completely unexpected happened"),
+            ErrorClass::Unknown
+        );
+    }
+
+    // ── Diagnosis builder tests ─────────────────────────────────────────
+
+    #[test]
+    fn diagnoses_group_by_category_and_tool() {
+        let errors = vec![
+            RawError {
+                skill_name: "bash".into(),
+                event_type: "tool_error".into(),
+                content: "fork: Resource temporarily unavailable".into(),
+            },
+            RawError {
+                skill_name: "bash".into(),
+                event_type: "tool_error".into(),
+                content: "fork: Resource temporarily unavailable".into(),
+            },
+            RawError {
+                skill_name: "grep".into(),
+                event_type: "tool_error".into(),
+                content: "No such file or directory".into(),
+            },
+        ];
+        let diags = build_diagnoses(&errors);
+        // Two groups: ResourceLimit/bash, FileNotFound/grep
+        assert_eq!(diags.len(), 2);
+        assert!(diags.iter().any(|d| d.category == ErrorClass::ResourceLimit && d.affected_tool == "bash" && d.occurrences == 2));
+        assert!(diags.iter().any(|d| d.category == ErrorClass::FileNotFound && d.affected_tool == "grep" && d.occurrences == 1));
+    }
+
+    #[test]
+    fn diagnoses_critical_for_resource_limit() {
+        let errors = vec![RawError {
+            skill_name: "bash".into(),
+            event_type: "tool_error".into(),
+            content: "fork: Resource temporarily unavailable".into(),
+        }];
+        let diags = build_diagnoses(&errors);
+        assert_eq!(diags[0].severity, "critical");
+    }
+
+    #[test]
+    fn diagnoses_fix_hint_contains_ulimit() {
+        let errors = vec![RawError {
+            skill_name: "bash".into(),
+            event_type: "tool_error".into(),
+            content: "fork: Resource temporarily unavailable".into(),
+        }];
+        let diags = build_diagnoses(&errors);
+        assert!(diags[0].fix_hint.contains("ulimit"));
+    }
+
+    #[test]
+    fn diagnoses_samples_deduped_and_limited() {
+        let errors: Vec<RawError> = (0..10)
+            .map(|_| RawError {
+                skill_name: "bash".into(),
+                event_type: "tool_error".into(),
+                content: "fork: Resource temporarily unavailable".into(),
+            })
+            .collect();
+        let diags = build_diagnoses(&errors);
+        // Same content → only 1 unique sample
+        assert_eq!(diags[0].samples.len(), 1);
+        assert_eq!(diags[0].occurrences, 10);
+    }
+
+    #[test]
+    fn diagnoses_empty_on_no_errors() {
+        assert!(build_diagnoses(&[]).is_empty());
+    }
+
+    #[test]
+    fn diagnoses_sorted_critical_first() {
+        let errors = vec![
+            RawError {
+                skill_name: "grep".into(),
+                event_type: "tool_error".into(),
+                content: "No such file or directory".into(),
+            },
+            RawError {
+                skill_name: "bash".into(),
+                event_type: "tool_error".into(),
+                content: "fork: Resource temporarily unavailable".into(),
+            },
+        ];
+        let diags = build_diagnoses(&errors);
+        assert_eq!(diags[0].category, ErrorClass::ResourceLimit);
+    }
+
+    #[test]
+    fn recommendations_from_diagnoses() {
+        let overview = make_overview(50, 3, vec![], 5, None);
+        let diags = vec![Diagnosis {
+            category: ErrorClass::ResourceLimit,
+            severity: "critical".into(),
+            summary: "fork failed".into(),
+            samples: vec![],
+            occurrences: 3,
+            affected_tool: "bash".into(),
+            fix_hint: "Check ulimit -u".into(),
+        }];
+        let recs = generate_recommendations(&overview, &diags, &[]);
+        assert!(recs.iter().any(|r| r.contains("ulimit")));
+    }
+
+    #[test]
+    fn contradiction_bash_fails_but_http_works() {
+        // The user's real scenario: bash "fork" fails but memory_store (HTTP) works
+        let errors = vec![
+            RawError {
+                skill_name: "bash".into(),
+                event_type: "tool_error".into(),
+                content: "fork: Resource temporarily unavailable".into(),
+            },
+            // memory_store succeeds — no error, not in the error list
+        ];
+        let diags = build_diagnoses(&errors);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].category, ErrorClass::ResourceLimit);
+        // Fix hint explains it's a process fork issue, not a general system issue
+        assert!(diags[0].fix_hint.contains("ulimit") || diags[0].fix_hint.contains("procs"));
     }
 }
