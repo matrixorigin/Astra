@@ -79,7 +79,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/compact", "Summarize conversation and save to memory"),
     (
         "/reflect",
-        "Diagnose session: /reflect [focus] [question]\n  Focuses: auto, skill_failure, tool_selection, performance, history",
+        "Diagnose session (focuses: auto, skill_failure, tool_selection, performance)",
     ),
     (
         "/memory",
