@@ -220,11 +220,25 @@ impl ToolExecutor {
             .get("case_sensitive")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let context_lines = args
+            .get("context_lines")
+            .and_then(Value::as_u64)
+            .map(|n| n.min(10) as usize); // cap at 10 to avoid huge output
+        let max_matches = args
+            .get("max_matches")
+            .and_then(Value::as_u64)
+            .map(|n| n.max(1) as usize);
 
         let mut cmd = Command::new("grep");
         cmd.arg("-rnE"); // -E enables extended regex (alternation with |)
         if !case_sensitive {
             cmd.arg("-i");
+        }
+        if let Some(ctx) = context_lines {
+            cmd.arg(format!("-C{ctx}"));
+        }
+        if let Some(max) = max_matches {
+            cmd.arg(format!("-m{max}"));
         }
         append_default_grep_excludes(&mut cmd);
         cmd.arg("--include").arg(include);
@@ -608,6 +622,10 @@ mod tests {
 
     fn test_executor() -> ToolExecutor {
         ToolExecutor::new(std::env::temp_dir())
+    }
+
+    fn test_executor_in(dir: &std::path::Path) -> ToolExecutor {
+        ToolExecutor::new(dir)
     }
 
     #[test]
@@ -1088,5 +1106,81 @@ mod tests {
     fn html_to_text_passthrough_plain_text() {
         let plain = "This is just plain text\nwith some newlines.";
         assert!(!looks_like_html(plain));
+    }
+
+    // ── grep context_lines and max_matches ───────────────────────────────────
+
+    #[test]
+    fn grep_context_lines_passed_to_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ctx.txt");
+        std::fs::write(&file, "line1\nline2\nMATCH\nline4\nline5\n").unwrap();
+
+        let executor = test_executor_in(dir.path());
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "MATCH",
+            "path": "ctx.txt",
+            "context_lines": 1
+        }));
+        // With -C1, should see line2 and line4 as context
+        assert!(result.contains("MATCH"), "should find match: {result}");
+        assert!(result.contains("line2") || result.contains("line4"),
+            "should have context lines: {result}");
+    }
+
+    #[test]
+    fn grep_max_matches_limits_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("repeat.txt");
+        std::fs::write(&file, "foo\nfoo\nfoo\nfoo\nfoo\n").unwrap();
+
+        let executor = test_executor_in(dir.path());
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "foo",
+            "path": "repeat.txt",
+            "max_matches": 2
+        }));
+        let match_count = result.matches("foo").count();
+        assert!(match_count <= 3, "should limit to ~2 matches, got {match_count}: {result}");
+    }
+
+    #[test]
+    fn grep_context_lines_capped_at_10() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("small.txt");
+        std::fs::write(&file, "MATCH\n").unwrap();
+
+        let executor = test_executor_in(dir.path());
+        // Requesting 100 context lines should be capped to 10
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "MATCH",
+            "path": "small.txt",
+            "context_lines": 100
+        }));
+        assert!(result.contains("MATCH"), "should still find match: {result}");
+    }
+
+    #[test]
+    fn grep_combined_context_and_max() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("combo.txt");
+        let mut content = String::new();
+        for i in 0..20 {
+            content.push_str(&format!("line{i}\n"));
+            if i % 5 == 0 {
+                content.push_str("TARGET\n");
+            }
+        }
+        std::fs::write(&file, &content).unwrap();
+
+        let executor = test_executor_in(dir.path());
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "TARGET",
+            "path": "combo.txt",
+            "context_lines": 1,
+            "max_matches": 2
+        }));
+        let target_count = result.matches("TARGET").count();
+        assert!(target_count <= 3, "should limit matches, got {target_count}: {result}");
     }
 }

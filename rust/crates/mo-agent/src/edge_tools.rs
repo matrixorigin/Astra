@@ -1,6 +1,7 @@
 //! Edge tool definitions and execution for the mo-agent CLI.
 //!
-//! Tools: bash, read_file, write_file, str_replace, list_dir, grep, glob,
+//! Tools: bash, read_file (with outline mode), write_file, str_replace (with fuzzy matching),
+//!        list_dir, grep (with context_lines/max_matches), glob,
 //!        git_status, git_diff, git_log, git_show, git_blame, git_file_history,
 //!        git_contributors, git_log_search, web_fetch,
 //!        mo_query, mo_snapshot, mo_branch
@@ -53,13 +54,14 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read file contents with optional line range. ALWAYS use start_line/end_line for large files instead of reading the whole file. Prefer targeted reads over full file reads.",
+                "description": "Read file contents with optional line range. ALWAYS use start_line/end_line for large files instead of reading the whole file. Prefer targeted reads over full file reads. Set outline=true to get only function/class/struct signatures (saves tokens).",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
                         "start_line": {"type": "integer", "description": "First line to read (1-based, optional)"},
-                        "end_line": {"type": "integer", "description": "Last line to read (inclusive, optional)"}
+                        "end_line": {"type": "integer", "description": "Last line to read (inclusive, optional)"},
+                        "outline": {"type": "boolean", "description": "If true, return only function/class/struct/trait signatures with line numbers instead of full content. Ideal for understanding file structure."}
                     },
                     "required": ["path"]
                 }
@@ -84,7 +86,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "str_replace",
-                "description": "Replace an exact string in a file. old_str must match exactly (including whitespace). Use for targeted edits.",
+                "description": "Replace an exact string in a file. old_str must match exactly (including whitespace). On mismatch, shows closest matches with line numbers so you can fix and retry.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -122,7 +124,9 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "pattern": {"type": "string", "description": "Regex pattern to search for"},
                         "path": {"type": "string", "description": "Directory or file to search (default: project root)"},
                         "include": {"type": "string", "description": "File glob filter e.g. '*.rs'"},
-                        "case_sensitive": {"type": "boolean", "description": "Case sensitive (default false)"}
+                        "case_sensitive": {"type": "boolean", "description": "Case sensitive (default false)"},
+                        "context_lines": {"type": "integer", "description": "Lines of context before and after each match (like grep -C)"},
+                        "max_matches": {"type": "integer", "description": "Max matches per file (limits output, saves tokens)"}
                     },
                     "required": ["pattern"]
                 }
