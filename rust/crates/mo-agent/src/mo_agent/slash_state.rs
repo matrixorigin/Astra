@@ -574,9 +574,14 @@ fn render_reflect_report(body: &str, session_id: &str) {
     // ── Insights (secondary — statistical observations) ─────────────
     if has_insights {
         eprintln!();
-        for insight in report["insights"].as_array().unwrap() {
+        let non_info_insights: Vec<_> = report["insights"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["severity"].as_str() != Some("info"))
+            .collect();
+        for insight in non_info_insights {
             let severity = insight["severity"].as_str().unwrap_or("info");
-            if severity == "info" { continue; }
             let message = insight["message"].as_str().unwrap_or("");
             let evidence = insight["evidence"].as_str().unwrap_or("");
             let line = if evidence.is_empty() {

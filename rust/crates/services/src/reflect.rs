@@ -55,6 +55,7 @@ pub enum ErrorClass {
     ToolMisuse,
     Timeout,
     DatabaseError,
+    Stall,
     Unknown,
 }
 
@@ -68,6 +69,7 @@ impl std::fmt::Display for ErrorClass {
             Self::ToolMisuse => write!(f, "tool_misuse"),
             Self::Timeout => write!(f, "timeout"),
             Self::DatabaseError => write!(f, "database"),
+            Self::Stall => write!(f, "stall"),
             Self::Unknown => write!(f, "unknown"),
         }
     }
@@ -125,7 +127,17 @@ pub trait ReflectService: Send + Sync {
 
 // ── Error classification (pure logic, no DB) ─────────────────────────────────
 
-/// Classify an error string into a root-cause category.
+/// Classify an error — considers both content text and event_type.
+pub fn classify_error(content: &str, event_type: &str) -> ErrorClass {
+    // Event-type based classification (high priority)
+    if event_type == "stall_detected" {
+        return ErrorClass::Stall;
+    }
+
+    classify_error_content(content)
+}
+
+/// Classify an error string into a root-cause category (content only).
 pub fn classify_error_content(content: &str) -> ErrorClass {
     let lower = content.to_lowercase();
 
@@ -210,7 +222,7 @@ pub fn build_diagnoses(raw_errors: &[RawError]) -> Vec<Diagnosis> {
     // Group by (ErrorClass, affected_tool)
     let mut groups: HashMap<(ErrorClass, String), Vec<&RawError>> = HashMap::new();
     for err in raw_errors {
-        let class = classify_error_content(&err.content);
+        let class = classify_error(&err.content, &err.event_type);
         let tool = if err.skill_name.is_empty() || err.skill_name == "unknown" {
             "system".to_string()
         } else {
@@ -240,6 +252,8 @@ pub fn build_diagnoses(raw_errors: &[RawError]) -> Vec<Diagnosis> {
 
             let severity = match (&class, count) {
                 (ErrorClass::ResourceLimit, _) => "critical",
+                (ErrorClass::Stall, n) if n >= 3 => "warning",
+                (ErrorClass::Stall, _) => "info",
                 (_, n) if n >= 5 => "critical",
                 (_, n) if n >= 3 => "warning",
                 _ => "info",
@@ -268,6 +282,9 @@ pub fn build_diagnoses(raw_errors: &[RawError]) -> Vec<Diagnosis> {
                 ErrorClass::DatabaseError => format!(
                     "Database error ({tool}): SQL or connection failure — {count} occurrences"
                 ),
+                ErrorClass::Stall => format!(
+                    "Agent stall detected — {count} stall events, agent may be looping or stuck"
+                ),
                 ErrorClass::Unknown => format!(
                     "Unclassified errors ({tool}): {count} occurrences"
                 ),
@@ -281,6 +298,7 @@ pub fn build_diagnoses(raw_errors: &[RawError]) -> Vec<Diagnosis> {
                 ErrorClass::FileNotFound => format!("Agent guessed wrong paths. Use `list_dir` before `read_file`/`grep`. Check that the workspace context is accurate."),
                 ErrorClass::ToolMisuse => "Model is calling tools with wrong parameters. This may improve with a better model or clearer system prompt.".to_string(),
                 ErrorClass::DatabaseError => "Check MatrixOne connectivity and SQL syntax. Use CAST for DATETIME columns, MIN/MAX for non-grouped columns.".to_string(),
+                ErrorClass::Stall => "Agent is stuck in a loop. Try `/rewind` to go back, or switch to a different model with `/model`. Break complex tasks into smaller steps.".to_string(),
                 ErrorClass::Unknown => "Review the error samples above to identify the pattern.".to_string(),
             };
 
@@ -491,7 +509,8 @@ impl ReflectService for DatabaseReflectService {
             "SELECT \
                COUNT(*) AS total_events, \
                COUNT(DISTINCT skill_name) AS unique_skills, \
-               SUM(CASE WHEN event_type = 'error' OR event_type = 'tool_error' THEN 1 ELSE 0 END) AS error_count, \
+               SUM(CASE WHEN event_type IN ('error', 'tool_error', 'stall_detected') \
+                    OR event_type LIKE '%error%' OR event_type LIKE '%fail%' THEN 1 ELSE 0 END) AS error_count, \
                CAST(MIN(created_at) AS CHAR) AS first_event, \
                CAST(MAX(created_at) AS CHAR) AS last_event \
              FROM agent_events WHERE session_id = ?",
@@ -588,7 +607,8 @@ impl ReflectService for DatabaseReflectService {
                 "SELECT IFNULL(skill_name, 'unknown') AS skill_name, event_type, COUNT(*) AS fail_count, \
                    SUBSTRING(COALESCE(MIN(content), ''), 1, 100) AS sample_error \
                  FROM agent_events \
-                 WHERE session_id = ? AND (event_type LIKE '%error%' OR event_type LIKE '%fail%') \
+                 WHERE session_id = ? AND (event_type IN ('error', 'tool_error', 'stall_detected') \
+                   OR event_type LIKE '%error%' OR event_type LIKE '%fail%') \
                  GROUP BY skill_name, event_type \
                  ORDER BY fail_count DESC LIMIT 10",
             )
@@ -617,7 +637,8 @@ impl ReflectService for DatabaseReflectService {
                 "SELECT IFNULL(skill_name, 'unknown') AS skill_name, event_type, \
                    SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 300) AS content \
                  FROM agent_events \
-                 WHERE session_id = ? AND (event_type LIKE '%error%' OR event_type LIKE '%fail%') \
+                 WHERE session_id = ? AND (event_type IN ('error', 'tool_error', 'stall_detected') \
+                   OR event_type LIKE '%error%' OR event_type LIKE '%fail%') \
                  ORDER BY created_at DESC LIMIT 30",
             )
             .bind(session_id)
@@ -943,7 +964,8 @@ mod tests {
             "SELECT IFNULL(skill_name, 'unknown') AS skill_name, event_type, COUNT(*) AS fail_count, \
                SUBSTRING(COALESCE(MIN(content), ''), 1, 100) AS sample_error \
              FROM agent_events \
-             WHERE session_id = ? AND (event_type LIKE '%error%' OR event_type LIKE '%fail%') \
+             WHERE session_id = ? AND (event_type IN ('error', 'tool_error', 'stall_detected') \
+               OR event_type LIKE '%error%' OR event_type LIKE '%fail%') \
              GROUP BY skill_name, event_type \
              ORDER BY fail_count DESC LIMIT 10",
         ];
@@ -1238,5 +1260,66 @@ mod tests {
         assert_eq!(diags[0].category, ErrorClass::ResourceLimit);
         // Fix hint explains it's a process fork issue, not a general system issue
         assert!(diags[0].fix_hint.contains("ulimit") || diags[0].fix_hint.contains("procs"));
+    }
+
+    #[test]
+    fn classify_stall_by_event_type() {
+        assert_eq!(
+            classify_error("some content", "stall_detected"),
+            ErrorClass::Stall
+        );
+        // Even if content looks like network error, event_type takes priority
+        assert_eq!(
+            classify_error("connection refused", "stall_detected"),
+            ErrorClass::Stall
+        );
+    }
+
+    #[test]
+    fn diagnoses_stall_detected() {
+        let errors = vec![
+            RawError {
+                skill_name: "system".into(),
+                event_type: "stall_detected".into(),
+                content: "Agent repeated same tool call 3 times".into(),
+            },
+            RawError {
+                skill_name: "system".into(),
+                event_type: "stall_detected".into(),
+                content: "Agent repeated same tool call 3 times".into(),
+            },
+            RawError {
+                skill_name: "system".into(),
+                event_type: "stall_detected".into(),
+                content: "Agent stuck in loop".into(),
+            },
+        ];
+        let diags = build_diagnoses(&errors);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].category, ErrorClass::Stall);
+        assert_eq!(diags[0].occurrences, 3);
+        assert_eq!(diags[0].severity, "warning"); // 3 stalls = warning
+        assert!(diags[0].fix_hint.contains("rewind") || diags[0].fix_hint.contains("/rewind"));
+    }
+
+    #[test]
+    fn diagnoses_mixed_stall_and_errors() {
+        let errors = vec![
+            RawError {
+                skill_name: "system".into(),
+                event_type: "stall_detected".into(),
+                content: "Agent looping".into(),
+            },
+            RawError {
+                skill_name: "bash".into(),
+                event_type: "tool_error".into(),
+                content: "fork: Resource temporarily unavailable".into(),
+            },
+        ];
+        let diags = build_diagnoses(&errors);
+        assert_eq!(diags.len(), 2);
+        // ResourceLimit is critical → sorted first
+        assert_eq!(diags[0].category, ErrorClass::ResourceLimit);
+        assert_eq!(diags[1].category, ErrorClass::Stall);
     }
 }
