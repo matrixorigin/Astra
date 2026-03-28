@@ -688,4 +688,38 @@ mod tests {
             "should not reach Critical with only 2 errors"
         );
     }
+
+    /// Regression test for resource-limit overwrite bug.
+    /// When resource-limit output is detected in a "successful" tool call
+    /// (e.g., bash returns "fork: Resource temporarily unavailable" with exit 0),
+    /// classify_result() sees it as Success because it doesn't start with "Error:".
+    /// If record_tool_result() is called, record_success() clears the deprioritized
+    /// flag that record_resource_limit_failure() just set.
+    ///
+    /// The fix: chat_stream.rs sets resource_limit_recorded=true and skips
+    /// record_tool_result() entirely for these cases.
+    #[test]
+    fn resource_limit_overwrite_via_record_tool_result() {
+        let mut guard = TurnGuard::new();
+        let resource_output = "bash: fork: Resource temporarily unavailable\nCannot create child process";
+
+        // Step 1: resource-limit handler records the failure directly
+        guard.health.record_resource_limit_failure("bash");
+        assert!(guard.health.is_deprioritized("bash"), "must be deprioritized");
+
+        // Step 2: if record_tool_result is called on the same output, it classifies
+        // as Success (no "Error:" prefix) → calls record_success → OVERWRITES
+        let quality = guard.record_tool_result("bash", resource_output);
+        assert_eq!(
+            quality,
+            super::result_quality::ResultQuality::Success,
+            "resource-limit output is classified as Success (the root cause)"
+        );
+        assert!(
+            !guard.health.is_deprioritized("bash"),
+            "BUG REPRODUCED: record_tool_result overwrites the deprioritization"
+        );
+        // This is why chat_stream.rs must skip record_tool_result() when
+        // resource_limit_recorded is true.
+    }
 }

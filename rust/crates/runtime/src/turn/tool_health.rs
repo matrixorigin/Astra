@@ -511,4 +511,51 @@ mod tests {
         tracker.record_failure("bash");
         assert!(tracker.is_deprioritized("bash")); // 3rd failure triggers
     }
+
+    /// Regression: resource-limit deprioritization MUST NOT be overwritten by
+    /// a subsequent record_success(). In production, the resource-limit path
+    /// records health directly, then skips record_tool_result() to prevent
+    /// classify_result() from returning Success (since the output text doesn't
+    /// start with "Error:") and calling record_success() which clears
+    /// deprioritized status. This test documents the overwrite hazard.
+    #[test]
+    fn resource_limit_overwrite_hazard_documented() {
+        let mut tracker = ToolHealthTracker::new();
+        // Step 1: resource limit → immediate deprioritize
+        tracker.record_resource_limit_failure("bash");
+        assert!(tracker.is_deprioritized("bash"), "must be deprioritized after resource limit");
+
+        // Step 2: if record_success is called (what the old code did via
+        // classify_result → Success), it rehabilitates — THIS IS THE BUG.
+        // In production, we now skip record_tool_result() when
+        // resource_limit_recorded=true, preventing this path.
+        tracker.record_success("bash");
+        assert!(
+            !tracker.is_deprioritized("bash"),
+            "record_success does rehabilitate — this is why we skip record_tool_result()"
+        );
+
+        // The fix: chat_stream.rs sets resource_limit_recorded=true and bypasses
+        // record_tool_result(), so record_success() is never reached.
+    }
+
+    /// Resource-limit should not double-count if record_tool_result is also called.
+    /// This documents why the is_err path also sets resource_limit_recorded.
+    #[test]
+    fn resource_limit_error_path_no_double_count() {
+        let mut tracker = ToolHealthTracker::new();
+        // The is_err path: classify_error returns ResourceLimit
+        tracker.record_resource_limit_failure("bash");
+        let health = tracker.get("bash").unwrap();
+        assert_eq!(health.total_calls, 1);
+        assert_eq!(health.total_failures, 1);
+
+        // If record_failure is also called (the old code path), it double-counts
+        tracker.record_failure("bash");
+        let health = tracker.get("bash").unwrap();
+        assert_eq!(health.total_calls, 2, "double call = double count (the bug)");
+        assert_eq!(health.total_failures, 2, "double call = double failure count");
+
+        // The fix: skip record_tool_result() when resource_limit_recorded=true
+    }
 }

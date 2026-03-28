@@ -1363,12 +1363,14 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             }
             let tool_elapsed = tool_start.elapsed();
             let mut is_err = is_tool_error(&result_str);
+            let mut resource_limit_recorded = false;
 
             // Error recovery: classify, retry transient errors, track via TurnGuard.
             // NOTE: error counting and health recording happen in record_tool_result()
             // below — do NOT call turn_guard.errors.record_error() here to avoid
             // double-counting (was a bug: 2 errors looked like 4, triggering premature
-            // escalation).
+            // escalation). Exception: resource-limit errors are fully handled here
+            // and skipped in record_tool_result() to prevent overwrite.
             if is_err {
                 use mo_agent_runtime::turn::error_recovery::{
                     build_recovery_message, classify_error,
@@ -1384,7 +1386,9 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     turn_guard
                         .health
                         .record_resource_limit_failure(&name);
+                    turn_guard.errors.record_error(category);
                     restricted_tools.insert(name.clone());
+                    resource_limit_recorded = true;
                     if !quiet {
                         eprintln!(
                             "{}",
@@ -1454,8 +1458,12 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 turn_guard
                     .health
                     .record_resource_limit_failure(&name);
+                turn_guard.errors.record_error(
+                    mo_agent_runtime::turn::error_recovery::ErrorCategory::ResourceLimit,
+                );
                 restricted_tools.insert(name.clone());
                 is_err = true; // promote to error for downstream tracking
+                resource_limit_recorded = true;
                 if !quiet {
                     eprintln!(
                         "{}",
@@ -1468,8 +1476,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             }
 
             // Record result in TurnGuard (handles health tracking + quality classification).
-            // Skip if already recorded as timeout — avoid double-counting.
-            let result_quality = if tool_timed_out {
+            // Skip if already recorded as timeout or resource-limit — avoid double-counting.
+            let result_quality = if tool_timed_out || resource_limit_recorded {
                 mo_agent_runtime::turn::result_quality::ResultQuality::Error
             } else {
                 turn_guard.record_tool_result(&name, &result_str)
