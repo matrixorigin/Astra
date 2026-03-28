@@ -32,6 +32,9 @@ pub fn build_main_system_prompt(
     let has_memory = tool_names.iter().any(|n| n.starts_with("memory"));
     let has_github = tool_names.iter().any(|n| n.starts_with("github"));
     let has_git = tool_names.iter().any(|n| n.starts_with("git_"));
+    let has_glob = tool_names.contains(&"glob");
+    let has_grep = tool_names.contains(&"grep");
+    let has_read_file = tool_names.contains(&"read_file");
 
     let mut prompt = format!(
         "{SYSTEM_PROMPT_BASE}\n\n\
@@ -98,10 +101,11 @@ pub fn build_main_system_prompt(
         Some("code_review") => {
             prompt.push_str(
                 "\n\
-             ## Code Review Strategy\n\
-             - Use git_diff ONCE to get the diff. Do NOT call it again with the same args.\n\
-             - Prefer targeted reads (specific line ranges) over full-file reads.\n\
-             - Focus on: correctness, security, edge cases, test coverage. Skip style nits.\n",
+              ## Code Review Strategy\n\
+              - Use git_diff ONCE to get the diff. Do NOT call it again with the same args.\n\
+              - Scope searches to changed files or nearby directories before using grep.\n\
+              - Prefer targeted reads (specific line ranges) over full-file reads.\n\
+              - Focus on: correctness, security, edge cases, test coverage. Skip style nits.\n",
             );
         }
         Some("debugging") => {
@@ -125,10 +129,11 @@ pub fn build_main_system_prompt(
         Some("implementation") => {
             prompt.push_str(
                 "\n\
-             ## Implementation Strategy\n\
-             - Read existing patterns before writing new code.\n\
-             - Make minimal, surgical changes — don't rewrite unrelated code.\n\
-             - Verify changes compile/pass tests before reporting done.\n",
+              ## Implementation Strategy\n\
+              - Read existing patterns before writing new code.\n\
+              - Find the owning files first: narrow with glob, then grep inside the likely subset.\n\
+              - Make minimal, surgical changes — don't rewrite unrelated code.\n\
+              - Verify changes compile/pass tests before reporting done.\n",
             );
         }
         Some("refactoring") => {
@@ -203,6 +208,20 @@ pub fn build_main_system_prompt(
     if has_memory {
         prompt
             .push_str("         - **Memory**: check '## User Memories' → search → store/correct\n");
+    }
+
+    if has_glob || has_grep || has_read_file {
+        prompt.push_str(
+            "\n\
+         ## Search Strategy\n\
+         - Start narrow. Prefer likely roots first: src, crates, app, lib, packages, cmd, internal, tests.\n\
+         - Use glob first to narrow filenames/dirs, then grep only that subset for content.\n\
+         - For code review, search within changed files or adjacent modules before scanning the whole repo.\n\
+         - Avoid broad repo-wide regex searches when a symbol, filename, extension, or directory hint is available.\n\
+         - Skip generated or bulky trees unless the task explicitly targets them: build, dist, target, coverage, htmlcov, node_modules, vendor.\n\
+         - After grep finds candidates, switch to targeted reads instead of repeating more broad searches.\n\
+         - If a grep is slow or noisy, tighten path, extension, or literal term — do NOT repeat the same broad search.\n",
+        );
     }
 
     // ── Reasoning protocol: always present ──
@@ -665,6 +684,7 @@ mod tests {
         let p = build_main_system_prompt(&["git_diff"], "", 0.5, Some("code_review"));
         assert!(p.contains("Code Review Strategy"));
         assert!(p.contains("git_diff ONCE"));
+        assert!(p.contains("changed files or nearby directories"));
     }
 
     #[test]
@@ -686,6 +706,17 @@ mod tests {
         let p = build_main_system_prompt(&["bash"], "", 0.5, Some("implementation"));
         assert!(p.contains("Implementation Strategy"));
         assert!(p.contains("surgical changes"));
+    }
+
+    #[test]
+    fn prompt_implementation_strategy_mentions_glob_then_grep() {
+        let p = build_main_system_prompt(
+            &["glob", "grep", "read_file"],
+            "",
+            0.5,
+            Some("implementation"),
+        );
+        assert!(p.contains("narrow with glob, then grep"));
     }
 
     #[test]
@@ -860,6 +891,21 @@ mod tests {
         assert!(!p.contains("Memory:"));
         let p_mem = build_main_system_prompt(&["memory_store"], "", 0.5, None);
         assert!(p_mem.contains("Memory"));
+    }
+
+    #[test]
+    fn prompt_includes_search_strategy_when_search_tools_present() {
+        let p = build_main_system_prompt(&["glob", "grep", "read_file"], "", 0.5, None);
+        assert!(p.contains("Search Strategy"));
+        assert!(p.contains("Use glob first"));
+        assert!(p.contains("Skip generated or bulky trees"));
+        assert!(p.contains("If a grep is slow or noisy"));
+    }
+
+    #[test]
+    fn prompt_omits_search_strategy_without_search_tools() {
+        let p = build_main_system_prompt(&["bash"], "", 0.5, None);
+        assert!(!p.contains("Search Strategy"));
     }
 
     // ── Enhanced memory rules ──
