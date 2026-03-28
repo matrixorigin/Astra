@@ -398,6 +398,20 @@ fn slash_left_arrow_command(active: bool, in_slash: bool, pos: usize) -> Option<
     }
 }
 
+fn slash_left_arrow_filter(line: &str, pos: usize, active: bool, in_slash: bool) -> Option<Option<String>> {
+    if !active || !in_slash || pos == 0 {
+        return None;
+    }
+    let before_cursor = &line[..pos.saturating_sub(1).min(line.len())];
+    let query = slash_completion_query(before_cursor)?;
+    let filter = query.trim_start_matches('/');
+    if filter.is_empty() {
+        Some(None)
+    } else {
+        Some(Some(filter.to_string()))
+    }
+}
+
 fn slash_overlay_row_content(cmd: &str, desc: &str, selected: bool) -> String {
     if selected {
         format!(
@@ -985,8 +999,16 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 nav!(-1);
             }
             RlKeyEvent(RlKeyCode::Left, _) if in_slash && active => {
-                clear_slash_overlay();
-                return slash_left_arrow_command(active, in_slash, ctx.pos());
+                let command = slash_left_arrow_command(active, in_slash, ctx.pos());
+                if let Some(filter) =
+                    slash_left_arrow_filter(ctx.line(), ctx.pos(), active, in_slash)
+                {
+                    set_slash_picker_selected(0);
+                    render_slash_overlay(filter.as_deref());
+                } else {
+                    clear_slash_overlay();
+                }
+                return command;
             }
             RlKeyEvent(RlKeyCode::Right, _) if in_slash && active && ctx.pos() == ctx.line().len() => {
                 let current = ctx.line();
@@ -1600,6 +1622,25 @@ mod tests {
     fn slash_left_arrow_ignores_non_slash_context() {
         assert_eq!(slash_left_arrow_command(true, false, 2), None);
         assert_eq!(slash_left_arrow_command(false, true, 2), None);
+    }
+
+    #[test]
+    fn slash_left_arrow_updates_filter_for_shorter_prefix() {
+        assert_eq!(
+            slash_left_arrow_filter("/exp", 4, true, true),
+            Some(Some("ex".to_string()))
+        );
+    }
+
+    #[test]
+    fn slash_left_arrow_keeps_root_picker_until_slash_is_removed() {
+        assert_eq!(slash_left_arrow_filter("/e", 2, true, true), Some(None));
+    }
+
+    #[test]
+    fn slash_left_arrow_dismisses_when_argument_completion_is_inactive() {
+        assert_eq!(slash_left_arrow_filter("/skill dev foo", 14, true, false), None);
+        assert_eq!(slash_left_arrow_filter("/skill dev foo", 14, true, true), None);
     }
 
     #[test]
