@@ -271,23 +271,87 @@ pub(super) async fn handle_memory_domain_command(
                         .send()
                         .await;
                     
-                    // Show the generated prompt for user to execute
-                    eprintln!();
-                    eprintln!("{}  Generated decomposition prompt:", "📋".green());
-                    eprintln!("{}", "─".repeat(60).dim());
+                    // Call LLM via /chat/turn SSE endpoint
+                    eprintln!("  {} Decomposing goal into subtasks...", "⋯".dim());
                     
-                    // Show first 500 chars of prompt as preview
-                    let preview: String = prompt.chars().take(500).collect();
-                    eprintln!("{}{}", preview.dim(), if prompt.len() > 500 { "..." } else { "" });
+                    let payload = serde_json::json!({
+                        "messages": [{"role": "user", "content": prompt}],
+                        "session_id": state.session_id.clone(),
+                        "model": state.model.clone(),
+                        "edge_profile": {
+                            "cwd": project_root.to_string_lossy(),
+                        },
+                        "edge_tools": [],  // No tools needed for plan generation
+                    });
                     
-                    eprintln!("{}", "─".repeat(60).dim());
-                    eprintln!();
-                    eprintln!("{}  To decompose, copy and paste the prompt above, or type:", "💡".yellow());
-                    eprintln!("     分解目标: {}", sub_arg.cyan());
-                    eprintln!();
-                    
-                    // Store the full prompt in state for potential auto-execution
-                    // For now, we just show guidance to the user
+                    match client
+                        .post(format!("{base}/chat/turn"))
+                        .headers(auth_headers(tok)?)
+                        .header("Accept", "text/event-stream")
+                        .json(&payload)
+                        .send()
+                        .await
+                    {
+                        Ok(resp) if resp.status().is_success() => {
+                            // Collect text from SSE stream
+                            let mut full_text = String::new();
+                            let mut stream = resp.bytes_stream();
+                            let mut buffer = String::new();
+                            
+                            use futures_util::StreamExt;
+                            while let Some(chunk) = stream.next().await {
+                                let Ok(chunk) = chunk else { break };
+                                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                                
+                                // Parse SSE events
+                                while let Some(event_end) = buffer.find("\n\n") {
+                                    let event_str = buffer[..event_end].to_string();
+                                    buffer = buffer[event_end + 2..].to_string();
+                                    
+                                    // Extract text_delta content from SSE data
+                                    for line in event_str.lines() {
+                                        if let Some(data) = line.strip_prefix("data: ") {
+                                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                                                // Check for text_delta type with content field
+                                                if json.get("type").and_then(|v| v.as_str()) == Some("text_delta") {
+                                                    if let Some(content) = json.get("content").and_then(|v| v.as_str()) {
+                                                        full_text.push_str(content);
+                                                        eprint!("{}", content); // Stream output
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            eprintln!(); // End streaming output
+                            
+                            // Parse the plan from the response
+                            match crate::plan_decompose::parse_plan_response(&full_text) {
+                                Ok(plan) => {
+                                    eprintln!();
+                                    eprint!("{}", crate::plan_decompose::format_plan(&plan));
+                                }
+                                Err(e) => {
+                                    eprintln!("{}", format!("  ✗ Could not parse plan: {e}").yellow());
+                                    eprintln!("  The response may still be useful — see above.");
+                                }
+                            }
+                        }
+                        Ok(resp) => {
+                            eprintln!("{}", format!("  ✗ LLM call failed ({})", resp.status()).red());
+                            // Fallback: show the prompt for manual execution
+                            eprintln!();
+                            eprintln!("{}  Generated decomposition prompt:", "📋".yellow());
+                            let preview: String = prompt.chars().take(300).collect();
+                            eprintln!("{}{}", preview.dim(), if prompt.len() > 300 { "..." } else { "" });
+                            eprintln!();
+                            eprintln!("{}  Type 'decompose: {}' to try again.", "💡".cyan(), sub_arg);
+                        }
+                        Err(e) => {
+                            eprintln!("{}", format!("  ✗ Request failed: {e}").red());
+                        }
+                    }
                 }
                 _ => {
                     eprintln!("  Usage: /plan [show | set <text> | clear | decompose <goal>]");
