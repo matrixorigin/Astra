@@ -1,6 +1,6 @@
 const STRUCTURAL_MARKERS: &[&str] = &[
     "## Core Rules",
-    "## Reasoning Protocol",
+    "## Planning Protocol",
     "## Self-Model",
     "## Conversation History",
     "File editing rules:",

@@ -57,7 +57,7 @@ mod tests {
             p.contains("check conversation history"),
             "should include history awareness"
         );
-        assert!(p.contains("Reasoning Protocol"), "should include protocol");
+        assert!(p.contains("Planning Protocol"), "should include protocol");
     }
 
     #[test]
@@ -221,12 +221,12 @@ mod tests {
             1.0,
             None,
         );
-        // Full prompt with all sections should be under 1200 chars (~300 tokens)
-        // Old version was ~1350 tokens. New should be ~1080.
-        // Char count: expect < 5000 chars (was ~5500)
+        // Full prompt with all sections should be under ~1500 tokens
+        // Enhanced prompt adds: Planning Protocol, Coding Discipline, Parallel Tool Calls, Token Efficiency
+        // These extra ~250 tokens pay for themselves in fewer wasted turns.
         assert!(
-            p.len() < 5000,
-            "compressed prompt should be under 5000 chars, got {}",
+            p.len() < 7000,
+            "compressed prompt should be under 7000 chars, got {}",
             p.len()
         );
     }

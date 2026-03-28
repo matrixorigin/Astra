@@ -5312,7 +5312,7 @@ mod hardening_proofs {
             &[]
         ));
         assert!(is_prompt_leaked(
-            "## Reasoning Protocol should be followed",
+            "## Planning Protocol should be followed",
             &[]
         ));
     }
