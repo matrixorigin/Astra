@@ -388,17 +388,7 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
         .and_then(|p| p.username.as_deref())
         .unwrap_or("not logged in");
     // Session: show "new" for fresh sessions, truncated ID for resumed
-    let session_display = match state.session_id.as_deref() {
-        Some(s) => {
-            let short = if s.len() > 8 { &s[..8] } else { s };
-            if state.turn > 0 {
-                format!("{short} (resumed)")
-            } else {
-                short.to_string()
-            }
-        }
-        None => "new".to_string(),
-    };
+    let session_display = banner_session_display(state);
     let model_display = state.model.as_deref().unwrap_or("auto");
     let logged_in = p.and_then(|p| p.access_token.as_ref()).is_some();
     let version = env!("CARGO_PKG_VERSION");
@@ -449,8 +439,7 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     let hr = "─".repeat(w + 2);
 
     eprintln!();
-    // Animated startup: brief typewriter effect for the logo
-    print_startup_animation();
+    print_startup_logo();
     eprintln!("{}", format!("╭{hr}╮").cyan());
     eprintln!("{}", row(&lines_colored[0], lines_plain[0].chars().count()));
     eprintln!("{}", row(&lines_colored[1], lines_plain[1].chars().count()));
@@ -460,38 +449,64 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     eprintln!();
 }
 
-/// Brief animated startup logo — gives a "premium CLI" feel like Cursor/Copilot.
-/// Uses progressive reveal of a compact ASCII art mark, ~300ms total.
-fn print_startup_animation() {
+fn banner_session_display(state: &ReplState) -> String {
+    match state.session_id.as_deref() {
+        Some(s) => {
+            let short = if s.len() > 8 { &s[..8] } else { s };
+            if state.turn > 0 {
+                format!("{short} (resumed)")
+            } else {
+                short.to_string()
+            }
+        }
+        None => "new".to_string(),
+    }
+}
+
+fn startup_logo_lines() -> &'static [&'static str] {
+    &[
+        "███╗   ███╗ ██████╗",
+        "████╗ ████║██╔═══██╗",
+        "██╔████╔██║██║   ██║",
+        "██║╚██╔╝██║██║   ██║",
+        "██║ ╚═╝ ██║╚██████╔╝",
+        "╚═╝     ╚═╝ ╚═════╝ ",
+    ]
+}
+
+#[cfg(test)]
+fn startup_logo_frames() -> Vec<String> {
+    let lines = startup_logo_lines();
+    (0..lines.len())
+        .map(|end| lines[..=end].join("\n"))
+        .collect()
+}
+
+fn print_startup_logo() {
     use std::io::Write;
     use std::time::Duration;
 
-    // Skip animation when not a terminal (piped, CI, etc.)
-    if crossterm::terminal::size().is_err() {
-        return;
-    }
-    // Also skip if NO_COLOR or CI is set
-    if std::env::var("NO_COLOR").is_ok() || std::env::var("CI").is_ok() {
-        return;
-    }
+    let logo_lines = startup_logo_lines();
+    let animated = crossterm::terminal::size().is_ok()
+        && std::env::var("NO_COLOR").is_err()
+        && std::env::var("CI").is_err();
 
-    let frames = [
-        "    ╱╲    ",
-        "   ╱╲╱╲   ",
-        "  ╱╲╱╲╱╲  ",
-        " ╱╲  MO ╲╱╲",
-    ];
-    let delay = Duration::from_millis(60);
-
-    for frame in &frames {
-        eprint!("\r{}", frame.cyan().bold());
-        let _ = std::io::stderr().flush();
-        std::thread::sleep(delay);
+    if animated {
+        let delay = Duration::from_millis(28);
+        for line in logo_lines {
+            eprintln!("  {}", line.cyan().bold());
+            let _ = std::io::stderr().flush();
+            std::thread::sleep(delay);
+        }
+        eprintln!("  {}", "agent runtime".cyan().dim());
+        std::thread::sleep(Duration::from_millis(70));
+    } else {
+        for line in logo_lines {
+            eprintln!("  {}", line.cyan().bold());
+        }
+        eprintln!("  {}", "agent runtime".cyan().dim());
     }
-    // Hold briefly, then clear the animation line
-    std::thread::sleep(Duration::from_millis(120));
-    eprint!("\r{}\r", " ".repeat(20));
-    let _ = std::io::stderr().flush();
+    eprintln!();
 }
 
 pub(super) fn current_access_token(profile: Option<&str>) -> Option<String> {
@@ -778,8 +793,7 @@ mod tests {
     #[test]
     fn session_display_shows_new_for_none() {
         let state = ReplState::default();
-        assert!(state.session_id.is_none());
-        // Would display "new" in banner
+        assert_eq!(banner_session_display(&state), "new");
     }
 
     #[test]
@@ -787,9 +801,7 @@ mod tests {
         let mut state = ReplState::default();
         state.session_id = Some("abcdef12-3456-7890".to_string());
         state.turn = 0;
-        // Banner should show "abcdef12" (truncated to 8 chars) without "(resumed)"
-        let short = &state.session_id.as_ref().unwrap()[..8];
-        assert_eq!(short, "abcdef12");
+        assert_eq!(banner_session_display(&state), "abcdef12");
     }
 
     #[test]
@@ -797,8 +809,7 @@ mod tests {
         let mut state = ReplState::default();
         state.session_id = Some("abcdef12-3456-7890".to_string());
         state.turn = 3; // Has prior turns → resumed
-        // Banner should show "abcdef12 (resumed)"
-        assert!(state.turn > 0);
+        assert_eq!(banner_session_display(&state), "abcdef12 (resumed)");
     }
 
     #[test]
@@ -814,5 +825,26 @@ mod tests {
         state.model = Some("gpt-5".to_string());
         let display = state.model.as_deref().unwrap_or("auto");
         assert_eq!(display, "gpt-5");
+    }
+
+    #[test]
+    fn startup_logo_has_multiple_lines_and_brand_shape() {
+        let lines = startup_logo_lines();
+        assert!(lines.len() >= 5);
+        assert!(lines.iter().all(|line| !line.trim().is_empty()));
+        assert!(lines[0].contains("███"));
+        assert!(lines.iter().any(|line| line.contains("╚═════╝")));
+    }
+
+    #[test]
+    fn startup_logo_frames_progressively_reveal_logo() {
+        let lines = startup_logo_lines();
+        let frames = startup_logo_frames();
+        assert_eq!(frames.len(), lines.len());
+        assert_eq!(frames[0], lines[0]);
+        assert_eq!(frames.last().unwrap(), &lines.join("\n"));
+        for (idx, frame) in frames.iter().enumerate() {
+            assert_eq!(frame.lines().count(), idx + 1);
+        }
     }
 }
