@@ -277,11 +277,18 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
         selected = rows.len() - 1;
     }
     let norm = filter.map(|q| q.to_string());
-    if let Ok(state) = slash_overlay_state().lock()
-        && state.0 == norm
-        && state.1 == selected
-    {
-        return;
+    // Only use cache when overlay is already visible — first render must always go through.
+    let already_visible = slash_overlay_lines()
+        .lock()
+        .map(|g| *g > 0)
+        .unwrap_or(false);
+    if already_visible {
+        if let Ok(state) = slash_overlay_state().lock()
+            && state.0 == norm
+            && state.1 == selected
+        {
+            return;
+        }
     }
 
     // Erase previous overlay (but preserve selected index across redraw)
@@ -584,10 +591,17 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
             // If the line already matches the selected command (user navigated),
             // just clear and accept. Otherwise replace the line — the user will
             // see the full command and press Enter once more to confirm.
+            // Special case: bare "/" should dispatch as the "/" command (show list),
+            // not auto-select the first picker item.
             RlKeyEvent(RlKeyCode::Enter, _) if active => {
+                let current = ctx.line();
+                if current == "/" {
+                    // Let the normal command dispatch handle "/" → print command list
+                    clear_slash_overlay();
+                    return None;
+                }
                 let rows = picker_rows_for_filter();
                 let selected = get_slash_picker_selected();
-                let current = ctx.line();
                 clear_slash_overlay();
                 if let Some((cmd, _)) = rows.get(selected)
                     && *cmd != current
@@ -928,5 +942,80 @@ mod tests {
         let result = resolve_slash_command("/tool");
         assert!(result.is_ok(), "got: {result:?}");
         assert_eq!(result.unwrap(), "/tools");
+    }
+
+    // ── Bug fix: "/" resolves as exact command, not ambiguous ──────────────
+
+    #[test]
+    fn bare_slash_resolves_to_slash_command() {
+        // "/" is an exact match in SLASH_COMMANDS, should never be ambiguous
+        let result = resolve_slash_command("/");
+        assert!(result.is_ok(), "bare '/' should resolve exactly, got: {result:?}");
+        assert_eq!(result.unwrap(), "/");
+    }
+
+    // ── Bug fix: filtered_slash_rows excludes "/" and aliases from picker ──
+
+    #[test]
+    fn filtered_rows_exclude_slash_and_aliases() {
+        let rows = filtered_slash_rows(None);
+        for (cmd, _) in &rows {
+            assert_ne!(*cmd, "/", "picker should not list bare /");
+            assert_ne!(*cmd, "/?", "picker should not list /?");
+            assert_ne!(*cmd, "/commands", "picker should not list /commands");
+            assert_ne!(*cmd, "/quit", "picker should not list /quit");
+        }
+        // But real commands like /copy, /clear should be present
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/copy"));
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/clear"));
+    }
+
+    #[test]
+    fn filtered_rows_first_item_is_not_slash() {
+        let rows = filtered_slash_rows(None);
+        assert!(!rows.is_empty());
+        assert_ne!(rows[0].0, "/", "first picker item should not be '/'");
+    }
+
+    // ── Bug fix: picker cycling wraps around ──────────────────────────────
+
+    #[test]
+    fn picker_cycling_wraps_around() {
+        // This test verifies rem_euclid cycling logic.
+        // All checks run sequentially because they share global picker state.
+        set_slash_picker_selected(0);
+        set_slash_filter(None);
+        let rows = picker_rows_for_filter();
+        let total = rows.len();
+        assert!(total > 2, "need multiple rows for cycling test");
+
+        // Forward wrap: navigate to last, then Down → should return first item
+        set_slash_picker_selected(total - 1);
+        let cmd = move_picker_selection(1);
+        assert!(cmd.is_some());
+        assert_eq!(cmd.unwrap(), rows[0].0, "Down from last should wrap to first");
+        assert_eq!(get_slash_picker_selected(), 0);
+
+        // Backward wrap: at first, Up → should return last item
+        set_slash_picker_selected(0);
+        let cmd = move_picker_selection(-1);
+        assert!(cmd.is_some());
+        assert_eq!(
+            cmd.unwrap(),
+            rows[total - 1].0,
+            "Up from first should wrap to last"
+        );
+        assert_eq!(get_slash_picker_selected(), total - 1);
+
+        // Full loop: navigate forward through ALL items → back to start
+        set_slash_picker_selected(0);
+        for _ in 0..total {
+            move_picker_selection(1);
+        }
+        assert_eq!(
+            get_slash_picker_selected(),
+            0,
+            "full loop should return to start"
+        );
     }
 }

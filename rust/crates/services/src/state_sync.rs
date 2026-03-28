@@ -232,28 +232,50 @@ impl StateSyncService for MatrixOneSyncService {
         let snapshot_id = uuid::Uuid::new_v4().to_string();
         let has_cal = if has_calibration { 1i32 } else { 0 };
 
-        // UPSERT: insert or update existing (user_id, profile_name) pair
-        let result = sqlx::query(
-            "INSERT INTO learning_snapshots \
-             (snapshot_id, user_id, profile_name, snapshot_json, entity_count, pattern_count, has_calibration, version, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW()) \
-             ON DUPLICATE KEY UPDATE \
-                snapshot_json = VALUES(snapshot_json), \
-                entity_count = VALUES(entity_count), \
-                pattern_count = VALUES(pattern_count), \
-                has_calibration = VALUES(has_calibration), \
+        // Two-step UPSERT: UPDATE existing row, then INSERT if no row existed.
+        // MatrixOne may not support ON DUPLICATE KEY UPDATE on UNIQUE keys,
+        // so we use an explicit UPDATE-then-INSERT pattern.
+        let updated = sqlx::query(
+            "UPDATE learning_snapshots SET \
+                snapshot_json = ?, \
+                entity_count = ?, \
+                pattern_count = ?, \
+                has_calibration = ?, \
                 version = version + 1, \
-                updated_at = NOW()",
+                updated_at = NOW() \
+             WHERE user_id = ? AND profile_name = ?",
         )
-        .bind(&snapshot_id)
-        .bind(user_id)
-        .bind(profile)
         .bind(snapshot_json)
         .bind(entity_count as i64)
         .bind(pattern_count as i64)
         .bind(has_cal)
+        .bind(user_id)
+        .bind(profile)
         .execute(&self.pool)
         .await;
+
+        let result = match updated {
+            Ok(r) if r.rows_affected() > 0 => Ok(r),
+            Ok(_) => {
+                // No existing row — insert fresh
+                sqlx::query(
+                    "INSERT INTO learning_snapshots \
+                     (snapshot_id, user_id, profile_name, snapshot_json, entity_count, \
+                      pattern_count, has_calibration, version, created_at, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())",
+                )
+                .bind(&snapshot_id)
+                .bind(user_id)
+                .bind(profile)
+                .bind(snapshot_json)
+                .bind(entity_count as i64)
+                .bind(pattern_count as i64)
+                .bind(has_cal)
+                .execute(&self.pool)
+                .await
+            }
+            Err(e) => Err(e),
+        };
 
         match result {
             Ok(_) => {
