@@ -233,6 +233,43 @@ fn picker_rows_for_filter() -> Vec<(&'static str, &'static str)> {
     filtered_slash_rows(q_ref)
 }
 
+fn picker_selected_command() -> Option<&'static str> {
+    let rows = picker_rows_for_filter();
+    let selected = get_slash_picker_selected();
+    rows.get(selected)
+        .map(|(cmd, _)| *cmd)
+        .or_else(|| match resolve_slash_command(&format!("/{}", get_slash_filter()?)) {
+            Ok(cmd) => Some(cmd),
+            Err(_) => None,
+        })
+}
+
+fn accepted_slash_line(
+    current: &str,
+    selected: Option<&'static str>,
+    append_space: bool,
+) -> Option<String> {
+    if current == "/" {
+        return None;
+    }
+
+    let cmd = selected.or_else(|| match resolve_slash_command(current) {
+        Ok(cmd) => Some(cmd),
+        Err(_) => None,
+    })?;
+
+    let mut accepted = cmd.to_string();
+    if append_space {
+        accepted.push(' ');
+    }
+
+    if accepted == current {
+        None
+    } else {
+        Some(accepted)
+    }
+}
+
 /// Move selection and return the newly selected command name.
 fn move_picker_selection(delta: isize) -> Option<&'static str> {
     let rows = picker_rows_for_filter();
@@ -581,6 +618,18 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
         }
 
         match key {
+            RlKeyEvent(RlKeyCode::Char(' '), _)
+                if in_slash && active && ctx.pos() == ctx.line().len() =>
+            {
+                let current = ctx.line();
+                let selected = picker_selected_command();
+                clear_slash_overlay();
+                if let Some(line) = accepted_slash_line(current, selected, true) {
+                    return Some(RlCmd::Replace(RlMovement::WholeLine, Some(line)));
+                }
+                return None;
+            }
+
             // ── Typing: project next char and update filter ─────────────
             RlKeyEvent(RlKeyCode::Char(c), mods)
                 if !mods.contains(RlModifiers::CTRL) && !mods.contains(RlModifiers::ALT) =>
@@ -639,6 +688,15 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 if in_slash && active && m.contains(RlModifiers::CTRL) =>
             {
                 nav!(-1);
+            }
+            RlKeyEvent(RlKeyCode::Right, _) if in_slash && active && ctx.pos() == ctx.line().len() => {
+                let current = ctx.line();
+                let selected = picker_selected_command();
+                clear_slash_overlay();
+                if let Some(line) = accepted_slash_line(current, selected, false) {
+                    return Some(RlCmd::Replace(RlMovement::WholeLine, Some(line)));
+                }
+                return None;
             }
 
             // ── Accept: Enter with picker selects the highlighted command ─────
@@ -1091,6 +1149,30 @@ mod tests {
         let result = resolve_slash_command("/key");
         assert!(result.is_ok(), "got: {result:?}");
         assert_eq!(result.unwrap(), "/keys");
+    }
+
+    #[test]
+    fn accepted_slash_line_right_arrow_completes_current_candidate() {
+        assert_eq!(
+            accepted_slash_line("/exp", Some("/explain"), false),
+            Some("/explain".to_string())
+        );
+    }
+
+    #[test]
+    fn accepted_slash_line_space_appends_after_completion() {
+        assert_eq!(
+            accepted_slash_line("/exp", Some("/explain"), true),
+            Some("/explain ".to_string())
+        );
+    }
+
+    #[test]
+    fn accepted_slash_line_space_appends_for_exact_command() {
+        assert_eq!(
+            accepted_slash_line("/explain", Some("/explain"), true),
+            Some("/explain ".to_string())
+        );
     }
 
     // ── Multi-line validator ──────────────────────────────────────────────
