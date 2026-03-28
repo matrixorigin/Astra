@@ -1255,6 +1255,43 @@ mod tests {
         assert!(result.contains("reflect_requires_session"), "got: {result}");
     }
 
+    // ── truncate_output ─────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_output_ascii_no_change() {
+        let input = "hello world".to_string();
+        let result = truncate_output(input.clone(), 100);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn truncate_output_ascii_truncates() {
+        let input = "hello world".to_string();
+        let result = truncate_output(input, 5);
+        assert!(result.starts_with("hello"));
+        assert!(result.contains("[truncated]"));
+    }
+
+    #[test]
+    fn truncate_output_utf8_boundary_no_panic() {
+        // 🔥 is 4 bytes, "ab🔥cd" = 2+4+2 = 8 bytes
+        let input = "ab🔥cd".to_string();
+        // Truncate at byte 3 — inside the 🔥 (bytes 2..5)
+        let result = truncate_output(input, 3);
+        // Should truncate at char boundary (byte 2, before 🔥)
+        assert!(result.starts_with("ab"), "got: {result}");
+        assert!(result.contains("[truncated]"));
+    }
+
+    #[test]
+    fn truncate_output_cjk_boundary_no_panic() {
+        // Chinese chars are 3 bytes each
+        let input = "你好世界".to_string(); // 12 bytes
+        let result = truncate_output(input, 7); // Between 2nd and 3rd char
+        assert!(result.contains("[truncated]"));
+        // Should not panic — regression for char boundary issue
+    }
+
     // ── fs tools ──────────────────────────────────────────────────────────────
 
     #[test]

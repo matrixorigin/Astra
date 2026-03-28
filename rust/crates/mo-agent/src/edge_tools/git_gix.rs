@@ -1978,4 +1978,124 @@ mod tests {
         let short = head_short(Path::new("/nonexistent/repo"));
         assert!(short.is_empty());
     }
+
+    // ─── Robustness regression tests ────────────────────────────────────────
+
+    #[test]
+    fn git_diff_staged_detects_no_staged() {
+        // In a clean repo, staged diff should say "No staged changes"
+        let root = repo_root();
+        let result = git_diff(&root, &json!({"staged": true}));
+        // Either "No staged changes" or actual staged content — no panic/error
+        assert!(
+            result.contains("staged") || result.contains("diff --git"),
+            "should handle staged query: {result}"
+        );
+    }
+
+    #[test]
+    fn git_log_n_capped_at_500() {
+        // Even with n=99999, should not produce huge output
+        let root = repo_root();
+        let result = git_log(&root, &json!({"n": 99999}));
+        let line_count = result.lines().count();
+        assert!(
+            line_count <= 501,
+            "n should be capped at 500: got {line_count} lines"
+        );
+    }
+
+    #[test]
+    fn git_log_output_truncated() {
+        // git_log should apply truncation
+        let root = repo_root();
+        let result = git_log(&root, &json!({"n": 500}));
+        // Just verify it doesn't panic and produces output
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn git_file_history_nonexistent_file_bounded() {
+        // For a nonexistent file, the walk should be bounded (not traverse all history)
+        let root = repo_root();
+        let start = std::time::Instant::now();
+        let result = git_file_history(&root, &json!({"file": "this/does/not/exist.xyz"}));
+        let elapsed = start.elapsed();
+        assert!(
+            result.contains("No history"),
+            "should say no history: {result}"
+        );
+        // Walk cap should prevent this from taking too long (50K cap)
+        // In a typical dev repo this should be well under 5 seconds
+        assert!(
+            elapsed.as_secs() < 30,
+            "walk should be bounded, took: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn git_contributors_bounded_walk() {
+        // Even without path filter, walk should complete in bounded time
+        let root = repo_root();
+        let start = std::time::Instant::now();
+        let result = git_contributors(&root, &json!({}));
+        let elapsed = start.elapsed();
+        assert!(
+            !result.contains("Error: cannot open"),
+            "should open repo: {result}"
+        );
+        assert!(
+            elapsed.as_secs() < 30,
+            "walk should be bounded, took: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn git_contributors_path_filter_bounded() {
+        // Path filter with nonexistent file should still be bounded
+        let root = repo_root();
+        let start = std::time::Instant::now();
+        let _result = git_contributors(
+            &root,
+            &json!({"path": "nonexistent/deeply/nested/file.xyz"}),
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_secs() < 30,
+            "path-filtered walk should be bounded, took: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn git_show_root_commit_lists_files() {
+        // Find the root commit and verify it lists actual file paths
+        let root = repo_root();
+        let repo = gix::discover(&root).unwrap();
+        // Walk to find root commit (no parents)
+        let head = repo.head_id().unwrap();
+        let mut root_oid = None;
+        if let Ok(walk) = head.ancestors().all() {
+            for info in walk.flatten() {
+                if let Ok(c) = info.object() {
+                    if c.parent_ids().count() == 0 {
+                        root_oid = Some(info.id.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(oid) = root_oid {
+            let result = git_show(&root, &json!({"commit": oid}));
+            assert!(
+                result.contains("[root commit]"),
+                "should mark as root: {result}"
+            );
+            // Should list files with full paths, not just top-level dirs
+            // (regression: previously only listed directory names)
+            assert!(
+                result.contains('/') || result.lines().filter(|l| l.starts_with("A ")).count() > 0,
+                "root commit should list files: {result}"
+            );
+        }
+    }
 }
