@@ -1292,6 +1292,9 @@ fn parse_since_to_epoch(since: &str) -> Option<i64> {
             let y: i64 = parts[0].parse().ok()?;
             let m: i64 = parts[1].parse().ok()?;
             let d: i64 = parts[2].parse().ok()?;
+            if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+                return None;
+            }
             // Rough epoch calculation (not leap-second accurate, good enough for filtering)
             let days_since_epoch = (y - 1970) * 365 + (y - 1969) / 4 - (y - 1901) / 100
                 + (y - 1601) / 400
@@ -1850,6 +1853,16 @@ mod tests {
     fn parse_since_invalid() {
         assert!(parse_since_to_epoch("not a date").is_none());
         assert!(parse_since_to_epoch("").is_none());
+    }
+
+    #[test]
+    fn parse_since_invalid_month_day() {
+        // Month 0 and 13 must not panic (was an array OOB bug)
+        assert!(parse_since_to_epoch("2024-00-15").is_none());
+        assert!(parse_since_to_epoch("2024-13-01").is_none());
+        // Day 0 and 32
+        assert!(parse_since_to_epoch("2024-01-00").is_none());
+        assert!(parse_since_to_epoch("2024-01-32").is_none());
     }
 
     // ─── current_branch / head_short tests ──────────────────────────────────
