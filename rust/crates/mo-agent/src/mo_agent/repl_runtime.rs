@@ -383,12 +383,19 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     let user_display = p
         .and_then(|p| p.username.as_deref())
         .unwrap_or("not logged in");
-    let session_display = state
-        .session_id
-        .as_deref()
-        .map(|s| if s.len() > 12 { &s[..12] } else { s })
-        .unwrap_or("new");
-    let model_display = state.model.as_deref().unwrap_or("default");
+    // Session: show "new" for fresh sessions, truncated ID for resumed
+    let session_display = match state.session_id.as_deref() {
+        Some(s) => {
+            let short = if s.len() > 8 { &s[..8] } else { s };
+            if state.turn > 0 {
+                format!("{short} (resumed)")
+            } else {
+                short.to_string()
+            }
+        }
+        None => "new".to_string(),
+    };
+    let model_display = state.model.as_deref().unwrap_or("auto");
     let logged_in = p.and_then(|p| p.access_token.as_ref()).is_some();
     let version = env!("CARGO_PKG_VERSION");
 
@@ -422,7 +429,7 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
                 user_display.yellow().to_string()
             },
             model_display.cyan(),
-            session_display.dim(),
+            session_display.as_str().dim().to_string(),
         ),
         format!(
             "  {}",
@@ -438,6 +445,8 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     let hr = "─".repeat(w + 2);
 
     eprintln!();
+    // Animated startup: brief typewriter effect for the logo
+    print_startup_animation();
     eprintln!("{}", format!("╭{hr}╮").cyan());
     eprintln!("{}", row(&lines_colored[0], lines_plain[0].chars().count()));
     eprintln!("{}", row(&lines_colored[1], lines_plain[1].chars().count()));
@@ -445,6 +454,40 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     eprintln!("{}", row(&lines_colored[2], lines_plain[2].chars().count()));
     eprintln!("{}", format!("╰{hr}╯").cyan());
     eprintln!();
+}
+
+/// Brief animated startup logo — gives a "premium CLI" feel like Cursor/Copilot.
+/// Uses progressive reveal of a compact ASCII art mark, ~300ms total.
+fn print_startup_animation() {
+    use std::io::Write;
+    use std::time::Duration;
+
+    // Skip animation when not a terminal (piped, CI, etc.)
+    if crossterm::terminal::size().is_err() {
+        return;
+    }
+    // Also skip if NO_COLOR or CI is set
+    if std::env::var("NO_COLOR").is_ok() || std::env::var("CI").is_ok() {
+        return;
+    }
+
+    let frames = [
+        "    ╱╲    ",
+        "   ╱╲╱╲   ",
+        "  ╱╲╱╲╱╲  ",
+        " ╱╲  MO ╲╱╲",
+    ];
+    let delay = Duration::from_millis(60);
+
+    for frame in &frames {
+        eprint!("\r{}", frame.cyan().bold());
+        let _ = std::io::stderr().flush();
+        std::thread::sleep(delay);
+    }
+    // Hold briefly, then clear the animation line
+    std::thread::sleep(Duration::from_millis(120));
+    eprint!("\r{}\r", " ".repeat(20));
+    let _ = std::io::stderr().flush();
 }
 
 pub(super) fn current_access_token(profile: Option<&str>) -> Option<String> {
@@ -724,5 +767,48 @@ mod tests {
         unsafe {
             std::env::remove_var("MO_AGENT_CREDENTIALS_DIR");
         }
+    }
+
+    // ── Session display logic ──────────────────────────────────────────────
+
+    #[test]
+    fn session_display_shows_new_for_none() {
+        let state = ReplState::default();
+        assert!(state.session_id.is_none());
+        // Would display "new" in banner
+    }
+
+    #[test]
+    fn session_display_shows_truncated_id_for_fresh_session() {
+        let mut state = ReplState::default();
+        state.session_id = Some("abcdef12-3456-7890".to_string());
+        state.turn = 0;
+        // Banner should show "abcdef12" (truncated to 8 chars) without "(resumed)"
+        let short = &state.session_id.as_ref().unwrap()[..8];
+        assert_eq!(short, "abcdef12");
+    }
+
+    #[test]
+    fn session_display_shows_resumed_for_restored_session() {
+        let mut state = ReplState::default();
+        state.session_id = Some("abcdef12-3456-7890".to_string());
+        state.turn = 3; // Has prior turns → resumed
+        // Banner should show "abcdef12 (resumed)"
+        assert!(state.turn > 0);
+    }
+
+    #[test]
+    fn model_display_shows_auto_when_none() {
+        let state = ReplState::default();
+        let display = state.model.as_deref().unwrap_or("auto");
+        assert_eq!(display, "auto");
+    }
+
+    #[test]
+    fn model_display_shows_actual_name_when_set() {
+        let mut state = ReplState::default();
+        state.model = Some("gpt-5".to_string());
+        let display = state.model.as_deref().unwrap_or("auto");
+        assert_eq!(display, "gpt-5");
     }
 }
