@@ -3758,4 +3758,66 @@ total_tokens_out: 500
         .unwrap();
         assert!(!exit);
     }
+
+    // ── Cloud sync regression tests (block_on panic fix cc6d011) ────
+    // These tests verify the async cloud sync functions don't panic when
+    // called from within a tokio runtime (the original bug was block_on
+    // inside an existing runtime). We unset MATRIXONE_HOST so they take
+    // the graceful-fallback path.
+
+    #[tokio::test]
+    async fn try_connect_matrixone_returns_none_without_env_vars() {
+        // Safety: test-only, single-threaded tokio runtime
+        unsafe { std::env::remove_var("MATRIXONE_HOST"); }
+        let pool = try_connect_matrixone().await;
+        assert!(pool.is_none(), "Without MATRIXONE_HOST, pool should be None");
+    }
+
+    #[tokio::test]
+    async fn try_cloud_pull_returns_empty_without_matrixone() {
+        unsafe { std::env::remove_var("MATRIXONE_HOST"); }
+        let eg = std::sync::Arc::new(std::sync::Mutex::new(
+            mo_agent_runtime::pipeline::entity::EntityGraph::new(),
+        ));
+        let pl = std::sync::Arc::new(std::sync::Mutex::new(
+            mo_agent_runtime::pipeline::pattern::PatternLibrary::new(),
+        ));
+        let cal = std::sync::Arc::new(std::sync::Mutex::new(
+            mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator::new(0.15),
+        ));
+        let health = try_cloud_pull("default", &eg, &pl, &cal).await;
+        assert!(health.is_empty(), "Without MatrixOne, cloud pull should return empty");
+    }
+
+    #[tokio::test]
+    async fn try_cloud_push_is_noop_without_matrixone() {
+        unsafe { std::env::remove_var("MATRIXONE_HOST"); }
+        let eg = std::sync::Arc::new(std::sync::Mutex::new(
+            mo_agent_runtime::pipeline::entity::EntityGraph::new(),
+        ));
+        let pl = std::sync::Arc::new(std::sync::Mutex::new(
+            mo_agent_runtime::pipeline::pattern::PatternLibrary::new(),
+        ));
+        let cal = std::sync::Arc::new(std::sync::Mutex::new(
+            mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator::new(0.15),
+        ));
+        // Should not panic (was the original bug)
+        try_cloud_push("default", &eg, &pl, &cal, &[]).await;
+    }
+
+    #[tokio::test]
+    async fn try_cloud_pull_preferences_is_noop_without_matrixone() {
+        unsafe { std::env::remove_var("MATRIXONE_HOST"); }
+        let mut state = ReplState::default();
+        // Should not panic (was the original bug)
+        try_cloud_pull_preferences(&mut state).await;
+    }
+
+    #[tokio::test]
+    async fn try_cloud_push_preferences_is_noop_without_matrixone() {
+        unsafe { std::env::remove_var("MATRIXONE_HOST"); }
+        let state = ReplState::default();
+        // Should not panic (was the original bug)
+        try_cloud_push_preferences(&state).await;
+    }
 }

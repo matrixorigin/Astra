@@ -157,7 +157,17 @@ pub fn list_checkpoints(session_id: &str) -> std::io::Result<Vec<(u32, Checkpoin
 
     let mut result = Vec::new();
     for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                mo_agent_core::agent_warn!(
+                    "checkpoint",
+                    "Failed to read dir entry during list: {}",
+                    err
+                );
+                continue;
+            }
+        };
         let name = entry.file_name().to_string_lossy().to_string();
         if let Some(rest) = name.strip_suffix(".json") {
             if let Some((num_str, tier_str)) = rest.split_once('-') {
@@ -205,7 +215,14 @@ fn prune_light_checkpoints(dir: &Path) -> std::io::Result<()> {
     light_files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
     let to_remove = light_files.len() - MAX_LIGHT_CHECKPOINTS;
     for entry in light_files.into_iter().take(to_remove) {
-        let _ = std::fs::remove_file(entry.path());
+        if let Err(err) = std::fs::remove_file(entry.path()) {
+            mo_agent_core::agent_warn!(
+                "checkpoint",
+                "Failed to prune light checkpoint {:?}: {}",
+                entry.file_name(),
+                err
+            );
+        }
     }
 
     Ok(())
@@ -302,7 +319,14 @@ impl FileBackedEventStore {
 
 impl StepEventStore for FileBackedEventStore {
     fn append(&mut self, event: StepEvent) {
-        let _ = self.persist_event(&event); // best-effort write
+        if let Err(err) = self.persist_event(&event) {
+            mo_agent_core::agent_warn!(
+                "event_store",
+                "Failed to persist step event {}: {}",
+                event.event_id,
+                err
+            );
+        }
         self.events.push(event);
     }
 
@@ -695,5 +719,103 @@ mod tests {
         let store = FileBackedEventStore::new("nonexistent-event-session-xyz");
         assert_eq!(store.event_count(), 0);
         assert!(store.all_events().is_empty());
+    }
+
+    // ── Corruption robustness tests (regression for silent IO fix) ──────
+
+    #[test]
+    fn read_heavy_skips_corrupted_json_files() {
+        let session_id = format!("test-corrupt-heavy-{}", std::process::id());
+        let dir = checkpoint_dir_for(&session_id);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write a valid heavy checkpoint
+        let heavy = make_heavy("step-ok", vec![json!({"role": "user", "content": "hello"})]);
+        let cp = StepCheckpoint::Heavy(Box::new(heavy));
+        let json_str = serde_json::to_string(&cp).unwrap();
+        std::fs::write(dir.join("000002-heavy.json"), &json_str).unwrap();
+
+        // Write a corrupted heavy checkpoint with a higher number
+        std::fs::write(dir.join("000003-heavy.json"), "NOT VALID JSON{{{").unwrap();
+
+        // read_latest_heavy should attempt 000003 first (highest), fail to parse,
+        // and return an InvalidData error — the corruption is not silently swallowed.
+        let result = read_latest_heavy_checkpoint(&session_id);
+        assert!(result.is_err(), "Corrupted checkpoint JSON should return error");
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn read_light_skips_corrupted_json_files() {
+        let session_id = format!("test-corrupt-light-{}", std::process::id());
+        let dir = checkpoint_dir_for(&session_id);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write a valid light checkpoint
+        let light = make_light("step-ok", 0.5);
+        let cp = StepCheckpoint::Light(light);
+        let json_str = serde_json::to_string(&cp).unwrap();
+        std::fs::write(dir.join("000001-light.json"), &json_str).unwrap();
+
+        // Write a corrupted light checkpoint with higher number
+        std::fs::write(dir.join("000002-light.json"), "GARBAGE").unwrap();
+
+        // read_latest_light tries 000002 first → error
+        let result = read_latest_light_checkpoint(&session_id);
+        assert!(result.is_err(), "Corrupted light checkpoint should return error");
+
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn file_event_store_skips_malformed_jsonl_lines() {
+        let session_id = format!("test-malformed-jsonl-{}", std::process::id());
+        let dir = session_dir_for(&session_id);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write a JSONL file with some valid and some malformed lines
+        let valid_event = make_event("e1", "s1", StepEventType::StepCreated);
+        let valid_json = serde_json::to_string(&valid_event).unwrap();
+
+        let content = format!(
+            "{}\nNOT VALID JSON\n{{\n{}\n",
+            valid_json, valid_json,
+        );
+        std::fs::write(events_path_for(&session_id), &content).unwrap();
+
+        // Load should skip malformed lines, keep valid ones
+        let store = FileBackedEventStore::new(&session_id);
+        assert_eq!(store.event_count(), 2, "Should load 2 valid events, skip 2 malformed lines");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dir_entry_errors_do_not_crash_read_heavy() {
+        // Regression: filter_map(|e| e.ok()) was silent. Now logs warnings.
+        // This test verifies the function still works when dir entries are fine.
+        let session_id = format!("test-dir-ok-{}", std::process::id());
+        let dir = checkpoint_dir_for(&session_id);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write a valid checkpoint
+        let heavy = make_heavy("step-1", vec![]);
+        let cp = StepCheckpoint::Heavy(Box::new(heavy));
+        let json_str = serde_json::to_string(&cp).unwrap();
+        std::fs::write(dir.join("000001-heavy.json"), &json_str).unwrap();
+
+        let result = read_latest_heavy_checkpoint(&session_id);
+        assert!(result.is_ok());
+        let cp = result.unwrap();
+        assert!(cp.is_some());
+        assert_eq!(cp.unwrap().light.step_id, "step-1");
+
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 }
