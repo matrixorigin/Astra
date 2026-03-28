@@ -23,6 +23,36 @@ fn open_repo(project_root: &Path) -> Result<gix::Repository, String> {
     gix::discover(project_root).map_err(|e| format!("Error: cannot open git repo: {e}"))
 }
 
+/// Return the current branch name (like `git branch --show-current`).
+pub(crate) fn current_branch(project_root: &Path) -> String {
+    let repo = match open_repo(project_root) {
+        Ok(r) => r,
+        Err(_) => return String::new(),
+    };
+    match repo.head_ref() {
+        Ok(Some(reference)) => {
+            let name = reference.name().shorten().to_string();
+            name
+        }
+        _ => String::new(),
+    }
+}
+
+/// Return the short HEAD commit hash (like `git rev-parse --short HEAD`).
+pub(crate) fn head_short(project_root: &Path) -> String {
+    let repo = match open_repo(project_root) {
+        Ok(r) => r,
+        Err(_) => return String::new(),
+    };
+    match repo.head_id() {
+        Ok(id) => {
+            let hex = id.to_string();
+            hex[..hex.len().min(7)].to_string()
+        }
+        Err(_) => String::new(),
+    }
+}
+
 /// Format author time as YYYY-MM-DD from a SignatureRef.
 fn format_author_date(sig: &gix::actor::SignatureRef<'_>) -> String {
     sig.time()
@@ -1820,5 +1850,43 @@ mod tests {
     fn parse_since_invalid() {
         assert!(parse_since_to_epoch("not a date").is_none());
         assert!(parse_since_to_epoch("").is_none());
+    }
+
+    // ─── current_branch / head_short tests ──────────────────────────────────
+
+    #[test]
+    fn current_branch_returns_nonempty_in_repo() {
+        let root = repo_root();
+        let branch = current_branch(&root);
+        // In a git repo we should get a branch name (or empty if detached HEAD)
+        // Just verify no panic and reasonable output
+        assert!(
+            !branch.contains("Error"),
+            "should not error: {branch}"
+        );
+    }
+
+    #[test]
+    fn head_short_returns_hex() {
+        let root = repo_root();
+        let short = head_short(&root);
+        assert!(!short.is_empty(), "should return a short hash");
+        assert!(short.len() <= 7, "should be at most 7 chars: {short}");
+        assert!(
+            short.chars().all(|c| c.is_ascii_hexdigit()),
+            "should be hex: {short}"
+        );
+    }
+
+    #[test]
+    fn current_branch_bad_path_returns_empty() {
+        let branch = current_branch(Path::new("/nonexistent/repo"));
+        assert!(branch.is_empty());
+    }
+
+    #[test]
+    fn head_short_bad_path_returns_empty() {
+        let short = head_short(Path::new("/nonexistent/repo"));
+        assert!(short.is_empty());
     }
 }

@@ -248,9 +248,9 @@ impl ToolExecutor {
                 let mut result = String::new();
 
                 // Current git branch
-                let git_branch = self.git_run(&["branch", "--show-current"]);
-                if !git_branch.trim().is_empty() {
-                    result.push_str(&format!("## Current Git Branch: {}\n\n", git_branch.trim()));
+                let git_branch = super::git_gix::current_branch(&self.project_root);
+                if !git_branch.is_empty() {
+                    result.push_str(&format!("## Current Git Branch: {}\n\n", git_branch));
                 }
 
                 // MatrixOne snapshots (serve as data branches)
@@ -271,8 +271,7 @@ impl ToolExecutor {
                     }
                     None => {
                         // Auto-generate name from git branch
-                        let git_branch = self.git_run(&["branch", "--show-current"]);
-                        let branch = git_branch.trim();
+                        let branch = super::git_gix::current_branch(&self.project_root);
                         if branch.is_empty() {
                             return "Error: missing 'name' and no git branch detected".to_string();
                         }
@@ -303,29 +302,29 @@ impl ToolExecutor {
                 // Show the relationship between git state and MO state
                 let mut result = String::from("## Git ↔ MatrixOne Sync Status\n\n");
 
-                let git_branch = self.git_run(&["branch", "--show-current"]);
-                let git_head = self.git_run(&["rev-parse", "--short", "HEAD"]);
+                let git_branch = super::git_gix::current_branch(&self.project_root);
+                let git_head = super::git_gix::head_short(&self.project_root);
                 result.push_str(&format!(
                     "Git: branch={}, head={}\n",
-                    git_branch.trim(),
-                    git_head.trim()
+                    git_branch,
+                    git_head
                 ));
 
                 let snapshots = mo_execute_sql("SHOW SNAPSHOTS", None);
                 result.push_str(&format!("MatrixOne snapshots:\n{}\n", snapshots));
 
                 // Check if there's a matching snapshot for current branch
-                let expected_name = format!("br_{}", git_branch.trim().replace(['/', '-'], "_"));
+                let expected_name = format!("br_{}", git_branch.replace(['/', '-'], "_"));
                 if snapshots.contains(&expected_name) {
                     result.push_str(&format!(
                         "\n✅ Data branch '{}' exists for git branch '{}'",
                         expected_name,
-                        git_branch.trim()
+                        git_branch
                     ));
                 } else {
                     result.push_str(&format!(
                         "\n⚠ No data branch found for git branch '{}'. Create with: mo_branch action=create",
-                        git_branch.trim()
+                        git_branch
                     ));
                 }
 

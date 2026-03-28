@@ -323,21 +323,6 @@ impl ToolExecutor {
         }
     }
 
-    pub(crate) fn git_run(&self, args: &[&str]) -> String {
-        match Command::new("git")
-            .args(args)
-            .current_dir(&self.project_root)
-            .output()
-        {
-            Ok(out) => {
-                let s = String::from_utf8_lossy(&out.stdout).to_string();
-                let e = String::from_utf8_lossy(&out.stderr).to_string();
-                if s.is_empty() && !e.is_empty() { e } else { s }
-            }
-            Err(e) => format!("Error: {e}"),
-        }
-    }
-
     /// Fetch a URL and return its content (text or HTML→text).
     pub(crate) fn web_fetch(&self, args: &Value) -> String {
         let url = match args.get("url").and_then(Value::as_str) {
