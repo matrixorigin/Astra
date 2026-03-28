@@ -608,6 +608,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     // Dynamic turn budget: each stall/divergence costs turns to prevent runaway sessions
     let max_turns = RuntimeLimits::global().max_turns;
     let mut remaining_turns: usize = max_turns;
+    // Intent drift tracker: per-turn tool names + args for drift detection
+    let mut intent_tool_turns: Vec<(Vec<String>, String)> = Vec::new();
     // Step Protocol recorder: maps implicit chat_stream phases to explicit Step events
     let mut step_recorder =
         mo_agent_runtime::pipeline::step_recorder::StepRecorder::with_persistence(
@@ -1348,6 +1350,27 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 let category = classify_error(&result_str);
                 turn_guard.errors.record_error(category);
 
+                // Resource-limit errors: immediately block the tool (the whole
+                // system is constrained — retrying only makes things worse)
+                if matches!(
+                    category,
+                    mo_agent_runtime::turn::error_recovery::ErrorCategory::ResourceLimit
+                ) {
+                    turn_guard
+                        .health
+                        .record_resource_limit_failure(&name);
+                    restricted_tools.insert(name.clone());
+                    if !quiet {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                "  ⚠ {name} blocked: system resource limit reached"
+                            )
+                            .yellow()
+                        );
+                    }
+                }
+
                 // Automatic retry for transient errors using scheduling contract
                 let mut retried_ok = false;
                 if matches!(
@@ -1517,6 +1540,40 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 "content": result_str,
             }));
             tool_results.push(tr);
+        }
+
+        // ── Intent drift detection ──
+        // Track per-turn tool names + args, detect when agent drifts from user's query
+        {
+            let turn_names: Vec<String> = turn_result
+                .tool_calls
+                .iter()
+                .filter_map(|tc| tc.get("name").and_then(|v| v.as_str()).map(String::from))
+                .collect();
+            let turn_args_text: String = turn_result
+                .tool_calls
+                .iter()
+                .filter_map(|tc| {
+                    tc.get("arguments")
+                        .map(|v| serde_json::to_string(v).unwrap_or_default())
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            intent_tool_turns.push((turn_names, turn_args_text));
+
+            if let mo_agent_runtime::turn::stall::IntentDrift::Drifting {
+                correction,
+                ..
+            } = mo_agent_runtime::turn::stall::detect_intent_drift(
+                message,
+                &intent_tool_turns,
+            ) {
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": correction
+                }));
+                stall_events.push(("intent_drift".to_string(), _turn as u32));
+            }
         }
 
         // ── TurnGuard: unified non-happy-path evaluation ──

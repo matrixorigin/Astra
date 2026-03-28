@@ -222,7 +222,7 @@ impl ToolExecutor {
             .unwrap_or(false);
 
         let mut cmd = Command::new("grep");
-        cmd.arg("-rn");
+        cmd.arg("-rnE"); // -E enables extended regex (alternation with |)
         if !case_sensitive {
             cmd.arg("-i");
         }
@@ -774,5 +774,38 @@ mod tests {
         let executor = test_executor();
         let result = executor.web_fetch(&serde_json::json!({"url": "ftp://example.com"}));
         assert!(result.contains("http"), "got: {result}");
+    }
+
+    // ── grep extended regex ──────────────────────────────────────────────────
+
+    #[test]
+    fn grep_alternation_pattern_works() {
+        // Regression test: grep must use -E for extended regex so that
+        // alternation patterns like "foo|bar" work as OR, not literal "|".
+        // Session 62c1e8e9: `grep "skill|Skill" --include "*.rs"` returned
+        // nothing because without -E, "|" is treated as literal.
+        let executor =
+            ToolExecutor::new(std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "fn|struct",
+            "include": "*.rs"
+        }));
+        // In a Rust project, "fn" and "struct" both exist — alternation should match
+        assert!(
+            !result.contains("No matches found"),
+            "Extended regex alternation should work: got: {result}"
+        );
+    }
+
+    #[test]
+    fn grep_basic_pattern_still_works() {
+        let executor =
+            ToolExecutor::new(std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "fn main",
+            "include": "*.rs"
+        }));
+        // Simple non-regex pattern should still work
+        assert!(!result.is_empty());
     }
 }

@@ -3000,12 +3000,12 @@ mod error_recovery_proofs {
         let l0 = escalation_level(0, 0, 0);
         assert_eq!(l0, EscalationLevel::Normal);
 
-        // After 3 nudges: warning
-        let l1 = escalation_level(3, 0, 0);
+        // After 2 nudges: warning (lowered from 3)
+        let l1 = escalation_level(2, 0, 0);
         assert_eq!(l1, EscalationLevel::Warning);
 
-        // After 5 nudges: critical
-        let l2 = escalation_level(5, 0, 0);
+        // After 3 nudges: critical (lowered from 5)
+        let l2 = escalation_level(3, 0, 0);
         assert_eq!(l2, EscalationLevel::Critical);
 
         // Severity only increases
@@ -8283,24 +8283,33 @@ mod turnguard_e2e_proofs {
         assert!(guard.health.get("write_file").is_some());
     }
 
-    // ── Scenario O: Force-stop requires BOTH Critical + nudge_count >= 6 ───────
+    // ── Scenario O: Force-stop requires BOTH Critical + nudge_count >= 3 ───────
     // Proves that Critical alone is not enough for force_stop.
     #[test]
     fn critical_without_enough_nudges_does_not_force_stop() {
         let mut guard = TurnGuard::new();
 
-        // Manually set escalation conditions for Critical (5 nudges)
-        // but don't go to 6 nudges
-        guard.nudge_count = 5;
+        // Manually set escalation conditions that will produce Critical (3+ nudges)
+        // but test with nudge_count=2 (below the force_stop threshold of 3)
+        guard.nudge_count = 2;
         guard
             .errors
             .record_error(mo_agent_runtime::turn::error_recovery::ErrorCategory::Unknown);
 
         let verdict = guard.evaluate();
-        assert_eq!(verdict.severity, VerdictSeverity::Critical);
+        // 2 nudges → Warning (not Critical), so force_stop should be false
         assert!(
             !verdict.force_stop,
-            "Critical with nudge_count=5 should NOT force_stop (need >= 6)"
+            "Warning severity with nudge_count=2 should NOT force_stop"
+        );
+
+        // Now at 3 nudges → Critical + force_stop
+        guard.nudge_count = 3;
+        let verdict = guard.evaluate();
+        assert_eq!(verdict.severity, VerdictSeverity::Critical);
+        assert!(
+            verdict.force_stop,
+            "Critical with nudge_count=3 SHOULD force_stop (lowered from 6)"
         );
     }
 

@@ -268,7 +268,7 @@ impl TurnGuard {
             };
         }
 
-        let force_stop = escalation == EscalationLevel::Critical && self.nudge_count >= 6;
+        let force_stop = escalation == EscalationLevel::Critical && self.nudge_count >= 3;
 
         let is_diverging = matches!(divergence, DivergenceStatus::Diverging(_));
 
@@ -570,13 +570,28 @@ mod tests {
     #[test]
     fn force_stop_requires_high_nudge_count() {
         let mut guard = TurnGuard::new();
-        guard.nudge_count = 5;
+        guard.nudge_count = 2;
         let v = guard.evaluate();
-        // 5 nudges → Critical escalation, but nudge_count < 6 → no force_stop
+        // 2 nudges → Critical escalation, but nudge_count < 3 → no force_stop
         assert!(!v.force_stop);
 
-        guard.nudge_count = 6;
+        guard.nudge_count = 3;
         let v = guard.evaluate();
         assert!(v.force_stop);
+    }
+
+    #[test]
+    fn force_stop_threshold_lowered_from_six_to_three() {
+        // Regression test: previously force_stop needed 6 nudges which was
+        // too lenient — session 62c1e8e9 had 11 stalls but never stopped.
+        // Now 3 nudges + Critical escalation triggers force_stop.
+        let mut guard = TurnGuard::new();
+        // Simulate 3 stall+nudge cycles
+        for _ in 0..3 {
+            guard.nudge_count += 1;
+        }
+        // With nudge_count=3 and Critical escalation, force_stop should fire
+        let v = guard.evaluate();
+        assert!(v.force_stop, "3 nudges + Critical should force stop");
     }
 }

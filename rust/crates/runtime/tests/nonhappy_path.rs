@@ -409,8 +409,9 @@ mod error_recovery_integration {
         let msg = build_recovery_message("github_list_prs", error, category, &[]);
         assert!(msg.contains("Alternatives"));
 
-        // Escalation after multiple issues (need >= 3 nudges or >= 5 errors for Warning)
-        let level = escalation_level(3, 3, 1);
+        // Escalation after multiple issues (3 nudges = Critical with new thresholds,
+        // use 2 nudges + 3 errors for Warning)
+        let level = escalation_level(2, 3, 1);
         assert_eq!(level, EscalationLevel::Warning);
     }
 

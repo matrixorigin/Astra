@@ -24,6 +24,9 @@ pub enum ErrorCategory {
     InvalidArgs,
     /// Tool explicitly says it's not available or unsupported.
     Unavailable,
+    /// System resource exhaustion (fork limit, OOM, disk full).
+    /// Don't retry — block the tool immediately.
+    ResourceLimit,
     /// Unknown error type — treat as permanent.
     Unknown,
 }
@@ -31,6 +34,20 @@ pub enum ErrorCategory {
 /// Classify a tool error string into an actionable category.
 pub fn classify_error(error_str: &str) -> ErrorCategory {
     let lower = error_str.to_lowercase();
+
+    // Resource limit: fork exhaustion, OOM, disk full — never retry
+    if lower.contains("resource temporarily unavailable")
+        || lower.contains("cannot allocate memory")
+        || lower.contains("out of memory")
+        || lower.contains("no space left on device")
+        || lower.contains("too many open files")
+        || lower.contains("fork:")
+        || lower.contains("enomem")
+        || lower.contains("资源暂时不足")
+        || lower.contains("系统资源")
+    {
+        return ErrorCategory::ResourceLimit;
+    }
 
     // Transient: network, timeout, rate limit, server errors
     if lower.contains("timeout")
@@ -238,6 +255,12 @@ pub fn build_recovery_message(
              Do NOT retry — use an alternative tool.",
             tool_name
         ),
+        ErrorCategory::ResourceLimit => format!(
+            "⚠ {} failed: system resource limit reached (fork/memory/disk). \
+             This tool is now BLOCKED for the rest of this session. \
+             Do NOT retry — reduce system load or try a different approach.",
+            tool_name
+        ),
         ErrorCategory::Unknown => format!("⚠ {} failed with an unclassified error.", tool_name),
     };
 
@@ -274,12 +297,14 @@ pub fn escalation_level(
     total_errors: usize,
     deprioritized_count: usize,
 ) -> EscalationLevel {
-    // Critical: 5+ nudges, or 8+ errors with deprioritized tools
-    if nudge_count >= 5 || (total_errors >= 8 && deprioritized_count >= 2) {
+    // Critical: 3+ nudges (lowered from 5: session 62c1e8e9 showed 11 stalls
+    // without force_stop because the old threshold was too lenient),
+    // or 8+ errors with deprioritized tools
+    if nudge_count >= 3 || (total_errors >= 8 && deprioritized_count >= 2) {
         return EscalationLevel::Critical;
     }
-    // Warning: 3 nudges, or 5+ errors
-    if nudge_count >= 3 || total_errors >= 5 {
+    // Warning: 2 nudges, or 5+ errors
+    if nudge_count >= 2 || total_errors >= 5 {
         return EscalationLevel::Warning;
     }
     EscalationLevel::Normal
@@ -582,15 +607,22 @@ mod tests {
 
     #[test]
     fn escalation_normal_low_nudges() {
-        // 1-2 nudges: still Normal (raised from old threshold of 1)
+        // 1 nudge: still Normal
         assert_eq!(escalation_level(1, 0, 0), EscalationLevel::Normal);
-        assert_eq!(escalation_level(2, 0, 0), EscalationLevel::Normal);
     }
 
     #[test]
-    fn escalation_warning_three_nudges() {
-        assert_eq!(escalation_level(3, 0, 0), EscalationLevel::Warning);
-        assert_eq!(escalation_level(4, 0, 0), EscalationLevel::Warning);
+    fn escalation_warning_two_nudges() {
+        // 2 nudges → Warning (lowered from 3)
+        assert_eq!(escalation_level(2, 0, 0), EscalationLevel::Warning);
+    }
+
+    #[test]
+    fn escalation_critical_three_nudges() {
+        // 3 nudges → Critical (lowered from 5: session 62c1e8e9 showed
+        // 11 stalls without triggering Critical under old threshold)
+        assert_eq!(escalation_level(3, 0, 0), EscalationLevel::Critical);
+        assert_eq!(escalation_level(4, 0, 0), EscalationLevel::Critical);
     }
 
     #[test]
@@ -606,7 +638,8 @@ mod tests {
     }
 
     #[test]
-    fn escalation_critical_five_nudges() {
+    fn escalation_critical_from_nudges() {
+        assert_eq!(escalation_level(3, 0, 0), EscalationLevel::Critical);
         assert_eq!(escalation_level(5, 0, 0), EscalationLevel::Critical);
     }
 
@@ -666,5 +699,68 @@ mod tests {
         summary.record_retry(false);
         summary.record_retry(true);
         assert!((summary.retry_success_rate() - 0.6667).abs() < 0.01);
+    }
+
+    // ── ResourceLimit classification tests ──
+
+    #[test]
+    fn classify_fork_resource_limit() {
+        assert_eq!(
+            classify_error("Error: fork: Resource temporarily unavailable"),
+            ErrorCategory::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn classify_oom_resource_limit() {
+        assert_eq!(
+            classify_error("Error: Cannot allocate memory"),
+            ErrorCategory::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn classify_disk_full_resource_limit() {
+        assert_eq!(
+            classify_error("Error: No space left on device"),
+            ErrorCategory::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn classify_chinese_resource_limit() {
+        assert_eq!(
+            classify_error("Error: 系统资源暂时不足，无法运行"),
+            ErrorCategory::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn classify_too_many_open_files() {
+        assert_eq!(
+            classify_error("Error: too many open files"),
+            ErrorCategory::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn resource_limit_not_transient() {
+        // Make sure resource limit is NOT classified as Transient
+        // even though it contains "unavailable" (which Unavailable would match)
+        let cat = classify_error("fork: Resource temporarily unavailable");
+        assert_eq!(cat, ErrorCategory::ResourceLimit);
+        assert_ne!(cat, ErrorCategory::Transient);
+    }
+
+    #[test]
+    fn recovery_message_for_resource_limit() {
+        let msg = build_recovery_message(
+            "bash",
+            "fork: Resource temporarily unavailable",
+            ErrorCategory::ResourceLimit,
+            &[],
+        );
+        assert!(msg.contains("BLOCKED"));
+        assert!(msg.contains("resource limit"));
     }
 }

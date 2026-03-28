@@ -117,6 +117,18 @@ impl ToolHealthTracker {
         }
     }
 
+    /// Record a system resource-limit failure (fork exhaustion, OOM, disk full).
+    /// Immediately deprioritizes the tool — the entire system is constrained,
+    /// retrying will only make things worse.
+    pub fn record_resource_limit_failure(&mut self, tool_name: &str) {
+        let health = self.tools.entry(tool_name.to_string()).or_default();
+        health.total_calls += 1;
+        health.total_failures += 1;
+        health.consecutive_failures += 1;
+        // Immediate deprioritization — resource limits affect the whole system
+        health.deprioritized = true;
+    }
+
     /// Record a cache hit (idempotency cache served the result).
     /// Neutral for health scoring — the tool didn't actually execute.
     /// Does NOT break the consecutive failure streak (tool wasn't tested).
@@ -463,5 +475,40 @@ mod tests {
         }];
         let tracker = ToolHealthTracker::from_entries(&entries);
         assert!(!tracker.is_deprioritized("read_file"));
+    }
+
+    #[test]
+    fn resource_limit_immediately_deprioritizes() {
+        let mut tracker = ToolHealthTracker::new();
+        // A single resource-limit failure should immediately block
+        tracker.record_resource_limit_failure("bash");
+        assert!(tracker.is_deprioritized("bash"));
+        let health = tracker.get("bash").unwrap();
+        assert_eq!(health.total_calls, 1);
+        assert_eq!(health.total_failures, 1);
+        assert_eq!(health.consecutive_failures, 1);
+    }
+
+    #[test]
+    fn resource_limit_not_rehabilitated_by_success() {
+        let mut tracker = ToolHealthTracker::new();
+        tracker.record_resource_limit_failure("bash");
+        assert!(tracker.is_deprioritized("bash"));
+        // Even after a success, the tool should be rehabilitated (standard behavior)
+        // but the system should have already blocked it in restricted_tools
+        tracker.record_success("bash");
+        assert!(!tracker.is_deprioritized("bash")); // rehabilitated
+        assert_eq!(tracker.get("bash").unwrap().rehabilitation_count, 1);
+    }
+
+    #[test]
+    fn normal_failure_needs_three_for_deprioritize() {
+        let mut tracker = ToolHealthTracker::new();
+        tracker.record_failure("bash");
+        assert!(!tracker.is_deprioritized("bash"));
+        tracker.record_failure("bash");
+        assert!(!tracker.is_deprioritized("bash"));
+        tracker.record_failure("bash");
+        assert!(tracker.is_deprioritized("bash")); // 3rd failure triggers
     }
 }

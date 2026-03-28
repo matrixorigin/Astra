@@ -295,6 +295,130 @@ pub fn detect_nudge_ignored(
 
 use std::collections::HashMap;
 
+// ─── Intent drift detection ─────────────────────────────────────────────────
+
+/// Result of intent drift analysis.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IntentDrift {
+    /// Agent is on-task — tools relate to the user's query.
+    OnTask,
+    /// Agent may be drifting — low relevance for N consecutive turns.
+    Drifting {
+        consecutive_off_task: usize,
+        correction: String,
+    },
+}
+
+/// Minimum consecutive off-task turns before flagging drift.
+pub const INTENT_DRIFT_WINDOW: usize = 3;
+
+/// Tools that are always considered on-task (utility/meta tools).
+const ALWAYS_ON_TASK_TOOLS: &[&str] = &[
+    "memory_search",
+    "memory_store",
+    "reflect",
+    "get_agent_info",
+];
+
+/// Extract keywords from user query for intent matching.
+/// Lowercases and splits on whitespace/punctuation, filters short words.
+fn extract_intent_keywords(query: &str) -> Vec<String> {
+    query
+        .to_lowercase()
+        .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+        .filter(|w| w.len() >= 2)
+        .map(String::from)
+        .collect()
+}
+
+/// Check if a set of tool names + their arguments have any relevance to
+/// the user's original query keywords.
+fn tools_relate_to_intent(
+    tool_names: &[String],
+    tool_args_text: &str,
+    intent_keywords: &[String],
+) -> bool {
+    if intent_keywords.is_empty() || tool_names.is_empty() {
+        return true; // can't judge → assume on-task
+    }
+    // Always-on-task tools are by definition relevant
+    if tool_names
+        .iter()
+        .any(|n| ALWAYS_ON_TASK_TOOLS.contains(&n.as_str()))
+    {
+        return true;
+    }
+
+    let combined = format!(
+        "{} {}",
+        tool_names.join(" "),
+        tool_args_text.to_lowercase()
+    );
+
+    // Check if any intent keyword appears in tool names or args
+    let match_count = intent_keywords
+        .iter()
+        .filter(|kw| combined.contains(kw.as_str()))
+        .count();
+
+    // At least 1 keyword match, or >20% overlap
+    match_count > 0 || {
+        // Fallback: check if tool names themselves suggest the right domain
+        let query_lower = intent_keywords.join(" ");
+        // Git-related queries match git tools
+        (query_lower.contains("commit")
+            || query_lower.contains("git")
+            || query_lower.contains("review")
+            || query_lower.contains("diff")
+            || query_lower.contains("blame"))
+            && tool_names
+                .iter()
+                .any(|n| n.starts_with("git_") || n == "bash")
+    }
+}
+
+/// Detect if the agent has drifted from the user's original intent.
+///
+/// `user_query`: the original user message.
+/// `recent_tool_turns`: for each recent turn, the (tool_names, concatenated_args) used.
+///
+/// Returns `IntentDrift::Drifting` if the last N turns used tools
+/// unrelated to the user's query.
+pub fn detect_intent_drift(
+    user_query: &str,
+    recent_tool_turns: &[(Vec<String>, String)],
+) -> IntentDrift {
+    let keywords = extract_intent_keywords(user_query);
+    if keywords.is_empty() || recent_tool_turns.is_empty() {
+        return IntentDrift::OnTask;
+    }
+
+    // Count consecutive off-task turns from the end
+    let mut consecutive_off_task = 0;
+    for (names, args_text) in recent_tool_turns.iter().rev() {
+        if tools_relate_to_intent(names, args_text, &keywords) {
+            break;
+        }
+        consecutive_off_task += 1;
+    }
+
+    if consecutive_off_task >= INTENT_DRIFT_WINDOW {
+        let original_snippet: String = user_query.chars().take(100).collect();
+        IntentDrift::Drifting {
+            consecutive_off_task,
+            correction: format!(
+                "⚠ INTENT DRIFT DETECTED — you have spent {} consecutive turns on tools \
+                 unrelated to the user's request: \"{}\". \
+                 STOP your current approach and refocus on what the user asked. \
+                 If you cannot accomplish the original task, explain why and ask for guidance.",
+                consecutive_off_task, original_snippet
+            ),
+        }
+    } else {
+        IntentDrift::OnTask
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,5 +716,120 @@ mod tests {
         used.insert("bash".to_string());
         let ignored = detect_nudge_ignored(&avoid, &used);
         assert!(ignored.is_empty());
+    }
+
+    // ── Intent drift detection ──
+
+    fn make_intent_turns(turns: &[(&[&str], &str)]) -> Vec<(Vec<String>, String)> {
+        turns
+            .iter()
+            .map(|(names, args)| {
+                (
+                    names.iter().map(|n| n.to_string()).collect(),
+                    args.to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn intent_drift_on_task_when_tools_match_query() {
+        let turns = make_intent_turns(&[
+            (&["git_log"], ""),
+            (&["git_show"], r#"{"commit":"abc123"}"#),
+            (&["git_diff"], r#"{"commit":"abc123"}"#),
+        ]);
+        let result = detect_intent_drift("review 最新的commit", &turns);
+        assert_eq!(result, IntentDrift::OnTask);
+    }
+
+    #[test]
+    fn intent_drift_detected_when_unrelated_tools() {
+        // User asked to review a commit, but agent writes a skill file
+        let turns = make_intent_turns(&[
+            (&["git_log"], ""),
+            (&["write_file"], r#"{"path":"skills/web_search.py"}"#),
+            (&["list_dir"], r#"{"path":"skills/"}"#),
+            (&["write_file"], r#"{"path":"skills/test.py"}"#),
+        ]);
+        let result = detect_intent_drift("review 最新的commit", &turns);
+        assert!(matches!(result, IntentDrift::Drifting { .. }));
+    }
+
+    #[test]
+    fn intent_drift_not_triggered_below_window() {
+        // Only 2 off-task turns (below INTENT_DRIFT_WINDOW=3)
+        let turns = make_intent_turns(&[
+            (&["git_log"], ""),
+            (&["write_file"], r#"{"path":"random.txt"}"#),
+            (&["list_dir"], r#"{"path":"random/"}"#),
+        ]);
+        let result = detect_intent_drift("review 最新的commit", &turns);
+        assert_eq!(result, IntentDrift::OnTask);
+    }
+
+    #[test]
+    fn intent_drift_reset_by_on_task_tool() {
+        // 2 off-task, then 1 on-task, then 2 off-task → no drift (reset in middle)
+        let turns = make_intent_turns(&[
+            (&["write_file"], r#"{"path":"random.txt"}"#),
+            (&["list_dir"], r#"{"path":"random/"}"#),
+            (&["git_show"], r#"{"commit":"abc"}"#), // on-task: resets counter
+            (&["write_file"], r#"{"path":"random2.txt"}"#),
+            (&["list_dir"], r#"{"path":"random2/"}"#),
+        ]);
+        let result = detect_intent_drift("review 最新的commit", &turns);
+        assert_eq!(result, IntentDrift::OnTask);
+    }
+
+    #[test]
+    fn intent_drift_meta_tools_always_on_task() {
+        let turns = make_intent_turns(&[
+            (&["write_file"], "random"),
+            (&["write_file"], "random"),
+            (&["memory_search"], "anything"), // meta tool: always on-task
+        ]);
+        let result = detect_intent_drift("review 最新的commit", &turns);
+        assert_eq!(result, IntentDrift::OnTask);
+    }
+
+    #[test]
+    fn intent_drift_keyword_in_args_counts() {
+        // Tools are generic but args contain keywords from the query
+        let turns = make_intent_turns(&[
+            (&["bash"], r#"{"command":"cat commit.txt"}"#),
+            (&["read_file"], r#"{"path":"review_notes.md"}"#),
+            (&["bash"], r#"{"command":"echo review done"}"#),
+        ]);
+        let result = detect_intent_drift("review 最新的commit", &turns);
+        assert_eq!(result, IntentDrift::OnTask);
+    }
+
+    #[test]
+    fn intent_drift_empty_query_is_on_task() {
+        let turns = make_intent_turns(&[
+            (&["write_file"], "random"),
+            (&["write_file"], "random"),
+            (&["write_file"], "random"),
+        ]);
+        let result = detect_intent_drift("", &turns);
+        assert_eq!(result, IntentDrift::OnTask);
+    }
+
+    #[test]
+    fn intent_drift_correction_includes_user_query() {
+        let turns = make_intent_turns(&[
+            (&["write_file"], "skill.py"),
+            (&["write_file"], "test.py"),
+            (&["list_dir"], "skills/"),
+        ]);
+        if let IntentDrift::Drifting { correction, .. } =
+            detect_intent_drift("review 最新的commit", &turns)
+        {
+            assert!(correction.contains("review"));
+            assert!(correction.contains("INTENT DRIFT"));
+        } else {
+            panic!("Expected Drifting");
+        }
     }
 }
