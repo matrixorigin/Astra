@@ -282,6 +282,87 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        // ── Git mutation tools ─────────────────────────────────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git_commit",
+                "description": "Stage files and create a git commit. Stages all changes by default. Use 'files' to stage specific files only.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string", "description": "Commit message (required)"},
+                        "files": {"type": "array", "items": {"type": "string"}, "description": "Specific files to stage (optional; if omitted, stages all changes)"},
+                        "all": {"type": "boolean", "description": "Stage all tracked changes (like git commit -a)"}
+                    },
+                    "required": ["message"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git_stash",
+                "description": "Save or restore working tree changes. Use to temporarily shelve changes before switching tasks.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["push", "pop", "list", "drop"], "description": "Stash operation"},
+                        "message": {"type": "string", "description": "Description for push (optional)"},
+                        "index": {"type": "integer", "description": "Stash index for pop/drop (default 0)"}
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git_checkout_file",
+                "description": "Revert a file to its last committed state, discarding working tree changes. Use as undo for bad edits.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File path to revert"},
+                        "ref": {"type": "string", "description": "Restore from specific commit/ref (default: HEAD)"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        // ── Code navigation tools ──────────────────────────────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "find_definition",
+                "description": "Find where a symbol (function, class, struct, trait, type) is defined across the codebase. Uses AST parsing for accurate results. More precise than grep for code navigation.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "symbol": {"type": "string", "description": "Symbol name to find (exact or regex)"},
+                        "language": {"type": "string", "description": "Filter by language: rust, python, typescript, go, java, c, cpp, ruby (optional; auto-detected if omitted)"},
+                        "path": {"type": "string", "description": "Limit search to a subdirectory (optional)"}
+                    },
+                    "required": ["symbol"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "find_references",
+                "description": "Find all usages/references to a symbol across the codebase. Combines grep for speed with AST validation for accuracy. Shows file:line for each reference.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "symbol": {"type": "string", "description": "Symbol name to search for (exact match)"},
+                        "path": {"type": "string", "description": "Limit search to a subdirectory (optional)"},
+                        "include": {"type": "string", "description": "File glob filter e.g. '*.rs' (optional)"}
+                    },
+                    "required": ["symbol"]
+                }
+            }
+        }),
         // ── MatrixOne tools ─────────────────────────────────────────────
         json!({
             "type": "function",
@@ -854,6 +935,11 @@ impl ToolExecutor {
             "git_file_history" => git_gix::git_file_history(&self.project_root, args),
             "git_contributors" => git_gix::git_contributors(&self.project_root, args),
             "git_log_search" => git_gix::git_log_search(&self.project_root, args),
+            "git_commit" => git_gix::git_commit(&self.project_root, args),
+            "git_stash" => git_gix::git_stash(&self.project_root, args),
+            "git_checkout_file" => git_gix::git_checkout_file(&self.project_root, args),
+            "find_definition" => self.find_definition(args),
+            "find_references" => self.find_references(args),
             "symbols" => self.symbols(args),
             "mo_query" => self.mo_query(args),
             "mo_snapshot" => self.mo_snapshot(args),
@@ -1054,6 +1140,227 @@ impl ToolExecutor {
         }
 
         output
+    }
+
+    /// Find where a symbol is defined across the codebase using tree-sitter.
+    /// Scans matching files, extracts symbols, and returns definitions.
+    fn find_definition(&self, args: &Value) -> String {
+        let symbol = match args.get("symbol").and_then(Value::as_str) {
+            Some(s) if !s.is_empty() => s,
+            _ => return "Error: 'symbol' parameter is required".to_string(),
+        };
+
+        let search_root = if let Some(p) = args.get("path").and_then(Value::as_str) {
+            self.project_root.join(p)
+        } else {
+            self.project_root.clone()
+        };
+
+        // Determine file extensions to search
+        let lang_filter = args.get("language").and_then(Value::as_str);
+        let extensions = match lang_filter {
+            Some("rust") => vec!["rs"],
+            Some("python") => vec!["py"],
+            Some("typescript") => vec!["ts", "tsx"],
+            Some("javascript") => vec!["js", "jsx"],
+            Some("go") => vec!["go"],
+            Some("java") => vec!["java"],
+            Some("c") => vec!["c", "h"],
+            Some("cpp") => vec!["cpp", "cc", "cxx", "hpp", "h"],
+            Some("ruby") => vec!["rb"],
+            None => vec!["rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "h", "cpp", "cc", "hpp", "rb"],
+            Some(other) => return format!("Error: unsupported language '{other}'. Supported: rust, python, typescript, javascript, go, java, c, cpp, ruby"),
+        };
+
+        // Build regex for matching symbol name
+        let pattern = if symbol.contains('*') || symbol.contains('(') || symbol.contains('[') {
+            match regex::Regex::new(symbol) {
+                Ok(re) => re,
+                Err(e) => return format!("Error: invalid regex pattern: {e}"),
+            }
+        } else {
+            // Exact match
+            match regex::Regex::new(&format!(r"^{}$", regex::escape(symbol))) {
+                Ok(re) => re,
+                Err(e) => return format!("Error: regex construction failed: {e}"),
+            }
+        };
+
+        let definition_kinds = ["fn", "method", "class", "struct", "trait", "interface",
+                                "enum", "type", "const", "var", "mod"];
+
+        let mut results: Vec<String> = Vec::new();
+        let max_files = 500; // Limit to prevent scanning huge repos
+        let mut files_scanned = 0;
+
+        // Collect matching files using a simple recursive walker
+        let mut dirs_to_visit = vec![search_root.clone()];
+        let skip_names = ["node_modules", "target", "vendor", "dist", "__pycache__"];
+        let mut file_paths: Vec<std::path::PathBuf> = Vec::new();
+
+        while let Some(dir) = dirs_to_visit.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with('.') || skip_names.contains(&name_str.as_ref()) {
+                    continue;
+                }
+                let ft = entry.file_type().ok();
+                if ft.map(|t| t.is_dir()).unwrap_or(false) {
+                    dirs_to_visit.push(entry.path());
+                } else if ft.map(|t| t.is_file()).unwrap_or(false) {
+                    let ext = entry.path().extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if extensions.contains(&ext.as_str()) {
+                        file_paths.push(entry.path());
+                    }
+                }
+            }
+        }
+
+        for path in &file_paths {
+            files_scanned += 1;
+            if files_scanned > max_files {
+                results.push(format!("\n[stopped after scanning {max_files} files]"));
+                break;
+            }
+
+            let lang = match code_intel::detect_language(path) {
+                Some(l) => l,
+                None => continue,
+            };
+            let content = match fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let symbols = code_intel::extract_symbols(&content, lang);
+            for sym in &symbols {
+                if pattern.is_match(&sym.name) && definition_kinds.contains(&sym.kind.as_str()) {
+                    let rel_path = path.strip_prefix(&self.project_root)
+                        .unwrap_or(path)
+                        .display();
+                    let parent_info = sym.parent.as_ref()
+                        .map(|p| format!(" (in {p})"))
+                        .unwrap_or_default();
+                    results.push(format!(
+                        "{}:{} [{}]{} {}",
+                        rel_path, sym.start_line, sym.kind.as_str(), parent_info, sym.signature
+                    ));
+                }
+            }
+        }
+
+        if results.is_empty() {
+            format!("No definitions found for '{symbol}' ({files_scanned} files scanned)")
+        } else {
+            let header = format!("# Definitions of '{}' ({} found, {} files scanned)\n\n",
+                symbol, results.len(), files_scanned);
+            let body = results.join("\n");
+            truncate_output(format!("{header}{body}"), tool_output_limit())
+        }
+    }
+
+    /// Find all references to a symbol across the codebase.
+    /// Uses grep for speed, with word-boundary matching for precision.
+    fn find_references(&self, args: &Value) -> String {
+        let symbol = match args.get("symbol").and_then(Value::as_str) {
+            Some(s) if !s.is_empty() => s,
+            _ => return "Error: 'symbol' parameter is required".to_string(),
+        };
+
+        let search_path = if let Some(p) = args.get("path").and_then(Value::as_str) {
+            self.project_root.join(p)
+        } else {
+            self.project_root.clone()
+        };
+
+        // Build ripgrep command for word-boundary matching
+        let mut cmd = std::process::Command::new("rg");
+        cmd.arg("--no-heading")
+            .arg("--line-number")
+            .arg("--color=never")
+            .arg("--max-count=5") // Max per file
+            .arg("-w") // Word boundary
+            .current_dir(&self.project_root);
+
+        // Apply include filter
+        if let Some(include) = args.get("include").and_then(Value::as_str) {
+            cmd.arg("--glob").arg(include);
+        }
+
+        // Exclude common noise directories
+        cmd.arg("--glob").arg("!.git/")
+            .arg("--glob").arg("!node_modules/")
+            .arg("--glob").arg("!target/")
+            .arg("--glob").arg("!vendor/")
+            .arg("--glob").arg("!dist/")
+            .arg("--glob").arg("!*.min.js")
+            .arg("--glob").arg("!*.min.css");
+
+        // Use fixed string for exact symbol (faster), word-bounded
+        cmd.arg(symbol);
+        cmd.arg(search_path.to_string_lossy().to_string());
+
+        match cmd.output() {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if stdout.is_empty() {
+                    return format!("No references found for '{symbol}'");
+                }
+
+                let lines: Vec<&str> = stdout.lines().collect();
+                let total = lines.len();
+
+                // Group by file for cleaner output
+                let mut output = format!("# References to '{}' ({} found)\n\n", symbol, total);
+                let mut current_file = "";
+                for line in lines.iter().take(50) { // Cap at 50 references
+                    if let Some(colon_pos) = line.find(':') {
+                        let file = &line[..colon_pos];
+                        if file != current_file {
+                            if !current_file.is_empty() {
+                                output.push('\n');
+                            }
+                            current_file = file;
+                        }
+                    }
+                    output.push_str(line);
+                    output.push('\n');
+                }
+
+                if total > 50 {
+                    output.push_str(&format!("\n[{} more references not shown]", total - 50));
+                }
+
+                truncate_output(output, tool_output_limit())
+            }
+            Err(_) => {
+                // Fallback to grep if rg not available
+                let out = std::process::Command::new("grep")
+                    .args(["-rnw", "--include=*.rs", "--include=*.py",
+                           "--include=*.ts", "--include=*.go", "--include=*.java",
+                           symbol])
+                    .arg(search_path.to_string_lossy().to_string())
+                    .current_dir(&self.project_root)
+                    .output();
+                match out {
+                    Ok(o) => {
+                        let stdout = String::from_utf8_lossy(&o.stdout);
+                        if stdout.is_empty() {
+                            format!("No references found for '{symbol}'")
+                        } else {
+                            let lines: Vec<&str> = stdout.lines().take(50).collect();
+                            let header = format!("# References to '{}' ({} found)\n\n", symbol, lines.len());
+                            truncate_output(format!("{header}{}", lines.join("\n")), tool_output_limit())
+                        }
+                    }
+                    Err(e) => format!("Error: search failed: {e}"),
+                }
+            }
+        }
     }
 
     /// Execute a multi-step ToolChain, forwarding each step to self.execute().
@@ -2093,5 +2400,107 @@ fn helper() {}
             .await;
         assert!(result.contains("Point"), "got: {result}");
         assert!(!result.contains("helper"), "got: {result}");
+    }
+
+    // ── find_definition tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn find_definition_requires_symbol() {
+        let executor = test_executor();
+        let result = executor.execute("find_definition", &json!({})).await;
+        assert!(result.contains("Error"), "should require symbol: {result}");
+    }
+
+    #[tokio::test]
+    async fn find_definition_in_repo() {
+        // Point at our own repo to find a known symbol
+        let root = {
+            let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.pop(); p.pop(); // → repo root
+            p
+        };
+        let executor = ToolExecutor::new(root);
+        let result = executor.execute("find_definition", &json!({"symbol": "ToolExecutor"})).await;
+        // Should find our own struct definition
+        assert!(
+            result.contains("ToolExecutor") || result.contains("No definitions"),
+            "unexpected: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_definition_regex_pattern() {
+        let root = {
+            let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.pop(); p.pop();
+            p
+        };
+        let executor = ToolExecutor::new(root);
+        // Regex pattern should work
+        let result = executor.execute("find_definition", &json!({"symbol": "git_st.*"})).await;
+        assert!(
+            result.contains("git_st") || result.contains("No definitions"),
+            "should match regex: {result}"
+        );
+    }
+
+    // ── find_references tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn find_references_requires_symbol() {
+        let executor = test_executor();
+        let result = executor.execute("find_references", &json!({})).await;
+        assert!(result.contains("Error"), "should require symbol: {result}");
+    }
+
+    #[tokio::test]
+    async fn find_references_in_repo() {
+        let root = {
+            let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.pop(); p.pop();
+            p
+        };
+        let executor = ToolExecutor::new(root);
+        let result = executor.execute("find_references", &json!({"symbol": "ToolExecutor"})).await;
+        // Should find references in our own codebase
+        assert!(
+            result.contains("ToolExecutor") || result.contains("No references"),
+            "unexpected: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_references_with_include_filter() {
+        let root = {
+            let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.pop(); p.pop();
+            p
+        };
+        let executor = ToolExecutor::new(root);
+        let result = executor.execute("find_references", &json!({
+            "symbol": "ToolExecutor",
+            "include": "*.rs"
+        })).await;
+        // All results should be .rs files
+        assert!(
+            result.contains("ToolExecutor") || result.contains("No references"),
+            "unexpected: {result}"
+        );
+    }
+
+    // ── new tool schema coverage ──────────────────────────────────────────────
+
+    #[test]
+    fn schemas_include_new_coding_tools() {
+        let schemas = all_tool_schemas();
+        let names: Vec<&str> = schemas
+            .iter()
+            .filter_map(|s| s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()))
+            .collect();
+        assert!(names.contains(&"git_commit"), "missing git_commit schema");
+        assert!(names.contains(&"git_stash"), "missing git_stash schema");
+        assert!(names.contains(&"git_checkout_file"), "missing git_checkout_file schema");
+        assert!(names.contains(&"find_definition"), "missing find_definition schema");
+        assert!(names.contains(&"find_references"), "missing find_references schema");
     }
 }

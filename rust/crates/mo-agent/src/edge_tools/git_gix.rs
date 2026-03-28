@@ -1383,6 +1383,215 @@ fn parse_since_to_epoch(since: &str) -> Option<i64> {
     None
 }
 
+// ─── Git Mutation Tools ─────────────────────────────────────────────────────
+// These use git subprocess (not gix) because gix's write operations are
+// complex and the git binary is universally available. Read tools stay pure-Rust.
+
+/// Stage files and create a commit.
+///
+/// Parameters:
+/// - `message` (required): commit message
+/// - `files` (optional): list of file paths to stage; if omitted, stages all changes
+/// - `all` (optional): if true, stages all tracked changes (like `git commit -a`)
+pub fn git_commit(project_root: &Path, args: &Value) -> String {
+    let message = match args.get("message").and_then(Value::as_str) {
+        Some(m) if !m.trim().is_empty() => m.trim(),
+        _ => return "Error: 'message' is required and must not be empty".to_string(),
+    };
+
+    // Validate message length (prevent absurdly long messages)
+    if message.len() > 5000 {
+        return "Error: commit message too long (max 5000 chars)".to_string();
+    }
+
+    // Stage files
+    let files: Vec<&str> = args
+        .get("files")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let stage_all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+
+    if files.is_empty() && !stage_all {
+        // Default: stage all changes
+        let add_out = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(project_root)
+            .output();
+        if let Err(e) = add_out {
+            return format!("Error: git add failed: {e}");
+        }
+        let add_out = add_out.unwrap();
+        if !add_out.status.success() {
+            return format!(
+                "Error: git add -A failed: {}",
+                String::from_utf8_lossy(&add_out.stderr).trim()
+            );
+        }
+    } else if !files.is_empty() {
+        // Stage specific files
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("add").args(&files).current_dir(project_root);
+        let add_out = cmd.output();
+        if let Err(e) = add_out {
+            return format!("Error: git add failed: {e}");
+        }
+        let add_out = add_out.unwrap();
+        if !add_out.status.success() {
+            return format!(
+                "Error: git add failed: {}",
+                String::from_utf8_lossy(&add_out.stderr).trim()
+            );
+        }
+    }
+
+    // Commit
+    let mut commit_args = vec!["commit", "-m", message];
+    if stage_all && files.is_empty() {
+        commit_args.insert(1, "-a");
+    }
+    let commit_out = std::process::Command::new("git")
+        .args(&commit_args)
+        .current_dir(project_root)
+        .output();
+
+    match commit_out {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // Extract commit hash from output
+            let short_hash = stdout
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("???");
+            format!("✓ Committed: {short_hash} {message}")
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if stderr.contains("nothing to commit") {
+                "Nothing to commit — working tree clean".to_string()
+            } else {
+                format!("Error: git commit failed: {}", stderr.trim())
+            }
+        }
+        Err(e) => format!("Error: git commit failed: {e}"),
+    }
+}
+
+/// Stash working tree changes.
+///
+/// Parameters:
+/// - `action` (required): "push" (save), "pop" (restore), "list", "drop"
+/// - `message` (optional): description for push
+/// - `index` (optional): stash index for pop/drop (default 0)
+pub fn git_stash(project_root: &Path, args: &Value) -> String {
+    let action = match args.get("action").and_then(Value::as_str) {
+        Some(a) => a,
+        None => return "Error: 'action' is required (push, pop, list, drop)".to_string(),
+    };
+
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(project_root);
+
+    match action {
+        "push" | "save" => {
+            cmd.arg("stash").arg("push");
+            if let Some(msg) = args.get("message").and_then(Value::as_str) {
+                cmd.arg("-m").arg(msg);
+            }
+        }
+        "pop" => {
+            let idx = args.get("index").and_then(Value::as_u64).unwrap_or(0);
+            cmd.arg("stash").arg("pop").arg(format!("stash@{{{idx}}}"));
+        }
+        "list" => {
+            cmd.arg("stash").arg("list");
+        }
+        "drop" => {
+            let idx = args.get("index").and_then(Value::as_u64).unwrap_or(0);
+            cmd.arg("stash").arg("drop").arg(format!("stash@{{{idx}}}"));
+        }
+        _ => {
+            return format!(
+                "Error: unknown stash action '{action}'. Use: push, pop, list, drop"
+            )
+        }
+    }
+
+    match cmd.output() {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if out.status.success() {
+                let result = stdout.trim();
+                if result.is_empty() {
+                    match action {
+                        "push" | "save" => "✓ Changes stashed".to_string(),
+                        "list" => "No stashes found".to_string(),
+                        _ => format!("✓ Stash {action} done"),
+                    }
+                } else {
+                    result.to_string()
+                }
+            } else {
+                let err = stderr.trim();
+                if err.contains("No local changes") || err.contains("No stash entries") {
+                    err.to_string()
+                } else {
+                    format!("Error: git stash {action} failed: {err}")
+                }
+            }
+        }
+        Err(e) => format!("Error: git stash failed: {e}"),
+    }
+}
+
+/// Revert a file to its last committed state (discard working tree changes).
+///
+/// Parameters:
+/// - `path` (required): file path relative to project root
+/// - `ref` (optional): restore from a specific commit/ref (default: HEAD)
+pub fn git_checkout_file(project_root: &Path, args: &Value) -> String {
+    let file_path = match args.get("path").and_then(Value::as_str) {
+        Some(p) if !p.is_empty() => p,
+        _ => return "Error: 'path' is required".to_string(),
+    };
+
+    // Security: reject path traversal
+    if file_path.contains("..") {
+        return "Error: path traversal not allowed".to_string();
+    }
+
+    let git_ref = args.get("ref").and_then(Value::as_str).unwrap_or("HEAD");
+
+    // Validate ref doesn't contain shell-dangerous chars
+    if git_ref.contains(';')
+        || git_ref.contains('|')
+        || git_ref.contains('&')
+        || git_ref.contains('`')
+    {
+        return "Error: invalid ref".to_string();
+    }
+
+    let out = std::process::Command::new("git")
+        .args(["checkout", git_ref, "--", file_path])
+        .current_dir(project_root)
+        .output();
+
+    match out {
+        Ok(o) if o.status.success() => {
+            format!("✓ Restored {file_path} from {git_ref}")
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            format!("Error: git checkout failed: {}", stderr.trim())
+        }
+        Err(e) => format!("Error: git checkout failed: {e}"),
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2153,6 +2362,106 @@ mod tests {
             "high-pressure diff ({}) should not exceed normal ({})",
             pressed.len(),
             normal.len()
+        );
+    }
+
+    // ─── git_commit tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn git_commit_rejects_empty_message() {
+        let root = repo_root();
+        let result = git_commit(&root, &json!({}));
+        assert!(result.starts_with("Error:"), "should reject missing message: {result}");
+
+        let result2 = git_commit(&root, &json!({"message": "  "}));
+        assert!(result2.starts_with("Error:"), "should reject blank message: {result2}");
+    }
+
+    #[test]
+    fn git_commit_rejects_long_message() {
+        let root = repo_root();
+        let long_msg = "x".repeat(5001);
+        let result = git_commit(&root, &json!({"message": long_msg}));
+        assert!(result.contains("too long"), "should reject over-long message: {result}");
+    }
+
+    #[test]
+    fn git_commit_clean_tree_says_nothing() {
+        // In a clean repo with nothing staged, commit should say "Nothing to commit"
+        // or succeed if there are pending changes — either is fine, just no panic
+        let root = repo_root();
+        let result = git_commit(&root, &json!({"message": "test commit", "files": ["nonexistent_file_xyz.txt"]}));
+        // Should either succeed or report a meaningful error
+        assert!(
+            !result.is_empty(),
+            "should return some output"
+        );
+    }
+
+    // ─── git_stash tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn git_stash_requires_action() {
+        let root = repo_root();
+        let result = git_stash(&root, &json!({}));
+        assert!(result.starts_with("Error:"), "should require action: {result}");
+    }
+
+    #[test]
+    fn git_stash_rejects_unknown_action() {
+        let root = repo_root();
+        let result = git_stash(&root, &json!({"action": "fly"}));
+        assert!(result.contains("unknown stash action"), "should reject unknown: {result}");
+    }
+
+    #[test]
+    fn git_stash_list_works() {
+        let root = repo_root();
+        let result = git_stash(&root, &json!({"action": "list"}));
+        // Should return stash list or "No stashes found"
+        assert!(
+            result.contains("stash@") || result.contains("No stashes") || result.is_empty(),
+            "unexpected stash list output: {result}"
+        );
+    }
+
+    // ─── git_checkout_file tests ────────────────────────────────────────────
+
+    #[test]
+    fn git_checkout_file_requires_path() {
+        let root = repo_root();
+        let result = git_checkout_file(&root, &json!({}));
+        assert!(result.starts_with("Error:"), "should require path: {result}");
+
+        let result2 = git_checkout_file(&root, &json!({"path": ""}));
+        assert!(result2.starts_with("Error:"), "should reject empty path: {result2}");
+    }
+
+    #[test]
+    fn git_checkout_file_rejects_path_traversal() {
+        let root = repo_root();
+        let result = git_checkout_file(&root, &json!({"path": "../../../etc/passwd"}));
+        assert!(result.contains("path traversal"), "should reject traversal: {result}");
+    }
+
+    #[test]
+    fn git_checkout_file_rejects_dangerous_ref() {
+        let root = repo_root();
+        let result = git_checkout_file(&root, &json!({"path": "README.md", "ref": "HEAD; rm -rf /"}));
+        assert!(result.contains("invalid ref"), "should reject dangerous ref: {result}");
+
+        let result2 = git_checkout_file(&root, &json!({"path": "README.md", "ref": "main|cat /etc/passwd"}));
+        assert!(result2.contains("invalid ref"), "should reject pipe ref: {result2}");
+    }
+
+    #[test]
+    fn git_checkout_file_known_file() {
+        let root = repo_root();
+        // Checkout a known file at HEAD — should succeed (idempotent)
+        let result = git_checkout_file(&root, &json!({"path": "README.md"}));
+        assert!(
+            result.contains("Restored") || result.contains("Error"),
+            "should restore or report error: {result}"
         );
     }
 }

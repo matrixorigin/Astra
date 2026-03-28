@@ -199,11 +199,14 @@ impl ToolExecutor {
         let new_content = content.replacen(old_str, new_str, 1);
         match fs::write(&path, &new_content) {
             Ok(_) => {
+                // Auto-format if formatter is available
+                let format_result = auto_format_file(&path, &self.project_root);
+
                 // Build a compact diff preview for the LLM and user
                 let old_lines: Vec<&str> = old_str.lines().collect();
                 let new_lines: Vec<&str> = new_str.lines().collect();
                 let diff_lines = old_lines.len().max(new_lines.len());
-                if diff_lines <= 10 {
+                let mut result = if diff_lines <= 10 {
                     let mut diff = String::from("Replaced successfully\n");
                     for l in &old_lines {
                         diff.push_str(&format!("- {l}\n"));
@@ -218,7 +221,11 @@ impl ToolExecutor {
                         old_lines.len(),
                         new_lines.len()
                     )
+                };
+                if let Some(fmt_note) = format_result {
+                    result.push_str(&format!("\n{fmt_note}"));
                 }
+                result
             }
             Err(e) => format!("Error writing file: {e}"),
         }
@@ -571,6 +578,65 @@ fn is_generic_def(line: &str) -> bool {
         || line.starts_with("export ")
         || line.starts_with("module ")
         || line.starts_with("func ")
+}
+
+// ─── Auto-format after edit ────────────────────────────────────────────────
+
+/// Detect project formatter and run it on the edited file.
+/// Returns Some(note) if formatter ran, None otherwise.
+fn auto_format_file(file_path: &Path, project_root: &Path) -> Option<String> {
+    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    let (cmd, args): (&str, Vec<&str>) = match ext {
+        "rs" => {
+            // Only format if Cargo.toml exists (we're in a Rust project)
+            if !project_root.join("Cargo.toml").exists()
+                && !project_root.join("rust/Cargo.toml").exists()
+            {
+                return None;
+            }
+            ("rustfmt", vec!["--edition", "2021"])
+        }
+        "py" => {
+            // Only if pyproject.toml or .black config exists
+            if !project_root.join("pyproject.toml").exists()
+                && !project_root.join("setup.cfg").exists()
+            {
+                return None;
+            }
+            ("black", vec!["--quiet"])
+        }
+        "go" => ("gofmt", vec!["-w"]),
+        "ts" | "tsx" | "js" | "jsx" | "json" | "css" | "scss" | "html" | "md" | "yaml"
+        | "yml" => {
+            // Only if prettier config or package.json exists
+            if !project_root.join("package.json").exists()
+                && !project_root.join(".prettierrc").exists()
+                && !project_root.join(".prettierrc.json").exists()
+            {
+                return None;
+            }
+            ("npx", vec!["prettier", "--write"])
+        }
+        _ => return None,
+    };
+
+    let file_str = file_path.to_string_lossy();
+    let mut full_args: Vec<&str> = args;
+    full_args.push(&file_str);
+
+    let result = std::process::Command::new(cmd)
+        .args(&full_args)
+        .current_dir(project_root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output();
+
+    match result {
+        Ok(out) if out.status.success() => Some(format!("✓ Auto-formatted with {cmd}")),
+        Ok(_) => None, // Formatter failed silently — don't report
+        Err(_) => None, // Formatter not available — don't report
+    }
 }
 
 // ─── str_replace fuzzy matching ─────────────────────────────────────────────
@@ -1264,5 +1330,54 @@ type Handler interface {
         let with_ext = similarity_score("config.rs", "setting.rs");
         let without_ext = similarity_score("config.rs", "setting.py");
         assert!(with_ext > without_ext, "same ext should score higher");
+    }
+
+    // ── auto_format_file tests ──────────────────────────────────────────────
+
+    #[test]
+    fn auto_format_unknown_extension_returns_none() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("data.xyz");
+        std::fs::write(&file, "content").unwrap();
+        assert!(auto_format_file(&file, tmpdir.path()).is_none());
+    }
+
+    #[test]
+    fn auto_format_rs_without_cargo_toml_returns_none() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+        // No Cargo.toml in tmpdir → should skip
+        assert!(auto_format_file(&file, tmpdir.path()).is_none());
+    }
+
+    #[test]
+    fn auto_format_py_without_pyproject_returns_none() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("main.py");
+        std::fs::write(&file, "print('hello')").unwrap();
+        assert!(auto_format_file(&file, tmpdir.path()).is_none());
+    }
+
+    #[test]
+    fn auto_format_ts_without_package_json_returns_none() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("app.ts");
+        std::fs::write(&file, "const x = 1;").unwrap();
+        assert!(auto_format_file(&file, tmpdir.path()).is_none());
+    }
+
+    #[test]
+    fn auto_format_rs_with_cargo_toml_tries_rustfmt() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        // Create Cargo.toml so the guard passes
+        std::fs::write(tmpdir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+        let file = tmpdir.path().join("main.rs");
+        std::fs::write(&file, "fn   main  (  )  {  }").unwrap();
+        let result = auto_format_file(&file, tmpdir.path());
+        // rustfmt may or may not be installed — either formatted or None is ok
+        if let Some(r) = &result {
+            assert!(r.contains("rustfmt"), "should mention rustfmt: {r}");
+        }
     }
 }

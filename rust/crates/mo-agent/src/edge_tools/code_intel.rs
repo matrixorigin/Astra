@@ -882,7 +882,12 @@ fn get_signature_line(node: tree_sitter::Node, source: &str) -> String {
         }
         // If no brace on first line, might be a multi-line sig — take first line
         if first_line.len() > 100 {
-            return format!("{}...", &first_line[..100]);
+            // Find a valid char boundary at or before byte 100
+            let mut end = 100;
+            while !first_line.is_char_boundary(end) && end > 0 {
+                end -= 1;
+            }
+            return format!("{}...", &first_line[..end]);
         }
         return first_line.to_string();
     }
