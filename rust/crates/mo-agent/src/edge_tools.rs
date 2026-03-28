@@ -265,6 +265,23 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        // ── Code Intelligence tools ────────────────────────────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "symbols",
+                "description": "Extract code symbols (functions, classes, structs, methods) from a file using AST parsing (tree-sitter). Supports Rust, Python, TypeScript/JavaScript, Go. Returns structured symbol info with signatures, line numbers, and nesting. Use for: understanding file structure, finding specific symbols by name, generating documentation outlines.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File path relative to project root"},
+                        "pattern": {"type": "string", "description": "Optional regex pattern to filter symbols by name (e.g., 'test_', 'parse.*')"},
+                        "kinds": {"type": "array", "items": {"type": "string"}, "description": "Optional filter by symbol kinds: fn, method, class, struct, trait, interface, enum, type, const, var"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
         // ── MatrixOne tools ─────────────────────────────────────────────
         json!({
             "type": "function",
@@ -837,6 +854,7 @@ impl ToolExecutor {
             "git_file_history" => git_gix::git_file_history(&self.project_root, args),
             "git_contributors" => git_gix::git_contributors(&self.project_root, args),
             "git_log_search" => git_gix::git_log_search(&self.project_root, args),
+            "symbols" => self.symbols(args),
             "mo_query" => self.mo_query(args),
             "mo_snapshot" => self.mo_snapshot(args),
             "mo_branch" => self.mo_branch(args),
@@ -926,6 +944,112 @@ impl ToolExecutor {
         };
         // Global safety net: no tool output exceeds 50KB
         truncate_output(output, global_output_limit())
+    }
+
+    /// Extract code symbols (functions, classes, structs) from a file using Tree-sitter.
+    ///
+    /// Returns structured symbol info with signatures and line numbers.
+    fn symbols(&self, args: &Value) -> String {
+        let path_str = match args.get("path").and_then(Value::as_str) {
+            Some(p) => p,
+            None => return "Error: missing 'path' parameter".to_string(),
+        };
+
+        let path = if path_str.starts_with('/') {
+            PathBuf::from(path_str)
+        } else {
+            self.project_root.join(path_str)
+        };
+
+        // Sandbox check
+        if let Some(ref policy) = self.sandbox_policy {
+            if let Err(e) = validate_path(policy, path_str) {
+                return format!("Sandbox: path blocked: {e}");
+            }
+        }
+
+        if !path.exists() {
+            return format!("Error: No such file: {}", path.display());
+        }
+
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => return format!("Error: Failed to read file: {e}"),
+        };
+
+        // Detect language from path
+        let lang = match code_intel::detect_language(&path) {
+            Some(l) => l,
+            None => {
+                return format!(
+                    "Error: Unsupported language for {}. Supports: Rust, Python, TypeScript/JavaScript, Go",
+                    path.display()
+                );
+            }
+        };
+
+        // Extract symbols
+        let mut symbols = code_intel::extract_symbols(&content, lang);
+
+        // Apply pattern filter if provided
+        if let Some(pattern) = args.get("pattern").and_then(Value::as_str) {
+            if let Ok(re) = regex::Regex::new(pattern) {
+                symbols.retain(|s| re.is_match(&s.name));
+            }
+        }
+
+        // Apply kind filter if provided
+        if let Some(kinds_arr) = args.get("kinds").and_then(Value::as_array) {
+            let kinds: Vec<&str> = kinds_arr
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            if !kinds.is_empty() {
+                symbols.retain(|s| {
+                    let kind_str = s.kind.as_str();
+                    kinds.iter().any(|k| k.eq_ignore_ascii_case(kind_str))
+                });
+            }
+        }
+
+        if symbols.is_empty() {
+            return "No symbols found matching criteria.".to_string();
+        }
+
+        // Format output
+        let lang_name = match lang {
+            code_intel::Language::Rust => "Rust",
+            code_intel::Language::Python => "Python",
+            code_intel::Language::TypeScript => "TypeScript",
+            code_intel::Language::JavaScript => "JavaScript",
+            code_intel::Language::Go => "Go",
+        };
+
+        let mut output = format!(
+            "# Symbols in {} ({}, {} found)\n\n",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            lang_name,
+            symbols.len()
+        );
+
+        for sym in &symbols {
+            let parent_suffix = sym
+                .parent
+                .as_ref()
+                .map(|p| format!(" (in {p})"))
+                .unwrap_or_default();
+            output.push_str(&format!(
+                "{}:{}-{} [{}]{}: {}\n",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                sym.start_line,
+                sym.end_line,
+                sym.kind.as_str(),
+                parent_suffix,
+                sym.signature
+            ));
+        }
+
+        output
     }
 
     /// Execute a multi-step ToolChain, forwarding each step to self.execute().
@@ -1840,5 +1964,130 @@ mod tests {
             result.contains("Error"),
             "should return error for invalid chain: {result}"
         );
+    }
+
+    // ── symbols tool ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn symbols_tool_schema_in_catalog() {
+        let names: Vec<String> = all_tool_schemas()
+            .iter()
+            .filter_map(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(String::from)
+            })
+            .collect();
+        assert!(names.contains(&"symbols".to_string()));
+    }
+
+    #[tokio::test]
+    async fn symbols_missing_path_returns_error() {
+        let executor = test_executor();
+        let result = executor.execute("symbols", &json!({})).await;
+        assert!(result.contains("missing 'path'"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn symbols_nonexistent_file_returns_error() {
+        let executor = test_executor();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let nonexistent = temp_dir.path().join("nonexistent.rs");
+        let result = executor
+            .execute(
+                "symbols",
+                &json!({"path": nonexistent.to_str().unwrap()}),
+            )
+            .await;
+        assert!(result.contains("No such file") || result.contains("Sandbox"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn symbols_unsupported_language_returns_error() {
+        let executor = test_executor();
+        let temp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
+        std::fs::write(temp.path(), "hello world").unwrap();
+        let result = executor
+            .execute(
+                "symbols",
+                &json!({"path": temp.path().to_str().unwrap()}),
+            )
+            .await;
+        assert!(result.contains("Unsupported language"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn symbols_rust_file_extracts_functions() {
+        let executor = test_executor();
+        let temp = tempfile::NamedTempFile::with_suffix(".rs").unwrap();
+        std::fs::write(
+            temp.path(),
+            r#"
+fn main() {
+    println!("hello");
+}
+
+pub fn helper(x: i32) -> i32 {
+    x * 2
+}
+"#,
+        )
+        .unwrap();
+        let result = executor
+            .execute(
+                "symbols",
+                &json!({"path": temp.path().to_str().unwrap()}),
+            )
+            .await;
+        assert!(result.contains("[fn]"), "got: {result}");
+        assert!(result.contains("main"), "got: {result}");
+        assert!(result.contains("helper"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn symbols_pattern_filter_works() {
+        let executor = test_executor();
+        let temp = tempfile::NamedTempFile::with_suffix(".rs").unwrap();
+        std::fs::write(
+            temp.path(),
+            r#"
+fn test_one() {}
+fn test_two() {}
+fn helper() {}
+"#,
+        )
+        .unwrap();
+        let result = executor
+            .execute(
+                "symbols",
+                &json!({"path": temp.path().to_str().unwrap(), "pattern": "^test_"}),
+            )
+            .await;
+        assert!(result.contains("test_one"), "got: {result}");
+        assert!(result.contains("test_two"), "got: {result}");
+        assert!(!result.contains("helper"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn symbols_kind_filter_works() {
+        let executor = test_executor();
+        let temp = tempfile::NamedTempFile::with_suffix(".rs").unwrap();
+        std::fs::write(
+            temp.path(),
+            r#"
+struct Point { x: i32 }
+fn helper() {}
+"#,
+        )
+        .unwrap();
+        let result = executor
+            .execute(
+                "symbols",
+                &json!({"path": temp.path().to_str().unwrap(), "kinds": ["struct"]}),
+            )
+            .await;
+        assert!(result.contains("Point"), "got: {result}");
+        assert!(!result.contains("helper"), "got: {result}");
     }
 }
