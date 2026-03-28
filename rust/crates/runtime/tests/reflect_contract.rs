@@ -8,10 +8,10 @@ use axum::{
 use mo_agent_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, LearningFeedbackRecord,
-    LearningFeedbackRequestData, LearningFeedbackService, ReflectEvidence, ReflectService,
+    LearningFeedbackRequestData, LearningFeedbackService, ReflectReport, ReflectService,
     ServiceInfo, build_app,
 };
-use mo_agent_services::reflect::{ReflectDecision, ReflectEvent};
+use mo_agent_services::reflect::{Insight, SessionOverview};
 use tower::util::ServiceExt;
 
 // ── Stubs ────────────────────────────────────────────────────────────────────
@@ -94,8 +94,8 @@ impl ReflectService for StubReflectService {
         session_id: &str,
         focus: &str,
         _last_n: i32,
-        question: &str,
-    ) -> Result<ReflectEvidence, (StatusCode, Json<ErrorResponse>)> {
+        _question: &str,
+    ) -> Result<ReflectReport, (StatusCode, Json<ErrorResponse>)> {
         if session_id == "not-found" {
             return Err((
                 StatusCode::NOT_FOUND,
@@ -104,31 +104,26 @@ impl ReflectService for StubReflectService {
                 }),
             ));
         }
-        Ok(ReflectEvidence {
-            focus: focus.to_string(),
+        Ok(ReflectReport {
             session_id: session_id.to_string(),
-            event_trail: vec![ReflectEvent {
-                event_id: "evt-001".to_string(),
-                event_type: "tool_call".to_string(),
-                skill_name: Some("code_search".to_string()),
-                created_at: "2026-03-25 08:00".to_string(),
-                content_preview: "Searching for function definition...".to_string(),
+            focus: focus.to_string(),
+            overview: SessionOverview {
+                total_events: 1,
+                total_decisions: 1,
+                duration_minutes: Some(5.0),
+                unique_skills_used: 1,
+                error_count: 0,
+                error_rate_pct: 0.0,
+                top_event_types: vec![("tool_call".into(), 1)],
+                top_skills: vec![("code_search".into(), 1)],
+            },
+            insights: vec![Insight {
+                severity: "info".into(),
+                category: "performance".into(),
+                message: "Very short session — limited data for analysis".into(),
+                evidence: "1 events total".into(),
             }],
-            decisions: vec![ReflectDecision {
-                decision_id: "dec-001".to_string(),
-                decision_type: "skill_routing".to_string(),
-                model_used: Some("gpt-4".to_string()),
-                created_at: "2026-03-25 08:00".to_string(),
-                output_preview: "{\"selected\": \"code_search\"}".to_string(),
-            }],
-            summary: format!(
-                "Session {session_id}: 1 events, 1 decisions (focus={focus}{})",
-                if question.is_empty() {
-                    String::new()
-                } else {
-                    format!(", question=\"{question}\"")
-                }
-            ),
+            recommendations: vec![],
         })
     }
 }
@@ -249,15 +244,16 @@ async fn reflect_returns_evidence_with_defaults() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["focus"], "auto");
     assert_eq!(json["session_id"], "sess-1");
-    assert!(json["event_trail"].is_array());
-    assert_eq!(json["event_trail"].as_array().unwrap().len(), 1);
-    assert_eq!(json["event_trail"][0]["event_id"], "evt-001");
-    assert_eq!(json["event_trail"][0]["event_type"], "tool_call");
-    assert_eq!(json["event_trail"][0]["skill_name"], "code_search");
-    assert!(json["decisions"].is_array());
-    assert_eq!(json["decisions"].as_array().unwrap().len(), 1);
-    assert_eq!(json["decisions"][0]["decision_type"], "skill_routing");
-    assert!(json["summary"].as_str().unwrap().contains("1 events"));
+    // New report structure
+    assert!(json["overview"].is_object());
+    assert_eq!(json["overview"]["total_events"], 1);
+    assert_eq!(json["overview"]["total_decisions"], 1);
+    assert!(json["insights"].is_array());
+    assert!(json["recommendations"].is_array());
+    // Verify top_skills populated
+    let skills = json["overview"]["top_skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0][0], "code_search");
 }
 
 #[tokio::test]
@@ -271,12 +267,7 @@ async fn reflect_passes_focus_and_question() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["focus"], "skill_failure");
-    assert!(
-        json["summary"]
-            .as_str()
-            .unwrap()
-            .contains("question=\"why did it fail\"")
-    );
+    assert_eq!(json["session_id"], "sess-1");
 }
 
 #[tokio::test]

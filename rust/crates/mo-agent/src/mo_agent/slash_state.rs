@@ -458,11 +458,110 @@ pub(super) async fn handle_state_command(
                     format!("  ✗ API Error ({}): {}", status, compact_or_raw(&body)).red()
                 );
             } else {
-                print_json_or_raw(&body);
+                render_reflect_report(&body, &sid);
             }
         }
         _ => unreachable!("unexpected state command: {cmd}"),
     }
 
     Ok(())
+}
+
+/// Render a `ReflectReport` JSON as a compact, colored terminal report.
+fn render_reflect_report(body: &str, session_id: &str) {
+    let Ok(report) = serde_json::from_str::<serde_json::Value>(body) else {
+        // Fallback: if the response isn't valid JSON, print raw
+        print_json_or_raw(body);
+        return;
+    };
+
+    let overview = &report["overview"];
+    let short_sid = if session_id.len() > 8 {
+        &session_id[..8]
+    } else {
+        session_id
+    };
+
+    // Header
+    eprintln!(
+        "{}",
+        format!("📊 Session Reflection — {short_sid}").cyan().bold()
+    );
+    eprintln!("{}", "─────────────────────────────────────".dim());
+
+    // Overview line
+    let total_events = overview["total_events"].as_i64().unwrap_or(0);
+    let total_decisions = overview["total_decisions"].as_i64().unwrap_or(0);
+    let dur = overview["duration_minutes"]
+        .as_f64()
+        .map(|d| format!(", {d:.0}min"))
+        .unwrap_or_default();
+    eprintln!(
+        "  {} {total_events} events, {total_decisions} decisions{dur}",
+        "Overview:".bold()
+    );
+
+    // Top skills
+    if let Some(skills) = overview["top_skills"].as_array() {
+        if !skills.is_empty() {
+            let skill_strs: Vec<String> = skills
+                .iter()
+                .filter_map(|s| {
+                    let name = s[0].as_str()?;
+                    let cnt = s[1].as_i64()?;
+                    Some(format!("{name}({cnt})"))
+                })
+                .collect();
+            eprintln!("  {} {}", "Skills:".bold(), skill_strs.join(", "));
+        }
+    }
+
+    // Errors
+    let error_count = overview["error_count"].as_i64().unwrap_or(0);
+    let error_rate = overview["error_rate_pct"].as_f64().unwrap_or(0.0);
+    if error_count > 0 {
+        let err_str = format!("  Errors: {error_count} ({error_rate:.1}%)");
+        if error_rate > 30.0 {
+            eprintln!("{}", err_str.red().bold());
+        } else if error_rate > 15.0 {
+            eprintln!("{}", err_str.yellow());
+        } else {
+            eprintln!("  {} {error_count} ({error_rate:.1}%)", "Errors:".bold());
+        }
+    }
+
+    // Insights
+    if let Some(insights) = report["insights"].as_array() {
+        if !insights.is_empty() {
+            eprintln!();
+        }
+        for insight in insights {
+            let severity = insight["severity"].as_str().unwrap_or("info");
+            let message = insight["message"].as_str().unwrap_or("");
+            let evidence = insight["evidence"].as_str().unwrap_or("");
+            let line = if evidence.is_empty() {
+                message.to_string()
+            } else {
+                format!("{message} — {evidence}")
+            };
+            match severity {
+                "critical" => eprintln!("  {} {}", "🔴".red(), line.red().bold()),
+                "warning" => eprintln!("  {} {}", "⚠".yellow(), line.yellow()),
+                _ => eprintln!("  {} {}", "ℹ".dim(), line.dim()),
+            }
+        }
+    }
+
+    // Recommendations
+    if let Some(recs) = report["recommendations"].as_array() {
+        if !recs.is_empty() {
+            eprintln!();
+            eprintln!("  {}", "Recommendations:".bold());
+            for rec in recs {
+                if let Some(r) = rec.as_str() {
+                    eprintln!("    {} {}", "•".dim(), r);
+                }
+            }
+        }
+    }
 }

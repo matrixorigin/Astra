@@ -85,7 +85,7 @@ pub use models::{
     ModelUpdateRequestData, PricingData, QuirksData, UnconfiguredModelService,
 };
 pub use reflect::{
-    DatabaseReflectService, ReflectEvidence, ReflectService, UnconfiguredReflectService,
+    DatabaseReflectService, ReflectReport, ReflectService, UnconfiguredReflectService,
 };
 pub use replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService};
 pub use runs::{

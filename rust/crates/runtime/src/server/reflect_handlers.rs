@@ -22,7 +22,7 @@ pub(super) async fn reflect_session_handler(
     headers: HeaderMap,
     Path(session_id): Path<String>,
     Query(params): Query<ReflectQuery>,
-) -> Result<Json<ReflectEvidence>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<ReflectReport>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     state
         .reflect_service
@@ -42,7 +42,7 @@ pub(super) async fn decision_trace_handler(
     headers: HeaderMap,
     Path(session_id): Path<String>,
     Query(params): Query<ReflectQuery>,
-) -> Result<Json<ReflectEvidence>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<ReflectReport>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     state
         .reflect_service
