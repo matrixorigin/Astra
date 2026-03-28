@@ -388,7 +388,7 @@ impl ReflectService for DatabaseReflectService {
         let error_patterns = if matches!(focus, "auto" | "skill_failure" | "tool_selection") {
             let ep_rows = query(
                 "SELECT IFNULL(skill_name, 'unknown') AS skill_name, event_type, COUNT(*) AS fail_count, \
-                   SUBSTRING(COALESCE(content, ''), 1, 100) AS sample_error \
+                   SUBSTRING(COALESCE(MIN(content), ''), 1, 100) AS sample_error \
                  FROM agent_events \
                  WHERE session_id = ? AND (event_type LIKE '%error%' OR event_type LIKE '%fail%') \
                  GROUP BY skill_name, event_type \
@@ -678,5 +678,105 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         let parsed: ReflectReport = serde_json::from_str(&json).unwrap();
         assert_eq!(report, parsed);
+    }
+
+    /// Validate that all GROUP BY queries only SELECT grouped columns or aggregate functions.
+    /// This prevents MatrixOne strict SQL standard errors (MySQL non-strict mode hides these).
+    #[test]
+    fn sql_group_by_compliance() {
+        // All the SQL queries used in build_evidence, extracted as constants for testing.
+        let queries = [
+            // event types
+            "SELECT event_type, COUNT(*) AS cnt \
+             FROM agent_events WHERE session_id = ? \
+             GROUP BY event_type ORDER BY cnt DESC LIMIT 5",
+            // skills
+            "SELECT skill_name, COUNT(*) AS cnt \
+             FROM agent_events WHERE session_id = ? AND skill_name IS NOT NULL \
+             GROUP BY skill_name ORDER BY cnt DESC LIMIT 5",
+            // decisions
+            "SELECT decision_type, COUNT(*) AS cnt, \
+               COUNT(DISTINCT model_used) AS models_used \
+             FROM ctx_decision_audits WHERE session_id = ? \
+             GROUP BY decision_type ORDER BY cnt DESC LIMIT 5",
+            // error patterns
+            "SELECT IFNULL(skill_name, 'unknown') AS skill_name, event_type, COUNT(*) AS fail_count, \
+               SUBSTRING(COALESCE(MIN(content), ''), 1, 100) AS sample_error \
+             FROM agent_events \
+             WHERE session_id = ? AND (event_type LIKE '%error%' OR event_type LIKE '%fail%') \
+             GROUP BY skill_name, event_type \
+             ORDER BY fail_count DESC LIMIT 10",
+        ];
+
+        for sql in &queries {
+            let upper = sql.to_uppercase();
+            if !upper.contains("GROUP BY") {
+                continue;
+            }
+            // Extract GROUP BY columns
+            let group_start = upper.find("GROUP BY").unwrap() + 8;
+            let group_end = upper[group_start..]
+                .find("ORDER BY")
+                .or_else(|| upper[group_start..].find("LIMIT"))
+                .or_else(|| upper[group_start..].find("HAVING"))
+                .map(|i| group_start + i)
+                .unwrap_or(upper.len());
+            let group_cols: Vec<&str> = upper[group_start..group_end]
+                .split(',')
+                .map(|s| s.trim())
+                .collect();
+
+            // Extract SELECT columns (between SELECT and FROM)
+            let sel_start = upper.find("SELECT").unwrap() + 6;
+            let sel_end = upper.find("FROM").unwrap();
+            // Extract SELECT columns — split by top-level commas only (respect parens)
+            let select_part = &upper[sel_start..sel_end];
+            let mut select_cols = Vec::new();
+            let mut depth = 0;
+            let mut start = 0;
+            for (i, ch) in select_part.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    ',' if depth == 0 => {
+                        select_cols.push(select_part[start..i].trim());
+                        start = i + 1;
+                    }
+                    _ => {}
+                }
+            }
+            select_cols.push(select_part[start..].trim());
+
+            // Each non-aggregate SELECT column must appear in GROUP BY
+            let agg_fns = ["COUNT(", "SUM(", "AVG(", "MIN(", "MAX(", "GROUP_CONCAT("];
+            for col in &select_cols {
+                let is_agg = agg_fns.iter().any(|f| col.contains(f));
+                // Also handle wrapped: SUBSTRING(COALESCE(MIN(...)))
+                let has_nested_agg = agg_fns.iter().any(|f| col.contains(f));
+                if is_agg || has_nested_agg {
+                    continue;
+                }
+                // Strip AS alias
+                let base = if let Some(pos) = col.find(" AS ") {
+                    col[..pos].trim()
+                } else {
+                    col.trim()
+                };
+                // Handle IFNULL(col, 'x') — extract the column name
+                let check_col = if base.starts_with("IFNULL(") {
+                    base.trim_start_matches("IFNULL(")
+                        .split(',')
+                        .next()
+                        .unwrap_or(base)
+                        .trim()
+                } else {
+                    base
+                };
+                assert!(
+                    group_cols.iter().any(|g| g.contains(check_col)),
+                    "SELECT column '{col}' not in GROUP BY {group_cols:?}\nQuery: {sql}"
+                );
+            }
+        }
     }
 }
