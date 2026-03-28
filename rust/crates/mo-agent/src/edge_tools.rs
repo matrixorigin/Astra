@@ -270,7 +270,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "symbols",
-                "description": "Extract code symbols (functions, classes, structs, methods) from a file using AST parsing (tree-sitter). Supports Rust, Python, TypeScript/JavaScript, Go. Returns structured symbol info with signatures, line numbers, and nesting. Use for: understanding file structure, finding specific symbols by name, generating documentation outlines.",
+                "description": "Extract code symbols (functions, classes, structs, methods) from a file using AST parsing (tree-sitter). Supports Rust, Python, TypeScript/JavaScript, Go, Java, C/C++, Ruby. Returns structured symbol info with signatures, line numbers, and nesting. Use for: understanding file structure, finding specific symbols by name, generating documentation outlines.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1023,6 +1023,10 @@ impl ToolExecutor {
             code_intel::Language::TypeScript => "TypeScript",
             code_intel::Language::JavaScript => "JavaScript",
             code_intel::Language::Go => "Go",
+            code_intel::Language::Java => "Java",
+            code_intel::Language::C => "C",
+            code_intel::Language::Cpp => "C++",
+            code_intel::Language::Ruby => "Ruby",
         };
 
         let mut output = format!(

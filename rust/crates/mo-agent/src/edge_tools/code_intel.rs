@@ -72,6 +72,10 @@ pub fn detect_language(path: &Path) -> Option<Language> {
         "ts" | "tsx" => Some(Language::TypeScript),
         "js" | "jsx" => Some(Language::JavaScript),
         "go" => Some(Language::Go),
+        "java" => Some(Language::Java),
+        "c" | "h" => Some(Language::C),
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => Some(Language::Cpp),
+        "rb" | "ruby" => Some(Language::Ruby),
         _ => None,
     }
 }
@@ -83,6 +87,10 @@ pub enum Language {
     TypeScript,
     JavaScript,
     Go,
+    Java,
+    C,
+    Cpp,
+    Ruby,
 }
 
 /// Extract symbols from source code.
@@ -97,6 +105,9 @@ pub fn extract_symbols(source: &str, lang: Language) -> Vec<Symbol> {
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
         }
         Language::Go => tree_sitter_go::LANGUAGE.into(),
+        Language::Java => tree_sitter_java::LANGUAGE.into(),
+        Language::C | Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
     };
 
     if parser.set_language(&language).is_err() {
@@ -118,6 +129,9 @@ pub fn extract_symbols(source: &str, lang: Language) -> Vec<Symbol> {
             extract_ts_symbols(root, source, &mut symbols, None)
         }
         Language::Go => extract_go_symbols(root, source, &mut symbols, None),
+        Language::Java => extract_java_symbols(root, source, &mut symbols, None),
+        Language::C | Language::Cpp => extract_cpp_symbols(root, source, &mut symbols, None),
+        Language::Ruby => extract_ruby_symbols(root, source, &mut symbols, None),
     }
 
     symbols
@@ -517,6 +531,329 @@ fn extract_go_symbols(
     }
 }
 
+// ─── Java extraction ─────────────────────────────────────────────────────────
+
+fn extract_java_symbols(
+    node: tree_sitter::Node,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+    parent: Option<&str>,
+) {
+    let mut cursor = node.walk();
+
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "class_declaration" => {
+                if let Some(name) = get_child_text(child, "identifier", source) {
+                    symbols.push(Symbol {
+                        name: name.clone(),
+                        kind: SymbolKind::Class,
+                        start_line: child.start_position().row + 1,
+                        end_line: child.end_position().row + 1,
+                        signature: get_signature_line(child, source),
+                        parent: parent.map(String::from),
+                    });
+                    // Recurse into class body
+                    if let Some(body) = child.child_by_field_name("body") {
+                        extract_java_symbols(body, source, symbols, Some(&name));
+                    }
+                }
+            }
+            "interface_declaration" => {
+                if let Some(name) = get_child_text(child, "identifier", source) {
+                    symbols.push(Symbol {
+                        name: name.clone(),
+                        kind: SymbolKind::Interface,
+                        start_line: child.start_position().row + 1,
+                        end_line: child.end_position().row + 1,
+                        signature: get_signature_line(child, source),
+                        parent: parent.map(String::from),
+                    });
+                    if let Some(body) = child.child_by_field_name("body") {
+                        extract_java_symbols(body, source, symbols, Some(&name));
+                    }
+                }
+            }
+            "enum_declaration" => {
+                if let Some(name) = get_child_text(child, "identifier", source) {
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::Enum,
+                        start_line: child.start_position().row + 1,
+                        end_line: child.end_position().row + 1,
+                        signature: get_signature_line(child, source),
+                        parent: parent.map(String::from),
+                    });
+                }
+            }
+            "method_declaration" | "constructor_declaration" => {
+                if let Some(name) = get_child_text(child, "identifier", source) {
+                    symbols.push(Symbol {
+                        name,
+                        kind: if child.kind() == "constructor_declaration" {
+                            SymbolKind::Method
+                        } else {
+                            SymbolKind::Method
+                        },
+                        start_line: child.start_position().row + 1,
+                        end_line: child.end_position().row + 1,
+                        signature: get_signature_line(child, source),
+                        parent: parent.map(String::from),
+                    });
+                }
+            }
+            "field_declaration" => {
+                // Extract field names (may have multiple declarators)
+                let mut decl_cursor = child.walk();
+                for decl_child in child.children(&mut decl_cursor) {
+                    if decl_child.kind() == "variable_declarator" {
+                        if let Some(name) = get_child_text(decl_child, "identifier", source) {
+                            symbols.push(Symbol {
+                                name,
+                                kind: SymbolKind::Variable,
+                                start_line: child.start_position().row + 1,
+                                end_line: child.end_position().row + 1,
+                                signature: get_signature_line(child, source),
+                                parent: parent.map(String::from),
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {
+                extract_java_symbols(child, source, symbols, parent);
+            }
+        }
+    }
+}
+
+// ─── C/C++ extraction ────────────────────────────────────────────────────────
+
+fn extract_cpp_symbols(
+    node: tree_sitter::Node,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+    parent: Option<&str>,
+) {
+    let mut cursor = node.walk();
+
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "function_definition" => {
+                // Try to get function name from declarator
+                if let Some(decl) = child.child_by_field_name("declarator") {
+                    if let Some(name) = extract_cpp_declarator_name(decl, source) {
+                        symbols.push(Symbol {
+                            name,
+                            kind: SymbolKind::Function,
+                            start_line: child.start_position().row + 1,
+                            end_line: child.end_position().row + 1,
+                            signature: get_signature_line(child, source),
+                            parent: parent.map(String::from),
+                        });
+                    }
+                }
+            }
+            "declaration" => {
+                // Could be function declaration, variable, etc.
+                if let Some(decl) = child.child_by_field_name("declarator") {
+                    // Check if it's a function declaration (has parameter list)
+                    let is_func = decl.kind() == "function_declarator"
+                        || has_child_kind(decl, "parameter_list");
+                    if let Some(name) = extract_cpp_declarator_name(decl, source) {
+                        symbols.push(Symbol {
+                            name,
+                            kind: if is_func {
+                                SymbolKind::Function
+                            } else {
+                                SymbolKind::Variable
+                            },
+                            start_line: child.start_position().row + 1,
+                            end_line: child.end_position().row + 1,
+                            signature: get_signature_line(child, source),
+                            parent: parent.map(String::from),
+                        });
+                    }
+                }
+            }
+            "struct_specifier" | "class_specifier" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    let name_str = name.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                    if !name_str.is_empty() {
+                        symbols.push(Symbol {
+                            name: name_str.clone(),
+                            kind: if child.kind() == "class_specifier" {
+                                SymbolKind::Class
+                            } else {
+                                SymbolKind::Struct
+                            },
+                            start_line: child.start_position().row + 1,
+                            end_line: child.end_position().row + 1,
+                            signature: get_signature_line(child, source),
+                            parent: parent.map(String::from),
+                        });
+                        // Recurse into body
+                        if let Some(body) = child.child_by_field_name("body") {
+                            extract_cpp_symbols(body, source, symbols, Some(&name_str));
+                        }
+                    }
+                }
+            }
+            "enum_specifier" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    let name_str = name.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                    if !name_str.is_empty() {
+                        symbols.push(Symbol {
+                            name: name_str,
+                            kind: SymbolKind::Enum,
+                            start_line: child.start_position().row + 1,
+                            end_line: child.end_position().row + 1,
+                            signature: get_signature_line(child, source),
+                            parent: parent.map(String::from),
+                        });
+                    }
+                }
+            }
+            "namespace_definition" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    let name_str = name.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                    symbols.push(Symbol {
+                        name: name_str.clone(),
+                        kind: SymbolKind::Module,
+                        start_line: child.start_position().row + 1,
+                        end_line: child.end_position().row + 1,
+                        signature: get_signature_line(child, source),
+                        parent: parent.map(String::from),
+                    });
+                    if let Some(body) = child.child_by_field_name("body") {
+                        extract_cpp_symbols(body, source, symbols, Some(&name_str));
+                    }
+                }
+            }
+            _ => {
+                extract_cpp_symbols(child, source, symbols, parent);
+            }
+        }
+    }
+}
+
+fn extract_cpp_declarator_name(node: tree_sitter::Node, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "field_identifier" => {
+            Some(node.utf8_text(source.as_bytes()).ok()?.to_string())
+        }
+        "function_declarator" | "pointer_declarator" | "reference_declarator" => {
+            // Recurse into nested declarator
+            if let Some(inner) = node.child_by_field_name("declarator") {
+                extract_cpp_declarator_name(inner, source)
+            } else {
+                // Try first child as fallback
+                node.child(0)
+                    .and_then(|c| extract_cpp_declarator_name(c, source))
+            }
+        }
+        "qualified_identifier" => {
+            // For things like ClassName::method
+            let text = node.utf8_text(source.as_bytes()).ok()?;
+            Some(text.to_string())
+        }
+        _ => {
+            // Try to find an identifier child
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "identifier" || child.kind() == "field_identifier" {
+                    return Some(child.utf8_text(source.as_bytes()).ok()?.to_string());
+                }
+            }
+            None
+        }
+    }
+}
+
+fn has_child_kind(node: tree_sitter::Node, kind: &str) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(|c| c.kind() == kind)
+}
+
+// ─── Ruby extraction ─────────────────────────────────────────────────────────
+
+fn extract_ruby_symbols(
+    node: tree_sitter::Node,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+    parent: Option<&str>,
+) {
+    let mut cursor = node.walk();
+
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "class" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    let name_str = name.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                    if !name_str.is_empty() {
+                        symbols.push(Symbol {
+                            name: name_str.clone(),
+                            kind: SymbolKind::Class,
+                            start_line: child.start_position().row + 1,
+                            end_line: child.end_position().row + 1,
+                            signature: get_signature_line(child, source),
+                            parent: parent.map(String::from),
+                        });
+                        // Recurse into class body
+                        extract_ruby_symbols(child, source, symbols, Some(&name_str));
+                    }
+                }
+            }
+            "module" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    let name_str = name.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                    if !name_str.is_empty() {
+                        symbols.push(Symbol {
+                            name: name_str.clone(),
+                            kind: SymbolKind::Module,
+                            start_line: child.start_position().row + 1,
+                            end_line: child.end_position().row + 1,
+                            signature: get_signature_line(child, source),
+                            parent: parent.map(String::from),
+                        });
+                        extract_ruby_symbols(child, source, symbols, Some(&name_str));
+                    }
+                }
+            }
+            "method" | "singleton_method" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    let name_str = name.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                    symbols.push(Symbol {
+                        name: name_str,
+                        kind: SymbolKind::Method,
+                        start_line: child.start_position().row + 1,
+                        end_line: child.end_position().row + 1,
+                        signature: get_signature_line(child, source),
+                        parent: parent.map(String::from),
+                    });
+                }
+            }
+            "constant" => {
+                // Top-level constants
+                let name_str = child.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                if !name_str.is_empty() && parent.is_none() {
+                    symbols.push(Symbol {
+                        name: name_str,
+                        kind: SymbolKind::Constant,
+                        start_line: child.start_position().row + 1,
+                        end_line: child.end_position().row + 1,
+                        signature: get_signature_line(child, source),
+                        parent: None,
+                    });
+                }
+            }
+            _ => {
+                extract_ruby_symbols(child, source, symbols, parent);
+            }
+        }
+    }
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn get_child_text(node: tree_sitter::Node, kind: &str, source: &str) -> Option<String> {
@@ -712,5 +1049,129 @@ fn set_user() {}
         assert_eq!(matches.len(), 2);
         assert!(matches.iter().any(|s| s.name == "get_user"));
         assert!(matches.iter().any(|s| s.name == "set_user"));
+    }
+
+    // ─── New language tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn detect_java_language() {
+        assert_eq!(
+            detect_language(Path::new("Main.java")),
+            Some(Language::Java)
+        );
+    }
+
+    #[test]
+    fn detect_cpp_language() {
+        assert_eq!(
+            detect_language(Path::new("main.cpp")),
+            Some(Language::Cpp)
+        );
+        assert_eq!(
+            detect_language(Path::new("main.cc")),
+            Some(Language::Cpp)
+        );
+        assert_eq!(
+            detect_language(Path::new("header.hpp")),
+            Some(Language::Cpp)
+        );
+    }
+
+    #[test]
+    fn detect_c_language() {
+        assert_eq!(detect_language(Path::new("main.c")), Some(Language::C));
+        assert_eq!(detect_language(Path::new("header.h")), Some(Language::C));
+    }
+
+    #[test]
+    fn detect_ruby_language() {
+        assert_eq!(
+            detect_language(Path::new("app.rb")),
+            Some(Language::Ruby)
+        );
+    }
+
+    #[test]
+    fn extract_java_class_and_methods() {
+        let source = r#"
+public class UserService {
+    private String name;
+
+    public void setName(String name) {
+        this.name = name;
+    }
+
+    public String getName() {
+        return this.name;
+    }
+}
+"#;
+        let symbols = extract_symbols(source, Language::Java);
+
+        let class_sym = symbols.iter().find(|s| s.name == "UserService");
+        assert!(class_sym.is_some(), "symbols: {:?}", symbols);
+        assert_eq!(class_sym.unwrap().kind, SymbolKind::Class);
+
+        let set_method = symbols.iter().find(|s| s.name == "setName");
+        assert!(set_method.is_some(), "symbols: {:?}", symbols);
+        assert_eq!(set_method.unwrap().kind, SymbolKind::Method);
+
+        let get_method = symbols.iter().find(|s| s.name == "getName");
+        assert!(get_method.is_some(), "symbols: {:?}", symbols);
+    }
+
+    #[test]
+    fn extract_cpp_functions_and_classes() {
+        let source = r#"
+#include <iostream>
+
+class Calculator {
+public:
+    int add(int a, int b) {
+        return a + b;
+    }
+};
+
+int main() {
+    Calculator calc;
+    return 0;
+}
+"#;
+        let symbols = extract_symbols(source, Language::Cpp);
+
+        let class_sym = symbols.iter().find(|s| s.name == "Calculator");
+        assert!(class_sym.is_some(), "symbols: {:?}", symbols);
+        assert_eq!(class_sym.unwrap().kind, SymbolKind::Class);
+
+        let main_sym = symbols.iter().find(|s| s.name == "main");
+        assert!(main_sym.is_some(), "symbols: {:?}", symbols);
+        assert_eq!(main_sym.unwrap().kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn extract_ruby_class_and_methods() {
+        let source = r#"
+class UserController
+  def index
+    @users = User.all
+  end
+
+  def show
+    @user = User.find(params[:id])
+  end
+end
+"#;
+        let symbols = extract_symbols(source, Language::Ruby);
+
+        let class_sym = symbols.iter().find(|s| s.name == "UserController");
+        assert!(class_sym.is_some(), "symbols: {:?}", symbols);
+        assert_eq!(class_sym.unwrap().kind, SymbolKind::Class);
+
+        let index_method = symbols.iter().find(|s| s.name == "index");
+        assert!(index_method.is_some(), "symbols: {:?}", symbols);
+        assert_eq!(index_method.unwrap().kind, SymbolKind::Method);
+
+        let show_method = symbols.iter().find(|s| s.name == "show");
+        assert!(show_method.is_some(), "symbols: {:?}", symbols);
     }
 }
