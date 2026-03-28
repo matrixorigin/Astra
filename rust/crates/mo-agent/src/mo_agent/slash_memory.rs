@@ -530,21 +530,31 @@ pub async fn handle_plan_mode_input(
         return Ok(());
     };
 
-    // Call LLM via SSE
+    // Call LLM via SSE (match the format used by /plan decompose)
     let turn_url = format!("{base}/chat/turn");
     let messages = vec![serde_json::json!({
         "role": "user",
         "content": prompt
     })];
 
-    let session_id_str = state.session_id.clone().unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    
+    // Don't pass session_id for plan mode - let server create ephemeral session
+    // This avoids "Session not found" errors since plan mode is self-contained
+    let payload = serde_json::json!({
+        "messages": messages,
+        "model": state.model.clone(),
+        "edge_profile": {
+            "cwd": cwd.to_string_lossy(),
+        },
+        "edge_tools": [],  // No tools needed for plan editing
+    });
+    
     let resp = client
         .post(&turn_url)
-        .bearer_auth(tok)
-        .json(&serde_json::json!({
-            "messages": messages,
-            "session_id": &session_id_str,
-        }))
+        .headers(auth_headers(tok)?)
+        .header("Accept", "text/event-stream")
+        .json(&payload)
         .send()
         .await;
 
@@ -552,6 +562,8 @@ pub async fn handle_plan_mode_input(
         Ok(r) if r.status().is_success() => {
             let mut full_text = String::new();
             let mut stream = r.bytes_stream();
+            let mut event_count = 0;
+            let mut event_types: Vec<String> = Vec::new();
             use futures_util::StreamExt;
             
             while let Some(chunk) = stream.next().await {
@@ -559,10 +571,20 @@ pub async fn handle_plan_mode_input(
                     let event_str = String::from_utf8_lossy(&bytes);
                     for line in event_str.lines() {
                         if let Some(data) = line.strip_prefix("data: ") {
+                            event_count += 1;
                             if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                                if json.get("type").and_then(|v| v.as_str()) == Some("text_delta") {
+                                let event_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                if !event_types.contains(&event_type.to_string()) {
+                                    event_types.push(event_type.to_string());
+                                }
+                                if event_type == "text_delta" {
                                     if let Some(content) = json.get("content").and_then(|v| v.as_str()) {
                                         full_text.push_str(content);
+                                    }
+                                } else if event_type == "error" {
+                                    // Show error messages from the server
+                                    if let Some(msg) = json.get("message").or_else(|| json.get("error")).and_then(|v| v.as_str()) {
+                                        eprintln!("\r  {} Server error: {}", "✗".red(), msg);
                                     }
                                 }
                             }
@@ -573,6 +595,15 @@ pub async fn handle_plan_mode_input(
             
             // Clear thinking indicator
             eprint!("\r                    \r");
+            
+            // Debug: show response info
+            if full_text.is_empty() {
+                if event_count == 0 {
+                    eprintln!("  {} No SSE events received from server", "⚠".yellow());
+                } else {
+                    eprintln!("  {} {} events (types: {}) but no text", "⚠".yellow(), event_count, event_types.join(", "));
+                }
+            }
             
             // Check if response contains JSON plan update
             if let Some(json_start) = full_text.find("```json") {
@@ -590,18 +621,30 @@ pub async fn handle_plan_mode_input(
                 }
             }
             
-            // Show the LLM response (text part)
-            let text_response = full_text
-                .replace("```json", "")
-                .replace("```", "");
-            let text_clean: String = text_response
-                .lines()
-                .filter(|l| !l.trim().starts_with('{') && !l.trim().starts_with('}') && !l.trim().starts_with('"'))
-                .collect::<Vec<_>>()
-                .join("\n");
-            
-            if !text_clean.trim().is_empty() {
-                eprintln!("{}", text_clean.trim());
+            // Show the LLM response (don't filter too aggressively)
+            if !full_text.is_empty() {
+                // Remove markdown code blocks but keep the rest
+                let text_clean = full_text
+                    .replace("```json", "")
+                    .replace("```", "");
+                // Only filter lines that look like pure JSON structure
+                let text_filtered: String = text_clean
+                    .lines()
+                    .filter(|l| {
+                        let trimmed = l.trim();
+                        // Keep lines that have text content, not just JSON delimiters
+                        !trimmed.is_empty() && 
+                        !(trimmed == "{" || trimmed == "}" || trimmed == "[" || trimmed == "]" ||
+                          (trimmed.starts_with('"') && trimmed.ends_with(',')) ||
+                          (trimmed.starts_with('"') && trimmed.ends_with('"')))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                
+                if !text_filtered.trim().is_empty() {
+                    eprintln!();
+                    eprintln!("{}", text_filtered.trim());
+                }
             }
             
             // Update history with assistant response
