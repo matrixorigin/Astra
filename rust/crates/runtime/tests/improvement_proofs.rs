@@ -5295,7 +5295,10 @@ mod hardening_proofs {
     use mo_agent_runtime::pipeline::persistence::{
         LearningSnapshot, ToolHealthEntry, load_snapshot_from, save_snapshot_to,
     };
-    use mo_agent_runtime::turn::response_guard::{is_prompt_leaked, is_repetition_loop};
+    use mo_agent_runtime::turn::response_guard::{
+        is_prompt_leaked, is_repetition_loop, check_response_quality, find_hallucinated_tools,
+        find_malformed_args, QualityReport,
+    };
     use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
     use mo_agent_runtime::turn::turn_guard::TurnGuard;
 
@@ -5355,6 +5358,76 @@ mod hardening_proofs {
 
         // Empty text safe
         assert!(!is_repetition_loop(""));
+    }
+
+    // ── Quality Guardrails ──
+
+    #[test]
+    fn quality_detects_hallucinated_tool_names() {
+        let calls = vec![
+            serde_json::json!({"name": "read_file", "arguments": "{}"}),
+            serde_json::json!({"name": "execute_python", "arguments": "{}"}),
+        ];
+        let found = find_hallucinated_tools(&calls, &["read_file", "bash", "grep"]);
+        assert_eq!(found, vec!["execute_python"]);
+    }
+
+    #[test]
+    fn quality_detects_malformed_json_args() {
+        let calls = vec![
+            serde_json::json!({"name": "bash", "arguments": "{not valid json"}),
+            serde_json::json!({"name": "grep", "arguments": "{\"pattern\":\"ok\"}"}),
+        ];
+        let bad = find_malformed_args(&calls);
+        assert_eq!(bad, vec!["bash"]);
+    }
+
+    #[test]
+    fn quality_detects_fabrication_in_response() {
+        let report = check_response_quality(
+            "The configuration is at /path/to/config.yaml. You should edit it.",
+            &[],
+            &["bash"],
+            "where is the config?",
+        );
+        assert!(report.has_fabrication_markers);
+        assert!(report.has_issues());
+    }
+
+    #[test]
+    fn quality_passes_clean_response() {
+        let report = check_response_quality(
+            "Found the config at rust/crates/runtime/src/config.rs line 42.",
+            &[serde_json::json!({"name": "grep", "arguments": "{}"})],
+            &["grep"],
+            "find the config",
+        );
+        assert!(!report.has_issues());
+        assert!(report.to_warning().is_none());
+    }
+
+    #[test]
+    fn quality_detects_echo() {
+        let q = "How does authentication work in this project?";
+        let report = check_response_quality(q, &[], &["bash"], q);
+        assert!(report.is_echo);
+        let w = report.to_warning().unwrap();
+        assert!(w.contains("echoed"));
+    }
+
+    #[test]
+    fn quality_report_aggregates_multiple_issues() {
+        let report = QualityReport {
+            hallucinated_tools: vec!["fake_tool".to_string()],
+            malformed_args: vec!["bash".to_string()],
+            has_fabrication_markers: true,
+            is_echo: false,
+        };
+        assert!(report.has_issues());
+        let w = report.to_warning().unwrap();
+        assert!(w.contains("fake_tool"));
+        assert!(w.contains("bash"));
+        assert!(w.contains("placeholder"));
     }
 
     // ── Cross-Session Tool Health ──

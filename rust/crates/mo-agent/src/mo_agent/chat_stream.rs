@@ -1047,6 +1047,26 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     .to_string();
                 break;
             }
+
+            // Response guard: quality check for fabrication and echo
+            let quality = mo_agent_runtime::turn::response_guard::check_response_quality(
+                &final_text,
+                &turn_result.tool_calls,
+                &[], // tool name validation handled at execution time (line 1262+)
+                message,
+            );
+            if quality.has_fabrication_markers {
+                agent_warn!(
+                    "response_guard",
+                    "Fabrication markers detected: placeholder paths in response"
+                );
+            }
+            if quality.is_echo {
+                agent_warn!(
+                    "response_guard",
+                    "Echo detected: LLM repeated user query instead of answering"
+                );
+            }
         }
         total_prompt += turn_result.prompt_tokens;
         total_completion += turn_result.completion_tokens;
