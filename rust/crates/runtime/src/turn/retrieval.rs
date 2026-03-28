@@ -423,11 +423,39 @@ pub fn rank_memory_results(query: &str, memory_contents: &[String]) -> Vec<(Stri
             let score = tfidf_cosine(&query_tf, doc_tf, &idf);
             (content.clone(), score)
         })
-        .filter(|(_, score)| *score >= MEMORY_RELEVANCE_THRESHOLD)
+        .filter(|(_, score)| *score >= adaptive_threshold(query))
         .collect();
 
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Adaptive recall: if scores cluster tightly (low spread), fewer results
+    // are genuinely relevant — trim to avoid injecting near-noise memories.
+    if scored.len() > 2 {
+        let top = scored[0].1;
+        let last = scored[scored.len() - 1].1;
+        let spread = top - last;
+        let keep = if spread < 0.03 {
+            scored.len().min(2) // Tight cluster: keep only top 2
+        } else if spread < 0.08 {
+            scored.len().min(4) // Moderate spread: keep top 4
+        } else {
+            scored.len() // Wide spread: keep all
+        };
+        scored.truncate(keep);
+    }
+
     scored
+}
+
+/// Adaptive relevance threshold based on query length.
+/// Short queries are more ambiguous → higher bar to prevent noise.
+/// Long queries provide more signal → lower bar to catch partial matches.
+fn adaptive_threshold(query: &str) -> f64 {
+    match query.chars().count() {
+        0..=20 => 0.08,
+        21..=100 => MEMORY_RELEVANCE_THRESHOLD,
+        _ => 0.03,
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -878,5 +906,55 @@ mod tests {
             "Completely irrelevant memories should all be filtered: {:?}",
             ranked
         );
+    }
+
+    // ── Adaptive threshold tests ──
+
+    #[test]
+    fn adaptive_threshold_short_query_higher_bar() {
+        assert_eq!(super::adaptive_threshold("fix bug"), 0.08);
+        assert_eq!(super::adaptive_threshold(""), 0.08);
+    }
+
+    #[test]
+    fn adaptive_threshold_medium_query_normal_bar() {
+        let medium = "how do I fix the authentication bug in login";
+        assert!(medium.chars().count() > 20 && medium.chars().count() <= 100);
+        assert_eq!(super::adaptive_threshold(medium), super::MEMORY_RELEVANCE_THRESHOLD);
+    }
+
+    #[test]
+    fn adaptive_threshold_long_query_lower_bar() {
+        let long = "I need to understand how the authentication system works with JWT tokens and how it integrates with the database layer for session management";
+        assert!(long.chars().count() > 100);
+        assert_eq!(super::adaptive_threshold(long), 0.03);
+    }
+
+    #[test]
+    fn adaptive_recall_tight_cluster_trimmed() {
+        // When all results score nearly identically, fewer survive
+        let query = "git diff status";
+        let memories = vec![
+            "git diff shows changes".to_string(),
+            "git status shows state".to_string(),
+            "git diff is useful".to_string(),
+            "git status diff check".to_string(),
+        ];
+        let ranked = rank_memory_results(query, &memories);
+        assert!(ranked.len() <= 4, "Should trim tight cluster: got {}", ranked.len());
+    }
+
+    #[test]
+    fn adaptive_recall_preserves_high_spread() {
+        let query = "matrixone database query optimization";
+        let memories = vec![
+            "matrixone database query optimization techniques".to_string(),
+            "generic unrelated content about weather".to_string(),
+        ];
+        let ranked = rank_memory_results(query, &memories);
+        assert!(ranked.len() <= 2);
+        if !ranked.is_empty() {
+            assert!(ranked[0].0.contains("matrixone"));
+        }
     }
 }

@@ -12,8 +12,8 @@ use serde_json::Value;
 
 use super::truncate_output;
 
-const DIFF_LIMIT: usize = 20_000;
-const SHOW_LIMIT: usize = 30_000;
+const DIFF_LIMIT: usize = 12_000; // ~3K tokens; was 20K
+const SHOW_LIMIT: usize = 16_000; // ~4K tokens; was 30K
 
 fn tool_output_limit() -> usize {
     super::tool_output_limit()
