@@ -25,20 +25,32 @@ pub fn server_tool_call_signature(tool_calls: &[Value]) -> BTreeSet<String> {
     tool_calls
         .iter()
         .map(|tool_call| {
-            let function = tool_call
-                .get("function")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            let name = function
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let arguments = function
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            format!("{name}:{}", canonical_tool_args(arguments))
+            // Support both formats:
+            //   Nested (OpenAI): {function: {name, arguments}}
+            //   Flat (internal): {name, arguments}
+            let (name, arguments) =
+                if let Some(function) = tool_call.get("function").and_then(Value::as_object) {
+                    let n = function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let a = function
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    (n.to_string(), a.to_string())
+                } else {
+                    let n = tool_call
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let a = tool_call
+                        .get("arguments")
+                        .map(|v| serde_json::to_string(v).unwrap_or_default())
+                        .unwrap_or_default();
+                    (n.to_string(), a)
+                };
+            format!("{name}:{}", canonical_tool_args(&arguments))
         })
         .collect()
 }
@@ -831,5 +843,140 @@ mod tests {
         } else {
             panic!("Expected Drifting");
         }
+    }
+
+    // ── Tool call signature format tests ──
+
+    #[test]
+    fn signature_nested_openai_format() {
+        // OpenAI format: {function: {name, arguments}}
+        let tool_calls = vec![serde_json::json!({
+            "function": {
+                "name": "read_file",
+                "arguments": r#"{"path":"src/main.rs"}"#
+            }
+        })];
+        let sigs = server_tool_call_signature(&tool_calls);
+        assert_eq!(sigs.len(), 1);
+        let sig = sigs.iter().next().unwrap();
+        assert!(sig.starts_with("read_file:"), "expected read_file prefix, got: {sig}");
+        assert!(sig.contains("main.rs"), "expected main.rs in sig, got: {sig}");
+    }
+
+    #[test]
+    fn signature_flat_internal_format() {
+        // Internal flat format: {name, arguments}
+        let tool_calls = vec![serde_json::json!({
+            "name": "read_file",
+            "arguments": {"path": "src/main.rs"}
+        })];
+        let sigs = server_tool_call_signature(&tool_calls);
+        assert_eq!(sigs.len(), 1);
+        let sig = sigs.iter().next().unwrap();
+        assert!(sig.starts_with("read_file:"), "expected read_file prefix, got: {sig}");
+        assert!(sig.contains("main.rs"), "expected main.rs in sig, got: {sig}");
+    }
+
+    #[test]
+    fn signature_flat_format_different_tools_not_equal() {
+        // Two different tool calls in flat format must produce different signatures
+        let calls_a = vec![serde_json::json!({
+            "name": "read_file",
+            "arguments": {"path": "src/main.rs"}
+        })];
+        let calls_b = vec![serde_json::json!({
+            "name": "read_file",
+            "arguments": {"path": "src/lib.rs"}
+        })];
+        let sigs_a = server_tool_call_signature(&calls_a);
+        let sigs_b = server_tool_call_signature(&calls_b);
+        assert_ne!(sigs_a, sigs_b, "different paths must produce different signatures");
+    }
+
+    #[test]
+    fn signature_flat_format_different_tool_names() {
+        let calls_a = vec![serde_json::json!({
+            "name": "read_file",
+            "arguments": {"path": "src/main.rs"}
+        })];
+        let calls_b = vec![serde_json::json!({
+            "name": "list_dir",
+            "arguments": {"path": "src/"}
+        })];
+        let sigs_a = server_tool_call_signature(&calls_a);
+        let sigs_b = server_tool_call_signature(&calls_b);
+        assert_ne!(sigs_a, sigs_b, "different tool names must produce different signatures");
+    }
+
+    /// Regression test for session 2c701822: flat-format tool calls were
+    /// all producing signature ":" (empty name, empty args), causing false
+    /// stall detection on EVERY round after the first.
+    #[test]
+    fn no_false_stall_with_flat_format_different_args() {
+        // Simulate 4 rounds of read_file with different paths (flat format)
+        let mut tool_sigs: Vec<BTreeSet<String>> = Vec::new();
+        let window = SERVER_STALL_WINDOW.max(MAX_EXPLORATION_ROUNDS) + 2;
+
+        // Round 1: read_file(Cargo.toml)
+        let calls_1 = vec![serde_json::json!({
+            "name": "read_file",
+            "arguments": {"path": "rust/crates/mo-agent/Cargo.toml"}
+        })];
+        record_server_tool_signatures(&mut tool_sigs, &calls_1, window);
+        assert!(!detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW));
+
+        // Round 2: list_dir + read_file(different path)
+        let calls_2 = vec![
+            serde_json::json!({"name": "list_dir", "arguments": {"path": "rust/crates/mo-agent/src/edge_tools"}}),
+            serde_json::json!({"name": "read_file", "arguments": {"path": "rust/crates/mo-agent/src/edge_tools/nonexistent.rs"}}),
+        ];
+        record_server_tool_signatures(&mut tool_sigs, &calls_2, window);
+        assert!(
+            !detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW),
+            "different tool calls across rounds must not trigger stall"
+        );
+
+        // Round 3: read_file(yet another path)
+        let calls_3 = vec![serde_json::json!({
+            "name": "read_file",
+            "arguments": {"path": "rust/crates/mo-agent/src/edge_tools/mo_tools.rs"}
+        })];
+        record_server_tool_signatures(&mut tool_sigs, &calls_3, window);
+        assert!(
+            !detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW),
+            "read_file with different paths across rounds must not trigger stall"
+        );
+
+        // Round 4: str_replace (completely different tool)
+        let calls_4 = vec![serde_json::json!({
+            "name": "str_replace",
+            "arguments": {"path": "Cargo.toml", "old_str": "foo", "new_str": "bar"}
+        })];
+        record_server_tool_signatures(&mut tool_sigs, &calls_4, window);
+        assert!(
+            !detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW),
+            "str_replace after read_file must not trigger stall"
+        );
+    }
+
+    /// Verify that ACTUAL stall (same tool, same args) is still detected with flat format
+    #[test]
+    fn real_stall_detected_with_flat_format() {
+        let mut tool_sigs: Vec<BTreeSet<String>> = Vec::new();
+        let window = SERVER_STALL_WINDOW.max(MAX_EXPLORATION_ROUNDS) + 2;
+
+        // Same exact call twice in a row
+        let calls = vec![serde_json::json!({
+            "name": "read_file",
+            "arguments": {"path": "src/main.rs"}
+        })];
+        record_server_tool_signatures(&mut tool_sigs, &calls, window);
+        assert!(!detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW));
+
+        record_server_tool_signatures(&mut tool_sigs, &calls, window);
+        assert!(
+            detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW),
+            "identical tool calls across rounds must trigger stall"
+        );
     }
 }
