@@ -477,9 +477,23 @@ fn strip_ansi_for_width(input: &str) -> String {
 
 fn slash_overlay_title(filter: Option<&str>) -> String {
     if let Some(q) = filter.filter(|q| !q.is_empty()) {
-        format!(" Slash Commands  ·  filter: {q} ")
+        format!(" Slash Commands  ·  /{q} ")
     } else {
         " Slash Commands ".to_string()
+    }
+}
+
+fn slash_overlay_context_summary(
+    filter: Option<&str>,
+    total: usize,
+    start: usize,
+    end: usize,
+) -> String {
+    match (filter.filter(|q| !q.is_empty()), total) {
+        (Some(q), 0) => format!(" filter /{q}  ·  no matching commands "),
+        (Some(q), _) => format!(" filter /{q}  ·  showing {}-{} of {} ", start + 1, end, total),
+        (None, 0) => " type to filter slash commands ".to_string(),
+        (None, _) => format!(" type to filter  ·  showing {}-{} of {} ", start + 1, end, total),
     }
 }
 
@@ -518,6 +532,17 @@ fn render_slash_overlay_footer(total: usize, start: usize, end: usize, inner_wid
         summary.dim(),
         "─".repeat(pad).cyan(),
         "╯".cyan()
+    )
+}
+
+fn render_slash_overlay_context_line(summary: &str, inner_width: usize) -> String {
+    let pad = inner_width.saturating_sub(summary.chars().count());
+    format!(
+        "{}{}{}{}",
+        "│".cyan().dim(),
+        summary.dim(),
+        " ".repeat(pad),
+        "│".cyan().dim()
     )
 }
 
@@ -633,7 +658,7 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
     let mut body_contents: Vec<(Option<(&'static str, &'static str, bool)>, String)> = Vec::new();
     if rows.is_empty() {
         let label = filter.unwrap_or("");
-        body_contents.push((None, format!("no commands match '{label}'")));
+        body_contents.push((None, format!("No slash commands match '/{label}'")));
     } else {
         let total = rows.len();
         let start = if total <= visible_limit {
@@ -651,6 +676,7 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
         }
         let title = slash_overlay_title(filter);
         let footer = slash_overlay_footer_summary(total, start, end);
+        let context = slash_overlay_context_summary(filter, total, start, end);
         let inner_width = body_contents
             .iter()
             .map(|(row, message)| match row {
@@ -662,8 +688,11 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
             .max()
             .unwrap_or(40)
             .max(title.chars().count())
+            .max(context.chars().count())
             .max(footer.chars().count());
         println!("{}", render_slash_overlay_header(filter, inner_width));
+        printed += 1;
+        println!("{}", render_slash_overlay_context_line(&context, inner_width));
         printed += 1;
         for (row, message) in &body_contents {
             let line = match row {
@@ -694,14 +723,18 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
     }
     let title = slash_overlay_title(filter);
     let footer = slash_overlay_footer_summary(0, 0, 0);
+    let context = slash_overlay_context_summary(filter, 0, 0, 0);
     let inner_width = body_contents
         .iter()
         .map(|(_, message)| message.chars().count())
         .max()
         .unwrap_or(40)
         .max(title.chars().count())
+        .max(context.chars().count())
         .max(footer.chars().count());
     println!("{}", render_slash_overlay_header(filter, inner_width));
+    printed += 1;
+    println!("{}", render_slash_overlay_context_line(&context, inner_width));
     printed += 1;
     for (_, message) in &body_contents {
         let line = render_slash_overlay_message_line(message, inner_width);
@@ -1748,7 +1781,30 @@ mod tests {
         assert!(plain.starts_with('╭'));
         assert!(plain.ends_with('╮'));
         assert!(plain.contains("Slash Commands"));
-        assert!(plain.contains("filter: skill d"));
+        assert!(plain.contains("/skill d"));
+    }
+
+    #[test]
+    fn slash_overlay_context_summary_reports_visible_range() {
+        let summary = slash_overlay_context_summary(Some("skill d"), 12, 0, 10);
+        assert!(summary.contains("filter /skill d"));
+        assert!(summary.contains("showing 1-10 of 12"));
+    }
+
+    #[test]
+    fn slash_overlay_context_summary_handles_empty_state() {
+        let summary = slash_overlay_context_summary(Some("zzz"), 0, 0, 0);
+        assert!(summary.contains("filter /zzz"));
+        assert!(summary.contains("no matching commands"));
+    }
+
+    #[test]
+    fn render_slash_overlay_context_line_draws_side_rails() {
+        let line = render_slash_overlay_context_line(" type to filter  ·  showing 1-10 of 12 ", 48);
+        let plain = strip_ansi_codes(&line);
+        assert!(plain.starts_with('│'));
+        assert!(plain.ends_with('│'));
+        assert!(plain.contains("showing 1-10 of 12"));
     }
 
     #[test]
