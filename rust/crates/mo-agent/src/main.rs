@@ -101,7 +101,7 @@ use repl_ui::{
 };
 use slash_account::handle_account_command;
 use slash_info::handle_info_command;
-use slash_memory::handle_memory_domain_command;
+use slash_memory::{handle_memory_domain_command, handle_plan_mode_input};
 use slash_session::handle_session_command;
 #[cfg(test)]
 use slash_session::resolve_journal_target_session;
@@ -380,6 +380,8 @@ struct ReplState {
     task_service: Option<std::sync::Arc<mo_agent_services::LocalTaskService>>,
     /// Cross-session tool health data for error budget persistence.
     tool_health_entries: Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry>,
+    /// Plan Mode state — when Some, REPL is in interactive plan editing mode.
+    plan_mode: Option<plan_decompose::PlanModeState>,
 }
 
 impl Default for ReplState {
@@ -409,6 +411,7 @@ impl Default for ReplState {
             learning_snapshot: None,
             task_service: None,
             tool_health_entries: Vec::new(),
+            plan_mode: None,
         }
     }
 }
@@ -1831,11 +1834,15 @@ async fn run_chat_repl(
     loop {
         let current_token = current_access_token(profile);
 
-        // Simple prompt line with ❯
+        // Prompt: plan> in plan mode, ❯ otherwise
         if let Some(ref sname) = state.skill_dev_name {
             eprintln!("  \u{1f527} {}", format!("Skill dev: {sname}").cyan().dim());
         }
-        let prompt_str = format!("{} ", "❯".cyan().bold(),);
+        let prompt_str = if state.plan_mode.is_some() {
+            format!("{} ", "plan>".yellow().bold())
+        } else {
+            format!("{} ", "❯".cyan().bold())
+        };
 
         let readline = tokio::task::block_in_place(|| editor.readline(&prompt_str));
 
@@ -1882,6 +1889,16 @@ async fn run_chat_repl(
                             &pipeline_modules.calibrator,
                         );
                     }
+                } else if state.plan_mode.is_some() {
+                    // Plan mode: handle input as plan editing
+                    handle_plan_mode_input(
+                        line.clone(),
+                        current_token.as_deref(),
+                        &mut state,
+                        client,
+                        base,
+                    )
+                    .await?;
                 } else {
                     handle_chat_input(
                         line,

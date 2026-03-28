@@ -353,13 +353,268 @@ pub(super) async fn handle_memory_domain_command(
                         }
                     }
                 }
+                "enter" if !sub_arg.is_empty() => {
+                    // Enter interactive plan mode (Kiro-style)
+                    use super::plan_decompose::{PlanModeState, analyze_project, decomposition_prompt, parse_plan_response, format_plan};
+                    
+                    let Some(tok) = token else {
+                        eprintln!("  {} Not logged in. Run /login first.", "✗".red());
+                        return Ok(());
+                    };
+                    
+                    // Analyze project context
+                    let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    eprintln!("  {} Analyzing project...", "⋯".dim());
+                    let context = analyze_project(&project_root);
+                    
+                    // Generate initial decomposition prompt
+                    let prompt = decomposition_prompt(sub_arg, &context);
+                    
+                    eprintln!("  {} Decomposing goal...", "⋯".dim());
+                    
+                    // Call LLM for initial plan
+                    let payload = serde_json::json!({
+                        "messages": [{"role": "user", "content": prompt}],
+                        "session_id": state.session_id.clone(),
+                    });
+                    
+                    let resp = client
+                        .post(format!("{base}/chat/turn"))
+                        .bearer_auth(tok)
+                        .json(&payload)
+                        .send()
+                        .await;
+                    
+                    match resp {
+                        Ok(r) if r.status().is_success() => {
+                            let mut full_text = String::new();
+                            let mut stream = r.bytes_stream();
+                            use futures_util::StreamExt;
+                            
+                            while let Some(chunk) = stream.next().await {
+                                if let Ok(bytes) = chunk {
+                                    let event_str = String::from_utf8_lossy(&bytes);
+                                    for line in event_str.lines() {
+                                        if let Some(data) = line.strip_prefix("data: ") {
+                                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                                                if json.get("type").and_then(|v| v.as_str()) == Some("text_delta") {
+                                                    if let Some(content) = json.get("content").and_then(|v| v.as_str()) {
+                                                        full_text.push_str(content);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // Parse the plan
+                            let plan_result = parse_plan_response(&full_text);
+                            
+                            // Create PlanModeState
+                            let mut plan_state = PlanModeState::new(sub_arg.to_string(), context);
+                            
+                            // Set the plan if parsing succeeded
+                            if let Ok(ref plan) = plan_result {
+                                plan_state.set_plan(plan.clone());
+                            }
+                            
+                            state.plan_mode = Some(plan_state);
+                            
+                            eprintln!();
+                            eprintln!("{}  Entered plan mode for: {}", "📋".yellow(), sub_arg.cyan());
+                            eprintln!();
+                            
+                            // Display the plan
+                            if let Ok(ref p) = plan_result {
+                                let formatted = format_plan(p);
+                                eprintln!("{formatted}");
+                            }
+                            
+                            eprintln!();
+                            eprintln!("  {} Commands: 'exit' to leave, 'execute' or 'go' to run the plan", "💡".cyan());
+                            eprintln!("  {} Or ask questions to modify the plan", "💬".cyan());
+                        }
+                        Ok(r) => {
+                            eprintln!("{}", format!("  ✗ LLM call failed ({})", r.status()).red());
+                        }
+                        Err(e) => {
+                            eprintln!("{}", format!("  ✗ Request failed: {e}").red());
+                        }
+                    }
+                }
+                "exit" => {
+                    if state.plan_mode.is_some() {
+                        state.plan_mode = None;
+                        eprintln!("  {} Exited plan mode", "✓".green());
+                    } else {
+                        eprintln!("  ⚠️ Not in plan mode");
+                    }
+                }
                 _ => {
-                    eprintln!("  Usage: /plan [show | set <text> | clear | decompose <goal>]");
+                    eprintln!("  Usage: /plan [show | set <text> | clear | decompose <goal> | enter <goal> | exit]");
                 }
             }
         }
 
         _ => unreachable!("unexpected memory-domain command: {cmd}"),
+    }
+
+    Ok(())
+}
+
+/// Handle user input in plan mode - sends to LLM for plan editing
+pub async fn handle_plan_mode_input(
+    input: String,
+    token: Option<&str>,
+    state: &mut ReplState,
+    client: &reqwest::Client,
+    base: &str,
+) -> Result<(), String> {
+    use super::plan_decompose::{PlanModeState, TaskPlan, format_plan};
+    
+    let plan_state = match state.plan_mode.as_mut() {
+        Some(ps) => ps,
+        None => {
+            eprintln!("  ⚠️ Not in plan mode");
+            return Ok(());
+        }
+    };
+
+    // Check for exit commands
+    let input_lower = input.to_lowercase();
+    if input_lower == "exit" || input_lower == "quit" || input_lower == "/plan exit" {
+        eprintln!();
+        eprintln!("{}  Exiting plan mode", "📋".yellow());
+        state.plan_mode = None;
+        return Ok(());
+    }
+
+    // Check for execute command
+    if PlanModeState::is_execute_command(&input) {
+        eprintln!();
+        eprintln!("{}  Executing plan...", "🚀".green());
+        // Store plan to memory before execution (TODO: actually persist this)
+        let _memory_content = plan_state.to_memory_content();
+        eprintln!("{}  Plan ready for execution", "💾".cyan());
+        eprintln!();
+        
+        // Display the tasks to execute
+        let plan = &plan_state.plan;
+        if !plan.subtasks.is_empty() {
+            eprintln!("{}  Tasks to execute:", "📋".yellow());
+            for task in &plan.subtasks {
+                let deps_str = if task.depends_on.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (depends on: {})", task.depends_on.join(", "))
+                };
+                eprintln!("    {} [{}] {}{}", "•".dim(), task.id, task.title, deps_str.dim());
+            }
+            eprintln!();
+        }
+        
+        state.plan_mode = None;
+        return Ok(());
+    }
+
+    // Build prompt for LLM
+    let prompt = plan_state.plan_mode_prompt(&input);
+    plan_state.add_turn(&input, ""); // Will update assistant part after response
+
+    // Show thinking indicator
+    eprint!("  ● Thinking...");
+    
+    let Some(tok) = token else {
+        eprintln!("\r  ✗ Not logged in. Run /login first.");
+        return Ok(());
+    };
+
+    // Call LLM via SSE
+    let turn_url = format!("{base}/chat/turn");
+    let messages = vec![serde_json::json!({
+        "role": "user",
+        "content": prompt
+    })];
+
+    let session_id_str = state.session_id.clone().unwrap_or_default();
+    let resp = client
+        .post(&turn_url)
+        .bearer_auth(tok)
+        .json(&serde_json::json!({
+            "messages": messages,
+            "session_id": &session_id_str,
+        }))
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            let mut full_text = String::new();
+            let mut stream = r.bytes_stream();
+            use futures_util::StreamExt;
+            
+            while let Some(chunk) = stream.next().await {
+                if let Ok(bytes) = chunk {
+                    let event_str = String::from_utf8_lossy(&bytes);
+                    for line in event_str.lines() {
+                        if let Some(data) = line.strip_prefix("data: ") {
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                                if json.get("type").and_then(|v| v.as_str()) == Some("text_delta") {
+                                    if let Some(content) = json.get("content").and_then(|v| v.as_str()) {
+                                        full_text.push_str(content);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Clear thinking indicator
+            eprint!("\r                    \r");
+            
+            // Check if response contains JSON plan update
+            if let Some(json_start) = full_text.find("```json") {
+                if let Some(json_end) = full_text[json_start..].find("```\n").or_else(|| full_text[json_start..].rfind("```")) {
+                    let json_content = &full_text[json_start + 7..json_start + json_end];
+                    if let Ok(plan) = serde_json::from_str::<TaskPlan>(json_content.trim()) {
+                        plan_state.set_plan(plan.clone());
+                        plan_state.modified = true;
+                        eprintln!("{}  Plan updated!", "✓".green());
+                        eprintln!();
+                        // Display the updated plan
+                        let formatted = format_plan(&plan);
+                        eprintln!("{formatted}");
+                    }
+                }
+            }
+            
+            // Show the LLM response (text part)
+            let text_response = full_text
+                .replace("```json", "")
+                .replace("```", "");
+            let text_clean: String = text_response
+                .lines()
+                .filter(|l| !l.trim().starts_with('{') && !l.trim().starts_with('}') && !l.trim().starts_with('"'))
+                .collect::<Vec<_>>()
+                .join("\n");
+            
+            if !text_clean.trim().is_empty() {
+                eprintln!("{}", text_clean.trim());
+            }
+            
+            // Update history with assistant response
+            if let Some(last) = plan_state.history.last_mut() {
+                last.1 = full_text.chars().take(500).collect();
+            }
+        }
+        Ok(r) => {
+            eprintln!("\r  ✗ LLM call failed ({})", r.status());
+        }
+        Err(e) => {
+            eprintln!("\r  ✗ Request failed: {e}");
+        }
     }
 
     Ok(())

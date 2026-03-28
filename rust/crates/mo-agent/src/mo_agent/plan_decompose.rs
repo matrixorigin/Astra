@@ -20,7 +20,7 @@ use std::path::Path;
 pub use mo_agent_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
 
 /// Project context gathered for plan decomposition.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectContext {
     /// Project root directory.
     pub root: String,
@@ -345,6 +345,126 @@ pub fn format_plan(plan: &TaskPlan) -> String {
     }
 
     out
+}
+
+// ─── Plan Mode State ─────────────────────────────────────────────────────────
+
+/// State for interactive Plan Mode (plan> prompt).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlanModeState {
+    /// The original goal from user
+    pub goal: String,
+    /// Current plan being edited
+    pub plan: TaskPlan,
+    /// Project context at time of entering plan mode
+    pub context: ProjectContext,
+    /// Conversation history within plan mode (user_msg, assistant_msg)
+    pub history: Vec<(String, String)>,
+    /// Whether the plan has been modified since generation
+    pub modified: bool,
+}
+
+impl PlanModeState {
+    /// Create a new plan mode state with initial goal and context
+    pub fn new(goal: String, context: ProjectContext) -> Self {
+        Self {
+            goal,
+            context,
+            plan: TaskPlan::default(),
+            history: Vec::new(),
+            modified: false,
+        }
+    }
+    
+    /// Set the plan (after LLM generation)
+    pub fn set_plan(&mut self, plan: TaskPlan) {
+        self.plan = plan;
+    }
+    
+    /// Add a conversation turn to history
+    pub fn add_turn(&mut self, user_msg: &str, assistant_msg: &str) {
+        self.history.push((user_msg.to_string(), assistant_msg.to_string()));
+    }
+    
+    /// Generate the plan mode prompt for LLM interactions
+    pub fn plan_mode_prompt(&self, user_message: &str) -> String {
+        let mut prompt = String::new();
+        
+        prompt.push_str("You are in PLAN MODE, helping the user refine a plan.\n\n");
+        prompt.push_str(&format!("## Original Goal\n{}\n\n", self.goal));
+        
+        if !self.plan.subtasks.is_empty() {
+            prompt.push_str("## Current Plan\n");
+            prompt.push_str(&serde_json::to_string_pretty(&self.plan).unwrap_or_default());
+            prompt.push_str("\n\n");
+        }
+        
+        // Include recent history
+        if !self.history.is_empty() {
+            prompt.push_str("## Recent Discussion\n");
+            for (i, (u, a)) in self.history.iter().rev().take(3).rev().enumerate() {
+                prompt.push_str(&format!("User {}: {}\n", i + 1, u));
+                prompt.push_str(&format!("Assistant {}: {}\n", i + 1, a));
+            }
+            prompt.push_str("\n");
+        }
+        
+        prompt.push_str(&format!("## User Request\n{}\n\n", user_message));
+        
+        prompt.push_str(r#"## Instructions
+Based on the user's request, respond in ONE of these ways:
+
+1. **If modifying the plan**: Output the updated plan as JSON with format:
+```json
+{
+  "subtasks": [{"id": "...", "title": "...", "description": "...", "depends_on": [...]}],
+  "notes": "..."
+}
+```
+
+2. **If answering a question**: Respond naturally, no JSON needed.
+
+3. **If user says "execute", "done", "start", "开始", or "执行"**: Respond with exactly:
+`[PLAN_EXECUTE]` followed by a brief confirmation.
+
+Keep responses concise. The plan JSON must be valid if provided."#);
+        
+        prompt
+    }
+    
+    /// Check if a response indicates the user wants to execute
+    pub fn is_execute_command(response: &str) -> bool {
+        response.contains("[PLAN_EXECUTE]")
+    }
+    
+    /// Memory protocol content for storing the active plan
+    pub fn to_memory_content(&self) -> String {
+        format!(
+            "[plan:active] Goal: {}\n\n{}",
+            self.goal,
+            serde_json::to_string_pretty(&self.plan).unwrap_or_default()
+        )
+    }
+    
+    /// Memory protocol content for a completed plan
+    pub fn to_completed_memory(&self) -> String {
+        format!(
+            "[plan:completed] Goal: {}\nStatus: {} subtasks\n\n{}",
+            self.goal,
+            self.plan.subtasks.len(),
+            serde_json::to_string_pretty(&self.plan).unwrap_or_default()
+        )
+    }
+}
+
+/// Format the plan mode prompt (for display)
+pub fn format_plan_mode_prompt() -> &'static str {
+    "plan> "
+}
+
+/// Generate a plan modification prompt for LLM
+pub fn plan_modification_prompt(state: &PlanModeState, user_request: &str) -> String {
+    state.plan_mode_prompt(user_request)
 }
 
 #[cfg(test)]
