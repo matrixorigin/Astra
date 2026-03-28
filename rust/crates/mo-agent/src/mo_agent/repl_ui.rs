@@ -398,18 +398,33 @@ fn slash_left_arrow_command(active: bool, in_slash: bool, pos: usize) -> Option<
     }
 }
 
-fn slash_left_arrow_filter(line: &str, pos: usize, active: bool, in_slash: bool) -> Option<Option<String>> {
-    if !active || !in_slash || pos == 0 {
-        return None;
-    }
-    let before_cursor = &line[..pos.saturating_sub(1).min(line.len())];
-    let query = slash_completion_query(before_cursor)?;
+fn slash_picker_filter(line: &str) -> Option<Option<String>> {
+    let query = slash_completion_query(line)?;
     let filter = query.trim_start_matches('/');
     if filter.is_empty() {
         Some(None)
     } else {
         Some(Some(filter.to_string()))
     }
+}
+
+fn slash_right_arrow_filter(
+    line: &str,
+    pos: usize,
+    active: bool,
+    in_slash: bool,
+) -> Option<Option<String>> {
+    if active || !in_slash || pos.saturating_add(1) != line.len() {
+        return None;
+    }
+    slash_picker_filter(line)
+}
+
+fn slash_ctrl_e_filter(line: &str, active: bool, in_slash: bool) -> Option<Option<String>> {
+    if active || !in_slash {
+        return None;
+    }
+    slash_picker_filter(line)
 }
 
 fn slash_overlay_row_content(cmd: &str, desc: &str, selected: bool) -> String {
@@ -999,16 +1014,8 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 nav!(-1);
             }
             RlKeyEvent(RlKeyCode::Left, _) if in_slash && active => {
-                let command = slash_left_arrow_command(active, in_slash, ctx.pos());
-                if let Some(filter) =
-                    slash_left_arrow_filter(ctx.line(), ctx.pos(), active, in_slash)
-                {
-                    set_slash_picker_selected(0);
-                    render_slash_overlay(filter.as_deref());
-                } else {
-                    clear_slash_overlay();
-                }
-                return command;
+                clear_slash_overlay();
+                return slash_left_arrow_command(active, in_slash, ctx.pos());
             }
             RlKeyEvent(RlKeyCode::Right, _) if in_slash && active && ctx.pos() == ctx.line().len() => {
                 let current = ctx.line();
@@ -1016,6 +1023,24 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 clear_slash_overlay();
                 if let Some(edit) = accepted_slash_edit(current, selected, false) {
                     return Some(apply_accepted_slash_edit(edit));
+                }
+                return None;
+            }
+            RlKeyEvent(RlKeyCode::Right, _) if in_slash && !active => {
+                if let Some(filter) =
+                    slash_right_arrow_filter(ctx.line(), ctx.pos(), active, in_slash)
+                {
+                    set_slash_picker_selected(0);
+                    render_slash_overlay(filter.as_deref());
+                }
+                return None;
+            }
+            RlKeyEvent(RlKeyCode::Char('e'), m)
+                if in_slash && !active && m.contains(RlModifiers::CTRL) =>
+            {
+                if let Some(filter) = slash_ctrl_e_filter(ctx.line(), active, in_slash) {
+                    set_slash_picker_selected(0);
+                    render_slash_overlay(filter.as_deref());
                 }
                 return None;
             }
@@ -1625,22 +1650,41 @@ mod tests {
     }
 
     #[test]
-    fn slash_left_arrow_updates_filter_for_shorter_prefix() {
+    fn slash_picker_filter_supports_prefixed_commands() {
+        assert_eq!(slash_picker_filter("/exp"), Some(Some("exp".to_string())));
+    }
+
+    #[test]
+    fn slash_picker_filter_keeps_root_picker_for_bare_slash() {
+        assert_eq!(slash_picker_filter("/"), Some(None));
+    }
+
+    #[test]
+    fn slash_right_arrow_reopens_picker_when_returning_to_end_of_line() {
         assert_eq!(
-            slash_left_arrow_filter("/exp", 4, true, true),
-            Some(Some("ex".to_string()))
+            slash_right_arrow_filter("/exp", 3, false, true),
+            Some(Some("exp".to_string()))
         );
     }
 
     #[test]
-    fn slash_left_arrow_keeps_root_picker_until_slash_is_removed() {
-        assert_eq!(slash_left_arrow_filter("/e", 2, true, true), Some(None));
+    fn slash_right_arrow_ignores_non_terminal_movements() {
+        assert_eq!(slash_right_arrow_filter("/exp", 2, false, true), None);
+        assert_eq!(slash_right_arrow_filter("/exp", 3, true, true), None);
     }
 
     #[test]
-    fn slash_left_arrow_dismisses_when_argument_completion_is_inactive() {
-        assert_eq!(slash_left_arrow_filter("/skill dev foo", 14, true, false), None);
-        assert_eq!(slash_left_arrow_filter("/skill dev foo", 14, true, true), None);
+    fn slash_ctrl_e_reopens_picker_in_slash_context() {
+        assert_eq!(
+            slash_ctrl_e_filter("/skill d", false, true),
+            Some(Some("skill d".to_string()))
+        );
+    }
+
+    #[test]
+    fn slash_ctrl_e_ignores_inactive_completion_contexts() {
+        assert_eq!(slash_ctrl_e_filter("/skill dev foo", false, true), None);
+        assert_eq!(slash_ctrl_e_filter("/exp", true, true), None);
     }
 
     #[test]
