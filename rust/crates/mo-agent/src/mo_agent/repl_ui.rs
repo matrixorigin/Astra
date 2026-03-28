@@ -387,6 +387,17 @@ fn apply_accepted_slash_edit(edit: AcceptedSlashEdit) -> RlCmd {
     }
 }
 
+fn slash_left_arrow_command(active: bool, in_slash: bool, pos: usize) -> Option<RlCmd> {
+    if !active || !in_slash {
+        return None;
+    }
+    if pos == 0 {
+        Some(RlCmd::Move(RlMovement::BeginningOfLine))
+    } else {
+        Some(RlCmd::Move(RlMovement::BackwardChar(1)))
+    }
+}
+
 fn slash_overlay_row_content(cmd: &str, desc: &str, selected: bool) -> String {
     if selected {
         format!(
@@ -973,6 +984,10 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
             {
                 nav!(-1);
             }
+            RlKeyEvent(RlKeyCode::Left, _) if in_slash && active => {
+                clear_slash_overlay();
+                return slash_left_arrow_command(active, in_slash, ctx.pos());
+            }
             RlKeyEvent(RlKeyCode::Right, _) if in_slash && active && ctx.pos() == ctx.line().len() => {
                 let current = ctx.line();
                 let selected = picker_selected_command();
@@ -1548,6 +1563,28 @@ mod tests {
             apply_accepted_slash_edit(AcceptedSlashEdit::InsertSuffix("ev ".to_string())),
             RlCmd::Insert(1, "ev ".to_string())
         );
+    }
+
+    #[test]
+    fn slash_left_arrow_moves_back_one_char_when_overlay_active() {
+        assert_eq!(
+            slash_left_arrow_command(true, true, 2),
+            Some(RlCmd::Move(RlMovement::BackwardChar(1)))
+        );
+    }
+
+    #[test]
+    fn slash_left_arrow_clamps_to_line_start() {
+        assert_eq!(
+            slash_left_arrow_command(true, true, 0),
+            Some(RlCmd::Move(RlMovement::BeginningOfLine))
+        );
+    }
+
+    #[test]
+    fn slash_left_arrow_ignores_non_slash_context() {
+        assert_eq!(slash_left_arrow_command(true, false, 2), None);
+        assert_eq!(slash_left_arrow_command(false, true, 2), None);
     }
 
     #[test]
