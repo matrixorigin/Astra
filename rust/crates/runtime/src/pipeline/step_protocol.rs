@@ -117,10 +117,7 @@ impl MigrationRegistry {
 
 /// Migration: v0 (pre-versioning) → v1000.
 /// Adds `protocol_version` field if missing.
-fn migrate_v0_to_v1000(
-    _from: u32,
-    data: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
+fn migrate_v0_to_v1000(_from: u32, data: &serde_json::Value) -> Result<serde_json::Value, String> {
     let mut migrated = data.clone();
     if let Some(obj) = migrated.as_object_mut() {
         // Add protocol_version to the light checkpoint (or top level)
@@ -2674,7 +2671,10 @@ mod tests {
     #[test]
     fn migration_registry_with_defaults_has_v0() {
         let reg = MigrationRegistry::with_defaults();
-        assert!(reg.has_migration(0), "v0→v1000 migration must be registered");
+        assert!(
+            reg.has_migration(0),
+            "v0→v1000 migration must be registered"
+        );
         assert!(!reg.has_migration(1), "no v1 migration expected");
         assert!(!reg.has_migration(999), "no v999 migration expected");
     }
@@ -3063,11 +3063,11 @@ mod tests {
     #[test]
     fn scheduling_contract_backoff_exponential() {
         let c = SchedulingContract::default();
-        assert_eq!(c.backoff_ms(0), 500);   // 500 * 2^0
-        assert_eq!(c.backoff_ms(1), 1000);  // 500 * 2^1
-        assert_eq!(c.backoff_ms(2), 2000);  // 500 * 2^2
-        assert_eq!(c.backoff_ms(3), 4000);  // 500 * 2^3
-        assert_eq!(c.backoff_ms(4), 5000);  // capped at max
+        assert_eq!(c.backoff_ms(0), 500); // 500 * 2^0
+        assert_eq!(c.backoff_ms(1), 1000); // 500 * 2^1
+        assert_eq!(c.backoff_ms(2), 2000); // 500 * 2^2
+        assert_eq!(c.backoff_ms(3), 4000); // 500 * 2^3
+        assert_eq!(c.backoff_ms(4), 5000); // capped at max
     }
 
     #[test]
@@ -3109,10 +3109,16 @@ mod tests {
     #[test]
     fn step_with_scheduling_contract() {
         let step = Step::new(
-            "step-1".into(), "task-1".into(), "node-1".into(),
+            "step-1".into(),
+            "task-1".into(),
+            "node-1".into(),
             StepAction::Act,
-            StepPayload::Act { selected_tools: vec![], tool_calls: vec![] },
-        ).with_scheduling(SchedulingContract {
+            StepPayload::Act {
+                selected_tools: vec![],
+                tool_calls: vec![],
+            },
+        )
+        .with_scheduling(SchedulingContract {
             priority: 10,
             timeout_ms: 60_000,
             ..Default::default()
@@ -3126,10 +3132,16 @@ mod tests {
     fn step_backward_compat_with_timeout() {
         // with_timeout_ms still works (sets scheduling.timeout_ms)
         let step = Step::new(
-            "step-1".into(), "task-1".into(), "node-1".into(),
+            "step-1".into(),
+            "task-1".into(),
+            "node-1".into(),
             StepAction::Perceive,
-            StepPayload::Perceive { user_query: "test".into(), memory_context: vec![] },
-        ).with_timeout_ms(120_000);
+            StepPayload::Perceive {
+                user_query: "test".into(),
+                memory_context: vec![],
+            },
+        )
+        .with_timeout_ms(120_000);
         assert_eq!(step.descriptor.scheduling.timeout_ms, 120_000);
     }
 }

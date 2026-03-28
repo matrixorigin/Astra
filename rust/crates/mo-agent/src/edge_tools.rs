@@ -769,7 +769,10 @@ impl ToolExecutor {
         match self.preferred_repos.lock() {
             Ok(r) => r.clone(),
             Err(poisoned) => {
-                mo_agent_core::agent_warn!("preferred_repos", "recovering from poisoned mutex on read");
+                mo_agent_core::agent_warn!(
+                    "preferred_repos",
+                    "recovering from poisoned mutex on read"
+                );
                 poisoned.into_inner().clone()
             }
         }
@@ -1573,10 +1576,7 @@ mod tests {
                 "write_file",
                 json!({"path": "chain_test.txt", "content": "hello from chain"}),
             )
-            .step(
-                "read_file",
-                json!({"path": "chain_test.txt"}),
-            );
+            .step("read_file", json!({"path": "chain_test.txt"}));
 
         let result = executor.execute_chain(&chain, json!({})).await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -1586,10 +1586,19 @@ mod tests {
         assert_eq!(parsed["steps_total"], 2);
 
         let steps = parsed["steps"].as_array().unwrap();
-        assert!(steps[0]["success"].as_bool().unwrap(), "write should succeed");
-        assert!(steps[1]["success"].as_bool().unwrap(), "read should succeed");
         assert!(
-            parsed["final_output"].as_str().unwrap().contains("hello from chain"),
+            steps[0]["success"].as_bool().unwrap(),
+            "write should succeed"
+        );
+        assert!(
+            steps[1]["success"].as_bool().unwrap(),
+            "read should succeed"
+        );
+        assert!(
+            parsed["final_output"]
+                .as_str()
+                .unwrap()
+                .contains("hello from chain"),
             "final output should be file contents"
         );
     }
@@ -1638,10 +1647,7 @@ mod tests {
                 "write_file",
                 json!({"path": "$input.filename", "content": "$input.message"}),
             )
-            .step(
-                "read_file",
-                json!({"path": "$input.filename"}),
-            )
+            .step("read_file", json!({"path": "$input.filename"}))
             .named_step(
                 "copy",
                 "write_file",
@@ -1733,7 +1739,10 @@ mod tests {
         assert!(steps[1]["success"].as_bool().unwrap());
         // list_dir should show the file we just wrote
         assert!(
-            parsed["final_output"].as_str().unwrap().contains("hello.txt"),
+            parsed["final_output"]
+                .as_str()
+                .unwrap()
+                .contains("hello.txt"),
             "list_dir should see the written file"
         );
     }
@@ -1744,6 +1753,9 @@ mod tests {
         let result = executor
             .execute("run_chain", &json!({"invalid": "no steps field"}))
             .await;
-        assert!(result.contains("Error"), "should return error for invalid chain: {result}");
+        assert!(
+            result.contains("Error"),
+            "should return error for invalid chain: {result}"
+        );
     }
 }

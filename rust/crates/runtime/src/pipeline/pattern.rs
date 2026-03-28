@@ -730,9 +730,18 @@ mod tests {
 
         // Given just_used = [grep], should suggest read_file and str_replace
         let scores = lib.co_occurrence_scores(&tools(&["grep"]));
-        assert!(scores.contains_key("read_file"), "read_file should be a co-occurrence");
-        assert!(scores.contains_key("str_replace"), "str_replace should be a co-occurrence");
-        assert!(!scores.contains_key("grep"), "grep itself should not appear");
+        assert!(
+            scores.contains_key("read_file"),
+            "read_file should be a co-occurrence"
+        );
+        assert!(
+            scores.contains_key("str_replace"),
+            "str_replace should be a co-occurrence"
+        );
+        assert!(
+            !scores.contains_key("grep"),
+            "grep itself should not appear"
+        );
     }
 
     #[test]
@@ -770,26 +779,17 @@ mod tests {
 
         // Should not recommend dangerous_tool (only failures)
         let scores = lib.co_occurrence_scores(&tools(&["bash"]));
-        assert!(scores.is_empty(), "Failed-only patterns should not produce co-occurrences");
+        assert!(
+            scores.is_empty(),
+            "Failed-only patterns should not produce co-occurrences"
+        );
     }
 
     #[test]
     fn co_occurrence_with_empty_just_used_returns_empty() {
         let mut lib = PatternLibrary::new();
-        lib.record_outcome(
-            &tools(&["bash", "grep"]),
-            TaskType::Fetch,
-            None,
-            true,
-            0.8,
-        );
-        lib.record_outcome(
-            &tools(&["bash", "grep"]),
-            TaskType::Fetch,
-            None,
-            true,
-            0.8,
-        );
+        lib.record_outcome(&tools(&["bash", "grep"]), TaskType::Fetch, None, true, 0.8);
+        lib.record_outcome(&tools(&["bash", "grep"]), TaskType::Fetch, None, true, 0.8);
         let scores = lib.co_occurrence_scores(&[]);
         assert!(scores.is_empty());
     }

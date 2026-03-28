@@ -221,7 +221,7 @@ pub(super) async fn handle_state_command(
                         quiet: true,
                         selector,
                         recent_tools: &[],
-                    tool_health_entries: &[],
+                        tool_health_entries: &[],
                     })
                     .await;
 
@@ -274,7 +274,7 @@ pub(super) async fn handle_state_command(
                                 quiet: true,
                                 selector,
                                 recent_tools: &[],
-                    tool_health_entries: &[],
+                                tool_health_entries: &[],
                             })
                             .await;
                             if let Ok(sr2) = synth_result {

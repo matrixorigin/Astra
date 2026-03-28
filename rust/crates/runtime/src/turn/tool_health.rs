@@ -242,7 +242,9 @@ impl ToolHealthTracker {
         self.tools
             .iter()
             .filter(|(_, h)| {
-                h.deprioritized && h.total_failures > 0 && h.timeout_count as f64 / h.total_failures as f64 >= 0.7
+                h.deprioritized
+                    && h.total_failures > 0
+                    && h.timeout_count as f64 / h.total_failures as f64 >= 0.7
             })
             .map(|(name, _)| name.as_str())
             .collect()

@@ -30,6 +30,13 @@ enum SearchRequest {
     Review(String),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ReviewMatch<'a> {
+    path: &'a str,
+    line: &'a str,
+    text: &'a str,
+}
+
 fn parse_search_request(arg: &str) -> Result<SearchRequest, &'static str> {
     let trimmed = arg.trim();
     if trimmed.is_empty() {
@@ -84,6 +91,72 @@ fn run_git_lines(project_root: &std::path::Path, args: &[&str]) -> Vec<String> {
     }
 }
 
+fn parse_review_match(line: &str) -> Option<ReviewMatch<'_>> {
+    let mut parts = line.splitn(3, ':');
+    let path = parts.next()?.trim();
+    let line = parts.next()?.trim();
+    let text = parts.next()?.trim_end();
+    if path.is_empty() || line.is_empty() {
+        return None;
+    }
+    Some(ReviewMatch { path, line, text })
+}
+
+fn summarize_file_list(files: &[String], limit: usize) -> String {
+    let shown: Vec<&str> = files.iter().take(limit).map(String::as_str).collect();
+    let mut summary = shown.join(", ");
+    if files.len() > limit {
+        if !summary.is_empty() {
+            summary.push_str(", ");
+        }
+        summary.push_str(&format!("+{} more", files.len() - limit));
+    }
+    summary
+}
+
+fn format_review_search_result(files: &[String], raw: &str) -> String {
+    if raw.trim().is_empty() {
+        return format!(
+            "Scope: {} changed files\nFiles: {}\n\nNo matches found in changed files\nTip: use /search <pattern> for a workspace-wide scan.",
+            files.len(),
+            summarize_file_list(files, 6)
+        );
+    }
+
+    let parsed: Vec<ReviewMatch<'_>> = raw.lines().filter_map(parse_review_match).collect();
+    if parsed.is_empty() {
+        return raw.trim().to_string();
+    }
+
+    let mut out = String::new();
+    let matched_files: HashSet<&str> = parsed.iter().map(|m| m.path).collect();
+    out.push_str(&format!(
+        "Scope: {} changed files\nFiles: {}\n\nMatches: {} hit(s) across {} file(s)\n",
+        files.len(),
+        summarize_file_list(files, 6),
+        parsed.len(),
+        matched_files.len()
+    ));
+
+    let mut current_path: Option<&str> = None;
+    for m in parsed {
+        if current_path != Some(m.path) {
+            if current_path.is_some() {
+                out.push('\n');
+            }
+            out.push_str(&format!("\n{}\n", m.path));
+            current_path = Some(m.path);
+        }
+        out.push_str(&format!("  {}: {}\n", m.line, m.text));
+    }
+
+    if out.len() > 20_000 {
+        out.truncate(20_000);
+        out.push_str("\n[truncated]");
+    }
+    out
+}
+
 fn review_search(executor: &edge_tools::ToolExecutor, pattern: &str) -> String {
     let staged = run_git_lines(&executor.project_root, &["diff", "--name-only", "--cached"]);
     let unstaged = run_git_lines(&executor.project_root, &["diff", "--name-only"]);
@@ -91,15 +164,21 @@ fn review_search(executor: &edge_tools::ToolExecutor, pattern: &str) -> String {
         &executor.project_root,
         &["ls-files", "--others", "--exclude-standard"],
     );
-    let files = collect_changed_files(&staged.join("\n"), &unstaged.join("\n"), &untracked.join("\n"));
+    let files = collect_changed_files(
+        &staged.join("\n"),
+        &unstaged.join("\n"),
+        &untracked.join("\n"),
+    );
     if files.is_empty() {
-        return "No changed files found. Use /search <pattern> for workspace-wide search.".to_string();
+        return "No changed files found. Use /search <pattern> for workspace-wide search."
+            .to_string();
     }
 
     let mut cmd = SysCommand::new("grep");
     cmd.arg("-n");
     cmd.arg("-i");
     cmd.arg("--binary-files=without-match");
+    cmd.arg("--");
     cmd.arg(pattern);
     for file in &files {
         cmd.arg(file);
@@ -110,13 +189,9 @@ fn review_search(executor: &edge_tools::ToolExecutor, pattern: &str) -> String {
         Ok(output) => match output.status.code() {
             Some(0) => {
                 let text = String::from_utf8_lossy(&output.stdout);
-                if text.len() > 20_000 {
-                    format!("{}\n[truncated]", &text[..20_000])
-                } else {
-                    text.to_string()
-                }
+                format_review_search_result(&files, &text)
             }
-            Some(1) => "No matches found in changed files".to_string(),
+            Some(1) => format_review_search_result(&files, ""),
             _ => {
                 let err = String::from_utf8_lossy(&output.stderr);
                 let detail = err.trim();
@@ -241,7 +316,10 @@ pub(super) async fn handle_info_command(
                 }
             };
 
-            eprintln!("\n{}", format!("─── {title} ─────────────────────────────────────────────").bold());
+            eprintln!(
+                "\n{}",
+                format!("─── {title} ─────────────────────────────────────────────").bold()
+            );
             for line in result.lines() {
                 eprintln!("  {line}");
             }
@@ -615,7 +693,47 @@ mod tests {
 
     #[test]
     fn collect_changed_files_deduplicates_and_skips_blanks() {
-        let files = collect_changed_files("src/main.rs\n", "src/main.rs\nsrc/lib.rs\n", "\nnew.rs\n");
+        let files =
+            collect_changed_files("src/main.rs\n", "src/main.rs\nsrc/lib.rs\n", "\nnew.rs\n");
         assert_eq!(files, vec!["src/main.rs", "src/lib.rs", "new.rs"]);
+    }
+
+    #[test]
+    fn parse_review_match_extracts_file_line_and_text() {
+        assert_eq!(
+            parse_review_match("src/main.rs:42:timeout exceeded"),
+            Some(ReviewMatch {
+                path: "src/main.rs",
+                line: "42",
+                text: "timeout exceeded",
+            })
+        );
+    }
+
+    #[test]
+    fn format_review_search_result_summarizes_grouped_hits() {
+        let files = vec![
+            "src/main.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "tests/review.rs".to_string(),
+        ];
+        let formatted = format_review_search_result(
+            &files,
+            "src/main.rs:12:tool timeout\nsrc/main.rs:18:retry timeout\nsrc/lib.rs:7:timeout budget",
+        );
+        assert!(formatted.contains("Scope: 3 changed files"));
+        assert!(formatted.contains("Matches: 3 hit(s) across 2 file(s)"));
+        assert!(formatted.contains("\nsrc/main.rs\n"));
+        assert!(formatted.contains("  12: tool timeout"));
+        assert!(formatted.contains("\nsrc/lib.rs\n"));
+    }
+
+    #[test]
+    fn format_review_search_result_guides_when_no_matches_found() {
+        let files = vec!["src/main.rs".to_string(), "tests/review.rs".to_string()];
+        let formatted = format_review_search_result(&files, "");
+        assert!(formatted.contains("Scope: 2 changed files"));
+        assert!(formatted.contains("No matches found in changed files"));
+        assert!(formatted.contains("Tip: use /search <pattern>"));
     }
 }

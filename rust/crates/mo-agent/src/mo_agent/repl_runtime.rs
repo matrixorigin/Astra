@@ -110,7 +110,10 @@ pub(super) async fn ensure_repl_authenticated(
             }
             Ok(_) => return Ok(()), // Non-401 errors: proceed anyway (server issues)
             Err(_) => {
-                eprintln!("{}", "  ⚠ Network unavailable, using cached credentials.".dim());
+                eprintln!(
+                    "{}",
+                    "  ⚠ Network unavailable, using cached credentials.".dim()
+                );
                 return Ok(());
             }
         }
@@ -189,7 +192,8 @@ pub(super) async fn ensure_repl_authenticated(
             }
             print!("  {} ", "Password:".bold());
             io::stdout().flush().ok();
-            let pw = rpassword::read_password().map_err(|e| format!("Could not read password: {e}"))?;
+            let pw =
+                rpassword::read_password().map_err(|e| format!("Could not read password: {e}"))?;
             if pw.trim().is_empty() {
                 return Err("Authentication cancelled.".to_string());
             }
@@ -214,7 +218,8 @@ pub(super) async fn ensure_repl_authenticated(
             }
             print!("  {} ", "Password:".bold());
             io::stdout().flush().ok();
-            let pw = rpassword::read_password().map_err(|e| format!("Could not read password: {e}"))?;
+            let pw =
+                rpassword::read_password().map_err(|e| format!("Could not read password: {e}"))?;
             if pw.trim().is_empty() {
                 return Err("Registration cancelled.".to_string());
             }

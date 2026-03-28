@@ -52,7 +52,11 @@ fn is_ssrf_target(url: &str) -> Option<&'static str> {
     // Handle IPv6 brackets: [::1]:port → extract [::1]
     let host = if host_port.starts_with('[') {
         // IPv6: take everything up to and including the closing bracket
-        host_port.split(']').next().map(|s| format!("{s}]")).unwrap_or_default()
+        host_port
+            .split(']')
+            .next()
+            .map(|s| format!("{s}]"))
+            .unwrap_or_default()
     } else {
         host_port.split(':').next().unwrap_or("").to_string()
     };
@@ -387,19 +391,19 @@ impl ToolExecutor {
 
         let mut cmd = Command::new("curl");
         cmd.args([
-                "-sS",
-                "-L",
-                "--max-time",
-                &timeout_secs.to_string(),
-                "--max-filesize",
-                &(max_bytes * 2).to_string(), // allow 2x for pre-truncation
-                "-H",
-                "User-Agent: mo-agent/0.1",
-                url,
-            ])
-            .current_dir(&self.project_root)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            "-sS",
+            "-L",
+            "--max-time",
+            &timeout_secs.to_string(),
+            "--max-filesize",
+            &(max_bytes * 2).to_string(), // allow 2x for pre-truncation
+            "-H",
+            "User-Agent: mo-agent/0.1",
+            url,
+        ])
+        .current_dir(&self.project_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
         // Apply sandbox environment filtering (same as bash)
         if let Some(ref policy) = self.sandbox_policy

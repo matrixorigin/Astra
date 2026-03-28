@@ -94,8 +94,8 @@ use repl_runtime::{
 use repl_turn::{ReplTurnContext, handle_chat_input};
 use repl_ui::{
     ReplHelper, SlashStartCompleteHandler, clear_slash_overlay, history_path,
-    is_slash_picker_active, print_keyboard_shortcuts, print_slash_commands,
-    resolve_slash_command, suggest_commands,
+    is_slash_picker_active, print_keyboard_shortcuts, print_slash_commands, resolve_slash_command,
+    suggest_commands,
 };
 use slash_account::handle_account_command;
 use slash_info::handle_info_command;
@@ -502,7 +502,8 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             state.recent_tools = restored.recent_tools;
 
             // Merge step checkpoint data if available (with migration support)
-            let registry = mo_agent_runtime::pipeline::step_protocol::MigrationRegistry::with_defaults();
+            let registry =
+                mo_agent_runtime::pipeline::step_protocol::MigrationRegistry::with_defaults();
             if let Ok(Some(step_restored)) =
                 mo_agent_runtime::pipeline::step_restore::restore_session_with_migrations(
                     &restored.session_id,
@@ -548,8 +549,15 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                 .await
                 {
                     Ok(Some(state_json)) => {
-                        match serde_json::from_str::<mo_agent_runtime::pipeline::step_protocol::StepCheckpoint>(&state_json) {
-                            Ok(mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(heavy)) => {
+                        match serde_json::from_str::<
+                            mo_agent_runtime::pipeline::step_protocol::StepCheckpoint,
+                        >(&state_json)
+                        {
+                            Ok(
+                                mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(
+                                    heavy,
+                                ),
+                            ) => {
                                 for tool in &heavy.blocked_tools {
                                     if !state.tool_health_entries.iter().any(|e| e.name == *tool) {
                                         state.tool_health_entries.push(
@@ -572,12 +580,17 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                                     let mut pairs = Vec::new();
                                     let mut last_user = String::new();
                                     for msg in &heavy.messages {
-                                        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                                        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                                        let role =
+                                            msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                                        let content = msg
+                                            .get("content")
+                                            .and_then(|c| c.as_str())
+                                            .unwrap_or("");
                                         match role {
                                             "user" => last_user = content.to_string(),
                                             "assistant" if !last_user.is_empty() => {
-                                                pairs.push((last_user.clone(), content.to_string()));
+                                                pairs
+                                                    .push((last_user.clone(), content.to_string()));
                                                 last_user.clear();
                                             }
                                             _ => {}
@@ -591,15 +604,18 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                             }
                             Ok(_) => {} // Light checkpoint — less useful, skip
                             Err(e) => {
-                                eprintln!("  {} Cloud checkpoint corrupted, skipping", "⚠".yellow());
-                eprintln!("{}", format!("     ({e})").dim());
+                                eprintln!(
+                                    "  {} Cloud checkpoint corrupted, skipping",
+                                    "⚠".yellow()
+                                );
+                                eprintln!("{}", format!("     ({e})").dim());
                             }
                         }
                     }
                     Ok(None) => {} // No cloud checkpoint available
                     Err(e) => {
                         eprintln!("  {} Cloud checkpoint unavailable", "⚠".yellow());
-                eprintln!("{}", format!("     ({e})").dim());
+                        eprintln!("{}", format!("     ({e})").dim());
                     }
                 }
             }
@@ -665,7 +681,10 @@ fn handle_stats_command(arg: &str, state: &ReplState) {
             let sessions = match session_journal::list_sessions() {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("{}", format!("  ⚠ Could not read session history: {e}").yellow());
+                    eprintln!(
+                        "{}",
+                        format!("  ⚠ Could not read session history: {e}").yellow()
+                    );
                     return;
                 }
             };
@@ -971,11 +990,7 @@ async fn handle_health_command(arg: &str, state: &ReplState) {
                 .map(|(n, _)| n.as_str())
                 .collect();
             if !recovering.is_empty() {
-                eprintln!(
-                    "  {} {}",
-                    "With errors:".yellow(),
-                    recovering.join(", ")
-                );
+                eprintln!("  {} {}", "With errors:".yellow(), recovering.join(", "));
             }
             if !detail {
                 eprintln!("  {}", "Use /health detail for per-tool breakdown.".dim());
@@ -995,10 +1010,7 @@ async fn handle_health_command(arg: &str, state: &ReplState) {
                 "○".dim(),
                 "Offline — no MatrixOne connection".dim()
             );
-            eprintln!(
-                "  {}",
-                "Set MATRIXONE_HOST to enable cloud sync.".dim()
-            );
+            eprintln!("  {}", "Set MATRIXONE_HOST to enable cloud sync.".dim());
         }
         Some(pool) => {
             let svc =
@@ -1275,10 +1287,7 @@ async fn try_cloud_pull_preferences(state: &mut ReplState) {
         }
         Ok(_) => {} // no cloud prefs yet
         Err(e) => {
-            eprintln!(
-                "{}",
-                format!("  ⚠ Preference pull skipped: {e}").dim()
-            );
+            eprintln!("{}", format!("  ⚠ Preference pull skipped: {e}").dim());
         }
     }
 }
@@ -1292,9 +1301,7 @@ async fn try_cloud_push_preferences(state: &ReplState) {
     let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
     let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
     use mo_agent_services::state_sync::{StateSyncService, pref_keys};
-    let prefs = [
-        (pref_keys::EXPLAIN_MODE, state.explain.to_string()),
-    ];
+    let prefs = [(pref_keys::EXPLAIN_MODE, state.explain.to_string())];
     let mut synced = 0u32;
     for (key, value) in &prefs {
         let result = svc.push_preference(&user_id, key, value).await;
@@ -1319,8 +1326,7 @@ async fn try_connect_matrixone() -> Option<sqlx::Pool<sqlx::MySql>> {
         .unwrap_or(6001);
     let user = std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".to_string());
     let password = std::env::var("MATRIXONE_PASSWORD").unwrap_or_default();
-    let database =
-        std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "mo_agent".to_string());
+    let database = std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "mo_agent".to_string());
     let url = format!("mysql://{user}:{password}@{host}:{port}/{database}");
     sqlx::mysql::MySqlPoolOptions::new()
         .max_connections(2)
@@ -1338,7 +1344,10 @@ async fn handle_task_command(arg: &str, state: &mut ReplState) {
     let svc = match &state.task_service {
         Some(s) => s.clone(),
         None => {
-            eprintln!("{}", "  ⚠ Task service not available (local-only mode).".yellow());
+            eprintln!(
+                "{}",
+                "  ⚠ Task service not available (local-only mode).".yellow()
+            );
             eprintln!("{}", "  Use /login to enable cloud task tracking.".dim());
             return;
         }
@@ -1888,8 +1897,7 @@ async fn run_chat_repl(
                     // to prevent data loss on crash (every CHECKPOINT_INTERVAL turns)
                     if state.matrixone_pool.is_some()
                         && state.turn > 0
-                        && state.turn
-                            % mo_agent_services::session_checkpoint::CHECKPOINT_INTERVAL
+                        && state.turn % mo_agent_services::session_checkpoint::CHECKPOINT_INTERVAL
                             == 0
                     {
                         try_cloud_push(
@@ -2738,15 +2746,14 @@ mod tests {
             edge_tools::all_tool_schemas(),
         ));
         let mut state = ReplState::default();
-        state.tool_health_entries = vec![
-            mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
+        state.tool_health_entries =
+            vec![mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
                 name: "bash".into(),
                 total_calls: 10,
                 total_failures: 5,
                 failure_rate: 0.5,
                 last_updated_epoch: 0,
-            },
-        ];
+            }];
         let exit = handle_slash_command(
             "/health detail",
             &client,
@@ -3802,14 +3809,21 @@ total_tokens_out: 500
     #[tokio::test]
     async fn try_connect_matrixone_returns_none_without_env_vars() {
         // Safety: test-only, single-threaded tokio runtime
-        unsafe { std::env::remove_var("MATRIXONE_HOST"); }
+        unsafe {
+            std::env::remove_var("MATRIXONE_HOST");
+        }
         let pool = try_connect_matrixone().await;
-        assert!(pool.is_none(), "Without MATRIXONE_HOST, pool should be None");
+        assert!(
+            pool.is_none(),
+            "Without MATRIXONE_HOST, pool should be None"
+        );
     }
 
     #[tokio::test]
     async fn try_cloud_pull_returns_empty_without_matrixone() {
-        unsafe { std::env::remove_var("MATRIXONE_HOST"); }
+        unsafe {
+            std::env::remove_var("MATRIXONE_HOST");
+        }
         let eg = std::sync::Arc::new(std::sync::Mutex::new(
             mo_agent_runtime::pipeline::entity::EntityGraph::new(),
         ));
@@ -3820,12 +3834,17 @@ total_tokens_out: 500
             mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator::new(0.15),
         ));
         let health = try_cloud_pull("default", &eg, &pl, &cal).await;
-        assert!(health.is_empty(), "Without MatrixOne, cloud pull should return empty");
+        assert!(
+            health.is_empty(),
+            "Without MatrixOne, cloud pull should return empty"
+        );
     }
 
     #[tokio::test]
     async fn try_cloud_push_is_noop_without_matrixone() {
-        unsafe { std::env::remove_var("MATRIXONE_HOST"); }
+        unsafe {
+            std::env::remove_var("MATRIXONE_HOST");
+        }
         let eg = std::sync::Arc::new(std::sync::Mutex::new(
             mo_agent_runtime::pipeline::entity::EntityGraph::new(),
         ));
@@ -3841,7 +3860,9 @@ total_tokens_out: 500
 
     #[tokio::test]
     async fn try_cloud_pull_preferences_is_noop_without_matrixone() {
-        unsafe { std::env::remove_var("MATRIXONE_HOST"); }
+        unsafe {
+            std::env::remove_var("MATRIXONE_HOST");
+        }
         let mut state = ReplState::default();
         // Should not panic (was the original bug)
         try_cloud_pull_preferences(&mut state).await;
@@ -3849,7 +3870,9 @@ total_tokens_out: 500
 
     #[tokio::test]
     async fn try_cloud_push_preferences_is_noop_without_matrixone() {
-        unsafe { std::env::remove_var("MATRIXONE_HOST"); }
+        unsafe {
+            std::env::remove_var("MATRIXONE_HOST");
+        }
         let state = ReplState::default();
         // Should not panic (was the original bug)
         try_cloud_push_preferences(&state).await;

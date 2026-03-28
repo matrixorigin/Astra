@@ -21,13 +21,11 @@
 
 use std::collections::HashMap;
 
-use crate::pipeline::step_checkpoint::{
-    read_latest_heavy_checkpoint, FileBackedEventStore,
-};
+use crate::pipeline::step_checkpoint::{FileBackedEventStore, read_latest_heavy_checkpoint};
 use crate::pipeline::step_protocol::{
-    check_protocol_version_with_policy, CachedToolResult, HeavyCheckpoint, IdempotencyKey,
-    InMemoryIdempotencyCache, MigrationRegistry, SlotState, StepEvent, StepEventType,
-    VersionPolicy, VersionVerdict, PROTOCOL_VERSION,
+    CachedToolResult, HeavyCheckpoint, IdempotencyKey, InMemoryIdempotencyCache, MigrationRegistry,
+    PROTOCOL_VERSION, SlotState, StepEvent, StepEventType, VersionPolicy, VersionVerdict,
+    check_protocol_version_with_policy,
 };
 
 /// Restored session state — everything needed to resume execution.
@@ -218,19 +216,15 @@ fn run_migration(
     registry: &MigrationRegistry,
 ) -> Result<HeavyCheckpoint, RestoreError> {
     let raw_json = serde_json::to_value(&heavy)
-        .map_err(|e| RestoreError::InvalidCheckpoint(
-            format!("serialization failed: {e}"),
-        ))?;
+        .map_err(|e| RestoreError::InvalidCheckpoint(format!("serialization failed: {e}")))?;
 
-    let migrated_json = registry.migrate(from_version, &raw_json)
-        .map_err(|e| RestoreError::InvalidCheckpoint(
-            format!("migration v{from_version} failed: {e}"),
-        ))?;
+    let migrated_json = registry.migrate(from_version, &raw_json).map_err(|e| {
+        RestoreError::InvalidCheckpoint(format!("migration v{from_version} failed: {e}"))
+    })?;
 
-    let mut migrated: HeavyCheckpoint = serde_json::from_value(migrated_json)
-        .map_err(|e| RestoreError::InvalidCheckpoint(
-            format!("post-migration parse failed: {e}"),
-        ))?;
+    let mut migrated: HeavyCheckpoint = serde_json::from_value(migrated_json).map_err(|e| {
+        RestoreError::InvalidCheckpoint(format!("post-migration parse failed: {e}"))
+    })?;
 
     // Stamp current version so next checkpoint write is up-to-date
     migrated.light.protocol_version = PROTOCOL_VERSION;
@@ -353,7 +347,11 @@ pub fn completed_slots(heavy: &HeavyCheckpoint) -> Vec<usize> {
 /// Build a summary of what was recovered (for logging/explain mode).
 pub fn restore_summary(restored: &RestoredSession) -> String {
     let cache_entries = restored.idempotency_cache.len();
-    let tool_count: usize = restored.completed_tool_results.values().map(|v| v.len()).sum();
+    let tool_count: usize = restored
+        .completed_tool_results
+        .values()
+        .map(|v| v.len())
+        .sum();
     format!(
         "Restored session: turn={}, messages={}, cache={} entries, \
          completed_tools={}, blocked={}, budget_tokens={}, budget_rounds={}",
@@ -437,9 +435,7 @@ pub struct ToolTimelineEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::step_protocol::{
-        epoch_ms, ExecutionCursor, LightCheckpoint,
-    };
+    use crate::pipeline::step_protocol::{ExecutionCursor, LightCheckpoint, epoch_ms};
 
     // ── Helper: build a heavy checkpoint for testing ──
 
@@ -718,7 +714,10 @@ mod tests {
         assert!(msg.contains("999"));
         assert!(msg.contains("1000"));
 
-        assert_eq!(RestoreError::NoCheckpoint.to_string(), "no checkpoint found");
+        assert_eq!(
+            RestoreError::NoCheckpoint.to_string(),
+            "no checkpoint found"
+        );
     }
 
     // ── Migration-aware restore ──

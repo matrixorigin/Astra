@@ -38,7 +38,11 @@ impl AppSettings {
                 host: value_or_default(&lookup, "MATRIXONE_HOST", "localhost"),
                 port: parse_or_default(&lookup, "MATRIXONE_PORT", 6001)?,
                 user: value_or_default(&lookup, "MATRIXONE_USER", "root"),
-                password: value_or_default(&lookup, "MATRIXONE_PASSWORD", super::runtime_limits::DEV_MATRIXONE_PASSWORD),
+                password: value_or_default(
+                    &lookup,
+                    "MATRIXONE_PASSWORD",
+                    super::runtime_limits::DEV_MATRIXONE_PASSWORD,
+                ),
                 database: value_or_default(&lookup, "MATRIXONE_DATABASE", "dev_agent"),
             },
             redis: RedisSettings {

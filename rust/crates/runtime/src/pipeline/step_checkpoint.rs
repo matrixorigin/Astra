@@ -85,11 +85,7 @@ pub fn read_latest_heavy_checkpoint(session_id: &str) -> std::io::Result<Option<
                 None
             }
         })
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .ends_with("-heavy.json")
-        })
+        .filter(|e| e.file_name().to_string_lossy().ends_with("-heavy.json"))
         .collect();
 
     // Sort by name descending (latest = highest number)
@@ -109,9 +105,7 @@ pub fn read_latest_heavy_checkpoint(session_id: &str) -> std::io::Result<Option<
 }
 
 /// Read the latest light checkpoint (for quick cursor restore).
-pub fn read_latest_light_checkpoint(
-    session_id: &str,
-) -> std::io::Result<Option<LightCheckpoint>> {
+pub fn read_latest_light_checkpoint(session_id: &str) -> std::io::Result<Option<LightCheckpoint>> {
     let dir = checkpoint_dir_for(session_id);
     if !dir.exists() {
         return Ok(None);
@@ -200,11 +194,7 @@ fn prune_light_checkpoints(dir: &Path) -> std::io::Result<()> {
                 None
             }
         })
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .ends_with("-light.json")
-        })
+        .filter(|e| e.file_name().to_string_lossy().ends_with("-light.json"))
         .collect();
 
     if light_files.len() <= MAX_LIGHT_CHECKPOINTS {
@@ -399,9 +389,7 @@ impl StepEventStore for FileBackedEventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::step_protocol::{
-        ExecutionCursor, PROTOCOL_VERSION,
-    };
+    use crate::pipeline::step_protocol::{ExecutionCursor, PROTOCOL_VERSION};
     use serde_json::json;
 
     fn make_light(step_id: &str, progress: f64) -> LightCheckpoint {
@@ -742,7 +730,10 @@ mod tests {
         // read_latest_heavy should attempt 000003 first (highest), fail to parse,
         // and return an InvalidData error — the corruption is not silently swallowed.
         let result = read_latest_heavy_checkpoint(&session_id);
-        assert!(result.is_err(), "Corrupted checkpoint JSON should return error");
+        assert!(
+            result.is_err(),
+            "Corrupted checkpoint JSON should return error"
+        );
 
         // Clean up
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
@@ -766,7 +757,10 @@ mod tests {
 
         // read_latest_light tries 000002 first → error
         let result = read_latest_light_checkpoint(&session_id);
-        assert!(result.is_err(), "Corrupted light checkpoint should return error");
+        assert!(
+            result.is_err(),
+            "Corrupted light checkpoint should return error"
+        );
 
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
@@ -782,15 +776,16 @@ mod tests {
         let valid_event = make_event("e1", "s1", StepEventType::StepCreated);
         let valid_json = serde_json::to_string(&valid_event).unwrap();
 
-        let content = format!(
-            "{}\nNOT VALID JSON\n{{\n{}\n",
-            valid_json, valid_json,
-        );
+        let content = format!("{}\nNOT VALID JSON\n{{\n{}\n", valid_json, valid_json,);
         std::fs::write(events_path_for(&session_id), &content).unwrap();
 
         // Load should skip malformed lines, keep valid ones
         let store = FileBackedEventStore::new(&session_id);
-        assert_eq!(store.event_count(), 2, "Should load 2 valid events, skip 2 malformed lines");
+        assert_eq!(
+            store.event_count(),
+            2,
+            "Should load 2 valid events, skip 2 malformed lines"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

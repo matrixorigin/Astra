@@ -370,7 +370,15 @@ pub fn pre_filter_dynamic_with_quality(
     query: &str,
     quality_tracker: Option<&ToolQualityTracker>,
 ) -> Vec<(usize, f64)> {
-    pre_filter_dynamic_core(state, query, quality_tracker, None, &[], &HashMap::new(), &[])
+    pre_filter_dynamic_core(
+        state,
+        query,
+        quality_tracker,
+        None,
+        &[],
+        &HashMap::new(),
+        &[],
+    )
 }
 
 /// Full-featured pre-filter with both quality tracking and confidence calibration.
@@ -381,7 +389,15 @@ pub fn pre_filter_dynamic_calibrated(
     quality_tracker: Option<&ToolQualityTracker>,
     calibrator: Option<&ConfidenceCalibrator>,
 ) -> Vec<(usize, f64)> {
-    pre_filter_dynamic_core(state, query, quality_tracker, calibrator, &[], &HashMap::new(), &[])
+    pre_filter_dynamic_core(
+        state,
+        query,
+        quality_tracker,
+        calibrator,
+        &[],
+        &HashMap::new(),
+        &[],
+    )
 }
 
 /// Full pre-filter with memory domain hints for gate softening.

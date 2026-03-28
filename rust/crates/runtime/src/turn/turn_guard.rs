@@ -106,7 +106,8 @@ impl TurnGuard {
     /// Distinct from generic errors — timeouts are infrastructure issues.
     pub fn record_tool_timeout(&mut self, tool_name: &str) {
         self.health.record_timeout(tool_name);
-        self.errors.record_error(error_recovery::ErrorCategory::Transient);
+        self.errors
+            .record_error(error_recovery::ErrorCategory::Transient);
     }
 
     /// Record an idempotency cache hit (tool skipped, result served from cache).

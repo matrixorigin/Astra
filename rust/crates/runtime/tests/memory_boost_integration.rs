@@ -218,7 +218,7 @@ fn full_pipeline_boost_improves_github_selection() {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
-                file_context: vec![],
+            file_context: vec![],
         };
         let r_no = selector.select(&ctx_no).await;
 
@@ -231,7 +231,7 @@ fn full_pipeline_boost_improves_github_selection() {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
-                file_context: vec![],
+            file_context: vec![],
         };
         let r_boost = selector.select(&ctx_boost).await;
 
@@ -281,7 +281,7 @@ fn full_pipeline_no_history_safe() {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
-                file_context: vec![],
+            file_context: vec![],
         };
         selector.select(&ctx).await
     });
@@ -349,7 +349,7 @@ fn full_pipeline_confidence_improves_with_history() {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
-                file_context: vec![],
+            file_context: vec![],
         };
         let r_no = selector.select(&ctx_no).await;
 
@@ -362,7 +362,7 @@ fn full_pipeline_confidence_improves_with_history() {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
-                file_context: vec![],
+            file_context: vec![],
         };
         let r_boost = selector.select(&ctx_boost).await;
 
@@ -545,7 +545,7 @@ fn cold_start_boost_improves_tool_selection() {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
-                file_context: vec![],
+            file_context: vec![],
         };
         let r_no = selector.select(&ctx_no).await;
 
@@ -565,7 +565,7 @@ fn cold_start_boost_improves_tool_selection() {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
-                file_context: vec![],
+            file_context: vec![],
         };
         let r_boost = selector.select(&ctx_boost).await;
         (r_no, r_boost)

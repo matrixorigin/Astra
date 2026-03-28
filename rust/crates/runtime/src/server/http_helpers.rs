@@ -18,7 +18,9 @@ pub(super) fn sse_json_response(events: Vec<serde_json::Value>) -> Response {
         .into_iter()
         .map(|event| match serde_json::to_string(&event) {
             Ok(json) => format!("data: {json}\n\n"),
-            Err(_) => "data: {\"type\":\"error\",\"message\":\"serialization failed\"}\n\n".to_string(),
+            Err(_) => {
+                "data: {\"type\":\"error\",\"message\":\"serialization failed\"}\n\n".to_string()
+            }
         })
         .collect::<String>();
 

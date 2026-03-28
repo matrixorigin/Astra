@@ -997,7 +997,8 @@ mod tests {
 
     #[test]
     fn turn_guard_verdict_info_minimal() {
-        let evt = JournalEvent::turn_guard_verdict(None, 1, "info", &[], &[], false, 0, 1, 0, 0, 0, 0);
+        let evt =
+            JournalEvent::turn_guard_verdict(None, 1, "info", &[], &[], false, 0, 1, 0, 0, 0, 0);
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.event_type, JournalEventType::TurnGuardVerdict);

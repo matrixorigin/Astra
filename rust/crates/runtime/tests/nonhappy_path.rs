@@ -1207,7 +1207,7 @@ mod chat_stream_turnguard_e2e {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: restricted,
-                file_context: vec![],
+            file_context: vec![],
         };
         let result = selector.select(&ctx).await;
         assert!(
@@ -1377,7 +1377,7 @@ mod chat_stream_turnguard_e2e {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: restricted,
-                file_context: vec![],
+            file_context: vec![],
         };
         let result = selector.select(&ctx).await;
         assert!(

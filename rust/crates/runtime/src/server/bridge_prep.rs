@@ -168,7 +168,9 @@ pub(super) async fn prepare_chat_turn_bridge_body(
                 .unwrap_or_else(|| normalize_execution_state(&serde_json::Map::new()))
         })
         .filter(|execution_state| !execution_state.is_empty())
-        .map(|execution_state| URL_SAFE.encode(serde_json::to_string(&execution_state).unwrap_or_default()));
+        .map(|execution_state| {
+            URL_SAFE.encode(serde_json::to_string(&execution_state).unwrap_or_default())
+        });
 
     serde_json::to_vec(&payload)
         .map(Bytes::from)

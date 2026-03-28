@@ -1,6 +1,6 @@
 use super::*;
 
-use mo_agent_core::{agent_warn, RuntimeLimits};
+use mo_agent_core::{RuntimeLimits, agent_warn};
 use mo_agent_runtime::pipeline::step_protocol::{
     CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache,
 };
@@ -442,7 +442,8 @@ pub(super) struct ChatTurnParams<'a> {
     pub(super) quiet: bool,
     pub(super) selector: &'a dyn tool_selector::ToolSelector,
     pub(super) recent_tools: &'a [String],
-    pub(super) tool_health_entries: &'a [mo_agent_runtime::pipeline::persistence::ToolHealthEntry],
+    pub(super) tool_health_entries:
+        &'a [mo_agent_runtime::pipeline::persistence::ToolHealthEntry],
 }
 
 /// Full edge-cloud agentic loop: sends message, executes tools, loops until done.
@@ -519,7 +520,9 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     let mut current_run_id: Option<String> = None;
     let mut stall_events: Vec<(String, u32)> = Vec::new();
     let mut verdict_events: Vec<VerdictEvent> = Vec::new();
-    let mut last_heavy_checkpoint: Option<mo_agent_runtime::pipeline::step_protocol::StepCheckpoint> = None;
+    let mut last_heavy_checkpoint: Option<
+        mo_agent_runtime::pipeline::step_protocol::StepCheckpoint,
+    > = None;
     let mut tool_call_records: Vec<mo_agent_services::session_journal::ToolCallRecord> = Vec::new();
     // Cross-turn dedup: IdempotencyCache with content-hash keys (Step Protocol)
     let mut idempotency_cache = InMemoryIdempotencyCache::new();
@@ -542,10 +545,11 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     let max_turns = RuntimeLimits::global().max_turns;
     let mut remaining_turns: usize = max_turns;
     // Step Protocol recorder: maps implicit chat_stream phases to explicit Step events
-    let mut step_recorder = mo_agent_runtime::pipeline::step_recorder::StepRecorder::with_persistence(
-        current_session_id.as_deref().unwrap_or("ephemeral"),
-        &format!("chat-{}", start.elapsed().as_millis()),
-    );
+    let mut step_recorder =
+        mo_agent_runtime::pipeline::step_recorder::StepRecorder::with_persistence(
+            current_session_id.as_deref().unwrap_or("ephemeral"),
+            &format!("chat-{}", start.elapsed().as_millis()),
+        );
 
     for _turn in 0..max_turns {
         if remaining_turns == 0 {
@@ -701,7 +705,10 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         step_recorder.record_perceive(
             message,
             &[], // memory IDs not yet tracked individually
-            &memory_domain_hints.iter().map(|h| format!("{:?}", h)).collect::<Vec<_>>(),
+            &memory_domain_hints
+                .iter()
+                .map(|h| format!("{:?}", h))
+                .collect::<Vec<_>>(),
             &boost_terms,
         );
 
@@ -916,15 +923,22 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
 
             // Response guard: detect prompt leakage in LLM output
             if mo_agent_runtime::turn::response_guard::is_prompt_leaked(&final_text, &[]) {
-                agent_warn!("response_guard", "Prompt leak detected in LLM output, sanitizing");
+                agent_warn!(
+                    "response_guard",
+                    "Prompt leak detected in LLM output, sanitizing"
+                );
                 final_text = "I apologize, but I encountered an issue generating that response. Let me try again.".to_string();
                 break;
             }
 
             // Response guard: detect repetition loops (LLM stuck repeating same word)
             if mo_agent_runtime::turn::response_guard::is_repetition_loop(&final_text) {
-                agent_warn!("response_guard", "Repetition loop detected in LLM output, breaking");
-                final_text = "I noticed I was repeating myself. Let me approach this differently.".to_string();
+                agent_warn!(
+                    "response_guard",
+                    "Repetition loop detected in LLM output, breaking"
+                );
+                final_text = "I noticed I was repeating myself. Let me approach this differently."
+                    .to_string();
                 break;
             }
         }
@@ -1063,8 +1077,14 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     .iter()
                     .filter_map(|tc| tc.get("name").and_then(|v| v.as_str()).map(String::from))
                     .collect();
-                agent_warn!("step", "Step timeout exceeded: {}ms > {}ms, aborting {} tools: {:?}",
-                    step_elapsed_ms, step_timeout_ms, aborted_count, aborted_tools);
+                agent_warn!(
+                    "step",
+                    "Step timeout exceeded: {}ms > {}ms, aborting {} tools: {:?}",
+                    step_elapsed_ms,
+                    step_timeout_ms,
+                    aborted_count,
+                    aborted_tools
+                );
                 turn_guard.record_step_abort(&aborted_tools);
                 break;
             }
@@ -1190,11 +1210,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             } else {
                 None
             };
-            step_recorder.begin_tool_with_key(
-                &name,
-                &id,
-                tool_idem_key.as_deref(),
-            );
+            step_recorder.begin_tool_with_key(&name, &id, tool_idem_key.as_deref());
 
             // Enforce per-tool timeout from scheduling contract,
             // reconciled with RuntimeLimits for the more restrictive policy.
@@ -1206,12 +1222,18 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             let mut result_str = match tokio::time::timeout(
                 std::time::Duration::from_millis(tool_timeout_ms),
                 executor.execute(&name, &args),
-            ).await {
+            )
+            .await
+            {
                 Ok(r) => r,
                 Err(_) => {
                     tool_timed_out = true;
                     turn_guard.record_tool_timeout(&name);
-                    format!("Tool '{}' took too long (>{}s). Consider retrying.", name, tool_timeout_ms / 1000)
+                    format!(
+                        "Tool '{}' took too long (>{}s). Consider retrying.",
+                        name,
+                        tool_timeout_ms / 1000
+                    )
                 }
             };
 
@@ -1274,9 +1296,16 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                         let retry_result = match tokio::time::timeout(
                             std::time::Duration::from_millis(tool_timeout_ms),
                             executor.execute(&name, &args),
-                        ).await {
+                        )
+                        .await
+                        {
                             Ok(r) => r,
-                            Err(_) => format!("Tool '{}' retry #{} took too long (>{}s)", name, attempt + 1, tool_timeout_ms / 1000),
+                            Err(_) => format!(
+                                "Tool '{}' retry #{} took too long (>{}s)",
+                                name,
+                                attempt + 1,
+                                tool_timeout_ms / 1000
+                            ),
                         };
                         if !is_tool_error(&retry_result) {
                             result_str = retry_result;
@@ -1285,8 +1314,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                             if !quiet {
                                 eprintln!(
                                     "{}",
-                                    format!("  ↻ {name} retry #{} succeeded", attempt + 1)
-                                        .green()
+                                    format!("  ↻ {name} retry #{} succeeded", attempt + 1).green()
                                 );
                             }
                             break;
@@ -1342,7 +1370,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             // Light checkpoint after each tool completion (best-effort, non-blocking)
             if let Some(ref sid) = current_session_id {
                 if let Some(light) = step_recorder.build_light_checkpoint() {
-                    let cp = mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Light(light);
+                    let cp =
+                        mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Light(light);
                     let _ = mo_agent_runtime::pipeline::step_checkpoint::write_step_checkpoint(
                         sid,
                         step_recorder.summary().checkpoints,
@@ -1745,10 +1774,8 @@ fn extract_repos_from_memory(text: &str) -> Vec<String> {
     use std::sync::LazyLock;
 
     static GITHUB_URL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(
-            r"(?i)github\.com/([a-zA-Z0-9][\w-]{0,38})/([a-zA-Z0-9][\w.-]{0,99})",
-        )
-        .expect("github url regex")
+        regex::Regex::new(r"(?i)github\.com/([a-zA-Z0-9][\w-]{0,38})/([a-zA-Z0-9][\w.-]{0,99})")
+            .expect("github url regex")
     });
 
     static BARE_REPO_RE: LazyLock<regex::Regex> = LazyLock::new(|| {

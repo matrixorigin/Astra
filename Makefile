@@ -45,6 +45,9 @@ help:
 	@echo "  make build-cli          - Build mo-agent + mo-admin (debug)"
 	@echo "  make build-cli-release  - Build mo-agent + mo-admin (release)"
 	@echo ""
+	@echo "Cleanup:"
+	@echo "  make clean              - Remove Rust build artifacts (target/)"
+	@echo ""
 	@echo "Memoria (Memory Service):"
 	@echo "  make memoria-start      - Start Memoria service"
 	@echo "  make memoria-stop       - Stop Memoria service"
@@ -358,6 +361,16 @@ build-server-release:
 	@echo "Building mo-agent-server (release)..."
 	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --release --bin $(API_SERVER_BIN)
 	@echo "Binary: $(RUST_RELEASE_BIN_DIR)/$(API_SERVER_BIN)"
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+.PHONY: clean
+clean:
+	@echo "Removing Rust build artifacts..."
+	@$(CARGO) clean $(CARGO_MANIFEST_FLAG)
+	@echo "✅ Build artifacts removed"
 
 # ============================================================================
 # Testing

@@ -222,7 +222,11 @@ impl StepRecorder {
                 slot.state = SlotState::Skipped;
             }
             // Track in Act result
-            if let Some(StepResult::Act { ref mut tool_results_count, .. }) = step.execution.result {
+            if let Some(StepResult::Act {
+                ref mut tool_results_count,
+                ..
+            }) = step.execution.result
+            {
                 *tool_results_count += 1;
             }
         }
@@ -304,7 +308,11 @@ impl StepRecorder {
             step.execution.cursor.advance_slot(slot_idx as usize, state);
 
             // Track completed tool count in Act result
-            if let Some(StepResult::Act { ref mut tool_results_count, .. }) = step.execution.result {
+            if let Some(StepResult::Act {
+                ref mut tool_results_count,
+                ..
+            }) = step.execution.result
+            {
                 *tool_results_count += 1;
             }
         }

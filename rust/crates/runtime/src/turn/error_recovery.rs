@@ -448,18 +448,12 @@ mod tests {
 
     #[test]
     fn classify_http_status_aliases_as_transient() {
-        assert_eq!(
-            classify_error("502 Bad Gateway"),
-            ErrorCategory::Transient
-        );
+        assert_eq!(classify_error("502 Bad Gateway"), ErrorCategory::Transient);
         assert_eq!(
             classify_error("service unavailable"),
             ErrorCategory::Transient
         );
-        assert_eq!(
-            classify_error("gateway timeout"),
-            ErrorCategory::Transient
-        );
+        assert_eq!(classify_error("gateway timeout"), ErrorCategory::Transient);
     }
 
     // ── Retry policy ──

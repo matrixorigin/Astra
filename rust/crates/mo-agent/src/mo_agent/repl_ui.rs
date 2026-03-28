@@ -29,6 +29,11 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/search",
         "Workspace search: /search <pattern> | /search files <glob> | /search review <pattern>",
     ),
+    ("/search files", "Search file names: /search files <glob>"),
+    (
+        "/search review",
+        "Search changed files only: /search review <pattern>",
+    ),
     ("/rewind", "Rewind conversation to turn N: /rewind <turn>"),
     ("/copy", "Copy last response to clipboard"),
     ("/context", "Show context window and session state"),
@@ -164,19 +169,16 @@ fn is_command_alias(command: &str) -> bool {
 
 fn command_name_matches_prefix(command: &str, query: &str) -> bool {
     let cmd = command.trim_start_matches('/').to_ascii_lowercase();
-    let q = query.trim_start().trim_start_matches('/').to_ascii_lowercase();
+    let q = query
+        .trim_start()
+        .trim_start_matches('/')
+        .to_ascii_lowercase();
     !q.is_empty() && cmd.starts_with(&q)
 }
 
-fn sort_picker_rows(
-    rows: &mut [(&'static str, &'static str)],
-    query: Option<&str>,
-) {
+fn sort_picker_rows(rows: &mut [(&'static str, &'static str)], query: Option<&str>) {
     rows.sort_by(|(a_cmd, _), (b_cmd, _)| {
-        let query_cmp = query.map(|q| {
-            suggestion_score(b_cmd, q)
-                .cmp(&suggestion_score(a_cmd, q))
-        });
+        let query_cmp = query.map(|q| suggestion_score(b_cmd, q).cmp(&suggestion_score(a_cmd, q)));
         query_cmp
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| is_command_alias(a_cmd).cmp(&is_command_alias(b_cmd)))
@@ -268,12 +270,12 @@ fn picker_rows_for_filter() -> Vec<(&'static str, &'static str)> {
 fn picker_selected_command() -> Option<&'static str> {
     let rows = picker_rows_for_filter();
     let selected = get_slash_picker_selected();
-    rows.get(selected)
-        .map(|(cmd, _)| *cmd)
-        .or_else(|| match resolve_slash_command(&format!("/{}", get_slash_filter()?)) {
+    rows.get(selected).map(|(cmd, _)| *cmd).or_else(|| {
+        match resolve_slash_command(&format!("/{}", get_slash_filter()?)) {
             Ok(cmd) => Some(cmd),
             Err(_) => None,
-        })
+        }
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -335,11 +337,11 @@ fn slash_completion_query(line: &str) -> Option<&str> {
 fn slash_argument_hint(command: &str) -> Option<&'static str> {
     match command {
         "/model" => Some("<name>"),
-        "/session history" | "/session errors" | "/session export" => {
-            Some("<session_id|prefix>")
-        }
+        "/session history" | "/session errors" | "/session export" => Some("<session_id|prefix>"),
         "/rewind" => Some("<turn>"),
         "/search" => Some("<pattern|files <glob>|review <pattern>>"),
+        "/search files" => Some("<glob>"),
+        "/search review" => Some("<pattern>"),
         "/skill" => Some("[list|new|test|dev|doctor|validate|config|system]"),
         "/skill new" => Some("<name>"),
         "/skill test" => Some("<name> [json_args]"),
@@ -433,7 +435,11 @@ fn slash_ctrl_e_filter(line: &str, active: bool, in_slash: bool) -> Option<Optio
 }
 
 fn slash_overlay_command_width(rows: &[(&'static str, &'static str)]) -> usize {
-    rows.iter().map(|(cmd, _)| cmd.chars().count()).max().unwrap_or(16).max(16)
+    rows.iter()
+        .map(|(cmd, _)| cmd.chars().count())
+        .max()
+        .unwrap_or(16)
+        .max(16)
 }
 
 fn slash_overlay_row_content(
@@ -450,11 +456,7 @@ fn slash_overlay_row_content(
             desc.bold()
         )
     } else {
-        format!(
-            "  {:<command_width$} {}",
-            cmd.dim(),
-            desc.dim()
-        )
+        format!("  {:<command_width$} {}", cmd.dim(), desc.dim())
     }
 }
 
@@ -496,9 +498,19 @@ fn slash_overlay_context_summary(
 ) -> String {
     match (filter.filter(|q| !q.is_empty()), total) {
         (Some(q), 0) => format!(" filter /{q}  ·  no matching commands "),
-        (Some(q), _) => format!(" filter /{q}  ·  showing {}-{} of {} ", start + 1, end, total),
+        (Some(q), _) => format!(
+            " filter /{q}  ·  showing {}-{} of {} ",
+            start + 1,
+            end,
+            total
+        ),
         (None, 0) => " type to filter slash commands ".to_string(),
-        (None, _) => format!(" type to filter  ·  showing {}-{} of {} ", start + 1, end, total),
+        (None, _) => format!(
+            " type to filter  ·  showing {}-{} of {} ",
+            start + 1,
+            end,
+            total
+        ),
     }
 }
 
@@ -527,7 +539,12 @@ fn slash_overlay_footer_summary(total: usize, start: usize, end: usize) -> Strin
     }
 }
 
-fn render_slash_overlay_footer(total: usize, start: usize, end: usize, inner_width: usize) -> String {
+fn render_slash_overlay_footer(
+    total: usize,
+    start: usize,
+    end: usize,
+    inner_width: usize,
+) -> String {
     let summary = slash_overlay_footer_summary(total, start, end);
     let summary_width = summary.chars().count();
     let pad = inner_width.saturating_sub(summary_width);
@@ -562,10 +579,18 @@ fn render_slash_overlay_row_with_width(
     let pad = inner_width.saturating_sub(visible_width(&content));
     format!(
         "{}{}{}{}",
-        if selected { "┃".cyan().bold() } else { "│".cyan().dim() },
+        if selected {
+            "┃".cyan().bold()
+        } else {
+            "│".cyan().dim()
+        },
         content,
         " ".repeat(pad),
-        if selected { "┃".cyan().bold() } else { "│".cyan().dim() }
+        if selected {
+            "┃".cyan().bold()
+        } else {
+            "│".cyan().dim()
+        }
     )
 }
 
@@ -685,9 +710,12 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
         let inner_width = body_contents
             .iter()
             .map(|(row, message)| match row {
-                Some((cmd, desc, selected)) => {
-                    visible_width(&slash_overlay_row_content(cmd, desc, *selected, command_width))
-                }
+                Some((cmd, desc, selected)) => visible_width(&slash_overlay_row_content(
+                    cmd,
+                    desc,
+                    *selected,
+                    command_width,
+                )),
                 None => message.chars().count(),
             })
             .max()
@@ -697,25 +725,29 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
             .max(footer.chars().count());
         println!("{}", render_slash_overlay_header(filter, inner_width));
         printed += 1;
-        println!("{}", render_slash_overlay_context_line(&context, inner_width));
+        println!(
+            "{}",
+            render_slash_overlay_context_line(&context, inner_width)
+        );
         printed += 1;
         for (row, message) in &body_contents {
             let line = match row {
-                Some((cmd, desc, selected)) => {
-                    render_slash_overlay_row_with_width(
-                        cmd,
-                        desc,
-                        *selected,
-                        command_width,
-                        inner_width,
-                    )
-                }
+                Some((cmd, desc, selected)) => render_slash_overlay_row_with_width(
+                    cmd,
+                    desc,
+                    *selected,
+                    command_width,
+                    inner_width,
+                ),
                 None => render_slash_overlay_message_line(message, inner_width),
             };
             println!("{line}");
             printed += 1;
         }
-        println!("{}", render_slash_overlay_footer(total, start, end, inner_width));
+        println!(
+            "{}",
+            render_slash_overlay_footer(total, start, end, inner_width)
+        );
         printed += 1;
         if let Ok(mut g) = slash_overlay_lines().lock() {
             *g = printed;
@@ -739,7 +771,10 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
         .max(footer.chars().count());
     println!("{}", render_slash_overlay_header(filter, inner_width));
     printed += 1;
-    println!("{}", render_slash_overlay_context_line(&context, inner_width));
+    println!(
+        "{}",
+        render_slash_overlay_context_line(&context, inner_width)
+    );
     printed += 1;
     for (_, message) in &body_contents {
         let line = render_slash_overlay_message_line(message, inner_width);
@@ -845,6 +880,8 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
             "/skill system",
             "/history",
             "/search",
+            "/search files",
+            "/search review",
             "/copy",
             "/context",
             "/version",
@@ -903,43 +940,64 @@ pub(super) fn print_keyboard_shortcuts() {
         "─── Keyboard Shortcuts ──────────────────────────".bold()
     );
     let shortcuts = [
-        ("Navigation", &[
-            ("Ctrl+A", "Move to line start"),
-            ("Ctrl+E", "Move to line end"),
-            ("Ctrl+B / ←", "Move back one character"),
-            ("Ctrl+F / →", "Move forward one character"),
-            ("Alt+B", "Move back one word"),
-            ("Alt+F", "Move forward one word"),
-        ] as &[(&str, &str)]),
-        ("Editing", &[
-            ("Ctrl+W", "Delete word backward"),
-            ("Ctrl+K", "Kill to end of line"),
-            ("Ctrl+U", "Kill from start to cursor"),
-            ("Ctrl+H / Backspace", "Delete previous character"),
-            ("Ctrl+D", "Delete character at cursor (or exit on empty line)"),
-            ("Ctrl+T", "Transpose characters"),
-        ]),
-        ("History", &[
-            ("↑ / ↓", "Navigate previous/next history"),
-            ("Ctrl+R", "Reverse search history"),
-            ("Ctrl+G", "Cancel search"),
-            ("Ctrl+P / Ctrl+N", "Previous/next (same as ↑/↓)"),
-        ]),
-        ("Multi-line", &[
-            ("Alt+Enter", "Insert newline (continue input)"),
-            ("\\ (at end)", "Backslash continuation"),
-        ]),
-        ("Screen", &[
-            ("Ctrl+L", "Clear screen"),
-            ("Ctrl+D", "Exit (on empty line)"),
-            ("Ctrl+C", "Cancel current input"),
-        ]),
-        ("Slash Picker", &[
-            ("/", "Open command picker"),
-            ("↑/↓ or Tab", "Navigate picker items"),
-            ("Enter", "Select command"),
-            ("Esc", "Dismiss picker"),
-        ]),
+        (
+            "Navigation",
+            &[
+                ("Ctrl+A", "Move to line start"),
+                ("Ctrl+E", "Move to line end"),
+                ("Ctrl+B / ←", "Move back one character"),
+                ("Ctrl+F / →", "Move forward one character"),
+                ("Alt+B", "Move back one word"),
+                ("Alt+F", "Move forward one word"),
+            ] as &[(&str, &str)],
+        ),
+        (
+            "Editing",
+            &[
+                ("Ctrl+W", "Delete word backward"),
+                ("Ctrl+K", "Kill to end of line"),
+                ("Ctrl+U", "Kill from start to cursor"),
+                ("Ctrl+H / Backspace", "Delete previous character"),
+                (
+                    "Ctrl+D",
+                    "Delete character at cursor (or exit on empty line)",
+                ),
+                ("Ctrl+T", "Transpose characters"),
+            ],
+        ),
+        (
+            "History",
+            &[
+                ("↑ / ↓", "Navigate previous/next history"),
+                ("Ctrl+R", "Reverse search history"),
+                ("Ctrl+G", "Cancel search"),
+                ("Ctrl+P / Ctrl+N", "Previous/next (same as ↑/↓)"),
+            ],
+        ),
+        (
+            "Multi-line",
+            &[
+                ("Alt+Enter", "Insert newline (continue input)"),
+                ("\\ (at end)", "Backslash continuation"),
+            ],
+        ),
+        (
+            "Screen",
+            &[
+                ("Ctrl+L", "Clear screen"),
+                ("Ctrl+D", "Exit (on empty line)"),
+                ("Ctrl+C", "Cancel current input"),
+            ],
+        ),
+        (
+            "Slash Picker",
+            &[
+                ("/", "Open command picker"),
+                ("↑/↓ or Tab", "Navigate picker items"),
+                ("Enter", "Select command"),
+                ("Esc", "Dismiss picker"),
+            ],
+        ),
     ];
     for (section, keys) in shortcuts {
         eprintln!("  {}", section.cyan().bold());
@@ -1079,7 +1137,9 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 clear_slash_overlay();
                 return slash_left_arrow_command(active, in_slash, ctx.pos());
             }
-            RlKeyEvent(RlKeyCode::Right, _) if in_slash && active && ctx.pos() == ctx.line().len() => {
+            RlKeyEvent(RlKeyCode::Right, _)
+                if in_slash && active && ctx.pos() == ctx.line().len() =>
+            {
                 let current = ctx.line();
                 let selected = picker_selected_command();
                 clear_slash_overlay();
@@ -1489,7 +1549,10 @@ mod tests {
     fn bare_slash_resolves_to_slash_command() {
         // "/" is an exact match in SLASH_COMMANDS, should never be ambiguous
         let result = resolve_slash_command("/");
-        assert!(result.is_ok(), "bare '/' should resolve exactly, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "bare '/' should resolve exactly, got: {result:?}"
+        );
         assert_eq!(result.unwrap(), "/");
     }
 
@@ -1548,7 +1611,11 @@ mod tests {
         set_slash_picker_selected(total - 1);
         let cmd = move_picker_selection(1);
         assert!(cmd.is_some());
-        assert_eq!(cmd.unwrap(), rows[0].0, "Down from last should wrap to first");
+        assert_eq!(
+            cmd.unwrap(),
+            rows[0].0,
+            "Down from last should wrap to first"
+        );
         assert_eq!(get_slash_picker_selected(), 0);
 
         // Backward wrap: at first, Up → should return last item
@@ -1637,6 +1704,17 @@ mod tests {
     }
 
     #[test]
+    fn slash_completion_query_keeps_search_subcommands_active() {
+        assert_eq!(slash_completion_query("/search "), Some("/search "));
+        assert_eq!(slash_completion_query("/search r"), Some("/search r"));
+        assert_eq!(
+            slash_completion_query("/search review"),
+            Some("/search review")
+        );
+        assert_eq!(slash_completion_query("/search review timeout"), None);
+    }
+
+    #[test]
     fn filtered_rows_for_skill_space_show_subcommands() {
         let rows = filtered_slash_rows(Some("skill "));
         assert!(!rows.is_empty());
@@ -1655,10 +1733,33 @@ mod tests {
     }
 
     #[test]
+    fn filtered_rows_for_search_space_show_subcommands() {
+        let rows = filtered_slash_rows(Some("search "));
+        assert!(!rows.is_empty());
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/search files"));
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/search review"));
+        assert!(!rows.iter().any(|(cmd, _)| *cmd == "/search"));
+    }
+
+    #[test]
+    fn filtered_rows_for_search_r_rank_review_first() {
+        let rows = filtered_slash_rows(Some("search r"));
+        assert!(!rows.is_empty());
+        assert_eq!(rows[0].0, "/search review");
+    }
+
+    #[test]
     fn completion_candidates_support_skill_subcommands_after_space() {
         let candidates = completion_candidates("/skill ");
         assert!(candidates.iter().any(|(cmd, _)| *cmd == "/skill list"));
         assert!(candidates.iter().any(|(cmd, _)| *cmd == "/skill dev"));
+    }
+
+    #[test]
+    fn completion_candidates_support_search_subcommands_after_space() {
+        let candidates = completion_candidates("/search ");
+        assert!(candidates.iter().any(|(cmd, _)| *cmd == "/search files"));
+        assert!(candidates.iter().any(|(cmd, _)| *cmd == "/search review"));
     }
 
     #[test]
@@ -1691,6 +1792,23 @@ mod tests {
         assert_eq!(
             slash_inline_hint("/search"),
             Some(" <pattern|files <glob>|review <pattern>>".to_string())
+        );
+    }
+
+    #[test]
+    fn slash_inline_hint_completes_search_subcommand_prefix() {
+        assert_eq!(slash_inline_hint("/search r"), Some("eview".to_string()));
+    }
+
+    #[test]
+    fn slash_inline_hint_shows_search_subcommand_parameter_hint() {
+        assert_eq!(
+            slash_inline_hint("/search review"),
+            Some(" <pattern>".to_string())
+        );
+        assert_eq!(
+            slash_inline_hint("/search files"),
+            Some(" <glob>".to_string())
         );
     }
 

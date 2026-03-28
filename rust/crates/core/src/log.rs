@@ -69,10 +69,6 @@ mod tests {
 
     #[test]
     fn persist_fail_macro_formats_kv() {
-        agent_persist_fail!("bridge",
-            session = "abc123",
-            events = 42,
-            error = "timeout"
-        );
+        agent_persist_fail!("bridge", session = "abc123", events = 42, error = "timeout");
     }
 }

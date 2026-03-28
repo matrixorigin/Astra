@@ -397,7 +397,9 @@ fn apply_turn_success(
                         let pool = pool.clone();
                         let sid_owned = sid.to_string();
                         let user_id_owned = user_id.to_string();
-                        let cp_number = result.step_recorder_summary.as_ref()
+                        let cp_number = result
+                            .step_recorder_summary
+                            .as_ref()
                             .map(|s| s.checkpoints)
                             .unwrap_or(0);
                         // Extract metadata from the checkpoint for column storage
@@ -412,18 +414,19 @@ fn apply_turn_success(
                             }
                         };
                         tokio::spawn(async move {
-                            let _ = mo_agent_services::session_restore::push_step_checkpoint_to_cloud(
-                                &pool,
-                                &sid_owned,
-                                &user_id_owned,
-                                cp_number,
-                                turn,
-                                &tier,
-                                &title,
-                                &tools_json,
-                                &state_json,
-                            )
-                            .await;
+                            let _ =
+                                mo_agent_services::session_restore::push_step_checkpoint_to_cloud(
+                                    &pool,
+                                    &sid_owned,
+                                    &user_id_owned,
+                                    cp_number,
+                                    turn,
+                                    &tier,
+                                    &title,
+                                    &tools_json,
+                                    &state_json,
+                                )
+                                .await;
                         });
                     }
                 }

@@ -4220,8 +4220,12 @@ mod plugin_registry_wiring {
         assert_eq!(registry.total_tool_count(), 1);
 
         let mut plugins = PluginRegistry::new();
-        plugins.register(make_plugin_entry("k8s_pods", "List Kubernetes pods")).unwrap();
-        plugins.register(make_plugin_entry("docker_ps", "List Docker containers")).unwrap();
+        plugins
+            .register(make_plugin_entry("k8s_pods", "List Kubernetes pods"))
+            .unwrap();
+        plugins
+            .register(make_plugin_entry("docker_ps", "List Docker containers"))
+            .unwrap();
 
         registry.register_plugins(&plugins);
         assert_eq!(registry.total_tool_count(), 3);
@@ -4231,7 +4235,9 @@ mod plugin_registry_wiring {
     fn register_plugins_updates_schema_index() {
         let mut registry = make_registry();
         let mut plugins = PluginRegistry::new();
-        plugins.register(make_plugin_entry("custom_deploy", "Deploy to staging")).unwrap();
+        plugins
+            .register(make_plugin_entry("custom_deploy", "Deploy to staging"))
+            .unwrap();
         registry.register_plugins(&plugins);
 
         // Schema index should find the new tool
@@ -4258,7 +4264,9 @@ mod plugin_registry_wiring {
     fn register_plugins_measured_costs_include_plugin_tools() {
         let mut registry = make_registry();
         let mut plugins = PluginRegistry::new();
-        plugins.register(make_plugin_entry("my_tool", "My custom tool")).unwrap();
+        plugins
+            .register(make_plugin_entry("my_tool", "My custom tool"))
+            .unwrap();
         registry.register_plugins(&plugins);
 
         // total_tool_count should include both built-in and plugin
@@ -4282,7 +4290,9 @@ mod plugin_registry_wiring {
         let mut registry = ToolRegistry::new(vec![]);
         let pinned_before = registry.pinned_schemas().len();
         let mut plugins = PluginRegistry::new();
-        plugins.register(make_plugin_entry("extra", "Extra tool")).unwrap();
+        plugins
+            .register(make_plugin_entry("extra", "Extra tool"))
+            .unwrap();
         registry.register_plugins(&plugins);
         // Pinned tools come from TOOL_CATALOG, not schemas — should be unchanged
         assert_eq!(registry.pinned_schemas().len(), pinned_before);
@@ -4341,7 +4351,9 @@ mod plugin_registry_wiring {
 
 mod tool_chain_catalog {
     use mo_agent_runtime::tool_registry::TOOL_CATALOG;
-    use mo_agent_runtime::tool_registry::chain::{ChainContext, ChainStep, ToolChain, resolve_args};
+    use mo_agent_runtime::tool_registry::chain::{
+        ChainContext, ChainStep, ToolChain, resolve_args,
+    };
     use serde_json::json;
 
     #[test]
@@ -4355,14 +4367,20 @@ mod tool_chain_catalog {
     #[test]
     fn run_chain_has_unique_triggers() {
         let chain_meta = TOOL_CATALOG.iter().find(|t| t.name == "run_chain").unwrap();
-        assert!(chain_meta.triggers.len() >= 4, "run_chain needs enough triggers for TF-IDF");
+        assert!(
+            chain_meta.triggers.len() >= 4,
+            "run_chain needs enough triggers for TF-IDF"
+        );
     }
 
     #[test]
     fn chain_execution_context_propagation() {
         let chain = ToolChain::new("test_flow", "Find files then analyze")
             .named_step("files", "list_dir", json!({"path": "$input.dir"}))
-            .step("grep", json!({"pattern": "$input.query", "path": "$step.files"}));
+            .step(
+                "grep",
+                json!({"pattern": "$input.query", "path": "$step.files"}),
+            );
 
         assert_eq!(chain.steps.len(), 2);
 
@@ -4370,7 +4388,13 @@ mod tool_chain_catalog {
         let resolved = resolve_args(&chain.steps[0].args, &ctx);
         assert_eq!(resolved["path"], "/src");
 
-        ctx.record_step(0, "list_dir", "file1.rs\nfile2.rs".into(), Some("files"), true);
+        ctx.record_step(
+            0,
+            "list_dir",
+            "file1.rs\nfile2.rs".into(),
+            Some("files"),
+            true,
+        );
         let resolved2 = resolve_args(&chain.steps[1].args, &ctx);
         assert_eq!(resolved2["path"], "file1.rs\nfile2.rs");
         assert_eq!(resolved2["pattern"], "TODO");
@@ -4439,7 +4463,10 @@ mod security_safety_gaps {
     fn sandbox_default_is_standard_mode() {
         let policy = SandboxPolicy::for_project("/tmp/test_project");
         assert!(
-            matches!(policy.mode, mo_agent_runtime::tool_sandbox::SandboxMode::Standard),
+            matches!(
+                policy.mode,
+                mo_agent_runtime::tool_sandbox::SandboxMode::Standard
+            ),
             "for_project() should produce Standard mode, not Permissive"
         );
     }
@@ -4464,7 +4491,10 @@ mod security_safety_gaps {
             &policy,
             dir.path().join("test.txt").to_str().unwrap(),
         );
-        assert!(result.is_ok(), "should allow file within project: {result:?}");
+        assert!(
+            result.is_ok(),
+            "should allow file within project: {result:?}"
+        );
     }
 
     /// PROOF: ToolChain.validate() catches unknown tools.
@@ -4554,14 +4584,19 @@ mod security_safety_gaps {
         lib.record_outcome(&tools, TaskType::Code, None, true, 0.7);
 
         let suggestions = lib.suggest(TaskType::Code, None, 5);
-        assert!(!suggestions.is_empty(), "should return at least one pattern");
+        assert!(
+            !suggestions.is_empty(),
+            "should return at least one pattern"
+        );
 
         // boost_terms_for should extract tool names from suggestions
         let boost = lib.boost_terms_for(TaskType::Code, None);
         assert!(!boost.is_empty(), "should produce boost terms");
         // Should contain the tools we recorded
         assert!(
-            boost.iter().any(|t| t == "git_log" || t == "read_file" || t == "bash"),
+            boost
+                .iter()
+                .any(|t| t == "git_log" || t == "read_file" || t == "bash"),
             "boost terms should include recorded tools: {boost:?}"
         );
     }
@@ -4584,11 +4619,26 @@ mod runtime_limits_proofs {
         let d = RuntimeLimits::default();
         assert_eq!(d.max_turns, 25, "was MAX_TURNS in chat_stream.rs");
         assert_eq!(d.max_tool_rounds, 10, "was MAX_TOOL_ROUNDS in routing.rs");
-        assert!((d.turn_timeout_s - 240.0).abs() < f64::EPSILON, "was TURN_TIMEOUT_S in bridge_inprocess.rs");
-        assert_eq!(d.global_output_limit, 50_000, "was GLOBAL_OUTPUT_LIMIT in edge_tools.rs");
-        assert_eq!(d.tool_output_limit, 20_000, "was DEFAULT_TOOL_OUTPUT_LIMIT in edge_tools.rs");
-        assert_eq!(d.max_tool_retries, 2, "was MAX_TOOL_RETRIES in error_recovery.rs");
-        assert_eq!(d.retry_base_ms, 500, "was RETRY_BASE_MS in error_recovery.rs");
+        assert!(
+            (d.turn_timeout_s - 240.0).abs() < f64::EPSILON,
+            "was TURN_TIMEOUT_S in bridge_inprocess.rs"
+        );
+        assert_eq!(
+            d.global_output_limit, 50_000,
+            "was GLOBAL_OUTPUT_LIMIT in edge_tools.rs"
+        );
+        assert_eq!(
+            d.tool_output_limit, 20_000,
+            "was DEFAULT_TOOL_OUTPUT_LIMIT in edge_tools.rs"
+        );
+        assert_eq!(
+            d.max_tool_retries, 2,
+            "was MAX_TOOL_RETRIES in error_recovery.rs"
+        );
+        assert_eq!(
+            d.retry_base_ms, 500,
+            "was RETRY_BASE_MS in error_recovery.rs"
+        );
         assert_eq!(d.max_retrieved, 6, "was MAX_RETRIEVED in retrieval.rs");
     }
 
@@ -4629,8 +4679,11 @@ mod idempotency_cache_proofs {
         let args2 = json!({"pattern": "fn main", "path": "src/main.rs"});
         let key1 = IdempotencyKey::semantic("grep", &args1);
         let key2 = IdempotencyKey::semantic("grep", &args2);
-        assert_eq!(key1.cache_key(), key2.cache_key(),
-            "Same args in different order must produce identical cache key");
+        assert_eq!(
+            key1.cache_key(),
+            key2.cache_key(),
+            "Same args in different order must produce identical cache key"
+        );
     }
 
     #[test]
@@ -4639,8 +4692,11 @@ mod idempotency_cache_proofs {
         let args2 = json!({"path": "src/lib.rs"});
         let key1 = IdempotencyKey::semantic("read_file", &args1);
         let key2 = IdempotencyKey::semantic("read_file", &args2);
-        assert_ne!(key1.cache_key(), key2.cache_key(),
-            "Different args must produce different cache keys");
+        assert_ne!(
+            key1.cache_key(),
+            key2.cache_key(),
+            "Different args must produce different cache keys"
+        );
     }
 
     #[test]
@@ -4648,8 +4704,11 @@ mod idempotency_cache_proofs {
         let args = json!({"path": "src/main.rs"});
         let key1 = IdempotencyKey::semantic("read_file", &args);
         let key2 = IdempotencyKey::semantic("list_dir", &args);
-        assert_ne!(key1.cache_key(), key2.cache_key(),
-            "Different tool names must produce different cache keys");
+        assert_ne!(
+            key1.cache_key(),
+            key2.cache_key(),
+            "Different tool names must produce different cache keys"
+        );
     }
 
     #[test]
@@ -4681,29 +4740,45 @@ mod idempotency_cache_proofs {
         // This is the key improvement over HashMap<String, String>.
         let key = IdempotencyKey::semantic("git_log", &json!({"count": 10, "branch": "main"}));
         let cache_key = key.cache_key();
-        assert!(cache_key.starts_with("sem:"), "Cache key format: sem:<hash>");
-        assert!(cache_key.len() > 10, "Cache key should include content hash");
+        assert!(
+            cache_key.starts_with("sem:"),
+            "Cache key format: sem:<hash>"
+        );
+        assert!(
+            cache_key.len() > 10,
+            "Cache key should include content hash"
+        );
         // Same computation again must yield same key
         let key2 = IdempotencyKey::semantic("git_log", &json!({"branch": "main", "count": 10}));
-        assert_eq!(cache_key, key2.cache_key(), "Content-addressable: order-independent");
+        assert_eq!(
+            cache_key,
+            key2.cache_key(),
+            "Content-addressable: order-independent"
+        );
     }
 
     #[test]
     fn cache_overwrite_updates_result() {
         let mut cache = InMemoryIdempotencyCache::new();
         let key = IdempotencyKey::semantic("git_status", &json!({}));
-        cache.record(&key, CachedToolResult {
-            tool_name: "git_status".into(),
-            output: "clean".into(),
-            is_error: false,
-            cached_at: 1000,
-        });
-        cache.record(&key, CachedToolResult {
-            tool_name: "git_status".into(),
-            output: "modified: foo.rs".into(),
-            is_error: false,
-            cached_at: 2000,
-        });
+        cache.record(
+            &key,
+            CachedToolResult {
+                tool_name: "git_status".into(),
+                output: "clean".into(),
+                is_error: false,
+                cached_at: 1000,
+            },
+        );
+        cache.record(
+            &key,
+            CachedToolResult {
+                tool_name: "git_status".into(),
+                output: "modified: foo.rs".into(),
+                is_error: false,
+                cached_at: 2000,
+            },
+        );
         let hit = cache.check(&key).unwrap();
         assert_eq!(hit.output, "modified: foo.rs", "Latest record wins");
     }
@@ -4722,8 +4797,11 @@ mod idempotency_cache_proofs {
             "filters": {"labels": ["bug", "critical"], "status": "open"}
         });
         let key2 = IdempotencyKey::semantic("github_list_issues", &args2);
-        assert_eq!(key1.cache_key(), key2.cache_key(),
-            "Nested JSON with same content must produce same key");
+        assert_eq!(
+            key1.cache_key(),
+            key2.cache_key(),
+            "Nested JSON with same content must produce same key"
+        );
     }
 }
 
@@ -4894,10 +4972,13 @@ mod scheduling_contract_proofs {
 
         let step = rec.current_step().unwrap();
         match &step.execution.payload {
-            StepPayload::Perceive { user_query, memory_context } => {
+            StepPayload::Perceive {
+                user_query,
+                memory_context,
+            } => {
                 assert_eq!(user_query, "show me the PR status");
                 assert_eq!(memory_context.len(), 2);
-            },
+            }
             other => panic!("Expected Perceive, got {:?}", other),
         }
         let mc = step.execution.memory_context.as_ref().unwrap();
@@ -4917,11 +4998,16 @@ mod scheduling_contract_proofs {
 
         let step = rec.current_step().unwrap();
         match &step.execution.result {
-            Some(StepResult::Act { tokens_in, tokens_out, tool_results_count, .. }) => {
+            Some(StepResult::Act {
+                tokens_in,
+                tokens_out,
+                tool_results_count,
+                ..
+            }) => {
                 assert_eq!(*tokens_in, 1500);
                 assert_eq!(*tokens_out, 800);
                 assert_eq!(*tool_results_count, 1);
-            },
+            }
             other => panic!("Expected Act result with tokens, got {:?}", other),
         }
     }
@@ -5021,7 +5107,10 @@ mod slot_integration_proofs {
         let step = rec.current_step().unwrap();
         let slot = &step.execution.cursor.slots[0];
         assert_eq!(slot.tool_name, "bash");
-        assert!(slot.idempotency_key.is_none(), "Side-effectful tools should not have idempotency key");
+        assert!(
+            slot.idempotency_key.is_none(),
+            "Side-effectful tools should not have idempotency key"
+        );
     }
 
     #[test]
@@ -5041,9 +5130,19 @@ mod slot_integration_proofs {
 
         let step = rec.current_step().unwrap();
         let slot = &step.execution.cursor.slots[0];
-        assert_eq!(slot.state, SlotState::Skipped, "Cache hit should set Skipped");
-        assert!(slot.cached_result.is_some(), "Cache hit should store result on slot");
-        assert_eq!(slot.cached_result.as_ref().unwrap().output, "file contents here");
+        assert_eq!(
+            slot.state,
+            SlotState::Skipped,
+            "Cache hit should set Skipped"
+        );
+        assert!(
+            slot.cached_result.is_some(),
+            "Cache hit should store result on slot"
+        );
+        assert_eq!(
+            slot.cached_result.as_ref().unwrap().output,
+            "file contents here"
+        );
     }
 
     #[test]
@@ -5066,8 +5165,17 @@ mod slot_integration_proofs {
         let step = rec.current_step().unwrap();
         let slot = &step.execution.cursor.slots[0];
         assert_eq!(slot.state, SlotState::Completed);
-        assert!(slot.cached_result.is_some(), "Attached result should be on slot");
-        assert!(slot.cached_result.as_ref().unwrap().output.contains("main.rs"));
+        assert!(
+            slot.cached_result.is_some(),
+            "Attached result should be on slot"
+        );
+        assert!(
+            slot.cached_result
+                .as_ref()
+                .unwrap()
+                .output
+                .contains("main.rs")
+        );
     }
 
     #[test]
@@ -5089,12 +5197,15 @@ mod slot_integration_proofs {
 
         // Tool 2: cache hit
         rec.begin_tool_with_key("grep", "c2", Some("sem:key-2"));
-        rec.record_cache_hit("grep", CachedToolResult {
-            tool_name: "grep".to_string(),
-            output: "match line 42".to_string(),
-            is_error: false,
-            cached_at: epoch_ms(),
-        });
+        rec.record_cache_hit(
+            "grep",
+            CachedToolResult {
+                tool_name: "grep".to_string(),
+                output: "match line 42".to_string(),
+                is_error: false,
+                cached_at: epoch_ms(),
+            },
+        );
 
         // Build checkpoint and verify slots are preserved
         let ckpt = rec.build_light_checkpoint();
@@ -5103,8 +5214,14 @@ mod slot_integration_proofs {
 
         // Verify via serialization roundtrip
         let json = serde_json::to_string(&light).unwrap();
-        assert!(json.contains("content A"), "Checkpoint should contain cached result A");
-        assert!(json.contains("match line 42"), "Checkpoint should contain cached result B");
+        assert!(
+            json.contains("content A"),
+            "Checkpoint should contain cached result A"
+        );
+        assert!(
+            json.contains("match line 42"),
+            "Checkpoint should contain cached result B"
+        );
     }
 
     #[test]
@@ -5123,12 +5240,15 @@ mod slot_integration_proofs {
 
         // Tool 3: cache hit (skipped)
         rec.begin_tool_with_key("grep", "c3", Some("sem:k3"));
-        rec.record_cache_hit("grep", CachedToolResult {
-            tool_name: "grep".to_string(),
-            output: "cached".to_string(),
-            is_error: false,
-            cached_at: epoch_ms(),
-        });
+        rec.record_cache_hit(
+            "grep",
+            CachedToolResult {
+                tool_name: "grep".to_string(),
+                output: "cached".to_string(),
+                is_error: false,
+                cached_at: epoch_ms(),
+            },
+        );
 
         // Tool 4: still pending (not executed)
         let step = rec.current_step().unwrap();
@@ -5150,33 +5270,51 @@ mod slot_integration_proofs {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod hardening_proofs {
-    use mo_agent_runtime::turn::response_guard::{is_prompt_leaked, is_repetition_loop};
-    use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
-    use mo_agent_runtime::turn::turn_guard::TurnGuard;
     use mo_agent_runtime::pipeline::persistence::{
         LearningSnapshot, ToolHealthEntry, load_snapshot_from, save_snapshot_to,
     };
+    use mo_agent_runtime::turn::response_guard::{is_prompt_leaked, is_repetition_loop};
+    use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
+    use mo_agent_runtime::turn::turn_guard::TurnGuard;
 
     // ── Response Guard ──
 
     #[test]
     fn prompt_leak_detects_structural_markers() {
-        assert!(is_prompt_leaked("Here is the output:\n## Core Rules\n1. Always...", &[]));
-        assert!(is_prompt_leaked("Some text with File editing rules: important", &[]));
-        assert!(is_prompt_leaked("## Reasoning Protocol should be followed", &[]));
+        assert!(is_prompt_leaked(
+            "Here is the output:\n## Core Rules\n1. Always...",
+            &[]
+        ));
+        assert!(is_prompt_leaked(
+            "Some text with File editing rules: important",
+            &[]
+        ));
+        assert!(is_prompt_leaked(
+            "## Reasoning Protocol should be followed",
+            &[]
+        ));
     }
 
     #[test]
     fn prompt_leak_ignores_normal_output() {
-        assert!(!is_prompt_leaked("Here is a normal code review of your PR.", &[]));
-        assert!(!is_prompt_leaked("The function implements a hash map.", &[]));
+        assert!(!is_prompt_leaked(
+            "Here is a normal code review of your PR.",
+            &[]
+        ));
+        assert!(!is_prompt_leaked(
+            "The function implements a hash map.",
+            &[]
+        ));
         assert!(!is_prompt_leaked("", &[]));
     }
 
     #[test]
     fn prompt_leak_detects_custom_fingerprints() {
         let fps = vec!["secret_sauce_v2".to_string()];
-        assert!(is_prompt_leaked("Let me explain: SECRET_SAUCE_V2 is...", &fps));
+        assert!(is_prompt_leaked(
+            "Let me explain: SECRET_SAUCE_V2 is...",
+            &fps
+        ));
         assert!(!is_prompt_leaked("Normal text about code", &fps));
     }
 
@@ -5240,15 +5378,13 @@ mod hardening_proofs {
 
     #[test]
     fn turn_guard_with_health_inherits_cross_session_data() {
-        let entries = vec![
-            ToolHealthEntry {
-                name: "flaky_tool".to_string(),
-                total_calls: 10,
-                total_failures: 8,
-                failure_rate: 0.8,
-                last_updated_epoch: 0,
-            },
-        ];
+        let entries = vec![ToolHealthEntry {
+            name: "flaky_tool".to_string(),
+            total_calls: 10,
+            total_failures: 8,
+            failure_rate: 0.8,
+            last_updated_epoch: 0,
+        }];
         let health = ToolHealthTracker::from_entries(&entries);
         let guard = TurnGuard::with_health(health);
 
@@ -5282,7 +5418,10 @@ mod hardening_proofs {
 
         let bash_entry = entries.iter().find(|e| e.name == "bash").unwrap();
         assert_eq!(bash_entry.total_failures, 3);
-        assert!(bash_entry.failure_rate > 0.9, "All bash calls were failures");
+        assert!(
+            bash_entry.failure_rate > 0.9,
+            "All bash calls were failures"
+        );
     }
 
     // ── SSE Error Handling ──
@@ -5570,7 +5709,8 @@ mod token_efficiency_deep {
         state.is_git = true;
 
         // No pressure: include everything relevant
-        let no_pressure = pre_filter_dynamic_with_pressure(&state, "git status", None, None, &[], 0.0);
+        let no_pressure =
+            pre_filter_dynamic_with_pressure(&state, "git status", None, None, &[], 0.0);
 
         // High pressure: exclude marginal tools
         let high_pressure =
@@ -5855,7 +5995,11 @@ mod crash_recovery_proofs {
         // slot 4: Pending (default)
 
         let done = completed_slots(&heavy);
-        assert_eq!(done, vec![0, 1], "Only completed slots should be identified");
+        assert_eq!(
+            done,
+            vec![0, 1],
+            "Only completed slots should be identified"
+        );
     }
 
     #[test]
@@ -5988,10 +6132,8 @@ mod crash_recovery_proofs {
         };
 
         // Strict should reject
-        let strict_result = check_protocol_version_with_policy(
-            heavy.light.protocol_version,
-            VersionPolicy::Strict,
-        );
+        let strict_result =
+            check_protocol_version_with_policy(heavy.light.protocol_version, VersionPolicy::Strict);
         assert!(strict_result.is_err(), "Strict should reject version drift");
 
         // Compatible should accept (same major)
@@ -6159,8 +6301,7 @@ mod protocol_hygiene_proofs {
 
         // Now version check should pass
         let found_version = migrated["protocol_version"].as_u64().unwrap() as u32;
-        let verdict =
-            check_protocol_version_with_policy(found_version, VersionPolicy::Compatible);
+        let verdict = check_protocol_version_with_policy(found_version, VersionPolicy::Compatible);
         assert!(verdict.is_ok());
         match verdict.unwrap() {
             VersionVerdict::ExactMatch => {} // expected
@@ -6178,8 +6319,8 @@ mod protocol_hygiene_proofs {
 
 // ─── Scheduling contract proofs ─────────────────────────────────────────────
 mod scheduling_wiring_proofs {
-    use mo_agent_runtime::pipeline::step_protocol::SchedulingContract;
     use mo_agent_core::RuntimeLimits;
+    use mo_agent_runtime::pipeline::step_protocol::SchedulingContract;
 
     /// Default contract has sane values.
     #[test]
@@ -6227,12 +6368,12 @@ mod scheduling_wiring_proofs {
             backoff_max_ms: 5_000,
             ..Default::default()
         };
-        assert_eq!(c.backoff_ms(0), 100);     // 100 * 2^0 = 100
-        assert_eq!(c.backoff_ms(1), 200);     // 100 * 2^1 = 200
-        assert_eq!(c.backoff_ms(2), 400);     // 100 * 2^2 = 400
-        assert_eq!(c.backoff_ms(3), 800);     // 100 * 2^3 = 800
+        assert_eq!(c.backoff_ms(0), 100); // 100 * 2^0 = 100
+        assert_eq!(c.backoff_ms(1), 200); // 100 * 2^1 = 200
+        assert_eq!(c.backoff_ms(2), 400); // 100 * 2^2 = 400
+        assert_eq!(c.backoff_ms(3), 800); // 100 * 2^3 = 800
         // Capped at max
-        assert_eq!(c.backoff_ms(10), 5_000);  // 100 * 2^10 = 102400, capped at 5000
+        assert_eq!(c.backoff_ms(10), 5_000); // 100 * 2^10 = 102400, capped at 5000
     }
 
     /// Backoff doesn't panic on large attempt numbers.
@@ -6279,8 +6420,8 @@ mod scheduling_wiring_proofs {
     #[test]
     fn custom_urgent_contract() {
         let c = SchedulingContract {
-            priority: 10,       // urgent
-            timeout_ms: 5_000,  // 5s total
+            priority: 10,      // urgent
+            timeout_ms: 5_000, // 5s total
             per_tool_timeout_ms: 2_000,
             max_retries: 1,
             backoff_base_ms: 100,
@@ -6403,14 +6544,8 @@ mod turnguard_step_integration_proofs {
         guard.record_cache_hit("read_file");
         guard.record_cache_hit("grep");
 
-        assert_eq!(
-            guard.health.get("read_file").unwrap().cache_hit_count,
-            1
-        );
-        assert_eq!(
-            guard.health.get("grep").unwrap().cache_hit_count,
-            1
-        );
+        assert_eq!(guard.health.get("read_file").unwrap().cache_hit_count, 1);
+        assert_eq!(guard.health.get("grep").unwrap().cache_hit_count, 1);
         assert_eq!(guard.errors.total_errors, 0);
     }
 
@@ -6419,21 +6554,11 @@ mod turnguard_step_integration_proofs {
     #[test]
     fn step_abort_records_timeout_for_each_aborted_tool() {
         let mut guard = TurnGuard::new();
-        guard.record_step_abort(&[
-            "bash".into(),
-            "read_file".into(),
-            "write_file".into(),
-        ]);
+        guard.record_step_abort(&["bash".into(), "read_file".into(), "write_file".into()]);
 
         assert_eq!(guard.health.get("bash").unwrap().timeout_count, 1);
-        assert_eq!(
-            guard.health.get("read_file").unwrap().timeout_count,
-            1
-        );
-        assert_eq!(
-            guard.health.get("write_file").unwrap().timeout_count,
-            1
-        );
+        assert_eq!(guard.health.get("read_file").unwrap().timeout_count, 1);
+        assert_eq!(guard.health.get("write_file").unwrap().timeout_count, 1);
         assert!(guard.errors.total_errors >= 1);
     }
 
@@ -6458,7 +6583,10 @@ mod turnguard_step_integration_proofs {
         guard.record_cache_hit("bash");
 
         let h = guard.health.get("bash").unwrap();
-        assert_eq!(h.total_calls, 3, "2 successes + 1 timeout (cache hit not counted)");
+        assert_eq!(
+            h.total_calls, 3,
+            "2 successes + 1 timeout (cache hit not counted)"
+        );
         assert_eq!(h.total_failures, 1, "1 timeout");
         assert_eq!(h.timeout_count, 1);
         assert_eq!(h.cache_hit_count, 1);
@@ -6516,12 +6644,21 @@ mod turnguard_step_integration_proofs {
         guard.record_tool_timeout("bash");
 
         let verdict = guard.evaluate();
-        let has_timeout_guidance = verdict.injections.iter().any(|msg| msg.contains("timing out"));
-        assert!(has_timeout_guidance, "Should inject infrastructure timeout guidance");
+        let has_timeout_guidance = verdict
+            .injections
+            .iter()
+            .any(|msg| msg.contains("timing out"));
+        assert!(
+            has_timeout_guidance,
+            "Should inject infrastructure timeout guidance"
+        );
         // Should NOT be in avoid_tools (timeouts are transient)
         assert!(
             !verdict.avoid_tools.contains(&"bash".to_string())
-                || verdict.injections.iter().any(|msg| msg.contains("timing out")),
+                || verdict
+                    .injections
+                    .iter()
+                    .any(|msg| msg.contains("timing out")),
             "Timeout-dominant tools get guidance, not permanent avoidance"
         );
     }
@@ -6536,8 +6673,14 @@ mod turnguard_step_integration_proofs {
         guard.record_cache_hit("read_file");
 
         let verdict = guard.evaluate();
-        let has_cache_warning = verdict.injections.iter().any(|msg| msg.contains("Duplicate calls"));
-        assert!(has_cache_warning, "3+ cache hits should trigger duplication warning");
+        let has_cache_warning = verdict
+            .injections
+            .iter()
+            .any(|msg| msg.contains("Duplicate calls"));
+        assert!(
+            has_cache_warning,
+            "3+ cache hits should trigger duplication warning"
+        );
         assert!(verdict.severity >= VerdictSeverity::Warning);
     }
 
@@ -6548,8 +6691,14 @@ mod turnguard_step_integration_proofs {
         guard.record_cache_hit("read_file");
 
         let verdict = guard.evaluate();
-        let has_cache_warning = verdict.injections.iter().any(|msg| msg.contains("Duplicate calls"));
-        assert!(!has_cache_warning, "2 cache hits should not trigger warning");
+        let has_cache_warning = verdict
+            .injections
+            .iter()
+            .any(|msg| msg.contains("Duplicate calls"));
+        assert!(
+            !has_cache_warning,
+            "2 cache hits should not trigger warning"
+        );
     }
 
     #[test]
@@ -6606,7 +6755,10 @@ mod turnguard_step_integration_proofs {
         let verdict = guard.evaluate();
         let msgs = verdict.injections.join(" ");
         assert!(msgs.contains("timing out"), "Should have timeout guidance");
-        assert!(msgs.contains("Duplicate calls"), "Should have cache warning");
+        assert!(
+            msgs.contains("Duplicate calls"),
+            "Should have cache warning"
+        );
         assert!(verdict.severity >= VerdictSeverity::Warning);
     }
 }
@@ -6618,7 +6770,7 @@ mod turnguard_step_integration_proofs {
 // =============================================================================
 mod checkpoint_cloud_persistence_proofs {
     use mo_agent_runtime::pipeline::step_protocol::{
-        ExecutionCursor, StepAction, HeavyCheckpoint, LightCheckpoint, StepCheckpoint,
+        ExecutionCursor, HeavyCheckpoint, LightCheckpoint, StepAction, StepCheckpoint,
     };
 
     fn make_light() -> LightCheckpoint {
@@ -6729,7 +6881,10 @@ mod checkpoint_cloud_persistence_proofs {
         let light = make_light();
         let cp = StepCheckpoint::Light(light);
         let json = serde_json::to_string(&cp).unwrap();
-        assert!(!json.contains("messages"), "Light checkpoints should NOT have messages");
+        assert!(
+            !json.contains("messages"),
+            "Light checkpoints should NOT have messages"
+        );
         assert!(json.contains("step-abc"));
     }
 
@@ -6738,10 +6893,12 @@ mod checkpoint_cloud_persistence_proofs {
         let mut heavy = make_heavy();
         // Simulate a large conversation (100 messages)
         heavy.messages = (0..100)
-            .map(|i| serde_json::json!({
-                "role": if i % 2 == 0 { "user" } else { "assistant" },
-                "content": format!("Message number {} with some reasonable length content", i),
-            }))
+            .map(|i| {
+                serde_json::json!({
+                    "role": if i % 2 == 0 { "user" } else { "assistant" },
+                    "content": format!("Message number {} with some reasonable length content", i),
+                })
+            })
             .collect();
 
         let cp = StepCheckpoint::Heavy(Box::new(heavy));
@@ -6896,7 +7053,10 @@ mod health_summary_auditability_proofs {
 
         let summary = tracker.summary();
         assert_eq!(summary.total_timeouts, 2, "should count 2 bash timeouts");
-        assert_eq!(summary.total_cache_hits, 3, "should count 3 grep cache hits");
+        assert_eq!(
+            summary.total_cache_hits, 3,
+            "should count 3 grep cache hits"
+        );
         assert_eq!(summary.total_errors, 2, "timeouts are failures");
         assert_eq!(summary.total_tools, 2, "bash + grep tracked");
     }
@@ -6913,8 +7073,14 @@ mod health_summary_auditability_proofs {
         }
 
         let summary = tracker.summary();
-        assert_eq!(summary.flaky_count, 1, "bash should be flaky after 2 rehab cycles");
-        assert_eq!(summary.deprioritized_count, 0, "rehabilitated = not deprioritized");
+        assert_eq!(
+            summary.flaky_count, 1,
+            "bash should be flaky after 2 rehab cycles"
+        );
+        assert_eq!(
+            summary.deprioritized_count, 0,
+            "rehabilitated = not deprioritized"
+        );
     }
 
     #[test]
@@ -6979,7 +7145,7 @@ mod learning_sync_cloud_proofs {
     use mo_agent_runtime::pipeline::entity::EntityGraph;
     use mo_agent_runtime::pipeline::pattern::PatternLibrary;
     use mo_agent_runtime::pipeline::persistence::{
-        export_from_modules, export_from_modules_with_health, LearningSnapshot, ToolHealthEntry,
+        LearningSnapshot, ToolHealthEntry, export_from_modules, export_from_modules_with_health,
     };
     use std::sync::{Arc, Mutex};
 
@@ -6999,7 +7165,10 @@ mod learning_sync_cloud_proofs {
     fn export_without_health_has_empty_tool_health() {
         let (eg, pl, cal) = empty_modules();
         let snapshot = export_from_modules(&eg, &pl, &cal);
-        assert!(snapshot.tool_health.is_empty(), "default export should have no health");
+        assert!(
+            snapshot.tool_health.is_empty(),
+            "default export should have no health"
+        );
     }
 
     #[test]
@@ -7239,9 +7408,7 @@ mod cloud_sync_status_proofs {
             last_error: None,
         };
         // Connected: has at least one push or pull
-        assert!(
-            status.learning_last_push.is_some() || status.learning_last_pull.is_some()
-        );
+        assert!(status.learning_last_push.is_some() || status.learning_last_pull.is_some());
         assert!(status.last_error.is_none());
     }
 
@@ -7293,7 +7460,7 @@ mod cloud_sync_status_proofs {
 }
 
 mod timestamp_merge_proofs {
-    use mo_agent_runtime::pipeline::persistence::{merge_tool_health, ToolHealthEntry};
+    use mo_agent_runtime::pipeline::persistence::{ToolHealthEntry, merge_tool_health};
 
     #[test]
     fn cloud_newer_timestamp_wins_over_local() {
@@ -7566,7 +7733,11 @@ mod turnguard_e2e_proofs {
         guard.record_tool_calls(&calls);
         guard.record_tool_result("bash", "127.0.0.1 localhost");
         let v1 = guard.evaluate();
-        assert_eq!(v1.severity, VerdictSeverity::Healthy, "First call is not a stall");
+        assert_eq!(
+            v1.severity,
+            VerdictSeverity::Healthy,
+            "First call is not a stall"
+        );
         assert!(!v1.force_stop);
 
         // Turn 2: identical call → stall detected, first nudge
@@ -7574,8 +7745,10 @@ mod turnguard_e2e_proofs {
         guard.record_tool_result("bash", "127.0.0.1 localhost");
         let v2 = guard.evaluate();
         assert!(v2.severity >= VerdictSeverity::Warning, "Stall → Warning");
-        assert!(v2.injections.iter().any(|m| m.contains("REFLECTION")),
-            "Should inject structured reflection");
+        assert!(
+            v2.injections.iter().any(|m| m.contains("REFLECTION")),
+            "Should inject structured reflection"
+        );
         assert!(!v2.force_stop, "First stall should not force stop");
         assert_eq!(guard.nudge_count, 1);
 
@@ -7583,10 +7756,15 @@ mod turnguard_e2e_proofs {
         guard.record_tool_calls(&calls);
         guard.record_tool_result("bash", "127.0.0.1 localhost");
         let v3 = guard.evaluate();
-        assert_eq!(v3.severity, VerdictSeverity::Critical,
-            "2 nudges → escalation_level Critical");
-        assert!(v3.injections.iter().any(|m| m.contains("CRITICAL")),
-            "Should have CRITICAL escalation message");
+        assert_eq!(
+            v3.severity,
+            VerdictSeverity::Critical,
+            "2 nudges → escalation_level Critical"
+        );
+        assert!(
+            v3.injections.iter().any(|m| m.contains("CRITICAL")),
+            "Should have CRITICAL escalation message"
+        );
         assert_eq!(guard.nudge_count, 2);
 
         // Turn 4: still repeating → 3rd nudge, Critical + force_stop
@@ -7594,8 +7772,10 @@ mod turnguard_e2e_proofs {
         guard.record_tool_result("bash", "127.0.0.1 localhost");
         let v4 = guard.evaluate();
         assert_eq!(v4.severity, VerdictSeverity::Critical);
-        assert!(v4.force_stop,
-            "nudge_count >= 3 + Critical escalation → force_stop");
+        assert!(
+            v4.force_stop,
+            "nudge_count >= 3 + Critical escalation → force_stop"
+        );
     }
 
     // ── Scenario B: Divergence with mixed productive + exploration tools ─────
@@ -7611,14 +7791,19 @@ mod turnguard_e2e_proofs {
         let v1 = guard.evaluate();
         // 1 exploration round is Exploring, not Diverging (need >= MAX_EXPLORATION_ROUNDS=2)
         let has_divergence = v1.injections.iter().any(|m| m.contains("exploring"));
-        assert!(!has_divergence, "1 exploration round should not trigger divergence");
+        assert!(
+            !has_divergence,
+            "1 exploration round should not trigger divergence"
+        );
 
         // Turn 2: productive tool breaks the streak
         guard.record_tool_calls(&[tc("memory_store", r#"{"content":"fact"}"#)]);
         guard.record_tool_result("memory_store", r#"{"stored": true}"#);
         let v2 = guard.evaluate();
-        assert!(!v2.injections.iter().any(|m| m.contains("exploring")),
-            "Productive tool resets divergence");
+        assert!(
+            !v2.injections.iter().any(|m| m.contains("exploring")),
+            "Productive tool resets divergence"
+        );
 
         // Turn 3-4: two consecutive exploration rounds → Diverging
         guard.record_tool_calls(&[tc("read_file", r#"{"path":"a.rs"}"#)]);
@@ -7626,8 +7811,10 @@ mod turnguard_e2e_proofs {
         guard.record_tool_calls(&[tc("grep", r#"{"pattern":"todo"}"#)]);
         guard.record_tool_result("grep", "[]");
         let v4 = guard.evaluate();
-        assert!(v4.injections.iter().any(|m| m.contains("exploring")),
-            "2 consecutive exploration rounds → divergence correction");
+        assert!(
+            v4.injections.iter().any(|m| m.contains("exploring")),
+            "2 consecutive exploration rounds → divergence correction"
+        );
     }
 
     // ── Scenario C: Timeouts don't escalate to Critical ──────────────────────
@@ -7651,8 +7838,10 @@ mod turnguard_e2e_proofs {
             "Timeout-only session must NEVER force_stop (infrastructure issue, not agent failure)"
         );
         // Should still warn about timeouts
-        assert!(verdict.injections.iter().any(|m| m.contains("timing out")),
-            "Should give timeout infrastructure guidance");
+        assert!(
+            verdict.injections.iter().any(|m| m.contains("timing out")),
+            "Should give timeout infrastructure guidance"
+        );
     }
 
     // ── Scenario D: Cache duplication + divergence combined verdict ───────────
@@ -7675,10 +7864,11 @@ mod turnguard_e2e_proofs {
 
         let verdict = guard.evaluate();
         let msgs = verdict.injections.join("\n");
-        assert!(msgs.contains("Duplicate calls"),
-            "Should warn about cache waste");
-        assert!(msgs.contains("exploring"),
-            "Should warn about divergence");
+        assert!(
+            msgs.contains("Duplicate calls"),
+            "Should warn about cache waste"
+        );
+        assert!(msgs.contains("exploring"), "Should warn about divergence");
         assert!(verdict.severity >= VerdictSeverity::Warning);
     }
 
@@ -7712,13 +7902,19 @@ mod turnguard_e2e_proofs {
 
         let verdict = guard.evaluate();
         // mo_query was deprioritized from history (70% failure rate, 10 calls)
-        assert!(verdict.avoid_tools.contains(&"mo_query".to_string()),
-            "Cross-session deprioritized tool should appear in avoid_tools");
+        assert!(
+            verdict.avoid_tools.contains(&"mo_query".to_string()),
+            "Cross-session deprioritized tool should appear in avoid_tools"
+        );
         // bash should NOT be deprioritized (10% failure rate)
-        assert!(!verdict.avoid_tools.contains(&"bash".to_string()),
-            "Healthy cross-session tool should NOT be in avoid_tools");
-        assert!(verdict.injections.iter().any(|m| m.contains("mo_query")),
-            "Should have a warning injection about the deprioritized tool");
+        assert!(
+            !verdict.avoid_tools.contains(&"bash".to_string()),
+            "Healthy cross-session tool should NOT be in avoid_tools"
+        );
+        assert!(
+            verdict.injections.iter().any(|m| m.contains("mo_query")),
+            "Should have a warning injection about the deprioritized tool"
+        );
     }
 
     // ── Scenario F: Nudge-ignore detection ───────────────────────────────────
@@ -7739,9 +7935,14 @@ mod turnguard_e2e_proofs {
         guard.record_tool_calls(&calls);
         guard.record_tool_calls(&calls);
         let v1 = guard.evaluate();
-        assert!(v1.severity >= VerdictSeverity::Warning, "Stall + deprioritized tool");
-        assert!(v1.avoid_tools.contains(&"bash".to_string()),
-            "Deprioritized+stalled tool should be in avoid_tools");
+        assert!(
+            v1.severity >= VerdictSeverity::Warning,
+            "Stall + deprioritized tool"
+        );
+        assert!(
+            v1.avoid_tools.contains(&"bash".to_string()),
+            "Deprioritized+stalled tool should be in avoid_tools"
+        );
         assert_eq!(guard.nudge_count, 1);
 
         // Turn: LLM uses a DIFFERENT tool → no nudge-ignore
@@ -7756,8 +7957,10 @@ mod turnguard_e2e_proofs {
         guard.record_tool_result("bash", "hello");
         let v3 = guard.evaluate();
         let nudge_ignored = v3.injections.iter().any(|m| m.contains("told to avoid"));
-        assert!(nudge_ignored,
-            "Using an avoided tool should trigger nudge-ignore warning");
+        assert!(
+            nudge_ignored,
+            "Using an avoided tool should trigger nudge-ignore warning"
+        );
     }
 
     // ── Scenario G: Rehabilitation + stricter threshold ──────────────────────
@@ -7772,14 +7975,18 @@ mod turnguard_e2e_proofs {
             guard.record_tool_result("flaky_api", "error: timeout");
         }
         let v1 = guard.evaluate();
-        assert!(v1.avoid_tools.contains(&"flaky_api".to_string()),
-            "3 failures → deprioritized in verdict");
+        assert!(
+            v1.avoid_tools.contains(&"flaky_api".to_string()),
+            "3 failures → deprioritized in verdict"
+        );
 
         // Rehabilitate with success
         guard.record_tool_result("flaky_api", r#"{"result":"ok"}"#);
         let v2 = guard.evaluate();
-        assert!(!v2.avoid_tools.contains(&"flaky_api".to_string()),
-            "Success rehabilitates tool");
+        assert!(
+            !v2.avoid_tools.contains(&"flaky_api".to_string()),
+            "Success rehabilitates tool"
+        );
 
         // Cycle 2: 3 more failures → deprioritized again
         for _ in 0..3 {
@@ -7795,8 +8002,10 @@ mod turnguard_e2e_proofs {
         guard.record_tool_result("flaky_api", "error: server error");
         guard.record_tool_result("flaky_api", "error: server error");
         let v4 = guard.evaluate();
-        assert!(v4.avoid_tools.contains(&"flaky_api".to_string()),
-            "Flaky tool (rehab_count >= 2) deprioritizes after only 2 failures");
+        assert!(
+            v4.avoid_tools.contains(&"flaky_api".to_string()),
+            "Flaky tool (rehab_count >= 2) deprioritizes after only 2 failures"
+        );
     }
 
     // ── Scenario H: Result quality classification chain ──────────────────────
@@ -7855,8 +8064,10 @@ mod turnguard_e2e_proofs {
         let verdict = guard.evaluate();
         // 3 timeouts → deprioritized → timeout_dominant (100% timeout)
         let has_timeout_guidance = verdict.injections.iter().any(|m| m.contains("timing out"));
-        assert!(has_timeout_guidance,
-            "3 step aborts on same tool should deprioritize and trigger timeout guidance");
+        assert!(
+            has_timeout_guidance,
+            "3 step aborts on same tool should deprioritize and trigger timeout guidance"
+        );
         // Timeouts shouldn't cause force_stop
         assert!(!verdict.force_stop);
     }
@@ -7890,13 +8101,17 @@ mod turnguard_e2e_proofs {
         assert!(has_stall, "Should detect stall");
         assert!(has_health, "Should detect unhealthy tool");
         // Multiple injections from different sources
-        assert!(verdict.injections.len() >= 2,
-            "Multiple warning sources should produce multiple injections");
+        assert!(
+            verdict.injections.len() >= 2,
+            "Multiple warning sources should produce multiple injections"
+        );
         assert!(verdict.severity >= VerdictSeverity::Warning);
 
         // Verify both tools in avoid_tools
-        assert!(verdict.avoid_tools.contains(&"mo_query".to_string()),
-            "Deprioritized tool in avoid_tools");
+        assert!(
+            verdict.avoid_tools.contains(&"mo_query".to_string()),
+            "Deprioritized tool in avoid_tools"
+        );
         let _ = has_divergence; // may or may not fire depending on exact window
     }
 
@@ -7912,17 +8127,25 @@ mod turnguard_e2e_proofs {
         guard.record_tool_result("bash", "total 0");
 
         let verdict = guard.evaluate();
-        let reflection = verdict.injections.iter()
+        let reflection = verdict
+            .injections
+            .iter()
             .find(|m| m.contains("REFLECTION"))
             .expect("Should have a REFLECTION injection");
 
         // Structured reflection has labeled sections per to_nudge_message()
-        assert!(reflection.contains("What happened"),
-            "Reflection should have 'What happened' section");
-        assert!(reflection.contains("What to try"),
-            "Reflection should have 'What to try' section");
-        assert!(reflection.contains("Why"),
-            "Reflection should have 'Why' section");
+        assert!(
+            reflection.contains("What happened"),
+            "Reflection should have 'What happened' section"
+        );
+        assert!(
+            reflection.contains("What to try"),
+            "Reflection should have 'What to try' section"
+        );
+        assert!(
+            reflection.contains("Why"),
+            "Reflection should have 'Why' section"
+        );
     }
 
     // ── Scenario L: Avoid-tools deduplication ────────────────────────────────
@@ -7944,11 +8167,11 @@ mod turnguard_e2e_proofs {
 
         let verdict = guard.evaluate();
         // Count occurrences of "bash" in avoid_tools
-        let bash_count = verdict.avoid_tools.iter()
-            .filter(|t| *t == "bash")
-            .count();
-        assert_eq!(bash_count, 1,
-            "bash should appear exactly once in avoid_tools despite multiple sources");
+        let bash_count = verdict.avoid_tools.iter().filter(|t| *t == "bash").count();
+        assert_eq!(
+            bash_count, 1,
+            "bash should appear exactly once in avoid_tools despite multiple sources"
+        );
     }
 
     // ── Scenario M: Error chain escalation (mixed categories) ────────────────
@@ -7968,8 +8191,10 @@ mod turnguard_e2e_proofs {
 
         let verdict = guard.evaluate();
         // 3 non-timeout errors + 0 nudges → Warning level
-        assert!(verdict.severity >= VerdictSeverity::Warning,
-            "3 total errors should trigger at least Warning");
+        assert!(
+            verdict.severity >= VerdictSeverity::Warning,
+            "3 total errors should trigger at least Warning"
+        );
     }
 
     // ── Scenario N: Session recovery — guard state is not lost across turns ──
@@ -7999,8 +8224,10 @@ mod turnguard_e2e_proofs {
         assert_eq!(guard.nudge_count, 0);
 
         // tool_sigs are windowed (SERVER_STALL_WINDOW + 2 = 4)
-        assert!(guard.tool_sigs.len() <= 5 && guard.tool_sigs.len() >= 4,
-            "tool_sigs are windowed to last ~4 entries");
+        assert!(
+            guard.tool_sigs.len() <= 5 && guard.tool_sigs.len() >= 4,
+            "tool_sigs are windowed to last ~4 entries"
+        );
 
         // Tool health should track all tools
         assert!(guard.health.get("bash").is_some());
@@ -8018,14 +8245,16 @@ mod turnguard_e2e_proofs {
         // Manually set escalation conditions for Critical (2 nudges + errors)
         // but don't go to 3 nudges
         guard.nudge_count = 2;
-        guard.errors.record_error(
-            mo_agent_runtime::turn::error_recovery::ErrorCategory::Unknown
-        );
+        guard
+            .errors
+            .record_error(mo_agent_runtime::turn::error_recovery::ErrorCategory::Unknown);
 
         let verdict = guard.evaluate();
         assert_eq!(verdict.severity, VerdictSeverity::Critical);
-        assert!(!verdict.force_stop,
-            "Critical with nudge_count=2 should NOT force_stop (need >= 3)");
+        assert!(
+            !verdict.force_stop,
+            "Critical with nudge_count=2 should NOT force_stop (need >= 3)"
+        );
     }
 
     // ── Scenario P: Healthy session produces minimal verdict ─────────────────
@@ -8050,10 +8279,14 @@ mod turnguard_e2e_proofs {
 
         let verdict = guard.evaluate();
         assert_eq!(verdict.severity, VerdictSeverity::Healthy);
-        assert!(verdict.injections.is_empty(),
-            "Productive session should have zero injections");
-        assert!(verdict.avoid_tools.is_empty(),
-            "Productive session should have zero avoid_tools");
+        assert!(
+            verdict.injections.is_empty(),
+            "Productive session should have zero injections"
+        );
+        assert!(
+            verdict.avoid_tools.is_empty(),
+            "Productive session should have zero avoid_tools"
+        );
         assert!(!verdict.force_stop);
         assert_eq!(guard.nudge_count, 0);
     }
@@ -8067,11 +8300,11 @@ mod turnguard_e2e_proofs {
 // pipeline: tools that frequently succeed together get boosted in subsequent turns.
 
 mod co_occurrence_scoring_proofs {
-    use std::collections::HashMap;
     use mo_agent_runtime::pipeline::pattern::PatternLibrary;
-    use mo_agent_runtime::pipeline::routing::{TaskType, DomainHint};
+    use mo_agent_runtime::pipeline::routing::{DomainHint, TaskType};
     use mo_agent_runtime::tool_registry::scoring::pre_filter_dynamic_with_cooccurrence;
     use mo_agent_runtime::tool_registry::state::ConversationState;
+    use std::collections::HashMap;
 
     fn tools(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
@@ -8096,8 +8329,10 @@ mod co_occurrence_scoring_proofs {
 
         // Compute co-occurrence from just having used "grep"
         let co_scores = lib.co_occurrence_scores(&tools(&["grep"]));
-        assert!(co_scores.contains_key("read_file"),
-            "read_file should appear in co-occurrence after grep");
+        assert!(
+            co_scores.contains_key("read_file"),
+            "read_file should appear in co-occurrence after grep"
+        );
 
         // Now score with co-occurrence vs without
         let state = ConversationState {
@@ -8107,16 +8342,22 @@ mod co_occurrence_scoring_proofs {
         let query = "show me the code";
 
         let without = pre_filter_dynamic_with_cooccurrence(
-            &state, query, None, None, &[], 0.0, &HashMap::new(),
+            &state,
+            query,
+            None,
+            None,
+            &[],
+            0.0,
+            &HashMap::new(),
         );
-        let with = pre_filter_dynamic_with_cooccurrence(
-            &state, query, None, None, &[], 0.0, &co_scores,
-        );
+        let with =
+            pre_filter_dynamic_with_cooccurrence(&state, query, None, None, &[], 0.0, &co_scores);
 
         // Find read_file score in both
         let find_score = |results: &[(usize, f64)], name: &str| -> Option<f64> {
             use mo_agent_runtime::tool_registry::TOOL_CATALOG;
-            results.iter()
+            results
+                .iter()
                 .find(|(idx, _)| TOOL_CATALOG[*idx].name == name)
                 .map(|(_, s)| *s)
         };
@@ -8126,8 +8367,7 @@ mod co_occurrence_scoring_proofs {
 
         // With co-occurrence, read_file score should be >= without
         if let (Some(sw), Some(s)) = (score_without, score_with) {
-            assert!(s >= sw,
-                "Co-occurrence should boost read_file: {s} >= {sw}");
+            assert!(s >= sw, "Co-occurrence should boost read_file: {s} >= {sw}");
         }
         // If read_file appears in 'with' but not 'without', that's also a valid boost
     }
@@ -8144,10 +8384,19 @@ mod co_occurrence_scoring_proofs {
 
         // Empty co-occurrence should produce same results as baseline
         let baseline = pre_filter_dynamic_with_cooccurrence(
-            &state, query, None, None, &[], 0.0, &HashMap::new(),
+            &state,
+            query,
+            None,
+            None,
+            &[],
+            0.0,
+            &HashMap::new(),
         );
 
-        assert!(!baseline.is_empty(), "Baseline should have results for GitHub fetch query");
+        assert!(
+            !baseline.is_empty(),
+            "Baseline should have results for GitHub fetch query"
+        );
 
         // All scores should be positive
         for &(_, score) in &baseline {
@@ -8162,7 +8411,10 @@ mod co_occurrence_scoring_proofs {
 
         // Phase 1: No history → no co-occurrence
         let empty = lib.co_occurrence_scores(&tools(&["bash"]));
-        assert!(empty.is_empty(), "Fresh library should have no co-occurrences");
+        assert!(
+            empty.is_empty(),
+            "Fresh library should have no co-occurrences"
+        );
 
         // Phase 2: Learn from successful tool chains
         for _ in 0..5 {
@@ -8187,10 +8439,18 @@ mod co_occurrence_scoring_proofs {
 
         // Phase 3: Co-occurrence reflects successes, not failures
         let scores = lib.co_occurrence_scores(&tools(&["bash"]));
-        assert!(scores.contains_key("grep"), "grep should co-occur with bash");
-        assert!(scores.contains_key("read_file"), "read_file should co-occur with bash");
-        assert!(!scores.contains_key("dangerous_cmd"),
-            "Failed-only tools should not appear in co-occurrence");
+        assert!(
+            scores.contains_key("grep"),
+            "grep should co-occur with bash"
+        );
+        assert!(
+            scores.contains_key("read_file"),
+            "read_file should co-occur with bash"
+        );
+        assert!(
+            !scores.contains_key("dangerous_cmd"),
+            "Failed-only tools should not appear in co-occurrence"
+        );
 
         // Phase 4: Scores are reasonable
         for (_, score) in &scores {
@@ -8226,9 +8486,18 @@ mod co_occurrence_scoring_proofs {
 
         // Query with both grep and bash → should get union of co-occurrences
         let scores = lib.co_occurrence_scores(&tools(&["grep", "bash"]));
-        assert!(scores.contains_key("read_file"), "read_file should co-occur (in both patterns)");
-        assert!(scores.contains_key("str_replace"), "str_replace should co-occur (from pattern A)");
-        assert!(scores.contains_key("write_file"), "write_file should co-occur (from pattern B)");
+        assert!(
+            scores.contains_key("read_file"),
+            "read_file should co-occur (in both patterns)"
+        );
+        assert!(
+            scores.contains_key("str_replace"),
+            "str_replace should co-occur (from pattern A)"
+        );
+        assert!(
+            scores.contains_key("write_file"),
+            "write_file should co-occur (from pattern B)"
+        );
     }
 
     /// E2E proof: co-occurrence flows through TfIdfSelector::select() pipeline.
@@ -8236,8 +8505,8 @@ mod co_occurrence_scoring_proofs {
     /// tools that co-occur with recent_tools should score higher than without.
     #[tokio::test]
     async fn proof_co_occurrence_flows_through_tfidf_selector_e2e() {
-        use mo_agent_runtime::tool_selector::{SelectionContext, ToolSelector, TfIdfSelector};
-        use mo_agent_runtime::tool_registry::{ToolRegistry, TOOL_CATALOG};
+        use mo_agent_runtime::tool_registry::{TOOL_CATALOG, ToolRegistry};
+        use mo_agent_runtime::tool_selector::{SelectionContext, TfIdfSelector, ToolSelector};
         use std::sync::{Arc, Mutex};
 
         let schemas: Vec<serde_json::Value> = TOOL_CATALOG
@@ -8268,8 +8537,7 @@ mod co_occurrence_scoring_proofs {
         }
 
         let pattern_lib = Arc::new(Mutex::new(lib));
-        let selector = TfIdfSelector::new(registry)
-            .with_pattern_library(pattern_lib);
+        let selector = TfIdfSelector::new(registry).with_pattern_library(pattern_lib);
 
         // With recent_tools = ["grep"], read_file should get co-occurrence boost
         let ctx_with_recent = SelectionContext {
@@ -8281,7 +8549,7 @@ mod co_occurrence_scoring_proofs {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
-                file_context: vec![],
+            file_context: vec![],
         };
         let result_with = selector.select(&ctx_with_recent).await;
 
@@ -8295,28 +8563,40 @@ mod co_occurrence_scoring_proofs {
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
             restricted_tools: vec![],
-                file_context: vec![],
+            file_context: vec![],
         };
         let result_without = selector.select(&ctx_without_recent).await;
 
         // Both should succeed (not crash, not fail)
-        assert!(!result_with.failed, "selection with recent_tools should succeed");
-        assert!(!result_without.failed, "selection without recent_tools should succeed");
+        assert!(
+            !result_with.failed,
+            "selection with recent_tools should succeed"
+        );
+        assert!(
+            !result_without.failed,
+            "selection without recent_tools should succeed"
+        );
 
         // The selector should produce tool lists — co-occurrence doesn't break anything
-        assert!(!result_with.tool_names.is_empty(), "should select tools with recent_tools");
-        assert!(!result_without.tool_names.is_empty(), "should select tools without recent_tools");
+        assert!(
+            !result_with.tool_names.is_empty(),
+            "should select tools with recent_tools"
+        );
+        assert!(
+            !result_without.tool_names.is_empty(),
+            "should select tools without recent_tools"
+        );
     }
 }
 
 // ── File-context scoring proofs ──────────────────────────────────────────────
 
 mod file_context_scoring_proofs {
+    use mo_agent_runtime::tool_registry::TOOL_CATALOG;
     use mo_agent_runtime::tool_registry::scoring::{
         pre_filter_dynamic, pre_filter_dynamic_with_file_context,
     };
     use mo_agent_runtime::tool_registry::state::ConversationState;
-    use mo_agent_runtime::tool_registry::TOOL_CATALOG;
     use std::collections::HashMap;
 
     fn tool_name(idx: usize) -> &'static str {
@@ -8345,10 +8625,19 @@ mod file_context_scoring_proofs {
         );
 
         // grep should score higher with rust context
-        let grep_without = without.iter().find(|(i, _)| tool_name(*i) == "grep").map(|t| t.1);
-        let grep_with = with_rust.iter().find(|(i, _)| tool_name(*i) == "grep").map(|t| t.1);
+        let grep_without = without
+            .iter()
+            .find(|(i, _)| tool_name(*i) == "grep")
+            .map(|t| t.1);
+        let grep_with = with_rust
+            .iter()
+            .find(|(i, _)| tool_name(*i) == "grep")
+            .map(|t| t.1);
         if let (Some(wo), Some(wi)) = (grep_without, grep_with) {
-            assert!(wi >= wo, "grep should score >= with rust context (was {wo}, now {wi})");
+            assert!(
+                wi >= wo,
+                "grep should score >= with rust context (was {wo}, now {wi})"
+            );
         }
     }
 
@@ -8373,30 +8662,39 @@ mod file_context_scoring_proofs {
             &[],
         );
 
-        assert_eq!(baseline.len(), with_empty.len(),
-            "empty file context should produce same tool count");
+        assert_eq!(
+            baseline.len(),
+            with_empty.len(),
+            "empty file context should produce same tool count"
+        );
         for (a, b) in baseline.iter().zip(with_empty.iter()) {
             assert_eq!(a.0, b.0, "same tool index ordering");
-            assert!((a.1 - b.1).abs() < 1e-9, "same score for tool {}", tool_name(a.0));
+            assert!(
+                (a.1 - b.1).abs() < 1e-9,
+                "same score for tool {}",
+                tool_name(a.0)
+            );
         }
     }
 
     /// File context flows through TfIdfSelector E2E
     #[tokio::test]
     async fn proof_file_context_flows_through_selector_e2e() {
-        use mo_agent_runtime::tool_selector::{SelectionContext, ToolSelector, TfIdfSelector};
         use mo_agent_runtime::tool_registry::ToolRegistry;
+        use mo_agent_runtime::tool_selector::{SelectionContext, TfIdfSelector, ToolSelector};
 
         let schemas: Vec<serde_json::Value> = TOOL_CATALOG
             .iter()
-            .map(|t| serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": {"type": "object", "properties": {}}
-                }
-            }))
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                })
+            })
             .collect();
         let registry = ToolRegistry::new(schemas);
         let selector = TfIdfSelector::new(registry);
