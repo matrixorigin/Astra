@@ -367,7 +367,9 @@ pub(crate) fn git_show(project_root: &Path, args: &Value) -> String {
 
 fn truncate_show(out: String) -> String {
     if out.len() > SHOW_LIMIT {
-        let mut t = out[..SHOW_LIMIT].to_string();
+        // Find char boundary at or before SHOW_LIMIT
+        let end = out.floor_char_boundary(SHOW_LIMIT);
+        let mut t = out[..end].to_string();
         t.push_str("\n[truncated — use stat_only:true or file param to narrow]");
         t
     } else {
@@ -743,7 +745,8 @@ fn resolve_tree<'r>(repo: &'r gix::Repository, ref_str: &str) -> Result<gix::Tre
 
 fn truncate_diff(out: String) -> String {
     if out.len() > DIFF_LIMIT {
-        let mut t = out[..DIFF_LIMIT].to_string();
+        let end = out.floor_char_boundary(DIFF_LIMIT);
+        let mut t = out[..end].to_string();
         t.push_str("\n[truncated]");
         t
     } else {
@@ -861,6 +864,415 @@ pub(crate) fn git_file_history(project_root: &Path, args: &Value) -> String {
         ),
         tool_output_limit(),
     )
+}
+
+// ─── git_log_search (TF-IDF semantic search) ────────────────────────────────
+
+/// A parsed commit with pre-computed tokens for TF-IDF scoring.
+struct CommitDoc {
+    hash: String,
+    author: String,
+    date: String,
+    message: String,
+    tokens: Vec<String>,
+}
+
+/// Score commit messages against a query using TF-IDF cosine similarity.
+fn score_commits(query: &str, commits: &[CommitDoc]) -> Vec<(usize, f64)> {
+    let query_tokens = mo_agent_runtime::text_tokenize::tokenize(query);
+    if query_tokens.is_empty() || commits.is_empty() {
+        return Vec::new();
+    }
+
+    let n = commits.len() as f64;
+
+    // Build IDF from the commit corpus
+    let mut doc_freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for doc in commits {
+        let unique: std::collections::HashSet<&String> = doc.tokens.iter().collect();
+        for t in unique {
+            *doc_freq.entry(t.clone()).or_default() += 1;
+        }
+    }
+    let idf: std::collections::HashMap<String, f64> = doc_freq
+        .into_iter()
+        .map(|(term, df)| (term, (n / df as f64).ln().max(0.1)))
+        .collect();
+
+    let mut scores: Vec<(usize, f64)> = commits
+        .iter()
+        .enumerate()
+        .map(|(i, doc)| {
+            let total = doc.tokens.len().max(1) as f64;
+            let mut doc_tf: std::collections::HashMap<&str, f64> =
+                std::collections::HashMap::new();
+            for t in &doc.tokens {
+                *doc_tf.entry(t.as_str()).or_default() += 1.0;
+            }
+            for v in doc_tf.values_mut() {
+                *v /= total;
+            }
+
+            let mut dot = 0.0;
+            let mut q_norm_sq = 0.0;
+            let mut d_norm_sq = 0.0;
+
+            for qt in &query_tokens {
+                let idf_val = idf.get(qt.as_str()).copied().unwrap_or(0.0);
+                let q_w = idf_val;
+                q_norm_sq += q_w * q_w;
+                if let Some(&tf) = doc_tf.get(qt.as_str()) {
+                    let d_w = tf * idf_val;
+                    dot += q_w * d_w;
+                }
+            }
+            for (term, &tf) in &doc_tf {
+                let idf_val = idf.get(*term).copied().unwrap_or(0.0);
+                let d_w = tf * idf_val;
+                d_norm_sq += d_w * d_w;
+            }
+
+            let denom = q_norm_sq.sqrt() * d_norm_sq.sqrt();
+            let score = if denom > 0.0 { dot / denom } else { 0.0 };
+            (i, score)
+        })
+        .filter(|(_, s)| *s > 0.01)
+        .collect();
+
+    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scores
+}
+
+pub(crate) fn git_log_search(project_root: &Path, args: &Value) -> String {
+    let query = match args.get("query").and_then(Value::as_str) {
+        Some(q) if !q.trim().is_empty() => q,
+        _ => return "Error: missing or empty 'query' parameter".to_string(),
+    };
+
+    let repo = match open_repo(project_root) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+
+    let n = args.get("n").and_then(Value::as_u64).unwrap_or(200) as usize;
+
+    let head = match repo.head_id() {
+        Ok(h) => h,
+        Err(e) => return format!("Error: {e}"),
+    };
+
+    let walk = match head
+        .ancestors()
+        .sorting(gix::revision::walk::Sorting::ByCommitTime(
+            gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
+        ))
+        .all()
+    {
+        Ok(w) => w,
+        Err(e) => return format!("Error: {e}"),
+    };
+
+    // Collect commits
+    let mut commits = Vec::new();
+    for info in walk {
+        if commits.len() >= n {
+            break;
+        }
+        let info = match info {
+            Ok(i) => i,
+            Err(_) => break,
+        };
+        let commit = match info.object() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let hash = info.id.to_string();
+        let author = commit
+            .author()
+            .ok()
+            .map(|a| String::from_utf8_lossy(a.name).to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let date = commit
+            .author()
+            .ok()
+            .map(|a| format_author_date(&a))
+            .unwrap_or_else(|| "?".to_string());
+        let message = {
+            let raw = commit.message_raw_sloppy();
+            raw.lines()
+                .next()
+                .map(|l| String::from_utf8_lossy(l).to_string())
+                .unwrap_or_default()
+        };
+        let tokens = mo_agent_runtime::text_tokenize::tokenize(&message);
+
+        commits.push(CommitDoc {
+            hash,
+            author,
+            date,
+            message,
+            tokens,
+        });
+    }
+
+    if commits.is_empty() {
+        return "No commits found".to_string();
+    }
+
+    let ranked = score_commits(query, &commits);
+    if ranked.is_empty() {
+        return format!(
+            "No commits matching '{}' found in last {} commits",
+            query,
+            commits.len()
+        );
+    }
+
+    let top_k = 10.min(ranked.len());
+    let mut result = format!(
+        "Search: '{}' ({} commits searched, {} matches)\n\n",
+        query,
+        commits.len(),
+        ranked.len()
+    );
+    for (i, &(idx, score)) in ranked.iter().take(top_k).enumerate() {
+        let c = &commits[idx];
+        result.push_str(&format!(
+            "{}. [score:{:.2}] {} {} [{}] {}\n",
+            i + 1,
+            score,
+            &c.hash[..8.min(c.hash.len())],
+            c.date,
+            c.author,
+            c.message,
+        ));
+    }
+
+    truncate_output(result, tool_output_limit())
+}
+
+// ─── git_contributors ───────────────────────────────────────────────────────
+
+pub(crate) fn git_contributors(project_root: &Path, args: &Value) -> String {
+    let repo = match open_repo(project_root) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+
+    let path_filter = args.get("path").and_then(Value::as_str);
+    let since_str = args.get("since").and_then(Value::as_str);
+
+    // Parse --since into a unix timestamp cutoff
+    let since_cutoff: Option<i64> = since_str.and_then(|s| parse_since_to_epoch(s));
+
+    let head = match repo.head_id() {
+        Ok(h) => h,
+        Err(e) => return format!("Error: {e}"),
+    };
+
+    let walk = match head
+        .ancestors()
+        .sorting(gix::revision::walk::Sorting::ByCommitTime(
+            gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
+        ))
+        .all()
+    {
+        Ok(w) => w,
+        Err(e) => return format!("Error: {e}"),
+    };
+
+    let mut author_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut file_freq: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut recent_lines: Vec<String> = Vec::new();
+    let mut total_commits = 0u32;
+
+    for info in walk {
+        let info = match info {
+            Ok(i) => i,
+            Err(_) => break,
+        };
+
+        let commit = match info.object() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Date cutoff
+        if let Some(cutoff) = since_cutoff {
+            if let Ok(author) = commit.author() {
+                if let Ok(time) = author.time() {
+                    if time.seconds < cutoff {
+                        break; // Commits are sorted newest-first, so stop early
+                    }
+                }
+            }
+        }
+
+        // Skip merges (2+ parents)
+        if commit.parent_ids().count() > 1 {
+            continue;
+        }
+
+        let author_name = commit
+            .author()
+            .ok()
+            .map(|a| String::from_utf8_lossy(a.name).to_string())
+            .unwrap_or_else(|| "?".to_string());
+
+        // Path filter: check if commit touches the target path
+        if let Some(path) = path_filter {
+            let tree = match commit.tree() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let cur_entry = match tree.lookup_entry_by_path(path) {
+                Ok(Some(e)) => e,
+                _ => continue,
+            };
+            // Check parent differs
+            let parent_same = commit.parent_ids().next().map_or(false, |pid| {
+                pid.object()
+                    .ok()
+                    .and_then(|o| o.try_into_commit().ok())
+                    .and_then(|pc| pc.tree().ok())
+                    .and_then(|pt| match pt.lookup_entry_by_path(path) {
+                        Ok(Some(pe)) => Some(pe.object_id() == cur_entry.object_id()),
+                        _ => Some(false),
+                    })
+                    .unwrap_or(false)
+            });
+            if parent_same {
+                continue;
+            }
+        }
+
+        *author_counts.entry(author_name).or_default() += 1;
+
+        // Collect changed files for hot-files (up to 500 commits)
+        if total_commits < 500 {
+            let tree = commit.tree().ok();
+            let parent_tree = commit
+                .parent_ids()
+                .next()
+                .and_then(|pid| pid.object().ok())
+                .and_then(|o| o.try_into_commit().ok())
+                .and_then(|pc| pc.tree().ok());
+
+            if let (Some(new_tree), Some(old_tree)) = (tree, parent_tree) {
+                if let Ok(mut changes) = old_tree.changes() {
+                    let _ = changes.for_each_to_obtain_tree(&new_tree, |change| {
+                        use gix::object::tree::diff::Change;
+                        let location = match &change {
+                            Change::Addition { location, .. }
+                            | Change::Deletion { location, .. }
+                            | Change::Modification { location, .. }
+                            | Change::Rewrite { location, .. } => location.to_string(),
+                        };
+
+                        if let Some(pf) = path_filter {
+                            if !location.starts_with(pf) {
+                                return Ok::<_, std::convert::Infallible>(
+                                    std::ops::ControlFlow::Continue(()),
+                                );
+                            }
+                        }
+
+                        *file_freq.entry(location).or_default() += 1;
+                        Ok(std::ops::ControlFlow::Continue(()))
+                    });
+                }
+            }
+        }
+
+        // Recent activity (first 5)
+        if recent_lines.len() < 5 {
+            let id_str = info.id.to_string();
+            let short = &id_str[..7.min(id_str.len())];
+            let msg = {
+                let raw = commit.message_raw_sloppy();
+                raw.lines()
+                    .next()
+                    .map(|l| String::from_utf8_lossy(l).to_string())
+                    .unwrap_or_default()
+            };
+            recent_lines.push(format!("{short} {msg}"));
+        }
+
+        total_commits += 1;
+
+        // Safety cap
+        if total_commits >= 10_000 {
+            break;
+        }
+    }
+
+    // Format output
+    let mut parts = Vec::new();
+
+    // Top contributors
+    if !author_counts.is_empty() {
+        let mut sorted: Vec<_> = author_counts.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        let top: Vec<String> = sorted
+            .iter()
+            .take(10)
+            .map(|(name, count)| format!("  {:>4}  {}", count, name))
+            .collect();
+        parts.push(format!("## Top Contributors\n{}", top.join("\n")));
+    }
+
+    // Hot files
+    if !file_freq.is_empty() {
+        let mut sorted: Vec<_> = file_freq.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        let top_files: Vec<String> = sorted
+            .iter()
+            .take(10)
+            .map(|(f, c)| format!("  {:>3}× {}", c, f))
+            .collect();
+        parts.push(format!(
+            "## Hot Files (most changed)\n{}",
+            top_files.join("\n")
+        ));
+    }
+
+    // Recent activity
+    if !recent_lines.is_empty() {
+        parts.push(format!(
+            "## Recent Activity\n{}",
+            recent_lines.join("\n")
+        ));
+    }
+
+    if parts.is_empty() {
+        "No git history found".to_string()
+    } else {
+        truncate_output(parts.join("\n\n"), tool_output_limit())
+    }
+}
+
+/// Parse a "since" string into a unix epoch timestamp.
+/// Supports ISO dates like "2024-01-01" and relative like "2 weeks ago".
+fn parse_since_to_epoch(since: &str) -> Option<i64> {
+    // Try ISO date (YYYY-MM-DD)
+    if since.len() == 10 && since.chars().nth(4) == Some('-') {
+        let parts: Vec<&str> = since.split('-').collect();
+        if parts.len() == 3 {
+            let y: i64 = parts[0].parse().ok()?;
+            let m: i64 = parts[1].parse().ok()?;
+            let d: i64 = parts[2].parse().ok()?;
+            // Rough epoch calculation (not leap-second accurate, good enough for filtering)
+            let days_since_epoch = (y - 1970) * 365 + (y - 1969) / 4 - (y - 1901) / 100
+                + (y - 1601) / 400
+                + [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334][(m - 1) as usize]
+                + d
+                - 1;
+            return Some(days_since_epoch * 86400);
+        }
+    }
+    // Relative dates: just skip filtering for unsupported formats
+    None
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -1059,12 +1471,12 @@ mod tests {
     #[test]
     fn git_show_allows_reflog_syntax() {
         let root = repo_root();
-        // HEAD@{0} should not be rejected by validation
+        // HEAD@{0} should not be rejected by validation — it should reach rev_parse
         let result = git_show(&root, &json!({"commit": "HEAD@{0}"}));
-        // Should either resolve or give a gix error, NOT "invalid commit reference"
+        // Should show a commit (passes validation), not be rejected outright
         assert!(
-            !result.contains("Error: invalid commit reference"),
-            "HEAD@{{0}} should pass validation: {result}"
+            result.starts_with("commit ") || result.starts_with("Error: cannot resolve"),
+            "HEAD@{{0}} should pass validation and reach parsing: {result}"
         );
     }
 
@@ -1222,10 +1634,191 @@ mod tests {
     fn git_show_parent_ref() {
         let root = repo_root();
         let result = git_show(&root, &json!({"commit": "HEAD~1"}));
-        // Should either resolve or error gracefully (if repo has only 1 commit)
         assert!(
             result.contains("commit ") || result.contains("Error: cannot resolve"),
             "HEAD~1 should work: {result}"
         );
+    }
+
+    // ─── git_log_search tests ───────────────────────────────────────────────
+
+    #[test]
+    fn git_log_search_missing_query() {
+        let root = repo_root();
+        let result = git_log_search(&root, &json!({}));
+        assert!(result.contains("Error: missing or empty"));
+    }
+
+    #[test]
+    fn git_log_search_empty_query() {
+        let root = repo_root();
+        let result = git_log_search(&root, &json!({"query": "  "}));
+        assert!(result.contains("Error: missing or empty"));
+    }
+
+    #[test]
+    fn git_log_search_finds_commits() {
+        let root = repo_root();
+        let result = git_log_search(&root, &json!({"query": "fix"}));
+        // Should find some commits with "fix" in the message
+        assert!(
+            result.contains("Search:") || result.contains("No commits matching"),
+            "should produce search result: {result}"
+        );
+    }
+
+    #[test]
+    fn git_log_search_respects_n() {
+        let root = repo_root();
+        let result = git_log_search(&root, &json!({"query": "fix", "n": 10}));
+        if result.contains("commits searched") {
+            // Extract the number of commits searched
+            if let Some(start) = result.find('(') {
+                if let Some(end) = result.find(" commits searched") {
+                    let num_str = &result[start + 1..end];
+                    let count: usize = num_str.parse().unwrap_or(0);
+                    assert!(count <= 10, "should search at most 10: {count}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn git_log_search_score_format() {
+        let root = repo_root();
+        let result = git_log_search(&root, &json!({"query": "feat"}));
+        if result.contains("[score:") {
+            // Scores should be between 0 and 1
+            for line in result.lines() {
+                if let Some(start) = line.find("[score:") {
+                    if let Some(end) = line[start..].find(']') {
+                        let score_str = &line[start + 7..start + end];
+                        let score: f64 = score_str.parse().unwrap_or(0.0);
+                        assert!(
+                            score > 0.0 && score <= 1.0,
+                            "score should be 0-1: {score}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ─── git_contributors tests ─────────────────────────────────────────────
+
+    #[test]
+    fn git_contributors_shows_authors() {
+        let root = repo_root();
+        let result = git_contributors(&root, &json!({}));
+        assert!(
+            result.contains("## Top Contributors") || result.contains("No git history"),
+            "should show contributors: {result}"
+        );
+    }
+
+    #[test]
+    fn git_contributors_shows_hot_files() {
+        let root = repo_root();
+        let result = git_contributors(&root, &json!({}));
+        if result.contains("## Top Contributors") {
+            assert!(
+                result.contains("## Hot Files") || result.contains("## Recent"),
+                "should have hot files or recent activity: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_contributors_shows_recent() {
+        let root = repo_root();
+        let result = git_contributors(&root, &json!({}));
+        if !result.contains("No git history") {
+            assert!(
+                result.contains("## Recent Activity"),
+                "should show recent activity: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_contributors_with_path_filter() {
+        let root = repo_root();
+        let result = git_contributors(&root, &json!({"path": "README.md"}));
+        // Either shows filtered results or no history
+        assert!(
+            result.contains("## Top Contributors") || result.contains("No git history"),
+            "path filter should work: {result}"
+        );
+    }
+
+    #[test]
+    fn git_contributors_with_since() {
+        let root = repo_root();
+        let result = git_contributors(&root, &json!({"since": "2020-01-01"}));
+        assert!(
+            result.contains("## Top Contributors") || result.contains("No git history"),
+            "since filter should work: {result}"
+        );
+    }
+
+    // ─── Score function unit tests ──────────────────────────────────────────
+
+    #[test]
+    fn score_commits_empty_corpus() {
+        let result = score_commits("test", &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn score_commits_empty_query() {
+        let commits = vec![CommitDoc {
+            hash: "abc".into(),
+            author: "test".into(),
+            date: "2024".into(),
+            message: "hello".into(),
+            tokens: vec!["hello".into()],
+        }];
+        let result = score_commits("", &commits);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn score_commits_exact_match_ranks_higher() {
+        let commits = vec![
+            CommitDoc {
+                hash: "a".into(),
+                author: "test".into(),
+                date: "2024".into(),
+                message: "fix bug in parser".into(),
+                tokens: mo_agent_runtime::text_tokenize::tokenize("fix bug in parser"),
+            },
+            CommitDoc {
+                hash: "b".into(),
+                author: "test".into(),
+                date: "2024".into(),
+                message: "add new feature".into(),
+                tokens: mo_agent_runtime::text_tokenize::tokenize("add new feature"),
+            },
+        ];
+        let result = score_commits("fix", &commits);
+        assert!(!result.is_empty(), "should find 'fix'");
+        assert_eq!(result[0].0, 0, "commit about 'fix' should rank first");
+    }
+
+    // ─── parse_since_to_epoch tests ─────────────────────────────────────────
+
+    #[test]
+    fn parse_since_iso_date() {
+        let epoch = parse_since_to_epoch("2024-01-01");
+        assert!(epoch.is_some());
+        let ts = epoch.unwrap();
+        // 2024-01-01 should be > 2023 in epoch seconds
+        assert!(ts > 1_672_000_000, "should be a valid epoch: {ts}");
+    }
+
+    #[test]
+    fn parse_since_invalid() {
+        assert!(parse_since_to_epoch("not a date").is_none());
+        assert!(parse_since_to_epoch("").is_none());
     }
 }

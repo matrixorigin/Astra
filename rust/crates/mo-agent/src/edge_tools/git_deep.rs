@@ -88,6 +88,7 @@ fn parse_blame_porcelain(raw: &str) -> String {
 // ─── TF-IDF commit search ──────────────────────────────────────────────────
 
 /// A parsed commit with pre-computed tokens.
+#[allow(dead_code)] // Kept as fallback; routing now uses git_gix::git_log_search
 struct CommitDoc {
     hash: String,
     author: String,
@@ -98,6 +99,7 @@ struct CommitDoc {
 
 /// Score commit messages against a query using TF-IDF cosine similarity.
 /// Returns (commit_index, score) pairs sorted by descending score.
+#[allow(dead_code)] // Kept as fallback; routing now uses git_gix::git_log_search
 fn score_commits(query: &str, commits: &[CommitDoc]) -> Vec<(usize, f64)> {
     let query_tokens = mo_agent_runtime::text_tokenize::tokenize(query);
     if query_tokens.is_empty() || commits.is_empty() {
@@ -253,6 +255,7 @@ impl ToolExecutor {
     }
 
     /// `git_contributors`: repository contributor analytics with hot files.
+    #[allow(dead_code)] // Kept as fallback; routing now uses git_gix::git_contributors
     pub(crate) fn git_contributors(&self, args: &Value) -> String {
         let path = args.get("path").and_then(Value::as_str);
         let since = args.get("since").and_then(Value::as_str);
@@ -325,6 +328,7 @@ impl ToolExecutor {
 
     /// `git_log_search`: semantic search on commit messages using TF-IDF.
     /// Reuses the shared CJK-aware tokenizer for cross-language support.
+    #[allow(dead_code)] // Kept as fallback; routing now uses git_gix::git_log_search
     pub(crate) fn git_log_search(&self, args: &Value) -> String {
         let query = match args.get("query").and_then(Value::as_str) {
             Some(q) if !q.trim().is_empty() => q,
