@@ -94,7 +94,8 @@ use repl_runtime::{
 use repl_turn::{ReplTurnContext, handle_chat_input};
 use repl_ui::{
     ReplHelper, SlashStartCompleteHandler, clear_slash_overlay, history_path,
-    is_slash_picker_active, print_slash_commands, resolve_slash_command, suggest_commands,
+    is_slash_picker_active, print_keyboard_shortcuts, print_slash_commands,
+    resolve_slash_command, suggest_commands,
 };
 use slash_account::handle_account_command;
 use slash_info::handle_info_command;
@@ -1561,6 +1562,8 @@ async fn handle_slash_command(
 
     match cmd {
         "/" | "/?" | "/commands" | "/help" => print_slash_commands(Some(arg)),
+
+        "/keys" => print_keyboard_shortcuts(),
 
         "/model" if arg.is_empty() => {
             let Some(tok) = token else {

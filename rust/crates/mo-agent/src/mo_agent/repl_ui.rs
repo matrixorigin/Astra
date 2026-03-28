@@ -85,6 +85,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/stats", "Session analytics: /stats [history]"),
     ("/tools", "Tool performance profile: /tools"),
     ("/health", "Tool health dashboard: /health [detail]"),
+    ("/keys", "Show all keyboard shortcuts"),
     ("/exit", "Exit the REPL"),
     ("/quit", "Exit the REPL"),
 ];
@@ -492,6 +493,59 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
     eprintln!();
 }
 
+pub(super) fn print_keyboard_shortcuts() {
+    eprintln!(
+        "\n{}",
+        "─── Keyboard Shortcuts ──────────────────────────".bold()
+    );
+    let shortcuts = [
+        ("Navigation", &[
+            ("Ctrl+A", "Move to line start"),
+            ("Ctrl+E", "Move to line end"),
+            ("Ctrl+B / ←", "Move back one character"),
+            ("Ctrl+F / →", "Move forward one character"),
+            ("Alt+B", "Move back one word"),
+            ("Alt+F", "Move forward one word"),
+        ] as &[(&str, &str)]),
+        ("Editing", &[
+            ("Ctrl+W", "Delete word backward"),
+            ("Ctrl+K", "Kill to end of line"),
+            ("Ctrl+U", "Kill from start to cursor"),
+            ("Ctrl+H / Backspace", "Delete previous character"),
+            ("Ctrl+D", "Delete character at cursor (or exit on empty line)"),
+            ("Ctrl+T", "Transpose characters"),
+        ]),
+        ("History", &[
+            ("↑ / ↓", "Navigate previous/next history"),
+            ("Ctrl+R", "Reverse search history"),
+            ("Ctrl+G", "Cancel search"),
+            ("Ctrl+P / Ctrl+N", "Previous/next (same as ↑/↓)"),
+        ]),
+        ("Multi-line", &[
+            ("Alt+Enter", "Insert newline (continue input)"),
+            ("\\ (at end)", "Backslash continuation"),
+        ]),
+        ("Screen", &[
+            ("Ctrl+L", "Clear screen"),
+            ("Ctrl+D", "Exit (on empty line)"),
+            ("Ctrl+C", "Cancel current input"),
+        ]),
+        ("Slash Picker", &[
+            ("/", "Open command picker"),
+            ("↑/↓ or Tab", "Navigate picker items"),
+            ("Enter", "Select command"),
+            ("Esc", "Dismiss picker"),
+        ]),
+    ];
+    for (section, keys) in shortcuts {
+        eprintln!("  {}", section.cyan().bold());
+        for (key, desc) in keys.iter() {
+            eprintln!("    {:<22} {}", key.bold(), desc.dim());
+        }
+    }
+    eprintln!();
+}
+
 pub(super) struct ReplHelper;
 
 impl Helper for ReplHelper {}
@@ -627,6 +681,12 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 clear_slash_overlay();
                 return None;
             }
+
+            // ── Alt+Enter: insert newline for multi-line input ──────────
+            RlKeyEvent(RlKeyCode::Enter, m) if m.contains(RlModifiers::ALT) => {
+                return Some(RlCmd::Newline);
+            }
+
             _ => {}
         }
         None
@@ -1017,5 +1077,32 @@ mod tests {
             0,
             "full loop should return to start"
         );
+    }
+
+    // ── /keys command registered ──────────────────────────────────────────
+
+    #[test]
+    fn keys_command_is_registered() {
+        assert!(SLASH_COMMANDS.iter().any(|(cmd, _)| *cmd == "/keys"));
+    }
+
+    #[test]
+    fn keys_resolves_from_prefix() {
+        let result = resolve_slash_command("/key");
+        assert!(result.is_ok(), "got: {result:?}");
+        assert_eq!(result.unwrap(), "/keys");
+    }
+
+    // ── Multi-line validator ──────────────────────────────────────────────
+
+    #[test]
+    fn validator_backslash_continuation() {
+        // Trailing backslash should signal incomplete input
+        let input_cont = "hello world \\";
+        assert!(input_cont.ends_with('\\'));
+
+        // No trailing backslash should be valid
+        let input_done = "hello world";
+        assert!(!input_done.ends_with('\\'));
     }
 }

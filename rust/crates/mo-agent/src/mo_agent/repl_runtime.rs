@@ -409,7 +409,7 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
             "  profile: {}  user: {}  model: {}  session: {}",
             pname, user_display, model_display, session_display
         ),
-        "  / commands · Tab complete · Ctrl+R history · ↑↓ recall · ^D exit".to_string(),
+        "  / commands · Ctrl+R search · Alt+Enter multi-line · /keys all shortcuts".to_string(),
     ];
     let w = lines_plain
         .iter()
@@ -437,7 +437,7 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
         ),
         format!(
             "  {}",
-            "/ commands · Tab complete · Ctrl+R history · ↑↓ recall · ^D exit".dim()
+            "/ commands · Ctrl+R search · Alt+Enter multi-line · /keys all shortcuts".dim()
         ),
     ];
 
