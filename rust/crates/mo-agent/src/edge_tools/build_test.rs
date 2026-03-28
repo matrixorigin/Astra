@@ -3,12 +3,31 @@
 //! Detects framework (cargo, pytest, jest, go test, etc.) and extracts:
 //! - Pass/fail status
 //! - Error count and messages
+//! - Error locations (file:line:col) for direct navigation
 //! - Test summary (passed, failed, skipped counts)
 //!
 //! Enables automated change→test→fix cycles by providing structured feedback.
 
 use regex::Regex;
 use std::sync::LazyLock;
+
+/// A precise error location extracted from compiler/test output.
+#[derive(Debug, Clone)]
+pub struct ErrorLocation {
+    /// File path (relative to project root)
+    pub file: String,
+    /// Line number (1-based)
+    pub line: usize,
+    /// Column number (1-based, 0 = unknown)
+    pub col: usize,
+    /// Error code (e.g., "E0425") if available
+    pub error_code: String,
+    /// Error message
+    pub message: String,
+    /// Severity: "error", "warning", "note"
+    #[allow(dead_code)]
+    pub severity: String,
+}
 
 /// Parsed result from a build or test command.
 #[derive(Debug, Clone, Default)]
@@ -23,6 +42,8 @@ pub struct BuildTestResult {
     pub error_count: usize,
     /// Top error messages (max 5)
     pub error_messages: Vec<String>,
+    /// Precise error locations (file:line:col) for navigation
+    pub error_locations: Vec<ErrorLocation>,
     /// Tests passed (if test command)
     pub tests_passed: usize,
     /// Tests failed (if test command)
@@ -95,6 +116,31 @@ impl BuildTestResult {
             }
             if self.error_messages.len() > 5 {
                 parts.push(format!("  ... and {} more", self.error_messages.len() - 5));
+            }
+        }
+
+        // Error locations for direct navigation
+        if !self.error_locations.is_empty() {
+            parts.push(String::new());
+            parts.push("Locations:".to_string());
+            for loc in self.error_locations.iter().take(10) {
+                let code_part = if loc.error_code.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", loc.error_code)
+                };
+                let col_part = if loc.col > 0 {
+                    format!(":{}", loc.col)
+                } else {
+                    String::new()
+                };
+                parts.push(format!(
+                    "  → {}:{}{}{} {}",
+                    loc.file, loc.line, col_part, code_part, loc.message
+                ));
+            }
+            if self.error_locations.len() > 10 {
+                parts.push(format!("  ... and {} more locations", self.error_locations.len() - 10));
             }
         }
 
@@ -182,13 +228,15 @@ pub fn parse_build_test_output(output: &str, exit_code: Option<i32>) -> BuildTes
         _ => {
             // Generic fallback
             let error_count = count_generic_errors(&lower);
+            let (error_messages, error_locations) = extract_generic_errors(output);
             let passed = passed_from_exit && error_count == 0;
             BuildTestResult {
                 passed,
                 exit_code,
                 framework,
                 error_count,
-                error_messages: extract_generic_errors(output),
+                error_messages,
+                error_locations,
                 summary: if passed {
                     "completed".to_string()
                 } else {
@@ -239,8 +287,11 @@ fn detect_framework(output: &str) -> String {
 
 // ─── Cargo Parser ────────────────────────────────────────────────────────────
 
-static CARGO_ERROR_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"error\[E\d+\]: (.+)").unwrap());
+static CARGO_ERROR_CODE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"error\[(E\d+)\]: (.+)").unwrap());
+
+static CARGO_LOCATION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*--> (.+):(\d+):(\d+)").unwrap());
 
 static CARGO_TEST_RESULT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored").unwrap()
@@ -254,15 +305,71 @@ fn parse_cargo_output(output: &str, exit_code: Option<i32>, truncated: bool) -> 
         ..Default::default()
     };
 
-    // Extract compilation errors
-    for cap in CARGO_ERROR_RE.captures_iter(output) {
-        if let Some(msg) = cap.get(1) {
-            let err_msg = msg.as_str().trim();
-            if !err_msg.is_empty() && result.error_messages.len() < 10 {
-                result.error_messages.push(err_msg.to_string());
+    let lines: Vec<&str> = output.lines().collect();
+
+    // Extract compilation errors with locations
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+
+        // Match error[EXXXX]: message
+        if let Some(cap) = CARGO_ERROR_CODE_RE.captures(line) {
+            let code = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let msg = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+
+            if !msg.is_empty() && result.error_messages.len() < 10 {
+                result.error_messages.push(msg.to_string());
+            }
+
+            // Look for location on the next few lines (usually line i+1)
+            for j in (i + 1)..lines.len().min(i + 4) {
+                if let Some(loc_cap) = CARGO_LOCATION_RE.captures(lines[j]) {
+                    let file = loc_cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                    let line_num: usize = loc_cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+                    let col: usize = loc_cap.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+
+                    if !file.is_empty() && line_num > 0 && result.error_locations.len() < 20 {
+                        result.error_locations.push(ErrorLocation {
+                            file: file.to_string(),
+                            line: line_num,
+                            col,
+                            error_code: code.to_string(),
+                            message: msg.to_string(),
+                            severity: "error".to_string(),
+                        });
+                    }
+                    break;
+                }
+            }
+        } else if line.starts_with("error:") && !line.contains("could not compile") && !line.contains("aborting due to") {
+            // Plain error: without code
+            let msg = line.strip_prefix("error:").unwrap_or(line).trim();
+            if !msg.is_empty() && result.error_messages.len() < 10 {
+                result.error_messages.push(msg.to_string());
+            }
+            // Check for location
+            for j in (i + 1)..lines.len().min(i + 4) {
+                if let Some(loc_cap) = CARGO_LOCATION_RE.captures(lines[j]) {
+                    let file = loc_cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                    let line_num: usize = loc_cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+                    let col: usize = loc_cap.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+                    if !file.is_empty() && line_num > 0 && result.error_locations.len() < 20 {
+                        result.error_locations.push(ErrorLocation {
+                            file: file.to_string(),
+                            line: line_num,
+                            col,
+                            error_code: String::new(),
+                            message: msg.to_string(),
+                            severity: "error".to_string(),
+                        });
+                    }
+                    break;
+                }
             }
         }
+        i += 1;
     }
+
     result.error_count = result.error_messages.len();
 
     // Check for test results
@@ -287,9 +394,9 @@ fn parse_cargo_output(output: &str, exit_code: Option<i32>, truncated: bool) -> 
             result.tests_passed, result.tests_failed
         );
 
-        // Extract failed test names
+        // Extract failed test names with panic locations
         if result.tests_failed > 0 {
-            let mut failed_tests = extract_cargo_failed_tests(output);
+            let mut failed_tests = extract_cargo_failed_tests(output, &mut result.error_locations);
             result.error_messages.append(&mut failed_tests);
             result.error_count = result.tests_failed;
         }
@@ -312,7 +419,10 @@ fn parse_cargo_output(output: &str, exit_code: Option<i32>, truncated: bool) -> 
     result
 }
 
-fn extract_cargo_failed_tests(output: &str) -> Vec<String> {
+static PANIC_LOCATION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"panicked at .+,?\s+(.+):(\d+):(\d+)"#).unwrap());
+
+fn extract_cargo_failed_tests(output: &str, locations: &mut Vec<ErrorLocation>) -> Vec<String> {
     let mut failed = Vec::new();
     let lines: Vec<&str> = output.lines().collect();
 
@@ -323,11 +433,29 @@ fn extract_cargo_failed_tests(output: &str) -> Vec<String> {
                 .strip_prefix("---- ")
                 .and_then(|s| s.strip_suffix(" stdout ----"))
             {
-                // Get the assertion/panic message from following lines
                 let mut msg = name.to_string();
-                for next_line in lines.iter().skip(i + 1).take(5) {
+                // Scan next lines for assertion/panic details
+                for next_line in lines.iter().skip(i + 1).take(10) {
                     if next_line.contains("assertion") || next_line.contains("panicked at") {
                         msg = format!("{}: {}", name, next_line.trim());
+
+                        // Extract panic location
+                        if let Some(pcap) = PANIC_LOCATION_RE.captures(next_line) {
+                            let panic_msg = pcap.get(1).map(|m| m.as_str()).unwrap_or("");
+                            let file = pcap.get(2).map(|m| m.as_str()).unwrap_or("");
+                            let line_num: usize = pcap.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+                            let col: usize = pcap.get(4).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+                            if !file.is_empty() && line_num > 0 && locations.len() < 20 {
+                                locations.push(ErrorLocation {
+                                    file: file.to_string(),
+                                    line: line_num,
+                                    col,
+                                    error_code: String::new(),
+                                    message: format!("test {name}: {panic_msg}"),
+                                    severity: "error".to_string(),
+                                });
+                            }
+                        }
                         break;
                     }
                 }
@@ -345,6 +473,10 @@ fn extract_cargo_failed_tests(output: &str) -> Vec<String> {
 
 static PYTEST_SUMMARY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(\d+) passed.*?(\d+) failed|(\d+) passed").unwrap());
+
+// Matches Python tracebacks: "  File "path.py", line 42, in func"
+static PYTHON_TRACEBACK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"File "(.+?)", line (\d+)(?:, in (.+))?"#).unwrap());
 
 fn parse_pytest_output(output: &str, exit_code: Option<i32>, truncated: bool) -> BuildTestResult {
     let mut result = BuildTestResult {
@@ -369,12 +501,36 @@ fn parse_pytest_output(output: &str, exit_code: Option<i32>, truncated: bool) ->
     result.passed = result.tests_failed == 0 && exit_code.map(|c| c == 0).unwrap_or(true);
     result.error_count = result.tests_failed;
 
-    // Extract failed test names
-    for line in output.lines() {
+    // Extract failed test names and traceback locations
+    let lines: Vec<&str> = output.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
         if line.starts_with("FAILED ") {
             let test_name = line.trim_start_matches("FAILED ").trim();
             if result.error_messages.len() < 10 {
                 result.error_messages.push(test_name.to_string());
+            }
+        }
+
+        // Extract traceback file locations (last File line before assertion error)
+        if let Some(cap) = PYTHON_TRACEBACK_RE.captures(line) {
+            let file = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let line_num: usize = cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+            let func = cap.get(3).map(|m| m.as_str()).unwrap_or("");
+
+            // Only include if the next few lines contain an assertion or error
+            let is_relevant = lines.iter().skip(i + 1).take(3).any(|l| {
+                l.contains("AssertionError") || l.contains("assert ") || l.contains("Error") || l.contains("raise ")
+            });
+
+            if is_relevant && !file.is_empty() && line_num > 0 && result.error_locations.len() < 20 {
+                result.error_locations.push(ErrorLocation {
+                    file: file.to_string(),
+                    line: line_num,
+                    col: 0,
+                    error_code: String::new(),
+                    message: if func.is_empty() { String::new() } else { format!("in {func}") },
+                    severity: "error".to_string(),
+                });
             }
         }
     }
@@ -439,6 +595,10 @@ fn parse_jest_output(output: &str, exit_code: Option<i32>, truncated: bool) -> B
 
 // ─── Go Test Parser ──────────────────────────────────────────────────────────
 
+// Matches go test failure locations: "    main_test.go:25: expected true, got false"
+static GO_TEST_LOCATION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s+(\S+\.go):(\d+): (.+)").unwrap());
+
 fn parse_go_output(output: &str, exit_code: Option<i32>, truncated: bool) -> BuildTestResult {
     let mut result = BuildTestResult {
         framework: "go".to_string(),
@@ -447,16 +607,37 @@ fn parse_go_output(output: &str, exit_code: Option<i32>, truncated: bool) -> Bui
         ..Default::default()
     };
 
+    let mut current_test = String::new();
     for line in output.lines() {
         if line.starts_with("--- PASS:") {
             result.tests_passed += 1;
         } else if line.starts_with("--- FAIL:") {
             result.tests_failed += 1;
+            current_test = line.trim_start_matches("--- FAIL: ").split(' ').next().unwrap_or("").to_string();
             if result.error_messages.len() < 10 {
                 result.error_messages.push(line.trim().to_string());
             }
         } else if line.starts_with("--- SKIP:") {
             result.tests_skipped += 1;
+        } else if let Some(cap) = GO_TEST_LOCATION_RE.captures(line) {
+            let file = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let line_num: usize = cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+            let msg = cap.get(3).map(|m| m.as_str()).unwrap_or("");
+            if !file.is_empty() && line_num > 0 && result.error_locations.len() < 20 {
+                let full_msg = if current_test.is_empty() {
+                    msg.to_string()
+                } else {
+                    format!("{}: {}", current_test, msg)
+                };
+                result.error_locations.push(ErrorLocation {
+                    file: file.to_string(),
+                    line: line_num,
+                    col: 0,
+                    error_code: String::new(),
+                    message: full_msg,
+                    severity: "error".to_string(),
+                });
+            }
         }
     }
 
@@ -472,29 +653,84 @@ fn parse_go_output(output: &str, exit_code: Option<i32>, truncated: bool) -> Bui
 
 // ─── Generic Fallback ────────────────────────────────────────────────────────
 
+// Matches TypeScript errors: "src/app.ts(10,5): error TS2304: Cannot find name 'foo'"
+static TS_ERROR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(.+)\((\d+),(\d+)\): error (TS\d+): (.+)").unwrap());
+
+// Matches generic file:line:col: error patterns
+static GENERIC_LOCATION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(.+?):(\d+):(\d+):\s*(error|warning):\s*(.+)").unwrap());
+
 fn count_generic_errors(lower: &str) -> usize {
     let mut count = 0;
-
-    // Count error-like patterns
     count += lower.matches("error:").count();
     count += lower.matches("error[").count();
-    count += lower.matches("failed").count().min(5); // Cap to avoid overcounting
+    count += lower.matches("failed").count().min(5);
     count += lower.matches("exception").count();
-
     count
 }
 
-fn extract_generic_errors(output: &str) -> Vec<String> {
+fn extract_generic_errors(output: &str) -> (Vec<String>, Vec<ErrorLocation>) {
     let mut errors = Vec::new();
+    let mut locations = Vec::new();
 
     for line in output.lines() {
         let lower = line.to_lowercase();
+
+        // Try TypeScript error format first
+        if let Some(cap) = TS_ERROR_RE.captures(line) {
+            let file = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let line_num: usize = cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+            let col: usize = cap.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+            let code = cap.get(4).map(|m| m.as_str()).unwrap_or("");
+            let msg = cap.get(5).map(|m| m.as_str()).unwrap_or("");
+            if errors.len() < 10 {
+                errors.push(format!("[{code}] {msg}"));
+            }
+            if locations.len() < 20 {
+                locations.push(ErrorLocation {
+                    file: file.to_string(),
+                    line: line_num,
+                    col,
+                    error_code: code.to_string(),
+                    message: msg.to_string(),
+                    severity: "error".to_string(),
+                });
+            }
+            continue;
+        }
+
+        // Try generic file:line:col: error format
+        if let Some(cap) = GENERIC_LOCATION_RE.captures(line) {
+            let file = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let line_num: usize = cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+            let col: usize = cap.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+            let severity = cap.get(4).map(|m| m.as_str()).unwrap_or("error");
+            let msg = cap.get(5).map(|m| m.as_str()).unwrap_or("");
+            if errors.len() < 10 {
+                errors.push(msg.to_string());
+            }
+            if locations.len() < 20 {
+                locations.push(ErrorLocation {
+                    file: file.to_string(),
+                    line: line_num,
+                    col,
+                    error_code: String::new(),
+                    message: msg.to_string(),
+                    severity: severity.to_string(),
+                });
+            }
+            continue;
+        }
+
+        // Fall through to simple text-matching
         if lower.contains("error:") || lower.contains("failed:") || lower.contains("exception:") {
             let trimmed = line.trim();
             if !trimmed.is_empty() && errors.len() < 10 {
-                // Truncate long error lines
                 if trimmed.len() > 200 {
-                    errors.push(format!("{}...", &trimmed[..200]));
+                    let mut end = 200;
+                    while !trimmed.is_char_boundary(end) && end > 0 { end -= 1; }
+                    errors.push(format!("{}...", &trimmed[..end]));
                 } else {
                     errors.push(trimmed.to_string());
                 }
@@ -502,7 +738,7 @@ fn extract_generic_errors(output: &str) -> Vec<String> {
         }
     }
 
-    errors
+    (errors, locations)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -596,6 +832,21 @@ error: could not compile `myproject` due to 2 previous errors
         assert_eq!(result.framework, "cargo");
         assert_eq!(result.error_count, 2);
         assert!(result.error_messages.iter().any(|m| m.contains("cannot find value")));
+
+        // Verify error locations extracted
+        assert_eq!(result.error_locations.len(), 2, "should extract 2 error locations");
+        let loc0 = &result.error_locations[0];
+        assert_eq!(loc0.file, "src/main.rs");
+        assert_eq!(loc0.line, 10);
+        assert_eq!(loc0.col, 5);
+        assert_eq!(loc0.error_code, "E0425");
+        assert!(loc0.message.contains("cannot find value"));
+
+        let loc1 = &result.error_locations[1];
+        assert_eq!(loc1.file, "src/lib.rs");
+        assert_eq!(loc1.line, 20);
+        assert_eq!(loc1.col, 10);
+        assert_eq!(loc1.error_code, "E0308");
     }
 
     #[test]
@@ -677,5 +928,98 @@ exit status 1
         assert_eq!(detect_framework("===== 5 passed ====="), "pytest");
         assert_eq!(detect_framework("Test Suites: 1 passed"), "jest");
         assert_eq!(detect_framework("--- PASS: TestMain"), "go");
+    }
+
+    // ─── Error Location Tests ─────────────────────────────────────────────
+
+    #[test]
+    fn cargo_error_locations_in_enhanced_output() {
+        let result = BuildTestResult {
+            passed: false,
+            framework: "cargo".to_string(),
+            error_count: 1,
+            error_messages: vec!["cannot find value `foo`".to_string()],
+            error_locations: vec![ErrorLocation {
+                file: "src/main.rs".to_string(),
+                line: 10,
+                col: 5,
+                error_code: "E0425".to_string(),
+                message: "cannot find value `foo`".to_string(),
+                severity: "error".to_string(),
+            }],
+            summary: "1 compilation error(s)".to_string(),
+            ..Default::default()
+        };
+        let output = result.to_enhanced_output("");
+        assert!(output.contains("Locations:"), "should have Locations section: {output}");
+        assert!(output.contains("→ src/main.rs:10:5"), "should show file:line:col: {output}");
+        assert!(output.contains("[E0425]"), "should show error code: {output}");
+    }
+
+    #[test]
+    fn go_test_extracts_locations() {
+        let output = r#"
+=== RUN   TestMain
+--- PASS: TestMain (0.00s)
+=== RUN   TestHelper
+--- PASS: TestHelper (0.01s)
+=== RUN   TestError
+    main_test.go:25: expected true, got false
+    main_test.go:30: another assertion failed
+--- FAIL: TestError (0.00s)
+FAIL
+exit status 1
+"#;
+        let result = parse_build_test_output(output, Some(1));
+        assert!(!result.passed);
+        assert_eq!(result.framework, "go");
+        assert_eq!(result.tests_failed, 1);
+        assert!(!result.error_locations.is_empty(), "should extract go test locations");
+        assert_eq!(result.error_locations[0].file, "main_test.go");
+        assert_eq!(result.error_locations[0].line, 25);
+    }
+
+    #[test]
+    fn typescript_error_locations() {
+        let output = r#"
+src/app.ts(10,5): error TS2304: Cannot find name 'foo'
+src/utils.ts(20,15): error TS2345: Argument of type 'string' is not assignable
+"#;
+        let result = parse_build_test_output(output, Some(1));
+        assert!(!result.passed);
+        assert_eq!(result.error_locations.len(), 2);
+        assert_eq!(result.error_locations[0].file, "src/app.ts");
+        assert_eq!(result.error_locations[0].line, 10);
+        assert_eq!(result.error_locations[0].col, 5);
+        assert_eq!(result.error_locations[0].error_code, "TS2304");
+        assert_eq!(result.error_locations[1].file, "src/utils.ts");
+        assert_eq!(result.error_locations[1].line, 20);
+    }
+
+    #[test]
+    fn generic_file_line_col_error_locations() {
+        let output = r#"
+src/main.c:42:10: error: use of undeclared identifier 'x'
+src/helper.c:15:3: warning: implicit conversion
+"#;
+        let result = parse_build_test_output(output, Some(1));
+        assert_eq!(result.error_locations.len(), 2);
+        assert_eq!(result.error_locations[0].file, "src/main.c");
+        assert_eq!(result.error_locations[0].line, 42);
+        assert_eq!(result.error_locations[0].severity, "error");
+        assert_eq!(result.error_locations[1].severity, "warning");
+    }
+
+    #[test]
+    fn enhanced_output_no_locations_when_empty() {
+        let result = BuildTestResult {
+            passed: true,
+            framework: "cargo".to_string(),
+            tests_passed: 10,
+            summary: "10 passed, 0 failed".to_string(),
+            ..Default::default()
+        };
+        let output = result.to_enhanced_output("");
+        assert!(!output.contains("Locations:"), "should not show Locations when empty");
     }
 }
