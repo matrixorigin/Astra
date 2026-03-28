@@ -107,6 +107,14 @@ fn is_tool_error(result_str: &str) -> bool {
         if let Some(err) = v.get("error") {
             return !err.is_null() && err.as_str() != Some("");
         }
+        // JSON with "error_code" field (some REST APIs)
+        if v.get("error_code").is_some() {
+            return true;
+        }
+        // JSON with "status": "error" (common API pattern)
+        if v.get("status").and_then(|s| s.as_str()) == Some("error") {
+            return true;
+        }
     }
     // Plain-text fallback: "Error: ..." or "error ..."
     result_str.to_lowercase().starts_with("error")
@@ -127,11 +135,17 @@ fn is_resource_limit_output(output: &str) -> bool {
         || lower.contains("no space left on device")
         || lower.contains("too many open files")
         || lower.contains("enomem")
+        || lower.contains("enospc")
+        // "Killed" prefix is OOM killer output (strict: requires standalone line)
+        || lower.lines().any(|l| l.trim() == "killed" || l.trim().starts_with("killed:"))
+        || lower.contains("device or resource busy")
         // Shell-specific: "bash: fork:" or "sh: fork:" prefix
         || lower.contains("bash: fork:")
         || lower.contains("sh: fork:")
         // Chinese locale equivalents
         || lower.contains("资源暂时不足")
+        || lower.contains("内存不足")
+        || lower.contains("系统资源")
 }
 
 /// Normalize a tool call signature for cache key matching.
@@ -2569,5 +2583,55 @@ mod tests {
         assert!(!dir_strs.contains(&"target/"), "should skip target");
         assert!(!dir_strs.contains(&"node_modules/"), "should skip node_modules");
         assert!(dir_strs.contains(&"src/"), "should include src/");
+    }
+
+    // ── is_tool_error extended pattern tests ──
+
+    #[test]
+    fn is_tool_error_json_error_code() {
+        assert!(is_tool_error(r#"{"error_code": 42, "message": "bad request"}"#));
+    }
+
+    #[test]
+    fn is_tool_error_json_status_error() {
+        assert!(is_tool_error(r#"{"status": "error", "detail": "oops"}"#));
+    }
+
+    #[test]
+    fn is_tool_error_json_status_ok_not_error() {
+        assert!(!is_tool_error(r#"{"status": "ok", "data": []}"#));
+    }
+
+    #[test]
+    fn is_tool_error_json_error_code_absent_not_error() {
+        assert!(!is_tool_error(r#"{"result": "success"}"#));
+    }
+
+    // ── is_resource_limit_output extended pattern tests ──
+
+    #[test]
+    fn resource_limit_enospc() {
+        assert!(is_resource_limit_output("Write failed: ENOSPC"));
+    }
+
+    #[test]
+    fn resource_limit_oom_killed() {
+        assert!(is_resource_limit_output("Killed: process ran out of memory"));
+        assert!(is_resource_limit_output("Killed"));
+    }
+
+    #[test]
+    fn resource_limit_device_busy() {
+        assert!(is_resource_limit_output("Error: Device or resource busy"));
+    }
+
+    #[test]
+    fn resource_limit_chinese_oom() {
+        assert!(is_resource_limit_output("错误：内存不足"));
+    }
+
+    #[test]
+    fn resource_limit_chinese_system_resource() {
+        assert!(is_resource_limit_output("错误：系统资源不足"));
     }
 }

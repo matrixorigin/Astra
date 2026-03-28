@@ -850,7 +850,6 @@ mod tests {
 
     #[test]
     fn intent_diversity_rejects_low_score_tools() {
-        use super::super::meta::IntentType;
         // Simulate: GitHub intent is active, but the only GitHub-intent tool
         // scored 0.05 (below the 0.10 floor).
         let mut state = ConversationState::default();

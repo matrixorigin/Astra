@@ -43,8 +43,12 @@ pub fn classify_error(error_str: &str) -> ErrorCategory {
         || lower.contains("too many open files")
         || lower.contains("fork:")
         || lower.contains("enomem")
+        || lower.contains("enospc")
+        || lower.contains("ebusy")
+        || lower.contains("device or resource busy")
         || lower.contains("资源暂时不足")
         || lower.contains("系统资源")
+        || lower.contains("内存不足")
     {
         return ErrorCategory::ResourceLimit;
     }
@@ -87,6 +91,9 @@ pub fn classify_error(error_str: &str) -> ErrorCategory {
         || lower.contains("invalid token")
         || lower.contains("could not validate")
         || lower.contains("credentials")
+        || lower.contains("eacces")
+        || lower.contains("eperm")
+        || lower.contains("operation not permitted")
     {
         return ErrorCategory::Auth;
     }
@@ -109,6 +116,8 @@ pub fn classify_error(error_str: &str) -> ErrorCategory {
         || lower.contains("does not exist")
         || lower.contains("couldn't find")
         || lower.contains("unknown tool")
+        || lower.contains("is a directory")
+        || lower.contains("eisdir")
     {
         return ErrorCategory::NotFound;
     }
@@ -299,8 +308,12 @@ pub fn escalation_level(
 ) -> EscalationLevel {
     // Critical: 3+ nudges (lowered from 5: session 62c1e8e9 showed 11 stalls
     // without force_stop because the old threshold was too lenient),
-    // or 8+ errors with deprioritized tools
-    if nudge_count >= 3 || (total_errors >= 8 && deprioritized_count >= 2) {
+    // or 8+ errors with at least one deprioritized tool,
+    // or 10+ total errors regardless (scattered failures are still broken)
+    if nudge_count >= 3
+        || (total_errors >= 8 && deprioritized_count >= 1)
+        || total_errors >= 10
+    {
         return EscalationLevel::Critical;
     }
     // Warning: 2 nudges, or 5+ errors
@@ -645,6 +658,8 @@ mod tests {
 
     #[test]
     fn escalation_critical_many_errors_with_deprioritized() {
+        // 8+ errors with at least 1 deprioritized tool → Critical (was 2, now 1)
+        assert_eq!(escalation_level(0, 8, 1), EscalationLevel::Critical);
         assert_eq!(escalation_level(0, 8, 2), EscalationLevel::Critical);
     }
 
@@ -652,6 +667,19 @@ mod tests {
     fn escalation_not_critical_errors_without_deprioritized() {
         // 8 errors but no deprioritized tools → Warning, not Critical
         assert_eq!(escalation_level(0, 8, 0), EscalationLevel::Warning);
+    }
+
+    #[test]
+    fn escalation_critical_ten_errors_regardless() {
+        // 10+ errors with zero deprioritized → Critical (new: standalone high-error gate)
+        assert_eq!(escalation_level(0, 10, 0), EscalationLevel::Critical);
+        assert_eq!(escalation_level(0, 12, 0), EscalationLevel::Critical);
+    }
+
+    #[test]
+    fn escalation_nine_errors_no_deprioritized_is_warning() {
+        // Below the standalone threshold, no deprioritized → stays Warning
+        assert_eq!(escalation_level(0, 9, 0), EscalationLevel::Warning);
     }
 
     #[test]
@@ -762,5 +790,71 @@ mod tests {
         );
         assert!(msg.contains("BLOCKED"));
         assert!(msg.contains("resource limit"));
+    }
+
+    // ── New error pattern classification tests ──
+
+    #[test]
+    fn classify_enospc_resource_limit() {
+        assert_eq!(
+            classify_error("write failed: ENOSPC"),
+            ErrorCategory::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn classify_ebusy_resource_limit() {
+        assert_eq!(
+            classify_error("Device or resource busy"),
+            ErrorCategory::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn classify_chinese_oom_resource_limit() {
+        assert_eq!(
+            classify_error("Error: 内存不足，无法继续"),
+            ErrorCategory::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn classify_eacces_as_auth() {
+        assert_eq!(
+            classify_error("EACCES: permission denied, open '/etc/shadow'"),
+            ErrorCategory::Auth
+        );
+    }
+
+    #[test]
+    fn classify_eperm_as_auth() {
+        assert_eq!(
+            classify_error("EPERM: operation not permitted"),
+            ErrorCategory::Auth
+        );
+    }
+
+    #[test]
+    fn classify_operation_not_permitted_as_auth() {
+        assert_eq!(
+            classify_error("Error: Operation not permitted"),
+            ErrorCategory::Auth
+        );
+    }
+
+    #[test]
+    fn classify_eisdir_as_not_found() {
+        assert_eq!(
+            classify_error("Error: EISDIR: illegal operation on a directory"),
+            ErrorCategory::NotFound
+        );
+    }
+
+    #[test]
+    fn classify_is_a_directory_as_not_found() {
+        assert_eq!(
+            classify_error("Error: Is a directory"),
+            ErrorCategory::NotFound
+        );
     }
 }

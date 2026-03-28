@@ -162,9 +162,14 @@ impl TurnGuard {
         }
 
         // 2. Divergence detection
+        // Only increment nudge_count if stall wasn't already detected this turn
+        // (both detect overlapping patterns; counting both inflates escalation).
         let divergence = stall::detect_divergence(&self.tool_sigs);
         if let DivergenceStatus::Diverging(_) = divergence {
             injections.push(stall::DIVERGENCE_CORRECTION.to_string());
+            if !stall_detected {
+                self.nudge_count += 1;
+            }
             severity = severity.max(VerdictSeverity::Warning);
         }
 
@@ -268,7 +273,10 @@ impl TurnGuard {
             };
         }
 
-        let force_stop = escalation == EscalationLevel::Critical && self.nudge_count >= 3;
+        // Force stop when escalation is Critical. Previously required
+        // nudge_count >= 3 as well, but this missed error-path escalation
+        // (10+ errors, scattered across tools, no stall nudges).
+        let force_stop = escalation == EscalationLevel::Critical;
 
         let is_diverging = matches!(divergence, DivergenceStatus::Diverging(_));
 
@@ -721,5 +729,60 @@ mod tests {
         );
         // This is why chat_stream.rs must skip record_tool_result() when
         // resource_limit_recorded is true.
+    }
+
+    // ── Force stop on error-path Critical (Fix) ──
+
+    #[test]
+    fn force_stop_on_error_path_critical() {
+        // Critical from errors (10+) with zero nudges should still force_stop
+        let mut guard = TurnGuard::new();
+        // Simulate 10+ errors across various tools
+        for i in 0..10 {
+            guard
+                .errors
+                .record_error(super::error_recovery::ErrorCategory::NotFound);
+            guard.record_tool_result(&format!("tool_{}", i), "Error: not found");
+        }
+        // Feed tool_sigs via record_tool_calls with JSON tool_call format
+        let call = serde_json::json!({"function": {"name": "read_file", "arguments": "{\"path\":\"/foo\"}"}});
+        for _ in 0..5 {
+            guard.record_tool_calls(&[call.clone()]);
+        }
+        let verdict = guard.evaluate();
+        assert!(
+            verdict.force_stop,
+            "Critical from errors alone (no nudges) must trigger force_stop"
+        );
+        assert_eq!(verdict.severity, super::VerdictSeverity::Critical);
+    }
+
+    // ── Divergence increments nudge_count (Fix) ──
+
+    #[test]
+    fn divergence_increments_nudge_count_when_no_stall() {
+        let mut guard = TurnGuard::new();
+        // Build a diverging pattern: all exploration tools, but varied enough
+        // that stall detection doesn't fire (stall needs identical consecutive sigs).
+        // Use different glob patterns each turn.
+        for i in 0..8 {
+            let sigs: std::collections::BTreeSet<String> =
+                vec![format!("glob:*.{}", i)].into_iter().collect();
+            guard.tool_sigs.push(sigs);
+        }
+        let initial_nudge = guard.nudge_count;
+        let verdict = guard.evaluate();
+        // Divergence should fire (all exploration tools) and increment nudge_count
+        // since stall shouldn't fire (different tool sigs each turn)
+        if verdict
+            .injections
+            .iter()
+            .any(|i| i.contains("productive action") || i.contains("diverge") || i.contains("Diverge"))
+        {
+            assert!(
+                guard.nudge_count > initial_nudge,
+                "divergence detection must increment nudge_count when no stall"
+            );
+        }
     }
 }

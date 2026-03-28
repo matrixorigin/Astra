@@ -13,6 +13,11 @@ use std::collections::HashMap;
 /// Maximum consecutive failures before a tool is deprioritized.
 const CONSECUTIVE_FAILURE_THRESHOLD: usize = 3;
 
+/// Consecutive successes needed to clear the "flaky" flag after rehabilitation.
+/// Once a tool succeeds this many times in a row, rehabilitation_count resets,
+/// restoring the standard (higher) failure threshold.
+const REHAB_STABILITY_WINDOW: usize = 5;
+
 /// Maximum failure rate from cross-session import that triggers deprioritization.
 /// Tools below this threshold start fresh even with historical failures.
 const CROSS_SESSION_DEPRIORITIZE_RATE: f64 = 0.5;
@@ -32,6 +37,9 @@ pub struct ToolHealth {
     /// Number of times this tool was rehabilitated this session.
     /// Rising rehab count means the tool is flaky — deprioritize more aggressively.
     pub rehabilitation_count: usize,
+    /// Consecutive successes since last failure/rehabilitation.
+    /// When this reaches REHAB_STABILITY_WINDOW, the tool is no longer "flaky".
+    pub consecutive_successes: usize,
     /// Timeout-specific failures (subset of total_failures).
     /// Tracked separately because timeouts are infrastructure issues, not tool bugs.
     pub timeout_count: usize,
@@ -66,10 +74,18 @@ impl ToolHealthTracker {
         let health = self.tools.entry(tool_name.to_string()).or_default();
         health.total_calls += 1;
         health.consecutive_failures = 0;
+        health.consecutive_successes += 1;
         // Success can rehabilitate a deprioritized tool
         if health.deprioritized {
             health.deprioritized = false;
             health.rehabilitation_count += 1;
+            health.consecutive_successes = 1; // reset counter on rehab
+        }
+        // After enough consecutive successes, clear "flaky" flag
+        if health.consecutive_successes >= REHAB_STABILITY_WINDOW
+            && health.rehabilitation_count > 0
+        {
+            health.rehabilitation_count = 0;
         }
     }
 
@@ -80,6 +96,7 @@ impl ToolHealthTracker {
         health.total_calls += 1;
         health.total_failures += 1;
         health.consecutive_failures += 1;
+        health.consecutive_successes = 0;
         // Flaky tools: lower threshold after repeated rehabilitation
         let threshold = if health.rehabilitation_count >= 2 {
             2 // Stricter: only 2 consecutive failures needed
@@ -218,6 +235,7 @@ impl ToolHealthTracker {
                     consecutive_failures: 0, // Reset per-session
                     deprioritized,
                     rehabilitation_count: 0,
+                    consecutive_successes: 0,
                     timeout_count: 0,
                     cache_hit_count: 0,
                 },
@@ -557,5 +575,66 @@ mod tests {
         assert_eq!(health.total_failures, 2, "double call = double failure count");
 
         // The fix: skip record_tool_result() when resource_limit_recorded=true
+    }
+
+    // ── Rehabilitation stability (Fix: flaky rehab_count reset) ──
+
+    #[test]
+    fn rehabilitation_count_resets_after_stability_window() {
+        let mut tracker = ToolHealthTracker::new();
+        // Cycle 1: fail 3 → deprioritize → succeed → rehab_count=1
+        for _ in 0..3 {
+            tracker.record_failure("bash");
+        }
+        assert!(tracker.is_deprioritized("bash"));
+        tracker.record_success("bash"); // rehabilitates
+        assert!(!tracker.is_deprioritized("bash"));
+        assert_eq!(tracker.get("bash").unwrap().rehabilitation_count, 1);
+
+        // Cycle 2: fail 3 → deprioritize → succeed → rehab_count=2
+        for _ in 0..3 {
+            tracker.record_failure("bash");
+        }
+        tracker.record_success("bash");
+        assert_eq!(tracker.get("bash").unwrap().rehabilitation_count, 2);
+        // Now threshold is lowered to 2 consecutive failures
+        tracker.record_failure("bash");
+        tracker.record_failure("bash");
+        assert!(tracker.is_deprioritized("bash"), "flaky tool should deprioritize faster");
+
+        // Rehabilitate and then sustain success for stability window
+        tracker.record_success("bash"); // rehab
+        assert_eq!(tracker.get("bash").unwrap().rehabilitation_count, 3);
+        // 4 more successes (total 5 including the rehab one) reaches window
+        for _ in 0..4 {
+            tracker.record_success("bash");
+        }
+        // rehabilitation_count should be reset
+        assert_eq!(
+            tracker.get("bash").unwrap().rehabilitation_count, 0,
+            "rehab_count must reset after {} consecutive successes",
+            REHAB_STABILITY_WINDOW
+        );
+        // Now tool should require the standard 3 failures again
+        tracker.record_failure("bash");
+        tracker.record_failure("bash");
+        assert!(
+            !tracker.is_deprioritized("bash"),
+            "after stability reset, 2 failures should NOT deprioritize (need 3)"
+        );
+        tracker.record_failure("bash");
+        assert!(tracker.is_deprioritized("bash"));
+    }
+
+    #[test]
+    fn consecutive_successes_reset_on_failure() {
+        let mut tracker = ToolHealthTracker::new();
+        tracker.record_success("bash");
+        tracker.record_success("bash");
+        tracker.record_success("bash");
+        assert_eq!(tracker.get("bash").unwrap().consecutive_successes, 3);
+
+        tracker.record_failure("bash");
+        assert_eq!(tracker.get("bash").unwrap().consecutive_successes, 0);
     }
 }
