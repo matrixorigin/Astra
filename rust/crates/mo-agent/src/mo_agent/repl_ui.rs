@@ -387,41 +387,114 @@ fn apply_accepted_slash_edit(edit: AcceptedSlashEdit) -> RlCmd {
     }
 }
 
-fn render_slash_overlay_row(cmd: &str, desc: &str, selected: bool) -> String {
+fn slash_overlay_row_content(cmd: &str, desc: &str, selected: bool) -> String {
     if selected {
         format!(
-            "{} {} {:<16} {}",
-            "│".cyan(),
+            "{} {:<16} {}",
             "▶".green().bold(),
             cmd.green().bold(),
             desc.green().bold()
         )
     } else {
         format!(
-            "{}   {:<16} {}",
-            "│".cyan().dim(),
+            "  {:<16} {}",
             cmd.dim(),
             desc.dim()
         )
     }
 }
 
-fn render_slash_overlay_header(filter: Option<&str>) -> String {
-    let title = if let Some(q) = filter.filter(|q| !q.is_empty()) {
+fn visible_width(text: &str) -> usize {
+    strip_ansi_for_width(text).chars().count()
+}
+
+fn strip_ansi_for_width(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && matches!(chars.peek(), Some('[')) {
+            let _ = chars.next();
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn slash_overlay_title(filter: Option<&str>) -> String {
+    if let Some(q) = filter.filter(|q| !q.is_empty()) {
         format!(" Slash Commands  ·  filter: {q} ")
     } else {
         " Slash Commands ".to_string()
-    };
-    format!("{}{}{}", "╭".cyan(), title.cyan().bold(), "╮".cyan())
+    }
 }
 
-fn render_slash_overlay_footer(total: usize, start: usize, end: usize) -> String {
-    let summary = if total > 0 {
+fn render_slash_overlay_header(filter: Option<&str>, inner_width: usize) -> String {
+    let title = slash_overlay_title(filter);
+    let title_width = title.chars().count();
+    let pad = inner_width.saturating_sub(title_width);
+    format!(
+        "{}{}{}{}",
+        "╭".cyan(),
+        title.cyan().bold(),
+        "─".repeat(pad).cyan(),
+        "╮".cyan()
+    )
+}
+
+fn slash_overlay_footer_summary(total: usize, start: usize, end: usize) -> String {
+    if total > 0 {
         format!(" {}/{} shown  ·  ↑↓ navigate  Tab accept  Enter run  Esc dismiss ", end - start, total)
     } else {
         " no matches  ·  Esc dismiss ".to_string()
-    };
-    format!("{}{}{}", "╰".cyan(), summary.dim(), "╯".cyan())
+    }
+}
+
+fn render_slash_overlay_footer(total: usize, start: usize, end: usize, inner_width: usize) -> String {
+    let summary = slash_overlay_footer_summary(total, start, end);
+    let summary_width = summary.chars().count();
+    let pad = inner_width.saturating_sub(summary_width);
+    format!(
+        "{}{}{}{}",
+        "╰".cyan(),
+        summary.dim(),
+        "─".repeat(pad).cyan(),
+        "╯".cyan()
+    )
+}
+
+fn render_slash_overlay_row_with_width(
+    cmd: &str,
+    desc: &str,
+    selected: bool,
+    inner_width: usize,
+) -> String {
+    let content = slash_overlay_row_content(cmd, desc, selected);
+    let pad = inner_width.saturating_sub(visible_width(&content));
+    format!(
+        "{}{}{}{}",
+        if selected { "│".cyan() } else { "│".cyan().dim() },
+        content,
+        " ".repeat(pad),
+        if selected { "│".cyan() } else { "│".cyan().dim() }
+    )
+}
+
+fn render_slash_overlay_message_line(message: &str, inner_width: usize) -> String {
+    let styled = message.yellow().to_string();
+    let pad = inner_width.saturating_sub(message.chars().count());
+    format!(
+        "{}{}{}{}",
+        "│".cyan().dim(),
+        styled,
+        " ".repeat(pad),
+        "│".cyan().dim()
+    )
 }
 
 /// Move selection and return the newly selected command name.
@@ -503,16 +576,10 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
 
     let mut printed: u16 = 0;
     let visible_limit = 10usize;
-    println!("{}", render_slash_overlay_header(filter));
-    printed += 1;
+    let mut body_contents: Vec<(Option<(&'static str, &'static str, bool)>, String)> = Vec::new();
     if rows.is_empty() {
         let label = filter.unwrap_or("");
-        println!(
-            "{} {}",
-            "│".cyan().dim(),
-            format!("no commands match '{label}'").yellow()
-        );
-        printed += 1;
+        body_contents.push((None, format!("no commands match '{label}'")));
     } else {
         let total = rows.len();
         let start = if total <= visible_limit {
@@ -525,17 +592,61 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
         let end = (start + visible_limit).min(total);
         for (idx, (cmd, desc)) in rows[start..end].iter().enumerate() {
             let abs = start + idx;
-            println!("{}", render_slash_overlay_row(cmd, desc, abs == selected));
+            body_contents.push((Some((*cmd, *desc, abs == selected)), String::new()));
+        }
+        let title = slash_overlay_title(filter);
+        let footer = slash_overlay_footer_summary(total, start, end);
+        let inner_width = body_contents
+            .iter()
+            .map(|(row, message)| match row {
+                Some((cmd, desc, selected)) => visible_width(&slash_overlay_row_content(cmd, desc, *selected)),
+                None => message.chars().count(),
+            })
+            .max()
+            .unwrap_or(40)
+            .max(title.chars().count())
+            .max(footer.chars().count());
+        println!("{}", render_slash_overlay_header(filter, inner_width));
+        printed += 1;
+        for (row, message) in &body_contents {
+            let line = match row {
+                Some((cmd, desc, selected)) => {
+                    render_slash_overlay_row_with_width(cmd, desc, *selected, inner_width)
+                }
+                None => render_slash_overlay_message_line(message, inner_width),
+            };
+            println!("{line}");
             printed += 1;
         }
-        println!("{}", render_slash_overlay_footer(total, start, end));
+        println!("{}", render_slash_overlay_footer(total, start, end, inner_width));
+        printed += 1;
+        if let Ok(mut g) = slash_overlay_lines().lock() {
+            *g = printed;
+        }
+        set_slash_filter(filter.map(|s| s.to_string()));
+        if let Ok(mut s) = slash_overlay_state().lock() {
+            *s = (norm, selected);
+        }
+        return;
+    }
+    let title = slash_overlay_title(filter);
+    let footer = slash_overlay_footer_summary(0, 0, 0);
+    let inner_width = body_contents
+        .iter()
+        .map(|(_, message)| message.chars().count())
+        .max()
+        .unwrap_or(40)
+        .max(title.chars().count())
+        .max(footer.chars().count());
+    println!("{}", render_slash_overlay_header(filter, inner_width));
+    printed += 1;
+    for (_, message) in &body_contents {
+        let line = render_slash_overlay_message_line(message, inner_width);
+        println!("{line}");
         printed += 1;
     }
-
-    if rows.is_empty() {
-        println!("{}", render_slash_overlay_footer(0, 0, 0));
-        printed += 1;
-    }
+    println!("{}", render_slash_overlay_footer(0, 0, 0, inner_width));
+    printed += 1;
 
     if let Ok(mut g) = slash_overlay_lines().lock() {
         *g = printed;
@@ -1441,9 +1552,10 @@ mod tests {
 
     #[test]
     fn render_selected_slash_row_highlights_command_and_description() {
-        let row = render_slash_overlay_row("/ask", "Toggle ask mode", true);
+        let row = render_slash_overlay_row_with_width("/ask", "Toggle ask mode", true, 40);
         let plain = strip_ansi_codes(&row);
-        assert!(plain.starts_with("│ ▶ /ask"));
+        assert!(plain.starts_with("│▶ /ask"));
+        assert!(plain.ends_with('│'));
         assert!(plain.contains("/ask"));
         assert!(plain.contains("Toggle ask mode"));
         assert!(row.contains("\u{1b}["));
@@ -1453,24 +1565,29 @@ mod tests {
 
     #[test]
     fn render_unselected_slash_row_keeps_plain_layout() {
-        let row = render_slash_overlay_row("/ask", "Toggle ask mode", false);
+        let row = render_slash_overlay_row_with_width("/ask", "Toggle ask mode", false, 40);
         let plain = strip_ansi_codes(&row);
-        assert!(plain.starts_with("│   /ask"));
+        assert!(plain.starts_with("│  /ask"));
+        assert!(plain.ends_with('│'));
         assert!(plain.contains("Toggle ask mode"));
     }
 
     #[test]
     fn render_slash_overlay_header_includes_filter_when_present() {
-        let header = render_slash_overlay_header(Some("skill d"));
+        let header = render_slash_overlay_header(Some("skill d"), 48);
         let plain = strip_ansi_codes(&header);
+        assert!(plain.starts_with('╭'));
+        assert!(plain.ends_with('╮'));
         assert!(plain.contains("Slash Commands"));
         assert!(plain.contains("filter: skill d"));
     }
 
     #[test]
     fn render_slash_overlay_footer_shows_navigation_help() {
-        let footer = render_slash_overlay_footer(12, 0, 10);
+        let footer = render_slash_overlay_footer(12, 0, 10, 56);
         let plain = strip_ansi_codes(&footer);
+        assert!(plain.starts_with('╰'));
+        assert!(plain.ends_with('╯'));
         assert!(plain.contains("10/12 shown"));
         assert!(plain.contains("Tab accept"));
         assert!(plain.contains("Enter run"));
@@ -1479,7 +1596,7 @@ mod tests {
 
     #[test]
     fn render_slash_overlay_footer_handles_empty_state() {
-        let footer = render_slash_overlay_footer(0, 0, 0);
+        let footer = render_slash_overlay_footer(0, 0, 0, 32);
         let plain = strip_ansi_codes(&footer);
         assert!(plain.contains("no matches"));
         assert!(plain.contains("Esc dismiss"));
