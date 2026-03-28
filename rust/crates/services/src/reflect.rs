@@ -118,7 +118,8 @@ impl ReflectService for DatabaseReflectService {
 
         let events = if let Some(et) = event_type_filter {
             query(
-                "SELECT event_id, event_type, skill_name, created_at, \
+                "SELECT event_id, event_type, skill_name, \
+                 CAST(created_at AS CHAR) AS created_at, \
                  SUBSTRING(COALESCE(content, ''), 1, 200) AS content_preview \
                  FROM agent_events \
                  WHERE session_id = ? AND event_type = ? \
@@ -131,7 +132,8 @@ impl ReflectService for DatabaseReflectService {
             .await
         } else {
             query(
-                "SELECT event_id, event_type, skill_name, created_at, \
+                "SELECT event_id, event_type, skill_name, \
+                 CAST(created_at AS CHAR) AS created_at, \
                  SUBSTRING(COALESCE(content, ''), 1, 200) AS content_preview \
                  FROM agent_events \
                  WHERE session_id = ? \
@@ -157,7 +159,8 @@ impl ReflectService for DatabaseReflectService {
 
         // Fetch decision audits for this session
         let decision_rows = query(
-            "SELECT decision_id, decision_type, model_used, created_at, \
+            "SELECT decision_id, decision_type, model_used, \
+             CAST(created_at AS CHAR) AS created_at, \
              SUBSTRING(CAST(COALESCE(decision_output, '{}') AS CHAR), 1, 200) AS output_preview \
              FROM ctx_decision_audits \
              WHERE session_id = ? \

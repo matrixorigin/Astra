@@ -409,7 +409,7 @@ impl StateSyncService for MatrixOneSyncService {
     async fn status(&self) -> SyncStatus {
         // Query latest sync timestamps from audit log
         let learning_push = sqlx::query(
-            "SELECT created_at FROM session_sync_log \
+            "SELECT CAST(created_at AS CHAR) AS created_at FROM session_sync_log \
              WHERE sync_type = 'learning' AND sync_direction = 'push' AND status = 'success' \
              ORDER BY created_at DESC LIMIT 1",
         )
@@ -423,7 +423,7 @@ impl StateSyncService for MatrixOneSyncService {
         });
 
         let learning_pull = sqlx::query(
-            "SELECT created_at FROM session_sync_log \
+            "SELECT CAST(created_at AS CHAR) AS created_at FROM session_sync_log \
              WHERE sync_type = 'learning' AND sync_direction = 'pull' AND status = 'success' \
              ORDER BY created_at DESC LIMIT 1",
         )

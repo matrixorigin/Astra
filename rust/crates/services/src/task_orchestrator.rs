@@ -330,7 +330,13 @@ impl TaskService for MatrixOneTaskService {
     ) -> Result<Vec<TaskRecord>, String> {
         let rows = if let Some(status) = status_filter {
             sqlx::query(
-                "SELECT * FROM agent_tasks WHERE user_id = ? AND status = ? ORDER BY updated_at DESC",
+                "SELECT task_id, user_id, session_id, parent_task_id, title, description, \
+                 status, progress_pct, items_done, items_total, plan_json, checkpoint_json, \
+                 error_message, \
+                 CAST(created_at AS CHAR) AS created_at, \
+                 CAST(updated_at AS CHAR) AS updated_at, \
+                 completed_at \
+                 FROM agent_tasks WHERE user_id = ? AND status = ? ORDER BY updated_at DESC",
             )
             .bind(user_id)
             .bind(status.as_str())
@@ -338,7 +344,13 @@ impl TaskService for MatrixOneTaskService {
             .await
         } else {
             sqlx::query(
-                "SELECT * FROM agent_tasks WHERE user_id = ? ORDER BY updated_at DESC",
+                "SELECT task_id, user_id, session_id, parent_task_id, title, description, \
+                 status, progress_pct, items_done, items_total, plan_json, checkpoint_json, \
+                 error_message, \
+                 CAST(created_at AS CHAR) AS created_at, \
+                 CAST(updated_at AS CHAR) AS updated_at, \
+                 completed_at \
+                 FROM agent_tasks WHERE user_id = ? ORDER BY updated_at DESC",
             )
             .bind(user_id)
             .fetch_all(&self.pool)
