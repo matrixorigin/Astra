@@ -128,6 +128,80 @@ impl IngestionEvent {
             metadata: event.metadata.clone(),
         }
     }
+
+    /// Expand a JournalEvent into one or more IngestionEvents.
+    ///
+    /// For Turn events that contain tool_call_records, this produces:
+    /// 1. The main turn event (same as `from_journal_event`)
+    /// 2. One `tool_call` event per tool execution record
+    ///
+    /// This ensures tool-level granularity reaches the DB regardless of
+    /// whether the request came through the HTTP bridge or CLI path.
+    pub fn expand_journal_event(
+        event: &crate::session_journal::JournalEvent,
+        user_id: &str,
+    ) -> Vec<Self> {
+        let main_event = Self::from_journal_event(event, user_id);
+        let session_id = main_event.session_id.clone();
+        let uid = main_event.user_id.clone();
+
+        let mut events = vec![main_event];
+
+        // Expand embedded tool_call_records into individual tool_call events
+        if let Some(ref tool_calls) = event.tool_calls {
+            for (i, tc) in tool_calls.iter().enumerate() {
+                // Deterministic event_id: hash of (session_id, turn, tool_call, index)
+                let tc_event_id = {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    session_id.hash(&mut hasher);
+                    event.turn.hash(&mut hasher);
+                    "tool_call".hash(&mut hasher);
+                    i.hash(&mut hasher);
+                    tc.name.hash(&mut hasher);
+                    format!("evt-{:016x}", hasher.finish())
+                };
+
+                let content = if tc.ok {
+                    format!("{} completed in {}ms", tc.name, tc.ms)
+                } else {
+                    format!(
+                        "{} failed in {}ms: {}",
+                        tc.name,
+                        tc.ms,
+                        tc.error.as_deref().unwrap_or("unknown error")
+                    )
+                };
+
+                let metadata = serde_json::json!({
+                    "tool_name": tc.name,
+                    "ok": tc.ok,
+                    "duration_ms": tc.ms,
+                    "error": tc.error,
+                    "turn": event.turn,
+                });
+
+                events.push(Self {
+                    event_id: tc_event_id,
+                    session_id: session_id.clone(),
+                    user_id: uid.clone(),
+                    event_type: if tc.ok {
+                        "tool_call".to_string()
+                    } else {
+                        "tool_error".to_string()
+                    },
+                    content: Some(content),
+                    token_usage: None,
+                    llm_model_used: None,
+                    skill_name: Some(tc.name.clone()),
+                    metadata: Some(metadata),
+                });
+            }
+        }
+
+        events
+    }
 }
 
 /// Handle for sending events to the ingestion worker.
@@ -535,6 +609,108 @@ mod tests {
         assert_eq!(ingestion.session_id, "sess-end");
         assert!(ingestion.event_type.contains("session"));
         assert!(ingestion.event_type.contains("end"));
+    }
+
+    // ── expand_journal_event tests ──────────────────────────────────────
+
+    #[test]
+    fn expand_turn_without_tool_calls_returns_one_event() {
+        let journal = make_turn_event();
+        let events = IngestionEvent::expand_journal_event(&journal, "user-1");
+        assert_eq!(events.len(), 1);
+        assert!(events[0].event_type.contains("turn"));
+    }
+
+    #[test]
+    fn expand_turn_with_tool_calls_returns_extra_events() {
+        let mut journal = make_turn_event();
+        journal.tool_calls = Some(vec![
+            crate::session_journal::ToolCallRecord {
+                name: "git_log".into(),
+                ok: true,
+                ms: 150,
+                error: None,
+            },
+            crate::session_journal::ToolCallRecord {
+                name: "read_file".into(),
+                ok: false,
+                ms: 20,
+                error: Some("not found".into()),
+            },
+        ]);
+
+        let events = IngestionEvent::expand_journal_event(&journal, "user-1");
+        // 1 turn event + 2 tool_call events
+        assert_eq!(events.len(), 3, "expected 3 events, got {}", events.len());
+
+        // First is the main turn event
+        assert!(events[0].event_type.contains("turn"));
+
+        // Second is successful tool_call
+        assert_eq!(events[1].event_type, "tool_call");
+        assert_eq!(events[1].skill_name.as_deref(), Some("git_log"));
+        assert!(
+            events[1].content.as_ref().unwrap().contains("150ms"),
+            "got: {:?}",
+            events[1].content
+        );
+
+        // Third is failed tool → tool_error
+        assert_eq!(events[2].event_type, "tool_error");
+        assert_eq!(events[2].skill_name.as_deref(), Some("read_file"));
+        assert!(
+            events[2].content.as_ref().unwrap().contains("not found"),
+            "got: {:?}",
+            events[2].content
+        );
+    }
+
+    #[test]
+    fn expand_tool_call_events_have_metadata() {
+        let mut journal = make_turn_event();
+        journal.tool_calls = Some(vec![crate::session_journal::ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            ms: 500,
+            error: None,
+        }]);
+
+        let events = IngestionEvent::expand_journal_event(&journal, "u1");
+        let tc_event = &events[1];
+        let meta = tc_event.metadata.as_ref().unwrap();
+        assert_eq!(meta["tool_name"], "bash");
+        assert_eq!(meta["ok"], true);
+        assert_eq!(meta["duration_ms"], 500);
+        assert_eq!(meta["turn"], 3);
+    }
+
+    #[test]
+    fn expand_tool_call_event_ids_are_deterministic() {
+        let mut journal = make_turn_event();
+        journal.tool_calls = Some(vec![crate::session_journal::ToolCallRecord {
+            name: "grep".into(),
+            ok: true,
+            ms: 10,
+            error: None,
+        }]);
+
+        let a = IngestionEvent::expand_journal_event(&journal, "u1");
+        let b = IngestionEvent::expand_journal_event(&journal, "u1");
+        assert_eq!(a[1].event_id, b[1].event_id, "tool_call events should be deterministic");
+    }
+
+    #[test]
+    fn expand_non_turn_event_returns_one_event() {
+        let event = crate::session_journal::JournalEvent::stall_detected(
+            Some("sess-s"),
+            5,
+            "name_stall",
+            2,
+            0.6,
+            &["github_list_prs".to_string()],
+        );
+        let events = IngestionEvent::expand_journal_event(&event, "u1");
+        assert_eq!(events.len(), 1, "non-turn events should not be expanded");
     }
 
     // ── Batching / pipeline logic (no DB required) ──

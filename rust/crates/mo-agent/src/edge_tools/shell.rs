@@ -449,6 +449,12 @@ impl ToolExecutor {
                     return format!("Error: {stderr}");
                 }
                 let mut result = stdout.to_string();
+
+                // Convert HTML to plain text for LLM consumption
+                if looks_like_html(&result) {
+                    result = html_to_text(&result);
+                }
+
                 if result.len() > max_bytes {
                     result.truncate(max_bytes);
                     result.push_str("\n[truncated]");
@@ -458,6 +464,142 @@ impl ToolExecutor {
             Err(e) => format!("Error: curl not available — {e}"),
         }
     }
+}
+
+/// Detect HTML content by checking for common HTML markers.
+fn looks_like_html(s: &str) -> bool {
+    let trimmed = s.trim_start();
+    trimmed.starts_with("<!DOCTYPE")
+        || trimmed.starts_with("<!doctype")
+        || trimmed.starts_with("<html")
+        || trimmed.starts_with("<HTML")
+        // Partial HTML without doctype (common in API error pages)
+        || (trimmed.starts_with('<')
+            && (trimmed.contains("</head>") || trimmed.contains("</body>")))
+}
+
+/// Lightweight HTML → text conversion without external dependencies.
+/// Strips tags, decodes common entities, collapses whitespace.
+fn html_to_text(html: &str) -> String {
+    let mut s = html.to_string();
+
+    // 1. Remove <script> and <style> blocks (case-insensitive via manual lowering)
+    for tag in &["script", "style", "noscript", "svg"] {
+        loop {
+            let lower = s.to_lowercase();
+            let open = format!("<{}", tag);
+            let close = format!("</{}>", tag);
+            if let Some(start) = lower.find(&open) {
+                if let Some(end_rel) = lower[start..].find(&close) {
+                    let end = start + end_rel + close.len();
+                    s.replace_range(start..end, " ");
+                    continue;
+                }
+            }
+            break;
+        }
+    }
+
+    // 2. Insert newlines for block elements
+    for tag in &[
+        "<br>", "<br/>", "<br />", "<BR>", "</p>", "</P>", "</div>", "</DIV>", "</li>", "</LI>",
+        "</tr>", "</TR>", "</h1>", "</h2>", "</h3>", "</h4>", "</h5>", "</h6>", "</H1>", "</H2>",
+        "</H3>", "</H4>", "</H5>", "</H6>",
+    ] {
+        s = s.replace(tag, &format!("\n{}", tag));
+    }
+
+    // 3. Strip all remaining HTML tags
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' if in_tag => {
+                in_tag = false;
+                out.push(' ');
+            }
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+
+    // 4. Decode common HTML entities
+    out = out
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&#x27;", "'")
+        .replace("&#x2F;", "/");
+
+    // Decode numeric character references &#NNN;
+    let mut decoded = String::with_capacity(out.len());
+    let mut chars = out.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '&' && chars.peek() == Some(&'#') {
+            chars.next(); // consume '#'
+            let mut num_str = String::new();
+            while let Some(&d) = chars.peek() {
+                if d == ';' {
+                    chars.next();
+                    break;
+                }
+                if d.is_ascii_digit() && num_str.len() < 7 {
+                    num_str.push(d);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if let Ok(code) = num_str.parse::<u32>() {
+                if let Some(decoded_char) = char::from_u32(code) {
+                    decoded.push(decoded_char);
+                    continue;
+                }
+            }
+            decoded.push('&');
+            decoded.push('#');
+            decoded.push_str(&num_str);
+        } else {
+            decoded.push(ch);
+        }
+    }
+
+    // 5. Collapse whitespace: runs of spaces/tabs → single space, 3+ newlines → 2
+    let mut result = String::with_capacity(decoded.len());
+    let mut last_was_newline = false;
+    let mut consecutive_newlines = 0u32;
+    let mut last_was_space = false;
+
+    for ch in decoded.chars() {
+        if ch == '\n' || ch == '\r' {
+            if ch == '\r' {
+                continue;
+            }
+            consecutive_newlines += 1;
+            last_was_space = false;
+            if consecutive_newlines <= 2 {
+                result.push('\n');
+            }
+            last_was_newline = true;
+        } else if ch == ' ' || ch == '\t' {
+            if !last_was_space && !last_was_newline {
+                result.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            result.push(ch);
+            last_was_newline = false;
+            last_was_space = false;
+            consecutive_newlines = 0;
+        }
+    }
+
+    result.trim().to_string()
 }
 
 #[cfg(test)]
@@ -807,5 +949,144 @@ mod tests {
         }));
         // Simple non-regex pattern should still work
         assert!(!result.is_empty());
+    }
+
+    // ── HTML detection ──────────────────────────────────────────────────────
+
+    #[test]
+    fn looks_like_html_detects_doctype() {
+        assert!(looks_like_html("<!DOCTYPE html><html><body>hello</body></html>"));
+        assert!(looks_like_html("<!doctype html>\n<html>"));
+    }
+
+    #[test]
+    fn looks_like_html_detects_html_tag() {
+        assert!(looks_like_html("<html lang=\"en\"><head></head></html>"));
+        assert!(looks_like_html("<HTML><BODY>hi</BODY></HTML>"));
+    }
+
+    #[test]
+    fn looks_like_html_rejects_plain_text() {
+        assert!(!looks_like_html("Hello world, this is plain text."));
+        assert!(!looks_like_html("{\"key\": \"value\"}"));
+        assert!(!looks_like_html("# Markdown heading\n\nSome text."));
+    }
+
+    #[test]
+    fn looks_like_html_rejects_xml_without_body() {
+        assert!(!looks_like_html("<root><item>data</item></root>"));
+    }
+
+    // ── HTML-to-text conversion ─────────────────────────────────────────────
+
+    #[test]
+    fn html_to_text_strips_tags() {
+        let html = "<p>Hello <b>world</b></p>";
+        let text = html_to_text(html);
+        assert!(text.contains("Hello"));
+        assert!(text.contains("world"));
+        assert!(!text.contains("<p>"));
+        assert!(!text.contains("<b>"));
+    }
+
+    #[test]
+    fn html_to_text_removes_script_and_style() {
+        let html = "<html><head><style>body{color:red}</style></head>\
+                     <body><script>alert('xss')</script><p>content</p></body></html>";
+        let text = html_to_text(html);
+        assert!(text.contains("content"), "got: {text}");
+        assert!(!text.contains("alert"), "script not stripped: {text}");
+        assert!(!text.contains("color:red"), "style not stripped: {text}");
+    }
+
+    #[test]
+    fn html_to_text_decodes_entities() {
+        let html = "<p>A &amp; B &lt; C &gt; D &quot;E&quot; F&apos;s</p>";
+        let text = html_to_text(html);
+        assert!(text.contains("A & B"), "got: {text}");
+        assert!(text.contains("< C >"), "got: {text}");
+        assert!(text.contains("\"E\""), "got: {text}");
+        assert!(text.contains("F's"), "got: {text}");
+    }
+
+    #[test]
+    fn html_to_text_decodes_numeric_entities() {
+        let html = "<p>&#65;&#66;&#67;</p>"; // ABC
+        let text = html_to_text(html);
+        assert!(text.contains("ABC"), "got: {text}");
+    }
+
+    #[test]
+    fn html_to_text_inserts_newlines_for_blocks() {
+        let html = "<h1>Title</h1><p>Paragraph one.</p><p>Paragraph two.</p>";
+        let text = html_to_text(html);
+        // Block elements should create line breaks
+        assert!(text.contains("Title"), "got: {text}");
+        assert!(
+            text.contains("Paragraph one.") && text.contains("Paragraph two."),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn html_to_text_collapses_whitespace() {
+        let html = "<p>  lots   of    spaces  </p>\n\n\n\n\n<p>many newlines</p>";
+        let text = html_to_text(html);
+        assert!(!text.contains("     "), "excessive spaces: {text}");
+        // No more than 2 consecutive newlines
+        assert!(
+            !text.contains("\n\n\n"),
+            "excessive newlines: {text}"
+        );
+    }
+
+    #[test]
+    fn html_to_text_handles_real_page() {
+        let html = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Example</title>
+  <style>body { margin: 0; }</style>
+  <script>window.ga=function(){}</script>
+</head>
+<body>
+  <div id="main">
+    <h1>Welcome</h1>
+    <p>This is a <a href="/about">test page</a> with links.</p>
+    <ul>
+      <li>Item 1</li>
+      <li>Item 2</li>
+    </ul>
+  </div>
+  <script src="analytics.js"></script>
+</body>
+</html>"#;
+        let text = html_to_text(html);
+        assert!(text.contains("Welcome"), "missing heading: {text}");
+        assert!(text.contains("test page"), "missing link text: {text}");
+        assert!(text.contains("Item 1"), "missing list item: {text}");
+        assert!(!text.contains("<"), "tags not stripped: {text}");
+        assert!(
+            !text.contains("window.ga"),
+            "script not removed: {text}"
+        );
+        assert!(
+            !text.contains("margin: 0"),
+            "style not removed: {text}"
+        );
+    }
+
+    #[test]
+    fn html_to_text_passthrough_json() {
+        // JSON is not HTML, so it passes through unchanged
+        let json = r#"{"name": "test", "value": 42}"#;
+        assert!(!looks_like_html(json));
+    }
+
+    #[test]
+    fn html_to_text_passthrough_plain_text() {
+        let plain = "This is just plain text\nwith some newlines.";
+        assert!(!looks_like_html(plain));
     }
 }

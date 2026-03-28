@@ -11,8 +11,13 @@ pub(super) struct ReplTurnContext<'a> {
 fn enqueue_ingestion(state: &ReplState, event: &session_journal::JournalEvent) {
     if let Some(ref sender) = state.ingestion_sender {
         let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
-        let ingestion_event = event_ingestion::IngestionEvent::from_journal_event(event, user_id);
-        sender.enqueue(ingestion_event);
+        // Expand: Turn events with tool_call_records produce individual tool_call
+        // events alongside the main turn event, ensuring DB-level tool granularity.
+        for ingestion_event in
+            event_ingestion::IngestionEvent::expand_journal_event(event, user_id)
+        {
+            sender.enqueue(ingestion_event);
+        }
     }
 }
 
