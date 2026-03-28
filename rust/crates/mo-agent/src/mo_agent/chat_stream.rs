@@ -5,6 +5,70 @@ use mo_agent_runtime::pipeline::step_protocol::{
     CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache,
 };
 
+/// Build a compact workspace context string for the LLM system prompt.
+/// Detects project type, key files, and top-level directory structure.
+/// Capped at ~500 chars to stay token-efficient.
+fn detect_workspace_context(project_root: &std::path::Path) -> serde_json::Value {
+    let mut project_type = Vec::new();
+    let mut key_files = Vec::new();
+
+    // Detect project type from marker files
+    let markers = [
+        ("Cargo.toml", "rust"),
+        ("package.json", "node/javascript"),
+        ("go.mod", "go"),
+        ("pyproject.toml", "python"),
+        ("requirements.txt", "python"),
+        ("pom.xml", "java/maven"),
+        ("build.gradle", "java/gradle"),
+        ("Makefile", "make"),
+        ("Dockerfile", "docker"),
+        ("docker-compose.yml", "docker-compose"),
+        ("docker-compose.yaml", "docker-compose"),
+    ];
+    for (file, ptype) in markers {
+        if project_root.join(file).exists() {
+            if !project_type.contains(&ptype) {
+                project_type.push(ptype);
+            }
+            key_files.push(file.to_string());
+        }
+    }
+
+    // Get top-level directories (max 15, skip hidden/noise)
+    let mut top_dirs = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(project_root) {
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.')
+                || name_str == "target"
+                || name_str == "node_modules"
+                || name_str == "__pycache__"
+                || name_str == "dist"
+                || name_str == "build"
+                || name_str == "htmlcov"
+            {
+                continue;
+            }
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                top_dirs.push(format!("{}/", name_str));
+            }
+            if top_dirs.len() >= 15 {
+                break;
+            }
+        }
+    }
+
+    serde_json::json!({
+        "project_types": project_type,
+        "key_files": key_files,
+        "top_directories": top_dirs,
+    })
+}
+
 /// Tools that are idempotent reads — safe to cache across turns.
 /// Side-effectful tools (bash, write_file, mo_query, etc.) must NOT be in this list.
 const CACHEABLE_TOOLS: &[&str] = &[
@@ -581,6 +645,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 "git_branch": git_branch,
                 "memoria_url": memoria_url,
                 "memoria_key": memoria_key,
+                "workspace": detect_workspace_context(&project_root),
             },
         });
         // Detect active system skills from skill instruction block in the message
@@ -2264,5 +2329,74 @@ mod tests {
         std::fs::write(tmp.path().join("tsconfig.json"), "{}").unwrap();
         let langs = detect_project_languages(tmp.path());
         assert!(langs.contains(&"typescript".to_string()));
+    }
+
+    // ── workspace context detection ──────────────────────────────────────────
+
+    #[test]
+    fn workspace_context_detects_rust_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]").unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::create_dir(tmp.path().join("tests")).unwrap();
+
+        let ctx = detect_workspace_context(tmp.path());
+        let types = ctx["project_types"].as_array().unwrap();
+        assert!(
+            types.iter().any(|v| v.as_str() == Some("rust")),
+            "should detect rust, got: {ctx}"
+        );
+        assert!(
+            ctx["key_files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str() == Some("Cargo.toml")),
+            "should list Cargo.toml, got: {ctx}"
+        );
+        let dirs = ctx["top_directories"].as_array().unwrap();
+        assert!(
+            dirs.iter().any(|v| v.as_str() == Some("src/")),
+            "should list src/, got: {ctx}"
+        );
+    }
+
+    #[test]
+    fn workspace_context_detects_multiple_project_types() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
+        std::fs::write(tmp.path().join("Makefile"), "").unwrap();
+        std::fs::write(tmp.path().join("Dockerfile"), "").unwrap();
+
+        let ctx = detect_workspace_context(tmp.path());
+        let types = ctx["project_types"].as_array().unwrap();
+        assert!(types.len() >= 3, "should detect 3+ types, got: {ctx}");
+    }
+
+    #[test]
+    fn workspace_context_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = detect_workspace_context(tmp.path());
+        let types = ctx["project_types"].as_array().unwrap();
+        assert!(types.is_empty(), "empty dir should have no project types");
+        let dirs = ctx["top_directories"].as_array().unwrap();
+        assert!(dirs.is_empty(), "empty dir should have no dirs");
+    }
+
+    #[test]
+    fn workspace_context_skips_hidden_and_noise() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::create_dir(tmp.path().join("target")).unwrap();
+        std::fs::create_dir(tmp.path().join("node_modules")).unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+
+        let ctx = detect_workspace_context(tmp.path());
+        let dirs = ctx["top_directories"].as_array().unwrap();
+        let dir_strs: Vec<&str> = dirs.iter().filter_map(|v| v.as_str()).collect();
+        assert!(!dir_strs.contains(&".git/"), "should skip .git");
+        assert!(!dir_strs.contains(&"target/"), "should skip target");
+        assert!(!dir_strs.contains(&"node_modules/"), "should skip node_modules");
+        assert!(dir_strs.contains(&"src/"), "should include src/");
     }
 }

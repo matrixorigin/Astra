@@ -206,6 +206,15 @@ impl ToolExecutor {
             .and_then(Value::as_str)
             .map(|p| self.resolve(p))
             .unwrap_or_else(|| self.project_root.clone());
+
+        // Validate search path exists before spawning grep
+        if !search_path.exists() {
+            return format!(
+                "Error: path '{}' does not exist. Use list_dir to see available files/directories.",
+                search_path.display()
+            );
+        }
+
         let include = args.get("include").and_then(Value::as_str).unwrap_or("*");
         let case_sensitive = args
             .get("case_sensitive")
@@ -236,7 +245,17 @@ impl ToolExecutor {
                             text.to_string()
                         }
                     }
-                    Some(1) => "No matches found".to_string(),
+                    Some(1) => {
+                        // stderr may contain "No such file or directory" warnings
+                        // even when exit code is 1 (grep found no matches but
+                        // some paths were bad)
+                        let warn = stderr.trim();
+                        if warn.is_empty() {
+                            "No matches found".to_string()
+                        } else {
+                            format!("No matches found (warnings: {warn})")
+                        }
+                    }
                     _ => {
                         let detail = stderr.trim();
                         if detail.is_empty() {
@@ -261,6 +280,14 @@ impl ToolExecutor {
             .and_then(Value::as_str)
             .map(|p| self.resolve(p))
             .unwrap_or_else(|| self.project_root.clone());
+
+        // Validate base path exists
+        if !base.exists() {
+            return format!(
+                "Error: path '{}' does not exist. Use list_dir to see available files/directories.",
+                base.display()
+            );
+        }
 
         let shell_cmd = format!(
             "cd {} && find . {} -o -name {} -print | sed 's|^./||' | head -200",
@@ -487,6 +514,31 @@ mod tests {
     }
 
     #[test]
+    fn grep_nonexistent_path_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "hello",
+            "path": "src-tauri/src"
+        }));
+        assert!(result.contains("Error"), "should error on missing path, got: {result}");
+        assert!(result.contains("does not exist"), "should mention path doesn't exist, got: {result}");
+        assert!(result.contains("list_dir"), "should suggest list_dir, got: {result}");
+    }
+
+    #[test]
+    fn grep_nonexistent_absolute_path_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "hello",
+            "path": "/nonexistent/fake/directory"
+        }));
+        assert!(result.contains("Error"), "should error on missing path, got: {result}");
+        assert!(result.contains("does not exist"), "got: {result}");
+    }
+
+    #[test]
     fn grep_finds_pattern_in_file() {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
@@ -538,6 +590,19 @@ mod tests {
             !result.contains("target/cached.rs"),
             "default glob should skip bulky dirs: {result}"
         );
+    }
+
+    #[test]
+    fn glob_nonexistent_path_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.glob(&serde_json::json!({
+            "pattern": "*.py",
+            "path": "nonexistent/directory"
+        }));
+        assert!(result.contains("Error"), "should error on missing path, got: {result}");
+        assert!(result.contains("does not exist"), "got: {result}");
+        assert!(result.contains("list_dir"), "should suggest list_dir, got: {result}");
     }
 
     #[test]
