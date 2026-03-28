@@ -35,6 +35,9 @@ pub fn build_main_system_prompt(
     let has_glob = tool_names.contains(&"glob");
     let has_grep = tool_names.contains(&"grep");
     let has_read_file = tool_names.contains(&"read_file");
+    let has_code_nav = tool_names.contains(&"find_definition") || tool_names.contains(&"find_references");
+    let has_build_test = tool_names.contains(&"run_build_test");
+    let has_git_mutations = tool_names.contains(&"git_commit");
 
     let mut prompt = format!(
         "{SYSTEM_PROMPT_BASE}\n\n\
@@ -96,6 +99,42 @@ pub fn build_main_system_prompt(
     if has_github {
         prompt.push_str(
             "8. For GitHub data: use github_list_prs / github_list_issues / github_repo_stats directly.\n",
+        );
+    }
+
+    // ── Code navigation guidance ──
+    if has_code_nav {
+        prompt.push_str(
+            "\n\
+             ## Code Navigation\n\
+             - **find_definition**: Jump to where a symbol is defined (function, class, struct, trait). Uses tree-sitter AST — more accurate than grep.\n\
+             - **find_references**: Find all usages of a symbol across the codebase. Uses word-boundary matching — fast and precise.\n\
+             - **symbols**: Extract all definitions from a file (outline view). Use with `kinds` filter to get only functions, structs, etc.\n\
+             Use these BEFORE grep when looking for code symbols. They understand language syntax, grep doesn't.\n",
+        );
+    }
+
+    // ── Build/test loop guidance ──
+    if has_build_test {
+        prompt.push_str(
+            "\n\
+             ## Build & Test Loop\n\
+             - Use **run_build_test** instead of bash for build/test commands. It returns structured errors WITH source context.\n\
+             - Each error location includes surrounding code — fix directly with str_replace, no extra read_file needed.\n\
+             - After fixing errors, call run_build_test again to verify. Repeat until clean.\n\
+             - If >3 errors, fix the FIRST one — later errors are often cascading.\n",
+        );
+    }
+
+    // ── Git workflow guidance ──
+    if has_git_mutations {
+        prompt.push_str(
+            "\n\
+             ## Git Workflow\n\
+             - Use **git_commit** to commit changes (stages automatically). Write clear, concise commit messages.\n\
+             - Use **git_stash** push/pop to save and restore work-in-progress.\n\
+             - Use **git_checkout_file** to revert a file to its last committed state if an edit goes wrong.\n\
+             - Commit after each logical milestone — don't accumulate too many uncommitted changes.\n",
         );
     }
 
@@ -174,13 +213,13 @@ pub fn build_main_system_prompt(
             prompt.push_str(
                 "\n\
               ## Implementation Strategy\n\
-              1. **Understand context**: read existing patterns, naming conventions, module structure.\n\
-              2. **Find the right location**: glob → grep → read targeted sections.\n\
-              3. **Check dependencies**: imports, types, traits needed for your change.\n\
-              4. **Implement surgically**: minimal changes, follow existing style.\n\
-              5. **Wire it up**: add imports, register new modules, update exports.\n\
-              6. **Verify**: build first, then run relevant tests. Fix any errors before reporting.\n\
-              7. If the task is large, break it into smaller steps and verify each.\n",
+              1. **Understand context**: read patterns, naming, module structure.\n\
+              2. **Find location**: find_definition → glob → grep → read sections.\n\
+              3. **Check deps**: find_references to see usage elsewhere.\n\
+              4. **Implement surgically**: minimal changes, follow style. str_replace auto-formats.\n\
+              5. **Wire it up**: add imports, register modules, update exports.\n\
+              6. **Verify**: run_build_test, fix from structured output, repeat.\n\
+              7. **Commit**: git_commit with a clear message.\n",
             );
         }
         Some("refactoring") => {
@@ -267,9 +306,12 @@ pub fn build_main_system_prompt(
     prompt.push_str(
         "\n\
          ## Tool Precedence (prefer earlier tools in each chain)\n\
+         - **Code navigation**: find_definition / find_references → grep → read_file (targeted ranges)\n\
          - **File search**: glob (by name) → grep (by content) → log search (by commit message)\n\
-         - **Code edit**: read first → surgical replace. Use write only for new files.\n\
+         - **Code edit**: read context → str_replace (auto-formats) → run_build_test to verify\n\
          - **Git investigation**: status → diff → log → show → blame\n\
+         - **Git changes**: edit files → git_commit. Use git_checkout_file to revert mistakes.\n\
+         - **Build/test**: run_build_test (structured) → fix errors from locations → repeat\n\
          - **GitHub**: list (PRs/issues) → detail (single PR/issue) → CI status\n",
     );
     if has_memory {
@@ -1046,5 +1088,77 @@ mod tests {
             });
             assert!(has_en, "task type '{}' missing English keywords", label);
         }
+    }
+
+    #[test]
+    fn code_nav_guidance_present_when_tools_available() {
+        let p = build_main_system_prompt(
+            &["find_definition", "find_references", "symbols"],
+            "",
+            0.5,
+            Some("implementation"),
+        );
+        assert!(p.contains("Code Navigation"), "should include code nav section");
+        assert!(p.contains("find_definition"), "should mention find_definition");
+        assert!(p.contains("tree-sitter"), "should mention tree-sitter advantage");
+    }
+
+    #[test]
+    fn code_nav_guidance_absent_without_tools() {
+        let p = build_main_system_prompt(&["bash", "read_file"], "", 0.5, Some("implementation"));
+        assert!(!p.contains("Code Navigation"), "should NOT include code nav without tools");
+    }
+
+    #[test]
+    fn build_test_guidance_present_when_tool_available() {
+        let p = build_main_system_prompt(
+            &["run_build_test", "str_replace"],
+            "",
+            0.5,
+            Some("implementation"),
+        );
+        assert!(p.contains("Build & Test Loop"), "should include build/test section");
+        assert!(p.contains("run_build_test"), "should mention the tool");
+        assert!(p.contains("structured errors"), "should describe structured output");
+    }
+
+    #[test]
+    fn build_test_guidance_absent_without_tool() {
+        let p = build_main_system_prompt(&["bash"], "", 0.5, Some("implementation"));
+        assert!(!p.contains("Build & Test Loop"), "should NOT include build/test without tool");
+    }
+
+    #[test]
+    fn git_mutations_guidance_present_when_tools_available() {
+        let p = build_main_system_prompt(
+            &["git_commit", "git_stash", "git_checkout_file"],
+            "",
+            0.5,
+            Some("implementation"),
+        );
+        assert!(p.contains("Git Workflow"), "should include git workflow section");
+        assert!(p.contains("git_commit"), "should mention git_commit");
+        assert!(p.contains("git_stash"), "should mention git_stash");
+        assert!(p.contains("git_checkout_file"), "should mention git_checkout_file");
+    }
+
+    #[test]
+    fn git_mutations_guidance_absent_without_tools() {
+        let p = build_main_system_prompt(&["git_diff", "git_log"], "", 0.5, None);
+        assert!(!p.contains("Git Workflow"), "should NOT include git mutations without commit tool");
+    }
+
+    #[test]
+    fn implementation_strategy_references_new_tools() {
+        let p = build_main_system_prompt(
+            &["find_definition", "run_build_test", "git_commit"],
+            "",
+            0.5,
+            Some("implementation"),
+        );
+        assert!(p.contains("find_definition"), "strategy should reference find_definition");
+        assert!(p.contains("run_build_test"), "strategy should reference run_build_test");
+        assert!(p.contains("git_commit"), "strategy should reference git_commit");
+        assert!(p.contains("str_replace auto-formats"), "strategy should mention auto-format");
     }
 }
