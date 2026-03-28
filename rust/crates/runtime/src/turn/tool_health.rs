@@ -82,8 +82,7 @@ impl ToolHealthTracker {
             health.consecutive_successes = 1; // reset counter on rehab
         }
         // After enough consecutive successes, clear "flaky" flag
-        if health.consecutive_successes >= REHAB_STABILITY_WINDOW
-            && health.rehabilitation_count > 0
+        if health.consecutive_successes >= REHAB_STABILITY_WINDOW && health.rehabilitation_count > 0
         {
             health.rehabilitation_count = 0;
         }
@@ -541,7 +540,10 @@ mod tests {
         let mut tracker = ToolHealthTracker::new();
         // Step 1: resource limit → immediate deprioritize
         tracker.record_resource_limit_failure("bash");
-        assert!(tracker.is_deprioritized("bash"), "must be deprioritized after resource limit");
+        assert!(
+            tracker.is_deprioritized("bash"),
+            "must be deprioritized after resource limit"
+        );
 
         // Step 2: if record_success is called (what the old code did via
         // classify_result → Success), it rehabilitates — THIS IS THE BUG.
@@ -571,8 +573,14 @@ mod tests {
         // If record_failure is also called (the old code path), it double-counts
         tracker.record_failure("bash");
         let health = tracker.get("bash").unwrap();
-        assert_eq!(health.total_calls, 2, "double call = double count (the bug)");
-        assert_eq!(health.total_failures, 2, "double call = double failure count");
+        assert_eq!(
+            health.total_calls, 2,
+            "double call = double count (the bug)"
+        );
+        assert_eq!(
+            health.total_failures, 2,
+            "double call = double failure count"
+        );
 
         // The fix: skip record_tool_result() when resource_limit_recorded=true
     }
@@ -600,7 +608,10 @@ mod tests {
         // Now threshold is lowered to 2 consecutive failures
         tracker.record_failure("bash");
         tracker.record_failure("bash");
-        assert!(tracker.is_deprioritized("bash"), "flaky tool should deprioritize faster");
+        assert!(
+            tracker.is_deprioritized("bash"),
+            "flaky tool should deprioritize faster"
+        );
 
         // Rehabilitate and then sustain success for stability window
         tracker.record_success("bash"); // rehab
@@ -611,7 +622,8 @@ mod tests {
         }
         // rehabilitation_count should be reset
         assert_eq!(
-            tracker.get("bash").unwrap().rehabilitation_count, 0,
+            tracker.get("bash").unwrap().rehabilitation_count,
+            0,
             "rehab_count must reset after {} consecutive successes",
             REHAB_STABILITY_WINDOW
         );

@@ -325,12 +325,8 @@ pub enum IntentDrift {
 pub const INTENT_DRIFT_WINDOW: usize = 3;
 
 /// Tools that are always considered on-task (utility/meta tools).
-const ALWAYS_ON_TASK_TOOLS: &[&str] = &[
-    "memory_search",
-    "memory_store",
-    "reflect",
-    "get_agent_info",
-];
+const ALWAYS_ON_TASK_TOOLS: &[&str] =
+    &["memory_search", "memory_store", "reflect", "get_agent_info"];
 
 /// Extract keywords from user query for intent matching.
 /// Lowercases and splits on whitespace/punctuation, filters short words.
@@ -361,11 +357,7 @@ fn tools_relate_to_intent(
         return true;
     }
 
-    let combined = format!(
-        "{} {}",
-        tool_names.join(" "),
-        tool_args_text.to_lowercase()
-    );
+    let combined = format!("{} {}", tool_names.join(" "), tool_args_text.to_lowercase());
 
     // Check if any intent keyword appears in tool names or args
     let match_count = intent_keywords
@@ -859,8 +851,14 @@ mod tests {
         let sigs = server_tool_call_signature(&tool_calls);
         assert_eq!(sigs.len(), 1);
         let sig = sigs.iter().next().unwrap();
-        assert!(sig.starts_with("read_file:"), "expected read_file prefix, got: {sig}");
-        assert!(sig.contains("main.rs"), "expected main.rs in sig, got: {sig}");
+        assert!(
+            sig.starts_with("read_file:"),
+            "expected read_file prefix, got: {sig}"
+        );
+        assert!(
+            sig.contains("main.rs"),
+            "expected main.rs in sig, got: {sig}"
+        );
     }
 
     #[test]
@@ -873,8 +871,14 @@ mod tests {
         let sigs = server_tool_call_signature(&tool_calls);
         assert_eq!(sigs.len(), 1);
         let sig = sigs.iter().next().unwrap();
-        assert!(sig.starts_with("read_file:"), "expected read_file prefix, got: {sig}");
-        assert!(sig.contains("main.rs"), "expected main.rs in sig, got: {sig}");
+        assert!(
+            sig.starts_with("read_file:"),
+            "expected read_file prefix, got: {sig}"
+        );
+        assert!(
+            sig.contains("main.rs"),
+            "expected main.rs in sig, got: {sig}"
+        );
     }
 
     #[test]
@@ -890,7 +894,10 @@ mod tests {
         })];
         let sigs_a = server_tool_call_signature(&calls_a);
         let sigs_b = server_tool_call_signature(&calls_b);
-        assert_ne!(sigs_a, sigs_b, "different paths must produce different signatures");
+        assert_ne!(
+            sigs_a, sigs_b,
+            "different paths must produce different signatures"
+        );
     }
 
     #[test]
@@ -905,7 +912,10 @@ mod tests {
         })];
         let sigs_a = server_tool_call_signature(&calls_a);
         let sigs_b = server_tool_call_signature(&calls_b);
-        assert_ne!(sigs_a, sigs_b, "different tool names must produce different signatures");
+        assert_ne!(
+            sigs_a, sigs_b,
+            "different tool names must produce different signatures"
+        );
     }
 
     /// Regression test for session 2c701822: flat-format tool calls were

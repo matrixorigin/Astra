@@ -1374,7 +1374,7 @@ mod tests {
 
         let write_result = executor.write_file(&json!({"path": path, "content": "hello world"}));
         assert!(
-            write_result.contains("Written"),
+            write_result.contains("\"success\":true") || write_result.contains("\"success\": true"),
             "write failed: {write_result}"
         );
 

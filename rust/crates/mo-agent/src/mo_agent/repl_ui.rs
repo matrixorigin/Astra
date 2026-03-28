@@ -302,12 +302,9 @@ fn picker_rows_for_filter() -> Vec<(&'static str, &'static str)> {
 fn picker_selected_command() -> Option<&'static str> {
     let rows = picker_rows_for_filter();
     let selected = get_slash_picker_selected();
-    rows.get(selected).map(|(cmd, _)| *cmd).or_else(|| {
-        match resolve_slash_command(&format!("/{}", get_slash_filter()?)) {
-            Ok(cmd) => Some(cmd),
-            Err(_) => None,
-        }
-    })
+    rows.get(selected)
+        .map(|(cmd, _)| *cmd)
+        .or_else(|| resolve_slash_command(&format!("/{}", get_slash_filter()?)).ok())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -326,10 +323,7 @@ fn accepted_slash_edit(
         return None;
     }
 
-    let cmd = selected.or_else(|| match resolve_slash_command(current) {
-        Ok(cmd) => Some(cmd),
-        Err(_) => None,
-    })?;
+    let cmd = selected.or_else(|| resolve_slash_command(current).ok())?;
 
     if let Some(rest) = cmd.strip_prefix(current) {
         let mut suffix = rest.to_string();
@@ -688,13 +682,12 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
         .lock()
         .map(|g| *g > 0)
         .unwrap_or(false);
-    if already_visible {
-        if let Ok(state) = slash_overlay_state().lock()
-            && state.0 == norm
-            && state.1 == selected
-        {
-            return;
-        }
+    if already_visible
+        && let Ok(state) = slash_overlay_state().lock()
+        && state.0 == norm
+        && state.1 == selected
+    {
+        return;
     }
 
     // Erase previous overlay (but preserve selected index across redraw)
@@ -717,6 +710,7 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
 
     let mut printed: u16 = 0;
     let visible_limit = 10usize;
+    #[allow(clippy::type_complexity)]
     let mut body_contents: Vec<(Option<(&'static str, &'static str, bool)>, String)> = Vec::new();
     if rows.is_empty() {
         let label = filter.unwrap_or("");
@@ -875,12 +869,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
             "╮".dim()
         );
     } else {
-        eprintln!(
-            "  {} {} {}",
-            "╭".dim(),
-            "Command Palette".bold(),
-            "╮".dim()
-        );
+        eprintln!("  {} {} {}", "╭".dim(), "Command Palette".bold(), "╮".dim());
     }
     eprintln!("  {}", bar.as_str().dim());
 
@@ -888,7 +877,11 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
 
     // Icon-decorated groups: (icon, title, commands)
     let groups: &[(&str, &str, &[&str])] = &[
-        ("⚡", "Core", &["/help", "/model", "/clear", "/exit", "/keys"]),
+        (
+            "⚡",
+            "Core",
+            &["/help", "/model", "/clear", "/exit", "/keys"],
+        ),
         (
             "📁",
             "Workspace",
@@ -958,7 +951,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
         .collect();
     if !alias_lines.is_empty() {
         any_results = true;
-        eprintln!("  {} {}", "↪", "Aliases".bold().cyan());
+        eprintln!("  ↪ {}", "Aliases".bold().cyan());
         for line in alias_lines {
             eprintln!("{line}");
         }
@@ -974,8 +967,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
     eprintln!("  {}", bar.as_str().dim());
     if filter.is_none() {
         eprintln!(
-            "  {}  {}",
-            "💡".to_string(),
+            "  💡  {}",
             "Type / then start typing to filter  ·  Tab to complete  ·  Enter to run".dim()
         );
     }
@@ -1245,10 +1237,10 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 let rows = picker_rows_for_filter();
                 let selected = get_slash_picker_selected();
                 clear_slash_overlay();
-                if let Some((cmd, _)) = rows.get(selected) {
-                    if *cmd != current {
-                        set_slash_pending_execute(Some(cmd.to_string()));
-                    }
+                if let Some((cmd, _)) = rows.get(selected)
+                    && *cmd != current
+                {
+                    set_slash_pending_execute(Some(cmd.to_string()));
                 }
                 return None; // AcceptLine → immediate execution
             }

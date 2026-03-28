@@ -696,7 +696,10 @@ mod tests {
 
         let a = IngestionEvent::expand_journal_event(&journal, "u1");
         let b = IngestionEvent::expand_journal_event(&journal, "u1");
-        assert_eq!(a[1].event_id, b[1].event_id, "tool_call events should be deterministic");
+        assert_eq!(
+            a[1].event_id, b[1].event_id,
+            "tool_call events should be deterministic"
+        );
     }
 
     #[test]

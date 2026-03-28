@@ -501,18 +501,18 @@ fn render_reflect_report(body: &str, session_id: &str) {
     );
 
     // Top skills
-    if let Some(skills) = overview["top_skills"].as_array() {
-        if !skills.is_empty() {
-            let skill_strs: Vec<String> = skills
-                .iter()
-                .filter_map(|s| {
-                    let name = s[0].as_str()?;
-                    let cnt = s[1].as_i64()?;
-                    Some(format!("{name}({cnt})"))
-                })
-                .collect();
-            eprintln!("  {} {}", "Skills:".bold(), skill_strs.join(", "));
-        }
+    if let Some(skills) = overview["top_skills"].as_array()
+        && !skills.is_empty()
+    {
+        let skill_strs: Vec<String> = skills
+            .iter()
+            .filter_map(|s| {
+                let name = s[0].as_str()?;
+                let cnt = s[1].as_i64()?;
+                Some(format!("{name}({cnt})"))
+            })
+            .collect();
+        eprintln!("  {} {}", "Skills:".bold(), skill_strs.join(", "));
     }
 
     // Errors summary
@@ -532,13 +532,13 @@ fn render_reflect_report(body: &str, session_id: &str) {
     // ── Diagnoses (primary output — root-cause analysis) ────────────
     let has_diagnoses = report["diagnoses"]
         .as_array()
-        .map_or(false, |d| !d.is_empty());
+        .is_some_and(|d| !d.is_empty());
     let has_insights = report["insights"]
         .as_array()
-        .map_or(false, |arr| arr.iter().any(|i| i["severity"].as_str() != Some("info")));
+        .is_some_and(|arr| arr.iter().any(|i| i["severity"].as_str() != Some("info")));
     let has_recs = report["recommendations"]
         .as_array()
-        .map_or(false, |r| !r.is_empty());
+        .is_some_and(|r| !r.is_empty());
 
     if has_diagnoses {
         eprintln!();
@@ -549,15 +549,17 @@ fn render_reflect_report(body: &str, session_id: &str) {
             let fix = diag["fix_hint"].as_str().unwrap_or("");
 
             match severity {
-                "critical" => eprintln!("  {} {}", "🔴", summary.red().bold()),
-                "warning" => eprintln!("  {} {}", "⚠️", summary.yellow()),
-                _ => eprintln!("  {} {}", "ℹ️", summary),
+                "critical" => eprintln!("  🔴 {}", summary.red().bold()),
+                "warning" => eprintln!("  ⚠️ {}", summary.yellow()),
+                _ => eprintln!("  ℹ️ {}", summary),
             }
 
             // Show sample errors (truncated)
             if let Some(samples) = diag["samples"].as_array() {
                 for (i, sample) in samples.iter().enumerate() {
-                    if i >= 2 { break; }
+                    if i >= 2 {
+                        break;
+                    }
                     if let Some(s) = sample.as_str() {
                         let truncated: String = s.chars().take(80).collect();
                         eprintln!("    {} {}", "│".dim(), truncated.dim());
@@ -590,9 +592,9 @@ fn render_reflect_report(body: &str, session_id: &str) {
                 format!("{message} — {evidence}")
             };
             match severity {
-                "critical" => eprintln!("  {} {}", "🔴", line.red().bold()),
-                "warning" => eprintln!("  {} {}", "⚠️", line.yellow()),
-                _ => eprintln!("  {} {}", "ℹ️", line.dim()),
+                "critical" => eprintln!("  🔴 {}", line.red().bold()),
+                "warning" => eprintln!("  ⚠️ {}", line.yellow()),
+                _ => eprintln!("  ℹ️ {}", line.dim()),
             }
         }
     }
@@ -612,34 +614,31 @@ fn render_reflect_report(body: &str, session_id: &str) {
     if !has_diagnoses && !has_insights && !has_recs {
         eprintln!();
         if total_events == 0 {
-            eprintln!("  {} {}", "ℹ️", "Empty session — no events recorded yet.".dim());
+            eprintln!("  ℹ️ {}", "Empty session — no events recorded yet.".dim());
         } else if error_count == 0 {
-            eprintln!("  {} {}", "✅", "Session healthy — no errors detected.".green());
+            eprintln!("  ✅ {}", "Session healthy — no errors detected.".green());
             // Show event distribution as useful info
-            if let Some(types) = overview["top_event_types"].as_array() {
-                if !types.is_empty() {
-                    let type_strs: Vec<String> = types
-                        .iter()
-                        .filter_map(|t| {
-                            let name = t[0].as_str()?;
-                            let cnt = t[1].as_i64()?;
-                            Some(format!("{name}({cnt})"))
-                        })
-                        .collect();
-                    eprintln!("  {} {}", "Events:".bold(), type_strs.join(", "));
-                }
+            if let Some(types) = overview["top_event_types"].as_array()
+                && !types.is_empty()
+            {
+                let type_strs: Vec<String> = types
+                    .iter()
+                    .filter_map(|t| {
+                        let name = t[0].as_str()?;
+                        let cnt = t[1].as_i64()?;
+                        Some(format!("{name}({cnt})"))
+                    })
+                    .collect();
+                eprintln!("  {} {}", "Events:".bold(), type_strs.join(", "));
             }
         } else {
-            eprintln!("  {} {}", "ℹ️", "No actionable issues found.".dim());
+            eprintln!("  ℹ️ {}", "No actionable issues found.".dim());
         }
         eprintln!();
         eprintln!(
             "  {}",
             "Tip: /reflect skill_failure — focus on tool errors".dim()
         );
-        eprintln!(
-            "  {}",
-            "     /reflect performance — focus on latency".dim()
-        );
+        eprintln!("  {}", "     /reflect performance — focus on latency".dim());
     }
 }

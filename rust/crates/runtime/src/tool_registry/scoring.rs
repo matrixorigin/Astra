@@ -207,6 +207,7 @@ fn file_context_tool_boost(tool_name: &str, file_context: &[String]) -> f64 {
     if boost { 0.05 } else { 0.0 }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tool_relevance_score(
     tool: &ToolMeta,
     tool_idx: usize,
@@ -303,9 +304,9 @@ fn tool_relevance_score(
     // soften the gate to avoid blocking valid tools. By turn 3+ the
     // recent_tools history is populated enough for the normal gate.
     let cold_start_factor = match state.turn_count {
-        0..=1 => 0.5,  // Halve gate on first 2 turns
-        2 => 0.75,     // Slightly relaxed on turn 3
-        _ => 1.0,      // Normal gate
+        0..=1 => 0.5, // Halve gate on first 2 turns
+        2 => 0.75,    // Slightly relaxed on turn 3
+        _ => 1.0,     // Normal gate
     };
     let effective_gate = if !memory_domain_hints.is_empty() {
         let tool_in_memory_domain = tool.intents.iter().any(|intent| {
@@ -488,6 +489,7 @@ pub fn pre_filter_dynamic_with_cooccurrence(
 
 /// Full pre-filter with pressure, co-occurrence, AND file-context scoring.
 /// This is the most complete scoring path for production use.
+#[allow(clippy::too_many_arguments)]
 pub fn pre_filter_dynamic_with_file_context(
     state: &ConversationState,
     query: &str,
@@ -511,6 +513,7 @@ pub fn pre_filter_dynamic_with_file_context(
 }
 
 /// Internal: pressure + co-occurrence + file-context combined.
+#[allow(clippy::too_many_arguments)]
 fn pre_filter_dynamic_with_pressure_and_cooccurrence(
     state: &ConversationState,
     query: &str,
@@ -780,9 +783,7 @@ fn ensure_intent_diversity(
         // a 0.02-scoring tool wastes a schema slot without helping.
         if let Some(&best) = all_scored
             .iter()
-            .find(|&&(idx, score)| {
-                TOOL_CATALOG[idx].intents.contains(intent) && score >= 0.10
-            })
+            .find(|&&(idx, score)| TOOL_CATALOG[idx].intents.contains(intent) && score >= 0.10)
         {
             result.push(best);
         }
@@ -807,9 +808,10 @@ mod tests {
     use crate::tool_registry::state::ConversationState;
 
     fn state_at_turn(turn: u32) -> ConversationState {
-        let mut s = ConversationState::default();
-        s.turn_count = turn;
-        s
+        ConversationState {
+            turn_count: turn,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -852,8 +854,10 @@ mod tests {
     fn intent_diversity_rejects_low_score_tools() {
         // Simulate: GitHub intent is active, but the only GitHub-intent tool
         // scored 0.05 (below the 0.10 floor).
-        let mut state = ConversationState::default();
-        state.is_github = true;
+        let state = ConversationState {
+            is_github: true,
+            ..Default::default()
+        };
 
         // We can't easily construct TOOL_CATALOG entries, but we can verify
         // the logic: the function skips tools whose score < 0.10.

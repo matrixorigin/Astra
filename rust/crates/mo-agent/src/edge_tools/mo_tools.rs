@@ -304,11 +304,7 @@ impl ToolExecutor {
 
                 let git_branch = super::git_gix::current_branch(&self.project_root);
                 let git_head = super::git_gix::head_short(&self.project_root);
-                result.push_str(&format!(
-                    "Git: branch={}, head={}\n",
-                    git_branch,
-                    git_head
-                ));
+                result.push_str(&format!("Git: branch={}, head={}\n", git_branch, git_head));
 
                 let snapshots = mo_execute_sql("SHOW SNAPSHOTS", None);
                 result.push_str(&format!("MatrixOne snapshots:\n{}\n", snapshots));
@@ -318,8 +314,7 @@ impl ToolExecutor {
                 if snapshots.contains(&expected_name) {
                     result.push_str(&format!(
                         "\n✅ Data branch '{}' exists for git branch '{}'",
-                        expected_name,
-                        git_branch
+                        expected_name, git_branch
                     ));
                 } else {
                     result.push_str(&format!(

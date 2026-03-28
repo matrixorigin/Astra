@@ -128,15 +128,14 @@ fn migrate_v0_to_v1000(_from: u32, data: &serde_json::Value) -> Result<serde_jso
             );
         }
         // If this is a Heavy checkpoint, ensure the inner light has it too
-        if let Some(light) = obj.get_mut("light") {
-            if let Some(light_obj) = light.as_object_mut() {
-                if !light_obj.contains_key("protocol_version") {
-                    light_obj.insert(
-                        "protocol_version".to_string(),
-                        serde_json::json!(PROTOCOL_VERSION),
-                    );
-                }
-            }
+        if let Some(light) = obj.get_mut("light")
+            && let Some(light_obj) = light.as_object_mut()
+            && !light_obj.contains_key("protocol_version")
+        {
+            light_obj.insert(
+                "protocol_version".to_string(),
+                serde_json::json!(PROTOCOL_VERSION),
+            );
         }
         Ok(migrated)
     } else {

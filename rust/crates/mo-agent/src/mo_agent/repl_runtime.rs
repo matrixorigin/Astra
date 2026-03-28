@@ -428,7 +428,7 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
                 user_display.yellow().to_string()
             },
             model_display.cyan(),
-            session_display.as_str().dim().to_string(),
+            session_display.as_str().dim(),
         ),
         format!(
             "  {}",
@@ -803,17 +803,20 @@ mod tests {
 
     #[test]
     fn session_display_shows_truncated_id_for_fresh_session() {
-        let mut state = ReplState::default();
-        state.session_id = Some("abcdef12-3456-7890".to_string());
-        state.turn = 0;
+        let state = ReplState {
+            session_id: Some("abcdef12-3456-7890".to_string()),
+            ..Default::default()
+        };
         assert_eq!(banner_session_display(&state), "abcdef12");
     }
 
     #[test]
     fn session_display_shows_resumed_for_restored_session() {
-        let mut state = ReplState::default();
-        state.session_id = Some("abcdef12-3456-7890".to_string());
-        state.turn = 3; // Has prior turns → resumed
+        let state = ReplState {
+            session_id: Some("abcdef12-3456-7890".to_string()),
+            turn: 3,
+            ..Default::default()
+        };
         assert_eq!(banner_session_display(&state), "abcdef12 (resumed)");
     }
 
@@ -826,8 +829,10 @@ mod tests {
 
     #[test]
     fn model_display_shows_actual_name_when_set() {
-        let mut state = ReplState::default();
-        state.model = Some("gpt-5".to_string());
+        let state = ReplState {
+            model: Some("gpt-5".to_string()),
+            ..Default::default()
+        };
         let display = state.model.as_deref().unwrap_or("auto");
         assert_eq!(display, "gpt-5");
     }

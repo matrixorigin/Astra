@@ -920,7 +920,10 @@ mod tests {
     fn adaptive_threshold_medium_query_normal_bar() {
         let medium = "how do I fix the authentication bug in login";
         assert!(medium.chars().count() > 20 && medium.chars().count() <= 100);
-        assert_eq!(super::adaptive_threshold(medium), super::MEMORY_RELEVANCE_THRESHOLD);
+        assert_eq!(
+            super::adaptive_threshold(medium),
+            super::MEMORY_RELEVANCE_THRESHOLD
+        );
     }
 
     #[test]
@@ -941,7 +944,11 @@ mod tests {
             "git status diff check".to_string(),
         ];
         let ranked = rank_memory_results(query, &memories);
-        assert!(ranked.len() <= 4, "Should trim tight cluster: got {}", ranked.len());
+        assert!(
+            ranked.len() <= 4,
+            "Should trim tight cluster: got {}",
+            ranked.len()
+        );
     }
 
     #[test]

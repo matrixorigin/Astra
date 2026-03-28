@@ -758,7 +758,7 @@ mod tests {
         }
 
         let scores = lib.co_occurrence_scores(&tools(&["bash"]));
-        for (_, score) in &scores {
+        for score in scores.values() {
             assert!(*score >= 0.0 && *score <= 1.0, "Scores must be 0.0-1.0");
         }
     }

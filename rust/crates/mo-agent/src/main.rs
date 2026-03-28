@@ -1269,15 +1269,12 @@ async fn try_cloud_pull_preferences(state: &mut ReplState) {
         Ok(prefs) if !prefs.is_empty() => {
             use mo_agent_services::state_sync::pref_keys;
             for (key, value) in &prefs {
-                match key.as_str() {
-                    pref_keys::EXPLAIN_MODE => {
-                        state.explain = match value.as_str() {
-                            "on" => ExplainMode::On,
-                            "verbose" => ExplainMode::Verbose,
-                            _ => ExplainMode::Off,
-                        };
-                    }
-                    _ => {} // other prefs stored but not yet applied
+                if key.as_str() == pref_keys::EXPLAIN_MODE {
+                    state.explain = match value.as_str() {
+                        "on" => ExplainMode::On,
+                        "verbose" => ExplainMode::Verbose,
+                        _ => ExplainMode::Off,
+                    };
                 }
             }
             eprintln!(
@@ -1901,8 +1898,9 @@ async fn run_chat_repl(
                     // to prevent data loss on crash (every CHECKPOINT_INTERVAL turns)
                     if state.matrixone_pool.is_some()
                         && state.turn > 0
-                        && state.turn % mo_agent_services::session_checkpoint::CHECKPOINT_INTERVAL
-                            == 0
+                        && state.turn.is_multiple_of(
+                            mo_agent_services::session_checkpoint::CHECKPOINT_INTERVAL,
+                        )
                     {
                         try_cloud_push(
                             &profile_name_str,
@@ -2735,23 +2733,25 @@ mod tests {
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
-        let mut state = ReplState::default();
-        state.tool_health_entries = vec![
-            mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
-                name: "bash".into(),
-                total_calls: 15,
-                total_failures: 3,
-                failure_rate: 0.2,
-                last_updated_epoch: 0,
-            },
-            mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
-                name: "grep".into(),
-                total_calls: 8,
-                total_failures: 0,
-                failure_rate: 0.0,
-                last_updated_epoch: 0,
-            },
-        ];
+        let mut state = ReplState {
+            tool_health_entries: vec![
+                mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
+                    name: "bash".into(),
+                    total_calls: 15,
+                    total_failures: 3,
+                    failure_rate: 0.2,
+                    last_updated_epoch: 0,
+                },
+                mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
+                    name: "grep".into(),
+                    total_calls: 8,
+                    total_failures: 0,
+                    failure_rate: 0.0,
+                    last_updated_epoch: 0,
+                },
+            ],
+            ..Default::default()
+        };
         let exit = handle_slash_command(
             "/health",
             &client,
@@ -2772,15 +2772,16 @@ mod tests {
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
-        let mut state = ReplState::default();
-        state.tool_health_entries =
-            vec![mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
+        let mut state = ReplState {
+            tool_health_entries: vec![mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
                 name: "bash".into(),
                 total_calls: 10,
                 total_failures: 5,
                 failure_rate: 0.5,
                 last_updated_epoch: 0,
-            }];
+            }],
+            ..Default::default()
+        };
         let exit = handle_slash_command(
             "/health detail",
             &client,

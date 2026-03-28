@@ -295,7 +295,7 @@ pub fn build_diagnoses(raw_errors: &[RawError]) -> Vec<Diagnosis> {
                 ErrorClass::Auth => "Re-authenticate with `/login`. Check token expiry. Verify API credentials in environment variables.".to_string(),
                 ErrorClass::Network => "Check network connectivity and proxy settings. Verify `NO_PROXY=localhost,127.0.0.1` for local services. Check if target service is running.".to_string(),
                 ErrorClass::Timeout => format!("Tool `{tool}` is slow. Consider breaking the operation into smaller chunks or increasing the timeout."),
-                ErrorClass::FileNotFound => format!("Agent guessed wrong paths. Use `list_dir` before `read_file`/`grep`. Check that the workspace context is accurate."),
+                ErrorClass::FileNotFound => "Agent guessed wrong paths. Use `list_dir` before `read_file`/`grep`. Check that the workspace context is accurate.".to_string(),
                 ErrorClass::ToolMisuse => "Model is calling tools with wrong parameters. This may improve with a better model or clearer system prompt.".to_string(),
                 ErrorClass::DatabaseError => "Check MatrixOne connectivity and SQL syntax. Use CAST for DATETIME columns, MIN/MAX for non-grouped columns.".to_string(),
                 ErrorClass::Stall => "Agent is stuck in a loop. Try `/rewind` to go back, or switch to a different model with `/model`. Break complex tasks into smaller steps.".to_string(),
@@ -316,7 +316,11 @@ pub fn build_diagnoses(raw_errors: &[RawError]) -> Vec<Diagnosis> {
 
     // Sort: critical first, then by occurrence count
     diagnoses.sort_by(|a, b| {
-        let sev_ord = |s: &str| match s { "critical" => 0, "warning" => 1, _ => 2 };
+        let sev_ord = |s: &str| match s {
+            "critical" => 0,
+            "warning" => 1,
+            _ => 2,
+        };
         sev_ord(&a.severity)
             .cmp(&sev_ord(&b.severity))
             .then(b.occurrences.cmp(&a.occurrences))
@@ -361,17 +365,17 @@ pub fn generate_insights(
         }
     }
 
-    if let Some((skill, count)) = overview.top_skills.first() {
-        if overview.total_events > 0 {
-            let pct = (*count as f64 / overview.total_events as f64) * 100.0;
-            if pct > 60.0 {
-                insights.push(Insight {
-                    severity: "info".into(),
-                    category: "tool_usage".into(),
-                    message: format!("Over-reliance on {skill}: {pct:.0}%"),
-                    evidence: format!("{count}/{}", overview.total_events),
-                });
-            }
+    if let Some((skill, count)) = overview.top_skills.first()
+        && overview.total_events > 0
+    {
+        let pct = (*count as f64 / overview.total_events as f64) * 100.0;
+        if pct > 60.0 {
+            insights.push(Insight {
+                severity: "info".into(),
+                category: "tool_usage".into(),
+                message: format!("Over-reliance on {skill}: {pct:.0}%"),
+                evidence: format!("{count}/{}", overview.total_events),
+            });
         }
     }
 
@@ -428,16 +432,19 @@ pub fn generate_recommendations(
                 recs.push("Consider using more diverse tools for better coverage".into());
             }
             (_, "stall") => {
-                recs.push("Review agent routing — events without decisions may be misconfigured".into());
+                recs.push(
+                    "Review agent routing — events without decisions may be misconfigured".into(),
+                );
             }
             _ => {}
         }
     }
 
-    if let Some(dur) = overview.duration_minutes {
-        if dur > 30.0 && overview.total_events > 100 {
-            recs.push("Long session — consider breaking into smaller tasks".into());
-        }
+    if let Some(dur) = overview.duration_minutes
+        && dur > 30.0
+        && overview.total_events > 100
+    {
+        recs.push("Long session — consider breaking into smaller tasks".into());
     }
 
     recs.dedup();
@@ -527,7 +534,8 @@ impl ReflectService for DatabaseReflectService {
         let last_event: Option<String> = overview_row.try_get("last_event").unwrap_or(None);
 
         // Compute duration in Rust from timestamp strings
-        let duration_minutes = compute_duration_minutes(first_event.as_deref(), last_event.as_deref());
+        let duration_minutes =
+            compute_duration_minutes(first_event.as_deref(), last_event.as_deref());
 
         let error_rate_pct = if total_events > 0 {
             (error_count as f64 / total_events as f64) * 100.0
@@ -758,14 +766,22 @@ mod tests {
     fn insight_high_error_rate() {
         let overview = make_overview(100, 40, vec![], 5, None);
         let insights = generate_insights(&overview, &[], &[]);
-        assert!(insights.iter().any(|i| i.severity == "critical" && i.category == "error_pattern"));
+        assert!(
+            insights
+                .iter()
+                .any(|i| i.severity == "critical" && i.category == "error_pattern")
+        );
     }
 
     #[test]
     fn insight_elevated_error_rate() {
         let overview = make_overview(100, 20, vec![], 5, None);
         let insights = generate_insights(&overview, &[], &[]);
-        assert!(insights.iter().any(|i| i.severity == "warning" && i.category == "error_pattern"));
+        assert!(
+            insights
+                .iter()
+                .any(|i| i.severity == "warning" && i.category == "error_pattern")
+        );
     }
 
     #[test]
@@ -785,7 +801,11 @@ mod tests {
             sample_error: "permission denied".into(),
         }];
         let insights = generate_insights(&overview, &patterns, &[]);
-        assert!(insights.iter().any(|i| i.category == "tool_usage" && i.message.contains("bash")));
+        assert!(
+            insights
+                .iter()
+                .any(|i| i.category == "tool_usage" && i.message.contains("bash"))
+        );
     }
 
     #[test]
@@ -798,7 +818,11 @@ mod tests {
             sample_error: "not found".into(),
         }];
         let insights = generate_insights(&overview, &patterns, &[]);
-        assert!(!insights.iter().any(|i| i.category == "tool_usage" && i.message.contains("bash")));
+        assert!(
+            !insights
+                .iter()
+                .any(|i| i.category == "tool_usage" && i.message.contains("bash"))
+        );
     }
 
     #[test]
@@ -810,7 +834,13 @@ mod tests {
 
     #[test]
     fn insight_no_over_reliance_when_balanced() {
-        let overview = make_overview(100, 0, vec![("bash".into(), 30), ("grep".into(), 25)], 5, None);
+        let overview = make_overview(
+            100,
+            0,
+            vec![("bash".into(), 30), ("grep".into(), 25)],
+            5,
+            None,
+        );
         let insights = generate_insights(&overview, &[], &[]);
         assert!(!insights.iter().any(|i| i.message.contains("Over-reliance")));
     }
@@ -842,12 +872,22 @@ mod tests {
     fn insight_100_pct_error_rate() {
         let overview = make_overview(10, 10, vec![], 0, None);
         let insights = generate_insights(&overview, &[], &[]);
-        assert!(insights.iter().any(|i| i.severity == "critical" && i.category == "error_pattern"));
+        assert!(
+            insights
+                .iter()
+                .any(|i| i.severity == "critical" && i.category == "error_pattern")
+        );
     }
 
     #[test]
     fn insight_huge_session_numbers() {
-        let overview = make_overview(100_000, 500, vec![("bash".into(), 40_000)], 5000, Some(120.0));
+        let overview = make_overview(
+            100_000,
+            500,
+            vec![("bash".into(), 40_000)],
+            5000,
+            Some(120.0),
+        );
         let insights = generate_insights(&overview, &[], &[]);
         // Should not panic, error rate is 0.5% so no error insights
         assert!(!insights.iter().any(|i| i.category == "error_pattern"));
@@ -894,10 +934,7 @@ mod tests {
 
     #[test]
     fn compute_duration_basic() {
-        let d = compute_duration_minutes(
-            Some("2026-03-25 08:00:00"),
-            Some("2026-03-25 08:18:30"),
-        );
+        let d = compute_duration_minutes(Some("2026-03-25 08:00:00"), Some("2026-03-25 08:18:30"));
         assert!((d.unwrap() - 18.5).abs() < 0.01);
     }
 
@@ -1164,8 +1201,12 @@ mod tests {
         let diags = build_diagnoses(&errors);
         // Two groups: ResourceLimit/bash, FileNotFound/grep
         assert_eq!(diags.len(), 2);
-        assert!(diags.iter().any(|d| d.category == ErrorClass::ResourceLimit && d.affected_tool == "bash" && d.occurrences == 2));
-        assert!(diags.iter().any(|d| d.category == ErrorClass::FileNotFound && d.affected_tool == "grep" && d.occurrences == 1));
+        assert!(diags.iter().any(|d| d.category == ErrorClass::ResourceLimit
+            && d.affected_tool == "bash"
+            && d.occurrences == 2));
+        assert!(diags.iter().any(|d| d.category == ErrorClass::FileNotFound
+            && d.affected_tool == "grep"
+            && d.occurrences == 1));
     }
 
     #[test]

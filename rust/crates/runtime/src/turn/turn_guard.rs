@@ -649,10 +649,7 @@ mod tests {
         guard.record_tool_result("glob", "Error: invalid pattern");
 
         let verdict = guard.evaluate();
-        assert_eq!(
-            guard.errors.total_errors, 4,
-            "should have exactly 4 errors"
-        );
+        assert_eq!(guard.errors.total_errors, 4, "should have exactly 4 errors");
         assert_eq!(
             verdict.severity,
             VerdictSeverity::Healthy,
@@ -672,7 +669,10 @@ mod tests {
             verdict.severity >= VerdictSeverity::Warning,
             "5 errors should trigger Warning"
         );
-        assert!(!verdict.force_stop, "5 errors without nudges should not force_stop");
+        assert!(
+            !verdict.force_stop,
+            "5 errors without nudges should not force_stop"
+        );
     }
 
     #[test]
@@ -690,7 +690,10 @@ mod tests {
         assert_eq!(guard.errors.total_errors, 2, "only 2 actual errors");
 
         let verdict = guard.evaluate();
-        assert!(!verdict.force_stop, "should NOT force_stop with 2 errors and 4 successes");
+        assert!(
+            !verdict.force_stop,
+            "should NOT force_stop with 2 errors and 4 successes"
+        );
         assert!(
             verdict.severity < VerdictSeverity::Critical,
             "should not reach Critical with only 2 errors"
@@ -709,11 +712,15 @@ mod tests {
     #[test]
     fn resource_limit_overwrite_via_record_tool_result() {
         let mut guard = TurnGuard::new();
-        let resource_output = "bash: fork: Resource temporarily unavailable\nCannot create child process";
+        let resource_output =
+            "bash: fork: Resource temporarily unavailable\nCannot create child process";
 
         // Step 1: resource-limit handler records the failure directly
         guard.health.record_resource_limit_failure("bash");
-        assert!(guard.health.is_deprioritized("bash"), "must be deprioritized");
+        assert!(
+            guard.health.is_deprioritized("bash"),
+            "must be deprioritized"
+        );
 
         // Step 2: if record_tool_result is called on the same output, it classifies
         // as Success (no "Error:" prefix) → calls record_success → OVERWRITES
@@ -747,7 +754,7 @@ mod tests {
         // Feed tool_sigs via record_tool_calls with JSON tool_call format
         let call = serde_json::json!({"function": {"name": "read_file", "arguments": "{\"path\":\"/foo\"}"}});
         for _ in 0..5 {
-            guard.record_tool_calls(&[call.clone()]);
+            guard.record_tool_calls(std::slice::from_ref(&call));
         }
         let verdict = guard.evaluate();
         assert!(
@@ -774,11 +781,9 @@ mod tests {
         let verdict = guard.evaluate();
         // Divergence should fire (all exploration tools) and increment nudge_count
         // since stall shouldn't fire (different tool sigs each turn)
-        if verdict
-            .injections
-            .iter()
-            .any(|i| i.contains("productive action") || i.contains("diverge") || i.contains("Diverge"))
-        {
+        if verdict.injections.iter().any(|i| {
+            i.contains("productive action") || i.contains("diverge") || i.contains("Diverge")
+        }) {
             assert!(
                 guard.nudge_count > initial_nudge,
                 "divergence detection must increment nudge_count when no stall"

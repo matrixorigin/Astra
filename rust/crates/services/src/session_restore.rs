@@ -447,6 +447,7 @@ pub async fn push_checkpoint_to_cloud(
 /// Push a Step Protocol checkpoint to MatrixOne with full state_json.
 /// Accepts pre-serialized JSON to avoid coupling services crate to runtime types.
 /// The caller serializes the StepCheckpoint; this function stores it.
+#[allow(clippy::too_many_arguments)]
 pub async fn push_step_checkpoint_to_cloud(
     pool: &sqlx::Pool<sqlx::MySql>,
     session_id: &str,

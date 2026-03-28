@@ -5726,9 +5726,11 @@ mod token_efficiency_deep {
         use mo_agent_runtime::tool_registry::scoring::pre_filter_dynamic_with_pressure;
         use mo_agent_runtime::tool_registry::state::ConversationState;
 
-        let mut state = ConversationState::default();
-        state.is_fetch = true;
-        state.is_git = true;
+        let state = ConversationState {
+            is_fetch: true,
+            is_git: true,
+            ..Default::default()
+        };
 
         // No pressure: include everything relevant
         let no_pressure =
@@ -5764,9 +5766,11 @@ mod token_efficiency_deep {
         };
         use mo_agent_runtime::tool_registry::state::ConversationState;
 
-        let mut state = ConversationState::default();
-        state.is_github = true;
-        state.is_fetch = true;
+        let state = ConversationState {
+            is_github: true,
+            is_fetch: true,
+            ..Default::default()
+        };
 
         let unpressured = pre_filter_dynamic_with_memory(&state, "list PRs", None, None, &[]);
         let zero_pressure =
@@ -5787,8 +5791,10 @@ mod token_efficiency_deep {
         use mo_agent_runtime::tool_registry::scoring::pre_filter_dynamic_with_pressure;
         use mo_agent_runtime::tool_registry::state::ConversationState;
 
-        let mut state = ConversationState::default();
-        state.is_fetch = true;
+        let state = ConversationState {
+            is_fetch: true,
+            ..Default::default()
+        };
 
         let p0 = pre_filter_dynamic_with_pressure(&state, "show me data", None, None, &[], 0.0);
         let p3 = pre_filter_dynamic_with_pressure(&state, "show me data", None, None, &[], 0.3);
@@ -7171,6 +7177,7 @@ mod learning_sync_cloud_proofs {
     };
     use std::sync::{Arc, Mutex};
 
+    #[allow(clippy::type_complexity)]
     fn empty_modules() -> (
         Arc<Mutex<EntityGraph>>,
         Arc<Mutex<PatternLibrary>>,
@@ -8509,7 +8516,7 @@ mod co_occurrence_scoring_proofs {
         );
 
         // Phase 4: Scores are reasonable
-        for (_, score) in &scores {
+        for score in scores.values() {
             assert!(*score > 0.0 && *score <= 1.0, "Scores must be in (0, 1]");
         }
     }

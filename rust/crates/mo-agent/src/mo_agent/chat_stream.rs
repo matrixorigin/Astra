@@ -1400,19 +1400,14 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     category,
                     mo_agent_runtime::turn::error_recovery::ErrorCategory::ResourceLimit
                 ) {
-                    turn_guard
-                        .health
-                        .record_resource_limit_failure(&name);
+                    turn_guard.health.record_resource_limit_failure(&name);
                     turn_guard.errors.record_error(category);
                     restricted_tools.insert(name.clone());
                     resource_limit_recorded = true;
                     if !quiet {
                         eprintln!(
                             "{}",
-                            format!(
-                                "  ⚠ {name} blocked: system resource limit reached"
-                            )
-                            .yellow()
+                            format!("  ⚠ {name} blocked: system resource limit reached").yellow()
                         );
                     }
                 }
@@ -1472,9 +1467,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             // is the strictness of is_resource_limit_output() patterns — not a
             // tool-name allowlist — so this applies to ALL tools.
             if !is_err && is_resource_limit_output(&result_str) {
-                turn_guard
-                    .health
-                    .record_resource_limit_failure(&name);
+                turn_guard.health.record_resource_limit_failure(&name);
                 turn_guard.errors.record_error(
                     mo_agent_runtime::turn::error_recovery::ErrorCategory::ResourceLimit,
                 );
@@ -1484,10 +1477,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 if !quiet {
                     eprintln!(
                         "{}",
-                        format!(
-                            "  ⚠ {name}: resource limit detected in output — tool blocked"
-                        )
-                        .dim()
+                        format!("  ⚠ {name}: resource limit detected in output — tool blocked")
+                            .dim()
                     );
                 }
             }
@@ -1528,16 +1519,15 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             );
 
             // Light checkpoint after each tool completion (best-effort, non-blocking)
-            if let Some(ref sid) = current_session_id {
-                if let Some(light) = step_recorder.build_light_checkpoint() {
-                    let cp =
-                        mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Light(light);
-                    let _ = mo_agent_runtime::pipeline::step_checkpoint::write_step_checkpoint(
-                        sid,
-                        step_recorder.summary().checkpoints,
-                        &cp,
-                    );
-                }
+            if let Some(ref sid) = current_session_id
+                && let Some(light) = step_recorder.build_light_checkpoint()
+            {
+                let cp = mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Light(light);
+                let _ = mo_agent_runtime::pipeline::step_checkpoint::write_step_checkpoint(
+                    sid,
+                    step_recorder.summary().checkpoints,
+                    &cp,
+                );
             }
 
             // Stop spinner, print final status with duration
@@ -1564,15 +1554,13 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     eprintln!("{}", format!("  ✗ {name} ({duration_str})").red());
                 }
                 // Show first line of error on └ line
-                if !quiet {
-                    if let Some(first_line) = result_str.lines().next() {
-                        let preview = if first_line.len() > 100 {
-                            format!("{}…", &first_line[..100])
-                        } else {
-                            first_line.to_string()
-                        };
-                        eprintln!("  {}", format!("└ Error: {preview}").dim());
-                    }
+                if !quiet && let Some(first_line) = result_str.lines().next() {
+                    let preview = if first_line.len() > 100 {
+                        format!("{}…", &first_line[..100])
+                    } else {
+                        first_line.to_string()
+                    };
+                    eprintln!("  {}", format!("└ Error: {preview}").dim());
                 }
             } else {
                 if !quiet {
@@ -1653,13 +1641,9 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 .join(" ");
             intent_tool_turns.push((turn_names, turn_args_text));
 
-            if let mo_agent_runtime::turn::stall::IntentDrift::Drifting {
-                correction,
-                ..
-            } = mo_agent_runtime::turn::stall::detect_intent_drift(
-                message,
-                &intent_tool_turns,
-            ) {
+            if let mo_agent_runtime::turn::stall::IntentDrift::Drifting { correction, .. } =
+                mo_agent_runtime::turn::stall::detect_intent_drift(message, &intent_tool_turns)
+            {
                 messages.push(serde_json::json!({
                     "role": "user",
                     "content": correction
@@ -1716,15 +1700,12 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             // Apply turn budget penalties based on severity.
             // Dedup: skip verdict stall when a more specific stall (name_stall,
             // intent_drift) already fired on this same turn.
-            let turn_already_stalled = stall_events
-                .iter()
-                .any(|(_, t)| *t == _turn as u32);
+            let turn_already_stalled = stall_events.iter().any(|(_, t)| *t == _turn as u32);
             match verdict.severity {
                 VerdictSeverity::Critical => {
                     remaining_turns = remaining_turns.saturating_sub(5);
                     if !turn_already_stalled {
-                        stall_events
-                            .push(("critical_escalation".to_string(), _turn as u32));
+                        stall_events.push(("critical_escalation".to_string(), _turn as u32));
                     }
                 }
                 VerdictSeverity::Warning => {
@@ -1752,8 +1733,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             );
 
             // Heavy checkpoint after verdict (captures full conversation state)
-            if let Some(ref sid) = current_session_id {
-                if let Some(heavy) = step_recorder.build_heavy_checkpoint(
+            if let Some(ref sid) = current_session_id
+                && let Some(heavy) = step_recorder.build_heavy_checkpoint(
                     &messages,
                     0, // budget tokens filled by caller if available
                     max_turns.saturating_sub(_turn) as u32,
@@ -1763,18 +1744,18 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                         .iter()
                         .map(|s| s.to_string())
                         .collect::<Vec<_>>(),
-                    &recent_tools,
-                ) {
-                    let cp = mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(
-                        Box::new(heavy),
-                    );
-                    let _ = mo_agent_runtime::pipeline::step_checkpoint::write_step_checkpoint(
-                        sid,
-                        step_recorder.summary().checkpoints,
-                        &cp,
-                    );
-                    last_heavy_checkpoint = Some(cp);
-                }
+                    recent_tools,
+                )
+            {
+                let cp = mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(
+                    Box::new(heavy),
+                );
+                let _ = mo_agent_runtime::pipeline::step_checkpoint::write_step_checkpoint(
+                    sid,
+                    step_recorder.summary().checkpoints,
+                    &cp,
+                );
+                last_heavy_checkpoint = Some(cp);
             }
 
             // Force stop on critical verdict
@@ -2079,15 +2060,15 @@ fn detect_project_languages(root: &std::path::Path) -> Vec<String> {
         }
     }
     // Check for *.csproj in root (glob-style, since filename varies)
-    if langs.iter().all(|l| l != "csharp") {
-        if let Ok(entries) = std::fs::read_dir(root) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.ends_with(".csproj") || name.ends_with(".sln") {
-                        langs.push("csharp".to_string());
-                        break;
-                    }
-                }
+    if langs.iter().all(|l| l != "csharp")
+        && let Ok(entries) = std::fs::read_dir(root)
+    {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str()
+                && (name.ends_with(".csproj") || name.ends_with(".sln"))
+            {
+                langs.push("csharp".to_string());
+                break;
             }
         }
     }
@@ -2314,7 +2295,9 @@ mod tests {
         assert!(is_resource_limit_output("Cannot allocate memory"));
         assert!(is_resource_limit_output("No space left on device"));
         assert!(is_resource_limit_output("Too many open files"));
-        assert!(is_resource_limit_output("sh: fork: retry: Resource temporarily unavailable"));
+        assert!(is_resource_limit_output(
+            "sh: fork: retry: Resource temporarily unavailable"
+        ));
     }
 
     #[test]
@@ -2601,7 +2584,10 @@ mod tests {
         let dir_strs: Vec<&str> = dirs.iter().filter_map(|v| v.as_str()).collect();
         assert!(!dir_strs.contains(&".git/"), "should skip .git");
         assert!(!dir_strs.contains(&"target/"), "should skip target");
-        assert!(!dir_strs.contains(&"node_modules/"), "should skip node_modules");
+        assert!(
+            !dir_strs.contains(&"node_modules/"),
+            "should skip node_modules"
+        );
         assert!(dir_strs.contains(&"src/"), "should include src/");
     }
 
@@ -2609,7 +2595,9 @@ mod tests {
 
     #[test]
     fn is_tool_error_json_error_code() {
-        assert!(is_tool_error(r#"{"error_code": 42, "message": "bad request"}"#));
+        assert!(is_tool_error(
+            r#"{"error_code": 42, "message": "bad request"}"#
+        ));
     }
 
     #[test]
@@ -2636,7 +2624,9 @@ mod tests {
 
     #[test]
     fn resource_limit_oom_killed() {
-        assert!(is_resource_limit_output("Killed: process ran out of memory"));
+        assert!(is_resource_limit_output(
+            "Killed: process ran out of memory"
+        ));
         assert!(is_resource_limit_output("Killed"));
     }
 

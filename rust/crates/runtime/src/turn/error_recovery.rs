@@ -310,10 +310,7 @@ pub fn escalation_level(
     // without force_stop because the old threshold was too lenient),
     // or 8+ errors with at least one deprioritized tool,
     // or 10+ total errors regardless (scattered failures are still broken)
-    if nudge_count >= 3
-        || (total_errors >= 8 && deprioritized_count >= 1)
-        || total_errors >= 10
-    {
+    if nudge_count >= 3 || (total_errors >= 8 && deprioritized_count >= 1) || total_errors >= 10 {
         return EscalationLevel::Critical;
     }
     // Warning: 2 nudges, or 5+ errors

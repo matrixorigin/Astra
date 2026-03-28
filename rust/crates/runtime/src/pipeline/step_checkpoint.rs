@@ -89,7 +89,7 @@ pub fn read_latest_heavy_checkpoint(session_id: &str) -> std::io::Result<Option<
         .collect();
 
     // Sort by name descending (latest = highest number)
-    heavy_files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    heavy_files.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
 
     if let Some(entry) = heavy_files.first() {
         let content = std::fs::read_to_string(entry.path())?;
@@ -127,7 +127,7 @@ pub fn read_latest_light_checkpoint(session_id: &str) -> std::io::Result<Option<
         .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
         .collect();
 
-    all_files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    all_files.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
 
     if let Some(entry) = all_files.first() {
         let content = std::fs::read_to_string(entry.path())?;
@@ -163,17 +163,16 @@ pub fn list_checkpoints(session_id: &str) -> std::io::Result<Vec<(u32, Checkpoin
             }
         };
         let name = entry.file_name().to_string_lossy().to_string();
-        if let Some(rest) = name.strip_suffix(".json") {
-            if let Some((num_str, tier_str)) = rest.split_once('-') {
-                if let Ok(num) = num_str.parse::<u32>() {
-                    let tier = match tier_str {
-                        "light" => CheckpointTier::Light,
-                        "heavy" => CheckpointTier::Heavy,
-                        _ => continue,
-                    };
-                    result.push((num, tier));
-                }
-            }
+        if let Some(rest) = name.strip_suffix(".json")
+            && let Some((num_str, tier_str)) = rest.split_once('-')
+            && let Ok(num) = num_str.parse::<u32>()
+        {
+            let tier = match tier_str {
+                "light" => CheckpointTier::Light,
+                "heavy" => CheckpointTier::Heavy,
+                _ => continue,
+            };
+            result.push((num, tier));
         }
     }
     result.sort_by_key(|(n, _)| *n);
@@ -202,7 +201,7 @@ fn prune_light_checkpoints(dir: &Path) -> std::io::Result<()> {
     }
 
     // Sort ascending by name, remove oldest
-    light_files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    light_files.sort_by_key(|a| a.file_name());
     let to_remove = light_files.len() - MAX_LIGHT_CHECKPOINTS;
     for entry in light_files.into_iter().take(to_remove) {
         if let Err(err) = std::fs::remove_file(entry.path()) {

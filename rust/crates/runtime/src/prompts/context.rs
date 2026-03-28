@@ -20,7 +20,7 @@ pub fn estimate_str_tokens(s: &str) -> usize {
         }
     }
     // CJK: ~1.5 tokens per char (3*n/2). ASCII: ~4 bytes per token.
-    (cjk_chars * 3 + 1) / 2 + ascii_bytes / 4
+    (cjk_chars * 3).div_ceil(2) + ascii_bytes / 4
 }
 
 /// Approximate token count with CJK-aware estimation.

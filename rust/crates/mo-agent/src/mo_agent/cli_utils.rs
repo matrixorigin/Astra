@@ -381,22 +381,51 @@ pub(super) fn print_markdown(text: &str) {
 }
 
 /// Extract a brief detail string from tool call arguments for the └ line.
-pub(super) fn tool_call_detail(name: &str, args: &serde_json::Value) -> Option<String> {
-    let obj = args.as_object()?;
+/// Tool categories for organized formatting
+#[derive(Debug, Clone, Copy)]
+enum ToolCat {
+    Github,
+    File,
+    Shell,
+    Search,
+    Git,
+    Mo,
+    Memory,
+    Other,
+}
+
+fn categorize(name: &str) -> ToolCat {
     match name {
-        // GitHub tools
-        n if n.starts_with("github_") => {
-            let owner = obj.get("owner").and_then(|v| v.as_str());
-            let repo = obj.get("repo").and_then(|v| v.as_str());
-            match (owner, repo) {
-                (Some(o), Some(r)) => Some(format!("{o}/{r}")),
-                _ => obj
-                    .get("query")
-                    .and_then(|v| v.as_str())
-                    .map(|q| truncate_str(q, 60)),
-            }
+        n if n.starts_with("github_") => ToolCat::Github,
+        "read_file" | "view_file" | "write_file" | "edit_file" | "str_replace" => ToolCat::File,
+        "run_command" | "shell" | "exec" | "bash" => ToolCat::Shell,
+        "search" | "grep" | "find" | "glob" | "list_dir" => ToolCat::Search,
+        "git_diff" | "git_log" | "git_show" | "git_blame" | "git_log_search" | "git_status" => {
+            ToolCat::Git
         }
-        // File system tools — show path + line range if present
+        "mo_query" => ToolCat::Mo,
+        n if n.starts_with("memoria_") || n.starts_with("memory_") => ToolCat::Memory,
+        _ => ToolCat::Other,
+    }
+}
+
+fn fmt_github_tool(
+    _name: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    let owner = obj.get("owner").and_then(|v| v.as_str());
+    let repo = obj.get("repo").and_then(|v| v.as_str());
+    match (owner, repo) {
+        (Some(o), Some(r)) => Some(format!("{o}/{r}")),
+        _ => obj
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(|q| truncate_str(q, 60)),
+    }
+}
+
+fn fmt_file_tool(name: &str, obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    match name {
         "read_file" | "view_file" => {
             let path = obj.get("path").and_then(|v| v.as_str())?;
             let start = obj.get("start_line").and_then(|v| v.as_u64());
@@ -405,6 +434,7 @@ pub(super) fn tool_call_detail(name: &str, args: &serde_json::Value) -> Option<S
                 .get("outline")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+
             if outline {
                 Some(format!("{path} (outline)"))
             } else {
@@ -419,7 +449,6 @@ pub(super) fn tool_call_detail(name: &str, args: &serde_json::Value) -> Option<S
             .get("path")
             .and_then(|v| v.as_str())
             .map(|p| p.to_string()),
-        // str_replace — show path + old_str preview
         "str_replace" => {
             let path = obj.get("path").and_then(|v| v.as_str())?;
             let old = obj.get("old_str").and_then(|v| v.as_str());
@@ -437,12 +466,18 @@ pub(super) fn tool_call_detail(name: &str, args: &serde_json::Value) -> Option<S
                 None => Some(path.to_string()),
             }
         }
-        // Shell / exec tools
-        "run_command" | "shell" | "exec" | "bash" => obj
-            .get("command")
-            .and_then(|v| v.as_str())
-            .map(|c| truncate_str(c, 60)),
-        // Search tools — show pattern + path scope
+        _ => None,
+    }
+}
+
+fn fmt_shell_tool(_name: &str, obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    obj.get("command")
+        .and_then(|v| v.as_str())
+        .map(|c| truncate_str(c, 60))
+}
+
+fn fmt_search_tool(name: &str, obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    match name {
         "search" | "grep" | "find" => {
             let pattern = obj
                 .get("query")
@@ -455,23 +490,23 @@ pub(super) fn tool_call_detail(name: &str, args: &serde_json::Value) -> Option<S
                 _ => None,
             }
         }
-        // glob — show pattern
         "glob" => obj
             .get("pattern")
             .and_then(|v| v.as_str())
             .map(|p| truncate_str(p, 60)),
-        // list_dir — show path
         "list_dir" => obj
             .get("path")
             .and_then(|v| v.as_str())
             .map(|p| p.to_string()),
-        // Git tools — show relevant context
+        _ => None,
+    }
+}
+
+fn fmt_git_tool(name: &str, obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    match name {
         "git_diff" => {
             let path = obj.get("path").and_then(|v| v.as_str());
-            let staged = obj
-                .get("staged")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let staged = obj.get("staged").and_then(|v| v.as_bool()).unwrap_or(false);
             let suffix = if staged { " (staged)" } else { "" };
             match path {
                 Some(p) => Some(format!("{p}{suffix}")),
@@ -505,22 +540,43 @@ pub(super) fn tool_call_detail(name: &str, args: &serde_json::Value) -> Option<S
             .get("query")
             .and_then(|v| v.as_str())
             .map(|q| format!("\"{}\"", truncate_str(q, 50))),
-        // MO tools
-        "mo_query" => obj
-            .get("sql")
-            .and_then(|v| v.as_str())
-            .map(|s| truncate_str(s, 60)),
-        // Memoria tools
-        n if n.starts_with("memoria_") || n.starts_with("memory_") => obj
-            .get("query")
-            .or_else(|| obj.get("content"))
-            .and_then(|v| v.as_str())
-            .map(|q| truncate_str(q, 50)),
-        // Default: show first string value
-        _ => obj
-            .values()
-            .find_map(|v| v.as_str())
-            .map(|s| truncate_str(s, 60)),
+        _ => None,
+    }
+}
+
+fn fmt_mo_tool(_name: &str, obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    obj.get("sql")
+        .and_then(|v| v.as_str())
+        .map(|s| truncate_str(s, 60))
+}
+
+fn fmt_memory_tool(
+    _name: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    obj.get("query")
+        .or_else(|| obj.get("content"))
+        .and_then(|v| v.as_str())
+        .map(|q| truncate_str(q, 50))
+}
+
+fn fmt_default(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    obj.values()
+        .find_map(|v| v.as_str())
+        .map(|s| truncate_str(s, 60))
+}
+
+pub(super) fn tool_call_detail(name: &str, args: &serde_json::Value) -> Option<String> {
+    let obj = args.as_object()?;
+    match categorize(name) {
+        ToolCat::Github => fmt_github_tool(name, obj),
+        ToolCat::File => fmt_file_tool(name, obj),
+        ToolCat::Shell => fmt_shell_tool(name, obj),
+        ToolCat::Search => fmt_search_tool(name, obj),
+        ToolCat::Git => fmt_git_tool(name, obj),
+        ToolCat::Mo => fmt_mo_tool(name, obj),
+        ToolCat::Memory => fmt_memory_tool(name, obj),
+        ToolCat::Other => fmt_default(obj),
     }
 }
 
@@ -540,18 +596,29 @@ pub(super) fn tool_result_summary(name: &str, result: &str) -> Option<String> {
             }
         }
         "write_file" => {
-            // "Written X bytes to /path"
-            if let Some(n) = result
-                .strip_prefix("Written ")
-                .and_then(|s| s.split(' ').next())
-                .and_then(|s| s.parse::<usize>().ok())
-            {
-                if n >= 1024 {
-                    Some(format!("{:.1}KB written", n as f64 / 1024.0))
+            // Parse JSON result: {"success": true, "bytes_written": N, "path": "..."}
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(result) {
+                if json
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    if let Some(n) = json.get("bytes_written").and_then(|v| v.as_u64()) {
+                        if n >= 1024 {
+                            Some(format!("{:.1}KB written", n as f64 / 1024.0))
+                        } else {
+                            Some(format!("{n} bytes written"))
+                        }
+                    } else {
+                        Some("written".to_string())
+                    }
                 } else {
-                    Some(format!("{n} bytes written"))
+                    json.get("error")
+                        .and_then(|v| v.as_str())
+                        .map(|err| format!("Error: {err}"))
                 }
             } else {
+                // Fallback for legacy format
                 None
             }
         }
@@ -794,19 +861,13 @@ mod tests {
 
     #[test]
     fn tool_call_detail_git_diff_staged() {
-        let detail = tool_call_detail(
-            "git_diff",
-            &serde_json::json!({"staged": true}),
-        );
+        let detail = tool_call_detail("git_diff", &serde_json::json!({"staged": true}));
         assert_eq!(detail.as_deref(), Some("working tree (staged)"));
     }
 
     #[test]
     fn tool_call_detail_git_log_with_count() {
-        let detail = tool_call_detail(
-            "git_log",
-            &serde_json::json!({"max_count": 5}),
-        );
+        let detail = tool_call_detail("git_log", &serde_json::json!({"max_count": 5}));
         assert_eq!(detail.as_deref(), Some("last 5 commits"));
     }
 
@@ -828,22 +889,21 @@ mod tests {
 
     #[test]
     fn result_summary_write_file_bytes() {
-        let summary = tool_result_summary("write_file", "Written 2048 bytes to /tmp/foo.rs");
+        let result = r#"{"success": true, "bytes_written": 2048, "path": "/tmp/foo.rs"}"#;
+        let summary = tool_result_summary("write_file", result);
         assert_eq!(summary.as_deref(), Some("2.0KB written"));
     }
 
     #[test]
     fn result_summary_write_file_small() {
-        let summary = tool_result_summary("write_file", "Written 128 bytes to /tmp/foo.rs");
+        let result = r#"{"success": true, "bytes_written": 128, "path": "/tmp/foo.rs"}"#;
+        let summary = tool_result_summary("write_file", result);
         assert_eq!(summary.as_deref(), Some("128 bytes written"));
     }
 
     #[test]
     fn result_summary_str_replace() {
-        let summary = tool_result_summary(
-            "str_replace",
-            "Replaced successfully\n- old\n+ new",
-        );
+        let summary = tool_result_summary("str_replace", "Replaced successfully\n- old\n+ new");
         assert_eq!(summary.as_deref(), Some("2 lines changed"));
     }
 
@@ -888,7 +948,10 @@ mod tests {
 
     #[test]
     fn result_summary_bash_long_shows_lines() {
-        let result = (0..10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let result = (0..10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let summary = tool_result_summary("bash", &result);
         assert_eq!(summary.as_deref(), Some("10 lines"));
     }

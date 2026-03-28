@@ -52,9 +52,7 @@ impl ToolExecutor {
             Err(e) => {
                 let msg = format!("Error: {e}");
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    return format!(
-                        "{msg}. Use list_dir or glob to find the correct path first."
-                    );
+                    return format!("{msg}. Use list_dir or glob to find the correct path first.");
                 }
                 return msg;
             }
@@ -66,10 +64,7 @@ impl ToolExecutor {
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let lang = detect_language(ext);
             let total_lines = content.lines().count();
             let outline = extract_outline(&content, lang);
@@ -112,29 +107,38 @@ impl ToolExecutor {
         truncate_output(lines[s..e].join("\n"), global_output_limit())
     }
 
+    /// Returns JSON with structured result for reliable parsing
     pub(crate) fn write_file(&self, args: &Value) -> String {
+        use serde_json::json;
+
         let path = match args.get("path").and_then(Value::as_str) {
             Some(p) => match self.resolve_checked(p) {
                 Ok(safe) => safe,
-                Err(e) => return e,
+                Err(e) => return json!({ "success": false, "error": e }).to_string(),
             },
-            None => return "Error: missing 'path'".to_string(),
+            None => return json!({ "success": false, "error": "missing 'path'" }).to_string(),
         };
         let content = match args.get("content").and_then(Value::as_str) {
             Some(c) => c,
-            None => return "Error: missing 'content'".to_string(),
+            None => return json!({ "success": false, "error": "missing 'content'" }).to_string(),
         };
         if let Some(parent) = path.parent()
             && let Err(e) = fs::create_dir_all(parent)
         {
-            return format!(
-                "Error: failed to create parent directory {}: {e}",
-                parent.display()
-            );
+            return json!({
+                "success": false,
+                "error": format!("failed to create parent directory {}: {e}", parent.display())
+            })
+            .to_string();
         }
         match fs::write(&path, content) {
-            Ok(_) => format!("Written {} bytes to {}", content.len(), path.display()),
-            Err(e) => format!("Error: {e}"),
+            Ok(_) => json!({
+                "success": true,
+                "bytes_written": content.len(),
+                "path": path.to_string_lossy().to_string()
+            })
+            .to_string(),
+            Err(e) => json!({ "success": false, "error": e.to_string() }).to_string(),
         }
     }
 
@@ -282,10 +286,13 @@ fn extract_outline(content: &str, lang: Language) -> Vec<(usize, String)> {
 
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') && lang != Language::Python {
+        if trimmed.is_empty()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with('#') && lang != Language::Python
+        {
             continue;
         }
-        if is_definition(trimmed, *line, lang) {
+        if is_definition(trimmed, line, lang) {
             // Trim trailing `{` and whitespace for cleaner output
             let sig = trimmed.trim_end_matches('{').trim_end();
             defs.push((i + 1, sig.to_string()));
@@ -329,8 +336,8 @@ fn is_rust_def(line: &str) -> bool {
 fn strip_rust_vis(line: &str) -> &str {
     let s = line.strip_prefix("pub(crate) ").unwrap_or(line);
     let s = s.strip_prefix("pub(super) ").unwrap_or(s);
-    let s = s.strip_prefix("pub ").unwrap_or(s);
-    s
+
+    (s.strip_prefix("pub ").unwrap_or(s)) as _
 }
 
 fn is_python_def(line: &str) -> bool {
@@ -389,7 +396,16 @@ fn is_java_def(line: &str) -> bool {
 
 fn strip_java_mods(line: &str) -> &str {
     let mut s = line;
-    for m in &["public ", "private ", "protected ", "static ", "final ", "abstract ", "synchronized ", "native "] {
+    for m in &[
+        "public ",
+        "private ",
+        "protected ",
+        "static ",
+        "final ",
+        "abstract ",
+        "synchronized ",
+        "native ",
+    ] {
         s = s.strip_prefix(m).unwrap_or(s);
     }
     s
@@ -438,7 +454,9 @@ fn str_replace_not_found_hint(content: &str, old_str: &str) -> String {
     let normalized_old = normalize_ws(old_str);
     let normalized_content = normalize_ws(content);
     if normalized_content.contains(&normalized_old) {
-        msg.push_str("Hint: A whitespace-normalized match exists. Check indentation/trailing spaces.\n");
+        msg.push_str(
+            "Hint: A whitespace-normalized match exists. Check indentation/trailing spaces.\n",
+        );
         // Find which line in the file the first old line matches (normalized)
         if let Some(first_line) = old_lines.first() {
             let norm_first = normalize_ws(first_line);
@@ -447,8 +465,8 @@ fn str_replace_not_found_hint(content: &str, old_str: &str) -> String {
                     msg.push_str(&format!("  Possible match at line {}\n", i + 1));
                     // Show a few lines of actual content
                     let end = (i + old_lines.len().min(5)).min(lines.len());
-                    for j in i..end {
-                        msg.push_str(&format!("  {}: {}\n", j + 1, lines[j]));
+                    for (j, line_content) in lines[i..end].iter().enumerate() {
+                        msg.push_str(&format!("  {}: {}\n", i + j + 1, line_content));
                     }
                     break;
                 }
@@ -481,8 +499,8 @@ fn str_replace_not_found_hint(content: &str, old_str: &str) -> String {
                 let start = line_idx;
                 let end = (line_idx + old_lines.len() + 1).min(lines.len());
                 msg.push_str("Actual file content:\n");
-                for j in start..end {
-                    msg.push_str(&format!("  {}: {}\n", j + 1, lines[j]));
+                for (j, line_content) in lines[start..end].iter().enumerate() {
+                    msg.push_str(&format!("  {}: {}\n", start + j + 1, line_content));
                 }
             }
         }
@@ -594,15 +612,42 @@ mod inner {
 "#;
         let defs = extract_outline(rust_code, Language::Rust);
         let names: Vec<&str> = defs.iter().map(|(_, s)| s.as_str()).collect();
-        assert!(names.iter().any(|s| s.contains("use std::collections")), "should find use: {names:?}");
-        assert!(names.iter().any(|s| s.contains("pub struct Config")), "should find struct: {names:?}");
-        assert!(names.iter().any(|s| s.contains("pub enum Status")), "should find enum: {names:?}");
-        assert!(names.iter().any(|s| s.contains("impl Config")), "should find impl: {names:?}");
-        assert!(names.iter().any(|s| s.contains("pub fn new")), "should find pub fn: {names:?}");
-        assert!(names.iter().any(|s| s.contains("validate")), "should find validate: {names:?}");
-        assert!(names.iter().any(|s| s.contains("pub trait Handler")), "should find trait: {names:?}");
-        assert!(names.iter().any(|s| s.contains("async fn fetch_data")), "should find async fn: {names:?}");
-        assert!(names.iter().any(|s| s.contains("mod inner")), "should find mod: {names:?}");
+        assert!(
+            names.iter().any(|s| s.contains("use std::collections")),
+            "should find use: {names:?}"
+        );
+        assert!(
+            names.iter().any(|s| s.contains("pub struct Config")),
+            "should find struct: {names:?}"
+        );
+        assert!(
+            names.iter().any(|s| s.contains("pub enum Status")),
+            "should find enum: {names:?}"
+        );
+        assert!(
+            names.iter().any(|s| s.contains("impl Config")),
+            "should find impl: {names:?}"
+        );
+        assert!(
+            names.iter().any(|s| s.contains("pub fn new")),
+            "should find pub fn: {names:?}"
+        );
+        assert!(
+            names.iter().any(|s| s.contains("validate")),
+            "should find validate: {names:?}"
+        );
+        assert!(
+            names.iter().any(|s| s.contains("pub trait Handler")),
+            "should find trait: {names:?}"
+        );
+        assert!(
+            names.iter().any(|s| s.contains("async fn fetch_data")),
+            "should find async fn: {names:?}"
+        );
+        assert!(
+            names.iter().any(|s| s.contains("mod inner")),
+            "should find mod: {names:?}"
+        );
     }
 
     #[test]
@@ -637,10 +682,22 @@ MAX_SIZE = 100
 "#;
         let defs = extract_outline(py_code, Language::Python);
         let names: Vec<&str> = defs.iter().map(|(_, s)| s.as_str()).collect();
-        assert!(names.iter().any(|s| s.contains("class MyClass")), "should find class: {names:?}");
-        assert!(names.iter().any(|s| s.contains("def standalone")), "should find def: {names:?}");
-        assert!(names.iter().any(|s| s.contains("async def async_handler")), "should find async def: {names:?}");
-        assert!(names.iter().any(|s| s.contains("MAX_SIZE")), "should find constant: {names:?}");
+        assert!(
+            names.iter().any(|s| s.contains("class MyClass")),
+            "should find class: {names:?}"
+        );
+        assert!(
+            names.iter().any(|s| s.contains("def standalone")),
+            "should find def: {names:?}"
+        );
+        assert!(
+            names.iter().any(|s| s.contains("async def async_handler")),
+            "should find async def: {names:?}"
+        );
+        assert!(
+            names.iter().any(|s| s.contains("MAX_SIZE")),
+            "should find constant: {names:?}"
+        );
     }
 
     // ── file_outline: TypeScript ─────────────────────────────────────────────
@@ -668,11 +725,28 @@ export default class App {
 "#;
         let defs = extract_outline(ts_code, Language::TypeScript);
         let names: Vec<&str> = defs.iter().map(|(_, s)| s.as_str()).collect();
-        assert!(names.iter().any(|s| s.contains("export function fetchData")), "should find export function: {names:?}");
-        assert!(names.iter().any(|s| s.contains("export class UserService")), "should find export class: {names:?}");
-        assert!(names.iter().any(|s| s.contains("export interface Config")), "should find interface: {names:?}");
-        assert!(names.iter().any(|s| s.contains("export type ID")), "should find type: {names:?}");
-        assert!(names.iter().any(|s| s.contains("export default class App")), "should find default class: {names:?}");
+        assert!(
+            names
+                .iter()
+                .any(|s| s.contains("export function fetchData")),
+            "should find export function: {names:?}"
+        );
+        assert!(
+            names.iter().any(|s| s.contains("export class UserService")),
+            "should find export class: {names:?}"
+        );
+        assert!(
+            names.iter().any(|s| s.contains("export interface Config")),
+            "should find interface: {names:?}"
+        );
+        assert!(
+            names.iter().any(|s| s.contains("export type ID")),
+            "should find type: {names:?}"
+        );
+        assert!(
+            names.iter().any(|s| s.contains("export default class App")),
+            "should find default class: {names:?}"
+        );
     }
 
     // ── file_outline: Go ─────────────────────────────────────────────────────
@@ -700,10 +774,24 @@ type Handler interface {
 "#;
         let defs = extract_outline(go_code, Language::Go);
         let names: Vec<&str> = defs.iter().map(|(_, s)| s.as_str()).collect();
-        assert!(names.iter().any(|s| s.contains("func main")), "should find func main: {names:?}");
-        assert!(names.iter().any(|s| s.contains("type Config struct")), "should find type struct: {names:?}");
-        assert!(names.iter().any(|s| s.contains("func (c *Config) Validate")), "should find method: {names:?}");
-        assert!(names.iter().any(|s| s.contains("type Handler interface")), "should find interface: {names:?}");
+        assert!(
+            names.iter().any(|s| s.contains("func main")),
+            "should find func main: {names:?}"
+        );
+        assert!(
+            names.iter().any(|s| s.contains("type Config struct")),
+            "should find type struct: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|s| s.contains("func (c *Config) Validate")),
+            "should find method: {names:?}"
+        );
+        assert!(
+            names.iter().any(|s| s.contains("type Handler interface")),
+            "should find interface: {names:?}"
+        );
     }
 
     // ── file_outline: language detection ─────────────────────────────────────
@@ -741,7 +829,11 @@ type Handler interface {
     fn read_file_outline_mode() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.rs");
-        std::fs::write(&file_path, "pub fn hello() {}\n\nstruct Foo {\n    x: i32\n}\n").unwrap();
+        std::fs::write(
+            &file_path,
+            "pub fn hello() {}\n\nstruct Foo {\n    x: i32\n}\n",
+        )
+        .unwrap();
 
         let executor = test_executor_in(dir.path());
         let result = executor.read_file(&serde_json::json!({
@@ -749,9 +841,18 @@ type Handler interface {
             "outline": true
         }));
 
-        assert!(result.contains("Outline"), "should have outline header: {result}");
-        assert!(result.contains("pub fn hello"), "should contain fn: {result}");
-        assert!(result.contains("struct Foo"), "should contain struct: {result}");
+        assert!(
+            result.contains("Outline"),
+            "should have outline header: {result}"
+        );
+        assert!(
+            result.contains("pub fn hello"),
+            "should contain fn: {result}"
+        );
+        assert!(
+            result.contains("struct Foo"),
+            "should contain struct: {result}"
+        );
         assert!(result.contains("1:"), "should have line numbers: {result}");
     }
 
@@ -767,7 +868,10 @@ type Handler interface {
             "outline": true
         }));
 
-        assert!(result.contains("no definitions found"), "should report empty: {result}");
+        assert!(
+            result.contains("no definitions found"),
+            "should report empty: {result}"
+        );
     }
 
     // ── str_replace: fuzzy matching ──────────────────────────────────────────
@@ -777,7 +881,10 @@ type Handler interface {
         let content = "  fn hello() {\n    println!(\"hi\");\n  }\n";
         let old_str = "fn hello() {\n  println!(\"hi\");\n}";
         let msg = str_replace_not_found_hint(content, old_str);
-        assert!(msg.contains("whitespace-normalized"), "should hint whitespace: {msg}");
+        assert!(
+            msg.contains("whitespace-normalized"),
+            "should hint whitespace: {msg}"
+        );
         assert!(msg.contains("line"), "should show line number: {msg}");
     }
 
@@ -786,8 +893,14 @@ type Handler interface {
         let content = "line one\nfn target() {\n    body\n}\nline five\n";
         let old_str = "fn target() {\n    wrong body\n}";
         let msg = str_replace_not_found_hint(content, old_str);
-        assert!(msg.contains("fn target()"), "should show first line match: {msg}");
-        assert!(msg.contains("2") || msg.contains("line"), "should show line number: {msg}");
+        assert!(
+            msg.contains("fn target()"),
+            "should show first line match: {msg}"
+        );
+        assert!(
+            msg.contains("2") || msg.contains("line"),
+            "should show line number: {msg}"
+        );
     }
 
     #[test]
@@ -796,7 +909,10 @@ type Handler interface {
         let old_str = "completely_nonexistent_text";
         let msg = str_replace_not_found_hint(content, old_str);
         assert!(msg.contains("Error"), "should be error: {msg}");
-        assert!(msg.contains("read_file") || msg.contains("Hint"), "should give guidance: {msg}");
+        assert!(
+            msg.contains("read_file") || msg.contains("Hint"),
+            "should give guidance: {msg}"
+        );
     }
 
     #[test]
@@ -806,7 +922,10 @@ type Handler interface {
         let msg = str_replace_ambiguous_hint(content, old_str, 2);
         assert!(msg.contains("2 times"), "should show count: {msg}");
         assert!(msg.contains("Locations"), "should show locations: {msg}");
-        assert!(msg.contains("unique"), "should hint about uniqueness: {msg}");
+        assert!(
+            msg.contains("unique"),
+            "should hint about uniqueness: {msg}"
+        );
     }
 
     // ── str_replace: integration via ToolExecutor ────────────────────────────
@@ -842,7 +961,10 @@ type Handler interface {
         }));
 
         assert!(result.contains("2 times"), "should show count: {result}");
-        assert!(result.contains("Locations"), "should show locations: {result}");
+        assert!(
+            result.contains("Locations"),
+            "should show locations: {result}"
+        );
     }
 
     // ── str_replace multi-line partial match ─────────────────────────────────
@@ -852,7 +974,10 @@ type Handler interface {
         let content = "fn alpha() {}\nfn beta() {}\nfn gamma() {}\n";
         let old_str = "fn alpha() {}\nfn WRONG() {}\nfn gamma() {}";
         let msg = str_replace_not_found_hint(content, old_str);
-        assert!(msg.contains("lines from old_str exist"), "should report partial: {msg}");
+        assert!(
+            msg.contains("lines from old_str exist"),
+            "should report partial: {msg}"
+        );
     }
 
     // ── read_file large file truncation hint ─────────────────────────────────
@@ -870,9 +995,16 @@ type Handler interface {
         let executor = test_executor_in(dir.path());
         let result = executor.read_file(&serde_json::json!({"path": "big.txt"}));
 
-        assert!(result.contains("truncated"), "should be truncated: last 100 chars: {}", &result[result.len().saturating_sub(100)..]);
-        assert!(result.contains("outline") || result.contains("start_line"),
-            "should suggest alternatives: last 200 chars: {}", &result[result.len().saturating_sub(200)..]);
+        assert!(
+            result.contains("truncated"),
+            "should be truncated: last 100 chars: {}",
+            &result[result.len().saturating_sub(100)..]
+        );
+        assert!(
+            result.contains("outline") || result.contains("start_line"),
+            "should suggest alternatives: last 200 chars: {}",
+            &result[result.len().saturating_sub(200)..]
+        );
     }
 
     // ── read_file not-found hints ────────────────────────────────────────────
@@ -916,8 +1048,14 @@ type Handler interface {
         let code = "function greet(name) {\n  console.log(name);\n}\n\nclass Animal {\n}\n";
         let defs = extract_outline(code, Language::Unknown);
         let names: Vec<&str> = defs.iter().map(|(_, s)| s.as_str()).collect();
-        assert!(names.iter().any(|s| s.contains("function greet")), "should find function: {names:?}");
-        assert!(names.iter().any(|s| s.contains("class Animal")), "should find class: {names:?}");
+        assert!(
+            names.iter().any(|s| s.contains("function greet")),
+            "should find function: {names:?}"
+        );
+        assert!(
+            names.iter().any(|s| s.contains("class Animal")),
+            "should find class: {names:?}"
+        );
     }
 
     // ── file_outline: strips trailing braces ─────────────────────────────────
@@ -928,7 +1066,15 @@ type Handler interface {
         let defs = extract_outline(code, Language::Rust);
         assert!(!defs.is_empty());
         // Should have "pub fn hello()" not "pub fn hello() {"
-        assert!(!defs[0].1.ends_with('{'), "should strip brace: {:?}", defs[0].1);
-        assert!(defs[0].1.contains("pub fn hello()"), "signature: {:?}", defs[0].1);
+        assert!(
+            !defs[0].1.ends_with('{'),
+            "should strip brace: {:?}",
+            defs[0].1
+        );
+        assert!(
+            defs[0].1.contains("pub fn hello()"),
+            "signature: {:?}",
+            defs[0].1
+        );
     }
 }

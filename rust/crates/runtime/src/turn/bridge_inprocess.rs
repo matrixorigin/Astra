@@ -222,12 +222,12 @@ fn prune_tool_schemas(tools: &[Value], tier: crate::prompts::CompactionTier) -> 
                 .iter()
                 .map(|tool| {
                     let mut t = tool.clone();
-                    if let Some(func) = t.get_mut("function") {
-                        if let Some(desc) = func.get("description").and_then(Value::as_str) {
-                            let truncated = truncate_to_first_sentence(desc).to_string();
-                            if let Some(obj) = func.as_object_mut() {
-                                obj.insert("description".to_string(), json!(truncated));
-                            }
+                    if let Some(func) = t.get_mut("function")
+                        && let Some(desc) = func.get("description").and_then(Value::as_str)
+                    {
+                        let truncated = truncate_to_first_sentence(desc).to_string();
+                        if let Some(obj) = func.as_object_mut() {
+                            obj.insert("description".to_string(), json!(truncated));
                         }
                     }
                     t

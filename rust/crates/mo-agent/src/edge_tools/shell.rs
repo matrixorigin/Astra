@@ -48,7 +48,7 @@ fn is_ssrf_target(url: &str) -> Option<&'static str> {
         .or_else(|| url.strip_prefix("http://"))?;
     let authority = after_scheme.split('/').next()?;
     // Handle userinfo@ prefix
-    let host_port = authority.split('@').last()?;
+    let host_port = authority.split('@').next_back()?;
     // Handle IPv6 brackets: [::1]:port → extract [::1]
     let host = if host_port.starts_with('[') {
         // IPv6: take everything up to and including the closing bracket
@@ -91,10 +91,10 @@ fn is_ssrf_target(url: &str) -> Option<&'static str> {
 
 /// Check if a 172.x.x.x address is in the private range 172.16-31.x.x
 fn is_private_172(host: &str) -> bool {
-    if let Some(second) = host.strip_prefix("172.").and_then(|r| r.split('.').next()) {
-        if let Ok(n) = second.parse::<u8>() {
-            return (16..=31).contains(&n);
-        }
+    if let Some(second) = host.strip_prefix("172.").and_then(|r| r.split('.').next())
+        && let Ok(n) = second.parse::<u8>()
+    {
+        return (16..=31).contains(&n);
     }
     false
 }
@@ -416,12 +416,12 @@ fn html_to_text(html: &str) -> String {
             let lower = s.to_lowercase();
             let open = format!("<{}", tag);
             let close = format!("</{}>", tag);
-            if let Some(start) = lower.find(&open) {
-                if let Some(end_rel) = lower[start..].find(&close) {
-                    let end = start + end_rel + close.len();
-                    s.replace_range(start..end, " ");
-                    continue;
-                }
+            if let Some(start) = lower.find(&open)
+                && let Some(end_rel) = lower[start..].find(&close)
+            {
+                let end = start + end_rel + close.len();
+                s.replace_range(start..end, " ");
+                continue;
             }
             break;
         }
@@ -482,11 +482,11 @@ fn html_to_text(html: &str) -> String {
                     break;
                 }
             }
-            if let Ok(code) = num_str.parse::<u32>() {
-                if let Some(decoded_char) = char::from_u32(code) {
-                    decoded.push(decoded_char);
-                    continue;
-                }
+            if let Ok(code) = num_str.parse::<u32>()
+                && let Some(decoded_char) = char::from_u32(code)
+            {
+                decoded.push(decoded_char);
+                continue;
             }
             decoded.push('&');
             decoded.push('#');
@@ -594,9 +594,18 @@ mod tests {
             "pattern": "hello",
             "path": "src-tauri/src"
         }));
-        assert!(result.contains("Error"), "should error on missing path, got: {result}");
-        assert!(result.contains("does not exist"), "should mention path doesn't exist, got: {result}");
-        assert!(result.contains("list_dir"), "should suggest list_dir, got: {result}");
+        assert!(
+            result.contains("Error"),
+            "should error on missing path, got: {result}"
+        );
+        assert!(
+            result.contains("does not exist"),
+            "should mention path doesn't exist, got: {result}"
+        );
+        assert!(
+            result.contains("list_dir"),
+            "should suggest list_dir, got: {result}"
+        );
     }
 
     #[test]
@@ -607,7 +616,10 @@ mod tests {
             "pattern": "hello",
             "path": "/nonexistent/fake/directory"
         }));
-        assert!(result.contains("Error"), "should error on missing path, got: {result}");
+        assert!(
+            result.contains("Error"),
+            "should error on missing path, got: {result}"
+        );
         assert!(result.contains("does not exist"), "got: {result}");
     }
 
@@ -673,9 +685,15 @@ mod tests {
             "pattern": "*.py",
             "path": "nonexistent/directory"
         }));
-        assert!(result.contains("Error"), "should error on missing path, got: {result}");
+        assert!(
+            result.contains("Error"),
+            "should error on missing path, got: {result}"
+        );
         assert!(result.contains("does not exist"), "got: {result}");
-        assert!(result.contains("list_dir"), "should suggest list_dir, got: {result}");
+        assert!(
+            result.contains("list_dir"),
+            "should suggest list_dir, got: {result}"
+        );
     }
 
     // ── str_replace diff preview ─────────────────────────────────────────────
@@ -842,7 +860,9 @@ mod tests {
 
     #[test]
     fn looks_like_html_detects_doctype() {
-        assert!(looks_like_html("<!DOCTYPE html><html><body>hello</body></html>"));
+        assert!(looks_like_html(
+            "<!DOCTYPE html><html><body>hello</body></html>"
+        ));
         assert!(looks_like_html("<!doctype html>\n<html>"));
     }
 
@@ -921,10 +941,7 @@ mod tests {
         let text = html_to_text(html);
         assert!(!text.contains("     "), "excessive spaces: {text}");
         // No more than 2 consecutive newlines
-        assert!(
-            !text.contains("\n\n\n"),
-            "excessive newlines: {text}"
-        );
+        assert!(!text.contains("\n\n\n"), "excessive newlines: {text}");
     }
 
     #[test]
@@ -954,14 +971,8 @@ mod tests {
         assert!(text.contains("test page"), "missing link text: {text}");
         assert!(text.contains("Item 1"), "missing list item: {text}");
         assert!(!text.contains("<"), "tags not stripped: {text}");
-        assert!(
-            !text.contains("window.ga"),
-            "script not removed: {text}"
-        );
-        assert!(
-            !text.contains("margin: 0"),
-            "style not removed: {text}"
-        );
+        assert!(!text.contains("window.ga"), "script not removed: {text}");
+        assert!(!text.contains("margin: 0"), "style not removed: {text}");
     }
 
     #[test]
@@ -993,8 +1004,10 @@ mod tests {
         }));
         // With -C1, should see line2 and line4 as context
         assert!(result.contains("MATCH"), "should find match: {result}");
-        assert!(result.contains("line2") || result.contains("line4"),
-            "should have context lines: {result}");
+        assert!(
+            result.contains("line2") || result.contains("line4"),
+            "should have context lines: {result}"
+        );
     }
 
     #[test]
@@ -1010,7 +1023,10 @@ mod tests {
             "max_matches": 2
         }));
         let match_count = result.matches("foo").count();
-        assert!(match_count <= 3, "should limit to ~2 matches, got {match_count}: {result}");
+        assert!(
+            match_count <= 3,
+            "should limit to ~2 matches, got {match_count}: {result}"
+        );
     }
 
     #[test]
@@ -1026,7 +1042,10 @@ mod tests {
             "path": "small.txt",
             "context_lines": 100
         }));
-        assert!(result.contains("MATCH"), "should still find match: {result}");
+        assert!(
+            result.contains("MATCH"),
+            "should still find match: {result}"
+        );
     }
 
     #[test]
@@ -1050,6 +1069,9 @@ mod tests {
             "max_matches": 2
         }));
         let target_count = result.matches("TARGET").count();
-        assert!(target_count <= 3, "should limit matches, got {target_count}: {result}");
+        assert!(
+            target_count <= 3,
+            "should limit matches, got {target_count}: {result}"
+        );
     }
 }

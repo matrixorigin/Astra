@@ -38,10 +38,7 @@ pub(crate) fn current_branch(project_root: &Path) -> String {
         Err(_) => return String::new(),
     };
     match repo.head_ref() {
-        Ok(Some(reference)) => {
-            let name = reference.name().shorten().to_string();
-            name
-        }
+        Ok(Some(reference)) => reference.name().shorten().to_string(),
         _ => String::new(),
     }
 }
@@ -155,7 +152,9 @@ pub(crate) fn git_log(project_root: &Path, args: &Value) -> String {
 
     let walk = match head
         .ancestors()
-        .sorting(gix::revision::walk::Sorting::ByCommitTime(gix::traverse::commit::simple::CommitTimeOrder::NewestFirst))
+        .sorting(gix::revision::walk::Sorting::ByCommitTime(
+            gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
+        ))
         .all()
     {
         Ok(w) => w,
@@ -284,23 +283,21 @@ pub(crate) fn git_show(project_root: &Path, args: &Value, pressure: f64) -> Stri
             // Root commit — show added files recursively
             out.push_str("\n[root commit]\n");
             fn list_tree_entries(tree: &gix::Tree<'_>, prefix: &str, out: &mut String) {
-                for entry in tree.iter() {
-                    if let Ok(e) = entry {
-                        let name = e.filename().to_string();
-                        let full = if prefix.is_empty() {
-                            name
-                        } else {
-                            format!("{prefix}/{name}")
-                        };
-                        if e.mode().is_tree() {
-                            if let Ok(obj) = e.object() {
-                                if let Ok(sub) = obj.try_into_tree() {
-                                    list_tree_entries(&sub, &full, out);
-                                }
-                            }
-                        } else {
-                            out.push_str(&format!("A {full}\n"));
+                for e in tree.iter().flatten() {
+                    let name = e.filename().to_string();
+                    let full = if prefix.is_empty() {
+                        name
+                    } else {
+                        format!("{prefix}/{name}")
+                    };
+                    if e.mode().is_tree() {
+                        if let Ok(obj) = e.object()
+                            && let Ok(sub) = obj.try_into_tree()
+                        {
+                            list_tree_entries(&sub, &full, out);
                         }
+                    } else {
+                        out.push_str(&format!("A {full}\n"));
                     }
                 }
             }
@@ -371,10 +368,10 @@ pub(crate) fn git_show(project_root: &Path, args: &Value, pressure: f64) -> Stri
                 | Change::Rewrite { location, .. } => location.to_string(),
             };
 
-            if let Some(filter) = file_filter {
-                if !location.contains(filter) {
-                    return Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Continue(()));
-                }
+            if let Some(filter) = file_filter
+                && !location.contains(filter)
+            {
+                return Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Continue(()));
             }
 
             out.push_str(&format!("--- a/{location}\n+++ b/{location}\n"));
@@ -457,9 +454,9 @@ pub(crate) fn git_blame(project_root: &Path, args: &Value) -> String {
     let mut options = gix::repository::blame_file::Options::default();
     if let Some(start) = line_start {
         let end = line_end.unwrap_or(start);
-        match gix::blame::BlameRanges::from_one_based_inclusive_ranges(
-            vec![(start as u32)..=(end as u32)],
-        ) {
+        match gix::blame::BlameRanges::from_one_based_inclusive_ranges(vec![
+            (start as u32)..=(end as u32),
+        ]) {
             Ok(ranges) => options.ranges = ranges,
             Err(e) => return format!("Error: invalid line range: {e}"),
         }
@@ -501,15 +498,15 @@ pub(crate) fn git_blame(project_root: &Path, args: &Value) -> String {
             let line_no = start_line + offset as u64;
 
             // Apply line range filter (in case blame ranges weren't exact)
-            if let Some(s) = line_start {
-                if line_no < s {
-                    continue;
-                }
+            if let Some(s) = line_start
+                && line_no < s
+            {
+                continue;
             }
-            if let Some(e) = line_end {
-                if line_no > e {
-                    continue;
-                }
+            if let Some(e) = line_end
+                && line_no > e
+            {
+                continue;
             }
 
             let content = String::from_utf8_lossy(line_content);
@@ -547,10 +544,7 @@ pub(crate) fn git_diff(project_root: &Path, args: &Value, pressure: f64) -> Stri
         Err(e) => return e,
     };
 
-    let staged = args
-        .get("staged")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
     let git_ref = args.get("ref").and_then(Value::as_str);
 
     // If a ref is given, do a tree-to-tree diff (HEAD vs ref)
@@ -591,65 +585,68 @@ fn diff_tree_to_tree_str(repo: &gix::Repository, ref_str: &str, limit: usize) ->
         Err(e) => return format!("Error: {e}"),
     };
 
-    let result = changes_platform.for_each_to_obtain_tree(&head_tree, |change: gix::object::tree::diff::Change<'_, '_, '_>| {
-        use gix::object::tree::diff::Change;
-        let location = match &change {
-            Change::Addition { location, .. }
-            | Change::Deletion { location, .. }
-            | Change::Modification { location, .. }
-            | Change::Rewrite { location, .. } => location.to_string(),
-        };
-        let change_type = match &change {
-            Change::Addition { .. } => "new file",
-            Change::Deletion { .. } => "deleted",
-            Change::Modification { .. } => "modified",
-            Change::Rewrite { .. } => "renamed",
-        };
+    let result = changes_platform.for_each_to_obtain_tree(
+        &head_tree,
+        |change: gix::object::tree::diff::Change<'_, '_, '_>| {
+            use gix::object::tree::diff::Change;
+            let location = match &change {
+                Change::Addition { location, .. }
+                | Change::Deletion { location, .. }
+                | Change::Modification { location, .. }
+                | Change::Rewrite { location, .. } => location.to_string(),
+            };
+            let change_type = match &change {
+                Change::Addition { .. } => "new file",
+                Change::Deletion { .. } => "deleted",
+                Change::Modification { .. } => "modified",
+                Change::Rewrite { .. } => "renamed",
+            };
 
-        out.push_str(&format!(
-            "diff --git a/{location} b/{location}\n--- a/{location}\n+++ b/{location}\n"
-        ));
+            out.push_str(&format!(
+                "diff --git a/{location} b/{location}\n--- a/{location}\n+++ b/{location}\n"
+            ));
 
-        // Try to get line-level diff
-        if let Ok(mut platform) = change.diff(&mut cache) {
-            let _ = platform.lines(|hunk| {
-                use gix::object::blob::diff::lines::Change as HC;
-                match hunk {
-                    HC::Addition { lines } => {
-                        for l in lines {
-                            out.push_str(&format!("+{}\n", l));
+            // Try to get line-level diff
+            if let Ok(mut platform) = change.diff(&mut cache) {
+                let _ = platform.lines(|hunk| {
+                    use gix::object::blob::diff::lines::Change as HC;
+                    match hunk {
+                        HC::Addition { lines } => {
+                            for l in lines {
+                                out.push_str(&format!("+{}\n", l));
+                            }
+                        }
+                        HC::Deletion { lines } => {
+                            for l in lines {
+                                out.push_str(&format!("-{}\n", l));
+                            }
+                        }
+                        HC::Modification {
+                            lines_before,
+                            lines_after,
+                        } => {
+                            for l in lines_before {
+                                out.push_str(&format!("-{}\n", l));
+                            }
+                            for l in lines_after {
+                                out.push_str(&format!("+{}\n", l));
+                            }
                         }
                     }
-                    HC::Deletion { lines } => {
-                        for l in lines {
-                            out.push_str(&format!("-{}\n", l));
-                        }
-                    }
-                    HC::Modification {
-                        lines_before,
-                        lines_after,
-                    } => {
-                        for l in lines_before {
-                            out.push_str(&format!("-{}\n", l));
-                        }
-                        for l in lines_after {
-                            out.push_str(&format!("+{}\n", l));
-                        }
-                    }
-                }
-                Ok::<_, std::convert::Infallible>(())
-            });
-        } else {
-            out.push_str(&format!("# {change_type}: {location}\n"));
-        }
-        out.push('\n');
-        count += 1;
+                    Ok::<_, std::convert::Infallible>(())
+                });
+            } else {
+                out.push_str(&format!("# {change_type}: {location}\n"));
+            }
+            out.push('\n');
+            count += 1;
 
-        if out.len() > limit {
-            return Ok(std::ops::ControlFlow::Break(()));
-        }
-        Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Continue(()))
-    });
+            if out.len() > limit {
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+            Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Continue(()))
+        },
+    );
 
     if let Err(e) = result {
         out.push_str(&format!("\n[diff error: {e}]\n"));
@@ -724,23 +721,21 @@ fn diff_index_to_head(repo: &gix::Repository, limit: usize) -> String {
             prefix: &str,
             paths: &mut std::collections::HashSet<String>,
         ) {
-            for entry in tree.iter() {
-                if let Ok(e) = entry {
-                    let name = e.filename().to_string();
-                    let full = if prefix.is_empty() {
-                        name
-                    } else {
-                        format!("{prefix}/{name}")
-                    };
-                    if e.mode().is_tree() {
-                        if let Ok(obj) = e.object() {
-                            if let Ok(sub) = obj.try_into_tree() {
-                                collect_tree_paths(&sub, &full, paths);
-                            }
-                        }
-                    } else {
-                        paths.insert(full);
+            for e in tree.iter().flatten() {
+                let name = e.filename().to_string();
+                let full = if prefix.is_empty() {
+                    name
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                if e.mode().is_tree() {
+                    if let Ok(obj) = e.object()
+                        && let Ok(sub) = obj.try_into_tree()
+                    {
+                        collect_tree_paths(&sub, &full, paths);
                     }
+                } else {
+                    paths.insert(full);
                 }
             }
         }
@@ -838,9 +833,7 @@ fn resolve_tree<'r>(repo: &'r gix::Repository, ref_str: &str) -> Result<gix::Tre
     let id = repo
         .rev_parse_single(ref_str)
         .map_err(|e| format!("Error: cannot resolve '{ref_str}': {e}"))?;
-    let obj = id
-        .object()
-        .map_err(|e| format!("Error: {e}"))?;
+    let obj = id.object().map_err(|e| format!("Error: {e}"))?;
     let commit = obj
         .try_into_commit()
         .map_err(|_| format!("Error: '{ref_str}' is not a commit"))?;
@@ -882,7 +875,9 @@ pub(crate) fn git_file_history(project_root: &Path, args: &Value) -> String {
 
     let walk = match head
         .ancestors()
-        .sorting(gix::revision::walk::Sorting::ByCommitTime(gix::traverse::commit::simple::CommitTimeOrder::NewestFirst))
+        .sorting(gix::revision::walk::Sorting::ByCommitTime(
+            gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
+        ))
         .all()
     {
         Ok(w) => w,
@@ -892,6 +887,7 @@ pub(crate) fn git_file_history(project_root: &Path, args: &Value) -> String {
     let mut lines = Vec::new();
     let mut walked = 0usize;
     const MAX_WALK: usize = 50_000;
+    #[allow(clippy::explicit_counter_loop)]
     for info in walk {
         if lines.len() >= n || walked >= MAX_WALK {
             break;
@@ -920,16 +916,14 @@ pub(crate) fn git_file_history(project_root: &Path, args: &Value) -> String {
         };
 
         // Check if parent had different content (file actually changed)
-        let parent_has_same = commit.parent_ids().next().map_or(false, |pid| {
+        let parent_has_same = commit.parent_ids().next().is_some_and(|pid| {
             pid.object()
                 .ok()
                 .and_then(|o| o.try_into_commit().ok())
                 .and_then(|pc| pc.tree().ok())
-                .and_then(|pt| match pt.lookup_entry_by_path(file) {
-                    Ok(Some(parent_entry)) => {
-                        Some(parent_entry.object_id() == cur_entry.object_id())
-                    }
-                    _ => Some(false),
+                .map(|pt| match pt.lookup_entry_by_path(file) {
+                    Ok(Some(parent_entry)) => parent_entry.object_id() == cur_entry.object_id(),
+                    _ => false,
                 })
                 .unwrap_or(false)
         });
@@ -1013,8 +1007,7 @@ fn score_commits(query: &str, commits: &[CommitDoc]) -> Vec<(usize, f64)> {
         .enumerate()
         .map(|(i, doc)| {
             let total = doc.tokens.len().max(1) as f64;
-            let mut doc_tf: std::collections::HashMap<&str, f64> =
-                std::collections::HashMap::new();
+            let mut doc_tf: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
             for t in &doc.tokens {
                 *doc_tf.entry(t.as_str()).or_default() += 1.0;
             }
@@ -1173,7 +1166,7 @@ pub(crate) fn git_contributors(project_root: &Path, args: &Value) -> String {
     let since_str = args.get("since").and_then(Value::as_str);
 
     // Parse --since into a unix timestamp cutoff
-    let since_cutoff: Option<i64> = since_str.and_then(|s| parse_since_to_epoch(s));
+    let since_cutoff: Option<i64> = since_str.and_then(parse_since_to_epoch);
 
     let head = match repo.head_id() {
         Ok(h) => h,
@@ -1191,13 +1184,15 @@ pub(crate) fn git_contributors(project_root: &Path, args: &Value) -> String {
         Err(e) => return format!("Error: {e}"),
     };
 
-    let mut author_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut author_counts: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
     let mut file_freq: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut recent_lines: Vec<String> = Vec::new();
     let mut total_commits = 0u32;
     let mut walked = 0u32;
     const MAX_WALK: u32 = 50_000;
 
+    #[allow(clippy::explicit_counter_loop)]
     for info in walk {
         if walked >= MAX_WALK {
             break;
@@ -1214,14 +1209,12 @@ pub(crate) fn git_contributors(project_root: &Path, args: &Value) -> String {
         };
 
         // Date cutoff
-        if let Some(cutoff) = since_cutoff {
-            if let Ok(author) = commit.author() {
-                if let Ok(time) = author.time() {
-                    if time.seconds < cutoff {
-                        break; // Commits are sorted newest-first, so stop early
-                    }
-                }
-            }
+        if let Some(cutoff) = since_cutoff
+            && let Ok(author) = commit.author()
+            && let Ok(time) = author.time()
+            && time.seconds < cutoff
+        {
+            break; // Commits are sorted newest-first, so stop early
         }
 
         // Skip merges (2+ parents)
@@ -1246,14 +1239,14 @@ pub(crate) fn git_contributors(project_root: &Path, args: &Value) -> String {
                 _ => continue,
             };
             // Check parent differs
-            let parent_same = commit.parent_ids().next().map_or(false, |pid| {
+            let parent_same = commit.parent_ids().next().is_some_and(|pid| {
                 pid.object()
                     .ok()
                     .and_then(|o| o.try_into_commit().ok())
                     .and_then(|pc| pc.tree().ok())
-                    .and_then(|pt| match pt.lookup_entry_by_path(path) {
-                        Ok(Some(pe)) => Some(pe.object_id() == cur_entry.object_id()),
-                        _ => Some(false),
+                    .map(|pt| match pt.lookup_entry_by_path(path) {
+                        Ok(Some(pe)) => pe.object_id() == cur_entry.object_id(),
+                        _ => false,
                     })
                     .unwrap_or(false)
             });
@@ -1274,29 +1267,29 @@ pub(crate) fn git_contributors(project_root: &Path, args: &Value) -> String {
                 .and_then(|o| o.try_into_commit().ok())
                 .and_then(|pc| pc.tree().ok());
 
-            if let (Some(new_tree), Some(old_tree)) = (tree, parent_tree) {
-                if let Ok(mut changes) = old_tree.changes() {
-                    let _ = changes.for_each_to_obtain_tree(&new_tree, |change| {
-                        use gix::object::tree::diff::Change;
-                        let location = match &change {
-                            Change::Addition { location, .. }
-                            | Change::Deletion { location, .. }
-                            | Change::Modification { location, .. }
-                            | Change::Rewrite { location, .. } => location.to_string(),
-                        };
+            if let (Some(new_tree), Some(old_tree)) = (tree, parent_tree)
+                && let Ok(mut changes) = old_tree.changes()
+            {
+                let _ = changes.for_each_to_obtain_tree(&new_tree, |change| {
+                    use gix::object::tree::diff::Change;
+                    let location = match &change {
+                        Change::Addition { location, .. }
+                        | Change::Deletion { location, .. }
+                        | Change::Modification { location, .. }
+                        | Change::Rewrite { location, .. } => location.to_string(),
+                    };
 
-                        if let Some(pf) = path_filter {
-                            if !location.starts_with(pf) {
-                                return Ok::<_, std::convert::Infallible>(
-                                    std::ops::ControlFlow::Continue(()),
-                                );
-                            }
-                        }
+                    if let Some(pf) = path_filter
+                        && !location.starts_with(pf)
+                    {
+                        return Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Continue(
+                            (),
+                        ));
+                    }
 
-                        *file_freq.entry(location).or_default() += 1;
-                        Ok(std::ops::ControlFlow::Continue(()))
-                    });
-                }
+                    *file_freq.entry(location).or_default() += 1;
+                    Ok(std::ops::ControlFlow::Continue(()))
+                });
             }
         }
 
@@ -1354,10 +1347,7 @@ pub(crate) fn git_contributors(project_root: &Path, args: &Value) -> String {
 
     // Recent activity
     if !recent_lines.is_empty() {
-        parts.push(format!(
-            "## Recent Activity\n{}",
-            recent_lines.join("\n")
-        ));
+        parts.push(format!("## Recent Activity\n{}", recent_lines.join("\n")));
     }
 
     if parts.is_empty() {
@@ -1537,15 +1527,15 @@ mod tests {
     fn git_file_history_limits_n() {
         let root = repo_root();
         let result = git_file_history(&root, &json!({"file": "README.md", "n": 3}));
-        if result.contains("Commits:") {
-            if let Some(line) = result.lines().find(|l| l.starts_with("Commits:")) {
-                let count: usize = line
-                    .trim_start_matches("Commits: ")
-                    .trim()
-                    .parse()
-                    .unwrap_or(0);
-                assert!(count <= 3, "should respect n limit: {count}");
-            }
+        if result.contains("Commits:")
+            && let Some(line) = result.lines().find(|l| l.starts_with("Commits:"))
+        {
+            let count: usize = line
+                .trim_start_matches("Commits: ")
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            assert!(count <= 3, "should respect n limit: {count}");
         }
     }
 
@@ -1568,7 +1558,9 @@ mod tests {
         // Diff HEAD against HEAD~1 should produce actual file changes
         let result = git_diff(&root, &json!({"ref": "HEAD~1"}), 0.0);
         assert!(
-            result.contains("diff --git") || result.contains("No changes") || result.contains("Error: cannot resolve"),
+            result.contains("diff --git")
+                || result.contains("No changes")
+                || result.contains("Error: cannot resolve"),
             "ref diff should produce diff output or error: {result}"
         );
     }
@@ -1673,7 +1665,9 @@ mod tests {
         let result = git_blame(&root, &json!({"file": "README.md"}));
         if !result.contains("Error") && !result.contains("No blame") {
             assert!(
-                result.contains("lines,") && result.contains("authors,") && result.contains("commits"),
+                result.contains("lines,")
+                    && result.contains("authors,")
+                    && result.contains("commits"),
                 "should have summary footer: {result}"
             );
         }
@@ -1687,7 +1681,9 @@ mod tests {
         let result = git_status(&root);
         // Should show branch info or be clean
         assert!(
-            result.contains("##") || result.contains("nothing to commit") || result.contains("HEAD detached"),
+            result.contains("##")
+                || result.contains("nothing to commit")
+                || result.contains("HEAD detached"),
             "status should show branch: {result}"
         );
     }
@@ -1699,7 +1695,11 @@ mod tests {
         let root = repo_root();
         let result = git_log(&root, &json!({"n": 3}));
         let lines: Vec<&str> = result.lines().filter(|l| !l.is_empty()).collect();
-        assert!(lines.len() <= 3, "should respect n=3: got {} lines", lines.len());
+        assert!(
+            lines.len() <= 3,
+            "should respect n=3: got {} lines",
+            lines.len()
+        );
         assert!(!lines.is_empty(), "should have at least 1 commit");
     }
 
@@ -1791,12 +1791,12 @@ mod tests {
         let result = git_log_search(&root, &json!({"query": "fix", "n": 10}));
         if result.contains("commits searched") {
             // Extract the number of commits searched
-            if let Some(start) = result.find('(') {
-                if let Some(end) = result.find(" commits searched") {
-                    let num_str = &result[start + 1..end];
-                    let count: usize = num_str.parse().unwrap_or(0);
-                    assert!(count <= 10, "should search at most 10: {count}");
-                }
+            if let Some(start) = result.find('(')
+                && let Some(end) = result.find(" commits searched")
+            {
+                let num_str = &result[start + 1..end];
+                let count: usize = num_str.parse().unwrap_or(0);
+                assert!(count <= 10, "should search at most 10: {count}");
             }
         }
     }
@@ -1808,15 +1808,12 @@ mod tests {
         if result.contains("[score:") {
             // Scores should be between 0 and 1
             for line in result.lines() {
-                if let Some(start) = line.find("[score:") {
-                    if let Some(end) = line[start..].find(']') {
-                        let score_str = &line[start + 7..start + end];
-                        let score: f64 = score_str.parse().unwrap_or(0.0);
-                        assert!(
-                            score > 0.0 && score <= 1.0,
-                            "score should be 0-1: {score}"
-                        );
-                    }
+                if let Some(start) = line.find("[score:")
+                    && let Some(end) = line[start..].find(']')
+                {
+                    let score_str = &line[start + 7..start + end];
+                    let score: f64 = score_str.parse().unwrap_or(0.0);
+                    assert!(score > 0.0 && score <= 1.0, "score should be 0-1: {score}");
                 }
             }
         }
@@ -1958,10 +1955,7 @@ mod tests {
         let branch = current_branch(&root);
         // In a git repo we should get a branch name (or empty if detached HEAD)
         // Just verify no panic and reasonable output
-        assert!(
-            !branch.contains("Error"),
-            "should not error: {branch}"
-        );
+        assert!(!branch.contains("Error"), "should not error: {branch}");
     }
 
     #[test]
@@ -2085,11 +2079,11 @@ mod tests {
         let mut root_oid = None;
         if let Ok(walk) = head.ancestors().all() {
             for info in walk.flatten() {
-                if let Ok(c) = info.object() {
-                    if c.parent_ids().count() == 0 {
-                        root_oid = Some(info.id.to_string());
-                        break;
-                    }
+                if let Ok(c) = info.object()
+                    && c.parent_ids().count() == 0
+                {
+                    root_oid = Some(info.id.to_string());
+                    break;
                 }
             }
         }

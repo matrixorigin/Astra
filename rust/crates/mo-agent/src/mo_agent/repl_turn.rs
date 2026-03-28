@@ -13,8 +13,7 @@ fn enqueue_ingestion(state: &ReplState, event: &session_journal::JournalEvent) {
         let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
         // Expand: Turn events with tool_call_records produce individual tool_call
         // events alongside the main turn event, ensuring DB-level tool granularity.
-        for ingestion_event in
-            event_ingestion::IngestionEvent::expand_journal_event(event, user_id)
+        for ingestion_event in event_ingestion::IngestionEvent::expand_journal_event(event, user_id)
         {
             sender.enqueue(ingestion_event);
         }
@@ -395,46 +394,52 @@ fn apply_turn_success(
             }
 
             // Push Step Protocol heavy checkpoint to MatrixOne (full state for recovery)
-            if let Some(ref pool) = state.matrixone_pool {
-                if let Some(ref step_cp) = result.last_heavy_checkpoint {
-                    if let Ok(state_json) = serde_json::to_string(step_cp) {
-                        let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
-                        let pool = pool.clone();
-                        let sid_owned = sid.to_string();
-                        let user_id_owned = user_id.to_string();
-                        let cp_number = result
-                            .step_recorder_summary
-                            .as_ref()
-                            .map(|s| s.checkpoints)
-                            .unwrap_or(0);
-                        // Extract metadata from the checkpoint for column storage
-                        let (tier, turn, title, tools_json): (String, u32, String, String) = match step_cp {
-                            mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Light(l) => {
-                                ("light".to_string(), 0u32, format!("step:{}", l.step_id), "[]".to_string())
-                            }
-                            mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(h) => {
-                                let tools = serde_json::to_string(&h.recent_tools)
-                                    .unwrap_or_else(|_| "[]".to_string());
-                                ("heavy".to_string(), 0u32, format!("step:{}", h.light.step_id), tools)
-                            }
-                        };
-                        tokio::spawn(async move {
-                            let _ =
-                                mo_agent_services::session_restore::push_step_checkpoint_to_cloud(
-                                    &pool,
-                                    &sid_owned,
-                                    &user_id_owned,
-                                    cp_number,
-                                    turn,
-                                    &tier,
-                                    &title,
-                                    &tools_json,
-                                    &state_json,
-                                )
-                                .await;
-                        });
+            if let Some(ref pool) = state.matrixone_pool
+                && let Some(ref step_cp) = result.last_heavy_checkpoint
+                && let Ok(state_json) = serde_json::to_string(step_cp)
+            {
+                let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
+                let pool = pool.clone();
+                let sid_owned = sid.to_string();
+                let user_id_owned = user_id.to_string();
+                let cp_number = result
+                    .step_recorder_summary
+                    .as_ref()
+                    .map(|s| s.checkpoints)
+                    .unwrap_or(0);
+                // Extract metadata from the checkpoint for column storage
+                let (tier, turn, title, tools_json): (String, u32, String, String) = match step_cp {
+                    mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Light(l) => (
+                        "light".to_string(),
+                        0u32,
+                        format!("step:{}", l.step_id),
+                        "[]".to_string(),
+                    ),
+                    mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(h) => {
+                        let tools = serde_json::to_string(&h.recent_tools)
+                            .unwrap_or_else(|_| "[]".to_string());
+                        (
+                            "heavy".to_string(),
+                            0u32,
+                            format!("step:{}", h.light.step_id),
+                            tools,
+                        )
                     }
-                }
+                };
+                tokio::spawn(async move {
+                    let _ = mo_agent_services::session_restore::push_step_checkpoint_to_cloud(
+                        &pool,
+                        &sid_owned,
+                        &user_id_owned,
+                        cp_number,
+                        turn,
+                        &tier,
+                        &title,
+                        &tools_json,
+                        &state_json,
+                    )
+                    .await;
+                });
             }
 
             let _ = mo_agent_services::session_workspace::write_workspace(&ws);

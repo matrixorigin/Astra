@@ -281,47 +281,47 @@ pub fn warm_cache_from_events(
 
     // Extract tool completion events and populate cache
     for event in events {
-        if let StepEventType::ToolCallCompleted = event.event_type {
-            if let Some(payload) = &event.payload {
-                let tool_name = payload
-                    .get("tool_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let output = payload
-                    .get("output")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let is_error = payload
-                    .get("is_error")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let content_hash = payload
-                    .get("idempotency_key")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
+        if let StepEventType::ToolCallCompleted = event.event_type
+            && let Some(payload) = &event.payload
+        {
+            let tool_name = payload
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let output = payload
+                .get("output")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let is_error = payload
+                .get("is_error")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let content_hash = payload
+                .get("idempotency_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
 
-                if !tool_name.is_empty() && !content_hash.is_empty() {
-                    let key = IdempotencyKey::semantic(
-                        tool_name,
-                        &serde_json::Value::String(content_hash.to_string()),
-                    );
-                    cache.record(
-                        &key,
-                        CachedToolResult {
-                            tool_name: tool_name.to_string(),
-                            output: output.to_string(),
-                            is_error,
-                            cached_at: event.created_at,
-                        },
-                    );
-                }
+            if !tool_name.is_empty() && !content_hash.is_empty() {
+                let key = IdempotencyKey::semantic(
+                    tool_name,
+                    &serde_json::Value::String(content_hash.to_string()),
+                );
+                cache.record(
+                    &key,
+                    CachedToolResult {
+                        tool_name: tool_name.to_string(),
+                        output: output.to_string(),
+                        is_error,
+                        cached_at: event.created_at,
+                    },
+                );
+            }
 
-                if !tool_name.is_empty() {
-                    completed_results
-                        .entry(tool_name.to_string())
-                        .or_default()
-                        .push(output.to_string());
-                }
+            if !tool_name.is_empty() {
+                completed_results
+                    .entry(tool_name.to_string())
+                    .or_default()
+                    .push(output.to_string());
             }
         }
     }
