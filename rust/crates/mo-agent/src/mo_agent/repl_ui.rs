@@ -387,6 +387,19 @@ fn apply_accepted_slash_edit(edit: AcceptedSlashEdit) -> RlCmd {
     }
 }
 
+fn render_slash_overlay_row(cmd: &str, desc: &str, selected: bool) -> String {
+    if selected {
+        format!(
+            "  {} {:<14}  {}",
+            "❯".green().bold(),
+            cmd.green().bold(),
+            desc.green().bold()
+        )
+    } else {
+        format!("    {:<14}  {}", cmd.dim(), desc.dim())
+    }
+}
+
 /// Move selection and return the newly selected command name.
 fn move_picker_selection(delta: isize) -> Option<&'static str> {
     let rows = picker_rows_for_filter();
@@ -487,11 +500,7 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
         let end = (start + visible_limit).min(total);
         for (idx, (cmd, desc)) in rows[start..end].iter().enumerate() {
             let abs = start + idx;
-            if abs == selected {
-                println!("  {} {:<14}  {}", "❯".green(), cmd.green().bold(), desc);
-            } else {
-                println!("    {:<14}  {}", cmd.dim(), desc);
-            }
+            println!("{}", render_slash_overlay_row(cmd, desc, abs == selected));
             printed += 1;
         }
         if total > visible_limit {
@@ -970,6 +979,24 @@ pub(super) fn history_path() -> PathBuf {
 mod tests {
     use super::*;
 
+    fn strip_ansi_codes(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' && matches!(chars.peek(), Some('[')) {
+                let _ = chars.next();
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.push(ch);
+        }
+        out
+    }
+
     // ── resolve_slash_command ──────────────────────────────────────────────────
 
     #[test]
@@ -1382,6 +1409,25 @@ mod tests {
             apply_accepted_slash_edit(AcceptedSlashEdit::InsertSuffix("ev ".to_string())),
             RlCmd::Insert(1, "ev ".to_string())
         );
+    }
+
+    #[test]
+    fn render_selected_slash_row_highlights_command_and_description() {
+        let row = render_slash_overlay_row("/ask", "Toggle ask mode", true);
+        let plain = strip_ansi_codes(&row);
+        assert!(plain.contains("/ask"));
+        assert!(plain.contains("Toggle ask mode"));
+        assert!(row.contains("\u{1b}["));
+        let desc_start = row.find("Toggle ask mode").expect("desc should be present");
+        assert!(row[..desc_start].contains("\u{1b}["));
+    }
+
+    #[test]
+    fn render_unselected_slash_row_keeps_plain_layout() {
+        let row = render_slash_overlay_row("/ask", "Toggle ask mode", false);
+        let plain = strip_ansi_codes(&row);
+        assert!(plain.starts_with("    /ask"));
+        assert!(plain.contains("Toggle ask mode"));
     }
 
     // ── Multi-line validator ──────────────────────────────────────────────
