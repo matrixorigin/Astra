@@ -416,17 +416,18 @@ mod divergence_detection {
 
     #[test]
     fn exploring_two_rounds() {
-        // With MAX_EXPLORATION_ROUNDS=2, two consecutive exploration rounds → Diverging
+        // With MAX_EXPLORATION_ROUNDS=5, two consecutive exploration rounds → Exploring(2)
         let sigs = make_sigs(&[&["write_file"], &["bash"], &["read_file"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(2));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(2));
     }
 
     // ── Diverging patterns (the bad path) ──
 
     #[test]
     fn diverging_three_rounds() {
+        // 3 consecutive exploration rounds → Exploring(3), below threshold of 5
         let sigs = make_sigs(&[&["bash"], &["list_dir"], &["read_file"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(3));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(3));
     }
 
     #[test]
@@ -444,20 +445,21 @@ mod divergence_detection {
 
     #[test]
     fn diverging_multi_exploration_per_round() {
+        // 3 multi-tool exploration rounds → Exploring(3), below threshold of 5
         let sigs = make_sigs(&[
             &["bash", "grep"],
             &["list_dir", "glob"],
             &["read_file", "bash"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(3));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(3));
     }
 
     // ── Reset behavior ──
 
     #[test]
     fn reset_by_productive_tool() {
-        // Even deep divergence resets when a productive tool is used,
-        // but 2 exploration rounds after reset → Diverging (MAX_EXPLORATION_ROUNDS=2)
+        // Deep divergence resets when a productive tool is used;
+        // 2 exploration rounds after reset → Exploring(2) (below MAX_EXPLORATION_ROUNDS=5)
         let sigs = make_sigs(&[
             &["bash"],
             &["bash"],
@@ -465,9 +467,9 @@ mod divergence_detection {
             &["bash"],         // 4 exploration
             &["memory_store"], // productive → reset
             &["bash"],
-            &["bash"], // 2 more exploration → Diverging
+            &["bash"], // 2 more exploration → Exploring(2)
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(2));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(2));
     }
 
     #[test]

@@ -153,8 +153,8 @@ mod turn_guard_integration {
         for _ in 0..5 {
             guard.record_tool_result("bash", "Error: fail");
         }
-        // 2 nudges already sent
-        guard.nudge_count = 2;
+        // 5 nudges already sent (need >= 5 for Critical)
+        guard.nudge_count = 5;
 
         let verdict = guard.evaluate();
         assert_eq!(verdict.severity, VerdictSeverity::Critical);
@@ -409,8 +409,8 @@ mod error_recovery_integration {
         let msg = build_recovery_message("github_list_prs", error, category, &[]);
         assert!(msg.contains("Alternatives"));
 
-        // Escalation after multiple issues
-        let level = escalation_level(1, 3, 1);
+        // Escalation after multiple issues (need >= 3 nudges or >= 5 errors for Warning)
+        let level = escalation_level(3, 3, 1);
         assert_eq!(level, EscalationLevel::Warning);
     }
 
@@ -612,12 +612,12 @@ mod chat_stream_turnguard_e2e {
 
     // ── Divergence scenarios ──
 
-    /// 3+ rounds of exploration-only tools → DIVERGENCE_CORRECTION injected.
+    /// 5+ rounds of exploration-only tools → DIVERGENCE_CORRECTION injected.
     #[test]
     fn exploration_divergence_triggers_correction() {
         let mut guard = TurnGuard::new();
 
-        // All exploration tools: bash, read_file, grep
+        // All exploration tools: bash, read_file, grep, list_dir, glob
         guard.record_tool_calls(&[tc("bash", r#"{"command":"find . -name *.rs"}"#)]);
         guard.record_tool_result("bash", "src/main.rs\nsrc/lib.rs");
 
@@ -626,6 +626,12 @@ mod chat_stream_turnguard_e2e {
 
         guard.record_tool_calls(&[tc("grep", r#"{"pattern":"TODO"}"#)]);
         guard.record_tool_result("grep", "src/lib.rs:10: // TODO fix this");
+
+        guard.record_tool_calls(&[tc("list_dir", r#"{"path":"src"}"#)]);
+        guard.record_tool_result("list_dir", "main.rs\nlib.rs");
+
+        guard.record_tool_calls(&[tc("glob", r#"{"pattern":"**/*.toml"}"#)]);
+        guard.record_tool_result("glob", "Cargo.toml");
 
         let v = guard.evaluate();
         assert!(
@@ -780,7 +786,7 @@ mod chat_stream_turnguard_e2e {
         let mut restricted = HashSet::new();
         let mut budget = 25usize;
 
-        // Phase 1: first stall → nudge_count=1, severity=Warning
+        // Phase 1: first stall → nudge_count=1, severity=Warning (from stall)
         let call = tc("bash", r#"{"command":"echo hi"}"#);
         guard.record_tool_calls(std::slice::from_ref(&call));
         guard.record_tool_calls(std::slice::from_ref(&call));
@@ -790,27 +796,36 @@ mod chat_stream_turnguard_e2e {
         budget = b;
         assert!(budget < 25, "warning should reduce budget");
 
-        // Phase 2: another stall → nudge_count=2, escalation=Critical
+        // Phase 2: stalls 2-4 → accumulate nudges to 4
+        for _ in 0..3 {
+            guard.record_tool_calls(std::slice::from_ref(&call));
+            let v = guard.evaluate();
+            let (b, _, _) = apply_verdict(&v, budget, &mut restricted);
+            budget = b;
+        }
+        assert_eq!(guard.nudge_count, 4);
+
+        // Phase 3: 5th stall → nudge_count=5, escalation=Critical
         guard.record_tool_calls(std::slice::from_ref(&call));
         let v = guard.evaluate();
-        assert_eq!(guard.nudge_count, 2);
+        assert_eq!(guard.nudge_count, 5);
         assert_eq!(v.severity, VerdictSeverity::Critical);
         let (b, events, _) = apply_verdict(&v, budget, &mut restricted);
         let _ = b;
         assert!(events.iter().any(|(e, _)| e == "critical_escalation"));
 
-        // Phase 3: one more stall → nudge_count=3 → force_stop
+        // Phase 4: 6th stall → nudge_count=6 → force_stop
         guard.record_tool_calls(std::slice::from_ref(&call));
         let v = guard.evaluate();
-        assert_eq!(guard.nudge_count, 3);
-        assert!(v.force_stop, "3 nudges + Critical → force_stop");
+        assert_eq!(guard.nudge_count, 6);
+        assert!(v.force_stop, "6 nudges + Critical → force_stop");
     }
 
-    /// Critical + 3 nudges → force_stop=true even without stall (error-only path).
+    /// Critical + 6 nudges → force_stop=true even without stall (error-only path).
     #[test]
     fn force_stop_from_errors_and_nudges() {
         let mut guard = TurnGuard::new();
-        guard.nudge_count = 3;
+        guard.nudge_count = 6;
 
         // Many errors + deprioritized tools
         for _ in 0..5 {
@@ -822,7 +837,7 @@ mod chat_stream_turnguard_e2e {
 
         let v = guard.evaluate();
         assert_eq!(v.severity, VerdictSeverity::Critical);
-        assert!(v.force_stop, "3 nudges + Critical from errors → force_stop");
+        assert!(v.force_stop, "6 nudges + Critical from errors → force_stop");
     }
 
     /// Budget depletion: Warning=-2, Critical=-5.
@@ -836,6 +851,8 @@ mod chat_stream_turnguard_e2e {
             avoid_tools: vec![],
             severity: VerdictSeverity::Warning,
             force_stop: false,
+            stall_detected: false,
+            is_diverging: false,
         };
         let (r, _, _) = apply_verdict(&warning_verdict, 25, &mut restricted);
         assert_eq!(r, 23);
@@ -846,6 +863,8 @@ mod chat_stream_turnguard_e2e {
             avoid_tools: vec![],
             severity: VerdictSeverity::Critical,
             force_stop: false,
+            stall_detected: false,
+            is_diverging: false,
         };
         let (r, _, _) = apply_verdict(&critical_verdict, 23, &mut restricted);
         assert_eq!(r, 18);
@@ -856,6 +875,8 @@ mod chat_stream_turnguard_e2e {
             avoid_tools: vec![],
             severity: VerdictSeverity::Healthy,
             force_stop: false,
+            stall_detected: false,
+            is_diverging: false,
         };
         let (r, _, _) = apply_verdict(&healthy_verdict, 18, &mut restricted);
         assert_eq!(r, 18);
@@ -1037,6 +1058,8 @@ mod chat_stream_turnguard_e2e {
             avoid_tools: vec![],
             severity: VerdictSeverity::Healthy,
             force_stop: false,
+            stall_detected: false,
+            is_diverging: false,
         };
         // chat_stream only skips (continues) when BOTH injections non-empty AND severity >= Warning
         let should_skip = !v.injections.is_empty() && v.severity >= VerdictSeverity::Warning;
@@ -1054,6 +1077,8 @@ mod chat_stream_turnguard_e2e {
             avoid_tools: vec![],
             severity: VerdictSeverity::Info,
             force_stop: false,
+            stall_detected: false,
+            is_diverging: false,
         };
         let should_skip = !v.injections.is_empty() && v.severity >= VerdictSeverity::Warning;
         assert!(
@@ -1070,6 +1095,8 @@ mod chat_stream_turnguard_e2e {
             avoid_tools: vec![],
             severity: VerdictSeverity::Warning,
             force_stop: false,
+            stall_detected: false,
+            is_diverging: false,
         };
         let should_skip = !v.injections.is_empty() && v.severity >= VerdictSeverity::Warning;
         assert!(

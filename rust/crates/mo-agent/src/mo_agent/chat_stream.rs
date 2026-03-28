@@ -1521,8 +1521,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             };
             step_recorder.record_verdict(
                 severity_label,
-                turn_guard.nudge_count > 0,
-                verdict.force_stop,
+                verdict.stall_detected,
+                verdict.is_diverging,
                 verdict.force_stop,
                 verdict.injections.len(),
             );

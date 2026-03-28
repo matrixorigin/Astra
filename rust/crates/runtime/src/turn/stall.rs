@@ -9,7 +9,10 @@ pub const SERVER_STALL_WINDOW: usize = 2;
 const EXPLORATION_TOOLS: &[&str] = &["bash", "list_dir", "read_file", "glob", "grep"];
 
 /// Maximum consecutive exploration-only rounds before triggering correction.
-pub const MAX_EXPLORATION_ROUNDS: usize = 2;
+/// Raised from 2→5: grep→read_file is the fundamental agent pattern,
+/// not divergence. 5 consecutive exploration-only rounds is a more reliable
+/// signal that the agent is truly stuck in a loop.
+pub const MAX_EXPLORATION_ROUNDS: usize = 5;
 
 pub fn canonical_tool_args(raw: &str) -> String {
     match serde_json::from_str::<Value>(raw) {
@@ -345,27 +348,55 @@ mod tests {
 
     #[test]
     fn divergence_exploring_two() {
-        // With MAX_EXPLORATION_ROUNDS=2, two consecutive exploration rounds → Diverging
+        // With MAX_EXPLORATION_ROUNDS=5, two consecutive exploration rounds → Exploring(2)
         let sigs = make_sigs(&[&["github_list_prs"], &["bash"], &["list_dir"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(2));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(2));
     }
 
     #[test]
-    fn divergence_detected_three() {
+    fn divergence_exploring_three() {
+        // 3 consecutive exploration rounds → still Exploring (threshold is 5)
         let sigs = make_sigs(&[&["bash"], &["list_dir"], &["read_file"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(3));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(3));
     }
 
     #[test]
-    fn divergence_detected_four() {
+    fn divergence_exploring_four() {
+        // 4 consecutive exploration rounds → still Exploring (threshold is 5)
         let sigs = make_sigs(&[&["bash"], &["list_dir"], &["grep"], &["read_file"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(4));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(4));
+    }
+
+    #[test]
+    fn divergence_detected_at_five() {
+        // 5 consecutive exploration rounds → Diverging (hits threshold)
+        let sigs = make_sigs(&[
+            &["bash"],
+            &["list_dir"],
+            &["grep"],
+            &["read_file"],
+            &["glob"],
+        ]);
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(5));
+    }
+
+    #[test]
+    fn divergence_detected_six() {
+        let sigs = make_sigs(&[
+            &["bash"],
+            &["list_dir"],
+            &["grep"],
+            &["read_file"],
+            &["glob"],
+            &["bash"],
+        ]);
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(6));
     }
 
     #[test]
     fn divergence_reset_by_productive() {
-        // Productive tool in the middle resets the counter, but 2 consecutive
-        // exploration rounds at the end → Diverging with MAX_EXPLORATION_ROUNDS=2
+        // Productive tool in the middle resets the counter;
+        // only 2 exploration rounds at the end → Exploring(2) (below threshold of 5)
         let sigs = make_sigs(&[
             &["bash"],
             &["list_dir"],
@@ -373,7 +404,7 @@ mod tests {
             &["bash"],
             &["list_dir"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(2));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(2));
     }
 
     #[test]
@@ -384,12 +415,40 @@ mod tests {
 
     #[test]
     fn divergence_multi_tool_exploration_only() {
+        // 3 rounds of multi-tool exploration → Exploring(3), below threshold of 5
         let sigs = make_sigs(&[
             &["bash", "grep"],
             &["list_dir", "read_file"],
             &["bash", "glob"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(3));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(3));
+    }
+
+    #[test]
+    fn divergence_multi_tool_exploration_at_threshold() {
+        // 5 rounds of multi-tool exploration → Diverging(5)
+        let sigs = make_sigs(&[
+            &["bash", "grep"],
+            &["list_dir", "read_file"],
+            &["bash", "glob"],
+            &["grep", "read_file"],
+            &["bash", "list_dir"],
+        ]);
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(5));
+    }
+
+    /// Regression test for session f9903b97: grep→read_file→grep→grep is
+    /// a normal code analysis pattern, NOT divergence.
+    #[test]
+    fn normal_code_analysis_not_diverging() {
+        let sigs = make_sigs(&[
+            &["grep", "grep"], // round 0: search
+            &["read_file"],    // round 1: read result
+            &["grep"],         // round 2: refine search
+            &["grep", "grep"], // round 3: more search
+        ]);
+        // 4 consecutive exploration rounds → Exploring(4), NOT Diverging
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(4));
     }
 
     // ── Universal stemming ──

@@ -95,7 +95,7 @@ use repl_turn::{ReplTurnContext, handle_chat_input};
 use repl_ui::{
     ReplHelper, SlashStartCompleteHandler, clear_slash_overlay, history_path,
     is_slash_picker_active, print_keyboard_shortcuts, print_slash_commands, resolve_slash_command,
-    suggest_commands,
+    suggest_commands, take_slash_pending_execute,
 };
 use slash_account::handle_account_command;
 use slash_info::handle_info_command;
@@ -1857,8 +1857,12 @@ async fn run_chat_repl(
                 let _ = editor.add_history_entry(line.as_str());
 
                 if line.starts_with('/') {
+                    // If Enter was pressed in the picker, the selected command is
+                    // stored in pending-execute.  Use it instead of the raw line.
+                    let pending = take_slash_pending_execute();
+                    let dispatch_line = pending.as_deref().unwrap_or(&line);
                     let should_exit = handle_slash_command(
-                        &line,
+                        dispatch_line,
                         client,
                         base,
                         profile,

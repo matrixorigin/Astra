@@ -68,6 +68,8 @@ pub fn classify_error(error_str: &str) -> ErrorCategory {
         || lower.contains("auth failed")
         || lower.contains("token expired")
         || lower.contains("invalid token")
+        || lower.contains("could not validate")
+        || lower.contains("credentials")
     {
         return ErrorCategory::Auth;
     }
@@ -262,19 +264,22 @@ pub enum EscalationLevel {
 /// Determine escalation level from session error signals.
 ///
 /// - `nudge_count`: how many stall nudges have been sent
-/// - `total_errors`: total tool errors this session
+/// - `total_errors`: total tool errors this session (excluding auth + timeouts)
 /// - `deprioritized_count`: number of deprioritized tools
+///
+/// Thresholds are deliberately generous: normal agent behavior (search→read→search)
+/// should NEVER trigger escalation. Only truly stuck/broken sessions escalate.
 pub fn escalation_level(
     nudge_count: usize,
     total_errors: usize,
     deprioritized_count: usize,
 ) -> EscalationLevel {
-    // Critical: 2+ nudges, or 5+ errors with deprioritized tools
-    if nudge_count >= 2 || (total_errors >= 5 && deprioritized_count >= 2) {
+    // Critical: 5+ nudges, or 8+ errors with deprioritized tools
+    if nudge_count >= 5 || (total_errors >= 8 && deprioritized_count >= 2) {
         return EscalationLevel::Critical;
     }
-    // Warning: 1 nudge, or 3+ errors
-    if nudge_count >= 1 || total_errors >= 3 {
+    // Warning: 3 nudges, or 5+ errors
+    if nudge_count >= 3 || total_errors >= 5 {
         return EscalationLevel::Warning;
     }
     EscalationLevel::Normal
@@ -387,6 +392,26 @@ mod tests {
             ErrorCategory::Auth
         );
         assert_eq!(classify_error("token expired"), ErrorCategory::Auth);
+    }
+
+    /// Regression: session f9903b97 — "Could not validate credentials" from
+    /// jwt.rs was classified as Unknown, causing false stall escalation.
+    #[test]
+    fn classify_auth_could_not_validate() {
+        assert_eq!(
+            classify_error("Could not validate credentials"),
+            ErrorCategory::Auth
+        );
+        assert_eq!(
+            classify_error("could not validate credentials for user"),
+            ErrorCategory::Auth
+        );
+    }
+
+    #[test]
+    fn classify_auth_credentials() {
+        assert_eq!(classify_error("invalid credentials"), ErrorCategory::Auth);
+        assert_eq!(classify_error("bad credentials"), ErrorCategory::Auth);
     }
 
     #[test]
@@ -556,23 +581,44 @@ mod tests {
     }
 
     #[test]
-    fn escalation_warning_one_nudge() {
-        assert_eq!(escalation_level(1, 0, 0), EscalationLevel::Warning);
+    fn escalation_normal_low_nudges() {
+        // 1-2 nudges: still Normal (raised from old threshold of 1)
+        assert_eq!(escalation_level(1, 0, 0), EscalationLevel::Normal);
+        assert_eq!(escalation_level(2, 0, 0), EscalationLevel::Normal);
     }
 
     #[test]
-    fn escalation_warning_three_errors() {
-        assert_eq!(escalation_level(0, 3, 0), EscalationLevel::Warning);
+    fn escalation_warning_three_nudges() {
+        assert_eq!(escalation_level(3, 0, 0), EscalationLevel::Warning);
+        assert_eq!(escalation_level(4, 0, 0), EscalationLevel::Warning);
     }
 
     #[test]
-    fn escalation_critical_two_nudges() {
-        assert_eq!(escalation_level(2, 0, 0), EscalationLevel::Critical);
+    fn escalation_warning_five_errors() {
+        assert_eq!(escalation_level(0, 5, 0), EscalationLevel::Warning);
+    }
+
+    #[test]
+    fn escalation_normal_few_errors() {
+        // 3-4 errors: still Normal (raised from old threshold of 3)
+        assert_eq!(escalation_level(0, 3, 0), EscalationLevel::Normal);
+        assert_eq!(escalation_level(0, 4, 0), EscalationLevel::Normal);
+    }
+
+    #[test]
+    fn escalation_critical_five_nudges() {
+        assert_eq!(escalation_level(5, 0, 0), EscalationLevel::Critical);
     }
 
     #[test]
     fn escalation_critical_many_errors_with_deprioritized() {
-        assert_eq!(escalation_level(0, 5, 2), EscalationLevel::Critical);
+        assert_eq!(escalation_level(0, 8, 2), EscalationLevel::Critical);
+    }
+
+    #[test]
+    fn escalation_not_critical_errors_without_deprioritized() {
+        // 8 errors but no deprioritized tools → Warning, not Critical
+        assert_eq!(escalation_level(0, 8, 0), EscalationLevel::Warning);
     }
 
     #[test]

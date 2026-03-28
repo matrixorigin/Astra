@@ -167,6 +167,11 @@ fn is_command_alias(command: &str) -> bool {
     matches!(command, "/?" | "/commands" | "/quit")
 }
 
+/// A sub-command contains a space (e.g. "/skill list", "/search files").
+fn is_subcommand(command: &str) -> bool {
+    command.trim_start_matches('/').contains(' ')
+}
+
 fn command_name_matches_prefix(command: &str, query: &str) -> bool {
     let cmd = command.trim_start_matches('/').to_ascii_lowercase();
     let q = query
@@ -200,6 +205,13 @@ pub(super) fn completion_candidates(prefix: &str) -> Vec<(&'static str, &'static
 fn filtered_slash_rows(query: Option<&str>) -> Vec<(&'static str, &'static str)> {
     let mut rows = completion_candidates("/");
     rows.retain(|(cmd, _)| *cmd != "/" && !is_command_alias(cmd));
+    // Hide sub-commands from the top-level picker.
+    // They only appear when the user types a parent prefix containing a space
+    // (e.g. "skill " → show "/skill list", "/skill dev", …).
+    let show_subcommands = query.map(|q| q.contains(' ')).unwrap_or(false);
+    if !show_subcommands {
+        rows.retain(|(cmd, _)| !is_subcommand(cmd));
+    }
     if let Some(q) = query {
         let mut prefix_rows: Vec<(&'static str, &'static str)> = rows
             .iter()
@@ -224,6 +236,7 @@ static SLASH_OVERLAY_LINES: OnceLock<Mutex<u16>> = OnceLock::new();
 static SLASH_PICKER_SELECTED: OnceLock<Mutex<usize>> = OnceLock::new();
 static SLASH_OVERLAY_STATE: OnceLock<Mutex<(Option<String>, usize)>> = OnceLock::new();
 static SLASH_FILTER_QUERY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static SLASH_PENDING_EXECUTE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 fn slash_overlay_lines() -> &'static Mutex<u16> {
     SLASH_OVERLAY_LINES.get_or_init(|| Mutex::new(0))
@@ -253,6 +266,25 @@ fn set_slash_filter(q: Option<String>) {
 }
 fn get_slash_filter() -> Option<String> {
     slash_filter_query().lock().ok().and_then(|g| g.clone())
+}
+
+// ── Pending-execute: picker Enter stores the command for immediate dispatch ──
+
+fn slash_pending_execute() -> &'static Mutex<Option<String>> {
+    SLASH_PENDING_EXECUTE.get_or_init(|| Mutex::new(None))
+}
+fn set_slash_pending_execute(cmd: Option<String>) {
+    if let Ok(mut g) = slash_pending_execute().lock() {
+        *g = cmd;
+    }
+}
+/// Take the command stored by Enter-in-picker.  Returns `Some` once, then
+/// `None` until the next picker Enter.  Called from the main REPL loop.
+pub(super) fn take_slash_pending_execute() -> Option<String> {
+    slash_pending_execute()
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take())
 }
 pub(super) fn is_slash_picker_active() -> bool {
     slash_overlay_lines()
@@ -862,51 +894,20 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
         eprintln!("\n{}", "Command Palette".bold());
     }
     eprintln!("{}", "\u{2500}".repeat(62).dim());
+    print_group("Core", &["/help", "/model", "/clear", "/exit", "/keys"]);
     print_group(
-        "General",
-        &[
-            "/",
-            "/help",
-            "/model",
-            "/skill",
-            "/skill list",
-            "/skill new",
-            "/skill test",
-            "/skill dev",
-            "/skill dev off",
-            "/skill doctor",
-            "/skill validate",
-            "/skill config",
-            "/skill system",
-            "/history",
-            "/search",
-            "/search files",
-            "/search review",
-            "/copy",
-            "/context",
-            "/version",
-            "/explain",
-            "/verbose",
-            "/compact",
-            "/exit",
-        ],
+        "Workspace",
+        &["/search", "/history", "/copy", "/context", "/rewind"],
     );
+    print_group("Agent", &["/explain", "/verbose", "/compact", "/reflect"]);
     print_group(
         "Session",
-        &[
-            "/session",
-            "/session history",
-            "/session list",
-            "/session errors",
-            "/session export",
-            "/clear",
-            "/reflect",
-        ],
+        &["/session", "/resume", "/stats", "/tools", "/health"],
     );
-    print_group("Memory", &["/memory", "/plan", "/task"]);
-    print_group("Diagnostics", &["/stats", "/tools", "/health", "/doctor"]);
+    print_group("Skills & Memory", &["/skill", "/memory", "/plan", "/task"]);
+    print_group("Diagnostics", &["/doctor", "/version"]);
     print_group(
-        "Authentication",
+        "Account",
         &["/login", "/register", "/logout", "/memory-setup"],
     );
     let alias_rows = [
@@ -931,6 +932,12 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
         eprintln!("  {}", format!("No commands match '{label}'").yellow());
     }
     eprintln!("{}", "\u{2500}".repeat(62).dim());
+    if filter.is_none() {
+        eprintln!(
+            "  {}",
+            "Tip: type a parent command + space to see sub-commands (e.g. /skill , /search )".dim()
+        );
+    }
     eprintln!();
 }
 
@@ -994,7 +1001,8 @@ pub(super) fn print_keyboard_shortcuts() {
             &[
                 ("/", "Open command picker"),
                 ("↑/↓ or Tab", "Navigate picker items"),
-                ("Enter", "Select command"),
+                ("Enter", "Execute selected command"),
+                ("→/Space", "Accept and continue editing"),
                 ("Esc", "Dismiss picker"),
             ],
         ),
@@ -1167,9 +1175,10 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 return None;
             }
 
-            // ── Accept: Enter with picker selects the highlighted command ─────
-            // Accept the currently selected command against the user's typed query.
-            // Navigation should not rewrite the buffer; Enter is the explicit accept step.
+            // ── Accept: Enter with picker executes the selected command ─────
+            // Store the selected command in pending-execute and return None so
+            // rustyline fires AcceptLine.  The main REPL loop reads the pending
+            // value and dispatches it instead of the (possibly incomplete) typed text.
             // Special case: bare "/" should dispatch as the "/" command (show list),
             // not auto-select the first picker item.
             RlKeyEvent(RlKeyCode::Enter, _) if active => {
@@ -1182,14 +1191,12 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 let rows = picker_rows_for_filter();
                 let selected = get_slash_picker_selected();
                 clear_slash_overlay();
-                if let Some((cmd, _)) = rows.get(selected)
-                    && *cmd != current
-                {
-                    if let Some(edit) = accepted_slash_edit(current, Some(*cmd), false) {
-                        return Some(apply_accepted_slash_edit(edit));
+                if let Some((cmd, _)) = rows.get(selected) {
+                    if *cmd != current {
+                        set_slash_pending_execute(Some(cmd.to_string()));
                     }
                 }
-                return None; // already correct — accept
+                return None; // AcceptLine → immediate execution
             }
 
             // ── Dismiss ─────────────────────────────────────────────────
@@ -1977,5 +1984,118 @@ mod tests {
         // No trailing backslash should be valid
         let input_done = "hello world";
         assert!(!input_done.ends_with('\\'));
+    }
+
+    // ── Sub-command tiering ──────────────────────────────────────────────
+
+    #[test]
+    fn is_subcommand_recognizes_space_commands() {
+        assert!(is_subcommand("/skill list"));
+        assert!(is_subcommand("/search files"));
+        assert!(is_subcommand("/session history"));
+        assert!(is_subcommand("/skill dev off"));
+        assert!(!is_subcommand("/skill"));
+        assert!(!is_subcommand("/search"));
+        assert!(!is_subcommand("/model"));
+    }
+
+    #[test]
+    fn filtered_rows_top_level_hides_subcommands() {
+        let rows = filtered_slash_rows(None);
+        assert!(
+            rows.iter().all(|(cmd, _)| !is_subcommand(cmd)),
+            "top-level picker should not show sub-commands"
+        );
+        // Parent commands still present
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/skill"));
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/search"));
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/session"));
+    }
+
+    #[test]
+    fn filtered_rows_single_prefix_hides_subcommands() {
+        let rows = filtered_slash_rows(Some("s"));
+        assert!(
+            rows.iter().all(|(cmd, _)| !is_subcommand(cmd)),
+            "single-char prefix should not show sub-commands"
+        );
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/session"));
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/search"));
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/skill"));
+    }
+
+    #[test]
+    fn filtered_rows_space_prefix_shows_subcommands() {
+        // Typing "/skill " should reveal skill sub-commands
+        let rows = filtered_slash_rows(Some("skill "));
+        assert!(!rows.is_empty());
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/skill list"));
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/skill dev"));
+        // Parent command itself should not appear (prefix "skill " doesn't match "/skill")
+        assert!(!rows.iter().any(|(cmd, _)| *cmd == "/skill"));
+    }
+
+    #[test]
+    fn filtered_rows_search_space_shows_subcommands() {
+        let rows = filtered_slash_rows(Some("search "));
+        assert!(!rows.is_empty());
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/search files"));
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/search review"));
+    }
+
+    // ── Pending-execute lifecycle ────────────────────────────────────────
+
+    #[test]
+    fn pending_execute_set_take_clears() {
+        // Start clean
+        let _ = take_slash_pending_execute();
+        // Set and take
+        set_slash_pending_execute(Some("/model".to_string()));
+        assert_eq!(
+            take_slash_pending_execute(),
+            Some("/model".to_string()),
+            "first take should return the stored command"
+        );
+        assert_eq!(
+            take_slash_pending_execute(),
+            None,
+            "second take should return None (already consumed)"
+        );
+    }
+
+    #[test]
+    fn pending_execute_none_by_default() {
+        // Drain any leftover from other tests
+        let _ = take_slash_pending_execute();
+        assert_eq!(take_slash_pending_execute(), None);
+    }
+
+    // ── Print group reorganization ───────────────────────────────────────
+
+    #[test]
+    fn print_slash_commands_has_expected_groups() {
+        // Capture stderr output from print_slash_commands
+        // We can't capture stderr easily in a unit test, so we validate the
+        // group structure indirectly by checking all listed commands exist
+        // in SLASH_COMMANDS.
+        let groups: &[&[&str]] = &[
+            &["/help", "/model", "/clear", "/exit", "/keys"],
+            &["/search", "/history", "/copy", "/context", "/rewind"],
+            &["/explain", "/verbose", "/compact", "/reflect"],
+            &["/session", "/resume", "/stats", "/tools", "/health"],
+            &["/skill", "/memory", "/plan", "/task"],
+            &["/doctor", "/version"],
+            &["/login", "/register", "/logout", "/memory-setup"],
+        ];
+        let known: std::collections::HashSet<&str> =
+            SLASH_COMMANDS.iter().map(|(cmd, _)| *cmd).collect();
+        for group in groups {
+            for cmd in *group {
+                assert!(
+                    known.contains(cmd),
+                    "group command {cmd} not in SLASH_COMMANDS"
+                );
+            }
+        }
     }
 }

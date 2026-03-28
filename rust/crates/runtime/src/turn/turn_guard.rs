@@ -26,6 +26,10 @@ pub struct TurnVerdict {
     pub severity: VerdictSeverity,
     /// Whether the session should be force-terminated.
     pub force_stop: bool,
+    /// Whether an exact-repetition stall was detected this round.
+    pub stall_detected: bool,
+    /// Whether divergence (exploration-only loop) was detected this round.
+    pub is_diverging: bool,
 }
 
 /// Severity level of the turn verdict.
@@ -78,11 +82,9 @@ impl TurnGuard {
 
     /// Record tool call signatures for this turn.
     pub fn record_tool_calls(&mut self, tool_calls: &[serde_json::Value]) {
-        stall::record_server_tool_signatures(
-            &mut self.tool_sigs,
-            tool_calls,
-            stall::SERVER_STALL_WINDOW + 2, // Keep a few extra for analysis
-        );
+        // Window must be large enough for both stall detection and divergence detection.
+        let window = stall::SERVER_STALL_WINDOW.max(stall::MAX_EXPLORATION_ROUNDS) + 2;
+        stall::record_server_tool_signatures(&mut self.tool_sigs, tool_calls, window);
     }
 
     /// Record a tool result and classify its quality.
@@ -236,12 +238,22 @@ impl TurnGuard {
 
         // 5. Escalation
         // Discount timeout-only errors: they're infrastructure issues, not agent failures.
-        // Use non-timeout errors for escalation to avoid false critical escalation.
+        // Also discount auth errors: they're credential issues, not agent misbehavior.
         let total_timeouts = self.health.total_timeouts();
-        let non_timeout_errors = self.errors.total_errors.saturating_sub(total_timeouts);
+        let auth_errors = self
+            .errors
+            .errors_by_category
+            .get(&error_recovery::ErrorCategory::Auth)
+            .copied()
+            .unwrap_or(0);
+        let actionable_errors = self
+            .errors
+            .total_errors
+            .saturating_sub(total_timeouts)
+            .saturating_sub(auth_errors);
         let escalation = error_recovery::escalation_level(
             self.nudge_count,
-            non_timeout_errors,
+            actionable_errors,
             self.health.deprioritized_tools().len(),
         );
         if let Some(msg) = error_recovery::build_escalation_message(
@@ -256,13 +268,17 @@ impl TurnGuard {
             };
         }
 
-        let force_stop = escalation == EscalationLevel::Critical && self.nudge_count >= 3;
+        let force_stop = escalation == EscalationLevel::Critical && self.nudge_count >= 6;
+
+        let is_diverging = matches!(divergence, DivergenceStatus::Diverging(_));
 
         TurnVerdict {
             injections,
             avoid_tools: avoid_tools.into_iter().collect(),
             severity,
             force_stop,
+            stall_detected,
+            is_diverging,
         }
     }
 
@@ -324,16 +340,16 @@ mod tests {
     #[test]
     fn divergence_triggers_correction() {
         let mut guard = TurnGuard::new();
-        // 3 rounds of exploration-only tools
-        let calls1 = [make_tool_call("bash", r#"{"command":"ls"}"#)];
-        let calls2 = [make_tool_call("read_file", r#"{"path":"foo"}"#)];
-        let calls3 = [make_tool_call("grep", r#"{"pattern":"bar"}"#)];
-        guard.record_tool_calls(&calls1);
-        guard.record_tool_calls(&calls2);
-        guard.record_tool_calls(&calls3);
+        // 5 rounds of exploration-only tools (hits MAX_EXPLORATION_ROUNDS=5)
+        guard.record_tool_calls(&[make_tool_call("bash", r#"{"command":"ls"}"#)]);
+        guard.record_tool_calls(&[make_tool_call("read_file", r#"{"path":"foo"}"#)]);
+        guard.record_tool_calls(&[make_tool_call("grep", r#"{"pattern":"bar"}"#)]);
+        guard.record_tool_calls(&[make_tool_call("list_dir", r#"{"path":"src"}"#)]);
+        guard.record_tool_calls(&[make_tool_call("glob", r#"{"pattern":"*.rs"}"#)]);
 
         let verdict = guard.evaluate();
         assert!(verdict.injections.iter().any(|m| m.contains("exploring")));
+        assert!(verdict.is_diverging);
     }
 
     #[test]
@@ -444,8 +460,8 @@ mod tests {
     #[test]
     fn verdict_escalation_to_critical() {
         let mut guard = TurnGuard::new();
-        // Simulate 2 nudges + many errors
-        guard.nudge_count = 2;
+        // Simulate 5 nudges (raised threshold) + many errors
+        guard.nudge_count = 5;
         guard
             .errors
             .record_error(error_recovery::ErrorCategory::Transient);
@@ -459,5 +475,108 @@ mod tests {
         let verdict = guard.evaluate();
         assert_eq!(verdict.severity, VerdictSeverity::Critical);
         assert!(verdict.injections.iter().any(|m| m.contains("CRITICAL")));
+    }
+
+    /// Auth errors should NOT count toward escalation.
+    /// Regression: session f9903b97 — auth failures cascaded to session abort.
+    #[test]
+    fn auth_errors_excluded_from_escalation() {
+        let mut guard = TurnGuard::new();
+        // Record 10 auth errors — should NOT escalate
+        for _ in 0..10 {
+            guard
+                .errors
+                .record_error(error_recovery::ErrorCategory::Auth);
+        }
+        let verdict = guard.evaluate();
+        assert_eq!(verdict.severity, VerdictSeverity::Healthy);
+        assert!(!verdict.force_stop);
+    }
+
+    /// Normal code exploration (grep→read_file→grep→grep) should never
+    /// trigger stall or divergence within 4 rounds.
+    /// Regression: session f9903b97 was killed during normal code analysis.
+    #[test]
+    fn normal_code_analysis_no_escalation() {
+        let mut guard = TurnGuard::new();
+
+        // Round 0: initial search
+        guard.record_tool_calls(&[
+            make_tool_call("grep", r#"{"pattern":"stall","path":"src/"}"#),
+            make_tool_call("grep", r#"{"pattern":"guard","path":"src/"}"#),
+        ]);
+        guard.record_tool_result("grep", r#"{"output": "file1.rs:10"}"#);
+        guard.record_tool_result("grep", r#"{"output": "file2.rs:20"}"#);
+        let v = guard.evaluate();
+        assert_eq!(v.severity, VerdictSeverity::Healthy);
+        assert!(!v.stall_detected);
+        assert!(!v.is_diverging);
+
+        // Round 1: read results
+        guard.record_tool_calls(&[make_tool_call("read_file", r#"{"path":"file1.rs"}"#)]);
+        guard.record_tool_result("read_file", r#"fn main() { ... }"#);
+        let v = guard.evaluate();
+        assert_eq!(v.severity, VerdictSeverity::Healthy);
+        assert!(!v.stall_detected);
+        assert!(!v.is_diverging);
+
+        // Round 2: more search
+        guard.record_tool_calls(&[make_tool_call(
+            "grep",
+            r#"{"pattern":"error","path":"src/"}"#,
+        )]);
+        guard.record_tool_result("grep", r#"{"output": "file3.rs:5"}"#);
+        let v = guard.evaluate();
+        assert_eq!(v.severity, VerdictSeverity::Healthy);
+        assert!(!v.stall_detected);
+        assert!(!v.is_diverging);
+
+        // Round 3: more search — still under threshold
+        guard.record_tool_calls(&[
+            make_tool_call("grep", r#"{"pattern":"warn","path":"src/"}"#),
+            make_tool_call("grep", r#"{"pattern":"critical","path":"src/"}"#),
+        ]);
+        let v = guard.evaluate();
+        assert_eq!(v.severity, VerdictSeverity::Healthy);
+        assert!(!v.stall_detected);
+        assert!(!v.is_diverging);
+        assert!(!v.force_stop);
+    }
+
+    /// Verify stall_detected and is_diverging fields are accurate.
+    #[test]
+    fn verdict_fields_reflect_actual_state() {
+        let mut guard = TurnGuard::new();
+
+        // Trigger stall (same call twice)
+        let calls = [make_tool_call("bash", r#"{"command":"ls"}"#)];
+        guard.record_tool_calls(&calls);
+        guard.record_tool_calls(&calls);
+        let v = guard.evaluate();
+        assert!(v.stall_detected);
+        assert!(!v.is_diverging); // stall detected, not divergence
+
+        // Fresh guard: trigger divergence (6 exploration rounds, all different)
+        let mut guard2 = TurnGuard::new();
+        let tools = ["bash", "read_file", "grep", "list_dir", "glob", "bash"];
+        for (i, tool) in tools.iter().enumerate() {
+            guard2.record_tool_calls(&[make_tool_call(tool, &format!(r#"{{"arg":"val{}"}}"#, i))]);
+        }
+        let v2 = guard2.evaluate();
+        assert!(v2.is_diverging);
+    }
+
+    /// force_stop requires 6+ nudges AND Critical escalation.
+    #[test]
+    fn force_stop_requires_high_nudge_count() {
+        let mut guard = TurnGuard::new();
+        guard.nudge_count = 5;
+        let v = guard.evaluate();
+        // 5 nudges → Critical escalation, but nudge_count < 6 → no force_stop
+        assert!(!v.force_stop);
+
+        guard.nudge_count = 6;
+        let v = guard.evaluate();
+        assert!(v.force_stop);
     }
 }
