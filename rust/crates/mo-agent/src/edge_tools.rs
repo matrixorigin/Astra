@@ -363,6 +363,22 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        // ── Build/Test tool ─────────────────────────────────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "run_build_test",
+                "description": "Run a build or test command with structured error parsing. Returns structured errors with file:line:col locations AND auto-reads surrounding source code for each error location, so you can fix issues in one shot without additional read_file calls. Use this instead of raw bash for build/test commands.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "Build/test command to run (e.g., 'cargo test', 'pytest', 'npm test')"},
+                        "context_lines": {"type": "integer", "description": "Lines of source context around each error (default: 5)"}
+                    },
+                    "required": ["command"]
+                }
+            }
+        }),
         // ── MatrixOne tools ─────────────────────────────────────────────
         json!({
             "type": "function",
@@ -940,6 +956,7 @@ impl ToolExecutor {
             "git_checkout_file" => git_gix::git_checkout_file(&self.project_root, args),
             "find_definition" => self.find_definition(args),
             "find_references" => self.find_references(args),
+            "run_build_test" => self.run_build_test(args),
             "symbols" => self.symbols(args),
             "mo_query" => self.mo_query(args),
             "mo_snapshot" => self.mo_snapshot(args),
@@ -1361,6 +1378,85 @@ impl ToolExecutor {
                 }
             }
         }
+    }
+
+    /// Run a build/test command with structured error parsing and auto-context.
+    ///
+    /// Returns structured errors with file:line:col locations plus surrounding
+    /// source code for each error, enabling single-shot fix without extra read_file calls.
+    fn run_build_test(&self, args: &Value) -> String {
+        let command = match args.get("command").and_then(Value::as_str) {
+            Some(c) if !c.trim().is_empty() => c.trim(),
+            _ => return "Error: 'command' parameter is required".to_string(),
+        };
+        let context_lines = args.get("context_lines").and_then(Value::as_u64).unwrap_or(5) as usize;
+
+        // Run the command
+        let output = std::process::Command::new("sh")
+            .args(["-c", command])
+            .current_dir(&self.project_root)
+            .output();
+
+        let (stdout, stderr, exit_code) = match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                let code = out.status.code();
+                (stdout, stderr, code)
+            }
+            Err(e) => return format!("Error: failed to run command: {e}"),
+        };
+
+        let combined = format!("{stdout}\n{stderr}");
+        let result = build_test::parse_build_test_output(&combined, exit_code);
+
+        // Build the structured output
+        let mut parts = Vec::new();
+        parts.push(result.to_enhanced_output(&combined));
+
+        // Auto-read source context for each error location
+        if !result.error_locations.is_empty() {
+            parts.push(String::new());
+            parts.push("─── Source Context ───".to_string());
+
+            let mut seen_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for loc in result.error_locations.iter().take(5) {
+                let file_path = self.project_root.join(&loc.file);
+                let file_key = format!("{}:{}", loc.file, loc.line);
+                if seen_files.contains(&file_key) {
+                    continue;
+                }
+                seen_files.insert(file_key);
+
+                if let Ok(content) = std::fs::read_to_string(&file_path) {
+                    let lines: Vec<&str> = content.lines().collect();
+                    let start = loc.line.saturating_sub(context_lines + 1);
+                    let end = (loc.line + context_lines).min(lines.len());
+
+                    let code_part = if loc.error_code.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", loc.error_code)
+                    };
+                    parts.push(format!("\n// {}:{}{} — {}", loc.file, loc.line, code_part, loc.message));
+
+                    for (idx, line) in lines[start..end].iter().enumerate() {
+                        let line_num = start + idx + 1;
+                        let marker = if line_num == loc.line { "→" } else { " " };
+                        parts.push(format!("{marker} {line_num:>4} │ {line}"));
+                    }
+                }
+            }
+
+            if result.error_locations.len() > 5 {
+                parts.push(format!(
+                    "\n[{} more error locations — use read_file to inspect]",
+                    result.error_locations.len() - 5
+                ));
+            }
+        }
+
+        truncate_output(parts.join("\n"), tool_output_limit())
     }
 
     /// Execute a multi-step ToolChain, forwarding each step to self.execute().
@@ -2502,5 +2598,49 @@ fn helper() {}
         assert!(names.contains(&"git_checkout_file"), "missing git_checkout_file schema");
         assert!(names.contains(&"find_definition"), "missing find_definition schema");
         assert!(names.contains(&"find_references"), "missing find_references schema");
+        assert!(names.contains(&"run_build_test"), "missing run_build_test schema");
+    }
+
+    // ── run_build_test tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_build_test_requires_command() {
+        let executor = test_executor();
+        let result = executor.execute("run_build_test", &json!({})).await;
+        assert!(result.contains("Error"), "should require command: {result}");
+    }
+
+    #[tokio::test]
+    async fn run_build_test_echo_passes() {
+        let executor = test_executor();
+        let result = executor.execute("run_build_test", &json!({"command": "echo 'hello world'"})).await;
+        // echo should succeed
+        assert!(result.contains("✓") || result.contains("hello"), "should pass: {result}");
+    }
+
+    #[tokio::test]
+    async fn run_build_test_failing_command() {
+        let executor = test_executor();
+        let result = executor.execute("run_build_test", &json!({"command": "false"})).await;
+        // false exits with code 1
+        assert!(result.contains("✗") || result.contains("exit 1") || result.contains("failed"),
+                "should detect failure: {result}");
+    }
+
+    #[tokio::test]
+    async fn run_build_test_cargo_in_repo() {
+        // Run cargo check in our own repo
+        let root = {
+            let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.pop(); // → rust/crates/
+            p.pop(); // → rust/
+            p
+        };
+        let executor = ToolExecutor::new(root);
+        let result = executor.execute("run_build_test", &json!({
+            "command": "cargo check -p mo-agent-cli --message-format=short 2>&1 | tail -5"
+        })).await;
+        // Should report something meaningful
+        assert!(!result.is_empty(), "should produce output");
     }
 }
