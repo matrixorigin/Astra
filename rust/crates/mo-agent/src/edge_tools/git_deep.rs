@@ -10,6 +10,7 @@ use super::*;
 // ─── Blame parsing ──────────────────────────────────────────────────────────
 
 /// A single blame entry from `git blame --porcelain`.
+#[allow(dead_code)] // Kept as fallback; routing now uses git_gix::git_blame
 struct BlameEntry {
     commit: String,
     author: String,
@@ -19,6 +20,7 @@ struct BlameEntry {
 }
 
 /// Parse `git blame --porcelain` output into structured text.
+#[allow(dead_code)] // Kept as fallback; routing now uses git_gix::git_blame
 fn parse_blame_porcelain(raw: &str) -> String {
     let mut entries: Vec<BlameEntry> = Vec::new();
     let mut current_commit = String::new();
@@ -167,6 +169,7 @@ fn score_commits(query: &str, commits: &[CommitDoc]) -> Vec<(usize, f64)> {
 
 impl ToolExecutor {
     /// `git_blame`: structured blame output with author, date, commit per line.
+    #[allow(dead_code)] // Kept as fallback; routing now uses git_gix::git_blame
     pub(crate) fn git_blame(&self, args: &Value) -> String {
         let file = match args.get("file").and_then(Value::as_str) {
             Some(f) => f,
@@ -196,6 +199,7 @@ impl ToolExecutor {
     }
 
     /// `git_file_history`: change history for a specific file with follow support.
+    #[allow(dead_code)] // Kept as fallback; routing now uses git_gix::git_file_history
     pub(crate) fn git_file_history(&self, args: &Value) -> String {
         let file = match args.get("file").and_then(Value::as_str) {
             Some(f) => f,

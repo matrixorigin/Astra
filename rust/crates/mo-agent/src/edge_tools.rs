@@ -24,6 +24,8 @@ use serde_json::{Value, json};
 mod fs_tools;
 #[path = "edge_tools/git_deep.rs"]
 mod git_deep;
+#[path = "edge_tools/git_gix.rs"]
+mod git_gix;
 #[path = "edge_tools/github.rs"]
 mod github;
 #[path = "edge_tools/mo_tools.rs"]
@@ -806,15 +808,12 @@ impl ToolExecutor {
             "list_dir" => self.list_dir(args),
             "grep" => self.grep(args),
             "glob" => self.glob(args),
-            "git_status" => truncate_output(
-                self.git_run(&["status", "--short", "--branch"]),
-                tool_output_limit(),
-            ),
-            "git_diff" => self.git_diff(args),
-            "git_log" => self.git_log(args),
-            "git_show" => self.git_show(args),
-            "git_blame" => self.git_blame(args),
-            "git_file_history" => self.git_file_history(args),
+            "git_status" => git_gix::git_status(&self.project_root),
+            "git_diff" => git_gix::git_diff(&self.project_root, args),
+            "git_log" => git_gix::git_log(&self.project_root, args),
+            "git_show" => git_gix::git_show(&self.project_root, args),
+            "git_blame" => git_gix::git_blame(&self.project_root, args),
+            "git_file_history" => git_gix::git_file_history(&self.project_root, args),
             "git_contributors" => self.git_contributors(args),
             "git_log_search" => self.git_log_search(args),
             "mo_query" => self.mo_query(args),

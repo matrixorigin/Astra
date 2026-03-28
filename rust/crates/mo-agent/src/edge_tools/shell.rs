@@ -338,6 +338,7 @@ impl ToolExecutor {
         }
     }
 
+    #[allow(dead_code)] // Kept as fallback; routing now uses git_gix
     pub(crate) fn git_diff(&self, args: &Value) -> String {
         let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
         let git_ref = args.get("ref").and_then(Value::as_str);
@@ -360,12 +361,14 @@ impl ToolExecutor {
         }
     }
 
+    #[allow(dead_code)] // Kept as fallback; routing now uses git_gix
     pub(crate) fn git_log(&self, args: &Value) -> String {
         let n = args.get("n").and_then(Value::as_u64).unwrap_or(10);
         self.git_run(&["log", "--oneline", &format!("-{n}")])
     }
 
     /// Show a specific commit's diff, message, and metadata.
+    #[allow(dead_code)] // Kept as fallback; routing now uses git_gix
     pub(crate) fn git_show(&self, args: &Value) -> String {
         let commit = match args.get("commit").and_then(Value::as_str) {
             Some(c) => c.to_string(),
