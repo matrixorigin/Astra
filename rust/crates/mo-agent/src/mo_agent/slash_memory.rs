@@ -240,8 +240,88 @@ pub(super) async fn handle_memory_domain_command(
                         Err(e) => eprintln!("{}", format!("  ✗ Unreachable: {e}").red()),
                     }
                 }
+                "decompose" if !sub_arg.is_empty() => {
+                    // Analyze project context using current working directory
+                    let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    eprintln!("  {} Analyzing project structure...", "⋯".dim());
+                    let context = crate::plan_decompose::analyze_project(&project_root);
+                    
+                    eprintln!(
+                        "  {} {} languages, {} files, {}",
+                        "✓".green(),
+                        context.languages.len(),
+                        context.source_file_count,
+                        context.entry_points.join(", ")
+                    );
+                    
+                    // Generate the decomposition prompt
+                    let prompt = crate::plan_decompose::decomposition_prompt(sub_arg, &context);
+                    
+                    // Call LLM to decompose
+                    eprintln!("  {} Decomposing goal into subtasks...", "⋯".dim());
+                    let payload = serde_json::json!({
+                        "model": state.model.as_deref().unwrap_or("ep-glm-5-fc5e97"),
+                        "messages": [
+                            {"role": "user", "content": prompt}
+                        ],
+                        "temperature": 0.3,
+                        "max_tokens": 2000,
+                    });
+                    
+                    match client
+                        .post(format!("{base}/chat"))
+                        .headers(auth_headers(tok)?)
+                        .json(&payload)
+                        .send()
+                        .await
+                    {
+                        Ok(r) if r.status().is_success() => {
+                            let body = r.text().await.unwrap_or_default();
+                            // Extract content from response
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                                let content = json
+                                    .get("choices")
+                                    .and_then(|c| c.get(0))
+                                    .and_then(|c| c.get("message"))
+                                    .and_then(|m| m.get("content"))
+                                    .and_then(|c| c.as_str())
+                                    .unwrap_or(&body);
+                                
+                                match crate::plan_decompose::parse_plan_response(content) {
+                                    Ok(plan) => {
+                                        // Store the plan in memory using MemoryEntry helper
+                                        let entry = prompts::memory_proto::MemoryEntry::new(
+                                            prompts::memory_proto::NS_PLAN,
+                                            prompts::memory_proto::ST_ACTIVE,
+                                            sub_arg,
+                                        );
+                                        let store_payload = entry.to_store_payload();
+                                        let _ = client
+                                            .post(format!("{base}/memory/store"))
+                                            .headers(auth_headers(tok)?)
+                                            .json(&store_payload)
+                                            .send()
+                                            .await;
+                                        
+                                        // Display the plan
+                                        eprintln!();
+                                        eprint!("{}", crate::plan_decompose::format_plan(&plan));
+                                    }
+                                    Err(e) => {
+                                        eprintln!("{}", format!("  ✗ Failed to parse plan: {e}").red());
+                                        eprintln!("  Raw response:\n{}", content);
+                                    }
+                                }
+                            } else {
+                                eprintln!("{}", format!("  ✗ Invalid JSON response").red());
+                            }
+                        }
+                        Ok(r) => eprintln!("{}", format!("  ✗ LLM call failed ({})", r.status()).red()),
+                        Err(e) => eprintln!("{}", format!("  ✗ Unreachable: {e}").red()),
+                    }
+                }
                 _ => {
-                    eprintln!("  Usage: /plan [show | set <text> | clear]");
+                    eprintln!("  Usage: /plan [show | set <text> | clear | decompose <goal>]");
                 }
             }
         }

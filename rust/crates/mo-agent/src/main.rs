@@ -62,6 +62,8 @@ mod slash_account;
 mod slash_info;
 #[path = "mo_agent/slash_memory.rs"]
 mod slash_memory;
+#[path = "mo_agent/plan_decompose.rs"]
+mod plan_decompose;
 #[path = "mo_agent/slash_session.rs"]
 mod slash_session;
 #[path = "mo_agent/slash_skill.rs"]
