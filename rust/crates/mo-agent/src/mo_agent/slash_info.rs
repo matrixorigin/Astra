@@ -23,6 +23,114 @@ fn copy_to_clipboard(text: &str) -> bool {
     false
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SearchRequest {
+    Content(String),
+    Files(String),
+    Review(String),
+}
+
+fn parse_search_request(arg: &str) -> Result<SearchRequest, &'static str> {
+    let trimmed = arg.trim();
+    if trimmed.is_empty() {
+        return Err("Usage: /search <pattern> | /search files <glob> | /search review <pattern>");
+    }
+    if let Some(rest) = trimmed.strip_prefix("files ").map(str::trim) {
+        if rest.is_empty() {
+            return Err("Usage: /search files <glob>");
+        }
+        return Ok(SearchRequest::Files(rest.to_string()));
+    }
+    if let Some(rest) = trimmed.strip_prefix("review ").map(str::trim) {
+        if rest.is_empty() {
+            return Err("Usage: /search review <pattern>");
+        }
+        return Ok(SearchRequest::Review(rest.to_string()));
+    }
+    Ok(SearchRequest::Content(trimmed.to_string()))
+}
+
+fn collect_changed_files(staged: &str, unstaged: &str, untracked: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    staged
+        .lines()
+        .chain(unstaged.lines())
+        .chain(untracked.lines())
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let normalized = line.to_string();
+            if seen.insert(normalized.clone()) {
+                Some(normalized)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn run_git_lines(project_root: &std::path::Path, args: &[&str]) -> Vec<String> {
+    match SysCommand::new("git")
+        .args(args)
+        .current_dir(project_root)
+        .output()
+    {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn review_search(executor: &edge_tools::ToolExecutor, pattern: &str) -> String {
+    let staged = run_git_lines(&executor.project_root, &["diff", "--name-only", "--cached"]);
+    let unstaged = run_git_lines(&executor.project_root, &["diff", "--name-only"]);
+    let untracked = run_git_lines(
+        &executor.project_root,
+        &["ls-files", "--others", "--exclude-standard"],
+    );
+    let files = collect_changed_files(&staged.join("\n"), &unstaged.join("\n"), &untracked.join("\n"));
+    if files.is_empty() {
+        return "No changed files found. Use /search <pattern> for workspace-wide search.".to_string();
+    }
+
+    let mut cmd = SysCommand::new("grep");
+    cmd.arg("-n");
+    cmd.arg("-i");
+    cmd.arg("--binary-files=without-match");
+    cmd.arg(pattern);
+    for file in &files {
+        cmd.arg(file);
+    }
+    cmd.current_dir(&executor.project_root);
+
+    match cmd.output() {
+        Ok(output) => match output.status.code() {
+            Some(0) => {
+                let text = String::from_utf8_lossy(&output.stdout);
+                if text.len() > 20_000 {
+                    format!("{}\n[truncated]", &text[..20_000])
+                } else {
+                    text.to_string()
+                }
+            }
+            Some(1) => "No matches found in changed files".to_string(),
+            _ => {
+                let err = String::from_utf8_lossy(&output.stderr);
+                let detail = err.trim();
+                if detail.is_empty() {
+                    "Error: review search failed".to_string()
+                } else {
+                    format!("Error: {detail}")
+                }
+            }
+        },
+        Err(e) => format!("Error: {e}"),
+    }
+}
+
 pub(super) async fn handle_info_command(
     cmd: &str,
     arg: &str,
@@ -104,6 +212,40 @@ pub(super) async fn handle_info_command(
                 }
                 eprintln!();
             }
+        }
+
+        "/search" => {
+            let request = match parse_search_request(arg) {
+                Ok(request) => request,
+                Err(usage) => {
+                    eprintln!("{}", format!("  {usage}").yellow());
+                    return Ok(());
+                }
+            };
+
+            let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let executor = edge_tools::ToolExecutor::new(project_root);
+
+            let (title, result) = match request {
+                SearchRequest::Content(pattern) => (
+                    format!("Workspace search · {pattern}"),
+                    executor.grep(&serde_json::json!({"pattern": pattern, "path": "."})),
+                ),
+                SearchRequest::Files(pattern) => (
+                    format!("File search · {pattern}"),
+                    executor.glob(&serde_json::json!({"pattern": pattern, "path": "."})),
+                ),
+                SearchRequest::Review(pattern) => {
+                    let title = format!("Review search · {pattern}");
+                    (title, review_search(&executor, &pattern))
+                }
+            };
+
+            eprintln!("\n{}", format!("─── {title} ─────────────────────────────────────────────").bold());
+            for line in result.lines() {
+                eprintln!("  {line}");
+            }
+            eprintln!();
         }
 
         "/copy" => match &state.last_response {
@@ -436,4 +578,44 @@ pub(super) async fn handle_info_command(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_search_request_defaults_to_content_search() {
+        assert_eq!(
+            parse_search_request("tool timeout").unwrap(),
+            SearchRequest::Content("tool timeout".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_search_request_supports_files_mode() {
+        assert_eq!(
+            parse_search_request("files Cargo.toml").unwrap(),
+            SearchRequest::Files("Cargo.toml".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_search_request_supports_review_mode() {
+        assert_eq!(
+            parse_search_request("review timeout").unwrap(),
+            SearchRequest::Review("timeout".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_search_request_rejects_empty_args() {
+        assert!(parse_search_request("").is_err());
+    }
+
+    #[test]
+    fn collect_changed_files_deduplicates_and_skips_blanks() {
+        let files = collect_changed_files("src/main.rs\n", "src/main.rs\nsrc/lib.rs\n", "\nnew.rs\n");
+        assert_eq!(files, vec!["src/main.rs", "src/lib.rs", "new.rs"]);
+    }
 }

@@ -25,6 +25,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/history",
         "Show conversation turns (or /history search <q>)",
     ),
+    (
+        "/search",
+        "Workspace search: /search <pattern> | /search files <glob> | /search review <pattern>",
+    ),
     ("/rewind", "Rewind conversation to turn N: /rewind <turn>"),
     ("/copy", "Copy last response to clipboard"),
     ("/context", "Show context window and session state"),
@@ -335,6 +339,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
             Some("<session_id|prefix>")
         }
         "/rewind" => Some("<turn>"),
+        "/search" => Some("<pattern|files <glob>|review <pattern>>"),
         "/skill" => Some("[list|new|test|dev|doctor|validate|config|system]"),
         "/skill new" => Some("<name>"),
         "/skill test" => Some("<name> [json_args]"),
@@ -839,6 +844,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
             "/skill config",
             "/skill system",
             "/history",
+            "/search",
             "/copy",
             "/context",
             "/version",
@@ -1420,6 +1426,11 @@ mod tests {
         );
     }
 
+    #[test]
+    fn search_command_is_registered() {
+        assert!(SLASH_COMMANDS.iter().any(|(cmd, _)| *cmd == "/search"));
+    }
+
     // ── /resume in SLASH_COMMANDS ─────────────────────────────────────────────
 
     #[test]
@@ -1672,6 +1683,14 @@ mod tests {
         assert_eq!(
             slash_inline_hint("/skill "),
             Some("[list|new|test|dev|doctor|validate|config|system]".to_string())
+        );
+    }
+
+    #[test]
+    fn slash_inline_hint_shows_search_modes() {
+        assert_eq!(
+            slash_inline_hint("/search"),
+            Some(" <pattern|files <glob>|review <pattern>>".to_string())
         );
     }
 

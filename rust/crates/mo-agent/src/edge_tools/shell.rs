@@ -4,6 +4,41 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+const DEFAULT_SEARCH_EXCLUDE_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "dist",
+    "build",
+    "coverage",
+    "htmlcov",
+    "node_modules",
+    "vendor",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".next",
+    ".nuxt",
+    ".cache",
+    "out",
+];
+
+fn append_default_grep_excludes(cmd: &mut Command) {
+    cmd.arg("--binary-files=without-match");
+    cmd.arg("--devices=skip");
+    for dir in DEFAULT_SEARCH_EXCLUDE_DIRS {
+        cmd.arg("--exclude-dir").arg(dir);
+    }
+}
+
+fn default_find_prune_clause() -> String {
+    let joined = DEFAULT_SEARCH_EXCLUDE_DIRS
+        .iter()
+        .map(|dir| format!("-name {}", shell_escape(dir)))
+        .collect::<Vec<_>>()
+        .join(" -o ");
+    format!("\\( -type d \\( {joined} \\) -prune \\)")
+}
+
 /// SSRF protection: check if a URL targets internal/private networks.
 /// Returns Some(reason) if blocked, None if safe.
 fn is_ssrf_target(url: &str) -> Option<&'static str> {
@@ -178,6 +213,7 @@ impl ToolExecutor {
         if !case_sensitive {
             cmd.arg("-i");
         }
+        append_default_grep_excludes(&mut cmd);
         cmd.arg("--include").arg(include);
         cmd.arg(pattern).arg(&search_path);
         cmd.current_dir(&self.project_root);
@@ -185,14 +221,26 @@ impl ToolExecutor {
         match cmd.output() {
             Ok(out) => {
                 let text = String::from_utf8_lossy(&out.stdout);
-                if text.is_empty() {
-                    "No matches found".to_string()
-                } else if text.len() > 20_000 {
-                    let mut t = text[..20_000].to_string();
-                    t.push_str("\n[truncated]");
-                    t
-                } else {
-                    text.to_string()
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                match out.status.code() {
+                    Some(0) => {
+                        if text.len() > 20_000 {
+                            let mut t = text[..20_000].to_string();
+                            t.push_str("\n[truncated]");
+                            t
+                        } else {
+                            text.to_string()
+                        }
+                    }
+                    Some(1) => "No matches found".to_string(),
+                    _ => {
+                        let detail = stderr.trim();
+                        if detail.is_empty() {
+                            "Error: grep failed".to_string()
+                        } else {
+                            format!("Error: {detail}")
+                        }
+                    }
                 }
             }
             Err(e) => format!("Error: {e}"),
@@ -210,21 +258,11 @@ impl ToolExecutor {
             .map(|p| self.resolve(p))
             .unwrap_or_else(|| self.project_root.clone());
 
-        // Use find as a portable glob implementation
-        let mut cmd = Command::new("bash");
-        cmd.arg("-c")
-            .arg(format!(
-                "find . -path '{}' 2>/dev/null | head -200",
-                pattern
-            ))
-            .current_dir(&base);
-
-        // Actually use glob via shell
         let shell_cmd = format!(
-            "cd {} && find . -name '{}' 2>/dev/null | sed 's|^./||' | head -200",
+            "cd {} && find . {} -o -name {} -print | sed 's|^./||' | head -200",
             shell_escape(base.to_string_lossy().as_ref()),
-            // Convert ** glob to find-compatible
-            pattern.split('/').next_back().unwrap_or(pattern)
+            default_find_prune_clause(),
+            shell_escape(pattern.split('/').next_back().unwrap_or(pattern))
         );
         let out = Command::new("bash").arg("-c").arg(&shell_cmd).output();
         match out {
@@ -233,7 +271,7 @@ impl ToolExecutor {
                 if text.trim().is_empty() {
                     "No files found".to_string()
                 } else {
-                    text
+                    text.to_string()
                 }
             }
             Err(e) => format!("Error: {e}"),
@@ -462,6 +500,40 @@ mod tests {
 
         let result = executor.grep(&serde_json::json!({"pattern": "zzzzz", "path": "."}));
         assert!(result.contains("No matches"), "got: {result}");
+    }
+
+    #[test]
+    fn grep_skips_default_generated_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("dist")).unwrap();
+        std::fs::write(dir.path().join("src").join("app.rs"), "needle in source").unwrap();
+        std::fs::write(dir.path().join("dist").join("bundle.js"), "needle in build").unwrap();
+
+        let result = executor.grep(&serde_json::json!({"pattern": "needle", "path": "."}));
+        assert!(result.contains("src/app.rs"), "got: {result}");
+        assert!(
+            !result.contains("dist/bundle.js"),
+            "default grep should skip bulky dirs: {result}"
+        );
+    }
+
+    #[test]
+    fn glob_skips_default_generated_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("src").join("main.rs"), "").unwrap();
+        std::fs::write(dir.path().join("target").join("cached.rs"), "").unwrap();
+
+        let result = executor.glob(&serde_json::json!({"pattern": "*.rs", "path": "."}));
+        assert!(result.contains("src/main.rs"), "got: {result}");
+        assert!(
+            !result.contains("target/cached.rs"),
+            "default glob should skip bulky dirs: {result}"
+        );
     }
 
     #[test]

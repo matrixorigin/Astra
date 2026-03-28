@@ -1644,7 +1644,7 @@ async fn handle_slash_command(
 
         "/session" => handle_session_command(arg, state),
 
-        "/history" | "/copy" | "/doctor" | "/context" | "/version" | "/rewind" => {
+        "/history" | "/search" | "/copy" | "/doctor" | "/context" | "/version" | "/rewind" => {
             handle_info_command(cmd, arg, client, base, state, token).await?;
         }
 
