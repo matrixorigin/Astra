@@ -851,15 +851,20 @@ pub fn prune_schema(mut schema: Value, level: PruneLevel) -> Value {
     schema
 }
 
-/// Truncate a string at a word boundary.
+/// Truncate a string at a word boundary, safely handling multi-byte UTF-8.
 fn truncate_at_boundary(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
-    // Find last space before max
-    match s[..max].rfind(' ') {
+    // Walk back to a valid char boundary (handles CJK, emoji, etc.)
+    let mut byte_idx = max;
+    while byte_idx > 0 && !s.is_char_boundary(byte_idx) {
+        byte_idx -= 1;
+    }
+    // Find last space before the safe boundary for a clean word break
+    match s[..byte_idx].rfind(' ') {
         Some(pos) => format!("{}…", &s[..pos]),
-        None => format!("{}…", &s[..max]),
+        None => format!("{}…", &s[..byte_idx]),
     }
 }
 
@@ -2603,5 +2608,24 @@ mod tests {
         assert_eq!(truncate_at_boundary("hello world", 20), "hello world");
         assert_eq!(truncate_at_boundary("hello world foo bar baz", 12), "hello world…");
         assert_eq!(truncate_at_boundary("abcdefghij", 5), "abcde…");
+    }
+
+    #[test]
+    fn truncate_at_boundary_utf8_safe() {
+        // Emoji: 🔴 is 4 bytes — slicing at byte 2 would panic without the fix
+        let emoji = "🔴 This is a test";
+        let result = truncate_at_boundary(emoji, 2);
+        assert!(!result.is_empty(), "should not panic on emoji boundary");
+
+        // CJK: 这 is 3 bytes — slicing at byte 5 would land inside '是'
+        let cjk = "这是测试描述";
+        let result = truncate_at_boundary(cjk, 5);
+        assert!(!result.is_empty(), "should not panic on CJK boundary");
+        assert!(result.ends_with('…'));
+
+        // Mixed: ASCII + CJK
+        let mixed = "read 文件内容 from disk";
+        let result = truncate_at_boundary(mixed, 8);
+        assert!(!result.is_empty());
     }
 }

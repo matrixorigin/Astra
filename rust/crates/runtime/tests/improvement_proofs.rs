@@ -5385,7 +5385,7 @@ mod hardening_proofs {
     #[test]
     fn quality_detects_fabrication_in_response() {
         let report = check_response_quality(
-            "The configuration is at /path/to/config.yaml. You should edit it.",
+            "The configuration is at path/to/your/config.yaml. You should edit it.",
             &[],
             &["bash"],
             "where is the config?",

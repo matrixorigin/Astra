@@ -13,15 +13,15 @@ const REPEAT_THRESHOLD: usize = 8;
 
 /// Patterns that indicate the LLM fabricated file paths or data.
 /// These are common hallucination signatures — paths that look plausible but are invented.
+/// Kept specific to avoid false-positiving on legitimate URLs.
 const FABRICATION_MARKERS: &[&str] = &[
-    "/path/to/",
-    "/example/",
-    "example.com/api",
+    "path/to/your/",
+    "path/to/project/",
+    "/example/project/",
     "<YOUR_",
     "<your_",
-    "INSERT_",
-    "REPLACE_",
-    "xxx",
+    "INSERT_YOUR_",
+    "REPLACE_WITH_",
     "TODO_REPLACE",
 ];
 
@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn fabrication_detected_in_text() {
         let report = check_response_quality(
-            "You can find the config at /path/to/config.yaml",
+            "You can find the config at path/to/your/config.yaml and edit it",
             &[],
             &["bash"],
             "where is the config?",
@@ -354,6 +354,17 @@ mod tests {
             "where is the config?",
         );
         assert!(!report.has_fabrication_markers);
+    }
+
+    #[test]
+    fn fabrication_not_triggered_for_legitimate_urls() {
+        let report = check_response_quality(
+            "See https://api.github.com/path/to/repo for the API docs and example.com/api/v1",
+            &[],
+            &["bash"],
+            "where are the docs?",
+        );
+        assert!(!report.has_fabrication_markers, "legitimate URLs should not trigger fabrication");
     }
 
     #[test]
@@ -410,7 +421,7 @@ mod tests {
             serde_json::json!({"name": "fake_tool", "arguments": "{bad json"}),
         ];
         let report = check_response_quality(
-            "Check /path/to/file for details",
+            "Check path/to/your/file for details and edit it",
             &calls,
             &["bash"],
             "find file",
