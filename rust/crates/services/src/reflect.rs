@@ -161,7 +161,7 @@ impl ReflectService for DatabaseReflectService {
         let decision_rows = query(
             "SELECT decision_id, decision_type, model_used, \
              CAST(created_at AS CHAR) AS created_at, \
-             SUBSTRING(CAST(COALESCE(decision_output, '{}') AS CHAR), 1, 200) AS output_preview \
+             SUBSTRING(COALESCE(CAST(decision_output AS CHAR), '{}'), 1, 200) AS output_preview \
              FROM ctx_decision_audits \
              WHERE session_id = ? \
              ORDER BY created_at DESC LIMIT ?",
