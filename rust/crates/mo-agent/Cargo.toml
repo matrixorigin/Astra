@@ -32,6 +32,11 @@ termimad = "0.23"
 tokio.workspace = true
 uuid.workspace = true
 gix = { version = "0.81.0", features = ["status", "blame", "mailmap", "revision"] }
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23"
 
 [dev-dependencies]
 tempfile = "3"

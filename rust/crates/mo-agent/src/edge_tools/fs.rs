@@ -59,14 +59,30 @@ impl ToolExecutor {
         };
 
         // Outline mode: return only definition signatures with line numbers
+        // Uses tree-sitter for supported languages (Rust, Python, TypeScript, Go)
+        // Falls back to regex-based detection for others
         if args
             .get("outline")
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let lang = detect_language(ext);
             let total_lines = content.lines().count();
+
+            // Try tree-sitter first for accurate AST-based extraction
+            if let Some(ts_lang) = super::code_intel::detect_language(&path) {
+                let outline = super::code_intel::generate_outline(&content, ts_lang);
+                if !outline.is_empty() {
+                    let def_count = outline.lines().count();
+                    return format!(
+                        "# Outline ({total_lines} lines, {def_count} symbols)\n{}",
+                        outline
+                    );
+                }
+            }
+
+            // Fall back to regex-based detection
+            let lang = detect_language(ext);
             let outline = extract_outline(&content, lang);
             if outline.is_empty() {
                 return format!("(no definitions found in {total_lines}-line file)");

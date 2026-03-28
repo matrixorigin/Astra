@@ -32,6 +32,8 @@ mod mo_tools;
 mod shell;
 #[path = "edge_tools/build_test.rs"]
 mod build_test;
+#[path = "edge_tools/code_intel.rs"]
+pub mod code_intel;
 
 // ─── Tool schema ─────────────────────────────────────────────────────────────
 
