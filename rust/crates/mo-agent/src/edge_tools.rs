@@ -22,8 +22,6 @@ use serde_json::{Value, json};
 
 #[path = "edge_tools/fs.rs"]
 mod fs_tools;
-#[path = "edge_tools/git_deep.rs"]
-mod git_deep;
 #[path = "edge_tools/git_gix.rs"]
 mod git_gix;
 #[path = "edge_tools/github.rs"]

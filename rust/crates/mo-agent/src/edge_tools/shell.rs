@@ -338,81 +338,6 @@ impl ToolExecutor {
         }
     }
 
-    #[allow(dead_code)] // Kept as fallback; routing now uses git_gix
-    pub(crate) fn git_diff(&self, args: &Value) -> String {
-        let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
-        let git_ref = args.get("ref").and_then(Value::as_str);
-        let mut cmd_args = vec!["diff"];
-        if staged {
-            cmd_args.push("--staged");
-        }
-        let ref_owned;
-        if let Some(r) = git_ref {
-            ref_owned = r.to_string();
-            cmd_args.push(&ref_owned);
-        }
-        let out = self.git_run(&cmd_args);
-        if out.len() > 20_000 {
-            let mut t = out[..20_000].to_string();
-            t.push_str("\n[truncated]");
-            t
-        } else {
-            out
-        }
-    }
-
-    #[allow(dead_code)] // Kept as fallback; routing now uses git_gix
-    pub(crate) fn git_log(&self, args: &Value) -> String {
-        let n = args.get("n").and_then(Value::as_u64).unwrap_or(10);
-        self.git_run(&["log", "--oneline", &format!("-{n}")])
-    }
-
-    /// Show a specific commit's diff, message, and metadata.
-    #[allow(dead_code)] // Kept as fallback; routing now uses git_gix
-    pub(crate) fn git_show(&self, args: &Value) -> String {
-        let commit = match args.get("commit").and_then(Value::as_str) {
-            Some(c) => c.to_string(),
-            None => return "Error: missing 'commit' (SHA, branch, or tag)".to_string(),
-        };
-        // Validate: no shell metacharacters
-        if commit.contains(|c: char| {
-            !c.is_alphanumeric()
-                && c != '-'
-                && c != '_'
-                && c != '.'
-                && c != '/'
-                && c != '~'
-                && c != '^'
-        }) {
-            return "Error: invalid commit reference".to_string();
-        }
-        let stat_only = args
-            .get("stat_only")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let file = args.get("file").and_then(Value::as_str);
-
-        let mut cmd_args = vec!["show", "--no-color"];
-        if stat_only {
-            cmd_args.push("--stat");
-        }
-        cmd_args.push(&commit);
-        // Optionally scope to a specific file
-        if let Some(f) = file {
-            cmd_args.push("--");
-            cmd_args.push(f);
-        }
-        let out = self.git_run(&cmd_args);
-        // Auto-truncate large diffs
-        if out.len() > 30_000 {
-            let mut t = out[..30_000].to_string();
-            t.push_str("\n[truncated — use stat_only:true or file param to narrow]");
-            t
-        } else {
-            out
-        }
-    }
-
     /// Fetch a URL and return its content (text or HTML→text).
     pub(crate) fn web_fetch(&self, args: &Value) -> String {
         let url = match args.get("url").and_then(Value::as_str) {
@@ -768,16 +693,6 @@ mod tests {
         assert!(result.contains("list_dir"), "should suggest list_dir, got: {result}");
     }
 
-    #[test]
-    fn git_log_returns_something_in_git_repo() {
-        // This test runs in the actual repo
-        let executor =
-            ToolExecutor::new(std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
-        let result = executor.git_log(&serde_json::json!({"n": 3}));
-        // May or may not be in a git repo, just verify no panic
-        assert!(!result.is_empty());
-    }
-
     // ── str_replace diff preview ─────────────────────────────────────────────
 
     #[test]
@@ -887,40 +802,6 @@ mod tests {
         assert!(is_ssrf_target("https://api.github.com/repos").is_none());
         assert!(is_ssrf_target("http://example.com").is_none());
         assert!(is_ssrf_target("https://docs.rs/tokio/latest").is_none());
-    }
-
-    // ── git_show ──────────────────────────────────────────────────────────────
-
-    #[test]
-    fn git_show_missing_commit_returns_error() {
-        let executor = test_executor();
-        let result = executor.git_show(&serde_json::json!({}));
-        assert!(result.contains("Error"), "got: {result}");
-    }
-
-    #[test]
-    fn git_show_invalid_ref_returns_error() {
-        let executor = test_executor();
-        let result = executor.git_show(&serde_json::json!({"commit": "abc; rm -rf /"}));
-        assert!(result.contains("invalid"), "got: {result}");
-    }
-
-    #[test]
-    fn git_show_head_returns_content() {
-        // Run in actual repo
-        let executor =
-            ToolExecutor::new(std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
-        let result = executor.git_show(&serde_json::json!({"commit": "HEAD"}));
-        // Either shows commit info or git error (if not in repo)
-        assert!(!result.is_empty());
-    }
-
-    #[test]
-    fn git_show_stat_only() {
-        let executor =
-            ToolExecutor::new(std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
-        let result = executor.git_show(&serde_json::json!({"commit": "HEAD", "stat_only": true}));
-        assert!(!result.is_empty());
     }
 
     // ── web_fetch ─────────────────────────────────────────────────────────────
