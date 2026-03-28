@@ -699,6 +699,11 @@ pub fn resolve_schemas(
 }
 
 /// Pressure-aware variant of [`resolve_schemas`].
+///
+/// At increasing pressure levels, schemas are progressively pruned:
+/// - `>= 0.3`: Truncate descriptions + remove param descriptions (saves ~40%)
+/// - `>= 0.6`: Remove descriptions entirely (saves ~60%)
+/// - `>= 0.8`: Also skip deferrable pinned tools + strip optional params (saves ~70%)
 pub fn resolve_schemas_with_pressure(
     registry: &ToolRegistry,
     selected_names: &[String],
@@ -710,6 +715,17 @@ pub fn resolve_schemas_with_pressure(
         && !selected_names
             .iter()
             .any(|n| DEFERRABLE_PINNED.contains(&n.as_str()));
+
+    // Determine pruning level based on pressure
+    let prune_level = if budget_pressure >= 0.8 {
+        PruneLevel::Aggressive
+    } else if budget_pressure >= 0.6 {
+        PruneLevel::Medium
+    } else if budget_pressure >= 0.3 {
+        PruneLevel::Light
+    } else {
+        PruneLevel::None
+    };
 
     let mut schemas = Vec::new();
     let mut names = Vec::new();
@@ -724,7 +740,7 @@ pub fn resolve_schemas_with_pressure(
         if skip_deferrable && DEFERRABLE_PINNED.contains(&name.as_str()) {
             continue;
         }
-        schemas.push(schema.clone());
+        schemas.push(prune_schema(schema.clone(), prune_level));
         names.push(name.clone());
     }
 
@@ -734,7 +750,7 @@ pub fn resolve_schemas_with_pressure(
             continue; // already included as pinned
         }
         if let Some(schema) = registry.schema_by_name(name) {
-            schemas.push(schema.clone());
+            schemas.push(prune_schema(schema.clone(), prune_level));
             names.push(name.clone());
         }
     }
@@ -753,6 +769,98 @@ pub fn resolve_schemas_with_pressure(
     };
 
     (schemas, report)
+}
+
+// ── Schema pruning ──────────────────────────────────────────────────────────
+
+/// Pruning intensity level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneLevel {
+    /// No pruning — full schema.
+    None,
+    /// Truncate tool description to 80 chars, remove param descriptions.
+    Light,
+    /// Remove tool description entirely, remove param descriptions.
+    Medium,
+    /// Remove descriptions, strip optional parameters (keep only required).
+    Aggressive,
+}
+
+/// Prune a single tool schema to reduce token cost.
+pub fn prune_schema(mut schema: Value, level: PruneLevel) -> Value {
+    if level == PruneLevel::None {
+        return schema;
+    }
+
+    let func = match schema.get_mut("function") {
+        Some(f) => f,
+        None => return schema,
+    };
+
+    // Prune function description
+    match level {
+        PruneLevel::Light => {
+            if let Some(Value::String(desc)) = func.get("description") {
+                if desc.len() > 80 {
+                    let truncated = truncate_at_boundary(desc, 80);
+                    func["description"] = Value::String(truncated);
+                }
+            }
+        }
+        PruneLevel::Medium | PruneLevel::Aggressive => {
+            func.as_object_mut()
+                .map(|m| m.remove("description"));
+        }
+        PruneLevel::None => {}
+    }
+
+    // Prune parameter descriptions
+    if let Some(params) = func.get_mut("parameters") {
+        // Extract required names first (before mutable borrow of properties)
+        let required_names: std::collections::HashSet<String> = if level == PruneLevel::Aggressive {
+            params
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        if let Some(props) = params.get_mut("properties") {
+            if let Some(obj) = props.as_object_mut() {
+                // Aggressive: strip optional params (keep only required)
+                if level == PruneLevel::Aggressive && !required_names.is_empty() {
+                    obj.retain(|name, _| required_names.contains(name));
+                }
+
+                // Light/Medium/Aggressive: remove param descriptions
+                for (_name, prop) in obj.iter_mut() {
+                    if let Some(p) = prop.as_object_mut() {
+                        p.remove("description");
+                    }
+                }
+            }
+        }
+    }
+
+    schema
+}
+
+/// Truncate a string at a word boundary.
+fn truncate_at_boundary(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    // Find last space before max
+    match s[..max].rfind(' ') {
+        Some(pos) => format!("{}…", &s[..pos]),
+        None => format!("{}…", &s[..max]),
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -2345,5 +2453,155 @@ mod tests {
     fn schema_by_name_returns_none_for_unknown() {
         let registry = mock_registry();
         assert!(registry.schema_by_name("nonexistent_tool").is_none());
+    }
+
+    // ── Schema Pruning ──────────────────────────────────────────
+
+    fn make_test_schema() -> Value {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "test_tool",
+                "description": "A very long description that explains what this tool does in great detail and should be truncated at the light level to save tokens efficiently.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File path relative to project root"},
+                        "start_line": {"type": "integer", "description": "First line to read (1-based, optional)"},
+                        "end_line": {"type": "integer", "description": "Last line to read (inclusive, optional)"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn prune_none_preserves_schema() {
+        let schema = make_test_schema();
+        let pruned = prune_schema(schema.clone(), PruneLevel::None);
+        assert_eq!(schema, pruned);
+    }
+
+    #[test]
+    fn prune_light_truncates_description() {
+        let schema = make_test_schema();
+        let pruned = prune_schema(schema, PruneLevel::Light);
+
+        let desc = pruned["function"]["description"].as_str().unwrap();
+        assert!(desc.len() <= 85, "description should be truncated, got {}", desc.len());
+        assert!(desc.ends_with('…'));
+
+        // Param descriptions removed
+        assert!(pruned["function"]["parameters"]["properties"]["path"]
+            .get("description")
+            .is_none());
+    }
+
+    #[test]
+    fn prune_medium_removes_description() {
+        let schema = make_test_schema();
+        let pruned = prune_schema(schema, PruneLevel::Medium);
+
+        assert!(pruned["function"].get("description").is_none(),
+            "description should be removed at medium level");
+
+        // All params still present (optional + required)
+        let props = pruned["function"]["parameters"]["properties"].as_object().unwrap();
+        assert_eq!(props.len(), 3, "all params should remain at medium level");
+
+        // Param descriptions removed
+        assert!(props["path"].get("description").is_none());
+    }
+
+    #[test]
+    fn prune_aggressive_strips_optional_params() {
+        let schema = make_test_schema();
+        let pruned = prune_schema(schema, PruneLevel::Aggressive);
+
+        assert!(pruned["function"].get("description").is_none(),
+            "description should be removed");
+
+        // Only required params remain
+        let props = pruned["function"]["parameters"]["properties"].as_object().unwrap();
+        assert_eq!(props.len(), 1, "only required param should remain");
+        assert!(props.contains_key("path"));
+        assert!(!props.contains_key("start_line"));
+        assert!(!props.contains_key("end_line"));
+    }
+
+    #[test]
+    fn prune_light_preserves_short_description() {
+        let schema = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "short_tool",
+                "description": "Short description.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        });
+        let pruned = prune_schema(schema, PruneLevel::Light);
+        assert_eq!(
+            pruned["function"]["description"].as_str().unwrap(),
+            "Short description."
+        );
+    }
+
+    #[test]
+    fn prune_schema_missing_function_key() {
+        let schema = serde_json::json!({"type": "function"});
+        let pruned = prune_schema(schema.clone(), PruneLevel::Aggressive);
+        assert_eq!(schema, pruned, "should be no-op without function key");
+    }
+
+    #[test]
+    fn prune_with_pressure_activates_at_thresholds() {
+        let registry = mock_registry();
+        let names = vec!["git_diff".to_string()];
+
+        // No pressure: schemas have descriptions
+        let (schemas_0, _) = resolve_schemas_with_pressure(&registry, &names, 0.0);
+        let has_desc = schemas_0.iter().all(|s| s["function"].get("description").is_some());
+        assert!(has_desc, "zero pressure should keep descriptions");
+
+        // Medium pressure: descriptions removed
+        let (schemas_06, _) = resolve_schemas_with_pressure(&registry, &names, 0.6);
+        let no_desc = schemas_06.iter().all(|s| s["function"].get("description").is_none());
+        assert!(no_desc, "medium pressure should remove descriptions");
+    }
+
+    #[test]
+    fn prune_token_savings_measured() {
+        let schema = make_test_schema();
+        let full_size = serde_json::to_string(&schema).unwrap().len();
+
+        let light = prune_schema(schema.clone(), PruneLevel::Light);
+        let light_size = serde_json::to_string(&light).unwrap().len();
+
+        let medium = prune_schema(schema.clone(), PruneLevel::Medium);
+        let medium_size = serde_json::to_string(&medium).unwrap().len();
+
+        let aggressive = prune_schema(schema, PruneLevel::Aggressive);
+        let aggressive_size = serde_json::to_string(&aggressive).unwrap().len();
+
+        // Each level should be strictly smaller than the previous
+        assert!(light_size < full_size,
+            "light ({}) should be smaller than full ({})", light_size, full_size);
+        assert!(medium_size < light_size,
+            "medium ({}) should be smaller than light ({})", medium_size, light_size);
+        assert!(aggressive_size < medium_size,
+            "aggressive ({}) should be smaller than medium ({})", aggressive_size, medium_size);
+
+        // Aggressive should save at least 50%
+        let savings = (full_size - aggressive_size) as f64 / full_size as f64;
+        assert!(savings >= 0.50,
+            "aggressive pruning should save >=50%, got {:.0}%", savings * 100.0);
+    }
+
+    #[test]
+    fn truncate_at_boundary_works() {
+        assert_eq!(truncate_at_boundary("hello world", 20), "hello world");
+        assert_eq!(truncate_at_boundary("hello world foo bar baz", 12), "hello world…");
+        assert_eq!(truncate_at_boundary("abcdefghij", 5), "abcde…");
     }
 }
