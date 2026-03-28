@@ -299,6 +299,18 @@ impl ToolSelector for TfIdfSelector {
         // ── Phase 3: Add pattern boost terms (needs task_type from routing) ──
         let pattern_boost = self.pattern_boost_terms(routing.task_type, routing.domain_hint);
 
+        // ── Phase 3b: Compute co-occurrence scores from learned patterns ──
+        let co_occurrence = self
+            .pattern_library
+            .as_ref()
+            .and_then(|pl| pl.lock().ok())
+            .map(|lib| {
+                lib.co_occurrence_scores(
+                    &ctx.recent_tools.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                )
+            })
+            .unwrap_or_default();
+
         // ── Phase 4: Select tools via RoutingDecision path ──
         // Apply budget pressure: reduce effective budget under token pressure.
         // pressure=0.0 → full budget, pressure=1.0 → 30% budget.
@@ -323,6 +335,7 @@ impl ToolSelector for TfIdfSelector {
             calibrator_ref,
             &ctx.memory_domain_hints,
             ctx.budget_pressure,
+            &co_occurrence,
         );
         drop(tracker_guard);
 

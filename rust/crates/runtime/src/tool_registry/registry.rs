@@ -4,7 +4,7 @@ use super::meta::{TOOL_CATALOG, ToolMeta};
 use super::report::{SelectionReport, ToolQualityTracker};
 use super::scoring::{
     DEFAULT_TOOL_BUDGET_TOKENS, pre_filter_dynamic, pre_filter_dynamic_calibrated,
-    pre_filter_dynamic_with_memory, pre_filter_dynamic_with_pressure,
+    pre_filter_dynamic_with_cooccurrence, pre_filter_dynamic_with_memory,
     pre_filter_dynamic_with_quality,
 };
 use super::state::ConversationState;
@@ -384,6 +384,7 @@ impl ToolRegistry {
             calibrator,
             memory_domain_hints,
             0.0,
+            &std::collections::HashMap::new(),
         )
     }
 
@@ -401,6 +402,7 @@ impl ToolRegistry {
         calibrator: Option<&ConfidenceCalibrator>,
         memory_domain_hints: &[crate::pipeline::routing::DomainHint],
         budget_pressure: f64,
+        co_occurrence: &std::collections::HashMap<String, f64>,
     ) -> (Vec<Value>, SelectionReport) {
         // Use tool_filter for early conversational detection
         if routing.tool_filter == ToolFilter::Minimal {
@@ -429,16 +431,18 @@ impl ToolRegistry {
 
         // Use the routing's embedded ConversationState for backward-compatible scoring.
         // Pass memory domain hints for gate softening in tool relevance scoring.
-        // When budget_pressure > 0, apply pressure-aware filtering to exclude
-        // marginally relevant tools — saving schema tokens.
-        let ranked = if budget_pressure > 0.01 {
-            pre_filter_dynamic_with_pressure(
+        // When budget_pressure > 0 or co-occurrence data exists, apply the full
+        // co-occurrence-aware scoring pipeline for maximum selection quality.
+        let has_co_occurrence = !co_occurrence.is_empty();
+        let ranked = if budget_pressure > 0.01 || has_co_occurrence {
+            pre_filter_dynamic_with_cooccurrence(
                 &routing.conversation_state,
                 &effective_query,
                 quality_tracker,
                 calibrator,
                 memory_domain_hints,
                 budget_pressure,
+                co_occurrence,
             )
         } else {
             pre_filter_dynamic_with_memory(
