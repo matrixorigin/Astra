@@ -32,6 +32,7 @@ pub struct Symbol {
 pub enum SymbolKind {
     Function,
     Method,
+    Constructor,
     Class,
     Struct,
     Interface,
@@ -49,6 +50,7 @@ impl SymbolKind {
         match self {
             Self::Function => "fn",
             Self::Method => "method",
+            Self::Constructor => "ctor",
             Self::Class => "class",
             Self::Struct => "struct",
             Self::Interface => "interface",
@@ -75,7 +77,7 @@ pub fn detect_language(path: &Path) -> Option<Language> {
         "java" => Some(Language::Java),
         "c" | "h" => Some(Language::C),
         "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => Some(Language::Cpp),
-        "rb" | "ruby" => Some(Language::Ruby),
+        "rb" => Some(Language::Ruby),
         _ => None,
     }
 }
@@ -591,7 +593,7 @@ fn extract_java_symbols(
                     symbols.push(Symbol {
                         name,
                         kind: if child.kind() == "constructor_declaration" {
-                            SymbolKind::Method
+                            SymbolKind::Constructor
                         } else {
                             SymbolKind::Method
                         },

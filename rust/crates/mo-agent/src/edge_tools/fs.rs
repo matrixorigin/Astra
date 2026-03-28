@@ -309,21 +309,30 @@ impl ToolExecutor {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy().to_lowercase();
                 
-                // Skip directories unless they might be what we want
+                // Skip directories (user should use list_dir for those)
                 let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                if is_dir && !target_name.ends_with('/') {
+                if is_dir {
                     continue;
                 }
                 
-                // Calculate simple similarity (shared prefix + extension match)
-                let score = similarity_score(&target_name, &name_str);
-                if score > 0 {
+                // Calculate similarity - also check against hidden file variants
+                let mut best_score = similarity_score(&target_name, &name_str);
+                
+                // If candidate is a hidden file, also compare without leading dot
+                if name_str.starts_with('.') {
+                    let without_dot = &name_str[1..];
+                    best_score = best_score.max(similarity_score(&target_name, without_dot));
+                }
+                
+                // Minimum threshold to avoid noise
+                const MIN_SIMILARITY: usize = 5;
+                if best_score >= MIN_SIMILARITY {
                     let rel_path = entry.path();
                     let display = rel_path.strip_prefix(&self.project_root)
                         .unwrap_or(&rel_path)
                         .display()
                         .to_string();
-                    candidates.push((display, score));
+                    candidates.push((display, best_score));
                 }
             }
         }
