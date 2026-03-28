@@ -427,17 +427,26 @@ fn slash_ctrl_e_filter(line: &str, active: bool, in_slash: bool) -> Option<Optio
     slash_picker_filter(line)
 }
 
-fn slash_overlay_row_content(cmd: &str, desc: &str, selected: bool) -> String {
+fn slash_overlay_command_width(rows: &[(&'static str, &'static str)]) -> usize {
+    rows.iter().map(|(cmd, _)| cmd.chars().count()).max().unwrap_or(16).max(16)
+}
+
+fn slash_overlay_row_content(
+    cmd: &str,
+    desc: &str,
+    selected: bool,
+    command_width: usize,
+) -> String {
     if selected {
         format!(
-            "{} {:<16} {}",
-            "▶".green().bold(),
-            cmd.green().bold(),
-            desc.green().bold()
+            "{} {:<command_width$} {}",
+            "❯".cyan().bold(),
+            cmd.cyan().bold(),
+            desc.bold()
         )
     } else {
         format!(
-            "  {:<16} {}",
+            "  {:<command_width$} {}",
             cmd.dim(),
             desc.dim()
         )
@@ -489,9 +498,13 @@ fn render_slash_overlay_header(filter: Option<&str>, inner_width: usize) -> Stri
 
 fn slash_overlay_footer_summary(total: usize, start: usize, end: usize) -> String {
     if total > 0 {
-        format!(" {}/{} shown  ·  ↑↓ navigate  Tab accept  Enter run  Esc dismiss ", end - start, total)
+        format!(
+            " {}/{} shown  ·  ↑↓ move  ·  →/Tab accept  ·  Enter run  ·  ← edit  ·  Esc close ",
+            end - start,
+            total
+        )
     } else {
-        " no matches  ·  Esc dismiss ".to_string()
+        " no matches  ·  ← edit  ·  Esc close ".to_string()
     }
 }
 
@@ -512,16 +525,17 @@ fn render_slash_overlay_row_with_width(
     cmd: &str,
     desc: &str,
     selected: bool,
+    command_width: usize,
     inner_width: usize,
 ) -> String {
-    let content = slash_overlay_row_content(cmd, desc, selected);
+    let content = slash_overlay_row_content(cmd, desc, selected, command_width);
     let pad = inner_width.saturating_sub(visible_width(&content));
     format!(
         "{}{}{}{}",
-        if selected { "│".cyan() } else { "│".cyan().dim() },
+        if selected { "┃".cyan().bold() } else { "│".cyan().dim() },
         content,
         " ".repeat(pad),
-        if selected { "│".cyan() } else { "│".cyan().dim() }
+        if selected { "┃".cyan().bold() } else { "│".cyan().dim() }
     )
 }
 
@@ -630,6 +644,7 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
             selected.saturating_sub(visible_limit / 2)
         };
         let end = (start + visible_limit).min(total);
+        let command_width = slash_overlay_command_width(&rows[start..end]);
         for (idx, (cmd, desc)) in rows[start..end].iter().enumerate() {
             let abs = start + idx;
             body_contents.push((Some((*cmd, *desc, abs == selected)), String::new()));
@@ -639,7 +654,9 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
         let inner_width = body_contents
             .iter()
             .map(|(row, message)| match row {
-                Some((cmd, desc, selected)) => visible_width(&slash_overlay_row_content(cmd, desc, *selected)),
+                Some((cmd, desc, selected)) => {
+                    visible_width(&slash_overlay_row_content(cmd, desc, *selected, command_width))
+                }
                 None => message.chars().count(),
             })
             .max()
@@ -651,7 +668,13 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
         for (row, message) in &body_contents {
             let line = match row {
                 Some((cmd, desc, selected)) => {
-                    render_slash_overlay_row_with_width(cmd, desc, *selected, inner_width)
+                    render_slash_overlay_row_with_width(
+                        cmd,
+                        desc,
+                        *selected,
+                        command_width,
+                        inner_width,
+                    )
                 }
                 None => render_slash_overlay_message_line(message, inner_width),
             };
@@ -1689,10 +1712,10 @@ mod tests {
 
     #[test]
     fn render_selected_slash_row_highlights_command_and_description() {
-        let row = render_slash_overlay_row_with_width("/ask", "Toggle ask mode", true, 40);
+        let row = render_slash_overlay_row_with_width("/ask", "Toggle ask mode", true, 16, 40);
         let plain = strip_ansi_codes(&row);
-        assert!(plain.starts_with("│▶ /ask"));
-        assert!(plain.ends_with('│'));
+        assert!(plain.starts_with("┃❯ /ask"));
+        assert!(plain.ends_with('┃'));
         assert!(plain.contains("/ask"));
         assert!(plain.contains("Toggle ask mode"));
         assert!(row.contains("\u{1b}["));
@@ -1702,11 +1725,20 @@ mod tests {
 
     #[test]
     fn render_unselected_slash_row_keeps_plain_layout() {
-        let row = render_slash_overlay_row_with_width("/ask", "Toggle ask mode", false, 40);
+        let row = render_slash_overlay_row_with_width("/ask", "Toggle ask mode", false, 16, 40);
         let plain = strip_ansi_codes(&row);
         assert!(plain.starts_with("│  /ask"));
         assert!(plain.ends_with('│'));
         assert!(plain.contains("Toggle ask mode"));
+    }
+
+    #[test]
+    fn slash_overlay_command_width_tracks_longest_visible_command() {
+        let width = slash_overlay_command_width(&[
+            ("/ask", "Toggle ask mode"),
+            ("/session export", "Export session as markdown"),
+        ]);
+        assert_eq!(width, 16);
     }
 
     #[test]
@@ -1726,9 +1758,10 @@ mod tests {
         assert!(plain.starts_with('╰'));
         assert!(plain.ends_with('╯'));
         assert!(plain.contains("10/12 shown"));
-        assert!(plain.contains("Tab accept"));
+        assert!(plain.contains("→/Tab accept"));
         assert!(plain.contains("Enter run"));
-        assert!(plain.contains("Esc dismiss"));
+        assert!(plain.contains("← edit"));
+        assert!(plain.contains("Esc close"));
     }
 
     #[test]
@@ -1736,7 +1769,8 @@ mod tests {
         let footer = render_slash_overlay_footer(0, 0, 0, 32);
         let plain = strip_ansi_codes(&footer);
         assert!(plain.contains("no matches"));
-        assert!(plain.contains("Esc dismiss"));
+        assert!(plain.contains("← edit"));
+        assert!(plain.contains("Esc close"));
     }
 
     // ── Multi-line validator ──────────────────────────────────────────────
