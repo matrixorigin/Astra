@@ -186,10 +186,19 @@ impl ToolExecutor {
                         format!("(exit code {})", out.status.code().unwrap_or(-1))
                     }
                 } else {
+                    // Truncate long output
                     if result.len() > 20_000 {
                         result.truncate(20_000);
                         result.push_str("\n[truncated]");
                     }
+
+                    // For build/test commands, provide structured output
+                    if super::build_test::is_build_test_command(command) {
+                        let parsed =
+                            super::build_test::parse_build_test_output(&result, out.status.code());
+                        return parsed.to_enhanced_output(&result);
+                    }
+
                     result
                 }
             }

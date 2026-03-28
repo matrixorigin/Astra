@@ -30,6 +30,8 @@ mod github;
 mod mo_tools;
 #[path = "edge_tools/shell.rs"]
 mod shell;
+#[path = "edge_tools/build_test.rs"]
+mod build_test;
 
 // ─── Tool schema ─────────────────────────────────────────────────────────────
 
