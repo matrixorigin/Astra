@@ -19,6 +19,14 @@ fn tool_output_limit() -> usize {
     super::tool_output_limit()
 }
 
+/// Scale a base output limit by budget pressure.
+/// pressure=0.0 → 100% of base, pressure=0.6 → 52%, pressure=0.9 → 28%.
+/// Never goes below 20% of base (minimum useful output).
+fn pressure_scaled_limit(base: usize, pressure: f64) -> usize {
+    let scale = (1.0 - pressure * 0.8).max(0.2);
+    (base as f64 * scale) as usize
+}
+
 fn open_repo(project_root: &Path) -> Result<gix::Repository, String> {
     gix::discover(project_root).map_err(|e| format!("Error: cannot open git repo: {e}"))
 }
@@ -194,7 +202,8 @@ pub(crate) fn git_log(project_root: &Path, args: &Value) -> String {
 
 // ─── git_show ───────────────────────────────────────────────────────────────
 
-pub(crate) fn git_show(project_root: &Path, args: &Value) -> String {
+pub(crate) fn git_show(project_root: &Path, args: &Value, pressure: f64) -> String {
+    let limit = pressure_scaled_limit(SHOW_LIMIT, pressure);
     let repo = match open_repo(project_root) {
         Ok(r) => r,
         Err(e) => return e,
@@ -296,7 +305,7 @@ pub(crate) fn git_show(project_root: &Path, args: &Value) -> String {
                 }
             }
             list_tree_entries(&new_tree, "", &mut out);
-            return truncate_show(out);
+            return truncate_show_at(out, limit);
         }
     };
 
@@ -306,7 +315,7 @@ pub(crate) fn git_show(project_root: &Path, args: &Value) -> String {
             Ok(p) => p,
             Err(e) => {
                 out.push_str(&format!("\n[diff error: {e}]\n"));
-                return truncate_show(out);
+                return truncate_show_at(out, limit);
             }
         };
 
@@ -320,7 +329,7 @@ pub(crate) fn git_show(project_root: &Path, args: &Value) -> String {
         // Also list file names
         let mut changes_platform2 = match old_tree.changes() {
             Ok(p) => p,
-            Err(_) => return truncate_show(out),
+            Err(_) => return truncate_show_at(out, limit),
         };
         let _ = changes_platform2.for_each_to_obtain_tree(&new_tree, |change| {
             use gix::object::tree::diff::Change;
@@ -341,7 +350,7 @@ pub(crate) fn git_show(project_root: &Path, args: &Value) -> String {
             Ok(c) => c,
             Err(e) => {
                 out.push_str(&format!("\n[diff cache error: {e}]\n"));
-                return truncate_show(out);
+                return truncate_show_at(out, limit);
             }
         };
 
@@ -349,7 +358,7 @@ pub(crate) fn git_show(project_root: &Path, args: &Value) -> String {
             Ok(p) => p,
             Err(e) => {
                 out.push_str(&format!("\n[diff error: {e}]\n"));
-                return truncate_show(out);
+                return truncate_show_at(out, limit);
             }
         };
 
@@ -402,20 +411,19 @@ pub(crate) fn git_show(project_root: &Path, args: &Value) -> String {
 
             out.push('\n');
 
-            if out.len() > SHOW_LIMIT {
+            if out.len() > limit {
                 return Ok(std::ops::ControlFlow::Break(()));
             }
             Ok(std::ops::ControlFlow::Continue(()))
         });
     }
 
-    truncate_show(out)
+    truncate_show_at(out, limit)
 }
 
-fn truncate_show(out: String) -> String {
-    if out.len() > SHOW_LIMIT {
-        // Find char boundary at or before SHOW_LIMIT
-        let end = out.floor_char_boundary(SHOW_LIMIT);
+fn truncate_show_at(out: String, limit: usize) -> String {
+    if out.len() > limit {
+        let end = out.floor_char_boundary(limit);
         let mut t = out[..end].to_string();
         t.push_str("\n[truncated — use stat_only:true or file param to narrow]");
         t
@@ -532,7 +540,8 @@ pub(crate) fn git_blame(project_root: &Path, args: &Value) -> String {
 
 // ─── git_diff ───────────────────────────────────────────────────────────────
 
-pub(crate) fn git_diff(project_root: &Path, args: &Value) -> String {
+pub(crate) fn git_diff(project_root: &Path, args: &Value, pressure: f64) -> String {
+    let limit = pressure_scaled_limit(DIFF_LIMIT, pressure);
     let repo = match open_repo(project_root) {
         Ok(r) => r,
         Err(e) => return e,
@@ -546,20 +555,20 @@ pub(crate) fn git_diff(project_root: &Path, args: &Value) -> String {
 
     // If a ref is given, do a tree-to-tree diff (HEAD vs ref)
     if let Some(ref_str) = git_ref {
-        return diff_tree_to_tree_str(&repo, ref_str);
+        return diff_tree_to_tree_str(&repo, ref_str, limit);
     }
 
     // If staged, do index-to-HEAD diff
     if staged {
-        return diff_index_to_head(&repo);
+        return diff_index_to_head(&repo, limit);
     }
 
     // Default: worktree changes (unstaged) using status iterator
-    diff_worktree(&repo)
+    diff_worktree(&repo, limit)
 }
 
 /// Diff between two tree-ish refs (e.g., HEAD vs a branch/commit).
-fn diff_tree_to_tree_str(repo: &gix::Repository, ref_str: &str) -> String {
+fn diff_tree_to_tree_str(repo: &gix::Repository, ref_str: &str, limit: usize) -> String {
     let head_tree = match resolve_tree(repo, "HEAD") {
         Ok(t) => t,
         Err(e) => return e,
@@ -636,7 +645,7 @@ fn diff_tree_to_tree_str(repo: &gix::Repository, ref_str: &str) -> String {
         out.push('\n');
         count += 1;
 
-        if out.len() > DIFF_LIMIT {
+        if out.len() > limit {
             return Ok(std::ops::ControlFlow::Break(()));
         }
         Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Continue(()))
@@ -650,12 +659,12 @@ fn diff_tree_to_tree_str(repo: &gix::Repository, ref_str: &str) -> String {
         "No changes".to_string()
     } else {
         out.push_str(&format!("\n{count} file(s) changed"));
-        truncate_diff(out)
+        truncate_diff_at(out, limit)
     }
 }
 
 /// Diff staged (index) changes against HEAD.
-fn diff_index_to_head(repo: &gix::Repository) -> String {
+fn diff_index_to_head(repo: &gix::Repository, limit: usize) -> String {
     let head_tree = match resolve_tree(repo, "HEAD") {
         Ok(t) => t,
         Err(e) => return e,
@@ -702,7 +711,7 @@ fn diff_index_to_head(repo: &gix::Repository) -> String {
             }
         }
 
-        if out.len() > DIFF_LIMIT {
+        if out.len() > limit {
             out.push_str("[truncated]\n");
             break;
         }
@@ -751,7 +760,7 @@ fn diff_index_to_head(repo: &gix::Repository) -> String {
             ));
             out.push_str("# deleted (staged)\n\n");
             count += 1;
-            if out.len() > DIFF_LIMIT {
+            if out.len() > limit {
                 out.push_str("[truncated]\n");
                 break;
             }
@@ -762,12 +771,12 @@ fn diff_index_to_head(repo: &gix::Repository) -> String {
         "No staged changes".to_string()
     } else {
         out.push_str(&format!("\n{count} file(s) staged"));
-        truncate_diff(out)
+        truncate_diff_at(out, limit)
     }
 }
 
 /// Diff worktree (unstaged) changes.
-fn diff_worktree(repo: &gix::Repository) -> String {
+fn diff_worktree(repo: &gix::Repository, limit: usize) -> String {
     let platform = match repo.status(gix::progress::Discard) {
         Ok(p) => p,
         Err(e) => return format!("Error: {e}"),
@@ -805,7 +814,7 @@ fn diff_worktree(repo: &gix::Repository) -> String {
                 ));
                 count += 1;
 
-                if out.len() > DIFF_LIMIT {
+                if out.len() > limit {
                     out.push_str("[truncated]\n");
                     break;
                 }
@@ -821,7 +830,7 @@ fn diff_worktree(repo: &gix::Repository) -> String {
         "No changes".to_string()
     } else {
         out.push_str(&format!("\n{count} file(s) changed"));
-        truncate_diff(out)
+        truncate_diff_at(out, limit)
     }
 }
 
@@ -840,9 +849,9 @@ fn resolve_tree<'r>(repo: &'r gix::Repository, ref_str: &str) -> Result<gix::Tre
         .map_err(|e| format!("Error: cannot get tree: {e}"))
 }
 
-fn truncate_diff(out: String) -> String {
-    if out.len() > DIFF_LIMIT {
-        let end = out.floor_char_boundary(DIFF_LIMIT);
+fn truncate_diff_at(out: String, limit: usize) -> String {
+    if out.len() > limit {
+        let end = out.floor_char_boundary(limit);
         let mut t = out[..end].to_string();
         t.push_str("\n[truncated]");
         t
@@ -1434,21 +1443,21 @@ mod tests {
     #[test]
     fn git_show_missing_commit() {
         let root = repo_root();
-        let result = git_show(&root, &json!({}));
+        let result = git_show(&root, &json!({}), 0.0);
         assert!(result.contains("Error: missing"));
     }
 
     #[test]
     fn git_show_invalid_ref() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "abc;rm -rf /"}));
+        let result = git_show(&root, &json!({"commit": "abc;rm -rf /"}), 0.0);
         assert!(result.contains("Error: invalid commit reference"));
     }
 
     #[test]
     fn git_show_head() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD"}));
+        let result = git_show(&root, &json!({"commit": "HEAD"}), 0.0);
         assert!(result.contains("commit "), "should show commit: {result}");
         assert!(result.contains("Author:"), "should show author");
     }
@@ -1456,7 +1465,7 @@ mod tests {
     #[test]
     fn git_show_stat_only() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD", "stat_only": true}));
+        let result = git_show(&root, &json!({"commit": "HEAD", "stat_only": true}), 0.0);
         assert!(result.contains("commit "));
         assert!(
             result.contains("files changed") || result.contains("root commit"),
@@ -1500,7 +1509,7 @@ mod tests {
     #[test]
     fn git_diff_no_crash() {
         let root = repo_root();
-        let result = git_diff(&root, &json!({}));
+        let result = git_diff(&root, &json!({}), 0.0);
         assert!(
             !result.contains("Error: cannot open"),
             "should open repo: {result}"
@@ -1546,7 +1555,7 @@ mod tests {
     fn git_diff_staged_param_accepted() {
         let root = repo_root();
         // staged=true should not crash (may return "No staged changes" or file list)
-        let result = git_diff(&root, &json!({"staged": true}));
+        let result = git_diff(&root, &json!({"staged": true}), 0.0);
         assert!(
             !result.contains("Error: cannot open"),
             "staged diff should not fail to open repo: {result}"
@@ -1557,7 +1566,7 @@ mod tests {
     fn git_diff_ref_param_uses_tree_diff() {
         let root = repo_root();
         // Diff HEAD against HEAD~1 should produce actual file changes
-        let result = git_diff(&root, &json!({"ref": "HEAD~1"}));
+        let result = git_diff(&root, &json!({"ref": "HEAD~1"}), 0.0);
         assert!(
             result.contains("diff --git") || result.contains("No changes") || result.contains("Error: cannot resolve"),
             "ref diff should produce diff output or error: {result}"
@@ -1567,7 +1576,7 @@ mod tests {
     #[test]
     fn git_diff_default_shows_worktree() {
         let root = repo_root();
-        let result = git_diff(&root, &json!({}));
+        let result = git_diff(&root, &json!({}), 0.0);
         // Should not error — either shows changes or "No changes"
         assert!(
             !result.starts_with("Error:"),
@@ -1581,7 +1590,7 @@ mod tests {
     fn git_show_allows_reflog_syntax() {
         let root = repo_root();
         // HEAD@{0} should not be rejected by validation — it should reach rev_parse
-        let result = git_show(&root, &json!({"commit": "HEAD@{0}"}));
+        let result = git_show(&root, &json!({"commit": "HEAD@{0}"}), 0.0);
         // Should show a commit (passes validation), not be rejected outright
         assert!(
             result.starts_with("commit ") || result.starts_with("Error: cannot resolve"),
@@ -1592,14 +1601,14 @@ mod tests {
     #[test]
     fn git_show_rejects_shell_metachar() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD;rm -rf /"}));
+        let result = git_show(&root, &json!({"commit": "HEAD;rm -rf /"}), 0.0);
         assert!(result.contains("Error: invalid commit reference"));
     }
 
     #[test]
     fn git_show_head_has_diff_content() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD"}));
+        let result = git_show(&root, &json!({"commit": "HEAD"}), 0.0);
         assert!(result.contains("commit "), "should show commit header");
         assert!(result.contains("Author:"), "should show author");
         // Should contain actual diff markers or root commit marker
@@ -1612,7 +1621,7 @@ mod tests {
     #[test]
     fn git_show_stat_only_has_stats() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD", "stat_only": true}));
+        let result = git_show(&root, &json!({"commit": "HEAD", "stat_only": true}), 0.0);
         assert!(result.contains("commit "));
         assert!(
             result.contains("files changed") || result.contains("[root commit]"),
@@ -1623,7 +1632,7 @@ mod tests {
     #[test]
     fn git_show_file_filter() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD", "file": "README.md"}));
+        let result = git_show(&root, &json!({"commit": "HEAD", "file": "README.md"}), 0.0);
         // If README.md was changed in HEAD, it should appear; otherwise no diff lines
         assert!(result.contains("commit "), "should show header: {result}");
     }
@@ -1717,7 +1726,7 @@ mod tests {
     #[test]
     fn git_diff_ref_produces_line_content() {
         let root = repo_root();
-        let result = git_diff(&root, &json!({"ref": "HEAD~1"}));
+        let result = git_diff(&root, &json!({"ref": "HEAD~1"}), 0.0);
         if result.contains("diff --git") {
             // If there are changes, we should see actual +/- lines
             assert!(
@@ -1742,7 +1751,7 @@ mod tests {
     #[test]
     fn git_show_parent_ref() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD~1"}));
+        let result = git_show(&root, &json!({"commit": "HEAD~1"}), 0.0);
         assert!(
             result.contains("commit ") || result.contains("Error: cannot resolve"),
             "HEAD~1 should work: {result}"
@@ -1985,7 +1994,7 @@ mod tests {
     fn git_diff_staged_detects_no_staged() {
         // In a clean repo, staged diff should say "No staged changes"
         let root = repo_root();
-        let result = git_diff(&root, &json!({"staged": true}));
+        let result = git_diff(&root, &json!({"staged": true}), 0.0);
         // Either "No staged changes" or actual staged content — no panic/error
         assert!(
             result.contains("staged") || result.contains("diff --git"),
@@ -2085,7 +2094,7 @@ mod tests {
             }
         }
         if let Some(oid) = root_oid {
-            let result = git_show(&root, &json!({"commit": oid}));
+            let result = git_show(&root, &json!({"commit": oid}), 0.0);
             assert!(
                 result.contains("[root commit]"),
                 "should mark as root: {result}"
@@ -2097,5 +2106,59 @@ mod tests {
                 "root commit should list files: {result}"
             );
         }
+    }
+
+    // ── Pressure-aware output limit tests ──
+
+    #[test]
+    fn pressure_scaled_limit_zero_pressure_returns_base() {
+        assert_eq!(super::pressure_scaled_limit(12_000, 0.0), 12_000);
+        assert_eq!(super::pressure_scaled_limit(16_000, 0.0), 16_000);
+    }
+
+    #[test]
+    fn pressure_scaled_limit_moderate_pressure_reduces() {
+        let limit = super::pressure_scaled_limit(12_000, 0.6);
+        assert!(limit < 12_000, "moderate pressure should reduce limit");
+        assert!(limit > 2_400, "should stay above 20% minimum");
+        assert_eq!(limit, 6_240);
+    }
+
+    #[test]
+    fn pressure_scaled_limit_max_pressure_reaches_floor() {
+        let limit = super::pressure_scaled_limit(12_000, 1.0);
+        assert_eq!(limit, 2_400);
+    }
+
+    #[test]
+    fn pressure_scaled_limit_never_goes_below_twenty_percent() {
+        let limit = super::pressure_scaled_limit(10_000, 1.5);
+        assert_eq!(limit, 2_000);
+    }
+
+    #[test]
+    fn git_show_under_pressure_truncates_earlier() {
+        let root = std::env::current_dir().unwrap();
+        let normal = git_show(&root, &json!({"commit": "HEAD"}), 0.0);
+        let pressed = git_show(&root, &json!({"commit": "HEAD"}), 0.9);
+        assert!(
+            pressed.len() <= normal.len(),
+            "high-pressure output ({}) should not exceed normal ({})",
+            pressed.len(),
+            normal.len()
+        );
+    }
+
+    #[test]
+    fn git_diff_under_pressure_truncates_earlier() {
+        let root = std::env::current_dir().unwrap();
+        let normal = git_diff(&root, &json!({}), 0.0);
+        let pressed = git_diff(&root, &json!({}), 0.9);
+        assert!(
+            pressed.len() <= normal.len(),
+            "high-pressure diff ({}) should not exceed normal ({})",
+            pressed.len(),
+            normal.len()
+        );
     }
 }

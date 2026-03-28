@@ -672,6 +672,10 @@ pub struct ToolExecutor {
     /// the resolver prefers repos whose owner/name is in this list.
     /// Uses Mutex to allow learning from resolved repos without &mut self.
     preferred_repos: std::sync::Mutex<Vec<String>>,
+    /// Per-turn budget pressure (0.0 = normal, 1.0 = critical).
+    /// Set before each tool execution batch, read by tools that produce
+    /// variable-size output (git_diff, git_show) to scale their limits.
+    budget_pressure: std::sync::Mutex<f64>,
 }
 
 /// Extract owner/repo from git remote URLs in the given directory.
@@ -740,6 +744,7 @@ impl ToolExecutor {
                 .expect("failed to create GitHub HTTP client"),
             sandbox_policy: Some(sandbox),
             preferred_repos: std::sync::Mutex::new(preferred_repos),
+            budget_pressure: std::sync::Mutex::new(0.0),
         }
     }
 
@@ -767,6 +772,19 @@ impl ToolExecutor {
                 repos.push(normalized);
             }
         }
+    }
+
+    /// Set per-turn budget pressure before executing a batch of tool calls.
+    /// 0.0 = normal, 0.3 = trimming, 0.6 = compact, 0.9 = aggressive.
+    pub fn set_budget_pressure(&self, pressure: f64) {
+        if let Ok(mut p) = self.budget_pressure.lock() {
+            *p = pressure.clamp(0.0, 1.0);
+        }
+    }
+
+    /// Read current budget pressure. Returns 0.0 if mutex is poisoned.
+    pub fn get_budget_pressure(&self) -> f64 {
+        self.budget_pressure.lock().map(|p| *p).unwrap_or(0.0)
     }
 
     /// Get current preferred repos (for use in repo resolution).
@@ -808,9 +826,9 @@ impl ToolExecutor {
             "grep" => self.grep(args),
             "glob" => self.glob(args),
             "git_status" => git_gix::git_status(&self.project_root),
-            "git_diff" => git_gix::git_diff(&self.project_root, args),
+            "git_diff" => git_gix::git_diff(&self.project_root, args, self.get_budget_pressure()),
             "git_log" => git_gix::git_log(&self.project_root, args),
-            "git_show" => git_gix::git_show(&self.project_root, args),
+            "git_show" => git_gix::git_show(&self.project_root, args, self.get_budget_pressure()),
             "git_blame" => git_gix::git_blame(&self.project_root, args),
             "git_file_history" => git_gix::git_file_history(&self.project_root, args),
             "git_contributors" => git_gix::git_contributors(&self.project_root, args),
@@ -1253,6 +1271,28 @@ mod tests {
         let executor = test_executor();
         let result = executor.execute("reflect", &json!({"focus": "auto"})).await;
         assert!(result.contains("reflect_requires_session"), "got: {result}");
+    }
+
+    #[test]
+    fn budget_pressure_defaults_to_zero() {
+        let executor = test_executor();
+        assert_eq!(executor.get_budget_pressure(), 0.0);
+    }
+
+    #[test]
+    fn budget_pressure_set_and_get() {
+        let executor = test_executor();
+        executor.set_budget_pressure(0.6);
+        assert!((executor.get_budget_pressure() - 0.6).abs() < 1e-10);
+    }
+
+    #[test]
+    fn budget_pressure_clamps_to_range() {
+        let executor = test_executor();
+        executor.set_budget_pressure(1.5);
+        assert_eq!(executor.get_budget_pressure(), 1.0);
+        executor.set_budget_pressure(-0.5);
+        assert_eq!(executor.get_budget_pressure(), 0.0);
     }
 
     // ── truncate_output ─────────────────────────────────────────────────────

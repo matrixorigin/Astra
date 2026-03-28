@@ -874,6 +874,9 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             first_selection_report = Some(selection_report);
             first_budget_pressure = budget_pressure;
         }
+        // Propagate budget pressure to tool executor for output scaling.
+        // Updated each iteration so tools always use the latest pressure.
+        executor.set_budget_pressure(budget_pressure);
 
         // ── Tool guidance hint: when the selector is confident, tell the server
         // which dynamic tools scored highest. The server can inject this as a
