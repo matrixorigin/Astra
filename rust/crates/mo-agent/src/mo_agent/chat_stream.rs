@@ -1033,7 +1033,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     "type": "function",
                     "function": {
                         "name": name,
-                        "arguments": serde_json::to_string(&args).unwrap_or_default(),
+                        "arguments": serde_json::to_string(&args)
+                            .unwrap_or_else(|_| r#"{"error":"argument serialization failed"}"#.to_string()),
                     }
                 })
             }).collect::<Vec<_>>(),
@@ -1210,7 +1211,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 Err(_) => {
                     tool_timed_out = true;
                     turn_guard.record_tool_timeout(&name);
-                    format!("Tool '{}' timed out after {}ms (scheduling contract limit)", name, tool_timeout_ms)
+                    format!("Tool '{}' took too long (>{}s). Consider retrying.", name, tool_timeout_ms / 1000)
                 }
             };
 
@@ -1275,7 +1276,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                             executor.execute(&name, &args),
                         ).await {
                             Ok(r) => r,
-                            Err(_) => format!("Tool '{}' retry #{} timed out after {}ms", name, attempt + 1, tool_timeout_ms),
+                            Err(_) => format!("Tool '{}' retry #{} took too long (>{}s)", name, attempt + 1, tool_timeout_ms / 1000),
                         };
                         if !is_tool_error(&retry_result) {
                             result_str = retry_result;

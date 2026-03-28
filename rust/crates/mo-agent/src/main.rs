@@ -452,7 +452,10 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                 }
                 eprintln!("  Use /resume <session_id> to restore.\n");
             }
-            Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+            Err(e) => {
+                eprintln!("{}", format!("  ✗ Could not list sessions: {e}").red());
+                eprintln!("{}", "  Check /doctor for connectivity status.".dim());
+            }
         }
         return;
     }
@@ -587,13 +590,15 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                             }
                             Ok(_) => {} // Light checkpoint — less useful, skip
                             Err(e) => {
-                                eprintln!("  {} Cloud checkpoint parse: {}", "⚠".yellow(), e);
+                                eprintln!("  {} Cloud checkpoint corrupted, skipping", "⚠".yellow());
+                eprintln!("{}", format!("     ({e})").dim());
                             }
                         }
                     }
                     Ok(None) => {} // No cloud checkpoint available
                     Err(e) => {
-                        eprintln!("  {} Cloud checkpoint pull: {}", "⚠".yellow(), e);
+                        eprintln!("  {} Cloud checkpoint unavailable", "⚠".yellow());
+                eprintln!("{}", format!("     ({e})").dim());
                     }
                 }
             }
@@ -633,9 +638,18 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             );
         }
         Ok(None) => {
-            eprintln!("{}", format!("  Session not found: {arg}").yellow());
+            eprintln!("{}", format!("  Session '{arg}' not found.").yellow());
+            eprintln!("{}", "  Use /resume to see available sessions.".dim());
         }
-        Err(e) => eprintln!("{}", format!("  ✗ Resume failed: {e}").red()),
+        Err(e) => {
+            let hint = if e.to_string().contains("not found") {
+                "Use /resume to see available sessions."
+            } else {
+                "Check connection with /doctor, or try a different session."
+            };
+            eprintln!("{}", format!("  ✗ Resume failed: {e}").red());
+            eprintln!("{}", format!("  {hint}").dim());
+        }
     }
 }
 
@@ -1116,7 +1130,7 @@ fn merge_learning_snapshot(
         Err(e) => {
             eprintln!(
                 "{}",
-                format!("  ⚠ Failed to parse learning snapshot: {e}").yellow()
+                format!("  ⚠ Learning snapshot format changed (starting fresh): {e}").yellow()
             );
         }
     }
@@ -1317,7 +1331,8 @@ async fn handle_task_command(arg: &str, state: &mut ReplState) {
     let svc = match &state.task_service {
         Some(s) => s.clone(),
         None => {
-            eprintln!("{}", "  Task service not initialized.".yellow());
+            eprintln!("{}", "  ⚠ Task service not available (local-only mode).".yellow());
+            eprintln!("{}", "  Use /login to enable cloud task tracking.".dim());
             return;
         }
     };
@@ -1401,7 +1416,10 @@ async fn handle_task_command(arg: &str, state: &mut ReplState) {
                     Ok(()) => eprintln!("  {} Task completed: {}", "✓".green(), sub_arg),
                     Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
                 },
-                Ok(None) => eprintln!("{}", format!("  Task not found: {sub_arg}").yellow()),
+                Ok(None) => {
+                    eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
+                    eprintln!("{}", "  Use /task list to see available tasks.".dim());
+                }
                 Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
             }
         }
@@ -1441,10 +1459,16 @@ async fn handle_task_command(arg: &str, state: &mut ReplState) {
                         }
                         eprintln!();
                     }
-                    Ok(None) => eprintln!("{}", format!("  Task not found: {sub_arg}").yellow()),
+                    Ok(None) => {
+                        eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
+                        eprintln!("{}", "  Use /task list to see available tasks.".dim());
+                    }
                     Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
                 },
-                Ok(None) => eprintln!("{}", format!("  Task not found: {sub_arg}").yellow()),
+                Ok(None) => {
+                    eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
+                    eprintln!("{}", "  Use /task list to see available tasks.".dim());
+                }
                 Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
             }
         }
@@ -1897,7 +1921,8 @@ async fn run_chat_repl(
             }
             Err(e) => {
                 clear_slash_overlay();
-                eprintln!("{}", format!("readline error: {}", e).red());
+                eprintln!("{}", "  ✗ Input error — exiting session.".red());
+                eprintln!("{}", format!("  ({e})").dim());
                 break;
             }
         }
@@ -1915,7 +1940,7 @@ async fn run_chat_repl(
         ) {
             eprintln!(
                 "{}",
-                format!("  ⚠ Failed to save learning state: {e}").yellow()
+                format!("  ⚠ Learning state not saved (will retry next session): {e}").yellow()
             );
         }
         // Push learning to cloud (best-effort, now includes tool health)
