@@ -112,6 +112,28 @@ fn is_tool_error(result_str: &str) -> bool {
     result_str.to_lowercase().starts_with("error")
 }
 
+/// Detect OS-level resource exhaustion in tool output that wasn't flagged
+/// as an error by `is_tool_error()`.
+///
+/// Stricter than `classify_error()` to avoid false positives on normal text
+/// that mentions "fork" or "memory" (git logs, documentation, etc.).
+/// Requires exact shell-error patterns, not substring keywords.
+fn is_resource_limit_output(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    // Exact shell-error patterns (not just keyword substrings)
+    lower.contains("resource temporarily unavailable")
+        || lower.contains("cannot allocate memory")
+        || lower.contains("cannot fork")
+        || lower.contains("no space left on device")
+        || lower.contains("too many open files")
+        || lower.contains("enomem")
+        // Shell-specific: "bash: fork:" or "sh: fork:" prefix
+        || lower.contains("bash: fork:")
+        || lower.contains("sh: fork:")
+        // Chinese locale equivalents
+        || lower.contains("资源暂时不足")
+}
+
 /// Normalize a tool call signature for cache key matching.
 /// - Strips trailing slashes from path-like string args
 /// - Sorts object keys for deterministic hashing
@@ -1340,7 +1362,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 }
             }
             let tool_elapsed = tool_start.elapsed();
-            let is_err = is_tool_error(&result_str);
+            let mut is_err = is_tool_error(&result_str);
 
             // Error recovery: classify, retry transient errors, track via TurnGuard
             if is_err {
@@ -1417,6 +1439,28 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     let recovery_msg =
                         build_recovery_message(&name, &result_str, category, &deprioritized);
                     result_str.push_str(&format!("\n{recovery_msg}"));
+                }
+            }
+
+            // Resource-limit scan for "successful" tool outputs.
+            // Any process-spawning tool can surface OS errors in stdout/stderr
+            // while returning exit code 0.  The guard against false positives
+            // is the strictness of is_resource_limit_output() patterns — not a
+            // tool-name allowlist — so this applies to ALL tools.
+            if !is_err && is_resource_limit_output(&result_str) {
+                turn_guard
+                    .health
+                    .record_resource_limit_failure(&name);
+                restricted_tools.insert(name.clone());
+                is_err = true; // promote to error for downstream tracking
+                if !quiet {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "  ⚠ {name}: resource limit detected in output — tool blocked"
+                        )
+                        .dim()
+                    );
                 }
             }
 
@@ -2199,6 +2243,52 @@ mod tests {
     #[test]
     fn tool_error_whitespace_is_not_error() {
         assert!(!is_tool_error("   \n\t  "));
+    }
+
+    #[test]
+    fn tool_error_bash_fork_resource_limit_is_not_detected_by_is_tool_error() {
+        // Resource-limit errors in stdout are NOT caught by is_tool_error
+        // (they start with "bash:" not "error"). The post-result
+        // is_resource_limit_output() scan in the agentic loop handles this.
+        let fork_err = "bash: fork: retry: Resource temporarily unavailable\nbash: fork: Resource temporarily unavailable";
+        assert!(
+            !is_tool_error(fork_err),
+            "is_tool_error should NOT detect bash fork errors"
+        );
+        assert!(
+            is_resource_limit_output(fork_err),
+            "is_resource_limit_output must catch fork errors"
+        );
+    }
+
+    #[test]
+    fn resource_limit_detects_oom_and_disk_full() {
+        assert!(is_resource_limit_output("Cannot allocate memory"));
+        assert!(is_resource_limit_output("No space left on device"));
+        assert!(is_resource_limit_output("Too many open files"));
+        assert!(is_resource_limit_output("sh: fork: retry: Resource temporarily unavailable"));
+    }
+
+    #[test]
+    fn resource_limit_no_false_positive_on_git_fork() {
+        // Git output mentioning "fork" must NOT trigger resource-limit
+        assert!(!is_resource_limit_output(
+            "Forked from user/repo\nfork: created successfully"
+        ));
+        assert!(!is_resource_limit_output(
+            "commit abc123\nAuthor: user\n\n  fork: implement new feature"
+        ));
+    }
+
+    #[test]
+    fn resource_limit_no_false_positive_on_docs() {
+        // Documentation text mentioning memory/resources
+        assert!(!is_resource_limit_output(
+            "This function allocates memory for the buffer.\nSee out of memory handling docs."
+        ));
+        assert!(!is_resource_limit_output(
+            "The fork() system call creates a new process."
+        ));
     }
 
     // ── Cross-turn dedup: CACHEABLE_TOOLS constant ──
