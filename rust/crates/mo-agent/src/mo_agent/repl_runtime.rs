@@ -109,7 +109,10 @@ pub(super) async fn ensure_repl_authenticated(
                 // Token expired — try refresh below
             }
             Ok(_) => return Ok(()), // Non-401 errors: proceed anyway (server issues)
-            Err(_) => return Ok(()), // Network error: proceed with stored token (offline mode)
+            Err(_) => {
+                eprintln!("{}", "  ⚠ Network unavailable, using cached credentials.".dim());
+                return Ok(());
+            }
         }
     }
 
@@ -122,6 +125,7 @@ pub(super) async fn ensure_repl_authenticated(
             }
             Err(_) => {
                 // Refresh failed — fall through to interactive login
+                eprintln!("{}", "  ⚠ Session expired, login required.".dim());
             }
         }
     }
@@ -153,7 +157,7 @@ pub(super) async fn ensure_repl_authenticated(
 
         print!("  {} ", "Password:".bold());
         io::stdout().flush().map_err(|e| e.to_string())?;
-        let pw = rpassword::read_password().unwrap_or_default();
+        let pw = rpassword::read_password().map_err(|e| format!("Could not read password: {e}"))?;
         if pw.trim().is_empty() {
             return Err("Authentication cancelled.".to_string());
         }
@@ -185,7 +189,7 @@ pub(super) async fn ensure_repl_authenticated(
             }
             print!("  {} ", "Password:".bold());
             io::stdout().flush().ok();
-            let pw = rpassword::read_password().unwrap_or_default();
+            let pw = rpassword::read_password().map_err(|e| format!("Could not read password: {e}"))?;
             if pw.trim().is_empty() {
                 return Err("Authentication cancelled.".to_string());
             }
@@ -210,7 +214,7 @@ pub(super) async fn ensure_repl_authenticated(
             }
             print!("  {} ", "Password:".bold());
             io::stdout().flush().ok();
-            let pw = rpassword::read_password().unwrap_or_default();
+            let pw = rpassword::read_password().map_err(|e| format!("Could not read password: {e}"))?;
             if pw.trim().is_empty() {
                 return Err("Registration cancelled.".to_string());
             }

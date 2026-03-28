@@ -661,7 +661,13 @@ fn handle_stats_command(arg: &str, state: &ReplState) {
     match arg {
         "history" => {
             // Show stats across recent sessions
-            let sessions = session_journal::list_sessions().unwrap_or_default();
+            let sessions = match session_journal::list_sessions() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("{}", format!("  ⚠ Could not read session history: {e}").yellow());
+                    return;
+                }
+            };
             if sessions.is_empty() {
                 eprintln!("{}", "  No sessions found.".dim());
                 return;
