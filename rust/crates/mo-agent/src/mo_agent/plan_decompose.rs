@@ -11,6 +11,8 @@
 //! 2. Calls the LLM to break down the goal into subtasks
 //! 3. Returns a TaskPlan with dependencies
 
+#![allow(dead_code)] // parse_plan_response and related structs are used in tests
+
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
