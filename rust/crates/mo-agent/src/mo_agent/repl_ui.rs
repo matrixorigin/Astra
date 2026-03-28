@@ -328,6 +328,65 @@ fn slash_completion_query(line: &str) -> Option<&str> {
     None
 }
 
+fn slash_argument_hint(command: &str) -> Option<&'static str> {
+    match command {
+        "/model" => Some("<name>"),
+        "/session history" | "/session errors" | "/session export" => {
+            Some("<session_id|prefix>")
+        }
+        "/rewind" => Some("<turn>"),
+        "/skill" => Some("[list|new|test|dev|doctor|validate|config|system]"),
+        "/skill new" => Some("<name>"),
+        "/skill test" => Some("<name> [json_args]"),
+        "/skill dev" => Some("<name|off>"),
+        "/skill validate" | "/skill config" => Some("<name>"),
+        "/skill system" => Some("<name|list>"),
+        "/memory" => Some("[list|search <q>|inspect <id>]"),
+        "/plan" => Some("[show|set <text>|clear]"),
+        "/task" => Some("[list|add <title>|done <id>|status <id>]"),
+        "/resume" => Some("[session_id]"),
+        "/stats" => Some("[history]"),
+        "/health" => Some("[detail]"),
+        _ => None,
+    }
+}
+
+fn slash_inline_hint(line: &str) -> Option<String> {
+    let trimmed = line.trim_end();
+    if let Ok(cmd) = resolve_slash_command(trimmed)
+        && trimmed == cmd
+        && let Some(arg_hint) = slash_argument_hint(cmd)
+    {
+        return if line.ends_with(' ') {
+            Some(arg_hint.to_string())
+        } else {
+            Some(format!(" {arg_hint}"))
+        };
+    }
+
+    let query = slash_completion_query(line)?;
+    let q = query.trim_start_matches('/');
+    let q = if q.is_empty() { None } else { Some(q) };
+    let rows = filtered_slash_rows(q);
+    if let Some((cmd, _)) = rows.first()
+        && *cmd != line
+        && cmd.starts_with(line)
+    {
+        return Some(cmd[line.len()..].to_string());
+    }
+    None
+}
+
+fn apply_accepted_slash_edit(edit: AcceptedSlashEdit) -> RlCmd {
+    match edit {
+        AcceptedSlashEdit::InsertSuffix(text) => RlCmd::Insert(1, text),
+        AcceptedSlashEdit::ReplaceWholeLine(line) => {
+            RlCmd::Replace(RlMovement::WholeLine, Some(line))
+        }
+        AcceptedSlashEdit::KeepLine => RlCmd::Move(RlMovement::EndOfLine),
+    }
+}
+
 /// Move selection and return the newly selected command name.
 fn move_picker_selection(delta: isize) -> Option<&'static str> {
     let rows = picker_rows_for_filter();
@@ -739,6 +798,18 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 nav!(1);
             }
             RlKeyEvent(RlKeyCode::Tab, _) if in_slash && active => {
+                let rows = picker_rows_for_filter();
+                let current = ctx.line();
+                let selected = get_slash_picker_selected();
+                let selected_cmd = rows.get(selected).map(|(cmd, _)| *cmd);
+                let exact_selected = selected_cmd == Some(current);
+                if rows.len() == 1 || exact_selected {
+                    clear_slash_overlay();
+                    if let Some(edit) = accepted_slash_edit(current, selected_cmd, true) {
+                        return Some(apply_accepted_slash_edit(edit));
+                    }
+                    return Some(RlCmd::Move(RlMovement::EndOfLine));
+                }
                 nav!(1);
             }
             RlKeyEvent(RlKeyCode::BackTab, _) if in_slash && active => {
@@ -759,13 +830,7 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 let selected = picker_selected_command();
                 clear_slash_overlay();
                 if let Some(edit) = accepted_slash_edit(current, selected, false) {
-                    return Some(match edit {
-                        AcceptedSlashEdit::InsertSuffix(text) => RlCmd::Insert(1, text),
-                        AcceptedSlashEdit::ReplaceWholeLine(line) => {
-                            RlCmd::Replace(RlMovement::WholeLine, Some(line))
-                        }
-                        AcceptedSlashEdit::KeepLine => RlCmd::Move(RlMovement::EndOfLine),
-                    });
+                    return Some(apply_accepted_slash_edit(edit));
                 }
                 return None;
             }
@@ -789,7 +854,9 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 if let Some((cmd, _)) = rows.get(selected)
                     && *cmd != current
                 {
-                    return Some(RlCmd::Replace(RlMovement::WholeLine, Some(cmd.to_string())));
+                    if let Some(edit) = accepted_slash_edit(current, Some(*cmd), false) {
+                        return Some(apply_accepted_slash_edit(edit));
+                    }
                 }
                 return None; // already correct — accept
             }
@@ -840,11 +907,10 @@ impl Completer for ReplHelper {
 
             let safe_pos = pos.min(line.len());
             let before_cursor = &line[..safe_pos];
-            let command_end = before_cursor.find(' ').unwrap_or(before_cursor.len());
-            if safe_pos > command_end {
+            let Some(prefix) = slash_completion_query(before_cursor) else {
                 return Ok((pos, vec![]));
-            }
-            (&before_cursor[..command_end], false)
+            };
+            (prefix, false)
         };
 
         let matches: Vec<Pair> = completion_candidates(prefix)
@@ -866,17 +932,7 @@ impl Hinter for ReplHelper {
     type Hint = String;
 
     fn hint(&self, line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
-        if !line.starts_with('/') {
-            return None;
-        }
-        if line.contains(' ') {
-            return None;
-        }
-        let prefix = line;
-        completion_candidates(prefix)
-            .into_iter()
-            .find(|(cmd, _)| *cmd != prefix)
-            .map(|(cmd, _)| cmd[prefix.len()..].to_string())
+        slash_inline_hint(line)
     }
 }
 
@@ -1286,6 +1342,46 @@ mod tests {
         assert_eq!(rows[0].0, "/skill dev");
         assert!(rows.iter().any(|(cmd, _)| *cmd == "/skill doctor"));
         assert!(rows.iter().any(|(cmd, _)| *cmd == "/skill dev off"));
+    }
+
+    #[test]
+    fn completion_candidates_support_skill_subcommands_after_space() {
+        let candidates = completion_candidates("/skill ");
+        assert!(candidates.iter().any(|(cmd, _)| *cmd == "/skill list"));
+        assert!(candidates.iter().any(|(cmd, _)| *cmd == "/skill dev"));
+    }
+
+    #[test]
+    fn slash_inline_hint_completes_skill_subcommand_prefix() {
+        assert_eq!(slash_inline_hint("/skill d"), Some("ev".to_string()));
+    }
+
+    #[test]
+    fn slash_inline_hint_shows_skill_subcommand_parameter_hint() {
+        assert_eq!(
+            slash_inline_hint("/skill dev"),
+            Some(" <name|off>".to_string())
+        );
+        assert_eq!(
+            slash_inline_hint("/skill dev "),
+            Some("<name|off>".to_string())
+        );
+    }
+
+    #[test]
+    fn slash_inline_hint_shows_skill_root_choices() {
+        assert_eq!(
+            slash_inline_hint("/skill "),
+            Some("[list|new|test|dev|doctor|validate|config|system]".to_string())
+        );
+    }
+
+    #[test]
+    fn apply_accepted_slash_edit_preserves_cursor_at_end() {
+        assert_eq!(
+            apply_accepted_slash_edit(AcceptedSlashEdit::InsertSuffix("ev ".to_string())),
+            RlCmd::Insert(1, "ev ".to_string())
+        );
     }
 
     // ── Multi-line validator ──────────────────────────────────────────────
