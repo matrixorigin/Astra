@@ -1245,6 +1245,12 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     "content": "(duplicate call — result same as previous identical call this turn)",
                 }));
                 tool_results.push(cached_tr);
+                tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
+                    name: name.clone(),
+                    ok: true,
+                    ms: 0,
+                    error: Some("duplicate_within_turn".to_string()),
+                });
                 continue;
             }
 
@@ -1275,6 +1281,12 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 step_recorder.begin_tool_with_key(&name, &id, Some(&cache_key));
                 step_recorder.record_cache_hit(&name, cached.clone());
                 turn_guard.record_cache_hit(&name);
+                tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
+                    name: name.clone(),
+                    ok: true,
+                    ms: 0,
+                    error: Some("cached_cross_turn".to_string()),
+                });
                 continue;
             }
 
@@ -1306,6 +1318,12 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     "content": err_msg,
                 }));
                 tool_results.push(err_tr);
+                tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
+                    name: name.clone(),
+                    ok: false,
+                    ms: 0,
+                    error: Some(format!("unknown_tool: {name}")),
+                });
                 continue;
             }
 
@@ -1321,6 +1339,12 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     "content": "Permission denied",
                 }));
                 tool_results.push(denied_tr);
+                tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
+                    name: name.clone(),
+                    ok: false,
+                    ms: 0,
+                    error: Some("permission_denied".to_string()),
+                });
                 continue;
             }
 
@@ -2663,5 +2687,82 @@ mod tests {
     #[test]
     fn resource_limit_chinese_system_resource() {
         assert!(is_resource_limit_output("错误：系统资源不足"));
+    }
+
+    // ── ToolCallRecord ingestion completeness ──
+
+    /// Verify ToolCallRecord can represent all early-exit paths
+    /// (duplicate, cached, unknown tool, permission denied) so that
+    /// DB ingestion captures 100% of tool_calls.
+    #[test]
+    fn tool_call_record_covers_early_exit_paths() {
+        use mo_agent_services::session_journal::ToolCallRecord;
+
+        // Duplicate within turn
+        let dup = ToolCallRecord {
+            name: "read_file".to_string(),
+            ok: true,
+            ms: 0,
+            error: Some("duplicate_within_turn".to_string()),
+        };
+        assert!(dup.ok);
+        assert_eq!(dup.ms, 0);
+
+        // Cross-turn cache hit
+        let cached = ToolCallRecord {
+            name: "grep".to_string(),
+            ok: true,
+            ms: 0,
+            error: Some("cached_cross_turn".to_string()),
+        };
+        assert!(cached.ok);
+
+        // Unknown tool
+        let unknown = ToolCallRecord {
+            name: "nonexistent_tool".to_string(),
+            ok: false,
+            ms: 0,
+            error: Some("unknown_tool: nonexistent_tool".to_string()),
+        };
+        assert!(!unknown.ok);
+        assert!(unknown.error.as_ref().unwrap().starts_with("unknown_tool:"));
+
+        // Permission denied
+        let denied = ToolCallRecord {
+            name: "bash".to_string(),
+            ok: false,
+            ms: 0,
+            error: Some("permission_denied".to_string()),
+        };
+        assert!(!denied.ok);
+
+        // All records serialize cleanly (required for DB ingestion)
+        let records = vec![dup, cached, unknown, denied];
+        let json = serde_json::to_string(&records).unwrap();
+        assert!(json.contains("duplicate_within_turn"));
+        assert!(json.contains("cached_cross_turn"));
+        assert!(json.contains("unknown_tool"));
+        assert!(json.contains("permission_denied"));
+    }
+
+    /// ToolCallRecord round-trips through JSON correctly.
+    #[test]
+    fn tool_call_record_json_roundtrip() {
+        use mo_agent_services::session_journal::ToolCallRecord;
+
+        let original = ToolCallRecord {
+            name: "web_fetch".to_string(),
+            ok: true,
+            ms: 42,
+            error: None,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: ToolCallRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.name, "web_fetch");
+        assert_eq!(restored.ms, 42);
+        assert!(restored.ok);
+        assert!(restored.error.is_none());
+        // error field should be absent when None (skip_serializing_if)
+        assert!(!json.contains("error"));
     }
 }
