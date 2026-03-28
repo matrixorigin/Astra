@@ -158,18 +158,36 @@ fn is_command_alias(command: &str) -> bool {
     matches!(command, "/?" | "/commands" | "/quit")
 }
 
+fn command_name_matches_prefix(command: &str, query: &str) -> bool {
+    let cmd = command.trim_start_matches('/').to_ascii_lowercase();
+    let q = query.trim().trim_start_matches('/').to_ascii_lowercase();
+    !q.is_empty() && cmd.starts_with(&q)
+}
+
+fn sort_picker_rows(
+    rows: &mut [(&'static str, &'static str)],
+    query: Option<&str>,
+) {
+    rows.sort_by(|(a_cmd, _), (b_cmd, _)| {
+        let query_cmp = query.map(|q| {
+            suggestion_score(b_cmd, q)
+                .cmp(&suggestion_score(a_cmd, q))
+        });
+        query_cmp
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| is_command_alias(a_cmd).cmp(&is_command_alias(b_cmd)))
+            .then_with(|| a_cmd.len().cmp(&b_cmd.len()))
+            .then_with(|| a_cmd.cmp(b_cmd))
+    });
+}
+
 pub(super) fn completion_candidates(prefix: &str) -> Vec<(&'static str, &'static str)> {
     let mut rows: Vec<(&'static str, &'static str)> = SLASH_COMMANDS
         .iter()
         .copied()
         .filter(|(cmd, _)| cmd.starts_with(prefix))
         .collect();
-    rows.sort_by(|(a_cmd, _), (b_cmd, _)| {
-        is_command_alias(a_cmd)
-            .cmp(&is_command_alias(b_cmd))
-            .then_with(|| a_cmd.len().cmp(&b_cmd.len()))
-            .then_with(|| a_cmd.cmp(b_cmd))
-    });
+    sort_picker_rows(&mut rows, None);
     rows
 }
 
@@ -177,7 +195,17 @@ fn filtered_slash_rows(query: Option<&str>) -> Vec<(&'static str, &'static str)>
     let mut rows = completion_candidates("/");
     rows.retain(|(cmd, _)| *cmd != "/" && !is_command_alias(cmd));
     if let Some(q) = query {
+        let mut prefix_rows: Vec<(&'static str, &'static str)> = rows
+            .iter()
+            .copied()
+            .filter(|(cmd, _)| command_name_matches_prefix(cmd, q))
+            .collect();
+        if !prefix_rows.is_empty() {
+            sort_picker_rows(&mut prefix_rows, Some(q));
+            return prefix_rows;
+        }
         rows.retain(|(cmd, desc)| command_matches_filter(cmd, desc, q));
+        sort_picker_rows(&mut rows, Some(q));
     }
     rows
 }
@@ -1093,6 +1121,22 @@ mod tests {
         let rows = filtered_slash_rows(None);
         assert!(!rows.is_empty());
         assert_ne!(rows[0].0, "/", "first picker item should not be '/'");
+    }
+
+    #[test]
+    fn filtered_rows_prefix_query_prefers_command_name_matches() {
+        let rows = filtered_slash_rows(Some("e"));
+        assert!(!rows.is_empty());
+        assert_eq!(rows[0].0, "/exit");
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/explain"));
+        assert!(!rows.iter().any(|(cmd, _)| *cmd == "/copy"));
+    }
+
+    #[test]
+    fn filtered_rows_falls_back_to_description_search_when_no_prefix_match() {
+        let rows = filtered_slash_rows(Some("keyboard"));
+        assert!(!rows.is_empty());
+        assert_eq!(rows[0].0, "/keys");
     }
 
     // ── Bug fix: picker cycling wraps around ──────────────────────────────
