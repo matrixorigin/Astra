@@ -2328,12 +2328,35 @@ mod tests {
             .unwrap()
     }
 
+    /// Guard that serializes tests touching MO_AGENT_CREDENTIALS_DIR.
+    /// Multiple async tests concurrently setting this env var is a data race;
+    /// the guard ensures they execute sequentially.
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    struct CredentialsGuard {
+        _lock: MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn creds_lock() -> MutexGuard<'static, ()> {
+        static CREDS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        CREDS_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Set credentials dir to a temp path so tests don't pollute ~/.mo-agent/credentials.json.
-    fn isolate_credentials() -> tempfile::TempDir {
+    /// Returns a guard that holds a mutex — tests using this are serialized.
+    fn isolate_credentials() -> CredentialsGuard {
+        let lock = creds_lock();
         let dir = tempfile::tempdir().unwrap();
-        // SAFETY: tests run in a single process; env var is set before any credential I/O.
+        // SAFETY: protected by CREDS_LOCK; no concurrent set_var.
         unsafe { std::env::set_var("MO_AGENT_CREDENTIALS_DIR", dir.path()) };
-        dir
+        CredentialsGuard {
+            _lock: lock,
+            _dir: dir,
+        }
     }
 
     // ── auth_flow ─────────────────────────────────────────────────────────
