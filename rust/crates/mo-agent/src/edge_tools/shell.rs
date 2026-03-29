@@ -192,11 +192,25 @@ impl ToolExecutor {
                         result.push_str("\n[truncated]");
                     }
 
-                    // For build/test commands, provide structured output
+                    // For build/test commands, provide structured output with iteration tracking
                     if super::build_test::is_build_test_command(command) {
-                        let parsed =
+                        let mut parsed =
                             super::build_test::parse_build_test_output(&result, out.status.code());
-                        return parsed.to_enhanced_output(&result);
+                        if !parsed.error_locations.is_empty() {
+                            parsed.enrich_with_scope(&self.project_root);
+                        }
+                        let delta = {
+                            let mut tracker = self.build_test_tracker.lock().unwrap();
+                            if tracker.command_changed(command) {
+                                tracker.reset();
+                            }
+                            tracker.record(&parsed, command)
+                        };
+                        let delta_summary = delta.to_summary();
+                        if delta_summary.is_empty() {
+                            return parsed.to_enhanced_output(&result);
+                        }
+                        return format!("{}\n\n{}", delta_summary, parsed.to_enhanced_output(&result));
                     }
 
                     result

@@ -925,8 +925,8 @@ mod tests {
         assert!(p.contains("## Memory Rules"));
         // Budget: full prompt should still be reasonable
         assert!(
-            p.len() < 11000,
-            "full toolset prompt should be under 11000 chars, got {}",
+            p.len() < 11500,
+            "full toolset prompt should be under 11500 chars, got {}",
             p.len()
         );
     }

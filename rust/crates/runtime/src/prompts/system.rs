@@ -147,11 +147,14 @@ pub fn build_main_system_prompt(
             "\n\
              ## Build & Test Loop\n\
              - Use **run_build_test** instead of bash for build/test commands. It returns structured errors WITH source context.\n\
-             - Each error shows a classification: 🔧 Trivial (mechanical fix), 🔨 Fixable (needs reasoning), or Complex.\n\
+             - Each error shows: 🔧 Trivial (mechanical fix), 🔨 Fixable (needs reasoning), or Complex.\n\
              - Errors include 💡 hints — follow them for quick resolution.\n\
              - Each error location includes surrounding code — fix directly with str_replace, no extra read_file needed.\n\
              - If >3 errors in the same file, fix the FIRST one — later errors are often cascading.\n\
-             - After fixing, call run_build_test again. Repeat until clean.\n",
+             - After fixing, call run_build_test again with the SAME command. The tool tracks iterations:\n\
+             - It shows ✅ Fixed, 🆕 New, ⏳ Persistent errors — use this to gauge your fix progress.\n\
+             - If you see ⚠ Regression (more errors after your fix), revert the change and try a different approach.\n\
+             - Repeat until clean. Aim to fix ALL errors, not just the first one.\n",
         );
     }
 

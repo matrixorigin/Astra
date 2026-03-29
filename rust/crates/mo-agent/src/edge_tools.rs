@@ -854,6 +854,8 @@ pub struct ToolExecutor {
     /// Set before each tool execution batch, read by tools that produce
     /// variable-size output (git_diff, git_show) to scale their limits.
     budget_pressure: std::sync::Mutex<f64>,
+    /// Build/test iteration tracker — tracks error deltas across fix cycles.
+    build_test_tracker: std::sync::Mutex<build_test::BuildTestTracker>,
 }
 
 /// Extract owner/repo from git remote URLs in the given directory.
@@ -923,6 +925,7 @@ impl ToolExecutor {
             sandbox_policy: Some(sandbox),
             preferred_repos: std::sync::Mutex::new(preferred_repos),
             budget_pressure: std::sync::Mutex::new(0.0),
+            build_test_tracker: std::sync::Mutex::new(build_test::BuildTestTracker::new()),
         }
     }
 
@@ -1545,8 +1548,25 @@ impl ToolExecutor {
             result.enrich_with_scope(&self.project_root);
         }
 
+        // Track iteration deltas — reset if command changed
+        let delta = {
+            let mut tracker = self.build_test_tracker.lock().unwrap();
+            if tracker.command_changed(command) {
+                tracker.reset();
+            }
+            tracker.record(&result, command)
+        };
+
         // Build the structured output
         let mut parts = Vec::new();
+
+        // Prepend delta summary for iterations > 0
+        let delta_summary = delta.to_summary();
+        if !delta_summary.is_empty() {
+            parts.push(delta_summary);
+            parts.push(String::new());
+        }
+
         parts.push(result.to_enhanced_output(&combined));
 
         // Auto-read source context for each error location
@@ -2846,5 +2866,28 @@ fn main() {
         assert!(names.contains(&"call_graph"), "should have call_graph: {:?}", names);
         assert!(names.contains(&"delete_file"), "should have delete_file: {:?}", names);
         assert!(names.contains(&"multi_edit"), "should have multi_edit: {:?}", names);
+    }
+
+    #[tokio::test]
+    async fn run_build_test_iteration_tracking() {
+        let executor = test_executor();
+        // First call — no delta header
+        let r1 = executor.execute("run_build_test", &json!({"command": "echo 'ok'"})).await;
+        assert!(!r1.contains("Iteration"), "first run should not show iteration: {r1}");
+
+        // Second call with same command — should show iteration 1
+        let r2 = executor.execute("run_build_test", &json!({"command": "echo 'ok'"})).await;
+        // Both succeed with 0 errors, so delta should be empty (nothing to report)
+        assert!(r2.contains("✓") || r2.contains("ok"), "should still work: {r2}");
+    }
+
+    #[tokio::test]
+    async fn run_build_test_different_command_resets_tracker() {
+        let executor = test_executor();
+        // Run one command
+        executor.execute("run_build_test", &json!({"command": "echo 'build'"})).await;
+        // Run different command — should reset tracker, not show iteration
+        let r2 = executor.execute("run_build_test", &json!({"command": "echo 'test'"})).await;
+        assert!(!r2.contains("Iteration"), "different command should reset: {r2}");
     }
 }

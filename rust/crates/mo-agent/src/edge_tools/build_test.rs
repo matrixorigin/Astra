@@ -9,6 +9,7 @@
 //! Enables automated change→test→fix cycles by providing structured feedback.
 
 use regex::Regex;
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 /// A precise error location extracted from compiler/test output.
@@ -257,6 +258,177 @@ impl BuildTestResult {
                 };
             }
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Build/Test Iteration Tracker — delta analysis across fix cycles
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Signature for an error location (fuzzy enough to survive line shifts).
+/// Format: "file::error_code::message_prefix" — ignores line numbers
+/// so that fixing above the error doesn't cause a false "new error".
+fn error_signature(loc: &ErrorLocation) -> String {
+    let msg_prefix: String = loc.message.chars().take(60).collect();
+    format!("{}::{}::{}", loc.file, loc.error_code, msg_prefix)
+}
+
+/// Delta between two build/test iterations.
+#[derive(Debug, Clone)]
+pub struct BuildTestDelta {
+    /// Which iteration this is (0 = first run)
+    pub iteration: usize,
+    /// Errors that are new since last run
+    pub new_errors: Vec<String>,
+    /// Errors that were fixed since last run
+    pub fixed_errors: Vec<String>,
+    /// Errors that persist from last run
+    pub persistent_errors: Vec<String>,
+    /// True if error count increased (regression)
+    pub regressed: bool,
+    /// Overall progress: errors fixed vs original count
+    pub progress_pct: f64,
+    /// Command that was run
+    #[allow(dead_code)]
+    pub command: String,
+}
+
+impl BuildTestDelta {
+    /// Format the delta as a compact summary for the LLM.
+    pub fn to_summary(&self) -> String {
+        if self.iteration == 0 {
+            return String::new(); // First run, no delta to show
+        }
+        let mut parts = Vec::new();
+        parts.push(format!("─── Iteration {} ───", self.iteration));
+
+        if !self.fixed_errors.is_empty() {
+            parts.push(format!("✅ Fixed {} error(s)", self.fixed_errors.len()));
+        }
+        if !self.new_errors.is_empty() {
+            parts.push(format!("🆕 {} new error(s)", self.new_errors.len()));
+        }
+        if !self.persistent_errors.is_empty() {
+            parts.push(format!("⏳ {} still present", self.persistent_errors.len()));
+        }
+        if self.regressed {
+            parts.push("⚠ Regression — more errors than before. Consider reverting last change.".into());
+        }
+        if self.progress_pct > 0.0 {
+            parts.push(format!("Progress: {:.0}% of original errors resolved", self.progress_pct));
+        }
+        parts.join("\n")
+    }
+}
+
+/// Tracks build/test results across iterations within a session.
+///
+/// Provides delta analysis: which errors were fixed, which are new,
+/// which persist. Helps the LLM understand the impact of each fix
+/// and avoid chasing regressions.
+#[derive(Debug)]
+pub struct BuildTestTracker {
+    /// Previous result's error signatures
+    previous_sigs: HashSet<String>,
+    /// Original error signatures from the very first failed run
+    original_sigs: HashSet<String>,
+    /// Current iteration count
+    iteration: usize,
+    /// Last command that was run
+    last_command: String,
+}
+
+impl BuildTestTracker {
+    pub fn new() -> Self {
+        Self {
+            previous_sigs: HashSet::new(),
+            original_sigs: HashSet::new(),
+            iteration: 0,
+            last_command: String::new(),
+        }
+    }
+
+    /// Record a new build/test result and compute the delta.
+    ///
+    /// Call this each time `run_build_test` completes. The returned
+    /// `BuildTestDelta` should be prepended to the tool output so the
+    /// LLM can see what changed since its last fix attempt.
+    pub fn record(&mut self, result: &BuildTestResult, command: &str) -> BuildTestDelta {
+        let current_sigs: HashSet<String> = result
+            .error_locations
+            .iter()
+            .map(error_signature)
+            .collect();
+
+        let delta = if self.iteration == 0 && !self.previous_sigs.is_empty() || self.iteration > 0 {
+            // Subsequent run — compute delta
+            let new_errors: Vec<String> = current_sigs
+                .difference(&self.previous_sigs)
+                .cloned()
+                .collect();
+            let fixed_errors: Vec<String> = self.previous_sigs
+                .difference(&current_sigs)
+                .cloned()
+                .collect();
+            let persistent_errors: Vec<String> = current_sigs
+                .intersection(&self.previous_sigs)
+                .cloned()
+                .collect();
+            let regressed = current_sigs.len() > self.previous_sigs.len();
+
+            // Progress vs original errors
+            let progress_pct = if self.original_sigs.is_empty() {
+                0.0
+            } else {
+                let fixed_from_original = self.original_sigs.difference(&current_sigs).count();
+                (fixed_from_original as f64 / self.original_sigs.len() as f64) * 100.0
+            };
+
+            BuildTestDelta {
+                iteration: self.iteration,
+                new_errors,
+                fixed_errors,
+                persistent_errors,
+                regressed,
+                progress_pct,
+                command: command.to_string(),
+            }
+        } else {
+            // First run — store baseline
+            self.original_sigs = current_sigs.clone();
+            BuildTestDelta {
+                iteration: 0,
+                new_errors: Vec::new(),
+                fixed_errors: Vec::new(),
+                persistent_errors: Vec::new(),
+                regressed: false,
+                progress_pct: 0.0,
+                command: command.to_string(),
+            }
+        };
+
+        self.previous_sigs = current_sigs;
+        self.last_command = command.to_string();
+        self.iteration += 1;
+        delta
+    }
+
+    /// How many iterations have been recorded.
+    pub fn iterations(&self) -> usize {
+        self.iteration
+    }
+
+    /// Reset tracker (e.g., when switching to a different command).
+    pub fn reset(&mut self) {
+        self.previous_sigs.clear();
+        self.original_sigs.clear();
+        self.iteration = 0;
+        self.last_command.clear();
+    }
+
+    /// Whether the command changed since last run (triggers a reset).
+    pub fn command_changed(&self, command: &str) -> bool {
+        !self.last_command.is_empty() && self.last_command != command
     }
 }
 
@@ -1451,5 +1623,199 @@ error[E0425]: cannot find value `nonexistent` in this scope
             output.contains("(in impl Foo > fn process)"),
             "scope should appear in enhanced output: {output}"
         );
+    }
+
+    // ═══════════════════════ BuildTestTracker Tests ═══════════════════════
+
+    fn make_errors(specs: &[(&str, &str, &str)]) -> Vec<ErrorLocation> {
+        specs.iter().map(|(file, code, msg)| {
+            ErrorLocation::new(file.to_string(), 10, 1, code.to_string(), msg.to_string(), "error".into())
+        }).collect()
+    }
+
+    fn make_result(errors: Vec<ErrorLocation>) -> BuildTestResult {
+        BuildTestResult {
+            passed: errors.is_empty(),
+            error_count: errors.len(),
+            error_locations: errors,
+            framework: "cargo".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tracker_first_run_no_delta() {
+        let mut tracker = BuildTestTracker::new();
+        let result = make_result(make_errors(&[
+            ("src/a.rs", "E0425", "cannot find value `foo`"),
+            ("src/b.rs", "E0308", "mismatched types"),
+        ]));
+        let delta = tracker.record(&result, "cargo build");
+        assert_eq!(delta.iteration, 0);
+        assert!(delta.new_errors.is_empty());
+        assert!(delta.fixed_errors.is_empty());
+        assert!(!delta.regressed);
+        assert_eq!(delta.to_summary(), ""); // No summary for first run
+    }
+
+    #[test]
+    fn tracker_detects_fixed_errors() {
+        let mut tracker = BuildTestTracker::new();
+        // First run: 2 errors
+        let r1 = make_result(make_errors(&[
+            ("src/a.rs", "E0425", "cannot find value `foo`"),
+            ("src/b.rs", "E0308", "mismatched types"),
+        ]));
+        tracker.record(&r1, "cargo build");
+
+        // Second run: only 1 error (fixed E0425)
+        let r2 = make_result(make_errors(&[
+            ("src/b.rs", "E0308", "mismatched types"),
+        ]));
+        let delta = tracker.record(&r2, "cargo build");
+
+        assert_eq!(delta.iteration, 1);
+        assert_eq!(delta.fixed_errors.len(), 1);
+        assert!(delta.fixed_errors[0].contains("E0425"));
+        assert!(delta.persistent_errors.len() == 1);
+        assert!(!delta.regressed);
+        assert!(delta.progress_pct > 0.0);
+    }
+
+    #[test]
+    fn tracker_detects_new_errors() {
+        let mut tracker = BuildTestTracker::new();
+        let r1 = make_result(make_errors(&[
+            ("src/a.rs", "E0425", "cannot find value `foo`"),
+        ]));
+        tracker.record(&r1, "cargo build");
+
+        // Fixed old error but introduced a new one
+        let r2 = make_result(make_errors(&[
+            ("src/c.rs", "E0277", "trait not satisfied"),
+        ]));
+        let delta = tracker.record(&r2, "cargo build");
+
+        assert_eq!(delta.new_errors.len(), 1);
+        assert_eq!(delta.fixed_errors.len(), 1);
+        assert!(delta.persistent_errors.is_empty());
+        assert!(!delta.regressed); // Same count, not regression
+    }
+
+    #[test]
+    fn tracker_detects_regression() {
+        let mut tracker = BuildTestTracker::new();
+        let r1 = make_result(make_errors(&[
+            ("src/a.rs", "E0425", "cannot find value `foo`"),
+        ]));
+        tracker.record(&r1, "cargo build");
+
+        // Introduced MORE errors than before
+        let r2 = make_result(make_errors(&[
+            ("src/a.rs", "E0425", "cannot find value `foo`"),
+            ("src/b.rs", "E0308", "mismatched types"),
+            ("src/c.rs", "E0277", "trait not satisfied"),
+        ]));
+        let delta = tracker.record(&r2, "cargo build");
+
+        assert!(delta.regressed);
+        assert_eq!(delta.new_errors.len(), 2);
+        assert_eq!(delta.persistent_errors.len(), 1);
+        let summary = delta.to_summary();
+        assert!(summary.contains("Regression"), "should warn about regression: {summary}");
+    }
+
+    #[test]
+    fn tracker_full_resolution_shows_100_percent() {
+        let mut tracker = BuildTestTracker::new();
+        let r1 = make_result(make_errors(&[
+            ("src/a.rs", "E0425", "cannot find value `foo`"),
+            ("src/b.rs", "E0308", "mismatched types"),
+        ]));
+        tracker.record(&r1, "cargo build");
+
+        // All errors fixed!
+        let r2 = make_result(Vec::new());
+        let delta = tracker.record(&r2, "cargo build");
+
+        assert_eq!(delta.fixed_errors.len(), 2);
+        assert!(delta.new_errors.is_empty());
+        assert!((delta.progress_pct - 100.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn tracker_command_change_resets() {
+        let mut tracker = BuildTestTracker::new();
+        let r1 = make_result(make_errors(&[
+            ("src/a.rs", "E0425", "cannot find value `foo`"),
+        ]));
+        tracker.record(&r1, "cargo build");
+        assert_eq!(tracker.iterations(), 1);
+
+        // Different command — should reset
+        assert!(tracker.command_changed("cargo test"));
+        tracker.reset();
+        let r2 = make_result(make_errors(&[
+            ("src/a.rs", "E0425", "cannot find value `foo`"),
+        ]));
+        let delta = tracker.record(&r2, "cargo test");
+        assert_eq!(delta.iteration, 0); // Fresh start
+    }
+
+    #[test]
+    fn tracker_multi_iteration_progress() {
+        let mut tracker = BuildTestTracker::new();
+        // 4 errors initially
+        let r1 = make_result(make_errors(&[
+            ("src/a.rs", "E0425", "cannot find value `foo`"),
+            ("src/b.rs", "E0308", "mismatched types"),
+            ("src/c.rs", "E0277", "trait not satisfied"),
+            ("src/d.rs", "E0599", "method not found"),
+        ]));
+        tracker.record(&r1, "cargo build");
+
+        // Fix 2
+        let r2 = make_result(make_errors(&[
+            ("src/c.rs", "E0277", "trait not satisfied"),
+            ("src/d.rs", "E0599", "method not found"),
+        ]));
+        let d2 = tracker.record(&r2, "cargo build");
+        assert_eq!(d2.fixed_errors.len(), 2);
+        assert!((d2.progress_pct - 50.0).abs() < 0.001);
+
+        // Fix 1 more
+        let r3 = make_result(make_errors(&[
+            ("src/d.rs", "E0599", "method not found"),
+        ]));
+        let d3 = tracker.record(&r3, "cargo build");
+        assert_eq!(d3.fixed_errors.len(), 1);
+        assert!((d3.progress_pct - 75.0).abs() < 0.001);
+        assert_eq!(d3.iteration, 2);
+    }
+
+    #[test]
+    fn tracker_error_signature_ignores_line_number() {
+        let loc1 = ErrorLocation::new("src/a.rs".into(), 10, 1, "E0425".into(), "cannot find value `foo`".into(), "error".into());
+        let loc2 = ErrorLocation::new("src/a.rs".into(), 20, 1, "E0425".into(), "cannot find value `foo`".into(), "error".into());
+        assert_eq!(error_signature(&loc1), error_signature(&loc2));
+    }
+
+    #[test]
+    fn delta_summary_format() {
+        let delta = BuildTestDelta {
+            iteration: 2,
+            new_errors: vec!["new1".into()],
+            fixed_errors: vec!["fix1".into(), "fix2".into()],
+            persistent_errors: vec!["persist1".into()],
+            regressed: false,
+            progress_pct: 66.7,
+            command: "cargo build".into(),
+        };
+        let summary = delta.to_summary();
+        assert!(summary.contains("Iteration 2"));
+        assert!(summary.contains("Fixed 2"));
+        assert!(summary.contains("1 new"));
+        assert!(summary.contains("1 still present"));
+        assert!(summary.contains("67%")); // 66.7 rounds to 67
     }
 }
