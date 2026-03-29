@@ -171,11 +171,14 @@ pub fn build_main_system_prompt(
              - Each error shows: 🔧 Trivial (mechanical fix), 🔨 Fixable (needs reasoning), or Complex.\n\
              - Errors include 💡 hints — follow them for quick resolution.\n\
              - Each error location includes surrounding code — fix directly with str_replace, no extra read_file needed.\n\
+             - ⚡ Cascading errors: when the tool says \"fix root cause FIRST\", do that — downstream errors often resolve automatically.\n\
              - If >3 errors in the same file, fix the FIRST one — later errors are often cascading.\n\
              - Set **auto_fix: true** for trivial fixes (unused imports/vars). The tool auto-applies high-confidence fixes and re-runs (max 3 iterations).\n\
+             - Auto-fix aborts on regression (more errors after fix) and reverts the offending changes automatically.\n\
+             - Set **report_only: true** to preview what auto-fix would do without applying — useful for checking before committing.\n\
              - After fixing, call run_build_test again with the SAME command. The tool tracks iterations:\n\
              - It shows ✅ Fixed, 🆕 New, ⏳ Persistent errors — use this to gauge your fix progress.\n\
-             - If you see ⚠ Regression (more errors after your fix), revert the change and try a different approach.\n\
+             - If you see ⚠ REGRESSION (more errors after your fix), revert the change and try a different approach.\n\
              - Repeat until clean. Aim to fix ALL errors, not just the first one.\n",
         );
     }

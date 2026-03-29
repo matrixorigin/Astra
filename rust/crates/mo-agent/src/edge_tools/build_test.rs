@@ -795,9 +795,16 @@ impl BuildTestResult {
             let cascades: Vec<&ErrorGroup> = groups.iter().filter(|g| g.is_cascade).collect();
             if !cascades.is_empty() {
                 parts.push(String::new());
-                parts.push("Cascading errors detected:".to_string());
+                parts.push("⚡ Cascading errors — fix root cause FIRST:".to_string());
                 for g in cascades.iter().take(3) {
-                    parts.push(format!("  ⚡ {}", g.cascade_hint));
+                    let root = &self.error_locations[g.root_index];
+                    parts.push(format!(
+                        "  → {}:{} — {} ({} downstream errors will likely resolve)",
+                        root.file,
+                        root.line,
+                        g.cascade_hint,
+                        g.member_indices.len().saturating_sub(1)
+                    ));
                 }
             }
 
@@ -949,7 +956,14 @@ impl BuildTestDelta {
             return String::new(); // First run, no delta to show
         }
         let mut parts = Vec::new();
-        parts.push(format!("─── Iteration {} ───", self.iteration));
+
+        // Compact header: iteration N: prev_count → current_count
+        let prev = self.fixed_errors.len() + self.persistent_errors.len();
+        let cur = self.new_errors.len() + self.persistent_errors.len();
+        parts.push(format!(
+            "─── Iteration {} ({} → {} errors) ───",
+            self.iteration, prev, cur
+        ));
 
         if !self.fixed_errors.is_empty() {
             parts.push(format!("✅ Fixed {} error(s)", self.fixed_errors.len()));
@@ -962,7 +976,7 @@ impl BuildTestDelta {
         }
         if self.regressed {
             parts.push(
-                "⚠ Regression — more errors than before. Consider reverting last change.".into(),
+                "⚠ REGRESSION — more errors than before. Revert your last change and try a different approach.".into(),
             );
         }
         if self.progress_pct > 0.0 {
@@ -3009,7 +3023,7 @@ error[E0425]: cannot find value `nonexistent` in this scope
         assert_eq!(delta.persistent_errors.len(), 1);
         let summary = delta.to_summary();
         assert!(
-            summary.contains("Regression"),
+            summary.contains("REGRESSION"),
             "should warn about regression: {summary}"
         );
     }
@@ -3584,5 +3598,179 @@ error[E0425]: cannot find value `nonexistent` in this scope
         apply_fix(&fix, dir.path()).unwrap();
         let content = std::fs::read_to_string(&file).unwrap();
         assert!(content.ends_with('\n'), "Should preserve trailing newline");
+    }
+
+    // ── C2 Enhancement Tests: Build/Test Loop ────────────────────────────
+
+    #[test]
+    fn delta_summary_shows_error_count_transition() {
+        let delta = BuildTestDelta {
+            iteration: 2,
+            new_errors: vec!["new1".into()],
+            fixed_errors: vec!["fix1".into(), "fix2".into()],
+            persistent_errors: vec!["persist1".into()],
+            regressed: false,
+            progress_pct: 40.0,
+            command: "cargo test".into(),
+        };
+        let summary = delta.to_summary();
+        // Should show prev→cur error count: prev = fixed + persistent = 3, cur = new + persistent = 2
+        assert!(summary.contains("3 → 2 errors"), "got: {summary}");
+        assert!(summary.contains("✅ Fixed 2"));
+        assert!(summary.contains("🆕 1 new"));
+        assert!(summary.contains("⏳ 1 still present"));
+        assert!(summary.contains("40%"));
+    }
+
+    #[test]
+    fn delta_summary_regression_directive() {
+        let delta = BuildTestDelta {
+            iteration: 1,
+            new_errors: vec!["a".into(), "b".into(), "c".into()],
+            fixed_errors: vec![],
+            persistent_errors: vec!["p1".into()],
+            regressed: true,
+            progress_pct: 0.0,
+            command: "cargo test".into(),
+        };
+        let summary = delta.to_summary();
+        assert!(summary.contains("REGRESSION"), "got: {summary}");
+        assert!(
+            summary.contains("Revert"),
+            "Should tell LLM to revert: {summary}"
+        );
+    }
+
+    #[test]
+    fn cascade_output_includes_root_cause_directive() {
+        // Build a result with import-cascade pattern
+        let result = BuildTestResult {
+            passed: false,
+            exit_code: Some(1),
+            framework: "cargo".into(),
+            error_count: 4,
+            error_messages: vec![],
+            error_locations: vec![
+                ErrorLocation::new(
+                    "src/main.rs".into(),
+                    5,
+                    0,
+                    "E0425".into(),
+                    "cannot find value `Foo`".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/main.rs".into(),
+                    10,
+                    0,
+                    "E0425".into(),
+                    "cannot find value `Foo`".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/main.rs".into(),
+                    15,
+                    0,
+                    "E0425".into(),
+                    "cannot find value `Foo`".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/main.rs".into(),
+                    20,
+                    0,
+                    "E0308".into(),
+                    "type mismatch".into(),
+                    "error".into(),
+                ),
+            ],
+            tests_passed: 0,
+            tests_failed: 0,
+            tests_skipped: 0,
+            summary: "4 errors".into(),
+            truncated: false,
+        };
+        let output = result.to_enhanced_output("");
+        assert!(
+            output.contains("fix root cause FIRST"),
+            "Should include root-cause directive: {output}"
+        );
+        assert!(
+            output.contains("downstream errors"),
+            "Should mention downstream: {output}"
+        );
+    }
+
+    #[test]
+    fn tracker_records_error_count_in_delta() {
+        let mut tracker = BuildTestTracker::new();
+
+        // First run: 3 errors
+        let r1 = BuildTestResult {
+            error_count: 3,
+            error_locations: vec![
+                ErrorLocation::new("a.rs".into(), 1, 0, "E0425".into(), "err1".into(), "error".into()),
+                ErrorLocation::new("a.rs".into(), 2, 0, "E0308".into(), "err2".into(), "error".into()),
+                ErrorLocation::new("b.rs".into(), 1, 0, "E0599".into(), "err3".into(), "error".into()),
+            ],
+            ..Default::default()
+        };
+        let d1 = tracker.record(&r1, "cargo test");
+        assert_eq!(d1.iteration, 0); // baseline
+
+        // Second run: 2 errors (one fixed, one new)
+        let r2 = BuildTestResult {
+            error_count: 2,
+            error_locations: vec![
+                ErrorLocation::new("a.rs".into(), 1, 0, "E0425".into(), "err1".into(), "error".into()),
+                ErrorLocation::new("c.rs".into(), 5, 0, "E0277".into(), "err4".into(), "error".into()),
+            ],
+            ..Default::default()
+        };
+        let d2 = tracker.record(&r2, "cargo test");
+        assert_eq!(d2.iteration, 1);
+        assert_eq!(d2.fixed_errors.len(), 2); // err2 and err3 gone
+        assert_eq!(d2.new_errors.len(), 1);   // err4 is new
+        assert!(!d2.regressed);                // 2 < 3
+
+        // Third run: regression (4 errors)
+        let r3 = BuildTestResult {
+            error_count: 4,
+            error_locations: vec![
+                ErrorLocation::new("a.rs".into(), 1, 0, "E0425".into(), "err1".into(), "error".into()),
+                ErrorLocation::new("c.rs".into(), 5, 0, "E0277".into(), "err4".into(), "error".into()),
+                ErrorLocation::new("d.rs".into(), 1, 0, "E0412".into(), "err5".into(), "error".into()),
+                ErrorLocation::new("d.rs".into(), 2, 0, "E0433".into(), "err6".into(), "error".into()),
+            ],
+            ..Default::default()
+        };
+        let d3 = tracker.record(&r3, "cargo test");
+        assert!(d3.regressed, "Should detect regression");
+        assert_eq!(d3.new_errors.len(), 2);
+    }
+
+    #[test]
+    fn fix_order_root_cause_first() {
+        let result = BuildTestResult {
+            passed: false,
+            error_count: 5,
+            error_locations: vec![
+                // Complex error
+                ErrorLocation::new("a.rs".into(), 100, 0, "E0277".into(), "trait not satisfied".into(), "error".into()),
+                // Trivial import errors (cascade root at index 1)
+                ErrorLocation::new("b.rs".into(), 1, 0, "E0425".into(), "cannot find `Vec`".into(), "error".into()),
+                ErrorLocation::new("b.rs".into(), 5, 0, "E0425".into(), "cannot find `Vec`".into(), "error".into()),
+                ErrorLocation::new("b.rs".into(), 10, 0, "E0425".into(), "cannot find `Vec`".into(), "error".into()),
+                // Fixable error
+                ErrorLocation::new("c.rs".into(), 20, 0, "E0308".into(), "type mismatch".into(), "error".into()),
+            ],
+            ..Default::default()
+        };
+        let order = result.fix_order();
+        // Root cause (cascade root in b.rs) should come before complex error
+        assert_eq!(order[0], 1, "Cascade root (b.rs:1) should be first");
+        // Complex error should be last
+        let complex_pos = order.iter().position(|&i| i == 0).unwrap();
+        assert!(complex_pos > 2, "Complex error should come after trivial/fixable");
     }
 }

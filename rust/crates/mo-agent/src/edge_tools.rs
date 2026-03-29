@@ -536,13 +536,15 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "run_build_test",
-                "description": "Run a build or test command with structured error parsing. Returns structured errors with file:line:col locations AND auto-reads surrounding source code for each error location, so you can fix issues in one shot without additional read_file calls. Use this instead of raw bash for build/test commands. Set auto_fix=true to automatically apply trivial fixes (unused imports/variables) and re-run.",
+                "description": "Run a build or test command with structured error parsing. Returns structured errors with file:line:col locations AND auto-reads surrounding source code for each error location, so you can fix issues in one shot without additional read_file calls. Use this instead of raw bash for build/test commands. Set auto_fix=true to automatically apply trivial fixes (unused imports/variables) and re-run. Set report_only=true to preview what auto-fix would do without applying.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "command": {"type": "string", "description": "Build/test command to run (e.g., 'cargo test', 'pytest', 'npm test')"},
                         "context_lines": {"type": "integer", "description": "Lines of source context around each error (default: 5)"},
-                        "auto_fix": {"type": "boolean", "description": "If true, automatically apply high-confidence trivial fixes and re-run (max 3 iterations). Only fixes with confidence >= 0.8 are applied. Default: false"}
+                        "auto_fix": {"type": "boolean", "description": "If true, automatically apply high-confidence trivial fixes and re-run (max 3 iterations). Only fixes with confidence >= 0.8 are applied. Default: false"},
+                        "abort_on_regression": {"type": "boolean", "description": "If true (default), abort auto-fix loop and revert changes when error count increases. Prevents fix attempts from making things worse."},
+                        "report_only": {"type": "boolean", "description": "If true, show what auto-fix would do without actually applying fixes. Useful for previewing changes before committing to them. Default: false"}
                     },
                     "required": ["command"]
                 }
@@ -3311,18 +3313,66 @@ impl ToolExecutor {
             .get("auto_fix")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let abort_on_regression = args
+            .get("abort_on_regression")
+            .and_then(Value::as_bool)
+            .unwrap_or(true); // default: abort on regression
+        let report_only = args
+            .get("report_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         // Run the initial build
-        let (initial_output, initial_fixes) = self.run_build_test_core(command, context_lines);
+        let (initial_output, initial_fixes, initial_errors) =
+            self.run_build_test_core(command, context_lines);
+
+        // Report-only mode: show what auto-fix would do, but don't apply
+        if report_only && !initial_fixes.is_empty() {
+            let eligible: Vec<&build_test::FixSuggestion> = initial_fixes
+                .iter()
+                .filter(|f| f.confidence >= build_test::AUTO_FIX_CONFIDENCE_THRESHOLD)
+                .collect();
+            if !eligible.is_empty() {
+                let mut preview = initial_output;
+                preview.push_str("\n\n─── Auto-Fix Preview (report_only=true, not applied) ───\n");
+                for (i, fix) in eligible.iter().enumerate() {
+                    let conf = format!("{:.0}%", fix.confidence * 100.0);
+                    preview.push_str(&format!(
+                        "  {}. [{}] {}:{} — {} ({})\n",
+                        i + 1,
+                        fix.action,
+                        fix.file,
+                        fix.line,
+                        fix.explanation,
+                        conf,
+                    ));
+                    if !fix.new_text.is_empty() {
+                        let text = if fix.new_text.len() > 80 {
+                            format!("{}...", &fix.new_text[..77])
+                        } else {
+                            fix.new_text.clone()
+                        };
+                        preview.push_str(&format!("     + {}\n", text));
+                    }
+                }
+                preview.push_str(&format!(
+                    "\n{} fix(es) eligible. Re-run with auto_fix=true to apply.\n",
+                    eligible.len()
+                ));
+                return truncate_output(preview, tool_output_limit());
+            }
+            return initial_output;
+        }
 
         if !auto_fix {
             return initial_output;
         }
 
         // Auto-fix loop: apply high-confidence fixes and re-run
-        let mut output = initial_output;
+        let mut output = initial_output.clone();
         let mut current_fixes: Vec<build_test::FixSuggestion> = initial_fixes;
         let mut all_reports = Vec::new();
+        let mut prev_error_count = initial_errors;
 
         for iteration in 1..=build_test::AUTO_FIX_MAX_ITERATIONS {
             let eligible_count = current_fixes
@@ -3344,7 +3394,30 @@ impl ToolExecutor {
             }
 
             // Re-run the build after applying fixes
-            let (new_output, new_fixes) = self.run_build_test_core(command, context_lines);
+            let (new_output, new_fixes, new_error_count) =
+                self.run_build_test_core(command, context_lines);
+
+            // Check for regression: more errors after fix attempt
+            if abort_on_regression && new_error_count > prev_error_count && prev_error_count > 0 {
+                // Revert applied fixes via git checkout
+                let reverted = self.revert_auto_fixes(&applied);
+                all_reports.push(format!(
+                    "\n⚠ REGRESSION: {} → {} errors. Auto-fix aborted.{}\n",
+                    prev_error_count,
+                    new_error_count,
+                    if reverted {
+                        " Files reverted to pre-fix state."
+                    } else {
+                        " Manual revert may be needed."
+                    }
+                ));
+                // Re-run to get clean output after revert
+                let (reverted_output, _, _) = self.run_build_test_core(command, context_lines);
+                output = reverted_output;
+                break;
+            }
+
+            prev_error_count = new_error_count;
             output = new_output;
             current_fixes = new_fixes;
         }
@@ -3360,13 +3433,36 @@ impl ToolExecutor {
         truncate_output(final_output, tool_output_limit())
     }
 
+    /// Revert files modified by auto-fix using git checkout.
+    /// Returns true if revert succeeded.
+    fn revert_auto_fixes(&self, applied: &[build_test::AppliedFix]) -> bool {
+        let files: std::collections::HashSet<&str> =
+            applied.iter().map(|a| a.file.as_str()).collect();
+        let mut all_ok = true;
+        for file in files {
+            let file_path = if std::path::Path::new(file).is_absolute() {
+                file.to_string()
+            } else {
+                self.project_root.join(file).display().to_string()
+            };
+            let status = std::process::Command::new("git")
+                .args(["checkout", "--", &file_path])
+                .current_dir(&self.project_root)
+                .status();
+            if status.map(|s| !s.success()).unwrap_or(true) {
+                all_ok = false;
+            }
+        }
+        all_ok
+    }
+
     /// Core build+parse logic extracted for auto-fix loop reuse.
-    /// Returns (formatted_output, fix_suggestions).
+    /// Returns (formatted_output, fix_suggestions, error_count).
     fn run_build_test_core(
         &self,
         command: &str,
         context_lines: usize,
-    ) -> (String, Vec<build_test::FixSuggestion>) {
+    ) -> (String, Vec<build_test::FixSuggestion>, usize) {
         // Run the command
         let output = std::process::Command::new("sh")
             .args(["-c", command])
@@ -3380,11 +3476,12 @@ impl ToolExecutor {
                 let code = out.status.code();
                 (stdout, stderr, code)
             }
-            Err(e) => return (format!("Error: failed to run command: {e}"), Vec::new()),
+            Err(e) => return (format!("Error: failed to run command: {e}"), Vec::new(), 0),
         };
 
         let combined = format!("{stdout}\n{stderr}");
         let mut result = build_test::parse_build_test_output(&combined, exit_code);
+        let error_count = result.error_count;
 
         // Enrich error locations with tree-sitter scope context
         if !result.error_locations.is_empty() {
@@ -3508,6 +3605,7 @@ impl ToolExecutor {
         (
             truncate_output(parts.join("\n"), tool_output_limit()),
             fix_list,
+            error_count,
         )
     }
 
