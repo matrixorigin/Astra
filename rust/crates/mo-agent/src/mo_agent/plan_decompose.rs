@@ -38,6 +38,18 @@ pub struct ProjectContext {
     pub git_branch: Option<String>,
     /// Test framework detected (e.g., "cargo test", "pytest", "jest").
     pub test_framework: Option<String>,
+    /// Number of test files detected.
+    #[serde(default)]
+    pub test_file_count: usize,
+    /// Git status: number of modified/untracked files.
+    #[serde(default)]
+    pub git_dirty_count: usize,
+    /// Whether there are uncommitted changes.
+    #[serde(default)]
+    pub has_uncommitted_changes: bool,
+    /// Key directories detected (src/, tests/, lib/, etc.)
+    #[serde(default)]
+    pub key_directories: Vec<String>,
 }
 
 /// Scan project root to gather context for planning.
@@ -162,27 +174,47 @@ pub fn analyze_project(root: &Path) -> ProjectContext {
         ctx.test_framework = Some("go test".into());
     }
 
-    // Detect git branch
+    // Detect git branch and status
     let head_file = root.join(".git").join("HEAD");
     if let Ok(head) = std::fs::read_to_string(&head_file) {
         if let Some(branch) = head.trim().strip_prefix("ref: refs/heads/") {
             ctx.git_branch = Some(branch.to_string());
         }
+        
+        // Check for uncommitted changes by looking at git index
+        let git_dir = root.join(".git");
+        if git_dir.exists() {
+            // Simple heuristic: check if index file exists and has recent mtime
+            let index_file = git_dir.join("index");
+            ctx.has_uncommitted_changes = index_file.exists();
+            
+            // Count dirty files by checking worktree against index (simplified)
+            // This is a fast approximation - not as accurate as `git status`
+            ctx.git_dirty_count = count_dirty_files(root);
+        }
     }
+    
+    // Count test files
+    ctx.test_file_count = count_test_files(root);
 
-    // Build structure summary
+    // Build structure summary and key directories
     let mut dirs = Vec::new();
+    let key_dir_names = ["src", "lib", "tests", "test", "spec", "examples", "docs", "benches"];
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if !name.starts_with('.') {
-                    dirs.push(name);
+                    dirs.push(name.clone());
+                    if key_dir_names.contains(&name.as_str()) {
+                        ctx.key_directories.push(name);
+                    }
                 }
             }
         }
     }
     dirs.sort();
+    ctx.key_directories.sort();
     ctx.structure_summary = if dirs.is_empty() {
         "(flat project)".to_string()
     } else {
@@ -190,6 +222,92 @@ pub fn analyze_project(root: &Path) -> ProjectContext {
     };
 
     ctx
+}
+
+/// Count test files in a project (simplified heuristic).
+fn count_test_files(root: &Path) -> usize {
+    let mut count = 0;
+    
+    // Common test directories
+    let test_dirs = ["tests", "test", "spec", "__tests__"];
+    for dir in &test_dirs {
+        let test_path = root.join(dir);
+        if test_path.is_dir() {
+            count += count_files_in_dir(&test_path, 3);
+        }
+    }
+    
+    // Also count files matching test patterns in src
+    let src_path = root.join("src");
+    if src_path.is_dir() {
+        count += count_test_files_in_src(&src_path, 4);
+    }
+    
+    count
+}
+
+/// Count files in a directory up to max_depth.
+fn count_files_in_dir(dir: &Path, max_depth: usize) -> usize {
+    fn inner(dir: &Path, depth: usize, max_depth: usize) -> usize {
+        if depth > max_depth { return 0; }
+        let Ok(entries) = std::fs::read_dir(dir) else { return 0; };
+        
+        let mut count = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                count += 1;
+            } else if path.is_dir() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if !name_str.starts_with('.') && !matches!(name_str.as_ref(), 
+                    "node_modules" | "target" | "venv" | "__pycache__") {
+                    count += inner(&path, depth + 1, max_depth);
+                }
+            }
+        }
+        count
+    }
+    inner(dir, 0, max_depth)
+}
+
+/// Count test files in src directory (files matching *_test.rs, test_*.py, etc.)
+fn count_test_files_in_src(dir: &Path, max_depth: usize) -> usize {
+    fn inner(dir: &Path, depth: usize, max_depth: usize) -> usize {
+        if depth > max_depth { return 0; }
+        let Ok(entries) = std::fs::read_dir(dir) else { return 0; };
+        
+        let mut count = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let name = entry.file_name().to_string_lossy().to_lowercase();
+                // Common test file patterns
+                if name.contains("_test.") || name.contains(".test.") 
+                    || name.contains("_spec.") || name.contains(".spec.")
+                    || name.starts_with("test_") {
+                    count += 1;
+                }
+            } else if path.is_dir() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if !name_str.starts_with('.') {
+                    count += inner(&path, depth + 1, max_depth);
+                }
+            }
+        }
+        count
+    }
+    inner(dir, 0, max_depth)
+}
+
+/// Simple heuristic to count dirty files (not as accurate as git status).
+fn count_dirty_files(root: &Path) -> usize {
+    // This is a very rough approximation
+    // In a real implementation, we'd use gix or shell out to git
+    // For now, just return 0 as a placeholder
+    let _ = root;
+    0
 }
 
 /// Collect source files with line counts for key module analysis.
@@ -683,6 +801,11 @@ Keep responses concise. The plan JSON must be valid if provided."#,
 
     /// Save plan mode state to a file for session recovery.
     pub fn save_to_file(&self, path: &Path) -> Result<(), String> {
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create plan directory: {e}"))?;
+        }
         let json =
             serde_json::to_string_pretty(self).map_err(|e| format!("serialize plan state: {e}"))?;
         std::fs::write(path, json).map_err(|e| format!("write plan state: {e}"))?;
@@ -708,11 +831,611 @@ Keep responses concise. The plan JSON must be valid if provided."#,
         let path = Self::state_path();
         let _ = std::fs::remove_file(path);
     }
+    
+    /// Directory for storing all plans.
+    pub fn plans_dir() -> std::path::PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        std::path::PathBuf::from(home)
+            .join(".mo-agent")
+            .join("plans")
+    }
+    
+    /// Generate a unique plan ID from the goal.
+    pub fn generate_plan_id(goal: &str) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        
+        // Create a slug from the goal (first few words)
+        let slug: String = goal
+            .split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("-")
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '-')
+            .take(30)
+            .collect();
+        
+        // Add a short hash for uniqueness
+        let mut hasher = DefaultHasher::new();
+        goal.hash(&mut hasher);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        ts.hash(&mut hasher);
+        let hash = hasher.finish();
+        
+        if slug.is_empty() {
+            format!("plan-{:08x}", hash as u32)
+        } else {
+            format!("{}-{:04x}", slug.to_lowercase(), (hash & 0xFFFF) as u16)
+        }
+    }
+    
+    /// Save this plan to the plans directory with a generated ID.
+    pub fn save_to_plans_dir(&self) -> Result<String, String> {
+        let plans_dir = Self::plans_dir();
+        std::fs::create_dir_all(&plans_dir)
+            .map_err(|e| format!("create plans dir: {e}"))?;
+        
+        let plan_id = Self::generate_plan_id(&self.goal);
+        let path = plans_dir.join(format!("{}.json", plan_id));
+        self.save_to_file(&path)?;
+        
+        Ok(plan_id)
+    }
+    
+    /// Load a plan from the plans directory by ID.
+    pub fn load_from_plans_dir(plan_id: &str) -> Result<Self, String> {
+        let path = Self::plans_dir().join(format!("{}.json", plan_id));
+        Self::load_from_file(&path)
+    }
+    
+    /// List all saved plans in the plans directory.
+    pub fn list_saved_plans() -> Vec<SavedPlanInfo> {
+        let plans_dir = Self::plans_dir();
+        let Ok(entries) = std::fs::read_dir(&plans_dir) else {
+            return Vec::new();
+        };
+        
+        let mut plans = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            
+            if let Ok(state) = Self::load_from_file(&path) {
+                let status = if state.plan.progress_pct() == 100 {
+                    "completed"
+                } else if state.plan.items_done() > 0 {
+                    "in_progress"
+                } else {
+                    "pending"
+                };
+                
+                plans.push(SavedPlanInfo {
+                    name: name.to_string(),
+                    goal: state.goal,
+                    progress_pct: state.plan.progress_pct() as u32,
+                    subtask_count: state.plan.subtasks.len(),
+                    status: status.to_string(),
+                });
+            }
+        }
+        
+        // Sort by progress (in-progress first, then pending, then completed)
+        plans.sort_by(|a, b| {
+            let order = |s: &str| match s {
+                "in_progress" => 0,
+                "pending" => 1,
+                "completed" => 2,
+                _ => 3,
+            };
+            order(&a.status).cmp(&order(&b.status))
+                .then_with(|| b.progress_pct.cmp(&a.progress_pct))
+        });
+        
+        plans
+    }
+    
+    /// Delete a saved plan by ID.
+    pub fn delete_saved_plan(plan_id: &str) -> Result<(), String> {
+        let path = Self::plans_dir().join(format!("{}.json", plan_id));
+        std::fs::remove_file(path).map_err(|e| format!("delete plan: {e}"))
+    }
 }
 
 /// Format the plan mode prompt (for display)
 pub fn format_plan_mode_prompt() -> &'static str {
     "plan> "
+}
+
+// ─── Plan Mode Entry Card ────────────────────────────────────────────────────
+
+/// Format the plan mode entry card shown when user enters /plan.
+/// 
+/// Shows:
+/// - Active plan status if any
+/// - Smart options based on state
+pub fn format_plan_entry_card(
+    active_plan: Option<&PlanModeState>,
+    paused_plan: Option<&TaskPlan>,
+) -> String {
+    let mut out = String::new();
+    
+    out.push_str("┌─────────────────────────────────────────────────────┐\n");
+    out.push_str("│  📋 Plan Mode                                        │\n");
+    out.push_str("│  ─────────────────────────────────────────────────  │\n");
+    
+    if let Some(ps) = active_plan {
+        // Show active plan summary
+        let pct = ps.plan.progress_pct();
+        let done = ps.plan.items_done();
+        let total = ps.plan.subtasks.len();
+        
+        out.push_str(&format!(
+            "│  Active: \"{}\" ({}% done)        \n",
+            truncate_str(&ps.goal, 35),
+            pct
+        ));
+        
+        // Show task tree (max 4 items)
+        for (i, st) in ps.plan.subtasks.iter().take(4).enumerate() {
+            let icon = match st.status {
+                TaskStatus::Completed => "✓",
+                TaskStatus::InProgress => "→",
+                _ => "○",
+            };
+            let prefix = if i < 3 { "├─" } else { "└─" };
+            out.push_str(&format!(
+                "│    {} {} {}                            \n",
+                prefix,
+                icon,
+                truncate_str(&st.title, 30)
+            ));
+        }
+        if ps.plan.subtasks.len() > 4 {
+            out.push_str(&format!(
+                "│    └─ ... and {} more                  \n",
+                ps.plan.subtasks.len() - 4
+            ));
+        }
+        
+        out.push_str("│                                                      │\n");
+        out.push_str("│  Options: [1] continue  [2] restart  [3] new  [4] exit │\n");
+    } else if let Some(paused) = paused_plan {
+        // Show paused plan
+        let pct = paused.progress_pct();
+        out.push_str(&format!(
+            "│  ⏸ Paused plan: {}% complete               │\n",
+            pct
+        ));
+        out.push_str("│                                                      │\n");
+        out.push_str("│  Options: [1] resume  [2] new  [3] exit              │\n");
+    } else {
+        // No active plan
+        out.push_str("│  No active plan.                                     │\n");
+        out.push_str("│                                                      │\n");
+        out.push_str("│  Describe what you want to do:                       │\n");
+    }
+    
+    out.push_str("└─────────────────────────────────────────────────────┘\n");
+    
+    out
+}
+
+/// Parse the user's entry choice (number or text).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlanEntryChoice {
+    Continue,
+    Resume,
+    Restart,
+    New(String),
+    Exit,
+    Goal(String),
+}
+
+/// Parse user input at plan mode entry.
+pub fn parse_plan_entry_choice(input: &str, has_active: bool, has_paused: bool) -> PlanEntryChoice {
+    let trimmed = input.trim();
+    let lower = trimmed.to_lowercase();
+    
+    // Check for explicit commands
+    if lower == "exit" || lower == "quit" || lower == "4" {
+        return PlanEntryChoice::Exit;
+    }
+    
+    if has_active {
+        // [1] continue [2] restart [3] new [4] exit
+        match trimmed {
+            "1" | "continue" | "继续" => return PlanEntryChoice::Continue,
+            "2" | "restart" | "重新开始" => return PlanEntryChoice::Restart,
+            "3" | "new" | "新建" => return PlanEntryChoice::New(String::new()),
+            _ => {}
+        }
+    } else if has_paused {
+        // [1] resume [2] new [3] exit
+        match trimmed {
+            "1" | "resume" | "恢复" => return PlanEntryChoice::Resume,
+            "2" | "new" | "新建" => return PlanEntryChoice::New(String::new()),
+            "3" => return PlanEntryChoice::Exit,
+            _ => {}
+        }
+    }
+    
+    // Anything else is a goal description
+    PlanEntryChoice::Goal(trimmed.to_string())
+}
+
+/// Truncate a string to max length, adding "..." if truncated.
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len.saturating_sub(3)])
+    }
+}
+
+// ─── Clarification Questions ─────────────────────────────────────────────────
+
+/// A clarification question with multiple choice options.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClarificationQuestion {
+    /// The question text
+    pub question: String,
+    /// Available options (1-indexed for user)
+    pub options: Vec<String>,
+    /// Optional default option (0-indexed)
+    pub default: Option<usize>,
+    /// Category of clarification (scope, approach, behavior, etc.)
+    pub category: ClarificationCategory,
+}
+
+/// Category of clarification to help UI formatting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClarificationCategory {
+    /// Scope: what features to include/exclude
+    Scope,
+    /// Approach: implementation strategy choice
+    Approach,
+    /// Behavior: how should X behave in edge cases
+    Behavior,
+    /// Technical: specific technical decisions
+    Technical,
+    /// Confirmation: yes/no confirmation
+    Confirmation,
+}
+
+impl Default for ClarificationCategory {
+    fn default() -> Self {
+        ClarificationCategory::Technical
+    }
+}
+
+/// Format a clarification question for CLI display.
+pub fn format_clarification_question(q: &ClarificationQuestion) -> String {
+    let mut out = String::new();
+    
+    // Category icon
+    let icon = match q.category {
+        ClarificationCategory::Scope => "📦",
+        ClarificationCategory::Approach => "🛤️ ",
+        ClarificationCategory::Behavior => "⚙️ ",
+        ClarificationCategory::Technical => "🔧",
+        ClarificationCategory::Confirmation => "❓",
+    };
+    
+    out.push_str(&format!("  {} {}\n", icon, q.question));
+    out.push_str("\n");
+    
+    for (i, opt) in q.options.iter().enumerate() {
+        let num = i + 1;
+        let is_default = q.default == Some(i);
+        let marker = if is_default { "→" } else { " " };
+        let suffix = if is_default { " (default)" } else { "" };
+        out.push_str(&format!("  {} [{}] {}{}\n", marker, num, opt, suffix));
+    }
+    
+    out.push_str("\n  Enter number or describe alternative: ");
+    out
+}
+
+/// Parse user's response to a clarification question.
+pub fn parse_clarification_response(input: &str, question: &ClarificationQuestion) -> ClarificationAnswer {
+    let trimmed = input.trim();
+    
+    // Empty input with default
+    if trimmed.is_empty() {
+        if let Some(default_idx) = question.default {
+            return ClarificationAnswer::Selected(default_idx);
+        }
+        return ClarificationAnswer::Invalid("Please enter a number or describe your choice".to_string());
+    }
+    
+    // Try to parse as number
+    if let Ok(num) = trimmed.parse::<usize>() {
+        if num >= 1 && num <= question.options.len() {
+            return ClarificationAnswer::Selected(num - 1);
+        }
+        return ClarificationAnswer::Invalid(format!(
+            "Please enter 1-{}", question.options.len()
+        ));
+    }
+    
+    // Treat as freeform answer
+    ClarificationAnswer::Freeform(trimmed.to_string())
+}
+
+/// User's answer to a clarification question.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClarificationAnswer {
+    /// Selected one of the provided options (0-indexed)
+    Selected(usize),
+    /// Provided a freeform alternative
+    Freeform(String),
+    /// Invalid input (with error message)
+    Invalid(String),
+}
+
+/// Pending clarifications during plan generation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PendingClarifications {
+    /// Questions waiting for answers
+    pub questions: Vec<ClarificationQuestion>,
+    /// Answers collected so far (parallel to questions)
+    pub answers: Vec<String>,
+}
+
+impl PendingClarifications {
+    /// Get the next unanswered question, if any.
+    pub fn next_question(&self) -> Option<&ClarificationQuestion> {
+        self.questions.get(self.answers.len())
+    }
+    
+    /// Record an answer and return true if all questions answered.
+    pub fn record_answer(&mut self, answer: String) -> bool {
+        self.answers.push(answer);
+        self.answers.len() >= self.questions.len()
+    }
+    
+    /// Check if all questions have been answered.
+    pub fn is_complete(&self) -> bool {
+        self.answers.len() >= self.questions.len()
+    }
+    
+    /// Format all Q&A pairs for inclusion in a prompt.
+    pub fn format_for_prompt(&self) -> String {
+        let mut out = String::new();
+        for (q, a) in self.questions.iter().zip(self.answers.iter()) {
+            out.push_str(&format!("Q: {}\nA: {}\n\n", q.question, a));
+        }
+        out
+    }
+}
+
+/// Detect if LLM response contains clarification questions.
+/// Returns parsed questions if found, None otherwise.
+pub fn detect_clarification_questions(llm_text: &str) -> Option<Vec<ClarificationQuestion>> {
+    // Look for JSON array of questions or structured question format
+    
+    // Try JSON array format first
+    if let Some(start) = llm_text.find("[{\"question\"") {
+        if let Some(end) = llm_text[start..].rfind(']') {
+            let json_str = &llm_text[start..start+end+1];
+            if let Ok(questions) = serde_json::from_str::<Vec<ClarificationQuestion>>(json_str) {
+                if !questions.is_empty() {
+                    return Some(questions);
+                }
+            }
+        }
+    }
+    
+    // Try CLARIFICATION: marker format
+    if llm_text.contains("CLARIFICATION:") || llm_text.contains("QUESTION:") {
+        let mut questions = Vec::new();
+        
+        for line in llm_text.lines() {
+            let line = line.trim();
+            if let Some(q_text) = line.strip_prefix("CLARIFICATION:").or_else(|| line.strip_prefix("QUESTION:")) {
+                // Simple question without options - treat as yes/no
+                questions.push(ClarificationQuestion {
+                    question: q_text.trim().to_string(),
+                    options: vec!["Yes".to_string(), "No".to_string()],
+                    default: Some(0),
+                    category: ClarificationCategory::Confirmation,
+                });
+            }
+        }
+        
+        if !questions.is_empty() {
+            return Some(questions);
+        }
+    }
+    
+    None
+}
+
+// ─── Project Context Display ─────────────────────────────────────────────────
+
+/// Format project context for display in plan mode.
+pub fn format_project_context(ctx: &ProjectContext) -> String {
+    let mut out = String::new();
+    
+    out.push_str("  📁 Project Context\n");
+    
+    // Type detection
+    let project_type = if ctx.entry_points.contains(&"Cargo.toml".to_string()) {
+        "Rust"
+    } else if ctx.entry_points.contains(&"package.json".to_string()) {
+        "Node.js"
+    } else if ctx.entry_points.contains(&"pyproject.toml".to_string()) 
+        || ctx.entry_points.contains(&"setup.py".to_string()) {
+        "Python"
+    } else if ctx.entry_points.contains(&"go.mod".to_string()) {
+        "Go"
+    } else {
+        "Unknown"
+    };
+    
+    let test_cmd = ctx.test_framework.as_deref().unwrap_or("unknown");
+    out.push_str(&format!("  ├─ Type: {} workspace ({})\n", project_type, test_cmd));
+    
+    // Languages
+    if !ctx.languages.is_empty() {
+        out.push_str(&format!("  ├─ Languages: {}\n", ctx.languages.join(", ")));
+    }
+    
+    // Key directories
+    if !ctx.key_directories.is_empty() {
+        out.push_str(&format!("  ├─ Key dirs: {}\n", ctx.key_directories.join(", ")));
+    }
+    
+    // File counts
+    let test_info = if ctx.test_file_count > 0 {
+        format!(" ({} test files)", ctx.test_file_count)
+    } else {
+        String::new()
+    };
+    out.push_str(&format!("  ├─ Source files: {}{}\n", ctx.source_file_count, test_info));
+    
+    // Git info
+    if let Some(ref branch) = ctx.git_branch {
+        let dirty_info = if ctx.has_uncommitted_changes {
+            if ctx.git_dirty_count > 0 {
+                format!(" ({}  modified)", ctx.git_dirty_count)
+            } else {
+                " (uncommitted changes)".to_string()
+            }
+        } else {
+            " ✓".to_string()
+        };
+        out.push_str(&format!("  └─ Git: {}{}\n", branch, dirty_info));
+    } else {
+        out.push_str("  └─ Git: not detected\n");
+    }
+    
+    out
+}
+
+// ─── Plan Tree Progress Display ──────────────────────────────────────────────
+
+/// Compact tree view options.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TreeViewMode {
+    /// Compact: one line per task with status icon
+    #[default]
+    Compact,
+    /// Detailed: shows descriptions and files
+    Detailed,
+    /// Progress: shows progress bars
+    Progress,
+}
+
+/// Format a plan as a compact tree with progress indicators.
+pub fn format_plan_tree(plan: &TaskPlan, mode: TreeViewMode) -> String {
+    let mut out = String::new();
+    
+    let done = plan.items_done() as usize;
+    let total = plan.subtasks.len();
+    let pct = plan.progress_pct();
+    
+    // Header with progress bar
+    out.push_str(&format_progress_header(pct, done, total));
+    out.push('\n');
+    
+    // Task tree
+    let ready: std::collections::HashSet<_> = plan.ready_subtasks()
+        .iter()
+        .map(|st| st.id.clone())
+        .collect();
+    
+    for (i, st) in plan.subtasks.iter().enumerate() {
+        let is_last = i == plan.subtasks.len() - 1;
+        let prefix = if is_last { "└─" } else { "├─" };
+        let icon = status_icon(&st.status, ready.contains(&st.id));
+        let effort = effort_badge(&st.effort);
+        
+        match mode {
+            TreeViewMode::Compact => {
+                out.push_str(&format!("  {} {} {}{}\n", prefix, icon, st.title, effort));
+            }
+            TreeViewMode::Detailed => {
+                out.push_str(&format!("  {} {} {} [{}]{}\n", prefix, icon, st.title, st.id, effort));
+                let cont_prefix = if is_last { "   " } else { "│  " };
+                if let Some(ref desc) = st.description {
+                    out.push_str(&format!("  {}   └─ {}\n", cont_prefix, truncate_str(desc, 50)));
+                }
+                if !st.files.is_empty() {
+                    out.push_str(&format!("  {}   📁 {}\n", cont_prefix, st.files.join(", ")));
+                }
+            }
+            TreeViewMode::Progress => {
+                let task_pct = if st.status == TaskStatus::Completed { 100 } else { 0 };
+                let bar = mini_progress_bar(task_pct, 10);
+                out.push_str(&format!("  {} {} {} {}{}\n", prefix, icon, bar, st.title, effort));
+            }
+        }
+    }
+    
+    out
+}
+
+/// Format progress header with bar.
+fn format_progress_header(pct: u32, done: usize, total: usize) -> String {
+    let bar = progress_bar(pct, 20);
+    format!("  📋 Progress {} {}% ({}/{})", bar, pct, done, total)
+}
+
+/// Generate a progress bar string.
+fn progress_bar(pct: u32, width: usize) -> String {
+    let filled = (pct as usize * width / 100).min(width);
+    let empty = width.saturating_sub(filled);
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
+}
+
+/// Generate a mini progress bar.
+fn mini_progress_bar(pct: u32, width: usize) -> String {
+    let filled = (pct as usize * width / 100).min(width);
+    let empty = width.saturating_sub(filled);
+    format!("[{}{}]", "▓".repeat(filled), "░".repeat(empty))
+}
+
+/// Get status icon for a task.
+fn status_icon(status: &TaskStatus, is_ready: bool) -> &'static str {
+    match status {
+        TaskStatus::Completed => "✓",
+        TaskStatus::InProgress => "▶",
+        TaskStatus::Failed => "✗",
+        TaskStatus::Paused => "⏸",
+        TaskStatus::Cancelled => "⊘",
+        TaskStatus::Pending if is_ready => "○",
+        TaskStatus::Pending => "·",
+    }
+}
+
+/// Get effort badge.
+fn effort_badge(effort: &Option<String>) -> &'static str {
+    match effort.as_deref() {
+        Some("small") => " [S]",
+        Some("medium") => " [M]",
+        Some("large") => " [L]",
+        _ => "",
+    }
+}
+
+/// Format compact status line (for inline display).
+pub fn format_status_line(plan: &TaskPlan) -> String {
+    let done = plan.items_done();
+    let total = plan.subtasks.len();
+    let pct = plan.progress_pct();
+    let bar = mini_progress_bar(pct, 8);
+    format!("{} {}% ({}/{})", bar, pct, done, total)
 }
 
 /// Generate a plan modification prompt for LLM
@@ -1519,14 +2242,16 @@ pub fn format_plan_list(plans: &[SavedPlanInfo]) -> String {
     out.push_str("  ┌── Saved Plans ──\n");
     for p in plans {
         let status_icon = match p.status.as_str() {
-            "active" => "▶",
+            "active" | "in_progress" => "▶",
             "completed" => "✓",
+            "pending" => "○",
             "template" => "📋",
             _ => "·",
         };
+        let done_count = (p.subtask_count as u32 * p.progress_pct / 100.max(1)) as usize;
         out.push_str(&format!("  {} {} — {} ({}%, {}/{} subtasks)\n",
-            status_icon, p.name, p.goal, p.progress_pct, 
-            (p.subtask_count as u32 * p.progress_pct / 100.max(1)),
+            status_icon, p.name, truncate_str(&p.goal, 40), p.progress_pct, 
+            done_count,
             p.subtask_count));
     }
     out.push_str("  └────────────────\n");
@@ -1988,6 +2713,10 @@ Done!"#;
             languages: vec!["TypeScript".to_string()],
             structure_summary: "src, tests".to_string(),
             source_file_count: 100,
+            test_file_count: 15,
+            git_dirty_count: 2,
+            has_uncommitted_changes: true,
+            key_directories: vec!["src".to_string(), "tests".to_string()],
             key_modules: vec![
                 ("src/api.ts".to_string(), 500),
                 ("src/db.ts".to_string(), 300),
@@ -3186,5 +3915,441 @@ Done!"#;
         };
         let preview2 = format_execution_preview(&plan2);
         assert!(preview2.contains("Low"));
+    }
+
+    // ═══════════════════════ Plan Entry Card Tests ═══════════════════════════
+
+    #[test]
+    fn plan_entry_card_shows_active_plan() {
+        let ctx = ProjectContext::default();
+        let mut ps = PlanModeState::new("Add authentication".into(), ctx);
+        ps.set_plan(TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "1".into(), title: "User model".into(),
+                    status: TaskStatus::Completed, ..Default::default() },
+                SubtaskPlan { id: "2".into(), title: "JWT middleware".into(),
+                    status: TaskStatus::InProgress, ..Default::default() },
+                SubtaskPlan { id: "3".into(), title: "Tests".into(),
+                    ..Default::default() },
+            ],
+            notes: None,
+        });
+        
+        let card = format_plan_entry_card(Some(&ps), None);
+        assert!(card.contains("Plan Mode"));
+        assert!(card.contains("Add authentication"));
+        assert!(card.contains("continue"));
+    }
+
+    #[test]
+    fn plan_entry_card_no_active_plan() {
+        let card = format_plan_entry_card(None, None);
+        assert!(card.contains("No active plan"));
+        assert!(card.contains("Describe what you want"));
+    }
+
+    #[test]
+    fn parse_plan_entry_choice_with_active() {
+        assert_eq!(parse_plan_entry_choice("1", true, false), PlanEntryChoice::Continue);
+        assert_eq!(parse_plan_entry_choice("continue", true, false), PlanEntryChoice::Continue);
+        assert_eq!(parse_plan_entry_choice("2", true, false), PlanEntryChoice::Restart);
+        assert_eq!(parse_plan_entry_choice("exit", true, false), PlanEntryChoice::Exit);
+        
+        // Unrecognized input becomes a goal
+        let choice = parse_plan_entry_choice("add user auth", true, false);
+        match choice {
+            PlanEntryChoice::Goal(g) => assert_eq!(g, "add user auth"),
+            _ => panic!("Expected Goal variant"),
+        }
+    }
+
+    #[test]
+    fn parse_plan_entry_choice_without_active() {
+        // Without active plan, most inputs become goals
+        let choice = parse_plan_entry_choice("add caching", false, false);
+        match choice {
+            PlanEntryChoice::Goal(g) => assert_eq!(g, "add caching"),
+            _ => panic!("Expected Goal variant"),
+        }
+        
+        // Exit still works
+        assert_eq!(parse_plan_entry_choice("exit", false, false), PlanEntryChoice::Exit);
+    }
+
+    #[test]
+    fn format_project_context_rust_project() {
+        let ctx = ProjectContext {
+            root: "/project".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            languages: vec!["Rust".into()],
+            structure_summary: "Top-level dirs: src, tests".into(),
+            source_file_count: 42,
+            test_framework: Some("cargo test".into()),
+            git_branch: Some("main".into()),
+            ..Default::default()
+        };
+        
+        let formatted = format_project_context(&ctx);
+        assert!(formatted.contains("Rust workspace"));
+        assert!(formatted.contains("cargo test"));
+        assert!(formatted.contains("42"));
+        assert!(formatted.contains("main"));
+    }
+
+    // ═══════════════════════ Clarification Questions Tests ═══════════════════
+
+    #[test]
+    fn clarification_question_format_basic() {
+        let q = ClarificationQuestion {
+            question: "Which database should we use?".into(),
+            options: vec!["PostgreSQL".into(), "MySQL".into(), "SQLite".into()],
+            default: Some(0),
+            category: ClarificationCategory::Technical,
+        };
+        
+        let formatted = format_clarification_question(&q);
+        assert!(formatted.contains("Which database"));
+        assert!(formatted.contains("[1] PostgreSQL"));
+        assert!(formatted.contains("[2] MySQL"));
+        assert!(formatted.contains("(default)"));
+        assert!(formatted.contains("🔧")); // Technical icon
+    }
+
+    #[test]
+    fn clarification_question_categories() {
+        let scope = ClarificationQuestion {
+            question: "test".into(),
+            options: vec![],
+            default: None,
+            category: ClarificationCategory::Scope,
+        };
+        assert!(format_clarification_question(&scope).contains("📦"));
+        
+        let approach = ClarificationQuestion {
+            question: "test".into(),
+            options: vec![],
+            default: None,
+            category: ClarificationCategory::Approach,
+        };
+        assert!(format_clarification_question(&approach).contains("🛤️"));
+    }
+
+    #[test]
+    fn parse_clarification_response_number() {
+        let q = ClarificationQuestion {
+            question: "test".into(),
+            options: vec!["A".into(), "B".into(), "C".into()],
+            default: None,
+            category: ClarificationCategory::Technical,
+        };
+        
+        assert_eq!(parse_clarification_response("1", &q), ClarificationAnswer::Selected(0));
+        assert_eq!(parse_clarification_response("2", &q), ClarificationAnswer::Selected(1));
+        assert_eq!(parse_clarification_response("3", &q), ClarificationAnswer::Selected(2));
+        
+        // Out of range
+        match parse_clarification_response("4", &q) {
+            ClarificationAnswer::Invalid(_) => {}
+            other => panic!("Expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_clarification_response_default() {
+        let q = ClarificationQuestion {
+            question: "test".into(),
+            options: vec!["A".into(), "B".into()],
+            default: Some(1),
+            category: ClarificationCategory::Technical,
+        };
+        
+        // Empty input uses default
+        assert_eq!(parse_clarification_response("", &q), ClarificationAnswer::Selected(1));
+    }
+
+    #[test]
+    fn parse_clarification_response_freeform() {
+        let q = ClarificationQuestion {
+            question: "test".into(),
+            options: vec!["A".into(), "B".into()],
+            default: None,
+            category: ClarificationCategory::Technical,
+        };
+        
+        // Non-numeric input is freeform
+        assert_eq!(
+            parse_clarification_response("use redis instead", &q),
+            ClarificationAnswer::Freeform("use redis instead".into())
+        );
+    }
+
+    #[test]
+    fn pending_clarifications_workflow() {
+        let mut pc = PendingClarifications {
+            questions: vec![
+                ClarificationQuestion {
+                    question: "Q1?".into(),
+                    options: vec!["A".into()],
+                    default: None,
+                    category: ClarificationCategory::Technical,
+                },
+                ClarificationQuestion {
+                    question: "Q2?".into(),
+                    options: vec!["B".into()],
+                    default: None,
+                    category: ClarificationCategory::Technical,
+                },
+            ],
+            answers: vec![],
+        };
+        
+        assert!(!pc.is_complete());
+        assert_eq!(pc.next_question().map(|q| &q.question), Some(&"Q1?".to_string()));
+        
+        assert!(!pc.record_answer("Answer 1".into()));
+        assert_eq!(pc.next_question().map(|q| &q.question), Some(&"Q2?".to_string()));
+        
+        assert!(pc.record_answer("Answer 2".into()));
+        assert!(pc.is_complete());
+        assert!(pc.next_question().is_none());
+    }
+
+    #[test]
+    fn pending_clarifications_format_for_prompt() {
+        let pc = PendingClarifications {
+            questions: vec![
+                ClarificationQuestion {
+                    question: "Database?".into(),
+                    options: vec![],
+                    default: None,
+                    category: ClarificationCategory::Technical,
+                },
+            ],
+            answers: vec!["PostgreSQL".into()],
+        };
+        
+        let formatted = pc.format_for_prompt();
+        assert!(formatted.contains("Q: Database?"));
+        assert!(formatted.contains("A: PostgreSQL"));
+    }
+
+    #[test]
+    fn detect_clarification_json_format() {
+        let llm_text = r#"I need some clarification:
+[{"question":"Which auth method?","options":["JWT","Session"],"default":0,"category":"technical"}]
+"#;
+        
+        let questions = detect_clarification_questions(llm_text);
+        assert!(questions.is_some());
+        let qs = questions.unwrap();
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].question, "Which auth method?");
+        assert_eq!(qs[0].options, vec!["JWT", "Session"]);
+    }
+
+    #[test]
+    fn detect_clarification_marker_format() {
+        let llm_text = "Before proceeding, I need to know:\nCLARIFICATION: Should we support SSO?";
+        
+        let questions = detect_clarification_questions(llm_text);
+        assert!(questions.is_some());
+        let qs = questions.unwrap();
+        assert_eq!(qs.len(), 1);
+        assert!(qs[0].question.contains("SSO"));
+        // Marker format creates yes/no options
+        assert_eq!(qs[0].options, vec!["Yes", "No"]);
+    }
+
+    #[test]
+    fn detect_clarification_no_questions() {
+        let llm_text = "Here's the plan:\n{\"subtasks\":[]}";
+        assert!(detect_clarification_questions(llm_text).is_none());
+    }
+
+    // ═══════════════════════ Plan Persistence Tests ══════════════════════════
+
+    #[test]
+    fn generate_plan_id_from_goal() {
+        let id1 = PlanModeState::generate_plan_id("Add user authentication");
+        assert!(id1.starts_with("add-user-authentication-"), "got: {}", id1);
+        assert!(id1.len() > 25 && id1.len() < 40, "reasonable length: {}", id1);
+        
+        // Empty goal
+        let id2 = PlanModeState::generate_plan_id("");
+        assert!(id2.starts_with("plan-"), "empty goal: {}", id2);
+        
+        // Special characters get filtered
+        let id3 = PlanModeState::generate_plan_id("Fix bug #123 & add tests!");
+        assert!(!id3.contains('#'));
+        assert!(!id3.contains('&'));
+        assert!(!id3.contains('!'));
+    }
+
+    #[test]
+    fn save_and_load_plan_to_temp_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("test-plan.json");
+        
+        let ctx = ProjectContext {
+            root: "/test".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            ..Default::default()
+        };
+        let mut state = PlanModeState::new("Test goal".into(), ctx);
+        state.set_plan(TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(), 
+                    depends_on: vec!["a".into()], ..Default::default() },
+            ],
+            notes: Some("Test notes".into()),
+        });
+        
+        // Save
+        state.save_to_file(&path).expect("save should succeed");
+        assert!(path.exists());
+        
+        // Load
+        let loaded = PlanModeState::load_from_file(&path).expect("load should succeed");
+        assert_eq!(loaded.goal, "Test goal");
+        assert_eq!(loaded.plan.subtasks.len(), 2);
+        assert_eq!(loaded.plan.notes, Some("Test notes".into()));
+    }
+
+    #[test]
+    fn list_saved_plans_returns_sorted() {
+        // This test is more of a sanity check - actual file listing depends on temp dir
+        let plans = vec![
+            SavedPlanInfo {
+                name: "plan-completed".into(),
+                goal: "Completed".into(),
+                progress_pct: 100,
+                subtask_count: 3,
+                status: "completed".into(),
+            },
+            SavedPlanInfo {
+                name: "plan-in-progress".into(),
+                goal: "In Progress".into(),
+                progress_pct: 50,
+                subtask_count: 4,
+                status: "in_progress".into(),
+            },
+            SavedPlanInfo {
+                name: "plan-pending".into(),
+                goal: "Pending".into(),
+                progress_pct: 0,
+                subtask_count: 2,
+                status: "pending".into(),
+            },
+        ];
+        
+        let formatted = format_plan_list(&plans);
+        // In progress should appear with ▶
+        assert!(formatted.contains("▶ plan-in-progress"));
+        // Completed should appear with ✓
+        assert!(formatted.contains("✓ plan-completed"));
+        // Pending should appear with ○
+        assert!(formatted.contains("○ plan-pending"));
+    }
+
+    // ═══════════════════════ Tree Progress Display Tests ═════════════════════
+
+    #[test]
+    fn format_plan_tree_compact() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "Task A".into(),
+                    status: TaskStatus::Completed, ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "Task B".into(),
+                    status: TaskStatus::InProgress, effort: Some("medium".into()),
+                    ..Default::default() },
+                SubtaskPlan { id: "c".into(), title: "Task C".into(),
+                    depends_on: vec!["b".into()], ..Default::default() },
+            ],
+            notes: None,
+        };
+        
+        let tree = format_plan_tree(&plan, TreeViewMode::Compact);
+        assert!(tree.contains("Progress"), "should have progress header");
+        assert!(tree.contains("33%"), "should show 33% (1/3)");
+        assert!(tree.contains("✓ Task A"), "completed task");
+        assert!(tree.contains("▶ Task B"), "in progress task");
+        assert!(tree.contains("[M]"), "effort badge");
+        assert!(tree.contains("Task C"), "pending task");
+    }
+
+    #[test]
+    fn format_plan_tree_detailed() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "setup".into(),
+                    title: "Setup database".into(),
+                    description: Some("Configure PostgreSQL connection".into()),
+                    files: vec!["src/db.rs".into()],
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+        
+        let tree = format_plan_tree(&plan, TreeViewMode::Detailed);
+        assert!(tree.contains("[setup]"), "should show ID");
+        assert!(tree.contains("PostgreSQL"), "should show description");
+        assert!(tree.contains("📁 src/db.rs"), "should show files");
+    }
+
+    #[test]
+    fn format_plan_tree_progress_bars() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "Done".into(),
+                    status: TaskStatus::Completed, ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "Pending".into(),
+                    ..Default::default() },
+            ],
+            notes: None,
+        };
+        
+        let tree = format_plan_tree(&plan, TreeViewMode::Progress);
+        // Progress mode shows mini bars per task
+        assert!(tree.contains("▓"), "completed task should have filled bar");
+        assert!(tree.contains("░"), "pending task should have empty bar");
+    }
+
+    #[test]
+    fn format_status_line_compact() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(),
+                    status: TaskStatus::Completed, ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(),
+                    status: TaskStatus::Completed, ..Default::default() },
+                SubtaskPlan { id: "c".into(), title: "C".into(),
+                    ..Default::default() },
+                SubtaskPlan { id: "d".into(), title: "D".into(),
+                    ..Default::default() },
+            ],
+            notes: None,
+        };
+        
+        let line = format_status_line(&plan);
+        assert!(line.contains("50%"));
+        assert!(line.contains("2/4"));
+    }
+
+    #[test]
+    fn progress_bar_rendering() {
+        // 0%
+        let bar0 = progress_bar(0, 10);
+        assert_eq!(bar0, "[░░░░░░░░░░]");
+        
+        // 50%
+        let bar50 = progress_bar(50, 10);
+        assert_eq!(bar50, "[█████░░░░░]");
+        
+        // 100%
+        let bar100 = progress_bar(100, 10);
+        assert_eq!(bar100, "[██████████]");
     }
 }

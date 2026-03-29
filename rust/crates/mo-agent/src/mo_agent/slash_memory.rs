@@ -143,10 +143,55 @@ pub(super) async fn handle_memory_domain_command(
                 eprintln!("{}", "  Not logged in. Use /login.".yellow());
                 return Ok(());
             };
-            let subcmd = arg.split_whitespace().next().unwrap_or("show");
+            let subcmd = arg.split_whitespace().next().unwrap_or("");
             let sub_arg = arg.strip_prefix(subcmd).unwrap_or("").trim();
             match subcmd {
-                "show" | "" => {
+                // Smart entry: /plan with no args shows entry card and enters plan mode
+                "" => {
+                    use super::plan_decompose::{
+                        PlanModeState, format_plan_entry_card, format_plan,
+                    };
+                    
+                    // Check for active plan in state or saved state
+                    let has_active = state.plan_mode.is_some();
+                    let _has_paused = state.executing_plan.is_some();
+                    
+                    // Try to load saved plan if not in memory
+                    let saved_plan = if !has_active {
+                        PlanModeState::load_from_file(&PlanModeState::state_path()).ok()
+                    } else {
+                        None
+                    };
+                    
+                    // Display entry card
+                    eprintln!();
+                    let card = format_plan_entry_card(
+                        state.plan_mode.as_ref().or(saved_plan.as_ref()),
+                        state.executing_plan.as_ref(),
+                    );
+                    eprintln!("{}", card);
+                    
+                    // If we loaded a saved plan, restore it
+                    if saved_plan.is_some() && state.plan_mode.is_none() {
+                        state.plan_mode = saved_plan;
+                        if let Some(ref ps) = state.plan_mode {
+                            eprintln!("  {} Restored saved plan: {}", "↩".cyan(), ps.goal.as_str().cyan());
+                            eprintln!();
+                            let formatted = format_plan(&ps.plan);
+                            eprintln!("{formatted}");
+                        }
+                    }
+                    
+                    // Enter plan mode (plan> prompt will be shown by main loop)
+                    if state.plan_mode.is_none() {
+                        // Create empty plan mode state - user will provide goal
+                        let project_root = std::env::current_dir()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                        let context = super::plan_decompose::analyze_project(&project_root);
+                        state.plan_mode = Some(PlanModeState::new(String::new(), context));
+                    }
+                }
+                "show" => {
                     let payload = prompts::memory_proto::MemoryEntry::search_query(
                         prompts::memory_proto::NS_PLAN,
                         "current goals",
@@ -616,7 +661,7 @@ pub(super) async fn handle_memory_domain_command(
                 "auto" if !sub_arg.is_empty() => {
                     // Auto mode: decompose + preview + execute in one shot
                     use super::plan_decompose::{
-                        PlanModeState, analyze_project, decomposition_prompt,
+                        analyze_project, decomposition_prompt,
                         format_execution_preview, format_plan, parse_plan_response,
                         PlanExecutionConfig,
                     };
@@ -737,7 +782,10 @@ pub async fn handle_plan_mode_input(
     client: &reqwest::Client,
     base: &str,
 ) -> Result<(), String> {
-    use super::plan_decompose::{PlanModeState, format_plan, parse_plan_response};
+    use super::plan_decompose::{
+        PlanModeState, format_plan, parse_plan_response, decomposition_prompt,
+        format_project_context, parse_plan_entry_choice, PlanEntryChoice,
+    };
 
     let plan_state = match state.plan_mode.as_mut() {
         Some(ps) => ps,
@@ -755,6 +803,170 @@ pub async fn handle_plan_mode_input(
         PlanModeState::clear_saved_state();
         state.plan_mode = None;
         return Ok(());
+    }
+    
+    // Handle entry choices (when goal is empty - fresh plan mode)
+    if plan_state.goal.is_empty() {
+        let has_plan = !plan_state.plan.subtasks.is_empty();
+        let choice = parse_plan_entry_choice(&input, has_plan, state.executing_plan.is_some());
+        
+        match choice {
+            PlanEntryChoice::Exit => {
+                eprintln!();
+                eprintln!("{}  Exiting plan mode", "📋".yellow());
+                state.plan_mode = None;
+                return Ok(());
+            }
+            PlanEntryChoice::Continue => {
+                // Already have a plan, just continue
+                eprintln!("  {} Continuing with current plan", "→".cyan());
+                return Ok(());
+            }
+            PlanEntryChoice::Restart => {
+                // Clear current plan, prompt for new goal
+                plan_state.plan = Default::default();
+                plan_state.goal = String::new();
+                eprintln!("  {} Plan cleared. Describe what you want to do:", "🔄".yellow());
+                return Ok(());
+            }
+            PlanEntryChoice::Resume => {
+                // Resume paused execution
+                if let Some(ref paused) = state.executing_plan {
+                    eprintln!("  {} Resuming plan execution...", "▶".cyan());
+                }
+                return Ok(());
+            }
+            PlanEntryChoice::New(_) => {
+                // Start fresh
+                plan_state.plan = Default::default();
+                eprintln!("  {} Describe what you want to do:", "📝".cyan());
+                return Ok(());
+            }
+            PlanEntryChoice::Goal(goal) => {
+                // User provided a goal - generate plan
+                let Some(tok) = token else {
+                    eprintln!("  {} Not logged in. Run /login first.", "✗".red());
+                    return Ok(());
+                };
+                
+                plan_state.goal = goal.clone();
+                
+                // Show project context
+                eprintln!();
+                eprintln!("{}", format_project_context(&plan_state.context));
+                eprintln!();
+                
+                // Streaming plan generation with real-time output
+                eprintln!("  {} Thinking...", "🧠".cyan());
+                eprintln!();
+                
+                let prompt = decomposition_prompt(&goal, &plan_state.context);
+                let payload = serde_json::json!({
+                    "messages": [{"role": "user", "content": prompt}],
+                    "session_id": state.session_id.clone(),
+                });
+                
+                let resp = client
+                    .post(format!("{base}/chat/turn"))
+                    .bearer_auth(tok)
+                    .json(&payload)
+                    .send()
+                    .await;
+                
+                match resp {
+                    Ok(r) if r.status().is_success() => {
+                        let mut full_text = String::new();
+                        let mut stream = r.bytes_stream();
+                        use futures_util::StreamExt;
+                        
+                        // Track streaming state
+                        let mut in_thinking = false;
+                        let mut in_plan_json = false;
+                        let mut chars_since_nl = 0;
+                        
+                        while let Some(chunk) = stream.next().await {
+                            if let Ok(bytes) = chunk {
+                                let event_str = String::from_utf8_lossy(&bytes);
+                                for line in event_str.lines() {
+                                    if let Some(data) = line.strip_prefix("data: ") {
+                                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                                            if json.get("type").and_then(|v| v.as_str()) == Some("text_delta") {
+                                                if let Some(content) = json.get("content").and_then(|v| v.as_str()) {
+                                                    full_text.push_str(content);
+                                                    
+                                                    // Stream thinking process to user (before JSON)
+                                                    for ch in content.chars() {
+                                                        // Detect start of JSON plan
+                                                        if ch == '{' && !in_thinking && !in_plan_json {
+                                                            in_plan_json = true;
+                                                            eprintln!();
+                                                            eprintln!();
+                                                            eprint!("  {} Parsing plan", "⚙".dim());
+                                                            continue;
+                                                        }
+                                                        
+                                                        if in_plan_json {
+                                                            // Show progress dots during JSON parsing
+                                                            if ch == ',' || ch == '}' {
+                                                                eprint!(".");
+                                                            }
+                                                            continue;
+                                                        }
+                                                        
+                                                        // Stream thinking text
+                                                        if !in_thinking && chars_since_nl == 0 {
+                                                            in_thinking = true;
+                                                            eprint!("  ");
+                                                        }
+                                                        
+                                                        eprint!("{}", ch);
+                                                        
+                                                        if ch == '\n' {
+                                                            chars_since_nl = 0;
+                                                            in_thinking = false;
+                                                        } else {
+                                                            chars_since_nl += 1;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        eprintln!();
+                        
+                        // Parse and set plan
+                        match parse_plan_response(&full_text) {
+                            Ok(plan) => {
+                                plan_state.set_plan(plan);
+                                let _ = plan_state.save_to_file(&PlanModeState::state_path());
+                                
+                                eprintln!();
+                                eprintln!("{}", format_plan(&plan_state.plan));
+                                eprintln!();
+                                eprintln!("  {} Commands:", "💡".cyan());
+                                eprintln!("    'go' or 'execute' → Run the plan");
+                                eprintln!("    'step' → Run step-by-step with confirmation");
+                                eprintln!("    Or describe changes to modify the plan");
+                            }
+                            Err(e) => {
+                                eprintln!("  {} Failed to parse plan: {}", "✗".red(), e);
+                            }
+                        }
+                    }
+                    Ok(r) => {
+                        eprintln!("  {} LLM call failed ({})", "✗".red(), r.status());
+                    }
+                    Err(e) => {
+                        eprintln!("  {} Request failed: {}", "✗".red(), e);
+                    }
+                }
+                
+                return Ok(());
+            }
+        }
     }
 
     // Check for "done <id>" — mark subtask completed
