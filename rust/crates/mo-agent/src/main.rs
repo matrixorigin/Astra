@@ -1155,122 +1155,178 @@ async fn run_plan_execution(
             None => return Ok(()),
         };
 
-        // Mark any in-progress subtask as completed (just finished by previous chat turn)
-        let mut just_completed: Option<String> = None;
+        // Mark any in-progress subtasks as completed (just finished by previous chat turn)
+        let mut completed_titles: Vec<String> = Vec::new();
         for st in plan.subtasks.iter_mut() {
             if st.status == TaskStatus::InProgress {
                 st.status = TaskStatus::Completed;
-                just_completed = Some(st.title.clone());
-                break;
+                completed_titles.push(st.title.clone());
             }
         }
-        if let Some(title) = just_completed {
+        for title in &completed_titles {
             let pct = plan.progress_pct();
             eprintln!("\n{}  Subtask done: {} ({}%)", "✓".green(), title, pct);
         }
 
-        // Find next ready subtask
-        let next = plan.ready_subtasks().first().map(|s| s.id.clone());
+        // Analyze parallelism for the current state
+        let analysis = plan_decompose::analyze_parallelism(&plan);
+        let ready = plan.ready_subtasks();
 
-        match next {
-            Some(next_id) => {
-                let (prompt, title) = {
-                    let st = plan.subtasks.iter_mut().find(|s| s.id == next_id).unwrap();
-                    st.status = TaskStatus::InProgress;
-                    let prompt = plan_decompose::format_subtask_prompt(st);
-                    let title = st.title.clone();
-                    (prompt, title)
-                };
-
-                let remaining = plan
+        if ready.is_empty() {
+            // No more ready subtasks — either all done or blocked
+            let pct = plan.progress_pct();
+            if pct == 100 {
+                eprintln!(
+                    "\n{}  Plan complete! All {} subtasks done.",
+                    "🎉".green(),
+                    plan.subtasks.len()
+                );
+            } else {
+                let blocked: Vec<_> = plan
                     .subtasks
                     .iter()
                     .filter(|s| s.status == TaskStatus::Pending)
-                    .count();
-                let done_so_far = plan.items_done() + 1;
-                let total = plan.subtasks.len();
-
+                    .map(|s| s.id.as_str())
+                    .collect();
                 eprintln!(
-                    "\n{}  Subtask {}/{}: {} [{}]",
-                    "▶".cyan(),
-                    done_so_far,
-                    total,
-                    title,
-                    next_id
+                    "\n{}  Plan execution paused at {}%. Blocked: {}",
+                    "⏸".yellow(),
+                    pct,
+                    blocked.join(", ")
                 );
-                if remaining > 0 {
-                    eprintln!("{}  {} remaining after this", "·".dim(), remaining);
-                }
-
-                // Put plan back before calling handle_chat_input
-                state.executing_plan = Some(plan);
-
-                handle_chat_input(
-                    prompt,
-                    current_token,
-                    state,
-                    ReplTurnContext {
-                        client,
-                        base,
-                        profile,
-                        selector,
-                    },
-                )
-                .await?;
-
-                // If user pressed Ctrl+C, pause execution
-                if state.last_turn_interrupted {
-                    if let Some(ref plan) = state.executing_plan {
-                        let pct = plan.progress_pct();
-                        let remaining = plan
-                            .subtasks
-                            .iter()
-                            .filter(|s| {
-                                s.status == TaskStatus::Pending
-                                    || s.status == TaskStatus::InProgress
-                            })
-                            .count();
-                        eprintln!(
-                            "\n{}  Plan paused (Ctrl+C). {}% done, {} subtasks remaining.",
-                            "⏸".yellow(),
-                            pct,
-                            remaining
-                        );
-                        eprintln!("{}  Say \"continue\" to resume execution.", "💡".cyan());
-                    }
-                    state.last_turn_interrupted = false;
-                    return Ok(());
-                }
-
-                // Loop continues — will mark this subtask done and find next
             }
-            None => {
-                // No more ready subtasks — either all done or blocked
-                let pct = plan.progress_pct();
-                if pct == 100 {
-                    eprintln!(
-                        "\n{}  Plan complete! All {} subtasks done.",
-                        "🎉".green(),
-                        plan.subtasks.len()
-                    );
-                } else {
-                    let blocked: Vec<_> = plan
-                        .subtasks
-                        .iter()
-                        .filter(|s| s.status == TaskStatus::Pending)
-                        .map(|s| s.id.as_str())
-                        .collect();
-                    eprintln!(
-                        "\n{}  Plan execution paused at {}%. Blocked: {}",
-                        "⏸".yellow(),
-                        pct,
-                        blocked.join(", ")
-                    );
-                }
-                // Don't put plan back — execution is done
-                return Ok(());
+            return Ok(());
+        }
+
+        // Show parallel group information if there are multiple ready subtasks
+        if ready.len() > 1 {
+            let group_count = analysis.groups.len();
+            let parallel_in_first = analysis.groups.first().map(|g| g.len()).unwrap_or(0);
+            if parallel_in_first > 1 {
+                eprintln!(
+                    "\n{}  {} subtasks ready, {} parallel-safe in current group",
+                    "║".cyan(),
+                    ready.len(),
+                    parallel_in_first,
+                );
+            }
+            if !analysis.conflicts.is_empty() {
+                eprintln!(
+                    "{}  ⚠ {} file conflict(s) detected — serializing conflicting subtasks",
+                    "║".cyan(),
+                    analysis.conflicts.len(),
+                );
+            }
+            if group_count > 1 {
+                eprintln!(
+                    "{}  Executing in {} rounds (by parallel-safety groups)",
+                    "║".cyan(),
+                    group_count,
+                );
             }
         }
+
+        // Execute the first parallel group — all subtasks in this group are safe to run
+        let exec_group = analysis.groups.first().cloned().unwrap_or_default();
+        let group_size = exec_group.len();
+
+        for (group_idx, next_id) in exec_group.iter().enumerate() {
+            let (prompt, title) = {
+                let st = plan.subtasks.iter_mut().find(|s| s.id == *next_id).unwrap();
+                st.status = TaskStatus::InProgress;
+                let prompt = plan_decompose::format_subtask_prompt(st);
+                let title = st.title.clone();
+                (prompt, title)
+            };
+
+            let remaining = plan
+                .subtasks
+                .iter()
+                .filter(|s| s.status == TaskStatus::Pending)
+                .count();
+            let done_so_far = plan.items_done() + 1;
+            let total = plan.subtasks.len();
+
+            let group_label = if group_size > 1 {
+                format!(" [{}/{}]", group_idx + 1, group_size)
+            } else {
+                String::new()
+            };
+
+            eprintln!(
+                "\n{}  Subtask {}/{}{}: {} [{}]",
+                "▶".cyan(),
+                done_so_far,
+                total,
+                group_label,
+                title,
+                next_id
+            );
+            if remaining > 0 {
+                eprintln!("{}  {} remaining after this", "·".dim(), remaining);
+            }
+
+            // Put plan back before calling handle_chat_input
+            state.executing_plan = Some(plan);
+
+            handle_chat_input(
+                prompt,
+                current_token,
+                state,
+                ReplTurnContext {
+                    client,
+                    base,
+                    profile,
+                    selector,
+                },
+            )
+            .await?;
+
+            // If user pressed Ctrl+C, pause execution
+            if state.last_turn_interrupted {
+                if let Some(ref exec_plan) = state.executing_plan {
+                    let pct = exec_plan.progress_pct();
+                    let remaining_count = exec_plan
+                        .subtasks
+                        .iter()
+                        .filter(|s| {
+                            s.status == TaskStatus::Pending
+                                || s.status == TaskStatus::InProgress
+                        })
+                        .count();
+                    eprintln!(
+                        "\n{}  Plan paused (Ctrl+C). {}% done, {} subtasks remaining.",
+                        "⏸".yellow(),
+                        pct,
+                        remaining_count
+                    );
+                    eprintln!("{}  Say \"continue\" to resume execution.", "💡".cyan());
+                }
+                state.last_turn_interrupted = false;
+                return Ok(());
+            }
+
+            // Take plan back for the next iteration in this group
+            plan = match state.executing_plan.take() {
+                Some(p) => p,
+                None => return Ok(()),
+            };
+
+            // Mark just-completed subtask as completed before next in group
+            if let Some(st) = plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
+                if st.status == TaskStatus::InProgress {
+                    st.status = TaskStatus::Completed;
+                    let title = st.title.clone();
+                    let pct = plan.progress_pct();
+                    eprintln!("\n{}  Subtask done: {} ({}%)", "✓".green(), title, pct);
+                }
+            }
+        }
+
+        // Put plan back for the outer loop to pick up the next group
+        state.executing_plan = Some(plan);
+
+        // Loop continues — will find next ready group
     }
 }
 

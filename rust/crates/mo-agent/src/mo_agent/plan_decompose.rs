@@ -2536,4 +2536,208 @@ Done!"#;
         assert!(diff.is_empty());
         assert!(diff.format().contains("no changes"));
     }
+
+    // ═══════════════════════ Parallel Execution Simulation ═══════════════════
+
+    #[test]
+    fn parallel_execution_simulation_groups() {
+        // Simulate the parallel-group-aware execution loop
+        let mut plan = TaskPlan {
+            subtasks: vec![
+                // Group 1: a and b are independent, can run in parallel
+                SubtaskPlan {
+                    id: "a".into(), title: "Step A".into(),
+                    files: vec!["src/a.rs".into()],
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(), title: "Step B".into(),
+                    files: vec!["src/b.rs".into()],
+                    ..Default::default()
+                },
+                // Group 2: c depends on a, d depends on b
+                SubtaskPlan {
+                    id: "c".into(), title: "Step C".into(),
+                    depends_on: vec!["a".into()],
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "d".into(), title: "Step D".into(),
+                    depends_on: vec!["b".into()],
+                    ..Default::default()
+                },
+                // Group 3: e depends on c and d
+                SubtaskPlan {
+                    id: "e".into(), title: "Step E".into(),
+                    depends_on: vec!["c".into(), "d".into()],
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+
+        let mut execution_rounds: Vec<Vec<String>> = Vec::new();
+
+        loop {
+            let analysis = analyze_parallelism(&plan);
+            let group = match analysis.groups.first() {
+                Some(g) if !g.is_empty() => g.clone(),
+                _ => break,
+            };
+
+            let mut round = Vec::new();
+            for id in &group {
+                let st = plan.subtasks.iter_mut().find(|s| s.id == *id).unwrap();
+                st.status = TaskStatus::InProgress;
+                round.push(id.clone());
+            }
+            // Simulate completion
+            for id in &round {
+                let st = plan.subtasks.iter_mut().find(|s| s.id == *id).unwrap();
+                st.status = TaskStatus::Completed;
+            }
+            execution_rounds.push(round);
+        }
+
+        assert_eq!(execution_rounds.len(), 3, "should have 3 rounds: {:?}", execution_rounds);
+        // Round 1: a and b (no conflicts, no deps)
+        assert!(execution_rounds[0].contains(&"a".to_string()));
+        assert!(execution_rounds[0].contains(&"b".to_string()));
+        // Round 2: c and d (unblocked after a and b)
+        assert!(execution_rounds[1].contains(&"c".to_string()));
+        assert!(execution_rounds[1].contains(&"d".to_string()));
+        // Round 3: e (depends on c and d)
+        assert_eq!(execution_rounds[2], vec!["e"]);
+        assert_eq!(plan.progress_pct(), 100);
+    }
+
+    #[test]
+    fn parallel_execution_with_file_conflicts_splits_groups() {
+        let mut plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "a".into(), title: "A".into(),
+                    files: vec!["shared.rs".into()],
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(), title: "B".into(),
+                    files: vec!["shared.rs".into()],
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "c".into(), title: "C".into(),
+                    files: vec!["other.rs".into()],
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+
+        let analysis = analyze_parallelism(&plan);
+        // a and b conflict on shared.rs, so they should be in different groups
+        assert!(analysis.groups.len() >= 2, "conflicting tasks should split: {:?}", analysis.groups);
+        assert!(!analysis.conflicts.is_empty());
+
+        // Simulate group-by-group execution
+        let mut rounds = Vec::new();
+        loop {
+            let analysis = analyze_parallelism(&plan);
+            let group = match analysis.groups.first() {
+                Some(g) if !g.is_empty() => g.clone(),
+                _ => break,
+            };
+            for id in &group {
+                let st = plan.subtasks.iter_mut().find(|s| s.id == *id).unwrap();
+                st.status = TaskStatus::Completed;
+            }
+            rounds.push(group);
+        }
+
+        // All 3 tasks should complete, but in at least 2 rounds due to conflict
+        assert!(rounds.len() >= 2, "file conflict should force multiple rounds: {:?}", rounds);
+        assert_eq!(plan.progress_pct(), 100);
+    }
+
+    #[test]
+    fn parallel_execution_single_chain_is_sequential() {
+        // Linear dependency chain: a → b → c
+        let mut plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(),
+                    depends_on: vec!["a".into()], ..Default::default() },
+                SubtaskPlan { id: "c".into(), title: "C".into(),
+                    depends_on: vec!["b".into()], ..Default::default() },
+            ],
+            notes: None,
+        };
+
+        let mut rounds = Vec::new();
+        loop {
+            let analysis = analyze_parallelism(&plan);
+            let group = match analysis.groups.first() {
+                Some(g) if !g.is_empty() => g.clone(),
+                _ => break,
+            };
+            assert_eq!(group.len(), 1, "sequential chain should yield groups of 1");
+            for id in &group {
+                let st = plan.subtasks.iter_mut().find(|s| s.id == *id).unwrap();
+                st.status = TaskStatus::Completed;
+            }
+            rounds.push(group);
+        }
+
+        assert_eq!(rounds.len(), 3, "should be 3 sequential rounds");
+        assert_eq!(rounds[0], vec!["a"]);
+        assert_eq!(rounds[1], vec!["b"]);
+        assert_eq!(rounds[2], vec!["c"]);
+    }
+
+    #[test]
+    fn version_history_in_plan_mode_state() {
+        let ctx = ProjectContext::default();
+        let mut ps = PlanModeState::new("test".into(), ctx);
+
+        // set_plan should auto-record version
+        ps.set_plan(TaskPlan {
+            subtasks: vec![SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() }],
+            notes: None,
+        });
+        assert_eq!(ps.version_history.current_version, 1);
+
+        // update_plan should also record
+        ps.update_plan(TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(), ..Default::default() },
+            ],
+            notes: None,
+        }, "Added subtask b");
+        assert_eq!(ps.version_history.current_version, 2);
+
+        // Rollback should work
+        let result = ps.rollback_to_version(1);
+        assert!(result.is_ok());
+        assert_eq!(ps.plan.subtasks.len(), 1, "should rollback to v1 with 1 subtask");
+        assert_eq!(ps.version_history.current_version, 3, "rollback creates new version");
+    }
+
+    #[test]
+    fn version_history_persists_through_save_load() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let ctx = ProjectContext::default();
+        let mut ps = PlanModeState::new("test".into(), ctx);
+        ps.set_plan(TaskPlan {
+            subtasks: vec![SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() }],
+            notes: None,
+        });
+        ps.save_to_file(&path).unwrap();
+
+        let loaded = PlanModeState::load_from_file(&path).unwrap();
+        assert_eq!(loaded.version_history.current_version, 1);
+        assert_eq!(loaded.version_history.versions.len(), 1);
+    }
 }
