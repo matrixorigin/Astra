@@ -550,22 +550,44 @@ fn apply_turn_success(
 
     // Record turn outcome for pipeline learning (entity graph, patterns, calibration)
     {
+        use mo_agent_runtime::pipeline::evaluation::{evaluate_turn, ToolCallInfo};
         use mo_agent_runtime::pipeline::routing::RoutingEngine;
         let routing = RoutingEngine::analyze(line, state.turn, &state.recent_tools, &[], vec![]);
         let is_live_query = looks_like_live_query_with_context(line, &state.recent_tools);
-        let success = result.tool_calls_count > 0 || !is_live_query;
-        let quality = if result.tool_calls_count > 0 {
-            0.7
-        } else {
-            0.3
-        };
+
+        // Build ToolCallInfo from audit records
+        let tool_infos: Vec<ToolCallInfo> = result
+            .tool_call_records
+            .iter()
+            .map(|r| ToolCallInfo {
+                name: r.name.clone(),
+                ok: r.ok,
+                ms: r.ms,
+                error: r.error.clone(),
+                output_bytes: r.output_bytes,
+            })
+            .collect();
+
+        let has_verdict_warning = result
+            .verdict_events
+            .iter()
+            .any(|v| v.severity == "Warning" || v.severity == "Critical");
+
+        let eval = evaluate_turn(
+            &tool_infos,
+            result.stall_events.len(),
+            has_verdict_warning,
+            result.budget_pressure,
+            is_live_query,
+        );
+
         selector.record_outcome(
             line,
             &result.tools_used,
             routing.task_type,
             routing.domain_hint,
-            success,
-            quality,
+            eval.success,
+            eval.quality,
             false,
             None, // user_feedback_score — populated later via /api/v1/learning/feedback
         );

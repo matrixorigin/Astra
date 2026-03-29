@@ -15,6 +15,7 @@ pub mod calibration;
 pub mod defaults;
 pub mod engine;
 pub mod entity;
+pub mod evaluation;
 pub mod event;
 pub mod learning;
 pub mod mo_persistence;
