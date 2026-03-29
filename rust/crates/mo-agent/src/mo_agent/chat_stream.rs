@@ -169,6 +169,46 @@ const CACHEABLE_TOOLS: &[&str] = &[
     "get_agent_info",
 ];
 
+/// Tools safe to execute in parallel (read-only, no side effects).
+/// When all tool calls in a turn are in this set, they execute concurrently
+/// via `join_all` — giving real parallelism for async HTTP tools (github_*,
+/// memory_*) and graceful degradation for sync local tools.
+const PARALLEL_SAFE_TOOLS: &[&str] = &[
+    "read_file",
+    "list_dir",
+    "glob",
+    "grep",
+    "symbols",
+    "find_definition",
+    "find_references",
+    "call_graph",
+    "dead_code",
+    "extract_members",
+    "type_hierarchy",
+    "hover_info",
+    "symbol_search",
+    "git_status",
+    "git_diff",
+    "git_log",
+    "git_show",
+    "git_blame",
+    "git_file_history",
+    "git_contributors",
+    "git_log_search",
+    "github_list_prs",
+    "github_get_pr",
+    "github_ci_status",
+    "github_list_issues",
+    "github_get_issue",
+    "github_repo_stats",
+    "memory_retrieve",
+    "memory_search",
+    "memory_profile",
+    "get_agent_info",
+    "reflect",
+    "mo_query",
+];
+
 /// Determine whether a tool result string indicates an error.
 ///
 /// For structured JSON results (our tools), checks `"ok": false` or a non-null
@@ -1331,7 +1371,47 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         let step_start_time = std::time::Instant::now();
         let step_timeout_ms = step_recorder.scheduling().timeout_ms;
 
-        for tc_event in &turn_result.tool_calls {
+        // Pre-compute per-tool timeout (constant across tools in this batch)
+        let contract_for_timeout = step_recorder.scheduling();
+        let per_tool_timeout_ms = contract_for_timeout.effective_tool_timeout_ms(tool_count);
+
+        // ── Parallel pre-execution for read-only tool batches ──
+        // When all tools are parallel-safe and there are 2+, execute them
+        // concurrently upfront. For async HTTP tools (github_*, memory_*),
+        // this gives real I/O parallelism. For sync local tools, it degrades
+        // gracefully to sequential (no worse than before).
+        let parallel_batch = tool_count > 1
+            && turn_result.tool_calls.iter().all(|tc| {
+                tc.get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|n| PARALLEL_SAFE_TOOLS.contains(&n))
+                    .unwrap_or(false)
+            });
+        let pre_results: Vec<Option<String>> = if parallel_batch {
+            let timeout_dur = std::time::Duration::from_millis(per_tool_timeout_ms);
+            let exec_ref = &executor;
+            let futs: Vec<_> = turn_result.tool_calls.iter().map(|tc| {
+                let name = tc
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let args = tc
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                async move {
+                    match tokio::time::timeout(timeout_dur, exec_ref.execute(name, &args)).await {
+                        Ok(r) => Some(r),
+                        Err(_) => None, // timeout — handled in main loop
+                    }
+                }
+            }).collect();
+            futures_util::future::join_all(futs).await
+        } else {
+            Vec::new()
+        };
+
+        for (tc_idx, tc_event) in turn_result.tool_calls.iter().enumerate() {
             // Step-level timeout: abort remaining tools if step time exceeded
             let step_elapsed_ms = step_start_time.elapsed().as_millis() as u64;
             if step_elapsed_ms > step_timeout_ms {
@@ -1519,21 +1599,37 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             let tool_timeout_ms = contract.effective_tool_timeout_ms(tool_count);
             let effective_retries = (contract.max_retries as usize).min(limits.max_tool_retries);
             let mut tool_timed_out = false;
-            let mut result_str = match tokio::time::timeout(
-                std::time::Duration::from_millis(tool_timeout_ms),
-                executor.execute(&name, &args),
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(_) => {
-                    tool_timed_out = true;
-                    turn_guard.record_tool_timeout(&name);
-                    format!(
-                        "Tool '{}' took too long (>{}s). Consider retrying.",
-                        name,
-                        tool_timeout_ms / 1000
-                    )
+
+            // Use pre-computed parallel result if available, else execute live
+            let mut result_str = if let Some(Some(pre)) = pre_results.get(tc_idx) {
+                pre.clone()
+            } else if pre_results.get(tc_idx) == Some(&None) {
+                // Pre-execution timed out
+                tool_timed_out = true;
+                turn_guard.record_tool_timeout(&name);
+                format!(
+                    "Tool '{}' took too long (>{}s). Consider retrying.",
+                    name,
+                    tool_timeout_ms / 1000
+                )
+            } else {
+                // Sequential execution (not a parallel batch)
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(tool_timeout_ms),
+                    executor.execute(&name, &args),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        tool_timed_out = true;
+                        turn_guard.record_tool_timeout(&name);
+                        format!(
+                            "Tool '{}' took too long (>{}s). Consider retrying.",
+                            name,
+                            tool_timeout_ms / 1000
+                        )
+                    }
                 }
             };
 
@@ -2993,5 +3089,86 @@ if let Err(e) = writeln!(file, "{line}") {
         assert!(restored.error.is_none());
         // error field should be absent when None (skip_serializing_if)
         assert!(!json.contains("error"));
+    }
+
+    // ── PARALLEL_SAFE_TOOLS classification ──
+
+    #[test]
+    fn parallel_safe_includes_all_read_only_tools() {
+        let must_be_parallel = [
+            "read_file", "list_dir", "glob", "grep",
+            "git_status", "git_diff", "git_log",
+            "github_list_prs", "github_get_pr",
+            "memory_retrieve", "memory_search",
+        ];
+        for tool in &must_be_parallel {
+            assert!(
+                PARALLEL_SAFE_TOOLS.contains(tool),
+                "{tool} should be parallel-safe"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_safe_excludes_mutating_tools() {
+        let must_not_be_parallel = [
+            "bash", "write_file", "str_replace", "delete_file", "multi_edit",
+            "git_commit", "git_stash", "git_checkout_file",
+            "memory_store", "memory_purge", "memory_correct",
+            "github_create_issue", "run_build_test",
+        ];
+        for tool in &must_not_be_parallel {
+            assert!(
+                !PARALLEL_SAFE_TOOLS.contains(tool),
+                "{tool} should NOT be parallel-safe"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_batch_detection_requires_two_plus() {
+        // Single tool → no parallel batch
+        let single = vec![serde_json::json!({"name": "read_file", "arguments": {}})];
+        let is_parallel = single.len() > 1
+            && single.iter().all(|tc| {
+                tc.get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|n| PARALLEL_SAFE_TOOLS.contains(&n))
+                    .unwrap_or(false)
+            });
+        assert!(!is_parallel, "single tool should not trigger parallel batch");
+    }
+
+    #[test]
+    fn parallel_batch_detects_all_safe_tools() {
+        let batch = vec![
+            serde_json::json!({"name": "read_file", "arguments": {"path": "a.rs"}}),
+            serde_json::json!({"name": "glob", "arguments": {"pattern": "*.rs"}}),
+            serde_json::json!({"name": "grep", "arguments": {"pattern": "fn main"}}),
+        ];
+        let is_parallel = batch.len() > 1
+            && batch.iter().all(|tc| {
+                tc.get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|n| PARALLEL_SAFE_TOOLS.contains(&n))
+                    .unwrap_or(false)
+            });
+        assert!(is_parallel, "all read-only tools should trigger parallel batch");
+    }
+
+    #[test]
+    fn parallel_batch_rejected_with_mutating_tool() {
+        let batch = vec![
+            serde_json::json!({"name": "read_file", "arguments": {"path": "a.rs"}}),
+            serde_json::json!({"name": "bash", "arguments": {"command": "echo hi"}}),
+        ];
+        let is_parallel = batch.len() > 1
+            && batch.iter().all(|tc| {
+                tc.get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|n| PARALLEL_SAFE_TOOLS.contains(&n))
+                    .unwrap_or(false)
+            });
+        assert!(!is_parallel, "bash should prevent parallel batch");
     }
 }
