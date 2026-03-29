@@ -146,49 +146,52 @@ pub(super) async fn handle_memory_domain_command(
             let subcmd = arg.split_whitespace().next().unwrap_or("");
             let sub_arg = arg.strip_prefix(subcmd).unwrap_or("").trim();
             match subcmd {
-                // Smart entry: /plan with no args shows entry card and enters plan mode
+                // Toggle: /plan with no args enters or exits plan mode
                 "" => {
                     use super::plan_decompose::{
                         PlanModeState, format_plan_entry_card, format_plan,
                     };
                     
-                    // Check for active plan in state or saved state
-                    let has_active = state.plan_mode.is_some();
-                    let _has_paused = state.executing_plan.is_some();
+                    // If already in plan mode, exit
+                    if state.plan_mode.is_some() {
+                        // Save state before exiting
+                        if let Some(ref ps) = state.plan_mode {
+                            if let Err(e) = ps.save_to_file(&PlanModeState::state_path()) {
+                                eprintln!("  {} Failed to save plan state: {e}", "⚠".yellow());
+                            }
+                        }
+                        state.plan_mode = None;
+                        eprintln!("  {} Exited plan mode", "←".cyan());
+                        return Ok(());
+                    }
                     
-                    // Try to load saved plan if not in memory
-                    let saved_plan = if !has_active {
-                        PlanModeState::load_from_file(&PlanModeState::state_path()).ok()
-                    } else {
-                        None
-                    };
+                    // Try to load saved plan
+                    let saved_plan = PlanModeState::load_from_file(&PlanModeState::state_path()).ok();
                     
                     // Display entry card
                     eprintln!();
                     let card = format_plan_entry_card(
-                        state.plan_mode.as_ref().or(saved_plan.as_ref()),
+                        saved_plan.as_ref(),
                         state.executing_plan.as_ref(),
                     );
                     eprintln!("{}", card);
                     
-                    // If we loaded a saved plan, restore it
-                    if saved_plan.is_some() && state.plan_mode.is_none() {
-                        state.plan_mode = saved_plan;
+                    // Restore saved plan or create new
+                    if let Some(plan) = saved_plan {
+                        state.plan_mode = Some(plan);
                         if let Some(ref ps) = state.plan_mode {
                             eprintln!("  {} Restored saved plan: {}", "↩".cyan(), ps.goal.as_str().cyan());
                             eprintln!();
                             let formatted = format_plan(&ps.plan);
                             eprintln!("{formatted}");
                         }
-                    }
-                    
-                    // Enter plan mode (plan> prompt will be shown by main loop)
-                    if state.plan_mode.is_none() {
-                        // Create empty plan mode state - user will provide goal
+                    } else {
+                        // Create empty plan mode state - user will provide goal via conversation
                         let project_root = std::env::current_dir()
                             .unwrap_or_else(|_| std::path::PathBuf::from("."));
                         let context = super::plan_decompose::analyze_project(&project_root);
                         state.plan_mode = Some(PlanModeState::new(String::new(), context));
+                        eprintln!("  {} Entered plan mode. Describe your goal to start planning.", "→".cyan());
                     }
                 }
                 "show" => {
@@ -1204,8 +1207,9 @@ pub(super) async fn handle_memory_domain_command(
                 }
                 _ => {
                     eprintln!(
-                        "  Usage: /plan [show | set <text> | clear | decompose <goal> | enter <goal> | auto <goal> | resume | exit | list | cloud | load <id> | rate <1-5> | template <name> <goal> | history | diff <v1> <v2> | rollback <v> | parallel]"
+                        "  Usage: /plan [list | history]"
                     );
+                    eprintln!("  In plan mode, just describe your goal - no commands needed.");
                 }
             }
         }
