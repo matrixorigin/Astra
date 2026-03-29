@@ -382,6 +382,8 @@ struct ReplState {
     tool_health_entries: Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry>,
     /// Plan Mode state — when Some, REPL is in interactive plan editing mode.
     plan_mode: Option<plan_decompose::PlanModeState>,
+    /// Plan being auto-executed — subtasks sent sequentially through chat.
+    executing_plan: Option<mo_agent_services::task_orchestrator::TaskPlan>,
 }
 
 impl Default for ReplState {
@@ -412,6 +414,7 @@ impl Default for ReplState {
             task_service: None,
             tool_health_entries: Vec::new(),
             plan_mode: None,
+            executing_plan: None,
         }
     }
 }
@@ -1116,6 +1119,124 @@ fn format_sync_age(ts: &str) -> String {
             }
         }
         Err(_) => ts.to_string(), // Fallback: show raw timestamp
+    }
+}
+
+// ═══════════════════════════════════════════════ Plan Auto-Execution ═════
+
+/// Run the plan auto-execution loop: iterate through ready subtasks,
+/// send each as a chat message, mark done, continue until all done or blocked.
+///
+/// Uses a take-modify-put pattern to avoid borrow conflicts with handle_chat_input.
+async fn run_plan_execution(
+    state: &mut ReplState,
+    current_token: Option<&str>,
+    client: &reqwest::Client,
+    base: &str,
+    profile: Option<&str>,
+    selector: &dyn tool_selector::ToolSelector,
+) -> Result<(), String> {
+    use mo_agent_services::task_orchestrator::TaskStatus;
+
+    loop {
+        // Take the plan out of state to avoid borrow conflicts
+        let mut plan = match state.executing_plan.take() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        // Mark any in-progress subtask as completed (just finished by previous chat turn)
+        let mut just_completed: Option<String> = None;
+        for st in plan.subtasks.iter_mut() {
+            if st.status == TaskStatus::InProgress {
+                st.status = TaskStatus::Completed;
+                just_completed = Some(st.title.clone());
+                break;
+            }
+        }
+        if let Some(title) = just_completed {
+            let pct = plan.progress_pct();
+            eprintln!("\n{}  Subtask done: {} ({}%)", "✓".green(), title, pct);
+        }
+
+        // Find next ready subtask
+        let next = plan.ready_subtasks().first().map(|s| s.id.clone());
+
+        match next {
+            Some(next_id) => {
+                let (prompt, title) = {
+                    let st = plan.subtasks.iter_mut().find(|s| s.id == next_id).unwrap();
+                    st.status = TaskStatus::InProgress;
+                    let prompt = plan_decompose::format_subtask_prompt(st);
+                    let title = st.title.clone();
+                    (prompt, title)
+                };
+
+                let remaining = plan
+                    .subtasks
+                    .iter()
+                    .filter(|s| s.status == TaskStatus::Pending)
+                    .count();
+                let done_so_far = plan.items_done() + 1;
+                let total = plan.subtasks.len();
+
+                eprintln!(
+                    "\n{}  Subtask {}/{}: {} [{}]",
+                    "▶".cyan(),
+                    done_so_far,
+                    total,
+                    title,
+                    next_id
+                );
+                if remaining > 0 {
+                    eprintln!("{}  {} remaining after this", "·".dim(), remaining);
+                }
+
+                // Put plan back before calling handle_chat_input
+                state.executing_plan = Some(plan);
+
+                handle_chat_input(
+                    prompt,
+                    current_token,
+                    state,
+                    ReplTurnContext {
+                        client,
+                        base,
+                        profile,
+                        selector,
+                    },
+                )
+                .await?;
+
+                // Loop continues — will mark this subtask done and find next
+            }
+            None => {
+                // No more ready subtasks — either all done or blocked
+                let pct = plan.progress_pct();
+                if pct == 100 {
+                    eprintln!(
+                        "\n{}  Plan complete! All {} subtasks done.",
+                        "🎉".green(),
+                        plan.subtasks.len()
+                    );
+                } else {
+                    let blocked: Vec<_> = plan
+                        .subtasks
+                        .iter()
+                        .filter(|s| s.status == TaskStatus::Pending)
+                        .map(|s| s.id.as_str())
+                        .collect();
+                    eprintln!(
+                        "\n{}  Plan execution paused at {}%. Blocked: {}",
+                        "⏸".yellow(),
+                        pct,
+                        blocked.join(", ")
+                    );
+                }
+                // Don't put plan back — execution is done
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -1899,6 +2020,19 @@ async fn run_chat_repl(
                         base,
                     )
                     .await?;
+
+                    // If plan execution was just triggered, run the auto-execution loop
+                    if state.executing_plan.is_some() {
+                        run_plan_execution(
+                            &mut state,
+                            current_token.as_deref(),
+                            client,
+                            base,
+                            profile,
+                            &*selector,
+                        )
+                        .await?;
+                    }
                 } else {
                     handle_chat_input(
                         line,

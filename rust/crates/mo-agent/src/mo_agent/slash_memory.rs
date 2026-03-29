@@ -619,35 +619,56 @@ pub async fn handle_plan_mode_input(
                     );
                 }
             }
-        } else {
-            eprintln!(
-                "{}  Task service unavailable — plan displayed but not persisted",
-                "⚠".yellow()
-            );
         }
 
         eprintln!();
 
-        // Display the tasks to execute
+        // Display execution plan summary
         if !plan.subtasks.is_empty() {
-            eprintln!("{}  Tasks to execute:", "📋".yellow());
+            eprintln!("{}  Execution plan ({} subtasks):", "📋".yellow(), plan.subtasks.len());
             for task in &plan.subtasks {
                 let deps_str = if task.depends_on.is_empty() {
                     String::new()
                 } else {
-                    format!(" (depends on: {})", task.depends_on.join(", "))
+                    format!(" (after: {})", task.depends_on.join(", "))
+                };
+                let effort_badge = match task.effort.as_deref() {
+                    Some("small") => " [S]",
+                    Some("medium") => " [M]",
+                    Some("large") => " [L]",
+                    _ => "",
                 };
                 eprintln!(
-                    "    {} [{}] {}{}",
+                    "    {} [{}]{} {}{}",
                     "•".dim(),
                     task.id,
+                    effort_badge.cyan(),
                     task.title,
                     deps_str.dim()
                 );
             }
             eprintln!();
+
+            let ready = plan.ready_subtasks();
+            if ready.is_empty() {
+                eprintln!(
+                    "{}  No subtasks ready (circular dependencies?)",
+                    "⚠".yellow()
+                );
+            } else {
+                eprintln!(
+                    "{}  Starting with: {} [{}]",
+                    "▶".cyan(),
+                    ready[0].title,
+                    ready[0].id
+                );
+            }
+            eprintln!();
         }
 
+        // Store plan for auto-execution and exit plan mode
+        // The main REPL loop will pick this up and start executing subtasks
+        state.executing_plan = Some(plan);
         PlanModeState::clear_saved_state();
         state.plan_mode = None;
         return Ok(());

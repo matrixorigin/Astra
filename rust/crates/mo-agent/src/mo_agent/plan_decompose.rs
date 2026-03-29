@@ -643,6 +643,33 @@ pub fn plan_modification_prompt(state: &PlanModeState, user_request: &str) -> St
     state.plan_mode_prompt(user_request)
 }
 
+/// Format a subtask as a rich prompt for the LLM to execute.
+///
+/// Includes the task title, description, files to modify, and acceptance criteria.
+/// Used by the plan auto-execution loop to convert subtasks into actionable LLM prompts.
+pub fn format_subtask_prompt(subtask: &SubtaskPlan) -> String {
+    let mut prompt = format!("Execute this subtask: {}\n", subtask.title);
+
+    if let Some(ref desc) = subtask.description {
+        prompt.push_str(&format!("\nDescription: {}\n", desc));
+    }
+
+    if !subtask.files.is_empty() {
+        prompt.push_str(&format!("\nFiles to modify: {}\n", subtask.files.join(", ")));
+    }
+
+    if let Some(ref acceptance) = subtask.acceptance {
+        prompt.push_str(&format!("\nAcceptance criteria: {}\n", acceptance));
+    }
+
+    prompt.push_str(
+        "\nPlease implement this change. Read the relevant files first, \
+         make the changes, and verify they compile/pass tests.",
+    );
+
+    prompt
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1183,5 +1210,193 @@ Done!"#;
         assert_eq!(plan.subtasks[0].effort, None);
         assert!(plan.subtasks[0].files.is_empty());
         assert!(plan.subtasks[0].acceptance.is_none());
+    }
+
+    // ═══════════════════════════ Auto-Execution Tests ═══════════════════════
+
+    #[test]
+    fn format_subtask_prompt_minimal() {
+        let st = SubtaskPlan {
+            id: "t1".into(),
+            title: "Add login page".into(),
+            ..Default::default()
+        };
+        let prompt = format_subtask_prompt(&st);
+        assert!(prompt.contains("Add login page"));
+        assert!(prompt.contains("implement this change"));
+        // No description, files, or acceptance → those sections omitted
+        assert!(!prompt.contains("Description:"));
+        assert!(!prompt.contains("Files to modify:"));
+        assert!(!prompt.contains("Acceptance criteria:"));
+    }
+
+    #[test]
+    fn format_subtask_prompt_full() {
+        let st = SubtaskPlan {
+            id: "t2".into(),
+            title: "Add auth middleware".into(),
+            description: Some("JWT token validation for all /api routes".into()),
+            files: vec!["src/middleware.rs".into(), "src/auth.rs".into()],
+            acceptance: Some("All /api routes return 401 without valid token".into()),
+            ..Default::default()
+        };
+        let prompt = format_subtask_prompt(&st);
+        assert!(prompt.contains("Add auth middleware"));
+        assert!(prompt.contains("JWT token validation"));
+        assert!(prompt.contains("src/middleware.rs, src/auth.rs"));
+        assert!(prompt.contains("401 without valid token"));
+    }
+
+    #[test]
+    fn format_subtask_prompt_preserves_description_detail() {
+        let st = SubtaskPlan {
+            id: "t3".into(),
+            title: "Refactor DB layer".into(),
+            description: Some("Extract connection pooling into a separate module.\nAdd retry logic.".into()),
+            ..Default::default()
+        };
+        let prompt = format_subtask_prompt(&st);
+        assert!(prompt.contains("Extract connection pooling"));
+        assert!(prompt.contains("retry logic"));
+    }
+
+    #[test]
+    fn plan_auto_execution_dependency_ordering() {
+        // Verify ready_subtasks respects dependencies
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "setup".into(),
+                    title: "Setup deps".into(),
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "impl".into(),
+                    title: "Implement feature".into(),
+                    depends_on: vec!["setup".into()],
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "test".into(),
+                    title: "Add tests".into(),
+                    depends_on: vec!["impl".into()],
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+
+        // Only "setup" should be ready initially
+        let ready = plan.ready_subtasks();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, "setup");
+    }
+
+    #[test]
+    fn plan_auto_execution_unblocks_after_completion() {
+        let mut plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "setup".into(),
+                    title: "Setup deps".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "impl".into(),
+                    title: "Implement feature".into(),
+                    depends_on: vec!["setup".into()],
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "test".into(),
+                    title: "Add tests".into(),
+                    depends_on: vec!["impl".into()],
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+
+        // After "setup" completes, "impl" should be ready
+        let ready = plan.ready_subtasks();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, "impl");
+
+        // "test" still blocked
+        assert!(!ready.iter().any(|s| s.id == "test"));
+
+        // Complete "impl" too
+        plan.subtasks[1].status = TaskStatus::Completed;
+        let ready = plan.ready_subtasks();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, "test");
+    }
+
+    #[test]
+    fn plan_progress_tracking() {
+        let mut plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(), status: TaskStatus::Completed, ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(), status: TaskStatus::InProgress, ..Default::default() },
+                SubtaskPlan { id: "c".into(), title: "C".into(), status: TaskStatus::Pending, ..Default::default() },
+            ],
+            notes: None,
+        };
+
+        assert_eq!(plan.progress_pct(), 33); // 1/3
+        assert_eq!(plan.items_done(), 1);
+
+        plan.subtasks[1].status = TaskStatus::Completed;
+        assert_eq!(plan.progress_pct(), 66); // 2/3
+        assert_eq!(plan.items_done(), 2);
+
+        plan.subtasks[2].status = TaskStatus::Completed;
+        assert_eq!(plan.progress_pct(), 100);
+        assert_eq!(plan.items_done(), 3);
+    }
+
+    #[test]
+    fn plan_parallel_subtasks_all_ready() {
+        // Multiple subtasks with no deps should all be ready at once
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(), ..Default::default() },
+                SubtaskPlan { id: "c".into(), title: "C".into(), ..Default::default() },
+            ],
+            notes: None,
+        };
+        let ready = plan.ready_subtasks();
+        assert_eq!(ready.len(), 3);
+    }
+
+    #[test]
+    fn plan_blocked_by_incomplete_dep() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "A".into(),
+                    status: TaskStatus::InProgress,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "B".into(),
+                    depends_on: vec!["a".into()],
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+        // "a" is in-progress (not completed), so "b" is blocked
+        let ready = plan.ready_subtasks();
+        assert!(ready.is_empty(), "b should be blocked while a is in-progress");
     }
 }
