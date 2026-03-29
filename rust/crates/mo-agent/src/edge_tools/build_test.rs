@@ -55,6 +55,21 @@ impl ErrorLocation {
     }
 }
 
+/// A group of related errors (same file or cascading from a root cause).
+#[derive(Debug)]
+pub struct ErrorGroup {
+    /// File where this group of errors occurs
+    pub file: String,
+    /// The root-cause error (first/most upstream in the cascade)
+    pub root_index: usize,
+    /// Indices of all errors in this group (including root)
+    pub member_indices: Vec<usize>,
+    /// Whether this is a suspected cascade (many errors from one root)
+    pub is_cascade: bool,
+    /// Description of the cascade pattern (e.g., "missing import causes 4 not-found errors")
+    pub cascade_hint: String,
+}
+
 /// Parsed result from a build or test command.
 #[derive(Debug, Clone, Default)]
 pub struct BuildTestResult {
@@ -83,6 +98,177 @@ pub struct BuildTestResult {
 }
 
 impl BuildTestResult {
+    /// Analyze error locations and group cascading errors by root cause.
+    ///
+    /// Cascade patterns detected:
+    /// 1. **Import cascade**: E0425/E0433/E0412 (not found) in same file from one missing import
+    /// 2. **Type cascade**: E0308 (type mismatch) following E0412/E0425 in same scope
+    /// 3. **Same-file cluster**: 3+ errors in one file → suggest fixing first
+    /// 4. **Trait cascade**: E0599 (method not found) following E0277 (trait not satisfied)
+    pub fn analyze_error_groups(&self) -> Vec<ErrorGroup> {
+        use std::collections::HashMap;
+
+        if self.error_locations.is_empty() {
+            return Vec::new();
+        }
+
+        // Group by file
+        let mut by_file: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, loc) in self.error_locations.iter().enumerate() {
+            by_file.entry(&loc.file).or_default().push(i);
+        }
+
+        let mut groups = Vec::new();
+        for (file, indices) in &by_file {
+            if indices.len() < 2 {
+                // Single error in file — trivial group, no cascade
+                groups.push(ErrorGroup {
+                    file: file.to_string(),
+                    root_index: indices[0],
+                    member_indices: indices.clone(),
+                    is_cascade: false,
+                    cascade_hint: String::new(),
+                });
+                continue;
+            }
+
+            // Look for cascade patterns within this file
+            let locs: Vec<&ErrorLocation> = indices.iter().map(|&i| &self.error_locations[i]).collect();
+
+            // Pattern 1: Import cascade — one missing import causes multiple "not found"
+            let import_codes = ["E0425", "E0433", "E0412", "E0432"];
+            let import_errors: Vec<usize> = indices.iter()
+                .filter(|&&i| import_codes.contains(&self.error_locations[i].error_code.as_str()))
+                .copied()
+                .collect();
+
+            if import_errors.len() >= 2 {
+                // Check if they reference the same identifier
+                let identifiers: Vec<Option<&str>> = import_errors.iter()
+                    .map(|&i| extract_identifier(&self.error_locations[i].message))
+                    .collect();
+                let first_id = identifiers[0];
+                let same_id_count = identifiers.iter().filter(|id| **id == first_id && id.is_some()).count();
+
+                if same_id_count >= 2 {
+                    let id_name = first_id.unwrap_or("unknown");
+                    groups.push(ErrorGroup {
+                        file: file.to_string(),
+                        root_index: import_errors[0],
+                        member_indices: import_errors,
+                        is_cascade: true,
+                        cascade_hint: format!(
+                            "Missing import for `{}` causes {} cascading errors — add the import to fix all",
+                            id_name, same_id_count
+                        ),
+                    });
+                    continue;
+                }
+            }
+
+            // Pattern 2: First error is trivial/import, rest are downstream
+            let first = &locs[0];
+            if first.class == ErrorClass::Trivial && locs.len() >= 3 {
+                groups.push(ErrorGroup {
+                    file: file.to_string(),
+                    root_index: indices[0],
+                    member_indices: indices.clone(),
+                    is_cascade: true,
+                    cascade_hint: format!(
+                        "{} errors likely cascade from line {} — fix `{}` first",
+                        indices.len(), first.line, first.message.chars().take(50).collect::<String>()
+                    ),
+                });
+                continue;
+            }
+
+            // Pattern 3: Same scope cascade — errors in the same function
+            if !locs[0].scope.is_empty() {
+                let same_scope: Vec<usize> = indices.iter()
+                    .filter(|&&i| self.error_locations[i].scope == locs[0].scope)
+                    .copied()
+                    .collect();
+                if same_scope.len() >= 3 {
+                    groups.push(ErrorGroup {
+                        file: file.to_string(),
+                        root_index: same_scope[0],
+                        member_indices: same_scope.clone(),
+                        is_cascade: true,
+                        cascade_hint: format!(
+                            "{} errors in `{}` — fix earliest (line {}) first",
+                            same_scope.len(),
+                            locs[0].scope,
+                            self.error_locations[same_scope[0]].line
+                        ),
+                    });
+                    continue;
+                }
+            }
+
+            // Generic cluster: 3+ errors in same file
+            groups.push(ErrorGroup {
+                file: file.to_string(),
+                root_index: indices[0],
+                member_indices: indices.clone(),
+                is_cascade: indices.len() >= 3,
+                cascade_hint: if indices.len() >= 3 {
+                    format!("{} errors in file — fix line {} first, others may resolve", indices.len(), locs[0].line)
+                } else {
+                    String::new()
+                },
+            });
+        }
+
+        // Sort groups: cascades first (most impactful), then by member count desc
+        groups.sort_by(|a, b| {
+            b.is_cascade.cmp(&a.is_cascade)
+                .then(b.member_indices.len().cmp(&a.member_indices.len()))
+        });
+
+        groups
+    }
+
+    /// Generate a fix ordering: returns error indices sorted by dependency.
+    /// Root-cause errors come first, downstream/cascading errors come last.
+    pub fn fix_order(&self) -> Vec<usize> {
+        let groups = self.analyze_error_groups();
+        let mut ordered = Vec::new();
+        let mut seen = HashSet::new();
+
+        // First: root causes from cascade groups
+        for g in &groups {
+            if g.is_cascade && !seen.contains(&g.root_index) {
+                ordered.push(g.root_index);
+                seen.insert(g.root_index);
+            }
+        }
+
+        // Then: trivial non-cascade errors
+        for (i, loc) in self.error_locations.iter().enumerate() {
+            if !seen.contains(&i) && loc.class == ErrorClass::Trivial {
+                ordered.push(i);
+                seen.insert(i);
+            }
+        }
+
+        // Then: fixable
+        for (i, loc) in self.error_locations.iter().enumerate() {
+            if !seen.contains(&i) && loc.class == ErrorClass::Fixable {
+                ordered.push(i);
+                seen.insert(i);
+            }
+        }
+
+        // Finally: complex
+        for i in 0..self.error_locations.len() {
+            if !seen.contains(&i) {
+                ordered.push(i);
+                seen.insert(i);
+            }
+        }
+
+        ordered
+    }
     /// Format as enhanced output with summary at top.
     pub fn to_enhanced_output(&self, raw_output: &str) -> String {
         let status_icon = if self.passed { "✓" } else { "✗" };
@@ -161,18 +347,22 @@ impl BuildTestResult {
                 ));
             }
 
-            // Detect cascading: multiple errors in same file likely cascade from first
-            let first_file = &self.error_locations[0].file;
-            let same_file_count = self.error_locations.iter().filter(|l| l.file == *first_file).count();
-            if same_file_count > 2 {
-                parts.push(format!(
-                    "⚡ {} errors in {} — fix first error, others may resolve",
-                    same_file_count, first_file
-                ));
+            // Cascading error analysis — detect root causes and group related errors
+            let groups = self.analyze_error_groups();
+            let cascades: Vec<&ErrorGroup> = groups.iter().filter(|g| g.is_cascade).collect();
+            if !cascades.is_empty() {
+                parts.push(String::new());
+                parts.push("Cascading errors detected:".to_string());
+                for g in cascades.iter().take(3) {
+                    parts.push(format!("  ⚡ {}", g.cascade_hint));
+                }
             }
 
-            parts.push("Locations:".to_string());
-            for loc in self.error_locations.iter().take(10) {
+            // Show errors in fix order (root causes first)
+            let fix_order = self.fix_order();
+            parts.push("Locations (fix order):".to_string());
+            for (rank, &idx) in fix_order.iter().take(10).enumerate() {
+                let loc = &self.error_locations[idx];
                 let code_part = if loc.error_code.is_empty() {
                     String::new()
                 } else {
@@ -193,12 +383,18 @@ impl BuildTestResult {
                 } else {
                     format!(" (in {})", loc.scope)
                 };
+                let root_marker = if cascades.iter().any(|g| g.root_index == idx) {
+                    " ← ROOT CAUSE"
+                } else {
+                    ""
+                };
                 parts.push(format!(
-                    "  → {}:{}{}{} {}{}{}",
-                    loc.file, loc.line, col_part, code_part, loc.message, class_tag, scope_part
+                    "  {}. {}:{}{}{} {}{}{}{}",
+                    rank + 1, loc.file, loc.line, col_part, code_part,
+                    loc.message, class_tag, scope_part, root_marker
                 ));
                 if !loc.hint.is_empty() {
-                    parts.push(format!("    💡 {}", loc.hint));
+                    parts.push(format!("     💡 {}", loc.hint));
                 }
             }
             if self.error_locations.len() > 10 {
@@ -1296,8 +1492,8 @@ exit status 1
             ..Default::default()
         };
         let output = result.to_enhanced_output("");
-        assert!(output.contains("Locations:"), "should have Locations section: {output}");
-        assert!(output.contains("→ src/main.rs:10:5"), "should show file:line:col: {output}");
+        assert!(output.contains("Locations"), "should have Locations section: {output}");
+        assert!(output.contains("src/main.rs:10:5"), "should show file:line:col: {output}");
         assert!(output.contains("[E0425]"), "should show error code: {output}");
     }
 
@@ -1365,7 +1561,7 @@ src/helper.c:15:3: warning: implicit conversion
             ..Default::default()
         };
         let output = result.to_enhanced_output("");
-        assert!(!output.contains("Locations:"), "should not show Locations when empty");
+        assert!(!output.contains("Locations"), "should not show Locations when empty");
     }
 
     #[test]
@@ -1519,8 +1715,9 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored
             ..Default::default()
         };
         let output = result.to_enhanced_output("");
-        assert!(output.contains("cascading") || output.contains("first error"),
+        assert!(output.contains("Cascading") || output.contains("cascade"),
             "should detect cascading errors in same file: {output}");
+        assert!(output.contains("ROOT CAUSE"), "should mark root cause: {output}");
     }
 
     #[test]
@@ -1623,6 +1820,144 @@ error[E0425]: cannot find value `nonexistent` in this scope
             output.contains("(in impl Foo > fn process)"),
             "scope should appear in enhanced output: {output}"
         );
+    }
+
+    // ═══════════════════════ Cascading Analysis Tests ═══════════════════════
+
+    #[test]
+    fn analyze_import_cascade_same_identifier() {
+        let result = BuildTestResult {
+            error_locations: vec![
+                ErrorLocation::new("src/a.rs".into(), 10, 1, "E0425".into(), "cannot find value `Foo`".into(), "error".into()),
+                ErrorLocation::new("src/a.rs".into(), 20, 1, "E0425".into(), "cannot find value `Foo`".into(), "error".into()),
+                ErrorLocation::new("src/a.rs".into(), 30, 1, "E0433".into(), "cannot find `Foo` in this scope".into(), "error".into()),
+            ],
+            ..Default::default()
+        };
+        let groups = result.analyze_error_groups();
+        assert!(!groups.is_empty());
+        let cascade = groups.iter().find(|g| g.is_cascade);
+        assert!(cascade.is_some(), "should detect import cascade");
+        let c = cascade.unwrap();
+        assert!(c.cascade_hint.contains("Foo"), "hint should mention the identifier: {}", c.cascade_hint);
+    }
+
+    #[test]
+    fn analyze_trivial_first_cascade() {
+        let result = BuildTestResult {
+            error_locations: vec![
+                ErrorLocation::new("src/b.rs".into(), 5, 1, "E0432".into(), "unresolved import".into(), "error".into()),
+                ErrorLocation::new("src/b.rs".into(), 15, 1, "E0308".into(), "mismatched types".into(), "error".into()),
+                ErrorLocation::new("src/b.rs".into(), 25, 1, "E0599".into(), "method not found".into(), "error".into()),
+            ],
+            ..Default::default()
+        };
+        let groups = result.analyze_error_groups();
+        let cascade = groups.iter().find(|g| g.is_cascade);
+        assert!(cascade.is_some(), "trivial-first with 3 errors should cascade");
+        let c = cascade.unwrap();
+        assert_eq!(c.root_index, 0, "root should be the first (trivial) error");
+    }
+
+    #[test]
+    fn analyze_no_cascade_two_errors() {
+        let result = BuildTestResult {
+            error_locations: vec![
+                ErrorLocation::new("src/c.rs".into(), 10, 1, "E0308".into(), "type mismatch".into(), "error".into()),
+                ErrorLocation::new("src/c.rs".into(), 20, 1, "E0277".into(), "trait not satisfied".into(), "error".into()),
+            ],
+            ..Default::default()
+        };
+        let groups = result.analyze_error_groups();
+        // 2 errors, first is Fixable (not Trivial), so no cascade
+        assert!(groups.iter().all(|g| !g.is_cascade), "2 non-trivial errors should not be cascade");
+    }
+
+    #[test]
+    fn analyze_multi_file_groups() {
+        let result = BuildTestResult {
+            error_locations: vec![
+                ErrorLocation::new("src/a.rs".into(), 10, 1, "E0425".into(), "not found".into(), "error".into()),
+                ErrorLocation::new("src/b.rs".into(), 20, 1, "E0308".into(), "type mismatch".into(), "error".into()),
+                ErrorLocation::new("src/c.rs".into(), 30, 1, "E0599".into(), "method not found".into(), "error".into()),
+            ],
+            ..Default::default()
+        };
+        let groups = result.analyze_error_groups();
+        assert_eq!(groups.len(), 3, "each file should be its own group");
+        assert!(groups.iter().all(|g| !g.is_cascade), "single error per file = no cascade");
+    }
+
+    #[test]
+    fn fix_order_root_causes_first() {
+        let result = BuildTestResult {
+            error_locations: vec![
+                // File A: cascade (trivial root)
+                ErrorLocation::new("src/a.rs".into(), 5, 1, "E0425".into(), "cannot find value `X`".into(), "error".into()),
+                ErrorLocation::new("src/a.rs".into(), 15, 1, "E0308".into(), "type mismatch".into(), "error".into()),
+                ErrorLocation::new("src/a.rs".into(), 25, 1, "E0599".into(), "method not found".into(), "error".into()),
+                // File B: standalone complex error
+                ErrorLocation::new("src/b.rs".into(), 10, 1, "E0382".into(), "value moved".into(), "error".into()),
+            ],
+            ..Default::default()
+        };
+        let order = result.fix_order();
+        assert_eq!(order.len(), 4);
+        // Root cause (index 0, E0425 cascade root) should be first
+        assert_eq!(order[0], 0, "cascade root should be first");
+        // Complex error should be last
+        assert_eq!(*order.last().unwrap(), 3, "complex error should be last");
+    }
+
+    #[test]
+    fn fix_order_trivial_before_fixable() {
+        let result = BuildTestResult {
+            error_locations: vec![
+                ErrorLocation::new("src/a.rs".into(), 10, 1, "E0308".into(), "type mismatch".into(), "error".into()),
+                ErrorLocation::new("src/b.rs".into(), 20, 1, "E0425".into(), "not found".into(), "error".into()),
+                ErrorLocation::new("src/c.rs".into(), 30, 1, "E0382".into(), "value moved".into(), "error".into()),
+            ],
+            ..Default::default()
+        };
+        let order = result.fix_order();
+        // Index 1 (Trivial E0425) should come before index 0 (Fixable E0308)
+        let trivial_pos = order.iter().position(|&i| i == 1).unwrap();
+        let fixable_pos = order.iter().position(|&i| i == 0).unwrap();
+        let complex_pos = order.iter().position(|&i| i == 2).unwrap();
+        assert!(trivial_pos < fixable_pos, "trivial should be before fixable");
+        assert!(fixable_pos < complex_pos, "fixable should be before complex");
+    }
+
+    #[test]
+    fn enhanced_output_shows_fix_order_numbers() {
+        let result = BuildTestResult {
+            passed: false,
+            error_locations: vec![
+                ErrorLocation::new("src/a.rs".into(), 10, 5, "E0308".into(), "type mismatch".into(), "error".into()),
+                ErrorLocation::new("src/b.rs".into(), 20, 1, "E0425".into(), "not found".into(), "error".into()),
+            ],
+            ..Default::default()
+        };
+        let output = result.to_enhanced_output("");
+        // Should show numbered list
+        assert!(output.contains("1."), "should have numbered errors: {output}");
+        assert!(output.contains("2."), "should have second error: {output}");
+    }
+
+    #[test]
+    fn enhanced_output_marks_root_cause() {
+        let result = BuildTestResult {
+            passed: false,
+            error_locations: vec![
+                ErrorLocation::new("src/a.rs".into(), 5, 1, "E0425".into(), "cannot find `X`".into(), "error".into()),
+                ErrorLocation::new("src/a.rs".into(), 15, 1, "E0308".into(), "type mismatch".into(), "error".into()),
+                ErrorLocation::new("src/a.rs".into(), 25, 1, "E0599".into(), "method not found".into(), "error".into()),
+            ],
+            ..Default::default()
+        };
+        let output = result.to_enhanced_output("");
+        assert!(output.contains("ROOT CAUSE"), "should mark root cause in cascade: {output}");
+        assert!(output.contains("cascade"), "should show cascade hint: {output}");
     }
 
     // ═══════════════════════ BuildTestTracker Tests ═══════════════════════
