@@ -1,5 +1,15 @@
 use super::*;
 
+fn format_bytes(bytes: u32) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
 fn copy_to_clipboard(text: &str) -> bool {
     let candidates: &[(&str, &[&str])] = &[
         ("xclip", &["-selection", "clipboard"]),
@@ -573,6 +583,14 @@ pub(super) async fn handle_info_command(
                 if let Some(ms) = ev.duration_ms {
                     eprintln!("  {} {}", "Total:".bold(), format!("{:.2}s", ms as f64 / 1000.0).bold());
                 }
+                
+                // TTFT and context time if available
+                if let Some(ttft) = ev.ttft_ms {
+                    eprintln!("  {} {}ms {}", "TTFT:".cyan(), ttft, "(time to first token)".dim());
+                }
+                if let Some(ctx) = ev.context_ms {
+                    eprintln!("  {} {}ms {}", "Context:".cyan(), ctx, "(prompt assembly)".dim());
+                }
                 eprintln!();
                 
                 // Timeline visualization
@@ -586,15 +604,19 @@ pub(super) async fn handle_info_command(
                 eprintln!("    {:<12} {:>6}ms {:>3}%  {}", 
                     "LLM".cyan(), llm_time_ms, llm_pct, llm_bar.blue());
                 
-                // Per-tool bars
+                // Per-tool bars with I/O sizes
                 if let Some(ref calls) = ev.tool_calls {
                     for tc in calls {
                         let pct = (tc.ms as f64 / total_ms * 100.0) as u32;
                         let bar_len = (pct as usize * bar_width / 100).max(1);
                         let bar = if tc.ok { "█".repeat(bar_len).green() } else { "█".repeat(bar_len).red() };
                         let status = if tc.ok { " " } else { "!" };
-                        eprintln!("    {:<12} {:>6}ms {:>3}%  {}{}", 
-                            tc.name.as_str().cyan(), tc.ms, pct, bar, status);
+                        let io_info = match (tc.input_bytes, tc.output_bytes) {
+                            (Some(i), Some(o)) => format!(" [{}/{}B]", format_bytes(i), format_bytes(o)),
+                            _ => String::new(),
+                        };
+                        eprintln!("    {:<12} {:>6}ms {:>3}%  {}{}{}", 
+                            tc.name.as_str().cyan(), tc.ms, pct, bar, status, io_info.dim());
                     }
                 }
                 
@@ -604,6 +626,15 @@ pub(super) async fn handle_info_command(
                 eprintln!("  {}", "Trace".bold());
                 let mut offset = 0u64;
                 
+                // Context assembly (if available)
+                if let Some(ctx) = ev.context_ms {
+                    eprintln!("    {} {} Context assembly", 
+                        format!("[{:>5}ms]", offset).dim(), "├─".dim());
+                    offset = ctx;
+                    eprintln!("    {} {} complete ({}ms)", 
+                        format!("[{:>5}ms]", offset).dim(), "│".dim(), ctx.to_string().dim());
+                }
+                
                 // LLM call
                 eprintln!("    {} {} LLM request", 
                     format!("[{:>5}ms]", offset).dim(), "├─".dim());
@@ -612,6 +643,12 @@ pub(super) async fn handle_info_command(
                 }
                 if let Some(t_in) = ev.tokens_in {
                     eprintln!("    {}    {} input: {} tokens", " ".repeat(8), "│".dim(), t_in.to_string().dim());
+                }
+                // Show TTFT inline
+                if let Some(ttft) = ev.ttft_ms {
+                    let ttft_offset = offset + ttft;
+                    eprintln!("    {} {} first token (TTFT: {}ms)", 
+                        format!("[{:>5}ms]", ttft_offset).dim(), "│".dim(), ttft.to_string().yellow());
                 }
                 if let Some(t_out) = ev.tokens_out {
                     eprintln!("    {}    {} output: {} tokens", " ".repeat(8), "│".dim(), t_out.to_string().dim());
@@ -626,11 +663,21 @@ pub(super) async fn handle_info_command(
                         let is_last = i == calls.len() - 1;
                         let branch = if is_last { "└─" } else { "├─" };
                         let status = if tc.ok { "✓".green() } else { "✗".red() };
-                        eprintln!("    {} {} {} {}", 
+                        
+                        // Build I/O size annotation
+                        let io_info = match (tc.input_bytes, tc.output_bytes) {
+                            (Some(i), Some(o)) => format!(" (in:{} out:{})", format_bytes(i), format_bytes(o)),
+                            (Some(i), None) => format!(" (in:{})", format_bytes(i)),
+                            (None, Some(o)) => format!(" (out:{})", format_bytes(o)),
+                            (None, None) => String::new(),
+                        };
+                        
+                        eprintln!("    {} {} {} {}{}", 
                             format!("[{:>5}ms]", offset).dim(), 
                             branch.dim(),
                             status,
-                            tc.name.as_str().cyan());
+                            tc.name.as_str().cyan(),
+                            io_info.dim());
                         if let Some(ref err) = tc.error {
                             let err_preview = if err.len() > 50 { format!("{}…", &err[..50]) } else { err.clone() };
                             let sub_branch = if is_last { "   " } else { "│  " };

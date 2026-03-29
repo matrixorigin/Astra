@@ -71,6 +71,10 @@ pub(super) struct TurnResult {
     pub(super) completion_tokens: u64,
     pub(super) has_usage: bool,
     pub(super) error_message: Option<String>,
+    /// Time to first token in milliseconds (streaming latency).
+    pub(super) ttft_ms: Option<u64>,
+    /// Context assembly time in milliseconds (prompt building).
+    pub(super) context_ms: Option<u64>,
 }
 
 impl TurnResult {
@@ -87,6 +91,8 @@ impl TurnResult {
             completion_tokens: 0,
             has_usage: false,
             error_message: None,
+            ttft_ms: None,
+            context_ms: None,
         }
     }
 }
@@ -135,6 +141,10 @@ pub(super) async fn consume_turn_sse(
     let mut render = StreamRenderState::new();
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
+    
+    // Track time to first token
+    let stream_start = std::time::Instant::now();
+    let mut first_token_recorded = false;
 
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else { break };
@@ -142,6 +152,13 @@ pub(super) async fn consume_turn_sse(
         while let Some(event_end) = buffer.find("\n\n") {
             let event_str = buffer[..event_end].to_string();
             buffer = buffer[event_end + 2..].to_string();
+            
+            // Capture TTFT on first text content
+            if !first_token_recorded && (event_str.contains("\"text_delta\"") || event_str.contains("\"content_block_delta\"")) {
+                result.ttft_ms = Some(stream_start.elapsed().as_millis() as u64);
+                first_token_recorded = true;
+            }
+            
             dispatch_turn_event_block(&event_str, &mut result, &mut render, quiet);
         }
     }

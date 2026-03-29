@@ -500,6 +500,9 @@ mod tests {
             budget_pressure: None,
             stall_type: None,
             metadata: None,
+            plan_subtask_id: None,
+            ttft_ms: None,
+            context_ms: None,
         }
     }
 
@@ -630,12 +633,16 @@ mod tests {
                 ok: true,
                 ms: 150,
                 error: None,
+                input_bytes: None,
+                output_bytes: None,
             },
             crate::session_journal::ToolCallRecord {
                 name: "read_file".into(),
                 ok: false,
                 ms: 20,
                 error: Some("not found".into()),
+                input_bytes: None,
+                output_bytes: None,
             },
         ]);
 
@@ -673,6 +680,8 @@ mod tests {
             ok: true,
             ms: 500,
             error: None,
+            input_bytes: None,
+            output_bytes: None,
         }]);
 
         let events = IngestionEvent::expand_journal_event(&journal, "u1");
@@ -692,6 +701,8 @@ mod tests {
             ok: true,
             ms: 10,
             error: None,
+            input_bytes: None,
+            output_bytes: None,
         }]);
 
         let a = IngestionEvent::expand_journal_event(&journal, "u1");

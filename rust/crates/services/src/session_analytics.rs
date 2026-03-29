@@ -285,18 +285,24 @@ mod tests {
                 ms: 100,
                 ok: true,
                 error: None,
+                input_bytes: None,
+                output_bytes: None,
             },
             crate::session_journal::ToolCallRecord {
                 name: "grep".into(),
                 ms: 50,
                 ok: true,
                 error: None,
+                input_bytes: None,
+                output_bytes: None,
             },
             crate::session_journal::ToolCallRecord {
                 name: "write_file".into(),
                 ms: 200,
                 ok: false,
                 error: Some("permission denied".into()),
+                input_bytes: None,
+                output_bytes: None,
             },
         ]);
         let stats = compute_session_stats("s1", &[turn]);
@@ -357,6 +363,8 @@ mod tests {
             ms,
             ok,
             error: if ok { None } else { Some("fail".into()) },
+            input_bytes: None,
+            output_bytes: None,
         }
     }
 

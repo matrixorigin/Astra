@@ -808,33 +808,28 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
         (
             "⚡",
             "Core",
-            &["/help", "/model", "/clear", "/exit", "/keys"],
+            &["/help", "/model", "/clear", "/history", "/copy", "/exit"],
         ),
         (
-            "📁",
-            "Workspace",
-            &["/search", "/history", "/copy", "/context", "/rewind"],
-        ),
-        (
-            "🤖",
-            "Agent",
-            &["/explain", "/verbose", "/compact", "/reflect"],
+            "🔭",
+            "Observability",
+            &["/explain", "/turn", "/stats", "/tools", "/health"],
         ),
         (
             "📋",
             "Session",
-            &["/session", "/resume", "/stats", "/tools", "/health"],
+            &["/session", "/resume", "/plan"],
         ),
         (
             "🧠",
-            "Skills & Memory",
-            &["/skill", "/memory", "/plan", "/task"],
+            "Skills",
+            &["/skill"],
         ),
         ("🔧", "Diagnostics", &["/doctor", "/version"]),
         (
             "🔑",
             "Account",
-            &["/login", "/register", "/logout", "/memory-setup"],
+            &["/login", "/logout"],
         ),
     ];
 
@@ -858,32 +853,6 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
             }
             eprintln!();
         }
-    }
-
-    // Aliases
-    let alias_rows = [
-        ("/?", "same as /help"),
-        ("/commands", "same as /help"),
-        ("/quit", "same as /exit"),
-    ];
-    let alias_lines: Vec<String> = alias_rows
-        .iter()
-        .filter(|(cmd, desc)| matches(cmd, desc))
-        .map(|(cmd, desc)| {
-            format!(
-                "    {}  {}",
-                format!("{:<14}", cmd).green(),
-                desc.to_string().dim()
-            )
-        })
-        .collect();
-    if !alias_lines.is_empty() {
-        any_results = true;
-        eprintln!("  ↪ {}", "Aliases".bold().cyan());
-        for line in alias_lines {
-            eprintln!("{line}");
-        }
-        eprintln!();
     }
 
     if !any_results {
@@ -1304,7 +1273,7 @@ mod tests {
     #[test]
     fn resolve_exact_match() {
         assert_eq!(resolve_slash_command("/help"), Ok("/help"));
-        assert_eq!(resolve_slash_command("/quit"), Ok("/quit"));
+        assert_eq!(resolve_slash_command("/exit"), Ok("/exit"));
     }
 
     #[test]
@@ -1432,43 +1401,11 @@ mod tests {
         assert!(input.ends_with('\\'));
     }
 
-    // ── /rewind in SLASH_COMMANDS ─────────────────────────────────────────────
-
-    #[test]
-    fn rewind_command_is_registered() {
-        assert!(SLASH_COMMANDS.iter().any(|(cmd, _)| *cmd == "/rewind"));
-    }
-
-    #[test]
-    fn rewind_resolves_from_prefix() {
-        let result = resolve_slash_command("/rew");
-        assert!(result.is_ok(), "got: {result:?}");
-        assert_eq!(result.unwrap(), "/rewind");
-    }
-
-    // ── /history search in SLASH_COMMANDS ─────────────────────────────────────
+    // ── /history in SLASH_COMMANDS ────────────────────────────────────────────
 
     #[test]
     fn history_command_is_registered() {
         assert!(SLASH_COMMANDS.iter().any(|(cmd, _)| *cmd == "/history"));
-    }
-
-    #[test]
-    fn history_help_text_mentions_search() {
-        let desc = SLASH_COMMANDS
-            .iter()
-            .find(|(cmd, _)| *cmd == "/history")
-            .map(|(_, d)| *d)
-            .unwrap();
-        assert!(
-            desc.contains("search"),
-            "history help should mention search: {desc}"
-        );
-    }
-
-    #[test]
-    fn search_command_is_registered() {
-        assert!(SLASH_COMMANDS.iter().any(|(cmd, _)| *cmd == "/search"));
     }
 
     // ── /resume in SLASH_COMMANDS ─────────────────────────────────────────────
@@ -1483,16 +1420,6 @@ mod tests {
         let result = resolve_slash_command("/resu");
         assert!(result.is_ok(), "got: {result:?}");
         assert_eq!(result.unwrap(), "/resume");
-    }
-
-    #[test]
-    fn resume_and_rewind_disambiguate() {
-        // /re is ambiguous between /resume, /rewind, /reflect, /register
-        let result = resolve_slash_command("/re");
-        assert!(result.is_err(), "/re should be ambiguous");
-        let candidates = result.unwrap_err();
-        assert!(candidates.len() > 1);
-        assert!(candidates.contains(&"/resume"));
     }
 
     // ── /stats in SLASH_COMMANDS ──────────────────────────────────────────────
@@ -1523,40 +1450,21 @@ mod tests {
         assert_eq!(result.unwrap(), "/tools");
     }
 
-    // ── Bug fix: "/" resolves as exact command, not ambiguous ──────────────
+    // ── filtered_slash_rows behavior ──────────────────────────────────────
 
     #[test]
-    fn bare_slash_resolves_to_slash_command() {
-        // "/" is an exact match in SLASH_COMMANDS, should never be ambiguous
-        let result = resolve_slash_command("/");
-        assert!(
-            result.is_ok(),
-            "bare '/' should resolve exactly, got: {result:?}"
-        );
-        assert_eq!(result.unwrap(), "/");
-    }
-
-    // ── Bug fix: filtered_slash_rows excludes "/" and aliases from picker ──
-
-    #[test]
-    fn filtered_rows_exclude_slash_and_aliases() {
+    fn filtered_rows_has_real_commands() {
         let rows = filtered_slash_rows(None);
-        for (cmd, _) in &rows {
-            assert_ne!(*cmd, "/", "picker should not list bare /");
-            assert_ne!(*cmd, "/?", "picker should not list /?");
-            assert_ne!(*cmd, "/commands", "picker should not list /commands");
-            assert_ne!(*cmd, "/quit", "picker should not list /quit");
-        }
-        // But real commands like /copy, /clear should be present
+        // Real commands like /copy, /clear should be present
         assert!(rows.iter().any(|(cmd, _)| *cmd == "/copy"));
         assert!(rows.iter().any(|(cmd, _)| *cmd == "/clear"));
     }
 
     #[test]
-    fn filtered_rows_first_item_is_not_slash() {
+    fn filtered_rows_first_item_is_real_command() {
         let rows = filtered_slash_rows(None);
         assert!(!rows.is_empty());
-        assert_ne!(rows[0].0, "/", "first picker item should not be '/'");
+        assert!(rows[0].0.starts_with("/"), "first item should start with /");
     }
 
     #[test]
@@ -1570,9 +1478,9 @@ mod tests {
 
     #[test]
     fn filtered_rows_falls_back_to_description_search_when_no_prefix_match() {
-        let rows = filtered_slash_rows(Some("keyboard"));
+        let rows = filtered_slash_rows(Some("authenticate"));
         assert!(!rows.is_empty());
-        assert_eq!(rows[0].0, "/keys");
+        assert_eq!(rows[0].0, "/login");
     }
 
     // ── Bug fix: picker cycling wraps around ──────────────────────────────
@@ -1621,20 +1529,6 @@ mod tests {
         );
     }
 
-    // ── /keys command registered ──────────────────────────────────────────
-
-    #[test]
-    fn keys_command_is_registered() {
-        assert!(SLASH_COMMANDS.iter().any(|(cmd, _)| *cmd == "/keys"));
-    }
-
-    #[test]
-    fn keys_resolves_from_prefix() {
-        let result = resolve_slash_command("/key");
-        assert!(result.is_ok(), "got: {result:?}");
-        assert_eq!(result.unwrap(), "/keys");
-    }
-
     #[test]
     fn accepted_slash_edit_right_arrow_inserts_missing_suffix() {
         assert_eq!(
@@ -1672,123 +1566,6 @@ mod tests {
         assert_eq!(
             accepted_slash_edit("/skill d", Some("/skill dev"), false),
             Some(AcceptedSlashEdit::InsertSuffix("ev".to_string()))
-        );
-    }
-
-    #[test]
-    fn slash_completion_query_keeps_skill_subcommands_active() {
-        assert_eq!(slash_completion_query("/skill "), Some("/skill "));
-        assert_eq!(slash_completion_query("/skill d"), Some("/skill d"));
-        assert_eq!(slash_completion_query("/skill dev"), Some("/skill dev"));
-        assert_eq!(slash_completion_query("/skill dev foo"), None);
-    }
-
-    #[test]
-    fn slash_completion_query_keeps_search_subcommands_active() {
-        assert_eq!(slash_completion_query("/search "), Some("/search "));
-        assert_eq!(slash_completion_query("/search r"), Some("/search r"));
-        assert_eq!(
-            slash_completion_query("/search review"),
-            Some("/search review")
-        );
-        assert_eq!(slash_completion_query("/search review timeout"), None);
-    }
-
-    #[test]
-    fn filtered_rows_for_skill_space_show_subcommands() {
-        let rows = filtered_slash_rows(Some("skill "));
-        assert!(!rows.is_empty());
-        assert!(rows.iter().any(|(cmd, _)| *cmd == "/skill list"));
-        assert!(rows.iter().any(|(cmd, _)| *cmd == "/skill dev"));
-        assert!(!rows.iter().any(|(cmd, _)| *cmd == "/skill"));
-    }
-
-    #[test]
-    fn filtered_rows_for_skill_d_rank_dev_before_doctor() {
-        let rows = filtered_slash_rows(Some("skill d"));
-        assert!(!rows.is_empty());
-        assert_eq!(rows[0].0, "/skill dev");
-        assert!(rows.iter().any(|(cmd, _)| *cmd == "/skill doctor"));
-        assert!(rows.iter().any(|(cmd, _)| *cmd == "/skill dev off"));
-    }
-
-    #[test]
-    fn filtered_rows_for_search_space_show_subcommands() {
-        let rows = filtered_slash_rows(Some("search "));
-        assert!(!rows.is_empty());
-        assert!(rows.iter().any(|(cmd, _)| *cmd == "/search files"));
-        assert!(rows.iter().any(|(cmd, _)| *cmd == "/search review"));
-        assert!(!rows.iter().any(|(cmd, _)| *cmd == "/search"));
-    }
-
-    #[test]
-    fn filtered_rows_for_search_r_rank_review_first() {
-        let rows = filtered_slash_rows(Some("search r"));
-        assert!(!rows.is_empty());
-        assert_eq!(rows[0].0, "/search review");
-    }
-
-    #[test]
-    fn completion_candidates_support_skill_subcommands_after_space() {
-        let candidates = completion_candidates("/skill ");
-        assert!(candidates.iter().any(|(cmd, _)| *cmd == "/skill list"));
-        assert!(candidates.iter().any(|(cmd, _)| *cmd == "/skill dev"));
-    }
-
-    #[test]
-    fn completion_candidates_support_search_subcommands_after_space() {
-        let candidates = completion_candidates("/search ");
-        assert!(candidates.iter().any(|(cmd, _)| *cmd == "/search files"));
-        assert!(candidates.iter().any(|(cmd, _)| *cmd == "/search review"));
-    }
-
-    #[test]
-    fn slash_inline_hint_completes_skill_subcommand_prefix() {
-        assert_eq!(slash_inline_hint("/skill d"), Some("ev".to_string()));
-    }
-
-    #[test]
-    fn slash_inline_hint_shows_skill_subcommand_parameter_hint() {
-        assert_eq!(
-            slash_inline_hint("/skill dev"),
-            Some(" <name|off>".to_string())
-        );
-        assert_eq!(
-            slash_inline_hint("/skill dev "),
-            Some("<name|off>".to_string())
-        );
-    }
-
-    #[test]
-    fn slash_inline_hint_shows_skill_root_choices() {
-        assert_eq!(
-            slash_inline_hint("/skill "),
-            Some("[list|new|test|dev|doctor|validate|config|system]".to_string())
-        );
-    }
-
-    #[test]
-    fn slash_inline_hint_shows_search_modes() {
-        assert_eq!(
-            slash_inline_hint("/search"),
-            Some(" <pattern|files <glob>|review <pattern>>".to_string())
-        );
-    }
-
-    #[test]
-    fn slash_inline_hint_completes_search_subcommand_prefix() {
-        assert_eq!(slash_inline_hint("/search r"), Some("eview".to_string()));
-    }
-
-    #[test]
-    fn slash_inline_hint_shows_search_subcommand_parameter_hint() {
-        assert_eq!(
-            slash_inline_hint("/search review"),
-            Some(" <pattern>".to_string())
-        );
-        assert_eq!(
-            slash_inline_hint("/search files"),
-            Some(" <glob>".to_string())
         );
     }
 
@@ -1849,14 +1626,14 @@ mod tests {
     #[test]
     fn slash_ctrl_e_reopens_picker_in_slash_context() {
         assert_eq!(
-            slash_ctrl_e_filter("/skill d", false, true),
-            Some(Some("skill d".to_string()))
+            slash_ctrl_e_filter("/plan l", false, true),
+            Some(Some("plan l".to_string()))
         );
     }
 
     #[test]
     fn slash_ctrl_e_ignores_inactive_completion_contexts() {
-        assert_eq!(slash_ctrl_e_filter("/skill dev foo", false, true), None);
+        assert_eq!(slash_ctrl_e_filter("/plan list foo", false, true), None);
         assert_eq!(slash_ctrl_e_filter("/exp", true, true), None);
     }
 
@@ -1964,11 +1741,8 @@ mod tests {
     #[test]
     fn is_subcommand_recognizes_space_commands() {
         assert!(is_subcommand("/skill list"));
-        assert!(is_subcommand("/search files"));
-        assert!(is_subcommand("/session history"));
-        assert!(is_subcommand("/skill dev off"));
+        assert!(is_subcommand("/plan list"));
         assert!(!is_subcommand("/skill"));
-        assert!(!is_subcommand("/search"));
         assert!(!is_subcommand("/model"));
     }
 
@@ -1981,8 +1755,6 @@ mod tests {
         );
         // Parent commands still present
         assert!(rows.iter().any(|(cmd, _)| *cmd == "/skill"));
-        assert!(rows.iter().any(|(cmd, _)| *cmd == "/search"));
-        assert!(rows.iter().any(|(cmd, _)| *cmd == "/session"));
     }
 
     #[test]
@@ -1993,27 +1765,17 @@ mod tests {
             "single-char prefix should not show sub-commands"
         );
         assert!(rows.iter().any(|(cmd, _)| *cmd == "/session"));
-        assert!(rows.iter().any(|(cmd, _)| *cmd == "/search"));
         assert!(rows.iter().any(|(cmd, _)| *cmd == "/skill"));
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/stats"));
     }
 
     #[test]
     fn filtered_rows_space_prefix_shows_subcommands() {
-        // Typing "/skill " should reveal skill sub-commands
-        let rows = filtered_slash_rows(Some("skill "));
+        // Typing "/plan " should reveal plan sub-commands
+        let rows = filtered_slash_rows(Some("plan "));
         assert!(!rows.is_empty());
-        assert!(rows.iter().any(|(cmd, _)| *cmd == "/skill list"));
-        assert!(rows.iter().any(|(cmd, _)| *cmd == "/skill dev"));
-        // Parent command itself should not appear (prefix "skill " doesn't match "/skill")
-        assert!(!rows.iter().any(|(cmd, _)| *cmd == "/skill"));
-    }
-
-    #[test]
-    fn filtered_rows_search_space_shows_subcommands() {
-        let rows = filtered_slash_rows(Some("search "));
-        assert!(!rows.is_empty());
-        assert!(rows.iter().any(|(cmd, _)| *cmd == "/search files"));
-        assert!(rows.iter().any(|(cmd, _)| *cmd == "/search review"));
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/plan list"));
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/plan history"));
     }
 
     // ── Pending-execute lifecycle ────────────────────────────────────────
@@ -2052,13 +1814,12 @@ mod tests {
         // group structure indirectly by checking all listed commands exist
         // in SLASH_COMMANDS.
         let groups: &[&[&str]] = &[
-            &["/help", "/model", "/clear", "/exit", "/keys"],
-            &["/search", "/history", "/copy", "/context", "/rewind"],
-            &["/explain", "/verbose", "/compact", "/reflect"],
-            &["/session", "/resume", "/stats", "/tools", "/health"],
-            &["/skill", "/memory", "/plan", "/task"],
+            &["/help", "/model", "/clear", "/history", "/copy", "/exit"],
+            &["/explain", "/turn", "/stats", "/tools", "/health"],
+            &["/session", "/resume", "/plan"],
+            &["/skill"],
             &["/doctor", "/version"],
-            &["/login", "/register", "/logout", "/memory-setup"],
+            &["/login", "/logout"],
         ];
         let known: std::collections::HashSet<&str> =
             SLASH_COMMANDS.iter().map(|(cmd, _)| *cmd).collect();

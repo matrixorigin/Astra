@@ -342,6 +342,12 @@ pub struct ToolCallRecord {
     /// Error message if the call failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Input size in bytes (arguments/parameters).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_bytes: Option<u32>,
+    /// Output size in bytes (result/response).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_bytes: Option<u32>,
 }
 
 /// A single journal event (one line in the JSONL file).
@@ -418,6 +424,12 @@ pub struct JournalEvent {
     /// Plan subtask ID — set when this turn was executed as part of plan mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_subtask_id: Option<String>,
+    /// Time to first token in milliseconds (streaming latency).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
+    /// Context assembly time in milliseconds (prompt building).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_ms: Option<u64>,
 }
 
 /// Event type discriminator.
@@ -623,6 +635,8 @@ impl JournalEvent {
             stall_type: None,
             metadata: None,
             plan_subtask_id: None,
+            ttft_ms: None,
+            context_ms: None,
         }
     }
 
@@ -742,6 +756,18 @@ impl JournalEvent {
     /// Tag this turn event as belonging to a plan mode subtask.
     pub fn with_plan_subtask(mut self, subtask_id: Option<&str>) -> Self {
         self.plan_subtask_id = subtask_id.map(|s| s.to_string());
+        self
+    }
+
+    /// Set time to first token (streaming latency).
+    pub fn with_ttft(mut self, ttft_ms: Option<u64>) -> Self {
+        self.ttft_ms = ttft_ms;
+        self
+    }
+
+    /// Set context assembly time (prompt building).
+    pub fn with_context_time(mut self, context_ms: Option<u64>) -> Self {
+        self.context_ms = context_ms;
         self
     }
 
@@ -1106,6 +1132,8 @@ mod tests {
             ok: true,
             ms: 761,
             error: None,
+            input_bytes: None,
+            output_bytes: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"ok\":true"));
@@ -1124,6 +1152,8 @@ mod tests {
             ok: false,
             ms: 587,
             error: Some("missing repo parameter".into()),
+            input_bytes: None,
+            output_bytes: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"ok\":false"));
@@ -1156,6 +1186,8 @@ mod tests {
             ok: true,
             ms: 761,
             error: None,
+            input_bytes: None,
+            output_bytes: None,
         }]);
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
@@ -1200,6 +1232,8 @@ mod tests {
                 } else {
                     None
                 },
+                input_bytes: None,
+                output_bytes: None,
             })
             .collect();
         let json = serde_json::to_string(&records).unwrap();
@@ -1216,6 +1250,8 @@ mod tests {
             ok: false,
             ms: 500,
             error: Some("连接超时: タイムアウト 🚫".into()),
+            input_bytes: None,
+            output_bytes: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
@@ -1229,6 +1265,8 @@ mod tests {
             ok: true,
             ms: u64::MAX,
             error: None,
+            input_bytes: None,
+            output_bytes: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();

@@ -668,6 +668,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         mo_agent_runtime::pipeline::step_protocol::StepCheckpoint,
     > = None;
     let mut tool_call_records: Vec<mo_agent_services::session_journal::ToolCallRecord> = Vec::new();
+    // Capture first turn's TTFT for observability
+    let mut first_ttft_ms: Option<u64> = None;
     // Cross-turn dedup: IdempotencyCache with content-hash keys (Step Protocol)
     let mut idempotency_cache = InMemoryIdempotencyCache::new();
     // Semantic near-duplicate tracker (Tier 2: param-aware, Tier 3: output similarity)
@@ -1062,6 +1064,11 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
 
         let turn_result = consume_turn_sse(resp, render_md, term_width, quiet).await;
 
+        // Capture TTFT from first turn for observability
+        if first_ttft_ms.is_none() {
+            first_ttft_ms = turn_result.ttft_ms;
+        }
+
         if let Some(sid) = &turn_result.session_id {
             current_session_id = Some(sid.clone());
         }
@@ -1294,6 +1301,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     ok: true,
                     ms: 0,
                     error: Some("duplicate_within_turn".to_string()),
+                    input_bytes: None,
+                    output_bytes: None,
                 });
                 continue;
             }
@@ -1330,6 +1339,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     ok: true,
                     ms: 0,
                     error: Some("cached_cross_turn".to_string()),
+                    input_bytes: None,
+                    output_bytes: Some(cached.output.len() as u32),
                 });
                 continue;
             }
@@ -1367,6 +1378,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     ok: false,
                     ms: 0,
                     error: Some(format!("unknown_tool: {name}")),
+                    input_bytes: None,
+                    output_bytes: None,
                 });
                 continue;
             }
@@ -1388,6 +1401,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     ok: false,
                     ms: 0,
                     error: Some("permission_denied".to_string()),
+                    input_bytes: None,
+                    output_bytes: None,
                 });
                 continue;
             }
@@ -1589,6 +1604,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             }
 
             // Record per-tool-call audit entry
+            let args_size = serde_json::to_string(&args).map(|s| s.len() as u32).unwrap_or(0);
+            let result_size = result_str.len() as u32;
             tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
                 name: name.clone(),
                 ok: !is_err,
@@ -1601,6 +1618,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 } else {
                     None
                 },
+                input_bytes: Some(args_size),
+                output_bytes: Some(result_size),
             });
             step_recorder.complete_tool_with_result(
                 &name,
@@ -1937,6 +1956,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         // Export tool health with merged historical entries to preserve unused tools
         tool_health_export: turn_guard.health.export_merged(tool_health_entries),
         last_heavy_checkpoint,
+        ttft_ms: first_ttft_ms,
+        context_ms: None, // TODO: track context assembly time
     })
 }
 
@@ -2804,6 +2825,8 @@ if let Err(e) = writeln!(file, "{line}") {
             ok: true,
             ms: 0,
             error: Some("duplicate_within_turn".to_string()),
+            input_bytes: None,
+            output_bytes: None,
         };
         assert!(dup.ok);
         assert_eq!(dup.ms, 0);
@@ -2814,6 +2837,8 @@ if let Err(e) = writeln!(file, "{line}") {
             ok: true,
             ms: 0,
             error: Some("cached_cross_turn".to_string()),
+            input_bytes: None,
+            output_bytes: Some(500),
         };
         assert!(cached.ok);
 
@@ -2823,6 +2848,8 @@ if let Err(e) = writeln!(file, "{line}") {
             ok: false,
             ms: 0,
             error: Some("unknown_tool: nonexistent_tool".to_string()),
+            input_bytes: None,
+            output_bytes: None,
         };
         assert!(!unknown.ok);
         assert!(unknown.error.as_ref().unwrap().starts_with("unknown_tool:"));
@@ -2833,6 +2860,8 @@ if let Err(e) = writeln!(file, "{line}") {
             ok: false,
             ms: 0,
             error: Some("permission_denied".to_string()),
+            input_bytes: None,
+            output_bytes: None,
         };
         assert!(!denied.ok);
 
@@ -2855,6 +2884,8 @@ if let Err(e) = writeln!(file, "{line}") {
             ok: true,
             ms: 42,
             error: None,
+            input_bytes: Some(100),
+            output_bytes: Some(5000),
         };
         let json = serde_json::to_string(&original).unwrap();
         let restored: ToolCallRecord = serde_json::from_str(&json).unwrap();

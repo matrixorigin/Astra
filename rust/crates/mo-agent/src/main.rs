@@ -307,6 +307,10 @@ struct StreamResult {
     tool_health_export: Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry>,
     /// Last heavy checkpoint built during the agentic loop (for cloud persistence).
     last_heavy_checkpoint: Option<mo_agent_runtime::pipeline::step_protocol::StepCheckpoint>,
+    /// Time to first token in milliseconds.
+    ttft_ms: Option<u64>,
+    /// Context assembly time in milliseconds.
+    context_ms: Option<u64>,
 }
 
 /// Structured audit record for a TurnGuard verdict.
@@ -2855,18 +2859,6 @@ mod tests {
         assert!(!from_prefix);
     }
 
-    #[test]
-    fn alias_completion_is_ranked_after_primary() {
-        let candidates = repl_ui::completion_candidates("/");
-        let commands: Vec<&str> = candidates.iter().map(|(cmd, _)| *cmd).collect();
-        let help_idx = commands.iter().position(|cmd| *cmd == "/help").unwrap();
-        let alias_idx = commands.iter().position(|cmd| *cmd == "/?").unwrap();
-        assert!(
-            help_idx < alias_idx,
-            "primary commands should rank before aliases"
-        );
-    }
-
     #[tokio::test]
     async fn slash_explain_toggles_state() {
         let client = reqwest::Client::new();
@@ -3318,31 +3310,6 @@ mod tests {
         assert_eq!(state.session_id.as_deref(), Some("new-sess-42"));
         assert_eq!(state.turn, 0);
         assert!(state.history.is_empty());
-    }
-
-    #[tokio::test]
-    async fn slash_verbose_sets_flag() {
-        let client = mock_client();
-        let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-            edge_tools::all_tool_schemas(),
-        ));
-        let mut state = ReplState {
-            verbose_mode: false,
-            ..Default::default()
-        };
-        let exit = handle_slash_command(
-            "/verbose",
-            &client,
-            "http://unused",
-            None,
-            &mut state,
-            None,
-            &selector,
-        )
-        .await
-        .unwrap();
-        assert!(!exit);
-        assert!(state.verbose_mode);
     }
 
     #[tokio::test]
@@ -4372,18 +4339,24 @@ total_tokens_out: 500
                 ms: 1000,
                 ok: true,
                 error: None,
+                input_bytes: Some(50),
+                output_bytes: Some(200),
             },
             session_journal::ToolCallRecord {
                 name: "bash".into(),
                 ms: 2000,
                 ok: false,
                 error: Some("exit code 1".into()),
+                input_bytes: Some(30),
+                output_bytes: Some(100),
             },
             session_journal::ToolCallRecord {
                 name: "grep".into(),
                 ms: 50,
                 ok: true,
                 error: None,
+                input_bytes: Some(20),
+                output_bytes: Some(500),
             },
         ]);
         writer.append(&event).unwrap();

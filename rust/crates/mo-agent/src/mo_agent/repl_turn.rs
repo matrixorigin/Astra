@@ -337,7 +337,9 @@ fn apply_turn_success(
         )
         .with_tool_calls(result.tool_call_records.clone())
         .with_budget_pressure(result.budget_pressure)
-        .with_plan_subtask(state.current_plan_subtask_id.as_deref());
+        .with_plan_subtask(state.current_plan_subtask_id.as_deref())
+        .with_ttft(result.ttft_ms)
+        .with_context_time(result.context_ms);
         
         // Store for /turn command
         state.last_turn_event = Some(turn_event.clone());
