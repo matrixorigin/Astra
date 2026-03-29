@@ -50,6 +50,8 @@ mod cli_utils;
 mod command_router;
 #[path = "mo_agent/permission_manager.rs"]
 mod permission_manager;
+#[path = "mo_agent/plan_decompose.rs"]
+mod plan_decompose;
 #[path = "mo_agent/repl_runtime.rs"]
 mod repl_runtime;
 #[path = "mo_agent/repl_turn.rs"]
@@ -62,8 +64,6 @@ mod slash_account;
 mod slash_info;
 #[path = "mo_agent/slash_memory.rs"]
 mod slash_memory;
-#[path = "mo_agent/plan_decompose.rs"]
-mod plan_decompose;
 #[path = "mo_agent/slash_session.rs"]
 mod slash_session;
 #[path = "mo_agent/slash_skill.rs"]
@@ -1236,10 +1236,7 @@ async fn run_plan_execution(
                             pct,
                             remaining
                         );
-                        eprintln!(
-                            "{}  Say \"continue\" to resume execution.",
-                            "💡".cyan()
-                        );
+                        eprintln!("{}  Say \"continue\" to resume execution.", "💡".cyan());
                     }
                     state.last_turn_interrupted = false;
                     return Ok(());
@@ -1347,7 +1344,7 @@ async fn try_cloud_pull(
             return CloudPullResult {
                 tool_health: Vec::new(),
                 version: None,
-            }
+            };
         }
     };
     let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
@@ -1444,9 +1441,10 @@ async fn try_cloud_push_versioned(
     }
 
     if result.success {
-        if let Err(e) =
-            mo_agent_runtime::pipeline::persistence::save_synced_tool_health(profile_name, tool_health)
-        {
+        if let Err(e) = mo_agent_runtime::pipeline::persistence::save_synced_tool_health(
+            profile_name,
+            tool_health,
+        ) {
             eprintln!(
                 "{}",
                 format!("  ⚠ Tool-health sync metadata not saved: {e}").dim()
@@ -2253,7 +2251,8 @@ async fn run_chat_repl(
                         )
                         .await?;
                     }
-                } else if state.executing_plan.is_some() && plan_decompose::is_resume_command(&line) {
+                } else if state.executing_plan.is_some() && plan_decompose::is_resume_command(&line)
+                {
                     // Resume paused plan execution
                     eprintln!();
                     eprintln!("{}  Resuming plan execution...", "▶".cyan());
@@ -2405,11 +2404,10 @@ async fn run_chat_repl(
                 expected_version = pull_result.version;
                 // Merge tool health from cloud pull
                 if !pull_result.tool_health.is_empty() {
-                    let (merged, _, _) =
-                        mo_agent_runtime::pipeline::persistence::merge_tool_health(
-                            &state.tool_health_entries,
-                            &pull_result.tool_health,
-                        );
+                    let (merged, _, _) = mo_agent_runtime::pipeline::persistence::merge_tool_health(
+                        &state.tool_health_entries,
+                        &pull_result.tool_health,
+                    );
                     // Update tool health in memory (though session is ending)
                     state.tool_health_entries = merged;
                 }
@@ -4351,9 +4349,12 @@ total_tokens_out: 500
             mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator::new(0.15),
         ));
         let mut synced = Vec::new();
-        eg.lock()
-            .unwrap()
-            .learn("rust", mo_agent_runtime::pipeline::routing::DomainHint::Code, &[], None);
+        eg.lock().unwrap().learn(
+            "rust",
+            mo_agent_runtime::pipeline::routing::DomainHint::Code,
+            &[],
+            None,
+        );
         let _result = try_cloud_push_delta("default", &eg, &pl, &cal, &[], &mut synced, None).await;
     }
 
