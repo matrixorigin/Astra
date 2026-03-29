@@ -699,12 +699,19 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             &format!("chat-{}", start.elapsed().as_millis()),
         );
 
+    // Track first turn's context assembly time for observability
+    let mut first_context_assembly_ms: Option<u64> = None;
+
     for _turn in 0..max_turns {
         if remaining_turns == 0 {
             return Err("Turn budget exhausted due to repeated stalls. Aborting.".to_string());
         }
         remaining_turns = remaining_turns.saturating_sub(1);
         step_recorder.begin_turn(_turn as u32);
+        
+        // Track context assembly time
+        let assembly_start = Instant::now();
+        
         // Build request payload
         let git_branch = std::process::Command::new("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -1029,6 +1036,11 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 .map(|r| r.budget_used as u64)
                 .unwrap_or(0);
             step_recorder.record_plan(&selected_tool_names, selection_confidence, bp, bt);
+        }
+
+        // Capture context assembly time (first turn only)
+        if first_context_assembly_ms.is_none() {
+            first_context_assembly_ms = Some(assembly_start.elapsed().as_millis() as u64);
         }
 
         // HTTP call with retry on 429 (rate limit) — exponential backoff up to 3 attempts.
@@ -1957,7 +1969,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         tool_health_export: turn_guard.health.export_merged(tool_health_entries),
         last_heavy_checkpoint,
         ttft_ms: first_ttft_ms,
-        context_ms: None, // TODO: track context assembly time
+        context_ms: first_context_assembly_ms,
     })
 }
 
