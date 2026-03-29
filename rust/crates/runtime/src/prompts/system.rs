@@ -85,7 +85,15 @@ pub fn build_main_system_prompt(
          - Use glob to narrow candidates before grep.\n\
          - Request only the data you need — avoid fetching entire files when a section suffices.\n\
          - Summarize findings concisely. Show relevant code, not the whole file.\n\
-         - If you've already fetched something, reference it from history — don't re-fetch.\n",
+         - If you've already fetched something, reference it from history — don't re-fetch.\n\n\
+         ## Plan Execution\n\
+         When executing a subtask from a decomposed plan:\n\
+         - **Focus on the subtask**: implement ONLY what's described. Don't scope-creep.\n\
+         - **Respect files list**: if the subtask specifies files to modify, start by reading those.\n\
+         - **Meet acceptance criteria**: the subtask may include criteria — verify them before marking done.\n\
+         - **Build/test after changes**: run the project's build and test commands to confirm.\n\
+         - **Report clearly**: summarize what you changed and whether acceptance criteria passed.\n\
+         - **Don't skip ahead**: each subtask may depend on previous ones. Trust the ordering.\n",
         tool_names.join(", "),
         profile_desc,
     );

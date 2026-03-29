@@ -221,13 +221,13 @@ mod tests {
             1.0,
             None,
         );
-        // Full prompt with all sections should be under ~1950 tokens (~7800 chars)
+        // Full prompt with all sections should be under ~2100 tokens (~8400 chars)
         // Enhanced prompt adds: Planning Protocol, Context Strategy, Coding Discipline,
-        // Parallel Tool Calls, Token Efficiency, Code Navigation, Build/Test, Git Workflow.
-        // These extra ~350 tokens pay for themselves in fewer wasted turns and better tool usage.
+        // Parallel Tool Calls, Token Efficiency, Plan Execution, Code Navigation, Build/Test,
+        // Git Workflow. These extra ~400 tokens pay for themselves in fewer wasted turns.
         assert!(
-            p.len() < 7800,
-            "compressed prompt should be under 7800 chars, got {}",
+            p.len() < 8400,
+            "compressed prompt should be under 8400 chars, got {}",
             p.len()
         );
     }
@@ -928,6 +928,24 @@ mod tests {
             p.len() < 11000,
             "full toolset prompt should be under 11000 chars, got {}",
             p.len()
+        );
+    }
+
+    #[test]
+    fn prompt_includes_plan_execution_guidance() {
+        // Plan Execution section is always included (not tool-conditional)
+        let p = build_main_system_prompt(&["read_file", "bash"], "", 1.0, None);
+        assert!(
+            p.contains("## Plan Execution"),
+            "should include plan execution section"
+        );
+        assert!(
+            p.contains("acceptance criteria"),
+            "should mention acceptance criteria"
+        );
+        assert!(
+            p.contains("Don't skip ahead"),
+            "should warn about ordering"
         );
     }
 }
