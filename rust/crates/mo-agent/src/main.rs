@@ -2470,19 +2470,64 @@ async fn run_chat_repl(
                             );
                         }
                     }
-
-                    handle_chat_input(
-                        line,
-                        current_token.as_deref(),
-                        &mut state,
-                        ReplTurnContext {
-                            client,
-                            base,
-                            profile,
-                            selector: &*selector,
-                        },
-                    )
-                    .await?;
+                    
+                    // Auto plan detection: suggest plan mode for complex tasks
+                    let mut should_proceed_normal = true;
+                    let line_for_plan = line.clone();  // Clone early to avoid borrow issues
+                    if let Some(reason) = plan_decompose::should_suggest_plan_mode(&line) {
+                        eprintln!();
+                        eprintln!("{}  {}", "📋".yellow(), reason);
+                        eprintln!("{}  This task might benefit from planning. Enter plan mode? (y/n)", "💡".cyan());
+                        
+                        // Read user response
+                        let mut response = String::new();
+                        if std::io::stdin().read_line(&mut response).is_ok() {
+                            let resp = response.trim().to_lowercase();
+                            if resp == "y" || resp == "yes" || resp == "是" {
+                                // Enter plan mode with the goal
+                                let project_root = std::env::current_dir()
+                                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                                let context = plan_decompose::analyze_project(&project_root);
+                                let goal_display = line_for_plan.clone();
+                                let plan_state = plan_decompose::PlanModeState::new(line_for_plan.clone(), context);
+                                
+                                eprintln!();
+                                eprintln!("{}  Entering plan mode for: {}", "📋".green(), goal_display.cyan());
+                                eprintln!("{}  Generating plan...", "⋯".dim());
+                                
+                                // Trigger plan generation (set goal, plan will be generated in plan mode)
+                                state.plan_mode = Some(plan_state);
+                                should_proceed_normal = false;
+                                
+                                // Call handle_plan_mode_input to generate the plan
+                                handle_plan_mode_input(
+                                    line_for_plan,
+                                    current_token.as_deref(),
+                                    &mut state,
+                                    client,
+                                    base,
+                                )
+                                .await?;
+                            } else {
+                                eprintln!("{}  Proceeding with normal chat...", "→".dim());
+                            }
+                        }
+                    }
+                    
+                    if should_proceed_normal {
+                        handle_chat_input(
+                            line,
+                            current_token.as_deref(),
+                            &mut state,
+                            ReplTurnContext {
+                                client,
+                                base,
+                                profile,
+                                selector: &*selector,
+                            },
+                        )
+                        .await?;
+                    }
 
                     // Periodic learning sync: push to cloud at checkpoint boundaries
                     // to prevent data loss on crash (every CHECKPOINT_INTERVAL turns)

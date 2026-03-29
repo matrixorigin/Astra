@@ -801,7 +801,113 @@ Keep responses concise. The plan JSON must be valid if provided."#,
             "execute" | "go" | "start" | "done" | "run" | "开始" | "执行" | "运行"
         )
     }
+}
 
+// ─── Auto Plan Detection ─────────────────────────────────────────────────────
+
+/// Heuristics to detect if user input likely needs a plan.
+/// Returns Some(reason) if plan mode should be suggested.
+pub fn should_suggest_plan_mode(input: &str) -> Option<&'static str> {
+    let lower = input.to_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    
+    // Skip if input is very short (likely a question or simple command)
+    // For Chinese text, count characters instead of words
+    let is_short = if input.chars().any(|c| c >= '\u{4e00}' && c <= '\u{9fff}') {
+        // Chinese: count non-whitespace characters
+        input.chars().filter(|c| !c.is_whitespace()).count() < 6
+    } else {
+        // English: count words
+        words.len() < 4
+    };
+    
+    if is_short {
+        return None;
+    }
+    
+    // Multi-step indicators
+    let has_multi_step = lower.contains(" and ") 
+        || lower.contains(" then ")
+        || lower.contains("，然后")
+        || lower.contains("然后")
+        || lower.contains("并且")
+        || lower.contains("同时");
+    
+    // Large scope indicators
+    let has_large_scope = lower.contains("refactor")
+        || lower.contains("重构")
+        || lower.contains("migrate")
+        || lower.contains("迁移")
+        || lower.contains("implement")
+        || lower.contains("实现")
+        || lower.contains("build")
+        || lower.contains("构建")
+        || lower.contains("create")
+        || lower.contains("创建");
+    
+    // Feature-level work
+    let has_feature_keywords = lower.contains("feature")
+        || lower.contains("功能")
+        || lower.contains("module")
+        || lower.contains("模块")
+        || lower.contains("system")
+        || lower.contains("系统")
+        || lower.contains("service")  // singular
+        || lower.contains("services") // plural
+        || lower.contains("服务");
+    
+    // Test + implementation pattern
+    let mentions_tests = lower.contains("test") || lower.contains("测试");
+    let mentions_impl = lower.contains("implement") 
+        || lower.contains("add") 
+        || lower.contains("create")
+        || lower.contains("添加");
+    
+    // Complexity indicators
+    let mentions_multiple = lower.contains("multiple")
+        || lower.contains("several")
+        || lower.contains("all ")  // "all files", "all services"
+        || lower.contains("多个")
+        || lower.contains("一些")
+        || lower.contains("files")
+        || lower.contains("文件");
+    
+    // Decision logic
+    if has_multi_step && (has_large_scope || has_feature_keywords) {
+        return Some("Multi-step task with significant scope detected");
+    }
+    
+    if has_multi_step && mentions_tests {
+        return Some("Multi-step task with testing detected");
+    }
+    
+    if mentions_tests && mentions_impl {
+        return Some("Implementation + testing workflow detected");
+    }
+    
+    if has_large_scope && mentions_multiple {
+        return Some("Large-scale change affecting multiple files");
+    }
+    
+    if has_large_scope && has_feature_keywords {
+        return Some("Feature-level change detected");
+    }
+    
+    // Long input with action verbs often indicates complex task
+    let is_long = if input.chars().any(|c| c >= '\u{4e00}' && c <= '\u{9fff}') {
+        input.chars().filter(|c| !c.is_whitespace()).count() >= 20
+    } else {
+        words.len() >= 15
+    };
+    
+    if is_long && (has_large_scope || has_feature_keywords) {
+        return Some("Complex task description detected");
+    }
+    
+    None
+}
+
+impl PlanModeState {
     /// Memory protocol content for storing the active plan
     pub fn to_memory_content(&self) -> String {
         format!(
@@ -4373,5 +4479,42 @@ Done!"#;
         // 100%
         let bar100 = progress_bar(100, 10);
         assert_eq!(bar100, "[██████████]");
+    }
+    
+    #[test]
+    fn should_suggest_plan_mode_multi_step() {
+        // Multi-step with large scope
+        assert!(should_suggest_plan_mode("implement authentication and then add tests").is_some());
+        assert!(should_suggest_plan_mode("refactor the module and then migrate the database").is_some());
+        assert!(should_suggest_plan_mode("重构代码，然后添加测试").is_some());
+    }
+    
+    #[test]
+    fn should_suggest_plan_mode_impl_and_test() {
+        // Implementation + testing pattern
+        assert!(should_suggest_plan_mode("implement the API endpoint and write tests for it").is_some());
+        assert!(should_suggest_plan_mode("add user authentication with comprehensive tests").is_some());
+    }
+    
+    #[test]
+    fn should_suggest_plan_mode_large_scope() {
+        // Large scope with multiple files
+        assert!(should_suggest_plan_mode("refactor multiple files in the auth module").is_some());
+        assert!(should_suggest_plan_mode("migrate all services to the new database schema").is_some());
+    }
+    
+    #[test]
+    fn should_suggest_plan_mode_short_input_skipped() {
+        // Short inputs should not trigger plan mode
+        assert!(should_suggest_plan_mode("fix bug").is_none());
+        assert!(should_suggest_plan_mode("add test").is_none());
+        assert!(should_suggest_plan_mode("what is this").is_none());
+    }
+    
+    #[test]
+    fn should_suggest_plan_mode_simple_questions_skipped() {
+        // Simple questions should not trigger
+        assert!(should_suggest_plan_mode("how does this work").is_none());
+        assert!(should_suggest_plan_mode("explain the code").is_none());
     }
 }
