@@ -201,6 +201,7 @@ mod tests {
             was_corrected: false,
             task_type_label: Some("code".to_string()),
             domain_hint_label: Some("github".to_string()),
+            user_feedback_score: None,
         };
         let _ = writer.record_outcome(outcome).await;
     }
@@ -219,6 +220,7 @@ mod tests {
                 was_corrected: false,
                 task_type_label: Some("code".to_string()),
                 domain_hint_label: None,
+                user_feedback_score: None,
             };
             let _ = writer.record_outcome(outcome).await;
         }

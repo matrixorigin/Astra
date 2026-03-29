@@ -113,6 +113,7 @@ pub trait ToolSelector: Send + Sync {
         _success: bool,
         _quality: f64,
         _was_corrected: bool,
+        _user_feedback_score: Option<i64>,
     ) {
     }
 }
@@ -244,6 +245,7 @@ impl TfIdfSelector {
         success: bool,
         quality: f64,
         was_corrected: bool,
+        user_feedback_score: Option<i64>,
     ) {
         // Learn entity → domain → tools associations
         if success
@@ -253,7 +255,7 @@ impl TfIdfSelector {
             let entities = extract_entities(query);
             if let Some(d) = domain {
                 for entity in &entities {
-                    graph.learn(entity, d, tools_used);
+                    graph.learn(entity, d, tools_used, user_feedback_score);
                 }
             }
         }
@@ -262,7 +264,7 @@ impl TfIdfSelector {
         if let Some(pl) = &self.pattern_library
             && let Ok(mut lib) = pl.lock()
         {
-            lib.record_outcome(tools_used, task_type, domain, success, quality);
+            lib.record_outcome(tools_used, task_type, domain, success, quality, user_feedback_score);
         }
 
         // Record calibration data
@@ -270,7 +272,7 @@ impl TfIdfSelector {
             && let Ok(mut cal) = pc.lock()
         {
             let intent = format!("{task_type:?}").to_lowercase();
-            cal.record(&intent, domain, task_type, was_corrected);
+            cal.record(&intent, domain, task_type, was_corrected, user_feedback_score);
         }
     }
 }
@@ -400,6 +402,7 @@ impl ToolSelector for TfIdfSelector {
         success: bool,
         quality: f64,
         was_corrected: bool,
+        user_feedback_score: Option<i64>,
     ) {
         self.record_turn_outcome(
             query,
@@ -409,6 +412,7 @@ impl ToolSelector for TfIdfSelector {
             success,
             quality,
             was_corrected,
+            user_feedback_score,
         );
     }
 }
@@ -670,6 +674,7 @@ impl ToolSelector for FallbackSelector {
         success: bool,
         quality: f64,
         was_corrected: bool,
+        user_feedback_score: Option<i64>,
     ) {
         // Forward to fallback (TfIdfSelector) — it has the pipeline modules.
         self.fallback.record_outcome(
@@ -680,6 +685,7 @@ impl ToolSelector for FallbackSelector {
             success,
             quality,
             was_corrected,
+            user_feedback_score,
         );
     }
 }
@@ -1603,11 +1609,13 @@ mod tests {
                 "matrixorigin",
                 DomainHint::GitHub,
                 &["github_list_prs".into(), "github_search_repos".into()],
+                None,
             );
             g.learn(
                 "matrixorigin",
                 DomainHint::GitHub,
                 &["github_list_prs".into()],
+                None,
             );
         }
 
@@ -1654,7 +1662,7 @@ mod tests {
                     TaskType::Fetch,
                     Some(DomainHint::GitHub),
                     true,
-                    0.9,
+                    0.9, None,
                 );
             }
         }
@@ -1704,6 +1712,7 @@ mod tests {
             true,  // success
             0.85,  // quality
             false, // not corrected
+            None,
         );
         selector.record_turn_outcome(
             "check matrixorigin issues",
@@ -1713,6 +1722,7 @@ mod tests {
             true,
             0.9,
             false,
+            None,
         );
 
         // Verify EntityGraph learned the association
@@ -1744,6 +1754,7 @@ mod tests {
             true,
             0.7,
             true, // was corrected
+            None,
         );
     }
 
@@ -1803,7 +1814,7 @@ mod tests {
                 Some(DomainHint::GitHub),
                 true,
                 0.9,
-                false,
+                false, None,
             );
         }
 
@@ -1831,8 +1842,9 @@ mod tests {
                 "rust",
                 DomainHint::Code,
                 &["file_read".into(), "bash".into()],
+                None,
             );
-            g.learn("rust", DomainHint::Code, &["file_read".into()]);
+            g.learn("rust", DomainHint::Code, &["file_read".into()], None);
         }
 
         // Pre-populate pattern library
@@ -1844,7 +1856,7 @@ mod tests {
                     TaskType::Code,
                     Some(DomainHint::Code),
                     true,
-                    0.85,
+                    0.85, None,
                 );
             }
         }
@@ -1891,7 +1903,7 @@ mod tests {
             Some(DomainHint::GitHub),
             false, // FAILED
             0.2,
-            false,
+            false, None,
         );
 
         // Entity graph should NOT learn from failures
@@ -1950,7 +1962,7 @@ mod tests {
             Some(DomainHint::GitHub),
             true,
             0.8,
-            false,
+            false, None,
         );
 
         // After: entity graph learned the association
@@ -1980,7 +1992,7 @@ mod tests {
             Some(DomainHint::GitHub),
             true,
             0.7,
-            false,
+            false, None,
         );
 
         // Verify it forwarded to fallback's TfIdfSelector
@@ -2004,7 +2016,7 @@ mod tests {
             None,
             true,
             0.5,
-            false,
+            false, None,
         );
     }
 

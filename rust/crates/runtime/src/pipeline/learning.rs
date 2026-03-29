@@ -91,8 +91,10 @@ impl TurnLearningWriter for PipelineLearningWriter {
     async fn record_outcome(&self, outcome: TurnLearningOutcome) -> Result<(), String> {
         let task_type = parse_task_type(outcome.task_type_label.as_deref());
         let domain = parse_domain_hint(outcome.domain_hint_label.as_deref());
+        let feedback = outcome.user_feedback_score;
 
         // 1. Entity graph: learn entity → domain → tools (only on success)
+        // Pass feedback to modulate confidence growth
         if outcome.success
             && let Some(eg) = &self.entity_graph
         {
@@ -100,12 +102,13 @@ impl TurnLearningWriter for PipelineLearningWriter {
             let entities = extract_entities(&outcome.query);
             if let Some(d) = domain {
                 for entity in &entities {
-                    graph.learn(entity, d, &outcome.tools_used);
+                    graph.learn(entity, d, &outcome.tools_used, feedback);
                 }
             }
         }
 
         // 2. Pattern library: record tool chain outcome (both success and failure)
+        // Pass feedback to adjust success/quality judgments
         if let Some(pl) = &self.pattern_library {
             let mut lib = pl.lock().unwrap_or_else(|e| e.into_inner());
             lib.record_outcome(
@@ -114,14 +117,16 @@ impl TurnLearningWriter for PipelineLearningWriter {
                 domain,
                 outcome.success,
                 outcome.quality,
+                feedback,
             );
         }
 
         // 3. Progressive calibrator: record correction data
+        // Pass feedback to convert low satisfaction into correction signal
         if let Some(pc) = &self.progressive_calibrator {
             let mut cal = pc.lock().unwrap_or_else(|e| e.into_inner());
             let intent = format!("{task_type:?}").to_lowercase();
-            cal.record(&intent, domain, task_type, outcome.was_corrected);
+            cal.record(&intent, domain, task_type, outcome.was_corrected, feedback);
         }
 
         Ok(())
@@ -169,6 +174,12 @@ pub fn build_learning_outcome_from_payload(
     // Correction detection: check if this payload indicates a correction turn
     let was_corrected = detect_correction(obj);
 
+    // User feedback score: extracted from payload if available (will be populated
+    // later when feedback is submitted via /api/v1/learning/feedback)
+    let user_feedback_score = obj
+        .get("user_feedback_score")
+        .and_then(|v| v.as_i64());
+
     Some(TurnLearningOutcome {
         query,
         tools_selected,
@@ -178,6 +189,7 @@ pub fn build_learning_outcome_from_payload(
         was_corrected,
         task_type_label,
         domain_hint_label,
+        user_feedback_score,
     })
 }
 
@@ -440,6 +452,7 @@ mod tests {
             was_corrected: false,
             task_type_label: Some("fetch".into()),
             domain_hint_label: Some("github".into()),
+            user_feedback_score: None,
         };
 
         writer.record_outcome(outcome).await.unwrap();
@@ -466,6 +479,7 @@ mod tests {
             was_corrected: false,
             task_type_label: Some("code".into()),
             domain_hint_label: Some("system".into()),
+            user_feedback_score: None,
         };
 
         writer.record_outcome(outcome).await.unwrap();
@@ -494,6 +508,7 @@ mod tests {
                 was_corrected: false,
                 task_type_label: Some("fetch".into()),
                 domain_hint_label: Some("github".into()),
+            user_feedback_score: None,
             };
             writer.record_outcome(outcome).await.unwrap();
         }
@@ -522,6 +537,7 @@ mod tests {
                 was_corrected: i % 3 == 0, // every 3rd turn is corrected
                 task_type_label: Some("code".into()),
                 domain_hint_label: Some("code".into()),
+            user_feedback_score: None,
             };
             writer.record_outcome(outcome).await.unwrap();
         }
@@ -557,6 +573,7 @@ mod tests {
             was_corrected: false,
             task_type_label: Some("fetch".into()),
             domain_hint_label: Some("github".into()),
+            user_feedback_score: None,
         };
 
         let result = writer.record_outcome(outcome).await;
@@ -579,6 +596,7 @@ mod tests {
             was_corrected: false,
             task_type_label: None,
             domain_hint_label: None,
+            user_feedback_score: None,
         };
         // Should not panic
         let result = writer.record_outcome(outcome).await;

@@ -75,7 +75,17 @@ impl EntityGraph {
     ///
     /// Called after the Evaluate stage confirms good progress.
     /// Strengthens the association between entity, domain, and tools.
-    pub fn learn(&mut self, entity: &str, domain: DomainHint, tools_used: &[String]) {
+    ///
+    /// If `user_feedback_score` is provided (0-100 scale), it modulates confidence growth:
+    /// - High feedback (≥50) allows normal confidence growth
+    /// - Low feedback (<50) dampens confidence growth (user unhappy despite success)
+    pub fn learn(
+        &mut self,
+        entity: &str,
+        domain: DomainHint,
+        tools_used: &[String],
+        user_feedback_score: Option<i64>,
+    ) {
         let key = entity.to_lowercase();
         let entry = self
             .entities
@@ -92,8 +102,22 @@ impl EntityGraph {
             }
         }
 
-        // Confidence grows with observations (asymptotic to 1.0)
-        entry.confidence = 1.0 - 1.0 / (1.0 + entry.observation_count as f64);
+        // Base confidence grows with observations (asymptotic to 1.0)
+        let base_confidence = 1.0 - 1.0 / (1.0 + entry.observation_count as f64);
+
+        // Apply feedback modulation:
+        // - No feedback: use base confidence
+        // - Low feedback (<50): dampen confidence growth by 30%
+        // - High feedback (≥50): allow full confidence
+        entry.confidence = match user_feedback_score {
+            Some(score) if score < 50 => {
+                // User unhappy → reduce confidence growth
+                let dampening = 0.7; // retain 70% of growth
+                let prev = entry.confidence;
+                prev + (base_confidence - prev) * dampening
+            }
+            _ => base_confidence,
+        };
     }
 
     /// Register an alias for an entity.
@@ -472,6 +496,7 @@ mod tests {
             "matrixorigin",
             DomainHint::GitHub,
             &["github_search".into()],
+            None,
         );
         assert_eq!(graph.len(), 1);
         assert_eq!(graph.domain_for("matrixorigin"), Some(DomainHint::GitHub));
@@ -489,13 +514,13 @@ mod tests {
     fn confidence_increases_with_observations() {
         let mut graph = EntityGraph::new();
 
-        graph.learn("mo", DomainHint::GitHub, &["gh_search".into()]);
+        graph.learn("mo", DomainHint::GitHub, &["gh_search".into()], None);
         let conf1 = graph.confidence_for("mo");
 
-        graph.learn("mo", DomainHint::GitHub, &["gh_list_prs".into()]);
+        graph.learn("mo", DomainHint::GitHub, &["gh_list_prs".into()], None);
         let conf2 = graph.confidence_for("mo");
 
-        graph.learn("mo", DomainHint::GitHub, &["gh_issues".into()]);
+        graph.learn("mo", DomainHint::GitHub, &["gh_issues".into()], None);
         let conf3 = graph.confidence_for("mo");
 
         assert!(
@@ -516,11 +541,12 @@ mod tests {
     #[test]
     fn tools_deduplicated() {
         let mut graph = EntityGraph::new();
-        graph.learn("mo", DomainHint::GitHub, &["gh_search".into()]);
+        graph.learn("mo", DomainHint::GitHub, &["gh_search".into()], None);
         graph.learn(
             "mo",
             DomainHint::GitHub,
             &["gh_search".into(), "gh_prs".into()],
+            None,
         );
 
         let entry = graph.get("mo").unwrap();
@@ -532,7 +558,7 @@ mod tests {
     #[test]
     fn alias_resolves_to_canonical() {
         let mut graph = EntityGraph::new();
-        graph.learn("matrixorigin", DomainHint::GitHub, &["gh_search".into()]);
+        graph.learn("matrixorigin", DomainHint::GitHub, &["gh_search".into()], None);
         graph.add_alias("mo", "matrixorigin");
 
         assert_eq!(graph.domain_for("mo"), Some(DomainHint::GitHub));
@@ -548,6 +574,7 @@ mod tests {
             "matrixorigin",
             DomainHint::GitHub,
             &["github_search_repos".into()],
+            None,
         );
 
         let terms = graph.boost_for("matrixorigin");
@@ -567,7 +594,7 @@ mod tests {
     #[test]
     fn merge_takes_higher_observation_count() {
         let mut graph = EntityGraph::new();
-        graph.learn("mo", DomainHint::GitHub, &["gh_search".into()]);
+        graph.learn("mo", DomainHint::GitHub, &["gh_search".into()], None);
 
         // External entry with higher observation count
         let external = EntityKnowledge {
@@ -590,7 +617,7 @@ mod tests {
         let mut graph = EntityGraph::new();
         // Local with 5 observations
         for _ in 0..5 {
-            graph.learn("mo", DomainHint::GitHub, &["gh_search".into()]);
+            graph.learn("mo", DomainHint::GitHub, &["gh_search".into()], None);
         }
 
         // External with only 2 observations
@@ -632,8 +659,8 @@ mod tests {
     #[test]
     fn export_all_entities() {
         let mut graph = EntityGraph::new();
-        graph.learn("mo", DomainHint::GitHub, &[]);
-        graph.learn("linux", DomainHint::System, &[]);
+        graph.learn("mo", DomainHint::GitHub, &[], None);
+        graph.learn("linux", DomainHint::System, &[], None);
 
         let exported = graph.export();
         assert_eq!(exported.len(), 2);
@@ -697,6 +724,7 @@ mod tests {
             "matrixorigin",
             DomainHint::GitHub,
             &["github_search".into()],
+            None,
         );
         let boost = graph.boost_for("matrixorigin");
 
@@ -722,6 +750,7 @@ mod tests {
             "matrixorigin",
             DomainHint::GitHub,
             &["github_search_repos".into(), "github_list_issues".into()],
+            None,
         );
 
         // Turn 2: known entity → domain hint available
@@ -732,5 +761,45 @@ mod tests {
 
         // Confidence should be meaningful
         assert!(graph.confidence_for("matrixorigin") > 0.3);
+    }
+
+    // ── User Feedback Integration ──
+
+    #[test]
+    fn low_feedback_dampens_confidence_growth() {
+        let mut graph = EntityGraph::new();
+
+        // First learn with high feedback
+        graph.learn("good_entity", DomainHint::GitHub, &["tool1".into()], Some(80));
+        let conf_high = graph.confidence_for("good_entity");
+
+        // Then learn with low feedback (same entity, another observation)
+        graph.learn("good_entity", DomainHint::GitHub, &["tool2".into()], Some(20));
+        let conf_low_after = graph.confidence_for("good_entity");
+
+        // Create another entity learned only with low feedback
+        graph.learn("bad_entity", DomainHint::Code, &["tool1".into()], Some(20));
+        graph.learn("bad_entity", DomainHint::Code, &["tool2".into()], Some(20));
+        let conf_bad = graph.confidence_for("bad_entity");
+
+        // Create entity learned only with high feedback (same observation count)
+        graph.learn("great_entity", DomainHint::Git, &["tool1".into()], Some(90));
+        graph.learn("great_entity", DomainHint::Git, &["tool2".into()], Some(90));
+        let conf_great = graph.confidence_for("great_entity");
+
+        assert!(conf_great > conf_bad,
+            "High feedback should yield higher confidence: {} > {}", conf_great, conf_bad);
+    }
+
+    #[test]
+    fn no_feedback_uses_normal_confidence() {
+        let mut graph = EntityGraph::new();
+
+        graph.learn("entity_a", DomainHint::GitHub, &["tool".into()], None);
+        graph.learn("entity_a", DomainHint::GitHub, &["tool".into()], None);
+
+        let conf = graph.confidence_for("entity_a");
+        // Normal asymptotic: 1.0 - 1.0/(1+2) ≈ 0.667
+        assert!((conf - 0.667).abs() < 0.1, "Should use normal confidence formula, got {}", conf);
     }
 }
