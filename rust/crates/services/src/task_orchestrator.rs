@@ -214,11 +214,16 @@ impl TaskOutcome {
 }
 
 /// Request to create a new task.
+#[derive(Default)]
 pub struct TaskCreateRequest {
     pub title: String,
     pub description: Option<String>,
     pub plan: Option<TaskPlan>,
     pub parent_task_id: Option<String>,
+    /// Project type for pattern learning (e.g., "rust", "python", "typescript")
+    pub project_type: Option<String>,
+    /// Goal pattern for matching similar tasks
+    pub goal_pattern: Option<String>,
 }
 
 // ─── Task Service Trait ─────────────────────────────────────────────────────
@@ -372,8 +377,8 @@ impl TaskService for MatrixOneTaskService {
         sqlx::query(
             "INSERT INTO agent_tasks \
              (task_id, user_id, session_id, parent_task_id, title, description, status, \
-              items_total, plan_json, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, NOW(), NOW())",
+              items_total, plan_json, project_type, goal_pattern, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, NOW(), NOW())",
         )
         .bind(&task_id)
         .bind(user_id)
@@ -383,6 +388,8 @@ impl TaskService for MatrixOneTaskService {
         .bind(&req.description)
         .bind(items_total)
         .bind(&plan_json)
+        .bind(&req.project_type)
+        .bind(&req.goal_pattern)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("create_task: {e}"))?;
@@ -649,14 +656,14 @@ impl TaskService for LocalTaskService {
             created_at: now.clone(),
             updated_at: now,
             completed_at: None,
-            // Learning fields default
+            // Learning fields
             user_rating: None,
             completion_time_sec: None,
             replan_count: 0,
             auto_adjustments: 0,
             outcome: None,
-            project_type: None,
-            goal_pattern: None,
+            project_type: req.project_type,
+            goal_pattern: req.goal_pattern,
         };
         self.save_task(&record)?;
         Ok(task_id)
@@ -1025,8 +1032,7 @@ mod tests {
                 TaskCreateRequest {
                     title: "Test Task".into(),
                     description: Some("A test".into()),
-                    plan: None,
-                    parent_task_id: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -1048,9 +1054,7 @@ mod tests {
                 "sess1",
                 TaskCreateRequest {
                     title: "Lifecycle Test".into(),
-                    description: None,
-                    plan: None,
-                    parent_task_id: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -1098,9 +1102,7 @@ mod tests {
             "s1",
             TaskCreateRequest {
                 title: "Active".into(),
-                description: None,
-                plan: None,
-                parent_task_id: None,
+                ..Default::default()
             },
         )
         .await
@@ -1112,9 +1114,7 @@ mod tests {
                 "s1",
                 TaskCreateRequest {
                     title: "Done".into(),
-                    description: None,
-                    plan: None,
-                    parent_task_id: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -1150,9 +1150,7 @@ mod tests {
                 "s1",
                 TaskCreateRequest {
                     title: "Will Fail".into(),
-                    description: None,
-                    plan: None,
-                    parent_task_id: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -1198,9 +1196,8 @@ mod tests {
                 "s1",
                 TaskCreateRequest {
                     title: "Plan Task".into(),
-                    description: None,
                     plan: Some(plan.clone()),
-                    parent_task_id: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -1269,7 +1266,7 @@ mod tests {
                         ],
                         notes: None,
                     }),
-                    parent_task_id: None,
+                    ..Default::default()
                 },
             )
             .await

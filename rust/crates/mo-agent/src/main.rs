@@ -1866,6 +1866,8 @@ async fn handle_task_command(arg: &str, state: &mut ReplState) {
                         description: None,
                         plan: None,
                         parent_task_id: None,
+                        project_type: None,
+                        goal_pattern: None,
                     },
                 )
                 .await
@@ -3486,9 +3488,7 @@ mod tests {
                 "s1",
                 mo_agent_services::TaskCreateRequest {
                     title: "Build auth".into(),
-                    description: None,
-                    plan: None,
-                    parent_task_id: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -3513,9 +3513,7 @@ mod tests {
             "s1",
             mo_agent_services::TaskCreateRequest {
                 title: "Refactor authentication module".into(),
-                description: None,
-                plan: None,
-                parent_task_id: None,
+                ..Default::default()
             },
         )
         .await
@@ -3548,9 +3546,7 @@ mod tests {
             "s1",
             mo_agent_services::TaskCreateRequest {
                 title: "Private task".into(),
-                description: None,
-                plan: None,
-                parent_task_id: None,
+                ..Default::default()
             },
         )
         .await

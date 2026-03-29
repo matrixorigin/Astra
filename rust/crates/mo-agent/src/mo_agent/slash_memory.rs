@@ -1029,6 +1029,12 @@ pub async fn handle_plan_mode_input(
             let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
             let session_id = state.session_id.as_deref().unwrap_or("no-session");
 
+            // Extract project_type from context
+            let project_type = plan_state.context.languages.first().map(|s| s.to_lowercase());
+
+            // Extract goal_pattern: normalize the goal for pattern matching
+            let goal_pattern = Some(extract_goal_pattern(&goal));
+
             match svc
                 .create_task(
                     user_id,
@@ -1038,6 +1044,8 @@ pub async fn handle_plan_mode_input(
                         description: Some(format!("Plan Mode: {} subtasks", plan.subtasks.len())),
                         plan: Some(plan.clone()),
                         parent_task_id: None,
+                        project_type,
+                        goal_pattern,
                     },
                 )
                 .await
@@ -1240,4 +1248,75 @@ pub async fn handle_plan_mode_input(
     }
 
     Ok(())
+}
+
+/// Extract a normalized goal pattern for matching similar tasks.
+///
+/// The pattern removes specific identifiers and normalizes common task patterns:
+/// - "add feature X to module Y" → "add feature * to module *"
+/// - "fix bug in file.rs" → "fix bug in *"
+/// - "implement API endpoint for users" → "implement api endpoint for *"
+fn extract_goal_pattern(goal: &str) -> String {
+    // Common task verbs to preserve
+    let task_verbs = [
+        "add", "fix", "implement", "create", "update", "refactor", "remove", "delete",
+        "optimize", "improve", "migrate", "integrate", "test", "document", "configure",
+    ];
+
+    // Normalize to lowercase and split
+    let goal_lower = goal.to_lowercase();
+    let words: Vec<&str> = goal_lower.split_whitespace().collect();
+    if words.is_empty() {
+        return "*".to_string();
+    }
+
+    let mut pattern_parts = Vec::new();
+    let mut i = 0;
+
+    while i < words.len() {
+        let word = words[i];
+
+        // Keep task verbs
+        if task_verbs.contains(&word) {
+            pattern_parts.push(word.to_string());
+        }
+        // Keep common structural words
+        else if ["for", "to", "in", "with", "from", "by", "the", "a", "an"].contains(&word) {
+            pattern_parts.push(word.to_string());
+        }
+        // Keep technology/domain keywords
+        else if [
+            "api", "endpoint", "database", "file", "module", "function", "class", "test",
+            "config", "error", "logging", "auth", "user", "data", "cache", "queue",
+        ].contains(&word) {
+            pattern_parts.push(word.to_string());
+        }
+        // Replace specific identifiers with wildcard
+        else if word.contains('.') || word.contains('/') || word.contains('_') {
+            pattern_parts.push("*".to_string());
+        }
+        // Keep short words, replace long specific words
+        else if word.len() <= 4 {
+            pattern_parts.push(word.to_string());
+        } else {
+            pattern_parts.push("*".to_string());
+        }
+
+        i += 1;
+    }
+
+    // Collapse consecutive wildcards
+    let mut result = Vec::new();
+    for part in pattern_parts {
+        if part == "*" && result.last() == Some(&"*".to_string()) {
+            continue;
+        }
+        result.push(part);
+    }
+
+    if result.is_empty() {
+        "*".to_string()
+    } else {
+        result.join(" ")
+    }
 }
