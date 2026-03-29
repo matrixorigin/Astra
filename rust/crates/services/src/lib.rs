@@ -13,6 +13,7 @@ pub mod jobs;
 pub mod learning;
 pub mod marketplace;
 pub mod models;
+pub mod protocol;
 pub mod reflect;
 pub mod replay;
 pub mod runs;
@@ -83,6 +84,13 @@ pub use marketplace::{
 pub use models::{
     DatabaseModelService, ModelCreateRequestData, ModelRecord, ModelService,
     ModelUpdateRequestData, PricingData, QuirksData, UnconfiguredModelService,
+};
+pub use protocol::{
+    ApplyDeltaRequest, ApplyDeltaResponse, ApplyOptions, Checkpoint, CheckpointOptions,
+    CheckpointTriggers, Conflict, ConflictResolution, DeltaBatch, DeltaEngine, DeltaError,
+    DeltaOp, DeltaOpType, DeltaRange, FallbackThresholds, GetChangesRequest, GetChangesResponse,
+    GetStateRequest, IncrementalSyncProtocol, StateRef, StateRefType, StateSnapshot, SyncMetrics,
+    SyncType, Tombstone, VersionVector, endpoints, grpc_methods, should_fallback_to_full_sync,
 };
 pub use reflect::{
     DatabaseReflectService, Diagnosis, ErrorClass, ReflectReport, ReflectService,

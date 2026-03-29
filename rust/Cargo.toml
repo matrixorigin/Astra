@@ -30,3 +30,4 @@ sqlx = { version = "0.8.6", default-features = false, features = ["mysql", "runt
 tokio = { version = "1.47.1", features = ["macros", "net", "rt-multi-thread", "signal"] }
 tower = { version = "0.5.2", features = ["util"] }
 uuid = { version = "1.18.1", features = ["v4", "v7"] }
+thiserror = "1.0"

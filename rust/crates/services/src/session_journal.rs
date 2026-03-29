@@ -9,6 +9,327 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Session state change tracking for edge-cloud sync.
+/// Records mutations as deltas instead of overwriting full state.
+pub mod state_delta {
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
+
+    /// Change operation type for session state mutations.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum StateChangeOp {
+        Create,
+        Update,
+        Delete,
+    }
+
+    /// A single state change entry for session mutations.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct StateChange {
+        /// Monotonic version number within the session.
+        pub version: u64,
+        /// Timestamp in milliseconds.
+        pub timestamp_ms: u64,
+        /// The state key being mutated.
+        pub key: String,
+        /// The operation type.
+        pub op: StateChangeOp,
+        /// The value (None for Delete).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub value: Option<serde_json::Value>,
+        /// Turn number when the change occurred.
+        pub turn: u32,
+    }
+
+    /// Accumulates session state changes for delta sync.
+    pub struct SessionStateAccumulator {
+        version_counter: u64,
+        entries: Vec<StateChange>,
+        current_state: HashMap<String, serde_json::Value>,
+    }
+
+    impl Default for SessionStateAccumulator {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl SessionStateAccumulator {
+        /// Create a new state accumulator starting at version 1.
+        pub fn new() -> Self {
+            Self {
+                version_counter: 1,
+                entries: Vec::new(),
+                current_state: HashMap::new(),
+            }
+        }
+
+        fn next_version(&mut self) -> u64 {
+            let v = self.version_counter;
+            self.version_counter += 1;
+            v
+        }
+
+        fn now_ms() -> u64 {
+            use std::time::SystemTime;
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        }
+
+        /// Record a state creation.
+        pub fn create(
+            &mut self,
+            key: impl Into<String>,
+            value: impl Serialize,
+            turn: u32,
+        ) -> Result<u64, String> {
+            let key = key.into();
+            if self.current_state.contains_key(&key) {
+                return Err(format!("Key '{}' already exists", key));
+            }
+
+            let version = self.next_version();
+            let json_value = serde_json::to_value(value).map_err(|e| e.to_string())?;
+
+            self.current_state.insert(key.clone(), json_value.clone());
+            self.entries.push(StateChange {
+                version,
+                timestamp_ms: Self::now_ms(),
+                key,
+                op: StateChangeOp::Create,
+                value: Some(json_value),
+                turn,
+            });
+
+            Ok(version)
+        }
+
+        /// Record a state update.
+        pub fn update(
+            &mut self,
+            key: impl Into<String>,
+            value: impl Serialize,
+            turn: u32,
+        ) -> Result<u64, String> {
+            let key = key.into();
+            if !self.current_state.contains_key(&key) {
+                return Err(format!("Key '{}' not found", key));
+            }
+
+            let version = self.next_version();
+            let json_value = serde_json::to_value(value).map_err(|e| e.to_string())?;
+
+            self.current_state.insert(key.clone(), json_value.clone());
+            self.entries.push(StateChange {
+                version,
+                timestamp_ms: Self::now_ms(),
+                key,
+                op: StateChangeOp::Update,
+                value: Some(json_value),
+                turn,
+            });
+
+            Ok(version)
+        }
+
+        /// Record a state deletion.
+        pub fn delete(&mut self, key: impl Into<String>, turn: u32) -> Result<u64, String> {
+            let key = key.into();
+            if !self.current_state.contains_key(&key) {
+                return Err(format!("Key '{}' not found", key));
+            }
+
+            let version = self.next_version();
+            self.current_state.remove(&key);
+            self.entries.push(StateChange {
+                version,
+                timestamp_ms: Self::now_ms(),
+                key,
+                op: StateChangeOp::Delete,
+                value: None,
+                turn,
+            });
+
+            Ok(version)
+        }
+
+        /// Get the current value for a key.
+        pub fn get(&self, key: &str) -> Option<&serde_json::Value> {
+            self.current_state.get(key)
+        }
+
+        /// Get all changes since a version (exclusive).
+        pub fn changes_since(&self, since_version: u64) -> Vec<&StateChange> {
+            self.entries
+                .iter()
+                .filter(|e| e.version > since_version)
+                .collect()
+        }
+
+        /// Get all changes.
+        pub fn all_changes(&self) -> &[StateChange] {
+            &self.entries
+        }
+
+        /// Get current state snapshot.
+        pub fn snapshot(&self) -> &HashMap<String, serde_json::Value> {
+            &self.current_state
+        }
+
+        /// Get the latest version number.
+        pub fn latest_version(&self) -> u64 {
+            self.version_counter.saturating_sub(1)
+        }
+
+        /// Get the number of change entries.
+        pub fn change_count(&self) -> usize {
+            self.entries.len()
+        }
+
+        /// Clear all change entries (after sync).
+        pub fn clear_changes(&mut self) {
+            self.entries.clear();
+        }
+
+        /// Compact by keeping only latest change per key.
+        pub fn compact(&mut self) {
+            let mut latest: HashMap<String, StateChange> = HashMap::new();
+
+            for entry in &self.entries {
+                if entry.op == StateChangeOp::Delete {
+                    latest.remove(&entry.key);
+                } else {
+                    latest.insert(entry.key.clone(), entry.clone());
+                }
+            }
+
+            let mut new_entries: Vec<StateChange> = latest.into_values().collect();
+            new_entries.sort_by_key(|e| e.version);
+            self.entries = new_entries;
+        }
+
+        /// Calculate memory overhead of changes vs full state.
+        pub fn overhead_percentage(&self) -> f64 {
+            let changes_bytes: usize = self
+                .entries
+                .iter()
+                .map(|e| {
+                    let base = e.key.len() + std::mem::size_of::<StateChange>();
+                    let val_bytes = e
+                        .value
+                        .as_ref()
+                        .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
+                        .unwrap_or(0);
+                    base + val_bytes
+                })
+                .sum();
+
+            let state_bytes: usize = self
+                .current_state
+                .iter()
+                .map(|(k, v)| k.len() + serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
+                .sum();
+
+            if state_bytes == 0 {
+                0.0
+            } else {
+                (changes_bytes as f64 / state_bytes as f64) * 100.0
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_create_and_get() {
+            let mut acc = SessionStateAccumulator::new();
+            let v = acc.create("key1", "value1", 1).unwrap();
+
+            assert_eq!(v, 1);
+            assert_eq!(acc.get("key1"), Some(&serde_json::json!("value1")));
+            assert_eq!(acc.change_count(), 1);
+        }
+
+        #[test]
+        fn test_update_existing() {
+            let mut acc = SessionStateAccumulator::new();
+            acc.create("key1", "value1", 1).unwrap();
+            let v = acc.update("key1", "value2", 2).unwrap();
+
+            assert_eq!(v, 2);
+            assert_eq!(acc.get("key1"), Some(&serde_json::json!("value2")));
+            assert_eq!(acc.change_count(), 2);
+        }
+
+        #[test]
+        fn test_delete_existing() {
+            let mut acc = SessionStateAccumulator::new();
+            acc.create("key1", "value1", 1).unwrap();
+            let v = acc.delete("key1", 2).unwrap();
+
+            assert_eq!(v, 2);
+            assert_eq!(acc.get("key1"), None);
+            assert_eq!(acc.change_count(), 2);
+        }
+
+        #[test]
+        fn test_changes_since_version() {
+            let mut acc = SessionStateAccumulator::new();
+            acc.create("a", 1, 1).unwrap();
+            acc.create("b", 2, 1).unwrap();
+            acc.update("a", 3, 2).unwrap();
+
+            let changes = acc.changes_since(1);
+            assert_eq!(changes.len(), 2); // b, a-update
+        }
+
+        #[test]
+        fn test_compact_reduces_entries() {
+            let mut acc = SessionStateAccumulator::new();
+            acc.create("key", "v1", 1).unwrap();
+            acc.update("key", "v2", 1).unwrap();
+            acc.update("key", "v3", 1).unwrap();
+
+            assert_eq!(acc.change_count(), 3);
+            acc.compact();
+            assert_eq!(acc.change_count(), 1);
+            assert_eq!(acc.get("key"), Some(&serde_json::json!("v3")));
+        }
+
+        #[test]
+        fn test_overhead_with_updates() {
+            let mut acc = SessionStateAccumulator::new();
+
+            // Create many entries
+            for i in 0..100 {
+                acc.create(format!("key{}", i), "x".repeat(100), 1).unwrap();
+            }
+
+            // Update many times
+            for _ in 0..5 {
+                for i in 0..50 {
+                    acc.update(format!("key{}", i), "y".repeat(100), 1).unwrap();
+                }
+            }
+
+            let overhead = acc.overhead_percentage();
+            // After many updates, overhead will be high until compaction
+            // This verifies the measurement works
+            assert!(overhead > 0.0, "Should have overhead after updates");
+            
+            // After compaction, overhead should be reduced
+            acc.compact();
+            let after = acc.overhead_percentage();
+            assert!(after < overhead, "Compaction should reduce overhead");
+        }
+    }
+}
+
 /// Per-tool-call audit record, embedded in turn events for granular tracking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallRecord {
@@ -1013,12 +1334,10 @@ mod tests {
         assert_eq!(meta["total_cache_hits"], 1);
         assert_eq!(meta["flaky_tools"], 1);
         // injection_preview should truncate to first injection
-        assert!(
-            meta["injection_preview"]
-                .as_str()
-                .unwrap()
-                .contains("CRITICAL")
-        );
+        assert!(meta["injection_preview"]
+            .as_str()
+            .unwrap()
+            .contains("CRITICAL"));
     }
 
     #[test]
@@ -1209,9 +1528,8 @@ mod tests {
 
     #[test]
     fn plan_progress_serialization_roundtrip() {
-        let evt = JournalEvent::plan_progress(
-            Some("s1"), 3, "fix-bug", "Fix login", "started", 0, 3, 0,
-        );
+        let evt =
+            JournalEvent::plan_progress(Some("s1"), 3, "fix-bug", "Fix login", "started", 0, 3, 0);
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.event_type, JournalEventType::PlanProgress);
@@ -1221,12 +1539,14 @@ mod tests {
         assert_eq!(meta["action"], "started");
 
         // Also test completed and plan_complete variants
-        let evt2 = JournalEvent::plan_progress(
-            Some("s1"), 5, "", "Full plan", "plan_complete", 100, 3, 3,
-        );
+        let evt2 =
+            JournalEvent::plan_progress(Some("s1"), 5, "", "Full plan", "plan_complete", 100, 3, 3);
         let json2 = serde_json::to_string(&evt2).unwrap();
         let parsed2: JournalEvent = serde_json::from_str(&json2).unwrap();
-        assert_eq!(parsed2.metadata.as_ref().unwrap()["action"], "plan_complete");
+        assert_eq!(
+            parsed2.metadata.as_ref().unwrap()["action"],
+            "plan_complete"
+        );
         assert_eq!(parsed2.metadata.as_ref().unwrap()["progress_pct"], 100);
     }
 }

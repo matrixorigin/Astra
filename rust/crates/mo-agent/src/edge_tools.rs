@@ -20,6 +20,9 @@ use mo_agent_runtime::tool_sandbox::{
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
 
+#[path = "delta_log.rs"]
+pub mod delta_log;
+
 #[path = "edge_tools/build_test.rs"]
 mod build_test;
 #[path = "edge_tools/code_intel.rs"]

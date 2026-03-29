@@ -414,6 +414,42 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .execute(&pool)
     .await?;
 
+    // ── Learning fields for agent_tasks (idempotent migration) ──
+    // These columns support plan feedback and learning
+    for alter in [
+        "ALTER TABLE agent_tasks ADD COLUMN user_rating TINYINT NULL",
+        "ALTER TABLE agent_tasks ADD COLUMN completion_time_sec INT NULL",
+        "ALTER TABLE agent_tasks ADD COLUMN replan_count INT NOT NULL DEFAULT 0",
+        "ALTER TABLE agent_tasks ADD COLUMN auto_adjustments INT NOT NULL DEFAULT 0",
+        "ALTER TABLE agent_tasks ADD COLUMN outcome VARCHAR(20) NULL",
+        "ALTER TABLE agent_tasks ADD COLUMN project_type VARCHAR(50) NULL",
+        "ALTER TABLE agent_tasks ADD COLUMN goal_pattern VARCHAR(500) NULL",
+    ] {
+        // Ignore "duplicate column" errors for idempotency
+        let _ = query(alter).execute(&pool).await;
+    }
+
+    // ── Plan templates table (learning successful patterns) ──
+    query(
+        "CREATE TABLE IF NOT EXISTS plan_templates (
+            template_id VARCHAR(36) PRIMARY KEY,
+            user_id VARCHAR(36) NULL,
+            goal_pattern VARCHAR(500) NOT NULL,
+            project_type VARCHAR(50) NULL,
+            template_json LONGTEXT NOT NULL,
+            success_rate FLOAT NOT NULL DEFAULT 0.0,
+            avg_completion_time INT NULL,
+            use_count INT NOT NULL DEFAULT 0,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_tpl_user (user_id),
+            INDEX idx_tpl_pattern (goal_pattern),
+            INDEX idx_tpl_project_type (project_type)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     query(
         "CREATE TABLE IF NOT EXISTS session_checkpoints (
             checkpoint_id VARCHAR(36) PRIMARY KEY,

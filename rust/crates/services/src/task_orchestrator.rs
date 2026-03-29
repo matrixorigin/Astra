@@ -165,6 +165,52 @@ pub struct TaskRecord {
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
+    // Learning feedback fields
+    #[serde(default)]
+    pub user_rating: Option<u8>,
+    #[serde(default)]
+    pub completion_time_sec: Option<i32>,
+    #[serde(default)]
+    pub replan_count: u32,
+    #[serde(default)]
+    pub auto_adjustments: u32,
+    #[serde(default)]
+    pub outcome: Option<TaskOutcome>,
+    #[serde(default)]
+    pub project_type: Option<String>,
+    #[serde(default)]
+    pub goal_pattern: Option<String>,
+}
+
+/// Task outcome for learning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskOutcome {
+    Success,
+    Partial,
+    Failed,
+    Cancelled,
+}
+
+impl TaskOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+    
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "success" => Some(Self::Success),
+            "partial" => Some(Self::Partial),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
 }
 
 /// Request to create a new task.
@@ -224,6 +270,18 @@ pub trait TaskService: Send + Sync {
 
     /// Mark task as completed.
     async fn complete_task(&self, task_id: &str) -> Result<(), String>;
+    
+    /// Record user feedback for learning.
+    async fn record_feedback(
+        &self,
+        task_id: &str,
+        rating: u8,
+        outcome: TaskOutcome,
+        completion_time_sec: Option<i32>,
+    ) -> Result<(), String>;
+    
+    /// Increment replan count.
+    async fn increment_replan_count(&self, task_id: &str) -> Result<(), String>;
 }
 
 // ─── MatrixOne Implementation ───────────────────────────────────────────────
@@ -258,6 +316,10 @@ impl MatrixOneTaskService {
             .and_then(|j| serde_json::from_str(j).ok());
 
         let status_str: String = row.try_get("status").map_err(|e| e.to_string())?;
+        
+        // Learning fields (may not exist in older schemas)
+        let outcome_str: Option<String> = row.try_get("outcome").ok().flatten();
+        let outcome = outcome_str.as_deref().and_then(TaskOutcome::parse);
 
         Ok(TaskRecord {
             task_id: row.try_get("task_id").map_err(|e| e.to_string())?,
@@ -276,6 +338,14 @@ impl MatrixOneTaskService {
             created_at: row.try_get::<String, _>("created_at").unwrap_or_default(),
             updated_at: row.try_get::<String, _>("updated_at").unwrap_or_default(),
             completed_at: row.try_get("completed_at").ok().flatten(),
+            // Learning fields
+            user_rating: row.try_get::<i8, _>("user_rating").ok().map(|r| r as u8),
+            completion_time_sec: row.try_get("completion_time_sec").ok(),
+            replan_count: row.try_get::<i32, _>("replan_count").unwrap_or(0) as u32,
+            auto_adjustments: row.try_get::<i32, _>("auto_adjustments").unwrap_or(0) as u32,
+            outcome,
+            project_type: row.try_get("project_type").ok().flatten(),
+            goal_pattern: row.try_get("goal_pattern").ok().flatten(),
         })
     }
 }
@@ -472,6 +542,38 @@ impl TaskService for MatrixOneTaskService {
         .map_err(|e| format!("complete_task: {e}"))?;
         Ok(())
     }
+    
+    async fn record_feedback(
+        &self,
+        task_id: &str,
+        rating: u8,
+        outcome: TaskOutcome,
+        completion_time_sec: Option<i32>,
+    ) -> Result<(), String> {
+        sqlx::query(
+            "UPDATE agent_tasks SET user_rating = ?, outcome = ?, completion_time_sec = ?, \
+             updated_at = NOW() WHERE task_id = ?",
+        )
+        .bind(rating as i8)
+        .bind(outcome.as_str())
+        .bind(completion_time_sec)
+        .bind(task_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("record_feedback: {e}"))?;
+        Ok(())
+    }
+    
+    async fn increment_replan_count(&self, task_id: &str) -> Result<(), String> {
+        sqlx::query(
+            "UPDATE agent_tasks SET replan_count = replan_count + 1, updated_at = NOW() WHERE task_id = ?",
+        )
+        .bind(task_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("increment_replan_count: {e}"))?;
+        Ok(())
+    }
 }
 
 // ─── Local-Only Implementation (Offline) ────────────────────────────────────
@@ -547,6 +649,14 @@ impl TaskService for LocalTaskService {
             created_at: now.clone(),
             updated_at: now,
             completed_at: None,
+            // Learning fields default
+            user_rating: None,
+            completion_time_sec: None,
+            replan_count: 0,
+            auto_adjustments: 0,
+            outcome: None,
+            project_type: None,
+            goal_pattern: None,
         };
         self.save_task(&record)?;
         Ok(task_id)
@@ -658,6 +768,32 @@ impl TaskService for LocalTaskService {
         let now = chrono::Utc::now().to_rfc3339();
         record.updated_at = now.clone();
         record.completed_at = Some(now);
+        self.save_task(&record)
+    }
+    
+    async fn record_feedback(
+        &self,
+        task_id: &str,
+        rating: u8,
+        outcome: TaskOutcome,
+        completion_time_sec: Option<i32>,
+    ) -> Result<(), String> {
+        let mut record = self
+            .load_task(task_id)?
+            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        record.user_rating = Some(rating);
+        record.outcome = Some(outcome);
+        record.completion_time_sec = completion_time_sec;
+        record.updated_at = chrono::Utc::now().to_rfc3339();
+        self.save_task(&record)
+    }
+    
+    async fn increment_replan_count(&self, task_id: &str) -> Result<(), String> {
+        let mut record = self
+            .load_task(task_id)?
+            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        record.replan_count += 1;
+        record.updated_at = chrono::Utc::now().to_rfc3339();
         self.save_task(&record)
     }
 }
@@ -857,12 +993,22 @@ mod tests {
             created_at: "2025-01-01T00:00:00Z".into(),
             updated_at: "2025-01-01T01:00:00Z".into(),
             completed_at: None,
+            // Learning fields
+            user_rating: Some(4),
+            completion_time_sec: Some(1200),
+            replan_count: 1,
+            auto_adjustments: 0,
+            outcome: Some(TaskOutcome::Success),
+            project_type: Some("Rust".into()),
+            goal_pattern: Some("refactor *".into()),
         };
         let json = serde_json::to_string(&record).unwrap();
         let loaded: TaskRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.task_id, "t-1");
         assert_eq!(loaded.status, TaskStatus::InProgress);
         assert_eq!(loaded.progress_pct, 50);
+        assert_eq!(loaded.user_rating, Some(4));
+        assert_eq!(loaded.outcome, Some(TaskOutcome::Success));
     }
 
     // ── LocalTaskService ──
