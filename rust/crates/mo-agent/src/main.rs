@@ -1213,7 +1213,7 @@ async fn run_plan_execution(
 
                 // If user pressed Ctrl+C, pause execution
                 if state.last_turn_interrupted {
-                    if let Some(plan) = state.executing_plan.take() {
+                    if let Some(ref plan) = state.executing_plan {
                         let pct = plan.progress_pct();
                         let remaining = plan
                             .subtasks
@@ -1230,7 +1230,7 @@ async fn run_plan_execution(
                             remaining
                         );
                         eprintln!(
-                            "{}  Use /plan to review, or say \"continue\" to resume.",
+                            "{}  Say \"continue\" to resume execution.",
                             "💡".cyan()
                         );
                     }
@@ -1991,6 +1991,8 @@ async fn run_chat_repl(
         }
         let prompt_str = if state.plan_mode.is_some() {
             format!("{} ", "plan>".yellow().bold())
+        } else if state.executing_plan.is_some() {
+            format!("{} ", "⏸>".yellow().bold())
         } else {
             format!("{} ", "❯".cyan().bold())
         };
@@ -2063,7 +2065,36 @@ async fn run_chat_repl(
                         )
                         .await?;
                     }
+                } else if state.executing_plan.is_some() && plan_decompose::is_resume_command(&line) {
+                    // Resume paused plan execution
+                    eprintln!();
+                    eprintln!("{}  Resuming plan execution...", "▶".cyan());
+                    run_plan_execution(
+                        &mut state,
+                        current_token.as_deref(),
+                        client,
+                        base,
+                        profile,
+                        &*selector,
+                    )
+                    .await?;
                 } else {
+                    // If there's a paused plan but user sends a different message,
+                    // abandon the plan and process as normal chat
+                    if state.executing_plan.is_some() && !plan_decompose::is_resume_command(&line) {
+                        let plan = state.executing_plan.take().unwrap();
+                        let done = plan.items_done();
+                        let total = plan.subtasks.len();
+                        if done < total as u32 {
+                            eprintln!(
+                                "{}  Plan abandoned ({}/{} done). Processing as normal chat.",
+                                "·".dim(),
+                                done,
+                                total
+                            );
+                        }
+                    }
+
                     handle_chat_input(
                         line,
                         current_token.as_deref(),

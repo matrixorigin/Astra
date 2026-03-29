@@ -643,6 +643,15 @@ pub fn plan_modification_prompt(state: &PlanModeState, user_request: &str) -> St
     state.plan_mode_prompt(user_request)
 }
 
+/// Check if user input is a resume command for paused plan execution.
+pub fn is_resume_command(input: &str) -> bool {
+    let trimmed = input.trim().to_lowercase();
+    matches!(
+        trimmed.as_str(),
+        "continue" | "resume" | "继续" | "go" | "next"
+    )
+}
+
 /// Format a subtask as a rich prompt for the LLM to execute.
 ///
 /// Includes the task title, description, files to modify, and acceptance criteria.
@@ -1496,5 +1505,26 @@ Done!"#;
         let ready = plan.ready_subtasks();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].id, "c");
+    }
+
+    #[test]
+    fn is_resume_command_detects_keywords() {
+        assert!(is_resume_command("continue"));
+        assert!(is_resume_command("Continue"));
+        assert!(is_resume_command("resume"));
+        assert!(is_resume_command("go"));
+        assert!(is_resume_command("next"));
+        assert!(is_resume_command("继续"));
+        // Whitespace
+        assert!(is_resume_command("  continue  "));
+        assert!(is_resume_command(" RESUME "));
+    }
+
+    #[test]
+    fn is_resume_command_rejects_non_resume() {
+        assert!(!is_resume_command("hello"));
+        assert!(!is_resume_command("fix the bug"));
+        assert!(!is_resume_command("continue with something else"));
+        assert!(!is_resume_command(""));
     }
 }
