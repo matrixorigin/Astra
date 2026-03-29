@@ -36,6 +36,8 @@ pub fn build_main_system_prompt(
     let has_grep = tool_names.contains(&"grep");
     let has_read_file = tool_names.contains(&"read_file");
     let has_code_nav = tool_names.contains(&"find_definition") || tool_names.contains(&"find_references");
+    let has_call_graph = tool_names.contains(&"call_graph");
+    let has_multi_edit = tool_names.contains(&"multi_edit");
     let has_build_test = tool_names.contains(&"run_build_test");
     let has_git_mutations = tool_names.contains(&"git_commit");
 
@@ -111,6 +113,23 @@ pub fn build_main_system_prompt(
              - **find_references**: Find all usages of a symbol across the codebase. Uses word-boundary matching — fast and precise.\n\
              - **symbols**: Extract all definitions from a file (outline view). Use with `kinds` filter to get only functions, structs, etc.\n\
              Use these BEFORE grep when looking for code symbols. They understand language syntax, grep doesn't.\n",
+        );
+    }
+    if has_call_graph {
+        prompt.push_str(
+            "- **call_graph**: Extract function calls within a symbol's body. Use to understand what a function does before refactoring, to trace data flow, or to find dependencies.\n",
+        );
+    }
+
+    // ── Editing strategy guidance ──
+    if has_multi_edit {
+        prompt.push_str(
+            "\n\
+             ## Editing Strategy\n\
+             - Use **multi_edit** for multiple related changes to one file — it's atomic (all-or-nothing) and more token-efficient than sequential str_replace.\n\
+             - Use **str_replace(dry_run=true)** to preview changes before applying. Great for complex edits where you want to verify first.\n\
+             - Use **delete_file** to remove files (safe: refuses .git/, directories, paths outside project root).\n\
+             - For risky refactors: dry_run first → review diff → apply if correct.\n",
         );
     }
 

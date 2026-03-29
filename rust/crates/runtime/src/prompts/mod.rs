@@ -847,4 +847,87 @@ mod tests {
             "planning should not have debugging strategy"
         );
     }
+
+    // ─── Tool guidance section tests ────────────────────────────────────
+
+    #[test]
+    fn prompt_includes_code_navigation_guidance() {
+        let p = build_main_system_prompt(
+            &["find_definition", "find_references", "read_file"],
+            "",
+            1.0,
+            None,
+        );
+        assert!(p.contains("## Code Navigation"), "should include code nav section");
+        assert!(p.contains("find_definition"), "should mention find_definition");
+        assert!(p.contains("find_references"), "should mention find_references");
+    }
+
+    #[test]
+    fn prompt_includes_call_graph_guidance() {
+        let p = build_main_system_prompt(
+            &["find_definition", "call_graph", "read_file"],
+            "",
+            1.0,
+            None,
+        );
+        assert!(p.contains("call_graph"), "should mention call_graph tool");
+        assert!(p.contains("refactoring") || p.contains("dependencies"), "should mention use case");
+    }
+
+    #[test]
+    fn prompt_includes_editing_strategy_guidance() {
+        let p = build_main_system_prompt(
+            &["multi_edit", "str_replace", "delete_file", "read_file"],
+            "",
+            1.0,
+            None,
+        );
+        assert!(p.contains("## Editing Strategy"), "should include editing section");
+        assert!(p.contains("multi_edit"), "should mention multi_edit");
+        assert!(p.contains("dry_run"), "should mention dry_run preview");
+        assert!(p.contains("delete_file"), "should mention delete_file");
+    }
+
+    #[test]
+    fn prompt_omits_editing_guidance_without_multi_edit() {
+        let p = build_main_system_prompt(
+            &["str_replace", "read_file"],
+            "",
+            1.0,
+            None,
+        );
+        assert!(!p.contains("## Editing Strategy"), "should not include editing section without multi_edit");
+    }
+
+    #[test]
+    fn prompt_full_toolset_under_budget() {
+        // Test with a realistic full toolset that triggers all guidance sections
+        let p = build_main_system_prompt(
+            &[
+                "read_file", "bash", "str_replace", "write_file", "delete_file", "multi_edit",
+                "list_dir", "grep", "glob",
+                "find_definition", "find_references", "call_graph", "symbols",
+                "run_build_test",
+                "git_diff", "git_log", "git_commit", "git_stash",
+                "github_list_prs", "github_repo_stats",
+                "memory_store", "memory_search",
+            ],
+            "",
+            1.0,
+            Some("code_review"),
+        );
+        // All sections should be present
+        assert!(p.contains("## Code Navigation"));
+        assert!(p.contains("## Editing Strategy"));
+        assert!(p.contains("## Build & Test Loop"));
+        assert!(p.contains("## Git Workflow"));
+        assert!(p.contains("## Memory Rules"));
+        // Budget: full prompt should still be reasonable
+        assert!(
+            p.len() < 11000,
+            "full toolset prompt should be under 11000 chars, got {}",
+            p.len()
+        );
+    }
 }
