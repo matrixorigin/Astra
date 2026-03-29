@@ -87,7 +87,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/plan",
-        "Plan mode: /plan [enter|resume|exit|show|list|template|history|diff|rollback|parallel]",
+        "Plan mode: /plan [enter|auto|resume|exit|show|list|template|history|diff|rollback|parallel]",
     ),
     (
         "/task",
@@ -378,7 +378,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/skill validate" | "/skill config" => Some("<name>"),
         "/skill system" => Some("<name|list>"),
         "/memory" => Some("[list|search <q>|inspect <id>]"),
-        "/plan" => Some("[enter <goal>|resume|exit|decompose|show|set|clear]"),
+        "/plan" => Some("[enter <goal>|auto <goal>|resume|exit|decompose|show|set|clear]"),
         "/task" => Some("[list|add <title>|done <id>|status <id>]"),
         "/resume" => Some("[session_id]"),
         "/stats" => Some("[history]"),

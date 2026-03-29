@@ -613,9 +613,111 @@ pub(super) async fn handle_memory_domain_command(
                         eprintln!("  {} Not in plan mode.", "⚠".yellow());
                     }
                 }
+                "auto" if !sub_arg.is_empty() => {
+                    // Auto mode: decompose + preview + execute in one shot
+                    use super::plan_decompose::{
+                        PlanModeState, analyze_project, decomposition_prompt,
+                        format_execution_preview, format_plan, parse_plan_response,
+                        PlanExecutionConfig,
+                    };
+
+                    let Some(tok) = token else {
+                        eprintln!("  {} Not logged in. Run /login first.", "✗".red());
+                        return Ok(());
+                    };
+
+                    let project_root =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    eprintln!("  {} Analyzing project...", "⋯".dim());
+                    let context = analyze_project(&project_root);
+                    let prompt = decomposition_prompt(sub_arg, &context);
+                    eprintln!("  {} Decomposing and auto-executing: {}", "🚀".cyan(), sub_arg);
+
+                    let payload = serde_json::json!({
+                        "messages": [{"role": "user", "content": prompt}],
+                        "session_id": state.session_id.clone(),
+                    });
+
+                    match client
+                        .post(format!("{base}/chat/turn"))
+                        .bearer_auth(tok)
+                        .json(&payload)
+                        .send()
+                        .await
+                    {
+                        Ok(r) if r.status().is_success() => {
+                            let mut full_text = String::new();
+                            let mut stream = r.bytes_stream();
+                            use futures_util::StreamExt;
+
+                            while let Some(chunk) = stream.next().await {
+                                if let Ok(bytes) = chunk {
+                                    let event_str = String::from_utf8_lossy(&bytes);
+                                    for line in event_str.lines() {
+                                        if let Some(data) = line.strip_prefix("data: ") {
+                                            if let Ok(json) =
+                                                serde_json::from_str::<serde_json::Value>(data)
+                                            {
+                                                if json.get("type").and_then(|v| v.as_str())
+                                                    == Some("text_delta")
+                                                {
+                                                    if let Some(content) =
+                                                        json.get("content").and_then(|v| v.as_str())
+                                                    {
+                                                        full_text.push_str(content);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            match parse_plan_response(&full_text) {
+                                Ok(plan) => {
+                                    eprintln!();
+                                    eprint!("{}", format_plan(&plan));
+                                    eprintln!();
+                                    eprint!("{}", format_execution_preview(&plan));
+                                    eprintln!();
+                                    eprintln!(
+                                        "{}  Auto-executing plan ({} subtasks)...",
+                                        "🚀".green(),
+                                        plan.subtasks.len()
+                                    );
+
+                                    state.plan_execution_config =
+                                        Some(PlanExecutionConfig { auto_execute: true, ..Default::default() });
+                                    state.executing_plan_goal = Some(sub_arg.to_string());
+                                    state.plan_execution_rounds = 0;
+                                    state.executing_plan = Some(plan);
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "{}",
+                                        format!("  ✗ Could not parse plan: {e}").yellow()
+                                    );
+                                    eprintln!(
+                                        "  Try '/plan enter {}' for interactive mode.",
+                                        sub_arg
+                                    );
+                                }
+                            }
+                        }
+                        Ok(r) => {
+                            eprintln!(
+                                "{}",
+                                format!("  ✗ LLM call failed ({})", r.status()).red()
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("{}", format!("  ✗ Request failed: {e}").red());
+                        }
+                    }
+                }
                 _ => {
                     eprintln!(
-                        "  Usage: /plan [show | set <text> | clear | decompose <goal> | enter <goal> | resume | exit | list | template <name> <goal> | history | diff <v1> <v2> | rollback <v> | parallel]"
+                        "  Usage: /plan [show | set <text> | clear | decompose <goal> | enter <goal> | auto <goal> | resume | exit | list | template <name> <goal> | history | diff <v1> <v2> | rollback <v> | parallel]"
                     );
                 }
             }
@@ -699,11 +801,15 @@ pub async fn handle_plan_mode_input(
 
     // Check for execute command
     if PlanModeState::is_execute_command(&input) {
-        eprintln!();
-        eprintln!("{}  Executing plan...", "🚀".green());
+        use super::plan_decompose::{format_execution_preview, PlanExecutionConfig};
 
         let plan = plan_state.plan.clone();
         let goal = plan_state.goal.clone();
+
+        // Show execution preview with parallel analysis
+        eprintln!();
+        eprint!("{}", format_execution_preview(&plan));
+        eprintln!();
 
         // Persist to task service if available
         if let Some(ref svc) = state.task_service {
@@ -735,57 +841,46 @@ pub async fn handle_plan_mode_input(
             }
         }
 
+        eprintln!("{}  Executing plan ({} subtasks)...", "🚀".green(), plan.subtasks.len());
         eprintln!();
 
-        // Display execution plan summary
-        if !plan.subtasks.is_empty() {
-            eprintln!(
-                "{}  Execution plan ({} subtasks):",
-                "📋".yellow(),
-                plan.subtasks.len()
-            );
-            for task in &plan.subtasks {
-                let deps_str = if task.depends_on.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (after: {})", task.depends_on.join(", "))
-                };
-                let effort_badge = match task.effort.as_deref() {
-                    Some("small") => " [S]",
-                    Some("medium") => " [M]",
-                    Some("large") => " [L]",
-                    _ => "",
-                };
-                eprintln!(
-                    "    {} [{}]{} {}{}",
-                    "•".dim(),
-                    task.id,
-                    effort_badge.cyan(),
-                    task.title,
-                    deps_str.dim()
-                );
-            }
-            eprintln!();
-
-            let ready = plan.ready_subtasks();
-            if ready.is_empty() {
-                eprintln!(
-                    "{}  No subtasks ready (circular dependencies?)",
-                    "⚠".yellow()
-                );
-            } else {
-                eprintln!(
-                    "{}  Starting with: {} [{}]",
-                    "▶".cyan(),
-                    ready[0].title,
-                    ready[0].id
-                );
-            }
-            eprintln!();
-        }
+        // Store execution config for step-by-step mode
+        state.plan_execution_config = Some(PlanExecutionConfig::default());
+        state.executing_plan_goal = Some(goal);
+        state.plan_execution_rounds = 0;
 
         // Store plan for auto-execution and exit plan mode
-        // The main REPL loop will pick this up and start executing subtasks
+        state.executing_plan = Some(plan);
+        PlanModeState::clear_saved_state();
+        state.plan_mode = None;
+        return Ok(());
+    }
+
+    // Check for step-by-step execute command
+    if input.trim().to_lowercase().starts_with("step") || input.trim() == "逐步执行" {
+        use super::plan_decompose::{format_execution_preview, PlanExecutionConfig};
+
+        let plan = plan_state.plan.clone();
+        let goal = plan_state.goal.clone();
+
+        // Show execution preview
+        eprintln!();
+        eprint!("{}", format_execution_preview(&plan));
+        eprintln!();
+        eprintln!(
+            "{}  Step-by-step mode: you'll confirm each subtask before execution.",
+            "⚙".cyan()
+        );
+        eprintln!();
+
+        // Set step-by-step config
+        state.plan_execution_config = Some(PlanExecutionConfig {
+            step_by_step: true,
+            auto_execute: false,
+        });
+        state.executing_plan_goal = Some(goal);
+        state.plan_execution_rounds = 0;
+
         state.executing_plan = Some(plan);
         PlanModeState::clear_saved_state();
         state.plan_mode = None;

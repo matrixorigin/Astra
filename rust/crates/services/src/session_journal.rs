@@ -120,6 +120,8 @@ pub enum JournalEventType {
     Checkpoint,
     /// TurnGuard verdict emitted (unified non-happy-path audit).
     TurnGuardVerdict,
+    /// Plan execution progress (subtask started, completed, plan done).
+    PlanProgress,
 }
 
 /// Writer that appends events to a session journal file.
@@ -484,6 +486,30 @@ impl JournalEvent {
             "total_timeouts": total_timeouts,
             "total_cache_hits": total_cache_hits,
             "flaky_tools": flaky_count,
+        }));
+        evt
+    }
+
+    /// Build a plan progress event — emitted when a subtask starts, completes, or plan finishes.
+    pub fn plan_progress(
+        session_id: Option<&str>,
+        turn: u32,
+        subtask_id: &str,
+        subtask_title: &str,
+        action: &str, // "started" | "completed" | "skipped" | "plan_complete" | "plan_paused"
+        progress_pct: u32,
+        total_subtasks: usize,
+        completed_subtasks: usize,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::PlanProgress, session_id);
+        evt.turn = Some(turn);
+        evt.metadata = Some(serde_json::json!({
+            "subtask_id": subtask_id,
+            "subtask_title": subtask_title,
+            "action": action,
+            "progress_pct": progress_pct,
+            "total_subtasks": total_subtasks,
+            "completed_subtasks": completed_subtasks,
         }));
         evt
     }
@@ -1156,5 +1182,51 @@ mod tests {
         let meta = ckpt.metadata.as_ref().unwrap();
         assert_eq!(meta["summary"], "Midpoint checkpoint");
         assert_eq!(meta["total_tokens"], 20_000);
+    }
+
+    #[test]
+    fn plan_progress_event_builder() {
+        let evt = JournalEvent::plan_progress(
+            Some("s1"),
+            5,
+            "add-tests",
+            "Add unit tests",
+            "started",
+            40,
+            5,
+            2,
+        );
+        assert_eq!(evt.event_type, JournalEventType::PlanProgress);
+        assert_eq!(evt.turn, Some(5));
+        let meta = evt.metadata.as_ref().unwrap();
+        assert_eq!(meta["subtask_id"], "add-tests");
+        assert_eq!(meta["subtask_title"], "Add unit tests");
+        assert_eq!(meta["action"], "started");
+        assert_eq!(meta["progress_pct"], 40);
+        assert_eq!(meta["total_subtasks"], 5);
+        assert_eq!(meta["completed_subtasks"], 2);
+    }
+
+    #[test]
+    fn plan_progress_serialization_roundtrip() {
+        let evt = JournalEvent::plan_progress(
+            Some("s1"), 3, "fix-bug", "Fix login", "started", 0, 3, 0,
+        );
+        let json = serde_json::to_string(&evt).unwrap();
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.event_type, JournalEventType::PlanProgress);
+        assert_eq!(parsed.turn, Some(3));
+        let meta = parsed.metadata.as_ref().unwrap();
+        assert_eq!(meta["subtask_id"], "fix-bug");
+        assert_eq!(meta["action"], "started");
+
+        // Also test completed and plan_complete variants
+        let evt2 = JournalEvent::plan_progress(
+            Some("s1"), 5, "", "Full plan", "plan_complete", 100, 3, 3,
+        );
+        let json2 = serde_json::to_string(&evt2).unwrap();
+        let parsed2: JournalEvent = serde_json::from_str(&json2).unwrap();
+        assert_eq!(parsed2.metadata.as_ref().unwrap()["action"], "plan_complete");
+        assert_eq!(parsed2.metadata.as_ref().unwrap()["progress_pct"], 100);
     }
 }

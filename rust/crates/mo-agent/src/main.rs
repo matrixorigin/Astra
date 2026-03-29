@@ -386,6 +386,12 @@ struct ReplState {
     plan_mode: Option<plan_decompose::PlanModeState>,
     /// Plan being auto-executed — subtasks sent sequentially through chat.
     executing_plan: Option<mo_agent_services::task_orchestrator::TaskPlan>,
+    /// Configuration for current plan execution (step-by-step, auto-execute, etc.).
+    plan_execution_config: Option<plan_decompose::PlanExecutionConfig>,
+    /// Goal text for the executing plan (for summary generation).
+    executing_plan_goal: Option<String>,
+    /// Number of parallel execution rounds completed (for summary).
+    plan_execution_rounds: usize,
     /// Whether the last chat turn was interrupted by Ctrl+C (used by plan auto-execution).
     last_turn_interrupted: bool,
     /// Cloud learning snapshot version for optimistic locking.
@@ -423,6 +429,9 @@ impl Default for ReplState {
             synced_tool_health_entries: Vec::new(),
             plan_mode: None,
             executing_plan: None,
+            plan_execution_config: None,
+            executing_plan_goal: None,
+            plan_execution_rounds: 0,
             last_turn_interrupted: false,
             cloud_learning_version: None,
         }
@@ -1175,12 +1184,32 @@ async fn run_plan_execution(
         if ready.is_empty() {
             // No more ready subtasks — either all done or blocked
             let pct = plan.progress_pct();
+            let goal = state
+                .executing_plan_goal
+                .clone()
+                .unwrap_or_else(|| "Plan".into());
+            let rounds = state.plan_execution_rounds;
+
             if pct == 100 {
-                eprintln!(
-                    "\n{}  Plan complete! All {} subtasks done.",
-                    "🎉".green(),
-                    plan.subtasks.len()
-                );
+                let summary =
+                    plan_decompose::PlanExecutionSummary::from_plan(&plan, &goal, rounds);
+                eprintln!();
+                eprint!("{}", summary.format());
+
+                // Journal: plan complete
+                if let Some(ref mut j) = state.journal {
+                    let evt = mo_agent_services::session_journal::JournalEvent::plan_progress(
+                        state.session_id.as_deref(),
+                        state.turn,
+                        "",
+                        &goal,
+                        "plan_complete",
+                        100,
+                        plan.subtasks.len(),
+                        plan.items_done() as usize,
+                    );
+                    let _ = j.append(&evt);
+                }
             } else {
                 let blocked: Vec<_> = plan
                     .subtasks
@@ -1194,6 +1223,15 @@ async fn run_plan_execution(
                     pct,
                     blocked.join(", ")
                 );
+                // Keep plan for potential resume
+                state.executing_plan = Some(plan);
+            }
+
+            // Clean up execution state (if fully done)
+            if pct == 100 {
+                state.plan_execution_config = None;
+                state.executing_plan_goal = None;
+                state.plan_execution_rounds = 0;
             }
             return Ok(());
         }
@@ -1266,6 +1304,21 @@ async fn run_plan_execution(
                 eprintln!("{}  {} remaining after this", "·".dim(), remaining);
             }
 
+            // Journal: subtask started
+            if let Some(ref mut j) = state.journal {
+                let evt = mo_agent_services::session_journal::JournalEvent::plan_progress(
+                    state.session_id.as_deref(),
+                    state.turn,
+                    next_id,
+                    &title,
+                    "started",
+                    plan.progress_pct(),
+                    total,
+                    plan.items_done() as usize,
+                );
+                let _ = j.append(&evt);
+            }
+
             // Put plan back before calling handle_chat_input
             state.executing_plan = Some(plan);
 
@@ -1319,12 +1372,28 @@ async fn run_plan_execution(
                     let title = st.title.clone();
                     let pct = plan.progress_pct();
                     eprintln!("\n{}  Subtask done: {} ({}%)", "✓".green(), title, pct);
+
+                    // Journal: subtask completed
+                    if let Some(ref mut j) = state.journal {
+                        let evt = mo_agent_services::session_journal::JournalEvent::plan_progress(
+                            state.session_id.as_deref(),
+                            state.turn,
+                            next_id,
+                            &title,
+                            "completed",
+                            pct,
+                            plan.subtasks.len(),
+                            plan.items_done() as usize,
+                        );
+                        let _ = j.append(&evt);
+                    }
                 }
             }
         }
 
         // Put plan back for the outer loop to pick up the next group
         state.executing_plan = Some(plan);
+        state.plan_execution_rounds += 1;
 
         // Loop continues — will find next ready group
     }
@@ -2283,6 +2352,19 @@ async fn run_chat_repl(
                             &pipeline_modules.pattern_library,
                             &pipeline_modules.calibrator,
                         );
+                    }
+
+                    // If /plan auto triggered execution, start the auto-execution loop
+                    if state.executing_plan.is_some() && state.plan_mode.is_none() {
+                        run_plan_execution(
+                            &mut state,
+                            current_token.as_deref(),
+                            client,
+                            base,
+                            profile,
+                            &*selector,
+                        )
+                        .await?;
                     }
                 } else if state.plan_mode.is_some() {
                     // Plan mode: handle input as plan editing

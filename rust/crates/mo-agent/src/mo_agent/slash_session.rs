@@ -239,6 +239,43 @@ pub(super) fn handle_session_command(arg: &str, state: &ReplState) {
                                     details,
                                 );
                             }
+                            session_journal::JournalEventType::PlanProgress => {
+                                let action = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("action"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("progress");
+                                let subtask = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("subtask_title"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let pct = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("progress_pct"))
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let icon = match action {
+                                    "started" => "▶",
+                                    "completed" => "✓",
+                                    "plan_complete" => "🎉",
+                                    "plan_paused" => "⏸",
+                                    "skipped" => "⏭",
+                                    _ => "·",
+                                };
+                                eprintln!(
+                                    "  {} {} T{} plan {}: {} ({}%)",
+                                    ts_short.dim(),
+                                    icon.cyan(),
+                                    evt.turn.unwrap_or(0),
+                                    action,
+                                    subtask,
+                                    pct,
+                                );
+                            }
                         }
                     }
                     // Summary stats

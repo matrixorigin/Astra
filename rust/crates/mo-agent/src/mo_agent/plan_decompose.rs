@@ -759,6 +759,242 @@ pub fn format_subtask_prompt(subtask: &SubtaskPlan) -> String {
     prompt
 }
 
+// ─── Plan Execution Config & Preview ─────────────────────────────────────────
+
+/// Configuration for plan execution behavior.
+#[derive(Debug, Clone, Default)]
+pub struct PlanExecutionConfig {
+    /// If true, prompt user for confirmation before executing each subtask.
+    pub step_by_step: bool,
+    /// If true, auto-execute immediately after plan decomposition (skip explicit "execute").
+    pub auto_execute: bool,
+}
+
+/// Result of a plan execution for summary purposes.
+#[derive(Debug, Clone, Default)]
+pub struct PlanExecutionSummary {
+    pub goal: String,
+    pub total_subtasks: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub paused: usize,
+    /// Subtask IDs that were completed, in execution order.
+    pub execution_order: Vec<String>,
+    /// Number of parallel groups that were executed.
+    pub parallel_rounds: usize,
+}
+
+impl PlanExecutionSummary {
+    /// Build a summary from a completed (or paused) plan.
+    pub fn from_plan(plan: &TaskPlan, goal: &str, parallel_rounds: usize) -> Self {
+        let completed = plan
+            .subtasks
+            .iter()
+            .filter(|s| s.status == TaskStatus::Completed)
+            .count();
+        let failed = plan
+            .subtasks
+            .iter()
+            .filter(|s| s.status == TaskStatus::Failed)
+            .count();
+        let paused = plan
+            .subtasks
+            .iter()
+            .filter(|s| s.status == TaskStatus::Paused || s.status == TaskStatus::InProgress)
+            .count();
+
+        Self {
+            goal: goal.to_string(),
+            total_subtasks: plan.subtasks.len(),
+            completed,
+            failed,
+            paused,
+            execution_order: plan
+                .subtasks
+                .iter()
+                .filter(|s| s.status == TaskStatus::Completed)
+                .map(|s| s.id.clone())
+                .collect(),
+            parallel_rounds,
+        }
+    }
+
+    /// Format the summary for display.
+    pub fn format(&self) -> String {
+        let mut out = String::new();
+        out.push_str("┌── Execution Summary ────────────────────────────\n");
+        out.push_str(&format!("│ Goal: {}\n", self.goal));
+        out.push_str("│\n");
+
+        let status = if self.completed == self.total_subtasks {
+            "✓ Complete"
+        } else if self.failed > 0 {
+            "✗ Partial (failures)"
+        } else if self.paused > 0 {
+            "⏸ Paused"
+        } else {
+            "· Incomplete"
+        };
+        out.push_str(&format!("│ Status:    {}\n", status));
+        out.push_str(&format!(
+            "│ Subtasks:  {}/{} completed\n",
+            self.completed, self.total_subtasks
+        ));
+        if self.failed > 0 {
+            out.push_str(&format!("│ Failed:    {}\n", self.failed));
+        }
+        if self.parallel_rounds > 0 {
+            out.push_str(&format!("│ Rounds:    {} (parallel-aware)\n", self.parallel_rounds));
+        }
+        if !self.execution_order.is_empty() {
+            out.push_str(&format!(
+                "│ Order:     {}\n",
+                self.execution_order.join(" → ")
+            ));
+        }
+        out.push_str("└─────────────────────────────────────────────────\n");
+        out
+    }
+}
+
+/// Format a pre-execution preview showing parallel analysis and execution order.
+///
+/// Displayed before execution starts to give the user insight into how
+/// the plan will be executed. Shows parallel groups, file conflicts, and
+/// estimated round count.
+pub fn format_execution_preview(plan: &TaskPlan) -> String {
+    let analysis = analyze_parallelism(plan);
+    let ready = plan.ready_subtasks();
+
+    let mut out = String::new();
+    out.push_str("┌── Execution Preview ────────────────────────────\n");
+    out.push_str(&format!(
+        "│ {} subtasks, {} ready now\n",
+        plan.subtasks.len(),
+        ready.len()
+    ));
+
+    // Show parallel groups
+    if analysis.groups.len() > 1 || analysis.groups.first().map(|g| g.len()).unwrap_or(0) > 1 {
+        out.push_str("│\n");
+        out.push_str(&format!("│ Parallel Groups ({} rounds):\n", analysis.groups.len()));
+        for (i, group) in analysis.groups.iter().enumerate() {
+            let names: Vec<_> = group
+                .iter()
+                .filter_map(|id| plan.subtasks.iter().find(|s| &s.id == id))
+                .map(|s| format!("[{}] {}", s.id, s.title))
+                .collect();
+            let parallel_marker = if group.len() > 1 { " ║" } else { "  " };
+            out.push_str(&format!(
+                "│   Round {}{}: {}\n",
+                i + 1,
+                parallel_marker,
+                names.join(", ")
+            ));
+        }
+    }
+
+    // Show file conflicts
+    if !analysis.conflicts.is_empty() {
+        out.push_str("│\n");
+        out.push_str(&format!(
+            "│ ⚠ {} file conflict(s):\n",
+            analysis.conflicts.len()
+        ));
+        for c in &analysis.conflicts {
+            out.push_str(&format!(
+                "│   {} ↔ {} ({})\n",
+                c.subtask_a, c.subtask_b, c.shared_files.join(", ")
+            ));
+        }
+    }
+
+    // Effort estimate
+    let total_effort: usize = plan
+        .subtasks
+        .iter()
+        .map(|s| match s.effort.as_deref() {
+            Some("large") => 3,
+            Some("medium") => 2,
+            _ => 1,
+        })
+        .sum();
+    let effort_label = match total_effort {
+        0..=3 => "Low",
+        4..=8 => "Medium",
+        _ => "High",
+    };
+    out.push_str("│\n");
+    out.push_str(&format!(
+        "│ Estimated effort: {} ({} units)\n",
+        effort_label, total_effort
+    ));
+
+    out.push_str("└─────────────────────────────────────────────────\n");
+    out
+}
+
+/// User confirmation result after viewing execution preview.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExecutionConfirmation {
+    /// User confirmed — proceed with execution.
+    Execute,
+    /// User chose step-by-step mode.
+    StepByStep,
+    /// User wants to edit the plan first.
+    Edit,
+    /// User cancelled execution.
+    Cancel,
+}
+
+/// Parse user response to the execution confirmation prompt.
+pub fn parse_execution_confirmation(input: &str) -> ExecutionConfirmation {
+    let lower = input.trim().to_lowercase();
+    match lower.as_str() {
+        "y" | "yes" | "go" | "execute" | "run" | "确认" | "是" => ExecutionConfirmation::Execute,
+        "s" | "step" | "step-by-step" | "逐步" => ExecutionConfirmation::StepByStep,
+        "e" | "edit" | "modify" | "编辑" | "修改" => ExecutionConfirmation::Edit,
+        _ => ExecutionConfirmation::Cancel,
+    }
+}
+
+/// Format the step-by-step confirmation prompt shown before each subtask.
+pub fn format_subtask_confirmation(subtask: &SubtaskPlan, idx: usize, total: usize) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "\n┌── Subtask {}/{}: [{}] {}\n",
+        idx + 1,
+        total,
+        subtask.id,
+        subtask.title
+    ));
+    if let Some(ref desc) = subtask.description {
+        out.push_str(&format!("│ {}\n", desc));
+    }
+    if !subtask.files.is_empty() {
+        out.push_str(&format!("│ Files: {}\n", subtask.files.join(", ")));
+    }
+    out.push_str("└ Execute? (y)es / (s)kip / (q)uit: ");
+    out
+}
+
+/// Parse the per-subtask confirmation response.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubtaskConfirmation {
+    Execute,
+    Skip,
+    Quit,
+}
+
+pub fn parse_subtask_confirmation(input: &str) -> SubtaskConfirmation {
+    let lower = input.trim().to_lowercase();
+    match lower.as_str() {
+        "y" | "yes" | "" => SubtaskConfirmation::Execute,
+        "s" | "skip" | "跳过" => SubtaskConfirmation::Skip,
+        _ => SubtaskConfirmation::Quit,
+    }
+}
+
 // ─── Plan Versioning ─────────────────────────────────────────────────────────
 
 /// A versioned snapshot of a plan, recording the full plan at a point in time.
@@ -2739,5 +2975,216 @@ Done!"#;
         let loaded = PlanModeState::load_from_file(&path).unwrap();
         assert_eq!(loaded.version_history.current_version, 1);
         assert_eq!(loaded.version_history.versions.len(), 1);
+    }
+
+    // ═══════════════════════ Execution Config & Preview Tests ════════════════
+
+    #[test]
+    fn execution_preview_format_basic() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(),
+                    effort: Some("small".into()), ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(),
+                    effort: Some("medium".into()), ..Default::default() },
+            ],
+            notes: None,
+        };
+        let preview = format_execution_preview(&plan);
+        assert!(preview.contains("Execution Preview"));
+        assert!(preview.contains("2 subtasks"));
+        assert!(preview.contains("2 ready now"));
+        assert!(preview.contains("Estimated effort"));
+    }
+
+    #[test]
+    fn execution_preview_shows_parallel_groups() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(),
+                    files: vec!["a.rs".into()], ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(),
+                    files: vec!["b.rs".into()], ..Default::default() },
+                SubtaskPlan { id: "c".into(), title: "C".into(),
+                    depends_on: vec!["a".into()], ..Default::default() },
+            ],
+            notes: None,
+        };
+        let preview = format_execution_preview(&plan);
+        assert!(preview.contains("Parallel Groups"));
+        assert!(preview.contains("Round"));
+    }
+
+    #[test]
+    fn execution_preview_shows_file_conflicts() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(),
+                    files: vec!["shared.rs".into()], ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(),
+                    files: vec!["shared.rs".into()], ..Default::default() },
+            ],
+            notes: None,
+        };
+        let preview = format_execution_preview(&plan);
+        assert!(preview.contains("file conflict"));
+        assert!(preview.contains("shared.rs"));
+    }
+
+    #[test]
+    fn execution_summary_complete_plan() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(),
+                    status: TaskStatus::Completed, ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(),
+                    status: TaskStatus::Completed, ..Default::default() },
+            ],
+            notes: None,
+        };
+        let summary = PlanExecutionSummary::from_plan(&plan, "Test goal", 2);
+        assert_eq!(summary.completed, 2);
+        assert_eq!(summary.total_subtasks, 2);
+        assert_eq!(summary.parallel_rounds, 2);
+        let formatted = summary.format();
+        assert!(formatted.contains("Execution Summary"));
+        assert!(formatted.contains("Test goal"));
+        assert!(formatted.contains("Complete"));
+        assert!(formatted.contains("2/2"));
+    }
+
+    #[test]
+    fn execution_summary_partial_with_failures() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(),
+                    status: TaskStatus::Completed, ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(),
+                    status: TaskStatus::Failed, ..Default::default() },
+                SubtaskPlan { id: "c".into(), title: "C".into(),
+                    status: TaskStatus::Pending, ..Default::default() },
+            ],
+            notes: None,
+        };
+        let summary = PlanExecutionSummary::from_plan(&plan, "Failing goal", 1);
+        assert_eq!(summary.completed, 1);
+        assert_eq!(summary.failed, 1);
+        let formatted = summary.format();
+        assert!(formatted.contains("Partial (failures)"));
+        assert!(formatted.contains("Failed:"));
+    }
+
+    #[test]
+    fn execution_summary_paused() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(),
+                    status: TaskStatus::Completed, ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(),
+                    status: TaskStatus::InProgress, ..Default::default() },
+            ],
+            notes: None,
+        };
+        let summary = PlanExecutionSummary::from_plan(&plan, "Paused goal", 1);
+        assert_eq!(summary.paused, 1);
+        assert!(summary.format().contains("Paused"));
+    }
+
+    #[test]
+    fn parse_execution_confirmation_variants() {
+        assert_eq!(parse_execution_confirmation("y"), ExecutionConfirmation::Execute);
+        assert_eq!(parse_execution_confirmation("yes"), ExecutionConfirmation::Execute);
+        assert_eq!(parse_execution_confirmation("go"), ExecutionConfirmation::Execute);
+        assert_eq!(parse_execution_confirmation("确认"), ExecutionConfirmation::Execute);
+        assert_eq!(parse_execution_confirmation("s"), ExecutionConfirmation::StepByStep);
+        assert_eq!(parse_execution_confirmation("step"), ExecutionConfirmation::StepByStep);
+        assert_eq!(parse_execution_confirmation("e"), ExecutionConfirmation::Edit);
+        assert_eq!(parse_execution_confirmation("edit"), ExecutionConfirmation::Edit);
+        assert_eq!(parse_execution_confirmation("n"), ExecutionConfirmation::Cancel);
+        assert_eq!(parse_execution_confirmation("no"), ExecutionConfirmation::Cancel);
+        assert_eq!(parse_execution_confirmation(""), ExecutionConfirmation::Cancel);
+    }
+
+    #[test]
+    fn parse_subtask_confirmation_variants() {
+        assert_eq!(parse_subtask_confirmation("y"), SubtaskConfirmation::Execute);
+        assert_eq!(parse_subtask_confirmation("yes"), SubtaskConfirmation::Execute);
+        assert_eq!(parse_subtask_confirmation(""), SubtaskConfirmation::Execute); // default = yes
+        assert_eq!(parse_subtask_confirmation("s"), SubtaskConfirmation::Skip);
+        assert_eq!(parse_subtask_confirmation("skip"), SubtaskConfirmation::Skip);
+        assert_eq!(parse_subtask_confirmation("q"), SubtaskConfirmation::Quit);
+        assert_eq!(parse_subtask_confirmation("quit"), SubtaskConfirmation::Quit);
+    }
+
+    #[test]
+    fn format_subtask_confirmation_shows_details() {
+        let st = SubtaskPlan {
+            id: "add-tests".into(),
+            title: "Add unit tests".into(),
+            description: Some("Write tests for the parser module".into()),
+            files: vec!["src/parser.rs".into(), "tests/parser_test.rs".into()],
+            ..Default::default()
+        };
+        let formatted = format_subtask_confirmation(&st, 2, 5);
+        assert!(formatted.contains("Subtask 3/5")); // 0-indexed → display as 3
+        assert!(formatted.contains("add-tests"));
+        assert!(formatted.contains("Add unit tests"));
+        assert!(formatted.contains("parser module"));
+        assert!(formatted.contains("parser.rs"));
+        assert!(formatted.contains("Execute?"));
+    }
+
+    #[test]
+    fn plan_execution_config_defaults() {
+        let config = PlanExecutionConfig::default();
+        assert!(!config.step_by_step);
+        assert!(!config.auto_execute);
+    }
+
+    #[test]
+    fn execution_summary_order_tracks_completed() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "x".into(), title: "X".into(),
+                    status: TaskStatus::Completed, ..Default::default() },
+                SubtaskPlan { id: "y".into(), title: "Y".into(),
+                    status: TaskStatus::Pending, ..Default::default() },
+                SubtaskPlan { id: "z".into(), title: "Z".into(),
+                    status: TaskStatus::Completed, ..Default::default() },
+            ],
+            notes: None,
+        };
+        let summary = PlanExecutionSummary::from_plan(&plan, "test", 0);
+        assert_eq!(summary.execution_order, vec!["x", "z"]);
+        assert!(summary.format().contains("x → z"));
+    }
+
+    #[test]
+    fn execution_preview_effort_levels() {
+        // All large = High effort
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(),
+                    effort: Some("large".into()), ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(),
+                    effort: Some("large".into()), ..Default::default() },
+                SubtaskPlan { id: "c".into(), title: "C".into(),
+                    effort: Some("large".into()), ..Default::default() },
+            ],
+            notes: None,
+        };
+        let preview = format_execution_preview(&plan);
+        assert!(preview.contains("High"));
+
+        // All small = Low effort
+        let plan2 = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(),
+                    effort: Some("small".into()), ..Default::default() },
+            ],
+            notes: None,
+        };
+        let preview2 = format_execution_preview(&plan2);
+        assert!(preview2.contains("Low"));
     }
 }
