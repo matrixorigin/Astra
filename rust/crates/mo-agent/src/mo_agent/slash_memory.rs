@@ -420,17 +420,22 @@ pub(super) async fn handle_memory_domain_command(
                             }
                             
                             state.plan_mode = Some(plan_state);
-                            
+
+                            // Save for session recovery
+                            if let Some(ref ps) = state.plan_mode {
+                                let _ = ps.save_to_file(&PlanModeState::state_path());
+                            }
+
                             eprintln!();
                             eprintln!("{}  Entered plan mode for: {}", "📋".yellow(), sub_arg.cyan());
                             eprintln!();
-                            
+
                             // Display the plan
                             if let Ok(ref p) = plan_result {
                                 let formatted = format_plan(p);
                                 eprintln!("{formatted}");
                             }
-                            
+
                             eprintln!();
                             eprintln!("  {} Commands: 'exit' to leave, 'execute' or 'go' to run the plan", "💡".cyan());
                             eprintln!("  {} Or ask questions to modify the plan", "💬".cyan());
@@ -443,16 +448,40 @@ pub(super) async fn handle_memory_domain_command(
                         }
                     }
                 }
+                "resume" => {
+                    // Resume plan mode from saved state
+                    use super::plan_decompose::{PlanModeState, format_plan};
+                    let path = PlanModeState::state_path();
+                    match PlanModeState::load_from_file(&path) {
+                        Ok(ps) => {
+                            let goal = ps.goal.clone();
+                            let plan = ps.plan.clone();
+                            state.plan_mode = Some(ps);
+                            eprintln!();
+                            eprintln!("{}  Resumed plan mode for: {}", "📋".yellow(), goal.cyan());
+                            eprintln!();
+                            if !plan.subtasks.is_empty() {
+                                eprintln!("{}", format_plan(&plan));
+                            }
+                            eprintln!();
+                            eprintln!("  {} Commands: 'exit' to leave, 'execute' or 'go' to run", "💡".cyan());
+                        }
+                        Err(_) => {
+                            eprintln!("  {} No saved plan state to resume", "⚠".yellow());
+                        }
+                    }
+                }
                 "exit" => {
                     if state.plan_mode.is_some() {
                         state.plan_mode = None;
+                        super::plan_decompose::PlanModeState::clear_saved_state();
                         eprintln!("  {} Exited plan mode", "✓".green());
                     } else {
                         eprintln!("  ⚠️ Not in plan mode");
                     }
                 }
                 _ => {
-                    eprintln!("  Usage: /plan [show | set <text> | clear | decompose <goal> | enter <goal> | exit]");
+                    eprintln!("  Usage: /plan [show | set <text> | clear | decompose <goal> | enter <goal> | resume | exit]");
                 }
             }
         }
@@ -471,7 +500,7 @@ pub async fn handle_plan_mode_input(
     client: &reqwest::Client,
     base: &str,
 ) -> Result<(), String> {
-    use super::plan_decompose::{PlanModeState, TaskPlan, format_plan};
+    use super::plan_decompose::{PlanModeState, format_plan, parse_plan_response};
     
     let plan_state = match state.plan_mode.as_mut() {
         Some(ps) => ps,
@@ -486,7 +515,55 @@ pub async fn handle_plan_mode_input(
     if input_lower == "exit" || input_lower == "quit" || input_lower == "/plan exit" {
         eprintln!();
         eprintln!("{}  Exiting plan mode", "📋".yellow());
+        PlanModeState::clear_saved_state();
         state.plan_mode = None;
+        return Ok(());
+    }
+
+    // Check for "done <id>" — mark subtask completed
+    if let Some(done_id) = input_lower.strip_prefix("done ").map(|s| s.trim()) {
+        if !done_id.is_empty() {
+            match plan_state.complete_subtask(done_id) {
+                Ok(title) => {
+                    let pct = plan_state.plan.progress_pct();
+                    eprintln!(
+                        "  {} Completed: {} ({}%)",
+                        "✓".green(),
+                        title,
+                        pct
+                    );
+                    // Save updated state
+                    let _ = plan_state.save_to_file(&PlanModeState::state_path());
+                    // Show remaining ready tasks
+                    let ready = plan_state.plan.ready_subtasks();
+                    if !ready.is_empty() {
+                        eprintln!("  {} Next ready:", "→".cyan());
+                        for st in &ready {
+                            eprintln!("    {} [{}] {}", "○".dim(), st.id, st.title);
+                        }
+                    } else if plan_state.plan.progress_pct() == 100 {
+                        eprintln!("  {} All tasks complete!", "🎉".green());
+                    }
+                }
+                Err(e) => eprintln!("  {} {}", "⚠".yellow(), e),
+            }
+            return Ok(());
+        }
+    }
+
+    // Check for "status" — show current progress
+    if input_lower == "status" {
+        let pct = plan_state.plan.progress_pct();
+        let done = plan_state.plan.items_done();
+        let total = plan_state.plan.subtasks.len();
+        eprintln!("  Progress: {done}/{total} ({pct}%)");
+        let ready = plan_state.plan.ready_subtasks();
+        if !ready.is_empty() {
+            eprintln!("  {} Ready:", "→".cyan());
+            for st in &ready {
+                eprintln!("    {} [{}] {}", "○".dim(), st.id, st.title);
+            }
+        }
         return Ok(());
     }
 
@@ -494,13 +571,64 @@ pub async fn handle_plan_mode_input(
     if PlanModeState::is_execute_command(&input) {
         eprintln!();
         eprintln!("{}  Executing plan...", "🚀".green());
-        // Store plan to memory before execution (TODO: actually persist this)
-        let _memory_content = plan_state.to_memory_content();
-        eprintln!("{}  Plan ready for execution", "💾".cyan());
+
+        let plan = plan_state.plan.clone();
+        let goal = plan_state.goal.clone();
+
+        // Persist to task service if available
+        if let Some(ref svc) = state.task_service {
+            use mo_agent_services::{TaskCreateRequest, TaskService};
+            let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
+            let session_id = state.session_id.as_deref().unwrap_or("no-session");
+
+            match svc
+                .create_task(
+                    user_id,
+                    session_id,
+                    TaskCreateRequest {
+                        title: goal.clone(),
+                        description: Some(format!(
+                            "Plan Mode: {} subtasks",
+                            plan.subtasks.len()
+                        )),
+                        plan: Some(plan.clone()),
+                        parent_task_id: None,
+                    },
+                )
+                .await
+            {
+                Ok(tid) => {
+                    let short = &tid[..8.min(tid.len())];
+                    eprintln!(
+                        "{}  Task created: {} ({})",
+                        "✓".green(),
+                        goal,
+                        short.dim()
+                    );
+                    eprintln!(
+                        "{}  Track progress: /task status {}",
+                        "💡".cyan(),
+                        short
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{}  Could not persist task: {}",
+                        "⚠".yellow(),
+                        e
+                    );
+                }
+            }
+        } else {
+            eprintln!(
+                "{}  Task service unavailable — plan displayed but not persisted",
+                "⚠".yellow()
+            );
+        }
+
         eprintln!();
-        
+
         // Display the tasks to execute
-        let plan = &plan_state.plan;
         if !plan.subtasks.is_empty() {
             eprintln!("{}  Tasks to execute:", "📋".yellow());
             for task in &plan.subtasks {
@@ -509,11 +637,18 @@ pub async fn handle_plan_mode_input(
                 } else {
                     format!(" (depends on: {})", task.depends_on.join(", "))
                 };
-                eprintln!("    {} [{}] {}{}", "•".dim(), task.id, task.title, deps_str.dim());
+                eprintln!(
+                    "    {} [{}] {}{}",
+                    "•".dim(),
+                    task.id,
+                    task.title,
+                    deps_str.dim()
+                );
             }
             eprintln!();
         }
-        
+
+        PlanModeState::clear_saved_state();
         state.plan_mode = None;
         return Ok(());
     }
@@ -605,46 +740,30 @@ pub async fn handle_plan_mode_input(
                 }
             }
             
-            // Check if response contains JSON plan update
-            if let Some(json_start) = full_text.find("```json") {
-                if let Some(json_end) = full_text[json_start..].find("```\n").or_else(|| full_text[json_start..].rfind("```")) {
-                    let json_content = &full_text[json_start + 7..json_start + json_end];
-                    if let Ok(plan) = serde_json::from_str::<TaskPlan>(json_content.trim()) {
+            // Try to parse plan update from LLM response
+            let plan_updated = if !full_text.is_empty() {
+                match parse_plan_response(&full_text) {
+                    Ok(plan) => {
                         plan_state.set_plan(plan.clone());
                         plan_state.modified = true;
+                        // Save updated state for recovery
+                        let _ = plan_state.save_to_file(&PlanModeState::state_path());
                         eprintln!("{}  Plan updated!", "✓".green());
                         eprintln!();
-                        // Display the updated plan
                         let formatted = format_plan(&plan);
                         eprintln!("{formatted}");
+                        true
                     }
+                    Err(_) => false, // No valid plan JSON — treat as conversational response
                 }
-            }
-            
-            // Show the LLM response (don't filter too aggressively)
-            if !full_text.is_empty() {
-                // Remove markdown code blocks but keep the rest
-                let text_clean = full_text
-                    .replace("```json", "")
-                    .replace("```", "");
-                // Only filter lines that look like pure JSON structure
-                let text_filtered: String = text_clean
-                    .lines()
-                    .filter(|l| {
-                        let trimmed = l.trim();
-                        // Keep lines that have text content, not just JSON delimiters
-                        !trimmed.is_empty() && 
-                        !(trimmed == "{" || trimmed == "}" || trimmed == "[" || trimmed == "]" ||
-                          (trimmed.starts_with('"') && trimmed.ends_with(',')) ||
-                          (trimmed.starts_with('"') && trimmed.ends_with('"')))
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                
-                if !text_filtered.trim().is_empty() {
-                    eprintln!();
-                    eprintln!("{}", text_filtered.trim());
-                }
+            } else {
+                false
+            };
+
+            // Show the LLM text response (skip if we already displayed the plan)
+            if !full_text.is_empty() && !plan_updated {
+                eprintln!();
+                eprintln!("{}", full_text.trim());
             }
             
             // Update history with assistant response

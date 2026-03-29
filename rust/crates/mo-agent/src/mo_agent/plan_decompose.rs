@@ -380,6 +380,32 @@ impl PlanModeState {
     pub fn set_plan(&mut self, plan: TaskPlan) {
         self.plan = plan;
     }
+
+    /// Mark a subtask as completed by ID (prefix match).
+    /// Returns Ok(title) on success, Err(msg) on failure.
+    pub fn complete_subtask(&mut self, id_prefix: &str) -> Result<String, String> {
+        let matches: Vec<usize> = self
+            .plan
+            .subtasks
+            .iter()
+            .enumerate()
+            .filter(|(_, st)| st.id.starts_with(id_prefix))
+            .map(|(i, _)| i)
+            .collect();
+        match matches.len() {
+            0 => Err(format!("No subtask matching '{id_prefix}'")),
+            1 => {
+                let st = &mut self.plan.subtasks[matches[0]];
+                st.status = TaskStatus::Completed;
+                self.modified = true;
+                Ok(st.title.clone())
+            }
+            _ => Err(format!(
+                "Ambiguous: {} subtasks match '{id_prefix}'",
+                matches.len()
+            )),
+        }
+    }
     
     /// Add a conversation turn to history
     pub fn add_turn(&mut self, user_msg: &str, assistant_msg: &str) {
@@ -424,17 +450,18 @@ Based on the user's request, respond in ONE of these ways:
 
 2. **If answering a question**: Respond naturally, no JSON needed.
 
-3. **If user says "execute", "done", "start", "开始", or "执行"**: Respond with exactly:
-`[PLAN_EXECUTE]` followed by a brief confirmation.
-
 Keep responses concise. The plan JSON must be valid if provided."#);
         
         prompt
     }
     
-    /// Check if a response indicates the user wants to execute
-    pub fn is_execute_command(response: &str) -> bool {
-        response.contains("[PLAN_EXECUTE]")
+    /// Check if user input is an execute command
+    pub fn is_execute_command(input: &str) -> bool {
+        let lower = input.trim().to_lowercase();
+        matches!(
+            lower.as_str(),
+            "execute" | "go" | "start" | "done" | "run" | "开始" | "执行" | "运行"
+        )
     }
     
     /// Memory protocol content for storing the active plan
@@ -454,6 +481,35 @@ Keep responses concise. The plan JSON must be valid if provided."#);
             self.plan.subtasks.len(),
             serde_json::to_string_pretty(&self.plan).unwrap_or_default()
         )
+    }
+
+    /// Save plan mode state to a file for session recovery.
+    pub fn save_to_file(&self, path: &Path) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("serialize plan state: {e}"))?;
+        std::fs::write(path, json).map_err(|e| format!("write plan state: {e}"))?;
+        Ok(())
+    }
+
+    /// Load plan mode state from a file.
+    pub fn load_from_file(path: &Path) -> Result<Self, String> {
+        let data = std::fs::read_to_string(path)
+            .map_err(|e| format!("read plan state: {e}"))?;
+        serde_json::from_str(&data).map_err(|e| format!("parse plan state: {e}"))
+    }
+
+    /// Default path for plan state persistence.
+    pub fn state_path() -> std::path::PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        std::path::PathBuf::from(home)
+            .join(".mo-agent")
+            .join("plan_state.json")
+    }
+
+    /// Remove the saved state file.
+    pub fn clear_saved_state() {
+        let path = Self::state_path();
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -585,5 +641,265 @@ Done!"#;
         let ready = plan.ready_subtasks();
         assert_eq!(ready.len(), 1, "only 'a' should be ready");
         assert_eq!(ready[0].id, "a");
+    }
+
+    // ─── New tests for Plan Mode gaps ───────────────────────────────────
+
+    #[test]
+    fn is_execute_command_detects_user_input() {
+        assert!(PlanModeState::is_execute_command("execute"));
+        assert!(PlanModeState::is_execute_command("Execute"));
+        assert!(PlanModeState::is_execute_command("go"));
+        assert!(PlanModeState::is_execute_command("start"));
+        assert!(PlanModeState::is_execute_command("done"));
+        assert!(PlanModeState::is_execute_command("run"));
+        assert!(PlanModeState::is_execute_command("开始"));
+        assert!(PlanModeState::is_execute_command("执行"));
+        assert!(PlanModeState::is_execute_command("运行"));
+        // Negatives
+        assert!(!PlanModeState::is_execute_command("add a task"));
+        assert!(!PlanModeState::is_execute_command("simplify the plan"));
+        assert!(!PlanModeState::is_execute_command("[PLAN_EXECUTE]"));
+    }
+
+    #[test]
+    fn is_execute_command_trims_whitespace() {
+        assert!(PlanModeState::is_execute_command("  go  "));
+        assert!(PlanModeState::is_execute_command(" Execute "));
+    }
+
+    #[test]
+    fn complete_subtask_by_prefix() {
+        let ctx = ProjectContext::default();
+        let mut ps = PlanModeState::new("test".into(), ctx);
+        ps.set_plan(TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "setup-deps".into(),
+                    title: "Install deps".into(),
+                    description: None,
+                    depends_on: vec![],
+                    status: TaskStatus::Pending,
+                },
+                SubtaskPlan {
+                    id: "write-code".into(),
+                    title: "Write code".into(),
+                    description: None,
+                    depends_on: vec!["setup-deps".into()],
+                    status: TaskStatus::Pending,
+                },
+            ],
+            notes: None,
+        });
+
+        // Complete by prefix
+        let result = ps.complete_subtask("setup");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Install deps");
+        assert_eq!(ps.plan.subtasks[0].status, TaskStatus::Completed);
+        assert!(ps.modified);
+
+        // Now "write-code" should be ready
+        let ready = ps.plan.ready_subtasks();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, "write-code");
+    }
+
+    #[test]
+    fn complete_subtask_not_found() {
+        let ctx = ProjectContext::default();
+        let mut ps = PlanModeState::new("test".into(), ctx);
+        ps.set_plan(TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "alpha".into(),
+                title: "A".into(),
+                description: None,
+                depends_on: vec![],
+                status: TaskStatus::Pending,
+            }],
+            notes: None,
+        });
+
+        let result = ps.complete_subtask("beta");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No subtask"));
+    }
+
+    #[test]
+    fn complete_subtask_ambiguous() {
+        let ctx = ProjectContext::default();
+        let mut ps = PlanModeState::new("test".into(), ctx);
+        ps.set_plan(TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "test-unit".into(),
+                    title: "Unit tests".into(),
+                    description: None,
+                    depends_on: vec![],
+                    status: TaskStatus::Pending,
+                },
+                SubtaskPlan {
+                    id: "test-integration".into(),
+                    title: "Integration tests".into(),
+                    description: None,
+                    depends_on: vec![],
+                    status: TaskStatus::Pending,
+                },
+            ],
+            notes: None,
+        });
+
+        let result = ps.complete_subtask("test");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Ambiguous"));
+    }
+
+    #[test]
+    fn save_and_load_plan_state() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let ctx = ProjectContext {
+            root: "/test".into(),
+            languages: vec!["Rust".into()],
+            ..Default::default()
+        };
+        let mut ps = PlanModeState::new("Build a thing".into(), ctx);
+        ps.set_plan(TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "step1".into(),
+                title: "First step".into(),
+                description: Some("Do it".into()),
+                depends_on: vec![],
+                status: TaskStatus::Pending,
+            }],
+            notes: Some("my notes".into()),
+        });
+        ps.add_turn("simplify", "OK done");
+
+        // Save
+        ps.save_to_file(&path).unwrap();
+
+        // Load
+        let loaded = PlanModeState::load_from_file(&path).unwrap();
+        assert_eq!(loaded.goal, "Build a thing");
+        assert_eq!(loaded.plan.subtasks.len(), 1);
+        assert_eq!(loaded.plan.subtasks[0].id, "step1");
+        assert_eq!(loaded.plan.notes, Some("my notes".into()));
+        assert_eq!(loaded.history.len(), 1);
+        assert_eq!(loaded.context.languages, vec!["Rust".to_string()]);
+    }
+
+    #[test]
+    fn load_from_missing_file_errors() {
+        let result = PlanModeState::load_from_file(std::path::Path::new("/nonexistent/plan.json"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn plan_mode_prompt_includes_plan_and_goal() {
+        let ctx = ProjectContext::default();
+        let mut ps = PlanModeState::new("Add auth".into(), ctx);
+        ps.set_plan(TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "jwt".into(),
+                title: "Add JWT".into(),
+                description: None,
+                depends_on: vec![],
+                status: TaskStatus::Pending,
+            }],
+            notes: None,
+        });
+
+        let prompt = ps.plan_mode_prompt("make it simpler");
+        assert!(prompt.contains("Add auth"), "should contain goal");
+        assert!(prompt.contains("jwt"), "should contain plan subtask");
+        assert!(prompt.contains("make it simpler"), "should contain user request");
+        assert!(prompt.contains("PLAN MODE"), "should contain mode indicator");
+    }
+
+    #[test]
+    fn plan_mode_prompt_includes_history() {
+        let ctx = ProjectContext::default();
+        let mut ps = PlanModeState::new("goal".into(), ctx);
+        ps.add_turn("q1", "a1");
+        ps.add_turn("q2", "a2");
+
+        let prompt = ps.plan_mode_prompt("q3");
+        assert!(prompt.contains("Recent Discussion"), "should have history");
+        assert!(prompt.contains("q1"), "should contain first turn");
+    }
+
+    #[test]
+    fn to_memory_content_format() {
+        let ctx = ProjectContext::default();
+        let mut ps = PlanModeState::new("Deploy app".into(), ctx);
+        ps.set_plan(TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "Step 1".into(),
+                description: None,
+                depends_on: vec![],
+                status: TaskStatus::Pending,
+            }],
+            notes: None,
+        });
+
+        let content = ps.to_memory_content();
+        assert!(content.starts_with("[plan:active]"));
+        assert!(content.contains("Deploy app"));
+
+        let completed = ps.to_completed_memory();
+        assert!(completed.starts_with("[plan:completed]"));
+        assert!(completed.contains("1 subtasks"));
+    }
+
+    #[test]
+    fn parse_plan_response_invalid_json() {
+        let result = parse_plan_response("not json at all");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_plan_response_missing_subtasks() {
+        let result = parse_plan_response(r#"{"notes": "just notes"}"#);
+        // Should fail because subtasks field is required
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn progress_tracking_after_completion() {
+        let ctx = ProjectContext::default();
+        let mut ps = PlanModeState::new("test".into(), ctx);
+        ps.set_plan(TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "A".into(),
+                    description: None,
+                    depends_on: vec![],
+                    status: TaskStatus::Pending,
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "B".into(),
+                    description: None,
+                    depends_on: vec![],
+                    status: TaskStatus::Pending,
+                },
+            ],
+            notes: None,
+        });
+
+        assert_eq!(ps.plan.progress_pct(), 0);
+        assert_eq!(ps.plan.items_done(), 0);
+
+        ps.complete_subtask("a").unwrap();
+        assert_eq!(ps.plan.progress_pct(), 50);
+        assert_eq!(ps.plan.items_done(), 1);
+
+        ps.complete_subtask("b").unwrap();
+        assert_eq!(ps.plan.progress_pct(), 100);
+        assert_eq!(ps.plan.items_done(), 2);
     }
 }
