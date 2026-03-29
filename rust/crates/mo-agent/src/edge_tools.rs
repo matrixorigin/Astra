@@ -90,15 +90,57 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "str_replace",
-                "description": "Replace an exact string in a file. old_str must match exactly (including whitespace). On mismatch, shows closest matches with line numbers so you can fix and retry.",
+                "description": "Replace an exact string in a file. old_str must match exactly (including whitespace). On mismatch, shows closest matches with line numbers so you can fix and retry. Set dry_run=true to preview the diff without applying.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
                         "old_str": {"type": "string", "description": "Exact string to replace"},
-                        "new_str": {"type": "string", "description": "Replacement string"}
+                        "new_str": {"type": "string", "description": "Replacement string"},
+                        "dry_run": {"type": "boolean", "description": "If true, show unified diff without applying changes (default: false)"}
                     },
                     "required": ["path", "old_str", "new_str"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "delete_file",
+                "description": "Delete a file. Refuses to delete directories, .git/ contents, or paths outside the project root.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File path relative to project root"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "multi_edit",
+                "description": "Apply multiple str_replace edits to a single file atomically. All edits must match; if any fails, none are applied. More token-efficient than sequential str_replace calls.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File path relative to project root"},
+                        "edits": {
+                            "type": "array",
+                            "description": "Array of {old_str, new_str} pairs to apply in order",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "old_str": {"type": "string", "description": "Exact string to replace"},
+                                    "new_str": {"type": "string", "description": "Replacement string"}
+                                },
+                                "required": ["old_str", "new_str"]
+                            }
+                        },
+                        "dry_run": {"type": "boolean", "description": "If true, show unified diff without applying (default: false)"}
+                    },
+                    "required": ["path", "edits"]
                 }
             }
         }),
@@ -940,6 +982,8 @@ impl ToolExecutor {
             "read_file" => self.read_file(args),
             "write_file" => self.write_file(args),
             "str_replace" => self.str_replace(args),
+            "delete_file" => self.delete_file(args),
+            "multi_edit" => self.multi_edit(args),
             "list_dir" => self.list_dir(args),
             "grep" => self.grep(args),
             "glob" => self.glob(args),

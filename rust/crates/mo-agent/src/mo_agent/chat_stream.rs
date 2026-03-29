@@ -2378,6 +2378,8 @@ mod tests {
             "bash",
             "write_file",
             "str_replace",
+            "delete_file",
+            "multi_edit",
             "git_commit",
             "git_stash",
             "git_checkout_file",

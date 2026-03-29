@@ -185,6 +185,11 @@ impl ToolExecutor {
             Some(s) => s,
             None => return "Error: missing 'new_str'".to_string(),
         };
+        let dry_run = args
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => return format!("Error reading file: {e}"),
@@ -196,7 +201,14 @@ impl ToolExecutor {
         if count > 1 {
             return str_replace_ambiguous_hint(&content, old_str, count);
         }
+
         let new_content = content.replacen(old_str, new_str, 1);
+
+        // Dry run: show unified diff without writing
+        if dry_run {
+            return unified_diff(&content, &new_content, &path);
+        }
+
         match fs::write(&path, &new_content) {
             Ok(_) => {
                 // Auto-format if formatter is available
@@ -222,6 +234,113 @@ impl ToolExecutor {
                         new_lines.len()
                     )
                 };
+                if let Some(fmt_note) = format_result {
+                    result.push_str(&format!("\n{fmt_note}"));
+                }
+                result
+            }
+            Err(e) => format!("Error writing file: {e}"),
+        }
+    }
+
+    pub(crate) fn delete_file(&self, args: &Value) -> String {
+        let path = match args.get("path").and_then(Value::as_str) {
+            Some(p) => match self.resolve_checked(p) {
+                Ok(safe) => safe,
+                Err(e) => return e,
+            },
+            None => return "Error: missing 'path'".to_string(),
+        };
+
+        // Safety: refuse .git/ contents
+        let rel = path
+            .strip_prefix(&self.project_root)
+            .unwrap_or(&path);
+        let rel_str = rel.to_string_lossy();
+        if rel_str.starts_with(".git/") || rel_str.starts_with(".git\\") || rel_str == ".git" {
+            return "Error: refusing to delete .git contents".to_string();
+        }
+
+        // Refuse directories
+        if path.is_dir() {
+            return "Error: refusing to delete a directory. Use bash 'rm -r' if you really need this.".to_string();
+        }
+
+        if !path.exists() {
+            return format!("Error: file not found: {}", rel_str);
+        }
+
+        match fs::remove_file(&path) {
+            Ok(_) => format!("Deleted: {}", rel_str),
+            Err(e) => format!("Error deleting file: {e}"),
+        }
+    }
+
+    pub(crate) fn multi_edit(&self, args: &Value) -> String {
+        let path = match args.get("path").and_then(Value::as_str) {
+            Some(p) => match self.resolve_checked(p) {
+                Ok(safe) => safe,
+                Err(e) => return e,
+            },
+            None => return "Error: missing 'path'".to_string(),
+        };
+        let edits = match args.get("edits").and_then(Value::as_array) {
+            Some(e) => e,
+            None => return "Error: missing 'edits' array".to_string(),
+        };
+        if edits.is_empty() {
+            return "Error: 'edits' array is empty".to_string();
+        }
+        let dry_run = args
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => return format!("Error reading file: {e}"),
+        };
+
+        // Validate all edits first (atomic: all or nothing)
+        let mut working = content.clone();
+        for (i, edit) in edits.iter().enumerate() {
+            let old_str = match edit.get("old_str").and_then(Value::as_str) {
+                Some(s) => s,
+                None => return format!("Error: edit[{i}] missing 'old_str'"),
+            };
+            let new_str = match edit.get("new_str").and_then(Value::as_str) {
+                Some(s) => s,
+                None => return format!("Error: edit[{i}] missing 'new_str'"),
+            };
+            let count = working.matches(old_str).count();
+            if count == 0 {
+                return format!(
+                    "Error: edit[{i}] old_str not found. Aborting all edits.\n{}",
+                    str_replace_not_found_hint(&working, old_str)
+                );
+            }
+            if count > 1 {
+                return format!(
+                    "Error: edit[{i}] old_str matches {count} times (must be unique). Aborting all edits.\n{}",
+                    str_replace_ambiguous_hint(&working, old_str, count)
+                );
+            }
+            working = working.replacen(old_str, new_str, 1);
+        }
+
+        // Dry run: show diff
+        if dry_run {
+            return unified_diff(&content, &working, &path);
+        }
+
+        // Apply
+        match fs::write(&path, &working) {
+            Ok(_) => {
+                let format_result = auto_format_file(&path, &self.project_root);
+                let mut result = format!(
+                    "Applied {} edit(s) successfully",
+                    edits.len()
+                );
                 if let Some(fmt_note) = format_result {
                     result.push_str(&format!("\n{fmt_note}"));
                 }
@@ -637,6 +756,77 @@ fn auto_format_file(file_path: &Path, project_root: &Path) -> Option<String> {
         Ok(_) => None, // Formatter failed silently — don't report
         Err(_) => None, // Formatter not available — don't report
     }
+}
+
+// ─── unified diff generation ────────────────────────────────────────────────
+
+/// Generate a unified diff between old and new content for a given file path.
+fn unified_diff(old_content: &str, new_content: &str, path: &std::path::Path) -> String {
+    let fname = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+
+    let old_lines: Vec<&str> = old_content.lines().collect();
+    let new_lines: Vec<&str> = new_content.lines().collect();
+
+    let mut out = format!("--- a/{fname}\n+++ b/{fname}\n");
+
+    // Find first and last differing line
+    let max_len = old_lines.len().max(new_lines.len());
+    let mut first_diff = max_len;
+    let mut last_diff = 0;
+    for i in 0..max_len {
+        let old_line = old_lines.get(i).copied().unwrap_or("");
+        let new_line = new_lines.get(i).copied().unwrap_or("");
+        if old_line != new_line {
+            if i < first_diff {
+                first_diff = i;
+            }
+            last_diff = i;
+        }
+    }
+
+    if first_diff > last_diff {
+        out.push_str("(no changes)\n");
+        return out;
+    }
+
+    // Show context around the diff (3 lines before/after)
+    let ctx = 3;
+    let start = first_diff.saturating_sub(ctx);
+    let end = (last_diff + ctx + 1).min(max_len);
+
+    out.push_str(&format!(
+        "@@ -{},{} +{},{} @@\n",
+        start + 1,
+        end.min(old_lines.len()).saturating_sub(start),
+        start + 1,
+        end.min(new_lines.len()).saturating_sub(start),
+    ));
+
+    for i in start..end {
+        let old_line = old_lines.get(i).copied();
+        let new_line = new_lines.get(i).copied();
+        match (old_line, new_line) {
+            (Some(o), Some(n)) if o == n => {
+                out.push_str(&format!(" {o}\n"));
+            }
+            (Some(o), Some(n)) => {
+                out.push_str(&format!("-{o}\n"));
+                out.push_str(&format!("+{n}\n"));
+            }
+            (Some(o), None) => {
+                out.push_str(&format!("-{o}\n"));
+            }
+            (None, Some(n)) => {
+                out.push_str(&format!("+{n}\n"));
+            }
+            (None, None) => {}
+        }
+    }
+
+    format!("[DRY RUN] Preview of changes (not applied):\n{out}")
 }
 
 // ─── str_replace fuzzy matching ─────────────────────────────────────────────
@@ -1379,5 +1569,214 @@ type Handler interface {
         if let Some(r) = &result {
             assert!(r.contains("rustfmt"), "should mention rustfmt: {r}");
         }
+    }
+
+    // ─── dry_run / diff preview tests ───────────────────────────────────────
+
+    #[test]
+    fn str_replace_dry_run_shows_diff_without_applying() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("test.txt");
+        std::fs::write(&file, "line1\nline2\nline3\n").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        let result = exe.str_replace(&json!({
+            "path": "test.txt",
+            "old_str": "line2",
+            "new_str": "REPLACED",
+            "dry_run": true
+        }));
+        assert!(result.contains("[DRY RUN]"), "should show dry run marker: {result}");
+        assert!(result.contains("-line2"), "should show removed line: {result}");
+        assert!(result.contains("+REPLACED"), "should show added line: {result}");
+        // File should NOT be modified
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(content, "line1\nline2\nline3\n");
+    }
+
+    #[test]
+    fn str_replace_dry_run_false_still_applies() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("test.txt");
+        std::fs::write(&file, "hello world").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        let result = exe.str_replace(&json!({
+            "path": "test.txt",
+            "old_str": "hello",
+            "new_str": "bye",
+            "dry_run": false
+        }));
+        assert!(result.contains("Replaced successfully"));
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("bye"));
+    }
+
+    // ─── delete_file tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn delete_file_removes_file() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("victim.txt");
+        std::fs::write(&file, "delete me").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        let result = exe.delete_file(&json!({"path": "victim.txt"}));
+        assert!(result.starts_with("Deleted:"), "result: {result}");
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn delete_file_rejects_missing() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        let result = exe.delete_file(&json!({"path": "nope.txt"}));
+        assert!(result.contains("not found"), "result: {result}");
+    }
+
+    #[test]
+    fn delete_file_rejects_directory() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmpdir.path().join("subdir")).unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        let result = exe.delete_file(&json!({"path": "subdir"}));
+        assert!(result.contains("refusing to delete a directory"), "result: {result}");
+    }
+
+    #[test]
+    fn delete_file_rejects_git_contents() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let git_dir = tmpdir.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        let result = exe.delete_file(&json!({"path": ".git/HEAD"}));
+        assert!(result.contains("refusing to delete .git"), "result: {result}");
+    }
+
+    // ─── multi_edit tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn multi_edit_applies_all_edits_atomically() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("code.rs");
+        std::fs::write(&file, "fn foo() {}\nfn bar() {}\nfn baz() {}\n").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        let result = exe.multi_edit(&json!({
+            "path": "code.rs",
+            "edits": [
+                {"old_str": "fn foo() {}", "new_str": "fn foo_renamed() {}"},
+                {"old_str": "fn baz() {}", "new_str": "fn baz_renamed() {}"}
+            ]
+        }));
+        assert!(result.contains("Applied 2 edit(s)"), "result: {result}");
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("fn foo_renamed() {}"));
+        assert!(content.contains("fn bar() {}"));
+        assert!(content.contains("fn baz_renamed() {}"));
+    }
+
+    #[test]
+    fn multi_edit_aborts_on_first_failure() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("code.rs");
+        std::fs::write(&file, "fn foo() {}\nfn bar() {}\n").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        let result = exe.multi_edit(&json!({
+            "path": "code.rs",
+            "edits": [
+                {"old_str": "fn foo() {}", "new_str": "fn renamed() {}"},
+                {"old_str": "fn NONEXISTENT() {}", "new_str": "fn nope() {}"}
+            ]
+        }));
+        assert!(result.contains("edit[1]"), "should identify failing edit: {result}");
+        assert!(result.contains("not found"), "should explain why: {result}");
+        // File should NOT be modified (atomic rollback)
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("fn foo() {}"), "original should be preserved");
+    }
+
+    #[test]
+    fn multi_edit_rejects_ambiguous_match() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("code.rs");
+        std::fs::write(&file, "aaa\naaa\nbbb\n").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        let result = exe.multi_edit(&json!({
+            "path": "code.rs",
+            "edits": [
+                {"old_str": "aaa", "new_str": "ccc"}
+            ]
+        }));
+        assert!(result.contains("edit[0]"), "should identify the edit: {result}");
+        assert!(result.contains("2 times"), "should report count: {result}");
+    }
+
+    #[test]
+    fn multi_edit_dry_run_shows_diff() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("code.rs");
+        std::fs::write(&file, "fn foo() {}\nfn bar() {}\n").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        let result = exe.multi_edit(&json!({
+            "path": "code.rs",
+            "edits": [
+                {"old_str": "fn foo() {}", "new_str": "fn renamed() {}"}
+            ],
+            "dry_run": true
+        }));
+        assert!(result.contains("[DRY RUN]"), "should show dry run marker: {result}");
+        assert!(result.contains("-fn foo() {}"), "should show removed: {result}");
+        assert!(result.contains("+fn renamed() {}"), "should show added: {result}");
+        // File should NOT be modified
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("fn foo() {}"));
+    }
+
+    #[test]
+    fn multi_edit_empty_edits_rejected() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        std::fs::write(tmpdir.path().join("f.txt"), "x").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        let result = exe.multi_edit(&json!({"path": "f.txt", "edits": []}));
+        assert!(result.contains("empty"), "result: {result}");
+    }
+
+    #[test]
+    fn multi_edit_sequential_edits_see_previous_results() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("chain.txt");
+        std::fs::write(&file, "alpha beta gamma").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        let result = exe.multi_edit(&json!({
+            "path": "chain.txt",
+            "edits": [
+                {"old_str": "alpha", "new_str": "ALPHA"},
+                {"old_str": "ALPHA beta", "new_str": "AB"}
+            ]
+        }));
+        assert!(result.contains("Applied 2 edit(s)"), "result: {result}");
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(content, "AB gamma");
+    }
+
+    // ─── unified_diff tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn unified_diff_shows_context() {
+        let old = "line1\nline2\nline3\nline4\nline5\n";
+        let new = "line1\nline2\nLINE3\nline4\nline5\n";
+        let path = std::path::PathBuf::from("test.txt");
+        let diff = super::unified_diff(old, new, &path);
+        assert!(diff.contains("--- a/test.txt"));
+        assert!(diff.contains("+++ b/test.txt"));
+        assert!(diff.contains("-line3"));
+        assert!(diff.contains("+LINE3"));
+        assert!(diff.contains(" line2"), "should have context around change");
+    }
+
+    #[test]
+    fn unified_diff_no_changes() {
+        let s = "same content\n";
+        let path = std::path::PathBuf::from("f.txt");
+        let diff = super::unified_diff(s, s, &path);
+        assert!(diff.contains("(no changes)"));
     }
 }
