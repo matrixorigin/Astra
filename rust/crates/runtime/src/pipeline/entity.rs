@@ -113,6 +113,10 @@ pub struct EntityGraph {
     entities: HashMap<String, EntityKnowledge>,
     /// Alias → canonical name mapping.
     alias_index: HashMap<String, String>,
+    /// Entities modified since last sync (for delta export).
+    dirty_entities: std::collections::HashSet<String>,
+    /// Unix timestamp of last successful sync export.
+    last_sync_epoch: u64,
 }
 
 impl EntityGraph {
@@ -170,6 +174,9 @@ impl EntityGraph {
 
         // Update timestamp to reflect recent observation
         entry.touch();
+
+        // Mark as dirty for delta sync
+        self.dirty_entities.insert(key);
     }
 
     /// Register an alias for an entity.
@@ -285,6 +292,31 @@ impl EntityGraph {
     /// Export all entity knowledge for persistence.
     pub fn export(&self) -> Vec<EntityKnowledge> {
         self.entities.values().cloned().collect()
+    }
+
+    /// Export only entities modified since last sync.
+    /// Call `clear_dirty()` after successful sync to reset tracking.
+    pub fn export_dirty(&self) -> Vec<EntityKnowledge> {
+        self.dirty_entities
+            .iter()
+            .filter_map(|name| self.entities.get(name).cloned())
+            .collect()
+    }
+
+    /// Check if there are dirty entities needing sync.
+    pub fn has_dirty(&self) -> bool {
+        !self.dirty_entities.is_empty()
+    }
+
+    /// Clear dirty tracking after successful sync.
+    pub fn clear_dirty(&mut self) {
+        self.dirty_entities.clear();
+        self.last_sync_epoch = current_entity_timestamp();
+    }
+
+    /// Get the timestamp of last successful sync.
+    pub fn last_sync_epoch(&self) -> u64 {
+        self.last_sync_epoch
     }
 
     /// Number of known entities.

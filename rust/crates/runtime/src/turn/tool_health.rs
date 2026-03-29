@@ -62,6 +62,10 @@ impl ToolHealth {
 #[derive(Debug, Clone, Default)]
 pub struct ToolHealthTracker {
     tools: HashMap<String, ToolHealth>,
+    /// Tools modified since last sync (for delta export).
+    dirty_tools: std::collections::HashSet<String>,
+    /// Unix timestamp of last successful sync export.
+    last_sync_epoch: u64,
 }
 
 impl ToolHealthTracker {
@@ -86,6 +90,8 @@ impl ToolHealthTracker {
         {
             health.rehabilitation_count = 0;
         }
+        // Mark dirty for delta sync
+        self.dirty_tools.insert(tool_name.to_string());
     }
 
     /// Record a failed tool execution.
@@ -105,6 +111,8 @@ impl ToolHealthTracker {
         if health.consecutive_failures >= threshold {
             health.deprioritized = true;
         }
+        // Mark dirty for delta sync
+        self.dirty_tools.insert(tool_name.to_string());
     }
 
     /// Record an empty result (not error, but useless).
@@ -115,6 +123,8 @@ impl ToolHealthTracker {
         health.total_calls += 1;
         // Empty results don't increment consecutive_failures or total_failures
         // but they break the success streak
+        // Mark dirty for delta sync
+        self.dirty_tools.insert(tool_name.to_string());
     }
 
     /// Record a tool timeout (infrastructure failure, not a tool bug).
@@ -131,6 +141,8 @@ impl ToolHealthTracker {
         if health.consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD {
             health.deprioritized = true;
         }
+        // Mark dirty for delta sync
+        self.dirty_tools.insert(tool_name.to_string());
     }
 
     /// Record a system resource-limit failure (fork exhaustion, OOM, disk full).
@@ -143,6 +155,8 @@ impl ToolHealthTracker {
         health.consecutive_failures += 1;
         // Immediate deprioritization — resource limits affect the whole system
         health.deprioritized = true;
+        // Mark dirty for delta sync
+        self.dirty_tools.insert(tool_name.to_string());
     }
 
     /// Record a cache hit (idempotency cache served the result).
@@ -153,6 +167,8 @@ impl ToolHealthTracker {
         health.cache_hit_count += 1;
         // Not counted as total_calls — the tool didn't run
         // Not counted as success or failure — no signal about tool health
+        // Mark dirty for delta sync (cache stats changed)
+        self.dirty_tools.insert(tool_name.to_string());
     }
 
     /// Check if a tool has been deprioritized due to repeated failures.
@@ -281,6 +297,50 @@ impl ToolHealthTracker {
         }
 
         result
+    }
+
+    /// Export only tools modified since last sync.
+    /// Call `clear_dirty()` after successful sync to reset tracking.
+    pub fn export_dirty(&self) -> Vec<crate::pipeline::persistence::ToolHealthEntry> {
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.dirty_tools
+            .iter()
+            .filter_map(|name| self.tools.get(name).map(|h| (name, h)))
+            .filter(|(_, h)| h.total_calls > 0)
+            .map(|(name, h)| crate::pipeline::persistence::ToolHealthEntry {
+                name: name.clone(),
+                total_calls: h.total_calls,
+                total_failures: h.total_failures,
+                failure_rate: if h.total_calls > 0 {
+                    h.total_failures as f64 / h.total_calls as f64
+                } else {
+                    0.0
+                },
+                last_updated_epoch: now_epoch,
+            })
+            .collect()
+    }
+
+    /// Check if there are dirty tools needing sync.
+    pub fn has_dirty(&self) -> bool {
+        !self.dirty_tools.is_empty()
+    }
+
+    /// Clear dirty tracking after successful sync.
+    pub fn clear_dirty(&mut self) {
+        self.dirty_tools.clear();
+        self.last_sync_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+    }
+
+    /// Get the timestamp of last successful sync.
+    pub fn last_sync_epoch(&self) -> u64 {
+        self.last_sync_epoch
     }
 
     /// Create a tracker seeded from persisted entries.

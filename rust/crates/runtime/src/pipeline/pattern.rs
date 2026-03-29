@@ -173,6 +173,10 @@ pub struct PatternLibrary {
     type_index: HashMap<TaskType, Vec<String>>,
     /// domain → [signature] for fast lookup.
     domain_index: HashMap<DomainHint, Vec<String>>,
+    /// Patterns modified since last sync (for delta export).
+    dirty_patterns: std::collections::HashSet<String>,
+    /// Unix timestamp of last successful sync export.
+    last_sync_epoch: u64,
 }
 
 /// Compute canonical signature from tool names (sorted, "|"-joined).
@@ -254,6 +258,9 @@ impl PatternLibrary {
 
         // Update timestamp to reflect recent use
         pattern.touch();
+
+        // Mark as dirty for delta sync
+        self.dirty_patterns.insert(key);
     }
 
     /// Suggest best patterns for a task type + optional domain filter.
@@ -448,6 +455,31 @@ impl PatternLibrary {
     /// Export all patterns for persistence.
     pub fn export(&self) -> Vec<ToolChainPattern> {
         self.patterns.values().cloned().collect()
+    }
+
+    /// Export only patterns modified since last sync.
+    /// Call `clear_dirty()` after successful sync to reset tracking.
+    pub fn export_dirty(&self) -> Vec<ToolChainPattern> {
+        self.dirty_patterns
+            .iter()
+            .filter_map(|key| self.patterns.get(key).cloned())
+            .collect()
+    }
+
+    /// Check if there are dirty patterns needing sync.
+    pub fn has_dirty(&self) -> bool {
+        !self.dirty_patterns.is_empty()
+    }
+
+    /// Clear dirty tracking after successful sync.
+    pub fn clear_dirty(&mut self) {
+        self.dirty_patterns.clear();
+        self.last_sync_epoch = current_timestamp();
+    }
+
+    /// Get the timestamp of last successful sync.
+    pub fn last_sync_epoch(&self) -> u64 {
+        self.last_sync_epoch
     }
 
     /// Merge stored patterns into the library.

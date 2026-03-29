@@ -40,6 +40,14 @@
 use super::routing::{DomainHint, TaskType};
 use std::collections::HashMap;
 
+/// Get current Unix timestamp in seconds.
+fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 // ─── Calibration Entry ───────────────────────────────────────────────────────
 
 /// Tracks total observations and corrections for one calibration dimension.
@@ -94,6 +102,10 @@ pub struct ProgressiveCalibrator {
     min_threshold: f64,
     /// Ceiling — never go above this.
     max_threshold: f64,
+    /// Whether any calibration data changed since last sync.
+    dirty: bool,
+    /// Unix timestamp of last successful sync export.
+    last_sync_epoch: u64,
 }
 
 /// Weight of each calibration axis in the combined threshold adjustment.
@@ -110,6 +122,8 @@ impl ProgressiveCalibrator {
             base_threshold,
             min_threshold: 0.25,
             max_threshold: 0.95,
+            dirty: false,
+            last_sync_epoch: 0,
         }
     }
 
@@ -151,6 +165,9 @@ impl ProgressiveCalibrator {
             .entry(task_type)
             .or_default()
             .record(effective_correction);
+
+        // Mark as dirty for delta sync
+        self.dirty = true;
     }
 
     /// Compute calibrated threshold blending all three axes.
@@ -225,6 +242,22 @@ impl ProgressiveCalibrator {
             per_task: self.per_task.clone(),
             base_threshold: self.base_threshold,
         }
+    }
+
+    /// Check if calibration data changed since last sync.
+    pub fn has_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Clear dirty flag after successful sync.
+    pub fn clear_dirty(&mut self) {
+        self.dirty = false;
+        self.last_sync_epoch = current_timestamp();
+    }
+
+    /// Get the timestamp of last successful sync.
+    pub fn last_sync_epoch(&self) -> u64 {
+        self.last_sync_epoch
     }
 
     /// Merge persisted calibration data.
