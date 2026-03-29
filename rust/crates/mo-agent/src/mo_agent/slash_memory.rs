@@ -521,9 +521,101 @@ pub(super) async fn handle_memory_domain_command(
                         eprintln!("  ⚠️ Not in plan mode");
                     }
                 }
+                "list" => {
+                    let plans = crate::plan_decompose::list_saved_plans();
+                    let templates = crate::plan_decompose::builtin_templates();
+                    eprintln!("{}", crate::plan_decompose::format_plan_list(&plans));
+                    eprintln!("  {} Built-in templates:", "📋".cyan());
+                    for t in &templates {
+                        eprintln!("    • {} — {} [{}]", t.name, t.description,
+                            t.languages.join(", "));
+                    }
+                    eprintln!("  Use /plan template <name> <goal> to instantiate");
+                }
+                "template" if !sub_arg.is_empty() => {
+                    let parts: Vec<&str> = sub_arg.splitn(2, ' ').collect();
+                    let name = parts[0];
+                    let goal = if parts.len() > 1 { parts[1] } else { "implement this feature" };
+                    match crate::plan_decompose::instantiate_template(name, goal) {
+                        Some(plan) => {
+                            eprintln!("  {} Template '{}' instantiated with {} subtasks",
+                                "✓".green(), name, plan.subtasks.len());
+                            eprintln!("{}", crate::plan_decompose::format_plan(&plan));
+                            // Enter plan mode with this template
+                            let project_root = std::env::current_dir()
+                                .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                            let context = crate::plan_decompose::analyze_project(&project_root);
+                            let mut ps = crate::plan_decompose::PlanModeState::new(
+                                goal.to_string(), context);
+                            ps.set_plan(plan);
+                            state.plan_mode = Some(ps);
+                            eprintln!("  {} Entered plan mode. Type 'execute' to run, 'exit' to leave.",
+                                "💡".cyan());
+                        }
+                        None => {
+                            let names: Vec<_> = crate::plan_decompose::builtin_templates()
+                                .iter().map(|t| t.name.clone()).collect();
+                            eprintln!("  {} Template '{}' not found. Available: {}",
+                                "⚠".yellow(), name, names.join(", "));
+                        }
+                    }
+                }
+                "history" => {
+                    if let Some(ref ps) = state.plan_mode {
+                        eprintln!("  ─── Version History ───");
+                        eprintln!("{}", ps.version_history.format_log());
+                    } else {
+                        eprintln!("  {} Not in plan mode. Use /plan enter <goal> first.",
+                            "⚠".yellow());
+                    }
+                }
+                "diff" if !sub_arg.is_empty() => {
+                    if let Some(ref ps) = state.plan_mode {
+                        let parts: Vec<&str> = sub_arg.split_whitespace().collect();
+                        if parts.len() == 2 {
+                            if let (Ok(from), Ok(to)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                                match ps.version_history.diff_versions(from, to) {
+                                    Ok(diff) => eprintln!("{}", diff.format()),
+                                    Err(e) => eprintln!("  {} {}", "⚠".yellow(), e),
+                                }
+                            } else {
+                                eprintln!("  Usage: /plan diff <from_version> <to_version>");
+                            }
+                        } else {
+                            eprintln!("  Usage: /plan diff <from_version> <to_version>");
+                        }
+                    } else {
+                        eprintln!("  {} Not in plan mode.", "⚠".yellow());
+                    }
+                }
+                "rollback" if !sub_arg.is_empty() => {
+                    if let Some(ref mut ps) = state.plan_mode {
+                        if let Ok(version) = sub_arg.trim().parse::<u32>() {
+                            match ps.rollback_to_version(version) {
+                                Ok(msg) => {
+                                    eprintln!("  {} {}", "✓".green(), msg);
+                                    eprintln!("{}", crate::plan_decompose::format_plan(&ps.plan));
+                                }
+                                Err(e) => eprintln!("  {} {}", "⚠".yellow(), e),
+                            }
+                        } else {
+                            eprintln!("  Usage: /plan rollback <version_number>");
+                        }
+                    } else {
+                        eprintln!("  {} Not in plan mode.", "⚠".yellow());
+                    }
+                }
+                "parallel" => {
+                    if let Some(ref ps) = state.plan_mode {
+                        let analysis = crate::plan_decompose::analyze_parallelism(&ps.plan);
+                        eprintln!("{}", crate::plan_decompose::format_parallelism(&analysis));
+                    } else {
+                        eprintln!("  {} Not in plan mode.", "⚠".yellow());
+                    }
+                }
                 _ => {
                     eprintln!(
-                        "  Usage: /plan [show | set <text> | clear | decompose <goal> | enter <goal> | resume | exit]"
+                        "  Usage: /plan [show | set <text> | clear | decompose <goal> | enter <goal> | resume | exit | list | template <name> <goal> | history | diff <v1> <v2> | rollback <v> | parallel]"
                     );
                 }
             }

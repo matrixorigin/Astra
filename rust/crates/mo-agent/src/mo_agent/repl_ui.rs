@@ -87,7 +87,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/plan",
-        "Plan mode: /plan [enter <goal>|resume|exit|decompose|show|set|clear]",
+        "Plan mode: /plan [enter|resume|exit|show|list|template|history|diff|rollback|parallel]",
     ),
     (
         "/task",

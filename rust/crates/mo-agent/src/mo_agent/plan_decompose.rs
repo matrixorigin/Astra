@@ -528,6 +528,9 @@ pub struct PlanModeState {
     pub history: Vec<(String, String)>,
     /// Whether the plan has been modified since generation
     pub modified: bool,
+    /// Version history for plan rollback and diffing
+    #[serde(default)]
+    pub version_history: PlanVersionHistory,
 }
 
 impl PlanModeState {
@@ -539,12 +542,38 @@ impl PlanModeState {
             plan: TaskPlan::default(),
             history: Vec::new(),
             modified: false,
+            version_history: PlanVersionHistory::default(),
         }
     }
 
-    /// Set the plan (after LLM generation)
+    /// Set the plan (after LLM generation) and record a version.
     pub fn set_plan(&mut self, plan: TaskPlan) {
+        let summary = if self.version_history.versions.is_empty() {
+            "Initial plan".to_string()
+        } else {
+            "Plan updated".to_string()
+        };
+        self.version_history.record(&plan, &summary);
         self.plan = plan;
+    }
+
+    /// Update the plan with a change description (for manual modifications).
+    pub fn update_plan(&mut self, plan: TaskPlan, change_summary: &str) {
+        self.version_history.record(&plan, change_summary);
+        self.plan = plan;
+        self.modified = true;
+    }
+
+    /// Rollback to a specific plan version.
+    pub fn rollback_to_version(&mut self, version: u32) -> Result<String, String> {
+        let v = self.version_history.get_version(version)
+            .ok_or_else(|| format!("Version {} not found", version))?;
+        let plan = v.plan.clone();
+        let summary = format!("Rollback to v{}", version);
+        self.version_history.record(&plan, &summary);
+        self.plan = plan;
+        self.modified = true;
+        Ok(summary)
     }
 
     /// Mark a subtask as completed by ID (prefix match).
@@ -728,6 +757,544 @@ pub fn format_subtask_prompt(subtask: &SubtaskPlan) -> String {
     );
 
     prompt
+}
+
+// ─── Plan Versioning ─────────────────────────────────────────────────────────
+
+/// A versioned snapshot of a plan, recording the full plan at a point in time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanVersion {
+    /// Monotonically increasing version number
+    pub version: u32,
+    /// What changed in this version (user-driven or auto-generated)
+    pub change_summary: String,
+    /// Snapshot of the plan at this version
+    pub plan: TaskPlan,
+    /// Timestamp (ISO 8601)
+    pub timestamp: String,
+}
+
+/// Version history tracker embedded in PlanModeState.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlanVersionHistory {
+    /// All recorded versions, ordered by version number.
+    pub versions: Vec<PlanVersion>,
+    /// Current version number (starts at 0).
+    pub current_version: u32,
+}
+
+impl PlanVersionHistory {
+    /// Record a new version. Returns the version number.
+    pub fn record(&mut self, plan: &TaskPlan, change_summary: &str) -> u32 {
+        self.current_version += 1;
+        let version = PlanVersion {
+            version: self.current_version,
+            change_summary: change_summary.to_string(),
+            plan: plan.clone(),
+            timestamp: chrono_now_iso(),
+        };
+        self.versions.push(version);
+        self.current_version
+    }
+
+    /// Get a specific version by number.
+    pub fn get_version(&self, version: u32) -> Option<&PlanVersion> {
+        self.versions.iter().find(|v| v.version == version)
+    }
+
+    /// Show a compact diff between two versions (by listing changed subtask IDs).
+    pub fn diff_versions(&self, from: u32, to: u32) -> Result<PlanDiff, String> {
+        let v_from = self.get_version(from)
+            .ok_or_else(|| format!("Version {} not found", from))?;
+        let v_to = self.get_version(to)
+            .ok_or_else(|| format!("Version {} not found", to))?;
+
+        let old_ids: std::collections::HashSet<&str> = v_from.plan.subtasks.iter()
+            .map(|s| s.id.as_str()).collect();
+        let new_ids: std::collections::HashSet<&str> = v_to.plan.subtasks.iter()
+            .map(|s| s.id.as_str()).collect();
+
+        let added: Vec<String> = new_ids.difference(&old_ids).map(|s| s.to_string()).collect();
+        let removed: Vec<String> = old_ids.difference(&new_ids).map(|s| s.to_string()).collect();
+
+        // Detect modified (same ID but different title/description/deps)
+        let mut modified = Vec::new();
+        for st_new in &v_to.plan.subtasks {
+            if let Some(st_old) = v_from.plan.subtasks.iter().find(|s| s.id == st_new.id) {
+                if st_new.title != st_old.title
+                    || st_new.description != st_old.description
+                    || st_new.depends_on != st_old.depends_on
+                    || st_new.effort != st_old.effort
+                    || st_new.files != st_old.files
+                {
+                    modified.push(st_new.id.clone());
+                }
+            }
+        }
+
+        Ok(PlanDiff { from_version: from, to_version: to, added, removed, modified })
+    }
+
+    /// Format a compact version log for display.
+    pub fn format_log(&self) -> String {
+        if self.versions.is_empty() {
+            return "  No version history yet.\n".to_string();
+        }
+        let mut out = String::new();
+        for v in self.versions.iter().rev().take(10) {
+            out.push_str(&format!("  v{}: {} ({} subtasks) — {}\n",
+                v.version, v.change_summary, v.plan.subtasks.len(), v.timestamp));
+        }
+        out
+    }
+}
+
+/// Result of diffing two plan versions.
+#[derive(Debug, Clone)]
+pub struct PlanDiff {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub modified: Vec<String>,
+}
+
+impl PlanDiff {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.modified.is_empty()
+    }
+
+    pub fn format(&self) -> String {
+        let mut out = format!("  Plan diff v{} → v{}:\n", self.from_version, self.to_version);
+        for id in &self.added {
+            out.push_str(&format!("    + {}\n", id));
+        }
+        for id in &self.removed {
+            out.push_str(&format!("    - {}\n", id));
+        }
+        for id in &self.modified {
+            out.push_str(&format!("    ~ {}\n", id));
+        }
+        if self.is_empty() {
+            out.push_str("    (no changes)\n");
+        }
+        out
+    }
+}
+
+fn chrono_now_iso() -> String {
+    // Use system time for a simple ISO 8601 timestamp
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Simple format without external crate
+    format!("{}", now)
+}
+
+// ─── Parallel Subtask Detection & File Conflict ─────────────────────────────
+
+/// Analysis of which subtasks can run in parallel.
+#[derive(Debug, Clone)]
+pub struct ParallelGroups {
+    /// Groups of subtask IDs that can execute concurrently.
+    /// Each group contains subtasks that are all ready and have no file conflicts.
+    pub groups: Vec<Vec<String>>,
+    /// File conflicts detected: (subtask_a, subtask_b, shared_files).
+    pub conflicts: Vec<FileConflict>,
+}
+
+/// Two subtasks targeting overlapping files.
+#[derive(Debug, Clone)]
+pub struct FileConflict {
+    pub subtask_a: String,
+    pub subtask_b: String,
+    pub shared_files: Vec<String>,
+}
+
+/// Analyze a plan to find parallelizable subtask groups and file conflicts.
+pub fn analyze_parallelism(plan: &TaskPlan) -> ParallelGroups {
+    let ready = plan.ready_subtasks();
+    if ready.len() <= 1 {
+        return ParallelGroups {
+            groups: if ready.is_empty() { vec![] } else { vec![vec![ready[0].id.clone()]] },
+            conflicts: vec![],
+        };
+    }
+
+    // Detect file conflicts between all pairs of ready subtasks
+    let mut conflicts = Vec::new();
+    for i in 0..ready.len() {
+        for j in (i + 1)..ready.len() {
+            let shared: Vec<String> = ready[i].files.iter()
+                .filter(|f| ready[j].files.contains(f))
+                .cloned()
+                .collect();
+            if !shared.is_empty() {
+                conflicts.push(FileConflict {
+                    subtask_a: ready[i].id.clone(),
+                    subtask_b: ready[j].id.clone(),
+                    shared_files: shared,
+                });
+            }
+        }
+    }
+
+    // Build groups: use a simple greedy coloring approach
+    // conflicting subtasks can't be in the same group
+    let conflict_pairs: std::collections::HashSet<(String, String)> = conflicts.iter()
+        .flat_map(|c| vec![
+            (c.subtask_a.clone(), c.subtask_b.clone()),
+            (c.subtask_b.clone(), c.subtask_a.clone()),
+        ])
+        .collect();
+
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    for st in &ready {
+        let mut placed = false;
+        for group in groups.iter_mut() {
+            let has_conflict = group.iter().any(|g_id| {
+                conflict_pairs.contains(&(g_id.clone(), st.id.clone()))
+            });
+            if !has_conflict {
+                group.push(st.id.clone());
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            groups.push(vec![st.id.clone()]);
+        }
+    }
+
+    ParallelGroups { groups, conflicts }
+}
+
+/// Format parallelism analysis for display.
+pub fn format_parallelism(analysis: &ParallelGroups) -> String {
+    let mut out = String::new();
+
+    if analysis.groups.len() <= 1 && analysis.conflicts.is_empty() {
+        if analysis.groups.is_empty() {
+            out.push_str("  No ready subtasks.\n");
+        } else {
+            out.push_str(&format!("  Sequential: {}\n", analysis.groups[0].join(", ")));
+        }
+        return out;
+    }
+
+    out.push_str("  ┌── Parallel Execution Groups ──\n");
+    for (i, group) in analysis.groups.iter().enumerate() {
+        let label = if group.len() > 1 { "║" } else { "│" };
+        out.push_str(&format!("  {} Group {}: {}\n", label, i + 1, group.join(" + ")));
+    }
+    out.push_str("  └────────────────────────────────\n");
+
+    if !analysis.conflicts.is_empty() {
+        out.push_str("  ⚠ File conflicts:\n");
+        for c in &analysis.conflicts {
+            out.push_str(&format!("    {} ↔ {} on: {}\n",
+                c.subtask_a, c.subtask_b, c.shared_files.join(", ")));
+        }
+    }
+
+    out
+}
+
+// ─── Plan Templates ─────────────────────────────────────────────────────────
+
+/// A reusable plan template.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanTemplate {
+    /// Template name (e.g., "rust-feature", "ts-api-endpoint")
+    pub name: String,
+    /// Description of when to use this template
+    pub description: String,
+    /// Languages this template applies to
+    pub languages: Vec<String>,
+    /// Template subtasks (with placeholder descriptions)
+    pub subtasks: Vec<SubtaskPlan>,
+    /// Notes to include in generated plans
+    pub notes: Option<String>,
+}
+
+/// Built-in templates for common coding tasks.
+pub fn builtin_templates() -> Vec<PlanTemplate> {
+    vec![
+        PlanTemplate {
+            name: "rust-feature".to_string(),
+            description: "Add a new feature to a Rust project".to_string(),
+            languages: vec!["Rust".to_string()],
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "design".into(), title: "Design the API surface".into(),
+                    description: Some("Define public types, traits, and function signatures".into()),
+                    effort: Some("small".into()),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "implement".into(), title: "Implement core logic".into(),
+                    description: Some("Write the implementation, handle error cases".into()),
+                    depends_on: vec!["design".into()],
+                    effort: Some("large".into()),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "tests".into(), title: "Add tests".into(),
+                    description: Some("Unit tests for core logic, integration tests for API".into()),
+                    depends_on: vec!["implement".into()],
+                    effort: Some("medium".into()),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "docs".into(), title: "Update documentation".into(),
+                    description: Some("Doc comments, README updates if needed".into()),
+                    depends_on: vec!["implement".into()],
+                    effort: Some("small".into()),
+                    ..Default::default()
+                },
+            ],
+            notes: Some("Follow existing code conventions. Run cargo test --workspace before committing.".into()),
+        },
+        PlanTemplate {
+            name: "ts-api-endpoint".to_string(),
+            description: "Add a new API endpoint to a TypeScript/Node.js project".to_string(),
+            languages: vec!["TypeScript".to_string(), "JavaScript".to_string()],
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "types".into(), title: "Define types/interfaces".into(),
+                    description: Some("Request/response types, validation schemas".into()),
+                    effort: Some("small".into()),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "route".into(), title: "Add route handler".into(),
+                    description: Some("Implement the endpoint with proper error handling".into()),
+                    depends_on: vec!["types".into()],
+                    effort: Some("medium".into()),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "test".into(), title: "Add endpoint tests".into(),
+                    description: Some("Unit + integration tests with mocked dependencies".into()),
+                    depends_on: vec!["route".into()],
+                    effort: Some("medium".into()),
+                    ..Default::default()
+                },
+            ],
+            notes: Some("Use existing middleware patterns. Add OpenAPI annotations if available.".into()),
+        },
+        PlanTemplate {
+            name: "bug-fix".to_string(),
+            description: "Fix a bug with proper regression testing".to_string(),
+            languages: vec![],
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "reproduce".into(), title: "Reproduce the bug".into(),
+                    description: Some("Write a failing test that demonstrates the bug".into()),
+                    effort: Some("small".into()),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "root-cause".into(), title: "Identify root cause".into(),
+                    description: Some("Trace the issue through the code, identify the exact location".into()),
+                    depends_on: vec!["reproduce".into()],
+                    effort: Some("medium".into()),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "fix".into(), title: "Implement the fix".into(),
+                    description: Some("Make minimal, targeted changes to fix the issue".into()),
+                    depends_on: vec!["root-cause".into()],
+                    effort: Some("small".into()),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "verify".into(), title: "Verify fix and test".into(),
+                    description: Some("Ensure the failing test passes and no regressions".into()),
+                    depends_on: vec!["fix".into()],
+                    effort: Some("small".into()),
+                    ..Default::default()
+                },
+            ],
+            notes: Some("Test-first approach: write the failing test BEFORE fixing. Run full test suite after.".into()),
+        },
+        PlanTemplate {
+            name: "refactor".to_string(),
+            description: "Refactor code with safety nets".to_string(),
+            languages: vec![],
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "baseline".into(), title: "Establish baseline".into(),
+                    description: Some("Ensure all tests pass, document current behavior".into()),
+                    effort: Some("small".into()),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "refactor".into(), title: "Apply refactoring".into(),
+                    description: Some("Make structural changes while preserving behavior".into()),
+                    depends_on: vec!["baseline".into()],
+                    effort: Some("large".into()),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "verify".into(), title: "Verify no regressions".into(),
+                    description: Some("Run full test suite, check for behavioral changes".into()),
+                    depends_on: vec!["refactor".into()],
+                    effort: Some("small".into()),
+                    ..Default::default()
+                },
+            ],
+            notes: Some("Make each refactoring step small and independently verifiable. Commit frequently.".into()),
+        },
+    ]
+}
+
+/// Find matching templates for a project context.
+pub fn suggest_templates(context: &ProjectContext, goal: &str) -> Vec<&'static str> {
+    let templates = builtin_templates();
+    let goal_lower = goal.to_lowercase();
+    let mut matches = Vec::new();
+
+    for t in &templates {
+        // Language match
+        let lang_match = t.languages.is_empty() || t.languages.iter().any(|l|
+            context.languages.iter().any(|cl| cl.eq_ignore_ascii_case(l))
+        );
+        if !lang_match {
+            continue;
+        }
+
+        // Goal keyword match
+        let name_match = goal_lower.contains(&t.name.replace('-', " "))
+            || goal_lower.contains(&t.name);
+        let desc_match = t.description.split_whitespace()
+            .any(|w| w.len() > 3 && goal_lower.contains(&w.to_lowercase()));
+
+        if name_match || desc_match {
+            matches.push(t.name.as_str());
+        }
+    }
+
+    // Static lifetime trick: return names that match the builtin list
+    let builtin = builtin_templates();
+    let mut result = Vec::new();
+    for m in matches {
+        for bt in &builtin {
+            if bt.name == m {
+                // Leak the string for static lifetime (these are a fixed small set)
+                result.push(&*Box::leak(bt.name.clone().into_boxed_str()));
+            }
+        }
+    }
+    result
+}
+
+/// Instantiate a template by name, customizing the goal.
+pub fn instantiate_template(name: &str, goal: &str) -> Option<TaskPlan> {
+    let templates = builtin_templates();
+    let template = templates.iter().find(|t| t.name == name)?;
+
+    let mut plan = TaskPlan {
+        subtasks: template.subtasks.clone(),
+        notes: template.notes.clone(),
+    };
+
+    // Reset all statuses and add goal context to notes
+    for st in &mut plan.subtasks {
+        st.status = TaskStatus::Pending;
+    }
+
+    if let Some(ref mut notes) = plan.notes {
+        *notes = format!("Goal: {}\n{}", goal, notes);
+    } else {
+        plan.notes = Some(format!("Goal: {}", goal));
+    }
+
+    Some(plan)
+}
+
+// ─── Plan Listing ───────────────────────────────────────────────────────────
+
+/// List all saved plan state files.
+pub fn list_saved_plans() -> Vec<SavedPlanInfo> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let plans_dir = std::path::PathBuf::from(&home).join(".mo-agent");
+
+    let mut result = Vec::new();
+
+    // Check for active plan state
+    let state_path = plans_dir.join("plan_state.json");
+    if state_path.exists() {
+        if let Ok(state) = PlanModeState::load_from_file(&state_path) {
+            result.push(SavedPlanInfo {
+                name: "active".to_string(),
+                goal: state.goal,
+                progress_pct: state.plan.progress_pct(),
+                subtask_count: state.plan.subtasks.len(),
+                status: if state.plan.progress_pct() == 100 { "completed" } else { "active" }.to_string(),
+            });
+        }
+    }
+
+    // Check for plan templates in templates dir
+    let templates_dir = plans_dir.join("plan_templates");
+    if templates_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&templates_dir) {
+            for entry in entries.flatten() {
+                if let Some(ext) = entry.path().extension() {
+                    if ext == "json" {
+                        if let Ok(data) = std::fs::read_to_string(entry.path()) {
+                            if let Ok(tmpl) = serde_json::from_str::<PlanTemplate>(&data) {
+                                result.push(SavedPlanInfo {
+                                    name: tmpl.name,
+                                    goal: tmpl.description,
+                                    progress_pct: 0,
+                                    subtask_count: tmpl.subtasks.len(),
+                                    status: "template".to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Summary info for a saved plan.
+#[derive(Debug, Clone)]
+pub struct SavedPlanInfo {
+    pub name: String,
+    pub goal: String,
+    pub progress_pct: u32,
+    pub subtask_count: usize,
+    pub status: String,
+}
+
+/// Format saved plans for display.
+pub fn format_plan_list(plans: &[SavedPlanInfo]) -> String {
+    if plans.is_empty() {
+        return "  No saved plans. Use /plan enter <goal> to create one.\n".to_string();
+    }
+    let mut out = String::new();
+    out.push_str("  ┌── Saved Plans ──\n");
+    for p in plans {
+        let status_icon = match p.status.as_str() {
+            "active" => "▶",
+            "completed" => "✓",
+            "template" => "📋",
+            _ => "·",
+        };
+        out.push_str(&format!("  {} {} — {} ({}%, {}/{} subtasks)\n",
+            status_icon, p.name, p.goal, p.progress_pct, 
+            (p.subtask_count as u32 * p.progress_pct / 100.max(1)),
+            p.subtask_count));
+    }
+    out.push_str("  └────────────────\n");
+    out
 }
 
 #[cfg(test)]
@@ -1660,5 +2227,313 @@ Done!"#;
         assert!(!is_resume_command("fix the bug"));
         assert!(!is_resume_command("continue with something else"));
         assert!(!is_resume_command(""));
+    }
+
+    // ═══════════════════════════ Plan Versioning Tests ════════════════════════
+
+    #[test]
+    fn version_history_record_and_retrieve() {
+        let mut history = PlanVersionHistory::default();
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "a".into(), title: "A".into(), ..Default::default()
+            }],
+            notes: None,
+        };
+
+        let v1 = history.record(&plan, "Initial plan");
+        assert_eq!(v1, 1);
+        assert_eq!(history.versions.len(), 1);
+
+        let v2 = history.record(&plan, "Added subtask");
+        assert_eq!(v2, 2);
+        assert_eq!(history.current_version, 2);
+
+        let retrieved = history.get_version(1).unwrap();
+        assert_eq!(retrieved.change_summary, "Initial plan");
+    }
+
+    #[test]
+    fn version_diff_detects_changes() {
+        let mut history = PlanVersionHistory::default();
+
+        let plan_v1 = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(), ..Default::default() },
+            ],
+            notes: None,
+        };
+        history.record(&plan_v1, "v1");
+
+        let plan_v2 = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A modified".into(), ..Default::default() },
+                SubtaskPlan { id: "c".into(), title: "C new".into(), ..Default::default() },
+            ],
+            notes: None,
+        };
+        history.record(&plan_v2, "v2");
+
+        let diff = history.diff_versions(1, 2).unwrap();
+        assert!(diff.added.contains(&"c".to_string()), "c should be added");
+        assert!(diff.removed.contains(&"b".to_string()), "b should be removed");
+        assert!(diff.modified.contains(&"a".to_string()), "a should be modified");
+    }
+
+    #[test]
+    fn version_diff_no_changes() {
+        let mut history = PlanVersionHistory::default();
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() }],
+            notes: None,
+        };
+        history.record(&plan, "v1");
+        history.record(&plan, "v2");
+
+        let diff = history.diff_versions(1, 2).unwrap();
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn version_diff_invalid_version() {
+        let history = PlanVersionHistory::default();
+        assert!(history.diff_versions(1, 2).is_err());
+    }
+
+    #[test]
+    fn version_log_format() {
+        let mut history = PlanVersionHistory::default();
+        let plan = TaskPlan { subtasks: vec![], notes: None };
+        history.record(&plan, "Created");
+        history.record(&plan, "Added tasks");
+
+        let log = history.format_log();
+        assert!(log.contains("v1"));
+        assert!(log.contains("v2"));
+        assert!(log.contains("Created"));
+        assert!(log.contains("Added tasks"));
+    }
+
+    // ═══════════════════════════ Parallel Subtask Tests ══════════════════════
+
+    #[test]
+    fn parallel_groups_no_deps_all_parallel() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(), ..Default::default() },
+                SubtaskPlan { id: "c".into(), title: "C".into(), ..Default::default() },
+            ],
+            notes: None,
+        };
+
+        let analysis = analyze_parallelism(&plan);
+        assert_eq!(analysis.groups.len(), 1, "all should be in one group");
+        assert_eq!(analysis.groups[0].len(), 3);
+        assert!(analysis.conflicts.is_empty());
+    }
+
+    #[test]
+    fn parallel_groups_with_file_conflict() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "a".into(), title: "A".into(),
+                    files: vec!["src/main.rs".into()],
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(), title: "B".into(),
+                    files: vec!["src/main.rs".into(), "src/lib.rs".into()],
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "c".into(), title: "C".into(),
+                    files: vec!["src/other.rs".into()],
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+
+        let analysis = analyze_parallelism(&plan);
+        assert!(analysis.conflicts.len() >= 1, "should detect a-b conflict");
+        assert!(analysis.conflicts[0].shared_files.contains(&"src/main.rs".to_string()));
+
+        // a and b should be in different groups, c can go with either
+        assert!(analysis.groups.len() >= 2, "should split conflicting subtasks: {:?}", analysis.groups);
+    }
+
+    #[test]
+    fn parallel_groups_single_subtask() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "only".into(), title: "Only one".into(), ..Default::default() },
+            ],
+            notes: None,
+        };
+
+        let analysis = analyze_parallelism(&plan);
+        assert_eq!(analysis.groups.len(), 1);
+        assert_eq!(analysis.groups[0], vec!["only"]);
+        assert!(analysis.conflicts.is_empty());
+    }
+
+    #[test]
+    fn parallel_groups_respects_dependency_filter() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() },
+                SubtaskPlan {
+                    id: "b".into(), title: "B".into(),
+                    depends_on: vec!["a".into()],
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+
+        let analysis = analyze_parallelism(&plan);
+        // Only "a" is ready, "b" depends on "a"
+        assert_eq!(analysis.groups.len(), 1);
+        assert_eq!(analysis.groups[0], vec!["a"]);
+    }
+
+    #[test]
+    fn format_parallelism_display() {
+        let analysis = ParallelGroups {
+            groups: vec![
+                vec!["a".into(), "c".into()],
+                vec!["b".into()],
+            ],
+            conflicts: vec![FileConflict {
+                subtask_a: "a".into(),
+                subtask_b: "b".into(),
+                shared_files: vec!["src/main.rs".into()],
+            }],
+        };
+
+        let output = format_parallelism(&analysis);
+        assert!(output.contains("Group 1"), "should show groups");
+        assert!(output.contains("a + c"), "group 1 should have a and c");
+        assert!(output.contains("Group 2"), "should have second group");
+        assert!(output.contains("⚠"), "should show conflict warning");
+        assert!(output.contains("src/main.rs"), "should show conflicting file");
+    }
+
+    // ═══════════════════════════ Plan Template Tests ═════════════════════════
+
+    #[test]
+    fn builtin_templates_exist() {
+        let templates = builtin_templates();
+        assert!(templates.len() >= 3, "should have at least 3 templates");
+
+        let names: Vec<&str> = templates.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"rust-feature"));
+        assert!(names.contains(&"bug-fix"));
+        assert!(names.contains(&"refactor"));
+    }
+
+    #[test]
+    fn builtin_templates_have_valid_deps() {
+        for template in builtin_templates() {
+            let ids: Vec<&str> = template.subtasks.iter().map(|s| s.id.as_str()).collect();
+            for st in &template.subtasks {
+                for dep in &st.depends_on {
+                    assert!(ids.contains(&dep.as_str()),
+                        "Template '{}': subtask '{}' depends on '{}' which doesn't exist",
+                        template.name, st.id, dep);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn instantiate_template_customizes_goal() {
+        let plan = instantiate_template("bug-fix", "Fix login timeout").unwrap();
+        assert!(!plan.subtasks.is_empty());
+        assert!(plan.notes.as_ref().unwrap().contains("Fix login timeout"));
+
+        // All statuses should be Pending
+        for st in &plan.subtasks {
+            assert_eq!(st.status, TaskStatus::Pending);
+        }
+    }
+
+    #[test]
+    fn instantiate_template_unknown_returns_none() {
+        assert!(instantiate_template("nonexistent-template", "goal").is_none());
+    }
+
+    #[test]
+    fn instantiate_template_rust_feature() {
+        let plan = instantiate_template("rust-feature", "Add user auth").unwrap();
+        let ids: Vec<&str> = plan.subtasks.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"design"));
+        assert!(ids.contains(&"implement"));
+        assert!(ids.contains(&"tests"));
+    }
+
+    // ═══════════════════════════ Plan List Tests ═════════════════════════════
+
+    #[test]
+    fn format_plan_list_empty() {
+        let output = format_plan_list(&[]);
+        assert!(output.contains("No saved plans"));
+    }
+
+    #[test]
+    fn format_plan_list_with_entries() {
+        let plans = vec![
+            SavedPlanInfo {
+                name: "active".to_string(),
+                goal: "Build auth system".to_string(),
+                progress_pct: 50,
+                subtask_count: 4,
+                status: "active".to_string(),
+            },
+            SavedPlanInfo {
+                name: "rust-feature".to_string(),
+                goal: "Add a feature template".to_string(),
+                progress_pct: 0,
+                subtask_count: 3,
+                status: "template".to_string(),
+            },
+        ];
+
+        let output = format_plan_list(&plans);
+        assert!(output.contains("▶"), "active plan should have play icon");
+        assert!(output.contains("📋"), "template should have clipboard icon");
+        assert!(output.contains("Build auth system"));
+    }
+
+    // ═══════════════════════════ PlanDiff Format Tests ═══════════════════════
+
+    #[test]
+    fn plan_diff_format_shows_changes() {
+        let diff = PlanDiff {
+            from_version: 1,
+            to_version: 2,
+            added: vec!["new-task".into()],
+            removed: vec!["old-task".into()],
+            modified: vec!["changed-task".into()],
+        };
+
+        let output = diff.format();
+        assert!(output.contains("+ new-task"));
+        assert!(output.contains("- old-task"));
+        assert!(output.contains("~ changed-task"));
+        assert!(output.contains("v1 → v2"));
+    }
+
+    #[test]
+    fn plan_diff_empty_format() {
+        let diff = PlanDiff {
+            from_version: 1, to_version: 2,
+            added: vec![], removed: vec![], modified: vec![],
+        };
+        assert!(diff.is_empty());
+        assert!(diff.format().contains("no changes"));
     }
 }
