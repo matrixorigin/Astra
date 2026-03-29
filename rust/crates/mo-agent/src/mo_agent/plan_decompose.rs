@@ -405,6 +405,24 @@ pub fn decomposition_prompt(goal: &str, context: &ProjectContext) -> String {
 
     prompt.push_str(r#"
 ## Instructions
+First, assess if you have enough information to create a precise plan. If the goal is ambiguous or you need clarification, ask 1-3 focused questions INSTEAD of generating a plan.
+
+### If You Need Clarification
+Return ONLY this JSON when information is missing:
+```json
+[
+  {
+    "question": "What is the scope of the authentication feature?",
+    "options": ["JWT-based API auth", "Session-based web auth", "Both"],
+    "default": 0,
+    "category": "scope"
+  }
+]
+```
+
+Question categories: "scope" (features to include), "approach" (implementation strategy), "behavior" (edge cases), "technical" (specific tech choices), "confirmation" (yes/no).
+
+### If You Have Enough Information
 Decompose this goal into 3-8 concrete subtasks. For EACH subtask, provide:
 
 1. **id**: short kebab-case ID (e.g., "add-auth", "fix-parser", "write-tests")
@@ -649,6 +667,9 @@ pub struct PlanModeState {
     /// Version history for plan rollback and diffing
     #[serde(default)]
     pub version_history: PlanVersionHistory,
+    /// Pending clarification questions from LLM
+    #[serde(default)]
+    pub pending_clarifications: Option<PendingClarifications>,
 }
 
 impl PlanModeState {
@@ -661,6 +682,7 @@ impl PlanModeState {
             history: Vec::new(),
             modified: false,
             version_history: PlanVersionHistory::default(),
+            pending_clarifications: None,
         }
     }
 

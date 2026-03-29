@@ -983,6 +983,8 @@ pub async fn handle_plan_mode_input(
     use super::plan_decompose::{
         PlanModeState, format_plan, parse_plan_response, decomposition_prompt,
         format_project_context, parse_plan_entry_choice, PlanEntryChoice,
+        format_clarification_question, parse_clarification_response, 
+        detect_clarification_questions, PendingClarifications, ClarificationAnswer,
     };
 
     let plan_state = match state.plan_mode.as_mut() {
@@ -992,6 +994,122 @@ pub async fn handle_plan_mode_input(
             return Ok(());
         }
     };
+    
+    // Handle pending clarification questions first
+    if let Some(ref mut pending) = plan_state.pending_clarifications {
+        if let Some(question) = pending.next_question().cloned() {
+            // Parse user's answer
+            let answer = parse_clarification_response(&input, &question);
+            match answer {
+                ClarificationAnswer::Selected(idx) => {
+                    let selected = &question.options[idx];
+                    pending.record_answer(selected.clone());
+                    eprintln!("  {} Selected: {}", "✓".green(), selected);
+                }
+                ClarificationAnswer::Freeform(text) => {
+                    pending.record_answer(text.clone());
+                    eprintln!("  {} Answer: {}", "✓".green(), text);
+                }
+                ClarificationAnswer::Invalid(msg) => {
+                    eprintln!("  {} {}", "✗".red(), msg);
+                    eprintln!();
+                    eprint!("{}", format_clarification_question(&question));
+                    return Ok(());
+                }
+            }
+            
+            // Check if more questions remain
+            if let Some(next_q) = pending.next_question() {
+                eprintln!();
+                eprint!("{}", format_clarification_question(next_q));
+                let _ = plan_state.save_to_file(&PlanModeState::state_path());
+                return Ok(());
+            }
+            
+            // All questions answered - regenerate plan with clarifications
+            eprintln!();
+            eprintln!("  {} All clarifications answered. Regenerating plan...", "🔄".cyan());
+            
+            let answers_context = pending.format_for_prompt();
+            let goal_with_context = format!(
+                "{}\n\n## Clarifications from user:\n{}",
+                plan_state.goal, answers_context
+            );
+            
+            // Clear pending and regenerate
+            plan_state.pending_clarifications = None;
+            
+            let Some(tok) = token else {
+                eprintln!("  {} Not logged in. Run /login first.", "✗".red());
+                return Ok(());
+            };
+            
+            let prompt = decomposition_prompt(&goal_with_context, &plan_state.context);
+            let payload = serde_json::json!({
+                "messages": [{"role": "user", "content": prompt}],
+                "session_id": state.session_id.clone(),
+            });
+            
+            let resp = client
+                .post(format!("{base}/chat/turn"))
+                .bearer_auth(tok)
+                .json(&payload)
+                .send()
+                .await;
+            
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let mut full_text = String::new();
+                    let mut stream = r.bytes_stream();
+                    use futures_util::StreamExt;
+                    
+                    eprintln!("  {} Thinking...", "🧠".cyan());
+                    
+                    while let Some(chunk) = stream.next().await {
+                        if let Ok(bytes) = chunk {
+                            let event_str = String::from_utf8_lossy(&bytes);
+                            for line in event_str.lines() {
+                                if let Some(data) = line.strip_prefix("data: ") {
+                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                                        if let Some(content) = json.get("content").and_then(|v| v.as_str()) {
+                                            full_text.push_str(content);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Parse and set plan (no clarification check in regeneration)
+                    match parse_plan_response(&full_text) {
+                        Ok(plan) => {
+                            plan_state.set_plan(plan);
+                            let _ = plan_state.save_to_file(&PlanModeState::state_path());
+                            
+                            eprintln!();
+                            eprintln!("{}", format_plan(&plan_state.plan));
+                            eprintln!();
+                            eprintln!("  {} Commands:", "💡".cyan());
+                            eprintln!("    'go' or 'execute' → Run the plan");
+                            eprintln!("    'step' → Run step-by-step with confirmation");
+                            eprintln!("    Or describe changes to modify the plan");
+                        }
+                        Err(e) => {
+                            eprintln!("  {} Failed to parse plan: {}", "✗".red(), e);
+                        }
+                    }
+                }
+                Ok(r) => {
+                    eprintln!("  {} LLM call failed ({})", "✗".red(), r.status());
+                }
+                Err(e) => {
+                    eprintln!("  {} Request failed: {}", "✗".red(), e);
+                }
+            }
+            
+            return Ok(());
+        }
+    }
 
     // Check for exit commands
     let input_lower = input.to_lowercase();
@@ -1135,22 +1253,40 @@ pub async fn handle_plan_mode_input(
                         }
                         eprintln!();
                         
-                        // Parse and set plan
-                        match parse_plan_response(&full_text) {
-                            Ok(plan) => {
-                                plan_state.set_plan(plan);
-                                let _ = plan_state.save_to_file(&PlanModeState::state_path());
-                                
-                                eprintln!();
-                                eprintln!("{}", format_plan(&plan_state.plan));
-                                eprintln!();
-                                eprintln!("  {} Commands:", "💡".cyan());
-                                eprintln!("    'go' or 'execute' → Run the plan");
-                                eprintln!("    'step' → Run step-by-step with confirmation");
-                                eprintln!("    Or describe changes to modify the plan");
-                            }
-                            Err(e) => {
-                                eprintln!("  {} Failed to parse plan: {}", "✗".red(), e);
+                        // Check for clarification questions first
+                        if let Some(questions) = detect_clarification_questions(&full_text) {
+                            // LLM is asking for clarification instead of producing plan
+                            eprintln!();
+                            eprintln!("  {} Need clarification before generating plan:", "❓".yellow());
+                            eprintln!();
+                            
+                            let pending = PendingClarifications {
+                                questions: questions.clone(),
+                                answers: Vec::new(),
+                            };
+                            plan_state.pending_clarifications = Some(pending);
+                            
+                            // Show first question
+                            eprint!("{}", format_clarification_question(&questions[0]));
+                            let _ = plan_state.save_to_file(&PlanModeState::state_path());
+                        } else {
+                            // Parse and set plan
+                            match parse_plan_response(&full_text) {
+                                Ok(plan) => {
+                                    plan_state.set_plan(plan);
+                                    let _ = plan_state.save_to_file(&PlanModeState::state_path());
+                                    
+                                    eprintln!();
+                                    eprintln!("{}", format_plan(&plan_state.plan));
+                                    eprintln!();
+                                    eprintln!("  {} Commands:", "💡".cyan());
+                                    eprintln!("    'go' or 'execute' → Run the plan");
+                                    eprintln!("    'step' → Run step-by-step with confirmation");
+                                    eprintln!("    Or describe changes to modify the plan");
+                                }
+                                Err(e) => {
+                                    eprintln!("  {} Failed to parse plan: {}", "✗".red(), e);
+                                }
                             }
                         }
                     }
