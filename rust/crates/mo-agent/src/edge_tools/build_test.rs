@@ -66,6 +66,170 @@ impl FixSuggestion {
     }
 }
 
+/// Minimum confidence threshold for auto-fix application.
+pub const AUTO_FIX_CONFIDENCE_THRESHOLD: f64 = 0.8;
+/// Maximum number of auto-fix iterations to prevent infinite loops.
+pub const AUTO_FIX_MAX_ITERATIONS: usize = 3;
+
+/// Result of applying a single fix.
+#[derive(Debug, Clone)]
+pub struct AppliedFix {
+    pub file: String,
+    pub action: String,
+    pub line: usize,
+    pub explanation: String,
+}
+
+/// Apply a single fix to a file. Returns Ok(description) on success.
+pub fn apply_fix(fix: &FixSuggestion, project_root: &std::path::Path) -> Result<AppliedFix, String> {
+    let file_path = if std::path::Path::new(&fix.file).is_absolute() {
+        std::path::PathBuf::from(&fix.file)
+    } else {
+        project_root.join(&fix.file)
+    };
+
+    let content = std::fs::read_to_string(&file_path)
+        .map_err(|e| format!("Failed to read {}: {}", fix.file, e))?;
+    let lines: Vec<&str> = content.lines().collect();
+
+    let new_content = match fix.action.as_str() {
+        "delete_line" => {
+            if fix.line == 0 || fix.line > lines.len() {
+                return Err(format!("Line {} out of range (file has {} lines)", fix.line, lines.len()));
+            }
+            let mut result: Vec<&str> = Vec::with_capacity(lines.len());
+            for (i, line) in lines.iter().enumerate() {
+                if i + 1 != fix.line {
+                    result.push(line);
+                }
+            }
+            result.join("\n") + if content.ends_with('\n') { "\n" } else { "" }
+        }
+        "replace" => {
+            if fix.line == 0 || fix.line > lines.len() {
+                return Err(format!("Line {} out of range (file has {} lines)", fix.line, lines.len()));
+            }
+            let mut result: Vec<String> = Vec::with_capacity(lines.len());
+            for (i, line) in lines.iter().enumerate() {
+                if i + 1 == fix.line {
+                    result.push(fix.new_text.clone());
+                } else {
+                    result.push(line.to_string());
+                }
+            }
+            result.join("\n") + if content.ends_with('\n') { "\n" } else { "" }
+        }
+        "insert_line" => {
+            if fix.line == 0 || fix.line > lines.len() + 1 {
+                return Err(format!("Insert line {} out of range (file has {} lines)", fix.line, lines.len()));
+            }
+            let mut result: Vec<String> = Vec::with_capacity(lines.len() + 1);
+            for (i, line) in lines.iter().enumerate() {
+                if i + 1 == fix.line {
+                    result.push(fix.new_text.clone());
+                }
+                result.push(line.to_string());
+            }
+            // insert after last line
+            if fix.line == lines.len() + 1 {
+                result.push(fix.new_text.clone());
+            }
+            result.join("\n") + if content.ends_with('\n') { "\n" } else { "" }
+        }
+        "add_import" => {
+            // Insert at top of file (line 1) or after existing use/import block
+            let insert_at = find_import_insertion_point(&lines);
+            let mut result: Vec<String> = Vec::with_capacity(lines.len() + 1);
+            for (i, line) in lines.iter().enumerate() {
+                if i == insert_at {
+                    result.push(fix.new_text.clone());
+                }
+                result.push(line.to_string());
+            }
+            if insert_at >= lines.len() {
+                result.push(fix.new_text.clone());
+            }
+            result.join("\n") + if content.ends_with('\n') { "\n" } else { "" }
+        }
+        other => {
+            return Err(format!("Unknown fix action: {}", other));
+        }
+    };
+
+    std::fs::write(&file_path, new_content)
+        .map_err(|e| format!("Failed to write {}: {}", fix.file, e))?;
+
+    Ok(AppliedFix {
+        file: fix.file.clone(),
+        action: fix.action.clone(),
+        line: fix.line,
+        explanation: fix.explanation.clone(),
+    })
+}
+
+/// Find the best insertion point for a new import/use statement.
+/// Returns the line index (0-based) where the new import should be inserted.
+fn find_import_insertion_point(lines: &[&str]) -> usize {
+    let mut last_import = 0;
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("use ") || trimmed.starts_with("import ")
+            || trimmed.starts_with("from ") || trimmed.starts_with("require(")
+            || trimmed.starts_with("const ") && trimmed.contains("require(")
+        {
+            last_import = i + 1; // insert after this line
+        }
+    }
+    last_import
+}
+
+/// Apply all high-confidence fixes from a list. Returns applied fixes.
+/// Fixes are applied in reverse line order within each file to preserve line numbers.
+pub fn apply_auto_fixes(
+    fixes: &[FixSuggestion],
+    project_root: &std::path::Path,
+) -> (Vec<AppliedFix>, Vec<String>) {
+    let mut applied = Vec::new();
+    let mut errors = Vec::new();
+
+    // Filter to high-confidence only
+    let mut eligible: Vec<&FixSuggestion> = fixes
+        .iter()
+        .filter(|f| f.confidence >= AUTO_FIX_CONFIDENCE_THRESHOLD)
+        .collect();
+
+    // Sort by file, then by line descending (so deletions don't shift later lines)
+    eligible.sort_by(|a, b| {
+        a.file.cmp(&b.file).then(b.line.cmp(&a.line))
+    });
+
+    for fix in eligible {
+        match apply_fix(fix, project_root) {
+            Ok(af) => applied.push(af),
+            Err(e) => errors.push(e),
+        }
+    }
+
+    (applied, errors)
+}
+
+/// Format applied fixes into a human-readable report section.
+pub fn format_auto_fix_report(applied: &[AppliedFix], errors: &[String], iteration: usize) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("\n── Auto-Fix Iteration {} ──\n", iteration));
+    if applied.is_empty() {
+        out.push_str("  No fixes applied.\n");
+    } else {
+        for af in applied {
+            out.push_str(&format!("  ✓ {} L{}: {} ({})\n", af.file, af.line, af.explanation, af.action));
+        }
+    }
+    for e in errors {
+        out.push_str(&format!("  ✗ {}\n", e));
+    }
+    out
+}
+
 /// Generate concrete fix suggestions for an error, given source context.
 ///
 /// Returns zero or more suggestions ranked by confidence. The source_lines
@@ -1479,6 +1643,7 @@ fn extract_generic_errors(output: &str) -> (Vec<String>, Vec<ErrorLocation>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn detect_cargo_build() {
@@ -2488,5 +2653,222 @@ error[E0425]: cannot find value `nonexistent` in this scope
         }
         // Unknown type returns None
         assert!(suggest_rust_import("MyCustomType").is_none());
+    }
+
+    // ── Auto-Fix Application Tests ────────────────────────────────────
+
+    #[test]
+    fn apply_fix_delete_line() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("test.rs");
+        std::fs::write(&file, "use std::io;\nuse std::fs;\nfn main() {}\n").unwrap();
+
+        let fix = FixSuggestion::new("test.rs", "delete_line", 1, "", "Remove unused import", 0.9);
+        let result = apply_fix(&fix, dir.path());
+        assert!(result.is_ok());
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(!content.contains("use std::io;"));
+        assert!(content.contains("use std::fs;"));
+        assert!(content.contains("fn main()"));
+    }
+
+    #[test]
+    fn apply_fix_replace_line() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("test.rs");
+        std::fs::write(&file, "fn main() {\n    let x = 42;\n    println!(\"{}\", x);\n}\n").unwrap();
+
+        let fix = FixSuggestion::new("test.rs", "replace", 2, "    let _x = 42;", "Prefix unused var", 0.9);
+        let result = apply_fix(&fix, dir.path());
+        assert!(result.is_ok());
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("let _x = 42;"));
+        assert!(!content.contains("let x = 42;"));
+    }
+
+    #[test]
+    fn apply_fix_insert_line() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("test.rs");
+        std::fs::write(&file, "fn main() {\n    let x = HashMap::new();\n}\n").unwrap();
+
+        let fix = FixSuggestion::new("test.rs", "insert_line", 1, "use std::collections::HashMap;", "Add missing import", 0.8);
+        let result = apply_fix(&fix, dir.path());
+        assert!(result.is_ok());
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.starts_with("use std::collections::HashMap;\nfn main()"));
+    }
+
+    #[test]
+    fn apply_fix_add_import_after_existing() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("test.rs");
+        std::fs::write(&file, "use std::io;\n\nfn main() {\n    let x = HashMap::new();\n}\n").unwrap();
+
+        let fix = FixSuggestion::new("test.rs", "add_import", 0, "use std::collections::HashMap;", "Add HashMap import", 0.8);
+        let result = apply_fix(&fix, dir.path());
+        assert!(result.is_ok());
+        let content = std::fs::read_to_string(&file).unwrap();
+        // New import should be after existing import
+        let io_pos = content.find("use std::io;").unwrap();
+        let hm_pos = content.find("use std::collections::HashMap;").unwrap();
+        assert!(hm_pos > io_pos, "New import should be after existing imports");
+    }
+
+    #[test]
+    fn apply_fix_line_out_of_range() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("test.rs");
+        std::fs::write(&file, "line1\nline2\n").unwrap();
+
+        let fix = FixSuggestion::new("test.rs", "delete_line", 99, "", "Bad line", 0.9);
+        let result = apply_fix(&fix, dir.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("out of range"));
+    }
+
+    #[test]
+    fn apply_fix_unknown_action() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("test.rs");
+        std::fs::write(&file, "line1\n").unwrap();
+
+        let fix = FixSuggestion::new("test.rs", "magic", 1, "x", "Bad action", 0.9);
+        let result = apply_fix(&fix, dir.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unknown fix action"));
+    }
+
+    #[test]
+    fn apply_fix_missing_file() {
+        let dir = tempdir().unwrap();
+        let fix = FixSuggestion::new("nonexistent.rs", "delete_line", 1, "", "Bad file", 0.9);
+        let result = apply_fix(&fix, dir.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Failed to read"));
+    }
+
+    #[test]
+    fn apply_auto_fixes_filters_low_confidence() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("test.rs");
+        std::fs::write(&file, "use std::io;\nuse std::fs;\nfn main() {}\n").unwrap();
+
+        let fixes = vec![
+            FixSuggestion::new("test.rs", "delete_line", 1, "", "High confidence", 0.9),
+            FixSuggestion::new("test.rs", "delete_line", 2, "", "Low confidence", 0.5),
+        ];
+
+        let (applied, errors) = apply_auto_fixes(&fixes, dir.path());
+        assert_eq!(applied.len(), 1, "Only high-confidence fix should be applied");
+        assert!(errors.is_empty());
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(!content.contains("use std::io;"), "High-confidence fix should delete line 1");
+        assert!(content.contains("use std::fs;"), "Low-confidence line 2 should remain");
+    }
+
+    #[test]
+    fn apply_auto_fixes_reverse_line_order() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("test.rs");
+        std::fs::write(&file, "use std::io;\nuse std::fs;\nuse std::net;\nfn main() {}\n").unwrap();
+
+        let fixes = vec![
+            FixSuggestion::new("test.rs", "delete_line", 1, "", "Delete line 1", 0.9),
+            FixSuggestion::new("test.rs", "delete_line", 3, "", "Delete line 3", 0.9),
+        ];
+
+        let (applied, errors) = apply_auto_fixes(&fixes, dir.path());
+        assert_eq!(applied.len(), 2);
+        assert!(errors.is_empty());
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(!content.contains("use std::io;"));
+        assert!(content.contains("use std::fs;"));
+        assert!(!content.contains("use std::net;"));
+    }
+
+    #[test]
+    fn apply_auto_fixes_empty_when_all_low_confidence() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("test.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        let fixes = vec![
+            FixSuggestion::new("test.rs", "replace", 1, "fn main() { todo!() }", "Low", 0.3),
+        ];
+
+        let (applied, _) = apply_auto_fixes(&fixes, dir.path());
+        assert!(applied.is_empty());
+        // File unchanged
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("fn main() {}"));
+    }
+
+    #[test]
+    fn format_auto_fix_report_applied() {
+        let applied = vec![
+            AppliedFix {
+                file: "src/main.rs".to_string(),
+                action: "delete_line".to_string(),
+                line: 3,
+                explanation: "Remove unused import".to_string(),
+            },
+        ];
+        let report = format_auto_fix_report(&applied, &[], 1);
+        assert!(report.contains("Auto-Fix Iteration 1"));
+        assert!(report.contains("✓ src/main.rs L3"));
+        assert!(report.contains("Remove unused import"));
+    }
+
+    #[test]
+    fn format_auto_fix_report_no_fixes() {
+        let report = format_auto_fix_report(&[], &[], 1);
+        assert!(report.contains("No fixes applied"));
+    }
+
+    #[test]
+    fn format_auto_fix_report_with_errors() {
+        let errors = vec!["Failed to read foo.rs: not found".to_string()];
+        let report = format_auto_fix_report(&[], &errors, 2);
+        assert!(report.contains("Auto-Fix Iteration 2"));
+        assert!(report.contains("✗ Failed to read foo.rs"));
+    }
+
+    #[test]
+    fn find_import_insertion_point_after_use() {
+        let lines = vec!["use std::io;", "use std::fs;", "", "fn main() {}"];
+        assert_eq!(find_import_insertion_point(&lines), 2);
+    }
+
+    #[test]
+    fn find_import_insertion_point_no_imports() {
+        let lines = vec!["fn main() {}", "  println!(\"hi\");", "}"];
+        assert_eq!(find_import_insertion_point(&lines), 0);
+    }
+
+    #[test]
+    fn find_import_insertion_point_python() {
+        let lines = vec!["import os", "from pathlib import Path", "", "def main():"];
+        assert_eq!(find_import_insertion_point(&lines), 2);
+    }
+
+    #[test]
+    fn auto_fix_constants_are_sane() {
+        assert!(AUTO_FIX_CONFIDENCE_THRESHOLD >= 0.7, "Threshold should be high");
+        assert!(AUTO_FIX_CONFIDENCE_THRESHOLD <= 1.0, "Threshold should be ≤1.0");
+        assert!(AUTO_FIX_MAX_ITERATIONS >= 1, "At least 1 iteration");
+        assert!(AUTO_FIX_MAX_ITERATIONS <= 5, "Max 5 iterations for safety");
+    }
+
+    #[test]
+    fn apply_fix_preserves_trailing_newline() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("test.rs");
+        std::fs::write(&file, "use std::io;\nfn main() {}\n").unwrap();
+
+        let fix = FixSuggestion::new("test.rs", "delete_line", 1, "", "Remove import", 0.9);
+        apply_fix(&fix, dir.path()).unwrap();
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.ends_with('\n'), "Should preserve trailing newline");
     }
 }

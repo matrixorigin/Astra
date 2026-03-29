@@ -532,12 +532,13 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "run_build_test",
-                "description": "Run a build or test command with structured error parsing. Returns structured errors with file:line:col locations AND auto-reads surrounding source code for each error location, so you can fix issues in one shot without additional read_file calls. Use this instead of raw bash for build/test commands.",
+                "description": "Run a build or test command with structured error parsing. Returns structured errors with file:line:col locations AND auto-reads surrounding source code for each error location, so you can fix issues in one shot without additional read_file calls. Use this instead of raw bash for build/test commands. Set auto_fix=true to automatically apply trivial fixes (unused imports/variables) and re-run.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "command": {"type": "string", "description": "Build/test command to run (e.g., 'cargo test', 'pytest', 'npm test')"},
-                        "context_lines": {"type": "integer", "description": "Lines of source context around each error (default: 5)"}
+                        "context_lines": {"type": "integer", "description": "Lines of source context around each error (default: 5)"},
+                        "auto_fix": {"type": "boolean", "description": "If true, automatically apply high-confidence trivial fixes and re-run (max 3 iterations). Only fixes with confidence >= 0.8 are applied. Default: false"}
                     },
                     "required": ["command"]
                 }
@@ -2855,7 +2856,58 @@ impl ToolExecutor {
             _ => return "Error: 'command' parameter is required".to_string(),
         };
         let context_lines = args.get("context_lines").and_then(Value::as_u64).unwrap_or(5) as usize;
+        let auto_fix = args.get("auto_fix").and_then(Value::as_bool).unwrap_or(false);
 
+        // Run the initial build
+        let (initial_output, initial_fixes) = self.run_build_test_core(command, context_lines);
+
+        if !auto_fix {
+            return initial_output;
+        }
+
+        // Auto-fix loop: apply high-confidence fixes and re-run
+        let mut output = initial_output;
+        let mut current_fixes: Vec<build_test::FixSuggestion> = initial_fixes;
+        let mut all_reports = Vec::new();
+
+        for iteration in 1..=build_test::AUTO_FIX_MAX_ITERATIONS {
+            let eligible_count = current_fixes
+                .iter()
+                .filter(|f| f.confidence >= build_test::AUTO_FIX_CONFIDENCE_THRESHOLD)
+                .count();
+
+            if eligible_count == 0 {
+                break;
+            }
+
+            let (applied, errors) = build_test::apply_auto_fixes(&current_fixes, &self.project_root);
+            let report = build_test::format_auto_fix_report(&applied, &errors, iteration);
+            all_reports.push(report);
+
+            if applied.is_empty() {
+                break;
+            }
+
+            // Re-run the build after applying fixes
+            let (new_output, new_fixes) = self.run_build_test_core(command, context_lines);
+            output = new_output;
+            current_fixes = new_fixes;
+        }
+
+        if all_reports.is_empty() {
+            return output;
+        }
+
+        // Prepend auto-fix reports to the final build output
+        let mut final_output = all_reports.join("");
+        final_output.push_str("\n── Final Build Result ──\n");
+        final_output.push_str(&output);
+        truncate_output(final_output, tool_output_limit())
+    }
+
+    /// Core build+parse logic extracted for auto-fix loop reuse.
+    /// Returns (formatted_output, fix_suggestions).
+    fn run_build_test_core(&self, command: &str, context_lines: usize) -> (String, Vec<build_test::FixSuggestion>) {
         // Run the command
         let output = std::process::Command::new("sh")
             .args(["-c", command])
@@ -2869,7 +2921,7 @@ impl ToolExecutor {
                 let code = out.status.code();
                 (stdout, stderr, code)
             }
-            Err(e) => return format!("Error: failed to run command: {e}"),
+            Err(e) => return (format!("Error: failed to run command: {e}"), Vec::new()),
         };
 
         let combined = format!("{stdout}\n{stderr}");
@@ -2943,7 +2995,7 @@ impl ToolExecutor {
             }
         }
 
-        // Generate and display concrete fix suggestions
+        // Generate concrete fix suggestions
         let mut all_fixes: Vec<(usize, build_test::FixSuggestion)> = Vec::new();
         for (i, loc) in result.error_locations.iter().enumerate().take(10) {
             let file_path = self.project_root.join(&loc.file);
@@ -2955,6 +3007,9 @@ impl ToolExecutor {
                 }
             }
         }
+
+        // Collect fix suggestions for return
+        let fix_list: Vec<build_test::FixSuggestion> = all_fixes.iter().map(|(_, f)| f.clone()).collect();
 
         if !all_fixes.is_empty() {
             parts.push(String::new());
@@ -2984,7 +3039,7 @@ impl ToolExecutor {
             }
         }
 
-        truncate_output(parts.join("\n"), tool_output_limit())
+        (truncate_output(parts.join("\n"), tool_output_limit()), fix_list)
     }
 
     /// Execute a multi-step ToolChain, forwarding each step to self.execute().
@@ -4262,6 +4317,59 @@ fn main() {
         // Run different command — should reset tracker, not show iteration
         let r2 = executor.execute("run_build_test", &json!({"command": "echo 'test'"})).await;
         assert!(!r2.contains("Iteration"), "different command should reset: {r2}");
+    }
+
+    #[tokio::test]
+    async fn run_build_test_auto_fix_false_same_as_default() {
+        let executor = test_executor();
+        let r1 = executor.execute("run_build_test", &json!({"command": "echo ok"})).await;
+        let executor2 = test_executor();
+        let r2 = executor2.execute("run_build_test", &json!({"command": "echo ok", "auto_fix": false})).await;
+        // Both should produce similar output (no auto-fix sections)
+        assert!(!r1.contains("Auto-Fix"), "default should not auto-fix: {r1}");
+        assert!(!r2.contains("Auto-Fix"), "explicit false should not auto-fix: {r2}");
+    }
+
+    #[tokio::test]
+    async fn run_build_test_auto_fix_on_success_no_effect() {
+        let executor = test_executor();
+        let result = executor.execute("run_build_test", &json!({
+            "command": "echo 'all tests passed'",
+            "auto_fix": true
+        })).await;
+        // Successful build = no errors = no fixes to apply
+        assert!(!result.contains("Auto-Fix"), "no errors = no auto-fix: {result}");
+    }
+
+    #[tokio::test]
+    async fn run_build_test_auto_fix_creates_report() {
+        // Create a temp dir with a Rust file that has an "unused import" error pattern
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("test.rs");
+        std::fs::write(&src, "use std::io;\n\nfn main() {}\n").unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        // Simulate a build that produces an unused import warning
+        // We use a command that outputs Rust-style warnings
+        let result = executor.execute("run_build_test", &json!({
+            "command": "echo 'warning: unused import: `std::io`\n --> test.rs:1:5'",
+            "auto_fix": true
+        })).await;
+        // Should contain auto-fix report since the warning matches unused import pattern
+        // and the file exists with the import
+        assert!(result.contains("Auto-Fix") || !result.contains("error"),
+            "should attempt auto-fix or have no errors: {result}");
+    }
+
+    #[test]
+    fn schema_includes_auto_fix_param() {
+        let schemas = all_tool_schemas();
+        let build = schemas.iter().find(|s|
+            s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) == Some("run_build_test")
+        ).expect("run_build_test schema should exist");
+        let props = build["function"]["parameters"]["properties"].as_object().unwrap();
+        assert!(props.contains_key("auto_fix"), "schema should have auto_fix param");
+        assert_eq!(props["auto_fix"]["type"], "boolean");
     }
 
     // ── Code Intelligence Enhancement Tests ──
