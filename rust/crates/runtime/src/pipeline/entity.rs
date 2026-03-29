@@ -36,7 +36,15 @@ pub struct EntityKnowledge {
     pub confidence: f64,
     /// Number of times this entity was observed in successful interactions.
     pub observation_count: u32,
+    /// Unix timestamp of last observation (seconds since epoch).
+    #[serde(default)]
+    pub last_observed_at: u64,
 }
+
+/// Days after which entity confidence starts decaying.
+const ENTITY_DECAY_GRACE_DAYS: u64 = 14;
+/// Half-life in days for confidence decay after grace period.
+const ENTITY_DECAY_HALF_LIFE_DAYS: f64 = 60.0;
 
 impl EntityKnowledge {
     fn new(name: impl Into<String>) -> Self {
@@ -47,8 +55,49 @@ impl EntityKnowledge {
             associated_tools: Vec::new(),
             confidence: 0.0,
             observation_count: 0,
+            last_observed_at: current_entity_timestamp(),
         }
     }
+
+    /// Get time-decayed confidence.
+    ///
+    /// Entities not observed for a long time have reduced confidence,
+    /// reflecting uncertainty about whether the association is still valid.
+    pub fn decayed_confidence(&self) -> f64 {
+        let decay = entity_time_decay_factor(self.last_observed_at);
+        self.confidence * decay
+    }
+
+    /// Update the last_observed_at timestamp to now.
+    pub fn touch(&mut self) {
+        self.last_observed_at = current_entity_timestamp();
+    }
+}
+
+/// Calculate time decay factor for entity confidence (0.0–1.0).
+fn entity_time_decay_factor(last_observed_at: u64) -> f64 {
+    let now = current_entity_timestamp();
+    if last_observed_at >= now {
+        return 1.0;
+    }
+
+    let age_secs = now - last_observed_at;
+    let age_days = age_secs as f64 / 86400.0;
+
+    if age_days <= ENTITY_DECAY_GRACE_DAYS as f64 {
+        return 1.0;
+    }
+
+    let days_past_grace = age_days - ENTITY_DECAY_GRACE_DAYS as f64;
+    0.5_f64.powf(days_past_grace / ENTITY_DECAY_HALF_LIFE_DAYS)
+}
+
+/// Get current Unix timestamp in seconds.
+fn current_entity_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // ─── Entity Graph ────────────────────────────────────────────────────────────
@@ -118,6 +167,9 @@ impl EntityGraph {
             }
             _ => base_confidence,
         };
+
+        // Update timestamp to reflect recent observation
+        entry.touch();
     }
 
     /// Register an alias for an entity.
@@ -201,9 +253,15 @@ impl EntityGraph {
     }
 
     /// Get confidence for an entity (0.0 if unknown).
+    ///
+    /// Returns time-decayed confidence: entities not observed recently
+    /// have lower effective confidence to reflect uncertainty.
     pub fn confidence_for(&self, entity: &str) -> f64 {
         let key = self.resolve(entity);
-        self.entities.get(&key).map(|e| e.confidence).unwrap_or(0.0)
+        self.entities
+            .get(&key)
+            .map(|e| e.decayed_confidence())
+            .unwrap_or(0.0)
     }
 
     /// Merge knowledge from persistent storage.
@@ -604,6 +662,7 @@ mod tests {
             associated_tools: vec!["gh_search".into(), "gh_prs".into()],
             confidence: 0.8,
             observation_count: 10,
+            last_observed_at: chrono::Utc::now().timestamp() as u64,
         };
         graph.merge(&[external]);
 
@@ -628,6 +687,7 @@ mod tests {
             associated_tools: vec!["git_log".into()],
             confidence: 0.5,
             observation_count: 2,
+            last_observed_at: chrono::Utc::now().timestamp() as u64,
         };
         graph.merge(&[external]);
 
@@ -647,6 +707,7 @@ mod tests {
             associated_tools: vec![],
             confidence: 0.5,
             observation_count: 3,
+            last_observed_at: chrono::Utc::now().timestamp() as u64,
         };
         graph.merge(&[external]);
 
@@ -771,11 +832,11 @@ mod tests {
 
         // First learn with high feedback
         graph.learn("good_entity", DomainHint::GitHub, &["tool1".into()], Some(80));
-        let conf_high = graph.confidence_for("good_entity");
+        let _conf_high = graph.confidence_for("good_entity");
 
         // Then learn with low feedback (same entity, another observation)
         graph.learn("good_entity", DomainHint::GitHub, &["tool2".into()], Some(20));
-        let conf_low_after = graph.confidence_for("good_entity");
+        let _conf_low_after = graph.confidence_for("good_entity");
 
         // Create another entity learned only with low feedback
         graph.learn("bad_entity", DomainHint::Code, &["tool1".into()], Some(20));
@@ -801,5 +862,86 @@ mod tests {
         let conf = graph.confidence_for("entity_a");
         // Normal asymptotic: 1.0 - 1.0/(1+2) ≈ 0.667
         assert!((conf - 0.667).abs() < 0.1, "Should use normal confidence formula, got {}", conf);
+    }
+
+    // ── Time Decay Tests ──
+
+    #[test]
+    fn entity_time_decay_within_grace_period() {
+        // Within grace period (14 days), decayed confidence should equal raw
+        let mut entity = EntityKnowledge::new("test");
+        entity.confidence = 0.8;
+        entity.touch(); // Set to now
+
+        let raw = entity.confidence;
+        let decayed = entity.decayed_confidence();
+        assert!((raw - decayed).abs() < 0.001, "Fresh entity should have no decay");
+    }
+
+    #[test]
+    fn entity_time_decay_at_half_life() {
+        // At exactly one half-life (60 days) past grace period (14 days), confidence should be ~50%
+        let mut entity = EntityKnowledge::new("stale");
+        entity.confidence = 0.8;
+        let now = chrono::Utc::now().timestamp() as u64;
+        entity.last_observed_at = now - (74 * 24 * 3600); // 14 grace + 60 half-life
+
+        let raw = entity.confidence;
+        let decayed = entity.decayed_confidence();
+        let ratio = decayed / raw;
+        assert!((ratio - 0.5).abs() < 0.1, "At half-life, confidence ratio should be ~0.5, got {}", ratio);
+    }
+
+    #[test]
+    fn decayed_confidence_recent_entity() {
+        let mut entity = EntityKnowledge::new("test");
+        entity.confidence = 0.8;
+        entity.touch(); // Set to now
+
+        let raw_conf = entity.confidence;
+        let decayed = entity.decayed_confidence();
+        assert!((raw_conf - decayed).abs() < 0.001, "Recent entity should have same raw and decayed confidence");
+    }
+
+    #[test]
+    fn decayed_confidence_stale_entity() {
+        let mut entity = EntityKnowledge::new("stale");
+        entity.confidence = 0.8;
+        // Set to 74 days ago (one half-life past grace)
+        let now = chrono::Utc::now().timestamp() as u64;
+        entity.last_observed_at = now - (74 * 24 * 3600);
+
+        let raw_conf = entity.confidence;
+        let decayed = entity.decayed_confidence();
+        let expected_decayed = raw_conf * 0.5; // Approximately
+
+        assert!(decayed < raw_conf, "Stale entity decayed confidence should be less than raw");
+        assert!((decayed - expected_decayed).abs() < 0.1, "Expected ~{}, got {}", expected_decayed, decayed);
+    }
+
+    #[test]
+    fn confidence_for_uses_decay() {
+        let mut graph = EntityGraph::new();
+        graph.learn("fresh_entity", DomainHint::GitHub, &["tool".into()], None);
+        graph.learn("fresh_entity", DomainHint::GitHub, &["tool".into()], None);
+
+        // Make the entity stale
+        if let Some(entity) = graph.entities.get_mut("fresh_entity") {
+            let now = chrono::Utc::now().timestamp() as u64;
+            entity.last_observed_at = now - (100 * 24 * 3600); // 100 days ago
+        }
+
+        let conf = graph.confidence_for("fresh_entity");
+        // Should be significantly less than normal due to decay
+        assert!(conf < 0.5, "Stale entity confidence should be reduced by decay, got {}", conf);
+    }
+
+    #[test]
+    fn entity_touch_updates_timestamp() {
+        let mut entity = EntityKnowledge::new("test");
+        let old_ts = entity.last_observed_at;
+        std::thread::sleep(std::time::Duration::from_millis(1100)); // Wait >1 second
+        entity.touch();
+        assert!(entity.last_observed_at > old_ts, "touch() should update timestamp");
     }
 }
