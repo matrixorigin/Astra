@@ -21,6 +21,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/stats", "Session analytics: turns, tokens, errors"),
     ("/tools", "Tool performance: calls, timing, success rate"),
     ("/health", "Tool health dashboard"),
+    ("/learn", "Learning insights: patterns, drift, exploration"),
     ("/sync", "Cloud sync status across all domains"),
     // ── Advanced ──────────────────────────────────────────────────────────
     ("/doctor", "Run diagnostics"),
