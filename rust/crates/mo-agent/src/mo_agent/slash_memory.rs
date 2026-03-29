@@ -780,6 +780,25 @@ pub(super) async fn handle_memory_domain_command(
                                                     stars.yellow(),
                                                     outcome.as_str()
                                                 );
+                                                
+                                                // Auto-extract template if rating >= 4
+                                                if rating >= 4 {
+                                                    let goal_pattern = extract_goal_pattern(&goal_text);
+                                                    match svc.extract_template(&task.task_id, &goal_pattern).await {
+                                                        Ok(Some(template_id)) => {
+                                                            eprintln!(
+                                                                "  {} Template extracted: {} → {}",
+                                                                "📝".cyan(),
+                                                                goal_pattern.dim(),
+                                                                &template_id[..8]
+                                                            );
+                                                        }
+                                                        Ok(None) => {} // Not eligible
+                                                        Err(e) => {
+                                                            eprintln!("  {} Template extraction failed: {}", "⚠".yellow(), e);
+                                                        }
+                                                    }
+                                                }
                                             }
                                             Err(e) => {
                                                 eprintln!("  {} Could not record feedback: {}", "⚠".yellow(), e);
@@ -801,6 +820,94 @@ pub(super) async fn handle_memory_domain_command(
                             "✓".green(),
                             "★".repeat(rating as usize).yellow()
                         );
+                    }
+                }
+                "recommend" => {
+                    // Show template recommendations for current or specified goal
+                    let query_goal = if sub_arg.is_empty() {
+                        state.plan_mode.as_ref().map(|ps| ps.goal.clone())
+                    } else {
+                        Some(sub_arg.to_string())
+                    };
+                    
+                    if let Some(goal) = query_goal {
+                        if let Some(ref svc) = state.task_service {
+                            use mo_agent_services::TaskService;
+                            let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
+                            let project_type = state.plan_mode.as_ref()
+                                .and_then(|ps| ps.context.languages.first())
+                                .map(|s| s.as_str());
+                            
+                            match svc.recommend_templates(user_id, &goal, project_type, 5).await {
+                                Ok(recommendations) => {
+                                    if recommendations.is_empty() {
+                                        eprintln!("  {} No templates found for: {}", "📋".dim(), goal.dim());
+                                        eprintln!("  {} Complete more plans and rate them to build templates!", "💡".cyan());
+                                    } else {
+                                        eprintln!("  {} Recommended templates for: {}", "📋".cyan(), goal.cyan());
+                                        eprintln!();
+                                        for (i, rec) in recommendations.iter().enumerate() {
+                                            let stars = "★".repeat((rec.template.success_rate * 5.0) as usize);
+                                            eprintln!(
+                                                "  [{}] {} {} ({}x used)",
+                                                (i + 1).to_string().cyan(),
+                                                rec.template.goal_pattern,
+                                                stars.yellow(),
+                                                rec.template.use_count
+                                            );
+                                            let reason_ref = &rec.reason;
+                                            eprintln!("      {} {}", "→".dim(), reason_ref.as_str().dim());
+                                            eprintln!("      {} {} subtasks", "📝".dim(), rec.template.template.subtasks.len());
+                                        }
+                                        eprintln!();
+                                        eprintln!("  {} Use '/plan use <n>' to apply a template", "💡".cyan());
+                                    }
+                                }
+                                Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+                            }
+                        } else {
+                            eprintln!("  {} Cloud service not available", "⚠".yellow());
+                        }
+                    } else {
+                        eprintln!("  {} Usage: /plan recommend <goal>", "⚠".yellow());
+                    }
+                }
+                "stats" => {
+                    // Show learning stats
+                    let query_pattern = if sub_arg.is_empty() {
+                        state.plan_mode.as_ref().map(|ps| ps.goal.clone())
+                    } else {
+                        Some(sub_arg.to_string())
+                    };
+                    
+                    if let Some(pattern) = query_pattern {
+                        if let Some(ref svc) = state.task_service {
+                            use mo_agent_services::TaskService;
+                            let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
+                            
+                            match svc.get_learning_stats(user_id, &pattern).await {
+                                Ok(stats) => {
+                                    eprintln!("  {} Learning Stats: {}", "📊".cyan(), pattern.cyan());
+                                    eprintln!();
+                                    eprintln!("  Total tasks:     {}", stats.total_tasks);
+                                    eprintln!("  Completed:       {} ({:.0}%)", 
+                                        stats.completed_tasks,
+                                        if stats.total_tasks > 0 { stats.completed_tasks as f32 / stats.total_tasks as f32 * 100.0 } else { 0.0 }
+                                    );
+                                    if let Some(avg) = stats.avg_rating {
+                                        let stars = "★".repeat(avg.round() as usize);
+                                        eprintln!("  Avg rating:      {} ({:.1})", stars.yellow(), avg);
+                                    }
+                                    eprintln!("  Avg replans:     {:.1}", stats.avg_replan_count);
+                                    eprintln!("  Success rate:    {:.0}% (inferred)", stats.inferred_success_rate * 100.0);
+                                }
+                                Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+                            }
+                        } else {
+                            eprintln!("  {} Cloud service not available", "⚠".yellow());
+                        }
+                    } else {
+                        eprintln!("  {} Usage: /plan stats <pattern>", "⚠".yellow());
                     }
                 }
                 "history" => {
