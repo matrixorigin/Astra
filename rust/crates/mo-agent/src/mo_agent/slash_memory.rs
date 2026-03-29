@@ -1173,9 +1173,33 @@ pub async fn handle_plan_mode_input(
             match plan_state.complete_subtask(done_id) {
                 Ok(title) => {
                     let pct = plan_state.plan.progress_pct();
+                    let done_count = plan_state.plan.items_done();
+                    let total_count = plan_state.plan.subtasks.len();
                     eprintln!("  {} Completed: {} ({}%)", "✓".green(), title, pct);
-                    // Save updated state
+                    // Save updated state locally
                     let _ = plan_state.save_to_file(&PlanModeState::state_path());
+                    
+                    // Sync progress to cloud if available
+                    if let Some(ref svc) = state.task_service {
+                        use mo_agent_services::TaskService;
+                        let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
+                        let goal = &plan_state.goal;
+                        
+                        // Find matching cloud task and update progress
+                        if let Ok(tasks) = svc.list_tasks(user_id, None).await {
+                            if let Some(task) = tasks.iter().find(|t| &t.title == goal) {
+                                // Update plan and progress in cloud
+                                let _ = svc.update_plan(&task.task_id, &plan_state.plan).await;
+                                let _ = svc.update_progress(
+                                    &task.task_id,
+                                    pct,
+                                    done_count,
+                                    total_count as u32,
+                                ).await;
+                            }
+                        }
+                    }
+                    
                     // Show remaining ready tasks
                     let ready = plan_state.plan.ready_subtasks();
                     if !ready.is_empty() {
@@ -1185,6 +1209,17 @@ pub async fn handle_plan_mode_input(
                         }
                     } else if plan_state.plan.progress_pct() == 100 {
                         eprintln!("  {} All tasks complete!", "🎉".green());
+                        // Complete the cloud task
+                        if let Some(ref svc) = state.task_service {
+                            use mo_agent_services::TaskService;
+                            let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
+                            let goal = &plan_state.goal;
+                            if let Ok(tasks) = svc.list_tasks(user_id, None).await {
+                                if let Some(task) = tasks.iter().find(|t| &t.title == goal) {
+                                    let _ = svc.complete_task(&task.task_id).await;
+                                }
+                            }
+                        }
                         // Prompt for feedback
                         eprintln!();
                         eprintln!(
