@@ -6,7 +6,7 @@
 //!   Edge (CLI)                          Cloud (MatrixOne)
 //!   ─────────                          ──────────────────
 //!   ~/.mo-agent/learning/            learning_snapshots table
-//!     {profile}.json         ──push──▶  (user_id, profile, json)
+//!     {profile}.json         ──push──▶  (user_id, profile, gzip+base64 json)
 //!                            ◀──pull──
 //!
 //!   ~/.mo-agent/sessions/            agent_sessions + agent_events
@@ -25,7 +25,10 @@
 //! - **Idempotent**: Repeated pushes produce same result (UPSERT semantics)
 
 use async_trait::async_trait;
+use base64::Engine;
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -37,6 +40,10 @@ const MAX_RETRIES: u32 = 3;
 const INITIAL_BACKOFF_MS: u64 = 100;
 /// Maximum backoff delay (exponential backoff caps at this value).
 const MAX_BACKOFF_MS: u64 = 2000;
+/// Retain only a bounded tail of successful sync audit rows per user.
+const SYNC_LOG_SUCCESS_RETAIN: usize = 200;
+/// Retain a smaller bounded tail of error rows per user.
+const SYNC_LOG_ERROR_RETAIN: usize = 50;
 
 /// Check if an error is likely transient and worth retrying.
 fn is_retryable_error(err: &sqlx::Error) -> bool {
@@ -69,6 +76,52 @@ fn is_retryable_error(err: &sqlx::Error) -> bool {
         // Other errors are not retryable
         _ => false,
     }
+}
+
+/// Compress a JSON payload with gzip and encode it as base64 for storage.
+fn compress_json_payload(json: &str) -> Result<String, String> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(json.as_bytes())
+        .map_err(|e| format!("gzip write: {e}"))?;
+    let compressed = encoder.finish().map_err(|e| format!("gzip finish: {e}"))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(compressed))
+}
+
+/// Decode a base64 payload and decompress it from gzip back into JSON text.
+fn decompress_json_payload(encoded: &str) -> Result<String, String> {
+    let compressed = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    let mut decoder = GzDecoder::new(compressed.as_slice());
+    let mut json = String::new();
+    decoder
+        .read_to_string(&mut json)
+        .map_err(|e| format!("gzip decode: {e}"))?;
+    Ok(json)
+}
+
+fn sync_log_retain_limit(status: &str) -> Option<usize> {
+    match status {
+        "success" => Some(SYNC_LOG_SUCCESS_RETAIN),
+        "error" => Some(SYNC_LOG_ERROR_RETAIN),
+        _ => None,
+    }
+}
+
+fn build_sync_log_prune_query(retain: usize) -> String {
+    format!(
+        "DELETE FROM session_sync_log \
+         WHERE user_id = ? AND status = ? \
+           AND sync_id NOT IN ( \
+               SELECT sync_id FROM ( \
+                   SELECT sync_id FROM session_sync_log \
+                   WHERE user_id = ? AND status = ? \
+                   ORDER BY created_at DESC \
+                   LIMIT {retain} \
+               ) AS keepers \
+           )"
+    )
 }
 
 // ─── Sync Types ─────────────────────────────────────────────────────────────
@@ -111,7 +164,12 @@ impl SyncResult {
         }
     }
 
-    pub fn ok_with_version(direction: SyncDirection, sync_type: &str, items: u32, version: i64) -> Self {
+    pub fn ok_with_version(
+        direction: SyncDirection,
+        sync_type: &str,
+        items: u32,
+        version: i64,
+    ) -> Self {
         Self {
             direction,
             sync_type: sync_type.to_string(),
@@ -197,10 +255,25 @@ impl DeltaSnapshot {
 
     /// Approximate size in bytes (for telemetry).
     pub fn approx_size(&self) -> usize {
-        self.entity_deltas.iter().map(|v| v.to_string().len()).sum::<usize>()
-            + self.pattern_deltas.iter().map(|v| v.to_string().len()).sum::<usize>()
-            + self.calibration.as_ref().map(|v| v.to_string().len()).unwrap_or(0)
-            + self.tool_health_deltas.iter().map(|v| v.to_string().len()).sum::<usize>()
+        self.entity_deltas
+            .iter()
+            .map(|v| v.to_string().len())
+            .sum::<usize>()
+            + self
+                .pattern_deltas
+                .iter()
+                .map(|v| v.to_string().len())
+                .sum::<usize>()
+            + self
+                .calibration
+                .as_ref()
+                .map(|v| v.to_string().len())
+                .unwrap_or(0)
+            + self
+                .tool_health_deltas
+                .iter()
+                .map(|v| v.to_string().len())
+                .sum::<usize>()
     }
 }
 
@@ -435,7 +508,7 @@ impl MatrixOneSyncService {
             SyncDirection::Push => "push",
             SyncDirection::Pull => "pull",
         };
-        let _ = sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO session_sync_log \
              (sync_id, user_id, session_id, sync_type, sync_direction, payload_size, status, error_message, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())",
@@ -450,6 +523,23 @@ impl MatrixOneSyncService {
         .bind(error_msg)
         .execute(&self.pool)
         .await;
+
+        if inserted.is_ok() {
+            if let Some(retain) = sync_log_retain_limit(status) {
+                self.prune_sync_logs(user_id, status, retain).await;
+            }
+        }
+    }
+
+    async fn prune_sync_logs(&self, user_id: &str, status: &str, retain: usize) {
+        let query = build_sync_log_prune_query(retain);
+        let _ = sqlx::query(&query)
+            .bind(user_id)
+            .bind(status)
+            .bind(user_id)
+            .bind(status)
+            .execute(&self.pool)
+            .await;
     }
 }
 
@@ -466,6 +556,10 @@ impl StateSyncService for MatrixOneSyncService {
     ) -> SyncResult {
         let snapshot_id = uuid::Uuid::new_v4().to_string();
         let has_cal = if has_calibration { 1i32 } else { 0 };
+        let compressed_snapshot = match compress_json_payload(snapshot_json) {
+            Ok(value) => value,
+            Err(e) => return SyncResult::err(SyncDirection::Push, "learning", e),
+        };
 
         // Retry loop with exponential backoff for transient network errors
         let mut last_error = None;
@@ -485,7 +579,7 @@ impl StateSyncService for MatrixOneSyncService {
                     updated_at = NOW() \
                  WHERE user_id = ? AND profile_name = ?",
             )
-            .bind(snapshot_json)
+            .bind(&compressed_snapshot)
             .bind(entity_count as i64)
             .bind(pattern_count as i64)
             .bind(has_cal)
@@ -507,7 +601,7 @@ impl StateSyncService for MatrixOneSyncService {
                     .bind(&snapshot_id)
                     .bind(user_id)
                     .bind(profile)
-                    .bind(snapshot_json)
+                    .bind(&compressed_snapshot)
                     .bind(entity_count as i64)
                     .bind(pattern_count as i64)
                     .bind(has_cal)
@@ -524,7 +618,7 @@ impl StateSyncService for MatrixOneSyncService {
                         "",
                         "learning",
                         SyncDirection::Push,
-                        snapshot_json.len(),
+                        compressed_snapshot.len(),
                         "success",
                         None,
                     )
@@ -591,6 +685,10 @@ impl StateSyncService for MatrixOneSyncService {
     ) -> SyncResult {
         let snapshot_id = uuid::Uuid::new_v4().to_string();
         let has_cal = if has_calibration { 1i32 } else { 0 };
+        let compressed_snapshot = match compress_json_payload(snapshot_json) {
+            Ok(value) => value,
+            Err(e) => return SyncResult::err(SyncDirection::Push, "learning", e),
+        };
 
         // Retry loop with exponential backoff for transient network errors
         let mut backoff_ms = INITIAL_BACKOFF_MS;
@@ -609,7 +707,7 @@ impl StateSyncService for MatrixOneSyncService {
                             updated_at = NOW() \
                          WHERE user_id = ? AND profile_name = ? AND version = ?",
                     )
-                    .bind(snapshot_json)
+                    .bind(&compressed_snapshot)
                     .bind(entity_count as i64)
                     .bind(pattern_count as i64)
                     .bind(has_cal)
@@ -627,7 +725,7 @@ impl StateSyncService for MatrixOneSyncService {
                                 "",
                                 "learning_versioned",
                                 SyncDirection::Push,
-                                snapshot_json.len(),
+                                compressed_snapshot.len(),
                                 "success",
                                 None,
                             )
@@ -706,7 +804,7 @@ impl StateSyncService for MatrixOneSyncService {
                     .bind(&snapshot_id)
                     .bind(user_id)
                     .bind(profile)
-                    .bind(snapshot_json)
+                    .bind(&compressed_snapshot)
                     .bind(entity_count as i64)
                     .bind(pattern_count as i64)
                     .bind(has_cal)
@@ -720,7 +818,7 @@ impl StateSyncService for MatrixOneSyncService {
                                 "",
                                 "learning_versioned",
                                 SyncDirection::Push,
-                                snapshot_json.len(),
+                                compressed_snapshot.len(),
                                 "success",
                                 None,
                             )
@@ -807,6 +905,8 @@ impl StateSyncService for MatrixOneSyncService {
                 let json: String = row
                     .try_get("snapshot_json")
                     .map_err(|e| format!("pull_learning decode: {e}"))?;
+                let decompressed = decompress_json_payload(&json)
+                    .map_err(|e| format!("pull_learning unzip: {e}"))?;
                 self.log_sync(
                     user_id,
                     "",
@@ -817,7 +917,7 @@ impl StateSyncService for MatrixOneSyncService {
                     None,
                 )
                 .await;
-                Ok(Some(json))
+                Ok(Some(decompressed))
             }
             None => Ok(None),
         }
@@ -849,6 +949,8 @@ impl StateSyncService for MatrixOneSyncService {
                     let json: String = row
                         .try_get("snapshot_json")
                         .map_err(|e| format!("pull_learning_versioned decode json: {e}"))?;
+                    let decompressed = decompress_json_payload(&json)
+                        .map_err(|e| format!("pull_learning_versioned unzip json: {e}"))?;
                     let version: i64 = row
                         .try_get("version")
                         .map_err(|e| format!("pull_learning_versioned decode version: {e}"))?;
@@ -862,7 +964,10 @@ impl StateSyncService for MatrixOneSyncService {
                         None,
                     )
                     .await;
-                    return Ok(Some(VersionedSnapshot { json, version }));
+                    return Ok(Some(VersionedSnapshot {
+                        json: decompressed,
+                        version,
+                    }));
                 }
                 Ok(None) => return Ok(None),
                 Err(e) => {
@@ -1031,11 +1136,18 @@ impl StateSyncService for MatrixOneSyncService {
         // Parse the delta JSON
         let delta: DeltaSnapshot = match serde_json::from_str(delta_json) {
             Ok(d) => d,
-            Err(e) => return SyncResult::err(SyncDirection::Push, "delta", format!("parse delta: {e}")),
+            Err(e) => {
+                return SyncResult::err(SyncDirection::Push, "delta", format!("parse delta: {e}"));
+            }
         };
         // If delta is empty, skip the push entirely
         if delta.is_empty() {
-            return SyncResult::ok_with_version(SyncDirection::Push, "delta", 0, expected_version.unwrap_or(0));
+            return SyncResult::ok_with_version(
+                SyncDirection::Push,
+                "delta",
+                0,
+                expected_version.unwrap_or(0),
+            );
         }
 
         // Delta sync algorithm:
@@ -1044,46 +1156,66 @@ impl StateSyncService for MatrixOneSyncService {
         // 3. Push merged result with version check
 
         // Step 1: Pull current snapshot
-        let (current_json, current_version) = match self.pull_learning_versioned(user_id, profile).await {
+        let (current_json, current_version) = match self
+            .pull_learning_versioned(user_id, profile)
+            .await
+        {
             Ok(Some(snap)) => (snap.json, snap.version),
             Ok(None) => {
                 // No existing snapshot - create from delta only
                 let snapshot = create_snapshot_from_delta(&delta);
                 let json = serde_json::to_string(&snapshot).unwrap_or_default();
-                return self.push_learning_versioned(user_id, profile, &json, 
-                    delta.entity_deltas.len() as u32, 
-                    delta.pattern_deltas.len() as u32, 
-                    delta.calibration.is_some(),
-                    None,
-                ).await;
+                return self
+                    .push_learning_versioned(
+                        user_id,
+                        profile,
+                        &json,
+                        delta.entity_deltas.len() as u32,
+                        delta.pattern_deltas.len() as u32,
+                        delta.calibration.is_some(),
+                        None,
+                    )
+                    .await;
             }
-            Err(e) => return SyncResult::err(SyncDirection::Push, "delta", format!("pull failed: {e}")),
+            Err(e) => {
+                return SyncResult::err(SyncDirection::Push, "delta", format!("pull failed: {e}"));
+            }
         };
 
         // Check version for conflict
         if let Some(expected) = expected_version {
             if current_version != expected {
-                return SyncResult::conflict(SyncDirection::Push, "delta", 
-                    format!("version mismatch: expected {}, found {}", expected, current_version));
+                return SyncResult::conflict(
+                    SyncDirection::Push,
+                    "delta",
+                    format!(
+                        "version mismatch: expected {}, found {}",
+                        expected, current_version
+                    ),
+                );
             }
         }
 
         // Step 2: Parse and merge
         let merged_json = match merge_delta_into_snapshot(&current_json, &delta) {
             Ok(j) => j,
-            Err(e) => return SyncResult::err(SyncDirection::Push, "delta", format!("merge failed: {e}")),
+            Err(e) => {
+                return SyncResult::err(SyncDirection::Push, "delta", format!("merge failed: {e}"));
+            }
         };
 
         // Step 3: Push merged result with optimistic locking
-        let result = self.push_learning_versioned(
-            user_id,
-            profile,
-            &merged_json,
-            delta.entity_deltas.len() as u32,
-            delta.pattern_deltas.len() as u32,
-            delta.calibration.is_some(),
-            Some(current_version),
-        ).await;
+        let result = self
+            .push_learning_versioned(
+                user_id,
+                profile,
+                &merged_json,
+                delta.entity_deltas.len() as u32,
+                delta.pattern_deltas.len() as u32,
+                delta.calibration.is_some(),
+                Some(current_version),
+            )
+            .await;
 
         // Note: Delta sync stats could be logged at the caller level
         // delta_items = delta.delta_count
@@ -1120,14 +1252,14 @@ fn merge_delta_into_snapshot(snapshot_json: &str, delta: &DeltaSnapshot) -> Resu
 
     // Merge entities by name
     if !delta.entity_deltas.is_empty() {
-        let entities = snapshot
-            .get_mut("entities")
-            .and_then(|v| v.as_array_mut());
+        let entities = snapshot.get_mut("entities").and_then(|v| v.as_array_mut());
         if let Some(arr) = entities {
             for entity_delta in &delta.entity_deltas {
                 if let Some(name) = entity_delta.get("name").and_then(|v| v.as_str()) {
                     // Find and replace existing, or append
-                    let pos = arr.iter().position(|e| e.get("name").and_then(|v| v.as_str()) == Some(name));
+                    let pos = arr
+                        .iter()
+                        .position(|e| e.get("name").and_then(|v| v.as_str()) == Some(name));
                     if let Some(idx) = pos {
                         arr[idx] = entity_delta.clone();
                     } else {
@@ -1143,13 +1275,13 @@ fn merge_delta_into_snapshot(snapshot_json: &str, delta: &DeltaSnapshot) -> Resu
 
     // Merge patterns by signature
     if !delta.pattern_deltas.is_empty() {
-        let patterns = snapshot
-            .get_mut("patterns")
-            .and_then(|v| v.as_array_mut());
+        let patterns = snapshot.get_mut("patterns").and_then(|v| v.as_array_mut());
         if let Some(arr) = patterns {
             for pattern_delta in &delta.pattern_deltas {
                 if let Some(sig) = pattern_delta.get("signature").and_then(|v| v.as_str()) {
-                    let pos = arr.iter().position(|p| p.get("signature").and_then(|v| v.as_str()) == Some(sig));
+                    let pos = arr
+                        .iter()
+                        .position(|p| p.get("signature").and_then(|v| v.as_str()) == Some(sig));
                     if let Some(idx) = pos {
                         arr[idx] = pattern_delta.clone();
                     } else {
@@ -1175,7 +1307,9 @@ fn merge_delta_into_snapshot(snapshot_json: &str, delta: &DeltaSnapshot) -> Resu
         if let Some(arr) = tool_health {
             for th_delta in &delta.tool_health_deltas {
                 if let Some(name) = th_delta.get("name").and_then(|v| v.as_str()) {
-                    let pos = arr.iter().position(|t| t.get("name").and_then(|v| v.as_str()) == Some(name));
+                    let pos = arr
+                        .iter()
+                        .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(name));
                     if let Some(idx) = pos {
                         arr[idx] = th_delta.clone();
                     } else {
@@ -1342,6 +1476,45 @@ mod tests {
         let loaded: SyncResult = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.items_synced, 3);
         assert!(loaded.success);
+    }
+
+    #[test]
+    fn compressed_payload_roundtrips_json() {
+        let original =
+            r#"{"entities":[{"name":"tool","count":3}],"patterns":[{"signature":"abc"}]}"#;
+
+        let encoded = compress_json_payload(original).unwrap();
+        let restored = decompress_json_payload(&encoded).unwrap();
+
+        assert_ne!(encoded, original);
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn decompress_rejects_plain_json_storage() {
+        let err = decompress_json_payload(r#"{"entities":[]}"#).unwrap_err();
+        assert!(err.contains("base64 decode"));
+    }
+
+    #[test]
+    fn sync_log_retention_limits_are_bounded() {
+        assert_eq!(
+            sync_log_retain_limit("success"),
+            Some(SYNC_LOG_SUCCESS_RETAIN)
+        );
+        assert_eq!(sync_log_retain_limit("error"), Some(SYNC_LOG_ERROR_RETAIN));
+        assert_eq!(sync_log_retain_limit("pending"), None);
+    }
+
+    #[test]
+    fn prune_query_keeps_latest_rows_for_user_and_status() {
+        let query = build_sync_log_prune_query(17);
+
+        assert!(query.contains("DELETE FROM session_sync_log"));
+        assert!(query.contains("WHERE user_id = ? AND status = ?"));
+        assert!(query.contains("SELECT sync_id FROM session_sync_log"));
+        assert!(query.contains("ORDER BY created_at DESC"));
+        assert!(query.contains("LIMIT 17"));
     }
 
     #[tokio::test]
