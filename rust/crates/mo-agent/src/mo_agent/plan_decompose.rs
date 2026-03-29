@@ -87,7 +87,7 @@ pub fn analyze_project(root: &Path) -> ProjectContext {
     ];
 
     let mut source_count = 0;
-    
+
     // Simple recursive scan (limited depth)
     fn scan_dir(
         dir: &Path,
@@ -106,7 +106,7 @@ pub fn analyze_project(root: &Path) -> ProjectContext {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            
+
             // Skip hidden and common non-source dirs
             if name_str.starts_with('.')
                 || matches!(
@@ -116,7 +116,7 @@ pub fn analyze_project(root: &Path) -> ProjectContext {
             {
                 continue;
             }
-            
+
             let path = entry.path();
             if path.is_dir() {
                 scan_dir(&path, depth + 1, max_depth, count, lang_set, ext_to_lang);
@@ -133,7 +133,7 @@ pub fn analyze_project(root: &Path) -> ProjectContext {
             }
         }
     }
-    
+
     scan_dir(root, 0, 4, &mut source_count, &mut lang_set, &ext_to_lang);
 
     ctx.languages = lang_set.into_iter().map(String::from).collect();
@@ -193,16 +193,31 @@ pub fn analyze_project(root: &Path) -> ProjectContext {
 }
 
 /// Collect source files with line counts for key module analysis.
-fn collect_source_files(root: &Path, dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<(String, usize)>) {
+fn collect_source_files(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    out: &mut Vec<(String, usize)>,
+) {
     if depth > max_depth || out.len() > 200 {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let source_exts = ["rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "rb", "cpp", "c"];
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let source_exts = [
+        "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "rb", "cpp", "c",
+    ];
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if name_str.starts_with('.') || matches!(name_str.as_ref(), "node_modules" | "target" | "venv" | "__pycache__" | "dist" | "build") {
+        if name_str.starts_with('.')
+            || matches!(
+                name_str.as_ref(),
+                "node_modules" | "target" | "venv" | "__pycache__" | "dist" | "build"
+            )
+        {
             continue;
         }
         let path = entry.path();
@@ -214,7 +229,11 @@ fn collect_source_files(root: &Path, dir: &Path, depth: usize, max_depth: usize,
                     if let Ok(content) = std::fs::read_to_string(&path) {
                         let lines = content.lines().count();
                         if lines > 20 {
-                            let rel = path.strip_prefix(root).unwrap_or(&path).display().to_string();
+                            let rel = path
+                                .strip_prefix(root)
+                                .unwrap_or(&path)
+                                .display()
+                                .to_string();
                             out.push((rel, lines));
                         }
                     }
@@ -233,11 +252,19 @@ pub fn decomposition_prompt(goal: &str, context: &ProjectContext) -> String {
     prompt.push_str(&format!("- Root: {}\n", context.root));
     prompt.push_str(&format!(
         "- Build system: {}\n",
-        if context.entry_points.is_empty() { "(none detected)".to_string() } else { context.entry_points.join(", ") }
+        if context.entry_points.is_empty() {
+            "(none detected)".to_string()
+        } else {
+            context.entry_points.join(", ")
+        }
     ));
     prompt.push_str(&format!(
         "- Languages: {}\n",
-        if context.languages.is_empty() { "(unknown)".to_string() } else { context.languages.join(", ") }
+        if context.languages.is_empty() {
+            "(unknown)".to_string()
+        } else {
+            context.languages.join(", ")
+        }
     ));
     prompt.push_str(&format!("- Structure: {}\n", context.structure_summary));
     prompt.push_str(&format!("- Source files: ~{}\n", context.source_file_count));
@@ -414,7 +441,10 @@ pub fn format_plan(plan: &TaskPlan) -> String {
             _ => "",
         };
 
-        out.push_str(&format!("│ {} {}{} {}\n", status_icon, st.id, effort_badge, st.title));
+        out.push_str(&format!(
+            "│ {} {}{} {}\n",
+            status_icon, st.id, effort_badge, st.title
+        ));
 
         if let Some(ref desc) = st.description {
             out.push_str(&format!("│     └─ {}\n", desc));
@@ -440,9 +470,21 @@ pub fn format_plan(plan: &TaskPlan) -> String {
     out.push_str("└─────────────────────────────────────────────────\n");
 
     // Effort summary
-    let small = plan.subtasks.iter().filter(|s| s.effort.as_deref() == Some("small")).count();
-    let medium = plan.subtasks.iter().filter(|s| s.effort.as_deref() == Some("medium")).count();
-    let large = plan.subtasks.iter().filter(|s| s.effort.as_deref() == Some("large")).count();
+    let small = plan
+        .subtasks
+        .iter()
+        .filter(|s| s.effort.as_deref() == Some("small"))
+        .count();
+    let medium = plan
+        .subtasks
+        .iter()
+        .filter(|s| s.effort.as_deref() == Some("medium"))
+        .count();
+    let large = plan
+        .subtasks
+        .iter()
+        .filter(|s| s.effort.as_deref() == Some("large"))
+        .count();
     if small + medium + large > 0 {
         out.push_str(&format!(
             "  Effort: {} small, {} medium, {} large\n",
@@ -460,7 +502,11 @@ pub fn format_plan(plan: &TaskPlan) -> String {
     if !ready.is_empty() {
         out.push_str(&format!(
             "  Ready: {}\n",
-            ready.iter().map(|st| st.id.as_str()).collect::<Vec<_>>().join(", ")
+            ready
+                .iter()
+                .map(|st| st.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
 
@@ -495,7 +541,7 @@ impl PlanModeState {
             modified: false,
         }
     }
-    
+
     /// Set the plan (after LLM generation)
     pub fn set_plan(&mut self, plan: TaskPlan) {
         self.plan = plan;
@@ -526,25 +572,26 @@ impl PlanModeState {
             )),
         }
     }
-    
+
     /// Add a conversation turn to history
     pub fn add_turn(&mut self, user_msg: &str, assistant_msg: &str) {
-        self.history.push((user_msg.to_string(), assistant_msg.to_string()));
+        self.history
+            .push((user_msg.to_string(), assistant_msg.to_string()));
     }
-    
+
     /// Generate the plan mode prompt for LLM interactions
     pub fn plan_mode_prompt(&self, user_message: &str) -> String {
         let mut prompt = String::new();
-        
+
         prompt.push_str("You are in PLAN MODE, helping the user refine a plan.\n\n");
         prompt.push_str(&format!("## Original Goal\n{}\n\n", self.goal));
-        
+
         if !self.plan.subtasks.is_empty() {
             prompt.push_str("## Current Plan\n");
             prompt.push_str(&serde_json::to_string_pretty(&self.plan).unwrap_or_default());
             prompt.push_str("\n\n");
         }
-        
+
         // Include recent history
         if !self.history.is_empty() {
             prompt.push_str("## Recent Discussion\n");
@@ -554,10 +601,11 @@ impl PlanModeState {
             }
             prompt.push_str("\n");
         }
-        
+
         prompt.push_str(&format!("## User Request\n{}\n\n", user_message));
-        
-        prompt.push_str(r#"## Instructions
+
+        prompt.push_str(
+            r#"## Instructions
 Based on the user's request, respond in ONE of these ways:
 
 1. **If modifying the plan**: Output the updated plan as JSON with format:
@@ -570,11 +618,12 @@ Based on the user's request, respond in ONE of these ways:
 
 2. **If answering a question**: Respond naturally, no JSON needed.
 
-Keep responses concise. The plan JSON must be valid if provided."#);
-        
+Keep responses concise. The plan JSON must be valid if provided."#,
+        );
+
         prompt
     }
-    
+
     /// Check if user input is an execute command
     pub fn is_execute_command(input: &str) -> bool {
         let lower = input.trim().to_lowercase();
@@ -583,7 +632,7 @@ Keep responses concise. The plan JSON must be valid if provided."#);
             "execute" | "go" | "start" | "done" | "run" | "开始" | "执行" | "运行"
         )
     }
-    
+
     /// Memory protocol content for storing the active plan
     pub fn to_memory_content(&self) -> String {
         format!(
@@ -592,7 +641,7 @@ Keep responses concise. The plan JSON must be valid if provided."#);
             serde_json::to_string_pretty(&self.plan).unwrap_or_default()
         )
     }
-    
+
     /// Memory protocol content for a completed plan
     pub fn to_completed_memory(&self) -> String {
         format!(
@@ -605,16 +654,15 @@ Keep responses concise. The plan JSON must be valid if provided."#);
 
     /// Save plan mode state to a file for session recovery.
     pub fn save_to_file(&self, path: &Path) -> Result<(), String> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| format!("serialize plan state: {e}"))?;
+        let json =
+            serde_json::to_string_pretty(self).map_err(|e| format!("serialize plan state: {e}"))?;
         std::fs::write(path, json).map_err(|e| format!("write plan state: {e}"))?;
         Ok(())
     }
 
     /// Load plan mode state from a file.
     pub fn load_from_file(path: &Path) -> Result<Self, String> {
-        let data = std::fs::read_to_string(path)
-            .map_err(|e| format!("read plan state: {e}"))?;
+        let data = std::fs::read_to_string(path).map_err(|e| format!("read plan state: {e}"))?;
         serde_json::from_str(&data).map_err(|e| format!("parse plan state: {e}"))
     }
 
@@ -664,7 +712,10 @@ pub fn format_subtask_prompt(subtask: &SubtaskPlan) -> String {
     }
 
     if !subtask.files.is_empty() {
-        prompt.push_str(&format!("\nFiles to modify: {}\n", subtask.files.join(", ")));
+        prompt.push_str(&format!(
+            "\nFiles to modify: {}\n",
+            subtask.files.join(", ")
+        ));
     }
 
     if let Some(ref acceptance) = subtask.acceptance {
@@ -750,9 +801,15 @@ Done!"#;
         };
 
         let formatted = format_plan(&plan);
-        assert!(formatted.contains("✓"), "should show completed: {formatted}");
+        assert!(
+            formatted.contains("✓"),
+            "should show completed: {formatted}"
+        );
         assert!(formatted.contains("50%"), "should show 50%: {formatted}");
-        assert!(formatted.contains("pending"), "should be ready: {formatted}");
+        assert!(
+            formatted.contains("pending"),
+            "should be ready: {formatted}"
+        );
     }
 
     #[test]
@@ -772,7 +829,10 @@ Done!"#;
             prompt.contains("Cargo.toml"),
             "should include entry point: {prompt}"
         );
-        assert!(prompt.contains("Add logging"), "should include goal: {prompt}");
+        assert!(
+            prompt.contains("Add logging"),
+            "should include goal: {prompt}"
+        );
     }
 
     #[test]
@@ -982,8 +1042,14 @@ Done!"#;
         let prompt = ps.plan_mode_prompt("make it simpler");
         assert!(prompt.contains("Add auth"), "should contain goal");
         assert!(prompt.contains("jwt"), "should contain plan subtask");
-        assert!(prompt.contains("make it simpler"), "should contain user request");
-        assert!(prompt.contains("PLAN MODE"), "should contain mode indicator");
+        assert!(
+            prompt.contains("make it simpler"),
+            "should contain user request"
+        );
+        assert!(
+            prompt.contains("PLAN MODE"),
+            "should contain mode indicator"
+        );
     }
 
     #[test]
@@ -1086,7 +1152,10 @@ Done!"#;
         );
         // Largest module should have a decent line count
         let (_, lines) = &ctx.key_modules[0];
-        assert!(*lines > 50, "largest module should be >50 lines, got {lines}");
+        assert!(
+            *lines > 50,
+            "largest module should be >50 lines, got {lines}"
+        );
     }
 
     #[test]
@@ -1125,14 +1194,32 @@ Done!"#;
         };
 
         let prompt = decomposition_prompt("Add user authentication", &ctx);
-        assert!(prompt.contains("Key Modules"), "should include modules section: {prompt}");
-        assert!(prompt.contains("src/api.ts"), "should list key module: {prompt}");
-        assert!(prompt.contains("500 lines"), "should show line count: {prompt}");
-        assert!(prompt.contains("feature/auth"), "should include branch: {prompt}");
-        assert!(prompt.contains("jest"), "should include test framework: {prompt}");
+        assert!(
+            prompt.contains("Key Modules"),
+            "should include modules section: {prompt}"
+        );
+        assert!(
+            prompt.contains("src/api.ts"),
+            "should list key module: {prompt}"
+        );
+        assert!(
+            prompt.contains("500 lines"),
+            "should show line count: {prompt}"
+        );
+        assert!(
+            prompt.contains("feature/auth"),
+            "should include branch: {prompt}"
+        );
+        assert!(
+            prompt.contains("jest"),
+            "should include test framework: {prompt}"
+        );
         assert!(prompt.contains("effort"), "should ask for effort: {prompt}");
         assert!(prompt.contains("files"), "should ask for files: {prompt}");
-        assert!(prompt.contains("acceptance"), "should ask for acceptance: {prompt}");
+        assert!(
+            prompt.contains("acceptance"),
+            "should ask for acceptance: {prompt}"
+        );
     }
 
     #[test]
@@ -1167,7 +1254,10 @@ Done!"#;
         let s0 = &plan.subtasks[0];
         assert_eq!(s0.effort.as_deref(), Some("small"));
         assert_eq!(s0.files, vec!["src/models/user.ts", "src/db/schema.ts"]);
-        assert_eq!(s0.acceptance.as_deref(), Some("User model compiles and has tests"));
+        assert_eq!(
+            s0.acceptance.as_deref(),
+            Some("User model compiles and has tests")
+        );
 
         let s1 = &plan.subtasks[1];
         assert_eq!(s1.effort.as_deref(), Some("large"));
@@ -1202,13 +1292,25 @@ Done!"#;
         };
 
         let output = format_plan(&plan);
-        assert!(output.contains("[M]"), "should show medium effort badge: {output}");
-        assert!(output.contains("[S]"), "should show small effort badge: {output}");
+        assert!(
+            output.contains("[M]"),
+            "should show medium effort badge: {output}"
+        );
+        assert!(
+            output.contains("[S]"),
+            "should show small effort badge: {output}"
+        );
         assert!(output.contains("📁"), "should show files icon: {output}");
         assert!(output.contains("src/feat.rs"), "should list file: {output}");
         assert!(output.contains("✅"), "should show acceptance: {output}");
-        assert!(output.contains("cargo test"), "should show acceptance criteria: {output}");
-        assert!(output.contains("Effort:"), "should show effort summary: {output}");
+        assert!(
+            output.contains("cargo test"),
+            "should show acceptance criteria: {output}"
+        );
+        assert!(
+            output.contains("Effort:"),
+            "should show effort summary: {output}"
+        );
     }
 
     #[test]
@@ -1261,7 +1363,9 @@ Done!"#;
         let st = SubtaskPlan {
             id: "t3".into(),
             title: "Refactor DB layer".into(),
-            description: Some("Extract connection pooling into a separate module.\nAdd retry logic.".into()),
+            description: Some(
+                "Extract connection pooling into a separate module.\nAdd retry logic.".into(),
+            ),
             ..Default::default()
         };
         let prompt = format_subtask_prompt(&st);
@@ -1351,9 +1455,24 @@ Done!"#;
     fn plan_progress_tracking() {
         let mut plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "A".into(), status: TaskStatus::Completed, ..Default::default() },
-                SubtaskPlan { id: "b".into(), title: "B".into(), status: TaskStatus::InProgress, ..Default::default() },
-                SubtaskPlan { id: "c".into(), title: "C".into(), status: TaskStatus::Pending, ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "A".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "B".into(),
+                    status: TaskStatus::InProgress,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "c".into(),
+                    title: "C".into(),
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
@@ -1375,9 +1494,21 @@ Done!"#;
         // Multiple subtasks with no deps should all be ready at once
         let plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() },
-                SubtaskPlan { id: "b".into(), title: "B".into(), ..Default::default() },
-                SubtaskPlan { id: "c".into(), title: "C".into(), ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "A".into(),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "B".into(),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "c".into(),
+                    title: "C".into(),
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
@@ -1406,7 +1537,10 @@ Done!"#;
         };
         // "a" is in-progress (not completed), so "b" is blocked
         let ready = plan.ready_subtasks();
-        assert!(ready.is_empty(), "b should be blocked while a is in-progress");
+        assert!(
+            ready.is_empty(),
+            "b should be blocked while a is in-progress"
+        );
     }
 
     #[test]

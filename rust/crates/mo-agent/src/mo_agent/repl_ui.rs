@@ -85,7 +85,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/memory",
         "Memory operations: /memory [list|search <q>|inspect <id>]",
     ),
-    ("/plan", "Plan mode: /plan [enter <goal>|resume|exit|decompose|show|set|clear]"),
+    (
+        "/plan",
+        "Plan mode: /plan [enter <goal>|resume|exit|decompose|show|set|clear]",
+    ),
     (
         "/task",
         "Task tracking: /task [list|add <title>|done <id>|status <id>]",

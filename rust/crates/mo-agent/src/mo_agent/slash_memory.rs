@@ -242,10 +242,11 @@ pub(super) async fn handle_memory_domain_command(
                 }
                 "decompose" if !sub_arg.is_empty() => {
                     // Analyze project context using current working directory
-                    let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let project_root =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                     eprintln!("  {} Analyzing project structure...", "⋯".dim());
                     let context = crate::plan_decompose::analyze_project(&project_root);
-                    
+
                     eprintln!(
                         "  {} {} languages, {} files, {}",
                         "✓".green(),
@@ -253,10 +254,10 @@ pub(super) async fn handle_memory_domain_command(
                         context.source_file_count,
                         context.entry_points.join(", ")
                     );
-                    
+
                     // Generate the decomposition prompt
                     let prompt = crate::plan_decompose::decomposition_prompt(sub_arg, &context);
-                    
+
                     // Store the goal in plan memory
                     let entry = prompts::memory_proto::MemoryEntry::new(
                         prompts::memory_proto::NS_PLAN,
@@ -270,10 +271,10 @@ pub(super) async fn handle_memory_domain_command(
                         .json(&store_payload)
                         .send()
                         .await;
-                    
+
                     // Call LLM via /chat/turn SSE endpoint
                     eprintln!("  {} Decomposing goal into subtasks...", "⋯".dim());
-                    
+
                     let payload = serde_json::json!({
                         "messages": [{"role": "user", "content": prompt}],
                         "session_id": state.session_id.clone(),
@@ -283,7 +284,7 @@ pub(super) async fn handle_memory_domain_command(
                         },
                         "edge_tools": [],  // No tools needed for plan generation
                     });
-                    
+
                     match client
                         .post(format!("{base}/chat/turn"))
                         .headers(auth_headers(tok)?)
@@ -297,24 +298,30 @@ pub(super) async fn handle_memory_domain_command(
                             let mut full_text = String::new();
                             let mut stream = resp.bytes_stream();
                             let mut buffer = String::new();
-                            
+
                             use futures_util::StreamExt;
                             while let Some(chunk) = stream.next().await {
                                 let Ok(chunk) = chunk else { break };
                                 buffer.push_str(&String::from_utf8_lossy(&chunk));
-                                
+
                                 // Parse SSE events
                                 while let Some(event_end) = buffer.find("\n\n") {
                                     let event_str = buffer[..event_end].to_string();
                                     buffer = buffer[event_end + 2..].to_string();
-                                    
+
                                     // Extract text_delta content from SSE data
                                     for line in event_str.lines() {
                                         if let Some(data) = line.strip_prefix("data: ") {
-                                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                                            if let Ok(json) =
+                                                serde_json::from_str::<serde_json::Value>(data)
+                                            {
                                                 // Check for text_delta type with content field
-                                                if json.get("type").and_then(|v| v.as_str()) == Some("text_delta") {
-                                                    if let Some(content) = json.get("content").and_then(|v| v.as_str()) {
+                                                if json.get("type").and_then(|v| v.as_str())
+                                                    == Some("text_delta")
+                                                {
+                                                    if let Some(content) =
+                                                        json.get("content").and_then(|v| v.as_str())
+                                                    {
                                                         full_text.push_str(content);
                                                         eprint!("{}", content); // Stream output
                                                     }
@@ -325,7 +332,7 @@ pub(super) async fn handle_memory_domain_command(
                                 }
                             }
                             eprintln!(); // End streaming output
-                            
+
                             // Parse the plan from the response
                             match crate::plan_decompose::parse_plan_response(&full_text) {
                                 Ok(plan) => {
@@ -333,20 +340,34 @@ pub(super) async fn handle_memory_domain_command(
                                     eprint!("{}", crate::plan_decompose::format_plan(&plan));
                                 }
                                 Err(e) => {
-                                    eprintln!("{}", format!("  ✗ Could not parse plan: {e}").yellow());
+                                    eprintln!(
+                                        "{}",
+                                        format!("  ✗ Could not parse plan: {e}").yellow()
+                                    );
                                     eprintln!("  The response may still be useful — see above.");
                                 }
                             }
                         }
                         Ok(resp) => {
-                            eprintln!("{}", format!("  ✗ LLM call failed ({})", resp.status()).red());
+                            eprintln!(
+                                "{}",
+                                format!("  ✗ LLM call failed ({})", resp.status()).red()
+                            );
                             // Fallback: show the prompt for manual execution
                             eprintln!();
                             eprintln!("{}  Generated decomposition prompt:", "📋".yellow());
                             let preview: String = prompt.chars().take(300).collect();
-                            eprintln!("{}{}", preview.dim(), if prompt.len() > 300 { "..." } else { "" });
+                            eprintln!(
+                                "{}{}",
+                                preview.dim(),
+                                if prompt.len() > 300 { "..." } else { "" }
+                            );
                             eprintln!();
-                            eprintln!("{}  Type 'decompose: {}' to try again.", "💡".cyan(), sub_arg);
+                            eprintln!(
+                                "{}  Type 'decompose: {}' to try again.",
+                                "💡".cyan(),
+                                sub_arg
+                            );
                         }
                         Err(e) => {
                             eprintln!("{}", format!("  ✗ Request failed: {e}").red());
@@ -355,50 +376,60 @@ pub(super) async fn handle_memory_domain_command(
                 }
                 "enter" if !sub_arg.is_empty() => {
                     // Enter interactive plan mode (Kiro-style)
-                    use super::plan_decompose::{PlanModeState, analyze_project, decomposition_prompt, parse_plan_response, format_plan};
-                    
+                    use super::plan_decompose::{
+                        PlanModeState, analyze_project, decomposition_prompt, format_plan,
+                        parse_plan_response,
+                    };
+
                     let Some(tok) = token else {
                         eprintln!("  {} Not logged in. Run /login first.", "✗".red());
                         return Ok(());
                     };
-                    
+
                     // Analyze project context
-                    let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let project_root =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                     eprintln!("  {} Analyzing project...", "⋯".dim());
                     let context = analyze_project(&project_root);
-                    
+
                     // Generate initial decomposition prompt
                     let prompt = decomposition_prompt(sub_arg, &context);
-                    
+
                     eprintln!("  {} Decomposing goal...", "⋯".dim());
-                    
+
                     // Call LLM for initial plan
                     let payload = serde_json::json!({
                         "messages": [{"role": "user", "content": prompt}],
                         "session_id": state.session_id.clone(),
                     });
-                    
+
                     let resp = client
                         .post(format!("{base}/chat/turn"))
                         .bearer_auth(tok)
                         .json(&payload)
                         .send()
                         .await;
-                    
+
                     match resp {
                         Ok(r) if r.status().is_success() => {
                             let mut full_text = String::new();
                             let mut stream = r.bytes_stream();
                             use futures_util::StreamExt;
-                            
+
                             while let Some(chunk) = stream.next().await {
                                 if let Ok(bytes) = chunk {
                                     let event_str = String::from_utf8_lossy(&bytes);
                                     for line in event_str.lines() {
                                         if let Some(data) = line.strip_prefix("data: ") {
-                                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                                                if json.get("type").and_then(|v| v.as_str()) == Some("text_delta") {
-                                                    if let Some(content) = json.get("content").and_then(|v| v.as_str()) {
+                                            if let Ok(json) =
+                                                serde_json::from_str::<serde_json::Value>(data)
+                                            {
+                                                if json.get("type").and_then(|v| v.as_str())
+                                                    == Some("text_delta")
+                                                {
+                                                    if let Some(content) =
+                                                        json.get("content").and_then(|v| v.as_str())
+                                                    {
                                                         full_text.push_str(content);
                                                     }
                                                 }
@@ -407,18 +438,18 @@ pub(super) async fn handle_memory_domain_command(
                                     }
                                 }
                             }
-                            
+
                             // Parse the plan
                             let plan_result = parse_plan_response(&full_text);
-                            
+
                             // Create PlanModeState
                             let mut plan_state = PlanModeState::new(sub_arg.to_string(), context);
-                            
+
                             // Set the plan if parsing succeeded
                             if let Ok(ref plan) = plan_result {
                                 plan_state.set_plan(plan.clone());
                             }
-                            
+
                             state.plan_mode = Some(plan_state);
 
                             // Save for session recovery
@@ -427,7 +458,11 @@ pub(super) async fn handle_memory_domain_command(
                             }
 
                             eprintln!();
-                            eprintln!("{}  Entered plan mode for: {}", "📋".yellow(), sub_arg.cyan());
+                            eprintln!(
+                                "{}  Entered plan mode for: {}",
+                                "📋".yellow(),
+                                sub_arg.cyan()
+                            );
                             eprintln!();
 
                             // Display the plan
@@ -437,7 +472,10 @@ pub(super) async fn handle_memory_domain_command(
                             }
 
                             eprintln!();
-                            eprintln!("  {} Commands: 'exit' to leave, 'execute' or 'go' to run the plan", "💡".cyan());
+                            eprintln!(
+                                "  {} Commands: 'exit' to leave, 'execute' or 'go' to run the plan",
+                                "💡".cyan()
+                            );
                             eprintln!("  {} Or ask questions to modify the plan", "💬".cyan());
                         }
                         Ok(r) => {
@@ -464,7 +502,10 @@ pub(super) async fn handle_memory_domain_command(
                                 eprintln!("{}", format_plan(&plan));
                             }
                             eprintln!();
-                            eprintln!("  {} Commands: 'exit' to leave, 'execute' or 'go' to run", "💡".cyan());
+                            eprintln!(
+                                "  {} Commands: 'exit' to leave, 'execute' or 'go' to run",
+                                "💡".cyan()
+                            );
                         }
                         Err(_) => {
                             eprintln!("  {} No saved plan state to resume", "⚠".yellow());
@@ -481,7 +522,9 @@ pub(super) async fn handle_memory_domain_command(
                     }
                 }
                 _ => {
-                    eprintln!("  Usage: /plan [show | set <text> | clear | decompose <goal> | enter <goal> | resume | exit]");
+                    eprintln!(
+                        "  Usage: /plan [show | set <text> | clear | decompose <goal> | enter <goal> | resume | exit]"
+                    );
                 }
             }
         }
@@ -501,7 +544,7 @@ pub async fn handle_plan_mode_input(
     base: &str,
 ) -> Result<(), String> {
     use super::plan_decompose::{PlanModeState, format_plan, parse_plan_response};
-    
+
     let plan_state = match state.plan_mode.as_mut() {
         Some(ps) => ps,
         None => {
@@ -526,12 +569,7 @@ pub async fn handle_plan_mode_input(
             match plan_state.complete_subtask(done_id) {
                 Ok(title) => {
                     let pct = plan_state.plan.progress_pct();
-                    eprintln!(
-                        "  {} Completed: {} ({}%)",
-                        "✓".green(),
-                        title,
-                        pct
-                    );
+                    eprintln!("  {} Completed: {} ({}%)", "✓".green(), title, pct);
                     // Save updated state
                     let _ = plan_state.save_to_file(&PlanModeState::state_path());
                     // Show remaining ready tasks
@@ -587,10 +625,7 @@ pub async fn handle_plan_mode_input(
                     session_id,
                     TaskCreateRequest {
                         title: goal.clone(),
-                        description: Some(format!(
-                            "Plan Mode: {} subtasks",
-                            plan.subtasks.len()
-                        )),
+                        description: Some(format!("Plan Mode: {} subtasks", plan.subtasks.len())),
                         plan: Some(plan.clone()),
                         parent_task_id: None,
                     },
@@ -599,24 +634,11 @@ pub async fn handle_plan_mode_input(
             {
                 Ok(tid) => {
                     let short = &tid[..8.min(tid.len())];
-                    eprintln!(
-                        "{}  Task created: {} ({})",
-                        "✓".green(),
-                        goal,
-                        short.dim()
-                    );
-                    eprintln!(
-                        "{}  Track progress: /task status {}",
-                        "💡".cyan(),
-                        short
-                    );
+                    eprintln!("{}  Task created: {} ({})", "✓".green(), goal, short.dim());
+                    eprintln!("{}  Track progress: /task status {}", "💡".cyan(), short);
                 }
                 Err(e) => {
-                    eprintln!(
-                        "{}  Could not persist task: {}",
-                        "⚠".yellow(),
-                        e
-                    );
+                    eprintln!("{}  Could not persist task: {}", "⚠".yellow(), e);
                 }
             }
         }
@@ -625,7 +647,11 @@ pub async fn handle_plan_mode_input(
 
         // Display execution plan summary
         if !plan.subtasks.is_empty() {
-            eprintln!("{}  Execution plan ({} subtasks):", "📋".yellow(), plan.subtasks.len());
+            eprintln!(
+                "{}  Execution plan ({} subtasks):",
+                "📋".yellow(),
+                plan.subtasks.len()
+            );
             for task in &plan.subtasks {
                 let deps_str = if task.depends_on.is_empty() {
                     String::new()
@@ -680,7 +706,7 @@ pub async fn handle_plan_mode_input(
 
     // Show thinking indicator
     eprint!("  ● Thinking...");
-    
+
     let Some(tok) = token else {
         eprintln!("\r  ✗ Not logged in. Run /login first.");
         return Ok(());
@@ -694,7 +720,7 @@ pub async fn handle_plan_mode_input(
     })];
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    
+
     // Don't pass session_id for plan mode - let server create ephemeral session
     // This avoids "Session not found" errors since plan mode is self-contained
     let payload = serde_json::json!({
@@ -705,7 +731,7 @@ pub async fn handle_plan_mode_input(
         },
         "edge_tools": [],  // No tools needed for plan editing
     });
-    
+
     let resp = client
         .post(&turn_url)
         .headers(auth_headers(tok)?)
@@ -721,7 +747,7 @@ pub async fn handle_plan_mode_input(
             let mut event_count = 0;
             let mut event_types: Vec<String> = Vec::new();
             use futures_util::StreamExt;
-            
+
             while let Some(chunk) = stream.next().await {
                 if let Ok(bytes) = chunk {
                     let event_str = String::from_utf8_lossy(&bytes);
@@ -729,17 +755,26 @@ pub async fn handle_plan_mode_input(
                         if let Some(data) = line.strip_prefix("data: ") {
                             event_count += 1;
                             if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                                let event_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                let event_type = json
+                                    .get("type")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
                                 if !event_types.contains(&event_type.to_string()) {
                                     event_types.push(event_type.to_string());
                                 }
                                 if event_type == "text_delta" {
-                                    if let Some(content) = json.get("content").and_then(|v| v.as_str()) {
+                                    if let Some(content) =
+                                        json.get("content").and_then(|v| v.as_str())
+                                    {
                                         full_text.push_str(content);
                                     }
                                 } else if event_type == "error" {
                                     // Show error messages from the server
-                                    if let Some(msg) = json.get("message").or_else(|| json.get("error")).and_then(|v| v.as_str()) {
+                                    if let Some(msg) = json
+                                        .get("message")
+                                        .or_else(|| json.get("error"))
+                                        .and_then(|v| v.as_str())
+                                    {
                                         eprintln!("\r  {} Server error: {}", "✗".red(), msg);
                                     }
                                 }
@@ -748,19 +783,24 @@ pub async fn handle_plan_mode_input(
                     }
                 }
             }
-            
+
             // Clear thinking indicator
             eprint!("\r                    \r");
-            
+
             // Debug: show response info
             if full_text.is_empty() {
                 if event_count == 0 {
                     eprintln!("  {} No SSE events received from server", "⚠".yellow());
                 } else {
-                    eprintln!("  {} {} events (types: {}) but no text", "⚠".yellow(), event_count, event_types.join(", "));
+                    eprintln!(
+                        "  {} {} events (types: {}) but no text",
+                        "⚠".yellow(),
+                        event_count,
+                        event_types.join(", ")
+                    );
                 }
             }
-            
+
             // Try to parse plan update from LLM response
             let plan_updated = if !full_text.is_empty() {
                 match parse_plan_response(&full_text) {
@@ -786,7 +826,7 @@ pub async fn handle_plan_mode_input(
                 eprintln!();
                 eprintln!("{}", full_text.trim());
             }
-            
+
             // Update history with assistant response
             if let Some(last) = plan_state.history.last_mut() {
                 last.1 = full_text.chars().take(500).collect();
