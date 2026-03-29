@@ -412,7 +412,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "call_graph",
-                "description": "Analyze function call relationships. Shows what a function calls (outgoing) and optionally what calls it (incoming/callers). Use to understand code flow, trace dependencies, or prepare for refactoring.",
+                "description": "Analyze function call relationships. Shows what a function calls (outgoing) and optionally what calls it (incoming/callers). When callers=true with scope='project', scans all project files to find callers across the codebase.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -420,7 +420,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "symbol": {"type": "string", "description": "Symbol name to analyze (function/method name)"},
                         "start_line": {"type": "integer", "description": "Start line (alternative to symbol name)"},
                         "end_line": {"type": "integer", "description": "End line (alternative to symbol name)"},
-                        "callers": {"type": "boolean", "description": "If true, also find functions that CALL this symbol (reverse call graph). Searches same file."}
+                        "callers": {"type": "boolean", "description": "If true, also find functions that CALL this symbol (reverse call graph)."},
+                        "scope": {"type": "string", "enum": ["file", "project"], "description": "Scope for caller search: 'file' (default, fast) or 'project' (cross-file, thorough). Only used with callers=true."}
                     },
                     "required": ["path"]
                 }
@@ -1313,6 +1314,138 @@ impl ToolExecutor {
         output
     }
 
+    /// Walk project files and find all functions that call `target` symbol.
+    /// Returns Vec of (relative_path, caller_name, caller_signature, call_line).
+    fn find_callers_cross_file(&self, target: &str, _origin_file: &std::path::Path) -> Vec<(String, String, String, usize)> {
+        let skip_names = ["node_modules", "target", "vendor", "dist", "__pycache__", ".git"];
+        let extensions = ["rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "h", "cpp", "cc", "hpp", "rb"];
+        let max_files = 300;
+
+        // Step 1: Use ripgrep to pre-filter files containing the target symbol (fast)
+        let candidate_files = self.prefilter_files_with_symbol(target, &extensions);
+
+        // Step 2: For each candidate, parse with tree-sitter and find callers
+        let mut callers = Vec::new();
+        let mut files_scanned = 0;
+
+        let files_to_scan: Vec<PathBuf> = if candidate_files.is_empty() {
+            // Fallback: walk all files (ripgrep not available)
+            self.collect_project_files(&skip_names, &extensions, max_files)
+        } else {
+            candidate_files.into_iter().take(max_files).collect()
+        };
+
+        for file_path in &files_to_scan {
+            files_scanned += 1;
+            if files_scanned > max_files {
+                break;
+            }
+
+            let lang = match code_intel::detect_language(file_path) {
+                Some(l) => l,
+                None => continue,
+            };
+            let content = match fs::read_to_string(file_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let symbols = code_intel::extract_symbols(&content, lang);
+            let rel_path = file_path.strip_prefix(&self.project_root)
+                .unwrap_or(file_path)
+                .display()
+                .to_string();
+
+            for sym in &symbols {
+                if sym.name == target {
+                    continue; // Skip the target's own definition
+                }
+                if !matches!(sym.kind, code_intel::SymbolKind::Function | code_intel::SymbolKind::Method) {
+                    continue;
+                }
+                let sym_calls = code_intel::extract_calls(&content, lang, sym.start_line, sym.end_line);
+                for call in &sym_calls {
+                    if call.callee == target {
+                        callers.push((
+                            rel_path.clone(),
+                            sym.name.clone(),
+                            sym.signature.clone(),
+                            call.line,
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+
+        callers
+    }
+
+    /// Use ripgrep to quickly find files that contain a symbol name (pre-filter).
+    fn prefilter_files_with_symbol(&self, symbol: &str, extensions: &[&str]) -> Vec<PathBuf> {
+        let mut cmd = std::process::Command::new("rg");
+        cmd.arg("--files-with-matches")
+            .arg("--no-heading")
+            .arg("--color=never")
+            .arg("-w") // word boundary
+            .current_dir(&self.project_root);
+
+        // Add extension filters
+        for ext in extensions {
+            cmd.arg("--glob").arg(format!("*.{ext}"));
+        }
+
+        // Exclude noise
+        for dir in &[".git", "node_modules", "target", "vendor", "dist"] {
+            cmd.arg("--glob").arg(format!("!{dir}/"));
+        }
+
+        cmd.arg(symbol);
+
+        match cmd.output() {
+            Ok(out) => {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(|l| self.project_root.join(l.trim()))
+                    .filter(|p| p.exists())
+                    .collect()
+            }
+            Err(_) => Vec::new(), // Fallback handled by caller
+        }
+    }
+
+    /// Collect project files by walking directories (fallback when ripgrep unavailable).
+    fn collect_project_files(&self, skip_names: &[&str], extensions: &[&str], max_files: usize) -> Vec<PathBuf> {
+        let mut result = Vec::new();
+        let mut dirs_to_visit = vec![self.project_root.clone()];
+
+        while let Some(dir) = dirs_to_visit.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with('.') || skip_names.contains(&name_str.as_ref()) {
+                    continue;
+                }
+                let ft = entry.file_type().ok();
+                if ft.map(|t| t.is_dir()).unwrap_or(false) {
+                    dirs_to_visit.push(entry.path());
+                } else if ft.map(|t| t.is_file()).unwrap_or(false) {
+                    if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
+                        if extensions.contains(&ext) {
+                            result.push(entry.path());
+                            if result.len() >= max_files {
+                                return result;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
     /// Find where a symbol is defined across the codebase using tree-sitter.
     /// Scans matching files, extracts symbols, and returns definitions.
     fn find_definition(&self, args: &Value) -> String {
@@ -1624,39 +1757,57 @@ impl ToolExecutor {
             out.push_str(&format!("No outgoing calls in lines {start_line}-{end_line}\n"));
         }
 
-        // Callers (what calls this function) — search within same file
+        // Callers search
         if show_callers {
             let sym_name = args.get("symbol").and_then(Value::as_str);
             if let Some(target) = sym_name {
-                let all_symbols = code_intel::extract_symbols(&content, lang);
-                let mut callers_found = Vec::new();
+                let scope = args.get("scope").and_then(Value::as_str).unwrap_or("file");
 
-                for sym in &all_symbols {
-                    // Skip the target symbol itself
-                    if sym.name == target {
-                        continue;
+                if scope == "project" {
+                    // Cross-file caller search
+                    out.push_str(&format!("\n# Callers OF '{}' (project-wide)\n\n", target));
+                    let callers = self.find_callers_cross_file(target, &path);
+                    if callers.is_empty() {
+                        out.push_str("  (none found in project)\n");
+                    } else {
+                        for (file, name, sig, line) in callers.iter().take(30) {
+                            out.push_str(&format!("  ← {}:L{}: {} ({})\n", file, line, name, sig));
+                        }
+                        if callers.len() > 30 {
+                            out.push_str(&format!("\n  ... and {} more callers\n", callers.len() - 30));
+                        }
+                        out.push_str(&format!("\n{} caller(s) across project\n", callers.len()));
                     }
-                    // Only scan callable symbols (functions, methods)
-                    if !matches!(sym.kind, code_intel::SymbolKind::Function | code_intel::SymbolKind::Method) {
-                        continue;
-                    }
-                    let sym_calls = code_intel::extract_calls(&content, lang, sym.start_line, sym.end_line);
-                    for call in &sym_calls {
-                        if call.callee == target {
-                            callers_found.push((sym.name.clone(), sym.signature.clone(), call.line));
-                            break; // One match per caller is enough
+                } else {
+                    // Same-file caller search (fast)
+                    let all_symbols = code_intel::extract_symbols(&content, lang);
+                    let mut callers_found = Vec::new();
+
+                    for sym in &all_symbols {
+                        if sym.name == target {
+                            continue;
+                        }
+                        if !matches!(sym.kind, code_intel::SymbolKind::Function | code_intel::SymbolKind::Method) {
+                            continue;
+                        }
+                        let sym_calls = code_intel::extract_calls(&content, lang, sym.start_line, sym.end_line);
+                        for call in &sym_calls {
+                            if call.callee == target {
+                                callers_found.push((sym.name.clone(), sym.signature.clone(), call.line));
+                                break;
+                            }
                         }
                     }
-                }
 
-                out.push_str(&format!("\n# Callers OF '{}' (same file)\n\n", target));
-                if callers_found.is_empty() {
-                    out.push_str("  (none found in this file)\n");
-                } else {
-                    for (name, sig, line) in &callers_found {
-                        out.push_str(&format!("  ← L{}: {} ({})\n", line, name, sig));
+                    out.push_str(&format!("\n# Callers OF '{}' (same file)\n\n", target));
+                    if callers_found.is_empty() {
+                        out.push_str("  (none found in this file)\n");
+                    } else {
+                        for (name, sig, line) in &callers_found {
+                            out.push_str(&format!("  ← L{}: {} ({})\n", line, name, sig));
+                        }
+                        out.push_str(&format!("\n{} caller(s) in file\n", callers_found.len()));
                     }
-                    out.push_str(&format!("\n{} caller(s) in file\n", callers_found.len()));
                 }
             } else {
                 out.push_str("\nNote: callers=true requires symbol name (not line range)\n");
@@ -3182,11 +3333,152 @@ fn unrelated() {
             .expect("call_graph schema should exist");
         let cg_props = &call_graph_schema["function"]["parameters"]["properties"];
         assert!(cg_props.get("callers").is_some(), "call_graph should have 'callers' param");
+        assert!(cg_props.get("scope").is_some(), "call_graph should have 'scope' param");
 
         let ref_schema = schemas.iter()
             .find(|s| s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) == Some("find_references"))
             .expect("find_references schema should exist");
         let ref_props = &ref_schema["function"]["parameters"]["properties"];
         assert!(ref_props.get("kind").is_some(), "find_references should have 'kind' param");
+    }
+
+    // ── Cross-File Caller Tests ──
+
+    #[tokio::test]
+    async fn cross_file_callers_finds_callers_in_other_files() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // File 1: defines the target function
+        let lib_code = "pub fn target_fn() -> i32 { 42 }\n";
+        std::fs::write(dir.path().join("lib.rs"), lib_code).unwrap();
+
+        // File 2: calls the target
+        let main_code = r#"
+fn main() {
+    let x = target_fn();
+    println!("{}", x);
+}
+"#;
+        std::fs::write(dir.path().join("main.rs"), main_code).unwrap();
+
+        // File 3: also calls the target
+        let util_code = r#"
+fn helper() {
+    target_fn();
+}
+
+fn unrelated() {
+    println!("no call here");
+}
+"#;
+        std::fs::write(dir.path().join("util.rs"), util_code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("call_graph", &json!({
+            "path": "lib.rs",
+            "symbol": "target_fn",
+            "callers": true,
+            "scope": "project"
+        })).await;
+
+        assert!(result.contains("project-wide"), "should indicate project scope: {result}");
+        assert!(result.contains("main"), "should find main() as caller: {result}");
+        assert!(result.contains("helper"), "should find helper() as caller: {result}");
+        assert!(!result.contains("unrelated"), "should not include unrelated(): {result}");
+    }
+
+    #[tokio::test]
+    async fn cross_file_callers_empty_when_no_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "pub fn lonely_fn() -> i32 { 42 }\n";
+        std::fs::write(dir.path().join("alone.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("call_graph", &json!({
+            "path": "alone.rs",
+            "symbol": "lonely_fn",
+            "callers": true,
+            "scope": "project"
+        })).await;
+
+        assert!(result.contains("none found"), "should report no callers: {result}");
+    }
+
+    #[tokio::test]
+    async fn cross_file_callers_with_methods() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let lib_code = r#"
+struct Engine;
+impl Engine {
+    fn run(&self) -> i32 { 42 }
+}
+"#;
+        std::fs::write(dir.path().join("engine.rs"), lib_code).unwrap();
+
+        let caller_code = r#"
+fn start_engine() {
+    let e = Engine;
+    e.run();
+}
+"#;
+        std::fs::write(dir.path().join("starter.rs"), caller_code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("call_graph", &json!({
+            "path": "engine.rs",
+            "symbol": "run",
+            "callers": true,
+            "scope": "project"
+        })).await;
+
+        assert!(result.contains("start_engine"), "should find start_engine as caller: {result}");
+    }
+
+    #[test]
+    fn prefilter_files_returns_matching_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn foo() { target_fn(); }").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn bar() { unrelated(); }").unwrap();
+        std::fs::write(dir.path().join("c.rs"), "fn baz() { target_fn(); }").unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let exts = ["rs"];
+        let files = executor.prefilter_files_with_symbol("target_fn", &exts);
+
+        // rg might not be available in CI — if empty, that's ok (fallback will be used)
+        if files.is_empty() {
+            return; // rg not available or returned nothing; cross_file_callers test covers fallback
+        }
+
+        let names: Vec<String> = files.iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"a.rs".to_string()), "should find a.rs: {:?}", names);
+        assert!(names.contains(&"c.rs".to_string()), "should find c.rs: {:?}", names);
+        assert!(!names.contains(&"b.rs".to_string()), "should not find b.rs: {:?}", names);
+    }
+
+    #[test]
+    fn collect_project_files_skips_noise_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.path().join("target/debug.rs"), "fn debug() {}").unwrap();
+        std::fs::write(dir.path().join("node_modules/dep.js"), "function x() {}").unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let skip = ["node_modules", "target", ".git"];
+        let exts = ["rs", "js"];
+        let files = executor.collect_project_files(&skip, &exts, 100);
+
+        let names: Vec<String> = files.iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"main.rs".to_string()), "should find src/main.rs");
+        assert!(!names.contains(&"debug.rs".to_string()), "should skip target/");
+        assert!(!names.contains(&"dep.js".to_string()), "should skip node_modules/");
     }
 }
