@@ -203,11 +203,36 @@ impl ToolHealthTracker {
             return None;
         }
         let tools_list = blocked.join(", ");
-        Some(format!(
+        let mut msg = format!(
             "⚠ The following tools have failed {} or more times consecutively \
-             and should be avoided: [{}]. Try alternative approaches or different tools.",
+             and should be avoided: [{}].",
             CONSECUTIVE_FAILURE_THRESHOLD, tools_list
-        ))
+        );
+        // Provide specific alternative suggestions for common blocked tools
+        for tool in &blocked {
+            match *tool {
+                "read_file" => {
+                    msg.push_str(
+                        " Instead of read_file, use grep to search for specific content, \
+                         or glob to find files by pattern.",
+                    );
+                }
+                "bash" => {
+                    msg.push_str(
+                        " Instead of bash, use built-in tools like read_file, grep, glob, \
+                         or list_dir for file operations.",
+                    );
+                }
+                "str_replace" => {
+                    msg.push_str(
+                        " If str_replace keeps failing, verify the exact match string \
+                         by reading the file first with read_file.",
+                    );
+                }
+                _ => {}
+            }
+        }
+        Some(msg)
     }
 
     /// Export tool health data for cross-session persistence.
@@ -551,6 +576,25 @@ mod tests {
         assert!(warning.contains("bash"));
         assert!(warning.contains("3"));
         assert!(warning.contains("avoided"));
+        // Should include specific alternative suggestions
+        assert!(
+            warning.contains("read_file") || warning.contains("grep"),
+            "bash warning should suggest alternatives: {warning}"
+        );
+    }
+
+    #[test]
+    fn deprioritize_warning_read_file_suggests_grep() {
+        let mut tracker = ToolHealthTracker::new();
+        for _ in 0..3 {
+            tracker.record_failure("read_file");
+        }
+        let warning = tracker.deprioritize_warning().unwrap();
+        assert!(warning.contains("read_file"));
+        assert!(
+            warning.contains("grep"),
+            "read_file warning should suggest grep: {warning}"
+        );
     }
 
     #[test]

@@ -336,7 +336,8 @@ fn apply_turn_success(
             result.budget_used,
         )
         .with_tool_calls(result.tool_call_records.clone())
-        .with_budget_pressure(result.budget_pressure);
+        .with_budget_pressure(result.budget_pressure)
+        .with_plan_subtask(state.current_plan_subtask_id.as_deref());
         if let Err(e) = journal.append(&turn_event) {
             mo_agent_core::agent_warn!("journal", "failed to write turn event: {e}");
         }

@@ -126,29 +126,70 @@ fn is_tool_error(result_str: &str) -> bool {
 /// Detect OS-level resource exhaustion in tool output that wasn't flagged
 /// as an error by `is_tool_error()`.
 ///
-/// Stricter than `classify_error()` to avoid false positives on normal text
-/// that mentions "fork" or "memory" (git logs, documentation, etc.).
-/// Requires exact shell-error patterns, not substring keywords.
+/// Scans **per-line** to avoid false positives: a line must look like an
+/// error message (shell prefix, errno, or standalone pattern) — not just
+/// contain a keyword buried in source code comments or documentation.
 fn is_resource_limit_output(output: &str) -> bool {
-    let lower = output.to_lowercase();
-    // Exact shell-error patterns (not just keyword substrings)
-    lower.contains("resource temporarily unavailable")
-        || lower.contains("cannot allocate memory")
-        || lower.contains("cannot fork")
-        || lower.contains("no space left on device")
-        || lower.contains("too many open files")
-        || lower.contains("enomem")
-        || lower.contains("enospc")
-        // "Killed" prefix is OOM killer output (strict: requires standalone line)
-        || lower.lines().any(|l| l.trim() == "killed" || l.trim().starts_with("killed:"))
-        || lower.contains("device or resource busy")
-        // Shell-specific: "bash: fork:" or "sh: fork:" prefix
-        || lower.contains("bash: fork:")
-        || lower.contains("sh: fork:")
-        // Chinese locale equivalents
-        || lower.contains("资源暂时不足")
-        || lower.contains("内存不足")
-        || lower.contains("系统资源")
+    // Fast reject: skip outputs > 8KB that are almost certainly file contents,
+    // not error messages. Real resource-limit errors are short.
+    if output.len() > 8192 {
+        return false;
+    }
+    for line in output.lines() {
+        let l = line.trim().to_lowercase();
+        if l.is_empty() {
+            continue;
+        }
+        // Skip lines that look like source code (comments, operators, keywords)
+        if l.starts_with("//")
+            || l.starts_with('#')
+            || l.starts_with("/*")
+            || l.starts_with('*')
+            || l.contains("||")
+            || l.contains("fn ")
+            || l.contains("let ")
+            || l.contains("if ")
+            || l.contains("match ")
+            || l.contains("def ")
+            || l.contains("import ")
+        {
+            continue;
+        }
+        // Full-line error messages (high confidence)
+        if l.contains("resource temporarily unavailable")
+            || l.contains("cannot allocate memory")
+            || l.contains("cannot fork")
+            || l.contains("no space left on device")
+            || l.contains("too many open files")
+            || l.contains("device or resource busy")
+        {
+            return true;
+        }
+        // Shell-specific prefixes
+        if l.starts_with("bash: fork:") || l.starts_with("sh: fork:") {
+            return true;
+        }
+        // Errno codes — only match on short lines (< 120 chars) that start
+        // with an error indicator. Real errno errors look like:
+        //   "Error: ENOSPC"  /  "write error (ENOMEM)"  /  "ENOSPC: disk full"
+        if l.len() < 120
+            && (l.contains("enomem") || l.contains("enospc") || l.contains("ebusy"))
+            && (l.starts_with("error") || l.starts_with("fatal") || l.starts_with("failed"))
+        {
+            return true;
+        }
+        // OOM killer: standalone "Killed" or "Killed: 9"
+        if l == "killed" || l.starts_with("killed:") {
+            return true;
+        }
+        // Chinese locale equivalents — only short lines (not buried in docs)
+        if l.len() < 200
+            && (l.contains("资源暂时不足") || l.contains("内存不足") || l.contains("系统资源"))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Normalize a tool call signature for cache key matching.
@@ -1429,13 +1470,18 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             let mut is_err = is_tool_error(&result_str);
             let mut resource_limit_recorded = false;
 
+            // Don't count errors from already-restricted tools toward escalation.
+            // The agent shouldn't be calling them (schema removes them), but if
+            // server returns a stale call, the failure is expected, not a new problem.
+            let tool_already_restricted = restricted_tools.contains(&name);
+
             // Error recovery: classify, retry transient errors, track via TurnGuard.
             // NOTE: error counting and health recording happen in record_tool_result()
             // below — do NOT call turn_guard.errors.record_error() here to avoid
             // double-counting (was a bug: 2 errors looked like 4, triggering premature
             // escalation). Exception: resource-limit errors are fully handled here
             // and skipped in record_tool_result() to prevent overwrite.
-            if is_err {
+            if is_err && !tool_already_restricted {
                 use mo_agent_runtime::turn::error_recovery::{
                     build_recovery_message, classify_error,
                 };
@@ -1510,10 +1556,9 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
 
             // Resource-limit scan for "successful" tool outputs.
             // Any process-spawning tool can surface OS errors in stdout/stderr
-            // while returning exit code 0.  The guard against false positives
-            // is the strictness of is_resource_limit_output() patterns — not a
-            // tool-name allowlist — so this applies to ALL tools.
-            if !is_err && is_resource_limit_output(&result_str) {
+            // while returning exit code 0.  Skip already-restricted tools to
+            // avoid cascading double-penalties.
+            if !is_err && !tool_already_restricted && is_resource_limit_output(&result_str) {
                 turn_guard.health.record_resource_limit_failure(&name);
                 turn_guard.errors.record_error(
                     mo_agent_runtime::turn::error_recovery::ErrorCategory::ResourceLimit,
@@ -2671,8 +2716,11 @@ mod tests {
     // ── is_resource_limit_output extended pattern tests ──
 
     #[test]
-    fn resource_limit_enospc() {
-        assert!(is_resource_limit_output("Write failed: ENOSPC"));
+    fn resource_limit_enospc_in_error_context() {
+        // ENOSPC with error-indicator prefix — should match
+        assert!(is_resource_limit_output("Error: ENOSPC"));
+        assert!(is_resource_limit_output("error writing file: enospc"));
+        assert!(is_resource_limit_output("failed to write: ENOSPC (disk full)"));
     }
 
     #[test]
@@ -2696,6 +2744,49 @@ mod tests {
     #[test]
     fn resource_limit_chinese_system_resource() {
         assert!(is_resource_limit_output("错误：系统资源不足"));
+    }
+
+    #[test]
+    fn resource_limit_no_false_positive_on_source_code_enospc() {
+        // THE critical regression test: source code containing ENOSPC as a
+        // comment must NOT trigger the resource limit detector.
+        let source_code = r#"
+if let Err(e) = writeln!(file, "{line}") {
+    if e.kind() == std::io::ErrorKind::Other
+        || e.raw_os_error() == Some(28) // ENOSPC
+        || e.to_string().contains("No space")
+    {
+        eprintln!("disk full");
+    }
+}
+"#;
+        assert!(
+            !is_resource_limit_output(source_code),
+            "source code comments with ENOSPC must not trigger resource limit"
+        );
+    }
+
+    #[test]
+    fn resource_limit_no_false_positive_on_large_file() {
+        // File contents > 8KB should be fast-rejected
+        let large = "x".repeat(9000);
+        assert!(!is_resource_limit_output(&large));
+        // Even if it contains a pattern — total output > 8KB
+        let mut large_with_pattern = "x".repeat(8200);
+        large_with_pattern.push_str("\nbash: fork: Resource temporarily unavailable");
+        assert!(
+            !is_resource_limit_output(&large_with_pattern),
+            "large outputs (>8KB) should be rejected as likely file contents"
+        );
+    }
+
+    #[test]
+    fn resource_limit_no_false_positive_on_comment_lines() {
+        // Comments mentioning error codes
+        assert!(!is_resource_limit_output("// handle ENOMEM gracefully"));
+        assert!(!is_resource_limit_output("# ENOSPC handling logic"));
+        assert!(!is_resource_limit_output("/* EBUSY retry loop */"));
+        assert!(!is_resource_limit_output("* Returns ENOMEM on failure"));
     }
 
     // ── ToolCallRecord ingestion completeness ──

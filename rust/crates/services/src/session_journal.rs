@@ -415,6 +415,9 @@ pub struct JournalEvent {
     /// Flexible metadata for event-specific data (JSON object).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// Plan subtask ID — set when this turn was executed as part of plan mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_subtask_id: Option<String>,
 }
 
 /// Event type discriminator.
@@ -619,6 +622,7 @@ impl JournalEvent {
             budget_pressure: None,
             stall_type: None,
             metadata: None,
+            plan_subtask_id: None,
         }
     }
 
@@ -732,6 +736,12 @@ impl JournalEvent {
         if !records.is_empty() {
             self.tool_calls = Some(records);
         }
+        self
+    }
+
+    /// Tag this turn event as belonging to a plan mode subtask.
+    pub fn with_plan_subtask(mut self, subtask_id: Option<&str>) -> Self {
+        self.plan_subtask_id = subtask_id.map(|s| s.to_string());
         self
     }
 

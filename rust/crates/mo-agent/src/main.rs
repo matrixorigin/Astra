@@ -392,6 +392,9 @@ struct ReplState {
     executing_plan_goal: Option<String>,
     /// Number of parallel execution rounds completed (for summary).
     plan_execution_rounds: usize,
+    /// ID of the currently-executing plan subtask (set during plan execution,
+    /// read by apply_turn_success to tag journal events).
+    current_plan_subtask_id: Option<String>,
     /// Whether the last chat turn was interrupted by Ctrl+C (used by plan auto-execution).
     last_turn_interrupted: bool,
     /// Cloud learning snapshot version for optimistic locking.
@@ -432,6 +435,7 @@ impl Default for ReplState {
             plan_execution_config: None,
             executing_plan_goal: None,
             plan_execution_rounds: 0,
+            current_plan_subtask_id: None,
             last_turn_interrupted: false,
             cloud_learning_version: None,
         }
@@ -1382,6 +1386,13 @@ async fn run_plan_execution(
             // Put plan back before calling handle_chat_input
             state.executing_plan = Some(plan);
 
+            // Reset tool health between subtasks — prevents false positives
+            // (e.g., resource-limit misdetection) from cascading across subtasks.
+            state.tool_health_entries.clear();
+
+            // Tag the upcoming turn with the subtask ID for journal attribution
+            state.current_plan_subtask_id = Some(next_id.clone());
+
             handle_chat_input(
                 prompt,
                 current_token,
@@ -1394,6 +1405,9 @@ async fn run_plan_execution(
                 },
             )
             .await?;
+
+            // Clear subtask context after turn completes
+            state.current_plan_subtask_id = None;
 
             // If user pressed Ctrl+C, pause execution
             if state.last_turn_interrupted {

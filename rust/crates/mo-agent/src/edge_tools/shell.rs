@@ -162,7 +162,18 @@ impl ToolExecutor {
             Some(c) => c,
             None => return "Error: missing 'command'".to_string(),
         };
-        let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0);
+        // Use explicit timeout if provided, otherwise pick a smart default:
+        // fast-read commands (cat, head, tail, wc, stat, file) get 10s;
+        // everything else gets 30s.
+        let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or_else(|| {
+            let cmd_base = command.trim_start().split_whitespace().next().unwrap_or("");
+            match cmd_base {
+                "cat" | "head" | "tail" | "wc" | "stat" | "file" | "ls" | "pwd" | "echo"
+                | "printf" | "true" | "false" | "which" | "whoami" | "date" | "basename"
+                | "dirname" | "realpath" | "readlink" => 10.0,
+                _ => 30.0,
+            }
+        });
 
         match self.run_shell_output(command, timeout_secs) {
             Err(error) => error,
