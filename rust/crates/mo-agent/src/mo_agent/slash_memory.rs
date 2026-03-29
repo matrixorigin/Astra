@@ -1436,11 +1436,14 @@ pub async fn handle_plan_mode_input(
             }
         }
 
-        eprintln!("{}  Executing plan ({} subtasks)...", "🚀".green(), plan.subtasks.len());
+        eprintln!("{}  Auto-executing plan ({} subtasks)...", "🚀".green(), plan.subtasks.len());
         eprintln!();
 
-        // Store execution config for step-by-step mode
-        state.plan_execution_config = Some(PlanExecutionConfig::default());
+        // Store execution config for auto mode (go = automatic)
+        state.plan_execution_config = Some(PlanExecutionConfig {
+            step_by_step: false,
+            auto_execute: true,
+        });
         state.executing_plan_goal = Some(goal);
         state.plan_execution_rounds = 0;
 

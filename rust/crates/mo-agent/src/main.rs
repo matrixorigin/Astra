@@ -1304,6 +1304,55 @@ async fn run_plan_execution(
                 eprintln!("{}  {} remaining after this", "·".dim(), remaining);
             }
 
+            // Step-by-step mode: ask user confirmation before each subtask
+            let is_step_by_step = state
+                .plan_execution_config
+                .as_ref()
+                .map(|c| c.step_by_step)
+                .unwrap_or(false);
+
+            if is_step_by_step {
+                eprintln!();
+                eprintln!(
+                    "{}  Execute this subtask? (y/n/skip/abort)",
+                    "❓".yellow()
+                );
+                // Put plan back before waiting for input
+                state.executing_plan = Some(plan);
+
+                // Read user input
+                let mut input = String::new();
+                if std::io::stdin().read_line(&mut input).is_ok() {
+                    let response = input.trim().to_lowercase();
+                    match response.as_str() {
+                        "n" | "no" | "skip" => {
+                            eprintln!("{}  Skipping subtask: {}", "→".cyan(), title);
+                            // Take plan back, mark as skipped (keep as pending), continue
+                            plan = state.executing_plan.take().unwrap();
+                            if let Some(st) = plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
+                                st.status = TaskStatus::Pending;  // Keep pending, skip for now
+                            }
+                            continue;
+                        }
+                        "abort" | "stop" | "q" => {
+                            eprintln!("{}  Plan execution aborted by user.", "⏹".red());
+                            return Ok(());
+                        }
+                        _ => {
+                            // Proceed with execution
+                            eprintln!("{}  Proceeding...", "→".cyan());
+                        }
+                    }
+                }
+
+                // Take plan back to continue execution
+                plan = state.executing_plan.take().unwrap();
+                // Re-set status to InProgress
+                if let Some(st) = plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
+                    st.status = TaskStatus::InProgress;
+                }
+            }
+
             // Journal: subtask started
             if let Some(ref mut j) = state.journal {
                 let evt = mo_agent_services::session_journal::JournalEvent::plan_progress(
