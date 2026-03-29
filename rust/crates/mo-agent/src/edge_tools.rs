@@ -319,7 +319,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
                         "pattern": {"type": "string", "description": "Optional regex pattern to filter symbols by name (e.g., 'test_', 'parse.*')"},
-                        "kinds": {"type": "array", "items": {"type": "string"}, "description": "Optional filter by symbol kinds: fn, method, class, struct, trait, interface, enum, type, const, var"}
+                        "kinds": {"type": "array", "items": {"type": "string"}, "description": "Optional filter by symbol kinds: fn, method, class, struct, trait, interface, enum, type, const, var"},
+                        "calls": {"type": "boolean", "description": "If true, show function calls within each symbol's body. Helps understand code flow without reading full source."}
                     },
                     "required": ["path"]
                 }
@@ -394,13 +395,14 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "find_references",
-                "description": "Find all usages/references to a symbol across the codebase. Combines grep for speed with AST validation for accuracy. Shows file:line for each reference.",
+                "description": "Find all usages/references to a symbol across the codebase. Combines grep for speed with AST validation for accuracy. Shows file:line for each reference, categorized as definition/import/call/usage.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "symbol": {"type": "string", "description": "Symbol name to search for (exact match)"},
                         "path": {"type": "string", "description": "Limit search to a subdirectory (optional)"},
-                        "include": {"type": "string", "description": "File glob filter e.g. '*.rs' (optional)"}
+                        "include": {"type": "string", "description": "File glob filter e.g. '*.rs' (optional)"},
+                        "kind": {"type": "string", "enum": ["all", "definition", "call", "import"], "description": "Filter references by kind (default: all)"}
                     },
                     "required": ["symbol"]
                 }
@@ -410,14 +412,15 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "call_graph",
-                "description": "Extract function calls within a symbol's body. Shows what functions/methods are called, with receivers and line numbers. Use to understand code flow, trace dependencies, or prepare for refactoring.",
+                "description": "Analyze function call relationships. Shows what a function calls (outgoing) and optionally what calls it (incoming/callers). Use to understand code flow, trace dependencies, or prepare for refactoring.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
                         "symbol": {"type": "string", "description": "Symbol name to analyze (function/method name)"},
                         "start_line": {"type": "integer", "description": "Start line (alternative to symbol name)"},
-                        "end_line": {"type": "integer", "description": "End line (alternative to symbol name)"}
+                        "end_line": {"type": "integer", "description": "End line (alternative to symbol name)"},
+                        "callers": {"type": "boolean", "description": "If true, also find functions that CALL this symbol (reverse call graph). Searches same file."}
                     },
                     "required": ["path"]
                 }
@@ -787,6 +790,72 @@ fn truncate_output(mut output: String, max_bytes: usize) -> String {
         output.push_str("\n[truncated]");
     }
     output
+}
+
+/// Categorize a grep reference line as definition, import, call, or usage.
+///
+/// Examines the content after the `file:line:` prefix for language-specific
+/// patterns to determine the kind of reference.
+fn categorize_reference(line: &str, _symbol: &str) -> &'static str {
+    // Extract content after file:line: prefix
+    let content = if let Some(first_colon) = line.find(':') {
+        let rest = &line[first_colon + 1..];
+        if let Some(second_colon) = rest.find(':') {
+            rest[second_colon + 1..].trim()
+        } else {
+            rest.trim()
+        }
+    } else {
+        line.trim()
+    };
+
+    let lower = content.to_lowercase();
+
+    // 1. Import patterns (check FIRST — some overlap with definitions via `const`)
+    if lower.starts_with("use ")
+        || lower.starts_with("pub use ")
+        || lower.starts_with("import ")
+        || lower.starts_with("from ")
+        || lower.contains("require(")
+        || lower.starts_with("#include")
+    {
+        return "import";
+    }
+
+    // 2. Definition patterns — type/function/class declarations (NOT variable bindings)
+    if lower.starts_with("fn ")
+        || lower.starts_with("pub fn ")
+        || lower.starts_with("pub(crate) fn ")
+        || lower.starts_with("async fn ")
+        || lower.starts_with("pub async fn ")
+        || lower.starts_with("def ")
+        || lower.starts_with("async def ")
+        || lower.starts_with("function ")
+        || lower.starts_with("func ")
+        || lower.starts_with("class ")
+        || lower.starts_with("pub struct ")
+        || lower.starts_with("struct ")
+        || lower.starts_with("pub enum ")
+        || lower.starts_with("enum ")
+        || lower.starts_with("pub trait ")
+        || lower.starts_with("trait ")
+        || lower.starts_with("interface ")
+        || lower.starts_with("type ")
+        || lower.starts_with("pub type ")
+        || lower.starts_with("pub const ")
+        || lower.starts_with("pub static ")
+        || lower.starts_with("static ")
+    {
+        return "definition";
+    }
+
+    // 3. Call patterns: contains parentheses (likely a function/method call)
+    if content.contains('(') {
+        return "call";
+    }
+
+    // 4. Everything else is a usage (type annotations, field access, etc.)
+    "usage"
 }
 
 /// Parse content strings from a Memoria search/retrieve response.
@@ -1198,6 +1267,8 @@ impl ToolExecutor {
             code_intel::Language::Ruby => "Ruby",
         };
 
+        let show_calls = args.get("calls").and_then(Value::as_bool).unwrap_or(false);
+
         let mut output = format!(
             "# Symbols in {} ({}, {} found)\n\n",
             path.file_name().unwrap_or_default().to_string_lossy(),
@@ -1220,6 +1291,23 @@ impl ToolExecutor {
                 parent_suffix,
                 sym.signature
             ));
+
+            // If calls=true, show what this symbol calls
+            if show_calls && matches!(sym.kind, code_intel::SymbolKind::Function | code_intel::SymbolKind::Method) {
+                let calls = code_intel::extract_calls(&content, lang, sym.start_line, sym.end_line);
+                if !calls.is_empty() {
+                    for call in calls.iter().take(8) {
+                        if let Some(ref recv) = call.receiver {
+                            output.push_str(&format!("    → {}.{}() L{}\n", recv, call.callee, call.line));
+                        } else {
+                            output.push_str(&format!("    → {}() L{}\n", call.callee, call.line));
+                        }
+                    }
+                    if calls.len() > 8 {
+                        output.push_str(&format!("    ... and {} more calls\n", calls.len() - 8));
+                    }
+                }
+            }
         }
 
         output
@@ -1387,6 +1475,8 @@ impl ToolExecutor {
         cmd.arg(symbol);
         cmd.arg(search_path.to_string_lossy().to_string());
 
+        let kind_filter = args.get("kind").and_then(Value::as_str).unwrap_or("all");
+
         match cmd.output() {
             Ok(out) => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1395,12 +1485,33 @@ impl ToolExecutor {
                 }
 
                 let lines: Vec<&str> = stdout.lines().collect();
-                let total = lines.len();
+
+                // Categorize each reference line
+                let categorized: Vec<(&str, &str)> = lines.iter().map(|line| {
+                    let category = categorize_reference(line, symbol);
+                    (*line, category)
+                }).collect();
+
+                // Apply kind filter
+                let filtered: Vec<(&str, &str)> = if kind_filter == "all" {
+                    categorized
+                } else {
+                    categorized.into_iter().filter(|(_, cat)| *cat == kind_filter).collect()
+                };
+
+                if filtered.is_empty() {
+                    return format!("No {kind_filter} references found for '{symbol}'");
+                }
+
+                let total = filtered.len();
 
                 // Group by file for cleaner output
-                let mut output = format!("# References to '{}' ({} found)\n\n", symbol, total);
+                let mut output = format!("# References to '{}' ({} found{})\n\n",
+                    symbol, total,
+                    if kind_filter != "all" { format!(", kind={kind_filter}") } else { String::new() }
+                );
                 let mut current_file = "";
-                for line in lines.iter().take(50) { // Cap at 50 references
+                for (line, cat) in filtered.iter().take(50) {
                     if let Some(colon_pos) = line.find(':') {
                         let file = &line[..colon_pos];
                         if file != current_file {
@@ -1410,8 +1521,7 @@ impl ToolExecutor {
                             current_file = file;
                         }
                     }
-                    output.push_str(line);
-                    output.push('\n');
+                    output.push_str(&format!("[{cat}] {line}\n"));
                 }
 
                 if total > 50 {
@@ -1494,22 +1604,65 @@ impl ToolExecutor {
 
         let calls = code_intel::extract_calls(&content, lang, start_line, end_line);
 
-        if calls.is_empty() {
-            return format!("No function calls found in lines {start_line}-{end_line}");
+        let fname = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let show_callers = args.get("callers").and_then(Value::as_bool).unwrap_or(false);
+
+        let mut out = String::new();
+
+        // Outgoing calls (what this function calls)
+        if !calls.is_empty() {
+            out.push_str(&format!("# Calls FROM {} (lines {}-{})\n\n", fname, start_line, end_line));
+            for call in &calls {
+                if let Some(ref recv) = call.receiver {
+                    out.push_str(&format!("  → L{}: {}.{}()\n", call.line, recv, call.callee));
+                } else {
+                    out.push_str(&format!("  → L{}: {}()\n", call.line, call.callee));
+                }
+            }
+            out.push_str(&format!("\n{} outgoing call(s)\n", calls.len()));
+        } else {
+            out.push_str(&format!("No outgoing calls in lines {start_line}-{end_line}\n"));
         }
 
-        let fname = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let mut out = format!("# Call graph for {} (lines {}-{})\n\n", fname, start_line, end_line);
+        // Callers (what calls this function) — search within same file
+        if show_callers {
+            let sym_name = args.get("symbol").and_then(Value::as_str);
+            if let Some(target) = sym_name {
+                let all_symbols = code_intel::extract_symbols(&content, lang);
+                let mut callers_found = Vec::new();
 
-        for call in &calls {
-            if let Some(ref recv) = call.receiver {
-                out.push_str(&format!("  L{}: {}.{}()\n", call.line, recv, call.callee));
+                for sym in &all_symbols {
+                    // Skip the target symbol itself
+                    if sym.name == target {
+                        continue;
+                    }
+                    // Only scan callable symbols (functions, methods)
+                    if !matches!(sym.kind, code_intel::SymbolKind::Function | code_intel::SymbolKind::Method) {
+                        continue;
+                    }
+                    let sym_calls = code_intel::extract_calls(&content, lang, sym.start_line, sym.end_line);
+                    for call in &sym_calls {
+                        if call.callee == target {
+                            callers_found.push((sym.name.clone(), sym.signature.clone(), call.line));
+                            break; // One match per caller is enough
+                        }
+                    }
+                }
+
+                out.push_str(&format!("\n# Callers OF '{}' (same file)\n\n", target));
+                if callers_found.is_empty() {
+                    out.push_str("  (none found in this file)\n");
+                } else {
+                    for (name, sig, line) in &callers_found {
+                        out.push_str(&format!("  ← L{}: {} ({})\n", line, name, sig));
+                    }
+                    out.push_str(&format!("\n{} caller(s) in file\n", callers_found.len()));
+                }
             } else {
-                out.push_str(&format!("  L{}: {}()\n", call.line, call.callee));
+                out.push_str("\nNote: callers=true requires symbol name (not line range)\n");
             }
         }
 
-        out.push_str(&format!("\n{} call(s) total", calls.len()));
         out
     }
 
@@ -2827,7 +2980,7 @@ fn main() {
         })).await;
         assert!(result.contains("helper"), "should find helper() call: {result}");
         assert!(result.contains("println!"), "should find println!: {result}");
-        assert!(result.contains("call(s) total"), "should show total: {result}");
+        assert!(result.contains("outgoing call(s)"), "should show total: {result}");
     }
 
     #[tokio::test]
@@ -2889,5 +3042,151 @@ fn main() {
         // Run different command — should reset tracker, not show iteration
         let r2 = executor.execute("run_build_test", &json!({"command": "echo 'test'"})).await;
         assert!(!r2.contains("Iteration"), "different command should reset: {r2}");
+    }
+
+    // ── Code Intelligence Enhancement Tests ──
+
+    #[tokio::test]
+    async fn symbols_with_calls_shows_callees() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = r#"
+fn helper() -> i32 { 42 }
+
+fn process(x: i32) -> i32 {
+    let a = helper();
+    println!("{}", a + x);
+    a + x
+}
+
+fn main() {
+    let result = process(10);
+    std::process::exit(result);
+}
+"#;
+        std::fs::write(dir.path().join("demo.rs"), code).unwrap();
+        let executor = ToolExecutor::new(dir.path());
+
+        // Without calls=true — no call info
+        let r1 = executor.execute("symbols", &json!({"path": "demo.rs"})).await;
+        assert!(!r1.contains("→"), "without calls should not show arrows: {r1}");
+
+        // With calls=true — should show callees inline
+        let r2 = executor.execute("symbols", &json!({"path": "demo.rs", "calls": true})).await;
+        assert!(r2.contains("→ helper()"), "should show helper() call: {r2}");
+        assert!(r2.contains("→ process("), "should show process() call: {r2}");
+        assert!(r2.contains("→ std::process::exit()") || r2.contains("→ exit()"), "should show exit call: {r2}");
+    }
+
+    #[tokio::test]
+    async fn symbols_calls_empty_for_leaf_functions() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "fn leaf() -> i32 { 42 }\n";
+        std::fs::write(dir.path().join("leaf.rs"), code).unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("symbols", &json!({"path": "leaf.rs", "calls": true})).await;
+        // Should not have any call arrows since leaf() calls nothing
+        assert!(!result.contains("→"), "leaf function should have no calls: {result}");
+    }
+
+    #[tokio::test]
+    async fn call_graph_with_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = r#"
+fn target() -> i32 { 42 }
+
+fn caller_a() {
+    let x = target();
+    println!("{}", x);
+}
+
+fn caller_b() {
+    target();
+}
+
+fn unrelated() {
+    println!("hello");
+}
+"#;
+        std::fs::write(dir.path().join("callers.rs"), code).unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("call_graph", &json!({
+            "path": "callers.rs",
+            "symbol": "target",
+            "callers": true
+        })).await;
+
+        // Should show callers section
+        assert!(result.contains("Callers OF 'target'"), "should have callers section: {result}");
+        assert!(result.contains("caller_a"), "should find caller_a: {result}");
+        assert!(result.contains("caller_b"), "should find caller_b: {result}");
+        assert!(!result.contains("unrelated"), "should not include unrelated: {result}");
+    }
+
+    #[tokio::test]
+    async fn call_graph_callers_without_symbol_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "fn foo() { bar(); }\nfn bar() {}\n";
+        std::fs::write(dir.path().join("test.rs"), code).unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        // Using line range instead of symbol name — callers should note it needs symbol
+        let result = executor.execute("call_graph", &json!({
+            "path": "test.rs",
+            "start_line": 1,
+            "end_line": 1,
+            "callers": true
+        })).await;
+        assert!(result.contains("requires symbol name"), "should warn about symbol requirement: {result}");
+    }
+
+    #[test]
+    fn categorize_reference_definitions() {
+        assert_eq!(categorize_reference("foo.rs:10:fn helper() -> i32 {", "helper"), "definition");
+        assert_eq!(categorize_reference("foo.rs:10:pub fn process(x: i32) {", "process"), "definition");
+        assert_eq!(categorize_reference("foo.py:5:def calculate(n):", "calculate"), "definition");
+        assert_eq!(categorize_reference("foo.rs:3:pub struct Config {", "Config"), "definition");
+        assert_eq!(categorize_reference("foo.rs:3:pub enum Status {", "Status"), "definition");
+    }
+
+    #[test]
+    fn categorize_reference_imports() {
+        assert_eq!(categorize_reference("foo.rs:1:use crate::helper;", "helper"), "import");
+        assert_eq!(categorize_reference("foo.py:1:from module import helper", "helper"), "import");
+        assert_eq!(categorize_reference("foo.py:1:import helper", "helper"), "import");
+        assert_eq!(categorize_reference("foo.js:1:const x = require('helper')", "helper"), "import");
+    }
+
+    #[test]
+    fn categorize_reference_calls() {
+        assert_eq!(categorize_reference("foo.rs:20:    let x = helper();", "helper"), "call");
+        assert_eq!(categorize_reference("foo.rs:20:    helper(42, true);", "helper"), "call");
+        assert_eq!(categorize_reference("foo.py:20:    result = calculate(n)", "calculate"), "call");
+    }
+
+    #[test]
+    fn categorize_reference_usage() {
+        // Type annotations, field access, etc. — no parens, not a definition/import
+        assert_eq!(categorize_reference("foo.rs:10:    let x: Config = default;", "Config"), "usage");
+    }
+
+    #[test]
+    fn schemas_include_new_params() {
+        let schemas = all_tool_schemas();
+        let symbols_schema = schemas.iter()
+            .find(|s| s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) == Some("symbols"))
+            .expect("symbols schema should exist");
+        let props = &symbols_schema["function"]["parameters"]["properties"];
+        assert!(props.get("calls").is_some(), "symbols should have 'calls' param");
+
+        let call_graph_schema = schemas.iter()
+            .find(|s| s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) == Some("call_graph"))
+            .expect("call_graph schema should exist");
+        let cg_props = &call_graph_schema["function"]["parameters"]["properties"];
+        assert!(cg_props.get("callers").is_some(), "call_graph should have 'callers' param");
+
+        let ref_schema = schemas.iter()
+            .find(|s| s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) == Some("find_references"))
+            .expect("find_references schema should exist");
+        let ref_props = &ref_schema["function"]["parameters"]["properties"];
+        assert!(ref_props.get("kind").is_some(), "find_references should have 'kind' param");
     }
 }
