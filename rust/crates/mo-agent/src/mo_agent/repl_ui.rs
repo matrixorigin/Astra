@@ -1232,18 +1232,17 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
             // not auto-select the first picker item.
             RlKeyEvent(RlKeyCode::Enter, _) if active => {
                 let current = ctx.line();
-                if current == "/" {
-                    // Let the normal command dispatch handle "/" → print command list
-                    clear_slash_overlay();
-                    return None;
-                }
                 let rows = picker_rows_for_filter();
                 let selected = get_slash_picker_selected();
                 clear_slash_overlay();
-                if let Some((cmd, _)) = rows.get(selected)
-                    && *cmd != current
-                {
-                    set_slash_pending_execute(Some(cmd.to_string()));
+                // Execute selected command if different from current input
+                if let Some((cmd, _)) = rows.get(selected) {
+                    if *cmd != current {
+                        set_slash_pending_execute(Some(cmd.to_string()));
+                    }
+                } else if current == "/" {
+                    // No selection and just "/" typed → show help
+                    return None;
                 }
                 return None; // AcceptLine → immediate execution
             }

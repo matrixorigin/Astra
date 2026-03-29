@@ -61,7 +61,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read file contents with optional line range. ALWAYS use start_line/end_line for large files instead of reading the whole file. Prefer targeted reads over full file reads. Set outline=true to get only function/class/struct signatures (saves tokens).",
+                "description": "Read file contents with optional line range. IMPORTANT: If you are NOT certain the file exists, use list_dir or glob FIRST to verify the path — do NOT guess paths. ALWAYS use start_line/end_line for large files instead of reading the whole file. Prefer targeted reads over full file reads. Set outline=true to get only function/class/struct signatures (saves tokens).",
                 "parameters": {
                     "type": "object",
                     "properties": {
