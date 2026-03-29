@@ -135,7 +135,17 @@ pub fn build_main_system_prompt(
     }
     if tool_names.contains(&"dead_code") {
         prompt.push_str(
-            "- **dead_code**: Find unused symbols. Use before cleanup to identify safe deletions.\n",
+            "- **dead_code**: Find unused symbols before cleanup.\n",
+        );
+    }
+    if tool_names.contains(&"extract_members") {
+        prompt.push_str(
+            "- **extract_members**: Struct/class/enum fields+methods. Point at any line inside.\n",
+        );
+    }
+    if tool_names.contains(&"type_hierarchy") {
+        prompt.push_str(
+            "- **type_hierarchy**: Who implements trait / what traits a type has.\n",
         );
     }
 
