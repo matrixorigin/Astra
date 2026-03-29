@@ -557,6 +557,83 @@ pub(super) async fn handle_info_command(
             eprintln!();
         }
 
+        "/turn" => {
+            if let Some(ref ev) = state.last_turn_event {
+                let sep = "─".repeat(42);
+                eprintln!("\n  {}", format!("─── Turn {} Details {sep}", ev.turn.unwrap_or(0)).cyan());
+                
+                // Basic info
+                eprintln!("  {:<12}  {}", "timestamp".cyan(), ev.ts.as_str().dim());
+                if let Some(ref m) = ev.model {
+                    eprintln!("  {:<12}  {}", "model".cyan(), m.as_str().dim());
+                }
+                if let Some(ms) = ev.duration_ms {
+                    let secs = ms as f64 / 1000.0;
+                    eprintln!("  {:<12}  {}", "duration".cyan(), format!("{secs:.2}s ({ms}ms)").dim());
+                }
+                
+                // Tokens
+                eprintln!();
+                eprintln!("  {}", "Tokens".bold());
+                if let Some(t) = ev.tokens_in {
+                    eprintln!("    {:<10}  {}", "input".cyan(), t.to_string().dim());
+                }
+                if let Some(t) = ev.tokens_out {
+                    eprintln!("    {:<10}  {}", "output".cyan(), t.to_string().dim());
+                }
+                if let Some(t) = ev.tokens_in.zip(ev.tokens_out).map(|(i, o)| i + o) {
+                    eprintln!("    {:<10}  {}", "total".cyan(), t.to_string().bold());
+                }
+                if let Some(p) = ev.budget_pressure {
+                    let pressure_str = if p < 0.3 {
+                        format!("{:.0}% (normal)", p * 100.0).green()
+                    } else if p < 0.6 {
+                        format!("{:.0}% (trimming)", p * 100.0).yellow()
+                    } else {
+                        format!("{:.0}% (aggressive)", p * 100.0).red()
+                    };
+                    eprintln!("    {:<10}  {}", "pressure".cyan(), pressure_str);
+                }
+                
+                // Tools
+                if ev.tool_count.unwrap_or(0) > 0 {
+                    eprintln!();
+                    eprintln!("  {}", "Tools".bold());
+                    if let Some(ref selected) = ev.tools_selected {
+                        eprintln!("    {:<10}  {}", "selected".cyan(), format!("{} tools", selected.len()).dim());
+                    }
+                    if let Some(ref used) = ev.tools_used {
+                        eprintln!("    {:<10}  {}", "called".cyan(), used.join(", ").dim());
+                    }
+                    if let Some(ref calls) = ev.tool_calls {
+                        eprintln!();
+                        for tc in calls {
+                            let status = if tc.ok { "✓".green() } else { "✗".red() };
+                            let timing = format!("{}ms", tc.ms);
+                            eprintln!("    {} {:<20} {}", status, tc.name.as_str().cyan(), timing.dim());
+                            if let Some(ref err) = tc.error {
+                                let err_preview = if err.len() > 60 { format!("{}…", &err[..60]) } else { err.clone() };
+                                eprintln!("      {}", err_preview.red());
+                            }
+                        }
+                    }
+                }
+                
+                // User input preview
+                if let Some(ref input) = ev.user_input {
+                    eprintln!();
+                    eprintln!("  {}", "Input".bold());
+                    let preview = if input.len() > 100 { format!("{}…", &input[..100]) } else { input.clone() };
+                    eprintln!("    {}", preview.dim());
+                }
+                
+                eprintln!("  {}", "─".repeat(56).cyan().dim());
+                eprintln!();
+            } else {
+                eprintln!("{}", "  No turn data yet. Complete a conversation turn first.".dim());
+            }
+        }
+
         "/version" => {
             eprintln!("{}", "  mo-agent version 0.1.0 (Rust)".bold());
         }

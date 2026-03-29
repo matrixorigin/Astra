@@ -400,6 +400,8 @@ struct ReplState {
     /// Cloud learning snapshot version for optimistic locking.
     /// Set by try_cloud_pull, used by try_cloud_push to prevent concurrent overwrites.
     cloud_learning_version: Option<i64>,
+    /// Last turn's journal event — for /turn command display.
+    last_turn_event: Option<session_journal::JournalEvent>,
 }
 
 impl Default for ReplState {
@@ -438,6 +440,7 @@ impl Default for ReplState {
             current_plan_subtask_id: None,
             last_turn_interrupted: false,
             cloud_learning_version: None,
+            last_turn_event: None,
         }
     }
 }
@@ -2186,7 +2189,7 @@ async fn handle_slash_command(
 
         "/session" => handle_session_command(arg, state),
 
-        "/history" | "/search" | "/copy" | "/doctor" | "/context" | "/version" | "/rewind" => {
+        "/history" | "/search" | "/copy" | "/doctor" | "/context" | "/version" | "/rewind" | "/turn" => {
             handle_info_command(cmd, arg, client, base, state, token).await?;
         }
 

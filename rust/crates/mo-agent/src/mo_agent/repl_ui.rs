@@ -15,7 +15,13 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     // ── Account ───────────────────────────────────────────────────────────
     ("/login", "Authenticate with the API"),
     ("/logout", "Logout from the API"),
-    // ── Advanced (for developers) ─────────────────────────────────────────
+    // ── Observability ─────────────────────────────────────────────────────
+    ("/explain", "Toggle explain mode (show reasoning)"),
+    ("/turn", "Show current turn details (timing, tokens, tools)"),
+    ("/stats", "Session analytics: turns, tokens, errors"),
+    ("/tools", "Tool performance: calls, timing, success rate"),
+    ("/health", "Tool health dashboard"),
+    // ── Advanced ──────────────────────────────────────────────────────────
     ("/doctor", "Run diagnostics"),
     ("/version", "Show version info"),
     ("/session", "Show current session info"),
