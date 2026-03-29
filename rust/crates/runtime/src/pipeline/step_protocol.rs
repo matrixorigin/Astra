@@ -300,11 +300,14 @@ impl SchedulingContract {
     }
 
     /// Effective per-tool timeout: explicit value, or step timeout / tool_count.
+    /// Floor: never less than 30s (30_000ms) to avoid starving individual tools
+    /// when many tools share a step budget.
     pub fn effective_tool_timeout_ms(&self, tool_count: usize) -> u64 {
+        const MIN_TOOL_TIMEOUT_MS: u64 = 30_000;
         if self.per_tool_timeout_ms > 0 {
             self.per_tool_timeout_ms
         } else if tool_count > 0 {
-            self.timeout_ms / tool_count as u64
+            (self.timeout_ms / tool_count as u64).max(MIN_TOOL_TIMEOUT_MS)
         } else {
             self.timeout_ms
         }
@@ -3072,7 +3075,7 @@ mod tests {
     #[test]
     fn scheduling_contract_effective_tool_timeout() {
         let c = SchedulingContract::default(); // 300s step, 0 per-tool
-        // With 3 tools: 300_000 / 3 = 100_000ms per tool
+        // With 3 tools: 300_000 / 3 = 100_000ms per tool (above 30s floor)
         assert_eq!(c.effective_tool_timeout_ms(3), 100_000);
         // With 1 tool: full step timeout
         assert_eq!(c.effective_tool_timeout_ms(1), 300_000);
@@ -3086,6 +3089,18 @@ mod tests {
         };
         assert_eq!(c2.effective_tool_timeout_ms(3), 30_000);
         assert_eq!(c2.effective_tool_timeout_ms(1), 30_000);
+
+        // Floor: many tools should not starve individual tools below 30s
+        let c3 = SchedulingContract {
+            timeout_ms: 60_000, // 60s step
+            ..Default::default()
+        };
+        // 60_000 / 5 = 12_000 which is below floor → clamp to 30_000
+        assert_eq!(c3.effective_tool_timeout_ms(5), 30_000);
+        // 60_000 / 2 = 30_000 which equals floor → OK
+        assert_eq!(c3.effective_tool_timeout_ms(2), 30_000);
+        // 60_000 / 1 = 60_000 which is above floor → unchanged
+        assert_eq!(c3.effective_tool_timeout_ms(1), 60_000);
     }
 
     #[test]

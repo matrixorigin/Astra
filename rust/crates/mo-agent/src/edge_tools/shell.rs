@@ -180,15 +180,27 @@ impl ToolExecutor {
             Some(c) => c,
             None => return "Error: missing 'command'".to_string(),
         };
-        // Use explicit timeout if provided, otherwise pick a smart default:
-        // fast-read commands (cat, head, tail, wc, stat, file) get 10s;
-        // everything else gets 30s.
+        // Use explicit timeout if provided, otherwise pick an adaptive default:
+        // Tier 1 (5s):  instant commands — no I/O beyond trivial reads
+        // Tier 2 (10s): fast read commands — cat, head, file stat
+        // Tier 3 (15s): search/traversal — grep, find, ripgrep
+        // Tier 4 (30s): everything else (build, test, network)
         let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or_else(|| {
             let cmd_base = command.trim_start().split_whitespace().next().unwrap_or("");
             match cmd_base {
-                "cat" | "head" | "tail" | "wc" | "stat" | "file" | "ls" | "pwd" | "echo"
-                | "printf" | "true" | "false" | "which" | "whoami" | "date" | "basename"
-                | "dirname" | "realpath" | "readlink" => 10.0,
+                // Tier 1: instant — no real I/O
+                "echo" | "printf" | "true" | "false" | "pwd" | "whoami" | "date"
+                | "basename" | "dirname" | "which" | "env" | "hostname" | "uname"
+                | "id" | "tty" | "nproc" | "arch" | "yes" => 5.0,
+                // Tier 2: fast reads — single file or dir stat
+                "cat" | "head" | "tail" | "wc" | "stat" | "file" | "ls" | "readlink"
+                | "realpath" | "md5sum" | "sha256sum" | "du" | "df" | "touch"
+                | "mkdir" | "cp" | "mv" | "rm" | "ln" | "chmod" | "chown" => 10.0,
+                // Tier 3: search/traversal — scan many files but bounded
+                "grep" | "rg" | "find" | "fd" | "ag" | "awk" | "sed" | "sort"
+                | "uniq" | "cut" | "tr" | "diff" | "comm" | "xargs" | "tree"
+                | "jq" | "yq" | "column" | "tee" => 15.0,
+                // Tier 4: everything else (compilation, network, etc.)
                 _ => 30.0,
             }
         });
@@ -719,6 +731,29 @@ mod tests {
             !std::path::Path::new(&marker).exists(),
             "child process survived timeout — process group kill failed"
         );
+    }
+
+    /// Adaptive bash timeout tiers: instant, fast-read, search, default.
+    #[test]
+    fn bash_timeout_tiers() {
+        // We can't easily test the actual timeout value used internally,
+        // but we verify the logic by checking that fast commands complete
+        // well within their 5s tier without hitting the 30s default.
+        let executor = test_executor();
+
+        // Tier 1 (5s): instant commands
+        let start = std::time::Instant::now();
+        let r = executor.bash(&serde_json::json!({"command": "echo hello"}));
+        assert!(!r.contains("timed out"));
+        assert!(start.elapsed().as_secs() < 5);
+
+        // Tier 3 (15s): search command that completes fast
+        let r = executor.bash(&serde_json::json!({"command": "grep --version"}));
+        assert!(!r.contains("timed out"));
+
+        // Explicit timeout overrides tier
+        let r = executor.bash(&serde_json::json!({"command": "sleep 10", "timeout": 0.1}));
+        assert!(r.contains("timed out"), "explicit timeout should override tier");
     }
 
     #[test]

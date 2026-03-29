@@ -6518,7 +6518,8 @@ mod scheduling_wiring_proofs {
             per_tool_timeout_ms: 0,
             ..Default::default()
         };
-        assert_eq!(c.effective_tool_timeout_ms(3), 20_000);
+        // 60_000 / 3 = 20_000 which is below 30s floor → clamped to 30_000
+        assert_eq!(c.effective_tool_timeout_ms(3), 30_000);
         assert_eq!(c.effective_tool_timeout_ms(1), 60_000);
         // Zero tools → full step timeout (no division by zero)
         assert_eq!(c.effective_tool_timeout_ms(0), 60_000);
