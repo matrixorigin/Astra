@@ -20,7 +20,12 @@ fn pattern(
 ) -> ToolChainPattern {
     // quality_sum = avg_quality * success_count
     // We use serde_json roundtrip to set the private quality_sum field
+    // last_used_at is set to current time (default patterns are "fresh")
     let quality_sum = avg_quality * success_count as f64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let json = serde_json::json!({
         "signature": signature,
         "tools": tools,
@@ -28,7 +33,8 @@ fn pattern(
         "domain": domain,
         "success_count": success_count,
         "failure_count": failure_count,
-        "quality_sum": quality_sum
+        "quality_sum": quality_sum,
+        "last_used_at": now
     });
     serde_json::from_value(json).expect("valid pattern JSON")
 }
@@ -139,6 +145,11 @@ pub fn default_patterns() -> Vec<ToolChainPattern> {
 ///
 /// This helps the system recognize common entities without prior learning.
 pub fn default_entities() -> Vec<EntityKnowledge> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     vec![
         // GitHub-related entities
         EntityKnowledge {
@@ -152,6 +163,7 @@ pub fn default_entities() -> Vec<EntityKnowledge> {
             confidence: 0.9,
             observation_count: 50,
             aliases: vec!["gh".into()],
+            last_observed_at: now,
         },
         EntityKnowledge {
             name: "pr".into(),
@@ -160,6 +172,7 @@ pub fn default_entities() -> Vec<EntityKnowledge> {
             confidence: 0.85,
             observation_count: 30,
             aliases: vec!["pull request".into(), "pull-request".into()],
+            last_observed_at: now,
         },
         EntityKnowledge {
             name: "issue".into(),
@@ -168,6 +181,7 @@ pub fn default_entities() -> Vec<EntityKnowledge> {
             confidence: 0.85,
             observation_count: 25,
             aliases: vec!["bug".into(), "ticket".into()],
+            last_observed_at: now,
         },
         // Git-related entities
         EntityKnowledge {
@@ -182,6 +196,7 @@ pub fn default_entities() -> Vec<EntityKnowledge> {
             confidence: 0.9,
             observation_count: 40,
             aliases: vec![],
+            last_observed_at: now,
         },
         EntityKnowledge {
             name: "commit".into(),
@@ -190,6 +205,7 @@ pub fn default_entities() -> Vec<EntityKnowledge> {
             confidence: 0.85,
             observation_count: 25,
             aliases: vec![],
+            last_observed_at: now,
         },
         EntityKnowledge {
             name: "diff".into(),
@@ -198,6 +214,7 @@ pub fn default_entities() -> Vec<EntityKnowledge> {
             confidence: 0.8,
             observation_count: 20,
             aliases: vec!["changes".into()],
+            last_observed_at: now,
         },
         // Code-related entities
         EntityKnowledge {
@@ -207,6 +224,7 @@ pub fn default_entities() -> Vec<EntityKnowledge> {
             confidence: 0.85,
             observation_count: 35,
             aliases: vec![],
+            last_observed_at: now,
         },
         EntityKnowledge {
             name: "code".into(),
@@ -215,6 +233,7 @@ pub fn default_entities() -> Vec<EntityKnowledge> {
             confidence: 0.8,
             observation_count: 30,
             aliases: vec!["source".into()],
+            last_observed_at: now,
         },
     ]
 }

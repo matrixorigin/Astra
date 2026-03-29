@@ -43,7 +43,16 @@ pub struct ToolChainPattern {
     pub failure_count: u32,
     /// Cumulative quality score (for computing average).
     quality_sum: f64,
+    /// Unix timestamp of last use (seconds since epoch).
+    /// Used for time-based decay calculations.
+    #[serde(default)]
+    pub last_used_at: u64,
 }
+
+/// Days after which pattern weight starts decaying.
+const DECAY_GRACE_DAYS: u64 = 7;
+/// Half-life in days for exponential decay after grace period.
+const DECAY_HALF_LIFE_DAYS: f64 = 30.0;
 
 impl ToolChainPattern {
     fn new(
@@ -60,6 +69,7 @@ impl ToolChainPattern {
             success_count: 0,
             failure_count: 0,
             quality_sum: 0.0,
+            last_used_at: current_timestamp(),
         }
     }
 
@@ -90,6 +100,53 @@ impl ToolChainPattern {
     pub fn score(&self) -> f64 {
         self.success_rate() * 0.6 + self.avg_quality() * 0.4
     }
+
+    /// Time-decayed score: applies exponential decay based on staleness.
+    ///
+    /// - Within grace period (7 days): no decay
+    /// - After grace period: exponential decay with 30-day half-life
+    ///
+    /// This prevents stale patterns from dominating suggestions.
+    pub fn decayed_score(&self) -> f64 {
+        let base = self.score();
+        let decay = time_decay_factor(self.last_used_at);
+        base * decay
+    }
+
+    /// Update the last_used_at timestamp to now.
+    pub fn touch(&mut self) {
+        self.last_used_at = current_timestamp();
+    }
+}
+
+/// Calculate time decay factor (0.0–1.0) based on staleness.
+///
+/// - Within grace period: returns 1.0 (no decay)
+/// - After grace period: exponential decay with configured half-life
+fn time_decay_factor(last_used_at: u64) -> f64 {
+    let now = current_timestamp();
+    if last_used_at >= now {
+        return 1.0;
+    }
+
+    let age_secs = now - last_used_at;
+    let age_days = age_secs as f64 / 86400.0;
+
+    if age_days <= DECAY_GRACE_DAYS as f64 {
+        return 1.0;
+    }
+
+    // Exponential decay: weight = 0.5^(days_past_grace / half_life)
+    let days_past_grace = age_days - DECAY_GRACE_DAYS as f64;
+    0.5_f64.powf(days_past_grace / DECAY_HALF_LIFE_DAYS)
+}
+
+/// Get current Unix timestamp in seconds.
+fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // ─── Pattern Library ─────────────────────────────────────────────────────────
@@ -185,12 +242,16 @@ impl PatternLibrary {
         } else {
             pattern.failure_count += 1;
         }
+
+        // Update timestamp to reflect recent use
+        pattern.touch();
     }
 
     /// Suggest best patterns for a task type + optional domain filter.
     ///
-    /// Returns up to `limit` patterns sorted by combined score (descending).
+    /// Returns up to `limit` patterns sorted by time-decayed score (descending).
     /// If domain is Some, only returns patterns matching that domain.
+    /// Stale patterns are ranked lower even if historically successful.
     pub fn suggest(
         &self,
         task_type: TaskType,
@@ -215,10 +276,10 @@ impl PatternLibrary {
             .filter(|p| p.total_count() >= 2) // need at least 2 observations
             .collect();
 
-        // Sort by score descending
+        // Sort by decayed score descending (freshness matters)
         candidates.sort_by(|a, b| {
-            b.score()
-                .partial_cmp(&a.score())
+            b.decayed_score()
+                .partial_cmp(&a.decayed_score())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         candidates.truncate(limit);
@@ -892,5 +953,149 @@ mod tests {
         let pattern = exported.iter().find(|p| p.tools.contains(&"raw_tool".to_string())).unwrap();
         assert_eq!(pattern.success_count, 1);
         assert!((pattern.avg_quality() - 0.8).abs() < 0.01, "No feedback should use raw quality");
+    }
+
+    // ── Time Decay Tests ──
+
+    #[test]
+    fn time_decay_within_grace_period() {
+        // Within grace period (7 days), decayed score should equal raw score
+        let mut lib = PatternLibrary::new();
+        for _ in 0..5 {
+            lib.record_outcome(&tools(&["grep"]), TaskType::Fetch, None, true, 0.9, None);
+        }
+
+        // Pattern is fresh (just created), so decayed_score == score
+        let pattern = lib.patterns.values().next().unwrap();
+        let raw = pattern.score();
+        let decayed = pattern.decayed_score();
+        assert!((raw - decayed).abs() < 0.001, "Fresh pattern should have no decay");
+    }
+
+    #[test]
+    fn time_decay_at_half_life() {
+        // At exactly one half-life (30 days) past grace period (7 days), score should be ~50%
+        let mut lib = PatternLibrary::new();
+        for _ in 0..5 {
+            lib.record_outcome(&tools(&["grep"]), TaskType::Fetch, None, true, 0.9, None);
+        }
+
+        // Manually age the pattern to 37 days ago
+        let now = chrono::Utc::now().timestamp() as u64;
+        for pattern in lib.patterns.values_mut() {
+            pattern.last_used_at = now - (37 * 24 * 3600);
+        }
+
+        let pattern = lib.patterns.values().next().unwrap();
+        let raw = pattern.score();
+        let decayed = pattern.decayed_score();
+        let ratio = decayed / raw;
+        assert!((ratio - 0.5).abs() < 0.1, "At half-life, score ratio should be ~0.5, got {}", ratio);
+    }
+
+    #[test]
+    fn time_decay_old_pattern() {
+        // At two half-lives past grace, score should be ~25%
+        let mut lib = PatternLibrary::new();
+        for _ in 0..5 {
+            lib.record_outcome(&tools(&["grep"]), TaskType::Fetch, None, true, 0.9, None);
+        }
+
+        // Manually age the pattern to 67 days ago (7 grace + 60 = 2 half-lives)
+        let now = chrono::Utc::now().timestamp() as u64;
+        for pattern in lib.patterns.values_mut() {
+            pattern.last_used_at = now - (67 * 24 * 3600);
+        }
+
+        let pattern = lib.patterns.values().next().unwrap();
+        let raw = pattern.score();
+        let decayed = pattern.decayed_score();
+        let ratio = decayed / raw;
+        assert!((ratio - 0.25).abs() < 0.1, "At 2 half-lives, score ratio should be ~0.25, got {}", ratio);
+    }
+
+    #[test]
+    fn decayed_score_recent_pattern() {
+        // Use record_outcome to build a pattern with quality
+        let mut lib = PatternLibrary::new();
+        for _ in 0..5 {
+            lib.record_outcome(&tools(&["grep"]), TaskType::Fetch, None, true, 0.9, None);
+        }
+
+        let pattern = lib.patterns.values().next().unwrap();
+        let raw_score = pattern.score();
+        let decayed = pattern.decayed_score();
+        assert!((raw_score - decayed).abs() < 0.001, "Recent pattern should have same raw and decayed score");
+    }
+
+    #[test]
+    fn decayed_score_stale_pattern() {
+        // Use record_outcome to build a pattern with quality
+        let mut lib = PatternLibrary::new();
+        for _ in 0..5 {
+            lib.record_outcome(&tools(&["grep"]), TaskType::Fetch, None, true, 0.9, None);
+        }
+
+        // Make it stale (37 days ago = one half-life past grace)
+        let now = chrono::Utc::now().timestamp() as u64;
+        for pattern in lib.patterns.values_mut() {
+            pattern.last_used_at = now - (37 * 24 * 3600);
+        }
+
+        let pattern = lib.patterns.values().next().unwrap();
+        let raw_score = pattern.score();
+        let decayed = pattern.decayed_score();
+        let expected_decayed = raw_score * 0.5; // Approximately
+
+        assert!(decayed < raw_score, "Stale pattern decayed score should be less than raw score");
+        assert!((decayed - expected_decayed).abs() < 0.1, "Expected ~{}, got {}", expected_decayed, decayed);
+    }
+
+    #[test]
+    fn touch_updates_last_used_at() {
+        let mut lib = PatternLibrary::new();
+        lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.8, None);
+
+        let pattern = lib.patterns.values().next().unwrap();
+        let old_ts = pattern.last_used_at;
+        std::thread::sleep(std::time::Duration::from_millis(1100)); // Wait >1 second
+
+        // Touch via record_outcome
+        lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.8, None);
+        let pattern = lib.patterns.values().next().unwrap();
+        assert!(pattern.last_used_at > old_ts, "touch() should update timestamp");
+    }
+
+    #[test]
+    fn suggest_prefers_recent_patterns() {
+        let mut lib = PatternLibrary::new();
+
+        // Create a stale pattern with high success
+        lib.record_outcome(&tools(&["stale_tool"]), TaskType::Fetch, Some(DomainHint::GitHub), true, 0.95, None);
+        lib.record_outcome(&tools(&["stale_tool"]), TaskType::Fetch, Some(DomainHint::GitHub), true, 0.95, None);
+        lib.record_outcome(&tools(&["stale_tool"]), TaskType::Fetch, Some(DomainHint::GitHub), true, 0.95, None);
+
+        // Manually make it stale
+        for pattern in lib.patterns.values_mut() {
+            if pattern.tools.contains(&"stale_tool".to_string()) {
+                let now = chrono::Utc::now().timestamp() as u64;
+                pattern.last_used_at = now - (50 * 24 * 3600); // 50 days ago
+            }
+        }
+
+        // Create a recent pattern with lower raw success but fresh
+        lib.record_outcome(&tools(&["recent_tool"]), TaskType::Fetch, Some(DomainHint::GitHub), true, 0.8, None);
+        lib.record_outcome(&tools(&["recent_tool"]), TaskType::Fetch, Some(DomainHint::GitHub), true, 0.8, None);
+
+        let suggestions = lib.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 2);
+
+        // Recent pattern should rank higher due to time decay
+        if suggestions.len() >= 2 {
+            let recent_idx = suggestions.iter().position(|t| t.tools.contains(&"recent_tool".to_string()));
+            let stale_idx = suggestions.iter().position(|t| t.tools.contains(&"stale_tool".to_string()));
+            if let (Some(r), Some(s)) = (recent_idx, stale_idx) {
+                assert!(r < s, "Recent pattern should rank before stale pattern");
+            }
+        }
     }
 }
