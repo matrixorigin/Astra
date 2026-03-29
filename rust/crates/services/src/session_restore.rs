@@ -151,12 +151,24 @@ impl HybridRestoreService {
                 let title: Option<String> = row.try_get("title").ok().flatten();
                 let event_count: i64 = row.try_get("event_count").unwrap_or(0);
 
+                // Extract plan state from metadata JSON
+                let metadata_str: Option<String> = row.try_get("metadata").ok().flatten();
+                let (plan_json, plan_goal, plan_config, plan_rounds) =
+                    match metadata_str.as_deref() {
+                        Some(m) if !m.is_empty() => extract_plan_from_metadata(m),
+                        _ => (None, None, None, 0),
+                    };
+
                 Ok(Some(RestoredSession {
                     session_id: session_id.to_string(),
                     turn_count: event_count as u32,
                     last_status: status,
                     title,
                     restored_from_cloud: true,
+                    executing_plan_json: plan_json,
+                    plan_goal,
+                    plan_config_json: plan_config,
+                    plan_execution_rounds: plan_rounds,
                     ..Default::default()
                 }))
             }
@@ -530,6 +542,92 @@ pub async fn pull_step_checkpoint_from_cloud(
     }
 }
 
+// ─── Plan State Cloud Sync ──────────────────────────────────────────────────
+
+/// Push plan execution state to cloud via the agent_sessions.metadata JSON column.
+/// Called at checkpoint boundaries and session end to enable cross-device plan restore.
+pub async fn push_plan_state_to_cloud(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    session_id: &str,
+    executing_plan_json: Option<&str>,
+    plan_goal: Option<&str>,
+    plan_config_json: Option<&str>,
+    plan_execution_rounds: usize,
+) -> Result<(), String> {
+    let mut metadata = serde_json::Map::new();
+    if let Some(plan) = executing_plan_json {
+        metadata.insert(
+            "executing_plan".to_string(),
+            serde_json::Value::String(plan.to_string()),
+        );
+    }
+    if let Some(goal) = plan_goal {
+        metadata.insert(
+            "plan_goal".to_string(),
+            serde_json::Value::String(goal.to_string()),
+        );
+    }
+    if let Some(config) = plan_config_json {
+        metadata.insert(
+            "plan_config".to_string(),
+            serde_json::Value::String(config.to_string()),
+        );
+    }
+    if plan_execution_rounds > 0 {
+        metadata.insert(
+            "plan_execution_rounds".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(plan_execution_rounds)),
+        );
+    }
+
+    let metadata_json = serde_json::Value::Object(metadata).to_string();
+
+    sqlx::query(
+        "UPDATE agent_sessions SET metadata = ?, updated_at = NOW() WHERE session_id = ?",
+    )
+    .bind(&metadata_json)
+    .bind(session_id)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("push_plan_state: {e}"))?;
+
+    Ok(())
+}
+
+/// Extract plan state from the metadata JSON returned by agent_sessions.
+/// Returns (executing_plan_json, plan_goal, plan_config_json, plan_execution_rounds).
+pub fn extract_plan_from_metadata(
+    metadata_json: &str,
+) -> (Option<String>, Option<String>, Option<String>, usize) {
+    let parsed: serde_json::Value = match serde_json::from_str(metadata_json) {
+        Ok(v) => v,
+        Err(_) => return (None, None, None, 0),
+    };
+    let obj = match parsed.as_object() {
+        Some(o) => o,
+        None => return (None, None, None, 0),
+    };
+
+    let plan = obj
+        .get("executing_plan")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let goal = obj
+        .get("plan_goal")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let config = obj
+        .get("plan_config")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let rounds = obj
+        .get("plan_execution_rounds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    (plan, goal, config, rounds)
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -827,5 +925,69 @@ mod tests {
         assert_eq!(rewound.model, Some("gpt-4".into()));
         assert_eq!(rewound.turn_count, 10);
         assert!(rewound.turn_count < original.turn_count);
+    }
+
+    // ── Plan state cloud sync ──
+
+    #[test]
+    fn extract_plan_from_metadata_full() {
+        let metadata = r#"{
+            "executing_plan": "{\"subtasks\":[{\"id\":\"s1\",\"title\":\"task\"}]}",
+            "plan_goal": "Build feature X",
+            "plan_config": "{\"step_by_step\":true,\"auto_execute\":false}",
+            "plan_execution_rounds": 3
+        }"#;
+        let (plan, goal, config, rounds) = extract_plan_from_metadata(metadata);
+        assert!(plan.is_some());
+        assert!(plan.unwrap().contains("subtasks"));
+        assert_eq!(goal, Some("Build feature X".to_string()));
+        assert!(config.is_some());
+        assert_eq!(rounds, 3);
+    }
+
+    #[test]
+    fn extract_plan_from_metadata_empty() {
+        let (plan, goal, config, rounds) = extract_plan_from_metadata("{}");
+        assert!(plan.is_none());
+        assert!(goal.is_none());
+        assert!(config.is_none());
+        assert_eq!(rounds, 0);
+    }
+
+    #[test]
+    fn extract_plan_from_metadata_invalid_json() {
+        let (plan, goal, config, rounds) = extract_plan_from_metadata("not json");
+        assert!(plan.is_none());
+        assert!(goal.is_none());
+        assert!(config.is_none());
+        assert_eq!(rounds, 0);
+    }
+
+    #[test]
+    fn extract_plan_from_metadata_partial() {
+        let metadata = r#"{"plan_goal": "Fix bug", "plan_execution_rounds": 1}"#;
+        let (plan, goal, config, rounds) = extract_plan_from_metadata(metadata);
+        assert!(plan.is_none());
+        assert_eq!(goal, Some("Fix bug".to_string()));
+        assert!(config.is_none());
+        assert_eq!(rounds, 1);
+    }
+
+    #[test]
+    fn restored_session_plan_fields_roundtrip() {
+        let s = RestoredSession {
+            session_id: "plan-sess".into(),
+            executing_plan_json: Some(r#"{"subtasks":[]}"#.into()),
+            plan_goal: Some("Cloud sync".into()),
+            plan_config_json: Some(r#"{"step_by_step":false}"#.into()),
+            plan_execution_rounds: 5,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let loaded: RestoredSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.executing_plan_json, s.executing_plan_json);
+        assert_eq!(loaded.plan_goal, s.plan_goal);
+        assert_eq!(loaded.plan_config_json, s.plan_config_json);
+        assert_eq!(loaded.plan_execution_rounds, 5);
     }
 }

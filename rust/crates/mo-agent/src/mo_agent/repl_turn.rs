@@ -464,6 +464,32 @@ fn apply_turn_success(
                 });
             }
 
+            // Push plan state to cloud at checkpoint boundaries
+            if let Some(ref pool) = state.matrixone_pool
+                && mo_agent_services::session_checkpoint::should_checkpoint(
+                    ws.turn_count,
+                    mo_agent_services::session_checkpoint::CHECKPOINT_INTERVAL,
+                )
+            {
+                let pool = pool.clone();
+                let sid_owned = sid.to_string();
+                let plan_json = ws.executing_plan_json.clone();
+                let goal = ws.plan_goal.clone();
+                let config = ws.plan_config_json.clone();
+                let rounds = ws.plan_execution_rounds;
+                tokio::spawn(async move {
+                    let _ = mo_agent_services::session_restore::push_plan_state_to_cloud(
+                        &pool,
+                        &sid_owned,
+                        plan_json.as_deref(),
+                        goal.as_deref(),
+                        config.as_deref(),
+                        rounds,
+                    )
+                    .await;
+                });
+            }
+
             let _ = mo_agent_services::session_workspace::write_workspace(&ws);
         }
 
