@@ -56,9 +56,13 @@ pub(super) async fn handle_chat_input(
 
     let session_id = state.session_id.clone();
     match run_chat_turn(state, &ctx, token, &effective_line, session_id.as_deref()).await {
-        TurnAttempt::Interrupted => return Ok(()),
+        TurnAttempt::Interrupted => {
+            state.last_turn_interrupted = true;
+            return Ok(());
+        }
         TurnAttempt::Completed(result) => match *result {
             Ok(result) => {
+                state.last_turn_interrupted = false;
                 apply_turn_success(state, ctx.selector, ctx.profile, &line, result, turn_start);
                 return Ok(());
             }
@@ -72,7 +76,10 @@ pub(super) async fn handle_chat_input(
                     );
 
                     match run_chat_turn(state, &ctx, token, &effective_line, None).await {
-                        TurnAttempt::Interrupted => return Ok(()),
+                        TurnAttempt::Interrupted => {
+                            state.last_turn_interrupted = true;
+                            return Ok(());
+                        }
                         TurnAttempt::Completed(result) => match *result {
                             Ok(result) => {
                                 apply_turn_success(

@@ -1399,4 +1399,102 @@ Done!"#;
         let ready = plan.ready_subtasks();
         assert!(ready.is_empty(), "b should be blocked while a is in-progress");
     }
+
+    #[test]
+    fn plan_execution_simulates_full_run() {
+        // Simulate the auto-execution loop logic without the async chat call
+        let mut plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "Step A".into(),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "Step B".into(),
+                    depends_on: vec!["a".into()],
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "c".into(),
+                    title: "Step C".into(),
+                    depends_on: vec!["b".into()],
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+
+        let mut executed_order = Vec::new();
+
+        // Simulate the execution loop
+        loop {
+            // Mark any in-progress as completed
+            for st in plan.subtasks.iter_mut() {
+                if st.status == TaskStatus::InProgress {
+                    st.status = TaskStatus::Completed;
+                    break;
+                }
+            }
+
+            // Find next ready
+            let next = plan.ready_subtasks().first().map(|s| s.id.clone());
+            match next {
+                Some(id) => {
+                    let st = plan.subtasks.iter_mut().find(|s| s.id == id).unwrap();
+                    st.status = TaskStatus::InProgress;
+                    executed_order.push(id);
+                }
+                None => break,
+            }
+        }
+
+        assert_eq!(executed_order, vec!["a", "b", "c"]);
+        assert_eq!(plan.progress_pct(), 100);
+    }
+
+    #[test]
+    fn plan_execution_pause_preserves_state() {
+        // Simulate Ctrl+C pause: in-progress subtask stays in-progress
+        let mut plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "Step A".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "Step B".into(),
+                    depends_on: vec!["a".into()],
+                    status: TaskStatus::InProgress,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "c".into(),
+                    title: "Step C".into(),
+                    depends_on: vec!["b".into()],
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+
+        // After pause: b is still in-progress, c is still pending
+        assert_eq!(plan.progress_pct(), 33); // only a is completed
+        let remaining = plan
+            .subtasks
+            .iter()
+            .filter(|s| s.status == TaskStatus::Pending || s.status == TaskStatus::InProgress)
+            .count();
+        assert_eq!(remaining, 2);
+
+        // Resume: complete b, then c should become ready
+        plan.subtasks[1].status = TaskStatus::Completed;
+        let ready = plan.ready_subtasks();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, "c");
+    }
 }

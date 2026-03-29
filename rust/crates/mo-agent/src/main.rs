@@ -384,6 +384,8 @@ struct ReplState {
     plan_mode: Option<plan_decompose::PlanModeState>,
     /// Plan being auto-executed — subtasks sent sequentially through chat.
     executing_plan: Option<mo_agent_services::task_orchestrator::TaskPlan>,
+    /// Whether the last chat turn was interrupted by Ctrl+C (used by plan auto-execution).
+    last_turn_interrupted: bool,
 }
 
 impl Default for ReplState {
@@ -415,6 +417,7 @@ impl Default for ReplState {
             tool_health_entries: Vec::new(),
             plan_mode: None,
             executing_plan: None,
+            last_turn_interrupted: false,
         }
     }
 }
@@ -1207,6 +1210,33 @@ async fn run_plan_execution(
                     },
                 )
                 .await?;
+
+                // If user pressed Ctrl+C, pause execution
+                if state.last_turn_interrupted {
+                    if let Some(plan) = state.executing_plan.take() {
+                        let pct = plan.progress_pct();
+                        let remaining = plan
+                            .subtasks
+                            .iter()
+                            .filter(|s| {
+                                s.status == TaskStatus::Pending
+                                    || s.status == TaskStatus::InProgress
+                            })
+                            .count();
+                        eprintln!(
+                            "\n{}  Plan paused (Ctrl+C). {}% done, {} subtasks remaining.",
+                            "⏸".yellow(),
+                            pct,
+                            remaining
+                        );
+                        eprintln!(
+                            "{}  Use /plan to review, or say \"continue\" to resume.",
+                            "💡".cyan()
+                        );
+                    }
+                    state.last_turn_interrupted = false;
+                    return Ok(());
+                }
 
                 // Loop continues — will mark this subtask done and find next
             }
