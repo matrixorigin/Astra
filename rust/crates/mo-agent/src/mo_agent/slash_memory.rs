@@ -715,6 +715,94 @@ pub(super) async fn handle_memory_domain_command(
                         }
                     }
                 }
+                "rate" if !sub_arg.is_empty() => {
+                    // Record user feedback for the current/last executed plan
+                    let rating_str = sub_arg.trim();
+                    
+                    if rating_str == "skip" {
+                        eprintln!("  {} Feedback skipped", "⚠".yellow());
+                        return Ok(());
+                    }
+                    
+                    let rating: u8 = match rating_str.parse() {
+                        Ok(r) if (1..=5).contains(&r) => r,
+                        _ => {
+                            eprintln!("  {} Rating must be 1-5 (or 'skip')", "⚠".yellow());
+                            return Ok(());
+                        }
+                    };
+                    
+                    // Find the task to rate - use the most recent task for current goal
+                    if let Some(ref svc) = state.task_service {
+                        use mo_agent_services::{TaskService, TaskOutcome};
+                        let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
+                        
+                        // Find task by current plan goal or executing plan goal
+                        let goal = state.plan_mode.as_ref().map(|ps| ps.goal.clone())
+                            .or_else(|| state.executing_plan_goal.clone());
+                        
+                        if let Some(goal_text) = goal {
+                            match svc.list_tasks(user_id, None).await {
+                                Ok(tasks) => {
+                                    // Find the most recent task matching the goal
+                                    let found = tasks.iter()
+                                        .filter(|t| t.title == goal_text)
+                                        .max_by_key(|t| &t.created_at);
+                                    
+                                    if let Some(task) = found {
+                                        // Determine outcome based on plan completion
+                                        let outcome = if let Some(ref ps) = state.plan_mode {
+                                            let pct = ps.plan.progress_pct();
+                                            if pct == 100 {
+                                                TaskOutcome::Success
+                                            } else if pct > 0 {
+                                                TaskOutcome::Partial
+                                            } else {
+                                                TaskOutcome::Failed
+                                            }
+                                        } else {
+                                            // Infer from rating
+                                            if rating >= 4 {
+                                                TaskOutcome::Success
+                                            } else if rating >= 2 {
+                                                TaskOutcome::Partial
+                                            } else {
+                                                TaskOutcome::Failed
+                                            }
+                                        };
+                                        
+                                        match svc.record_feedback(&task.task_id, rating, outcome, None).await {
+                                            Ok(_) => {
+                                                let stars = "★".repeat(rating as usize) + &"☆".repeat(5 - rating as usize);
+                                                eprintln!(
+                                                    "  {} Feedback recorded: {} ({})",
+                                                    "✓".green(),
+                                                    stars.yellow(),
+                                                    outcome.as_str()
+                                                );
+                                            }
+                                            Err(e) => {
+                                                eprintln!("  {} Could not record feedback: {}", "⚠".yellow(), e);
+                                            }
+                                        }
+                                    } else {
+                                        eprintln!("  {} No task found for current goal", "⚠".yellow());
+                                    }
+                                }
+                                Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+                            }
+                        } else {
+                            eprintln!("  {} No active plan to rate", "⚠".yellow());
+                        }
+                    } else {
+                        // Store rating locally
+                        eprintln!(
+                            "  {} Rating {} recorded locally (cloud sync not available)",
+                            "✓".green(),
+                            "★".repeat(rating as usize).yellow()
+                        );
+                    }
+                }
                 "history" => {
                     if let Some(ref ps) = state.plan_mode {
                         eprintln!("  ─── Version History ───");
@@ -872,7 +960,7 @@ pub(super) async fn handle_memory_domain_command(
                 }
                 _ => {
                     eprintln!(
-                        "  Usage: /plan [show | set <text> | clear | decompose <goal> | enter <goal> | auto <goal> | resume | exit | list | cloud | load <id> | template <name> <goal> | history | diff <v1> <v2> | rollback <v> | parallel]"
+                        "  Usage: /plan [show | set <text> | clear | decompose <goal> | enter <goal> | auto <goal> | resume | exit | list | cloud | load <id> | rate <1-5> | template <name> <goal> | history | diff <v1> <v2> | rollback <v> | parallel]"
                     );
                 }
             }
@@ -1097,6 +1185,12 @@ pub async fn handle_plan_mode_input(
                         }
                     } else if plan_state.plan.progress_pct() == 100 {
                         eprintln!("  {} All tasks complete!", "🎉".green());
+                        // Prompt for feedback
+                        eprintln!();
+                        eprintln!(
+                            "  {} Rate this plan (1-5)? Or 'skip' to skip: /plan rate <1-5>",
+                            "💡".cyan()
+                        );
                     }
                 }
                 Err(e) => eprintln!("  {} {}", "⚠".yellow(), e),

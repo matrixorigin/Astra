@@ -119,7 +119,7 @@ pub use storage::{
 pub use streaming::{DatabaseStreamingService, StreamingService, UnconfiguredStreamingService};
 pub use task_orchestrator::{
     LocalTaskService, MatrixOneTaskService, SubtaskPlan, TaskCheckpoint, TaskCreateRequest,
-    TaskPlan, TaskRecord, TaskService, TaskStatus,
+    TaskOutcome, TaskPlan, TaskRecord, TaskService, TaskStatus,
 };
 pub use triggers::{
     DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService,
