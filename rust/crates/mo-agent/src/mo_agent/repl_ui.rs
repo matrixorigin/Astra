@@ -1,104 +1,25 @@
 use super::*;
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/", "Show slash command list"),
-    ("/?", "Show slash command list"),
-    ("/commands", "Show slash command list (optionally filtered)"),
-    ("/help", "Show all slash commands"),
+    // ── Core Commands ─────────────────────────────────────────────────────
+    ("/help", "Show available commands"),
     ("/model", "List models or set active: /model <name>"),
-    ("/session", "Show current session info"),
-    (
-        "/session history",
-        "Show session journal timeline (full id or unique prefix)",
-    ),
-    ("/session list", "List all journal files"),
-    (
-        "/session errors",
-        "Show session errors (full id or unique prefix)",
-    ),
-    (
-        "/session export",
-        "Export session as markdown (full id or unique prefix)",
-    ),
     ("/clear", "Start a new session"),
-    (
-        "/history",
-        "Show conversation turns (or /history search <q>)",
-    ),
-    (
-        "/search",
-        "Workspace search: /search <pattern> | /search files <glob> | /search review <pattern>",
-    ),
-    ("/search files", "Search file names: /search files <glob>"),
-    (
-        "/search review",
-        "Search changed files only: /search review <pattern>",
-    ),
-    ("/rewind", "Rewind conversation to turn N: /rewind <turn>"),
+    ("/history", "Show conversation turns"),
     ("/copy", "Copy last response to clipboard"),
-    ("/context", "Show context window and session state"),
-    ("/skill", "List available skills"),
-    ("/skill list", "List available skills"),
-    (
-        "/skill new",
-        "Create a new skill scaffold: /skill new <name>",
-    ),
-    (
-        "/skill test",
-        "Test a skill: /skill test <name> [json_args]",
-    ),
-    (
-        "/skill dev",
-        "Enter AI-assisted skill dev mode: /skill dev <name>",
-    ),
-    ("/skill dev off", "Exit skill dev mode"),
-    ("/skill doctor", "Check skill health"),
-    (
-        "/skill validate",
-        "Validate skill source: /skill validate <name>",
-    ),
-    ("/skill config", "Show skill config: /skill config <name>"),
-    (
-        "/skill system",
-        "Toggle a system skill: /skill system <name|list>",
-    ),
-    ("/doctor", "Run diagnostics (health + auth)"),
-    ("/version", "Show version info"),
-    (
-        "/register",
-        "Register a new account (prompts interactively)",
-    ),
+    ("/plan", "Toggle plan mode (enter/exit)"),
+    ("/plan list", "List plan history"),
+    ("/plan history", "Show plan version history"),
+    ("/resume", "Resume a previous session: /resume [session_id]"),
+    ("/exit", "Exit the REPL"),
+    // ── Account ───────────────────────────────────────────────────────────
     ("/login", "Authenticate with the API"),
     ("/logout", "Logout from the API"),
-    (
-        "/memory-setup",
-        "Configure Memoria API key: /memory-setup <api_key>",
-    ),
-    ("/explain", "Toggle explain mode"),
-    ("/verbose", "Show status bar after each response"),
-    ("/compact", "Summarize conversation and save to memory"),
-    (
-        "/reflect",
-        "Diagnose session (focuses: auto, skill_failure, tool_selection, performance)",
-    ),
-    (
-        "/memory",
-        "Memory operations: /memory [list|search <q>|inspect <id>]",
-    ),
-    ("/plan", "Toggle plan mode (enter/exit)"),
-    ("/plan list", "List plan history (local + cloud)"),
-    ("/plan history", "Show current plan version history"),
-    (
-        "/task",
-        "Task tracking: /task [list|add <title>|done <id>|status <id>]",
-    ),
-    ("/resume", "Resume a previous session: /resume [session_id]"),
-    ("/stats", "Session analytics: /stats [history]"),
-    ("/tools", "Tool performance profile: /tools"),
-    ("/health", "Tool health dashboard: /health [detail]"),
-    ("/keys", "Show all keyboard shortcuts"),
-    ("/exit", "Exit the REPL"),
-    ("/quit", "Exit the REPL"),
+    // ── Advanced (for developers) ─────────────────────────────────────────
+    ("/doctor", "Run diagnostics"),
+    ("/version", "Show version info"),
+    ("/session", "Show current session info"),
+    ("/skill", "Skill management: /skill [list|new|dev|test]"),
 ];
 
 fn command_matches_filter(command: &str, desc: &str, filter: &str) -> bool {
