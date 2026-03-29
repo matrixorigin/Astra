@@ -237,9 +237,13 @@ impl ToolExecutor {
             .get("max_matches")
             .and_then(Value::as_u64)
             .map(|n| n.max(1) as usize);
+        let scope_context = args
+            .get("scope_context")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         let mut cmd = Command::new("grep");
-        cmd.arg("-rnE"); // -E enables extended regex (alternation with |)
+        cmd.arg("-rnHE"); // -H forces filename display, -E enables extended regex
         if !case_sensitive {
             cmd.arg("-i");
         }
@@ -260,18 +264,21 @@ impl ToolExecutor {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 match out.status.code() {
                     Some(0) => {
-                        if text.len() > 20_000 {
+                        let result = if text.len() > 20_000 {
                             let mut t = text[..20_000].to_string();
                             t.push_str("\n[truncated]");
                             t
                         } else {
                             text.to_string()
+                        };
+
+                        if scope_context {
+                            annotate_grep_with_scope(&result, &self.project_root)
+                        } else {
+                            result
                         }
                     }
                     Some(1) => {
-                        // stderr may contain "No such file or directory" warnings
-                        // even when exit code is 1 (grep found no matches but
-                        // some paths were bad)
                         let warn = stderr.trim();
                         if warn.is_empty() {
                             "No matches found".to_string()
@@ -400,6 +407,72 @@ impl ToolExecutor {
             Err(e) => format!("Error: curl not available — {e}"),
         }
     }
+}
+
+/// Annotate grep results with tree-sitter scope context.
+///
+/// For each `file:line:content` match, looks up the containing function/class
+/// using `scope_at_line()` and appends it as `  (in fn_name)` annotation.
+/// Only annotates matches in files with supported languages.
+/// File contents are cached to avoid re-reading the same file for multiple matches.
+fn annotate_grep_with_scope(grep_output: &str, project_root: &std::path::Path) -> String {
+    use super::code_intel::{detect_language, scope_at_line};
+    use std::collections::HashMap;
+
+    // Cache: file path → (source, language)
+    let mut file_cache: HashMap<String, Option<(String, super::code_intel::Language)>> =
+        HashMap::new();
+
+    let mut result = String::with_capacity(grep_output.len() + grep_output.len() / 10);
+
+    for line in grep_output.lines() {
+        // Parse grep output: file:line:content or file-line-content (context)
+        // Only annotate primary matches (colon separator), not context (dash separator)
+        if let Some((file_part, rest)) = line.split_once(':') {
+            if let Some((line_num_str, _content)) = rest.split_once(':') {
+                if let Ok(line_num) = line_num_str.trim().parse::<usize>() {
+                    let file_path = if std::path::Path::new(file_part).is_absolute() {
+                        file_part.to_string()
+                    } else {
+                        project_root.join(file_part).to_string_lossy().to_string()
+                    };
+
+                    let cached = file_cache.entry(file_path.clone()).or_insert_with(|| {
+                        let path = std::path::Path::new(&file_path);
+                        let lang = detect_language(path)?;
+                        let source = std::fs::read_to_string(path).ok()?;
+                        Some((source, lang))
+                    });
+
+                    if let Some((source, lang)) = cached {
+                        let ctx = scope_at_line(source, *lang, line_num);
+                        let scope_str = if ctx.breadcrumbs.len() > 1 {
+                            ctx.breadcrumbs.join(" > ")
+                        } else if let Some(ref sym) = ctx.symbol {
+                            sym.name.clone()
+                        } else {
+                            String::new()
+                        };
+                        if !scope_str.is_empty() {
+                            result.push_str(line);
+                            result.push_str("  // in ");
+                            result.push_str(&scope_str);
+                            result.push('\n');
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        result.push_str(line);
+        result.push('\n');
+    }
+
+    // Remove trailing newline
+    if result.ends_with('\n') {
+        result.pop();
+    }
+    result
 }
 
 /// Detect HTML content by checking for common HTML markers.
@@ -1081,6 +1154,68 @@ mod tests {
         assert!(
             target_count <= 3,
             "should limit matches, got {target_count}: {result}"
+        );
+    }
+
+    // ═══════════════════════ Scope Context Tests ═══════════════════════
+
+    #[test]
+    fn annotate_grep_with_scope_adds_function_context() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // Grep output for a pattern that should be inside a known function in code_intel.rs
+        let grep_output = format!(
+            "{}/src/edge_tools/code_intel.rs:100:    let symbols = extract_symbols(source, lang);",
+            root.display()
+        );
+        let result = annotate_grep_with_scope(&grep_output, root);
+        // Should annotate with the containing function name
+        assert!(
+            result.contains("// in "),
+            "should contain scope annotation: {result}"
+        );
+    }
+
+    #[test]
+    fn annotate_grep_with_scope_no_change_for_unknown_files() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let grep_output = "nonexistent.xyz:10:some content";
+        let result = annotate_grep_with_scope(grep_output, root);
+        assert_eq!(result, grep_output, "unknown files should pass through unchanged");
+    }
+
+    #[test]
+    fn annotate_grep_with_scope_handles_empty_input() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let result = annotate_grep_with_scope("", root);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn annotate_grep_with_scope_preserves_non_match_lines() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let grep_output = "-- separator --\nsome random line";
+        let result = annotate_grep_with_scope(grep_output, root);
+        assert!(result.contains("-- separator --"), "should preserve non-match lines");
+    }
+
+    #[test]
+    fn grep_scope_context_parameter() {
+        // Test that scope_context parameter is properly parsed
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let executor = super::ToolExecutor::new(root.to_path_buf());
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "fn annotate_grep_with_scope",
+            "path": "src/edge_tools/shell.rs",
+            "scope_context": true
+        }));
+        assert!(
+            result.contains("annotate_grep_with_scope"),
+            "should find the function: {result}"
+        );
+        // With scope_context=true, should have function annotation
+        assert!(
+            result.contains("// in "),
+            "should have scope context annotation: {result}"
         );
     }
 }

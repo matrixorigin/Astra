@@ -31,6 +31,8 @@ pub struct ErrorLocation {
     pub class: ErrorClass,
     /// Quick-fix hint for the LLM (empty if no suggestion)
     pub hint: String,
+    /// Containing function/class scope (from tree-sitter, empty if unavailable)
+    pub scope: String,
 }
 
 /// Error classification for auto-fix prioritization.
@@ -48,7 +50,7 @@ impl ErrorLocation {
     /// Create a new ErrorLocation with automatic classification and hints.
     fn new(file: String, line: usize, col: usize, error_code: String, message: String, severity: String) -> Self {
         let (class, hint) = classify_and_hint(&error_code, &message);
-        Self { file, line, col, error_code, message, severity, class, hint }
+        Self { file, line, col, error_code, message, severity, class, hint, scope: String::new() }
     }
 }
 
@@ -185,9 +187,14 @@ impl BuildTestResult {
                     ErrorClass::Fixable => " 🔨",
                     ErrorClass::Complex => "",
                 };
+                let scope_part = if loc.scope.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (in {})", loc.scope)
+                };
                 parts.push(format!(
-                    "  → {}:{}{}{} {}{}",
-                    loc.file, loc.line, col_part, code_part, loc.message, class_tag
+                    "  → {}:{}{}{} {}{}{}",
+                    loc.file, loc.line, col_part, code_part, loc.message, class_tag, scope_part
                 ));
                 if !loc.hint.is_empty() {
                     parts.push(format!("    💡 {}", loc.hint));
@@ -214,6 +221,42 @@ impl BuildTestResult {
         }
 
         parts.join("\n")
+    }
+
+    /// Enrich error locations with tree-sitter scope context.
+    ///
+    /// For each error location, reads the source file and uses tree-sitter's
+    /// `scope_at_line()` to find the containing function/class. This adds
+    /// context like "in fn process_data" or "in impl Foo > fn bar" to each error.
+    pub fn enrich_with_scope(&mut self, project_root: &std::path::Path) {
+        use super::code_intel::{detect_language, scope_at_line};
+        use std::collections::HashMap;
+
+        // Cache file contents to avoid re-reading for multiple errors in same file
+        let mut file_cache: HashMap<String, Option<(String, super::code_intel::Language)>> =
+            HashMap::new();
+
+        for loc in self.error_locations.iter_mut() {
+            let file_path = project_root.join(&loc.file);
+            let key = loc.file.clone();
+
+            let cached = file_cache.entry(key).or_insert_with(|| {
+                let lang = detect_language(&file_path)?;
+                let source = std::fs::read_to_string(&file_path).ok()?;
+                Some((source, lang))
+            });
+
+            if let Some((source, lang)) = cached {
+                let ctx = scope_at_line(source, *lang, loc.line);
+                loc.scope = if ctx.breadcrumbs.len() > 1 {
+                    ctx.breadcrumbs.join(" > ")
+                } else if let Some(ref sym) = ctx.symbol {
+                    sym.name.clone()
+                } else {
+                    String::new()
+                };
+            }
+        }
     }
 }
 
@@ -1336,5 +1379,77 @@ error[E0425]: cannot find value `nonexistent` in this scope
         assert_eq!(loc.error_code, "E0425");
         assert_eq!(loc.class, ErrorClass::Trivial, "E0425 should be trivial");
         assert!(!loc.hint.is_empty(), "should have a hint");
+    }
+
+    #[test]
+    fn enrich_with_scope_fills_scope_field() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut result = BuildTestResult {
+            error_locations: vec![ErrorLocation::new(
+                "src/edge_tools/code_intel.rs".into(),
+                100,
+                5,
+                "E0425".into(),
+                "cannot find value".into(),
+                "error".into(),
+            )],
+            ..Default::default()
+        };
+        // Scope should be empty initially
+        assert!(result.error_locations[0].scope.is_empty());
+        // Enrich
+        result.enrich_with_scope(root);
+        // After enrichment, scope should have the containing function
+        let scope = &result.error_locations[0].scope;
+        assert!(
+            !scope.is_empty(),
+            "scope should be filled after enrichment for a valid Rust file"
+        );
+    }
+
+    #[test]
+    fn enrich_with_scope_handles_nonexistent_file() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut result = BuildTestResult {
+            error_locations: vec![ErrorLocation::new(
+                "nonexistent_file.rs".into(),
+                10,
+                0,
+                "".into(),
+                "some error".into(),
+                "error".into(),
+            )],
+            ..Default::default()
+        };
+        result.enrich_with_scope(root);
+        // Should not crash, scope should remain empty
+        assert!(result.error_locations[0].scope.is_empty());
+    }
+
+    #[test]
+    fn scope_field_appears_in_enhanced_output() {
+        let result = BuildTestResult {
+            passed: false,
+            framework: "cargo".into(),
+            error_count: 1,
+            error_locations: vec![ErrorLocation {
+                file: "src/lib.rs".into(),
+                line: 42,
+                col: 5,
+                error_code: "E0308".into(),
+                message: "type mismatch".into(),
+                severity: "error".into(),
+                class: ErrorClass::Fixable,
+                hint: "check types".into(),
+                scope: "impl Foo > fn process".into(),
+            }],
+            summary: "Build failed".into(),
+            ..Default::default()
+        };
+        let output = result.to_enhanced_output("");
+        assert!(
+            output.contains("(in impl Foo > fn process)"),
+            "scope should appear in enhanced output: {output}"
+        );
     }
 }

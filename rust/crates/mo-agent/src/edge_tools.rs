@@ -163,7 +163,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "grep",
-                "description": "Search for a pattern in files. Returns matching lines with file:line context.",
+                "description": "Search for a pattern in files. Returns matching lines with file:line context. Use scope_context=true to see which function/class each match is in.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -172,7 +172,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "include": {"type": "string", "description": "File glob filter e.g. '*.rs'"},
                         "case_sensitive": {"type": "boolean", "description": "Case sensitive (default false)"},
                         "context_lines": {"type": "integer", "description": "Lines of context before and after each match (like grep -C)"},
-                        "max_matches": {"type": "integer", "description": "Max matches per file (limits output, saves tokens)"}
+                        "max_matches": {"type": "integer", "description": "Max matches per file (limits output, saves tokens)"},
+                        "scope_context": {"type": "boolean", "description": "Annotate each match with its containing function/class name (tree-sitter)"}
                     },
                     "required": ["pattern"]
                 }
@@ -1537,7 +1538,12 @@ impl ToolExecutor {
         };
 
         let combined = format!("{stdout}\n{stderr}");
-        let result = build_test::parse_build_test_output(&combined, exit_code);
+        let mut result = build_test::parse_build_test_output(&combined, exit_code);
+
+        // Enrich error locations with tree-sitter scope context
+        if !result.error_locations.is_empty() {
+            result.enrich_with_scope(&self.project_root);
+        }
 
         // Build the structured output
         let mut parts = Vec::new();
