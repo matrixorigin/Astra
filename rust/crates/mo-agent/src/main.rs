@@ -1444,6 +1444,14 @@ async fn try_cloud_push_versioned(
     }
 
     if result.success {
+        if let Err(e) =
+            mo_agent_runtime::pipeline::persistence::save_synced_tool_health(profile_name, tool_health)
+        {
+            eprintln!(
+                "{}",
+                format!("  ⚠ Tool-health sync metadata not saved: {e}").dim()
+            );
+        }
         if let Some(v) = result.new_version {
             eprintln!("{}", format!("  ✓ Learning synced to cloud (v{})", v).dim());
             return Some(v);
@@ -1547,6 +1555,15 @@ async fn try_cloud_push_delta(
             calibrator,
         );
         *synced_tool_health_entries = tool_health_entries.to_vec();
+        if let Err(e) = mo_agent_runtime::pipeline::persistence::save_synced_tool_health(
+            profile_name,
+            synced_tool_health_entries,
+        ) {
+            eprintln!(
+                "{}",
+                format!("  ⚠ Tool-health sync metadata not saved: {e}").dim()
+            );
+        }
 
         if let Some(v) = result.new_version {
             eprintln!(
@@ -2097,6 +2114,8 @@ async fn run_chat_repl(
         // Load tool health for cross-session error budgets
         cross_session_health_entries =
             mo_agent_runtime::pipeline::persistence::load_tool_health(profile_name);
+        state.synced_tool_health_entries =
+            mo_agent_runtime::pipeline::persistence::load_synced_tool_health(profile_name);
         if !cross_session_health_entries.is_empty() {
             eprintln!(
                 "{}",
@@ -2143,7 +2162,9 @@ async fn run_chat_repl(
         try_cloud_pull_preferences(&mut state).await;
     }
     state.tool_health_entries = cross_session_health_entries.clone();
-    state.synced_tool_health_entries = cross_session_health_entries;
+    if state.synced_tool_health_entries.is_empty() {
+        state.synced_tool_health_entries = cross_session_health_entries;
+    }
 
     let profile_name_str = profile.unwrap_or("default").to_string();
     print_repl_banner(profile, &state);

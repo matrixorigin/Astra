@@ -91,6 +91,18 @@ pub struct ToolHealthEntry {
     pub last_updated_epoch: u64,
 }
 
+/// Local-only sync metadata for cross-session delta sync bookkeeping.
+///
+/// This is intentionally stored outside the main learning snapshot so it can
+/// track "what was last synced to cloud" without polluting the user-facing
+/// learning state persisted locally and in cloud.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LearningSyncMetadata {
+    /// Last successfully synced tool health baseline used for delta export.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synced_tool_health: Vec<ToolHealthEntry>,
+}
+
 impl Default for LearningSnapshot {
     fn default() -> Self {
         Self {
@@ -119,10 +131,22 @@ pub fn learning_path(profile: &str) -> PathBuf {
     learning_dir().join(format!("{profile}.json"))
 }
 
+/// Full path for a profile's local sync metadata file.
+pub fn learning_sync_metadata_path(profile: &str) -> PathBuf {
+    learning_dir().join(format!("{profile}.sync.json"))
+}
+
 /// Load a learning snapshot from disk. Returns `None` if the file doesn't exist
 /// or can't be parsed (graceful degradation — never blocks startup).
 pub fn load_snapshot(profile: &str) -> Option<LearningSnapshot> {
     let path = learning_path(profile);
+    let data = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+/// Load local sync metadata for a profile.
+pub fn load_sync_metadata(profile: &str) -> Option<LearningSyncMetadata> {
+    let path = learning_sync_metadata_path(profile);
     let data = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&data).ok()
 }
@@ -138,6 +162,33 @@ pub fn save_snapshot(profile: &str, snapshot: &LearningSnapshot) -> Result<(), S
     let json = serde_json::to_string_pretty(snapshot).map_err(|e| format!("serialize: {e}"))?;
 
     // Atomic write: tmp file + rename
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &json).map_err(|e| format!("write: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
+
+    Ok(())
+}
+
+/// Save local sync metadata atomically (write to tmp, rename).
+pub fn save_sync_metadata(profile: &str, metadata: &LearningSyncMetadata) -> Result<(), String> {
+    let path = learning_sync_metadata_path(profile);
+    save_sync_metadata_to(&path, metadata)
+}
+
+/// Load sync metadata from a custom path (for testing).
+pub fn load_sync_metadata_from(path: &Path) -> Option<LearningSyncMetadata> {
+    let data = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+/// Save sync metadata to a custom path (for testing).
+pub fn save_sync_metadata_to(path: &Path, metadata: &LearningSyncMetadata) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+    }
+
+    let json = serde_json::to_string_pretty(metadata).map_err(|e| format!("serialize: {e}"))?;
+
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &json).map_err(|e| format!("write: {e}"))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
@@ -311,6 +362,23 @@ pub fn load_tool_health(profile: &str) -> Vec<ToolHealthEntry> {
     load_snapshot(profile)
         .map(|s| s.tool_health)
         .unwrap_or_default()
+}
+
+/// Load the last successfully synced tool-health baseline for delta sync.
+pub fn load_synced_tool_health(profile: &str) -> Vec<ToolHealthEntry> {
+    load_sync_metadata(profile)
+        .map(|m| m.synced_tool_health)
+        .unwrap_or_default()
+}
+
+/// Save the last successfully synced tool-health baseline for delta sync.
+pub fn save_synced_tool_health(profile: &str, entries: &[ToolHealthEntry]) -> Result<(), String> {
+    save_sync_metadata(
+        profile,
+        &LearningSyncMetadata {
+            synced_tool_health: entries.to_vec(),
+        },
+    )
 }
 
 /// Load a snapshot from a custom path (for testing or server-side use).
@@ -871,6 +939,32 @@ mod tests {
         assert_eq!(loaded.tool_health.len(), 1);
         assert_eq!(loaded.tool_health[0].name, "github_ci_status");
         assert_eq!(loaded.tool_health[0].total_failures, 4);
+    }
+
+    #[test]
+    fn sync_metadata_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.sync.json");
+
+        let metadata = LearningSyncMetadata {
+            synced_tool_health: vec![ToolHealthEntry {
+                name: "bash".to_string(),
+                total_calls: 7,
+                total_failures: 2,
+                failure_rate: 2.0 / 7.0,
+                last_updated_epoch: 123,
+            }],
+        };
+        save_sync_metadata_to(&path, &metadata).unwrap();
+        let loaded = load_sync_metadata_from(&path).unwrap();
+        assert_eq!(loaded.synced_tool_health.len(), 1);
+        assert_eq!(loaded.synced_tool_health[0].name, "bash");
+    }
+
+    #[test]
+    fn missing_sync_metadata_returns_empty_tool_health_baseline() {
+        let baseline = load_synced_tool_health("missing-sync-metadata-profile-xyz");
+        assert!(baseline.is_empty());
     }
 
     // ── Delta Sync Tests ──
