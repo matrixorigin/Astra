@@ -237,6 +237,22 @@ impl ToolExecutor {
                 if let Some(fmt_note) = format_result {
                     result.push_str(&format!("\n{fmt_note}"));
                 }
+
+                // Scope context: show where in the code structure this edit landed
+                if let Some(lang) = super::code_intel::detect_language(&path) {
+                    let edit_line = content[..content.find(old_str).unwrap_or(0)]
+                        .matches('\n')
+                        .count()
+                        + 1;
+                    let scope = super::code_intel::scope_at_line(&new_content, lang, edit_line);
+                    if !scope.breadcrumbs.is_empty() {
+                        result.push_str(&format!(
+                            "\n📍 {}",
+                            scope.breadcrumbs.join(" > ")
+                        ));
+                    }
+                }
+
                 result
             }
             Err(e) => format!("Error writing file: {e}"),
@@ -344,6 +360,24 @@ impl ToolExecutor {
                 if let Some(fmt_note) = format_result {
                     result.push_str(&format!("\n{fmt_note}"));
                 }
+
+                // Scope context for the first edit location
+                if let Some(lang) = super::code_intel::detect_language(&path) {
+                    if let Some(first_old) = edits.first().and_then(|e| e.get("old_str")).and_then(Value::as_str) {
+                        let edit_line = content[..content.find(first_old).unwrap_or(0)]
+                            .matches('\n')
+                            .count()
+                            + 1;
+                        let scope = super::code_intel::scope_at_line(&working, lang, edit_line);
+                        if !scope.breadcrumbs.is_empty() {
+                            result.push_str(&format!(
+                                "\n📍 {}",
+                                scope.breadcrumbs.join(" > ")
+                            ));
+                        }
+                    }
+                }
+
                 result
             }
             Err(e) => format!("Error writing file: {e}"),
@@ -1778,5 +1812,83 @@ type Handler interface {
         let path = std::path::PathBuf::from("f.txt");
         let diff = super::unified_diff(s, s, &path);
         assert!(diff.contains("(no changes)"));
+    }
+
+    // ─── scope context in str_replace ───────────────────────────────────
+
+    #[test]
+    fn str_replace_shows_scope_context_for_rust() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("lib.rs");
+        std::fs::write(
+            &file,
+            "struct Foo {\n    x: i32,\n}\n\nimpl Foo {\n    fn bar(&self) -> i32 {\n        self.x + 1\n    }\n}\n",
+        )
+        .unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        let result = exe.str_replace(&json!({
+            "path": "lib.rs",
+            "old_str": "self.x + 1",
+            "new_str": "self.x + 2"
+        }));
+        assert!(result.contains("Replaced successfully"), "result: {result}");
+        assert!(result.contains("📍"), "should show scope icon: {result}");
+        assert!(result.contains("bar"), "should mention the function: {result}");
+    }
+
+    #[test]
+    fn str_replace_no_scope_for_unsupported_language() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("config.toml");
+        std::fs::write(&file, "[package]\nname = \"old\"\n").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        let result = exe.str_replace(&json!({
+            "path": "config.toml",
+            "old_str": "\"old\"",
+            "new_str": "\"new\""
+        }));
+        assert!(result.contains("Replaced successfully"), "result: {result}");
+        assert!(!result.contains("📍"), "should not show scope for .toml: {result}");
+    }
+
+    #[test]
+    fn str_replace_scope_for_python() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("app.py");
+        std::fs::write(
+            &file,
+            "class Handler:\n    def process(self, data):\n        return data.strip()\n",
+        )
+        .unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        let result = exe.str_replace(&json!({
+            "path": "app.py",
+            "old_str": "data.strip()",
+            "new_str": "data.strip().lower()"
+        }));
+        assert!(result.contains("📍"), "should show scope: {result}");
+        assert!(result.contains("process"), "should mention function: {result}");
+    }
+
+    #[test]
+    fn multi_edit_shows_scope_context() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("main.rs");
+        std::fs::write(
+            &file,
+            "fn main() {\n    let x = 1;\n    let y = 2;\n}\n",
+        )
+        .unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        let result = exe.multi_edit(&json!({
+            "path": "main.rs",
+            "edits": [
+                {"old_str": "let x = 1", "new_str": "let x = 10"},
+                {"old_str": "let y = 2", "new_str": "let y = 20"}
+            ]
+        }));
+        assert!(result.contains("Applied 2 edit(s)"), "result: {result}");
+        assert!(result.contains("📍"), "should show scope: {result}");
+        assert!(result.contains("main"), "should mention fn main: {result}");
     }
 }
