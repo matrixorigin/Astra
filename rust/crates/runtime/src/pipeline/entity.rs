@@ -648,7 +648,12 @@ mod tests {
     #[test]
     fn alias_resolves_to_canonical() {
         let mut graph = EntityGraph::new();
-        graph.learn("matrixorigin", DomainHint::GitHub, &["gh_search".into()], None);
+        graph.learn(
+            "matrixorigin",
+            DomainHint::GitHub,
+            &["gh_search".into()],
+            None,
+        );
         graph.add_alias("mo", "matrixorigin");
 
         assert_eq!(graph.domain_for("mo"), Some(DomainHint::GitHub));
@@ -863,11 +868,21 @@ mod tests {
         let mut graph = EntityGraph::new();
 
         // First learn with high feedback
-        graph.learn("good_entity", DomainHint::GitHub, &["tool1".into()], Some(80));
+        graph.learn(
+            "good_entity",
+            DomainHint::GitHub,
+            &["tool1".into()],
+            Some(80),
+        );
         let _conf_high = graph.confidence_for("good_entity");
 
         // Then learn with low feedback (same entity, another observation)
-        graph.learn("good_entity", DomainHint::GitHub, &["tool2".into()], Some(20));
+        graph.learn(
+            "good_entity",
+            DomainHint::GitHub,
+            &["tool2".into()],
+            Some(20),
+        );
         let _conf_low_after = graph.confidence_for("good_entity");
 
         // Create another entity learned only with low feedback
@@ -880,8 +895,12 @@ mod tests {
         graph.learn("great_entity", DomainHint::Git, &["tool2".into()], Some(90));
         let conf_great = graph.confidence_for("great_entity");
 
-        assert!(conf_great > conf_bad,
-            "High feedback should yield higher confidence: {} > {}", conf_great, conf_bad);
+        assert!(
+            conf_great > conf_bad,
+            "High feedback should yield higher confidence: {} > {}",
+            conf_great,
+            conf_bad
+        );
     }
 
     #[test]
@@ -893,7 +912,11 @@ mod tests {
 
         let conf = graph.confidence_for("entity_a");
         // Normal asymptotic: 1.0 - 1.0/(1+2) ≈ 0.667
-        assert!((conf - 0.667).abs() < 0.1, "Should use normal confidence formula, got {}", conf);
+        assert!(
+            (conf - 0.667).abs() < 0.1,
+            "Should use normal confidence formula, got {}",
+            conf
+        );
     }
 
     // ── Time Decay Tests ──
@@ -907,7 +930,10 @@ mod tests {
 
         let raw = entity.confidence;
         let decayed = entity.decayed_confidence();
-        assert!((raw - decayed).abs() < 0.001, "Fresh entity should have no decay");
+        assert!(
+            (raw - decayed).abs() < 0.001,
+            "Fresh entity should have no decay"
+        );
     }
 
     #[test]
@@ -921,7 +947,11 @@ mod tests {
         let raw = entity.confidence;
         let decayed = entity.decayed_confidence();
         let ratio = decayed / raw;
-        assert!((ratio - 0.5).abs() < 0.1, "At half-life, confidence ratio should be ~0.5, got {}", ratio);
+        assert!(
+            (ratio - 0.5).abs() < 0.1,
+            "At half-life, confidence ratio should be ~0.5, got {}",
+            ratio
+        );
     }
 
     #[test]
@@ -932,7 +962,10 @@ mod tests {
 
         let raw_conf = entity.confidence;
         let decayed = entity.decayed_confidence();
-        assert!((raw_conf - decayed).abs() < 0.001, "Recent entity should have same raw and decayed confidence");
+        assert!(
+            (raw_conf - decayed).abs() < 0.001,
+            "Recent entity should have same raw and decayed confidence"
+        );
     }
 
     #[test]
@@ -947,8 +980,16 @@ mod tests {
         let decayed = entity.decayed_confidence();
         let expected_decayed = raw_conf * 0.5; // Approximately
 
-        assert!(decayed < raw_conf, "Stale entity decayed confidence should be less than raw");
-        assert!((decayed - expected_decayed).abs() < 0.1, "Expected ~{}, got {}", expected_decayed, decayed);
+        assert!(
+            decayed < raw_conf,
+            "Stale entity decayed confidence should be less than raw"
+        );
+        assert!(
+            (decayed - expected_decayed).abs() < 0.1,
+            "Expected ~{}, got {}",
+            expected_decayed,
+            decayed
+        );
     }
 
     #[test]
@@ -965,7 +1006,11 @@ mod tests {
 
         let conf = graph.confidence_for("fresh_entity");
         // Should be significantly less than normal due to decay
-        assert!(conf < 0.5, "Stale entity confidence should be reduced by decay, got {}", conf);
+        assert!(
+            conf < 0.5,
+            "Stale entity confidence should be reduced by decay, got {}",
+            conf
+        );
     }
 
     #[test]
@@ -974,6 +1019,9 @@ mod tests {
         let old_ts = entity.last_observed_at;
         std::thread::sleep(std::time::Duration::from_millis(1100)); // Wait >1 second
         entity.touch();
-        assert!(entity.last_observed_at > old_ts, "touch() should update timestamp");
+        assert!(
+            entity.last_observed_at > old_ts,
+            "touch() should update timestamp"
+        );
     }
 }

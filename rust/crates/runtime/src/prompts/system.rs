@@ -1,6 +1,5 @@
 /// Agent persona / base identity.
-pub const SYSTEM_PROMPT_BASE: &str =
-    "You are an expert software engineer. You write clean, correct code and use tools precisely to solve tasks.";
+pub const SYSTEM_PROMPT_BASE: &str = "You are an expert software engineer. You write clean, correct code and use tools precisely to solve tasks.";
 
 /// Confidence threshold below which the system prompt includes an advisory
 /// telling the LLM to ask for clarification rather than guessing with wrong tools.
@@ -35,7 +34,8 @@ pub fn build_main_system_prompt(
     let has_glob = tool_names.contains(&"glob");
     let has_grep = tool_names.contains(&"grep");
     let has_read_file = tool_names.contains(&"read_file");
-    let has_code_nav = tool_names.contains(&"find_definition") || tool_names.contains(&"find_references");
+    let has_code_nav =
+        tool_names.contains(&"find_definition") || tool_names.contains(&"find_references");
     let has_call_graph = tool_names.contains(&"call_graph");
     let has_multi_edit = tool_names.contains(&"multi_edit");
     let has_build_test = tool_names.contains(&"run_build_test");
@@ -134,9 +134,7 @@ pub fn build_main_system_prompt(
         );
     }
     if tool_names.contains(&"dead_code") {
-        prompt.push_str(
-            "- **dead_code**: Find unused symbols before cleanup.\n",
-        );
+        prompt.push_str("- **dead_code**: Find unused symbols before cleanup.\n");
     }
     if tool_names.contains(&"extract_members") {
         prompt.push_str(
@@ -144,9 +142,7 @@ pub fn build_main_system_prompt(
         );
     }
     if tool_names.contains(&"type_hierarchy") {
-        prompt.push_str(
-            "- **type_hierarchy**: Who implements trait / what traits a type has.\n",
-        );
+        prompt.push_str("- **type_hierarchy**: Who implements trait / what traits a type has.\n");
     }
 
     // ── Editing strategy guidance ──
@@ -1154,15 +1150,27 @@ mod tests {
             0.5,
             Some("implementation"),
         );
-        assert!(p.contains("Code Navigation"), "should include code nav section");
-        assert!(p.contains("find_definition"), "should mention find_definition");
-        assert!(p.contains("tree-sitter"), "should mention tree-sitter advantage");
+        assert!(
+            p.contains("Code Navigation"),
+            "should include code nav section"
+        );
+        assert!(
+            p.contains("find_definition"),
+            "should mention find_definition"
+        );
+        assert!(
+            p.contains("tree-sitter"),
+            "should mention tree-sitter advantage"
+        );
     }
 
     #[test]
     fn code_nav_guidance_absent_without_tools() {
         let p = build_main_system_prompt(&["bash", "read_file"], "", 0.5, Some("implementation"));
-        assert!(!p.contains("Code Navigation"), "should NOT include code nav without tools");
+        assert!(
+            !p.contains("Code Navigation"),
+            "should NOT include code nav without tools"
+        );
     }
 
     #[test]
@@ -1173,15 +1181,24 @@ mod tests {
             0.5,
             Some("implementation"),
         );
-        assert!(p.contains("Build & Test Loop"), "should include build/test section");
+        assert!(
+            p.contains("Build & Test Loop"),
+            "should include build/test section"
+        );
         assert!(p.contains("run_build_test"), "should mention the tool");
-        assert!(p.contains("structured errors"), "should describe structured output");
+        assert!(
+            p.contains("structured errors"),
+            "should describe structured output"
+        );
     }
 
     #[test]
     fn build_test_guidance_absent_without_tool() {
         let p = build_main_system_prompt(&["bash"], "", 0.5, Some("implementation"));
-        assert!(!p.contains("Build & Test Loop"), "should NOT include build/test without tool");
+        assert!(
+            !p.contains("Build & Test Loop"),
+            "should NOT include build/test without tool"
+        );
     }
 
     #[test]
@@ -1192,16 +1209,25 @@ mod tests {
             0.5,
             Some("implementation"),
         );
-        assert!(p.contains("Git Workflow"), "should include git workflow section");
+        assert!(
+            p.contains("Git Workflow"),
+            "should include git workflow section"
+        );
         assert!(p.contains("git_commit"), "should mention git_commit");
         assert!(p.contains("git_stash"), "should mention git_stash");
-        assert!(p.contains("git_checkout_file"), "should mention git_checkout_file");
+        assert!(
+            p.contains("git_checkout_file"),
+            "should mention git_checkout_file"
+        );
     }
 
     #[test]
     fn git_mutations_guidance_absent_without_tools() {
         let p = build_main_system_prompt(&["git_diff", "git_log"], "", 0.5, None);
-        assert!(!p.contains("Git Workflow"), "should NOT include git mutations without commit tool");
+        assert!(
+            !p.contains("Git Workflow"),
+            "should NOT include git mutations without commit tool"
+        );
     }
 
     #[test]
@@ -1212,9 +1238,21 @@ mod tests {
             0.5,
             Some("implementation"),
         );
-        assert!(p.contains("find_definition"), "strategy should reference find_definition");
-        assert!(p.contains("run_build_test"), "strategy should reference run_build_test");
-        assert!(p.contains("git_commit"), "strategy should reference git_commit");
-        assert!(p.contains("str_replace auto-formats"), "strategy should mention auto-format");
+        assert!(
+            p.contains("find_definition"),
+            "strategy should reference find_definition"
+        );
+        assert!(
+            p.contains("run_build_test"),
+            "strategy should reference run_build_test"
+        );
+        assert!(
+            p.contains("git_commit"),
+            "strategy should reference git_commit"
+        );
+        assert!(
+            p.contains("str_replace auto-formats"),
+            "strategy should mention auto-format"
+        );
     }
 }

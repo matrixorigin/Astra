@@ -1513,11 +1513,7 @@ pub fn git_stash(project_root: &Path, args: &Value) -> String {
             let idx = args.get("index").and_then(Value::as_u64).unwrap_or(0);
             cmd.arg("stash").arg("drop").arg(format!("stash@{{{idx}}}"));
         }
-        _ => {
-            return format!(
-                "Error: unknown stash action '{action}'. Use: push, pop, list, drop"
-            )
-        }
+        _ => return format!("Error: unknown stash action '{action}'. Use: push, pop, list, drop"),
     }
 
     match cmd.output() {
@@ -2371,10 +2367,16 @@ mod tests {
     fn git_commit_rejects_empty_message() {
         let root = repo_root();
         let result = git_commit(&root, &json!({}));
-        assert!(result.starts_with("Error:"), "should reject missing message: {result}");
+        assert!(
+            result.starts_with("Error:"),
+            "should reject missing message: {result}"
+        );
 
         let result2 = git_commit(&root, &json!({"message": "  "}));
-        assert!(result2.starts_with("Error:"), "should reject blank message: {result2}");
+        assert!(
+            result2.starts_with("Error:"),
+            "should reject blank message: {result2}"
+        );
     }
 
     #[test]
@@ -2382,7 +2384,10 @@ mod tests {
         let root = repo_root();
         let long_msg = "x".repeat(5001);
         let result = git_commit(&root, &json!({"message": long_msg}));
-        assert!(result.contains("too long"), "should reject over-long message: {result}");
+        assert!(
+            result.contains("too long"),
+            "should reject over-long message: {result}"
+        );
     }
 
     #[test]
@@ -2390,12 +2395,12 @@ mod tests {
         // In a clean repo with nothing staged, commit should say "Nothing to commit"
         // or succeed if there are pending changes — either is fine, just no panic
         let root = repo_root();
-        let result = git_commit(&root, &json!({"message": "test commit", "files": ["nonexistent_file_xyz.txt"]}));
-        // Should either succeed or report a meaningful error
-        assert!(
-            !result.is_empty(),
-            "should return some output"
+        let result = git_commit(
+            &root,
+            &json!({"message": "test commit", "files": ["nonexistent_file_xyz.txt"]}),
         );
+        // Should either succeed or report a meaningful error
+        assert!(!result.is_empty(), "should return some output");
     }
 
     // ─── git_stash tests ────────────────────────────────────────────────────
@@ -2404,14 +2409,20 @@ mod tests {
     fn git_stash_requires_action() {
         let root = repo_root();
         let result = git_stash(&root, &json!({}));
-        assert!(result.starts_with("Error:"), "should require action: {result}");
+        assert!(
+            result.starts_with("Error:"),
+            "should require action: {result}"
+        );
     }
 
     #[test]
     fn git_stash_rejects_unknown_action() {
         let root = repo_root();
         let result = git_stash(&root, &json!({"action": "fly"}));
-        assert!(result.contains("unknown stash action"), "should reject unknown: {result}");
+        assert!(
+            result.contains("unknown stash action"),
+            "should reject unknown: {result}"
+        );
     }
 
     #[test]
@@ -2431,27 +2442,48 @@ mod tests {
     fn git_checkout_file_requires_path() {
         let root = repo_root();
         let result = git_checkout_file(&root, &json!({}));
-        assert!(result.starts_with("Error:"), "should require path: {result}");
+        assert!(
+            result.starts_with("Error:"),
+            "should require path: {result}"
+        );
 
         let result2 = git_checkout_file(&root, &json!({"path": ""}));
-        assert!(result2.starts_with("Error:"), "should reject empty path: {result2}");
+        assert!(
+            result2.starts_with("Error:"),
+            "should reject empty path: {result2}"
+        );
     }
 
     #[test]
     fn git_checkout_file_rejects_path_traversal() {
         let root = repo_root();
         let result = git_checkout_file(&root, &json!({"path": "../../../etc/passwd"}));
-        assert!(result.contains("path traversal"), "should reject traversal: {result}");
+        assert!(
+            result.contains("path traversal"),
+            "should reject traversal: {result}"
+        );
     }
 
     #[test]
     fn git_checkout_file_rejects_dangerous_ref() {
         let root = repo_root();
-        let result = git_checkout_file(&root, &json!({"path": "README.md", "ref": "HEAD; rm -rf /"}));
-        assert!(result.contains("invalid ref"), "should reject dangerous ref: {result}");
+        let result = git_checkout_file(
+            &root,
+            &json!({"path": "README.md", "ref": "HEAD; rm -rf /"}),
+        );
+        assert!(
+            result.contains("invalid ref"),
+            "should reject dangerous ref: {result}"
+        );
 
-        let result2 = git_checkout_file(&root, &json!({"path": "README.md", "ref": "main|cat /etc/passwd"}));
-        assert!(result2.contains("invalid ref"), "should reject pipe ref: {result2}");
+        let result2 = git_checkout_file(
+            &root,
+            &json!({"path": "README.md", "ref": "main|cat /etc/passwd"}),
+        );
+        assert!(
+            result2.contains("invalid ref"),
+            "should reject pipe ref: {result2}"
+        );
     }
 
     #[test]

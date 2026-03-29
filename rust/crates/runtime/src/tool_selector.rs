@@ -264,7 +264,14 @@ impl TfIdfSelector {
         if let Some(pl) = &self.pattern_library
             && let Ok(mut lib) = pl.lock()
         {
-            lib.record_outcome(tools_used, task_type, domain, success, quality, user_feedback_score);
+            lib.record_outcome(
+                tools_used,
+                task_type,
+                domain,
+                success,
+                quality,
+                user_feedback_score,
+            );
         }
 
         // Record calibration data
@@ -272,7 +279,13 @@ impl TfIdfSelector {
             && let Ok(mut cal) = pc.lock()
         {
             let intent = format!("{task_type:?}").to_lowercase();
-            cal.record(&intent, domain, task_type, was_corrected, user_feedback_score);
+            cal.record(
+                &intent,
+                domain,
+                task_type,
+                was_corrected,
+                user_feedback_score,
+            );
         }
     }
 }
@@ -814,8 +827,7 @@ pub fn prune_schema(mut schema: Value, level: PruneLevel) -> Value {
             }
         }
         PruneLevel::Medium | PruneLevel::Aggressive => {
-            func.as_object_mut()
-                .map(|m| m.remove("description"));
+            func.as_object_mut().map(|m| m.remove("description"));
         }
         PruneLevel::None => {}
     }
@@ -1662,7 +1674,8 @@ mod tests {
                     TaskType::Fetch,
                     Some(DomainHint::GitHub),
                     true,
-                    0.9, None,
+                    0.9,
+                    None,
                 );
             }
         }
@@ -1814,7 +1827,8 @@ mod tests {
                 Some(DomainHint::GitHub),
                 true,
                 0.9,
-                false, None,
+                false,
+                None,
             );
         }
 
@@ -1856,7 +1870,8 @@ mod tests {
                     TaskType::Code,
                     Some(DomainHint::Code),
                     true,
-                    0.85, None,
+                    0.85,
+                    None,
                 );
             }
         }
@@ -1903,7 +1918,8 @@ mod tests {
             Some(DomainHint::GitHub),
             false, // FAILED
             0.2,
-            false, None,
+            false,
+            None,
         );
 
         // Entity graph should NOT learn from failures
@@ -1962,7 +1978,8 @@ mod tests {
             Some(DomainHint::GitHub),
             true,
             0.8,
-            false, None,
+            false,
+            None,
         );
 
         // After: entity graph learned the association
@@ -1992,7 +2009,8 @@ mod tests {
             Some(DomainHint::GitHub),
             true,
             0.7,
-            false, None,
+            false,
+            None,
         );
 
         // Verify it forwarded to fallback's TfIdfSelector
@@ -2016,7 +2034,8 @@ mod tests {
             None,
             true,
             0.5,
-            false, None,
+            false,
+            None,
         );
     }
 
@@ -2506,13 +2525,19 @@ mod tests {
         let pruned = prune_schema(schema, PruneLevel::Light);
 
         let desc = pruned["function"]["description"].as_str().unwrap();
-        assert!(desc.len() <= 85, "description should be truncated, got {}", desc.len());
+        assert!(
+            desc.len() <= 85,
+            "description should be truncated, got {}",
+            desc.len()
+        );
         assert!(desc.ends_with('…'));
 
         // Param descriptions removed
-        assert!(pruned["function"]["parameters"]["properties"]["path"]
-            .get("description")
-            .is_none());
+        assert!(
+            pruned["function"]["parameters"]["properties"]["path"]
+                .get("description")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2520,11 +2545,15 @@ mod tests {
         let schema = make_test_schema();
         let pruned = prune_schema(schema, PruneLevel::Medium);
 
-        assert!(pruned["function"].get("description").is_none(),
-            "description should be removed at medium level");
+        assert!(
+            pruned["function"].get("description").is_none(),
+            "description should be removed at medium level"
+        );
 
         // All params still present (optional + required)
-        let props = pruned["function"]["parameters"]["properties"].as_object().unwrap();
+        let props = pruned["function"]["parameters"]["properties"]
+            .as_object()
+            .unwrap();
         assert_eq!(props.len(), 3, "all params should remain at medium level");
 
         // Param descriptions removed
@@ -2536,11 +2565,15 @@ mod tests {
         let schema = make_test_schema();
         let pruned = prune_schema(schema, PruneLevel::Aggressive);
 
-        assert!(pruned["function"].get("description").is_none(),
-            "description should be removed");
+        assert!(
+            pruned["function"].get("description").is_none(),
+            "description should be removed"
+        );
 
         // Only required params remain
-        let props = pruned["function"]["parameters"]["properties"].as_object().unwrap();
+        let props = pruned["function"]["parameters"]["properties"]
+            .as_object()
+            .unwrap();
         assert_eq!(props.len(), 1, "only required param should remain");
         assert!(props.contains_key("path"));
         assert!(!props.contains_key("start_line"));
@@ -2578,12 +2611,16 @@ mod tests {
 
         // No pressure: schemas have descriptions
         let (schemas_0, _) = resolve_schemas_with_pressure(&registry, &names, 0.0);
-        let has_desc = schemas_0.iter().all(|s| s["function"].get("description").is_some());
+        let has_desc = schemas_0
+            .iter()
+            .all(|s| s["function"].get("description").is_some());
         assert!(has_desc, "zero pressure should keep descriptions");
 
         // Medium pressure: descriptions removed
         let (schemas_06, _) = resolve_schemas_with_pressure(&registry, &names, 0.6);
-        let no_desc = schemas_06.iter().all(|s| s["function"].get("description").is_none());
+        let no_desc = schemas_06
+            .iter()
+            .all(|s| s["function"].get("description").is_none());
         assert!(no_desc, "medium pressure should remove descriptions");
     }
 
@@ -2602,23 +2639,41 @@ mod tests {
         let aggressive_size = serde_json::to_string(&aggressive).unwrap().len();
 
         // Each level should be strictly smaller than the previous
-        assert!(light_size < full_size,
-            "light ({}) should be smaller than full ({})", light_size, full_size);
-        assert!(medium_size < light_size,
-            "medium ({}) should be smaller than light ({})", medium_size, light_size);
-        assert!(aggressive_size < medium_size,
-            "aggressive ({}) should be smaller than medium ({})", aggressive_size, medium_size);
+        assert!(
+            light_size < full_size,
+            "light ({}) should be smaller than full ({})",
+            light_size,
+            full_size
+        );
+        assert!(
+            medium_size < light_size,
+            "medium ({}) should be smaller than light ({})",
+            medium_size,
+            light_size
+        );
+        assert!(
+            aggressive_size < medium_size,
+            "aggressive ({}) should be smaller than medium ({})",
+            aggressive_size,
+            medium_size
+        );
 
         // Aggressive should save at least 50%
         let savings = (full_size - aggressive_size) as f64 / full_size as f64;
-        assert!(savings >= 0.50,
-            "aggressive pruning should save >=50%, got {:.0}%", savings * 100.0);
+        assert!(
+            savings >= 0.50,
+            "aggressive pruning should save >=50%, got {:.0}%",
+            savings * 100.0
+        );
     }
 
     #[test]
     fn truncate_at_boundary_works() {
         assert_eq!(truncate_at_boundary("hello world", 20), "hello world");
-        assert_eq!(truncate_at_boundary("hello world foo bar baz", 12), "hello world…");
+        assert_eq!(
+            truncate_at_boundary("hello world foo bar baz", 12),
+            "hello world…"
+        );
         assert_eq!(truncate_at_boundary("abcdefghij", 5), "abcde…");
     }
 

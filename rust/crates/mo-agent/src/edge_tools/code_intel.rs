@@ -910,7 +910,12 @@ pub struct CallSite {
 
 /// Extract function/method calls within the body of a given symbol range.
 /// Returns a list of call sites found between `start_line` and `end_line`.
-pub fn extract_calls(source: &str, lang: Language, start_line: usize, end_line: usize) -> Vec<CallSite> {
+pub fn extract_calls(
+    source: &str,
+    lang: Language,
+    start_line: usize,
+    end_line: usize,
+) -> Vec<CallSite> {
     let mut parser = tree_sitter::Parser::new();
     let language = match lang {
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
@@ -932,7 +937,14 @@ pub fn extract_calls(source: &str, lang: Language, start_line: usize, end_line: 
     };
 
     let mut calls = Vec::new();
-    collect_calls(tree.root_node(), source, start_line, end_line, lang, &mut calls);
+    collect_calls(
+        tree.root_node(),
+        source,
+        start_line,
+        end_line,
+        lang,
+        &mut calls,
+    );
     // Deduplicate by (callee, line)
     calls.sort_by(|a, b| a.line.cmp(&b.line).then(a.callee.cmp(&b.callee)));
     calls.dedup_by(|a, b| a.line == b.line && a.callee == b.callee);
@@ -961,7 +973,9 @@ fn collect_calls(
     let is_call = match lang {
         Language::Rust => kind == "call_expression" || kind == "macro_invocation",
         Language::Python => kind == "call",
-        Language::TypeScript | Language::JavaScript => kind == "call_expression" || kind == "new_expression",
+        Language::TypeScript | Language::JavaScript => {
+            kind == "call_expression" || kind == "new_expression"
+        }
         Language::Go => kind == "call_expression",
         Language::Java => kind == "method_invocation" || kind == "object_creation_expression",
         Language::C | Language::Cpp => kind == "call_expression",
@@ -1190,10 +1204,7 @@ pub fn identifier_at_position(
             || kind == "method_name"
             || kind == "name"
         {
-            let text = current
-                .utf8_text(source.as_bytes())
-                .ok()?
-                .to_string();
+            let text = current.utf8_text(source.as_bytes()).ok()?.to_string();
             return Some((text, kind.to_string()));
         }
         match current.parent() {
@@ -1299,7 +1310,10 @@ pub fn extract_doc_comment(source: &str, lang: Language, symbol_line: usize) -> 
                 let line = lines[i].trim();
                 if line.starts_with("/**") || line.starts_with("/*") {
                     // Strip the opening marker
-                    let content = line.trim_start_matches("/**").trim_start_matches("/*").trim();
+                    let content = line
+                        .trim_start_matches("/**")
+                        .trim_start_matches("/*")
+                        .trim();
                     let content = content.trim_end_matches("*/").trim();
                     if !content.is_empty() {
                         block_lines.push(content.to_string());
@@ -1310,7 +1324,9 @@ pub fn extract_doc_comment(source: &str, lang: Language, symbol_line: usize) -> 
                 // Strip leading * and trailing */
                 let content = line.trim_start_matches('*').trim_end_matches("*/").trim();
                 block_lines.push(content.to_string());
-                if i == 0 { break; }
+                if i == 0 {
+                    break;
+                }
                 i -= 1;
             }
         }
@@ -1319,7 +1335,9 @@ pub fn extract_doc_comment(source: &str, lang: Language, symbol_line: usize) -> 
     // Walk backward collecting single-line comments
     i = start_idx;
     loop {
-        if i >= lines.len() { break; }
+        if i >= lines.len() {
+            break;
+        }
         let line = lines[i].trim();
 
         // Check for doc comment patterns by language
@@ -1368,7 +1386,9 @@ pub fn extract_doc_comment(source: &str, lang: Language, symbol_line: usize) -> 
             break;
         }
 
-        if i == 0 { break; }
+        if i == 0 {
+            break;
+        }
         i -= 1;
     }
 
@@ -1393,10 +1413,17 @@ fn extract_python_docstring(lines: &[&str], symbol_line: usize) -> Option<String
 
     let first_body = lines[body_start].trim();
     if first_body.starts_with("\"\"\"") || first_body.starts_with("'''") {
-        let quote = if first_body.starts_with("\"\"\"") { "\"\"\"" } else { "'''" };
+        let quote = if first_body.starts_with("\"\"\"") {
+            "\"\"\""
+        } else {
+            "'''"
+        };
         // Single-line docstring
         if first_body.ends_with(quote) && first_body.len() > 6 {
-            let content = first_body.trim_start_matches(quote).trim_end_matches(quote).trim();
+            let content = first_body
+                .trim_start_matches(quote)
+                .trim_end_matches(quote)
+                .trim();
             return Some(content.to_string());
         }
         // Multi-line docstring
@@ -1576,7 +1603,11 @@ fn find_type_node_at_line(
             "type_alias_declaration",
         ],
         Language::Go => &["type_declaration", "type_spec"],
-        Language::Java => &["class_declaration", "interface_declaration", "enum_declaration"],
+        Language::Java => &[
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+        ],
         _ => &[],
     };
 
@@ -1618,8 +1649,8 @@ fn extract_rust_members(node: tree_sitter::Node, source: &str) -> Vec<Member> {
                 for field in child.children(&mut fc) {
                     if field.kind() == "field_declaration" {
                         let vis = extract_rust_visibility(field, source);
-                        let name = get_child_text(field, "field_identifier", source)
-                            .unwrap_or_default();
+                        let name =
+                            get_child_text(field, "field_identifier", source).unwrap_or_default();
                         let type_ann = get_child_text(field, "type_identifier", source)
                             .or_else(|| get_child_by_kind_text(field, source))
                             .unwrap_or_default();
@@ -1638,8 +1669,8 @@ fn extract_rust_members(node: tree_sitter::Node, source: &str) -> Vec<Member> {
                 let mut vc = child.walk();
                 for variant in child.children(&mut vc) {
                     if variant.kind() == "enum_variant" {
-                        let name = get_child_text(variant, "identifier", source)
-                            .unwrap_or_default();
+                        let name =
+                            get_child_text(variant, "identifier", source).unwrap_or_default();
                         members.push(Member {
                             name,
                             kind: "variant".to_string(),
@@ -1656,8 +1687,7 @@ fn extract_rust_members(node: tree_sitter::Node, source: &str) -> Vec<Member> {
                 let mut dc = child.walk();
                 for item in child.children(&mut dc) {
                     if item.kind() == "function_item" || item.kind() == "function_signature_item" {
-                        let name = get_child_text(item, "identifier", source)
-                            .unwrap_or_default();
+                        let name = get_child_text(item, "identifier", source).unwrap_or_default();
                         let sig = get_signature_line(item, source);
                         members.push(Member {
                             name,
@@ -1695,12 +1725,7 @@ fn get_child_by_kind_text(node: tree_sitter::Node, source: &str) -> Option<Strin
     for child in node.children(&mut cursor) {
         let k = child.kind();
         if k.ends_with("_type") || k == "generic_type" || k == "scoped_type_identifier" {
-            return Some(
-                child
-                    .utf8_text(source.as_bytes())
-                    .ok()?
-                    .to_string(),
-            );
+            return Some(child.utf8_text(source.as_bytes()).ok()?.to_string());
         }
     }
     None
@@ -1716,8 +1741,7 @@ fn extract_python_members(node: tree_sitter::Node, source: &str) -> Vec<Member> 
             for stmt in child.children(&mut bc) {
                 match stmt.kind() {
                     "function_definition" => {
-                        let name = get_child_text(stmt, "identifier", source)
-                            .unwrap_or_default();
+                        let name = get_child_text(stmt, "identifier", source).unwrap_or_default();
                         let sig = get_signature_line(stmt, source);
                         members.push(Member {
                             name,
@@ -1746,10 +1770,7 @@ fn extract_python_members(node: tree_sitter::Node, source: &str) -> Vec<Member> 
                             } else {
                                 (rest.to_string(), String::new())
                             };
-                            if !name.is_empty()
-                                && !name.contains(' ')
-                                && !name.starts_with('#')
-                            {
+                            if !name.is_empty() && !name.contains(' ') && !name.starts_with('#') {
                                 members.push(Member {
                                     name,
                                     kind: "property".to_string(),
@@ -1773,15 +1794,16 @@ fn extract_ts_members(node: tree_sitter::Node, source: &str) -> Vec<Member> {
     let mut members = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "class_body" || child.kind() == "interface_body"
+        if child.kind() == "class_body"
+            || child.kind() == "interface_body"
             || child.kind() == "object_type"
         {
             let mut bc = child.walk();
             for item in child.children(&mut bc) {
                 match item.kind() {
                     "method_definition" | "method_signature" => {
-                        let name = get_child_text(item, "property_identifier", source)
-                            .unwrap_or_default();
+                        let name =
+                            get_child_text(item, "property_identifier", source).unwrap_or_default();
                         let sig = get_signature_line(item, source);
                         members.push(Member {
                             name,
@@ -1793,8 +1815,8 @@ fn extract_ts_members(node: tree_sitter::Node, source: &str) -> Vec<Member> {
                         });
                     }
                     "public_field_definition" | "property_signature" => {
-                        let name = get_child_text(item, "property_identifier", source)
-                            .unwrap_or_default();
+                        let name =
+                            get_child_text(item, "property_identifier", source).unwrap_or_default();
                         let type_ann = get_child_text(item, "type_annotation", source)
                             .map(|t| t.trim_start_matches(':').trim().to_string())
                             .unwrap_or_default();
@@ -1845,8 +1867,9 @@ fn extract_go_members(node: tree_sitter::Node, source: &str) -> Vec<Member> {
                                 let mut flc = field_list.walk();
                                 for field in field_list.children(&mut flc) {
                                     if field.kind() == "field_declaration" {
-                                        let name = get_child_text(field, "field_identifier", source)
-                                            .unwrap_or_default();
+                                        let name =
+                                            get_child_text(field, "field_identifier", source)
+                                                .unwrap_or_default();
                                         let type_ann = field
                                             .utf8_text(source.as_bytes())
                                             .unwrap_or_default()
@@ -1874,15 +1897,25 @@ fn extract_go_members(node: tree_sitter::Node, source: &str) -> Vec<Member> {
                     "interface_type" => {
                         let mut ic = type_child.walk();
                         for method_list in type_child.children(&mut ic) {
-                            if method_list.kind() == "method_spec_list" || method_list.kind() == "method_spec" {
+                            if method_list.kind() == "method_spec_list"
+                                || method_list.kind() == "method_spec"
+                            {
                                 let text = method_list
                                     .utf8_text(source.as_bytes())
                                     .unwrap_or_default()
                                     .trim()
                                     .to_string();
-                                if !text.is_empty() && !text.starts_with('{') && !text.starts_with('}') {
+                                if !text.is_empty()
+                                    && !text.starts_with('{')
+                                    && !text.starts_with('}')
+                                {
                                     members.push(Member {
-                                        name: text.split('(').next().unwrap_or("").trim().to_string(),
+                                        name: text
+                                            .split('(')
+                                            .next()
+                                            .unwrap_or("")
+                                            .trim()
+                                            .to_string(),
                                         kind: "method".to_string(),
                                         type_annotation: text,
                                         line: method_list.start_position().row + 1,
@@ -1944,9 +1977,7 @@ fn collect_rust_impls(
     for child in node.children(&mut cursor) {
         if child.kind() == "impl_item" {
             // Check if this is `impl Trait for Type`
-            let text = child
-                .utf8_text(source.as_bytes())
-                .unwrap_or_default();
+            let text = child.utf8_text(source.as_bytes()).unwrap_or_default();
             let first_line = text.lines().next().unwrap_or("");
 
             if let Some(for_pos) = first_line.find(" for ") {
@@ -2004,10 +2035,7 @@ mod tests {
 
     #[test]
     fn detect_python_language() {
-        assert_eq!(
-            detect_language(Path::new("app.py")),
-            Some(Language::Python)
-        );
+        assert_eq!(detect_language(Path::new("app.py")), Some(Language::Python));
     }
 
     #[test]
@@ -2163,14 +2191,8 @@ fn set_user() {}
 
     #[test]
     fn detect_cpp_language() {
-        assert_eq!(
-            detect_language(Path::new("main.cpp")),
-            Some(Language::Cpp)
-        );
-        assert_eq!(
-            detect_language(Path::new("main.cc")),
-            Some(Language::Cpp)
-        );
+        assert_eq!(detect_language(Path::new("main.cpp")), Some(Language::Cpp));
+        assert_eq!(detect_language(Path::new("main.cc")), Some(Language::Cpp));
         assert_eq!(
             detect_language(Path::new("header.hpp")),
             Some(Language::Cpp)
@@ -2185,10 +2207,7 @@ fn set_user() {}
 
     #[test]
     fn detect_ruby_language() {
-        assert_eq!(
-            detect_language(Path::new("app.rb")),
-            Some(Language::Ruby)
-        );
+        assert_eq!(detect_language(Path::new("app.rb")), Some(Language::Ruby));
     }
 
     #[test]
@@ -2296,11 +2315,31 @@ fn process(items: &[Item]) -> Result<()> {
         assert!(!calls.is_empty(), "should find calls");
 
         let names: Vec<&str> = calls.iter().map(|c| c.callee.as_str()).collect();
-        assert!(names.contains(&"Config::load"), "should find Config::load: {:?}", names);
-        assert!(names.contains(&"transform"), "should find item.transform: {:?}", names);
-        assert!(names.contains(&"push"), "should find results.push: {:?}", names);
-        assert!(names.contains(&"println!"), "should find println!: {:?}", names);
-        assert!(names.contains(&"save_results"), "should find save_results: {:?}", names);
+        assert!(
+            names.contains(&"Config::load"),
+            "should find Config::load: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"transform"),
+            "should find item.transform: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"push"),
+            "should find results.push: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"println!"),
+            "should find println!: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"save_results"),
+            "should find save_results: {:?}",
+            names
+        );
 
         // Check receiver on method calls
         let transform_call = calls.iter().find(|c| c.callee == "transform").unwrap();
@@ -2318,9 +2357,17 @@ def process_data(df):
 "#;
         let calls = extract_calls(source, Language::Python, 2, 6);
         let names: Vec<&str> = calls.iter().map(|c| c.callee.as_str()).collect();
-        assert!(names.contains(&"groupby"), "should find df.groupby: {:?}", names);
+        assert!(
+            names.contains(&"groupby"),
+            "should find df.groupby: {:?}",
+            names
+        );
         assert!(names.contains(&"print"), "should find print: {:?}", names);
-        assert!(names.contains(&"save_to_csv"), "should find save_to_csv: {:?}", names);
+        assert!(
+            names.contains(&"save_to_csv"),
+            "should find save_to_csv: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -2335,9 +2382,21 @@ function handleRequest(req: Request): Response {
 "#;
         let calls = extract_calls(source, Language::TypeScript, 2, 7);
         let names: Vec<&str> = calls.iter().map(|c| c.callee.as_str()).collect();
-        assert!(names.contains(&"authenticateUser"), "should find authenticateUser: {:?}", names);
-        assert!(names.contains(&"query"), "should find db.query: {:?}", names);
-        assert!(names.contains(&"log"), "should find console.log: {:?}", names);
+        assert!(
+            names.contains(&"authenticateUser"),
+            "should find authenticateUser: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"query"),
+            "should find db.query: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"log"),
+            "should find console.log: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -2354,9 +2413,21 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 "#;
         let calls = extract_calls(source, Language::Go, 2, 9);
         let names: Vec<&str> = calls.iter().map(|c| c.callee.as_str()).collect();
-        assert!(names.contains(&"ReadAll"), "should find ioutil.ReadAll: {:?}", names);
-        assert!(names.contains(&"Error"), "should find http.Error: {:?}", names);
-        assert!(names.contains(&"Fprintf"), "should find fmt.Fprintf: {:?}", names);
+        assert!(
+            names.contains(&"ReadAll"),
+            "should find ioutil.ReadAll: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Error"),
+            "should find http.Error: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Fprintf"),
+            "should find fmt.Fprintf: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -2402,7 +2473,10 @@ mod utils {
 "#;
         // Line 9 is inside Config::new, inside impl Config, inside mod utils
         let scope = scope_at_line(source, Language::Rust, 9);
-        assert!(!scope.breadcrumbs.is_empty(), "should have scope breadcrumbs");
+        assert!(
+            !scope.breadcrumbs.is_empty(),
+            "should have scope breadcrumbs"
+        );
         assert!(scope.symbol.is_some(), "should have innermost symbol");
         let inner = scope.symbol.unwrap();
         assert_eq!(inner.name, "new");
@@ -2412,7 +2486,10 @@ mod utils {
     fn scope_at_line_outside_any_symbol() {
         let source = "// just a comment\nlet x = 1;\n";
         let scope = scope_at_line(source, Language::Rust, 1);
-        assert!(scope.breadcrumbs.is_empty(), "should be empty for comment-only line");
+        assert!(
+            scope.breadcrumbs.is_empty(),
+            "should be empty for comment-only line"
+        );
         assert!(scope.symbol.is_none());
     }
 
@@ -2432,7 +2509,10 @@ class UserService:
         assert_eq!(sym.name, "get_user");
         // Breadcrumbs should include the class
         let crumbs_str = scope.breadcrumbs.join(" > ");
-        assert!(crumbs_str.contains("UserService"), "breadcrumbs: {crumbs_str}");
+        assert!(
+            crumbs_str.contains("UserService"),
+            "breadcrumbs: {crumbs_str}"
+        );
     }
 
     // ── extract_members tests ────────────────────────────────────────────────
@@ -2461,9 +2541,14 @@ class UserService:
 
     #[test]
     fn extract_members_python_class() {
-        let source = "class User:\n    name: str\n    age: int = 25\n    def greet(self):\n        pass\n";
+        let source =
+            "class User:\n    name: str\n    age: int = 25\n    def greet(self):\n        pass\n";
         let members = extract_members(source, Language::Python, 1);
-        assert!(members.len() >= 2, "should have at least name and greet: {:?}", members);
+        assert!(
+            members.len() >= 2,
+            "should have at least name and greet: {:?}",
+            members
+        );
         let props: Vec<_> = members.iter().filter(|m| m.kind == "property").collect();
         assert!(!props.is_empty(), "should have properties");
         let methods: Vec<_> = members.iter().filter(|m| m.kind == "method").collect();

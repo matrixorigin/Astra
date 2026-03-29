@@ -343,11 +343,9 @@ impl PatternLibrary {
             .iter()
             .filter_map(|k| self.patterns.get(k))
             .filter(|p| !top_sigs.contains(&p.signature))
-            .filter(|p| {
-                match domain {
-                    Some(d) => p.domain == Some(d) || p.domain.is_none(),
-                    None => true,
-                }
+            .filter(|p| match domain {
+                Some(d) => p.domain == Some(d) || p.domain.is_none(),
+                None => true,
             })
             .filter(|p| p.success_rate() >= 0.3) // Must have some success history
             .collect();
@@ -397,11 +395,9 @@ impl PatternLibrary {
             .iter()
             .filter_map(|k| self.patterns.get(k))
             .filter(|p| !top_sigs.contains(&p.signature))
-            .filter(|p| {
-                match domain {
-                    Some(d) => p.domain == Some(d) || p.domain.is_none(),
-                    None => true,
-                }
+            .filter(|p| match domain {
+                Some(d) => p.domain == Some(d) || p.domain.is_none(),
+                None => true,
             })
             .filter(|p| p.success_rate() >= 0.3)
             .collect();
@@ -626,9 +622,9 @@ mod tests {
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
-            0.8 + (i as f64) * 0.02,
-            None,
-        );
+                0.8 + (i as f64) * 0.02,
+                None,
+            );
         }
         lib.record_outcome(
             &tools(&["github_search", "github_api"]),
@@ -702,9 +698,9 @@ mod tests {
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
-            0.9,
-            None,
-        );
+                0.9,
+                None,
+            );
         }
         for _ in 0..3 {
             lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.8, None);
@@ -732,9 +728,9 @@ mod tests {
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
-            0.9,
-            None,
-        );
+                0.9,
+                None,
+            );
         }
         for _ in 0..3 {
             lib.record_outcome(
@@ -742,9 +738,9 @@ mod tests {
                 TaskType::Fetch,
                 Some(DomainHint::System),
                 true,
-            0.8,
-            None,
-        );
+                0.8,
+                None,
+            );
         }
 
         let github = lib.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 5);
@@ -769,18 +765,46 @@ mod tests {
         let mut lib = PatternLibrary::new();
         // Pattern A: high quality
         for _ in 0..5 {
-            lib.record_outcome(&tools(&["pattern_a"]), TaskType::Fetch, None, true, 0.95, None);
+            lib.record_outcome(
+                &tools(&["pattern_a"]),
+                TaskType::Fetch,
+                None,
+                true,
+                0.95,
+                None,
+            );
         }
         // Pattern B: lower quality
         for _ in 0..5 {
-            lib.record_outcome(&tools(&["pattern_b"]), TaskType::Fetch, None, true, 0.5, None);
+            lib.record_outcome(
+                &tools(&["pattern_b"]),
+                TaskType::Fetch,
+                None,
+                true,
+                0.5,
+                None,
+            );
         }
         // Pattern C: mixed success
         for _ in 0..3 {
-            lib.record_outcome(&tools(&["pattern_c"]), TaskType::Fetch, None, true, 0.7, None);
+            lib.record_outcome(
+                &tools(&["pattern_c"]),
+                TaskType::Fetch,
+                None,
+                true,
+                0.7,
+                None,
+            );
         }
         for _ in 0..3 {
-            lib.record_outcome(&tools(&["pattern_c"]), TaskType::Fetch, None, false, 0.0, None);
+            lib.record_outcome(
+                &tools(&["pattern_c"]),
+                TaskType::Fetch,
+                None,
+                false,
+                0.0,
+                None,
+            );
         }
 
         let suggestions = lib.suggest(TaskType::Fetch, None, 3);
@@ -795,7 +819,14 @@ mod tests {
         for i in 0..5 {
             let name = format!("tool_{i}");
             for _ in 0..3 {
-                lib.record_outcome(std::slice::from_ref(&name), TaskType::Code, None, true, 0.8, None);
+                lib.record_outcome(
+                    std::slice::from_ref(&name),
+                    TaskType::Code,
+                    None,
+                    true,
+                    0.8,
+                    None,
+                );
             }
         }
         let suggestions = lib.suggest(TaskType::Code, None, 2);
@@ -819,9 +850,9 @@ mod tests {
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
-            0.9,
-            None,
-        );
+                0.9,
+                None,
+            );
         }
         let terms = lib.boost_terms_for(TaskType::Fetch, Some(DomainHint::GitHub));
         assert!(terms.contains(&"github_search".to_string()));
@@ -833,10 +864,24 @@ mod tests {
         let mut lib = PatternLibrary::new();
         // Two patterns share "bash"
         for _ in 0..3 {
-            lib.record_outcome(&tools(&["bash", "grep"]), TaskType::Code, None, true, 0.9, None);
+            lib.record_outcome(
+                &tools(&["bash", "grep"]),
+                TaskType::Code,
+                None,
+                true,
+                0.9,
+                None,
+            );
         }
         for _ in 0..3 {
-            lib.record_outcome(&tools(&["bash", "sed"]), TaskType::Code, None, true, 0.8, None);
+            lib.record_outcome(
+                &tools(&["bash", "sed"]),
+                TaskType::Code,
+                None,
+                true,
+                0.8,
+                None,
+            );
         }
         let terms = lib.boost_terms_for(TaskType::Code, None);
         let bash_count = terms.iter().filter(|t| *t == "bash").count();
@@ -847,10 +892,24 @@ mod tests {
     fn boost_terms_excludes_low_success_rate() {
         let mut lib = PatternLibrary::new();
         for _ in 0..2 {
-            lib.record_outcome(&tools(&["flaky_tool"]), TaskType::Code, None, true, 0.3, None);
+            lib.record_outcome(
+                &tools(&["flaky_tool"]),
+                TaskType::Code,
+                None,
+                true,
+                0.3,
+                None,
+            );
         }
         for _ in 0..5 {
-            lib.record_outcome(&tools(&["flaky_tool"]), TaskType::Code, None, false, 0.0, None);
+            lib.record_outcome(
+                &tools(&["flaky_tool"]),
+                TaskType::Code,
+                None,
+                false,
+                0.0,
+                None,
+            );
         }
         // Success rate ~28% < 50% → excluded
         let terms = lib.boost_terms_for(TaskType::Code, None);
@@ -868,9 +927,9 @@ mod tests {
                 TaskType::Code,
                 Some(DomainHint::Code),
                 true,
-            0.9,
-            None,
-        );
+                0.9,
+                None,
+            );
         }
         let exported = lib.export();
 
@@ -939,9 +998,9 @@ mod tests {
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
-            0.9,
-            None,
-        );
+                0.9,
+                None,
+            );
         }
 
         // Phase 3: Suggestions now available
@@ -975,9 +1034,9 @@ mod tests {
                 TaskType::Code,
                 None,
                 true,
-            0.9,
-            None,
-        );
+                0.9,
+                None,
+            );
         }
 
         // Given just_used = [grep], should suggest read_file and str_replace
@@ -1005,9 +1064,9 @@ mod tests {
                 TaskType::Code,
                 None,
                 true,
-            0.8,
-            None,
-        );
+                0.8,
+                None,
+            );
         }
 
         let scores = lib.co_occurrence_scores(&tools(&["bash"]));
@@ -1026,9 +1085,9 @@ mod tests {
                 TaskType::Code,
                 None,
                 false,
-            0.0,
-            None,
-        );
+                0.0,
+                None,
+            );
         }
 
         // Should not recommend dangerous_tool (only failures)
@@ -1042,8 +1101,22 @@ mod tests {
     #[test]
     fn co_occurrence_with_empty_just_used_returns_empty() {
         let mut lib = PatternLibrary::new();
-        lib.record_outcome(&tools(&["bash", "grep"]), TaskType::Fetch, None, true, 0.8, None);
-        lib.record_outcome(&tools(&["bash", "grep"]), TaskType::Fetch, None, true, 0.8, None);
+        lib.record_outcome(
+            &tools(&["bash", "grep"]),
+            TaskType::Fetch,
+            None,
+            true,
+            0.8,
+            None,
+        );
+        lib.record_outcome(
+            &tools(&["bash", "grep"]),
+            TaskType::Fetch,
+            None,
+            true,
+            0.8,
+            None,
+        );
         let scores = lib.co_occurrence_scores(&[]);
         assert!(scores.is_empty());
     }
@@ -1058,14 +1131,20 @@ mod tests {
             &tools(&["bad_tool"]),
             TaskType::Fetch,
             None,
-            true,  // success
-            0.9,   // quality
-            Some(30),  // low feedback → should become failure
+            true,     // success
+            0.9,      // quality
+            Some(30), // low feedback → should become failure
         );
 
         let exported = lib.export();
-        let pattern = exported.iter().find(|p| p.tools.contains(&"bad_tool".to_string())).unwrap();
-        assert_eq!(pattern.success_count, 0, "Low feedback should convert to failure");
+        let pattern = exported
+            .iter()
+            .find(|p| p.tools.contains(&"bad_tool".to_string()))
+            .unwrap();
+        assert_eq!(
+            pattern.success_count, 0,
+            "Low feedback should convert to failure"
+        );
         assert_eq!(pattern.failure_count, 1);
     }
 
@@ -1078,12 +1157,18 @@ mod tests {
             None,
             true,
             0.9,
-            Some(80),  // high feedback → stays success
+            Some(80), // high feedback → stays success
         );
 
         let exported = lib.export();
-        let pattern = exported.iter().find(|p| p.tools.contains(&"good_tool".to_string())).unwrap();
-        assert_eq!(pattern.success_count, 1, "High feedback should keep success");
+        let pattern = exported
+            .iter()
+            .find(|p| p.tools.contains(&"good_tool".to_string()))
+            .unwrap();
+        assert_eq!(
+            pattern.success_count, 1,
+            "High feedback should keep success"
+        );
         assert_eq!(pattern.failure_count, 0);
     }
 
@@ -1091,27 +1176,64 @@ mod tests {
     fn feedback_scales_quality() {
         let mut lib = PatternLibrary::new();
         // High feedback: quality stays high (0.9 * (0.5 + 100/200) = 0.9)
-        lib.record_outcome(&tools(&["tool_a"]), TaskType::Code, None, true, 0.9, Some(100));
+        lib.record_outcome(
+            &tools(&["tool_a"]),
+            TaskType::Code,
+            None,
+            true,
+            0.9,
+            Some(100),
+        );
         // Medium feedback: quality reduced (0.9 * (0.5 + 50/200) = 0.675)
-        lib.record_outcome(&tools(&["tool_b"]), TaskType::Code, None, true, 0.9, Some(50));
+        lib.record_outcome(
+            &tools(&["tool_b"]),
+            TaskType::Code,
+            None,
+            true,
+            0.9,
+            Some(50),
+        );
 
         let exported = lib.export();
-        let a = exported.iter().find(|p| p.tools.contains(&"tool_a".to_string())).unwrap();
-        let b = exported.iter().find(|p| p.tools.contains(&"tool_b".to_string())).unwrap();
+        let a = exported
+            .iter()
+            .find(|p| p.tools.contains(&"tool_a".to_string()))
+            .unwrap();
+        let b = exported
+            .iter()
+            .find(|p| p.tools.contains(&"tool_b".to_string()))
+            .unwrap();
 
-        assert!(a.avg_quality() > b.avg_quality(),
-            "Higher feedback should yield higher quality: {} > {}", a.avg_quality(), b.avg_quality());
+        assert!(
+            a.avg_quality() > b.avg_quality(),
+            "Higher feedback should yield higher quality: {} > {}",
+            a.avg_quality(),
+            b.avg_quality()
+        );
     }
 
     #[test]
     fn no_feedback_uses_raw_values() {
         let mut lib = PatternLibrary::new();
-        lib.record_outcome(&tools(&["raw_tool"]), TaskType::Fetch, None, true, 0.8, None);
+        lib.record_outcome(
+            &tools(&["raw_tool"]),
+            TaskType::Fetch,
+            None,
+            true,
+            0.8,
+            None,
+        );
 
         let exported = lib.export();
-        let pattern = exported.iter().find(|p| p.tools.contains(&"raw_tool".to_string())).unwrap();
+        let pattern = exported
+            .iter()
+            .find(|p| p.tools.contains(&"raw_tool".to_string()))
+            .unwrap();
         assert_eq!(pattern.success_count, 1);
-        assert!((pattern.avg_quality() - 0.8).abs() < 0.01, "No feedback should use raw quality");
+        assert!(
+            (pattern.avg_quality() - 0.8).abs() < 0.01,
+            "No feedback should use raw quality"
+        );
     }
 
     // ── Time Decay Tests ──
@@ -1128,7 +1250,10 @@ mod tests {
         let pattern = lib.patterns.values().next().unwrap();
         let raw = pattern.score();
         let decayed = pattern.decayed_score();
-        assert!((raw - decayed).abs() < 0.001, "Fresh pattern should have no decay");
+        assert!(
+            (raw - decayed).abs() < 0.001,
+            "Fresh pattern should have no decay"
+        );
     }
 
     #[test]
@@ -1149,7 +1274,11 @@ mod tests {
         let raw = pattern.score();
         let decayed = pattern.decayed_score();
         let ratio = decayed / raw;
-        assert!((ratio - 0.5).abs() < 0.1, "At half-life, score ratio should be ~0.5, got {}", ratio);
+        assert!(
+            (ratio - 0.5).abs() < 0.1,
+            "At half-life, score ratio should be ~0.5, got {}",
+            ratio
+        );
     }
 
     #[test]
@@ -1170,7 +1299,11 @@ mod tests {
         let raw = pattern.score();
         let decayed = pattern.decayed_score();
         let ratio = decayed / raw;
-        assert!((ratio - 0.25).abs() < 0.1, "At 2 half-lives, score ratio should be ~0.25, got {}", ratio);
+        assert!(
+            (ratio - 0.25).abs() < 0.1,
+            "At 2 half-lives, score ratio should be ~0.25, got {}",
+            ratio
+        );
     }
 
     #[test]
@@ -1184,7 +1317,10 @@ mod tests {
         let pattern = lib.patterns.values().next().unwrap();
         let raw_score = pattern.score();
         let decayed = pattern.decayed_score();
-        assert!((raw_score - decayed).abs() < 0.001, "Recent pattern should have same raw and decayed score");
+        assert!(
+            (raw_score - decayed).abs() < 0.001,
+            "Recent pattern should have same raw and decayed score"
+        );
     }
 
     #[test]
@@ -1206,8 +1342,16 @@ mod tests {
         let decayed = pattern.decayed_score();
         let expected_decayed = raw_score * 0.5; // Approximately
 
-        assert!(decayed < raw_score, "Stale pattern decayed score should be less than raw score");
-        assert!((decayed - expected_decayed).abs() < 0.1, "Expected ~{}, got {}", expected_decayed, decayed);
+        assert!(
+            decayed < raw_score,
+            "Stale pattern decayed score should be less than raw score"
+        );
+        assert!(
+            (decayed - expected_decayed).abs() < 0.1,
+            "Expected ~{}, got {}",
+            expected_decayed,
+            decayed
+        );
     }
 
     #[test]
@@ -1222,7 +1366,10 @@ mod tests {
         // Touch via record_outcome
         lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.8, None);
         let pattern = lib.patterns.values().next().unwrap();
-        assert!(pattern.last_used_at > old_ts, "touch() should update timestamp");
+        assert!(
+            pattern.last_used_at > old_ts,
+            "touch() should update timestamp"
+        );
     }
 
     #[test]
@@ -1230,9 +1377,30 @@ mod tests {
         let mut lib = PatternLibrary::new();
 
         // Create a stale pattern with high success
-        lib.record_outcome(&tools(&["stale_tool"]), TaskType::Fetch, Some(DomainHint::GitHub), true, 0.95, None);
-        lib.record_outcome(&tools(&["stale_tool"]), TaskType::Fetch, Some(DomainHint::GitHub), true, 0.95, None);
-        lib.record_outcome(&tools(&["stale_tool"]), TaskType::Fetch, Some(DomainHint::GitHub), true, 0.95, None);
+        lib.record_outcome(
+            &tools(&["stale_tool"]),
+            TaskType::Fetch,
+            Some(DomainHint::GitHub),
+            true,
+            0.95,
+            None,
+        );
+        lib.record_outcome(
+            &tools(&["stale_tool"]),
+            TaskType::Fetch,
+            Some(DomainHint::GitHub),
+            true,
+            0.95,
+            None,
+        );
+        lib.record_outcome(
+            &tools(&["stale_tool"]),
+            TaskType::Fetch,
+            Some(DomainHint::GitHub),
+            true,
+            0.95,
+            None,
+        );
 
         // Manually make it stale
         for pattern in lib.patterns.values_mut() {
@@ -1243,15 +1411,33 @@ mod tests {
         }
 
         // Create a recent pattern with lower raw success but fresh
-        lib.record_outcome(&tools(&["recent_tool"]), TaskType::Fetch, Some(DomainHint::GitHub), true, 0.8, None);
-        lib.record_outcome(&tools(&["recent_tool"]), TaskType::Fetch, Some(DomainHint::GitHub), true, 0.8, None);
+        lib.record_outcome(
+            &tools(&["recent_tool"]),
+            TaskType::Fetch,
+            Some(DomainHint::GitHub),
+            true,
+            0.8,
+            None,
+        );
+        lib.record_outcome(
+            &tools(&["recent_tool"]),
+            TaskType::Fetch,
+            Some(DomainHint::GitHub),
+            true,
+            0.8,
+            None,
+        );
 
         let suggestions = lib.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 2);
 
         // Recent pattern should rank higher due to time decay
         if suggestions.len() >= 2 {
-            let recent_idx = suggestions.iter().position(|t| t.tools.contains(&"recent_tool".to_string()));
-            let stale_idx = suggestions.iter().position(|t| t.tools.contains(&"stale_tool".to_string()));
+            let recent_idx = suggestions
+                .iter()
+                .position(|t| t.tools.contains(&"recent_tool".to_string()));
+            let stale_idx = suggestions
+                .iter()
+                .position(|t| t.tools.contains(&"stale_tool".to_string()));
             if let (Some(r), Some(s)) = (recent_idx, stale_idx) {
                 assert!(r < s, "Recent pattern should rank before stale pattern");
             }
@@ -1266,13 +1452,34 @@ mod tests {
 
         // Create two fresh high-score patterns
         for _ in 0..5 {
-            lib.record_outcome(&tools(&["tool_a"]), TaskType::Fetch, Some(DomainHint::GitHub), true, 0.95, None);
-            lib.record_outcome(&tools(&["tool_b"]), TaskType::Fetch, Some(DomainHint::GitHub), true, 0.9, None);
+            lib.record_outcome(
+                &tools(&["tool_a"]),
+                TaskType::Fetch,
+                Some(DomainHint::GitHub),
+                true,
+                0.95,
+                None,
+            );
+            lib.record_outcome(
+                &tools(&["tool_b"]),
+                TaskType::Fetch,
+                Some(DomainHint::GitHub),
+                true,
+                0.9,
+                None,
+            );
         }
 
         // Create a stale pattern with decent success (should be exploration candidate)
         for _ in 0..3 {
-            lib.record_outcome(&tools(&["old_tool"]), TaskType::Fetch, Some(DomainHint::GitHub), true, 0.7, None);
+            lib.record_outcome(
+                &tools(&["old_tool"]),
+                TaskType::Fetch,
+                Some(DomainHint::GitHub),
+                true,
+                0.7,
+                None,
+            );
         }
 
         // Make old_tool stale
@@ -1285,14 +1492,25 @@ mod tests {
 
         // Normal suggest should not include old_tool (decayed score too low)
         let normal = lib.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 2);
-        let has_old_in_normal = normal.iter().any(|p| p.tools.contains(&"old_tool".to_string()));
+        let has_old_in_normal = normal
+            .iter()
+            .any(|p| p.tools.contains(&"old_tool".to_string()));
 
         // Forced exploration should include old_tool
-        let explored = lib.suggest_with_forced_exploration(TaskType::Fetch, Some(DomainHint::GitHub), 2);
-        let has_old_in_explored = explored.iter().any(|p| p.tools.contains(&"old_tool".to_string()));
+        let explored =
+            lib.suggest_with_forced_exploration(TaskType::Fetch, Some(DomainHint::GitHub), 2);
+        let has_old_in_explored = explored
+            .iter()
+            .any(|p| p.tools.contains(&"old_tool".to_string()));
 
-        assert!(!has_old_in_normal, "Normal suggest should not include stale pattern");
-        assert!(has_old_in_explored, "Exploration should include stale pattern for rediscovery");
+        assert!(
+            !has_old_in_normal,
+            "Normal suggest should not include stale pattern"
+        );
+        assert!(
+            has_old_in_explored,
+            "Exploration should include stale pattern for rediscovery"
+        );
     }
 
     #[test]
@@ -1322,11 +1540,16 @@ mod tests {
 
         // Exploration should pick the oldest (old_60)
         let explored = lib.suggest_with_forced_exploration(TaskType::Fetch, None, 1);
-        let picked = explored.iter().find(|p| p.tools.contains(&"old_60".to_string()) || p.tools.contains(&"old_30".to_string()));
+        let picked = explored.iter().find(|p| {
+            p.tools.contains(&"old_60".to_string()) || p.tools.contains(&"old_30".to_string())
+        });
 
         if let Some(p) = picked {
-            assert!(p.tools.contains(&"old_60".to_string()),
-                "Exploration should prefer oldest stale pattern (old_60), got {:?}", p.tools);
+            assert!(
+                p.tools.contains(&"old_60".to_string()),
+                "Exploration should prefer oldest stale pattern (old_60), got {:?}",
+                p.tools
+            );
         }
     }
 
@@ -1349,9 +1572,16 @@ mod tests {
         lib.record_outcome(&tools(&["bad"]), TaskType::Fetch, None, false, 0.0, None);
 
         // Verify success rate
-        let bad_pattern = lib.patterns.values().find(|p| p.tools.contains(&"bad".to_string())).unwrap();
-        assert!(bad_pattern.success_rate() < 0.3,
-            "Bad pattern should have success_rate < 0.3, got {}", bad_pattern.success_rate());
+        let bad_pattern = lib
+            .patterns
+            .values()
+            .find(|p| p.tools.contains(&"bad".to_string()))
+            .unwrap();
+        assert!(
+            bad_pattern.success_rate() < 0.3,
+            "Bad pattern should have success_rate < 0.3, got {}",
+            bad_pattern.success_rate()
+        );
 
         let now = chrono::Utc::now().timestamp() as u64;
         for pattern in lib.patterns.values_mut() {
@@ -1366,13 +1596,17 @@ mod tests {
 
         // Forced exploration: bad pattern excluded because success_rate < 0.3
         let explored = lib.suggest_with_forced_exploration(TaskType::Fetch, None, 2);
-        let has_bad_in_explored = explored.iter().any(|p| p.tools.contains(&"bad".to_string()));
+        let has_bad_in_explored = explored
+            .iter()
+            .any(|p| p.tools.contains(&"bad".to_string()));
 
         // If bad is already in normal suggest (decayed_score still competitive), test is moot
         // Otherwise, exploration should NOT include it due to low success rate
         if !has_bad_in_normal {
-            assert!(!has_bad_in_explored,
-                "Exploration should not include patterns with success_rate < 0.3");
+            assert!(
+                !has_bad_in_explored,
+                "Exploration should not include patterns with success_rate < 0.3"
+            );
         }
     }
 

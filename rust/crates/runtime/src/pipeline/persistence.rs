@@ -48,10 +48,25 @@ impl DeltaSnapshot {
 
     /// Approximate size in bytes (for telemetry).
     pub fn approx_size(&self) -> usize {
-        self.entity_deltas.iter().map(|v| v.to_string().len()).sum::<usize>()
-            + self.pattern_deltas.iter().map(|v| v.to_string().len()).sum::<usize>()
-            + self.calibration.as_ref().map(|v| v.to_string().len()).unwrap_or(0)
-            + self.tool_health_deltas.iter().map(|v| v.to_string().len()).sum::<usize>()
+        self.entity_deltas
+            .iter()
+            .map(|v| v.to_string().len())
+            .sum::<usize>()
+            + self
+                .pattern_deltas
+                .iter()
+                .map(|v| v.to_string().len())
+                .sum::<usize>()
+            + self
+                .calibration
+                .as_ref()
+                .map(|v| v.to_string().len())
+                .unwrap_or(0)
+            + self
+                .tool_health_deltas
+                .iter()
+                .map(|v| v.to_string().len())
+                .sum::<usize>()
     }
 }
 
@@ -596,7 +611,10 @@ pub fn has_dirty_data(
     tool_health: &crate::turn::tool_health::ToolHealthTracker,
 ) -> bool {
     let entities_dirty = entity_graph.lock().map(|g| g.has_dirty()).unwrap_or(false);
-    let patterns_dirty = pattern_library.lock().map(|l| l.has_dirty()).unwrap_or(false);
+    let patterns_dirty = pattern_library
+        .lock()
+        .map(|l| l.has_dirty())
+        .unwrap_or(false);
     let calibration_dirty = calibrator.lock().map(|c| c.has_dirty()).unwrap_or(false);
     let tools_dirty = tool_health.has_dirty();
 
@@ -610,7 +628,10 @@ pub fn has_dirty_learning_data(
     calibrator: &Arc<Mutex<ProgressiveCalibrator>>,
 ) -> bool {
     let entities_dirty = entity_graph.lock().map(|g| g.has_dirty()).unwrap_or(false);
-    let patterns_dirty = pattern_library.lock().map(|l| l.has_dirty()).unwrap_or(false);
+    let patterns_dirty = pattern_library
+        .lock()
+        .map(|l| l.has_dirty())
+        .unwrap_or(false);
     let calibration_dirty = calibrator.lock().map(|c| c.has_dirty()).unwrap_or(false);
 
     entities_dirty || patterns_dirty || calibration_dirty
@@ -621,8 +642,10 @@ pub fn export_tool_health_delta(
     current: &[ToolHealthEntry],
     baseline: &[ToolHealthEntry],
 ) -> Vec<serde_json::Value> {
-    let baseline_map: std::collections::HashMap<&str, &ToolHealthEntry> =
-        baseline.iter().map(|entry| (entry.name.as_str(), entry)).collect();
+    let baseline_map: std::collections::HashMap<&str, &ToolHealthEntry> = baseline
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry))
+        .collect();
 
     current
         .iter()
@@ -685,7 +708,8 @@ mod tests {
             graph.learn(
                 "matrixorigin",
                 DomainHint::GitHub,
-                &["github_search".into()], None,
+                &["github_search".into()],
+                None,
             );
         }
         {
@@ -695,12 +719,19 @@ mod tests {
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
-                0.9, None,
+                0.9,
+                None,
             );
         }
         {
             let mut c = cal.lock().unwrap();
-            c.record("fetch", Some(DomainHint::GitHub), TaskType::Fetch, false, None);
+            c.record(
+                "fetch",
+                Some(DomainHint::GitHub),
+                TaskType::Fetch,
+                false,
+                None,
+            );
         }
 
         let snapshot = export_from_modules(&eg, &pl, &cal);
@@ -748,7 +779,8 @@ mod tests {
         eg2.lock().unwrap().learn(
             "matrixorigin",
             DomainHint::GitHub,
-            &["github_search".into()], None,
+            &["github_search".into()],
+            None,
         );
 
         // Export set 1, merge into set 2
@@ -814,12 +846,14 @@ mod tests {
             g.learn(
                 "matrixorigin",
                 DomainHint::GitHub,
-                &["github_search".into()], None,
+                &["github_search".into()],
+                None,
             );
             g.learn(
                 "matrixorigin",
                 DomainHint::GitHub,
-                &["github_search".into()], None,
+                &["github_search".into()],
+                None,
             );
         }
         {
@@ -829,19 +863,27 @@ mod tests {
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
-                0.9, None,
+                0.9,
+                None,
             );
             l.record_outcome(
                 &["github_search".into()],
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
-                0.8, None,
+                0.8,
+                None,
             );
         }
         {
             let mut c = cal.lock().unwrap();
-            c.record("fetch", Some(DomainHint::GitHub), TaskType::Fetch, false, None);
+            c.record(
+                "fetch",
+                Some(DomainHint::GitHub),
+                TaskType::Fetch,
+                false,
+                None,
+            );
         }
         let snapshot = export_from_modules(&eg, &pl, &cal);
         save_snapshot_to(&path, &snapshot).unwrap();
@@ -1030,7 +1072,13 @@ mod tests {
         assert!(!cal.has_dirty());
 
         // Record a calibration
-        cal.record("github", Some(DomainHint::GitHub), TaskType::Fetch, false, None);
+        cal.record(
+            "github",
+            Some(DomainHint::GitHub),
+            TaskType::Fetch,
+            false,
+            None,
+        );
 
         // Now dirty
         assert!(cal.has_dirty());

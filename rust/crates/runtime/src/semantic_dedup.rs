@@ -303,7 +303,11 @@ impl SemanticDedup {
                 t if t.starts_with("github_") => {
                     // Extract repo from key if present
                     if let Some(repo) = key.split(':').nth(1) {
-                        github_ops.push(format!("{} {}", t.strip_prefix("github_").unwrap_or(t), repo));
+                        github_ops.push(format!(
+                            "{} {}",
+                            t.strip_prefix("github_").unwrap_or(t),
+                            repo
+                        ));
                     } else {
                         github_ops.push(t.strip_prefix("github_").unwrap_or(t).to_string());
                     }
@@ -606,7 +610,12 @@ mod tests {
     #[test]
     fn context_inventory_shows_searches() {
         let mut tracker = SemanticDedup::new(0.75);
-        tracker.check_and_record("grep", &json!({"pattern": "TODO", "path": "src/"}), "match", 0);
+        tracker.check_and_record(
+            "grep",
+            &json!({"pattern": "TODO", "path": "src/"}),
+            "match",
+            0,
+        );
         tracker.check_and_record("glob", &json!({"pattern": "*.rs", "path": "."}), "files", 1);
 
         let inv = tracker.context_inventory();
@@ -638,7 +647,10 @@ mod tests {
         }
 
         let inv = tracker.context_inventory();
-        assert!(inv.contains("+5 more"), "should truncate to 5 files with count");
+        assert!(
+            inv.contains("+5 more"),
+            "should truncate to 5 files with count"
+        );
     }
 
     #[test]
@@ -657,7 +669,12 @@ mod tests {
         let mut tracker = SemanticDedup::new(0.75);
         assert!(!tracker.has_grep_in("src/"));
 
-        tracker.check_and_record("grep", &json!({"pattern": "foo", "path": "src/"}), "match", 0);
+        tracker.check_and_record(
+            "grep",
+            &json!({"pattern": "foo", "path": "src/"}),
+            "match",
+            0,
+        );
         assert!(tracker.has_grep_in("src/"));
         assert!(!tracker.has_grep_in("tests/"));
     }

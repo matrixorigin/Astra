@@ -81,10 +81,7 @@ pub fn find_hallucinated_tools(
 ) -> Vec<String> {
     let mut hallucinated = Vec::new();
     for tc in tool_calls {
-        let name = tc
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
         if !name.is_empty() && !allowed_tools.contains(&name) {
             hallucinated.push(name.to_string());
         }
@@ -165,11 +162,15 @@ impl QualityReport {
         }
         if self.has_fabrication_markers {
             parts.push(
-                "Response may contain placeholder paths. Use real paths from the project.".to_string(),
+                "Response may contain placeholder paths. Use real paths from the project."
+                    .to_string(),
             );
         }
         if self.is_echo {
-            parts.push("You echoed the question instead of answering it. Use tools to find the answer.".to_string());
+            parts.push(
+                "You echoed the question instead of answering it. Use tools to find the answer."
+                    .to_string(),
+            );
         }
         Some(format!("⚠ Quality issues: {}", parts.join(" ")))
     }
@@ -257,7 +258,9 @@ mod tests {
 
     #[test]
     fn repetition_loop_not_triggered_normal() {
-        assert!(!is_repetition_loop("the quick brown fox jumps over the lazy dog"));
+        assert!(!is_repetition_loop(
+            "the quick brown fox jumps over the lazy dog"
+        ));
     }
 
     #[test]
@@ -313,9 +316,7 @@ mod tests {
 
     #[test]
     fn malformed_args_object_is_valid() {
-        let calls = vec![
-            serde_json::json!({"name": "bash", "arguments": {"command": "ls"}}),
-        ];
+        let calls = vec![serde_json::json!({"name": "bash", "arguments": {"command": "ls"}})];
         assert!(find_malformed_args(&calls).is_empty());
     }
 
@@ -364,7 +365,10 @@ mod tests {
             &["bash"],
             "where are the docs?",
         );
-        assert!(!report.has_fabrication_markers, "legitimate URLs should not trigger fabrication");
+        assert!(
+            !report.has_fabrication_markers,
+            "legitimate URLs should not trigger fabrication"
+        );
     }
 
     #[test]
@@ -417,9 +421,7 @@ mod tests {
 
     #[test]
     fn quality_report_multiple_issues() {
-        let calls = vec![
-            serde_json::json!({"name": "fake_tool", "arguments": "{bad json"}),
-        ];
+        let calls = vec![serde_json::json!({"name": "fake_tool", "arguments": "{bad json"})];
         let report = check_response_quality(
             "Check path/to/your/file for details and edit it",
             &calls,

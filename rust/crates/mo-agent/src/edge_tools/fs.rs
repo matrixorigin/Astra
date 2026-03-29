@@ -60,7 +60,9 @@ impl ToolExecutor {
                     } else {
                         String::new()
                     };
-                    return format!("{msg}. Use list_dir or glob to find the correct path first.{hint}");
+                    return format!(
+                        "{msg}. Use list_dir or glob to find the correct path first.{hint}"
+                    );
                 }
                 if e.kind() == std::io::ErrorKind::IsADirectory {
                     return format!("{msg}. Use list_dir instead for directories.");
@@ -246,10 +248,7 @@ impl ToolExecutor {
                         + 1;
                     let scope = super::code_intel::scope_at_line(&new_content, lang, edit_line);
                     if !scope.breadcrumbs.is_empty() {
-                        result.push_str(&format!(
-                            "\n📍 {}",
-                            scope.breadcrumbs.join(" > ")
-                        ));
+                        result.push_str(&format!("\n📍 {}", scope.breadcrumbs.join(" > ")));
                     }
                 }
 
@@ -269,9 +268,7 @@ impl ToolExecutor {
         };
 
         // Safety: refuse .git/ contents
-        let rel = path
-            .strip_prefix(&self.project_root)
-            .unwrap_or(&path);
+        let rel = path.strip_prefix(&self.project_root).unwrap_or(&path);
         let rel_str = rel.to_string_lossy();
         if rel_str.starts_with(".git/") || rel_str.starts_with(".git\\") || rel_str == ".git" {
             return "Error: refusing to delete .git contents".to_string();
@@ -353,27 +350,25 @@ impl ToolExecutor {
         match fs::write(&path, &working) {
             Ok(_) => {
                 let format_result = auto_format_file(&path, &self.project_root);
-                let mut result = format!(
-                    "Applied {} edit(s) successfully",
-                    edits.len()
-                );
+                let mut result = format!("Applied {} edit(s) successfully", edits.len());
                 if let Some(fmt_note) = format_result {
                     result.push_str(&format!("\n{fmt_note}"));
                 }
 
                 // Scope context for the first edit location
                 if let Some(lang) = super::code_intel::detect_language(&path) {
-                    if let Some(first_old) = edits.first().and_then(|e| e.get("old_str")).and_then(Value::as_str) {
+                    if let Some(first_old) = edits
+                        .first()
+                        .and_then(|e| e.get("old_str"))
+                        .and_then(Value::as_str)
+                    {
                         let edit_line = content[..content.find(first_old).unwrap_or(0)]
                             .matches('\n')
                             .count()
                             + 1;
                         let scope = super::code_intel::scope_at_line(&working, lang, edit_line);
                         if !scope.breadcrumbs.is_empty() {
-                            result.push_str(&format!(
-                                "\n📍 {}",
-                                scope.breadcrumbs.join(" > ")
-                            ));
+                            result.push_str(&format!("\n📍 {}", scope.breadcrumbs.join(" > ")));
                         }
                     }
                 }
@@ -443,52 +438,56 @@ impl ToolExecutor {
     /// Returns up to 3 suggestions based on filename similarity.
     fn find_similar_files(&self, path_str: &str) -> Vec<String> {
         let path = Path::new(path_str);
-        
+
         // Get the filename we're looking for
         let target_name = match path.file_name().and_then(|n| n.to_str()) {
             Some(n) => n.to_lowercase(),
             None => return Vec::new(),
         };
-        
+
         // Get the parent directory to search in
         let search_dir = if path.is_absolute() {
             path.parent().map(|p| p.to_path_buf())
         } else {
-            Some(self.project_root.join(path.parent().unwrap_or(Path::new(""))))
+            Some(
+                self.project_root
+                    .join(path.parent().unwrap_or(Path::new(""))),
+            )
         };
-        
+
         let search_dir = match search_dir {
             Some(d) if d.exists() => d,
             _ => return Vec::new(),
         };
-        
+
         // Find similar files in the directory
         let mut candidates: Vec<(String, usize)> = Vec::new();
         if let Ok(entries) = fs::read_dir(&search_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy().to_lowercase();
-                
+
                 // Skip directories (user should use list_dir for those)
                 let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
                 if is_dir {
                     continue;
                 }
-                
+
                 // Calculate similarity - also check against hidden file variants
                 let mut best_score = similarity_score(&target_name, &name_str);
-                
+
                 // If candidate is a hidden file, also compare without leading dot
                 if name_str.starts_with('.') {
                     let without_dot = &name_str[1..];
                     best_score = best_score.max(similarity_score(&target_name, without_dot));
                 }
-                
+
                 // Minimum threshold to avoid noise
                 const MIN_SIMILARITY: usize = 5;
                 if best_score >= MIN_SIMILARITY {
                     let rel_path = entry.path();
-                    let display = rel_path.strip_prefix(&self.project_root)
+                    let display = rel_path
+                        .strip_prefix(&self.project_root)
                         .unwrap_or(&rel_path)
                         .display()
                         .to_string();
@@ -496,10 +495,11 @@ impl ToolExecutor {
                 }
             }
         }
-        
+
         // Sort by score descending and take top 3
         candidates.sort_by(|a, b| b.1.cmp(&a.1));
-        candidates.into_iter()
+        candidates
+            .into_iter()
             .take(3)
             .map(|(path, _)| path)
             .collect()
@@ -510,37 +510,38 @@ impl ToolExecutor {
 /// Higher score = more similar.
 fn similarity_score(target: &str, candidate: &str) -> usize {
     let mut score = 0;
-    
+
     // Exact match (shouldn't happen but handle it)
     if target == candidate {
         return 100;
     }
-    
+
     // Shared prefix
-    let common_prefix = target.chars()
+    let common_prefix = target
+        .chars()
         .zip(candidate.chars())
         .take_while(|(a, b)| a == b)
         .count();
     score += common_prefix * 3;
-    
+
     // Same extension
     let target_ext = target.rsplit('.').next();
     let cand_ext = candidate.rsplit('.').next();
     if target_ext == cand_ext && target_ext.is_some() {
         score += 5;
     }
-    
+
     // Contains target as substring
     if candidate.contains(target) || target.contains(candidate) {
         score += 10;
     }
-    
+
     // Similar length
     let len_diff = (target.len() as isize - candidate.len() as isize).unsigned_abs();
     if len_diff < 5 {
         score += 5 - len_diff;
     }
-    
+
     score
 }
 
@@ -760,8 +761,7 @@ fn auto_format_file(file_path: &Path, project_root: &Path) -> Option<String> {
             ("black", vec!["--quiet"])
         }
         "go" => ("gofmt", vec!["-w"]),
-        "ts" | "tsx" | "js" | "jsx" | "json" | "css" | "scss" | "html" | "md" | "yaml"
-        | "yml" => {
+        "ts" | "tsx" | "js" | "jsx" | "json" | "css" | "scss" | "html" | "md" | "yaml" | "yml" => {
             // Only if prettier config or package.json exists
             if !project_root.join("package.json").exists()
                 && !project_root.join(".prettierrc").exists()
@@ -787,7 +787,7 @@ fn auto_format_file(file_path: &Path, project_root: &Path) -> Option<String> {
 
     match result {
         Ok(out) if out.status.success() => Some(format!("✓ Auto-formatted with {cmd}")),
-        Ok(_) => None, // Formatter failed silently — don't report
+        Ok(_) => None,  // Formatter failed silently — don't report
         Err(_) => None, // Formatter not available — don't report
     }
 }
@@ -1595,7 +1595,11 @@ type Handler interface {
     fn auto_format_rs_with_cargo_toml_tries_rustfmt() {
         let tmpdir = tempfile::tempdir().unwrap();
         // Create Cargo.toml so the guard passes
-        std::fs::write(tmpdir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+        std::fs::write(
+            tmpdir.path().join("Cargo.toml"),
+            "[package]\nname = \"test\"",
+        )
+        .unwrap();
         let file = tmpdir.path().join("main.rs");
         std::fs::write(&file, "fn   main  (  )  {  }").unwrap();
         let result = auto_format_file(&file, tmpdir.path());
@@ -1619,9 +1623,18 @@ type Handler interface {
             "new_str": "REPLACED",
             "dry_run": true
         }));
-        assert!(result.contains("[DRY RUN]"), "should show dry run marker: {result}");
-        assert!(result.contains("-line2"), "should show removed line: {result}");
-        assert!(result.contains("+REPLACED"), "should show added line: {result}");
+        assert!(
+            result.contains("[DRY RUN]"),
+            "should show dry run marker: {result}"
+        );
+        assert!(
+            result.contains("-line2"),
+            "should show removed line: {result}"
+        );
+        assert!(
+            result.contains("+REPLACED"),
+            "should show added line: {result}"
+        );
         // File should NOT be modified
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "line1\nline2\nline3\n");
@@ -1671,7 +1684,10 @@ type Handler interface {
         std::fs::create_dir(tmpdir.path().join("subdir")).unwrap();
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
         let result = exe.delete_file(&json!({"path": "subdir"}));
-        assert!(result.contains("refusing to delete a directory"), "result: {result}");
+        assert!(
+            result.contains("refusing to delete a directory"),
+            "result: {result}"
+        );
     }
 
     #[test]
@@ -1682,7 +1698,10 @@ type Handler interface {
         std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
         let result = exe.delete_file(&json!({"path": ".git/HEAD"}));
-        assert!(result.contains("refusing to delete .git"), "result: {result}");
+        assert!(
+            result.contains("refusing to delete .git"),
+            "result: {result}"
+        );
     }
 
     // ─── multi_edit tests ───────────────────────────────────────────────────
@@ -1720,11 +1739,17 @@ type Handler interface {
                 {"old_str": "fn NONEXISTENT() {}", "new_str": "fn nope() {}"}
             ]
         }));
-        assert!(result.contains("edit[1]"), "should identify failing edit: {result}");
+        assert!(
+            result.contains("edit[1]"),
+            "should identify failing edit: {result}"
+        );
         assert!(result.contains("not found"), "should explain why: {result}");
         // File should NOT be modified (atomic rollback)
         let content = std::fs::read_to_string(&file).unwrap();
-        assert!(content.contains("fn foo() {}"), "original should be preserved");
+        assert!(
+            content.contains("fn foo() {}"),
+            "original should be preserved"
+        );
     }
 
     #[test]
@@ -1739,7 +1764,10 @@ type Handler interface {
                 {"old_str": "aaa", "new_str": "ccc"}
             ]
         }));
-        assert!(result.contains("edit[0]"), "should identify the edit: {result}");
+        assert!(
+            result.contains("edit[0]"),
+            "should identify the edit: {result}"
+        );
         assert!(result.contains("2 times"), "should report count: {result}");
     }
 
@@ -1756,9 +1784,18 @@ type Handler interface {
             ],
             "dry_run": true
         }));
-        assert!(result.contains("[DRY RUN]"), "should show dry run marker: {result}");
-        assert!(result.contains("-fn foo() {}"), "should show removed: {result}");
-        assert!(result.contains("+fn renamed() {}"), "should show added: {result}");
+        assert!(
+            result.contains("[DRY RUN]"),
+            "should show dry run marker: {result}"
+        );
+        assert!(
+            result.contains("-fn foo() {}"),
+            "should show removed: {result}"
+        );
+        assert!(
+            result.contains("+fn renamed() {}"),
+            "should show added: {result}"
+        );
         // File should NOT be modified
         let content = std::fs::read_to_string(&file).unwrap();
         assert!(content.contains("fn foo() {}"));
@@ -1833,7 +1870,10 @@ type Handler interface {
         }));
         assert!(result.contains("Replaced successfully"), "result: {result}");
         assert!(result.contains("📍"), "should show scope icon: {result}");
-        assert!(result.contains("bar"), "should mention the function: {result}");
+        assert!(
+            result.contains("bar"),
+            "should mention the function: {result}"
+        );
     }
 
     #[test]
@@ -1848,7 +1888,10 @@ type Handler interface {
             "new_str": "\"new\""
         }));
         assert!(result.contains("Replaced successfully"), "result: {result}");
-        assert!(!result.contains("📍"), "should not show scope for .toml: {result}");
+        assert!(
+            !result.contains("📍"),
+            "should not show scope for .toml: {result}"
+        );
     }
 
     #[test]
@@ -1867,18 +1910,17 @@ type Handler interface {
             "new_str": "data.strip().lower()"
         }));
         assert!(result.contains("📍"), "should show scope: {result}");
-        assert!(result.contains("process"), "should mention function: {result}");
+        assert!(
+            result.contains("process"),
+            "should mention function: {result}"
+        );
     }
 
     #[test]
     fn multi_edit_shows_scope_context() {
         let tmpdir = tempfile::tempdir().unwrap();
         let file = tmpdir.path().join("main.rs");
-        std::fs::write(
-            &file,
-            "fn main() {\n    let x = 1;\n    let y = 2;\n}\n",
-        )
-        .unwrap();
+        std::fs::write(&file, "fn main() {\n    let x = 1;\n    let y = 2;\n}\n").unwrap();
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
         let result = exe.multi_edit(&json!({
             "path": "main.rs",

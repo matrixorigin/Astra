@@ -291,7 +291,10 @@ mod tests {
         for e in &entities {
             assert!(!e.name.is_empty(), "name should not be empty");
             assert!(e.domain.is_some(), "domain should be set");
-            assert!(!e.associated_tools.is_empty(), "should have associated tools");
+            assert!(
+                !e.associated_tools.is_empty(),
+                "should have associated tools"
+            );
             assert!(e.confidence > 0.0, "confidence should be positive");
         }
     }

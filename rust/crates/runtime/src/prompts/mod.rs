@@ -858,9 +858,18 @@ mod tests {
             1.0,
             None,
         );
-        assert!(p.contains("## Code Navigation"), "should include code nav section");
-        assert!(p.contains("find_definition"), "should mention find_definition");
-        assert!(p.contains("find_references"), "should mention find_references");
+        assert!(
+            p.contains("## Code Navigation"),
+            "should include code nav section"
+        );
+        assert!(
+            p.contains("find_definition"),
+            "should mention find_definition"
+        );
+        assert!(
+            p.contains("find_references"),
+            "should mention find_references"
+        );
     }
 
     #[test]
@@ -872,7 +881,10 @@ mod tests {
             None,
         );
         assert!(p.contains("call_graph"), "should mention call_graph tool");
-        assert!(p.contains("refactoring") || p.contains("dependencies"), "should mention use case");
+        assert!(
+            p.contains("refactoring") || p.contains("dependencies"),
+            "should mention use case"
+        );
     }
 
     #[test]
@@ -883,7 +895,10 @@ mod tests {
             1.0,
             None,
         );
-        assert!(p.contains("## Editing Strategy"), "should include editing section");
+        assert!(
+            p.contains("## Editing Strategy"),
+            "should include editing section"
+        );
         assert!(p.contains("multi_edit"), "should mention multi_edit");
         assert!(p.contains("dry_run"), "should mention dry_run preview");
         assert!(p.contains("delete_file"), "should mention delete_file");
@@ -891,13 +906,11 @@ mod tests {
 
     #[test]
     fn prompt_omits_editing_guidance_without_multi_edit() {
-        let p = build_main_system_prompt(
-            &["str_replace", "read_file"],
-            "",
-            1.0,
-            None,
+        let p = build_main_system_prompt(&["str_replace", "read_file"], "", 1.0, None);
+        assert!(
+            !p.contains("## Editing Strategy"),
+            "should not include editing section without multi_edit"
         );
-        assert!(!p.contains("## Editing Strategy"), "should not include editing section without multi_edit");
     }
 
     #[test]
@@ -905,14 +918,34 @@ mod tests {
         // Test with a realistic full toolset that triggers all guidance sections
         let p = build_main_system_prompt(
             &[
-                "read_file", "bash", "str_replace", "write_file", "delete_file", "multi_edit",
-                "list_dir", "grep", "glob",
-                "find_definition", "find_references", "call_graph", "symbols", "rename_symbol", "dead_code",
-                "extract_members", "type_hierarchy", "hover_info", "symbol_search",
+                "read_file",
+                "bash",
+                "str_replace",
+                "write_file",
+                "delete_file",
+                "multi_edit",
+                "list_dir",
+                "grep",
+                "glob",
+                "find_definition",
+                "find_references",
+                "call_graph",
+                "symbols",
+                "rename_symbol",
+                "dead_code",
+                "extract_members",
+                "type_hierarchy",
+                "hover_info",
+                "symbol_search",
                 "run_build_test",
-                "git_diff", "git_log", "git_commit", "git_stash",
-                "github_list_prs", "github_repo_stats",
-                "memory_store", "memory_search",
+                "git_diff",
+                "git_log",
+                "git_commit",
+                "git_stash",
+                "github_list_prs",
+                "github_repo_stats",
+                "memory_store",
+                "memory_search",
             ],
             "",
             1.0,
@@ -944,9 +977,6 @@ mod tests {
             p.contains("acceptance criteria"),
             "should mention acceptance criteria"
         );
-        assert!(
-            p.contains("Don't skip ahead"),
-            "should warn about ordering"
-        );
+        assert!(p.contains("Don't skip ahead"), "should warn about ordering");
     }
 }

@@ -248,8 +248,10 @@ impl ToolHealthTracker {
             .unwrap_or(0);
 
         // Build a map of historical tools for quick lookup
-        let historical_map: std::collections::HashMap<&str, &crate::pipeline::persistence::ToolHealthEntry> =
-            historical.iter().map(|e| (e.name.as_str(), e)).collect();
+        let historical_map: std::collections::HashMap<
+            &str,
+            &crate::pipeline::persistence::ToolHealthEntry,
+        > = historical.iter().map(|e| (e.name.as_str(), e)).collect();
 
         // Export tools from tracker
         let mut result: Vec<_> = self
@@ -259,7 +261,9 @@ impl ToolHealthTracker {
             .map(|(name, h)| {
                 // Check if this tool had activity this session by comparing with historical data
                 let had_session_activity = match historical_map.get(name.as_str()) {
-                    Some(hist) => h.total_calls != hist.total_calls || h.total_failures != hist.total_failures,
+                    Some(hist) => {
+                        h.total_calls != hist.total_calls || h.total_failures != hist.total_failures
+                    }
                     None => true, // New tool, definitely had activity
                 };
 

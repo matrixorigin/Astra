@@ -20,6 +20,10 @@ use mo_agent_runtime::tool_sandbox::{
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
 
+#[path = "edge_tools/build_test.rs"]
+mod build_test;
+#[path = "edge_tools/code_intel.rs"]
+pub mod code_intel;
 #[path = "edge_tools/fs.rs"]
 mod fs_tools;
 #[path = "edge_tools/git_gix.rs"]
@@ -30,10 +34,6 @@ mod github;
 mod mo_tools;
 #[path = "edge_tools/shell.rs"]
 mod shell;
-#[path = "edge_tools/build_test.rs"]
-mod build_test;
-#[path = "edge_tools/code_intel.rs"]
-pub mod code_intel;
 
 // ─── Tool schema ─────────────────────────────────────────────────────────────
 
@@ -1358,10 +1358,7 @@ impl ToolExecutor {
 
         // Apply kind filter if provided
         if let Some(kinds_arr) = args.get("kinds").and_then(Value::as_array) {
-            let kinds: Vec<&str> = kinds_arr
-                .iter()
-                .filter_map(Value::as_str)
-                .collect();
+            let kinds: Vec<&str> = kinds_arr.iter().filter_map(Value::as_str).collect();
             if !kinds.is_empty() {
                 symbols.retain(|s| {
                     let kind_str = s.kind.as_str();
@@ -1413,12 +1410,20 @@ impl ToolExecutor {
             ));
 
             // If calls=true, show what this symbol calls
-            if show_calls && matches!(sym.kind, code_intel::SymbolKind::Function | code_intel::SymbolKind::Method) {
+            if show_calls
+                && matches!(
+                    sym.kind,
+                    code_intel::SymbolKind::Function | code_intel::SymbolKind::Method
+                )
+            {
                 let calls = code_intel::extract_calls(&content, lang, sym.start_line, sym.end_line);
                 if !calls.is_empty() {
                     for call in calls.iter().take(8) {
                         if let Some(ref recv) = call.receiver {
-                            output.push_str(&format!("    → {}.{}() L{}\n", recv, call.callee, call.line));
+                            output.push_str(&format!(
+                                "    → {}.{}() L{}\n",
+                                recv, call.callee, call.line
+                            ));
                         } else {
                             output.push_str(&format!("    → {}() L{}\n", call.callee, call.line));
                         }
@@ -1470,7 +1475,10 @@ impl ToolExecutor {
 
             for &(line_num, line) in matches {
                 // Find the column where the symbol appears in this line
-                let line_content = content.lines().nth(line_num.saturating_sub(1)).unwrap_or("");
+                let line_content = content
+                    .lines()
+                    .nth(line_num.saturating_sub(1))
+                    .unwrap_or("");
                 let col = match line_content.find(symbol) {
                     Some(c) => c,
                     None => {
@@ -1497,9 +1505,22 @@ impl ToolExecutor {
 
     /// Walk project files and find all functions that call `target` symbol.
     /// Returns Vec of (relative_path, caller_name, caller_signature, call_line).
-    fn find_callers_cross_file(&self, target: &str, _origin_file: &std::path::Path) -> Vec<(String, String, String, usize)> {
-        let skip_names = ["node_modules", "target", "vendor", "dist", "__pycache__", ".git"];
-        let extensions = ["rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "h", "cpp", "cc", "hpp", "rb"];
+    fn find_callers_cross_file(
+        &self,
+        target: &str,
+        _origin_file: &std::path::Path,
+    ) -> Vec<(String, String, String, usize)> {
+        let skip_names = [
+            "node_modules",
+            "target",
+            "vendor",
+            "dist",
+            "__pycache__",
+            ".git",
+        ];
+        let extensions = [
+            "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "h", "cpp", "cc", "hpp", "rb",
+        ];
         let max_files = 300;
 
         // Step 1: Use ripgrep to pre-filter files containing the target symbol (fast)
@@ -1532,7 +1553,8 @@ impl ToolExecutor {
             };
 
             let symbols = code_intel::extract_symbols(&content, lang);
-            let rel_path = file_path.strip_prefix(&self.project_root)
+            let rel_path = file_path
+                .strip_prefix(&self.project_root)
                 .unwrap_or(file_path)
                 .display()
                 .to_string();
@@ -1541,10 +1563,14 @@ impl ToolExecutor {
                 if sym.name == target {
                     continue; // Skip the target's own definition
                 }
-                if !matches!(sym.kind, code_intel::SymbolKind::Function | code_intel::SymbolKind::Method) {
+                if !matches!(
+                    sym.kind,
+                    code_intel::SymbolKind::Function | code_intel::SymbolKind::Method
+                ) {
                     continue;
                 }
-                let sym_calls = code_intel::extract_calls(&content, lang, sym.start_line, sym.end_line);
+                let sym_calls =
+                    code_intel::extract_calls(&content, lang, sym.start_line, sym.end_line);
                 for call in &sym_calls {
                     if call.callee == target {
                         callers.push((
@@ -1584,24 +1610,29 @@ impl ToolExecutor {
         cmd.arg(symbol);
 
         match cmd.output() {
-            Ok(out) => {
-                String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .map(|l| self.project_root.join(l.trim()))
-                    .filter(|p| p.exists())
-                    .collect()
-            }
+            Ok(out) => String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|l| self.project_root.join(l.trim()))
+                .filter(|p| p.exists())
+                .collect(),
             Err(_) => Vec::new(), // Fallback handled by caller
         }
     }
 
     /// Collect project files by walking directories (fallback when ripgrep unavailable).
-    fn collect_project_files(&self, skip_names: &[&str], extensions: &[&str], max_files: usize) -> Vec<PathBuf> {
+    fn collect_project_files(
+        &self,
+        skip_names: &[&str],
+        extensions: &[&str],
+        max_files: usize,
+    ) -> Vec<PathBuf> {
         let mut result = Vec::new();
         let mut dirs_to_visit = vec![self.project_root.clone()];
 
         while let Some(dir) = dirs_to_visit.pop() {
-            let Ok(entries) = fs::read_dir(&dir) else { continue };
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
@@ -1627,13 +1658,27 @@ impl ToolExecutor {
         result
     }
 
-    fn collect_files_with_glob(&self, root: &std::path::Path, glob_pat: &str, files: &mut Vec<std::path::PathBuf>) {
-        let skip_dirs = ["node_modules", "target", "vendor", "dist", "__pycache__", ".git"];
+    fn collect_files_with_glob(
+        &self,
+        root: &std::path::Path,
+        glob_pat: &str,
+        files: &mut Vec<std::path::PathBuf>,
+    ) {
+        let skip_dirs = [
+            "node_modules",
+            "target",
+            "vendor",
+            "dist",
+            "__pycache__",
+            ".git",
+        ];
         let pat = glob_pat.trim_start_matches('*');
 
         let mut dirs_to_visit = vec![root.to_path_buf()];
         while let Some(dir) = dirs_to_visit.pop() {
-            let Ok(entries) = fs::read_dir(&dir) else { continue };
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
@@ -1644,8 +1689,12 @@ impl ToolExecutor {
                 if ft.map(|t| t.is_dir()).unwrap_or(false) {
                     dirs_to_visit.push(entry.path());
                 } else if ft.map(|t| t.is_file()).unwrap_or(false) {
-                    let file_name = entry.path().file_name()
-                        .unwrap_or_default().to_string_lossy().to_string();
+                    let file_name = entry
+                        .path()
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
                     if file_name.ends_with(pat) {
                         files.push(entry.path());
                         if files.len() >= 500 {
@@ -1683,8 +1732,15 @@ impl ToolExecutor {
             Some("c") => vec!["c", "h"],
             Some("cpp") => vec!["cpp", "cc", "cxx", "hpp", "h"],
             Some("ruby") => vec!["rb"],
-            None => vec!["rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "h", "cpp", "cc", "hpp", "rb"],
-            Some(other) => return format!("Error: unsupported language '{other}'. Supported: rust, python, typescript, javascript, go, java, c, cpp, ruby"),
+            None => vec![
+                "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "h", "cpp", "cc", "hpp",
+                "rb",
+            ],
+            Some(other) => {
+                return format!(
+                    "Error: unsupported language '{other}'. Supported: rust, python, typescript, javascript, go, java, c, cpp, ruby"
+                );
+            }
         };
 
         // Build regex for matching symbol name
@@ -1701,8 +1757,19 @@ impl ToolExecutor {
             }
         };
 
-        let definition_kinds = ["fn", "method", "class", "struct", "trait", "interface",
-                                "enum", "type", "const", "var", "mod"];
+        let definition_kinds = [
+            "fn",
+            "method",
+            "class",
+            "struct",
+            "trait",
+            "interface",
+            "enum",
+            "type",
+            "const",
+            "var",
+            "mod",
+        ];
 
         let mut results: Vec<String> = Vec::new();
         let max_files = 500; // Limit to prevent scanning huge repos
@@ -1714,7 +1781,9 @@ impl ToolExecutor {
         let mut file_paths: Vec<std::path::PathBuf> = Vec::new();
 
         while let Some(dir) = dirs_to_visit.pop() {
-            let Ok(entries) = fs::read_dir(&dir) else { continue };
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
@@ -1725,7 +1794,9 @@ impl ToolExecutor {
                 if ft.map(|t| t.is_dir()).unwrap_or(false) {
                     dirs_to_visit.push(entry.path());
                 } else if ft.map(|t| t.is_file()).unwrap_or(false) {
-                    let ext = entry.path().extension()
+                    let ext = entry
+                        .path()
+                        .extension()
                         .and_then(|e| e.to_str())
                         .unwrap_or("")
                         .to_string();
@@ -1754,10 +1825,13 @@ impl ToolExecutor {
             let symbols = code_intel::extract_symbols(&content, lang);
             for sym in &symbols {
                 if pattern.is_match(&sym.name) && definition_kinds.contains(&sym.kind.as_str()) {
-                    let rel_path = path.strip_prefix(&self.project_root)
+                    let rel_path = path
+                        .strip_prefix(&self.project_root)
                         .unwrap_or(path)
                         .display();
-                    let parent_info = sym.parent.as_ref()
+                    let parent_info = sym
+                        .parent
+                        .as_ref()
                         .map(|p| format!(" (in {p})"))
                         .unwrap_or_default();
 
@@ -1768,13 +1842,22 @@ impl ToolExecutor {
                     } else {
                         // Indent doc and limit to first 5 lines
                         let doc_lines: Vec<&str> = doc.lines().take(5).collect();
-                        let truncated = if doc.lines().count() > 5 { "\n    ..." } else { "" };
+                        let truncated = if doc.lines().count() > 5 {
+                            "\n    ..."
+                        } else {
+                            ""
+                        };
                         format!("\n    📝 {}{}", doc_lines.join("\n    "), truncated)
                     };
 
                     results.push(format!(
                         "{}:{} [{}]{} {}{}",
-                        rel_path, sym.start_line, sym.kind.as_str(), parent_info, sym.signature, doc_info
+                        rel_path,
+                        sym.start_line,
+                        sym.kind.as_str(),
+                        parent_info,
+                        sym.signature,
+                        doc_info
                     ));
                 }
             }
@@ -1783,8 +1866,12 @@ impl ToolExecutor {
         if results.is_empty() {
             format!("No definitions found for '{symbol}' ({files_scanned} files scanned)")
         } else {
-            let header = format!("# Definitions of '{}' ({} found, {} files scanned)\n\n",
-                symbol, results.len(), files_scanned);
+            let header = format!(
+                "# Definitions of '{}' ({} found, {} files scanned)\n\n",
+                symbol,
+                results.len(),
+                files_scanned
+            );
             let body = results.join("\n");
             truncate_output(format!("{header}{body}"), tool_output_limit())
         }
@@ -1819,20 +1906,30 @@ impl ToolExecutor {
         }
 
         // Exclude common noise directories
-        cmd.arg("--glob").arg("!.git/")
-            .arg("--glob").arg("!node_modules/")
-            .arg("--glob").arg("!target/")
-            .arg("--glob").arg("!vendor/")
-            .arg("--glob").arg("!dist/")
-            .arg("--glob").arg("!*.min.js")
-            .arg("--glob").arg("!*.min.css");
+        cmd.arg("--glob")
+            .arg("!.git/")
+            .arg("--glob")
+            .arg("!node_modules/")
+            .arg("--glob")
+            .arg("!target/")
+            .arg("--glob")
+            .arg("!vendor/")
+            .arg("--glob")
+            .arg("!dist/")
+            .arg("--glob")
+            .arg("!*.min.js")
+            .arg("--glob")
+            .arg("!*.min.css");
 
         // Use fixed string for exact symbol (faster), word-bounded
         cmd.arg(symbol);
         cmd.arg(search_path.to_string_lossy().to_string());
 
         let kind_filter = args.get("kind").and_then(Value::as_str).unwrap_or("all");
-        let ast_validate = args.get("validate").and_then(Value::as_bool).unwrap_or(true);
+        let ast_validate = args
+            .get("validate")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
 
         match cmd.output() {
             Ok(out) => {
@@ -1853,16 +1950,22 @@ impl ToolExecutor {
                 let ast_filtered = total_grep - validated_lines.len();
 
                 // Categorize each reference line
-                let categorized: Vec<(&str, &str)> = validated_lines.iter().map(|line| {
-                    let category = categorize_reference(line, symbol);
-                    (*line, category)
-                }).collect();
+                let categorized: Vec<(&str, &str)> = validated_lines
+                    .iter()
+                    .map(|line| {
+                        let category = categorize_reference(line, symbol);
+                        (*line, category)
+                    })
+                    .collect();
 
                 // Apply kind filter
                 let filtered: Vec<(&str, &str)> = if kind_filter == "all" {
                     categorized
                 } else {
-                    categorized.into_iter().filter(|(_, cat)| *cat == kind_filter).collect()
+                    categorized
+                        .into_iter()
+                        .filter(|(_, cat)| *cat == kind_filter)
+                        .collect()
                 };
 
                 if filtered.is_empty() {
@@ -1877,9 +1980,15 @@ impl ToolExecutor {
                 } else {
                     String::new()
                 };
-                let mut output = format!("# References to '{}' ({} found{}{})\n\n",
-                    symbol, total,
-                    if kind_filter != "all" { format!(", kind={kind_filter}") } else { String::new() },
+                let mut output = format!(
+                    "# References to '{}' ({} found{}{})\n\n",
+                    symbol,
+                    total,
+                    if kind_filter != "all" {
+                        format!(", kind={kind_filter}")
+                    } else {
+                        String::new()
+                    },
                     ast_note
                 );
                 let mut current_file = "";
@@ -1905,9 +2014,15 @@ impl ToolExecutor {
             Err(_) => {
                 // Fallback to grep if rg not available
                 let out = std::process::Command::new("grep")
-                    .args(["-rnw", "--include=*.rs", "--include=*.py",
-                           "--include=*.ts", "--include=*.go", "--include=*.java",
-                           symbol])
+                    .args([
+                        "-rnw",
+                        "--include=*.rs",
+                        "--include=*.py",
+                        "--include=*.ts",
+                        "--include=*.go",
+                        "--include=*.java",
+                        symbol,
+                    ])
                     .arg(search_path.to_string_lossy().to_string())
                     .current_dir(&self.project_root)
                     .output();
@@ -1918,8 +2033,12 @@ impl ToolExecutor {
                             format!("No references found for '{symbol}'")
                         } else {
                             let lines: Vec<&str> = stdout.lines().take(50).collect();
-                            let header = format!("# References to '{}' ({} found)\n\n", symbol, lines.len());
-                            truncate_output(format!("{header}{}", lines.join("\n")), tool_output_limit())
+                            let header =
+                                format!("# References to '{}' ({} found)\n\n", symbol, lines.len());
+                            truncate_output(
+                                format!("{header}{}", lines.join("\n")),
+                                tool_output_limit(),
+                            )
                         }
                     }
                     Err(e) => format!("Error: search failed: {e}"),
@@ -1943,7 +2062,10 @@ impl ToolExecutor {
         }
 
         // Validate new_name is a valid identifier
-        if !new_name.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_')
+        if !new_name
+            .chars()
+            .next()
+            .map_or(false, |c| c.is_alphabetic() || c == '_')
             || !new_name.chars().all(|c| c.is_alphanumeric() || c == '_')
         {
             return format!("Error: '{}' is not a valid identifier", new_name);
@@ -1963,8 +2085,11 @@ impl ToolExecutor {
         // Build search command — try ripgrep first, fall back to grep
         let output = {
             let mut cmd = std::process::Command::new("rg");
-            cmd.arg("-n").arg("-w").arg("--no-heading")
-                .arg("--max-count").arg("1000")
+            cmd.arg("-n")
+                .arg("-w")
+                .arg("--no-heading")
+                .arg("--max-count")
+                .arg("1000")
                 .arg(symbol)
                 .current_dir(&search_dir);
             if let Some(inc) = include {
@@ -2006,11 +2131,15 @@ impl ToolExecutor {
         let filtered_count = total_grep - validated.len();
 
         if validated.is_empty() {
-            return format!("No code references to '{}' found (all {} matches were in comments/strings)", symbol, total_grep);
+            return format!(
+                "No code references to '{}' found (all {} matches were in comments/strings)",
+                symbol, total_grep
+            );
         }
 
         // Step 3: Group by file and collect line numbers
-        let mut by_file: std::collections::BTreeMap<String, Vec<usize>> = std::collections::BTreeMap::new();
+        let mut by_file: std::collections::BTreeMap<String, Vec<usize>> =
+            std::collections::BTreeMap::new();
         for line in &validated {
             if let Some((file, line_num)) = parse_grep_file_line(line) {
                 by_file.entry(file.to_string()).or_default().push(line_num);
@@ -2088,20 +2217,29 @@ impl ToolExecutor {
                         output.push_str(&format!("  ⚠ {}: write error: {}\n", rel_path, e));
                         continue;
                     }
-                    output.push_str(&format!("  ✓ {} ({} replacement{})\n", rel_path, replacements_in_file,
-                        if replacements_in_file == 1 { "" } else { "s" }));
+                    output.push_str(&format!(
+                        "  ✓ {} ({} replacement{})\n",
+                        rel_path,
+                        replacements_in_file,
+                        if replacements_in_file == 1 { "" } else { "s" }
+                    ));
                 }
             }
         }
 
-        output.push_str(&format!("\n{} replacement{} in {} file{}",
+        output.push_str(&format!(
+            "\n{} replacement{} in {} file{}",
             total_replacements,
             if total_replacements == 1 { "" } else { "s" },
             files_changed,
-            if files_changed == 1 { "" } else { "s" }));
+            if files_changed == 1 { "" } else { "s" }
+        ));
 
         if filtered_count > 0 {
-            output.push_str(&format!(" ({} comment/string matches skipped)", filtered_count));
+            output.push_str(&format!(
+                " ({} comment/string matches skipped)",
+                filtered_count
+            ));
         }
 
         if dry_run {
@@ -2123,8 +2261,17 @@ impl ToolExecutor {
         }
 
         // Step 1: Collect files to scan
-        let extensions = ["rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "h", "cpp", "cc", "hpp", "rb"];
-        let skip_dirs = ["node_modules", "target", "vendor", "dist", "__pycache__", ".git"];
+        let extensions = [
+            "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "h", "cpp", "cc", "hpp", "rb",
+        ];
+        let skip_dirs = [
+            "node_modules",
+            "target",
+            "vendor",
+            "dist",
+            "__pycache__",
+            ".git",
+        ];
         let max_files = 200;
 
         let files: Vec<std::path::PathBuf> = if scan_dir.is_file() {
@@ -2171,16 +2318,22 @@ impl ToolExecutor {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            let rel = file_path.strip_prefix(&self.project_root)
-                .unwrap_or(file_path).to_string_lossy().to_string();
+            let rel = file_path
+                .strip_prefix(&self.project_root)
+                .unwrap_or(file_path)
+                .to_string_lossy()
+                .to_string();
 
             let extracted = code_intel::extract_symbols(&content, lang);
             for sym in extracted {
                 let kind_str = match sym.kind {
                     code_intel::SymbolKind::Function | code_intel::SymbolKind::Method => "function",
-                    code_intel::SymbolKind::Struct | code_intel::SymbolKind::Class
-                    | code_intel::SymbolKind::Enum | code_intel::SymbolKind::Trait
-                    | code_intel::SymbolKind::Interface | code_intel::SymbolKind::Type => "type",
+                    code_intel::SymbolKind::Struct
+                    | code_intel::SymbolKind::Class
+                    | code_intel::SymbolKind::Enum
+                    | code_intel::SymbolKind::Trait
+                    | code_intel::SymbolKind::Interface
+                    | code_intel::SymbolKind::Type => "type",
                     code_intel::SymbolKind::Constant => "constant",
                     _ => continue, // skip variables, imports, constructors, modules
                 };
@@ -2196,10 +2349,13 @@ impl ToolExecutor {
                 let is_test = sym.name.starts_with("test_")
                     || sym.name.ends_with("_test")
                     || sym.name.starts_with("Test")
-                    || sig.contains("#[test]") || sig.contains("#[cfg(test)]");
+                    || sig.contains("#[test]")
+                    || sig.contains("#[cfg(test)]");
 
                 // Check visibility
-                let is_public = sig.starts_with("pub ") || sig.starts_with("pub(") || sig.starts_with("export ");
+                let is_public = sig.starts_with("pub ")
+                    || sig.starts_with("pub(")
+                    || sig.starts_with("export ");
 
                 symbols.push(SymbolInfo {
                     name: sym.name,
@@ -2214,7 +2370,10 @@ impl ToolExecutor {
         }
 
         if symbols.is_empty() {
-            return format!("No symbols of kind '{}' found in '{}'", kind_filter, scan_path);
+            return format!(
+                "No symbols of kind '{}' found in '{}'",
+                kind_filter, scan_path
+            );
         }
 
         // Step 3: For each symbol, count references project-wide
@@ -2242,16 +2401,23 @@ impl ToolExecutor {
         // Step 4: Format output
         let mut output = String::new();
         if dead.is_empty() {
-            output.push_str(&format!("✓ No dead code found ({} symbols checked in {} files)\n",
-                checked, files.len()));
+            output.push_str(&format!(
+                "✓ No dead code found ({} symbols checked in {} files)\n",
+                checked,
+                files.len()
+            ));
         } else {
-            output.push_str(&format!("⚠ {} potentially unused symbol{} ({} checked in {} files):\n\n",
+            output.push_str(&format!(
+                "⚠ {} potentially unused symbol{} ({} checked in {} files):\n\n",
                 dead.len(),
                 if dead.len() == 1 { "" } else { "s" },
-                checked, files.len()));
+                checked,
+                files.len()
+            ));
 
             // Group by file
-            let mut by_file: std::collections::BTreeMap<&str, Vec<&SymbolInfo>> = std::collections::BTreeMap::new();
+            let mut by_file: std::collections::BTreeMap<&str, Vec<&SymbolInfo>> =
+                std::collections::BTreeMap::new();
             for sym in &dead {
                 by_file.entry(&sym.file).or_default().push(sym);
             }
@@ -2260,13 +2426,17 @@ impl ToolExecutor {
                 output.push_str(&format!("{}:\n", file));
                 for sym in syms {
                     let pub_marker = if sym.is_public { " (pub)" } else { "" };
-                    output.push_str(&format!("  L{}: {} {}{}\n",
-                        sym.line, sym.kind, sym.name, pub_marker));
+                    output.push_str(&format!(
+                        "  L{}: {} {}{}\n",
+                        sym.line, sym.kind, sym.name, pub_marker
+                    ));
                 }
             }
 
             if dead.iter().any(|s| s.is_public) {
-                output.push_str("\n💡 Public symbols marked (pub) may be used by external consumers.\n");
+                output.push_str(
+                    "\n💡 Public symbols marked (pub) may be used by external consumers.\n",
+                );
             }
         }
 
@@ -2278,7 +2448,9 @@ impl ToolExecutor {
         // Try ripgrep first, fall back to grep
         let output = {
             let mut cmd = std::process::Command::new("rg");
-            cmd.arg("-c").arg("-w").arg("--no-heading")
+            cmd.arg("-c")
+                .arg("-w")
+                .arg("--no-heading")
                 .arg(symbol)
                 .current_dir(&self.project_root);
             for exc in &[".git", "node_modules", "target", "vendor", "dist"] {
@@ -2302,7 +2474,8 @@ impl ToolExecutor {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         // Each line is "file:count" — sum all counts
-        stdout.lines()
+        stdout
+            .lines()
             .filter_map(|line| {
                 let parts: Vec<&str> = line.rsplitn(2, ':').collect();
                 parts.first().and_then(|s| s.parse::<usize>().ok())
@@ -2329,7 +2502,7 @@ impl ToolExecutor {
         let lang = match code_intel::detect_language(&file) {
             Some(l) => l,
             None => {
-                return "Error: unsupported language (supported: rs, py, ts, js, go)".to_string()
+                return "Error: unsupported language (supported: rs, py, ts, js, go)".to_string();
             }
         };
 
@@ -2341,7 +2514,10 @@ impl ToolExecutor {
         let members = code_intel::extract_members(&source, lang, line);
 
         if members.is_empty() {
-            return format!("No type definition found at line {line} in {}", file.display());
+            return format!(
+                "No type definition found at line {line} in {}",
+                file.display()
+            );
         }
 
         let mut parts = Vec::new();
@@ -2389,7 +2565,10 @@ impl ToolExecutor {
             .get("direction")
             .and_then(Value::as_str)
             .unwrap_or("implementations");
-        let include_glob = args.get("include").and_then(Value::as_str).unwrap_or("*.rs");
+        let include_glob = args
+            .get("include")
+            .and_then(Value::as_str)
+            .unwrap_or("*.rs");
 
         // Collect Rust source files
         let mut files = Vec::new();
@@ -2434,10 +2613,7 @@ impl ToolExecutor {
                 let mut found = false;
                 for imp in &all_impls {
                     if imp.trait_name == name {
-                        results.push(format!(
-                            "  {} — {}:{}",
-                            imp.type_name, imp.file, imp.line
-                        ));
+                        results.push(format!("  {} — {}:{}", imp.type_name, imp.file, imp.line));
                         found = true;
                     }
                 }
@@ -2493,25 +2669,35 @@ impl ToolExecutor {
 
         // Step 3: Symbol definition at this line
         let symbols = code_intel::extract_symbols(&source, lang);
-        let at_line: Vec<&code_intel::Symbol> = symbols
-            .iter()
-            .filter(|s| s.start_line == line)
-            .collect();
+        let at_line: Vec<&code_intel::Symbol> =
+            symbols.iter().filter(|s| s.start_line == line).collect();
 
         // Also try to find the definition of the cursor identifier
-        let cursor_def = cursor_ident.as_ref().and_then(|(name, _)| {
-            symbols.iter().find(|s| &s.name == name)
-        });
+        let cursor_def = cursor_ident
+            .as_ref()
+            .and_then(|(name, _)| symbols.iter().find(|s| &s.name == name));
 
         let primary_sym = at_line.first().copied().or(cursor_def);
 
         if let Some(sym) = primary_sym {
-            let parent_info = sym.parent.as_ref()
+            let parent_info = sym
+                .parent
+                .as_ref()
                 .map(|p| format!(" (in {})", p))
                 .unwrap_or_default();
             parts.push(format!(""));
-            parts.push(format!("▸ {} {}{}", sym.kind.as_str(), sym.signature, parent_info));
-            parts.push(format!("  {}:{}–{}", rel_path.display(), sym.start_line, sym.end_line));
+            parts.push(format!(
+                "▸ {} {}{}",
+                sym.kind.as_str(),
+                sym.signature,
+                parent_info
+            ));
+            parts.push(format!(
+                "  {}:{}–{}",
+                rel_path.display(),
+                sym.start_line,
+                sym.end_line
+            ));
 
             // Doc comment
             let doc = code_intel::extract_doc_comment(&source, lang, sym.start_line);
@@ -2523,12 +2709,13 @@ impl ToolExecutor {
             }
 
             // If it's a type, show members preview
-            if matches!(sym.kind,
+            if matches!(
+                sym.kind,
                 code_intel::SymbolKind::Struct
-                | code_intel::SymbolKind::Enum
-                | code_intel::SymbolKind::Class
-                | code_intel::SymbolKind::Interface
-                | code_intel::SymbolKind::Trait
+                    | code_intel::SymbolKind::Enum
+                    | code_intel::SymbolKind::Class
+                    | code_intel::SymbolKind::Interface
+                    | code_intel::SymbolKind::Trait
             ) {
                 let members = code_intel::extract_members(&source, lang, sym.start_line);
                 if !members.is_empty() {
@@ -2549,15 +2736,16 @@ impl ToolExecutor {
             }
 
             // Calls made by this function
-            if matches!(sym.kind,
+            if matches!(
+                sym.kind,
                 code_intel::SymbolKind::Function | code_intel::SymbolKind::Method
             ) {
-                let calls = code_intel::extract_calls(
-                    &source, lang, sym.start_line, sym.end_line,
-                );
+                let calls = code_intel::extract_calls(&source, lang, sym.start_line, sym.end_line);
                 if !calls.is_empty() {
                     parts.push(format!(""));
-                    let call_names: Vec<String> = calls.iter().take(8)
+                    let call_names: Vec<String> = calls
+                        .iter()
+                        .take(8)
                         .map(|c| {
                             if let Some(ref r) = c.receiver {
                                 format!("{}.{}", r, c.callee)
@@ -2610,8 +2798,17 @@ impl ToolExecutor {
         let include_glob = args.get("include").and_then(Value::as_str);
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
 
-        let extensions = ["rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "h", "cpp", "cc", "hpp", "rb"];
-        let skip_dirs = ["node_modules", "target", "vendor", "dist", "__pycache__", ".git"];
+        let extensions = [
+            "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "h", "cpp", "cc", "hpp", "rb",
+        ];
+        let skip_dirs = [
+            "node_modules",
+            "target",
+            "vendor",
+            "dist",
+            "__pycache__",
+            ".git",
+        ];
         let files = self.collect_project_files(&skip_dirs, &extensions, 300);
 
         struct Match {
@@ -2643,8 +2840,11 @@ impl ToolExecutor {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            let rel = file_path.strip_prefix(&self.project_root)
-                .unwrap_or(file_path).to_string_lossy().to_string();
+            let rel = file_path
+                .strip_prefix(&self.project_root)
+                .unwrap_or(file_path)
+                .to_string_lossy()
+                .to_string();
 
             let symbols = code_intel::extract_symbols(&content, lang);
             for sym in symbols {
@@ -2652,14 +2852,19 @@ impl ToolExecutor {
                 let kind_str = sym.kind.as_str();
                 match kind_filter {
                     "function" if kind_str != "fn" && kind_str != "method" => continue,
-                    "type" if !matches!(sym.kind,
-                        code_intel::SymbolKind::Struct
-                        | code_intel::SymbolKind::Class
-                        | code_intel::SymbolKind::Enum
-                        | code_intel::SymbolKind::Interface
-                        | code_intel::SymbolKind::Trait
-                        | code_intel::SymbolKind::Type
-                    ) => continue,
+                    "type"
+                        if !matches!(
+                            sym.kind,
+                            code_intel::SymbolKind::Struct
+                                | code_intel::SymbolKind::Class
+                                | code_intel::SymbolKind::Enum
+                                | code_intel::SymbolKind::Interface
+                                | code_intel::SymbolKind::Trait
+                                | code_intel::SymbolKind::Type
+                        ) =>
+                    {
+                        continue;
+                    }
                     "method" if kind_str != "method" => continue,
                     "constant" if kind_str != "const" && kind_str != "var" => continue,
                     _ => {}
@@ -2699,7 +2904,11 @@ impl ToolExecutor {
         }
 
         let mut parts = Vec::new();
-        parts.push(format!("Symbols matching '{}' ({} results):", query, matches.len()));
+        parts.push(format!(
+            "Symbols matching '{}' ({} results):",
+            query,
+            matches.len()
+        ));
         parts.push(String::new());
 
         for m in &matches {
@@ -2729,7 +2938,10 @@ impl ToolExecutor {
 
         let lang = match code_intel::detect_language(&path) {
             Some(l) => l,
-            None => return "Error: unsupported language (supported: rs, py, ts, go, java, c, cpp, rb)".to_string(),
+            None => {
+                return "Error: unsupported language (supported: rs, py, ts, go, java, c, cpp, rb)"
+                    .to_string();
+            }
         };
 
         let content = match std::fs::read_to_string(&path) {
@@ -2738,7 +2950,9 @@ impl ToolExecutor {
         };
 
         // Determine the line range to analyze
-        let (start_line, end_line) = if let Some(sym_name) = args.get("symbol").and_then(Value::as_str) {
+        let (start_line, end_line) = if let Some(sym_name) =
+            args.get("symbol").and_then(Value::as_str)
+        {
             // Find the symbol by name
             let symbols = code_intel::extract_symbols(&content, lang);
             let matches: Vec<_> = symbols.iter().filter(|s| s.name == sym_name).collect();
@@ -2749,7 +2963,13 @@ impl ToolExecutor {
                     // Multiple matches — show them and ask for disambiguation
                     let mut msg = format!("Multiple symbols named '{sym_name}':\n");
                     for s in &matches {
-                        msg.push_str(&format!("  L{}-{}: {} {}\n", s.start_line, s.end_line, s.kind.as_str(), s.signature));
+                        msg.push_str(&format!(
+                            "  L{}-{}: {} {}\n",
+                            s.start_line,
+                            s.end_line,
+                            s.kind.as_str(),
+                            s.signature
+                        ));
                     }
                     msg.push_str("Use start_line/end_line to specify which one.");
                     return msg;
@@ -2766,14 +2986,23 @@ impl ToolExecutor {
 
         let calls = code_intel::extract_calls(&content, lang, start_line, end_line);
 
-        let fname = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let show_callers = args.get("callers").and_then(Value::as_bool).unwrap_or(false);
+        let fname = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let show_callers = args
+            .get("callers")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         let mut out = String::new();
 
         // Outgoing calls (what this function calls)
         if !calls.is_empty() {
-            out.push_str(&format!("# Calls FROM {} (lines {}-{})\n\n", fname, start_line, end_line));
+            out.push_str(&format!(
+                "# Calls FROM {} (lines {}-{})\n\n",
+                fname, start_line, end_line
+            ));
             for call in &calls {
                 if let Some(ref recv) = call.receiver {
                     out.push_str(&format!("  → L{}: {}.{}()\n", call.line, recv, call.callee));
@@ -2783,7 +3012,9 @@ impl ToolExecutor {
             }
             out.push_str(&format!("\n{} outgoing call(s)\n", calls.len()));
         } else {
-            out.push_str(&format!("No outgoing calls in lines {start_line}-{end_line}\n"));
+            out.push_str(&format!(
+                "No outgoing calls in lines {start_line}-{end_line}\n"
+            ));
         }
 
         // Callers search
@@ -2803,7 +3034,10 @@ impl ToolExecutor {
                             out.push_str(&format!("  ← {}:L{}: {} ({})\n", file, line, name, sig));
                         }
                         if callers.len() > 30 {
-                            out.push_str(&format!("\n  ... and {} more callers\n", callers.len() - 30));
+                            out.push_str(&format!(
+                                "\n  ... and {} more callers\n",
+                                callers.len() - 30
+                            ));
                         }
                         out.push_str(&format!("\n{} caller(s) across project\n", callers.len()));
                     }
@@ -2816,13 +3050,21 @@ impl ToolExecutor {
                         if sym.name == target {
                             continue;
                         }
-                        if !matches!(sym.kind, code_intel::SymbolKind::Function | code_intel::SymbolKind::Method) {
+                        if !matches!(
+                            sym.kind,
+                            code_intel::SymbolKind::Function | code_intel::SymbolKind::Method
+                        ) {
                             continue;
                         }
-                        let sym_calls = code_intel::extract_calls(&content, lang, sym.start_line, sym.end_line);
+                        let sym_calls =
+                            code_intel::extract_calls(&content, lang, sym.start_line, sym.end_line);
                         for call in &sym_calls {
                             if call.callee == target {
-                                callers_found.push((sym.name.clone(), sym.signature.clone(), call.line));
+                                callers_found.push((
+                                    sym.name.clone(),
+                                    sym.signature.clone(),
+                                    call.line,
+                                ));
                                 break;
                             }
                         }
@@ -2855,8 +3097,14 @@ impl ToolExecutor {
             Some(c) if !c.trim().is_empty() => c.trim(),
             _ => return "Error: 'command' parameter is required".to_string(),
         };
-        let context_lines = args.get("context_lines").and_then(Value::as_u64).unwrap_or(5) as usize;
-        let auto_fix = args.get("auto_fix").and_then(Value::as_bool).unwrap_or(false);
+        let context_lines = args
+            .get("context_lines")
+            .and_then(Value::as_u64)
+            .unwrap_or(5) as usize;
+        let auto_fix = args
+            .get("auto_fix")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         // Run the initial build
         let (initial_output, initial_fixes) = self.run_build_test_core(command, context_lines);
@@ -2880,7 +3128,8 @@ impl ToolExecutor {
                 break;
             }
 
-            let (applied, errors) = build_test::apply_auto_fixes(&current_fixes, &self.project_root);
+            let (applied, errors) =
+                build_test::apply_auto_fixes(&current_fixes, &self.project_root);
             let report = build_test::format_auto_fix_report(&applied, &errors, iteration);
             all_reports.push(report);
 
@@ -2907,7 +3156,11 @@ impl ToolExecutor {
 
     /// Core build+parse logic extracted for auto-fix loop reuse.
     /// Returns (formatted_output, fix_suggestions).
-    fn run_build_test_core(&self, command: &str, context_lines: usize) -> (String, Vec<build_test::FixSuggestion>) {
+    fn run_build_test_core(
+        &self,
+        command: &str,
+        context_lines: usize,
+    ) -> (String, Vec<build_test::FixSuggestion>) {
         // Run the command
         let output = std::process::Command::new("sh")
             .args(["-c", command])
@@ -2958,7 +3211,8 @@ impl ToolExecutor {
             parts.push(String::new());
             parts.push("─── Source Context ───".to_string());
 
-            let mut seen_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut seen_files: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for loc in result.error_locations.iter().take(5) {
                 let file_path = self.project_root.join(&loc.file);
                 let file_key = format!("{}:{}", loc.file, loc.line);
@@ -2977,7 +3231,10 @@ impl ToolExecutor {
                     } else {
                         format!(" [{}]", loc.error_code)
                     };
-                    parts.push(format!("\n// {}:{}{} — {}", loc.file, loc.line, code_part, loc.message));
+                    parts.push(format!(
+                        "\n// {}:{}{} — {}",
+                        loc.file, loc.line, code_part, loc.message
+                    ));
 
                     for (idx, line) in lines[start..end].iter().enumerate() {
                         let line_num = start + idx + 1;
@@ -3009,7 +3266,8 @@ impl ToolExecutor {
         }
 
         // Collect fix suggestions for return
-        let fix_list: Vec<build_test::FixSuggestion> = all_fixes.iter().map(|(_, f)| f.clone()).collect();
+        let fix_list: Vec<build_test::FixSuggestion> =
+            all_fixes.iter().map(|(_, f)| f.clone()).collect();
 
         if !all_fixes.is_empty() {
             parts.push(String::new());
@@ -3020,8 +3278,10 @@ impl ToolExecutor {
                     c if c >= 0.5 => "●●○",
                     _ => "●○○",
                 };
-                parts.push(format!("\n{}  [{}] {}",
-                    confidence_bar, fix.action, fix.explanation));
+                parts.push(format!(
+                    "\n{}  [{}] {}",
+                    confidence_bar, fix.action, fix.explanation
+                ));
                 parts.push(format!("  → {}:{}", fix.file, fix.line));
                 if !fix.new_text.is_empty() {
                     // Show what to insert/replace
@@ -3039,7 +3299,10 @@ impl ToolExecutor {
             }
         }
 
-        (truncate_output(parts.join("\n"), tool_output_limit()), fix_list)
+        (
+            truncate_output(parts.join("\n"), tool_output_limit()),
+            fix_list,
+        )
     }
 
     /// Execute a multi-step ToolChain, forwarding each step to self.execute().
@@ -3985,12 +4248,12 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let nonexistent = temp_dir.path().join("nonexistent.rs");
         let result = executor
-            .execute(
-                "symbols",
-                &json!({"path": nonexistent.to_str().unwrap()}),
-            )
+            .execute("symbols", &json!({"path": nonexistent.to_str().unwrap()}))
             .await;
-        assert!(result.contains("No such file") || result.contains("Sandbox"), "got: {result}");
+        assert!(
+            result.contains("No such file") || result.contains("Sandbox"),
+            "got: {result}"
+        );
     }
 
     #[tokio::test]
@@ -3999,10 +4262,7 @@ mod tests {
         let temp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
         std::fs::write(temp.path(), "hello world").unwrap();
         let result = executor
-            .execute(
-                "symbols",
-                &json!({"path": temp.path().to_str().unwrap()}),
-            )
+            .execute("symbols", &json!({"path": temp.path().to_str().unwrap()}))
             .await;
         assert!(result.contains("Unsupported language"), "got: {result}");
     }
@@ -4025,10 +4285,7 @@ pub fn helper(x: i32) -> i32 {
         )
         .unwrap();
         let result = executor
-            .execute(
-                "symbols",
-                &json!({"path": temp.path().to_str().unwrap()}),
-            )
+            .execute("symbols", &json!({"path": temp.path().to_str().unwrap()}))
             .await;
         assert!(result.contains("[fn]"), "got: {result}");
         assert!(result.contains("main"), "got: {result}");
@@ -4095,11 +4352,14 @@ fn helper() {}
         // Point at our own repo to find a known symbol
         let root = {
             let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            p.pop(); p.pop(); // → repo root
+            p.pop();
+            p.pop(); // → repo root
             p
         };
         let executor = ToolExecutor::new(root);
-        let result = executor.execute("find_definition", &json!({"symbol": "ToolExecutor"})).await;
+        let result = executor
+            .execute("find_definition", &json!({"symbol": "ToolExecutor"}))
+            .await;
         // Should find our own struct definition
         assert!(
             result.contains("ToolExecutor") || result.contains("No definitions"),
@@ -4111,12 +4371,15 @@ fn helper() {}
     async fn find_definition_regex_pattern() {
         let root = {
             let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            p.pop(); p.pop();
+            p.pop();
+            p.pop();
             p
         };
         let executor = ToolExecutor::new(root);
         // Regex pattern should work
-        let result = executor.execute("find_definition", &json!({"symbol": "git_st.*"})).await;
+        let result = executor
+            .execute("find_definition", &json!({"symbol": "git_st.*"}))
+            .await;
         assert!(
             result.contains("git_st") || result.contains("No definitions"),
             "should match regex: {result}"
@@ -4136,11 +4399,14 @@ fn helper() {}
     async fn find_references_in_repo() {
         let root = {
             let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            p.pop(); p.pop();
+            p.pop();
+            p.pop();
             p
         };
         let executor = ToolExecutor::new(root);
-        let result = executor.execute("find_references", &json!({"symbol": "ToolExecutor"})).await;
+        let result = executor
+            .execute("find_references", &json!({"symbol": "ToolExecutor"}))
+            .await;
         // Should find references in our own codebase
         assert!(
             result.contains("ToolExecutor") || result.contains("No references"),
@@ -4152,14 +4418,20 @@ fn helper() {}
     async fn find_references_with_include_filter() {
         let root = {
             let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            p.pop(); p.pop();
+            p.pop();
+            p.pop();
             p
         };
         let executor = ToolExecutor::new(root);
-        let result = executor.execute("find_references", &json!({
-            "symbol": "ToolExecutor",
-            "include": "*.rs"
-        })).await;
+        let result = executor
+            .execute(
+                "find_references",
+                &json!({
+                    "symbol": "ToolExecutor",
+                    "include": "*.rs"
+                }),
+            )
+            .await;
         // All results should be .rs files
         assert!(
             result.contains("ToolExecutor") || result.contains("No references"),
@@ -4174,14 +4446,30 @@ fn helper() {}
         let schemas = all_tool_schemas();
         let names: Vec<&str> = schemas
             .iter()
-            .filter_map(|s| s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()))
+            .filter_map(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+            })
             .collect();
         assert!(names.contains(&"git_commit"), "missing git_commit schema");
         assert!(names.contains(&"git_stash"), "missing git_stash schema");
-        assert!(names.contains(&"git_checkout_file"), "missing git_checkout_file schema");
-        assert!(names.contains(&"find_definition"), "missing find_definition schema");
-        assert!(names.contains(&"find_references"), "missing find_references schema");
-        assert!(names.contains(&"run_build_test"), "missing run_build_test schema");
+        assert!(
+            names.contains(&"git_checkout_file"),
+            "missing git_checkout_file schema"
+        );
+        assert!(
+            names.contains(&"find_definition"),
+            "missing find_definition schema"
+        );
+        assert!(
+            names.contains(&"find_references"),
+            "missing find_references schema"
+        );
+        assert!(
+            names.contains(&"run_build_test"),
+            "missing run_build_test schema"
+        );
     }
 
     // ── run_build_test tests ──────────────────────────────────────────────
@@ -4196,18 +4484,27 @@ fn helper() {}
     #[tokio::test]
     async fn run_build_test_echo_passes() {
         let executor = test_executor();
-        let result = executor.execute("run_build_test", &json!({"command": "echo 'hello world'"})).await;
+        let result = executor
+            .execute("run_build_test", &json!({"command": "echo 'hello world'"}))
+            .await;
         // echo should succeed
-        assert!(result.contains("✓") || result.contains("hello"), "should pass: {result}");
+        assert!(
+            result.contains("✓") || result.contains("hello"),
+            "should pass: {result}"
+        );
     }
 
     #[tokio::test]
     async fn run_build_test_failing_command() {
         let executor = test_executor();
-        let result = executor.execute("run_build_test", &json!({"command": "false"})).await;
+        let result = executor
+            .execute("run_build_test", &json!({"command": "false"}))
+            .await;
         // false exits with code 1
-        assert!(result.contains("✗") || result.contains("exit 1") || result.contains("failed"),
-                "should detect failure: {result}");
+        assert!(
+            result.contains("✗") || result.contains("exit 1") || result.contains("failed"),
+            "should detect failure: {result}"
+        );
     }
 
     #[tokio::test]
@@ -4220,9 +4517,14 @@ fn helper() {}
             p
         };
         let executor = ToolExecutor::new(root);
-        let result = executor.execute("run_build_test", &json!({
-            "command": "cargo check -p mo-agent-cli --message-format=short 2>&1 | tail -5"
-        })).await;
+        let result = executor
+            .execute(
+                "run_build_test",
+                &json!({
+                    "command": "cargo check -p mo-agent-cli --message-format=short 2>&1 | tail -5"
+                }),
+            )
+            .await;
         // Should report something meaningful
         assert!(!result.is_empty(), "should produce output");
     }
@@ -4249,13 +4551,27 @@ fn main() {
 "#;
         std::fs::write(dir.path().join("main.rs"), code).unwrap();
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("call_graph", &json!({
-            "path": "main.rs",
-            "symbol": "main"
-        })).await;
-        assert!(result.contains("helper"), "should find helper() call: {result}");
-        assert!(result.contains("println!"), "should find println!: {result}");
-        assert!(result.contains("outgoing call(s)"), "should show total: {result}");
+        let result = executor
+            .execute(
+                "call_graph",
+                &json!({
+                    "path": "main.rs",
+                    "symbol": "main"
+                }),
+            )
+            .await;
+        assert!(
+            result.contains("helper"),
+            "should find helper() call: {result}"
+        );
+        assert!(
+            result.contains("println!"),
+            "should find println!: {result}"
+        );
+        assert!(
+            result.contains("outgoing call(s)"),
+            "should show total: {result}"
+        );
     }
 
     #[tokio::test]
@@ -4264,11 +4580,16 @@ fn main() {
         let code = "fn foo() {\n    bar();\n    baz();\n}\n";
         std::fs::write(dir.path().join("test.rs"), code).unwrap();
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("call_graph", &json!({
-            "path": "test.rs",
-            "start_line": 1,
-            "end_line": 4
-        })).await;
+        let result = executor
+            .execute(
+                "call_graph",
+                &json!({
+                    "path": "test.rs",
+                    "start_line": 1,
+                    "end_line": 4
+                }),
+            )
+            .await;
         assert!(result.contains("bar"), "should find bar(): {result}");
         assert!(result.contains("baz"), "should find baz(): {result}");
     }
@@ -4278,67 +4599,130 @@ fn main() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("empty.rs"), "fn hello() {}\n").unwrap();
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("call_graph", &json!({
-            "path": "empty.rs",
-            "symbol": "nonexistent"
-        })).await;
-        assert!(result.contains("not found"), "should report not found: {result}");
+        let result = executor
+            .execute(
+                "call_graph",
+                &json!({
+                    "path": "empty.rs",
+                    "symbol": "nonexistent"
+                }),
+            )
+            .await;
+        assert!(
+            result.contains("not found"),
+            "should report not found: {result}"
+        );
     }
 
     #[test]
     fn schemas_include_call_graph_and_coding_tools() {
         let schemas = all_tool_schemas();
-        let names: Vec<&str> = schemas.iter()
-            .filter_map(|s| s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()))
+        let names: Vec<&str> = schemas
+            .iter()
+            .filter_map(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+            })
             .collect();
-        assert!(names.contains(&"call_graph"), "should have call_graph: {:?}", names);
-        assert!(names.contains(&"delete_file"), "should have delete_file: {:?}", names);
-        assert!(names.contains(&"multi_edit"), "should have multi_edit: {:?}", names);
+        assert!(
+            names.contains(&"call_graph"),
+            "should have call_graph: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"delete_file"),
+            "should have delete_file: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"multi_edit"),
+            "should have multi_edit: {:?}",
+            names
+        );
     }
 
     #[tokio::test]
     async fn run_build_test_iteration_tracking() {
         let executor = test_executor();
         // First call — no delta header
-        let r1 = executor.execute("run_build_test", &json!({"command": "echo 'ok'"})).await;
-        assert!(!r1.contains("Iteration"), "first run should not show iteration: {r1}");
+        let r1 = executor
+            .execute("run_build_test", &json!({"command": "echo 'ok'"}))
+            .await;
+        assert!(
+            !r1.contains("Iteration"),
+            "first run should not show iteration: {r1}"
+        );
 
         // Second call with same command — should show iteration 1
-        let r2 = executor.execute("run_build_test", &json!({"command": "echo 'ok'"})).await;
+        let r2 = executor
+            .execute("run_build_test", &json!({"command": "echo 'ok'"}))
+            .await;
         // Both succeed with 0 errors, so delta should be empty (nothing to report)
-        assert!(r2.contains("✓") || r2.contains("ok"), "should still work: {r2}");
+        assert!(
+            r2.contains("✓") || r2.contains("ok"),
+            "should still work: {r2}"
+        );
     }
 
     #[tokio::test]
     async fn run_build_test_different_command_resets_tracker() {
         let executor = test_executor();
         // Run one command
-        executor.execute("run_build_test", &json!({"command": "echo 'build'"})).await;
+        executor
+            .execute("run_build_test", &json!({"command": "echo 'build'"}))
+            .await;
         // Run different command — should reset tracker, not show iteration
-        let r2 = executor.execute("run_build_test", &json!({"command": "echo 'test'"})).await;
-        assert!(!r2.contains("Iteration"), "different command should reset: {r2}");
+        let r2 = executor
+            .execute("run_build_test", &json!({"command": "echo 'test'"}))
+            .await;
+        assert!(
+            !r2.contains("Iteration"),
+            "different command should reset: {r2}"
+        );
     }
 
     #[tokio::test]
     async fn run_build_test_auto_fix_false_same_as_default() {
         let executor = test_executor();
-        let r1 = executor.execute("run_build_test", &json!({"command": "echo ok"})).await;
+        let r1 = executor
+            .execute("run_build_test", &json!({"command": "echo ok"}))
+            .await;
         let executor2 = test_executor();
-        let r2 = executor2.execute("run_build_test", &json!({"command": "echo ok", "auto_fix": false})).await;
+        let r2 = executor2
+            .execute(
+                "run_build_test",
+                &json!({"command": "echo ok", "auto_fix": false}),
+            )
+            .await;
         // Both should produce similar output (no auto-fix sections)
-        assert!(!r1.contains("Auto-Fix"), "default should not auto-fix: {r1}");
-        assert!(!r2.contains("Auto-Fix"), "explicit false should not auto-fix: {r2}");
+        assert!(
+            !r1.contains("Auto-Fix"),
+            "default should not auto-fix: {r1}"
+        );
+        assert!(
+            !r2.contains("Auto-Fix"),
+            "explicit false should not auto-fix: {r2}"
+        );
     }
 
     #[tokio::test]
     async fn run_build_test_auto_fix_on_success_no_effect() {
         let executor = test_executor();
-        let result = executor.execute("run_build_test", &json!({
-            "command": "echo 'all tests passed'",
-            "auto_fix": true
-        })).await;
+        let result = executor
+            .execute(
+                "run_build_test",
+                &json!({
+                    "command": "echo 'all tests passed'",
+                    "auto_fix": true
+                }),
+            )
+            .await;
         // Successful build = no errors = no fixes to apply
-        assert!(!result.contains("Auto-Fix"), "no errors = no auto-fix: {result}");
+        assert!(
+            !result.contains("Auto-Fix"),
+            "no errors = no auto-fix: {result}"
+        );
     }
 
     #[tokio::test]
@@ -4351,24 +4735,42 @@ fn main() {
         let executor = ToolExecutor::new(dir.path());
         // Simulate a build that produces an unused import warning
         // We use a command that outputs Rust-style warnings
-        let result = executor.execute("run_build_test", &json!({
-            "command": "echo 'warning: unused import: `std::io`\n --> test.rs:1:5'",
-            "auto_fix": true
-        })).await;
+        let result = executor
+            .execute(
+                "run_build_test",
+                &json!({
+                    "command": "echo 'warning: unused import: `std::io`\n --> test.rs:1:5'",
+                    "auto_fix": true
+                }),
+            )
+            .await;
         // Should contain auto-fix report since the warning matches unused import pattern
         // and the file exists with the import
-        assert!(result.contains("Auto-Fix") || !result.contains("error"),
-            "should attempt auto-fix or have no errors: {result}");
+        assert!(
+            result.contains("Auto-Fix") || !result.contains("error"),
+            "should attempt auto-fix or have no errors: {result}"
+        );
     }
 
     #[test]
     fn schema_includes_auto_fix_param() {
         let schemas = all_tool_schemas();
-        let build = schemas.iter().find(|s|
-            s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) == Some("run_build_test")
-        ).expect("run_build_test schema should exist");
-        let props = build["function"]["parameters"]["properties"].as_object().unwrap();
-        assert!(props.contains_key("auto_fix"), "schema should have auto_fix param");
+        let build = schemas
+            .iter()
+            .find(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    == Some("run_build_test")
+            })
+            .expect("run_build_test schema should exist");
+        let props = build["function"]["parameters"]["properties"]
+            .as_object()
+            .unwrap();
+        assert!(
+            props.contains_key("auto_fix"),
+            "schema should have auto_fix param"
+        );
         assert_eq!(props["auto_fix"]["type"], "boolean");
     }
 
@@ -4395,14 +4797,27 @@ fn main() {
         let executor = ToolExecutor::new(dir.path());
 
         // Without calls=true — no call info
-        let r1 = executor.execute("symbols", &json!({"path": "demo.rs"})).await;
-        assert!(!r1.contains("→"), "without calls should not show arrows: {r1}");
+        let r1 = executor
+            .execute("symbols", &json!({"path": "demo.rs"}))
+            .await;
+        assert!(
+            !r1.contains("→"),
+            "without calls should not show arrows: {r1}"
+        );
 
         // With calls=true — should show callees inline
-        let r2 = executor.execute("symbols", &json!({"path": "demo.rs", "calls": true})).await;
+        let r2 = executor
+            .execute("symbols", &json!({"path": "demo.rs", "calls": true}))
+            .await;
         assert!(r2.contains("→ helper()"), "should show helper() call: {r2}");
-        assert!(r2.contains("→ process("), "should show process() call: {r2}");
-        assert!(r2.contains("→ std::process::exit()") || r2.contains("→ exit()"), "should show exit call: {r2}");
+        assert!(
+            r2.contains("→ process("),
+            "should show process() call: {r2}"
+        );
+        assert!(
+            r2.contains("→ std::process::exit()") || r2.contains("→ exit()"),
+            "should show exit call: {r2}"
+        );
     }
 
     #[tokio::test]
@@ -4411,9 +4826,14 @@ fn main() {
         let code = "fn leaf() -> i32 { 42 }\n";
         std::fs::write(dir.path().join("leaf.rs"), code).unwrap();
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("symbols", &json!({"path": "leaf.rs", "calls": true})).await;
+        let result = executor
+            .execute("symbols", &json!({"path": "leaf.rs", "calls": true}))
+            .await;
         // Should not have any call arrows since leaf() calls nothing
-        assert!(!result.contains("→"), "leaf function should have no calls: {result}");
+        assert!(
+            !result.contains("→"),
+            "leaf function should have no calls: {result}"
+        );
     }
 
     #[tokio::test]
@@ -4437,17 +4857,34 @@ fn unrelated() {
 "#;
         std::fs::write(dir.path().join("callers.rs"), code).unwrap();
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("call_graph", &json!({
-            "path": "callers.rs",
-            "symbol": "target",
-            "callers": true
-        })).await;
+        let result = executor
+            .execute(
+                "call_graph",
+                &json!({
+                    "path": "callers.rs",
+                    "symbol": "target",
+                    "callers": true
+                }),
+            )
+            .await;
 
         // Should show callers section
-        assert!(result.contains("Callers OF 'target'"), "should have callers section: {result}");
-        assert!(result.contains("caller_a"), "should find caller_a: {result}");
-        assert!(result.contains("caller_b"), "should find caller_b: {result}");
-        assert!(!result.contains("unrelated"), "should not include unrelated: {result}");
+        assert!(
+            result.contains("Callers OF 'target'"),
+            "should have callers section: {result}"
+        );
+        assert!(
+            result.contains("caller_a"),
+            "should find caller_a: {result}"
+        );
+        assert!(
+            result.contains("caller_b"),
+            "should find caller_b: {result}"
+        );
+        assert!(
+            !result.contains("unrelated"),
+            "should not include unrelated: {result}"
+        );
     }
 
     #[tokio::test]
@@ -4457,66 +4894,143 @@ fn unrelated() {
         std::fs::write(dir.path().join("test.rs"), code).unwrap();
         let executor = ToolExecutor::new(dir.path());
         // Using line range instead of symbol name — callers should note it needs symbol
-        let result = executor.execute("call_graph", &json!({
-            "path": "test.rs",
-            "start_line": 1,
-            "end_line": 1,
-            "callers": true
-        })).await;
-        assert!(result.contains("requires symbol name"), "should warn about symbol requirement: {result}");
+        let result = executor
+            .execute(
+                "call_graph",
+                &json!({
+                    "path": "test.rs",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "callers": true
+                }),
+            )
+            .await;
+        assert!(
+            result.contains("requires symbol name"),
+            "should warn about symbol requirement: {result}"
+        );
     }
 
     #[test]
     fn categorize_reference_definitions() {
-        assert_eq!(categorize_reference("foo.rs:10:fn helper() -> i32 {", "helper"), "definition");
-        assert_eq!(categorize_reference("foo.rs:10:pub fn process(x: i32) {", "process"), "definition");
-        assert_eq!(categorize_reference("foo.py:5:def calculate(n):", "calculate"), "definition");
-        assert_eq!(categorize_reference("foo.rs:3:pub struct Config {", "Config"), "definition");
-        assert_eq!(categorize_reference("foo.rs:3:pub enum Status {", "Status"), "definition");
+        assert_eq!(
+            categorize_reference("foo.rs:10:fn helper() -> i32 {", "helper"),
+            "definition"
+        );
+        assert_eq!(
+            categorize_reference("foo.rs:10:pub fn process(x: i32) {", "process"),
+            "definition"
+        );
+        assert_eq!(
+            categorize_reference("foo.py:5:def calculate(n):", "calculate"),
+            "definition"
+        );
+        assert_eq!(
+            categorize_reference("foo.rs:3:pub struct Config {", "Config"),
+            "definition"
+        );
+        assert_eq!(
+            categorize_reference("foo.rs:3:pub enum Status {", "Status"),
+            "definition"
+        );
     }
 
     #[test]
     fn categorize_reference_imports() {
-        assert_eq!(categorize_reference("foo.rs:1:use crate::helper;", "helper"), "import");
-        assert_eq!(categorize_reference("foo.py:1:from module import helper", "helper"), "import");
-        assert_eq!(categorize_reference("foo.py:1:import helper", "helper"), "import");
-        assert_eq!(categorize_reference("foo.js:1:const x = require('helper')", "helper"), "import");
+        assert_eq!(
+            categorize_reference("foo.rs:1:use crate::helper;", "helper"),
+            "import"
+        );
+        assert_eq!(
+            categorize_reference("foo.py:1:from module import helper", "helper"),
+            "import"
+        );
+        assert_eq!(
+            categorize_reference("foo.py:1:import helper", "helper"),
+            "import"
+        );
+        assert_eq!(
+            categorize_reference("foo.js:1:const x = require('helper')", "helper"),
+            "import"
+        );
     }
 
     #[test]
     fn categorize_reference_calls() {
-        assert_eq!(categorize_reference("foo.rs:20:    let x = helper();", "helper"), "call");
-        assert_eq!(categorize_reference("foo.rs:20:    helper(42, true);", "helper"), "call");
-        assert_eq!(categorize_reference("foo.py:20:    result = calculate(n)", "calculate"), "call");
+        assert_eq!(
+            categorize_reference("foo.rs:20:    let x = helper();", "helper"),
+            "call"
+        );
+        assert_eq!(
+            categorize_reference("foo.rs:20:    helper(42, true);", "helper"),
+            "call"
+        );
+        assert_eq!(
+            categorize_reference("foo.py:20:    result = calculate(n)", "calculate"),
+            "call"
+        );
     }
 
     #[test]
     fn categorize_reference_usage() {
         // Type annotations, field access, etc. — no parens, not a definition/import
-        assert_eq!(categorize_reference("foo.rs:10:    let x: Config = default;", "Config"), "usage");
+        assert_eq!(
+            categorize_reference("foo.rs:10:    let x: Config = default;", "Config"),
+            "usage"
+        );
     }
 
     #[test]
     fn schemas_include_new_params() {
         let schemas = all_tool_schemas();
-        let symbols_schema = schemas.iter()
-            .find(|s| s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) == Some("symbols"))
+        let symbols_schema = schemas
+            .iter()
+            .find(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    == Some("symbols")
+            })
             .expect("symbols schema should exist");
         let props = &symbols_schema["function"]["parameters"]["properties"];
-        assert!(props.get("calls").is_some(), "symbols should have 'calls' param");
+        assert!(
+            props.get("calls").is_some(),
+            "symbols should have 'calls' param"
+        );
 
-        let call_graph_schema = schemas.iter()
-            .find(|s| s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) == Some("call_graph"))
+        let call_graph_schema = schemas
+            .iter()
+            .find(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    == Some("call_graph")
+            })
             .expect("call_graph schema should exist");
         let cg_props = &call_graph_schema["function"]["parameters"]["properties"];
-        assert!(cg_props.get("callers").is_some(), "call_graph should have 'callers' param");
-        assert!(cg_props.get("scope").is_some(), "call_graph should have 'scope' param");
+        assert!(
+            cg_props.get("callers").is_some(),
+            "call_graph should have 'callers' param"
+        );
+        assert!(
+            cg_props.get("scope").is_some(),
+            "call_graph should have 'scope' param"
+        );
 
-        let ref_schema = schemas.iter()
-            .find(|s| s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) == Some("find_references"))
+        let ref_schema = schemas
+            .iter()
+            .find(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    == Some("find_references")
+            })
             .expect("find_references schema should exist");
         let ref_props = &ref_schema["function"]["parameters"]["properties"];
-        assert!(ref_props.get("kind").is_some(), "find_references should have 'kind' param");
+        assert!(
+            ref_props.get("kind").is_some(),
+            "find_references should have 'kind' param"
+        );
     }
 
     // ── Cross-File Caller Tests ──
@@ -4551,17 +5065,34 @@ fn unrelated() {
         std::fs::write(dir.path().join("util.rs"), util_code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("call_graph", &json!({
-            "path": "lib.rs",
-            "symbol": "target_fn",
-            "callers": true,
-            "scope": "project"
-        })).await;
+        let result = executor
+            .execute(
+                "call_graph",
+                &json!({
+                    "path": "lib.rs",
+                    "symbol": "target_fn",
+                    "callers": true,
+                    "scope": "project"
+                }),
+            )
+            .await;
 
-        assert!(result.contains("project-wide"), "should indicate project scope: {result}");
-        assert!(result.contains("main"), "should find main() as caller: {result}");
-        assert!(result.contains("helper"), "should find helper() as caller: {result}");
-        assert!(!result.contains("unrelated"), "should not include unrelated(): {result}");
+        assert!(
+            result.contains("project-wide"),
+            "should indicate project scope: {result}"
+        );
+        assert!(
+            result.contains("main"),
+            "should find main() as caller: {result}"
+        );
+        assert!(
+            result.contains("helper"),
+            "should find helper() as caller: {result}"
+        );
+        assert!(
+            !result.contains("unrelated"),
+            "should not include unrelated(): {result}"
+        );
     }
 
     #[tokio::test]
@@ -4571,14 +5102,22 @@ fn unrelated() {
         std::fs::write(dir.path().join("alone.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("call_graph", &json!({
-            "path": "alone.rs",
-            "symbol": "lonely_fn",
-            "callers": true,
-            "scope": "project"
-        })).await;
+        let result = executor
+            .execute(
+                "call_graph",
+                &json!({
+                    "path": "alone.rs",
+                    "symbol": "lonely_fn",
+                    "callers": true,
+                    "scope": "project"
+                }),
+            )
+            .await;
 
-        assert!(result.contains("none found"), "should report no callers: {result}");
+        assert!(
+            result.contains("none found"),
+            "should report no callers: {result}"
+        );
     }
 
     #[tokio::test]
@@ -4602,14 +5141,22 @@ fn start_engine() {
         std::fs::write(dir.path().join("starter.rs"), caller_code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("call_graph", &json!({
-            "path": "engine.rs",
-            "symbol": "run",
-            "callers": true,
-            "scope": "project"
-        })).await;
+        let result = executor
+            .execute(
+                "call_graph",
+                &json!({
+                    "path": "engine.rs",
+                    "symbol": "run",
+                    "callers": true,
+                    "scope": "project"
+                }),
+            )
+            .await;
 
-        assert!(result.contains("start_engine"), "should find start_engine as caller: {result}");
+        assert!(
+            result.contains("start_engine"),
+            "should find start_engine as caller: {result}"
+        );
     }
 
     #[test]
@@ -4628,12 +5175,25 @@ fn start_engine() {
             return; // rg not available or returned nothing; cross_file_callers test covers fallback
         }
 
-        let names: Vec<String> = files.iter()
+        let names: Vec<String> = files
+            .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
-        assert!(names.contains(&"a.rs".to_string()), "should find a.rs: {:?}", names);
-        assert!(names.contains(&"c.rs".to_string()), "should find c.rs: {:?}", names);
-        assert!(!names.contains(&"b.rs".to_string()), "should not find b.rs: {:?}", names);
+        assert!(
+            names.contains(&"a.rs".to_string()),
+            "should find a.rs: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"c.rs".to_string()),
+            "should find c.rs: {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"b.rs".to_string()),
+            "should not find b.rs: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -4651,20 +5211,36 @@ fn start_engine() {
         let exts = ["rs", "js"];
         let files = executor.collect_project_files(&skip, &exts, 100);
 
-        let names: Vec<String> = files.iter()
+        let names: Vec<String> = files
+            .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
-        assert!(names.contains(&"main.rs".to_string()), "should find src/main.rs");
-        assert!(!names.contains(&"debug.rs".to_string()), "should skip target/");
-        assert!(!names.contains(&"dep.js".to_string()), "should skip node_modules/");
+        assert!(
+            names.contains(&"main.rs".to_string()),
+            "should find src/main.rs"
+        );
+        assert!(
+            !names.contains(&"debug.rs".to_string()),
+            "should skip target/"
+        );
+        assert!(
+            !names.contains(&"dep.js".to_string()),
+            "should skip node_modules/"
+        );
     }
 
     // ---- AST validation tests ----
 
     #[test]
     fn parse_grep_file_line_extracts_path_and_line() {
-        assert_eq!(parse_grep_file_line("src/main.rs:42:fn foo()"), Some(("src/main.rs", 42)));
-        assert_eq!(parse_grep_file_line("lib.py:1:import os"), Some(("lib.py", 1)));
+        assert_eq!(
+            parse_grep_file_line("src/main.rs:42:fn foo()"),
+            Some(("src/main.rs", 42))
+        );
+        assert_eq!(
+            parse_grep_file_line("lib.py:1:import os"),
+            Some(("lib.py", 1))
+        );
         assert_eq!(parse_grep_file_line("no-colon"), None);
         assert_eq!(parse_grep_file_line("file:abc:content"), None);
     }
@@ -4685,9 +5261,21 @@ fn another() { target(); }
             "test.rs:3:fn another() { target(); }",
         ];
         let result = executor.ast_validate_references(&lines, "target");
-        assert!(result.contains(&"test.rs:1:fn real_call() { target(); }"), "real call kept: {:?}", result);
-        assert!(!result.iter().any(|l| l.contains("comment")), "comment filtered: {:?}", result);
-        assert!(result.contains(&"test.rs:3:fn another() { target(); }"), "another call kept: {:?}", result);
+        assert!(
+            result.contains(&"test.rs:1:fn real_call() { target(); }"),
+            "real call kept: {:?}",
+            result
+        );
+        assert!(
+            !result.iter().any(|l| l.contains("comment")),
+            "comment filtered: {:?}",
+            result
+        );
+        assert!(
+            result.contains(&"test.rs:3:fn another() { target(); }"),
+            "another call kept: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -4705,8 +5293,16 @@ fn actual() { target(); }
             "test.rs:3:fn actual() { target(); }",
         ];
         let result = executor.ast_validate_references(&lines, "target");
-        assert!(!result.iter().any(|l| l.contains("string")), "string literal filtered: {:?}", result);
-        assert!(result.contains(&"test.rs:3:fn actual() { target(); }"), "real call kept: {:?}", result);
+        assert!(
+            !result.iter().any(|l| l.contains("string")),
+            "string literal filtered: {:?}",
+            result
+        );
+        assert!(
+            result.contains(&"test.rs:3:fn actual() { target(); }"),
+            "real call kept: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -4727,13 +5323,18 @@ fn actual() { target(); }
         std::fs::write(dir.path().join("test.py"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let lines = vec![
-            "test.py:1:# target in comment",
-            "test.py:2:target = 42",
-        ];
+        let lines = vec!["test.py:1:# target in comment", "test.py:2:target = 42"];
         let result = executor.ast_validate_references(&lines, "target");
-        assert!(!result.iter().any(|l| l.contains("comment")), "python comment filtered: {:?}", result);
-        assert!(result.contains(&"test.py:2:target = 42"), "real code kept: {:?}", result);
+        assert!(
+            !result.iter().any(|l| l.contains("comment")),
+            "python comment filtered: {:?}",
+            result
+        );
+        assert!(
+            result.contains(&"test.py:2:target = 42"),
+            "real code kept: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -4757,12 +5358,28 @@ fn actual() { target(); }
         ];
         let result = executor.ast_validate_references(&lines, "target");
         // Comment and string should be filtered; real code should remain
-        assert!(!result.iter().any(|l| l.contains("//")), "comment filtered: {:?}", result);
+        assert!(
+            !result.iter().any(|l| l.contains("//")),
+            "comment filtered: {:?}",
+            result
+        );
         // Line 4 has "target" in a string, should be filtered
-        assert!(!result.iter().any(|l| l.contains("in string")), "string filtered: {:?}", result);
+        assert!(
+            !result.iter().any(|l| l.contains("in string")),
+            "string filtered: {:?}",
+            result
+        );
         // Real calls should remain
-        assert!(result.iter().any(|l| l.contains("target();")), "real call kept: {:?}", result);
-        assert!(result.iter().any(|l| l.contains("target.method();")), "method call kept: {:?}", result);
+        assert!(
+            result.iter().any(|l| l.contains("target();")),
+            "real call kept: {:?}",
+            result
+        );
+        assert!(
+            result.iter().any(|l| l.contains("target.method();")),
+            "method call kept: {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -4772,12 +5389,20 @@ fn actual() { target(); }
         std::fs::write(dir.path().join("test.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("find_references", &json!({
-            "symbol": "target",
-            "validate": false
-        })).await;
+        let result = executor
+            .execute(
+                "find_references",
+                &json!({
+                    "symbol": "target",
+                    "validate": false
+                }),
+            )
+            .await;
         // With validate=false, the comment line should still appear
-        assert!(result.contains("target"), "should find references: {result}");
+        assert!(
+            result.contains("target"),
+            "should find references: {result}"
+        );
     }
 
     // ---- rename_symbol tests ----
@@ -4789,10 +5414,15 @@ fn actual() { target(); }
         std::fs::write(dir.path().join("main.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("rename_symbol", &json!({
-            "symbol": "target_fn",
-            "new_name": "renamed_fn"
-        })).await;
+        let result = executor
+            .execute(
+                "rename_symbol",
+                &json!({
+                    "symbol": "target_fn",
+                    "new_name": "renamed_fn"
+                }),
+            )
+            .await;
 
         assert!(result.contains("preview"), "default is dry run: {result}");
         assert!(result.contains("target_fn"), "shows old name: {result}");
@@ -4810,14 +5440,22 @@ fn actual() { target(); }
         std::fs::write(dir.path().join("lib.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("rename_symbol", &json!({
-            "symbol": "old_name",
-            "new_name": "new_name",
-            "dry_run": false
-        })).await;
+        let result = executor
+            .execute(
+                "rename_symbol",
+                &json!({
+                    "symbol": "old_name",
+                    "new_name": "new_name",
+                    "dry_run": false
+                }),
+            )
+            .await;
 
         assert!(result.contains("Renaming"), "shows applied: {result}");
-        assert!(result.contains("2 replacement"), "both occurrences renamed: {result}");
+        assert!(
+            result.contains("2 replacement"),
+            "both occurrences renamed: {result}"
+        );
         let content = std::fs::read_to_string(dir.path().join("lib.rs")).unwrap();
         assert!(content.contains("fn new_name()"), "definition renamed");
         assert!(content.contains("new_name();"), "call site renamed");
@@ -4837,19 +5475,36 @@ fn caller() {
         std::fs::write(dir.path().join("test.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("rename_symbol", &json!({
-            "symbol": "target",
-            "new_name": "renamed",
-            "dry_run": false
-        })).await;
+        let result = executor
+            .execute(
+                "rename_symbol",
+                &json!({
+                    "symbol": "target",
+                    "new_name": "renamed",
+                    "dry_run": false
+                }),
+            )
+            .await;
 
         let content = std::fs::read_to_string(dir.path().join("test.rs")).unwrap();
         // Real code references should be renamed
-        assert!(content.contains("fn renamed()"), "definition renamed: {}", content);
+        assert!(
+            content.contains("fn renamed()"),
+            "definition renamed: {}",
+            content
+        );
         assert!(content.contains("renamed();"), "call renamed: {}", content);
         // Comment and string should be preserved
-        assert!(content.contains("// target is a good function"), "comment preserved: {}", content);
-        assert!(content.contains("\"target in string\""), "string preserved: {}", content);
+        assert!(
+            content.contains("// target is a good function"),
+            "comment preserved: {}",
+            content
+        );
+        assert!(
+            content.contains("\"target in string\""),
+            "string preserved: {}",
+            content
+        );
         // Should report filtered matches
         assert!(result.contains("skipped"), "mentions filtered: {result}");
     }
@@ -4858,22 +5513,49 @@ fn caller() {
     async fn rename_symbol_across_files() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/lib.rs"), "pub fn shared_fn() -> i32 { 42 }\n").unwrap();
-        std::fs::write(dir.path().join("src/main.rs"), "fn main() { shared_fn(); }\n").unwrap();
-        std::fs::write(dir.path().join("src/test.rs"), "fn test_it() { assert_eq!(shared_fn(), 42); }\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn shared_fn() -> i32 { 42 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "fn main() { shared_fn(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/test.rs"),
+            "fn test_it() { assert_eq!(shared_fn(), 42); }\n",
+        )
+        .unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("rename_symbol", &json!({
-            "symbol": "shared_fn",
-            "new_name": "common_fn",
-            "dry_run": false
-        })).await;
+        let result = executor
+            .execute(
+                "rename_symbol",
+                &json!({
+                    "symbol": "shared_fn",
+                    "new_name": "common_fn",
+                    "dry_run": false
+                }),
+            )
+            .await;
 
         assert!(result.contains("3 file"), "changed 3 files: {result}");
         for file in &["src/lib.rs", "src/main.rs", "src/test.rs"] {
             let content = std::fs::read_to_string(dir.path().join(file)).unwrap();
-            assert!(content.contains("common_fn"), "{} should have new name: {}", file, content);
-            assert!(!content.contains("shared_fn"), "{} should not have old name: {}", file, content);
+            assert!(
+                content.contains("common_fn"),
+                "{} should have new name: {}",
+                file,
+                content
+            );
+            assert!(
+                !content.contains("shared_fn"),
+                "{} should not have old name: {}",
+                file,
+                content
+            );
         }
     }
 
@@ -4884,15 +5566,23 @@ fn caller() {
         std::fs::write(dir.path().join("test.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("rename_symbol", &json!({
-            "symbol": "foo",
-            "new_name": "bar",
-            "dry_run": false
-        })).await;
+        let result = executor
+            .execute(
+                "rename_symbol",
+                &json!({
+                    "symbol": "foo",
+                    "new_name": "bar",
+                    "dry_run": false
+                }),
+            )
+            .await;
 
         let content = std::fs::read_to_string(dir.path().join("test.rs")).unwrap();
         assert!(content.contains("fn bar()"), "foo renamed to bar");
-        assert!(content.contains("foobar"), "foobar NOT renamed (word boundary)");
+        assert!(
+            content.contains("foobar"),
+            "foobar NOT renamed (word boundary)"
+        );
         assert!(content.contains("bar() + 2"), "call in foobar line renamed");
         assert!(result.contains("replacement"), "has replacements: {result}");
     }
@@ -4904,22 +5594,43 @@ fn caller() {
 
         let executor = ToolExecutor::new(dir.path());
 
-        let result = executor.execute("rename_symbol", &json!({
-            "symbol": "foo",
-            "new_name": "123invalid"
-        })).await;
-        assert!(result.contains("not a valid identifier"), "rejects numeric start: {result}");
+        let result = executor
+            .execute(
+                "rename_symbol",
+                &json!({
+                    "symbol": "foo",
+                    "new_name": "123invalid"
+                }),
+            )
+            .await;
+        assert!(
+            result.contains("not a valid identifier"),
+            "rejects numeric start: {result}"
+        );
 
-        let result = executor.execute("rename_symbol", &json!({
-            "symbol": "foo",
-            "new_name": "has space"
-        })).await;
-        assert!(result.contains("not a valid identifier"), "rejects spaces: {result}");
+        let result = executor
+            .execute(
+                "rename_symbol",
+                &json!({
+                    "symbol": "foo",
+                    "new_name": "has space"
+                }),
+            )
+            .await;
+        assert!(
+            result.contains("not a valid identifier"),
+            "rejects spaces: {result}"
+        );
 
-        let result = executor.execute("rename_symbol", &json!({
-            "symbol": "foo",
-            "new_name": "foo"
-        })).await;
+        let result = executor
+            .execute(
+                "rename_symbol",
+                &json!({
+                    "symbol": "foo",
+                    "new_name": "foo"
+                }),
+            )
+            .await;
         assert!(result.contains("same"), "rejects same name: {result}");
     }
 
@@ -4929,11 +5640,19 @@ fn caller() {
         std::fs::write(dir.path().join("test.rs"), "fn bar() {}\n").unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("rename_symbol", &json!({
-            "symbol": "nonexistent_symbol_xyz",
-            "new_name": "new_name"
-        })).await;
-        assert!(result.contains("No references"), "reports no matches: {result}");
+        let result = executor
+            .execute(
+                "rename_symbol",
+                &json!({
+                    "symbol": "nonexistent_symbol_xyz",
+                    "new_name": "new_name"
+                }),
+            )
+            .await;
+        assert!(
+            result.contains("No references"),
+            "reports no matches: {result}"
+        );
     }
 
     #[tokio::test]
@@ -4943,18 +5662,31 @@ fn caller() {
         std::fs::write(dir.path().join("main.py"), "def target(): pass\ntarget()\n").unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("rename_symbol", &json!({
-            "symbol": "target",
-            "new_name": "renamed",
-            "include": "*.rs",
-            "dry_run": false
-        })).await;
+        let result = executor
+            .execute(
+                "rename_symbol",
+                &json!({
+                    "symbol": "target",
+                    "new_name": "renamed",
+                    "include": "*.rs",
+                    "dry_run": false
+                }),
+            )
+            .await;
 
         // Only .rs file should be modified
         let rs_content = std::fs::read_to_string(dir.path().join("lib.rs")).unwrap();
         let py_content = std::fs::read_to_string(dir.path().join("main.py")).unwrap();
-        assert!(rs_content.contains("renamed"), "rs file renamed: {}", rs_content);
-        assert!(py_content.contains("target"), "py file untouched: {}", py_content);
+        assert!(
+            rs_content.contains("renamed"),
+            "rs file renamed: {}",
+            rs_content
+        );
+        assert!(
+            py_content.contains("target"),
+            "py file untouched: {}",
+            py_content
+        );
         assert!(result.contains("1 file"), "only 1 file changed: {result}");
     }
 
@@ -4963,20 +5695,35 @@ fn caller() {
     #[tokio::test]
     async fn dead_code_finds_unused_function() {
         let dir = tempfile::tempdir().unwrap();
-        let code = "fn used_fn() -> i32 { 42 }\nfn unused_fn() -> i32 { 99 }\nfn main() { used_fn(); }\n";
+        let code =
+            "fn used_fn() -> i32 { 42 }\nfn unused_fn() -> i32 { 99 }\nfn main() { used_fn(); }\n";
         std::fs::write(dir.path().join("main.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("dead_code", &json!({
-            "path": "."
-        })).await;
+        let result = executor
+            .execute(
+                "dead_code",
+                &json!({
+                    "path": "."
+                }),
+            )
+            .await;
 
-        assert!(result.contains("unused_fn"), "should find unused_fn: {result}");
+        assert!(
+            result.contains("unused_fn"),
+            "should find unused_fn: {result}"
+        );
         // Verify used_fn is NOT flagged (careful: "unused_fn" contains "used_fn")
         let without_unused = result.replace("unused_fn", "");
-        assert!(!without_unused.contains("used_fn"), "used_fn should not be listed: {result}");
+        assert!(
+            !without_unused.contains("used_fn"),
+            "used_fn should not be listed: {result}"
+        );
         // main() should be skipped as entry point — check it's not listed as a symbol
-        assert!(!result.contains("function main"), "main() should be skipped: {result}");
+        assert!(
+            !result.contains("function main"),
+            "main() should be skipped: {result}"
+        );
     }
 
     #[tokio::test]
@@ -4986,12 +5733,20 @@ fn caller() {
         std::fs::write(dir.path().join("test.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("dead_code", &json!({
-            "path": "."
-        })).await;
+        let result = executor
+            .execute(
+                "dead_code",
+                &json!({
+                    "path": "."
+                }),
+            )
+            .await;
 
         // test_helper should be skipped (it's a test)
-        assert!(!result.contains("test_helper"), "test functions should be skipped: {result}");
+        assert!(
+            !result.contains("test_helper"),
+            "test functions should be skipped: {result}"
+        );
     }
 
     #[tokio::test]
@@ -5002,19 +5757,41 @@ fn caller() {
 
         let executor = ToolExecutor::new(dir.path());
 
-        let result_fn = executor.execute("dead_code", &json!({
-            "path": ".",
-            "kind": "function"
-        })).await;
-        assert!(result_fn.contains("unused_fn"), "should find unused_fn: {result_fn}");
-        assert!(!result_fn.contains("UnusedStruct"), "should not show structs: {result_fn}");
+        let result_fn = executor
+            .execute(
+                "dead_code",
+                &json!({
+                    "path": ".",
+                    "kind": "function"
+                }),
+            )
+            .await;
+        assert!(
+            result_fn.contains("unused_fn"),
+            "should find unused_fn: {result_fn}"
+        );
+        assert!(
+            !result_fn.contains("UnusedStruct"),
+            "should not show structs: {result_fn}"
+        );
 
-        let result_type = executor.execute("dead_code", &json!({
-            "path": ".",
-            "kind": "type"
-        })).await;
-        assert!(result_type.contains("UnusedStruct"), "should find UnusedStruct: {result_type}");
-        assert!(!result_type.contains("unused_fn"), "should not show functions: {result_type}");
+        let result_type = executor
+            .execute(
+                "dead_code",
+                &json!({
+                    "path": ".",
+                    "kind": "type"
+                }),
+            )
+            .await;
+        assert!(
+            result_type.contains("UnusedStruct"),
+            "should find UnusedStruct: {result_type}"
+        );
+        assert!(
+            !result_type.contains("unused_fn"),
+            "should not show functions: {result_type}"
+        );
     }
 
     #[tokio::test]
@@ -5028,7 +5805,10 @@ fn caller() {
 
         // Both should be detected as unused, but public should have marker
         if result.contains("exported") {
-            assert!(result.contains("(pub)"), "public symbol should be marked: {result}");
+            assert!(
+                result.contains("(pub)"),
+                "public symbol should be marked: {result}"
+            );
         }
     }
 
@@ -5041,8 +5821,10 @@ fn caller() {
         let executor = ToolExecutor::new(dir.path());
         let result = executor.execute("dead_code", &json!({})).await;
 
-        assert!(result.contains("No dead code") || result.contains("0 potentially"),
-            "should report clean: {result}");
+        assert!(
+            result.contains("No dead code") || result.contains("0 potentially"),
+            "should report clean: {result}"
+        );
     }
 
     #[tokio::test]
@@ -5053,20 +5835,28 @@ fn caller() {
         let executor = ToolExecutor::new(dir.path());
         let result = executor.execute("dead_code", &json!({})).await;
 
-        assert!(result.contains("No source files") || result.contains("No symbols"),
-            "should report no files: {result}");
+        assert!(
+            result.contains("No source files") || result.contains("No symbols"),
+            "should report no files: {result}"
+        );
     }
 
     #[tokio::test]
     async fn dead_code_python() {
         let dir = tempfile::tempdir().unwrap();
-        let code = "def used():\n    return 42\n\ndef unused():\n    return 99\n\nresult = used()\n";
+        let code =
+            "def used():\n    return 42\n\ndef unused():\n    return 99\n\nresult = used()\n";
         std::fs::write(dir.path().join("main.py"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("dead_code", &json!({
-            "path": "."
-        })).await;
+        let result = executor
+            .execute(
+                "dead_code",
+                &json!({
+                    "path": "."
+                }),
+            )
+            .await;
 
         assert!(result.contains("unused"), "should find unused: {result}");
     }
@@ -5085,13 +5875,24 @@ fn documented_fn() -> i32 {
         std::fs::write(dir.path().join("lib.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("find_definition", &json!({
-            "symbol": "documented_fn"
-        })).await;
+        let result = executor
+            .execute(
+                "find_definition",
+                &json!({
+                    "symbol": "documented_fn"
+                }),
+            )
+            .await;
 
-        assert!(result.contains("documented_fn"), "should find definition: {result}");
+        assert!(
+            result.contains("documented_fn"),
+            "should find definition: {result}"
+        );
         assert!(result.contains("📝"), "should include doc marker: {result}");
-        assert!(result.contains("something important"), "should include doc text: {result}");
+        assert!(
+            result.contains("something important"),
+            "should include doc text: {result}"
+        );
     }
 
     #[tokio::test]
@@ -5101,13 +5902,24 @@ fn documented_fn() -> i32 {
         std::fs::write(dir.path().join("module.py"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("find_definition", &json!({
-            "symbol": "my_func"
-        })).await;
+        let result = executor
+            .execute(
+                "find_definition",
+                &json!({
+                    "symbol": "my_func"
+                }),
+            )
+            .await;
 
-        assert!(result.contains("my_func"), "should find definition: {result}");
+        assert!(
+            result.contains("my_func"),
+            "should find definition: {result}"
+        );
         assert!(result.contains("📝"), "should include doc marker: {result}");
-        assert!(result.contains("Python docstring"), "should include docstring: {result}");
+        assert!(
+            result.contains("Python docstring"),
+            "should include docstring: {result}"
+        );
     }
 
     #[tokio::test]
@@ -5117,42 +5929,71 @@ fn documented_fn() -> i32 {
         std::fs::write(dir.path().join("lib.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("find_definition", &json!({
-            "symbol": "bare_fn"
-        })).await;
+        let result = executor
+            .execute(
+                "find_definition",
+                &json!({
+                    "symbol": "bare_fn"
+                }),
+            )
+            .await;
 
-        assert!(result.contains("bare_fn"), "should find definition: {result}");
-        assert!(!result.contains("📝"), "no doc marker without doc: {result}");
+        assert!(
+            result.contains("bare_fn"),
+            "should find definition: {result}"
+        );
+        assert!(
+            !result.contains("📝"),
+            "no doc marker without doc: {result}"
+        );
     }
 
     #[test]
     fn extract_doc_comment_rust_triple_slash() {
         let source = "/// First line.\n/// Second line.\nfn foo() {}\n";
         let doc = code_intel::extract_doc_comment(source, code_intel::Language::Rust, 3);
-        assert!(doc.contains("First line"), "should extract first line: {doc}");
-        assert!(doc.contains("Second line"), "should extract second line: {doc}");
+        assert!(
+            doc.contains("First line"),
+            "should extract first line: {doc}"
+        );
+        assert!(
+            doc.contains("Second line"),
+            "should extract second line: {doc}"
+        );
     }
 
     #[test]
     fn extract_doc_comment_block_comment() {
         let source = "/**\n * A block doc comment.\n * With multiple lines.\n */\nfn foo() {}\n";
         let doc = code_intel::extract_doc_comment(source, code_intel::Language::Rust, 5);
-        assert!(doc.contains("block doc comment"), "should extract block: {doc}");
-        assert!(doc.contains("multiple lines"), "should extract multi-line: {doc}");
+        assert!(
+            doc.contains("block doc comment"),
+            "should extract block: {doc}"
+        );
+        assert!(
+            doc.contains("multiple lines"),
+            "should extract multi-line: {doc}"
+        );
     }
 
     #[test]
     fn extract_doc_comment_python_docstring() {
         let source = "def foo():\n    \"\"\"A short docstring.\"\"\"\n    pass\n";
         let doc = code_intel::extract_doc_comment(source, code_intel::Language::Python, 1);
-        assert!(doc.contains("short docstring"), "should extract docstring: {doc}");
+        assert!(
+            doc.contains("short docstring"),
+            "should extract docstring: {doc}"
+        );
     }
 
     #[test]
     fn extract_doc_comment_go_comments() {
         let source = "// Package foo provides utilities.\n// It does things.\nfunc Foo() {}\n";
         let doc = code_intel::extract_doc_comment(source, code_intel::Language::Go, 3);
-        assert!(doc.contains("Package foo"), "should extract Go comments: {doc}");
+        assert!(
+            doc.contains("Package foo"),
+            "should extract Go comments: {doc}"
+        );
     }
 
     #[test]
@@ -5171,14 +6012,25 @@ fn documented_fn() -> i32 {
         std::fs::write(dir.path().join("config.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("extract_members", &json!({
-            "file": "config.rs", "line": 1
-        })).await;
+        let result = executor
+            .execute(
+                "extract_members",
+                &json!({
+                    "file": "config.rs", "line": 1
+                }),
+            )
+            .await;
 
         assert!(result.contains("name"), "should list name field: {result}");
         assert!(result.contains("port"), "should list port field: {result}");
-        assert!(result.contains("timeout"), "should list timeout field: {result}");
-        assert!(result.contains("3 members"), "should report 3 members: {result}");
+        assert!(
+            result.contains("timeout"),
+            "should list timeout field: {result}"
+        );
+        assert!(
+            result.contains("3 members"),
+            "should report 3 members: {result}"
+        );
     }
 
     #[tokio::test]
@@ -5188,28 +6040,45 @@ fn documented_fn() -> i32 {
         std::fs::write(dir.path().join("color.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("extract_members", &json!({
-            "file": "color.rs", "line": 1
-        })).await;
+        let result = executor
+            .execute(
+                "extract_members",
+                &json!({
+                    "file": "color.rs", "line": 1
+                }),
+            )
+            .await;
 
         assert!(result.contains("Red"), "should list Red: {result}");
         assert!(result.contains("Blue"), "should list Blue: {result}");
-        assert!(result.contains("variant"), "should report as variant: {result}");
+        assert!(
+            result.contains("variant"),
+            "should report as variant: {result}"
+        );
     }
 
     #[tokio::test]
     async fn extract_members_python_class() {
         let dir = tempfile::tempdir().unwrap();
-        let code = "class User:\n    name: str\n    age: int = 0\n    def greet(self):\n        pass\n";
+        let code =
+            "class User:\n    name: str\n    age: int = 0\n    def greet(self):\n        pass\n";
         std::fs::write(dir.path().join("user.py"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("extract_members", &json!({
-            "file": "user.py", "line": 1
-        })).await;
+        let result = executor
+            .execute(
+                "extract_members",
+                &json!({
+                    "file": "user.py", "line": 1
+                }),
+            )
+            .await;
 
         assert!(result.contains("name"), "should list name: {result}");
-        assert!(result.contains("greet"), "should list greet method: {result}");
+        assert!(
+            result.contains("greet"),
+            "should list greet method: {result}"
+        );
     }
 
     #[tokio::test]
@@ -5219,11 +6088,19 @@ fn documented_fn() -> i32 {
         std::fs::write(dir.path().join("main.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("extract_members", &json!({
-            "file": "main.rs", "line": 1
-        })).await;
+        let result = executor
+            .execute(
+                "extract_members",
+                &json!({
+                    "file": "main.rs", "line": 1
+                }),
+            )
+            .await;
 
-        assert!(result.contains("No type definition"), "should report no type: {result}");
+        assert!(
+            result.contains("No type definition"),
+            "should report no type: {result}"
+        );
     }
 
     #[tokio::test]
@@ -5234,11 +6111,19 @@ fn documented_fn() -> i32 {
 
         let executor = ToolExecutor::new(dir.path());
         // Point at line 2 (inside the struct, not at its start)
-        let result = executor.execute("extract_members", &json!({
-            "file": "point.rs", "line": 2
-        })).await;
+        let result = executor
+            .execute(
+                "extract_members",
+                &json!({
+                    "file": "point.rs", "line": 2
+                }),
+            )
+            .await;
 
-        assert!(result.contains("x"), "should find members even pointing inside: {result}");
+        assert!(
+            result.contains("x"),
+            "should find members even pointing inside: {result}"
+        );
         assert!(result.contains("y"), "should find y: {result}");
     }
 
@@ -5265,13 +6150,24 @@ impl Serialize for Config {
         std::fs::write(dir.path().join("types.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("type_hierarchy", &json!({
-            "name": "Serialize"
-        })).await;
+        let result = executor
+            .execute(
+                "type_hierarchy",
+                &json!({
+                    "name": "Serialize"
+                }),
+            )
+            .await;
 
         assert!(result.contains("User"), "should find User impl: {result}");
-        assert!(result.contains("Config"), "should find Config impl: {result}");
-        assert!(result.contains("implementing"), "should say implementing: {result}");
+        assert!(
+            result.contains("Config"),
+            "should find Config impl: {result}"
+        );
+        assert!(
+            result.contains("implementing"),
+            "should say implementing: {result}"
+        );
     }
 
     #[tokio::test]
@@ -5294,13 +6190,24 @@ impl Debug for Foo {
         std::fs::write(dir.path().join("foo.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("type_hierarchy", &json!({
-            "name": "Foo",
-            "direction": "supertypes"
-        })).await;
+        let result = executor
+            .execute(
+                "type_hierarchy",
+                &json!({
+                    "name": "Foo",
+                    "direction": "supertypes"
+                }),
+            )
+            .await;
 
-        assert!(result.contains("Display"), "should find Display trait: {result}");
-        assert!(result.contains("Debug"), "should find Debug trait: {result}");
+        assert!(
+            result.contains("Display"),
+            "should find Display trait: {result}"
+        );
+        assert!(
+            result.contains("Debug"),
+            "should find Debug trait: {result}"
+        );
     }
 
     #[tokio::test]
@@ -5310,11 +6217,19 @@ impl Debug for Foo {
         std::fs::write(dir.path().join("lonely.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("type_hierarchy", &json!({
-            "name": "NonExistent"
-        })).await;
+        let result = executor
+            .execute(
+                "type_hierarchy",
+                &json!({
+                    "name": "NonExistent"
+                }),
+            )
+            .await;
 
-        assert!(result.contains("no implementations"), "should report none: {result}");
+        assert!(
+            result.contains("no implementations"),
+            "should report none: {result}"
+        );
     }
 
     #[test]
@@ -5340,9 +6255,22 @@ impl MyType {
 }
 "#;
         let impls = code_intel::find_rust_impls(source, "src/lib.rs");
-        assert_eq!(impls.len(), 2, "should find 2 trait impls, not inherent: {:?}", impls);
-        assert!(impls.iter().any(|i| i.trait_name == "Foo" && i.type_name == "MyType"));
-        assert!(impls.iter().any(|i| i.trait_name == "Bar" && i.type_name == "MyType"));
+        assert_eq!(
+            impls.len(),
+            2,
+            "should find 2 trait impls, not inherent: {:?}",
+            impls
+        );
+        assert!(
+            impls
+                .iter()
+                .any(|i| i.trait_name == "Foo" && i.type_name == "MyType")
+        );
+        assert!(
+            impls
+                .iter()
+                .any(|i| i.trait_name == "Bar" && i.type_name == "MyType")
+        );
     }
 
     // ── hover_info tests ─────────────────────────────────────────────────
@@ -5354,11 +6282,19 @@ impl MyType {
         std::fs::write(dir.path().join("math.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("hover_info", &json!({
-            "file": "math.rs", "line": 2
-        })).await;
+        let result = executor
+            .execute(
+                "hover_info",
+                &json!({
+                    "file": "math.rs", "line": 2
+                }),
+            )
+            .await;
 
-        assert!(result.contains("add"), "should show function name: {result}");
+        assert!(
+            result.contains("add"),
+            "should show function name: {result}"
+        );
         assert!(result.contains("fn"), "should show kind: {result}");
         assert!(result.contains("sum"), "should show doc: {result}");
     }
@@ -5370,12 +6306,23 @@ impl MyType {
         std::fs::write(dir.path().join("config.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("hover_info", &json!({
-            "file": "config.rs", "line": 1
-        })).await;
+        let result = executor
+            .execute(
+                "hover_info",
+                &json!({
+                    "file": "config.rs", "line": 1
+                }),
+            )
+            .await;
 
-        assert!(result.contains("Config"), "should show struct name: {result}");
-        assert!(result.contains("Members"), "should show members section: {result}");
+        assert!(
+            result.contains("Config"),
+            "should show struct name: {result}"
+        );
+        assert!(
+            result.contains("Members"),
+            "should show members section: {result}"
+        );
         assert!(result.contains("host"), "should list host field: {result}");
         assert!(result.contains("port"), "should list port field: {result}");
     }
@@ -5387,12 +6334,20 @@ impl MyType {
         std::fs::write(dir.path().join("server.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("hover_info", &json!({
-            "file": "server.rs", "line": 4
-        })).await;
+        let result = executor
+            .execute(
+                "hover_info",
+                &json!({
+                    "file": "server.rs", "line": 4
+                }),
+            )
+            .await;
 
         // Line 4 is inside fn start, scope should show breadcrumbs
-        assert!(result.contains("start"), "should show start in scope: {result}");
+        assert!(
+            result.contains("start"),
+            "should show start in scope: {result}"
+        );
         assert!(result.contains("📍"), "should show scope marker: {result}");
     }
 
@@ -5403,11 +6358,19 @@ impl MyType {
         std::fs::write(dir.path().join("fns.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("hover_info", &json!({
-            "file": "fns.rs", "line": 1, "column": 3
-        })).await;
+        let result = executor
+            .execute(
+                "hover_info",
+                &json!({
+                    "file": "fns.rs", "line": 1, "column": 3
+                }),
+            )
+            .await;
 
-        assert!(result.contains("foo"), "should identify foo at column 3: {result}");
+        assert!(
+            result.contains("foo"),
+            "should identify foo at column 3: {result}"
+        );
     }
 
     // ── symbol_search tests ──────────────────────────────────────────────
@@ -5419,13 +6382,27 @@ impl MyType {
         std::fs::write(dir.path().join("app.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("symbol_search", &json!({
-            "query": "process"
-        })).await;
+        let result = executor
+            .execute(
+                "symbol_search",
+                &json!({
+                    "query": "process"
+                }),
+            )
+            .await;
 
-        assert!(result.contains("process_data"), "should find process_data: {result}");
-        assert!(result.contains("process_config"), "should find process_config: {result}");
-        assert!(!result.contains("unrelated"), "should NOT find unrelated: {result}");
+        assert!(
+            result.contains("process_data"),
+            "should find process_data: {result}"
+        );
+        assert!(
+            result.contains("process_config"),
+            "should find process_config: {result}"
+        );
+        assert!(
+            !result.contains("unrelated"),
+            "should NOT find unrelated: {result}"
+        );
     }
 
     #[tokio::test]
@@ -5435,13 +6412,24 @@ impl MyType {
         std::fs::write(dir.path().join("cfg.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("symbol_search", &json!({
-            "query": "config",
-            "kind": "type"
-        })).await;
+        let result = executor
+            .execute(
+                "symbol_search",
+                &json!({
+                    "query": "config",
+                    "kind": "type"
+                }),
+            )
+            .await;
 
-        assert!(result.contains("Config"), "should find Config struct: {result}");
-        assert!(!result.contains("config_new"), "should NOT find function: {result}");
+        assert!(
+            result.contains("Config"),
+            "should find Config struct: {result}"
+        );
+        assert!(
+            !result.contains("config_new"),
+            "should NOT find function: {result}"
+        );
     }
 
     #[tokio::test]
@@ -5451,14 +6439,22 @@ impl MyType {
         std::fs::write(dir.path().join("runner.rs"), code).unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("symbol_search", &json!({
-            "query": "run"
-        })).await;
+        let result = executor
+            .execute(
+                "symbol_search",
+                &json!({
+                    "query": "run"
+                }),
+            )
+            .await;
 
         // "run" should appear before "run_all" and "prerun"
         let pos_run = result.find("fn run()").unwrap_or(9999);
         let pos_run_all = result.find("fn run_all()").unwrap_or(9999);
-        assert!(pos_run < pos_run_all, "exact match should come first: {result}");
+        assert!(
+            pos_run < pos_run_all,
+            "exact match should come first: {result}"
+        );
     }
 
     #[tokio::test]
@@ -5469,13 +6465,27 @@ impl MyType {
         std::fs::write(dir.path().join("c.py"), "def search_log():\n    pass\n").unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("symbol_search", &json!({
-            "query": "search"
-        })).await;
+        let result = executor
+            .execute(
+                "symbol_search",
+                &json!({
+                    "query": "search"
+                }),
+            )
+            .await;
 
-        assert!(result.contains("search_user"), "should find in a.rs: {result}");
-        assert!(result.contains("search_order"), "should find in b.rs: {result}");
-        assert!(result.contains("search_log"), "should find in c.py: {result}");
+        assert!(
+            result.contains("search_user"),
+            "should find in a.rs: {result}"
+        );
+        assert!(
+            result.contains("search_order"),
+            "should find in b.rs: {result}"
+        );
+        assert!(
+            result.contains("search_log"),
+            "should find in c.py: {result}"
+        );
     }
 
     #[tokio::test]
@@ -5484,11 +6494,19 @@ impl MyType {
         std::fs::write(dir.path().join("empty.rs"), "fn hello() {}\n").unwrap();
 
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.execute("symbol_search", &json!({
-            "query": "nonexistent_xyz"
-        })).await;
+        let result = executor
+            .execute(
+                "symbol_search",
+                &json!({
+                    "query": "nonexistent_xyz"
+                }),
+            )
+            .await;
 
-        assert!(result.contains("No symbols matching"), "should report no results: {result}");
+        assert!(
+            result.contains("No symbols matching"),
+            "should report no results: {result}"
+        );
     }
 
     #[test]

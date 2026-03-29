@@ -2289,7 +2289,8 @@ mod state_convergence {
             g.learn(
                 "matrixorigin",
                 DomainHint::GitHub,
-                &["github_search".into()], None,
+                &["github_search".into()],
+                None,
             );
             g.learn("kubernetes", DomainHint::Code, &["bash".into()], None);
         }
@@ -2300,12 +2301,19 @@ mod state_convergence {
                 TaskType::Mutate,
                 Some(DomainHint::Code),
                 true,
-                0.8, None,
+                0.8,
+                None,
             );
         }
         {
             let mut c = cal.lock().unwrap();
-            c.record("fetch", Some(DomainHint::GitHub), TaskType::Fetch, false, None);
+            c.record(
+                "fetch",
+                Some(DomainHint::GitHub),
+                TaskType::Fetch,
+                false,
+                None,
+            );
         }
 
         let snapshot = export_from_modules(&eg, &pl, &cal);
@@ -2328,7 +2336,8 @@ mod state_convergence {
         eg_a.lock().unwrap().learn(
             "matrixorigin",
             DomainHint::GitHub,
-            &["github_search".into()], None,
+            &["github_search".into()],
+            None,
         );
         {
             let mut pl = pl_a.lock().unwrap();
@@ -2337,21 +2346,26 @@ mod state_convergence {
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
-                0.9, None,
+                0.9,
+                None,
             );
             pl.record_outcome(
                 &["github_search".into()],
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
-                0.85, None,
+                0.85,
+                None,
             );
         }
 
         // Device B: Database knowledge (record 2×)
-        eg_b.lock()
-            .unwrap()
-            .learn("mo_tables", DomainHint::Database, &["mo_query".into()], None);
+        eg_b.lock().unwrap().learn(
+            "mo_tables",
+            DomainHint::Database,
+            &["mo_query".into()],
+            None,
+        );
         {
             let mut pl = pl_b.lock().unwrap();
             pl.record_outcome(
@@ -2359,14 +2373,16 @@ mod state_convergence {
                 TaskType::Mutate,
                 Some(DomainHint::Database),
                 true,
-                0.85, None,
+                0.85,
+                None,
             );
             pl.record_outcome(
                 &["mo_query".into()],
                 TaskType::Mutate,
                 Some(DomainHint::Database),
                 true,
-                0.80, None,
+                0.80,
+                None,
             );
         }
 
@@ -2433,9 +2449,12 @@ mod state_convergence {
     fn database_domain_hint_persists_through_sync() {
         // Phase D added DomainHint::Database — verify it survives serialization
         let (eg, pl, cal) = make_modules();
-        eg.lock()
-            .unwrap()
-            .learn("users_table", DomainHint::Database, &["mo_query".into()], None);
+        eg.lock().unwrap().learn(
+            "users_table",
+            DomainHint::Database,
+            &["mo_query".into()],
+            None,
+        );
 
         let snapshot = export_from_modules(&eg, &pl, &cal);
         let json = serde_json::to_string(&snapshot).unwrap();
@@ -3343,12 +3362,14 @@ mod learning_improves_selection {
         g.learn(
             "matrixorigin",
             DomainHint::GitHub,
-            &["github_list_prs".into()], None,
+            &["github_list_prs".into()],
+            None,
         );
         g.learn(
             "matrixorigin",
             DomainHint::GitHub,
-            &["github_get_issue".into()], None,
+            &["github_get_issue".into()],
+            None,
         );
 
         // After learning: boost terms include domain keywords
@@ -3380,14 +3401,16 @@ mod learning_improves_selection {
             TaskType::Fetch,
             Some(DomainHint::GitHub),
             true,
-            0.9, None,
+            0.9,
+            None,
         );
         lib.record_outcome(
             &["github_list_prs".into(), "github_get_pr".into()],
             TaskType::Fetch,
             Some(DomainHint::GitHub),
             true,
-            0.85, None,
+            0.85,
+            None,
         );
 
         // After: should produce boost terms for GitHub fetch queries
@@ -3415,10 +3438,22 @@ mod learning_improves_selection {
 
         // Record corrections: 3/10 fetch queries had wrong tool selection
         for _ in 0..7 {
-            cal.record("fetch", Some(DomainHint::GitHub), TaskType::Fetch, false, None);
+            cal.record(
+                "fetch",
+                Some(DomainHint::GitHub),
+                TaskType::Fetch,
+                false,
+                None,
+            );
         }
         for _ in 0..3 {
-            cal.record("fetch", Some(DomainHint::GitHub), TaskType::Fetch, true, None);
+            cal.record(
+                "fetch",
+                Some(DomainHint::GitHub),
+                TaskType::Fetch,
+                true,
+                None,
+            );
         }
 
         let after = cal.calibrated_threshold("fetch", Some(DomainHint::GitHub), TaskType::Fetch);
@@ -3444,17 +3479,20 @@ mod learning_improves_selection {
             g.learn(
                 "matrixorigin",
                 DomainHint::GitHub,
-                &["github_list_prs".into()], None,
+                &["github_list_prs".into()],
+                None,
             );
             g.learn(
                 "matrixorigin",
                 DomainHint::GitHub,
-                &["github_get_issue".into()], None,
+                &["github_get_issue".into()],
+                None,
             );
             g.learn(
                 "matrixorigin",
                 DomainHint::GitHub,
-                &["github_ci_status".into()], None,
+                &["github_ci_status".into()],
+                None,
             );
         }
 
@@ -3535,10 +3573,22 @@ mod learning_improves_selection {
         {
             let mut c = cal1.lock().unwrap();
             for _ in 0..7 {
-                c.record("fetch", Some(DomainHint::GitHub), TaskType::Fetch, false, None);
+                c.record(
+                    "fetch",
+                    Some(DomainHint::GitHub),
+                    TaskType::Fetch,
+                    false,
+                    None,
+                );
             }
             for _ in 0..3 {
-                c.record("fetch", Some(DomainHint::GitHub), TaskType::Fetch, true, None);
+                c.record(
+                    "fetch",
+                    Some(DomainHint::GitHub),
+                    TaskType::Fetch,
+                    true,
+                    None,
+                );
             }
         }
 
@@ -3579,7 +3629,8 @@ mod learning_improves_selection {
                     TaskType::Reasoning,
                     Some(DomainHint::Git),
                     true,
-                    0.9, None,
+                    0.9,
+                    None,
                 );
             }
         }
@@ -3613,8 +3664,18 @@ mod learning_improves_selection {
         // Populate all three modules
         {
             let mut g = eg1.lock().unwrap();
-            g.learn("memoria", DomainHint::GitHub, &["github_list_prs".into()], None);
-            g.learn("memoria", DomainHint::GitHub, &["github_ci_status".into()], None);
+            g.learn(
+                "memoria",
+                DomainHint::GitHub,
+                &["github_list_prs".into()],
+                None,
+            );
+            g.learn(
+                "memoria",
+                DomainHint::GitHub,
+                &["github_ci_status".into()],
+                None,
+            );
         }
         {
             let mut lib = pl1.lock().unwrap();
@@ -3624,14 +3685,21 @@ mod learning_improves_selection {
                     TaskType::Fetch,
                     Some(DomainHint::GitHub),
                     true,
-                    0.85, None,
+                    0.85,
+                    None,
                 );
             }
         }
         {
             let mut c = cal1.lock().unwrap();
             for i in 0..10 {
-                c.record("fetch", Some(DomainHint::GitHub), TaskType::Fetch, i < 2, None);
+                c.record(
+                    "fetch",
+                    Some(DomainHint::GitHub),
+                    TaskType::Fetch,
+                    i < 2,
+                    None,
+                );
             }
         }
 
@@ -3678,7 +3746,8 @@ mod learning_improves_selection {
         eg1.lock().unwrap().learn(
             "matrixorigin",
             DomainHint::GitHub,
-            &["github_list_prs".into()], None,
+            &["github_list_prs".into()],
+            None,
         );
 
         let snap1 = export_from_modules(&eg1, &pl1, &cal1);
@@ -5296,8 +5365,8 @@ mod hardening_proofs {
         LearningSnapshot, ToolHealthEntry, load_snapshot_from, save_snapshot_to,
     };
     use mo_agent_runtime::turn::response_guard::{
-        is_prompt_leaked, is_repetition_loop, check_response_quality, find_hallucinated_tools,
-        find_malformed_args, QualityReport,
+        QualityReport, check_response_quality, find_hallucinated_tools, find_malformed_args,
+        is_prompt_leaked, is_repetition_loop,
     };
     use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
     use mo_agent_runtime::turn::turn_guard::TurnGuard;
@@ -8463,7 +8532,8 @@ mod co_occurrence_scoring_proofs {
                 TaskType::Code,
                 Some(DomainHint::Code),
                 true,
-                0.9, None,
+                0.9,
+                None,
             );
         }
 
@@ -8563,7 +8633,8 @@ mod co_occurrence_scoring_proofs {
                 TaskType::Code,
                 Some(DomainHint::Code),
                 true,
-                0.85, None,
+                0.85,
+                None,
             );
         }
         // Also record some failures (should not contribute)
@@ -8573,7 +8644,8 @@ mod co_occurrence_scoring_proofs {
                 TaskType::Code,
                 None,
                 false,
-                0.0, None,
+                0.0,
+                None,
             );
         }
 
@@ -8610,7 +8682,8 @@ mod co_occurrence_scoring_proofs {
                 TaskType::Code,
                 Some(DomainHint::Code),
                 true,
-                0.9, None,
+                0.9,
+                None,
             );
         }
         // Pattern B: bash + read_file
@@ -8620,7 +8693,8 @@ mod co_occurrence_scoring_proofs {
                 TaskType::Code,
                 Some(DomainHint::Code),
                 true,
-                0.8, None,
+                0.8,
+                None,
             );
         }
 
@@ -8672,7 +8746,8 @@ mod co_occurrence_scoring_proofs {
                 TaskType::Code,
                 Some(DomainHint::Code),
                 true,
-                0.9, None,
+                0.9,
+                None,
             );
         }
 

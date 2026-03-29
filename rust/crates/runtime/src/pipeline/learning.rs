@@ -176,9 +176,7 @@ pub fn build_learning_outcome_from_payload(
 
     // User feedback score: extracted from payload if available (will be populated
     // later when feedback is submitted via /api/v1/learning/feedback)
-    let user_feedback_score = obj
-        .get("user_feedback_score")
-        .and_then(|v| v.as_i64());
+    let user_feedback_score = obj.get("user_feedback_score").and_then(|v| v.as_i64());
 
     Some(TurnLearningOutcome {
         query,
@@ -508,7 +506,7 @@ mod tests {
                 was_corrected: false,
                 task_type_label: Some("fetch".into()),
                 domain_hint_label: Some("github".into()),
-            user_feedback_score: None,
+                user_feedback_score: None,
             };
             writer.record_outcome(outcome).await.unwrap();
         }
@@ -537,7 +535,7 @@ mod tests {
                 was_corrected: i % 3 == 0, // every 3rd turn is corrected
                 task_type_label: Some("code".into()),
                 domain_hint_label: Some("code".into()),
-            user_feedback_score: None,
+                user_feedback_score: None,
             };
             writer.record_outcome(outcome).await.unwrap();
         }

@@ -146,8 +146,8 @@ impl ProgressiveCalibrator {
         // Convert low user satisfaction into a correction signal:
         // - was_corrected=true: explicit correction happened
         // - feedback < 50: user unhappy, treat as implicit correction
-        let effective_correction = was_corrected
-            || user_feedback_score.map_or(false, |score| score < 50);
+        let effective_correction =
+            was_corrected || user_feedback_score.map_or(false, |score| score < 50);
 
         self.per_intent
             .entry(intent.to_string())
@@ -354,7 +354,13 @@ mod tests {
     fn insufficient_data_returns_base() {
         let mut cal = ProgressiveCalibrator::default();
         for _ in 0..4 {
-            cal.record("fetch", Some(DomainHint::GitHub), TaskType::Fetch, true, None);
+            cal.record(
+                "fetch",
+                Some(DomainHint::GitHub),
+                TaskType::Fetch,
+                true,
+                None,
+            );
         }
         // Only 4 samples — not enough for any axis
         let threshold =
@@ -394,7 +400,13 @@ mod tests {
     fn domain_correction_lowers_threshold() {
         let mut cal = ProgressiveCalibrator::default();
         for _ in 0..10 {
-            cal.record("any", Some(DomainHint::GitHub), TaskType::Unknown, true, None);
+            cal.record(
+                "any",
+                Some(DomainHint::GitHub),
+                TaskType::Unknown,
+                true,
+                None,
+            );
         }
         // Intent axis: "any" has data → 100% correction → -0.15
         // Domain axis: GitHub has data → 100% correction → -0.10
@@ -410,7 +422,13 @@ mod tests {
         let mut cal = ProgressiveCalibrator::default();
         // Intent "x" gets no corrections, domain GitHub does
         for _ in 0..5 {
-            cal.record("x", Some(DomainHint::GitHub), TaskType::Unknown, false, None);
+            cal.record(
+                "x",
+                Some(DomainHint::GitHub),
+                TaskType::Unknown,
+                false,
+                None,
+            );
         }
         for _ in 0..5 {
             cal.record("y", Some(DomainHint::GitHub), TaskType::Unknown, true, None);
@@ -446,10 +464,22 @@ mod tests {
         let mut cal = ProgressiveCalibrator::default();
         // Intent "fetch": 50% correction
         for _ in 0..5 {
-            cal.record("fetch", Some(DomainHint::GitHub), TaskType::Fetch, true, None);
+            cal.record(
+                "fetch",
+                Some(DomainHint::GitHub),
+                TaskType::Fetch,
+                true,
+                None,
+            );
         }
         for _ in 0..5 {
-            cal.record("fetch", Some(DomainHint::GitHub), TaskType::Fetch, false, None);
+            cal.record(
+                "fetch",
+                Some(DomainHint::GitHub),
+                TaskType::Fetch,
+                false,
+                None,
+            );
         }
         let threshold =
             cal.calibrated_threshold("fetch", Some(DomainHint::GitHub), TaskType::Fetch);
@@ -523,7 +553,13 @@ mod tests {
     #[test]
     fn stats_accessible() {
         let mut cal = ProgressiveCalibrator::default();
-        cal.record("fetch", Some(DomainHint::GitHub), TaskType::Fetch, true, None);
+        cal.record(
+            "fetch",
+            Some(DomainHint::GitHub),
+            TaskType::Fetch,
+            true,
+            None,
+        );
 
         let intent = cal.intent_stats("fetch").unwrap();
         assert_eq!(intent.total, 1);
@@ -554,7 +590,13 @@ mod tests {
     fn export_merge_round_trip() {
         let mut cal = ProgressiveCalibrator::default();
         for _ in 0..10 {
-            cal.record("fetch", Some(DomainHint::GitHub), TaskType::Fetch, true, None);
+            cal.record(
+                "fetch",
+                Some(DomainHint::GitHub),
+                TaskType::Fetch,
+                true,
+                None,
+            );
         }
 
         let exported = cal.export();
@@ -623,7 +665,13 @@ mod tests {
 
         // Phase 2: GitHub routing works well (no corrections)
         for _ in 0..10 {
-            cal.record("github", Some(DomainHint::GitHub), TaskType::Fetch, false, None);
+            cal.record(
+                "github",
+                Some(DomainHint::GitHub),
+                TaskType::Fetch,
+                false,
+                None,
+            );
         }
         let t2 = cal.calibrated_threshold("github", Some(DomainHint::GitHub), TaskType::Fetch);
         assert!((t2 - 0.70).abs() < 0.01, "no corrections = no change");
@@ -665,7 +713,10 @@ mod tests {
         let implicit_rate = cal.intent_stats("implicit").unwrap().correction_rate();
 
         assert_eq!(explicit_rate, 1.0, "Explicit corrections should be 100%");
-        assert_eq!(implicit_rate, 1.0, "Low feedback should be treated as correction");
+        assert_eq!(
+            implicit_rate, 1.0,
+            "Low feedback should be treated as correction"
+        );
     }
 
     #[test]
@@ -676,7 +727,10 @@ mod tests {
             cal.record("happy", None, TaskType::Fetch, false, Some(80)); // no correction, high feedback
         }
         let rate = cal.intent_stats("happy").unwrap().correction_rate();
-        assert_eq!(rate, 0.0, "High feedback with no correction should have 0% rate");
+        assert_eq!(
+            rate, 0.0,
+            "High feedback with no correction should have 0% rate"
+        );
     }
 
     #[test]
