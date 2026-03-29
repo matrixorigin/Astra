@@ -128,6 +128,11 @@ pub fn build_main_system_prompt(
             "- **call_graph**: Call relationships. `callers=true` finds who calls a function. `scope='project'` searches cross-file.\n",
         );
     }
+    if tool_names.contains(&"rename_symbol") {
+        prompt.push_str(
+            "- **rename_symbol**: Rename across project. AST-validated, skips comments/strings. dry_run=true previews.\n",
+        );
+    }
 
     // ── Editing strategy guidance ──
     if has_multi_edit {
@@ -260,9 +265,9 @@ pub fn build_main_system_prompt(
              ## Refactoring Strategy\n\
              1. Run tests BEFORE refactoring to establish a passing baseline.\n\
              2. Use call_graph(callers=true, scope='project') to find all callers before changing a signature.\n\
-             3. Make one logical change at a time — verify after each.\n\
-             4. Preserve external behavior; focus on clarity and maintainability.\n\
-             5. Update all call sites when renaming or changing signatures.\n\
+             3. For renames: rename_symbol(dry_run=true) to preview, then dry_run=false to apply.\n\
+             4. Make one logical change at a time — verify after each.\n\
+             5. Preserve external behavior; focus on clarity and maintainability.\n\
              6. Run tests AFTER to confirm nothing regressed.\n",
             );
         }
@@ -342,6 +347,7 @@ pub fn build_main_system_prompt(
          - **Understand code**: symbols(calls=true) → call_graph → read_file (targeted ranges)\n\
          - **Navigate code**: find_definition / find_references(kind=...) → grep → read_file\n\
          - **Impact analysis**: call_graph(callers=true, scope='project') → find_references → grep\n\
+         - **Rename/refactor**: rename_symbol(dry_run=true) → review preview → rename_symbol(dry_run=false)\n\
          - **File search**: glob (by name) → grep (by content) → log search (by commit message)\n\
          - **Code edit**: read context → str_replace (auto-formats) → run_build_test to verify\n\
          - **Git investigation**: status → diff → log → show → blame\n\

@@ -428,6 +428,25 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        // ── Rename Symbol tool ────────────────────────────────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "rename_symbol",
+                "description": "Rename a symbol across all files in the project. Uses AST-validated find_references to identify real code references (not comments/strings), then applies word-boundary-safe replacements. Dry-run by default for safety.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "symbol": {"type": "string", "description": "Current name of the symbol to rename"},
+                        "new_name": {"type": "string", "description": "New name for the symbol"},
+                        "path": {"type": "string", "description": "Limit rename to a subdirectory (optional)"},
+                        "include": {"type": "string", "description": "File glob filter e.g. '*.rs' (optional)"},
+                        "dry_run": {"type": "boolean", "description": "Preview changes without applying (default: true). Set false to apply."}
+                    },
+                    "required": ["symbol", "new_name"]
+                }
+            }
+        }),
         // ── Build/Test tool ─────────────────────────────────────────────
         json!({
             "type": "function",
@@ -1105,6 +1124,7 @@ impl ToolExecutor {
             "find_definition" => self.find_definition(args),
             "find_references" => self.find_references(args),
             "call_graph" => self.call_graph(args),
+            "rename_symbol" => self.rename_symbol(args),
             "run_build_test" => self.run_build_test(args),
             "symbols" => self.symbols(args),
             "mo_query" => self.mo_query(args),
@@ -1778,6 +1798,189 @@ impl ToolExecutor {
                 }
             }
         }
+    }
+
+    /// Smart rename: find all AST-validated references to a symbol and replace them.
+    fn rename_symbol(&self, args: &Value) -> String {
+        let symbol = match args.get("symbol").and_then(Value::as_str) {
+            Some(s) if !s.is_empty() => s,
+            _ => return "Error: 'symbol' (current name) is required".into(),
+        };
+        let new_name = match args.get("new_name").and_then(Value::as_str) {
+            Some(s) if !s.is_empty() => s,
+            _ => return "Error: 'new_name' is required".into(),
+        };
+        if symbol == new_name {
+            return "Error: symbol and new_name are the same".into();
+        }
+
+        // Validate new_name is a valid identifier
+        if !new_name.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_')
+            || !new_name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            return format!("Error: '{}' is not a valid identifier", new_name);
+        }
+
+        let dry_run = args.get("dry_run").and_then(Value::as_bool).unwrap_or(true);
+
+        // Step 1: Find all references using AST-validated find_references
+        let search_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        let include = args.get("include").and_then(Value::as_str);
+
+        let search_dir = self.project_root.join(search_path);
+        if !search_dir.exists() {
+            return format!("Error: path '{}' not found", search_path);
+        }
+
+        // Build search command — try ripgrep first, fall back to grep
+        let output = {
+            let mut cmd = std::process::Command::new("rg");
+            cmd.arg("-n").arg("-w").arg("--no-heading")
+                .arg("--max-count").arg("1000")
+                .arg(symbol)
+                .current_dir(&search_dir);
+            if let Some(inc) = include {
+                cmd.arg("-g").arg(inc);
+            }
+            for exc in &[".git", "node_modules", "target", "vendor", "dist"] {
+                cmd.arg("--glob").arg(format!("!{}", exc));
+            }
+            match cmd.output() {
+                Ok(o) => o,
+                Err(_) => {
+                    // Fallback to grep
+                    let mut cmd = std::process::Command::new("grep");
+                    cmd.arg("-rnw").arg(symbol).current_dir(&search_dir);
+                    if let Some(inc) = include {
+                        cmd.arg("--include").arg(inc);
+                    }
+                    for exc in &[".git", "node_modules", "target", "vendor", "dist"] {
+                        cmd.arg("--exclude-dir").arg(*exc);
+                    }
+                    match cmd.output() {
+                        Ok(o) => o,
+                        Err(_) => return "Error: neither rg nor grep available".into(),
+                    }
+                }
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.trim().is_empty() {
+            return format!("No references to '{}' found", symbol);
+        }
+
+        let lines: Vec<&str> = stdout.lines().collect();
+        let total_grep = lines.len();
+
+        // Step 2: AST-validate to filter comments/strings
+        let validated = self.ast_validate_references(&lines, symbol);
+        let filtered_count = total_grep - validated.len();
+
+        if validated.is_empty() {
+            return format!("No code references to '{}' found (all {} matches were in comments/strings)", symbol, total_grep);
+        }
+
+        // Step 3: Group by file and collect line numbers
+        let mut by_file: std::collections::BTreeMap<String, Vec<usize>> = std::collections::BTreeMap::new();
+        for line in &validated {
+            if let Some((file, line_num)) = parse_grep_file_line(line) {
+                by_file.entry(file.to_string()).or_default().push(line_num);
+            }
+        }
+
+        // Step 4: Apply or preview replacements
+        let mut output = String::new();
+        let mut total_replacements = 0usize;
+        let mut files_changed = 0usize;
+
+        if dry_run {
+            output.push_str(&format!("🔍 Rename preview: {} → {}\n", symbol, new_name));
+        } else {
+            output.push_str(&format!("✏️  Renaming: {} → {}\n", symbol, new_name));
+        }
+
+        for (rel_path, line_nums) in &by_file {
+            let abs_path = search_dir.join(rel_path);
+            let content = match fs::read_to_string(&abs_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    output.push_str(&format!("  ⚠ {}: read error: {}\n", rel_path, e));
+                    continue;
+                }
+            };
+
+            let content_lines: Vec<&str> = content.lines().collect();
+            let mut replacements_in_file = 0;
+            let mut new_lines: Vec<String> = content_lines.iter().map(|l| l.to_string()).collect();
+
+            // Build word-boundary regex for precise replacement
+            let pattern = format!(r"\b{}\b", regex::escape(symbol));
+            let re = match regex::Regex::new(&pattern) {
+                Ok(r) => r,
+                Err(_) => {
+                    output.push_str(&format!("  ⚠ {}: invalid regex for symbol\n", rel_path));
+                    continue;
+                }
+            };
+
+            for &line_num in line_nums {
+                let idx = line_num.saturating_sub(1);
+                if idx >= new_lines.len() {
+                    continue;
+                }
+
+                // Check this specific occurrence via AST validation before replacing
+                let old_line = &new_lines[idx];
+                let replaced = re.replace_all(old_line, new_name).to_string();
+                if replaced != *old_line {
+                    if dry_run {
+                        output.push_str(&format!("  {}:{}:\n", rel_path, line_num));
+                        output.push_str(&format!("    - {}\n", old_line.trim()));
+                        output.push_str(&format!("    + {}\n", replaced.trim()));
+                    }
+                    new_lines[idx] = replaced;
+                    replacements_in_file += 1;
+                }
+            }
+
+            if replacements_in_file > 0 {
+                files_changed += 1;
+                total_replacements += replacements_in_file;
+
+                if !dry_run {
+                    // Reconstruct file content preserving original line endings
+                    let has_trailing_newline = content.ends_with('\n');
+                    let mut new_content = new_lines.join("\n");
+                    if has_trailing_newline {
+                        new_content.push('\n');
+                    }
+
+                    if let Err(e) = fs::write(&abs_path, &new_content) {
+                        output.push_str(&format!("  ⚠ {}: write error: {}\n", rel_path, e));
+                        continue;
+                    }
+                    output.push_str(&format!("  ✓ {} ({} replacement{})\n", rel_path, replacements_in_file,
+                        if replacements_in_file == 1 { "" } else { "s" }));
+                }
+            }
+        }
+
+        output.push_str(&format!("\n{} replacement{} in {} file{}",
+            total_replacements,
+            if total_replacements == 1 { "" } else { "s" },
+            files_changed,
+            if files_changed == 1 { "" } else { "s" }));
+
+        if filtered_count > 0 {
+            output.push_str(&format!(" ({} comment/string matches skipped)", filtered_count));
+        }
+
+        if dry_run {
+            output.push_str("\n\n💡 This is a dry run. Set dry_run=false to apply changes.");
+        }
+
+        output
     }
 
     fn call_graph(&self, args: &Value) -> String {
@@ -3692,5 +3895,183 @@ fn actual() { target(); }
         })).await;
         // With validate=false, the comment line should still appear
         assert!(result.contains("target"), "should find references: {result}");
+    }
+
+    // ---- rename_symbol tests ----
+
+    #[tokio::test]
+    async fn rename_symbol_dry_run_shows_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "fn target_fn() { 42 }\nfn caller() { target_fn(); }\n";
+        std::fs::write(dir.path().join("main.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("rename_symbol", &json!({
+            "symbol": "target_fn",
+            "new_name": "renamed_fn"
+        })).await;
+
+        assert!(result.contains("preview"), "default is dry run: {result}");
+        assert!(result.contains("target_fn"), "shows old name: {result}");
+        assert!(result.contains("renamed_fn"), "shows new name: {result}");
+        assert!(result.contains("dry_run=false"), "hints to apply: {result}");
+        // File should NOT be modified
+        let content = std::fs::read_to_string(dir.path().join("main.rs")).unwrap();
+        assert!(content.contains("target_fn"), "file untouched in dry run");
+    }
+
+    #[tokio::test]
+    async fn rename_symbol_applies_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "fn old_name() -> i32 { 42 }\nfn caller() { old_name(); }\n";
+        std::fs::write(dir.path().join("lib.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("rename_symbol", &json!({
+            "symbol": "old_name",
+            "new_name": "new_name",
+            "dry_run": false
+        })).await;
+
+        assert!(result.contains("Renaming"), "shows applied: {result}");
+        assert!(result.contains("2 replacement"), "both occurrences renamed: {result}");
+        let content = std::fs::read_to_string(dir.path().join("lib.rs")).unwrap();
+        assert!(content.contains("fn new_name()"), "definition renamed");
+        assert!(content.contains("new_name();"), "call site renamed");
+        assert!(!content.contains("old_name"), "old name fully gone");
+    }
+
+    #[tokio::test]
+    async fn rename_symbol_skips_comments_and_strings() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = r#"fn target() -> i32 { 42 }
+// target is a good function
+fn caller() {
+    let s = "target in string";
+    target();
+}
+"#;
+        std::fs::write(dir.path().join("test.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("rename_symbol", &json!({
+            "symbol": "target",
+            "new_name": "renamed",
+            "dry_run": false
+        })).await;
+
+        let content = std::fs::read_to_string(dir.path().join("test.rs")).unwrap();
+        // Real code references should be renamed
+        assert!(content.contains("fn renamed()"), "definition renamed: {}", content);
+        assert!(content.contains("renamed();"), "call renamed: {}", content);
+        // Comment and string should be preserved
+        assert!(content.contains("// target is a good function"), "comment preserved: {}", content);
+        assert!(content.contains("\"target in string\""), "string preserved: {}", content);
+        // Should report filtered matches
+        assert!(result.contains("skipped"), "mentions filtered: {result}");
+    }
+
+    #[tokio::test]
+    async fn rename_symbol_across_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn shared_fn() -> i32 { 42 }\n").unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() { shared_fn(); }\n").unwrap();
+        std::fs::write(dir.path().join("src/test.rs"), "fn test_it() { assert_eq!(shared_fn(), 42); }\n").unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("rename_symbol", &json!({
+            "symbol": "shared_fn",
+            "new_name": "common_fn",
+            "dry_run": false
+        })).await;
+
+        assert!(result.contains("3 file"), "changed 3 files: {result}");
+        for file in &["src/lib.rs", "src/main.rs", "src/test.rs"] {
+            let content = std::fs::read_to_string(dir.path().join(file)).unwrap();
+            assert!(content.contains("common_fn"), "{} should have new name: {}", file, content);
+            assert!(!content.contains("shared_fn"), "{} should not have old name: {}", file, content);
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_symbol_word_boundary_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "fn foo() { 1 }\nfn foobar() { foo() + 2 }\nfn foo_baz() { foo() }\n";
+        std::fs::write(dir.path().join("test.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("rename_symbol", &json!({
+            "symbol": "foo",
+            "new_name": "bar",
+            "dry_run": false
+        })).await;
+
+        let content = std::fs::read_to_string(dir.path().join("test.rs")).unwrap();
+        assert!(content.contains("fn bar()"), "foo renamed to bar");
+        assert!(content.contains("foobar"), "foobar NOT renamed (word boundary)");
+        assert!(content.contains("bar() + 2"), "call in foobar line renamed");
+        assert!(result.contains("replacement"), "has replacements: {result}");
+    }
+
+    #[tokio::test]
+    async fn rename_symbol_errors_on_invalid_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.rs"), "fn foo() {}\n").unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+
+        let result = executor.execute("rename_symbol", &json!({
+            "symbol": "foo",
+            "new_name": "123invalid"
+        })).await;
+        assert!(result.contains("not a valid identifier"), "rejects numeric start: {result}");
+
+        let result = executor.execute("rename_symbol", &json!({
+            "symbol": "foo",
+            "new_name": "has space"
+        })).await;
+        assert!(result.contains("not a valid identifier"), "rejects spaces: {result}");
+
+        let result = executor.execute("rename_symbol", &json!({
+            "symbol": "foo",
+            "new_name": "foo"
+        })).await;
+        assert!(result.contains("same"), "rejects same name: {result}");
+    }
+
+    #[tokio::test]
+    async fn rename_symbol_no_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.rs"), "fn bar() {}\n").unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("rename_symbol", &json!({
+            "symbol": "nonexistent_symbol_xyz",
+            "new_name": "new_name"
+        })).await;
+        assert!(result.contains("No references"), "reports no matches: {result}");
+    }
+
+    #[tokio::test]
+    async fn rename_symbol_with_include_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn target() { 1 }\n").unwrap();
+        std::fs::write(dir.path().join("main.py"), "def target(): pass\ntarget()\n").unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("rename_symbol", &json!({
+            "symbol": "target",
+            "new_name": "renamed",
+            "include": "*.rs",
+            "dry_run": false
+        })).await;
+
+        // Only .rs file should be modified
+        let rs_content = std::fs::read_to_string(dir.path().join("lib.rs")).unwrap();
+        let py_content = std::fs::read_to_string(dir.path().join("main.py")).unwrap();
+        assert!(rs_content.contains("renamed"), "rs file renamed: {}", rs_content);
+        assert!(py_content.contains("target"), "py file untouched: {}", py_content);
+        assert!(result.contains("1 file"), "only 1 file changed: {result}");
     }
 }

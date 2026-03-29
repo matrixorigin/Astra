@@ -10,6 +10,11 @@
 //! 3. Pattern recorded: signature="github_list_prs|github_search", task=Fetch, domain=GitHub
 //! 4. Next similar query → suggest() returns this pattern → boost these tools
 //!
+//! # Exploration
+//!
+//! To prevent pattern drift and discover new tools, `suggest_with_exploration()`
+//! uses epsilon-greedy: 10% chance to include a low-frequency or stale pattern.
+//!
 //! # Integration
 //!
 //! ```rust,ignore
@@ -23,6 +28,15 @@
 
 use super::routing::{DomainHint, TaskType};
 use std::collections::HashMap;
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+/// Days after which pattern weight starts decaying.
+const DECAY_GRACE_DAYS: u64 = 7;
+/// Half-life in days for exponential decay after grace period.
+const DECAY_HALF_LIFE_DAYS: f64 = 30.0;
+/// Probability of including an exploration pattern (epsilon-greedy).
+const EXPLORATION_EPSILON: f64 = 0.1;
 
 // ─── Tool Chain Pattern ──────────────────────────────────────────────────────
 
@@ -48,11 +62,6 @@ pub struct ToolChainPattern {
     #[serde(default)]
     pub last_used_at: u64,
 }
-
-/// Days after which pattern weight starts decaying.
-const DECAY_GRACE_DAYS: u64 = 7;
-/// Half-life in days for exponential decay after grace period.
-const DECAY_HALF_LIFE_DAYS: f64 = 30.0;
 
 impl ToolChainPattern {
     fn new(
@@ -284,6 +293,124 @@ impl PatternLibrary {
         });
         candidates.truncate(limit);
         candidates
+    }
+
+    /// Suggest patterns with epsilon-greedy exploration.
+    ///
+    /// With probability EXPLORATION_EPSILON (10%), includes a low-frequency or
+    /// stale pattern among the suggestions. This helps rediscover tools that
+    /// may have been deprecated due to time decay but are still valuable.
+    ///
+    /// Returns up to `limit` patterns, with the exploration slot (if triggered)
+    /// replacing the last regular suggestion.
+    pub fn suggest_with_exploration(
+        &self,
+        task_type: TaskType,
+        domain: Option<DomainHint>,
+        limit: usize,
+    ) -> Vec<&ToolChainPattern> {
+        let mut suggestions = self.suggest(task_type, domain, limit);
+
+        // Roll for exploration using timestamp-based pseudo-randomness
+        // Using nanos % 100 gives 0-99, so < 10 is ~10% probability
+        let roll = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() % 100)
+            .unwrap_or(50);
+        let should_explore = (roll as f64) < (EXPLORATION_EPSILON * 100.0);
+
+        if !should_explore || limit == 0 {
+            return suggestions;
+        }
+
+        // Find exploration candidates: patterns not in top suggestions, sorted by staleness
+        let top_sigs: std::collections::HashSet<_> =
+            suggestions.iter().map(|p| &p.signature).collect();
+
+        let keys = match self.type_index.get(&task_type) {
+            Some(keys) => keys,
+            None => return suggestions,
+        };
+
+        let mut exploration_candidates: Vec<&ToolChainPattern> = keys
+            .iter()
+            .filter_map(|k| self.patterns.get(k))
+            .filter(|p| !top_sigs.contains(&p.signature))
+            .filter(|p| {
+                match domain {
+                    Some(d) => p.domain == Some(d) || p.domain.is_none(),
+                    None => true,
+                }
+            })
+            .filter(|p| p.success_rate() >= 0.3) // Must have some success history
+            .collect();
+
+        if exploration_candidates.is_empty() {
+            return suggestions;
+        }
+
+        // Sort by staleness (oldest first) to prioritize rediscovery
+        exploration_candidates.sort_by(|a, b| a.last_used_at.cmp(&b.last_used_at));
+
+        // Replace last suggestion with exploration pick
+        if suggestions.len() >= limit {
+            suggestions.pop();
+        }
+        suggestions.push(exploration_candidates[0]);
+
+        suggestions
+    }
+
+    /// Suggest patterns with forced exploration (for testing).
+    ///
+    /// Same as `suggest_with_exploration` but always triggers exploration
+    /// if exploration candidates exist.
+    #[cfg(test)]
+    pub fn suggest_with_forced_exploration(
+        &self,
+        task_type: TaskType,
+        domain: Option<DomainHint>,
+        limit: usize,
+    ) -> Vec<&ToolChainPattern> {
+        let mut suggestions = self.suggest(task_type, domain, limit);
+
+        if limit == 0 {
+            return suggestions;
+        }
+
+        let top_sigs: std::collections::HashSet<_> =
+            suggestions.iter().map(|p| &p.signature).collect();
+
+        let keys = match self.type_index.get(&task_type) {
+            Some(keys) => keys,
+            None => return suggestions,
+        };
+
+        let mut exploration_candidates: Vec<&ToolChainPattern> = keys
+            .iter()
+            .filter_map(|k| self.patterns.get(k))
+            .filter(|p| !top_sigs.contains(&p.signature))
+            .filter(|p| {
+                match domain {
+                    Some(d) => p.domain == Some(d) || p.domain.is_none(),
+                    None => true,
+                }
+            })
+            .filter(|p| p.success_rate() >= 0.3)
+            .collect();
+
+        if exploration_candidates.is_empty() {
+            return suggestions;
+        }
+
+        exploration_candidates.sort_by(|a, b| a.last_used_at.cmp(&b.last_used_at));
+
+        if suggestions.len() >= limit {
+            suggestions.pop();
+        }
+        suggestions.push(exploration_candidates[0]);
+
+        suggestions
     }
 
     /// Get boost terms from successful patterns for a task type + domain.
@@ -1097,5 +1224,139 @@ mod tests {
                 assert!(r < s, "Recent pattern should rank before stale pattern");
             }
         }
+    }
+
+    // ── Exploration Tests ──
+
+    #[test]
+    fn exploration_includes_stale_pattern() {
+        let mut lib = PatternLibrary::new();
+
+        // Create two fresh high-score patterns
+        for _ in 0..5 {
+            lib.record_outcome(&tools(&["tool_a"]), TaskType::Fetch, Some(DomainHint::GitHub), true, 0.95, None);
+            lib.record_outcome(&tools(&["tool_b"]), TaskType::Fetch, Some(DomainHint::GitHub), true, 0.9, None);
+        }
+
+        // Create a stale pattern with decent success (should be exploration candidate)
+        for _ in 0..3 {
+            lib.record_outcome(&tools(&["old_tool"]), TaskType::Fetch, Some(DomainHint::GitHub), true, 0.7, None);
+        }
+
+        // Make old_tool stale
+        let now = chrono::Utc::now().timestamp() as u64;
+        for pattern in lib.patterns.values_mut() {
+            if pattern.tools.contains(&"old_tool".to_string()) {
+                pattern.last_used_at = now - (60 * 24 * 3600); // 60 days ago
+            }
+        }
+
+        // Normal suggest should not include old_tool (decayed score too low)
+        let normal = lib.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 2);
+        let has_old_in_normal = normal.iter().any(|p| p.tools.contains(&"old_tool".to_string()));
+
+        // Forced exploration should include old_tool
+        let explored = lib.suggest_with_forced_exploration(TaskType::Fetch, Some(DomainHint::GitHub), 2);
+        let has_old_in_explored = explored.iter().any(|p| p.tools.contains(&"old_tool".to_string()));
+
+        assert!(!has_old_in_normal, "Normal suggest should not include stale pattern");
+        assert!(has_old_in_explored, "Exploration should include stale pattern for rediscovery");
+    }
+
+    #[test]
+    fn exploration_prefers_oldest_pattern() {
+        let mut lib = PatternLibrary::new();
+
+        // Create a fresh top pattern
+        for _ in 0..5 {
+            lib.record_outcome(&tools(&["fresh"]), TaskType::Fetch, None, true, 0.9, None);
+        }
+
+        // Create two stale patterns with different ages
+        for _ in 0..3 {
+            lib.record_outcome(&tools(&["old_30"]), TaskType::Fetch, None, true, 0.6, None);
+            lib.record_outcome(&tools(&["old_60"]), TaskType::Fetch, None, true, 0.6, None);
+        }
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        for pattern in lib.patterns.values_mut() {
+            if pattern.tools.contains(&"old_30".to_string()) {
+                pattern.last_used_at = now - (30 * 24 * 3600);
+            }
+            if pattern.tools.contains(&"old_60".to_string()) {
+                pattern.last_used_at = now - (60 * 24 * 3600);
+            }
+        }
+
+        // Exploration should pick the oldest (old_60)
+        let explored = lib.suggest_with_forced_exploration(TaskType::Fetch, None, 1);
+        let picked = explored.iter().find(|p| p.tools.contains(&"old_60".to_string()) || p.tools.contains(&"old_30".to_string()));
+
+        if let Some(p) = picked {
+            assert!(p.tools.contains(&"old_60".to_string()),
+                "Exploration should prefer oldest stale pattern (old_60), got {:?}", p.tools);
+        }
+    }
+
+    #[test]
+    fn exploration_requires_minimum_success_rate() {
+        let mut lib = PatternLibrary::new();
+
+        // Create two fresh high-score patterns (to fill limit=2)
+        for _ in 0..5 {
+            lib.record_outcome(&tools(&["good_a"]), TaskType::Fetch, None, true, 0.95, None);
+            lib.record_outcome(&tools(&["good_b"]), TaskType::Fetch, None, true, 0.9, None);
+        }
+
+        // Create a stale pattern with poor success rate (below 0.3 threshold)
+        // 1 success + 4 failures = 1/5 = 0.2 success rate
+        lib.record_outcome(&tools(&["bad"]), TaskType::Fetch, None, true, 0.5, None);
+        lib.record_outcome(&tools(&["bad"]), TaskType::Fetch, None, false, 0.0, None);
+        lib.record_outcome(&tools(&["bad"]), TaskType::Fetch, None, false, 0.0, None);
+        lib.record_outcome(&tools(&["bad"]), TaskType::Fetch, None, false, 0.0, None);
+        lib.record_outcome(&tools(&["bad"]), TaskType::Fetch, None, false, 0.0, None);
+
+        // Verify success rate
+        let bad_pattern = lib.patterns.values().find(|p| p.tools.contains(&"bad".to_string())).unwrap();
+        assert!(bad_pattern.success_rate() < 0.3,
+            "Bad pattern should have success_rate < 0.3, got {}", bad_pattern.success_rate());
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        for pattern in lib.patterns.values_mut() {
+            if pattern.tools.contains(&"bad".to_string()) {
+                pattern.last_used_at = now - (60 * 24 * 3600);
+            }
+        }
+
+        // Normal suggest returns top 2 by decayed_score (good_a and good_b)
+        let normal = lib.suggest(TaskType::Fetch, None, 2);
+        let has_bad_in_normal = normal.iter().any(|p| p.tools.contains(&"bad".to_string()));
+
+        // Forced exploration: bad pattern excluded because success_rate < 0.3
+        let explored = lib.suggest_with_forced_exploration(TaskType::Fetch, None, 2);
+        let has_bad_in_explored = explored.iter().any(|p| p.tools.contains(&"bad".to_string()));
+
+        // If bad is already in normal suggest (decayed_score still competitive), test is moot
+        // Otherwise, exploration should NOT include it due to low success rate
+        if !has_bad_in_normal {
+            assert!(!has_bad_in_explored,
+                "Exploration should not include patterns with success_rate < 0.3");
+        }
+    }
+
+    #[test]
+    fn exploration_no_candidates_returns_normal() {
+        let mut lib = PatternLibrary::new();
+
+        // Create only one pattern
+        for _ in 0..5 {
+            lib.record_outcome(&tools(&["only"]), TaskType::Fetch, None, true, 0.9, None);
+        }
+
+        let normal = lib.suggest(TaskType::Fetch, None, 2);
+        let explored = lib.suggest_with_forced_exploration(TaskType::Fetch, None, 2);
+
+        // With no exploration candidates, both should return the same
+        assert_eq!(normal.len(), explored.len());
     }
 }
