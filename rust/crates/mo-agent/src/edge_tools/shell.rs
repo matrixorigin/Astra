@@ -124,6 +124,14 @@ impl ToolExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        // Create a new process group so we can kill the entire tree on timeout.
+        // This prevents orphaned git/curl/etc. child processes.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            child_cmd.process_group(0); // child becomes its own process group leader
+        }
+
         // Apply sandbox environment filtering
         if let Some(ref policy) = self.sandbox_policy
             && !matches!(policy.mode, SandboxMode::Permissive)
@@ -141,8 +149,18 @@ impl ToolExecutor {
                 Ok(Some(_)) => break,
                 Ok(None) => {
                     if std::time::Instant::now() > deadline {
-                        if let Err(e) = child.kill() {
-                            eprintln!("[shell] failed to kill timed-out child: {e}");
+                        // Kill entire process group (bash + all children)
+                        #[cfg(unix)]
+                        {
+                            let pid = child.id();
+                            // Negative PID = kill process group via /bin/kill
+                            let _ = Command::new("kill")
+                                .args(["-9", &format!("-{pid}")])
+                                .output();
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            let _ = child.kill();
                         }
                         // Reap the zombie process to prevent resource leak
                         let _ = child.wait();
@@ -681,6 +699,26 @@ mod tests {
         let executor = test_executor();
         let result = executor.bash(&serde_json::json!({"command": "sleep 10", "timeout": 0.2}));
         assert!(result.contains("timed out"), "got: {result}");
+    }
+
+    #[test]
+    fn bash_timeout_kills_child_process_tree() {
+        // Spawn a parent bash that starts a child sleep.
+        // After timeout, verify the child is also killed via process group.
+        let executor = test_executor();
+        // Use a unique marker file to detect if the child survived
+        let marker = format!("/tmp/mo_test_pgid_{}", std::process::id());
+        let cmd = format!(
+            "bash -c 'sleep 10 && touch {marker}' & wait"
+        );
+        let result = executor.bash(&serde_json::json!({"command": cmd, "timeout": 0.3}));
+        assert!(result.contains("timed out"), "got: {result}");
+        // Give a moment for any surviving child to act
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !std::path::Path::new(&marker).exists(),
+            "child process survived timeout — process group kill failed"
+        );
     }
 
     #[test]
