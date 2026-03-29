@@ -355,6 +355,14 @@ fn apply_turn_success(
         {
             ws.record_turn(result.prompt_tokens, result.completion_tokens);
 
+            // Persist plan state to workspace for session resume
+            ws.executing_plan_json = state.executing_plan.as_ref()
+                .and_then(|p| serde_json::to_string(p).ok());
+            ws.plan_goal = state.executing_plan_goal.clone();
+            ws.plan_config_json = state.plan_execution_config.as_ref()
+                .and_then(|c| serde_json::to_string(c).ok());
+            ws.plan_execution_rounds = state.plan_execution_rounds;
+
             // Check if checkpoint is due
             if mo_agent_services::session_checkpoint::should_checkpoint(
                 ws.turn_count,

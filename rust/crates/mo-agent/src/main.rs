@@ -679,6 +679,18 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             // restore_history_from_journal already handles session segmentation (only reads after latest session_start)
             state.history = repl_runtime::restore_history_from_journal(&session_id);
 
+            // Restore plan execution state from workspace snapshot
+            if let Some(ref json) = restored.executing_plan_json {
+                state.executing_plan = serde_json::from_str(json).ok();
+            }
+            if let Some(ref goal) = restored.plan_goal {
+                state.executing_plan_goal = Some(goal.clone());
+            }
+            if let Some(ref json) = restored.plan_config_json {
+                state.plan_execution_config = serde_json::from_str(json).ok();
+            }
+            state.plan_execution_rounds = restored.plan_execution_rounds;
+
             // Re-initialize journal for the resumed session
             repl_turn::initialize_journal_pub(state, &session_id);
             repl_turn::persist_last_session_id(profile, &session_id);
@@ -696,6 +708,27 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                 restored.turn_count,
                 restored.checkpoint_count,
             );
+
+            // Show paused plan banner
+            if let Some(ref plan) = state.executing_plan {
+                let done = plan.items_done();
+                let total = plan.subtasks.len();
+                let pct = plan.progress_pct();
+                eprintln!(
+                    "  {} Paused plan restored: {}/{} subtasks done ({}%)",
+                    "📋".cyan(),
+                    done,
+                    total,
+                    pct,
+                );
+                if let Some(ref goal) = state.executing_plan_goal {
+                    eprintln!("     Goal: {}", goal.as_str().dim());
+                }
+                eprintln!(
+                    "     {}",
+                    "Say \"continue\" or \"resume\" to pick up where you left off.".dim()
+                );
+            }
         }
         Ok(None) => {
             eprintln!("{}", format!("  Session '{arg}' not found.").yellow());

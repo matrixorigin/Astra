@@ -52,6 +52,18 @@ pub struct RestoredSession {
     /// Blocked/deprioritized tools from checkpoint.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_tools: Vec<String>,
+    /// Active plan being executed (JSON-serialized TaskPlan).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executing_plan_json: Option<String>,
+    /// Goal text for the executing plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_goal: Option<String>,
+    /// Plan execution config (JSON-serialized PlanExecutionConfig).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_config_json: Option<String>,
+    /// Number of parallel execution rounds completed.
+    #[serde(default)]
+    pub plan_execution_rounds: usize,
 }
 
 /// A restored checkpoint entry (lightweight, for listing).
@@ -291,6 +303,10 @@ impl SessionRestoreService for HybridRestoreService {
                 model: Some(ws.model),
                 title: None,
                 restored_from_cloud: false,
+                executing_plan_json: ws.executing_plan_json,
+                plan_goal: ws.plan_goal,
+                plan_config_json: ws.plan_config_json,
+                plan_execution_rounds: ws.plan_execution_rounds,
                 ..Default::default()
             }));
         }

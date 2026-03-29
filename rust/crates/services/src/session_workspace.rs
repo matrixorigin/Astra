@@ -11,6 +11,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+fn is_zero(v: &usize) -> bool {
+    *v == 0
+}
+
 /// Session workspace metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceMetadata {
@@ -47,6 +51,18 @@ pub struct WorkspaceMetadata {
     /// Checkpoint turns (turn numbers where checkpoints were created).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub checkpoints: Vec<u32>,
+    /// Active plan being executed (JSON-serialized TaskPlan).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub executing_plan_json: Option<String>,
+    /// Goal text for the executing plan.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub plan_goal: Option<String>,
+    /// Plan execution config (JSON-serialized PlanExecutionConfig).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub plan_config_json: Option<String>,
+    /// Number of parallel execution rounds completed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub plan_execution_rounds: usize,
 }
 
 impl WorkspaceMetadata {
@@ -116,6 +132,10 @@ impl WorkspaceMetadata {
             status: "active".to_string(),
             summary: None,
             checkpoints: Vec::new(),
+            executing_plan_json: None,
+            plan_goal: None,
+            plan_config_json: None,
+            plan_execution_rounds: 0,
         }
     }
 
@@ -142,6 +162,10 @@ impl WorkspaceMetadata {
             status: "active".to_string(),
             summary: None,
             checkpoints: Vec::new(),
+            executing_plan_json: None,
+            plan_goal: None,
+            plan_config_json: None,
+            plan_execution_rounds: 0,
         }
     }
 
@@ -332,5 +356,38 @@ mod tests {
         let yaml = "session_id: s\ncwd: /tmp\nmodel: m\ncreated_at: '2025-01-01T00:00:00Z'\nupdated_at: '2025-01-01T00:00:00Z'\nturn_count: 0\ntotal_tokens_in: 0\ntotal_tokens_out: 0\nstatus: active\n";
         let ws: WorkspaceMetadata = serde_yaml::from_str(yaml).unwrap();
         assert!(ws.checkpoints.is_empty());
+        // Plan fields default to None/0
+        assert!(ws.executing_plan_json.is_none());
+        assert!(ws.plan_goal.is_none());
+        assert!(ws.plan_config_json.is_none());
+        assert_eq!(ws.plan_execution_rounds, 0);
+    }
+
+    #[test]
+    fn workspace_plan_state_round_trip() {
+        let mut ws = WorkspaceMetadata::with_context("plan-sess", "gpt-4", "/tmp", Some("main"));
+        ws.executing_plan_json = Some(r#"{"subtasks":[{"id":"s1","title":"task 1","status":"InProgress","depends_on":[]}]}"#.to_string());
+        ws.plan_goal = Some("Implement feature X".to_string());
+        ws.plan_config_json = Some(r#"{"step_by_step":true,"auto_execute":false}"#.to_string());
+        ws.plan_execution_rounds = 3;
+
+        let yaml = serde_yaml::to_string(&ws).unwrap();
+        let parsed: WorkspaceMetadata = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(parsed.executing_plan_json, ws.executing_plan_json);
+        assert_eq!(parsed.plan_goal, Some("Implement feature X".to_string()));
+        assert_eq!(parsed.plan_config_json, ws.plan_config_json);
+        assert_eq!(parsed.plan_execution_rounds, 3);
+    }
+
+    #[test]
+    fn workspace_no_plan_omits_fields() {
+        let ws = WorkspaceMetadata::with_context("s", "m", "/tmp", None);
+        let yaml = serde_yaml::to_string(&ws).unwrap();
+        // Plan fields should be omitted when None/0
+        assert!(!yaml.contains("executing_plan_json"));
+        assert!(!yaml.contains("plan_goal"));
+        assert!(!yaml.contains("plan_config_json"));
+        assert!(!yaml.contains("plan_execution_rounds"));
     }
 }

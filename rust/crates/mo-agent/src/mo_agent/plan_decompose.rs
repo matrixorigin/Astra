@@ -1617,7 +1617,7 @@ pub fn format_subtask_prompt(subtask: &SubtaskPlan) -> String {
 // ─── Plan Execution Config & Preview ─────────────────────────────────────────
 
 /// Configuration for plan execution behavior.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PlanExecutionConfig {
     /// If true, prompt user for confirmation before executing each subtask.
     pub step_by_step: bool,
