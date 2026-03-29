@@ -149,7 +149,7 @@ fn suggestion_score(command: &str, query: &str) -> usize {
         return usize::MAX;
     }
     if cmd.starts_with(&q) {
-        return 10_000usize.saturating_sub(cmd.len());
+        return 10_000; // Fixed score for prefix match; alphabetical sort handles order
     }
     if cmd.contains(&q) {
         return 5_000usize.saturating_sub(cmd.len());
@@ -212,8 +212,7 @@ fn sort_picker_rows(rows: &mut [(&'static str, &'static str)], query: Option<&st
         query_cmp
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| is_command_alias(a_cmd).cmp(&is_command_alias(b_cmd)))
-            .then_with(|| a_cmd.len().cmp(&b_cmd.len()))
-            .then_with(|| a_cmd.cmp(b_cmd))
+            .then_with(|| a_cmd.cmp(b_cmd)) // alphabetical before length
     });
 }
 
