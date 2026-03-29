@@ -1192,6 +1192,170 @@ fn node_text(node: tree_sitter::Node, source: &str) -> String {
     }
 }
 
+/// Extract the doc comment block immediately preceding a given line.
+///
+/// Walks backward from `symbol_line - 1` collecting contiguous comment lines.
+/// Handles language-specific doc comment styles:
+/// - Rust: `///`, `//!`, `/** ... */`
+/// - Python: `"""..."""` docstring (first expression in function body at symbol_line + 1)
+/// - TypeScript/JavaScript/Go/Java/C/C++: `/** ... */`, `///`, `//`
+/// - Ruby: `#` comment blocks
+///
+/// Returns the cleaned doc text (comment markers stripped) or empty string if no doc found.
+pub fn extract_doc_comment(source: &str, lang: Language, symbol_line: usize) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    if symbol_line == 0 || symbol_line > lines.len() {
+        return String::new();
+    }
+
+    // For Python, check for docstring INSIDE the function body
+    if lang == Language::Python {
+        if let Some(docstring) = extract_python_docstring(&lines, symbol_line) {
+            return docstring;
+        }
+    }
+
+    // Walk backward collecting comment lines
+    let mut doc_lines: Vec<String> = Vec::new();
+    let mut i = symbol_line.saturating_sub(1); // 0-indexed line before symbol (symbol_line is 1-indexed)
+    if i == 0 && symbol_line > 1 {
+        // symbol_line is 1-indexed, so line before it is at index symbol_line - 2
+    }
+    // Convert to 0-indexed
+    let start_idx = symbol_line.checked_sub(2).unwrap_or(0);
+
+    // Check for block comment first (/** ... */)
+    if start_idx < lines.len() {
+        let trimmed = lines[start_idx].trim();
+        if trimmed.ends_with("*/") {
+            // Walk back to find the opening `/**` or `/*`
+            let mut block_lines: Vec<String> = Vec::new();
+            i = start_idx;
+            loop {
+                let line = lines[i].trim();
+                if line.starts_with("/**") || line.starts_with("/*") {
+                    // Strip the opening marker
+                    let content = line.trim_start_matches("/**").trim_start_matches("/*").trim();
+                    let content = content.trim_end_matches("*/").trim();
+                    if !content.is_empty() {
+                        block_lines.push(content.to_string());
+                    }
+                    block_lines.reverse();
+                    return block_lines.join("\n");
+                }
+                // Strip leading * and trailing */
+                let content = line.trim_start_matches('*').trim_end_matches("*/").trim();
+                block_lines.push(content.to_string());
+                if i == 0 { break; }
+                i -= 1;
+            }
+        }
+    }
+
+    // Walk backward collecting single-line comments
+    i = start_idx;
+    loop {
+        if i >= lines.len() { break; }
+        let line = lines[i].trim();
+
+        // Check for doc comment patterns by language
+        let (is_doc, content) = match lang {
+            Language::Rust => {
+                if let Some(rest) = line.strip_prefix("///") {
+                    (true, rest.trim().to_string())
+                } else if let Some(rest) = line.strip_prefix("//!") {
+                    (true, rest.trim().to_string())
+                } else {
+                    (false, String::new())
+                }
+            }
+            Language::Go => {
+                if let Some(rest) = line.strip_prefix("//") {
+                    (true, rest.trim().to_string())
+                } else {
+                    (false, String::new())
+                }
+            }
+            Language::Ruby => {
+                if let Some(rest) = line.strip_prefix('#') {
+                    (true, rest.trim().to_string())
+                } else {
+                    (false, String::new())
+                }
+            }
+            _ => {
+                // JS/TS/Java/C/C++: accept // and ///
+                if let Some(rest) = line.strip_prefix("///") {
+                    (true, rest.trim().to_string())
+                } else if let Some(rest) = line.strip_prefix("//") {
+                    (true, rest.trim().to_string())
+                } else {
+                    (false, String::new())
+                }
+            }
+        };
+
+        if is_doc {
+            doc_lines.push(content);
+        } else if line.is_empty() && !doc_lines.is_empty() {
+            // Allow one blank line in the middle of a doc block
+            doc_lines.push(String::new());
+        } else {
+            break;
+        }
+
+        if i == 0 { break; }
+        i -= 1;
+    }
+
+    doc_lines.reverse();
+    // Trim leading/trailing blank lines
+    while doc_lines.first().map_or(false, |l| l.is_empty()) {
+        doc_lines.remove(0);
+    }
+    while doc_lines.last().map_or(false, |l| l.is_empty()) {
+        doc_lines.pop();
+    }
+    doc_lines.join("\n")
+}
+
+/// Extract Python docstring: the first string literal in the function body.
+fn extract_python_docstring(lines: &[&str], symbol_line: usize) -> Option<String> {
+    // Look at lines after the def/class line for a triple-quoted string
+    let body_start = symbol_line; // 0-indexed line after the symbol (symbol_line is 1-indexed)
+    if body_start >= lines.len() {
+        return None;
+    }
+
+    let first_body = lines[body_start].trim();
+    if first_body.starts_with("\"\"\"") || first_body.starts_with("'''") {
+        let quote = if first_body.starts_with("\"\"\"") { "\"\"\"" } else { "'''" };
+        // Single-line docstring
+        if first_body.ends_with(quote) && first_body.len() > 6 {
+            let content = first_body.trim_start_matches(quote).trim_end_matches(quote).trim();
+            return Some(content.to_string());
+        }
+        // Multi-line docstring
+        let mut doc_lines = Vec::new();
+        let first_content = first_body.trim_start_matches(quote).trim();
+        if !first_content.is_empty() {
+            doc_lines.push(first_content.to_string());
+        }
+        for j in (body_start + 1)..lines.len() {
+            let line = lines[j].trim();
+            if line.contains(quote) {
+                let content = line.trim_end_matches(quote).trim();
+                if !content.is_empty() {
+                    doc_lines.push(content.to_string());
+                }
+                return Some(doc_lines.join("\n"));
+            }
+            doc_lines.push(line.to_string());
+        }
+    }
+    None
+}
+
 /// Check if a position in source code falls inside a comment or string literal.
 ///
 /// Parses the source with tree-sitter and walks ancestors of the node at

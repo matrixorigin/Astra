@@ -47,6 +47,12 @@ pub struct SyncResult {
     pub success: bool,
     pub items_synced: u32,
     pub message: String,
+    /// New cloud version after successful push (for optimistic locking).
+    #[serde(default)]
+    pub new_version: Option<i64>,
+    /// Whether this was a conflict (version mismatch).
+    #[serde(default)]
+    pub is_conflict: bool,
 }
 
 impl SyncResult {
@@ -57,6 +63,20 @@ impl SyncResult {
             success: true,
             items_synced: items,
             message: "ok".to_string(),
+            new_version: None,
+            is_conflict: false,
+        }
+    }
+
+    pub fn ok_with_version(direction: SyncDirection, sync_type: &str, items: u32, version: i64) -> Self {
+        Self {
+            direction,
+            sync_type: sync_type.to_string(),
+            success: true,
+            items_synced: items,
+            message: "ok".to_string(),
+            new_version: Some(version),
+            is_conflict: false,
         }
     }
 
@@ -67,8 +87,31 @@ impl SyncResult {
             success: false,
             items_synced: 0,
             message: msg.into(),
+            new_version: None,
+            is_conflict: false,
         }
     }
+
+    pub fn conflict(direction: SyncDirection, sync_type: &str, msg: impl Into<String>) -> Self {
+        Self {
+            direction,
+            sync_type: sync_type.to_string(),
+            success: false,
+            items_synced: 0,
+            message: msg.into(),
+            new_version: None,
+            is_conflict: true,
+        }
+    }
+}
+
+/// Learning snapshot with version for optimistic locking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionedSnapshot {
+    /// The JSON-serialized learning snapshot.
+    pub json: String,
+    /// Cloud version number (for optimistic locking).
+    pub version: i64,
 }
 
 /// Metadata about the current sync state.
@@ -79,6 +122,9 @@ pub struct SyncStatus {
     pub preferences_last_sync: Option<String>,
     pub pending_pushes: u32,
     pub last_error: Option<String>,
+    /// Last known cloud version (for optimistic locking).
+    #[serde(default)]
+    pub cloud_version: Option<i64>,
 }
 
 // ─── State Sync Service Trait ───────────────────────────────────────────────
@@ -89,9 +135,24 @@ pub struct SyncStatus {
 /// - `LocalOnlySyncService` — no-op for offline/edge-only mode
 /// - `MatrixOneSyncService` — full cloud sync via database
 /// - Mock implementations for testing
+///
+/// # Optimistic Locking
+///
+/// The `push_learning_versioned` method uses optimistic locking to prevent
+/// concurrent sessions from overwriting each other's changes:
+///
+/// 1. Call `pull_learning_versioned` to get `(json, version)`
+/// 2. Merge cloud data with local changes
+/// 3. Call `push_learning_versioned(expected_version=version)` to push
+/// 4. If another session pushed in between, returns `is_conflict=true`
+/// 5. On conflict, re-pull, re-merge, and retry
+///
+/// The non-versioned `push_learning` method always succeeds (last-writer-wins).
 #[async_trait]
 pub trait StateSyncService: Send + Sync {
-    /// Push local learning snapshot to cloud.
+    /// Push local learning snapshot to cloud (last-writer-wins, no version check).
+    ///
+    /// Use `push_learning_versioned` for concurrent-safe updates.
     async fn push_learning(
         &self,
         user_id: &str,
@@ -102,8 +163,37 @@ pub trait StateSyncService: Send + Sync {
         has_calibration: bool,
     ) -> SyncResult;
 
-    /// Pull learning snapshot from cloud.
+    /// Push local learning snapshot with optimistic locking.
+    ///
+    /// - `expected_version`: The version returned by the last `pull_learning_versioned`.
+    ///   Pass `None` to create a new snapshot (fails if one already exists).
+    ///
+    /// Returns:
+    /// - `success=true, new_version=Some(v)` on success
+    /// - `success=false, is_conflict=true` if version mismatch (another session pushed)
+    /// - `success=false, is_conflict=false` on other errors
+    async fn push_learning_versioned(
+        &self,
+        user_id: &str,
+        profile: &str,
+        snapshot_json: &str,
+        entity_count: u32,
+        pattern_count: u32,
+        has_calibration: bool,
+        expected_version: Option<i64>,
+    ) -> SyncResult;
+
+    /// Pull learning snapshot from cloud (without version).
     async fn pull_learning(&self, user_id: &str, profile: &str) -> Result<Option<String>, String>;
+
+    /// Pull learning snapshot with version for optimistic locking.
+    ///
+    /// Returns `None` if no snapshot exists, or `Some((json, version))`.
+    async fn pull_learning_versioned(
+        &self,
+        user_id: &str,
+        profile: &str,
+    ) -> Result<Option<VersionedSnapshot>, String>;
 
     /// Push a user preference to cloud.
     async fn push_preference(&self, user_id: &str, key: &str, value: &str) -> SyncResult;
@@ -138,11 +228,33 @@ impl StateSyncService for LocalOnlySyncService {
         SyncResult::ok(SyncDirection::Push, "learning", 0)
     }
 
+    async fn push_learning_versioned(
+        &self,
+        _user_id: &str,
+        _profile: &str,
+        _snapshot_json: &str,
+        _entity_count: u32,
+        _pattern_count: u32,
+        _has_calibration: bool,
+        _expected_version: Option<i64>,
+    ) -> SyncResult {
+        // Local-only: always succeeds with version 0
+        SyncResult::ok_with_version(SyncDirection::Push, "learning", 0, 0)
+    }
+
     async fn pull_learning(
         &self,
         _user_id: &str,
         _profile: &str,
     ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    async fn pull_learning_versioned(
+        &self,
+        _user_id: &str,
+        _profile: &str,
+    ) -> Result<Option<VersionedSnapshot>, String> {
         Ok(None)
     }
 
@@ -308,6 +420,152 @@ impl StateSyncService for MatrixOneSyncService {
         }
     }
 
+    async fn push_learning_versioned(
+        &self,
+        user_id: &str,
+        profile: &str,
+        snapshot_json: &str,
+        entity_count: u32,
+        pattern_count: u32,
+        has_calibration: bool,
+        expected_version: Option<i64>,
+    ) -> SyncResult {
+        let snapshot_id = uuid::Uuid::new_v4().to_string();
+        let has_cal = if has_calibration { 1i32 } else { 0 };
+
+        match expected_version {
+            Some(ver) => {
+                // Optimistic lock: UPDATE only if version matches
+                let updated = sqlx::query(
+                    "UPDATE learning_snapshots SET \
+                        snapshot_json = ?, \
+                        entity_count = ?, \
+                        pattern_count = ?, \
+                        has_calibration = ?, \
+                        version = version + 1, \
+                        updated_at = NOW() \
+                     WHERE user_id = ? AND profile_name = ? AND version = ?",
+                )
+                .bind(snapshot_json)
+                .bind(entity_count as i64)
+                .bind(pattern_count as i64)
+                .bind(has_cal)
+                .bind(user_id)
+                .bind(profile)
+                .bind(ver)
+                .execute(&self.pool)
+                .await;
+
+                match updated {
+                    Ok(r) if r.rows_affected() > 0 => {
+                        let new_ver = ver + 1;
+                        self.log_sync(
+                            user_id,
+                            "",
+                            "learning_versioned",
+                            SyncDirection::Push,
+                            snapshot_json.len(),
+                            "success",
+                            None,
+                        )
+                        .await;
+                        SyncResult::ok_with_version(SyncDirection::Push, "learning", 1, new_ver)
+                    }
+                    Ok(_) => {
+                        // No rows affected — version mismatch (conflict)
+                        self.log_sync(
+                            user_id,
+                            "",
+                            "learning_versioned",
+                            SyncDirection::Push,
+                            0,
+                            "conflict",
+                            Some(&format!("expected version {ver}")),
+                        )
+                        .await;
+                        SyncResult::conflict(
+                            SyncDirection::Push,
+                            "learning",
+                            format!("version conflict: expected {ver}, snapshot was modified by another session"),
+                        )
+                    }
+                    Err(e) => {
+                        let msg = format!("push_learning_versioned: {e}");
+                        self.log_sync(
+                            user_id,
+                            "",
+                            "learning_versioned",
+                            SyncDirection::Push,
+                            0,
+                            "error",
+                            Some(&msg),
+                        )
+                        .await;
+                        SyncResult::err(SyncDirection::Push, "learning", msg)
+                    }
+                }
+            }
+            None => {
+                // No expected version — create new (fail if exists)
+                let inserted = sqlx::query(
+                    "INSERT INTO learning_snapshots \
+                     (snapshot_id, user_id, profile_name, snapshot_json, entity_count, \
+                      pattern_count, has_calibration, version, created_at, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())",
+                )
+                .bind(&snapshot_id)
+                .bind(user_id)
+                .bind(profile)
+                .bind(snapshot_json)
+                .bind(entity_count as i64)
+                .bind(pattern_count as i64)
+                .bind(has_cal)
+                .execute(&self.pool)
+                .await;
+
+                match inserted {
+                    Ok(_) => {
+                        self.log_sync(
+                            user_id,
+                            "",
+                            "learning_versioned",
+                            SyncDirection::Push,
+                            snapshot_json.len(),
+                            "success",
+                            None,
+                        )
+                        .await;
+                        SyncResult::ok_with_version(SyncDirection::Push, "learning", 1, 1)
+                    }
+                    Err(e) => {
+                        // Likely duplicate key — snapshot already exists
+                        let msg = format!("push_learning_versioned (new): {e}");
+                        let is_dup = msg.contains("Duplicate") || msg.contains("duplicate");
+                        self.log_sync(
+                            user_id,
+                            "",
+                            "learning_versioned",
+                            SyncDirection::Push,
+                            0,
+                            if is_dup { "conflict" } else { "error" },
+                            Some(&msg),
+                        )
+                        .await;
+                        if is_dup {
+                            SyncResult::conflict(
+                                SyncDirection::Push,
+                                "learning",
+                                "snapshot already exists; use expected_version to update",
+                            )
+                        } else {
+                            SyncResult::err(SyncDirection::Push, "learning", msg)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     async fn pull_learning(&self, user_id: &str, profile: &str) -> Result<Option<String>, String> {
         let row = sqlx::query(
             "SELECT snapshot_json FROM learning_snapshots \
@@ -337,6 +595,47 @@ impl StateSyncService for MatrixOneSyncService {
                 )
                 .await;
                 Ok(Some(json))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn pull_learning_versioned(
+        &self,
+        user_id: &str,
+        profile: &str,
+    ) -> Result<Option<VersionedSnapshot>, String> {
+        let row = sqlx::query(
+            "SELECT snapshot_json, version FROM learning_snapshots \
+             WHERE user_id = ? AND profile_name = ? \
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(profile)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("pull_learning_versioned: {e}"))?;
+
+        match row {
+            Some(row) => {
+                use sqlx::Row;
+                let json: String = row
+                    .try_get("snapshot_json")
+                    .map_err(|e| format!("pull_learning_versioned decode json: {e}"))?;
+                let version: i64 = row
+                    .try_get("version")
+                    .map_err(|e| format!("pull_learning_versioned decode version: {e}"))?;
+                self.log_sync(
+                    user_id,
+                    "",
+                    "learning_versioned",
+                    SyncDirection::Pull,
+                    json.len(),
+                    "success",
+                    None,
+                )
+                .await;
+                Ok(Some(VersionedSnapshot { json, version }))
             }
             None => Ok(None),
         }
@@ -469,6 +768,7 @@ impl StateSyncService for MatrixOneSyncService {
             preferences_last_sync: None,
             pending_pushes: pending,
             last_error: last_err,
+            cloud_version: None, // Could be fetched from DB if needed
         }
     }
 }
@@ -684,6 +984,8 @@ mod tests {
             success: true,
             items_synced: 10,
             message: "synced 10 entities".to_string(),
+            new_version: Some(5),
+            is_conflict: false,
         };
 
         let json = serde_json::to_string(&original).unwrap();
@@ -694,6 +996,8 @@ mod tests {
         assert_eq!(restored.success, original.success);
         assert_eq!(restored.items_synced, original.items_synced);
         assert_eq!(restored.message, original.message);
+        assert_eq!(restored.new_version, original.new_version);
+        assert_eq!(restored.is_conflict, original.is_conflict);
     }
 
     #[test]
@@ -705,6 +1009,7 @@ mod tests {
         assert!(status.preferences_last_sync.is_none());
         assert_eq!(status.pending_pushes, 0);
         assert!(status.last_error.is_none());
+        assert!(status.cloud_version.is_none());
     }
 
     #[test]
@@ -715,6 +1020,7 @@ mod tests {
             preferences_last_sync: Some("2024-01-03T00:00:00Z".to_string()),
             pending_pushes: 3,
             last_error: Some("connection refused".to_string()),
+            cloud_version: Some(42),
         };
 
         let json = serde_json::to_string(&original).unwrap();
@@ -723,6 +1029,7 @@ mod tests {
         assert_eq!(restored.learning_last_push, original.learning_last_push);
         assert_eq!(restored.pending_pushes, original.pending_pushes);
         assert_eq!(restored.last_error, original.last_error);
+        assert_eq!(restored.cloud_version, original.cloud_version);
     }
 
     #[tokio::test]
@@ -788,5 +1095,61 @@ mod tests {
         assert!(status.last_error.is_none());
         assert_eq!(status.pending_pushes, 0);
         assert!(status.learning_last_push.is_none());
+    }
+
+    // ── Optimistic Locking Tests ──
+
+    #[tokio::test]
+    async fn local_only_versioned_push_succeeds_with_version_zero() {
+        let svc = LocalOnlySyncService;
+
+        let result = svc
+            .push_learning_versioned("user1", "default", "{}", 0, 0, false, None)
+            .await;
+
+        assert!(result.success);
+        assert_eq!(result.new_version, Some(0)); // LocalOnly always returns 0
+        assert!(!result.is_conflict);
+    }
+
+    #[tokio::test]
+    async fn local_only_versioned_pull_returns_none() {
+        let svc = LocalOnlySyncService;
+
+        let result = svc.pull_learning_versioned("user1", "default").await;
+
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn sync_result_conflict_has_is_conflict_flag() {
+        let result = SyncResult::conflict(SyncDirection::Push, "learning", "version mismatch");
+
+        assert!(!result.success);
+        assert!(result.is_conflict);
+        assert!(result.message.contains("version"));
+    }
+
+    #[test]
+    fn versioned_snapshot_roundtrips_through_json() {
+        let original = VersionedSnapshot {
+            json: r#"{"entities": []}"#.to_string(),
+            version: 42,
+        };
+
+        let serialized = serde_json::to_string(&original).unwrap();
+        let restored: VersionedSnapshot = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(restored.json, original.json);
+        assert_eq!(restored.version, original.version);
+    }
+
+    #[test]
+    fn sync_result_ok_with_version_includes_version() {
+        let result = SyncResult::ok_with_version(SyncDirection::Push, "learning", 1, 5);
+
+        assert!(result.success);
+        assert_eq!(result.new_version, Some(5));
+        assert!(!result.is_conflict);
     }
 }

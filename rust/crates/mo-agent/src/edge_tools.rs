@@ -1661,9 +1661,21 @@ impl ToolExecutor {
                     let parent_info = sym.parent.as_ref()
                         .map(|p| format!(" (in {p})"))
                         .unwrap_or_default();
+
+                    // Extract doc comment for the symbol
+                    let doc = code_intel::extract_doc_comment(&content, lang, sym.start_line);
+                    let doc_info = if doc.is_empty() {
+                        String::new()
+                    } else {
+                        // Indent doc and limit to first 5 lines
+                        let doc_lines: Vec<&str> = doc.lines().take(5).collect();
+                        let truncated = if doc.lines().count() > 5 { "\n    ..." } else { "" };
+                        format!("\n    📝 {}{}", doc_lines.join("\n    "), truncated)
+                    };
+
                     results.push(format!(
-                        "{}:{} [{}]{} {}",
-                        rel_path, sym.start_line, sym.kind.as_str(), parent_info, sym.signature
+                        "{}:{} [{}]{} {}{}",
+                        rel_path, sym.start_line, sym.kind.as_str(), parent_info, sym.signature, doc_info
                     ));
                 }
             }
@@ -4402,5 +4414,96 @@ fn caller() {
         })).await;
 
         assert!(result.contains("unused"), "should find unused: {result}");
+    }
+
+    // ---- doc comment extraction tests ----
+
+    #[tokio::test]
+    async fn find_definition_includes_rust_doc_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = r#"/// This function does something important.
+/// It returns a number.
+fn documented_fn() -> i32 {
+    42
+}
+"#;
+        std::fs::write(dir.path().join("lib.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("find_definition", &json!({
+            "symbol": "documented_fn"
+        })).await;
+
+        assert!(result.contains("documented_fn"), "should find definition: {result}");
+        assert!(result.contains("📝"), "should include doc marker: {result}");
+        assert!(result.contains("something important"), "should include doc text: {result}");
+    }
+
+    #[tokio::test]
+    async fn find_definition_includes_python_docstring() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "def my_func():\n    \"\"\"This is a Python docstring.\"\"\"\n    return 42\n";
+        std::fs::write(dir.path().join("module.py"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("find_definition", &json!({
+            "symbol": "my_func"
+        })).await;
+
+        assert!(result.contains("my_func"), "should find definition: {result}");
+        assert!(result.contains("📝"), "should include doc marker: {result}");
+        assert!(result.contains("Python docstring"), "should include docstring: {result}");
+    }
+
+    #[tokio::test]
+    async fn find_definition_no_doc_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "fn bare_fn() -> i32 { 42 }\n";
+        std::fs::write(dir.path().join("lib.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("find_definition", &json!({
+            "symbol": "bare_fn"
+        })).await;
+
+        assert!(result.contains("bare_fn"), "should find definition: {result}");
+        assert!(!result.contains("📝"), "no doc marker without doc: {result}");
+    }
+
+    #[test]
+    fn extract_doc_comment_rust_triple_slash() {
+        let source = "/// First line.\n/// Second line.\nfn foo() {}\n";
+        let doc = code_intel::extract_doc_comment(source, code_intel::Language::Rust, 3);
+        assert!(doc.contains("First line"), "should extract first line: {doc}");
+        assert!(doc.contains("Second line"), "should extract second line: {doc}");
+    }
+
+    #[test]
+    fn extract_doc_comment_block_comment() {
+        let source = "/**\n * A block doc comment.\n * With multiple lines.\n */\nfn foo() {}\n";
+        let doc = code_intel::extract_doc_comment(source, code_intel::Language::Rust, 5);
+        assert!(doc.contains("block doc comment"), "should extract block: {doc}");
+        assert!(doc.contains("multiple lines"), "should extract multi-line: {doc}");
+    }
+
+    #[test]
+    fn extract_doc_comment_python_docstring() {
+        let source = "def foo():\n    \"\"\"A short docstring.\"\"\"\n    pass\n";
+        let doc = code_intel::extract_doc_comment(source, code_intel::Language::Python, 1);
+        assert!(doc.contains("short docstring"), "should extract docstring: {doc}");
+    }
+
+    #[test]
+    fn extract_doc_comment_go_comments() {
+        let source = "// Package foo provides utilities.\n// It does things.\nfunc Foo() {}\n";
+        let doc = code_intel::extract_doc_comment(source, code_intel::Language::Go, 3);
+        assert!(doc.contains("Package foo"), "should extract Go comments: {doc}");
+    }
+
+    #[test]
+    fn extract_doc_comment_empty_when_no_doc() {
+        let source = "fn bar() {}\nfn foo() {}\n";
+        let doc = code_intel::extract_doc_comment(source, code_intel::Language::Rust, 2);
+        assert!(doc.is_empty(), "no doc should be empty: {doc}");
     }
 }

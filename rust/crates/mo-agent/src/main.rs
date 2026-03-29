@@ -4015,6 +4015,7 @@ total_tokens_out: 500
             preferences_last_sync: Some(chrono::Utc::now().to_rfc3339()),
             pending_pushes: 2,
             last_error: Some("connection reset by peer".into()),
+            cloud_version: None,
         };
         display_sync_status(&status);
     }
