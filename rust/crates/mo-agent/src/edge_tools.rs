@@ -385,7 +385,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                     "properties": {
                         "symbol": {"type": "string", "description": "Symbol name to find (exact or regex)"},
                         "language": {"type": "string", "description": "Filter by language: rust, python, typescript, go, java, c, cpp, ruby (optional; auto-detected if omitted)"},
-                        "path": {"type": "string", "description": "Limit search to a subdirectory (optional)"}
+                        "path": {"type": "string", "description": "Limit search to a subdirectory (optional)"},
+                        "file": {"type": "string", "description": "File where the symbol is used (optional). Enables import-aware resolution: imports in this file are analyzed to prioritize the most likely definition."}
                     },
                     "required": ["symbol"]
                 }
@@ -1706,8 +1707,131 @@ impl ToolExecutor {
         }
     }
 
+    /// Resolve an import path to candidate file paths.
+    ///
+    /// Given an import path (e.g., "std::collections::HashMap" for Rust,
+    /// "os.path" for Python, "./config" for TS), returns file paths within
+    /// the project that likely define the imported symbol.
+    fn resolve_import_to_files(
+        &self,
+        import: &code_intel::ImportStatement,
+        lang: code_intel::Language,
+        file_paths: &[std::path::PathBuf],
+    ) -> Vec<usize> {
+        let mut candidates: Vec<usize> = Vec::new();
+
+        // Convert import path to file path segments
+        let path_segments: Vec<&str> = match lang {
+            code_intel::Language::Rust => {
+                // "crate::utils::helper" → ["utils", "helper"]
+                // "super::config" → ["config"]
+                let cleaned = import
+                    .path
+                    .trim_start_matches("crate::")
+                    .trim_start_matches("super::");
+                cleaned.split("::").collect()
+            }
+            code_intel::Language::Python => {
+                // "os.path" → ["os", "path"]
+                // ".utils" → ["utils"]
+                import.path.trim_start_matches('.').split('.').collect()
+            }
+            code_intel::Language::TypeScript | code_intel::Language::JavaScript => {
+                // "./config" → ["config"]
+                // "../utils/helper" → ["utils", "helper"]
+                let cleaned = import
+                    .path
+                    .trim_start_matches("./")
+                    .trim_start_matches("../");
+                cleaned.split('/').collect()
+            }
+            code_intel::Language::Go => {
+                // "path/filepath" → ["path", "filepath"]
+                import.path.split('/').collect()
+            }
+            _ => return candidates,
+        };
+
+        if path_segments.is_empty() {
+            return candidates;
+        }
+
+        // Match file paths that contain import path segments
+        let last_segment = path_segments.last().unwrap_or(&"");
+        for (idx, file_path) in file_paths.iter().enumerate() {
+            let path_str = file_path.to_string_lossy();
+            let file_stem = file_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+
+            // Exact stem match (e.g., import "config" → config.rs/config.py)
+            if file_stem.eq_ignore_ascii_case(last_segment) {
+                candidates.push(idx);
+                continue;
+            }
+
+            // Check if the path contains all segments in order
+            // e.g., "crate::utils::helper" matches "src/utils/helper.rs"
+            if path_segments.len() > 1 {
+                let lower_path = path_str.to_lowercase();
+                let all_match = path_segments
+                    .iter()
+                    .all(|seg| lower_path.contains(&seg.to_lowercase()));
+                if all_match {
+                    candidates.push(idx);
+                    continue;
+                }
+            }
+
+            // For Rust: mod.rs in a directory matching the segment
+            if matches!(lang, code_intel::Language::Rust) && file_stem == "mod" {
+                let parent_name = file_path
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                if parent_name.eq_ignore_ascii_case(last_segment) {
+                    candidates.push(idx);
+                }
+            }
+
+            // For Python: __init__.py in a directory matching the segment
+            if matches!(lang, code_intel::Language::Python) && file_stem == "__init__" {
+                let parent_name = file_path
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                if parent_name.eq_ignore_ascii_case(last_segment) {
+                    candidates.push(idx);
+                }
+            }
+
+            // For TS: index.ts in a directory matching the segment
+            if matches!(
+                lang,
+                code_intel::Language::TypeScript | code_intel::Language::JavaScript
+            ) && file_stem == "index"
+            {
+                let parent_name = file_path
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                if parent_name.eq_ignore_ascii_case(last_segment) {
+                    candidates.push(idx);
+                }
+            }
+        }
+
+        candidates.dedup();
+        candidates
+    }
+
     /// Find where a symbol is defined across the codebase using tree-sitter.
-    /// Scans matching files, extracts symbols, and returns definitions.
+    /// When a `file` parameter is provided, analyzes imports in that file to
+    /// prioritize the most likely definition (import-aware resolution).
     fn find_definition(&self, args: &Value) -> String {
         let symbol = match args.get("symbol").and_then(Value::as_str) {
             Some(s) if !s.is_empty() => s,
@@ -1772,7 +1896,8 @@ impl ToolExecutor {
         ];
 
         let mut results: Vec<String> = Vec::new();
-        let max_files = 500; // Limit to prevent scanning huge repos
+        let mut import_results: Vec<String> = Vec::new();
+        let max_files = 500;
         let mut files_scanned = 0;
 
         // Collect matching files using a simple recursive walker
@@ -1807,73 +1932,151 @@ impl ToolExecutor {
             }
         }
 
-        for path in &file_paths {
+        // ── Import-aware resolution ────────────────────────────────────
+        // When `file` parameter is provided, extract imports from that file
+        // and prioritize files matching the import paths.
+        let mut import_priority_indices: Vec<usize> = Vec::new();
+        let context_file = args.get("file").and_then(Value::as_str);
+
+        if let Some(ctx_file) = context_file {
+            let ctx_path = if ctx_file.starts_with('/') {
+                PathBuf::from(ctx_file)
+            } else {
+                self.project_root.join(ctx_file)
+            };
+            if ctx_path.exists() {
+                if let Some(ctx_lang) = code_intel::detect_language(&ctx_path) {
+                    if let Ok(ctx_content) = fs::read_to_string(&ctx_path) {
+                        let imports = code_intel::extract_imports(&ctx_content, ctx_lang);
+                        // Find imports that reference the target symbol
+                        for import in &imports {
+                            let matches_symbol = import.names.iter().any(|n| n == symbol)
+                                || import.is_wildcard
+                                || import.path.ends_with(symbol);
+                            if matches_symbol {
+                                let candidates =
+                                    self.resolve_import_to_files(import, ctx_lang, &file_paths);
+                                import_priority_indices.extend(candidates);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        import_priority_indices.sort_unstable();
+        import_priority_indices.dedup();
+
+        // Helper closure: scan a file for matching definitions
+        let scan_file =
+            |path: &std::path::PathBuf, project_root: &Path| -> Vec<(String, bool)> {
+                let mut hits = Vec::new();
+                let lang = match code_intel::detect_language(path) {
+                    Some(l) => l,
+                    None => return hits,
+                };
+                let content = match fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => return hits,
+                };
+                let symbols = code_intel::extract_symbols(&content, lang);
+                for sym in &symbols {
+                    if pattern.is_match(&sym.name)
+                        && definition_kinds.contains(&sym.kind.as_str())
+                    {
+                        let rel_path = path.strip_prefix(project_root).unwrap_or(path).display();
+                        let parent_info = sym
+                            .parent
+                            .as_ref()
+                            .map(|p| format!(" (in {p})"))
+                            .unwrap_or_default();
+
+                        let doc = code_intel::extract_doc_comment(&content, lang, sym.start_line);
+                        let doc_info = if doc.is_empty() {
+                            String::new()
+                        } else {
+                            let doc_lines: Vec<&str> = doc.lines().take(5).collect();
+                            let truncated = if doc.lines().count() > 5 {
+                                "\n    ..."
+                            } else {
+                                ""
+                            };
+                            format!("\n    📝 {}{}", doc_lines.join("\n    "), truncated)
+                        };
+
+                        hits.push((
+                            format!(
+                                "{}:{} [{}]{} {}{}",
+                                rel_path,
+                                sym.start_line,
+                                sym.kind.as_str(),
+                                parent_info,
+                                sym.signature,
+                                doc_info
+                            ),
+                            false,
+                        ));
+                    }
+                }
+                hits
+            };
+
+        // Scan import-priority files first
+        let mut scanned_indices: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        for &idx in &import_priority_indices {
+            if idx < file_paths.len() {
+                scanned_indices.insert(idx);
+                files_scanned += 1;
+                for (hit, _) in scan_file(&file_paths[idx], &self.project_root) {
+                    import_results.push(hit);
+                }
+            }
+        }
+
+        // Then scan remaining files
+        for (idx, path) in file_paths.iter().enumerate() {
+            if scanned_indices.contains(&idx) {
+                continue;
+            }
             files_scanned += 1;
             if files_scanned > max_files {
                 results.push(format!("\n[stopped after scanning {max_files} files]"));
                 break;
             }
-
-            let lang = match code_intel::detect_language(path) {
-                Some(l) => l,
-                None => continue,
-            };
-            let content = match fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let symbols = code_intel::extract_symbols(&content, lang);
-            for sym in &symbols {
-                if pattern.is_match(&sym.name) && definition_kinds.contains(&sym.kind.as_str()) {
-                    let rel_path = path
-                        .strip_prefix(&self.project_root)
-                        .unwrap_or(path)
-                        .display();
-                    let parent_info = sym
-                        .parent
-                        .as_ref()
-                        .map(|p| format!(" (in {p})"))
-                        .unwrap_or_default();
-
-                    // Extract doc comment for the symbol
-                    let doc = code_intel::extract_doc_comment(&content, lang, sym.start_line);
-                    let doc_info = if doc.is_empty() {
-                        String::new()
-                    } else {
-                        // Indent doc and limit to first 5 lines
-                        let doc_lines: Vec<&str> = doc.lines().take(5).collect();
-                        let truncated = if doc.lines().count() > 5 {
-                            "\n    ..."
-                        } else {
-                            ""
-                        };
-                        format!("\n    📝 {}{}", doc_lines.join("\n    "), truncated)
-                    };
-
-                    results.push(format!(
-                        "{}:{} [{}]{} {}{}",
-                        rel_path,
-                        sym.start_line,
-                        sym.kind.as_str(),
-                        parent_info,
-                        sym.signature,
-                        doc_info
-                    ));
-                }
+            for (hit, _) in scan_file(path, &self.project_root) {
+                results.push(hit);
             }
         }
 
-        if results.is_empty() {
+        let total_found = import_results.len() + results.len();
+        if total_found == 0 {
             format!("No definitions found for '{symbol}' ({files_scanned} files scanned)")
         } else {
+            let mut body_parts: Vec<String> = Vec::new();
+
+            // Show import-resolved results first with marker
+            if !import_results.is_empty() {
+                body_parts.push(format!(
+                    "## 📦 Import-resolved ({} via import analysis)\n",
+                    import_results.len()
+                ));
+                body_parts.push(import_results.join("\n"));
+                if !results.is_empty() {
+                    body_parts.push(format!(
+                        "\n\n## Other definitions ({})\n",
+                        results.len()
+                    ));
+                    body_parts.push(results.join("\n"));
+                }
+            } else {
+                body_parts.push(results.join("\n"));
+            }
+
             let header = format!(
                 "# Definitions of '{}' ({} found, {} files scanned)\n\n",
-                symbol,
-                results.len(),
-                files_scanned
+                symbol, total_found, files_scanned
             );
-            let body = results.join("\n");
-            truncate_output(format!("{header}{body}"), tool_output_limit())
+            truncate_output(format!("{}{}", header, body_parts.join("")), tool_output_limit())
         }
     }
 
@@ -4383,6 +4586,208 @@ fn helper() {}
         assert!(
             result.contains("git_st") || result.contains("No definitions"),
             "should match regex: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_definition_import_aware_prioritizes_imported_file() {
+        // When `file` is provided and that file imports the symbol,
+        // definitions from the imported module should appear in the
+        // "Import-resolved" section.
+        let root = {
+            let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.pop();
+            p.pop();
+            p
+        };
+        let executor = ToolExecutor::new(root);
+        // edge_tools.rs imports code_intel which defines Language, Symbol, etc.
+        // Search for "Language" with file=edge_tools.rs context
+        let result = executor
+            .execute(
+                "find_definition",
+                &json!({
+                    "symbol": "Language",
+                    "language": "rust",
+                    "file": "crates/mo-agent/src/edge_tools.rs"
+                }),
+            )
+            .await;
+        // Should find Language definition
+        assert!(
+            result.contains("Language"),
+            "should find Language definition: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_definition_without_file_still_works() {
+        // Without `file` parameter, find_definition should still work
+        // (backward compatibility)
+        let root = {
+            let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.pop();
+            p.pop();
+            p
+        };
+        let executor = ToolExecutor::new(root);
+        let result = executor
+            .execute(
+                "find_definition",
+                &json!({"symbol": "ToolExecutor", "language": "rust"}),
+            )
+            .await;
+        assert!(
+            result.contains("ToolExecutor"),
+            "should find ToolExecutor without file param: {result}"
+        );
+        // Without import resolution, all results are in main section (no "Import-resolved")
+    }
+
+    #[tokio::test]
+    async fn find_definition_file_param_nonexistent_graceful() {
+        // Non-existent file should degrade gracefully (no import resolution)
+        let root = {
+            let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.pop();
+            p.pop();
+            p
+        };
+        let executor = ToolExecutor::new(root);
+        let result = executor
+            .execute(
+                "find_definition",
+                &json!({
+                    "symbol": "ToolExecutor",
+                    "file": "nonexistent/file.rs"
+                }),
+            )
+            .await;
+        // Should still find results via regular scan
+        assert!(
+            result.contains("ToolExecutor") || result.contains("No definitions"),
+            "should degrade gracefully: {result}"
+        );
+    }
+
+    // ── resolve_import_to_files unit tests ───────────────────────────────────
+
+    #[test]
+    fn resolve_import_rust_crate_path() {
+        let executor = test_executor();
+        let files = vec![
+            PathBuf::from("/project/src/utils.rs"),
+            PathBuf::from("/project/src/config.rs"),
+            PathBuf::from("/project/src/main.rs"),
+        ];
+        let import = code_intel::ImportStatement {
+            path: "crate::config".to_string(),
+            names: vec!["Config".to_string()],
+            line: 1,
+            is_wildcard: false,
+        };
+        let candidates =
+            executor.resolve_import_to_files(&import, code_intel::Language::Rust, &files);
+        assert!(
+            candidates.contains(&1),
+            "should resolve to config.rs (index 1): {:?}",
+            candidates
+        );
+        assert!(
+            !candidates.contains(&0),
+            "should NOT include utils.rs: {:?}",
+            candidates
+        );
+    }
+
+    #[test]
+    fn resolve_import_python_module() {
+        let executor = test_executor();
+        let files = vec![
+            PathBuf::from("/project/utils.py"),
+            PathBuf::from("/project/config.py"),
+            PathBuf::from("/project/models/__init__.py"),
+        ];
+        let import = code_intel::ImportStatement {
+            path: "config".to_string(),
+            names: vec!["Config".to_string()],
+            line: 1,
+            is_wildcard: false,
+        };
+        let candidates =
+            executor.resolve_import_to_files(&import, code_intel::Language::Python, &files);
+        assert!(
+            candidates.contains(&1),
+            "should resolve to config.py (index 1): {:?}",
+            candidates
+        );
+    }
+
+    #[test]
+    fn resolve_import_ts_relative_path() {
+        let executor = test_executor();
+        let files = vec![
+            PathBuf::from("/project/src/utils.ts"),
+            PathBuf::from("/project/src/config.ts"),
+            PathBuf::from("/project/src/components/index.ts"),
+        ];
+        let import = code_intel::ImportStatement {
+            path: "./config".to_string(),
+            names: vec!["Config".to_string()],
+            line: 1,
+            is_wildcard: false,
+        };
+        let candidates = executor.resolve_import_to_files(
+            &import,
+            code_intel::Language::TypeScript,
+            &files,
+        );
+        assert!(
+            candidates.contains(&1),
+            "should resolve to config.ts (index 1): {:?}",
+            candidates
+        );
+    }
+
+    #[test]
+    fn resolve_import_rust_mod_rs() {
+        let executor = test_executor();
+        let files = vec![
+            PathBuf::from("/project/src/edge_tools/mod.rs"),
+            PathBuf::from("/project/src/edge_tools/shell.rs"),
+            PathBuf::from("/project/src/main.rs"),
+        ];
+        let import = code_intel::ImportStatement {
+            path: "crate::edge_tools".to_string(),
+            names: vec!["ToolExecutor".to_string()],
+            line: 1,
+            is_wildcard: false,
+        };
+        let candidates =
+            executor.resolve_import_to_files(&import, code_intel::Language::Rust, &files);
+        // Should match mod.rs (parent dir = edge_tools) and edge_tools/shell.rs contains edge_tools
+        assert!(
+            candidates.contains(&0),
+            "should resolve to edge_tools/mod.rs: {:?}",
+            candidates
+        );
+    }
+
+    #[test]
+    fn resolve_import_empty_returns_nothing() {
+        let executor = test_executor();
+        let files = vec![PathBuf::from("/project/src/main.rs")];
+        let import = code_intel::ImportStatement {
+            path: String::new(),
+            names: vec![],
+            line: 1,
+            is_wildcard: false,
+        };
+        let candidates =
+            executor.resolve_import_to_files(&import, code_intel::Language::Rust, &files);
+        assert!(
+            candidates.is_empty(),
+            "empty import should resolve to nothing"
         );
     }
 
