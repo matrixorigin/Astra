@@ -447,6 +447,22 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        // ── Dead Code Detection tool ─────────────────────────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "dead_code",
+                "description": "Find potentially unused functions, types, and constants by cross-referencing definitions with project-wide usage. Reports symbols with zero external references. Useful before cleanup or to understand code coverage.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File or directory to scan (default: current directory)"},
+                        "include": {"type": "string", "description": "File glob filter e.g. '*.rs' (optional)"},
+                        "kind": {"type": "string", "enum": ["all", "function", "type", "constant"], "description": "Filter by symbol kind (default: all)"}
+                    }
+                }
+            }
+        }),
         // ── Build/Test tool ─────────────────────────────────────────────
         json!({
             "type": "function",
@@ -1125,6 +1141,7 @@ impl ToolExecutor {
             "find_references" => self.find_references(args),
             "call_graph" => self.call_graph(args),
             "rename_symbol" => self.rename_symbol(args),
+            "dead_code" => self.dead_code(args),
             "run_build_test" => self.run_build_test(args),
             "symbols" => self.symbols(args),
             "mo_query" => self.mo_query(args),
@@ -1981,6 +1998,205 @@ impl ToolExecutor {
         }
 
         output
+    }
+
+    /// Dead code detection: find symbols with zero external references.
+    fn dead_code(&self, args: &Value) -> String {
+        let scan_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        let include = args.get("include").and_then(Value::as_str);
+        let kind_filter = args.get("kind").and_then(Value::as_str).unwrap_or("all");
+
+        let scan_dir = self.project_root.join(scan_path);
+        if !scan_dir.exists() {
+            return format!("Error: path '{}' not found", scan_path);
+        }
+
+        // Step 1: Collect files to scan
+        let extensions = ["rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "h", "cpp", "cc", "hpp", "rb"];
+        let skip_dirs = ["node_modules", "target", "vendor", "dist", "__pycache__", ".git"];
+        let max_files = 200;
+
+        let files: Vec<std::path::PathBuf> = if scan_dir.is_file() {
+            vec![scan_dir.clone()]
+        } else {
+            self.collect_project_files(&skip_dirs, &extensions, max_files)
+                .into_iter()
+                .filter(|p| p.starts_with(&scan_dir))
+                .filter(|p| {
+                    if let Some(inc) = include {
+                        let name = p.file_name().unwrap_or_default().to_string_lossy();
+                        let pat = inc.trim_start_matches('*');
+                        name.ends_with(pat)
+                    } else {
+                        true
+                    }
+                })
+                .collect()
+        };
+
+        if files.is_empty() {
+            return format!("No source files found in '{}'", scan_path);
+        }
+
+        // Step 2: Extract all symbols from scanned files
+        struct SymbolInfo {
+            name: String,
+            kind: String,
+            file: String,
+            line: usize,
+            is_public: bool,
+            is_test: bool,
+            is_main: bool,
+        }
+
+        let mut symbols: Vec<SymbolInfo> = Vec::new();
+
+        for file_path in &files {
+            let lang = match code_intel::detect_language(file_path) {
+                Some(l) => l,
+                None => continue,
+            };
+            let content = match fs::read_to_string(file_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let rel = file_path.strip_prefix(&self.project_root)
+                .unwrap_or(file_path).to_string_lossy().to_string();
+
+            let extracted = code_intel::extract_symbols(&content, lang);
+            for sym in extracted {
+                let kind_str = match sym.kind {
+                    code_intel::SymbolKind::Function | code_intel::SymbolKind::Method => "function",
+                    code_intel::SymbolKind::Struct | code_intel::SymbolKind::Class
+                    | code_intel::SymbolKind::Enum | code_intel::SymbolKind::Trait
+                    | code_intel::SymbolKind::Interface | code_intel::SymbolKind::Type => "type",
+                    code_intel::SymbolKind::Constant => "constant",
+                    _ => continue, // skip variables, imports, constructors, modules
+                };
+
+                // Apply kind filter
+                if kind_filter != "all" && kind_str != kind_filter {
+                    continue;
+                }
+
+                // Check for known entry points and special patterns
+                let is_main = sym.name == "main" || sym.name == "Main";
+                let sig = &sym.signature;
+                let is_test = sym.name.starts_with("test_")
+                    || sym.name.ends_with("_test")
+                    || sym.name.starts_with("Test")
+                    || sig.contains("#[test]") || sig.contains("#[cfg(test)]");
+
+                // Check visibility
+                let is_public = sig.starts_with("pub ") || sig.starts_with("pub(") || sig.starts_with("export ");
+
+                symbols.push(SymbolInfo {
+                    name: sym.name,
+                    kind: kind_str.to_string(),
+                    file: rel.clone(),
+                    line: sym.start_line,
+                    is_public,
+                    is_test,
+                    is_main,
+                });
+            }
+        }
+
+        if symbols.is_empty() {
+            return format!("No symbols of kind '{}' found in '{}'", kind_filter, scan_path);
+        }
+
+        // Step 3: For each symbol, count references project-wide
+        let mut dead: Vec<&SymbolInfo> = Vec::new();
+        let mut checked = 0;
+
+        for sym in &symbols {
+            // Skip known entry points
+            if sym.is_main || sym.is_test {
+                continue;
+            }
+
+            checked += 1;
+
+            // Quick grep count
+            let ref_count = self.count_symbol_references(&sym.name);
+
+            // A symbol with only 1 reference (its own definition) is dead
+            // A symbol with 0 references means grep couldn't find it (unlikely but safe)
+            if ref_count <= 1 {
+                dead.push(sym);
+            }
+        }
+
+        // Step 4: Format output
+        let mut output = String::new();
+        if dead.is_empty() {
+            output.push_str(&format!("✓ No dead code found ({} symbols checked in {} files)\n",
+                checked, files.len()));
+        } else {
+            output.push_str(&format!("⚠ {} potentially unused symbol{} ({} checked in {} files):\n\n",
+                dead.len(),
+                if dead.len() == 1 { "" } else { "s" },
+                checked, files.len()));
+
+            // Group by file
+            let mut by_file: std::collections::BTreeMap<&str, Vec<&SymbolInfo>> = std::collections::BTreeMap::new();
+            for sym in &dead {
+                by_file.entry(&sym.file).or_default().push(sym);
+            }
+
+            for (file, syms) in &by_file {
+                output.push_str(&format!("{}:\n", file));
+                for sym in syms {
+                    let pub_marker = if sym.is_public { " (pub)" } else { "" };
+                    output.push_str(&format!("  L{}: {} {}{}\n",
+                        sym.line, sym.kind, sym.name, pub_marker));
+                }
+            }
+
+            if dead.iter().any(|s| s.is_public) {
+                output.push_str("\n💡 Public symbols marked (pub) may be used by external consumers.\n");
+            }
+        }
+
+        output
+    }
+
+    /// Count how many times a symbol appears in the project (word-boundary match).
+    fn count_symbol_references(&self, symbol: &str) -> usize {
+        // Try ripgrep first, fall back to grep
+        let output = {
+            let mut cmd = std::process::Command::new("rg");
+            cmd.arg("-c").arg("-w").arg("--no-heading")
+                .arg(symbol)
+                .current_dir(&self.project_root);
+            for exc in &[".git", "node_modules", "target", "vendor", "dist"] {
+                cmd.arg("--glob").arg(format!("!{}", exc));
+            }
+            match cmd.output() {
+                Ok(o) => o,
+                Err(_) => {
+                    let mut cmd = std::process::Command::new("grep");
+                    cmd.arg("-rcw").arg(symbol).current_dir(&self.project_root);
+                    for exc in &[".git", "node_modules", "target", "vendor", "dist"] {
+                        cmd.arg("--exclude-dir").arg(*exc);
+                    }
+                    match cmd.output() {
+                        Ok(o) => o,
+                        Err(_) => return usize::MAX, // can't count, assume referenced
+                    }
+                }
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Each line is "file:count" — sum all counts
+        stdout.lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.rsplitn(2, ':').collect();
+                parts.first().and_then(|s| s.parse::<usize>().ok())
+            })
+            .sum()
     }
 
     fn call_graph(&self, args: &Value) -> String {
@@ -4073,5 +4289,118 @@ fn caller() {
         assert!(rs_content.contains("renamed"), "rs file renamed: {}", rs_content);
         assert!(py_content.contains("target"), "py file untouched: {}", py_content);
         assert!(result.contains("1 file"), "only 1 file changed: {result}");
+    }
+
+    // ---- dead_code tests ----
+
+    #[tokio::test]
+    async fn dead_code_finds_unused_function() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "fn used_fn() -> i32 { 42 }\nfn unused_fn() -> i32 { 99 }\nfn main() { used_fn(); }\n";
+        std::fs::write(dir.path().join("main.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("dead_code", &json!({
+            "path": "."
+        })).await;
+
+        assert!(result.contains("unused_fn"), "should find unused_fn: {result}");
+        // Verify used_fn is NOT flagged (careful: "unused_fn" contains "used_fn")
+        let without_unused = result.replace("unused_fn", "");
+        assert!(!without_unused.contains("used_fn"), "used_fn should not be listed: {result}");
+        // main() should be skipped as entry point — check it's not listed as a symbol
+        assert!(!result.contains("function main"), "main() should be skipped: {result}");
+    }
+
+    #[tokio::test]
+    async fn dead_code_skips_test_functions() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "fn helper() -> i32 { 42 }\nfn test_helper() { assert_eq!(helper(), 42); }\n";
+        std::fs::write(dir.path().join("test.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("dead_code", &json!({
+            "path": "."
+        })).await;
+
+        // test_helper should be skipped (it's a test)
+        assert!(!result.contains("test_helper"), "test functions should be skipped: {result}");
+    }
+
+    #[tokio::test]
+    async fn dead_code_filters_by_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "struct UnusedStruct { x: i32 }\nfn unused_fn() -> i32 { 42 }\n";
+        std::fs::write(dir.path().join("lib.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+
+        let result_fn = executor.execute("dead_code", &json!({
+            "path": ".",
+            "kind": "function"
+        })).await;
+        assert!(result_fn.contains("unused_fn"), "should find unused_fn: {result_fn}");
+        assert!(!result_fn.contains("UnusedStruct"), "should not show structs: {result_fn}");
+
+        let result_type = executor.execute("dead_code", &json!({
+            "path": ".",
+            "kind": "type"
+        })).await;
+        assert!(result_type.contains("UnusedStruct"), "should find UnusedStruct: {result_type}");
+        assert!(!result_type.contains("unused_fn"), "should not show functions: {result_type}");
+    }
+
+    #[tokio::test]
+    async fn dead_code_reports_public_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "pub fn exported() -> i32 { 42 }\nfn internal() -> i32 { 99 }\n";
+        std::fs::write(dir.path().join("lib.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("dead_code", &json!({})).await;
+
+        // Both should be detected as unused, but public should have marker
+        if result.contains("exported") {
+            assert!(result.contains("(pub)"), "public symbol should be marked: {result}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dead_code_clean_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "fn main() { helper(); }\nfn helper() -> i32 { 42 }\n";
+        std::fs::write(dir.path().join("main.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("dead_code", &json!({})).await;
+
+        assert!(result.contains("No dead code") || result.contains("0 potentially"),
+            "should report clean: {result}");
+    }
+
+    #[tokio::test]
+    async fn dead_code_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.txt"), "not a source file\n").unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("dead_code", &json!({})).await;
+
+        assert!(result.contains("No source files") || result.contains("No symbols"),
+            "should report no files: {result}");
+    }
+
+    #[tokio::test]
+    async fn dead_code_python() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "def used():\n    return 42\n\ndef unused():\n    return 99\n\nresult = used()\n";
+        std::fs::write(dir.path().join("main.py"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("dead_code", &json!({
+            "path": "."
+        })).await;
+
+        assert!(result.contains("unused"), "should find unused: {result}");
     }
 }

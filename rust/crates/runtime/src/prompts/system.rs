@@ -133,6 +133,11 @@ pub fn build_main_system_prompt(
             "- **rename_symbol**: Rename across project. AST-validated, skips comments/strings. dry_run=true previews.\n",
         );
     }
+    if tool_names.contains(&"dead_code") {
+        prompt.push_str(
+            "- **dead_code**: Find unused symbols. Use before cleanup to identify safe deletions.\n",
+        );
+    }
 
     // ── Editing strategy guidance ──
     if has_multi_edit {
@@ -344,16 +349,15 @@ pub fn build_main_system_prompt(
     prompt.push_str(
         "\n\
          ## Tool Precedence (prefer earlier tools in each chain)\n\
-         - **Understand code**: symbols(calls=true) → call_graph → read_file (targeted ranges)\n\
-         - **Navigate code**: find_definition / find_references(kind=...) → grep → read_file\n\
-         - **Impact analysis**: call_graph(callers=true, scope='project') → find_references → grep\n\
-         - **Rename/refactor**: rename_symbol(dry_run=true) → review preview → rename_symbol(dry_run=false)\n\
-         - **File search**: glob (by name) → grep (by content) → log search (by commit message)\n\
-         - **Code edit**: read context → str_replace (auto-formats) → run_build_test to verify\n\
-         - **Git investigation**: status → diff → log → show → blame\n\
-         - **Git changes**: edit files → git_commit. Use git_checkout_file to revert mistakes.\n\
-         - **Build/test**: run_build_test (structured) → fix errors from locations → repeat\n\
-         - **GitHub**: list (PRs/issues) → detail (single PR/issue) → CI status\n",
+         - **Understand code**: symbols(calls=true) → call_graph → read_file\n\
+         - **Navigate code**: find_definition / find_references(kind=...) → grep\n\
+         - **Impact analysis**: call_graph(callers=true, scope='project') → find_references\n\
+         - **Rename/refactor**: rename_symbol(dry_run=true) → review → apply\n\
+         - **File search**: glob → grep (content) → log search (commits)\n\
+         - **Code edit**: read context → str_replace → run_build_test\n\
+         - **Git**: status → diff → log → show → blame; git_commit for changes\n\
+         - **Build/test**: run_build_test → fix errors → repeat\n\
+         - **GitHub**: list → detail → CI status\n",
     );
     if has_memory {
         prompt
@@ -1069,7 +1073,7 @@ mod tests {
         assert!(p.contains("Tool Precedence"));
         assert!(p.contains("File search"));
         assert!(p.contains("Code edit"));
-        assert!(p.contains("Git investigation"));
+        assert!(p.contains("Git"));
         // Memory line only when memory tools present
         assert!(!p.contains("Memory:"));
         let p_mem = build_main_system_prompt(&["memory_store"], "", 0.5, None);

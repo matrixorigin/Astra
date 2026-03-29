@@ -907,7 +907,7 @@ mod tests {
             &[
                 "read_file", "bash", "str_replace", "write_file", "delete_file", "multi_edit",
                 "list_dir", "grep", "glob",
-                "find_definition", "find_references", "call_graph", "symbols", "rename_symbol",
+                "find_definition", "find_references", "call_graph", "symbols", "rename_symbol", "dead_code",
                 "run_build_test",
                 "git_diff", "git_log", "git_commit", "git_stash",
                 "github_list_prs", "github_repo_stats",
