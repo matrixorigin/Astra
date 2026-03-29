@@ -441,17 +441,16 @@ fn extract_cargo_failed_tests(output: &str, locations: &mut Vec<ErrorLocation>) 
 
                         // Extract panic location
                         if let Some(pcap) = PANIC_LOCATION_RE.captures(next_line) {
-                            let panic_msg = pcap.get(1).map(|m| m.as_str()).unwrap_or("");
-                            let file = pcap.get(2).map(|m| m.as_str()).unwrap_or("");
-                            let line_num: usize = pcap.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
-                            let col: usize = pcap.get(4).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+                            let file = pcap.get(1).map(|m| m.as_str()).unwrap_or("");
+                            let line_num: usize = pcap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+                            let col: usize = pcap.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
                             if !file.is_empty() && line_num > 0 && locations.len() < 20 {
                                 locations.push(ErrorLocation {
                                     file: file.to_string(),
                                     line: line_num,
                                     col,
                                     error_code: String::new(),
-                                    message: format!("test {name}: {panic_msg}"),
+                                    message: format!("test {name} panicked"),
                                     severity: "error".to_string(),
                                 });
                             }
@@ -1021,5 +1020,34 @@ src/helper.c:15:3: warning: implicit conversion
         };
         let output = result.to_enhanced_output("");
         assert!(!output.contains("Locations:"), "should not show Locations when empty");
+    }
+
+    #[test]
+    fn parse_cargo_panic_location_extraction() {
+        let output = r#"
+running 1 test
+test tests::my_test ... FAILED
+
+failures:
+
+---- tests::my_test stdout ----
+thread 'tests::my_test' panicked at 'assertion failed: x > 0', src/lib.rs:42:9
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored
+"#;
+        let result = parse_build_test_output(output, None);
+        assert!(!result.passed);
+        assert_eq!(result.tests_failed, 1);
+        // Verify panic location was correctly extracted
+        assert!(
+            !result.error_locations.is_empty(),
+            "should extract panic location, got: {:?}",
+            result.error_locations
+        );
+        let loc = &result.error_locations[0];
+        assert_eq!(loc.file, "src/lib.rs", "file should be src/lib.rs");
+        assert_eq!(loc.line, 42, "line should be 42");
+        assert_eq!(loc.col, 9, "col should be 9");
+        assert!(loc.message.contains("my_test"), "message should reference test name");
     }
 }
