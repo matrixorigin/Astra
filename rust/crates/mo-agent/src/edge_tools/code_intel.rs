@@ -2370,4 +2370,75 @@ class UserService:
         let crumbs_str = scope.breadcrumbs.join(" > ");
         assert!(crumbs_str.contains("UserService"), "breadcrumbs: {crumbs_str}");
     }
+
+    // ── extract_members tests ────────────────────────────────────────────────
+
+    #[test]
+    fn extract_members_rust_struct_fields() {
+        let source = "pub struct Config {\n    pub name: String,\n    port: u16,\n}\n";
+        let members = extract_members(source, Language::Rust, 1);
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].name, "name");
+        assert_eq!(members[0].kind, "field");
+        assert!(members[0].visibility.contains("pub"));
+        assert_eq!(members[1].name, "port");
+        assert!(members[1].visibility.is_empty());
+    }
+
+    #[test]
+    fn extract_members_rust_enum_variants() {
+        let source = "enum Direction {\n    North,\n    South,\n    East,\n    West,\n}\n";
+        let members = extract_members(source, Language::Rust, 1);
+        assert_eq!(members.len(), 4);
+        assert!(members.iter().all(|m| m.kind == "variant"));
+        assert_eq!(members[0].name, "North");
+        assert_eq!(members[3].name, "West");
+    }
+
+    #[test]
+    fn extract_members_python_class() {
+        let source = "class User:\n    name: str\n    age: int = 25\n    def greet(self):\n        pass\n";
+        let members = extract_members(source, Language::Python, 1);
+        assert!(members.len() >= 2, "should have at least name and greet: {:?}", members);
+        let props: Vec<_> = members.iter().filter(|m| m.kind == "property").collect();
+        assert!(!props.is_empty(), "should have properties");
+        let methods: Vec<_> = members.iter().filter(|m| m.kind == "method").collect();
+        assert!(!methods.is_empty(), "should have methods");
+    }
+
+    #[test]
+    fn extract_members_empty_for_non_type() {
+        let source = "fn main() {\n    println!(\"hello\");\n}\n";
+        let members = extract_members(source, Language::Rust, 1);
+        assert!(members.is_empty());
+    }
+
+    #[test]
+    fn find_rust_impls_basic() {
+        let source = "trait A {}\nstruct B;\nimpl A for B {}\n";
+        let impls = find_rust_impls(source, "test.rs");
+        assert_eq!(impls.len(), 1);
+        assert_eq!(impls[0].trait_name, "A");
+        assert_eq!(impls[0].type_name, "B");
+        assert_eq!(impls[0].file, "test.rs");
+    }
+
+    #[test]
+    fn find_rust_impls_skips_inherent() {
+        let source = "struct Foo;\nimpl Foo {\n    fn new() -> Self { Self }\n}\n";
+        let impls = find_rust_impls(source, "test.rs");
+        assert!(impls.is_empty(), "inherent impls should not be listed");
+    }
+
+    #[test]
+    fn find_rust_impls_multiple() {
+        let source = r#"trait X {}
+trait Y {}
+struct Z;
+impl X for Z {}
+impl Y for Z {}
+"#;
+        let impls = find_rust_impls(source, "multi.rs");
+        assert_eq!(impls.len(), 2);
+    }
 }
