@@ -386,6 +386,9 @@ struct ReplState {
     executing_plan: Option<mo_agent_services::task_orchestrator::TaskPlan>,
     /// Whether the last chat turn was interrupted by Ctrl+C (used by plan auto-execution).
     last_turn_interrupted: bool,
+    /// Cloud learning snapshot version for optimistic locking.
+    /// Set by try_cloud_pull, used by try_cloud_push to prevent concurrent overwrites.
+    cloud_learning_version: Option<i64>,
 }
 
 impl Default for ReplState {
@@ -418,6 +421,7 @@ impl Default for ReplState {
             plan_mode: None,
             executing_plan: None,
             last_turn_interrupted: false,
+            cloud_learning_version: None,
         }
     }
 }
@@ -1313,8 +1317,15 @@ fn merge_learning_snapshot(
 
 // ═══════════════════════════════════════════ Cloud Learning Sync ═══════
 
+/// Result from cloud pull including tool health and version for optimistic locking.
+struct CloudPullResult {
+    tool_health: Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry>,
+    version: Option<i64>,
+}
+
 /// Try to pull learning state from MatrixOne and merge into live modules.
 /// Best-effort: silently skips if cloud is unavailable.
+/// Returns tool health entries and cloud version for optimistic locking.
 async fn try_cloud_pull(
     profile_name: &str,
     entity_graph: &std::sync::Arc<
@@ -1326,42 +1337,60 @@ async fn try_cloud_pull(
     calibrator: &std::sync::Arc<
         std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
     >,
-) -> Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry> {
+) -> CloudPullResult {
     let pool = match try_connect_matrixone().await {
         Some(p) => p,
-        None => return Vec::new(),
+        None => {
+            return CloudPullResult {
+                tool_health: Vec::new(),
+                version: None,
+            }
+        }
     };
     let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
     let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
-    match mo_agent_services::state_sync::StateSyncService::pull_learning(
+    match mo_agent_services::state_sync::StateSyncService::pull_learning_versioned(
         &svc,
         &user_id,
         profile_name,
     )
     .await
     {
-        Ok(Some(json)) => {
+        Ok(Some(versioned)) => {
             // Parse snapshot to extract tool health before merging entities/patterns
             let cloud_health = serde_json::from_str::<
                 mo_agent_runtime::pipeline::persistence::LearningSnapshot,
-            >(&json)
+            >(&versioned.json)
             .map(|s| s.tool_health)
             .unwrap_or_default();
-            merge_learning_snapshot(&json, entity_graph, pattern_library, calibrator);
-            eprintln!("{}", "  ✓ Cloud learning merged".dim());
-            cloud_health
+            merge_learning_snapshot(&versioned.json, entity_graph, pattern_library, calibrator);
+            eprintln!(
+                "{}",
+                format!("  ✓ Cloud learning merged (v{})", versioned.version).dim()
+            );
+            CloudPullResult {
+                tool_health: cloud_health,
+                version: Some(versioned.version),
+            }
         }
-        Ok(None) => Vec::new(),
+        Ok(None) => CloudPullResult {
+            tool_health: Vec::new(),
+            version: None,
+        },
         Err(e) => {
             eprintln!("{}", format!("  ⚠ Cloud pull skipped: {e}").dim());
-            Vec::new()
+            CloudPullResult {
+                tool_health: Vec::new(),
+                version: None,
+            }
         }
     }
 }
 
-/// Try to push learning state to MatrixOne after local save.
-/// Best-effort: silently skips if cloud is unavailable.
-async fn try_cloud_push(
+/// Push learning state to cloud with optimistic locking.
+/// Returns the new cloud version if successful, or None on conflict/failure.
+/// On conflict, the caller should pull fresh data and retry.
+async fn try_cloud_push_versioned(
     profile_name: &str,
     entity_graph: &std::sync::Arc<
         std::sync::Mutex<mo_agent_runtime::pipeline::entity::EntityGraph>,
@@ -1373,10 +1402,11 @@ async fn try_cloud_push(
         std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
     >,
     tool_health: &[mo_agent_runtime::pipeline::persistence::ToolHealthEntry],
-) {
+    expected_version: Option<i64>,
+) -> Option<i64> {
     let pool = match try_connect_matrixone().await {
         Some(p) => p,
-        None => return,
+        None => return None,
     };
     let snapshot = mo_agent_runtime::pipeline::persistence::export_from_modules_with_health(
         entity_graph,
@@ -1386,11 +1416,11 @@ async fn try_cloud_push(
     );
     let json = match serde_json::to_string(&snapshot) {
         Ok(j) => j,
-        Err(_) => return,
+        Err(_) => return None,
     };
     let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
     let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
-    let result = mo_agent_services::state_sync::StateSyncService::push_learning(
+    let result = mo_agent_services::state_sync::StateSyncService::push_learning_versioned(
         &svc,
         &user_id,
         profile_name,
@@ -1398,9 +1428,23 @@ async fn try_cloud_push(
         snapshot.entities.len() as u32,
         snapshot.patterns.len() as u32,
         snapshot.calibration.is_some(),
+        expected_version,
     )
     .await;
+
+    if result.is_conflict {
+        eprintln!(
+            "{}",
+            "  ⚠ Cloud sync conflict (another session updated)".yellow()
+        );
+        return None;
+    }
+
     if result.success {
+        if let Some(v) = result.new_version {
+            eprintln!("{}", format!("  ✓ Learning synced to cloud (v{})", v).dim());
+            return Some(v);
+        }
         eprintln!("{}", "  ✓ Learning synced to cloud".dim());
     } else {
         eprintln!(
@@ -1408,6 +1452,7 @@ async fn try_cloud_push(
             format!("  ⚠ Cloud push skipped: {}", result.message).dim()
         );
     }
+    result.new_version
 }
 
 /// Pull user preferences from cloud at session start.
@@ -1943,20 +1988,22 @@ async fn run_chat_repl(
                 .dim()
             );
         }
-        // Try to merge cloud learning (best-effort, returns cloud tool health)
-        let cloud_health = try_cloud_pull(
+        // Try to merge cloud learning (best-effort, returns cloud tool health and version)
+        let cloud_pull_result = try_cloud_pull(
             profile_name,
             &pipeline_modules.entity_graph,
             &pipeline_modules.pattern_library,
             &pipeline_modules.calibrator,
         )
         .await;
+        // Store cloud version for optimistic locking on push
+        state.cloud_learning_version = cloud_pull_result.version;
         // Merge cloud tool health: timestamp-based conflict resolution
-        if !cloud_health.is_empty() {
+        if !cloud_pull_result.tool_health.is_empty() {
             let (merged, cloud_wins, cloud_only) =
                 mo_agent_runtime::pipeline::persistence::merge_tool_health(
                     &cross_session_health_entries,
-                    &cloud_health,
+                    &cloud_pull_result.tool_health,
                 );
             cross_session_health_entries = merged;
             if cloud_wins > 0 || cloud_only > 0 {
@@ -2116,14 +2163,21 @@ async fn run_chat_repl(
                             mo_agent_services::session_checkpoint::CHECKPOINT_INTERVAL,
                         )
                     {
-                        try_cloud_push(
+                        // Use versioned push for optimistic locking
+                        if let Some(new_version) = try_cloud_push_versioned(
                             &profile_name_str,
                             &pipeline_modules.entity_graph,
                             &pipeline_modules.pattern_library,
                             &pipeline_modules.calibrator,
                             &state.tool_health_entries,
+                            state.cloud_learning_version,
                         )
-                        .await;
+                        .await
+                        {
+                            state.cloud_learning_version = Some(new_version);
+                        }
+                        // On conflict, we skip this push — the final push at session end
+                        // will resolve conflicts via pull-merge-push cycle
                     }
                 }
             }
@@ -2176,15 +2230,48 @@ async fn run_chat_repl(
                 format!("  ⚠ Learning state not saved (will retry next session): {e}").yellow()
             );
         }
-        // Push learning to cloud (best-effort, now includes tool health)
-        try_cloud_push(
-            profile_name,
-            &pipeline_modules.entity_graph,
-            &pipeline_modules.pattern_library,
-            &pipeline_modules.calibrator,
-            &state.tool_health_entries,
-        )
-        .await;
+        // Push learning to cloud with versioned API (conflict resolution loop)
+        // On conflict: pull fresh data, merge, retry push (max 3 attempts)
+        const MAX_SYNC_RETRIES: u32 = 3;
+        let mut expected_version = state.cloud_learning_version;
+        for attempt in 0..MAX_SYNC_RETRIES {
+            if try_cloud_push_versioned(
+                profile_name,
+                &pipeline_modules.entity_graph,
+                &pipeline_modules.pattern_library,
+                &pipeline_modules.calibrator,
+                &state.tool_health_entries,
+                expected_version,
+            )
+            .await
+            .is_some()
+            {
+                // Success — done
+                break;
+            }
+            // Conflict or failure — pull fresh, merge, retry
+            if attempt + 1 < MAX_SYNC_RETRIES {
+                eprintln!("{}", "  ↻ Pulling fresh cloud state for merge...".dim());
+                let pull_result = try_cloud_pull(
+                    profile_name,
+                    &pipeline_modules.entity_graph,
+                    &pipeline_modules.pattern_library,
+                    &pipeline_modules.calibrator,
+                )
+                .await;
+                expected_version = pull_result.version;
+                // Merge tool health from cloud pull
+                if !pull_result.tool_health.is_empty() {
+                    let (merged, _, _) =
+                        mo_agent_runtime::pipeline::persistence::merge_tool_health(
+                            &state.tool_health_entries,
+                            &pull_result.tool_health,
+                        );
+                    // Update tool health in memory (though session is ending)
+                    state.tool_health_entries = merged;
+                }
+            }
+        }
         // Push preferences to cloud (best-effort)
         try_cloud_push_preferences(&state).await;
     }
@@ -4076,10 +4163,14 @@ total_tokens_out: 500
         let cal = std::sync::Arc::new(std::sync::Mutex::new(
             mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator::new(0.15),
         ));
-        let health = try_cloud_pull("default", &eg, &pl, &cal).await;
+        let result = try_cloud_pull("default", &eg, &pl, &cal).await;
         assert!(
-            health.is_empty(),
-            "Without MatrixOne, cloud pull should return empty"
+            result.tool_health.is_empty(),
+            "Without MatrixOne, cloud pull should return empty tool health"
+        );
+        assert!(
+            result.version.is_none(),
+            "Without MatrixOne, cloud pull should return no version"
         );
     }
 
@@ -4098,7 +4189,8 @@ total_tokens_out: 500
             mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator::new(0.15),
         ));
         // Should not panic (was the original bug)
-        try_cloud_push("default", &eg, &pl, &cal, &[]).await;
+        // Use versioned API (None = new snapshot or unconditional push)
+        let _result = try_cloud_push_versioned("default", &eg, &pl, &cal, &[], None).await;
     }
 
     #[tokio::test]

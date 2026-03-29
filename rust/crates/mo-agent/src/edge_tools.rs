@@ -2437,6 +2437,47 @@ impl ToolExecutor {
             }
         }
 
+        // Generate and display concrete fix suggestions
+        let mut all_fixes: Vec<(usize, build_test::FixSuggestion)> = Vec::new();
+        for (i, loc) in result.error_locations.iter().enumerate().take(10) {
+            let file_path = self.project_root.join(&loc.file);
+            if let Ok(content) = std::fs::read_to_string(&file_path) {
+                let source_lines: Vec<&str> = content.lines().collect();
+                let fixes = build_test::suggest_fix(loc, &source_lines);
+                for fix in fixes {
+                    all_fixes.push((i, fix));
+                }
+            }
+        }
+
+        if !all_fixes.is_empty() {
+            parts.push(String::new());
+            parts.push("─── Suggested Fixes ───".to_string());
+            for (err_idx, fix) in all_fixes.iter().take(8) {
+                let confidence_bar = match fix.confidence {
+                    c if c >= 0.8 => "●●●",
+                    c if c >= 0.5 => "●●○",
+                    _ => "●○○",
+                };
+                parts.push(format!("\n{}  [{}] {}",
+                    confidence_bar, fix.action, fix.explanation));
+                parts.push(format!("  → {}:{}", fix.file, fix.line));
+                if !fix.new_text.is_empty() {
+                    // Show what to insert/replace
+                    let preview = if fix.new_text.len() > 80 {
+                        format!("{}...", &fix.new_text[..77])
+                    } else {
+                        fix.new_text.clone()
+                    };
+                    parts.push(format!("  + {}", preview));
+                }
+                let _ = err_idx; // used for ordering
+            }
+            if all_fixes.len() > 8 {
+                parts.push(format!("\n[{} more suggestions]", all_fixes.len() - 8));
+            }
+        }
+
         truncate_output(parts.join("\n"), tool_output_limit())
     }
 

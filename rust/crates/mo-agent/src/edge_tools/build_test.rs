@@ -36,6 +36,187 @@ pub struct ErrorLocation {
     pub scope: String,
 }
 
+/// A concrete, applicable fix suggestion for an error.
+#[derive(Debug, Clone)]
+pub struct FixSuggestion {
+    /// The file to edit
+    pub file: String,
+    /// What to do: "insert_line", "replace", "delete_line", "add_import"
+    pub action: String,
+    /// Target line number (for insert: where to insert before)
+    pub line: usize,
+    /// Text to insert or replace with (empty for delete)
+    pub new_text: String,
+    /// Human-readable explanation of the fix
+    pub explanation: String,
+    /// Confidence: 0.0-1.0 (1.0 = certain, 0.5 = likely, below 0.3 = speculative)
+    pub confidence: f64,
+}
+
+impl FixSuggestion {
+    fn new(file: &str, action: &str, line: usize, new_text: &str, explanation: &str, confidence: f64) -> Self {
+        Self {
+            file: file.to_string(),
+            action: action.to_string(),
+            line,
+            new_text: new_text.to_string(),
+            explanation: explanation.to_string(),
+            confidence,
+        }
+    }
+}
+
+/// Generate concrete fix suggestions for an error, given source context.
+///
+/// Returns zero or more suggestions ranked by confidence. The source_lines
+/// parameter should contain the relevant file content for context.
+pub fn suggest_fix(error: &ErrorLocation, source_lines: &[&str]) -> Vec<FixSuggestion> {
+    let mut fixes = Vec::new();
+
+    match error.error_code.as_str() {
+        // ── Rust: Missing import (E0425, E0433, E0412) ──
+        "E0425" | "E0433" | "E0412" => {
+            if let Some(name) = extract_identifier(&error.message) {
+                // Suggest common std imports
+                if let Some(import) = suggest_rust_import(name) {
+                    fixes.push(FixSuggestion::new(
+                        &error.file, "add_import", 1,
+                        &format!("use {};", import),
+                        &format!("Add missing import for `{}`", name),
+                        0.8,
+                    ));
+                }
+            }
+        }
+
+        // ── Rust: Missing field (E0063) ──
+        "E0063" => {
+            if let Some(field) = extract_identifier(&error.message) {
+                let err_line = error.line.saturating_sub(1);
+                if err_line < source_lines.len() {
+                    fixes.push(FixSuggestion::new(
+                        &error.file, "insert_line", error.line,
+                        &format!("            {}: Default::default(),", field),
+                        &format!("Add missing field `{}` with default value", field),
+                        0.6,
+                    ));
+                }
+            }
+        }
+
+        // ── Rust: Unused variable ──
+        _ if error.message.contains("unused variable") => {
+            if let Some(name) = extract_identifier(&error.message) {
+                let err_idx = error.line.saturating_sub(1);
+                if err_idx < source_lines.len() {
+                    let line = source_lines[err_idx];
+                    let new_line = line.replace(name, &format!("_{}", name));
+                    fixes.push(FixSuggestion::new(
+                        &error.file, "replace", error.line,
+                        &new_line,
+                        &format!("Prefix unused variable `{}` with underscore", name),
+                        0.9,
+                    ));
+                }
+            }
+        }
+
+        // ── Rust: Unused import ──
+        _ if error.message.contains("unused import") => {
+            fixes.push(FixSuggestion::new(
+                &error.file, "delete_line", error.line, "",
+                "Remove unused import",
+                0.9,
+            ));
+        }
+
+        // ── Rust: String/&str mismatch (E0308) ──
+        "E0308" if error.message.contains("&str") && error.message.contains("String") => {
+            let err_idx = error.line.saturating_sub(1);
+            if err_idx < source_lines.len() {
+                let line = source_lines[err_idx];
+                if error.message.contains("expected `String`") || error.message.contains("expected struct `String`") {
+                    // Need String, got &str → add .to_string()
+                    fixes.push(FixSuggestion::new(
+                        &error.file, "replace", error.line,
+                        &format!("{}  // consider adding .to_string()", line.trim_end()),
+                        "Add .to_string() to convert &str to String",
+                        0.5,
+                    ));
+                } else {
+                    // Need &str, got String → add .as_str() or &
+                    fixes.push(FixSuggestion::new(
+                        &error.file, "replace", error.line,
+                        &format!("{}  // consider adding .as_str() or &", line.trim_end()),
+                        "Add .as_str() or & to convert String to &str",
+                        0.5,
+                    ));
+                }
+            }
+        }
+
+        // ── Rust: Missing trait method (E0046) ──
+        "E0046" => {
+            if let Some(method) = extract_identifier(&error.message) {
+                fixes.push(FixSuggestion::new(
+                    &error.file, "insert_line", error.line,
+                    &format!("    fn {}(&self) {{ todo!() }}", method),
+                    &format!("Add stub for missing trait method `{}`", method),
+                    0.6,
+                ));
+            }
+        }
+
+        // ── TypeScript/JavaScript: Cannot find name (TS2304) ──
+        "TS2304" => {
+            if let Some(name) = extract_identifier(&error.message) {
+                fixes.push(FixSuggestion::new(
+                    &error.file, "add_import", 1,
+                    &format!("import {{ {} }} from './';  // TODO: specify module path", name),
+                    &format!("Add import for `{}`", name),
+                    0.4,
+                ));
+            }
+        }
+
+        _ => {}
+    }
+
+    // Sort by confidence descending
+    fixes.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+    fixes
+}
+
+/// Suggest a Rust import path for common standard library types.
+fn suggest_rust_import(name: &str) -> Option<&'static str> {
+    match name {
+        "HashMap" => Some("std::collections::HashMap"),
+        "HashSet" => Some("std::collections::HashSet"),
+        "BTreeMap" => Some("std::collections::BTreeMap"),
+        "BTreeSet" => Some("std::collections::BTreeSet"),
+        "VecDeque" => Some("std::collections::VecDeque"),
+        "BinaryHeap" => Some("std::collections::BinaryHeap"),
+        "Arc" => Some("std::sync::Arc"),
+        "Mutex" => Some("std::sync::Mutex"),
+        "RwLock" => Some("std::sync::RwLock"),
+        "Rc" => Some("std::rc::Rc"),
+        "RefCell" => Some("std::cell::RefCell"),
+        "Cell" => Some("std::cell::Cell"),
+        "Pin" => Some("std::pin::Pin"),
+        "Path" => Some("std::path::Path"),
+        "PathBuf" => Some("std::path::PathBuf"),
+        "File" => Some("std::fs::File"),
+        "Read" | "Write" | "BufReader" | "BufWriter" => Some("std::io"),
+        "Sender" | "Receiver" => Some("std::sync::mpsc"),
+        "Duration" | "Instant" | "SystemTime" => Some("std::time"),
+        "Display" | "Formatter" => Some("std::fmt"),
+        "Error" => Some("std::error::Error"),
+        "Cow" => Some("std::borrow::Cow"),
+        "NonZeroU32" | "NonZeroU64" | "NonZeroUsize" => Some("std::num"),
+        _ => None,
+    }
+}
+
 /// Error classification for auto-fix prioritization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorClass {
@@ -707,9 +888,20 @@ fn classify_by_message(message: &str) -> (ErrorClass, String) {
 
 /// Extract an identifier name from an error message like "cannot find value `foo`".
 fn extract_identifier(message: &str) -> Option<&str> {
-    let start = message.find('`')? + 1;
-    let end = message[start..].find('`')? + start;
-    Some(&message[start..end])
+    // Try backtick-quoted (Rust), then single-quoted (TypeScript/Go)
+    for quote in ['`', '\''] {
+        if let Some(start_pos) = message.find(quote) {
+            let start = start_pos + 1;
+            if let Some(end_offset) = message[start..].find(quote) {
+                let end = start + end_offset;
+                let candidate = &message[start..end];
+                if !candidate.is_empty() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Detect if a command is a build or test command.
@@ -2152,5 +2344,149 @@ error[E0425]: cannot find value `nonexistent` in this scope
         assert!(summary.contains("1 new"));
         assert!(summary.contains("1 still present"));
         assert!(summary.contains("67%")); // 66.7 rounds to 67
+    }
+
+    // ────────────────────────────────────────────────────────
+    // suggest_fix tests
+    // ────────────────────────────────────────────────────────
+
+    fn make_error(file: &str, line: usize, code: &str, msg: &str) -> ErrorLocation {
+        ErrorLocation {
+            file: file.to_string(),
+            line,
+            col: 0,
+            error_code: code.to_string(),
+            message: msg.to_string(),
+            severity: "error".to_string(),
+            class: ErrorClass::Fixable,
+            hint: String::new(),
+            scope: String::new(),
+        }
+    }
+
+    #[test]
+    fn fix_unused_variable() {
+        let err = make_error("src/main.rs", 3, "", "unused variable: `count`");
+        let source = vec!["fn main() {", "    let x = 1;", "    let count = 42;", "}"];
+        let fixes = suggest_fix(&err, &source);
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(fixes[0].action, "replace");
+        assert!(fixes[0].new_text.contains("_count"));
+        assert!(fixes[0].confidence >= 0.9);
+    }
+
+    #[test]
+    fn fix_unused_import() {
+        let err = make_error("src/lib.rs", 2, "", "unused import: `HashMap`");
+        let source = vec!["use std::io;", "use std::collections::HashMap;", "", "fn main() {}"];
+        let fixes = suggest_fix(&err, &source);
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(fixes[0].action, "delete_line");
+        assert_eq!(fixes[0].line, 2);
+        assert!(fixes[0].confidence >= 0.9);
+    }
+
+    #[test]
+    fn fix_missing_import_hashmap() {
+        let err = make_error("src/main.rs", 5, "E0425", "cannot find value `HashMap` in this scope");
+        let source = vec!["fn main() {", "    let m = HashMap::new();", "}"];
+        let fixes = suggest_fix(&err, &source);
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(fixes[0].action, "add_import");
+        assert!(fixes[0].new_text.contains("std::collections::HashMap"));
+        assert!(fixes[0].confidence >= 0.7);
+    }
+
+    #[test]
+    fn fix_missing_import_arc() {
+        let err = make_error("src/lib.rs", 1, "E0433", "failed to resolve: use of undeclared type `Arc`");
+        let source = vec!["let a = Arc::new(42);"];
+        let fixes = suggest_fix(&err, &source);
+        assert_eq!(fixes.len(), 1);
+        assert!(fixes[0].new_text.contains("std::sync::Arc"));
+    }
+
+    #[test]
+    fn fix_missing_field() {
+        let err = make_error("src/config.rs", 10, "E0063", "missing field `name` in initializer");
+        let source = vec![""; 20];
+        let fixes = suggest_fix(&err, &source);
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(fixes[0].action, "insert_line");
+        assert!(fixes[0].new_text.contains("name"));
+        assert!(fixes[0].new_text.contains("Default::default()"));
+    }
+
+    #[test]
+    fn fix_string_str_mismatch_need_string() {
+        let err = make_error("src/lib.rs", 3, "E0308",
+            "mismatched types: expected `String`, found `&str`");
+        let source = vec!["fn f() {", "    let s: &str = \"hi\";", "    takes_string(s);", "}"];
+        let fixes = suggest_fix(&err, &source);
+        assert_eq!(fixes.len(), 1);
+        assert!(fixes[0].new_text.contains(".to_string()"));
+    }
+
+    #[test]
+    fn fix_string_str_mismatch_need_ref() {
+        let err = make_error("src/lib.rs", 3, "E0308",
+            "mismatched types: expected `&str`, found struct `String`");
+        let source = vec!["fn f() {", "    let s = String::new();", "    takes_ref(s);", "}"];
+        let fixes = suggest_fix(&err, &source);
+        assert_eq!(fixes.len(), 1);
+        assert!(fixes[0].new_text.contains(".as_str()"));
+    }
+
+    #[test]
+    fn fix_missing_trait_method() {
+        let err = make_error("src/impl.rs", 5, "E0046",
+            "not all trait items implemented, missing: `process`");
+        let source = vec!["impl Handler for MyType {", "}"];
+        let fixes = suggest_fix(&err, &source);
+        assert_eq!(fixes.len(), 1);
+        assert!(fixes[0].new_text.contains("fn process"));
+        assert!(fixes[0].new_text.contains("todo!()"));
+    }
+
+    #[test]
+    fn fix_ts_missing_name() {
+        let err = make_error("src/app.ts", 3, "TS2304",
+            "Cannot find name 'Router'");
+        let source = vec!["const app = new Router();"];
+        let fixes = suggest_fix(&err, &source);
+        assert_eq!(fixes.len(), 1);
+        assert!(fixes[0].new_text.contains("import { Router }"));
+    }
+
+    #[test]
+    fn fix_unknown_error_no_suggestion() {
+        let err = make_error("src/main.rs", 1, "E9999", "something weird happened");
+        let source = vec!["fn main() {}"];
+        let fixes = suggest_fix(&err, &source);
+        assert!(fixes.is_empty());
+    }
+
+    #[test]
+    fn fix_sorted_by_confidence() {
+        // The unused variable fix should have high confidence
+        let err = make_error("src/main.rs", 1, "", "unused variable: `x`");
+        let source = vec!["let x = 1;"];
+        let fixes = suggest_fix(&err, &source);
+        if fixes.len() > 1 {
+            for w in fixes.windows(2) {
+                assert!(w[0].confidence >= w[1].confidence);
+            }
+        }
+    }
+
+    #[test]
+    fn fix_suggest_rust_import_coverage() {
+        // Check several common types have import suggestions
+        for name in &["HashMap", "HashSet", "Arc", "Mutex", "PathBuf", "File", "Cow", "Rc"] {
+            assert!(suggest_rust_import(name).is_some(),
+                "Expected import suggestion for {}", name);
+        }
+        // Unknown type returns None
+        assert!(suggest_rust_import("MyCustomType").is_none());
     }
 }
