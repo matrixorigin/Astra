@@ -494,6 +494,39 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "hover_info",
+                "description": "Get comprehensive info about the symbol at a specific cursor position. Returns: symbol kind, signature, doc comment, scope breadcrumbs, member preview (for types), and usage count. Like an IDE hover tooltip. Use when you need full context about what's at a specific location.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file": {"type": "string", "description": "File path"},
+                        "line": {"type": "integer", "description": "Line number (1-indexed)"},
+                        "column": {"type": "integer", "description": "Column number (0-indexed, default: 0)"}
+                    },
+                    "required": ["file", "line"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "symbol_search",
+                "description": "Search for symbols (functions, types, methods) across the project by name. Like 'Go to Symbol in Workspace'. Faster and more precise than grep for finding code definitions. Supports fuzzy matching.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Symbol name or pattern to search for (case-insensitive substring match)"},
+                        "kind": {"type": "string", "enum": ["all", "function", "type", "method", "constant"], "description": "Filter by symbol kind (default: all)"},
+                        "include": {"type": "string", "description": "File glob filter e.g. '*.rs' (optional)"},
+                        "limit": {"type": "integer", "description": "Max results (default: 20)"}
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
         // ── Build/Test tool ─────────────────────────────────────────────
         json!({
             "type": "function",
@@ -1175,6 +1208,8 @@ impl ToolExecutor {
             "dead_code" => self.dead_code(args),
             "extract_members" => self.extract_members(args),
             "type_hierarchy" => self.type_hierarchy(args),
+            "hover_info" => self.hover_info(args),
+            "symbol_search" => self.symbol_search(args),
             "run_build_test" => self.run_build_test(args),
             "symbols" => self.symbols(args),
             "mo_query" => self.mo_query(args),
@@ -2413,6 +2448,273 @@ impl ToolExecutor {
 
         results.push(format!("\nScanned {} files", files.len()));
         results.join("\n")
+    }
+
+    // ── hover_info tool ──────────────────────────────────────────────────
+
+    fn hover_info(&self, args: &Value) -> String {
+        let file = match args.get("file").and_then(Value::as_str) {
+            Some(f) => match self.resolve_checked(f) {
+                Ok(safe) => safe,
+                Err(e) => return e,
+            },
+            None => return "Error: missing 'file'".to_string(),
+        };
+        let line = match args.get("line").and_then(Value::as_u64) {
+            Some(l) => l as usize,
+            None => return "Error: missing 'line'".to_string(),
+        };
+        let column = args.get("column").and_then(Value::as_u64).unwrap_or(0) as usize;
+
+        let lang = match code_intel::detect_language(&file) {
+            Some(l) => l,
+            None => return "Error: unsupported language".to_string(),
+        };
+        let source = match std::fs::read_to_string(&file) {
+            Ok(s) => s,
+            Err(e) => return format!("Error: {e}"),
+        };
+        let rel_path = file.strip_prefix(&self.project_root).unwrap_or(&file);
+
+        let mut parts = Vec::new();
+
+        // Step 1: Identify what's at cursor
+        let cursor_ident = code_intel::identifier_at_position(&source, lang, line, column);
+        if let Some((ref name, ref node_kind)) = cursor_ident {
+            parts.push(format!("🔍 `{}` ({})", name, node_kind));
+        }
+
+        // Step 2: Scope breadcrumbs
+        let scope = code_intel::scope_at_line(&source, lang, line);
+        if !scope.breadcrumbs.is_empty() {
+            parts.push(format!("📍 {}", scope.breadcrumbs.join(" → ")));
+        }
+
+        // Step 3: Symbol definition at this line
+        let symbols = code_intel::extract_symbols(&source, lang);
+        let at_line: Vec<&code_intel::Symbol> = symbols
+            .iter()
+            .filter(|s| s.start_line == line)
+            .collect();
+
+        // Also try to find the definition of the cursor identifier
+        let cursor_def = cursor_ident.as_ref().and_then(|(name, _)| {
+            symbols.iter().find(|s| &s.name == name)
+        });
+
+        let primary_sym = at_line.first().copied().or(cursor_def);
+
+        if let Some(sym) = primary_sym {
+            let parent_info = sym.parent.as_ref()
+                .map(|p| format!(" (in {})", p))
+                .unwrap_or_default();
+            parts.push(format!(""));
+            parts.push(format!("▸ {} {}{}", sym.kind.as_str(), sym.signature, parent_info));
+            parts.push(format!("  {}:{}–{}", rel_path.display(), sym.start_line, sym.end_line));
+
+            // Doc comment
+            let doc = code_intel::extract_doc_comment(&source, lang, sym.start_line);
+            if !doc.is_empty() {
+                parts.push(format!(""));
+                for doc_line in doc.lines().take(5) {
+                    parts.push(format!("  📝 {}", doc_line));
+                }
+            }
+
+            // If it's a type, show members preview
+            if matches!(sym.kind,
+                code_intel::SymbolKind::Struct
+                | code_intel::SymbolKind::Enum
+                | code_intel::SymbolKind::Class
+                | code_intel::SymbolKind::Interface
+                | code_intel::SymbolKind::Trait
+            ) {
+                let members = code_intel::extract_members(&source, lang, sym.start_line);
+                if !members.is_empty() {
+                    parts.push(format!(""));
+                    parts.push(format!("  Members ({}):", members.len()));
+                    for m in members.iter().take(10) {
+                        let type_str = if m.type_annotation.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", m.type_annotation)
+                        };
+                        parts.push(format!("    {} {}{}", m.kind, m.name, type_str));
+                    }
+                    if members.len() > 10 {
+                        parts.push(format!("    ... +{} more", members.len() - 10));
+                    }
+                }
+            }
+
+            // Calls made by this function
+            if matches!(sym.kind,
+                code_intel::SymbolKind::Function | code_intel::SymbolKind::Method
+            ) {
+                let calls = code_intel::extract_calls(
+                    &source, lang, sym.start_line, sym.end_line,
+                );
+                if !calls.is_empty() {
+                    parts.push(format!(""));
+                    let call_names: Vec<String> = calls.iter().take(8)
+                        .map(|c| {
+                            if let Some(ref r) = c.receiver {
+                                format!("{}.{}", r, c.callee)
+                            } else {
+                                c.callee.clone()
+                            }
+                        })
+                        .collect();
+                    parts.push(format!("  Calls: {}", call_names.join(", ")));
+                    if calls.len() > 8 {
+                        parts.push(format!("    +{} more", calls.len() - 8));
+                    }
+                }
+            }
+
+            // Usage count
+            let ref_count = self.count_symbol_references(&sym.name);
+            if ref_count < usize::MAX {
+                parts.push(format!("  Referenced: {} times in project", ref_count));
+            }
+        } else if let Some((name, _)) = &cursor_ident {
+            // Not a definition line, but we found an identifier — show usage count
+            let ref_count = self.count_symbol_references(name);
+            if ref_count < usize::MAX {
+                parts.push(format!("  Referenced: {} times in project", ref_count));
+            }
+        } else {
+            // Show source line for context
+            let lines: Vec<&str> = source.lines().collect();
+            if line > 0 && line <= lines.len() {
+                parts.push(format!("Line {}: {}", line, lines[line - 1].trim()));
+            }
+        }
+
+        if parts.is_empty() {
+            return format!("No symbol information at {}:{}", rel_path.display(), line);
+        }
+
+        parts.join("\n")
+    }
+
+    // ── symbol_search tool ───────────────────────────────────────────────
+
+    fn symbol_search(&self, args: &Value) -> String {
+        let query = match args.get("query").and_then(Value::as_str) {
+            Some(q) if !q.trim().is_empty() => q.trim().to_lowercase(),
+            _ => return "Error: missing 'query'".to_string(),
+        };
+        let kind_filter = args.get("kind").and_then(Value::as_str).unwrap_or("all");
+        let include_glob = args.get("include").and_then(Value::as_str);
+        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
+
+        let extensions = ["rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "h", "cpp", "cc", "hpp", "rb"];
+        let skip_dirs = ["node_modules", "target", "vendor", "dist", "__pycache__", ".git"];
+        let files = self.collect_project_files(&skip_dirs, &extensions, 300);
+
+        struct Match {
+            name: String,
+            kind: String,
+            file: String,
+            line: usize,
+            signature: String,
+            score: usize, // lower = better
+        }
+
+        let mut matches: Vec<Match> = Vec::new();
+
+        for file_path in &files {
+            // Apply glob filter
+            if let Some(inc) = include_glob {
+                let name = file_path.file_name().unwrap_or_default().to_string_lossy();
+                let pat = inc.trim_start_matches('*');
+                if !name.ends_with(pat) {
+                    continue;
+                }
+            }
+
+            let lang = match code_intel::detect_language(file_path) {
+                Some(l) => l,
+                None => continue,
+            };
+            let content = match fs::read_to_string(file_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let rel = file_path.strip_prefix(&self.project_root)
+                .unwrap_or(file_path).to_string_lossy().to_string();
+
+            let symbols = code_intel::extract_symbols(&content, lang);
+            for sym in symbols {
+                // Kind filter
+                let kind_str = sym.kind.as_str();
+                match kind_filter {
+                    "function" if kind_str != "fn" && kind_str != "method" => continue,
+                    "type" if !matches!(sym.kind,
+                        code_intel::SymbolKind::Struct
+                        | code_intel::SymbolKind::Class
+                        | code_intel::SymbolKind::Enum
+                        | code_intel::SymbolKind::Interface
+                        | code_intel::SymbolKind::Trait
+                        | code_intel::SymbolKind::Type
+                    ) => continue,
+                    "method" if kind_str != "method" => continue,
+                    "constant" if kind_str != "const" && kind_str != "var" => continue,
+                    _ => {}
+                }
+
+                let name_lower = sym.name.to_lowercase();
+                if !name_lower.contains(&query) {
+                    continue;
+                }
+
+                // Score: exact match = 0, starts-with = 1, contains = 2
+                let score = if name_lower == query {
+                    0
+                } else if name_lower.starts_with(&query) {
+                    1
+                } else {
+                    2
+                };
+
+                matches.push(Match {
+                    name: sym.name,
+                    kind: kind_str.to_string(),
+                    file: rel.clone(),
+                    line: sym.start_line,
+                    signature: sym.signature,
+                    score,
+                });
+            }
+        }
+
+        // Sort by score (exact first), then by name
+        matches.sort_by(|a, b| a.score.cmp(&b.score).then(a.name.cmp(&b.name)));
+        matches.truncate(limit);
+
+        if matches.is_empty() {
+            return format!("No symbols matching '{}' found", query);
+        }
+
+        let mut parts = Vec::new();
+        parts.push(format!("Symbols matching '{}' ({} results):", query, matches.len()));
+        parts.push(String::new());
+
+        for m in &matches {
+            let sig = if m.signature.len() > 80 {
+                let mut end = 80;
+                while !m.signature.is_char_boundary(end) && end > 0 {
+                    end -= 1;
+                }
+                format!("{}...", &m.signature[..end])
+            } else {
+                m.signature.clone()
+            };
+            parts.push(format!("  [{}] {} — {}:{}", m.kind, sig, m.file, m.line));
+        }
+
+        parts.join("\n")
     }
 
     fn call_graph(&self, args: &Value) -> String {
@@ -4933,5 +5235,165 @@ impl MyType {
         assert_eq!(impls.len(), 2, "should find 2 trait impls, not inherent: {:?}", impls);
         assert!(impls.iter().any(|i| i.trait_name == "Foo" && i.type_name == "MyType"));
         assert!(impls.iter().any(|i| i.trait_name == "Bar" && i.type_name == "MyType"));
+    }
+
+    // ── hover_info tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hover_info_on_function_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "/// Computes the sum.\nfn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
+        std::fs::write(dir.path().join("math.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("hover_info", &json!({
+            "file": "math.rs", "line": 2
+        })).await;
+
+        assert!(result.contains("add"), "should show function name: {result}");
+        assert!(result.contains("fn"), "should show kind: {result}");
+        assert!(result.contains("sum"), "should show doc: {result}");
+    }
+
+    #[tokio::test]
+    async fn hover_info_on_struct_shows_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "pub struct Config {\n    pub host: String,\n    pub port: u16,\n}\n";
+        std::fs::write(dir.path().join("config.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("hover_info", &json!({
+            "file": "config.rs", "line": 1
+        })).await;
+
+        assert!(result.contains("Config"), "should show struct name: {result}");
+        assert!(result.contains("Members"), "should show members section: {result}");
+        assert!(result.contains("host"), "should list host field: {result}");
+        assert!(result.contains("port"), "should list port field: {result}");
+    }
+
+    #[tokio::test]
+    async fn hover_info_scope_breadcrumbs() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "struct Server;\nimpl Server {\n    fn start(&self) {\n        println!(\"ok\");\n    }\n}\n";
+        std::fs::write(dir.path().join("server.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("hover_info", &json!({
+            "file": "server.rs", "line": 4
+        })).await;
+
+        // Line 4 is inside fn start, scope should show breadcrumbs
+        assert!(result.contains("start"), "should show start in scope: {result}");
+        assert!(result.contains("📍"), "should show scope marker: {result}");
+    }
+
+    #[tokio::test]
+    async fn hover_info_with_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "fn foo() { bar(); }\nfn bar() { 42; }\n";
+        std::fs::write(dir.path().join("fns.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("hover_info", &json!({
+            "file": "fns.rs", "line": 1, "column": 3
+        })).await;
+
+        assert!(result.contains("foo"), "should identify foo at column 3: {result}");
+    }
+
+    // ── symbol_search tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn symbol_search_finds_functions() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "fn process_data() {}\nfn process_config() {}\nfn unrelated() {}\n";
+        std::fs::write(dir.path().join("app.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("symbol_search", &json!({
+            "query": "process"
+        })).await;
+
+        assert!(result.contains("process_data"), "should find process_data: {result}");
+        assert!(result.contains("process_config"), "should find process_config: {result}");
+        assert!(!result.contains("unrelated"), "should NOT find unrelated: {result}");
+    }
+
+    #[tokio::test]
+    async fn symbol_search_kind_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "struct Config {}\nfn config_new() {}\nconst CONFIG_MAX: u32 = 100;\n";
+        std::fs::write(dir.path().join("cfg.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("symbol_search", &json!({
+            "query": "config",
+            "kind": "type"
+        })).await;
+
+        assert!(result.contains("Config"), "should find Config struct: {result}");
+        assert!(!result.contains("config_new"), "should NOT find function: {result}");
+    }
+
+    #[tokio::test]
+    async fn symbol_search_exact_match_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "fn run() {}\nfn run_all() {}\nfn prerun() {}\n";
+        std::fs::write(dir.path().join("runner.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("symbol_search", &json!({
+            "query": "run"
+        })).await;
+
+        // "run" should appear before "run_all" and "prerun"
+        let pos_run = result.find("fn run()").unwrap_or(9999);
+        let pos_run_all = result.find("fn run_all()").unwrap_or(9999);
+        assert!(pos_run < pos_run_all, "exact match should come first: {result}");
+    }
+
+    #[tokio::test]
+    async fn symbol_search_cross_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn search_user() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn search_order() {}\n").unwrap();
+        std::fs::write(dir.path().join("c.py"), "def search_log():\n    pass\n").unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("symbol_search", &json!({
+            "query": "search"
+        })).await;
+
+        assert!(result.contains("search_user"), "should find in a.rs: {result}");
+        assert!(result.contains("search_order"), "should find in b.rs: {result}");
+        assert!(result.contains("search_log"), "should find in c.py: {result}");
+    }
+
+    #[tokio::test]
+    async fn symbol_search_no_results() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("empty.rs"), "fn hello() {}\n").unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("symbol_search", &json!({
+            "query": "nonexistent_xyz"
+        })).await;
+
+        assert!(result.contains("No symbols matching"), "should report no results: {result}");
+    }
+
+    #[test]
+    fn code_intel_identifier_at_position() {
+        let source = "fn foo() {\n    let bar = 42;\n}\n";
+        // Line 1 (fn foo), col 3 → "foo"
+        let result = code_intel::identifier_at_position(source, code_intel::Language::Rust, 1, 3);
+        assert!(result.is_some(), "should find identifier at fn name");
+        assert_eq!(result.unwrap().0, "foo");
+
+        // Line 2, col 8 → "bar"
+        let result = code_intel::identifier_at_position(source, code_intel::Language::Rust, 2, 8);
+        assert!(result.is_some(), "should find identifier at let binding");
+        assert_eq!(result.unwrap().0, "bar");
     }
 }

@@ -908,7 +908,7 @@ mod tests {
                 "read_file", "bash", "str_replace", "write_file", "delete_file", "multi_edit",
                 "list_dir", "grep", "glob",
                 "find_definition", "find_references", "call_graph", "symbols", "rename_symbol", "dead_code",
-                "extract_members", "type_hierarchy",
+                "extract_members", "type_hierarchy", "hover_info", "symbol_search",
                 "run_build_test",
                 "git_diff", "git_log", "git_commit", "git_stash",
                 "github_list_prs", "github_repo_stats",
@@ -926,8 +926,8 @@ mod tests {
         assert!(p.contains("## Memory Rules"));
         // Budget: full prompt should still be reasonable
         assert!(
-            p.len() < 11500,
-            "full toolset prompt should be under 11500 chars, got {}",
+            p.len() < 12000,
+            "full toolset prompt should be under 12000 chars, got {}",
             p.len()
         );
     }

@@ -420,6 +420,70 @@ pub fn export_dirty_from_modules(
     }
 }
 
+/// Export only dirty learning data from modules since last sync.
+///
+/// Unlike `export_dirty_from_modules`, this excludes tool health deltas.
+/// This is useful for callers that only have access to the persistent
+/// tool-health snapshot, not the live `ToolHealthTracker`.
+pub fn export_dirty_learning_from_modules(
+    entity_graph: &Arc<Mutex<EntityGraph>>,
+    pattern_library: &Arc<Mutex<PatternLibrary>>,
+    calibrator: &Arc<Mutex<ProgressiveCalibrator>>,
+) -> Option<DeltaSnapshot> {
+    let mut delta = DeltaSnapshot {
+        baseline_epoch: 0,
+        entity_deltas: Vec::new(),
+        pattern_deltas: Vec::new(),
+        calibration: None,
+        tool_health_deltas: Vec::new(),
+        delta_count: 0,
+    };
+
+    if let Ok(graph) = entity_graph.lock() {
+        if graph.has_dirty() {
+            delta.baseline_epoch = graph.last_sync_epoch();
+            for ent in graph.export_dirty() {
+                if let Ok(json) = serde_json::to_value(&ent) {
+                    delta.entity_deltas.push(json);
+                    delta.delta_count += 1;
+                }
+            }
+        }
+    }
+
+    if let Ok(library) = pattern_library.lock() {
+        if library.has_dirty() {
+            if delta.baseline_epoch == 0 {
+                delta.baseline_epoch = library.last_sync_epoch();
+            }
+            for pat in library.export_dirty() {
+                if let Ok(json) = serde_json::to_value(&pat) {
+                    delta.pattern_deltas.push(json);
+                    delta.delta_count += 1;
+                }
+            }
+        }
+    }
+
+    if let Ok(cal) = calibrator.lock() {
+        if cal.has_dirty() {
+            if delta.baseline_epoch == 0 {
+                delta.baseline_epoch = cal.last_sync_epoch();
+            }
+            if let Ok(json) = serde_json::to_value(&cal.export()) {
+                delta.calibration = Some(json);
+                delta.delta_count += 1;
+            }
+        }
+    }
+
+    if delta.delta_count > 0 {
+        Some(delta)
+    } else {
+        None
+    }
+}
+
 /// Clear dirty flags from all modules after successful sync.
 pub fn clear_dirty_in_modules(
     entity_graph: &Arc<Mutex<EntityGraph>>,
@@ -439,6 +503,23 @@ pub fn clear_dirty_in_modules(
     tool_health.clear_dirty();
 }
 
+/// Clear dirty flags from learning modules after successful sync.
+pub fn clear_dirty_learning_in_modules(
+    entity_graph: &Arc<Mutex<EntityGraph>>,
+    pattern_library: &Arc<Mutex<PatternLibrary>>,
+    calibrator: &Arc<Mutex<ProgressiveCalibrator>>,
+) {
+    if let Ok(mut graph) = entity_graph.lock() {
+        graph.clear_dirty();
+    }
+    if let Ok(mut library) = pattern_library.lock() {
+        library.clear_dirty();
+    }
+    if let Ok(mut cal) = calibrator.lock() {
+        cal.clear_dirty();
+    }
+}
+
 /// Check if any module has dirty data needing sync.
 pub fn has_dirty_data(
     entity_graph: &Arc<Mutex<EntityGraph>>,
@@ -452,6 +533,19 @@ pub fn has_dirty_data(
     let tools_dirty = tool_health.has_dirty();
 
     entities_dirty || patterns_dirty || calibration_dirty || tools_dirty
+}
+
+/// Check if any learning module has dirty data needing sync.
+pub fn has_dirty_learning_data(
+    entity_graph: &Arc<Mutex<EntityGraph>>,
+    pattern_library: &Arc<Mutex<PatternLibrary>>,
+    calibrator: &Arc<Mutex<ProgressiveCalibrator>>,
+) -> bool {
+    let entities_dirty = entity_graph.lock().map(|g| g.has_dirty()).unwrap_or(false);
+    let patterns_dirty = pattern_library.lock().map(|l| l.has_dirty()).unwrap_or(false);
+    let calibration_dirty = calibrator.lock().map(|c| c.has_dirty()).unwrap_or(false);
+
+    entities_dirty || patterns_dirty || calibration_dirty
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

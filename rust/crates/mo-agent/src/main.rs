@@ -1455,6 +1455,105 @@ async fn try_cloud_push_versioned(
     result.new_version
 }
 
+/// Push only changed learning data to cloud using delta sync.
+///
+/// Delta sync reduces bandwidth by ~90%: full snapshot ~40KB, delta ~2-5KB.
+/// Falls back to full push if delta export fails or is empty.
+///
+/// Returns the new cloud version if successful, None otherwise.
+async fn try_cloud_push_delta(
+    profile_name: &str,
+    entity_graph: &std::sync::Arc<
+        std::sync::Mutex<mo_agent_runtime::pipeline::entity::EntityGraph>,
+    >,
+    pattern_library: &std::sync::Arc<
+        std::sync::Mutex<mo_agent_runtime::pipeline::pattern::PatternLibrary>,
+    >,
+    calibrator: &std::sync::Arc<
+        std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
+    >,
+    expected_version: Option<i64>,
+) -> Option<i64> {
+    if !mo_agent_runtime::pipeline::persistence::has_dirty_learning_data(
+        entity_graph,
+        pattern_library,
+        calibrator,
+    ) {
+        return expected_version;
+    }
+
+    let delta = match mo_agent_runtime::pipeline::persistence::export_dirty_learning_from_modules(
+        entity_graph,
+        pattern_library,
+        calibrator,
+    ) {
+        Some(delta) => delta,
+        None => return expected_version,
+    };
+
+    let delta_json = match serde_json::to_string(&delta) {
+        Ok(j) => j,
+        Err(_) => return None,
+    };
+
+    let pool = match try_connect_matrixone().await {
+        Some(p) => p,
+        None => return None,
+    };
+
+    let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
+    let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+
+    let result = mo_agent_services::state_sync::StateSyncService::push_delta(
+        &svc,
+        &user_id,
+        profile_name,
+        &delta_json,
+        expected_version,
+    )
+    .await;
+
+    if result.is_conflict {
+        eprintln!(
+            "{}",
+            "  ⚠ Delta sync conflict (another session updated)".yellow()
+        );
+        return None;
+    }
+
+    if result.success {
+        mo_agent_runtime::pipeline::persistence::clear_dirty_learning_in_modules(
+            entity_graph,
+            pattern_library,
+            calibrator,
+        );
+
+        if let Some(v) = result.new_version {
+            eprintln!(
+                "{}",
+                format!(
+                    "  ✓ Delta synced to cloud (v{}, {} items, {}B)",
+                    v,
+                    delta.delta_count,
+                    delta_json.len()
+                )
+                .dim()
+            );
+            return Some(v);
+        }
+        eprintln!(
+            "{}",
+            format!("  ✓ Delta synced ({} items)", delta.delta_count).dim()
+        );
+    } else {
+        eprintln!(
+            "{}",
+            format!("  ⚠ Delta push skipped: {}", result.message).dim()
+        );
+    }
+    result.new_version
+}
+
 /// Pull user preferences from cloud at session start.
 /// Merges cloud preferences into local state (cloud-wins).
 async fn try_cloud_pull_preferences(state: &mut ReplState) {
@@ -2163,13 +2262,13 @@ async fn run_chat_repl(
                             mo_agent_services::session_checkpoint::CHECKPOINT_INTERVAL,
                         )
                     {
-                        // Use versioned push for optimistic locking
-                        if let Some(new_version) = try_cloud_push_versioned(
+                        // Use delta push at checkpoints to reduce sync bandwidth.
+                        // Final session-end sync still uses full push for convergence.
+                        if let Some(new_version) = try_cloud_push_delta(
                             &profile_name_str,
                             &pipeline_modules.entity_graph,
                             &pipeline_modules.pattern_library,
                             &pipeline_modules.calibrator,
-                            &state.tool_health_entries,
                             state.cloud_learning_version,
                         )
                         .await
@@ -4191,6 +4290,26 @@ total_tokens_out: 500
         // Should not panic (was the original bug)
         // Use versioned API (None = new snapshot or unconditional push)
         let _result = try_cloud_push_versioned("default", &eg, &pl, &cal, &[], None).await;
+    }
+
+    #[tokio::test]
+    async fn try_cloud_push_delta_is_noop_without_matrixone() {
+        unsafe {
+            std::env::remove_var("MATRIXONE_HOST");
+        }
+        let eg = std::sync::Arc::new(std::sync::Mutex::new(
+            mo_agent_runtime::pipeline::entity::EntityGraph::new(),
+        ));
+        let pl = std::sync::Arc::new(std::sync::Mutex::new(
+            mo_agent_runtime::pipeline::pattern::PatternLibrary::new(),
+        ));
+        let cal = std::sync::Arc::new(std::sync::Mutex::new(
+            mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator::new(0.15),
+        ));
+        eg.lock()
+            .unwrap()
+            .learn("rust", mo_agent_runtime::pipeline::routing::DomainHint::Code, &[], None);
+        let _result = try_cloud_push_delta("default", &eg, &pl, &cal, None).await;
     }
 
     #[tokio::test]

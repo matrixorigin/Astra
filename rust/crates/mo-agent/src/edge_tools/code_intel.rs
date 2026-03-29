@@ -1147,6 +1147,70 @@ pub struct ScopeContext {
     pub symbol: Option<Symbol>,
 }
 
+/// Identify the symbol/identifier at exact (line, column) using tree-sitter AST.
+/// Returns (identifier_text, node_kind) or None if not on an identifier.
+pub fn identifier_at_position(
+    source: &str,
+    lang: Language,
+    line: usize,
+    column: usize,
+) -> Option<(String, String)> {
+    let mut parser = tree_sitter::Parser::new();
+    let language: tree_sitter::Language = match lang {
+        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
+        Language::Python => tree_sitter_python::LANGUAGE.into(),
+        Language::TypeScript | Language::JavaScript => {
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+        }
+        Language::Go => tree_sitter_go::LANGUAGE.into(),
+        Language::Java => tree_sitter_java::LANGUAGE.into(),
+        Language::C | Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+    };
+    if parser.set_language(&language).is_err() {
+        return None;
+    }
+    let tree = parser.parse(source, None)?;
+
+    let point = tree_sitter::Point {
+        row: line.saturating_sub(1),
+        column,
+    };
+
+    let node = tree.root_node().descendant_for_point_range(point, point)?;
+
+    // Walk up to find an identifier or type_identifier node
+    let mut current = node;
+    for _ in 0..5 {
+        let kind = current.kind();
+        if kind == "identifier"
+            || kind == "type_identifier"
+            || kind == "field_identifier"
+            || kind == "property_identifier"
+            || kind == "method_name"
+            || kind == "name"
+        {
+            let text = current
+                .utf8_text(source.as_bytes())
+                .ok()?
+                .to_string();
+            return Some((text, kind.to_string()));
+        }
+        match current.parent() {
+            Some(p) => current = p,
+            None => break,
+        }
+    }
+
+    // If we landed on a leaf node with content, use it directly
+    let text = node.utf8_text(source.as_bytes()).ok()?.to_string();
+    if !text.is_empty() && text.len() < 100 && !text.contains('\n') {
+        Some((text, node.kind().to_string()))
+    } else {
+        None
+    }
+}
+
 /// Find the enclosing scope at a given line (1-indexed).
 pub fn scope_at_line(source: &str, lang: Language, line: usize) -> ScopeContext {
     let symbols = extract_symbols(source, lang);
