@@ -27,9 +27,10 @@ use serde::{Deserialize, Serialize};
 // ─── Task Model ─────────────────────────────────────────────────────────────
 
 /// Task lifecycle status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
+    #[default]
     Pending,
     InProgress,
     Paused,
@@ -68,13 +69,22 @@ impl TaskStatus {
 }
 
 /// A single subtask within a plan.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubtaskPlan {
     pub id: String,
     pub title: String,
     pub description: Option<String>,
     pub depends_on: Vec<String>,
     pub status: TaskStatus,
+    /// Estimated effort: "small" (< 30 lines), "medium" (30-100), "large" (100+)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Files likely to be modified (relative paths)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    /// Acceptance criteria — how to verify this subtask is done
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<String>,
 }
 
 /// Decomposed plan for a complex task.
@@ -709,6 +719,7 @@ mod tests {
                     description: None,
                     depends_on: vec![],
                     status: TaskStatus::Completed,
+                    ..Default::default()
                 },
                 SubtaskPlan {
                     id: "b".into(),
@@ -716,6 +727,7 @@ mod tests {
                     description: None,
                     depends_on: vec!["a".into()],
                     status: TaskStatus::Pending,
+                    ..Default::default()
                 },
                 SubtaskPlan {
                     id: "c".into(),
@@ -723,6 +735,7 @@ mod tests {
                     description: None,
                     depends_on: vec!["a".into()],
                     status: TaskStatus::Pending,
+                    ..Default::default()
                 },
             ],
             notes: None,
@@ -741,6 +754,7 @@ mod tests {
                     description: None,
                     depends_on: vec![],
                     status: TaskStatus::Completed,
+                    ..Default::default()
                 },
                 SubtaskPlan {
                     id: "b".into(),
@@ -748,6 +762,7 @@ mod tests {
                     description: None,
                     depends_on: vec!["a".into()],
                     status: TaskStatus::Pending,
+                    ..Default::default()
                 },
                 SubtaskPlan {
                     id: "c".into(),
@@ -755,6 +770,7 @@ mod tests {
                     description: None,
                     depends_on: vec!["b".into()],
                     status: TaskStatus::Pending,
+                    ..Default::default()
                 },
             ],
             notes: None,
@@ -774,6 +790,7 @@ mod tests {
                     description: None,
                     depends_on: vec![],
                     status: TaskStatus::Completed,
+                    ..Default::default()
                 },
                 SubtaskPlan {
                     id: "b".into(),
@@ -781,6 +798,7 @@ mod tests {
                     description: None,
                     depends_on: vec!["a".into()],
                     status: TaskStatus::Pending,
+                    ..Default::default()
                 },
                 SubtaskPlan {
                     id: "c".into(),
@@ -788,6 +806,7 @@ mod tests {
                     description: None,
                     depends_on: vec!["a".into()],
                     status: TaskStatus::Pending,
+                    ..Default::default()
                 },
             ],
             notes: None,
@@ -1013,6 +1032,7 @@ mod tests {
                     description: None,
                     depends_on: vec![],
                     status: TaskStatus::Pending,
+                    ..Default::default()
                 },
                 SubtaskPlan {
                     id: "b".into(),
@@ -1020,6 +1040,7 @@ mod tests {
                     description: None,
                     depends_on: vec!["a".into()],
                     status: TaskStatus::Pending,
+                    ..Default::default()
                 },
             ],
             notes: Some("two-step plan".into()),
@@ -1081,6 +1102,7 @@ mod tests {
                                 description: None,
                                 depends_on: vec![],
                                 status: TaskStatus::Completed,
+                                ..Default::default()
                             },
                             SubtaskPlan {
                                 id: "s2".into(),
@@ -1088,6 +1110,7 @@ mod tests {
                                 description: None,
                                 depends_on: vec!["s1".into()],
                                 status: TaskStatus::InProgress,
+                                ..Default::default()
                             },
                             SubtaskPlan {
                                 id: "s3".into(),
@@ -1095,6 +1118,7 @@ mod tests {
                                 description: None,
                                 depends_on: vec!["s2".into()],
                                 status: TaskStatus::Pending,
+                                ..Default::default()
                             },
                         ],
                         notes: None,

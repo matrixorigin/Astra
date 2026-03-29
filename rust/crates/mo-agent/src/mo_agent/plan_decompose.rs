@@ -32,6 +32,12 @@ pub struct ProjectContext {
     pub structure_summary: String,
     /// Number of source files.
     pub source_file_count: usize,
+    /// Key source modules with line counts: ("src/main.rs", 150)
+    pub key_modules: Vec<(String, usize)>,
+    /// Git branch name if in a repo.
+    pub git_branch: Option<String>,
+    /// Test framework detected (e.g., "cargo test", "pytest", "jest").
+    pub test_framework: Option<String>,
 }
 
 /// Scan project root to gather context for planning.
@@ -134,6 +140,36 @@ pub fn analyze_project(root: &Path) -> ProjectContext {
     ctx.languages.sort();
     ctx.source_file_count = source_count;
 
+    // Collect key modules: largest source files (by line count), top 15
+    let mut source_files: Vec<(String, usize)> = Vec::new();
+    collect_source_files(root, root, 0, 4, &mut source_files);
+    source_files.sort_by(|a, b| b.1.cmp(&a.1));
+    source_files.truncate(15);
+    ctx.key_modules = source_files;
+
+    // Detect test framework
+    if root.join("Cargo.toml").exists() {
+        ctx.test_framework = Some("cargo test".into());
+    } else if root.join("package.json").exists() {
+        if root.join("jest.config.js").exists() || root.join("jest.config.ts").exists() {
+            ctx.test_framework = Some("jest".into());
+        } else {
+            ctx.test_framework = Some("npm test".into());
+        }
+    } else if root.join("pyproject.toml").exists() || root.join("setup.py").exists() {
+        ctx.test_framework = Some("pytest".into());
+    } else if root.join("go.mod").exists() {
+        ctx.test_framework = Some("go test".into());
+    }
+
+    // Detect git branch
+    let head_file = root.join(".git").join("HEAD");
+    if let Ok(head) = std::fs::read_to_string(&head_file) {
+        if let Some(branch) = head.trim().strip_prefix("ref: refs/heads/") {
+            ctx.git_branch = Some(branch.to_string());
+        }
+    }
+
     // Build structure summary
     let mut dirs = Vec::new();
     if let Ok(entries) = std::fs::read_dir(root) {
@@ -156,59 +192,109 @@ pub fn analyze_project(root: &Path) -> ProjectContext {
     ctx
 }
 
+/// Collect source files with line counts for key module analysis.
+fn collect_source_files(root: &Path, dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<(String, usize)>) {
+    if depth > max_depth || out.len() > 200 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let source_exts = ["rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "rb", "cpp", "c"];
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with('.') || matches!(name_str.as_ref(), "node_modules" | "target" | "venv" | "__pycache__" | "dist" | "build") {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            collect_source_files(root, &path, depth + 1, max_depth, out);
+        } else if path.is_file() {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if source_exts.contains(&ext) {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        let lines = content.lines().count();
+                        if lines > 20 {
+                            let rel = path.strip_prefix(root).unwrap_or(&path).display().to_string();
+                            out.push((rel, lines));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Prompt template for plan decomposition.
 pub fn decomposition_prompt(goal: &str, context: &ProjectContext) -> String {
-    format!(
-        r#"You are a senior software architect analyzing a project and creating an execution plan.
+    let mut prompt = String::with_capacity(2048);
 
-## Project Context
-- Root: {root}
-- Entry points: {entry_points}
-- Languages: {languages}
-- Structure: {structure}
-- Source files: ~{count}
+    prompt.push_str("You are a senior software architect creating an execution plan.\n\n");
+    prompt.push_str("## Project Context\n");
+    prompt.push_str(&format!("- Root: {}\n", context.root));
+    prompt.push_str(&format!(
+        "- Build system: {}\n",
+        if context.entry_points.is_empty() { "(none detected)".to_string() } else { context.entry_points.join(", ") }
+    ));
+    prompt.push_str(&format!(
+        "- Languages: {}\n",
+        if context.languages.is_empty() { "(unknown)".to_string() } else { context.languages.join(", ") }
+    ));
+    prompt.push_str(&format!("- Structure: {}\n", context.structure_summary));
+    prompt.push_str(&format!("- Source files: ~{}\n", context.source_file_count));
+    if let Some(ref branch) = context.git_branch {
+        prompt.push_str(&format!("- Git branch: {branch}\n"));
+    }
+    if let Some(ref test_fw) = context.test_framework {
+        prompt.push_str(&format!("- Test framework: {test_fw}\n"));
+    }
 
-## User Goal
-{goal}
+    // Key modules — the LLM needs this to suggest which files to modify
+    if !context.key_modules.is_empty() {
+        prompt.push_str("\n## Key Modules (by size)\n");
+        for (path, lines) in &context.key_modules {
+            prompt.push_str(&format!("- {path} ({lines} lines)\n"));
+        }
+    }
 
+    prompt.push_str(&format!("\n## Goal\n{goal}\n"));
+
+    prompt.push_str(r#"
 ## Instructions
-Break down this goal into 3-8 concrete subtasks. For each subtask:
-1. Give it a short ID (e.g., "setup", "impl-api", "tests")
-2. Provide a clear title
-3. List any dependencies (subtask IDs that must complete first)
-4. Keep scope manageable (each subtask should be completable in one focused session)
+Decompose this goal into 3-8 concrete subtasks. For EACH subtask, provide:
 
-Return a JSON object with this exact structure:
+1. **id**: short kebab-case ID (e.g., "add-auth", "fix-parser", "write-tests")
+2. **title**: one-line summary
+3. **description**: what specifically needs to be done
+4. **depends_on**: IDs of subtasks that must finish first (empty array if none)
+5. **effort**: estimated scope — "small" (<30 lines changed), "medium" (30-100), or "large" (100+)
+6. **files**: list of files likely to be modified (relative paths; best guess from project structure)
+7. **acceptance**: how to verify this subtask is done (e.g., "tests pass", "endpoint returns 200")
+
+Guidelines:
+- Order subtasks so dependencies come first
+- Each subtask should be completable in ONE focused session
+- Always include a testing subtask
+- If the goal involves refactoring, add a "verify no regression" final subtask
+
+Return ONLY this JSON:
 ```json
-{{
+{
   "subtasks": [
-    {{
+    {
       "id": "unique-id",
       "title": "Short title",
       "description": "What needs to be done",
-      "depends_on": ["id-of-dependency"]
-    }}
+      "depends_on": [],
+      "effort": "small|medium|large",
+      "files": ["src/foo.rs", "tests/test_foo.rs"],
+      "acceptance": "How to verify completion"
+    }
   ],
-  "notes": "Optional high-level approach notes"
-}}
-```
+  "notes": "High-level approach and risk considerations"
+}
+```"#);
 
-Only return the JSON, no other text."#,
-        root = context.root,
-        entry_points = if context.entry_points.is_empty() {
-            "(none detected)".to_string()
-        } else {
-            context.entry_points.join(", ")
-        },
-        languages = if context.languages.is_empty() {
-            "(unknown)".to_string()
-        } else {
-            context.languages.join(", ")
-        },
-        structure = context.structure_summary,
-        count = context.source_file_count,
-        goal = goal
-    )
+    prompt
 }
 
 /// Parse LLM response into a TaskPlan.
@@ -230,6 +316,9 @@ pub fn parse_plan_response(response: &str) -> Result<TaskPlan, String> {
             description: st.description,
             depends_on: st.depends_on.unwrap_or_default(),
             status: TaskStatus::Pending,
+            effort: st.effort,
+            files: st.files.unwrap_or_default(),
+            acceptance: st.acceptance,
         })
         .collect();
 
@@ -251,6 +340,9 @@ struct SubtaskResponse {
     title: String,
     description: Option<String>,
     depends_on: Option<Vec<String>>,
+    effort: Option<String>,
+    files: Option<Vec<String>>,
+    acceptance: Option<String>,
 }
 
 /// Extract JSON from a response that may include markdown code blocks.
@@ -310,14 +402,30 @@ pub fn format_plan(plan: &TaskPlan) -> String {
             TaskStatus::InProgress => "▶",
             TaskStatus::Failed => "✗",
             TaskStatus::Paused => "⏸",
-            _ if ready_ids.contains(st.id.as_str()) => "○", // ready to execute
-            _ => "·", // blocked
+            _ if ready_ids.contains(st.id.as_str()) => "○",
+            _ => "·",
         };
 
-        out.push_str(&format!("│ {} {} {}\n", status_icon, st.id, st.title));
+        // Effort badge
+        let effort_badge = match st.effort.as_deref() {
+            Some("small") => " [S]",
+            Some("medium") => " [M]",
+            Some("large") => " [L]",
+            _ => "",
+        };
+
+        out.push_str(&format!("│ {} {}{} {}\n", status_icon, st.id, effort_badge, st.title));
 
         if let Some(ref desc) = st.description {
             out.push_str(&format!("│     └─ {}\n", desc));
+        }
+
+        if !st.files.is_empty() {
+            out.push_str(&format!("│     📁 {}\n", st.files.join(", ")));
+        }
+
+        if let Some(ref acc) = st.acceptance {
+            out.push_str(&format!("│     ✅ {}\n", acc));
         }
 
         if !st.depends_on.is_empty() {
@@ -330,6 +438,18 @@ pub fn format_plan(plan: &TaskPlan) -> String {
     }
 
     out.push_str("└─────────────────────────────────────────────────\n");
+
+    // Effort summary
+    let small = plan.subtasks.iter().filter(|s| s.effort.as_deref() == Some("small")).count();
+    let medium = plan.subtasks.iter().filter(|s| s.effort.as_deref() == Some("medium")).count();
+    let large = plan.subtasks.iter().filter(|s| s.effort.as_deref() == Some("large")).count();
+    if small + medium + large > 0 {
+        out.push_str(&format!(
+            "  Effort: {} small, {} medium, {} large\n",
+            small, medium, large
+        ));
+    }
+
     out.push_str(&format!(
         "  Progress: {}% ({}/{})\n",
         plan.progress_pct(),
@@ -339,7 +459,7 @@ pub fn format_plan(plan: &TaskPlan) -> String {
 
     if !ready.is_empty() {
         out.push_str(&format!(
-            "  Ready to execute: {}\n",
+            "  Ready: {}\n",
             ready.iter().map(|st| st.id.as_str()).collect::<Vec<_>>().join(", ")
         ));
     }
@@ -579,6 +699,7 @@ Done!"#;
                     description: None,
                     depends_on: vec![],
                     status: TaskStatus::Completed,
+                    ..Default::default()
                 },
                 SubtaskPlan {
                     id: "pending".to_string(),
@@ -586,6 +707,7 @@ Done!"#;
                     description: Some("Needs work".to_string()),
                     depends_on: vec!["done".to_string()],
                     status: TaskStatus::Pending,
+                    ..Default::default()
                 },
             ],
             notes: Some("Test plan".to_string()),
@@ -605,6 +727,7 @@ Done!"#;
             languages: vec!["Rust".to_string()],
             structure_summary: "src, tests".to_string(),
             source_file_count: 42,
+            ..Default::default()
         };
 
         let prompt = decomposition_prompt("Add logging", &ctx);
@@ -626,6 +749,7 @@ Done!"#;
                     description: None,
                     depends_on: vec![],
                     status: TaskStatus::Pending,
+                    ..Default::default()
                 },
                 SubtaskPlan {
                     id: "b".to_string(),
@@ -633,6 +757,7 @@ Done!"#;
                     description: None,
                     depends_on: vec!["a".to_string()],
                     status: TaskStatus::Pending,
+                    ..Default::default()
                 },
             ],
             notes: None,
@@ -680,6 +805,7 @@ Done!"#;
                     description: None,
                     depends_on: vec![],
                     status: TaskStatus::Pending,
+                    ..Default::default()
                 },
                 SubtaskPlan {
                     id: "write-code".into(),
@@ -687,6 +813,7 @@ Done!"#;
                     description: None,
                     depends_on: vec!["setup-deps".into()],
                     status: TaskStatus::Pending,
+                    ..Default::default()
                 },
             ],
             notes: None,
@@ -716,6 +843,7 @@ Done!"#;
                 description: None,
                 depends_on: vec![],
                 status: TaskStatus::Pending,
+                ..Default::default()
             }],
             notes: None,
         });
@@ -737,6 +865,7 @@ Done!"#;
                     description: None,
                     depends_on: vec![],
                     status: TaskStatus::Pending,
+                    ..Default::default()
                 },
                 SubtaskPlan {
                     id: "test-integration".into(),
@@ -744,6 +873,7 @@ Done!"#;
                     description: None,
                     depends_on: vec![],
                     status: TaskStatus::Pending,
+                    ..Default::default()
                 },
             ],
             notes: None,
@@ -772,6 +902,7 @@ Done!"#;
                 description: Some("Do it".into()),
                 depends_on: vec![],
                 status: TaskStatus::Pending,
+                ..Default::default()
             }],
             notes: Some("my notes".into()),
         });
@@ -807,6 +938,7 @@ Done!"#;
                 description: None,
                 depends_on: vec![],
                 status: TaskStatus::Pending,
+                ..Default::default()
             }],
             notes: None,
         });
@@ -841,6 +973,7 @@ Done!"#;
                 description: None,
                 depends_on: vec![],
                 status: TaskStatus::Pending,
+                ..Default::default()
             }],
             notes: None,
         });
@@ -879,6 +1012,7 @@ Done!"#;
                     description: None,
                     depends_on: vec![],
                     status: TaskStatus::Pending,
+                    ..Default::default()
                 },
                 SubtaskPlan {
                     id: "b".into(),
@@ -886,6 +1020,7 @@ Done!"#;
                     description: None,
                     depends_on: vec![],
                     status: TaskStatus::Pending,
+                    ..Default::default()
                 },
             ],
             notes: None,
@@ -901,5 +1036,152 @@ Done!"#;
         ps.complete_subtask("b").unwrap();
         assert_eq!(ps.plan.progress_pct(), 100);
         assert_eq!(ps.plan.items_done(), 2);
+    }
+
+    // ─── Enhanced plan features tests ───────────────────────────────────
+
+    #[test]
+    fn analyze_project_detects_key_modules() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ctx = analyze_project(root);
+        assert!(
+            !ctx.key_modules.is_empty(),
+            "should find key modules in Rust project"
+        );
+        // Largest module should have a decent line count
+        let (_, lines) = &ctx.key_modules[0];
+        assert!(*lines > 50, "largest module should be >50 lines, got {lines}");
+    }
+
+    #[test]
+    fn analyze_project_detects_test_framework() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ctx = analyze_project(root);
+        assert_eq!(ctx.test_framework.as_deref(), Some("cargo test"));
+    }
+
+    #[test]
+    fn analyze_project_detects_git_branch() {
+        // This test runs in a git repo
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .expect("should find repo root");
+        let ctx = analyze_project(root);
+        assert!(ctx.git_branch.is_some(), "should detect git branch");
+    }
+
+    #[test]
+    fn decomposition_prompt_includes_new_fields() {
+        let ctx = ProjectContext {
+            root: "/myapp".to_string(),
+            entry_points: vec!["package.json".to_string()],
+            languages: vec!["TypeScript".to_string()],
+            structure_summary: "src, tests".to_string(),
+            source_file_count: 100,
+            key_modules: vec![
+                ("src/api.ts".to_string(), 500),
+                ("src/db.ts".to_string(), 300),
+            ],
+            git_branch: Some("feature/auth".to_string()),
+            test_framework: Some("jest".to_string()),
+        };
+
+        let prompt = decomposition_prompt("Add user authentication", &ctx);
+        assert!(prompt.contains("Key Modules"), "should include modules section: {prompt}");
+        assert!(prompt.contains("src/api.ts"), "should list key module: {prompt}");
+        assert!(prompt.contains("500 lines"), "should show line count: {prompt}");
+        assert!(prompt.contains("feature/auth"), "should include branch: {prompt}");
+        assert!(prompt.contains("jest"), "should include test framework: {prompt}");
+        assert!(prompt.contains("effort"), "should ask for effort: {prompt}");
+        assert!(prompt.contains("files"), "should ask for files: {prompt}");
+        assert!(prompt.contains("acceptance"), "should ask for acceptance: {prompt}");
+    }
+
+    #[test]
+    fn parse_plan_response_with_effort_and_files() {
+        let response = r#"```json
+{
+  "subtasks": [
+    {
+      "id": "add-model",
+      "title": "Add User model",
+      "description": "Create user schema",
+      "depends_on": [],
+      "effort": "small",
+      "files": ["src/models/user.ts", "src/db/schema.ts"],
+      "acceptance": "User model compiles and has tests"
+    },
+    {
+      "id": "add-api",
+      "title": "Add auth endpoints",
+      "depends_on": ["add-model"],
+      "effort": "large",
+      "files": ["src/routes/auth.ts"]
+    }
+  ],
+  "notes": "Use JWT for stateless auth"
+}
+```"#;
+
+        let plan = parse_plan_response(response).unwrap();
+        assert_eq!(plan.subtasks.len(), 2);
+
+        let s0 = &plan.subtasks[0];
+        assert_eq!(s0.effort.as_deref(), Some("small"));
+        assert_eq!(s0.files, vec!["src/models/user.ts", "src/db/schema.ts"]);
+        assert_eq!(s0.acceptance.as_deref(), Some("User model compiles and has tests"));
+
+        let s1 = &plan.subtasks[1];
+        assert_eq!(s1.effort.as_deref(), Some("large"));
+        assert!(s1.acceptance.is_none(), "optional field should be None");
+    }
+
+    #[test]
+    fn format_plan_shows_effort_and_files() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "impl".into(),
+                    title: "Implement feature".into(),
+                    description: Some("Do the thing".into()),
+                    depends_on: vec![],
+                    status: TaskStatus::Pending,
+                    effort: Some("medium".into()),
+                    files: vec!["src/feat.rs".into(), "tests/feat_test.rs".into()],
+                    acceptance: Some("cargo test passes".into()),
+                },
+                SubtaskPlan {
+                    id: "docs".into(),
+                    title: "Write docs".into(),
+                    description: None,
+                    depends_on: vec!["impl".into()],
+                    status: TaskStatus::Pending,
+                    effort: Some("small".into()),
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+
+        let output = format_plan(&plan);
+        assert!(output.contains("[M]"), "should show medium effort badge: {output}");
+        assert!(output.contains("[S]"), "should show small effort badge: {output}");
+        assert!(output.contains("📁"), "should show files icon: {output}");
+        assert!(output.contains("src/feat.rs"), "should list file: {output}");
+        assert!(output.contains("✅"), "should show acceptance: {output}");
+        assert!(output.contains("cargo test"), "should show acceptance criteria: {output}");
+        assert!(output.contains("Effort:"), "should show effort summary: {output}");
+    }
+
+    #[test]
+    fn parse_plan_response_backward_compatible() {
+        // Old format without effort/files/acceptance should still parse
+        let response = r#"{"subtasks": [{"id": "t1", "title": "Do thing"}]}"#;
+        let plan = parse_plan_response(response).unwrap();
+        assert_eq!(plan.subtasks[0].effort, None);
+        assert!(plan.subtasks[0].files.is_empty());
+        assert!(plan.subtasks[0].acceptance.is_none());
     }
 }
