@@ -848,6 +848,120 @@ pub(super) async fn handle_memory_domain_command(
                         eprintln!("  {} Not in plan mode.", "⚠".yellow());
                     }
                 }
+                "replan" => {
+                    // Regenerate plan based on current state and issues
+                    use super::plan_decompose::{
+                        detect_replan_needed, generate_replan_prompt, format_plan,
+                        parse_plan_response, ReplanReason,
+                    };
+                    
+                    let Some(ref mut ps) = state.plan_mode else {
+                        // Check if there's an executing plan to replan
+                        if let Some(ref exec_plan) = state.executing_plan {
+                            eprintln!("  {} Replan from executing plan not yet supported", "⚠".yellow());
+                            eprintln!("  {} Pause execution first with Ctrl+C, then enter plan mode", "💡".cyan());
+                        } else {
+                            eprintln!("  {} Not in plan mode. Use /plan first.", "⚠".yellow());
+                        }
+                        return Ok(());
+                    };
+                    
+                    let Some(tok) = token else {
+                        eprintln!("  {} Not logged in. Run /login first.", "✗".red());
+                        return Ok(());
+                    };
+                    
+                    // Determine reason for replan
+                    let reason = if !sub_arg.is_empty() {
+                        // User provided reason
+                        ReplanReason::UserRequest
+                    } else {
+                        // Auto-detect reason
+                        let failed: Vec<(&str, &str)> = vec![];  // TODO: track failed subtasks
+                        match detect_replan_needed(&ps.plan, state.plan_execution_rounds, &failed) {
+                            Some(suggestion) => suggestion.reason,
+                            None => ReplanReason::UserRequest,
+                        }
+                    };
+                    
+                    eprintln!();
+                    eprintln!("  {} Replanning: {}", "🔄".yellow(), reason.format());
+                    eprintln!("  {} Generating revised plan...", "⋯".dim());
+                    
+                    let prompt = generate_replan_prompt(&ps.goal, &ps.plan, &reason, &ps.context);
+                    let payload = serde_json::json!({
+                        "messages": [{"role": "user", "content": prompt}],
+                        "session_id": state.session_id.clone(),
+                    });
+                    
+                    let resp = client
+                        .post(format!("{base}/chat/turn"))
+                        .bearer_auth(tok)
+                        .json(&payload)
+                        .send()
+                        .await;
+                    
+                    match resp {
+                        Ok(r) if r.status().is_success() => {
+                            let mut full_text = String::new();
+                            let mut stream = r.bytes_stream();
+                            use futures_util::StreamExt;
+                            
+                            while let Some(chunk) = stream.next().await {
+                                if let Ok(bytes) = chunk {
+                                    let event_str = String::from_utf8_lossy(&bytes);
+                                    for line in event_str.lines() {
+                                        if let Some(data) = line.strip_prefix("data: ") {
+                                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                                                if let Some(content) = json.get("content").and_then(|v| v.as_str()) {
+                                                    full_text.push_str(content);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            match parse_plan_response(&full_text) {
+                                Ok(new_plan) => {
+                                    // Keep completed subtasks, update pending ones
+                                    let old_version = ps.version_history.current_version;
+                                    ps.update_plan(new_plan, &format!("Replan: {}", reason.format()));
+                                    let _ = ps.save_to_file(&super::plan_decompose::PlanModeState::state_path());
+                                    
+                                    eprintln!();
+                                    eprintln!("  {} Plan updated (v{} → v{})", 
+                                        "✓".green(), old_version, ps.version_history.current_version);
+                                    eprintln!();
+                                    eprintln!("{}", format_plan(&ps.plan));
+                                    eprintln!();
+                                    eprintln!("  {} Use '/plan diff {} {}' to see changes", 
+                                        "💡".cyan(), old_version, ps.version_history.current_version);
+                                }
+                                Err(e) => {
+                                    eprintln!("  {} Failed to parse replan: {}", "✗".red(), e);
+                                }
+                            }
+                        }
+                        Ok(r) => {
+                            eprintln!("  {} LLM call failed ({})", "✗".red(), r.status());
+                        }
+                        Err(e) => {
+                            eprintln!("  {} Request failed: {}", "✗".red(), e);
+                        }
+                    }
+                    
+                    // Increment replan count in cloud if available
+                    if let Some(ref svc) = state.task_service {
+                        use mo_agent_services::TaskService;
+                        let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
+                        if let Ok(tasks) = svc.list_tasks(user_id, None).await {
+                            if let Some(task) = tasks.iter().find(|t| t.title == ps.goal) {
+                                let _ = svc.increment_replan_count(&task.task_id).await;
+                            }
+                        }
+                    }
+                }
                 "parallel" => {
                     if let Some(ref ps) = state.plan_mode {
                         let analysis = crate::plan_decompose::analyze_parallelism(&ps.plan);

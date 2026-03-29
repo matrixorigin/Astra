@@ -2088,6 +2088,196 @@ pub fn format_parallelism(analysis: &ParallelGroups) -> String {
     out
 }
 
+// ─── Replan Detection ───────────────────────────────────────────────────────
+
+/// Reasons for suggesting a replan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplanReason {
+    /// Subtask execution failed
+    SubtaskFailed { subtask_id: String, error: String },
+    /// Dependencies are deadlocked (circular or missing)
+    DependencyDeadlock { blocked_ids: Vec<String> },
+    /// Too many file conflicts blocking parallel execution
+    FileConflicts { conflict_count: usize },
+    /// Execution taking longer than expected
+    SlowExecution { rounds: usize, expected: usize },
+    /// User explicitly requested replan
+    UserRequest,
+}
+
+impl ReplanReason {
+    pub fn format(&self) -> String {
+        match self {
+            Self::SubtaskFailed { subtask_id, error } => {
+                format!("Subtask '{}' failed: {}", subtask_id, error)
+            }
+            Self::DependencyDeadlock { blocked_ids } => {
+                format!("Dependency deadlock: {} subtasks blocked", blocked_ids.len())
+            }
+            Self::FileConflicts { conflict_count } => {
+                format!("{} file conflicts preventing parallel execution", conflict_count)
+            }
+            Self::SlowExecution { rounds, expected } => {
+                format!("Execution slow: {} rounds (expected {})", rounds, expected)
+            }
+            Self::UserRequest => "User requested replan".to_string(),
+        }
+    }
+}
+
+/// Replan suggestion with reason and proposed action.
+#[derive(Debug, Clone)]
+pub struct ReplanSuggestion {
+    pub reason: ReplanReason,
+    pub suggested_action: String,
+    pub auto_applicable: bool,  // Can be applied without user confirmation
+}
+
+/// Detect if a replan is needed based on current plan state.
+pub fn detect_replan_needed(
+    plan: &TaskPlan,
+    execution_rounds: usize,
+    failed_subtasks: &[(&str, &str)],  // (subtask_id, error_message)
+) -> Option<ReplanSuggestion> {
+    use mo_agent_services::task_orchestrator::TaskStatus;
+    
+    // 1. Check for failed subtasks
+    if let Some((id, error)) = failed_subtasks.first() {
+        return Some(ReplanSuggestion {
+            reason: ReplanReason::SubtaskFailed {
+                subtask_id: id.to_string(),
+                error: error.to_string(),
+            },
+            suggested_action: format!(
+                "Retry subtask '{}' or modify dependencies to work around failure",
+                id
+            ),
+            auto_applicable: false,
+        });
+    }
+    
+    // 2. Check for dependency deadlock
+    let pending: Vec<&str> = plan
+        .subtasks
+        .iter()
+        .filter(|s| s.status == TaskStatus::Pending)
+        .map(|s| s.id.as_str())
+        .collect();
+    
+    let ready = plan.ready_subtasks();
+    
+    // If there are pending subtasks but none are ready, we have a deadlock
+    if !pending.is_empty() && ready.is_empty() {
+        let blocked_ids: Vec<String> = pending.iter().map(|s| s.to_string()).collect();
+        return Some(ReplanSuggestion {
+            reason: ReplanReason::DependencyDeadlock { blocked_ids },
+            suggested_action: "Review dependencies and remove or reorder blocked subtasks".to_string(),
+            auto_applicable: false,
+        });
+    }
+    
+    // 3. Check for excessive file conflicts
+    let analysis = analyze_parallelism(plan);
+    if analysis.conflicts.len() >= 3 {
+        return Some(ReplanSuggestion {
+            reason: ReplanReason::FileConflicts {
+                conflict_count: analysis.conflicts.len(),
+            },
+            suggested_action: "Split subtasks to reduce file overlap or merge related subtasks".to_string(),
+            auto_applicable: false,
+        });
+    }
+    
+    // 4. Check for slow execution
+    let expected_rounds = plan.subtasks.len();
+    if execution_rounds > expected_rounds * 2 && execution_rounds >= 6 {
+        return Some(ReplanSuggestion {
+            reason: ReplanReason::SlowExecution {
+                rounds: execution_rounds,
+                expected: expected_rounds,
+            },
+            suggested_action: "Review subtask complexity or split into smaller tasks".to_string(),
+            auto_applicable: false,
+        });
+    }
+    
+    None
+}
+
+/// Generate a replan prompt for the LLM.
+pub fn generate_replan_prompt(
+    original_goal: &str,
+    current_plan: &TaskPlan,
+    reason: &ReplanReason,
+    context: &ProjectContext,
+) -> String {
+    use mo_agent_services::task_orchestrator::TaskStatus;
+    
+    let mut prompt = String::with_capacity(2048);
+    
+    prompt.push_str("You are replanning a task that encountered issues during execution.\n\n");
+    
+    prompt.push_str("## Original Goal\n");
+    prompt.push_str(original_goal);
+    prompt.push_str("\n\n");
+    
+    prompt.push_str("## Current Plan Status\n");
+    for st in &current_plan.subtasks {
+        let status_icon = match st.status {
+            TaskStatus::Completed => "✅",
+            TaskStatus::Failed => "❌",
+            TaskStatus::InProgress => "🔄",
+            TaskStatus::Pending => "⏳",
+            _ => "○",
+        };
+        prompt.push_str(&format!("- {} [{}] {} (deps: {:?})\n", 
+            status_icon, st.id, st.title, st.depends_on));
+    }
+    prompt.push_str("\n");
+    
+    prompt.push_str("## Problem Encountered\n");
+    prompt.push_str(&reason.format());
+    prompt.push_str("\n\n");
+    
+    prompt.push_str("## Project Context\n");
+    prompt.push_str(&format!("- Languages: {}\n", context.languages.join(", ")));
+    if let Some(ref branch) = context.git_branch {
+        prompt.push_str(&format!("- Git branch: {}\n", branch));
+    }
+    prompt.push_str("\n");
+    
+    prompt.push_str(r#"## Instructions
+Generate a revised plan that:
+1. Keeps completed subtasks as-is (do NOT modify them)
+2. Addresses the problem by modifying pending/failed subtasks
+3. May add new subtasks if needed
+4. May remove blocked subtasks if they're no longer relevant
+5. Updates dependencies to resolve deadlocks
+
+Return JSON in the same format as the original plan:
+```json
+{
+  "subtasks": [...],
+  "notes": "Explanation of changes made"
+}
+```
+"#);
+    
+    prompt
+}
+
+/// Format replan suggestion for CLI display.
+pub fn format_replan_suggestion(suggestion: &ReplanSuggestion) -> String {
+    let mut out = String::new();
+    out.push_str("\n");
+    out.push_str("  ⚠️ Replan Suggested\n");
+    out.push_str(&format!("  Reason: {}\n", suggestion.reason.format()));
+    out.push_str(&format!("  Action: {}\n", suggestion.suggested_action));
+    out.push_str("\n");
+    out.push_str("  Type '/plan replan' to regenerate the plan\n");
+    out
+}
+
 // ─── Plan Templates ─────────────────────────────────────────────────────────
 
 /// A reusable plan template.
@@ -4516,5 +4706,86 @@ Done!"#;
         // Simple questions should not trigger
         assert!(should_suggest_plan_mode("how does this work").is_none());
         assert!(should_suggest_plan_mode("explain the code").is_none());
+    }
+    
+    #[test]
+    fn detect_replan_deadlock() {
+        use mo_agent_services::task_orchestrator::{TaskPlan, SubtaskPlan, TaskStatus};
+        
+        // Create plan with circular dependency (a -> b -> a)
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "a".to_string(),
+                    title: "Task A".to_string(),
+                    depends_on: vec!["b".to_string()],
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".to_string(),
+                    title: "Task B".to_string(),
+                    depends_on: vec!["a".to_string()],
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+        
+        let result = detect_replan_needed(&plan, 0, &[]);
+        assert!(result.is_some());
+        let suggestion = result.unwrap();
+        assert!(matches!(suggestion.reason, ReplanReason::DependencyDeadlock { .. }));
+    }
+    
+    #[test]
+    fn detect_replan_failed_subtask() {
+        use mo_agent_services::task_orchestrator::{TaskPlan, SubtaskPlan, TaskStatus};
+        
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "test".to_string(),
+                title: "Test task".to_string(),
+                status: TaskStatus::Pending,
+                ..Default::default()
+            }],
+            notes: None,
+        };
+        
+        let failed = vec![("test", "compilation error")];
+        let result = detect_replan_needed(&plan, 0, &failed);
+        assert!(result.is_some());
+        let suggestion = result.unwrap();
+        assert!(matches!(suggestion.reason, ReplanReason::SubtaskFailed { .. }));
+    }
+    
+    #[test]
+    fn detect_replan_none_for_healthy_plan() {
+        use mo_agent_services::task_orchestrator::{TaskPlan, SubtaskPlan, TaskStatus};
+        
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "first".to_string(),
+                    title: "First task".to_string(),
+                    depends_on: vec![],
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "second".to_string(),
+                    title: "Second task".to_string(),
+                    depends_on: vec!["first".to_string()],
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+        
+        // Healthy plan with no issues
+        let result = detect_replan_needed(&plan, 1, &[]);
+        assert!(result.is_none());
     }
 }

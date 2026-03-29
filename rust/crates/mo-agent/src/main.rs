@@ -1223,6 +1223,17 @@ async fn run_plan_execution(
                     pct,
                     blocked.join(", ")
                 );
+                
+                // Detect and suggest replan
+                let failed: Vec<(&str, &str)> = vec![];
+                if let Some(suggestion) = plan_decompose::detect_replan_needed(
+                    &plan, 
+                    state.plan_execution_rounds, 
+                    &failed
+                ) {
+                    eprintln!("{}", plan_decompose::format_replan_suggestion(&suggestion));
+                }
+                
                 // Keep plan for potential resume
                 state.executing_plan = Some(plan);
             }
