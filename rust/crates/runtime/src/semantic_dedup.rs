@@ -232,9 +232,14 @@ impl SemanticDedup {
             }
         }
 
-        // Record this output (truncated)
+        // Record this output (truncated at character boundary)
         let truncated = if output.len() > 2000 {
-            &output[..2000]
+            // Find a valid UTF-8 boundary before 2000
+            let mut end = 2000;
+            while end > 0 && !output.is_char_boundary(end) {
+                end -= 1;
+            }
+            &output[..end]
         } else {
             output
         };
@@ -677,5 +682,27 @@ mod tests {
         );
         assert!(tracker.has_grep_in("src/"));
         assert!(!tracker.has_grep_in("tests/"));
+    }
+
+    #[test]
+    fn utf8_boundary_truncation_no_panic() {
+        // Create output with multi-byte UTF-8 characters (Chinese)
+        // Each Chinese character is 3 bytes. Build a string that's > 2000 bytes
+        // so truncation kicks in, with the 2000th byte in the middle of a char.
+        let chinese_chars = "你好世界"; // 4 chars × 3 bytes = 12 bytes
+        let output: String = chinese_chars.repeat(200); // 2400 bytes
+        assert!(output.len() > 2000);
+
+        // This should NOT panic even though byte 2000 lands mid-character
+        let mut tracker = SemanticDedup::new(0.75);
+        tracker.check_and_record("shell_exec", &json!({"cmd": "echo"}), &output, 1);
+
+        // Second call with similar output - triggers similarity check
+        let output2: String = chinese_chars.repeat(198);
+        let result =
+            tracker.check_and_record("shell_exec", &json!({"cmd": "echo2"}), &output2, 2);
+
+        // Just verify no panic occurred - similarity result depends on exact truncation
+        drop(result);
     }
 }
