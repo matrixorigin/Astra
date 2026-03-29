@@ -348,6 +348,9 @@ pub struct ToolCallRecord {
     /// Output size in bytes (result/response).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_bytes: Option<u32>,
+    /// Preview of tool arguments (truncated to ~80 chars).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args_preview: Option<String>,
 }
 
 /// A single journal event (one line in the JSONL file).
@@ -1134,6 +1137,7 @@ mod tests {
             error: None,
             input_bytes: None,
             output_bytes: None,
+            args_preview: Some("owner/repo".into()),
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"ok\":true"));
@@ -1154,6 +1158,7 @@ mod tests {
             error: Some("missing repo parameter".into()),
             input_bytes: None,
             output_bytes: None,
+            args_preview: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"ok\":false"));
@@ -1188,6 +1193,7 @@ mod tests {
             error: None,
             input_bytes: None,
             output_bytes: None,
+            args_preview: Some("owner/repo".into()),
         }]);
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
@@ -1234,6 +1240,7 @@ mod tests {
                 },
                 input_bytes: None,
                 output_bytes: None,
+                args_preview: None,
             })
             .collect();
         let json = serde_json::to_string(&records).unwrap();
@@ -1252,6 +1259,7 @@ mod tests {
             error: Some("连接超时: タイムアウト 🚫".into()),
             input_bytes: None,
             output_bytes: None,
+            args_preview: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
@@ -1267,6 +1275,7 @@ mod tests {
             error: None,
             input_bytes: None,
             output_bytes: None,
+            args_preview: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();

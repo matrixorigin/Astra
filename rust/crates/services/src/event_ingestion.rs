@@ -635,6 +635,7 @@ mod tests {
                 error: None,
                 input_bytes: None,
                 output_bytes: None,
+                args_preview: Some("HEAD~10".into()),
             },
             crate::session_journal::ToolCallRecord {
                 name: "read_file".into(),
@@ -643,6 +644,7 @@ mod tests {
                 error: Some("not found".into()),
                 input_bytes: None,
                 output_bytes: None,
+                args_preview: Some("missing.txt".into()),
             },
         ]);
 
@@ -682,6 +684,7 @@ mod tests {
             error: None,
             input_bytes: None,
             output_bytes: None,
+            args_preview: Some("npm test".into()),
         }]);
 
         let events = IngestionEvent::expand_journal_event(&journal, "u1");
@@ -703,6 +706,7 @@ mod tests {
             error: None,
             input_bytes: None,
             output_bytes: None,
+            args_preview: None,
         }]);
 
         let a = IngestionEvent::expand_journal_event(&journal, "u1");

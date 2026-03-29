@@ -287,6 +287,7 @@ mod tests {
                 error: None,
                 input_bytes: None,
                 output_bytes: None,
+                args_preview: None,
             },
             crate::session_journal::ToolCallRecord {
                 name: "grep".into(),
@@ -295,6 +296,7 @@ mod tests {
                 error: None,
                 input_bytes: None,
                 output_bytes: None,
+                args_preview: None,
             },
             crate::session_journal::ToolCallRecord {
                 name: "write_file".into(),
@@ -303,6 +305,7 @@ mod tests {
                 error: Some("permission denied".into()),
                 input_bytes: None,
                 output_bytes: None,
+                args_preview: None,
             },
         ]);
         let stats = compute_session_stats("s1", &[turn]);
@@ -365,6 +368,7 @@ mod tests {
             error: if ok { None } else { Some("fail".into()) },
             input_bytes: None,
             output_bytes: None,
+            args_preview: None,
         }
     }
 

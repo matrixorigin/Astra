@@ -4341,6 +4341,7 @@ total_tokens_out: 500
                 error: None,
                 input_bytes: Some(50),
                 output_bytes: Some(200),
+                args_preview: Some("npm test".into()),
             },
             session_journal::ToolCallRecord {
                 name: "bash".into(),
@@ -4349,6 +4350,7 @@ total_tokens_out: 500
                 error: Some("exit code 1".into()),
                 input_bytes: Some(30),
                 output_bytes: Some(100),
+                args_preview: Some("cargo build".into()),
             },
             session_journal::ToolCallRecord {
                 name: "grep".into(),
@@ -4357,6 +4359,7 @@ total_tokens_out: 500
                 error: None,
                 input_bytes: Some(20),
                 output_bytes: Some(500),
+                args_preview: Some("/error/ in src/".into()),
             },
         ]);
         writer.append(&event).unwrap();

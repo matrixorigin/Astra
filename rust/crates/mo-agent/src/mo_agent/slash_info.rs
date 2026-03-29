@@ -678,6 +678,14 @@ pub(super) async fn handle_info_command(
                             status,
                             tc.name.as_str().cyan(),
                             io_info.dim());
+                        
+                        // Show args preview if available
+                        if let Some(ref args) = tc.args_preview {
+                            let sub_branch = if is_last { "   " } else { "│  " };
+                            let args_truncated = if args.len() > 60 { format!("{}…", &args[..59]) } else { args.clone() };
+                            eprintln!("    {}    {} {}", " ".repeat(8), sub_branch.dim(), args_truncated.dim());
+                        }
+                        
                         if let Some(ref err) = tc.error {
                             let err_preview = if err.len() > 50 { format!("{}…", &err[..50]) } else { err.clone() };
                             let sub_branch = if is_last { "   " } else { "│  " };

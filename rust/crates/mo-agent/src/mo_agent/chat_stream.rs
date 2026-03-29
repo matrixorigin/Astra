@@ -5,6 +5,81 @@ use mo_agent_runtime::pipeline::step_protocol::{
     CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache,
 };
 
+/// Generate a human-readable preview of tool arguments for observability.
+/// Returns a compact string highlighting the most relevant parameters.
+fn make_args_preview(tool_name: &str, args: &serde_json::Value) -> Option<String> {
+    let max_len = 80;
+    
+    let preview = match tool_name {
+        // File operations - show path
+        "read_file" | "write_file" | "delete_file" | "str_replace" | "multi_edit" => {
+            args.get("path").and_then(|v| v.as_str()).map(|s| s.to_string())
+        }
+        // Search operations - show pattern and path
+        "grep" => {
+            let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            Some(format!("/{pattern}/ in {path}"))
+        }
+        "glob" => {
+            args.get("pattern").and_then(|v| v.as_str()).map(|s| s.to_string())
+        }
+        // Shell commands - show command
+        "shell_exec" | "bash" => {
+            args.get("command").or_else(|| args.get("cmd"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        }
+        // Git operations - show relevant refs/files
+        "git_diff" => {
+            let base = args.get("base").and_then(|v| v.as_str()).unwrap_or("HEAD");
+            let file = args.get("file").and_then(|v| v.as_str());
+            match file {
+                Some(f) => Some(format!("{base} -- {f}")),
+                None => Some(base.to_string()),
+            }
+        }
+        "git_log" | "git_show" => {
+            args.get("ref").or_else(|| args.get("commit"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        }
+        "git_blame" => {
+            args.get("file").and_then(|v| v.as_str()).map(|s| s.to_string())
+        }
+        // Memory operations - show query
+        "memory_search" | "memory_retrieve" => {
+            args.get("query").and_then(|v| v.as_str()).map(|s| s.to_string())
+        }
+        "memory_store" => {
+            args.get("content").and_then(|v| v.as_str()).map(|s| s.to_string())
+        }
+        // Web operations
+        "web_fetch" => {
+            args.get("url").and_then(|v| v.as_str()).map(|s| s.to_string())
+        }
+        // Default: try to extract the first string value
+        _ => {
+            args.as_object()
+                .and_then(|obj| {
+                    obj.values()
+                        .filter_map(|v| v.as_str())
+                        .next()
+                        .map(|s| s.to_string())
+                })
+        }
+    };
+    
+    // Truncate if needed
+    preview.map(|s| {
+        if s.len() > max_len {
+            format!("{}…", &s[..max_len - 1])
+        } else {
+            s
+        }
+    })
+}
+
 /// Build a compact workspace context string for the LLM system prompt.
 /// Detects project type, key files, and top-level directory structure.
 /// Capped at ~500 chars to stay token-efficient.
@@ -1315,6 +1390,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     error: Some("duplicate_within_turn".to_string()),
                     input_bytes: None,
                     output_bytes: None,
+                    args_preview: make_args_preview(&name, &args),
                 });
                 continue;
             }
@@ -1353,6 +1429,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     error: Some("cached_cross_turn".to_string()),
                     input_bytes: None,
                     output_bytes: Some(cached.output.len() as u32),
+                    args_preview: make_args_preview(&name, &args),
                 });
                 continue;
             }
@@ -1392,6 +1469,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     error: Some(format!("unknown_tool: {name}")),
                     input_bytes: None,
                     output_bytes: None,
+                    args_preview: None,
                 });
                 continue;
             }
@@ -1415,6 +1493,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     error: Some("permission_denied".to_string()),
                     input_bytes: None,
                     output_bytes: None,
+                    args_preview: make_args_preview(&name, &args),
                 });
                 continue;
             }
@@ -1618,6 +1697,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             // Record per-tool-call audit entry
             let args_size = serde_json::to_string(&args).map(|s| s.len() as u32).unwrap_or(0);
             let result_size = result_str.len() as u32;
+            let args_preview = make_args_preview(&name, &args);
             tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
                 name: name.clone(),
                 ok: !is_err,
@@ -1632,6 +1712,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 },
                 input_bytes: Some(args_size),
                 output_bytes: Some(result_size),
+                args_preview,
             });
             step_recorder.complete_tool_with_result(
                 &name,
@@ -2839,6 +2920,7 @@ if let Err(e) = writeln!(file, "{line}") {
             error: Some("duplicate_within_turn".to_string()),
             input_bytes: None,
             output_bytes: None,
+            args_preview: Some("src/main.rs".to_string()),
         };
         assert!(dup.ok);
         assert_eq!(dup.ms, 0);
@@ -2851,6 +2933,7 @@ if let Err(e) = writeln!(file, "{line}") {
             error: Some("cached_cross_turn".to_string()),
             input_bytes: None,
             output_bytes: Some(500),
+            args_preview: Some("/TODO/ in src/".to_string()),
         };
         assert!(cached.ok);
 
@@ -2862,6 +2945,7 @@ if let Err(e) = writeln!(file, "{line}") {
             error: Some("unknown_tool: nonexistent_tool".to_string()),
             input_bytes: None,
             output_bytes: None,
+            args_preview: None,
         };
         assert!(!unknown.ok);
         assert!(unknown.error.as_ref().unwrap().starts_with("unknown_tool:"));
@@ -2874,6 +2958,7 @@ if let Err(e) = writeln!(file, "{line}") {
             error: Some("permission_denied".to_string()),
             input_bytes: None,
             output_bytes: None,
+            args_preview: Some("rm -rf /".to_string()),
         };
         assert!(!denied.ok);
 
@@ -2898,6 +2983,7 @@ if let Err(e) = writeln!(file, "{line}") {
             error: None,
             input_bytes: Some(100),
             output_bytes: Some(5000),
+            args_preview: Some("https://example.com".to_string()),
         };
         let json = serde_json::to_string(&original).unwrap();
         let restored: ToolCallRecord = serde_json::from_str(&json).unwrap();
