@@ -70,6 +70,8 @@ mod slash_session;
 mod slash_skill;
 #[path = "mo_agent/slash_state.rs"]
 mod slash_state;
+#[path = "mo_agent/sync_adapters.rs"]
+mod sync_adapters;
 #[path = "mo_agent/stream_render.rs"]
 mod stream_render;
 

@@ -28,6 +28,7 @@ pub mod skills;
 pub mod state_sync;
 pub mod storage;
 pub mod streaming;
+pub mod sync_engine;
 pub mod task_orchestrator;
 pub mod triggers;
 pub mod workflows;
@@ -117,6 +118,11 @@ pub use storage::{
     session_record_from_row, update_turn_skill_selection_version,
 };
 pub use streaming::{DatabaseStreamingService, StreamingService, UnconfiguredStreamingService};
+pub use sync_engine::{
+    CloudTransport, DomainAdapter, DomainSyncResult, MergeResult, NoopTransport, PayloadFormat,
+    PullResult, PullTrigger, PushResult, PushTrigger, SyncDomain, SyncEnvelope, SyncError,
+    SyncEvent, SyncOperation, SyncOrchestrator, SyncPayload, SyncPolicy, SyncState, SyncStats,
+};
 pub use task_orchestrator::{
     LocalTaskService, MatrixOneTaskService, SubtaskPlan, TaskCheckpoint, TaskCreateRequest,
     TaskOutcome, TaskPlan, TaskRecord, TaskService, TaskStatus,
