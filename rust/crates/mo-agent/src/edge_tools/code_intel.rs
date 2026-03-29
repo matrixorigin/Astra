@@ -895,6 +895,303 @@ fn get_signature_line(node: tree_sitter::Node, source: &str) -> String {
     format!("(lines {}-{})", start.row + 1, end.row + 1)
 }
 
+// ─── Call Graph Extraction ───────────────────────────────────────────────────
+
+/// A function call found within a symbol's body.
+#[derive(Debug, Clone)]
+pub struct CallSite {
+    /// Name of the function/method being called
+    pub callee: String,
+    /// Line number of the call (1-indexed)
+    pub line: usize,
+    /// Optional receiver (e.g., "self", "config", "Vec")
+    pub receiver: Option<String>,
+}
+
+/// Extract function/method calls within the body of a given symbol range.
+/// Returns a list of call sites found between `start_line` and `end_line`.
+pub fn extract_calls(source: &str, lang: Language, start_line: usize, end_line: usize) -> Vec<CallSite> {
+    let mut parser = tree_sitter::Parser::new();
+    let language = match lang {
+        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
+        Language::Python => tree_sitter_python::LANGUAGE.into(),
+        Language::TypeScript | Language::JavaScript => {
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+        }
+        Language::Go => tree_sitter_go::LANGUAGE.into(),
+        Language::Java => tree_sitter_java::LANGUAGE.into(),
+        Language::C | Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+    };
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+    let tree = match parser.parse(source, None) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let mut calls = Vec::new();
+    collect_calls(tree.root_node(), source, start_line, end_line, lang, &mut calls);
+    // Deduplicate by (callee, line)
+    calls.sort_by(|a, b| a.line.cmp(&b.line).then(a.callee.cmp(&b.callee)));
+    calls.dedup_by(|a, b| a.line == b.line && a.callee == b.callee);
+    calls
+}
+
+fn collect_calls(
+    node: tree_sitter::Node,
+    source: &str,
+    start_line: usize,
+    end_line: usize,
+    lang: Language,
+    calls: &mut Vec<CallSite>,
+) {
+    let node_start = node.start_position().row + 1;
+    let node_end = node.end_position().row + 1;
+
+    // Skip nodes entirely outside our range
+    if node_end < start_line || node_start > end_line {
+        return;
+    }
+
+    let kind = node.kind();
+
+    // Match call expressions based on language
+    let is_call = match lang {
+        Language::Rust => kind == "call_expression" || kind == "macro_invocation",
+        Language::Python => kind == "call",
+        Language::TypeScript | Language::JavaScript => kind == "call_expression" || kind == "new_expression",
+        Language::Go => kind == "call_expression",
+        Language::Java => kind == "method_invocation" || kind == "object_creation_expression",
+        Language::C | Language::Cpp => kind == "call_expression",
+        Language::Ruby => kind == "call" || kind == "method_call",
+    };
+
+    if is_call {
+        if let Some(cs) = parse_call_site(node, source, lang) {
+            if cs.line >= start_line && cs.line <= end_line {
+                calls.push(cs);
+            }
+        }
+    }
+
+    // Recurse into children
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_calls(child, source, start_line, end_line, lang, calls);
+    }
+}
+
+fn parse_call_site(node: tree_sitter::Node, source: &str, lang: Language) -> Option<CallSite> {
+    let line = node.start_position().row + 1;
+
+    match lang {
+        Language::Rust => {
+            // call_expression: function child is the callee
+            if node.kind() == "macro_invocation" {
+                // macro!(...) — first child is the macro name
+                let name_node = node.child(0)?;
+                let name = node_text(name_node, source);
+                return Some(CallSite {
+                    callee: format!("{name}!"),
+                    line,
+                    receiver: None,
+                });
+            }
+            let func = node.child(0)?;
+            if func.kind() == "field_expression" {
+                // receiver.method() form
+                let receiver_node = func.child(0)?;
+                let method_node = func.child_by_field_name("field")?;
+                Some(CallSite {
+                    callee: node_text(method_node, source),
+                    line,
+                    receiver: Some(node_text(receiver_node, source)),
+                })
+            } else if func.kind() == "scoped_identifier" {
+                // Path::method() form
+                Some(CallSite {
+                    callee: node_text(func, source),
+                    line,
+                    receiver: None,
+                })
+            } else {
+                Some(CallSite {
+                    callee: node_text(func, source),
+                    line,
+                    receiver: None,
+                })
+            }
+        }
+        Language::Python => {
+            let func = node.child_by_field_name("function")?;
+            if func.kind() == "attribute" {
+                let obj = func.child_by_field_name("object")?;
+                let attr = func.child_by_field_name("attribute")?;
+                Some(CallSite {
+                    callee: node_text(attr, source),
+                    line,
+                    receiver: Some(node_text(obj, source)),
+                })
+            } else {
+                Some(CallSite {
+                    callee: node_text(func, source),
+                    line,
+                    receiver: None,
+                })
+            }
+        }
+        Language::TypeScript | Language::JavaScript => {
+            if node.kind() == "new_expression" {
+                let ctor = node.child(1)?;
+                return Some(CallSite {
+                    callee: format!("new {}", node_text(ctor, source)),
+                    line,
+                    receiver: None,
+                });
+            }
+            let func = node.child_by_field_name("function")?;
+            if func.kind() == "member_expression" {
+                let obj = func.child_by_field_name("object")?;
+                let prop = func.child_by_field_name("property")?;
+                Some(CallSite {
+                    callee: node_text(prop, source),
+                    line,
+                    receiver: Some(node_text(obj, source)),
+                })
+            } else {
+                Some(CallSite {
+                    callee: node_text(func, source),
+                    line,
+                    receiver: None,
+                })
+            }
+        }
+        Language::Go => {
+            let func = node.child_by_field_name("function")?;
+            if func.kind() == "selector_expression" {
+                let obj = func.child_by_field_name("operand")?;
+                let sel = func.child_by_field_name("field")?;
+                Some(CallSite {
+                    callee: node_text(sel, source),
+                    line,
+                    receiver: Some(node_text(obj, source)),
+                })
+            } else {
+                Some(CallSite {
+                    callee: node_text(func, source),
+                    line,
+                    receiver: None,
+                })
+            }
+        }
+        Language::Java => {
+            if node.kind() == "method_invocation" {
+                let name = node.child_by_field_name("name")?;
+                let obj = node.child_by_field_name("object");
+                Some(CallSite {
+                    callee: node_text(name, source),
+                    line,
+                    receiver: obj.map(|o| node_text(o, source)),
+                })
+            } else {
+                // object_creation_expression
+                let typ = node.child_by_field_name("type")?;
+                Some(CallSite {
+                    callee: format!("new {}", node_text(typ, source)),
+                    line,
+                    receiver: None,
+                })
+            }
+        }
+        Language::C | Language::Cpp => {
+            let func = node.child_by_field_name("function")?;
+            if func.kind() == "field_expression" {
+                let obj = func.child_by_field_name("argument")?;
+                let field = func.child_by_field_name("field")?;
+                Some(CallSite {
+                    callee: node_text(field, source),
+                    line,
+                    receiver: Some(node_text(obj, source)),
+                })
+            } else {
+                Some(CallSite {
+                    callee: node_text(func, source),
+                    line,
+                    receiver: None,
+                })
+            }
+        }
+        Language::Ruby => {
+            let method = node.child_by_field_name("method")?;
+            let recv = node.child_by_field_name("receiver");
+            Some(CallSite {
+                callee: node_text(method, source),
+                line,
+                receiver: recv.map(|r| node_text(r, source)),
+            })
+        }
+    }
+}
+
+// ─── Scope Context ──────────────────────────────────────────────────────────
+
+/// The enclosing scope at a given line.
+#[derive(Debug, Clone)]
+pub struct ScopeContext {
+    /// Breadcrumb path from outermost to innermost scope
+    /// e.g., ["impl ToolExecutor", "fn str_replace"]
+    pub breadcrumbs: Vec<String>,
+    /// The innermost symbol containing the target line
+    pub symbol: Option<Symbol>,
+}
+
+/// Find the enclosing scope at a given line (1-indexed).
+pub fn scope_at_line(source: &str, lang: Language, line: usize) -> ScopeContext {
+    let symbols = extract_symbols(source, lang);
+
+    // Find all symbols that contain this line, sorted by specificity (smaller range = more specific)
+    let mut containing: Vec<&Symbol> = symbols
+        .iter()
+        .filter(|s| s.start_line <= line && s.end_line >= line)
+        .collect();
+
+    // Sort by range size ascending (most specific first)
+    containing.sort_by_key(|s| s.end_line - s.start_line);
+
+    let innermost = containing.first().copied().cloned();
+
+    // Build breadcrumb trail from outermost to innermost
+    // We reverse to go from outermost to innermost
+    containing.reverse();
+    let breadcrumbs: Vec<String> = containing
+        .iter()
+        .map(|s| {
+            if s.signature.len() > 80 {
+                format!("{} {}...", s.kind.as_str(), s.name)
+            } else {
+                format!("{} {}", s.kind.as_str(), s.signature)
+            }
+        })
+        .collect();
+
+    ScopeContext {
+        breadcrumbs,
+        symbol: innermost,
+    }
+}
+
+fn node_text(node: tree_sitter::Node, source: &str) -> String {
+    let start = node.start_byte();
+    let end = node.end_byte();
+    if start <= end && end <= source.len() {
+        source[start..end].to_string()
+    } else {
+        String::new()
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1180,5 +1477,165 @@ end
 
         let show_method = symbols.iter().find(|s| s.name == "show");
         assert!(show_method.is_some(), "symbols: {:?}", symbols);
+    }
+
+    // ─── Call graph extraction tests ────────────────────────────────────
+
+    #[test]
+    fn extract_calls_rust_function() {
+        let source = r#"
+fn process(items: &[Item]) -> Result<()> {
+    let config = Config::load("default")?;
+    let mut results = Vec::new();
+    for item in items {
+        let val = item.transform();
+        results.push(val);
+    }
+    println!("done: {}", results.len());
+    save_results(&results)?;
+    Ok(())
+}
+"#;
+        let calls = extract_calls(source, Language::Rust, 2, 12);
+        assert!(!calls.is_empty(), "should find calls");
+
+        let names: Vec<&str> = calls.iter().map(|c| c.callee.as_str()).collect();
+        assert!(names.contains(&"Config::load"), "should find Config::load: {:?}", names);
+        assert!(names.contains(&"transform"), "should find item.transform: {:?}", names);
+        assert!(names.contains(&"push"), "should find results.push: {:?}", names);
+        assert!(names.contains(&"println!"), "should find println!: {:?}", names);
+        assert!(names.contains(&"save_results"), "should find save_results: {:?}", names);
+
+        // Check receiver on method calls
+        let transform_call = calls.iter().find(|c| c.callee == "transform").unwrap();
+        assert_eq!(transform_call.receiver.as_deref(), Some("item"));
+    }
+
+    #[test]
+    fn extract_calls_python() {
+        let source = r#"
+def process_data(df):
+    result = df.groupby("category").agg({"value": "sum"})
+    print(f"Groups: {len(result)}")
+    save_to_csv(result, "output.csv")
+    return result
+"#;
+        let calls = extract_calls(source, Language::Python, 2, 6);
+        let names: Vec<&str> = calls.iter().map(|c| c.callee.as_str()).collect();
+        assert!(names.contains(&"groupby"), "should find df.groupby: {:?}", names);
+        assert!(names.contains(&"print"), "should find print: {:?}", names);
+        assert!(names.contains(&"save_to_csv"), "should find save_to_csv: {:?}", names);
+    }
+
+    #[test]
+    fn extract_calls_typescript() {
+        let source = r#"
+function handleRequest(req: Request): Response {
+    const user = authenticateUser(req.headers);
+    const data = db.query("SELECT * FROM users");
+    console.log("processed", user.id);
+    return new Response(JSON.stringify(data));
+}
+"#;
+        let calls = extract_calls(source, Language::TypeScript, 2, 7);
+        let names: Vec<&str> = calls.iter().map(|c| c.callee.as_str()).collect();
+        assert!(names.contains(&"authenticateUser"), "should find authenticateUser: {:?}", names);
+        assert!(names.contains(&"query"), "should find db.query: {:?}", names);
+        assert!(names.contains(&"log"), "should find console.log: {:?}", names);
+    }
+
+    #[test]
+    fn extract_calls_go() {
+        let source = r#"
+func handleRequest(w http.ResponseWriter, r *http.Request) {
+    body, err := ioutil.ReadAll(r.Body)
+    if err != nil {
+        http.Error(w, "bad request", 400)
+        return
+    }
+    fmt.Fprintf(w, "OK: %d bytes", len(body))
+}
+"#;
+        let calls = extract_calls(source, Language::Go, 2, 9);
+        let names: Vec<&str> = calls.iter().map(|c| c.callee.as_str()).collect();
+        assert!(names.contains(&"ReadAll"), "should find ioutil.ReadAll: {:?}", names);
+        assert!(names.contains(&"Error"), "should find http.Error: {:?}", names);
+        assert!(names.contains(&"Fprintf"), "should find fmt.Fprintf: {:?}", names);
+    }
+
+    #[test]
+    fn extract_calls_empty_function() {
+        let source = "fn noop() {}\n";
+        let calls = extract_calls(source, Language::Rust, 1, 1);
+        assert!(calls.is_empty(), "should find no calls in empty function");
+    }
+
+    #[test]
+    fn extract_calls_respects_line_range() {
+        let source = r#"
+fn first() {
+    a();
+}
+fn second() {
+    b();
+}
+"#;
+        // Only analyze first function (lines 2-4)
+        let calls = extract_calls(source, Language::Rust, 2, 4);
+        let names: Vec<&str> = calls.iter().map(|c| c.callee.as_str()).collect();
+        assert!(names.contains(&"a"), "should find a(): {:?}", names);
+        assert!(!names.contains(&"b"), "should NOT find b(): {:?}", names);
+    }
+
+    // ─── Scope context tests ────────────────────────────────────────────
+
+    #[test]
+    fn scope_at_line_rust_nested() {
+        let source = r#"
+mod utils {
+    pub struct Config {
+        pub name: String,
+    }
+
+    impl Config {
+        pub fn new(name: &str) -> Self {
+            Config { name: name.to_string() }
+        }
+    }
+}
+"#;
+        // Line 9 is inside Config::new, inside impl Config, inside mod utils
+        let scope = scope_at_line(source, Language::Rust, 9);
+        assert!(!scope.breadcrumbs.is_empty(), "should have scope breadcrumbs");
+        assert!(scope.symbol.is_some(), "should have innermost symbol");
+        let inner = scope.symbol.unwrap();
+        assert_eq!(inner.name, "new");
+    }
+
+    #[test]
+    fn scope_at_line_outside_any_symbol() {
+        let source = "// just a comment\nlet x = 1;\n";
+        let scope = scope_at_line(source, Language::Rust, 1);
+        assert!(scope.breadcrumbs.is_empty(), "should be empty for comment-only line");
+        assert!(scope.symbol.is_none());
+    }
+
+    #[test]
+    fn scope_at_line_python_class_method() {
+        let source = r#"
+class UserService:
+    def __init__(self, db):
+        self.db = db
+
+    def get_user(self, user_id):
+        return self.db.query(user_id)
+"#;
+        let scope = scope_at_line(source, Language::Python, 7);
+        assert!(scope.symbol.is_some());
+        let sym = scope.symbol.unwrap();
+        assert_eq!(sym.name, "get_user");
+        // Breadcrumbs should include the class
+        let crumbs_str = scope.breadcrumbs.join(" > ");
+        assert!(crumbs_str.contains("UserService"), "breadcrumbs: {crumbs_str}");
     }
 }

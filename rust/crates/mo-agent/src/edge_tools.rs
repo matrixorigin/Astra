@@ -405,6 +405,23 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "call_graph",
+                "description": "Extract function calls within a symbol's body. Shows what functions/methods are called, with receivers and line numbers. Use to understand code flow, trace dependencies, or prepare for refactoring.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File path relative to project root"},
+                        "symbol": {"type": "string", "description": "Symbol name to analyze (function/method name)"},
+                        "start_line": {"type": "integer", "description": "Start line (alternative to symbol name)"},
+                        "end_line": {"type": "integer", "description": "End line (alternative to symbol name)"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
         // ── Build/Test tool ─────────────────────────────────────────────
         json!({
             "type": "function",
@@ -1000,6 +1017,7 @@ impl ToolExecutor {
             "git_checkout_file" => git_gix::git_checkout_file(&self.project_root, args),
             "find_definition" => self.find_definition(args),
             "find_references" => self.find_references(args),
+            "call_graph" => self.call_graph(args),
             "run_build_test" => self.run_build_test(args),
             "symbols" => self.symbols(args),
             "mo_query" => self.mo_query(args),
@@ -1422,6 +1440,73 @@ impl ToolExecutor {
                 }
             }
         }
+    }
+
+    fn call_graph(&self, args: &Value) -> String {
+        let path = match args.get("path").and_then(Value::as_str) {
+            Some(p) => match self.resolve_checked(p) {
+                Ok(safe) => safe,
+                Err(e) => return e,
+            },
+            None => return "Error: missing 'path'".to_string(),
+        };
+
+        let lang = match code_intel::detect_language(&path) {
+            Some(l) => l,
+            None => return "Error: unsupported language (supported: rs, py, ts, go, java, c, cpp, rb)".to_string(),
+        };
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => return format!("Error reading file: {e}"),
+        };
+
+        // Determine the line range to analyze
+        let (start_line, end_line) = if let Some(sym_name) = args.get("symbol").and_then(Value::as_str) {
+            // Find the symbol by name
+            let symbols = code_intel::extract_symbols(&content, lang);
+            let matches: Vec<_> = symbols.iter().filter(|s| s.name == sym_name).collect();
+            match matches.len() {
+                0 => return format!("Error: symbol '{sym_name}' not found in file"),
+                1 => (matches[0].start_line, matches[0].end_line),
+                _ => {
+                    // Multiple matches — show them and ask for disambiguation
+                    let mut msg = format!("Multiple symbols named '{sym_name}':\n");
+                    for s in &matches {
+                        msg.push_str(&format!("  L{}-{}: {} {}\n", s.start_line, s.end_line, s.kind.as_str(), s.signature));
+                    }
+                    msg.push_str("Use start_line/end_line to specify which one.");
+                    return msg;
+                }
+            }
+        } else if let (Some(sl), Some(el)) = (
+            args.get("start_line").and_then(Value::as_u64),
+            args.get("end_line").and_then(Value::as_u64),
+        ) {
+            (sl as usize, el as usize)
+        } else {
+            return "Error: provide either 'symbol' name or 'start_line'+'end_line'".to_string();
+        };
+
+        let calls = code_intel::extract_calls(&content, lang, start_line, end_line);
+
+        if calls.is_empty() {
+            return format!("No function calls found in lines {start_line}-{end_line}");
+        }
+
+        let fname = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let mut out = format!("# Call graph for {} (lines {}-{})\n\n", fname, start_line, end_line);
+
+        for call in &calls {
+            if let Some(ref recv) = call.receiver {
+                out.push_str(&format!("  L{}: {}.{}()\n", call.line, recv, call.callee));
+            } else {
+                out.push_str(&format!("  L{}: {}()\n", call.line, call.callee));
+            }
+        }
+
+        out.push_str(&format!("\n{} call(s) total", calls.len()));
+        out
     }
 
     /// Run a build/test command with structured error parsing and auto-context.
@@ -2686,5 +2771,74 @@ fn helper() {}
         })).await;
         // Should report something meaningful
         assert!(!result.is_empty(), "should produce output");
+    }
+
+    #[tokio::test]
+    async fn call_graph_requires_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("call_graph", &json!({})).await;
+        assert!(result.contains("Error"), "should require path: {result}");
+    }
+
+    #[tokio::test]
+    async fn call_graph_by_symbol_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = r#"
+fn helper() -> i32 { 42 }
+
+fn main() {
+    let x = helper();
+    println!("{}", x);
+    std::process::exit(0);
+}
+"#;
+        std::fs::write(dir.path().join("main.rs"), code).unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("call_graph", &json!({
+            "path": "main.rs",
+            "symbol": "main"
+        })).await;
+        assert!(result.contains("helper"), "should find helper() call: {result}");
+        assert!(result.contains("println!"), "should find println!: {result}");
+        assert!(result.contains("call(s) total"), "should show total: {result}");
+    }
+
+    #[tokio::test]
+    async fn call_graph_by_line_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "fn foo() {\n    bar();\n    baz();\n}\n";
+        std::fs::write(dir.path().join("test.rs"), code).unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("call_graph", &json!({
+            "path": "test.rs",
+            "start_line": 1,
+            "end_line": 4
+        })).await;
+        assert!(result.contains("bar"), "should find bar(): {result}");
+        assert!(result.contains("baz"), "should find baz(): {result}");
+    }
+
+    #[tokio::test]
+    async fn call_graph_symbol_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("empty.rs"), "fn hello() {}\n").unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("call_graph", &json!({
+            "path": "empty.rs",
+            "symbol": "nonexistent"
+        })).await;
+        assert!(result.contains("not found"), "should report not found: {result}");
+    }
+
+    #[test]
+    fn schemas_include_call_graph_and_coding_tools() {
+        let schemas = all_tool_schemas();
+        let names: Vec<&str> = schemas.iter()
+            .filter_map(|s| s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()))
+            .collect();
+        assert!(names.contains(&"call_graph"), "should have call_graph: {:?}", names);
+        assert!(names.contains(&"delete_file"), "should have delete_file: {:?}", names);
+        assert!(names.contains(&"multi_edit"), "should have multi_edit: {:?}", names);
     }
 }
