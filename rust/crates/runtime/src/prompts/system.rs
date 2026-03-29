@@ -117,15 +117,15 @@ pub fn build_main_system_prompt(
         prompt.push_str(
             "\n\
              ## Code Navigation\n\
-             - **find_definition**: Jump to where a symbol is defined (function, class, struct, trait). Uses tree-sitter AST — more accurate than grep.\n\
-             - **find_references**: Find all usages of a symbol across the codebase. Uses word-boundary matching — fast and precise.\n\
-             - **symbols**: Extract all definitions from a file (outline view). Use with `kinds` filter to get only functions, structs, etc.\n\
-             Use these BEFORE grep when looking for code symbols. They understand language syntax, grep doesn't.\n",
+             - **find_definition**: Where a symbol is defined. tree-sitter AST — more accurate than grep.\n\
+             - **find_references**: All usages of a symbol. Use `kind` (definition/import/call/usage) to filter.\n\
+             - **symbols**: File outline. Use `calls=true` to see what each function calls inline.\n\
+             Use these BEFORE grep for code symbols. They understand syntax, grep doesn't.\n",
         );
     }
     if has_call_graph {
         prompt.push_str(
-            "- **call_graph**: Extract function calls within a symbol's body. Use to understand what a function does before refactoring, to trace data flow, or to find dependencies.\n",
+            "- **call_graph**: Call relationships. `callers=true` finds who calls a function. `scope='project'` searches cross-file.\n",
         );
     }
 
@@ -245,9 +245,9 @@ pub fn build_main_system_prompt(
             prompt.push_str(
                 "\n\
               ## Implementation Strategy\n\
-              1. **Understand context**: read patterns, naming, module structure.\n\
+              1. **Understand structure**: symbols(calls=true) for file overview + call flow in one shot.\n\
               2. **Find location**: find_definition → glob → grep → read sections.\n\
-              3. **Check deps**: find_references to see usage elsewhere.\n\
+              3. **Check impact**: find_references(kind='call') to see callers. call_graph(callers=true, scope='project') for thorough impact.\n\
               4. **Implement surgically**: minimal changes, follow style. str_replace auto-formats.\n\
               5. **Wire it up**: add imports, register modules, update exports.\n\
               6. **Verify**: run_build_test, fix from structured output, repeat.\n\
@@ -259,10 +259,11 @@ pub fn build_main_system_prompt(
                 "\n\
              ## Refactoring Strategy\n\
              1. Run tests BEFORE refactoring to establish a passing baseline.\n\
-             2. Make one logical change at a time — verify after each.\n\
-             3. Preserve external behavior; focus on clarity and maintainability.\n\
-             4. Update all call sites when renaming or changing signatures.\n\
-             5. Run tests AFTER to confirm nothing regressed.\n",
+             2. Use call_graph(callers=true, scope='project') to find all callers before changing a signature.\n\
+             3. Make one logical change at a time — verify after each.\n\
+             4. Preserve external behavior; focus on clarity and maintainability.\n\
+             5. Update all call sites when renaming or changing signatures.\n\
+             6. Run tests AFTER to confirm nothing regressed.\n",
             );
         }
         Some("testing") => {
@@ -338,7 +339,9 @@ pub fn build_main_system_prompt(
     prompt.push_str(
         "\n\
          ## Tool Precedence (prefer earlier tools in each chain)\n\
-         - **Code navigation**: find_definition / find_references → grep → read_file (targeted ranges)\n\
+         - **Understand code**: symbols(calls=true) → call_graph → read_file (targeted ranges)\n\
+         - **Navigate code**: find_definition / find_references(kind=...) → grep → read_file\n\
+         - **Impact analysis**: call_graph(callers=true, scope='project') → find_references → grep\n\
          - **File search**: glob (by name) → grep (by content) → log search (by commit message)\n\
          - **Code edit**: read context → str_replace (auto-formats) → run_build_test to verify\n\
          - **Git investigation**: status → diff → log → show → blame\n\

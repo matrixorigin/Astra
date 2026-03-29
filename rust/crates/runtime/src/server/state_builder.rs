@@ -167,13 +167,29 @@ pub(super) async fn build_server_state(
 /// and wires them into a PipelineLearningWriter for turn-outcome-driven learning.
 fn build_pipeline_learning_writer() -> Arc<dyn TurnLearningWriter> {
     use crate::pipeline::{
-        calibration::ProgressiveCalibrator, entity::EntityGraph, learning::PipelineLearningWriter,
+        calibration::ProgressiveCalibrator,
+        defaults::{default_calibration, default_entities, default_patterns},
+        entity::EntityGraph,
+        learning::PipelineLearningWriter,
         pattern::PatternLibrary,
     };
 
     let entity_graph = Arc::new(Mutex::new(EntityGraph::new()));
     let pattern_library = Arc::new(Mutex::new(PatternLibrary::new()));
-    let calibrator = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
+    // Use 0.70 as initial threshold - a reasonable starting point that
+    // requires some confidence before auto-routing while allowing learning
+    let calibrator = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.70)));
+
+    // Bootstrap with built-in defaults to avoid cold-start problem
+    if let Ok(mut eg) = entity_graph.lock() {
+        eg.merge(&default_entities());
+    }
+    if let Ok(mut pl) = pattern_library.lock() {
+        pl.merge(&default_patterns());
+    }
+    if let Ok(mut cal) = calibrator.lock() {
+        cal.merge(&default_calibration());
+    }
 
     Arc::new(
         PipelineLearningWriter::new()
