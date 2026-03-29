@@ -195,7 +195,8 @@ impl ToolHealthTracker {
     }
 
     /// Export tool health data for cross-session persistence.
-    /// Only exports tools with at least one call.
+    /// Exports ALL tracked tools, not just those used in this session.
+    /// Tools used this session get updated timestamps; others retain their loaded timestamps.
     pub fn export(&self) -> Vec<crate::pipeline::persistence::ToolHealthEntry> {
         let now_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -216,6 +217,70 @@ impl ToolHealthTracker {
                 last_updated_epoch: now_epoch,
             })
             .collect()
+    }
+
+    /// Export tool health with merged historical entries.
+    /// Returns all tools from this session (with updated timestamps) plus historical entries
+    /// that weren't used this session (with their original timestamps preserved).
+    pub fn export_merged(
+        &self,
+        historical: &[crate::pipeline::persistence::ToolHealthEntry],
+    ) -> Vec<crate::pipeline::persistence::ToolHealthEntry> {
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // Build a map of historical tools for quick lookup
+        let historical_map: std::collections::HashMap<&str, &crate::pipeline::persistence::ToolHealthEntry> =
+            historical.iter().map(|e| (e.name.as_str(), e)).collect();
+
+        // Export tools from tracker
+        let mut result: Vec<_> = self
+            .tools
+            .iter()
+            .filter(|(_, h)| h.total_calls > 0)
+            .map(|(name, h)| {
+                // Check if this tool had activity this session by comparing with historical data
+                let had_session_activity = match historical_map.get(name.as_str()) {
+                    Some(hist) => h.total_calls != hist.total_calls || h.total_failures != hist.total_failures,
+                    None => true, // New tool, definitely had activity
+                };
+
+                crate::pipeline::persistence::ToolHealthEntry {
+                    name: name.clone(),
+                    total_calls: h.total_calls,
+                    total_failures: h.total_failures,
+                    failure_rate: if h.total_calls > 0 {
+                        h.total_failures as f64 / h.total_calls as f64
+                    } else {
+                        0.0
+                    },
+                    // Update timestamp only if tool had session activity
+                    last_updated_epoch: if had_session_activity {
+                        now_epoch
+                    } else {
+                        historical_map
+                            .get(name.as_str())
+                            .map(|h| h.last_updated_epoch)
+                            .unwrap_or(now_epoch)
+                    },
+                }
+            })
+            .collect();
+
+        // Collect session tool names to avoid duplicates
+        let session_tools: std::collections::HashSet<String> =
+            result.iter().map(|e| e.name.clone()).collect();
+
+        // Add historical entries that aren't in tracker at all (preserve timestamps)
+        for entry in historical {
+            if !session_tools.contains(&entry.name) {
+                result.push(entry.clone());
+            }
+        }
+
+        result
     }
 
     /// Create a tracker seeded from persisted entries.
@@ -648,5 +713,82 @@ mod tests {
 
         tracker.record_failure("bash");
         assert_eq!(tracker.get("bash").unwrap().consecutive_successes, 0);
+    }
+
+    #[test]
+    fn export_merged_preserves_historical_entries() {
+        use crate::pipeline::persistence::ToolHealthEntry;
+
+        // Historical entries: bash (old), grep (old)
+        let historical = vec![
+            ToolHealthEntry {
+                name: "bash".to_string(),
+                total_calls: 10,
+                total_failures: 2,
+                failure_rate: 0.2,
+                last_updated_epoch: 1000, // Old timestamp
+            },
+            ToolHealthEntry {
+                name: "grep".to_string(),
+                total_calls: 5,
+                total_failures: 1,
+                failure_rate: 0.2,
+                last_updated_epoch: 1000, // Old timestamp
+            },
+        ];
+
+        // Session tracker: bash used (new data), grep NOT used
+        let mut tracker = ToolHealthTracker::from_entries(&historical);
+        tracker.record_success("bash"); // Use bash this session
+        tracker.record_success("bash");
+        // grep is NOT used this session
+
+        let exported = tracker.export_merged(&historical);
+
+        assert_eq!(exported.len(), 2, "Both tools should be in export");
+
+        // bash should have updated data and fresh timestamp
+        let bash = exported.iter().find(|e| e.name == "bash").unwrap();
+        assert_eq!(bash.total_calls, 12, "bash should have 10+2 calls");
+        assert!(
+            bash.last_updated_epoch > 1000,
+            "bash timestamp should be updated"
+        );
+
+        // grep should have original data and original timestamp
+        let grep = exported.iter().find(|e| e.name == "grep").unwrap();
+        assert_eq!(grep.total_calls, 5, "grep should have original calls");
+        assert_eq!(
+            grep.last_updated_epoch, 1000,
+            "grep timestamp should be preserved"
+        );
+    }
+
+    #[test]
+    fn export_merged_new_tool_gets_fresh_timestamp() {
+        use crate::pipeline::persistence::ToolHealthEntry;
+
+        let historical = vec![ToolHealthEntry {
+            name: "bash".to_string(),
+            total_calls: 5,
+            total_failures: 0,
+            failure_rate: 0.0,
+            last_updated_epoch: 1000,
+        }];
+
+        let mut tracker = ToolHealthTracker::from_entries(&historical);
+        // Use a NEW tool not in historical
+        tracker.record_success("find");
+
+        let exported = tracker.export_merged(&historical);
+
+        assert_eq!(exported.len(), 2, "Both bash and find should be exported");
+
+        let find = exported.iter().find(|e| e.name == "find").unwrap();
+        assert_eq!(find.total_calls, 1);
+        assert!(
+            find.last_updated_epoch > 1000,
+            "new tool should have fresh timestamp"
+        );
     }
 }

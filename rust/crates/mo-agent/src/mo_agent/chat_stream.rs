@@ -1889,7 +1889,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         stall_events,
         verdict_events,
         step_recorder_summary: Some(step_recorder.summary()),
-        tool_health_export: turn_guard.health.export(),
+        // Export tool health with merged historical entries to preserve unused tools
+        tool_health_export: turn_guard.health.export_merged(tool_health_entries),
         last_heavy_checkpoint,
     })
 }

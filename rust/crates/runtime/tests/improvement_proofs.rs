@@ -7508,6 +7508,7 @@ mod cloud_sync_status_proofs {
             preferences_last_sync: None,
             pending_pushes: 0,
             last_error: None,
+            cloud_version: None,
         };
         // Connected: has at least one push or pull
         assert!(status.learning_last_push.is_some() || status.learning_last_pull.is_some());
@@ -7522,6 +7523,7 @@ mod cloud_sync_status_proofs {
             preferences_last_sync: None,
             pending_pushes: 0,
             last_error: Some("connection refused".into()),
+            cloud_version: Some(5),
         };
         // Error should take priority in display
         assert!(status.last_error.is_some());
@@ -7538,6 +7540,7 @@ mod cloud_sync_status_proofs {
             preferences_last_sync: None,
             pending_pushes: 3,
             last_error: None,
+            cloud_version: None,
         };
         assert!(status.pending_pushes > 0);
     }
@@ -7550,6 +7553,7 @@ mod cloud_sync_status_proofs {
             preferences_last_sync: Some("2026-01-15T09:00:00Z".into()),
             pending_pushes: 2,
             last_error: Some("timeout".into()),
+            cloud_version: Some(42),
         };
         let json = serde_json::to_string(&status).unwrap();
         let back: SyncStatus = serde_json::from_str(&json).unwrap();
