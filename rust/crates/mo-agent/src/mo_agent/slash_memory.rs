@@ -566,6 +566,112 @@ pub(super) async fn handle_memory_domain_command(
                         eprintln!("  ⚠️ Not in plan mode");
                     }
                 }
+                "cloud" => {
+                    // List or load plans from cloud
+                    if let Some(ref svc) = state.task_service {
+                        use mo_agent_services::TaskService;
+                        let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
+                        
+                        match svc.list_tasks(user_id, None).await {
+                            Ok(tasks) => {
+                                let with_plans: Vec<_> = tasks.iter()
+                                    .filter(|t| t.plan.is_some())
+                                    .collect();
+                                
+                                if with_plans.is_empty() {
+                                    eprintln!("  {} No cloud plans found. Use /plan auto <goal> to create one.", "⚠".yellow());
+                                } else {
+                                    eprintln!("\n{}  Cloud Plans", "☁️".cyan());
+                                    eprintln!("{}", "─".repeat(50));
+                                    for t in &with_plans {
+                                        let icon = match t.status {
+                                            mo_agent_services::TaskStatus::Completed => "✓",
+                                            mo_agent_services::TaskStatus::Failed => "✗",
+                                            mo_agent_services::TaskStatus::InProgress => "▶",
+                                            mo_agent_services::TaskStatus::Paused => "⏸",
+                                            _ => "○",
+                                        };
+                                        let short_id = &t.task_id[..8.min(t.task_id.len())];
+                                        let subtask_count = t.plan.as_ref().map(|p| p.subtasks.len()).unwrap_or(0);
+                                        let project_type = t.project_type.as_deref().unwrap_or("?");
+                                        eprintln!(
+                                            "  {} {} {} [{}] ({} subtasks, {})",
+                                            short_id.dim(),
+                                            icon,
+                                            t.title.as_str().cyan(),
+                                            t.status.as_str(),
+                                            subtask_count,
+                                            project_type,
+                                        );
+                                    }
+                                    eprintln!();
+                                    eprintln!("  {} Use /plan load <id> to restore a cloud plan", "💡".cyan());
+                                }
+                            }
+                            Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+                        }
+                    } else {
+                        eprintln!("  {} Cloud not available. Use /login first.", "⚠".yellow());
+                    }
+                }
+                "load" if !sub_arg.is_empty() => {
+                    // Load a specific plan from cloud by task_id (or prefix)
+                    if let Some(ref svc) = state.task_service {
+                        use mo_agent_services::TaskService;
+                        use super::plan_decompose::{PlanModeState, format_plan, analyze_project};
+                        
+                        let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
+                        let query = sub_arg.trim();
+                        
+                        // Find task by ID prefix or title substring
+                        match svc.list_tasks(user_id, None).await {
+                            Ok(tasks) => {
+                                let found = tasks.iter().find(|t| {
+                                    t.task_id.starts_with(query) || 
+                                    t.title.to_lowercase().contains(&query.to_lowercase())
+                                });
+                                
+                                match found {
+                                    Some(task) if task.plan.is_some() => {
+                                        let plan = task.plan.as_ref().unwrap().clone();
+                                        let project_root = std::env::current_dir()
+                                            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                                        let context = analyze_project(&project_root);
+                                        let mut ps = PlanModeState::new(task.title.clone(), context);
+                                        ps.set_plan(plan.clone());
+                                        
+                                        state.plan_mode = Some(ps);
+                                        let short_id = &task.task_id[..8.min(task.task_id.len())];
+                                        eprintln!();
+                                        eprintln!(
+                                            "{}  Loaded cloud plan: {} ({})",
+                                            "☁️".cyan(),
+                                            task.title.as_str().cyan(),
+                                            short_id.dim()
+                                        );
+                                        eprintln!();
+                                        eprintln!("{}", format_plan(&plan));
+                                        eprintln!();
+                                        eprintln!(
+                                            "  {} Commands: 'execute' to run, 'exit' to leave plan mode",
+                                            "💡".cyan()
+                                        );
+                                    }
+                                    Some(_) => {
+                                        eprintln!("  {} Task '{}' has no plan", "⚠".yellow(), query);
+                                    }
+                                    None => {
+                                        eprintln!("  {} No task found matching '{}'", "⚠".yellow(), query);
+                                        eprintln!("  {} Use /plan cloud to list available plans", "💡".cyan());
+                                    }
+                                }
+                            }
+                            Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+                        }
+                    } else {
+                        eprintln!("  {} Cloud not available. Use /login first.", "⚠".yellow());
+                    }
+                }
                 "list" => {
                     let plans = crate::plan_decompose::list_saved_plans();
                     let templates = crate::plan_decompose::builtin_templates();
@@ -576,6 +682,10 @@ pub(super) async fn handle_memory_domain_command(
                             t.languages.join(", "));
                     }
                     eprintln!("  Use /plan template <name> <goal> to instantiate");
+                    // Also hint about cloud if available
+                    if state.task_service.is_some() {
+                        eprintln!("  {} Use /plan cloud to list cloud-synced plans", "☁️".cyan());
+                    }
                 }
                 "template" if !sub_arg.is_empty() => {
                     let parts: Vec<&str> = sub_arg.splitn(2, ' ').collect();
@@ -762,7 +872,7 @@ pub(super) async fn handle_memory_domain_command(
                 }
                 _ => {
                     eprintln!(
-                        "  Usage: /plan [show | set <text> | clear | decompose <goal> | enter <goal> | auto <goal> | resume | exit | list | template <name> <goal> | history | diff <v1> <v2> | rollback <v> | parallel]"
+                        "  Usage: /plan [show | set <text> | clear | decompose <goal> | enter <goal> | auto <goal> | resume | exit | list | cloud | load <id> | template <name> <goal> | history | diff <v1> <v2> | rollback <v> | parallel]"
                     );
                 }
             }
