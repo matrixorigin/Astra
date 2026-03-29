@@ -342,7 +342,7 @@ mod tests {
             graph.learn(
                 "matrixorigin",
                 DomainHint::GitHub,
-                &["github_search".into()],
+                &["github_search".into()], None,
             );
         }
         {
@@ -352,12 +352,12 @@ mod tests {
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
-                0.9,
+                0.9, None,
             );
         }
         {
             let mut c = cal.lock().unwrap();
-            c.record("fetch", Some(DomainHint::GitHub), TaskType::Fetch, false);
+            c.record("fetch", Some(DomainHint::GitHub), TaskType::Fetch, false, None);
         }
 
         let snapshot = export_from_modules(&eg, &pl, &cal);
@@ -380,7 +380,7 @@ mod tests {
         let (eg, pl, cal) = make_modules();
         {
             let mut graph = eg.lock().unwrap();
-            graph.learn("rust", DomainHint::Code, &["bash".into()]);
+            graph.learn("rust", DomainHint::Code, &["bash".into()], None);
         }
 
         let snapshot = export_from_modules(&eg, &pl, &cal);
@@ -399,13 +399,13 @@ mod tests {
         // Module set 1 knows about "rust"
         eg1.lock()
             .unwrap()
-            .learn("rust", DomainHint::Code, &["bash".into()]);
+            .learn("rust", DomainHint::Code, &["bash".into()], None);
 
         // Module set 2 knows about "matrixorigin"
         eg2.lock().unwrap().learn(
             "matrixorigin",
             DomainHint::GitHub,
-            &["github_search".into()],
+            &["github_search".into()], None,
         );
 
         // Export set 1, merge into set 2
@@ -471,12 +471,12 @@ mod tests {
             g.learn(
                 "matrixorigin",
                 DomainHint::GitHub,
-                &["github_search".into()],
+                &["github_search".into()], None,
             );
             g.learn(
                 "matrixorigin",
                 DomainHint::GitHub,
-                &["github_search".into()],
+                &["github_search".into()], None,
             );
         }
         {
@@ -486,19 +486,19 @@ mod tests {
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
-                0.9,
+                0.9, None,
             );
             l.record_outcome(
                 &["github_search".into()],
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
-                0.8,
+                0.8, None,
             );
         }
         {
             let mut c = cal.lock().unwrap();
-            c.record("fetch", Some(DomainHint::GitHub), TaskType::Fetch, false);
+            c.record("fetch", Some(DomainHint::GitHub), TaskType::Fetch, false, None);
         }
         let snapshot = export_from_modules(&eg, &pl, &cal);
         save_snapshot_to(&path, &snapshot).unwrap();

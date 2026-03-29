@@ -14,7 +14,7 @@
 //!
 //! ```rust,ignore
 //! // At turn end (Evaluate → Complete):
-//! library.record_outcome(&tools_used, TaskType::Fetch, Some(DomainHint::GitHub), true, 0.9);
+//! library.record_outcome(&tools_used, TaskType::Fetch, Some(DomainHint::GitHub), true, 0.9, None);
 //!
 //! // At turn start (Plan):
 //! let suggestions = library.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 3);
@@ -130,6 +130,10 @@ impl PatternLibrary {
     ///
     /// Called at turn end (Evaluate → Complete) with the tools that were used,
     /// the task type, domain, whether it succeeded, and quality score.
+    ///
+    /// If `user_feedback_score` is provided (0-100 scale), it adjusts the outcome:
+    /// - Low feedback (< 50) treats the turn as a failure even if technically successful
+    /// - Feedback also scales the quality score to reflect user satisfaction
     pub fn record_outcome(
         &mut self,
         tools: &[String],
@@ -137,6 +141,7 @@ impl PatternLibrary {
         domain: Option<DomainHint>,
         success: bool,
         quality: f64,
+        user_feedback_score: Option<i64>,
     ) {
         if tools.is_empty() {
             return;
@@ -157,9 +162,26 @@ impl PatternLibrary {
             ToolChainPattern::new(sig, tools.to_vec(), task_type, domain)
         });
 
-        if success {
+        // Apply user feedback to adjust success and quality:
+        // - Low satisfaction (< 50) overrides technical success → treat as failure
+        // - Feedback score scales quality proportionally
+        let adjusted_success = match user_feedback_score {
+            Some(score) if score < 50 => false, // User unhappy → failure
+            _ => success,
+        };
+
+        let adjusted_quality = match user_feedback_score {
+            Some(score) => {
+                // Scale quality by feedback: score=100 → 1.0x, score=50 → 0.75x, score=0 → 0.5x
+                let feedback_factor = 0.5 + (score.max(0) as f64 / 200.0);
+                quality * feedback_factor
+            }
+            None => quality,
+        };
+
+        if adjusted_success {
             pattern.success_count += 1;
-            pattern.quality_sum += quality.clamp(0.0, 1.0);
+            pattern.quality_sum += adjusted_quality.clamp(0.0, 1.0);
         } else {
             pattern.failure_count += 1;
         }
@@ -356,6 +378,7 @@ mod tests {
             Some(DomainHint::Code),
             true,
             0.9,
+            None,
         );
         assert_eq!(lib.len(), 1);
         let exported = lib.export();
@@ -367,7 +390,7 @@ mod tests {
     #[test]
     fn record_failure_increments_failure_count() {
         let mut lib = PatternLibrary::new();
-        lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, false, 0.0);
+        lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, false, 0.0, None);
         let exported = lib.export();
         assert_eq!(exported[0].success_count, 0);
         assert_eq!(exported[0].failure_count, 1);
@@ -383,8 +406,9 @@ mod tests {
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
-                0.8 + (i as f64) * 0.02,
-            );
+            0.8 + (i as f64) * 0.02,
+            None,
+        );
         }
         lib.record_outcome(
             &tools(&["github_search", "github_api"]),
@@ -392,6 +416,7 @@ mod tests {
             Some(DomainHint::GitHub),
             false,
             0.0,
+            None,
         );
         let exported = lib.export();
         assert_eq!(exported[0].success_count, 5);
@@ -402,15 +427,15 @@ mod tests {
     #[test]
     fn record_empty_tools_ignored() {
         let mut lib = PatternLibrary::new();
-        lib.record_outcome(&[], TaskType::Fetch, None, true, 0.9);
+        lib.record_outcome(&[], TaskType::Fetch, None, true, 0.9, None);
         assert!(lib.is_empty());
     }
 
     #[test]
     fn different_task_types_different_patterns() {
         let mut lib = PatternLibrary::new();
-        lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.9);
-        lib.record_outcome(&tools(&["bash"]), TaskType::Fetch, None, true, 0.8);
+        lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.9, None);
+        lib.record_outcome(&tools(&["bash"]), TaskType::Fetch, None, true, 0.8, None);
         assert_eq!(lib.len(), 2);
     }
 
@@ -457,11 +482,12 @@ mod tests {
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
-                0.9,
-            );
+            0.9,
+            None,
+        );
         }
         for _ in 0..3 {
-            lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.8);
+            lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.8, None);
         }
 
         let fetch_suggestions = lib.suggest(TaskType::Fetch, None, 5);
@@ -486,8 +512,9 @@ mod tests {
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
-                0.9,
-            );
+            0.9,
+            None,
+        );
         }
         for _ in 0..3 {
             lib.record_outcome(
@@ -495,8 +522,9 @@ mod tests {
                 TaskType::Fetch,
                 Some(DomainHint::System),
                 true,
-                0.8,
-            );
+            0.8,
+            None,
+        );
         }
 
         let github = lib.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 5);
@@ -511,7 +539,7 @@ mod tests {
     #[test]
     fn suggest_needs_min_observations() {
         let mut lib = PatternLibrary::new();
-        lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.9);
+        lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.9, None);
         // Only 1 observation → not suggested
         assert!(lib.suggest(TaskType::Code, None, 5).is_empty());
     }
@@ -521,18 +549,18 @@ mod tests {
         let mut lib = PatternLibrary::new();
         // Pattern A: high quality
         for _ in 0..5 {
-            lib.record_outcome(&tools(&["pattern_a"]), TaskType::Fetch, None, true, 0.95);
+            lib.record_outcome(&tools(&["pattern_a"]), TaskType::Fetch, None, true, 0.95, None);
         }
         // Pattern B: lower quality
         for _ in 0..5 {
-            lib.record_outcome(&tools(&["pattern_b"]), TaskType::Fetch, None, true, 0.5);
+            lib.record_outcome(&tools(&["pattern_b"]), TaskType::Fetch, None, true, 0.5, None);
         }
         // Pattern C: mixed success
         for _ in 0..3 {
-            lib.record_outcome(&tools(&["pattern_c"]), TaskType::Fetch, None, true, 0.7);
+            lib.record_outcome(&tools(&["pattern_c"]), TaskType::Fetch, None, true, 0.7, None);
         }
         for _ in 0..3 {
-            lib.record_outcome(&tools(&["pattern_c"]), TaskType::Fetch, None, false, 0.0);
+            lib.record_outcome(&tools(&["pattern_c"]), TaskType::Fetch, None, false, 0.0, None);
         }
 
         let suggestions = lib.suggest(TaskType::Fetch, None, 3);
@@ -547,7 +575,7 @@ mod tests {
         for i in 0..5 {
             let name = format!("tool_{i}");
             for _ in 0..3 {
-                lib.record_outcome(std::slice::from_ref(&name), TaskType::Code, None, true, 0.8);
+                lib.record_outcome(std::slice::from_ref(&name), TaskType::Code, None, true, 0.8, None);
             }
         }
         let suggestions = lib.suggest(TaskType::Code, None, 2);
@@ -571,8 +599,9 @@ mod tests {
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
-                0.9,
-            );
+            0.9,
+            None,
+        );
         }
         let terms = lib.boost_terms_for(TaskType::Fetch, Some(DomainHint::GitHub));
         assert!(terms.contains(&"github_search".to_string()));
@@ -584,10 +613,10 @@ mod tests {
         let mut lib = PatternLibrary::new();
         // Two patterns share "bash"
         for _ in 0..3 {
-            lib.record_outcome(&tools(&["bash", "grep"]), TaskType::Code, None, true, 0.9);
+            lib.record_outcome(&tools(&["bash", "grep"]), TaskType::Code, None, true, 0.9, None);
         }
         for _ in 0..3 {
-            lib.record_outcome(&tools(&["bash", "sed"]), TaskType::Code, None, true, 0.8);
+            lib.record_outcome(&tools(&["bash", "sed"]), TaskType::Code, None, true, 0.8, None);
         }
         let terms = lib.boost_terms_for(TaskType::Code, None);
         let bash_count = terms.iter().filter(|t| *t == "bash").count();
@@ -598,10 +627,10 @@ mod tests {
     fn boost_terms_excludes_low_success_rate() {
         let mut lib = PatternLibrary::new();
         for _ in 0..2 {
-            lib.record_outcome(&tools(&["flaky_tool"]), TaskType::Code, None, true, 0.3);
+            lib.record_outcome(&tools(&["flaky_tool"]), TaskType::Code, None, true, 0.3, None);
         }
         for _ in 0..5 {
-            lib.record_outcome(&tools(&["flaky_tool"]), TaskType::Code, None, false, 0.0);
+            lib.record_outcome(&tools(&["flaky_tool"]), TaskType::Code, None, false, 0.0, None);
         }
         // Success rate ~28% < 50% → excluded
         let terms = lib.boost_terms_for(TaskType::Code, None);
@@ -619,8 +648,9 @@ mod tests {
                 TaskType::Code,
                 Some(DomainHint::Code),
                 true,
-                0.9,
-            );
+            0.9,
+            None,
+        );
         }
         let exported = lib.export();
 
@@ -637,7 +667,7 @@ mod tests {
     fn merge_keeps_higher_observation_count() {
         let mut lib = PatternLibrary::new();
         for _ in 0..3 {
-            lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.9);
+            lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.9, None);
         }
 
         // Create a stored version with more data
@@ -656,7 +686,7 @@ mod tests {
     fn merge_keeps_local_if_higher() {
         let mut lib = PatternLibrary::new();
         for _ in 0..10 {
-            lib.record_outcome(&tools(&["grep"]), TaskType::Fetch, None, true, 0.9);
+            lib.record_outcome(&tools(&["grep"]), TaskType::Fetch, None, true, 0.9, None);
         }
 
         let mut stored =
@@ -689,8 +719,9 @@ mod tests {
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
-                0.9,
-            );
+            0.9,
+            None,
+        );
         }
 
         // Phase 3: Suggestions now available
@@ -724,8 +755,9 @@ mod tests {
                 TaskType::Code,
                 None,
                 true,
-                0.9,
-            );
+            0.9,
+            None,
+        );
         }
 
         // Given just_used = [grep], should suggest read_file and str_replace
@@ -753,8 +785,9 @@ mod tests {
                 TaskType::Code,
                 None,
                 true,
-                0.8,
-            );
+            0.8,
+            None,
+        );
         }
 
         let scores = lib.co_occurrence_scores(&tools(&["bash"]));
@@ -773,8 +806,9 @@ mod tests {
                 TaskType::Code,
                 None,
                 false,
-                0.0,
-            );
+            0.0,
+            None,
+        );
         }
 
         // Should not recommend dangerous_tool (only failures)
@@ -788,9 +822,75 @@ mod tests {
     #[test]
     fn co_occurrence_with_empty_just_used_returns_empty() {
         let mut lib = PatternLibrary::new();
-        lib.record_outcome(&tools(&["bash", "grep"]), TaskType::Fetch, None, true, 0.8);
-        lib.record_outcome(&tools(&["bash", "grep"]), TaskType::Fetch, None, true, 0.8);
+        lib.record_outcome(&tools(&["bash", "grep"]), TaskType::Fetch, None, true, 0.8, None);
+        lib.record_outcome(&tools(&["bash", "grep"]), TaskType::Fetch, None, true, 0.8, None);
         let scores = lib.co_occurrence_scores(&[]);
         assert!(scores.is_empty());
+    }
+
+    // ── User Feedback Integration ──
+
+    #[test]
+    fn low_feedback_converts_success_to_failure() {
+        let mut lib = PatternLibrary::new();
+        // Technically successful (quality=0.9), but user unhappy (score=30)
+        lib.record_outcome(
+            &tools(&["bad_tool"]),
+            TaskType::Fetch,
+            None,
+            true,  // success
+            0.9,   // quality
+            Some(30),  // low feedback → should become failure
+        );
+
+        let exported = lib.export();
+        let pattern = exported.iter().find(|p| p.tools.contains(&"bad_tool".to_string())).unwrap();
+        assert_eq!(pattern.success_count, 0, "Low feedback should convert to failure");
+        assert_eq!(pattern.failure_count, 1);
+    }
+
+    #[test]
+    fn high_feedback_keeps_success() {
+        let mut lib = PatternLibrary::new();
+        lib.record_outcome(
+            &tools(&["good_tool"]),
+            TaskType::Fetch,
+            None,
+            true,
+            0.9,
+            Some(80),  // high feedback → stays success
+        );
+
+        let exported = lib.export();
+        let pattern = exported.iter().find(|p| p.tools.contains(&"good_tool".to_string())).unwrap();
+        assert_eq!(pattern.success_count, 1, "High feedback should keep success");
+        assert_eq!(pattern.failure_count, 0);
+    }
+
+    #[test]
+    fn feedback_scales_quality() {
+        let mut lib = PatternLibrary::new();
+        // High feedback: quality stays high (0.9 * (0.5 + 100/200) = 0.9)
+        lib.record_outcome(&tools(&["tool_a"]), TaskType::Code, None, true, 0.9, Some(100));
+        // Medium feedback: quality reduced (0.9 * (0.5 + 50/200) = 0.675)
+        lib.record_outcome(&tools(&["tool_b"]), TaskType::Code, None, true, 0.9, Some(50));
+
+        let exported = lib.export();
+        let a = exported.iter().find(|p| p.tools.contains(&"tool_a".to_string())).unwrap();
+        let b = exported.iter().find(|p| p.tools.contains(&"tool_b".to_string())).unwrap();
+
+        assert!(a.avg_quality() > b.avg_quality(),
+            "Higher feedback should yield higher quality: {} > {}", a.avg_quality(), b.avg_quality());
+    }
+
+    #[test]
+    fn no_feedback_uses_raw_values() {
+        let mut lib = PatternLibrary::new();
+        lib.record_outcome(&tools(&["raw_tool"]), TaskType::Fetch, None, true, 0.8, None);
+
+        let exported = lib.export();
+        let pattern = exported.iter().find(|p| p.tools.contains(&"raw_tool".to_string())).unwrap();
+        assert_eq!(pattern.success_count, 1);
+        assert!((pattern.avg_quality() - 0.8).abs() < 0.01, "No feedback should use raw quality");
     }
 }

@@ -201,6 +201,10 @@ pub struct TurnLearningOutcome {
     pub task_type_label: Option<String>,
     /// Routing metadata: domain_hint label from RoutingDecision.
     pub domain_hint_label: Option<String>,
+    /// User feedback score (0-100), pulled from skill_selection_events.
+    /// Used to close the feedback loop: low scores indicate user dissatisfaction
+    /// even if the turn technically succeeded.
+    pub user_feedback_score: Option<i64>,
 }
 
 /// Trait for recording turn outcomes into pipeline learning modules.

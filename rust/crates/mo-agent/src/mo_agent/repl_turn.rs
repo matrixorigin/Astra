@@ -526,6 +526,7 @@ fn apply_turn_success(
             success,
             quality,
             false,
+            None, // user_feedback_score — populated later via /api/v1/learning/feedback
         );
     }
 
