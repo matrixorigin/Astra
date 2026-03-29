@@ -670,6 +670,9 @@ pub struct PlanModeState {
     /// Pending clarification questions from LLM
     #[serde(default)]
     pub pending_clarifications: Option<PendingClarifications>,
+    /// Execution timeline tracking all events
+    #[serde(default)]
+    pub timeline: ExecutionTimeline,
 }
 
 impl PlanModeState {
@@ -683,6 +686,7 @@ impl PlanModeState {
             modified: false,
             version_history: PlanVersionHistory::default(),
             pending_clarifications: None,
+            timeline: ExecutionTimeline::default(),
         }
     }
 
@@ -1977,6 +1981,264 @@ fn chrono_now_iso() -> String {
         .as_secs();
     // Simple format without external crate
     format!("{}", now)
+}
+
+// ─── Execution Timeline ─────────────────────────────────────────────────────
+
+/// Types of events that can occur during plan execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TimelineEventKind {
+    /// Plan was created
+    PlanCreated { subtask_count: usize },
+    /// Execution started (auto or step mode)
+    ExecutionStarted { mode: String },
+    /// A subtask started
+    SubtaskStarted { subtask_id: String, title: String },
+    /// A subtask completed successfully
+    SubtaskCompleted { subtask_id: String, title: String, duration_sec: u64 },
+    /// A subtask failed
+    SubtaskFailed { subtask_id: String, title: String, error: String },
+    /// A subtask was skipped
+    SubtaskSkipped { subtask_id: String, title: String, reason: String },
+    /// Plan was modified/replanned
+    Replan { reason: String, changes: String },
+    /// User provided feedback/rating
+    UserRating { rating: u8 },
+    /// Execution was paused
+    ExecutionPaused { reason: String },
+    /// Execution was resumed
+    ExecutionResumed,
+    /// Plan completed (all subtasks done)
+    PlanCompleted { success: bool, duration_sec: u64 },
+    /// A discovery/observation during execution
+    Discovery { message: String },
+    /// Git commit associated with changes
+    GitCommit { commit_hash: String, message: String },
+}
+
+/// A single event in the execution timeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineEvent {
+    /// ISO 8601 timestamp
+    pub timestamp: String,
+    /// Human-readable time (e.g., "14:23")
+    pub time_display: String,
+    /// The event details
+    pub event: TimelineEventKind,
+}
+
+impl TimelineEvent {
+    /// Create a new timeline event with current timestamp.
+    pub fn new(event: TimelineEventKind) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        // Convert to HH:MM format (simplified - assumes local time)
+        let hours = (now / 3600) % 24;
+        let minutes = (now / 60) % 60;
+        
+        Self {
+            timestamp: now.to_string(),
+            time_display: format!("{:02}:{:02}", hours, minutes),
+            event,
+        }
+    }
+    
+    /// Format event for display
+    pub fn format_display(&self) -> String {
+        let icon = match &self.event {
+            TimelineEventKind::PlanCreated { .. } => "📋",
+            TimelineEventKind::ExecutionStarted { .. } => "▶",
+            TimelineEventKind::SubtaskStarted { .. } => "→",
+            TimelineEventKind::SubtaskCompleted { .. } => "✓",
+            TimelineEventKind::SubtaskFailed { .. } => "✗",
+            TimelineEventKind::SubtaskSkipped { .. } => "⏭",
+            TimelineEventKind::Replan { .. } => "🔄",
+            TimelineEventKind::UserRating { .. } => "⭐",
+            TimelineEventKind::ExecutionPaused { .. } => "⏸",
+            TimelineEventKind::ExecutionResumed => "▶",
+            TimelineEventKind::PlanCompleted { success, .. } => if *success { "✅" } else { "❌" },
+            TimelineEventKind::Discovery { .. } => "⚠",
+            TimelineEventKind::GitCommit { .. } => "📦",
+        };
+        
+        let desc = match &self.event {
+            TimelineEventKind::PlanCreated { subtask_count } => 
+                format!("Plan created ({} subtasks)", subtask_count),
+            TimelineEventKind::ExecutionStarted { mode } => 
+                format!("Started {} execution", mode),
+            TimelineEventKind::SubtaskStarted { title, .. } => 
+                format!("Started: {}", title),
+            TimelineEventKind::SubtaskCompleted { title, duration_sec, .. } => 
+                format!("{} ({} sec)", title, duration_sec),
+            TimelineEventKind::SubtaskFailed { title, error, .. } => 
+                format!("{} - {}", title, error),
+            TimelineEventKind::SubtaskSkipped { title, reason, .. } => 
+                format!("Skipped: {} ({})", title, reason),
+            TimelineEventKind::Replan { reason, .. } => 
+                format!("Replan: {}", reason),
+            TimelineEventKind::UserRating { rating } => 
+                format!("Rating: {}/5", rating),
+            TimelineEventKind::ExecutionPaused { reason } => 
+                format!("Paused: {}", reason),
+            TimelineEventKind::ExecutionResumed => 
+                "Resumed".to_string(),
+            TimelineEventKind::PlanCompleted { success, duration_sec } => 
+                if *success { 
+                    format!("Completed ({} sec total)", duration_sec) 
+                } else { 
+                    format!("Failed ({} sec total)", duration_sec) 
+                },
+            TimelineEventKind::Discovery { message } => 
+                format!("Discovered: {}", message),
+            TimelineEventKind::GitCommit { commit_hash, message } => 
+                format!("Commit {}: {}", &commit_hash[..7.min(commit_hash.len())], message),
+        };
+        
+        format!("{}  {} {}", self.time_display, icon, desc)
+    }
+}
+
+/// Execution timeline tracking all events during plan execution.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExecutionTimeline {
+    /// All recorded events, in chronological order.
+    pub events: Vec<TimelineEvent>,
+    /// Plan creation timestamp (for duration calculation).
+    pub start_timestamp: Option<String>,
+    /// Plan completion timestamp.
+    pub end_timestamp: Option<String>,
+}
+
+impl ExecutionTimeline {
+    /// Record a new event.
+    pub fn record(&mut self, kind: TimelineEventKind) {
+        let event = TimelineEvent::new(kind);
+        
+        // Track start/end timestamps
+        match &event.event {
+            TimelineEventKind::PlanCreated { .. } => {
+                self.start_timestamp = Some(event.timestamp.clone());
+            }
+            TimelineEventKind::PlanCompleted { .. } => {
+                self.end_timestamp = Some(event.timestamp.clone());
+            }
+            _ => {}
+        }
+        
+        self.events.push(event);
+    }
+    
+    /// Record plan creation.
+    pub fn plan_created(&mut self, subtask_count: usize) {
+        self.record(TimelineEventKind::PlanCreated { subtask_count });
+    }
+    
+    /// Record execution start.
+    pub fn execution_started(&mut self, auto_mode: bool) {
+        let mode = if auto_mode { "auto".to_string() } else { "step".to_string() };
+        self.record(TimelineEventKind::ExecutionStarted { mode });
+    }
+    
+    /// Record subtask start.
+    pub fn subtask_started(&mut self, subtask_id: &str, title: &str) {
+        self.record(TimelineEventKind::SubtaskStarted { 
+            subtask_id: subtask_id.to_string(), 
+            title: title.to_string() 
+        });
+    }
+    
+    /// Record subtask completion.
+    pub fn subtask_completed(&mut self, subtask_id: &str, title: &str, duration_sec: u64) {
+        self.record(TimelineEventKind::SubtaskCompleted { 
+            subtask_id: subtask_id.to_string(), 
+            title: title.to_string(),
+            duration_sec 
+        });
+    }
+    
+    /// Record subtask failure.
+    pub fn subtask_failed(&mut self, subtask_id: &str, title: &str, error: &str) {
+        self.record(TimelineEventKind::SubtaskFailed { 
+            subtask_id: subtask_id.to_string(), 
+            title: title.to_string(),
+            error: error.to_string()
+        });
+    }
+    
+    /// Record a discovery/observation.
+    pub fn discovery(&mut self, message: &str) {
+        self.record(TimelineEventKind::Discovery { message: message.to_string() });
+    }
+    
+    /// Record a git commit.
+    pub fn git_commit(&mut self, commit_hash: &str, message: &str) {
+        self.record(TimelineEventKind::GitCommit { 
+            commit_hash: commit_hash.to_string(),
+            message: message.to_string()
+        });
+    }
+    
+    /// Record plan completion.
+    pub fn plan_completed(&mut self, success: bool) {
+        let duration_sec = self.start_timestamp.as_ref()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|start| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                now.saturating_sub(start)
+            })
+            .unwrap_or(0);
+        
+        self.record(TimelineEventKind::PlanCompleted { success, duration_sec });
+    }
+    
+    /// Format timeline for display.
+    pub fn format_display(&self) -> String {
+        if self.events.is_empty() {
+            return "  (no events recorded)".to_string();
+        }
+        
+        let mut out = String::new();
+        for event in &self.events {
+            out.push_str("  ");
+            out.push_str(&event.format_display());
+            out.push('\n');
+        }
+        out
+    }
+    
+    /// Get total duration in seconds (if completed).
+    pub fn total_duration_sec(&self) -> Option<u64> {
+        match (self.start_timestamp.as_ref(), self.end_timestamp.as_ref()) {
+            (Some(start), Some(end)) => {
+                let start_sec = start.parse::<u64>().ok()?;
+                let end_sec = end.parse::<u64>().ok()?;
+                Some(end_sec.saturating_sub(start_sec))
+            }
+            _ => None
+        }
+    }
+    
+    /// Count completed subtasks.
+    pub fn completed_subtask_count(&self) -> usize {
+        self.events.iter().filter(|e| matches!(e.event, TimelineEventKind::SubtaskCompleted { .. })).count()
+    }
+    
+    /// Count failed subtasks.
+    pub fn failed_subtask_count(&self) -> usize {
+        self.events.iter().filter(|e| matches!(e.event, TimelineEventKind::SubtaskFailed { .. })).count()
+    }
+    
+    /// Count replans.
+    pub fn replan_count(&self) -> usize {
+        self.events.iter().filter(|e| matches!(e.event, TimelineEventKind::Replan { .. })).count()
+    }
 }
 
 // ─── Parallel Subtask Detection & File Conflict ─────────────────────────────
@@ -4787,5 +5049,86 @@ Done!"#;
         // Healthy plan with no issues
         let result = detect_replan_needed(&plan, 1, &[]);
         assert!(result.is_none());
+    }
+    
+    // ═══════════════════════ Execution Timeline Tests ════════════════════════
+    
+    #[test]
+    fn timeline_records_events() {
+        let mut timeline = ExecutionTimeline::default();
+        
+        timeline.plan_created(3);
+        timeline.execution_started(true);
+        timeline.subtask_started("s1", "Setup");
+        timeline.subtask_completed("s1", "Setup", 60);
+        timeline.discovery("Found existing config");
+        
+        assert_eq!(timeline.events.len(), 5);
+        assert_eq!(timeline.completed_subtask_count(), 1);
+        assert!(timeline.start_timestamp.is_some());
+    }
+    
+    #[test]
+    fn timeline_format_display() {
+        let mut timeline = ExecutionTimeline::default();
+        
+        timeline.plan_created(2);
+        timeline.subtask_completed("s1", "First task", 30);
+        timeline.subtask_failed("s2", "Second task", "timeout");
+        
+        let display = timeline.format_display();
+        assert!(display.contains("📋"), "should have plan created icon");
+        assert!(display.contains("✓"), "should have completed icon");
+        assert!(display.contains("✗"), "should have failed icon");
+        assert!(display.contains("First task"));
+        assert!(display.contains("Second task"));
+        assert!(display.contains("timeout"));
+    }
+    
+    #[test]
+    fn timeline_counts() {
+        let mut timeline = ExecutionTimeline::default();
+        
+        timeline.subtask_completed("s1", "A", 10);
+        timeline.subtask_completed("s2", "B", 20);
+        timeline.subtask_failed("s3", "C", "error");
+        timeline.record(TimelineEventKind::Replan { 
+            reason: "user request".into(), 
+            changes: "added task".into() 
+        });
+        timeline.record(TimelineEventKind::Replan { 
+            reason: "conflict".into(), 
+            changes: "modified".into() 
+        });
+        
+        assert_eq!(timeline.completed_subtask_count(), 2);
+        assert_eq!(timeline.failed_subtask_count(), 1);
+        assert_eq!(timeline.replan_count(), 2);
+    }
+    
+    #[test]
+    fn timeline_git_commit() {
+        let mut timeline = ExecutionTimeline::default();
+        
+        timeline.git_commit("abc1234567890", "feat: add auth");
+        
+        let display = timeline.format_display();
+        assert!(display.contains("📦"), "should have commit icon");
+        assert!(display.contains("abc1234"), "should have short hash");
+        assert!(display.contains("feat: add auth"));
+    }
+    
+    #[test]
+    fn timeline_plan_completed() {
+        let mut timeline = ExecutionTimeline::default();
+        
+        timeline.plan_created(2);
+        // Simulate some delay (we can't actually delay in tests, but the logic works)
+        timeline.plan_completed(true);
+        
+        assert!(timeline.end_timestamp.is_some());
+        
+        let display = timeline.format_display();
+        assert!(display.contains("✅"), "should have success icon");
     }
 }

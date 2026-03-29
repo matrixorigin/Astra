@@ -919,6 +919,29 @@ pub(super) async fn handle_memory_domain_command(
                             "⚠".yellow());
                     }
                 }
+                "timeline" => {
+                    if let Some(ref ps) = state.plan_mode {
+                        eprintln!("  ─── Execution Timeline ───");
+                        if ps.timeline.events.is_empty() {
+                            eprintln!("  {} No events recorded yet", "(empty)".dim());
+                            eprintln!("  {} Events are recorded during plan execution", "💡".cyan());
+                        } else {
+                            eprintln!("{}", ps.timeline.format_display());
+                            // Show summary
+                            eprintln!("  ─────────────────────────");
+                            eprintln!("  Completed: {} | Failed: {} | Replans: {}",
+                                ps.timeline.completed_subtask_count().to_string().green(),
+                                ps.timeline.failed_subtask_count().to_string().red(),
+                                ps.timeline.replan_count()
+                            );
+                            if let Some(duration) = ps.timeline.total_duration_sec() {
+                                eprintln!("  Total duration: {} sec", duration);
+                            }
+                        }
+                    } else {
+                        eprintln!("  {} Not in plan mode.", "⚠".yellow());
+                    }
+                }
                 "diff" if !sub_arg.is_empty() => {
                     if let Some(ref ps) = state.plan_mode {
                         let parts: Vec<&str> = sub_arg.split_whitespace().collect();
