@@ -12,6 +12,7 @@
 //! 5. **Structured reflection** — not just "nudge", but causal analysis + strategy change.
 
 pub mod calibration;
+pub mod defaults;
 pub mod engine;
 pub mod entity;
 pub mod event;
