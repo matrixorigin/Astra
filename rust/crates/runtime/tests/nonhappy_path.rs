@@ -127,8 +127,9 @@ mod turn_guard_integration {
         guard.record_tool_result("bash", "Error: permission denied");
         guard.record_tool_result("bash", "Error: permission denied");
 
-        // Same tool call twice → stall
+        // Same tool call three times → stall (window=3)
         let calls = [tool_call("bash", r#"{"command":"ls"}"#)];
+        guard.record_tool_calls(&calls);
         guard.record_tool_calls(&calls);
         guard.record_tool_calls(&calls);
 
@@ -555,7 +556,9 @@ mod chat_stream_turnguard_e2e {
         let v1 = guard.evaluate();
         assert_eq!(v1.severity, VerdictSeverity::Healthy);
 
-        // Repeat exact same call
+        // Repeat exact same call twice more (need 3 for window=3)
+        guard.record_tool_calls(std::slice::from_ref(&call));
+        guard.record_tool_result("bash", "file1.rs\nfile2.rs");
         guard.record_tool_calls(std::slice::from_ref(&call));
         guard.record_tool_result("bash", "file1.rs\nfile2.rs");
         let v2 = guard.evaluate();
@@ -588,8 +591,10 @@ mod chat_stream_turnguard_e2e {
     fn stall_recovery_with_different_tool() {
         let mut guard = TurnGuard::new();
 
-        // Turn 1-2: stall
+        // Turn 1-3: stall (need 3 identical calls for window=3)
         let call = tc("bash", r#"{"command":"cat config.yaml"}"#);
+        guard.record_tool_calls(std::slice::from_ref(&call));
+        guard.record_tool_result("bash", "key: value");
         guard.record_tool_calls(std::slice::from_ref(&call));
         guard.record_tool_result("bash", "key: value");
         guard.record_tool_calls(std::slice::from_ref(&call));
@@ -613,12 +618,12 @@ mod chat_stream_turnguard_e2e {
 
     // ── Divergence scenarios ──
 
-    /// 5+ rounds of exploration-only tools → DIVERGENCE_CORRECTION injected.
+    /// 8+ rounds of exploration-only tools → DIVERGENCE_CORRECTION injected.
     #[test]
     fn exploration_divergence_triggers_correction() {
         let mut guard = TurnGuard::new();
 
-        // All exploration tools: bash, read_file, grep, list_dir, glob
+        // All exploration tools: bash, read_file, grep, list_dir, glob (8 rounds)
         guard.record_tool_calls(&[tc("bash", r#"{"command":"find . -name *.rs"}"#)]);
         guard.record_tool_result("bash", "src/main.rs\nsrc/lib.rs");
 
@@ -633,6 +638,15 @@ mod chat_stream_turnguard_e2e {
 
         guard.record_tool_calls(&[tc("glob", r#"{"pattern":"**/*.toml"}"#)]);
         guard.record_tool_result("glob", "Cargo.toml");
+
+        guard.record_tool_calls(&[tc("bash", r#"{"command":"wc -l src/*.rs"}"#)]);
+        guard.record_tool_result("bash", "42 src/main.rs");
+
+        guard.record_tool_calls(&[tc("read_file", r#"{"path":"src/lib.rs"}"#)]);
+        guard.record_tool_result("read_file", "pub fn lib() {}");
+
+        guard.record_tool_calls(&[tc("grep", r#"{"pattern":"fn "}"#)]);
+        guard.record_tool_result("grep", "src/main.rs:1: fn main()");
 
         let v = guard.evaluate();
         assert!(
@@ -781,14 +795,16 @@ mod chat_stream_turnguard_e2e {
     // ── Escalation + force stop ──
 
     /// Full escalation path: normal → warning → critical → force_stop.
+    /// Now Critical requires nudges + errors (pure nudges stay at Warning).
     #[test]
     fn escalation_path_to_force_stop() {
         let mut guard = TurnGuard::new();
         let mut restricted = HashSet::new();
         let mut budget = 25usize;
 
-        // Phase 1: first stall → nudge_count=1, severity=Warning (from stall)
+        // Phase 1: first stall (need 3 identical calls for window=3)
         let call = tc("bash", r#"{"command":"echo hi"}"#);
+        guard.record_tool_calls(std::slice::from_ref(&call));
         guard.record_tool_calls(std::slice::from_ref(&call));
         guard.record_tool_calls(std::slice::from_ref(&call));
         let v = guard.evaluate();
@@ -797,29 +813,28 @@ mod chat_stream_turnguard_e2e {
         budget = b;
         assert!(budget < 25, "warning should reduce budget");
 
-        // Phase 2: stalls 2-4 → accumulate nudges to 4
+        // Phase 2: more stalls to accumulate nudges
         for _ in 0..3 {
             guard.record_tool_calls(std::slice::from_ref(&call));
             let v = guard.evaluate();
             let (b, _, _) = apply_verdict(&v, budget, &mut restricted);
             budget = b;
         }
-        assert_eq!(guard.nudge_count, 4);
+        assert!(guard.nudge_count >= 3);
 
-        // Phase 3: 5th stall → nudge_count=5, escalation=Critical
-        guard.record_tool_calls(std::slice::from_ref(&call));
+        // Phase 3: pure nudges → only Warning (not Critical without errors)
         let v = guard.evaluate();
-        assert_eq!(guard.nudge_count, 5);
+        assert!(
+            !v.force_stop,
+            "pure nudges without errors must NOT force_stop"
+        );
+
+        // Phase 4: add tool errors to couple with nudges → Critical + force_stop
+        guard.record_tool_result("bash", "error: no such file");
+        guard.record_tool_result("bash", "error: not found");
+        let v = guard.evaluate();
         assert_eq!(v.severity, VerdictSeverity::Critical);
-        let (b, events, _) = apply_verdict(&v, budget, &mut restricted);
-        let _ = b;
-        assert!(events.iter().any(|(e, _)| e == "critical_escalation"));
-
-        // Phase 4: 6th stall → nudge_count=6 → force_stop
-        guard.record_tool_calls(std::slice::from_ref(&call));
-        let v = guard.evaluate();
-        assert_eq!(guard.nudge_count, 6);
-        assert!(v.force_stop, "6 nudges + Critical → force_stop");
+        assert!(v.force_stop, "nudges + 2 errors → Critical → force_stop");
     }
 
     /// Critical + 6 nudges → force_stop=true even without stall (error-only path).
@@ -968,13 +983,21 @@ mod chat_stream_turnguard_e2e {
         // One error is not enough for warning escalation
         assert!(v.severity <= VerdictSeverity::Info);
 
-        // Turn 3: mo_query fails again (same call → also a stall!)
+        // Turn 3: mo_query fails again (same call, but window=3 needs one more)
+        guard.record_tool_calls(&[tc("mo_query", r#"{"sql":"SELECT 1"}"#)]);
+        guard.record_tool_result("mo_query", "Error: connection refused");
+        let v = guard.evaluate();
+        // 2 identical calls → below window=3, no stall yet
+        // But 2 errors may push toward warning via error count
+        assert!(v.severity <= VerdictSeverity::Info);
+
+        // Turn 3b: third identical mo_query → stall detected!
         guard.record_tool_calls(&[tc("mo_query", r#"{"sql":"SELECT 1"}"#)]);
         guard.record_tool_result("mo_query", "Error: connection refused");
         let v = guard.evaluate();
         assert!(
             v.severity >= VerdictSeverity::Warning,
-            "stall on failing tool"
+            "stall on failing tool after 3 identical calls"
         );
         let (b, _, _) = apply_verdict(&v, budget, &mut restricted);
         budget = b;

@@ -334,8 +334,9 @@ mod tests {
     #[test]
     fn stall_triggers_nudge() {
         let mut guard = TurnGuard::new();
-        // Same tool call twice → stall
+        // Same tool call 3x → stall (SERVER_STALL_WINDOW=3)
         let calls = [make_tool_call("bash", r#"{"command":"ls"}"#)];
+        guard.record_tool_calls(&calls);
         guard.record_tool_calls(&calls);
         guard.record_tool_calls(&calls);
 
@@ -348,12 +349,15 @@ mod tests {
     #[test]
     fn divergence_triggers_correction() {
         let mut guard = TurnGuard::new();
-        // 5 rounds of exploration-only tools (hits MAX_EXPLORATION_ROUNDS=5)
+        // 8 rounds of exploration-only tools (hits MAX_EXPLORATION_ROUNDS=8)
         guard.record_tool_calls(&[make_tool_call("bash", r#"{"command":"ls"}"#)]);
         guard.record_tool_calls(&[make_tool_call("read_file", r#"{"path":"foo"}"#)]);
         guard.record_tool_calls(&[make_tool_call("grep", r#"{"pattern":"bar"}"#)]);
         guard.record_tool_calls(&[make_tool_call("list_dir", r#"{"path":"src"}"#)]);
         guard.record_tool_calls(&[make_tool_call("glob", r#"{"pattern":"*.rs"}"#)]);
+        guard.record_tool_calls(&[make_tool_call("bash", r#"{"command":"find ."}"#)]);
+        guard.record_tool_calls(&[make_tool_call("read_file", r#"{"path":"bar"}"#)]);
+        guard.record_tool_calls(&[make_tool_call("grep", r#"{"pattern":"baz"}"#)]);
 
         let verdict = guard.evaluate();
         assert!(verdict.injections.iter().any(|m| m.contains("exploring")));
@@ -556,17 +560,18 @@ mod tests {
     fn verdict_fields_reflect_actual_state() {
         let mut guard = TurnGuard::new();
 
-        // Trigger stall (same call twice)
+        // Trigger stall (same call 3x, SERVER_STALL_WINDOW=3)
         let calls = [make_tool_call("bash", r#"{"command":"ls"}"#)];
+        guard.record_tool_calls(&calls);
         guard.record_tool_calls(&calls);
         guard.record_tool_calls(&calls);
         let v = guard.evaluate();
         assert!(v.stall_detected);
         assert!(!v.is_diverging); // stall detected, not divergence
 
-        // Fresh guard: trigger divergence (6 exploration rounds, all different)
+        // Fresh guard: trigger divergence (8 exploration rounds, all different)
         let mut guard2 = TurnGuard::new();
-        let tools = ["bash", "read_file", "grep", "list_dir", "glob", "bash"];
+        let tools = ["bash", "read_file", "grep", "list_dir", "glob", "bash", "read_file", "grep"];
         for (i, tool) in tools.iter().enumerate() {
             guard2.record_tool_calls(&[make_tool_call(tool, &format!(r#"{{"arg":"val{}"}}"#, i))]);
         }
@@ -574,33 +579,40 @@ mod tests {
         assert!(v2.is_diverging);
     }
 
-    /// force_stop requires 6+ nudges AND Critical escalation.
+    /// force_stop requires Critical escalation. With coupled nudge+error
+    /// thresholds, pure nudges without errors → Warning, not Critical.
     #[test]
-    fn force_stop_requires_high_nudge_count() {
+    fn force_stop_requires_nudges_plus_errors() {
         let mut guard = TurnGuard::new();
+        // 2 nudges, 0 errors → Warning, no force_stop
         guard.nudge_count = 2;
         let v = guard.evaluate();
-        // 2 nudges → Critical escalation, but nudge_count < 3 → no force_stop
         assert!(!v.force_stop);
 
+        // 3 nudges, 0 errors → still Warning (not Critical without errors)
         guard.nudge_count = 3;
         let v = guard.evaluate();
-        assert!(v.force_stop);
+        assert!(!v.force_stop, "pure stalls without errors should not force_stop");
+
+        // 3 nudges + 2 errors → Critical → force_stop
+        for _ in 0..2 {
+            guard.record_tool_result("test_tool", "Error: something failed");
+        }
+        let v = guard.evaluate();
+        assert!(v.force_stop, "stalls + errors should force_stop");
     }
 
     #[test]
-    fn force_stop_threshold_lowered_from_six_to_three() {
-        // Regression test: previously force_stop needed 6 nudges which was
-        // too lenient — session 62c1e8e9 had 11 stalls but never stopped.
-        // Now 3 nudges + Critical escalation triggers force_stop.
+    fn force_stop_nudges_alone_no_longer_sufficient() {
+        // Regression test: previously 3 nudges alone triggered Critical + force_stop.
+        // Sessions 62fee584 and 2c701822 showed this was too aggressive — exploration
+        // patterns (grep→read→grep) with zero errors got force-stopped.
+        // Now nudge_count >= 3 requires total_errors >= 2 for Critical.
         let mut guard = TurnGuard::new();
-        // Simulate 3 stall+nudge cycles
-        for _ in 0..3 {
-            guard.nudge_count += 1;
-        }
-        // With nudge_count=3 and Critical escalation, force_stop should fire
+        guard.nudge_count = 5; // many nudges
         let v = guard.evaluate();
-        assert!(v.force_stop, "3 nudges + Critical should force stop");
+        assert!(!v.force_stop, "5 nudges + 0 errors must NOT force_stop");
+        assert_eq!(v.severity, VerdictSeverity::Warning);
     }
 
     // ── Error counting: single-count per tool result ─────────────────────────

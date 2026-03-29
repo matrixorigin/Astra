@@ -2,17 +2,21 @@ use std::collections::BTreeSet;
 
 use serde_json::Value;
 
-pub const SERVER_STALL_WINDOW: usize = 2;
+/// Require 3 consecutive identical tool call turns (not 2) to detect stall.
+/// Window=2 was too aggressive: legitimate retries and exploration patterns
+/// (e.g. read_file with different args each turn) triggered false stalls.
+pub const SERVER_STALL_WINDOW: usize = 3;
 
 /// Tools considered "exploration" — low-value if used repeatedly without
 /// a "productive" tool call in between.
 const EXPLORATION_TOOLS: &[&str] = &["bash", "list_dir", "read_file", "glob", "grep"];
 
 /// Maximum consecutive exploration-only rounds before triggering correction.
-/// Raised from 2→5: grep→read_file is the fundamental agent pattern,
-/// not divergence. 5 consecutive exploration-only rounds is a more reliable
-/// signal that the agent is truly stuck in a loop.
-pub const MAX_EXPLORATION_ROUNDS: usize = 5;
+/// Raised from 5→8: coding agents routinely need 6-8 rounds of
+/// grep→read_file→list_dir to understand a codebase before acting.
+/// 5 was too aggressive — sessions doing legitimate investigation got
+/// flagged as diverging prematurely.
+pub const MAX_EXPLORATION_ROUNDS: usize = 8;
 
 pub fn canonical_tool_args(raw: &str) -> String {
     match serde_json::from_str::<Value>(raw) {
@@ -476,28 +480,28 @@ mod tests {
 
     #[test]
     fn divergence_exploring_two() {
-        // With MAX_EXPLORATION_ROUNDS=5, two consecutive exploration rounds → Exploring(2)
+        // With MAX_EXPLORATION_ROUNDS=8, two consecutive exploration rounds → Exploring(2)
         let sigs = make_sigs(&[&["github_list_prs"], &["bash"], &["list_dir"]]);
         assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(2));
     }
 
     #[test]
     fn divergence_exploring_three() {
-        // 3 consecutive exploration rounds → still Exploring (threshold is 5)
+        // 3 consecutive exploration rounds → still Exploring (threshold is 8)
         let sigs = make_sigs(&[&["bash"], &["list_dir"], &["read_file"]]);
         assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(3));
     }
 
     #[test]
     fn divergence_exploring_four() {
-        // 4 consecutive exploration rounds → still Exploring (threshold is 5)
+        // 4 consecutive exploration rounds → still Exploring (threshold is 8)
         let sigs = make_sigs(&[&["bash"], &["list_dir"], &["grep"], &["read_file"]]);
         assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(4));
     }
 
     #[test]
-    fn divergence_detected_at_five() {
-        // 5 consecutive exploration rounds → Diverging (hits threshold)
+    fn divergence_exploring_five_and_seven() {
+        // 5-7 consecutive exploration rounds → still Exploring (threshold is 8)
         let sigs = make_sigs(&[
             &["bash"],
             &["list_dir"],
@@ -505,11 +509,22 @@ mod tests {
             &["read_file"],
             &["glob"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(5));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(5));
+        let sigs7 = make_sigs(&[
+            &["bash"],
+            &["list_dir"],
+            &["grep"],
+            &["read_file"],
+            &["glob"],
+            &["bash"],
+            &["grep"],
+        ]);
+        assert_eq!(detect_divergence(&sigs7), DivergenceStatus::Exploring(7));
     }
 
     #[test]
-    fn divergence_detected_six() {
+    fn divergence_detected_at_eight() {
+        // 8 consecutive exploration rounds → Diverging (hits threshold)
         let sigs = make_sigs(&[
             &["bash"],
             &["list_dir"],
@@ -517,14 +532,32 @@ mod tests {
             &["read_file"],
             &["glob"],
             &["bash"],
+            &["list_dir"],
+            &["grep"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(6));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(8));
+    }
+
+    #[test]
+    fn divergence_detected_nine() {
+        let sigs = make_sigs(&[
+            &["bash"],
+            &["list_dir"],
+            &["grep"],
+            &["read_file"],
+            &["glob"],
+            &["bash"],
+            &["list_dir"],
+            &["grep"],
+            &["read_file"],
+        ]);
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(9));
     }
 
     #[test]
     fn divergence_reset_by_productive() {
         // Productive tool in the middle resets the counter;
-        // only 2 exploration rounds at the end → Exploring(2) (below threshold of 5)
+        // only 2 exploration rounds at the end → Exploring(2) (below threshold of 8)
         let sigs = make_sigs(&[
             &["bash"],
             &["list_dir"],
@@ -543,7 +576,7 @@ mod tests {
 
     #[test]
     fn divergence_multi_tool_exploration_only() {
-        // 3 rounds of multi-tool exploration → Exploring(3), below threshold of 5
+        // 3 rounds of multi-tool exploration → Exploring(3), below threshold of 8
         let sigs = make_sigs(&[
             &["bash", "grep"],
             &["list_dir", "read_file"],
@@ -554,15 +587,18 @@ mod tests {
 
     #[test]
     fn divergence_multi_tool_exploration_at_threshold() {
-        // 5 rounds of multi-tool exploration → Diverging(5)
+        // 8 rounds of multi-tool exploration → Diverging(8)
         let sigs = make_sigs(&[
             &["bash", "grep"],
             &["list_dir", "read_file"],
             &["bash", "glob"],
             &["grep", "read_file"],
             &["bash", "list_dir"],
+            &["grep", "glob"],
+            &["read_file", "bash"],
+            &["list_dir", "grep"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(5));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(8));
     }
 
     /// Regression test for session f9903b97: grep→read_file→grep→grep is
@@ -975,7 +1011,7 @@ mod tests {
         let mut tool_sigs: Vec<BTreeSet<String>> = Vec::new();
         let window = SERVER_STALL_WINDOW.max(MAX_EXPLORATION_ROUNDS) + 2;
 
-        // Same exact call twice in a row
+        // Same exact call 3x in a row (SERVER_STALL_WINDOW=3)
         let calls = vec![serde_json::json!({
             "name": "read_file",
             "arguments": {"path": "src/main.rs"}
@@ -984,9 +1020,13 @@ mod tests {
         assert!(!detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW));
 
         record_server_tool_signatures(&mut tool_sigs, &calls, window);
+        assert!(!detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW),
+            "2 identical calls should not trigger stall with window=3");
+
+        record_server_tool_signatures(&mut tool_sigs, &calls, window);
         assert!(
             detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW),
-            "identical tool calls across rounds must trigger stall"
+            "3 identical tool calls across rounds must trigger stall"
         );
     }
 }

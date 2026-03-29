@@ -1687,11 +1687,14 @@ mod non_happy_path {
             &["read_file"],
             &["grep"],
             &["glob"],
+            &["bash"],
+            &["list_dir"],
+            &["read_file"],
         ]);
         let status = detect_divergence(&sigs);
         assert!(
             matches!(status, DivergenceStatus::Diverging(_)),
-            "Pure exploration should be flagged as diverging"
+            "Pure exploration (8 rounds) should be flagged as diverging"
         );
     }
 
@@ -1714,6 +1717,9 @@ mod non_happy_path {
             &["read_file"],
             &["grep"],
             &["glob"],
+            &["bash"],
+            &["list_dir"],
+            &["read_file"],
         ]);
 
         assert!(detect_server_stall(&stall_sigs, 3), "Should detect stall");
@@ -1726,7 +1732,7 @@ mod non_happy_path {
                 detect_divergence(&diverge_sigs),
                 DivergenceStatus::Diverging(_)
             ),
-            "Should detect divergence — all exploration"
+            "Should detect divergence — all exploration (8 rounds)"
         );
     }
 
@@ -3019,12 +3025,12 @@ mod error_recovery_proofs {
         let l0 = escalation_level(0, 0, 0);
         assert_eq!(l0, EscalationLevel::Normal);
 
-        // After 2 nudges: warning (lowered from 3)
+        // After 2 nudges: warning
         let l1 = escalation_level(2, 0, 0);
         assert_eq!(l1, EscalationLevel::Warning);
 
-        // After 3 nudges: critical (lowered from 5)
-        let l2 = escalation_level(3, 0, 0);
+        // After 3 nudges + 2 errors: critical (nudges alone stay Warning)
+        let l2 = escalation_level(3, 2, 0);
         assert_eq!(l2, EscalationLevel::Critical);
 
         // Severity only increases
@@ -3211,7 +3217,7 @@ mod stall_enforcement_proofs {
             },
         ];
         assert!(!detect_server_stall(&div_sigs, 2)); // different tools each turn
-        assert_eq!(detect_divergence(&div_sigs), DivergenceStatus::Diverging(5));
+        assert_eq!(detect_divergence(&div_sigs), DivergenceStatus::Exploring(5));
     }
 }
 
@@ -7897,14 +7903,15 @@ mod turnguard_e2e_proofs {
     }
 
     // ── Scenario A: Full stall → escalation → force_stop pipeline ────────────
-    // Simulates: LLM repeats identical tool calls across 5+ turns, ignoring
-    // structured reflections, until the guard escalates to Critical + force_stop.
+    // Simulates: LLM repeats identical tool calls across turns, ignoring
+    // structured reflections. Pure stalls (no errors) → Warning only.
+    // Adding tool errors pushes to Critical + force_stop.
     #[test]
     fn full_stall_escalation_to_force_stop() {
         let mut guard = TurnGuard::new();
         let calls = [tc("bash", r#"{"command":"cat /etc/hosts"}"#)];
 
-        // Turn 1: first call, no stall yet (need window=2 repetitions)
+        // Turn 1: first call, no stall yet (need window=3 repetitions)
         guard.record_tool_calls(&calls);
         guard.record_tool_result("bash", "127.0.0.1 localhost");
         let v1 = guard.evaluate();
@@ -7915,49 +7922,45 @@ mod turnguard_e2e_proofs {
         );
         assert!(!v1.force_stop);
 
-        // Turn 2: identical call → stall detected, first nudge
+        // Turn 2: second identical call, still below window=3
         guard.record_tool_calls(&calls);
         guard.record_tool_result("bash", "127.0.0.1 localhost");
         let v2 = guard.evaluate();
-        assert!(v2.severity >= VerdictSeverity::Warning, "Stall → Warning");
+        assert!(!v2.force_stop, "Below stall window, no force stop");
+
+        // Turn 3: third identical call → stall detected, first nudge
+        guard.record_tool_calls(&calls);
+        guard.record_tool_result("bash", "127.0.0.1 localhost");
+        let v3 = guard.evaluate();
+        assert!(v3.severity >= VerdictSeverity::Warning, "Stall → Warning");
         assert!(
-            v2.injections.iter().any(|m| m.contains("REFLECTION")),
+            v3.injections.iter().any(|m| m.contains("REFLECTION")),
             "Should inject structured reflection"
         );
-        assert!(!v2.force_stop, "First stall should not force stop");
-        assert_eq!(guard.nudge_count, 1);
+        assert!(!v3.force_stop, "First stall should not force stop");
 
-        // Turns 3-5: continue stalling to accumulate nudges
+        // Turns 4-6: continue stalling to accumulate nudges
         for _ in 0..3 {
             guard.record_tool_calls(&calls);
             guard.record_tool_result("bash", "127.0.0.1 localhost");
             guard.evaluate();
         }
-        assert_eq!(guard.nudge_count, 4);
 
-        // Turn 6: 5th nudge → escalation_level Critical
-        guard.record_tool_calls(&calls);
-        guard.record_tool_result("bash", "127.0.0.1 localhost");
-        let v6 = guard.evaluate();
-        assert_eq!(
-            v6.severity,
-            VerdictSeverity::Critical,
-            "5 nudges → escalation_level Critical"
-        );
+        // Pure stalls, 0 errors → nudge_count high but NOT Critical
+        let v_stall = guard.evaluate();
         assert!(
-            v6.injections.iter().any(|m| m.contains("CRITICAL")),
-            "Should have CRITICAL escalation message"
+            !v_stall.force_stop,
+            "Pure stalls without errors must NOT force_stop"
         );
-        assert_eq!(guard.nudge_count, 5);
 
-        // Turn 7: still repeating → 6th nudge, Critical + force_stop
-        guard.record_tool_calls(&calls);
-        guard.record_tool_result("bash", "127.0.0.1 localhost");
-        let v7 = guard.evaluate();
-        assert_eq!(v7.severity, VerdictSeverity::Critical);
+        // Now add actual errors to couple with nudges → Critical + force_stop
+        guard.record_tool_result("bash", "error: command not found");
+        guard.record_tool_result("bash", "error: no such file or directory");
+        let v_final = guard.evaluate();
+        assert_eq!(v_final.severity, VerdictSeverity::Critical);
         assert!(
-            v7.force_stop,
-            "nudge_count >= 6 + Critical escalation → force_stop"
+            v_final.force_stop,
+            "nudges + errors → Critical + force_stop"
         );
     }
 
@@ -7987,7 +7990,7 @@ mod turnguard_e2e_proofs {
             "Productive tool resets divergence"
         );
 
-        // Turns 3-7: five consecutive exploration rounds → Diverging
+        // Turns 3-9: eight consecutive exploration rounds → Diverging
         guard.record_tool_calls(&[tc("read_file", r#"{"path":"a.rs"}"#)]);
         guard.record_tool_result("read_file", "fn main(){}");
         guard.record_tool_calls(&[tc("grep", r#"{"pattern":"todo"}"#)]);
@@ -7998,10 +8001,16 @@ mod turnguard_e2e_proofs {
         guard.record_tool_result("list_dir", "main.rs");
         guard.record_tool_calls(&[tc("glob", r#"{"pattern":"*.toml"}"#)]);
         guard.record_tool_result("glob", "Cargo.toml");
-        let v7 = guard.evaluate();
+        guard.record_tool_calls(&[tc("bash", r#"{"command":"wc -l src/*.rs"}"#)]);
+        guard.record_tool_result("bash", "42 src/main.rs");
+        guard.record_tool_calls(&[tc("read_file", r#"{"path":"Cargo.toml"}"#)]);
+        guard.record_tool_result("read_file", "[package]");
+        guard.record_tool_calls(&[tc("grep", r#"{"pattern":"fn "}"#)]);
+        guard.record_tool_result("grep", "src/main.rs:1:fn main");
+        let v9 = guard.evaluate();
         assert!(
-            v7.injections.iter().any(|m| m.contains("exploring")),
-            "5 consecutive exploration rounds → divergence correction"
+            v9.injections.iter().any(|m| m.contains("exploring")),
+            "8 consecutive exploration rounds → divergence correction"
         );
     }
 
@@ -8039,7 +8048,7 @@ mod turnguard_e2e_proofs {
     fn cache_waste_and_divergence_combined_in_single_verdict() {
         let mut guard = TurnGuard::new();
 
-        // Exploration turns with cache hits — need 5 consecutive for divergence
+        // Exploration turns with cache hits — need 8 consecutive for divergence
         guard.record_tool_calls(&[tc("read_file", r#"{"path":"a.rs"}"#)]);
         guard.record_tool_result("read_file", "fn main(){}");
         guard.record_cache_hit("read_file");
@@ -8057,7 +8066,16 @@ mod turnguard_e2e_proofs {
 
         guard.record_tool_calls(&[tc("grep", r#"{"pattern":"fn main"}"#)]);
         guard.record_tool_result("grep", "main.rs:1");
-        // 5 consecutive exploration rounds → Diverging
+
+        guard.record_tool_calls(&[tc("bash", r#"{"command":"wc -l *.rs"}"#)]);
+        guard.record_tool_result("bash", "42");
+
+        guard.record_tool_calls(&[tc("read_file", r#"{"path":"b.rs"}"#)]);
+        guard.record_tool_result("read_file", "pub fn lib(){}");
+
+        guard.record_tool_calls(&[tc("grep", r#"{"pattern":"pub fn"}"#)]);
+        guard.record_tool_result("grep", "b.rs:1");
+        // 8 consecutive exploration rounds → Diverging
 
         let verdict = guard.evaluate();
         let msgs = verdict.injections.join("\n");
@@ -8131,6 +8149,7 @@ mod turnguard_e2e_proofs {
         let calls = [tc("bash", r#"{"command":"cat /etc/hosts"}"#)];
         guard.record_tool_calls(&calls);
         guard.record_tool_calls(&calls);
+        guard.record_tool_calls(&calls); // window=3 needed for stall
         let v1 = guard.evaluate();
         assert!(
             v1.severity >= VerdictSeverity::Warning,
@@ -8281,8 +8300,9 @@ mod turnguard_e2e_proofs {
         guard.record_tool_result("mo_query", "error: connection failed");
         guard.record_tool_result("mo_query", "error: connection failed");
 
-        // Set up stall: repeated identical exploration calls
+        // Set up stall: repeated identical exploration calls (3 for window=3)
         let calls = [tc("bash", r#"{"command":"find . -name '*.rs'"}"#)];
+        guard.record_tool_calls(&calls);
         guard.record_tool_calls(&calls);
         guard.record_tool_calls(&calls);
 
@@ -8321,6 +8341,7 @@ mod turnguard_e2e_proofs {
         let calls = [tc("bash", r#"{"command":"ls -la"}"#)];
         guard.record_tool_calls(&calls);
         guard.record_tool_calls(&calls);
+        guard.record_tool_calls(&calls); // window=3 for stall detection
         guard.record_tool_result("bash", "total 0");
 
         let verdict = guard.evaluate();
@@ -8437,32 +8458,33 @@ mod turnguard_e2e_proofs {
     }
 
     // ── Scenario O: Force-stop requires BOTH Critical + nudge_count >= 3 ───────
-    // Proves that Critical alone is not enough for force_stop.
+    // Proves that nudges alone are not enough for force_stop.
+    // Critical requires nudge_count >= 3 AND total_errors >= 2.
     #[test]
     fn critical_without_enough_nudges_does_not_force_stop() {
         let mut guard = TurnGuard::new();
 
-        // Manually set escalation conditions that will produce Critical (3+ nudges)
-        // but test with nudge_count=2 (below the force_stop threshold of 3)
-        guard.nudge_count = 2;
+        // 3 nudges + 1 error → still Warning (need 2+ errors for Critical)
+        guard.nudge_count = 3;
         guard
             .errors
             .record_error(mo_agent_runtime::turn::error_recovery::ErrorCategory::Unknown);
 
         let verdict = guard.evaluate();
-        // 2 nudges → Warning (not Critical), so force_stop should be false
         assert!(
             !verdict.force_stop,
-            "Warning severity with nudge_count=2 should NOT force_stop"
+            "3 nudges + 1 error should NOT force_stop (need 2+ errors)"
         );
 
-        // Now at 3 nudges → Critical + force_stop
-        guard.nudge_count = 3;
+        // Now at 3 nudges + 2 errors → Critical + force_stop
+        guard
+            .errors
+            .record_error(mo_agent_runtime::turn::error_recovery::ErrorCategory::Unknown);
         let verdict = guard.evaluate();
         assert_eq!(verdict.severity, VerdictSeverity::Critical);
         assert!(
             verdict.force_stop,
-            "Critical with nudge_count=3 SHOULD force_stop (lowered from 6)"
+            "3 nudges + 2 errors SHOULD force_stop"
         );
     }
 

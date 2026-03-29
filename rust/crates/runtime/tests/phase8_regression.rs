@@ -432,7 +432,7 @@ mod divergence_detection {
 
     #[test]
     fn diverging_classic_pattern() {
-        // The exact bad pattern: bash→find→list_dir→read_file→grep
+        // 5 exploration rounds → Exploring(5), below threshold of 8
         let sigs = make_sigs(&[
             &["bash"],
             &["bash"],
@@ -440,7 +440,23 @@ mod divergence_detection {
             &["read_file"],
             &["grep"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(5));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(5));
+    }
+
+    #[test]
+    fn diverging_at_threshold() {
+        // 8 exploration rounds → Diverging(8), hits threshold
+        let sigs = make_sigs(&[
+            &["bash"],
+            &["list_dir"],
+            &["read_file"],
+            &["grep"],
+            &["glob"],
+            &["bash"],
+            &["list_dir"],
+            &["read_file"],
+        ]);
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(8));
     }
 
     #[test]

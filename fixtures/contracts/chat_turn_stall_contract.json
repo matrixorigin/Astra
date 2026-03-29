@@ -29,6 +29,7 @@
       [{ "function": { "name": "tool_four", "arguments": "{\"x\":4}" } }]
     ],
     "expected": [
+      ["tool_two:{\"x\":2}"],
       ["tool_three:{\"x\":3}"],
       ["tool_four:{\"x\":4}"]
     ]
@@ -41,12 +42,14 @@
   "detect_true": {
     "tool_sigs": [
       ["read_file:{\"path\":\"a.py\"}"],
+      ["read_file:{\"path\":\"a.py\"}"],
       ["read_file:{\"path\":\"a.py\"}"]
     ],
     "expected": true
   },
   "detect_false_below_window": {
     "tool_sigs": [
+      ["read_file:{\"path\":\"a.py\"}"],
       ["read_file:{\"path\":\"a.py\"}"]
     ],
     "expected": false
@@ -54,7 +57,8 @@
   "detect_false_mixed": {
     "tool_sigs": [
       ["read_file:{\"path\":\"a.py\"}"],
-      ["read_file:{\"path\":\"b.py\"}"]
+      ["read_file:{\"path\":\"b.py\"}"],
+      ["read_file:{\"path\":\"a.py\"}"]
     ],
     "expected": false
   }

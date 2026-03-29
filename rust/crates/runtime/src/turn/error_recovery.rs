@@ -306,11 +306,19 @@ pub fn escalation_level(
     total_errors: usize,
     deprioritized_count: usize,
 ) -> EscalationLevel {
-    // Critical: 3+ nudges (lowered from 5: session 62c1e8e9 showed 11 stalls
-    // without force_stop because the old threshold was too lenient),
+    // Critical: nudges + errors coupled (prevents pure-stall sessions from
+    // force-stopping when the agent is actually making progress with 0 errors),
     // or 8+ errors with at least one deprioritized tool,
-    // or 10+ total errors regardless (scattered failures are still broken)
-    if nudge_count >= 3 || (total_errors >= 8 && deprioritized_count >= 1) || total_errors >= 10 {
+    // or 10+ total errors regardless (scattered failures are still broken).
+    //
+    // Previously nudge_count >= 3 alone triggered Critical, which meant a session
+    // with repeated exploration patterns (grep→read→grep) and ZERO tool errors
+    // could be force-stopped. Now we require at least 2 actionable errors to
+    // accompany the stall signal, ensuring genuine stuck-ness.
+    if (nudge_count >= 3 && total_errors >= 2)
+        || (total_errors >= 8 && deprioritized_count >= 1)
+        || total_errors >= 10
+    {
         return EscalationLevel::Critical;
     }
     // Warning: 2 nudges, or 5+ errors
@@ -629,10 +637,15 @@ mod tests {
 
     #[test]
     fn escalation_critical_three_nudges() {
-        // 3 nudges → Critical (lowered from 5: session 62c1e8e9 showed
-        // 11 stalls without triggering Critical under old threshold)
-        assert_eq!(escalation_level(3, 0, 0), EscalationLevel::Critical);
-        assert_eq!(escalation_level(4, 0, 0), EscalationLevel::Critical);
+        // 3 nudges alone (0 errors) → Warning, NOT Critical.
+        // Critical requires nudge_count >= 3 AND total_errors >= 2.
+        // This prevents force-stopping sessions with exploration patterns
+        // (grep→read→grep) that produce stall nudges but zero tool errors.
+        assert_eq!(escalation_level(3, 0, 0), EscalationLevel::Warning);
+        assert_eq!(escalation_level(4, 0, 0), EscalationLevel::Warning);
+        // But with 2+ errors, nudges trigger Critical
+        assert_eq!(escalation_level(3, 2, 0), EscalationLevel::Critical);
+        assert_eq!(escalation_level(4, 3, 0), EscalationLevel::Critical);
     }
 
     #[test]
@@ -649,8 +662,11 @@ mod tests {
 
     #[test]
     fn escalation_critical_from_nudges() {
-        assert_eq!(escalation_level(3, 0, 0), EscalationLevel::Critical);
-        assert_eq!(escalation_level(5, 0, 0), EscalationLevel::Critical);
+        // Nudges alone stay Warning; coupled with errors → Critical
+        assert_eq!(escalation_level(3, 0, 0), EscalationLevel::Warning);
+        assert_eq!(escalation_level(5, 0, 0), EscalationLevel::Warning);
+        assert_eq!(escalation_level(3, 2, 0), EscalationLevel::Critical);
+        assert_eq!(escalation_level(5, 3, 0), EscalationLevel::Critical);
     }
 
     #[test]
