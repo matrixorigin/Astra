@@ -2508,7 +2508,7 @@ error[E0425]: cannot find value `nonexistent` in this scope
         let mut result = BuildTestResult {
             error_locations: vec![ErrorLocation::new(
                 "src/edge_tools/code_intel.rs".into(),
-                100,
+                138,
                 5,
                 "E0425".into(),
                 "cannot find value".into(),

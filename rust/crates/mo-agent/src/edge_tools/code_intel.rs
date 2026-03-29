@@ -9,6 +9,8 @@
 
 #![allow(dead_code)] // Symbol/find_symbols are exported for future tools
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Extracted symbol from source code.
@@ -95,12 +97,13 @@ pub enum Language {
     Ruby,
 }
 
-/// Extract symbols from source code.
-pub fn extract_symbols(source: &str, lang: Language) -> Vec<Symbol> {
-    let mut parser = tree_sitter::Parser::new();
+thread_local! {
+    static PARSER_CACHE: RefCell<HashMap<u8, tree_sitter::Parser>> = RefCell::new(HashMap::new());
+}
 
-    // Set language grammar
-    let language = match lang {
+/// Get a tree-sitter Language grammar for our Language enum.
+fn ts_language(lang: Language) -> tree_sitter::Language {
+    match lang {
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
         Language::Python => tree_sitter_python::LANGUAGE.into(),
         Language::TypeScript | Language::JavaScript => {
@@ -110,13 +113,29 @@ pub fn extract_symbols(source: &str, lang: Language) -> Vec<Symbol> {
         Language::Java => tree_sitter_java::LANGUAGE.into(),
         Language::C | Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
-    };
-
-    if parser.set_language(&language).is_err() {
-        return Vec::new();
     }
+}
 
-    let tree = match parser.parse(source, None) {
+/// Parse source code using a cached thread-local parser.
+/// Returns None if parsing fails.
+fn cached_parse(source: &str, lang: Language) -> Option<tree_sitter::Tree> {
+    let key = lang as u8;
+    PARSER_CACHE.with(|cache| {
+        let mut map = cache.borrow_mut();
+        let parser = map.entry(key).or_insert_with(|| {
+            let mut p = tree_sitter::Parser::new();
+            let _ = p.set_language(&ts_language(lang));
+            p
+        });
+        // Ensure the right language is set (in case of C/Cpp sharing)
+        let _ = parser.set_language(&ts_language(lang));
+        parser.parse(source, None)
+    })
+}
+
+/// Extract symbols from source code.
+pub fn extract_symbols(source: &str, lang: Language) -> Vec<Symbol> {
+    let tree = match cached_parse(source, lang) {
         Some(t) => t,
         None => return Vec::new(),
     };
@@ -916,22 +935,7 @@ pub fn extract_calls(
     start_line: usize,
     end_line: usize,
 ) -> Vec<CallSite> {
-    let mut parser = tree_sitter::Parser::new();
-    let language = match lang {
-        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
-        Language::Python => tree_sitter_python::LANGUAGE.into(),
-        Language::TypeScript | Language::JavaScript => {
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
-        }
-        Language::Go => tree_sitter_go::LANGUAGE.into(),
-        Language::Java => tree_sitter_java::LANGUAGE.into(),
-        Language::C | Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
-        Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
-    };
-    if parser.set_language(&language).is_err() {
-        return Vec::new();
-    }
-    let tree = match parser.parse(source, None) {
+    let tree = match cached_parse(source, lang) {
         Some(t) => t,
         None => return Vec::new(),
     };
@@ -1169,22 +1173,7 @@ pub fn identifier_at_position(
     line: usize,
     column: usize,
 ) -> Option<(String, String)> {
-    let mut parser = tree_sitter::Parser::new();
-    let language: tree_sitter::Language = match lang {
-        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
-        Language::Python => tree_sitter_python::LANGUAGE.into(),
-        Language::TypeScript | Language::JavaScript => {
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
-        }
-        Language::Go => tree_sitter_go::LANGUAGE.into(),
-        Language::Java => tree_sitter_java::LANGUAGE.into(),
-        Language::C | Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
-        Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
-    };
-    if parser.set_language(&language).is_err() {
-        return None;
-    }
-    let tree = parser.parse(source, None)?;
+    let tree = cached_parse(source, lang)?;
 
     let point = tree_sitter::Point {
         row: line.saturating_sub(1),
@@ -1456,25 +1445,7 @@ fn extract_python_docstring(lines: &[&str], symbol_line: usize) -> Option<String
 /// Used by find_references to filter out false-positive grep matches that
 /// appear in comments or string literals.
 pub fn is_in_comment_or_string(source: &str, lang: Language, line: usize, column: usize) -> bool {
-    let mut parser = tree_sitter::Parser::new();
-
-    let language = match lang {
-        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
-        Language::Python => tree_sitter_python::LANGUAGE.into(),
-        Language::TypeScript | Language::JavaScript => {
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
-        }
-        Language::Go => tree_sitter_go::LANGUAGE.into(),
-        Language::Java => tree_sitter_java::LANGUAGE.into(),
-        Language::C | Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
-        Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
-    };
-
-    if parser.set_language(&language).is_err() {
-        return false;
-    }
-
-    let tree = match parser.parse(source, None) {
+    let tree = match cached_parse(source, lang) {
         Some(t) => t,
         None => return false,
     };
@@ -1552,22 +1523,7 @@ pub struct Member {
 /// specific line in the source. Finds the enclosing struct/class/enum/interface
 /// and returns its members.
 pub fn extract_members(source: &str, lang: Language, type_line: usize) -> Vec<Member> {
-    let mut parser = tree_sitter::Parser::new();
-    let language = match lang {
-        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
-        Language::Python => tree_sitter_python::LANGUAGE.into(),
-        Language::TypeScript | Language::JavaScript => {
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
-        }
-        Language::Go => tree_sitter_go::LANGUAGE.into(),
-        Language::Java => tree_sitter_java::LANGUAGE.into(),
-        Language::C | Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
-        Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
-    };
-    if parser.set_language(&language).is_err() {
-        return Vec::new();
-    }
-    let tree = match parser.parse(source, None) {
+    let tree = match cached_parse(source, lang) {
         Some(t) => t,
         None => return Vec::new(),
     };
@@ -1952,12 +1908,7 @@ pub struct ImplRelation {
 /// Find impl blocks in a Rust source file.
 /// Returns all `impl Trait for Type` relationships.
 pub fn find_rust_impls(source: &str, file_path: &str) -> Vec<ImplRelation> {
-    let mut parser = tree_sitter::Parser::new();
-    let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
-    if parser.set_language(&lang).is_err() {
-        return Vec::new();
-    }
-    let tree = match parser.parse(source, None) {
+    let tree = match cached_parse(source, Language::Rust) {
         Some(t) => t,
         None => return Vec::new(),
     };
@@ -2017,6 +1968,272 @@ fn collect_rust_impls(
         }
         collect_rust_impls(child, source, file_path, impls);
     }
+}
+
+// ─── Import / Use Statement Extraction ──────────────────────────────────────
+
+/// An import/use statement extracted from source code.
+#[derive(Debug, Clone)]
+pub struct ImportStatement {
+    /// The full import path (e.g., "std::collections::HashMap", "os.path")
+    pub path: String,
+    /// The imported name(s) — the leaf items being imported
+    pub names: Vec<String>,
+    /// Line number (1-indexed)
+    pub line: usize,
+    /// Whether it's a wildcard import (e.g., `use foo::*`, `from foo import *`)
+    pub is_wildcard: bool,
+}
+
+/// Extract import/use statements from source code.
+pub fn extract_imports(source: &str, lang: Language) -> Vec<ImportStatement> {
+    let tree = match cached_parse(source, lang) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    let root = tree.root_node();
+    match lang {
+        Language::Rust => extract_rust_imports(root, source),
+        Language::Python => extract_python_imports(root, source),
+        Language::TypeScript | Language::JavaScript => extract_ts_imports(root, source),
+        Language::Go => extract_go_imports(root, source),
+        _ => Vec::new(), // Java, C, Cpp, Ruby: not yet implemented
+    }
+}
+
+fn extract_rust_imports(node: tree_sitter::Node, source: &str) -> Vec<ImportStatement> {
+    let mut imports = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "use_declaration" {
+            let line = child.start_position().row + 1;
+            let text = child.utf8_text(source.as_bytes()).unwrap_or_default();
+            // Remove `use ` prefix and `;` suffix
+            let path_str = text
+                .trim_start_matches("use ")
+                .trim_start_matches("pub use ")
+                .trim_end_matches(';')
+                .trim();
+
+            let is_wildcard = path_str.ends_with("::*");
+
+            // Extract names from use tree
+            let names = extract_rust_use_names(path_str);
+            let path = path_str
+                .split("::{")
+                .next()
+                .unwrap_or(path_str)
+                .trim_end_matches("::*")
+                .to_string();
+
+            imports.push(ImportStatement {
+                path,
+                names,
+                line,
+                is_wildcard,
+            });
+        }
+    }
+    imports
+}
+
+fn extract_rust_use_names(path: &str) -> Vec<String> {
+    // Handle `use std::collections::{HashMap, HashSet};`
+    if let Some(brace_start) = path.find("::{") {
+        let names_str = &path[brace_start + 3..];
+        let names_str = names_str.trim_end_matches('}');
+        return names_str
+            .split(',')
+            .map(|n| {
+                let n = n.trim();
+                // Handle `self` and `as Alias`
+                n.split(" as ").next().unwrap_or(n).trim().to_string()
+            })
+            .filter(|n| !n.is_empty())
+            .collect();
+    }
+    // Handle `use std::collections::HashMap;`
+    if let Some(last) = path.rsplit("::").next() {
+        if last != "*" {
+            return vec![last.split(" as ").next().unwrap_or(last).trim().to_string()];
+        }
+    }
+    Vec::new()
+}
+
+fn extract_python_imports(node: tree_sitter::Node, source: &str) -> Vec<ImportStatement> {
+    let mut imports = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "import_statement" => {
+                // `import os.path`
+                let line = child.start_position().row + 1;
+                let text = child.utf8_text(source.as_bytes()).unwrap_or_default();
+                let path = text.trim_start_matches("import ").trim();
+                let names: Vec<String> = path
+                    .split(',')
+                    .map(|p| {
+                        let p = p.trim();
+                        p.split(" as ")
+                            .next()
+                            .unwrap_or(p)
+                            .trim()
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(p)
+                            .to_string()
+                    })
+                    .collect();
+                imports.push(ImportStatement {
+                    path: path
+                        .split(',')
+                        .next()
+                        .unwrap_or(path)
+                        .split(" as ")
+                        .next()
+                        .unwrap_or(path)
+                        .trim()
+                        .to_string(),
+                    names,
+                    line,
+                    is_wildcard: false,
+                });
+            }
+            "import_from_statement" => {
+                // `from os.path import join, exists`
+                let line = child.start_position().row + 1;
+                let text = child.utf8_text(source.as_bytes()).unwrap_or_default();
+                let is_wildcard = text.contains("import *");
+
+                // Parse "from MODULE import NAMES"
+                let after_from = text.trim_start_matches("from ").trim();
+                let parts: Vec<&str> = after_from.splitn(2, " import ").collect();
+                let module = parts.first().map(|s| s.trim()).unwrap_or("").to_string();
+                let names = if parts.len() > 1 {
+                    parts[1]
+                        .split(',')
+                        .map(|n| {
+                            n.trim()
+                                .split(" as ")
+                                .next()
+                                .unwrap_or("")
+                                .trim()
+                                .to_string()
+                        })
+                        .filter(|n| !n.is_empty() && n != "*")
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                imports.push(ImportStatement {
+                    path: module,
+                    names,
+                    line,
+                    is_wildcard,
+                });
+            }
+            _ => {}
+        }
+    }
+    imports
+}
+
+fn extract_ts_imports(node: tree_sitter::Node, source: &str) -> Vec<ImportStatement> {
+    let mut imports = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "import_statement" {
+            let line = child.start_position().row + 1;
+            let text = child.utf8_text(source.as_bytes()).unwrap_or_default();
+
+            // Extract module path from string literal
+            let path = text
+                .split('\'')
+                .nth(1)
+                .or_else(|| text.split('"').nth(1))
+                .unwrap_or("")
+                .to_string();
+
+            // Extract imported names
+            let mut names = Vec::new();
+            let is_wildcard = text.contains("* as ");
+
+            if let Some(brace_start) = text.find('{') {
+                if let Some(brace_end) = text.find('}') {
+                    let inner = &text[brace_start + 1..brace_end];
+                    for name in inner.split(',') {
+                        let n = name.trim().split(" as ").next().unwrap_or("").trim();
+                        if !n.is_empty() {
+                            names.push(n.to_string());
+                        }
+                    }
+                }
+            }
+            // Default import: `import Foo from '...'`
+            if names.is_empty() && !is_wildcard {
+                let after_import = text.trim_start_matches("import ").trim();
+                if let Some(name) = after_import.split_whitespace().next() {
+                    if name != "{" && name != "*" && name != "type" {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+
+            imports.push(ImportStatement {
+                path,
+                names,
+                line,
+                is_wildcard,
+            });
+        }
+    }
+    imports
+}
+
+fn extract_go_imports(node: tree_sitter::Node, source: &str) -> Vec<ImportStatement> {
+    let mut imports = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "import_declaration" {
+            let line = child.start_position().row + 1;
+            // Can be single: `import "fmt"` or grouped: `import ("fmt" \n "os")`
+            let text = child.utf8_text(source.as_bytes()).unwrap_or_default();
+
+            for import_line in text.lines() {
+                let trimmed = import_line.trim();
+                if trimmed == "import"
+                    || trimmed == "import ("
+                    || trimmed == ")"
+                    || trimmed.is_empty()
+                {
+                    continue;
+                }
+                let path_str = trimmed
+                    .trim_start_matches("import ")
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('(')
+                    .trim_matches(')')
+                    .trim()
+                    .trim_matches('"');
+
+                if path_str.is_empty() {
+                    continue;
+                }
+
+                let name = path_str.rsplit('/').next().unwrap_or(path_str).to_string();
+                imports.push(ImportStatement {
+                    path: path_str.to_string(),
+                    names: vec![name],
+                    line,
+                    is_wildcard: false,
+                });
+            }
+        }
+    }
+    imports
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -2589,5 +2806,162 @@ impl Y for Z {}
 "#;
         let impls = find_rust_impls(source, "multi.rs");
         assert_eq!(impls.len(), 2);
+    }
+
+    // ─── Parser cache tests ─────────────────────────────────────────────
+
+    #[test]
+    fn cached_parse_returns_valid_tree() {
+        let source = "fn main() {}\n";
+        let tree = cached_parse(source, Language::Rust);
+        assert!(tree.is_some(), "should parse simple Rust");
+        let tree = tree.unwrap();
+        let root = tree.root_node();
+        assert_eq!(root.kind(), "source_file");
+    }
+
+    #[test]
+    fn cached_parse_works_across_languages() {
+        // Parse with different languages sequentially
+        let rust_tree = cached_parse("fn main() {}\n", Language::Rust);
+        assert!(rust_tree.is_some());
+
+        let py_tree = cached_parse("def main(): pass\n", Language::Python);
+        assert!(py_tree.is_some());
+
+        let ts_tree = cached_parse("function main() {}\n", Language::TypeScript);
+        assert!(ts_tree.is_some());
+
+        let go_tree = cached_parse("package main\nfunc main() {}\n", Language::Go);
+        assert!(go_tree.is_some());
+
+        // Re-parse Rust to verify cache still works
+        let rust_tree2 = cached_parse("struct Foo {}\n", Language::Rust);
+        assert!(rust_tree2.is_some());
+    }
+
+    #[test]
+    fn cached_parse_handles_invalid_source_gracefully() {
+        // Empty source should still parse (tree-sitter is lenient)
+        let tree = cached_parse("", Language::Rust);
+        assert!(tree.is_some());
+    }
+
+    // ─── Import extraction tests ────────────────────────────────────────
+
+    #[test]
+    fn extract_rust_imports_simple() {
+        let source = r#"
+use std::collections::HashMap;
+use std::io::{self, Read, Write};
+use crate::utils::*;
+pub use super::config::Config;
+"#;
+        let imports = extract_imports(source, Language::Rust);
+        assert!(imports.len() >= 4, "found: {:?}", imports);
+
+        let hashmap = imports
+            .iter()
+            .find(|i| i.names.contains(&"HashMap".to_string()));
+        assert!(hashmap.is_some(), "should find HashMap import");
+        assert_eq!(hashmap.unwrap().path, "std::collections::HashMap");
+
+        let io = imports.iter().find(|i| i.path.contains("std::io"));
+        assert!(io.is_some(), "should find io import");
+        assert!(io.unwrap().names.contains(&"Read".to_string()));
+        assert!(io.unwrap().names.contains(&"Write".to_string()));
+
+        let wildcard = imports.iter().find(|i| i.is_wildcard);
+        assert!(wildcard.is_some(), "should find wildcard import");
+    }
+
+    #[test]
+    fn extract_python_imports_basic() {
+        let source = r#"
+import os
+import os.path
+from collections import OrderedDict, defaultdict
+from typing import List, Optional
+from module import *
+"#;
+        let imports = extract_imports(source, Language::Python);
+        assert!(imports.len() >= 4, "found: {:?}", imports);
+
+        let os_import = imports.iter().find(|i| i.path == "os");
+        assert!(os_import.is_some(), "should find 'import os'");
+
+        let collections = imports.iter().find(|i| i.path == "collections");
+        assert!(collections.is_some(), "should find collections import");
+        assert!(collections
+            .unwrap()
+            .names
+            .contains(&"OrderedDict".to_string()));
+
+        let wildcard = imports.iter().find(|i| i.is_wildcard);
+        assert!(wildcard.is_some(), "should find wildcard import");
+    }
+
+    #[test]
+    fn extract_typescript_imports_basic() {
+        let source = r#"
+import React from 'react';
+import { useState, useEffect } from 'react';
+import * as path from 'path';
+import type { Config } from './config';
+"#;
+        let imports = extract_imports(source, Language::TypeScript);
+        assert!(imports.len() >= 3, "found: {:?}", imports);
+
+        let react = imports.iter().find(|i| {
+            i.path == "react" && i.names.contains(&"React".to_string())
+        });
+        assert!(react.is_some(), "should find default React import");
+
+        let hooks = imports.iter().find(|i| {
+            i.path == "react" && i.names.contains(&"useState".to_string())
+        });
+        assert!(hooks.is_some(), "should find named React imports");
+
+        let wildcard = imports.iter().find(|i| i.is_wildcard);
+        assert!(wildcard.is_some(), "should find wildcard import");
+    }
+
+    #[test]
+    fn extract_go_imports_basic() {
+        let source = r#"
+package main
+
+import (
+    "fmt"
+    "os"
+    "path/filepath"
+)
+"#;
+        let imports = extract_imports(source, Language::Go);
+        assert!(imports.len() >= 3, "found: {:?}", imports);
+
+        let fmt_import = imports.iter().find(|i| i.path == "fmt");
+        assert!(fmt_import.is_some(), "should find fmt import");
+        assert!(fmt_import.unwrap().names.contains(&"fmt".to_string()));
+
+        let filepath = imports.iter().find(|i| i.path == "path/filepath");
+        assert!(filepath.is_some(), "should find path/filepath import");
+        assert!(filepath
+            .unwrap()
+            .names
+            .contains(&"filepath".to_string()));
+    }
+
+    #[test]
+    fn extract_imports_unsupported_language_returns_empty() {
+        let source = "class Foo { void bar() {} }";
+        let imports = extract_imports(source, Language::Java);
+        assert!(imports.is_empty());
+    }
+
+    #[test]
+    fn extract_imports_empty_source() {
+        let imports = extract_imports("", Language::Rust);
+        assert!(imports.is_empty());
     }
 }

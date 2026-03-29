@@ -1182,7 +1182,7 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         // Grep output for a pattern that should be inside a known function in code_intel.rs
         let grep_output = format!(
-            "{}/src/edge_tools/code_intel.rs:100:    let symbols = extract_symbols(source, lang);",
+            "{}/src/edge_tools/code_intel.rs:138:    let tree = match cached_parse(source, lang) {{",
             root.display()
         );
         let result = annotate_grep_with_scope(&grep_output, root);
