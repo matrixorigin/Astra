@@ -548,6 +548,29 @@ pub fn has_dirty_learning_data(
     entities_dirty || patterns_dirty || calibration_dirty
 }
 
+/// Export tool health entries that changed relative to the last synced baseline.
+pub fn export_tool_health_delta(
+    current: &[ToolHealthEntry],
+    baseline: &[ToolHealthEntry],
+) -> Vec<serde_json::Value> {
+    let baseline_map: std::collections::HashMap<&str, &ToolHealthEntry> =
+        baseline.iter().map(|entry| (entry.name.as_str(), entry)).collect();
+
+    current
+        .iter()
+        .filter(|entry| match baseline_map.get(entry.name.as_str()) {
+            Some(prev) => {
+                prev.total_calls != entry.total_calls
+                    || prev.total_failures != entry.total_failures
+                    || (prev.failure_rate - entry.failure_rate).abs() > f64::EPSILON
+                    || prev.last_updated_epoch != entry.last_updated_epoch
+            }
+            None => true,
+        })
+        .filter_map(|entry| serde_json::to_value(entry).ok())
+        .collect()
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -970,5 +993,39 @@ mod tests {
             delta_count: 1,
         };
         assert!(!delta.is_empty());
+    }
+
+    #[test]
+    fn tool_health_delta_empty_when_unchanged() {
+        let entries = vec![ToolHealthEntry {
+            name: "bash".to_string(),
+            total_calls: 3,
+            total_failures: 1,
+            failure_rate: 1.0 / 3.0,
+            last_updated_epoch: 42,
+        }];
+        let delta = export_tool_health_delta(&entries, &entries);
+        assert!(delta.is_empty());
+    }
+
+    #[test]
+    fn tool_health_delta_includes_changed_entries() {
+        let baseline = vec![ToolHealthEntry {
+            name: "bash".to_string(),
+            total_calls: 3,
+            total_failures: 1,
+            failure_rate: 1.0 / 3.0,
+            last_updated_epoch: 42,
+        }];
+        let current = vec![ToolHealthEntry {
+            name: "bash".to_string(),
+            total_calls: 4,
+            total_failures: 1,
+            failure_rate: 0.25,
+            last_updated_epoch: 99,
+        }];
+        let delta = export_tool_health_delta(&current, &baseline);
+        assert_eq!(delta.len(), 1);
+        assert_eq!(delta[0].get("name").and_then(|v| v.as_str()), Some("bash"));
     }
 }

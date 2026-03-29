@@ -380,6 +380,8 @@ struct ReplState {
     task_service: Option<std::sync::Arc<mo_agent_services::LocalTaskService>>,
     /// Cross-session tool health data for error budget persistence.
     tool_health_entries: Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry>,
+    /// Last successfully synced tool health snapshot, used to compute deltas.
+    synced_tool_health_entries: Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry>,
     /// Plan Mode state — when Some, REPL is in interactive plan editing mode.
     plan_mode: Option<plan_decompose::PlanModeState>,
     /// Plan being auto-executed — subtasks sent sequentially through chat.
@@ -418,6 +420,7 @@ impl Default for ReplState {
             learning_snapshot: None,
             task_service: None,
             tool_health_entries: Vec::new(),
+            synced_tool_health_entries: Vec::new(),
             plan_mode: None,
             executing_plan: None,
             last_turn_interrupted: false,
@@ -1472,24 +1475,40 @@ async fn try_cloud_push_delta(
     calibrator: &std::sync::Arc<
         std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
     >,
+    tool_health_entries: &[mo_agent_runtime::pipeline::persistence::ToolHealthEntry],
+    synced_tool_health_entries: &mut Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry>,
     expected_version: Option<i64>,
 ) -> Option<i64> {
-    if !mo_agent_runtime::pipeline::persistence::has_dirty_learning_data(
+    let learning_dirty = mo_agent_runtime::pipeline::persistence::has_dirty_learning_data(
         entity_graph,
         pattern_library,
         calibrator,
-    ) {
+    );
+    let tool_health_deltas = mo_agent_runtime::pipeline::persistence::export_tool_health_delta(
+        tool_health_entries,
+        synced_tool_health_entries,
+    );
+
+    if !learning_dirty && tool_health_deltas.is_empty() {
         return expected_version;
     }
 
-    let delta = match mo_agent_runtime::pipeline::persistence::export_dirty_learning_from_modules(
+    let mut delta = mo_agent_runtime::pipeline::persistence::export_dirty_learning_from_modules(
         entity_graph,
         pattern_library,
         calibrator,
-    ) {
-        Some(delta) => delta,
-        None => return expected_version,
-    };
+    )
+    .unwrap_or(mo_agent_runtime::pipeline::persistence::DeltaSnapshot {
+        baseline_epoch: 0,
+        entity_deltas: Vec::new(),
+        pattern_deltas: Vec::new(),
+        calibration: None,
+        tool_health_deltas: Vec::new(),
+        delta_count: 0,
+    });
+
+    delta.delta_count += tool_health_deltas.len() as u32;
+    delta.tool_health_deltas = tool_health_deltas;
 
     let delta_json = match serde_json::to_string(&delta) {
         Ok(j) => j,
@@ -1527,6 +1546,7 @@ async fn try_cloud_push_delta(
             pattern_library,
             calibrator,
         );
+        *synced_tool_health_entries = tool_health_entries.to_vec();
 
         if let Some(v) = result.new_version {
             eprintln!(
@@ -2122,7 +2142,8 @@ async fn run_chat_repl(
         // Try to pull user preferences from cloud
         try_cloud_pull_preferences(&mut state).await;
     }
-    state.tool_health_entries = cross_session_health_entries;
+    state.tool_health_entries = cross_session_health_entries.clone();
+    state.synced_tool_health_entries = cross_session_health_entries;
 
     let profile_name_str = profile.unwrap_or("default").to_string();
     print_repl_banner(profile, &state);
@@ -2269,6 +2290,8 @@ async fn run_chat_repl(
                             &pipeline_modules.entity_graph,
                             &pipeline_modules.pattern_library,
                             &pipeline_modules.calibrator,
+                            &state.tool_health_entries,
+                            &mut state.synced_tool_health_entries,
                             state.cloud_learning_version,
                         )
                         .await
@@ -4306,10 +4329,11 @@ total_tokens_out: 500
         let cal = std::sync::Arc::new(std::sync::Mutex::new(
             mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator::new(0.15),
         ));
+        let mut synced = Vec::new();
         eg.lock()
             .unwrap()
             .learn("rust", mo_agent_runtime::pipeline::routing::DomainHint::Code, &[], None);
-        let _result = try_cloud_push_delta("default", &eg, &pl, &cal, None).await;
+        let _result = try_cloud_push_delta("default", &eg, &pl, &cal, &[], &mut synced, None).await;
     }
 
     #[tokio::test]
