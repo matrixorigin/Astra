@@ -204,10 +204,24 @@ const PARALLEL_SAFE_TOOLS: &[&str] = &[
     "memory_retrieve",
     "memory_search",
     "memory_profile",
+    "web_fetch",
     "get_agent_info",
     "reflect",
     "mo_query",
 ];
+
+enum PreExecutionResult {
+    Completed(String),
+    TimedOut,
+}
+
+fn tool_timeout_message(name: &str, timeout_ms: u64) -> String {
+    format!(
+        "Tool '{}' took too long (>{}s). Consider retrying.",
+        name,
+        timeout_ms / 1000
+    )
+}
 
 /// Determine whether a tool result string indicates an error.
 ///
@@ -1387,7 +1401,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     .map(|n| PARALLEL_SAFE_TOOLS.contains(&n))
                     .unwrap_or(false)
             });
-        let pre_results: Vec<Option<String>> = if parallel_batch {
+        let pre_results: Vec<PreExecutionResult> = if parallel_batch {
             let timeout_dur = std::time::Duration::from_millis(per_tool_timeout_ms);
             let exec_ref = &executor;
             let futs: Vec<_> = turn_result.tool_calls.iter().map(|tc| {
@@ -1401,8 +1415,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     .unwrap_or(serde_json::Value::Object(Default::default()));
                 async move {
                     match tokio::time::timeout(timeout_dur, exec_ref.execute(name, &args)).await {
-                        Ok(r) => Some(r),
-                        Err(_) => None, // timeout — handled in main loop
+                        Ok(result) => PreExecutionResult::Completed(result),
+                        Err(_) => PreExecutionResult::TimedOut,
                     }
                 }
             }).collect();
@@ -1601,34 +1615,27 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             let mut tool_timed_out = false;
 
             // Use pre-computed parallel result if available, else execute live
-            let mut result_str = if let Some(Some(pre)) = pre_results.get(tc_idx) {
-                pre.clone()
-            } else if pre_results.get(tc_idx) == Some(&None) {
-                // Pre-execution timed out
-                tool_timed_out = true;
-                turn_guard.record_tool_timeout(&name);
-                format!(
-                    "Tool '{}' took too long (>{}s). Consider retrying.",
-                    name,
-                    tool_timeout_ms / 1000
-                )
-            } else {
-                // Sequential execution (not a parallel batch)
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(tool_timeout_ms),
-                    executor.execute(&name, &args),
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(_) => {
-                        tool_timed_out = true;
-                        turn_guard.record_tool_timeout(&name);
-                        format!(
-                            "Tool '{}' took too long (>{}s). Consider retrying.",
-                            name,
-                            tool_timeout_ms / 1000
-                        )
+            let mut result_str = match pre_results.get(tc_idx) {
+                Some(PreExecutionResult::Completed(pre)) => pre.clone(),
+                Some(PreExecutionResult::TimedOut) => {
+                    tool_timed_out = true;
+                    turn_guard.record_tool_timeout(&name);
+                    tool_timeout_message(&name, per_tool_timeout_ms)
+                }
+                None => {
+                    // Sequential execution (not a parallel batch)
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(tool_timeout_ms),
+                        executor.execute(&name, &args),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            tool_timed_out = true;
+                            turn_guard.record_tool_timeout(&name);
+                            tool_timeout_message(&name, tool_timeout_ms)
+                        }
                     }
                 }
             };
@@ -3099,7 +3106,7 @@ if let Err(e) = writeln!(file, "{line}") {
             "read_file", "list_dir", "glob", "grep",
             "git_status", "git_diff", "git_log",
             "github_list_prs", "github_get_pr",
-            "memory_retrieve", "memory_search",
+            "memory_retrieve", "memory_search", "web_fetch",
         ];
         for tool in &must_be_parallel {
             assert!(
@@ -3144,7 +3151,7 @@ if let Err(e) = writeln!(file, "{line}") {
         let batch = vec![
             serde_json::json!({"name": "read_file", "arguments": {"path": "a.rs"}}),
             serde_json::json!({"name": "glob", "arguments": {"pattern": "*.rs"}}),
-            serde_json::json!({"name": "grep", "arguments": {"pattern": "fn main"}}),
+            serde_json::json!({"name": "web_fetch", "arguments": {"url": "https://example.com"}}),
         ];
         let is_parallel = batch.len() > 1
             && batch.iter().all(|tc| {
@@ -3168,7 +3175,16 @@ if let Err(e) = writeln!(file, "{line}") {
                     .and_then(|v| v.as_str())
                     .map(|n| PARALLEL_SAFE_TOOLS.contains(&n))
                     .unwrap_or(false)
-            });
+        });
         assert!(!is_parallel, "bash should prevent parallel batch");
+    }
+
+    #[test]
+    fn tool_timeout_message_uses_provided_timeout() {
+        let pre_exec = tool_timeout_message("web_fetch", 2_000);
+        let sequential = tool_timeout_message("web_fetch", 9_000);
+
+        assert!(pre_exec.contains(">2s"));
+        assert!(sequential.contains(">9s"));
     }
 }
