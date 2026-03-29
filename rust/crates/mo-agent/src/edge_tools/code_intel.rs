@@ -1192,6 +1192,88 @@ fn node_text(node: tree_sitter::Node, source: &str) -> String {
     }
 }
 
+/// Check if a position in source code falls inside a comment or string literal.
+///
+/// Parses the source with tree-sitter and walks ancestors of the node at
+/// the given (line, column) position. Returns true if ANY ancestor is a
+/// comment, string, or doc-comment node.
+///
+/// Used by find_references to filter out false-positive grep matches that
+/// appear in comments or string literals.
+pub fn is_in_comment_or_string(source: &str, lang: Language, line: usize, column: usize) -> bool {
+    let mut parser = tree_sitter::Parser::new();
+
+    let language = match lang {
+        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
+        Language::Python => tree_sitter_python::LANGUAGE.into(),
+        Language::TypeScript | Language::JavaScript => {
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+        }
+        Language::Go => tree_sitter_go::LANGUAGE.into(),
+        Language::Java => tree_sitter_java::LANGUAGE.into(),
+        Language::C | Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+    };
+
+    if parser.set_language(&language).is_err() {
+        return false;
+    }
+
+    let tree = match parser.parse(source, None) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    // tree-sitter uses 0-indexed rows
+    let point = tree_sitter::Point {
+        row: line.saturating_sub(1),
+        column,
+    };
+
+    let Some(node) = tree.root_node().descendant_for_point_range(point, point) else {
+        return false;
+    };
+
+    // Walk up from the node to check if any ancestor is a comment or string
+    let mut current = Some(node);
+    while let Some(n) = current {
+        let kind = n.kind();
+        if is_non_code_node(kind) {
+            return true;
+        }
+        current = n.parent();
+    }
+
+    false
+}
+
+/// Check if a tree-sitter node kind represents non-code content (comments, strings, etc.)
+fn is_non_code_node(kind: &str) -> bool {
+    // Comments (across all languages)
+    kind == "line_comment"
+        || kind == "block_comment"
+        || kind == "comment"
+        || kind == "doc_comment"
+        // Rust-specific
+        || kind == "inner_line_doc_comment"
+        || kind == "outer_line_doc_comment"
+        || kind == "inner_block_doc_comment"
+        || kind == "outer_block_doc_comment"
+        // String literals
+        || kind == "string_literal"
+        || kind == "raw_string_literal"
+        || kind == "string"
+        || kind == "raw_string"
+        || kind == "string_content"
+        || kind == "interpreted_string_literal"  // Go
+        || kind == "raw_string_literal"
+        || kind == "template_string"  // JS/TS
+        || kind == "string_fragment"
+        || kind == "heredoc_body"  // Ruby
+        // Python specific
+        || kind == "concatenated_string"
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

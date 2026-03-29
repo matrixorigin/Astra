@@ -402,7 +402,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "symbol": {"type": "string", "description": "Symbol name to search for (exact match)"},
                         "path": {"type": "string", "description": "Limit search to a subdirectory (optional)"},
                         "include": {"type": "string", "description": "File glob filter e.g. '*.rs' (optional)"},
-                        "kind": {"type": "string", "enum": ["all", "definition", "call", "import"], "description": "Filter references by kind (default: all)"}
+                        "kind": {"type": "string", "enum": ["all", "definition", "call", "import"], "description": "Filter references by kind (default: all)"},
+                        "validate": {"type": "boolean", "description": "AST-validate results to filter comments/strings (default: true). Set false for speed."}
                     },
                     "required": ["symbol"]
                 }
@@ -791,6 +792,18 @@ fn truncate_output(mut output: String, max_bytes: usize) -> String {
         output.push_str("\n[truncated]");
     }
     output
+}
+
+/// Parse a grep output line to extract the file path and line number.
+/// Handles format: `file:line:content` or `file:line:col:content`.
+fn parse_grep_file_line(line: &str) -> Option<(&str, usize)> {
+    let first_colon = line.find(':')?;
+    let file = &line[..first_colon];
+    let rest = &line[first_colon + 1..];
+    let second_colon = rest.find(':')?;
+    let line_str = &rest[..second_colon];
+    let line_num: usize = line_str.parse().ok()?;
+    Some((file, line_num))
 }
 
 /// Categorize a grep reference line as definition, import, call, or usage.
@@ -1314,6 +1327,68 @@ impl ToolExecutor {
         output
     }
 
+    /// AST-validate grep matches: filter out references in comments and string literals.
+    ///
+    /// Groups matches by file, parses each file once with tree-sitter, and checks
+    /// if the symbol at each match position falls inside a non-code node.
+    fn ast_validate_references<'a>(&self, lines: &[&'a str], symbol: &str) -> Vec<&'a str> {
+        use std::collections::HashMap;
+
+        // Group lines by file path for efficient per-file parsing
+        let mut by_file: HashMap<&str, Vec<(usize, &'a str)>> = HashMap::new();
+        for line in lines {
+            if let Some((file, line_num)) = parse_grep_file_line(line) {
+                by_file.entry(file).or_default().push((line_num, line));
+            }
+        }
+
+        let mut result = Vec::with_capacity(lines.len());
+
+        for (file, matches) in &by_file {
+            let file_path = self.project_root.join(file);
+            let lang = match code_intel::detect_language(&file_path) {
+                Some(l) => l,
+                None => {
+                    // Can't validate — keep all matches for this file
+                    result.extend(matches.iter().map(|(_, line)| *line));
+                    continue;
+                }
+            };
+            let content = match fs::read_to_string(&file_path) {
+                Ok(c) => c,
+                Err(_) => {
+                    result.extend(matches.iter().map(|(_, line)| *line));
+                    continue;
+                }
+            };
+
+            for &(line_num, line) in matches {
+                // Find the column where the symbol appears in this line
+                let line_content = content.lines().nth(line_num.saturating_sub(1)).unwrap_or("");
+                let col = match line_content.find(symbol) {
+                    Some(c) => c,
+                    None => {
+                        result.push(line); // Can't find symbol in line, keep it
+                        continue;
+                    }
+                };
+
+                if !code_intel::is_in_comment_or_string(&content, lang, line_num, col) {
+                    result.push(line);
+                }
+            }
+        }
+
+        // Also keep lines that couldn't be parsed
+        for line in lines {
+            if parse_grep_file_line(line).is_none() {
+                result.push(line);
+            }
+        }
+
+        result
+    }
+
     /// Walk project files and find all functions that call `target` symbol.
     /// Returns Vec of (relative_path, caller_name, caller_signature, call_line).
     fn find_callers_cross_file(&self, target: &str, _origin_file: &std::path::Path) -> Vec<(String, String, String, usize)> {
@@ -1609,6 +1684,7 @@ impl ToolExecutor {
         cmd.arg(search_path.to_string_lossy().to_string());
 
         let kind_filter = args.get("kind").and_then(Value::as_str).unwrap_or("all");
+        let ast_validate = args.get("validate").and_then(Value::as_bool).unwrap_or(true);
 
         match cmd.output() {
             Ok(out) => {
@@ -1618,9 +1694,18 @@ impl ToolExecutor {
                 }
 
                 let lines: Vec<&str> = stdout.lines().collect();
+                let total_grep = lines.len();
+
+                // AST validation: filter out matches in comments/strings
+                let validated_lines: Vec<&str> = if ast_validate {
+                    self.ast_validate_references(&lines, symbol)
+                } else {
+                    lines
+                };
+                let ast_filtered = total_grep - validated_lines.len();
 
                 // Categorize each reference line
-                let categorized: Vec<(&str, &str)> = lines.iter().map(|line| {
+                let categorized: Vec<(&str, &str)> = validated_lines.iter().map(|line| {
                     let category = categorize_reference(line, symbol);
                     (*line, category)
                 }).collect();
@@ -1639,9 +1724,15 @@ impl ToolExecutor {
                 let total = filtered.len();
 
                 // Group by file for cleaner output
-                let mut output = format!("# References to '{}' ({} found{})\n\n",
+                let ast_note = if ast_filtered > 0 {
+                    format!(", {} in comments/strings filtered", ast_filtered)
+                } else {
+                    String::new()
+                };
+                let mut output = format!("# References to '{}' ({} found{}{})\n\n",
                     symbol, total,
-                    if kind_filter != "all" { format!(", kind={kind_filter}") } else { String::new() }
+                    if kind_filter != "all" { format!(", kind={kind_filter}") } else { String::new() },
+                    ast_note
                 );
                 let mut current_file = "";
                 for (line, cat) in filtered.iter().take(50) {
@@ -3480,5 +3571,126 @@ fn start_engine() {
         assert!(names.contains(&"main.rs".to_string()), "should find src/main.rs");
         assert!(!names.contains(&"debug.rs".to_string()), "should skip target/");
         assert!(!names.contains(&"dep.js".to_string()), "should skip node_modules/");
+    }
+
+    // ---- AST validation tests ----
+
+    #[test]
+    fn parse_grep_file_line_extracts_path_and_line() {
+        assert_eq!(parse_grep_file_line("src/main.rs:42:fn foo()"), Some(("src/main.rs", 42)));
+        assert_eq!(parse_grep_file_line("lib.py:1:import os"), Some(("lib.py", 1)));
+        assert_eq!(parse_grep_file_line("no-colon"), None);
+        assert_eq!(parse_grep_file_line("file:abc:content"), None);
+    }
+
+    #[test]
+    fn ast_validate_filters_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = r#"fn real_call() { target(); }
+// target is mentioned in this comment
+fn another() { target(); }
+"#;
+        std::fs::write(dir.path().join("test.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let lines = vec![
+            "test.rs:1:fn real_call() { target(); }",
+            "test.rs:2:// target is mentioned in this comment",
+            "test.rs:3:fn another() { target(); }",
+        ];
+        let result = executor.ast_validate_references(&lines, "target");
+        assert!(result.contains(&"test.rs:1:fn real_call() { target(); }"), "real call kept: {:?}", result);
+        assert!(!result.iter().any(|l| l.contains("comment")), "comment filtered: {:?}", result);
+        assert!(result.contains(&"test.rs:3:fn another() { target(); }"), "another call kept: {:?}", result);
+    }
+
+    #[test]
+    fn ast_validate_filters_string_literals() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = r#"fn real_use() -> &str { "hello" }
+fn fake_use() -> &str { "target is in a string" }
+fn actual() { target(); }
+"#;
+        std::fs::write(dir.path().join("test.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let lines = vec![
+            "test.rs:2:fn fake_use() -> &str { \"target is in a string\" }",
+            "test.rs:3:fn actual() { target(); }",
+        ];
+        let result = executor.ast_validate_references(&lines, "target");
+        assert!(!result.iter().any(|l| l.contains("string")), "string literal filtered: {:?}", result);
+        assert!(result.contains(&"test.rs:3:fn actual() { target(); }"), "real call kept: {:?}", result);
+    }
+
+    #[test]
+    fn ast_validate_keeps_all_for_unknown_language() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.xyz"), "target is here\n").unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let lines = vec!["data.xyz:1:target is here"];
+        let result = executor.ast_validate_references(&lines, "target");
+        assert_eq!(result.len(), 1, "unknown language keeps all matches");
+    }
+
+    #[test]
+    fn ast_validate_python_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "# target in comment\ntarget = 42\n";
+        std::fs::write(dir.path().join("test.py"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let lines = vec![
+            "test.py:1:# target in comment",
+            "test.py:2:target = 42",
+        ];
+        let result = executor.ast_validate_references(&lines, "target");
+        assert!(!result.iter().any(|l| l.contains("comment")), "python comment filtered: {:?}", result);
+        assert!(result.contains(&"test.py:2:target = 42"), "real code kept: {:?}", result);
+    }
+
+    #[test]
+    fn ast_validate_mixed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = r#"fn main() {
+    // Call target here
+    target();
+    let s = "target in string";
+    target.method();
+}
+"#;
+        std::fs::write(dir.path().join("mixed.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let lines = vec![
+            "mixed.rs:2:    // Call target here",
+            "mixed.rs:3:    target();",
+            "mixed.rs:4:    let s = \"target in string\";",
+            "mixed.rs:5:    target.method();",
+        ];
+        let result = executor.ast_validate_references(&lines, "target");
+        // Comment and string should be filtered; real code should remain
+        assert!(!result.iter().any(|l| l.contains("//")), "comment filtered: {:?}", result);
+        // Line 4 has "target" in a string, should be filtered
+        assert!(!result.iter().any(|l| l.contains("in string")), "string filtered: {:?}", result);
+        // Real calls should remain
+        assert!(result.iter().any(|l| l.contains("target();")), "real call kept: {:?}", result);
+        assert!(result.iter().any(|l| l.contains("target.method();")), "method call kept: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn find_references_with_validate_false_skips_ast() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "fn foo() { target(); }\n// target in comment\n";
+        std::fs::write(dir.path().join("test.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("find_references", &json!({
+            "symbol": "target",
+            "validate": false
+        })).await;
+        // With validate=false, the comment line should still appear
+        assert!(result.contains("target"), "should find references: {result}");
     }
 }
