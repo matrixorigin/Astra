@@ -27,6 +27,29 @@ pub struct ErrorLocation {
     /// Severity: "error", "warning", "note"
     #[allow(dead_code)]
     pub severity: String,
+    /// Classification for auto-fix prioritization
+    pub class: ErrorClass,
+    /// Quick-fix hint for the LLM (empty if no suggestion)
+    pub hint: String,
+}
+
+/// Error classification for auto-fix prioritization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// Trivial: can be fixed mechanically (missing import, unused var prefix)
+    Trivial,
+    /// Fixable: LLM can likely fix with context (type mismatch, wrong args)
+    Fixable,
+    /// Complex: requires deep understanding (borrow checker, trait bounds, logic)
+    Complex,
+}
+
+impl ErrorLocation {
+    /// Create a new ErrorLocation with automatic classification and hints.
+    fn new(file: String, line: usize, col: usize, error_code: String, message: String, severity: String) -> Self {
+        let (class, hint) = classify_and_hint(&error_code, &message);
+        Self { file, line, col, error_code, message, severity, class, hint }
+    }
 }
 
 /// Parsed result from a build or test command.
@@ -122,6 +145,29 @@ impl BuildTestResult {
         // Error locations for direct navigation
         if !self.error_locations.is_empty() {
             parts.push(String::new());
+
+            // Classify errors for the LLM: show fixable count
+            let trivial_count = self.error_locations.iter().filter(|l| l.class == ErrorClass::Trivial).count();
+            let fixable_count = self.error_locations.iter().filter(|l| l.class == ErrorClass::Fixable).count();
+            let complex_count = self.error_locations.iter().filter(|l| l.class == ErrorClass::Complex).count();
+
+            if trivial_count + fixable_count > 0 {
+                parts.push(format!(
+                    "Fix priority: {} trivial, {} fixable, {} complex",
+                    trivial_count, fixable_count, complex_count
+                ));
+            }
+
+            // Detect cascading: multiple errors in same file likely cascade from first
+            let first_file = &self.error_locations[0].file;
+            let same_file_count = self.error_locations.iter().filter(|l| l.file == *first_file).count();
+            if same_file_count > 2 {
+                parts.push(format!(
+                    "⚡ {} errors in {} — fix first error, others may resolve",
+                    same_file_count, first_file
+                ));
+            }
+
             parts.push("Locations:".to_string());
             for loc in self.error_locations.iter().take(10) {
                 let code_part = if loc.error_code.is_empty() {
@@ -134,10 +180,18 @@ impl BuildTestResult {
                 } else {
                     String::new()
                 };
+                let class_tag = match loc.class {
+                    ErrorClass::Trivial => " 🔧",
+                    ErrorClass::Fixable => " 🔨",
+                    ErrorClass::Complex => "",
+                };
                 parts.push(format!(
-                    "  → {}:{}{}{} {}",
-                    loc.file, loc.line, col_part, code_part, loc.message
+                    "  → {}:{}{}{} {}{}",
+                    loc.file, loc.line, col_part, code_part, loc.message, class_tag
                 ));
+                if !loc.hint.is_empty() {
+                    parts.push(format!("    💡 {}", loc.hint));
+                }
             }
             if self.error_locations.len() > 10 {
                 parts.push(format!("  ... and {} more locations", self.error_locations.len() - 10));
@@ -161,6 +215,90 @@ impl BuildTestResult {
 
         parts.join("\n")
     }
+}
+
+/// Classify an error and generate a quick-fix hint for the LLM.
+fn classify_and_hint(error_code: &str, message: &str) -> (ErrorClass, String) {
+    // Rust error codes
+    match error_code {
+        // Trivial: mechanical fixes
+        "E0425" => {
+            // cannot find value — usually missing import
+            if let Some(name) = extract_identifier(message) {
+                return (ErrorClass::Trivial, format!("Add `use` import for `{name}`, or check spelling"));
+            }
+            (ErrorClass::Trivial, "Add missing import or check spelling".into())
+        }
+        "E0433" => (ErrorClass::Trivial, "Add missing `use` or crate dependency in Cargo.toml".into()),
+        "E0432" => (ErrorClass::Trivial, "Fix import path — module or item doesn't exist at that path".into()),
+        "E0412" => (ErrorClass::Trivial, "Type not found — add missing `use` import".into()),
+        "E0603" => (ErrorClass::Trivial, "Item is private — add `pub` to definition or use a public re-export".into()),
+
+        // Fixable: LLM can reason about these
+        "E0308" => {
+            // Mismatched types
+            if message.contains("&str") && message.contains("String") {
+                (ErrorClass::Fixable, "String/&str mismatch — use `.to_string()` or `&*s` / `.as_str()`".into())
+            } else if message.contains("Option") {
+                (ErrorClass::Fixable, "Wrap in Some() or unwrap with .unwrap_or()".into())
+            } else {
+                (ErrorClass::Fixable, "Check expected vs actual type — may need conversion or different return".into())
+            }
+        }
+        "E0277" => (ErrorClass::Fixable, "Trait not satisfied — implement the trait or add a bound".into()),
+        "E0599" => (ErrorClass::Fixable, "Method not found — check spelling, or the type may need a different impl/import".into()),
+        "E0061" => (ErrorClass::Fixable, "Wrong number of arguments — check function signature".into()),
+        "E0063" => (ErrorClass::Fixable, "Missing struct fields — add the required fields".into()),
+        "E0609" => (ErrorClass::Fixable, "No field on type — check struct definition for correct field name".into()),
+        "E0107" => (ErrorClass::Fixable, "Wrong number of type arguments — check generic parameters".into()),
+        "E0369" => (ErrorClass::Fixable, "Operator not implemented — derive trait or implement manually".into()),
+        "E0046" => (ErrorClass::Fixable, "Missing trait method — implement the required method".into()),
+
+        // Complex: requires deep understanding
+        "E0382" | "E0505" | "E0502" => (ErrorClass::Complex, "Borrow/move error — restructure ownership or use .clone()".into()),
+        "E0597" => (ErrorClass::Complex, "Value doesn't live long enough — restructure lifetimes".into()),
+        "E0106" => (ErrorClass::Complex, "Missing lifetime — add explicit lifetime annotations".into()),
+        "E0495" => (ErrorClass::Complex, "Conflicting lifetime requirements — simplify borrowing structure".into()),
+
+        _ => {
+            // Fallback: classify by message patterns
+            classify_by_message(message)
+        }
+    }
+}
+
+/// Classify non-Rust errors or errors without codes by message content.
+fn classify_by_message(message: &str) -> (ErrorClass, String) {
+    let lower = message.to_lowercase();
+
+    // Python / TypeScript / Go common patterns
+    if lower.contains("import") && (lower.contains("not found") || lower.contains("cannot find") || lower.contains("no module")) {
+        return (ErrorClass::Trivial, "Missing import — add the correct import statement".into());
+    }
+    if lower.contains("undefined") || lower.contains("is not defined") {
+        return (ErrorClass::Fixable, "Undefined variable/function — check spelling or add import".into());
+    }
+    if lower.contains("type") && lower.contains("not assignable") {
+        return (ErrorClass::Fixable, "Type mismatch — check expected vs actual type".into());
+    }
+    if lower.contains("unused") {
+        return (ErrorClass::Trivial, "Unused variable — prefix with _ or remove".into());
+    }
+    if lower.contains("syntax error") || lower.contains("unexpected token") {
+        return (ErrorClass::Fixable, "Syntax error — check for missing brackets, semicolons, or typos".into());
+    }
+    if lower.contains("assertion") || lower.contains("expected") && lower.contains("got") {
+        return (ErrorClass::Complex, "Test assertion failure — check logic and expected values".into());
+    }
+
+    (ErrorClass::Fixable, String::new())
+}
+
+/// Extract an identifier name from an error message like "cannot find value `foo`".
+fn extract_identifier(message: &str) -> Option<&str> {
+    let start = message.find('`')? + 1;
+    let end = message[start..].find('`')? + start;
+    Some(&message[start..end])
 }
 
 /// Detect if a command is a build or test command.
@@ -329,14 +467,14 @@ fn parse_cargo_output(output: &str, exit_code: Option<i32>, truncated: bool) -> 
                     let col: usize = loc_cap.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
 
                     if !file.is_empty() && line_num > 0 && result.error_locations.len() < 20 {
-                        result.error_locations.push(ErrorLocation {
-                            file: file.to_string(),
-                            line: line_num,
+                        result.error_locations.push(ErrorLocation::new(
+                            file.to_string(),
+                            line_num,
                             col,
-                            error_code: code.to_string(),
-                            message: msg.to_string(),
-                            severity: "error".to_string(),
-                        });
+                            code.to_string(),
+                            msg.to_string(),
+                            "error".to_string(),
+                        ));
                     }
                     break;
                 }
@@ -354,14 +492,14 @@ fn parse_cargo_output(output: &str, exit_code: Option<i32>, truncated: bool) -> 
                     let line_num: usize = loc_cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
                     let col: usize = loc_cap.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
                     if !file.is_empty() && line_num > 0 && result.error_locations.len() < 20 {
-                        result.error_locations.push(ErrorLocation {
-                            file: file.to_string(),
-                            line: line_num,
+                        result.error_locations.push(ErrorLocation::new(
+                            file.to_string(),
+                            line_num,
                             col,
-                            error_code: String::new(),
-                            message: msg.to_string(),
-                            severity: "error".to_string(),
-                        });
+                            String::new(),
+                            msg.to_string(),
+                            "error".to_string(),
+                        ));
                     }
                     break;
                 }
@@ -445,14 +583,14 @@ fn extract_cargo_failed_tests(output: &str, locations: &mut Vec<ErrorLocation>) 
                             let line_num: usize = pcap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
                             let col: usize = pcap.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
                             if !file.is_empty() && line_num > 0 && locations.len() < 20 {
-                                locations.push(ErrorLocation {
-                                    file: file.to_string(),
-                                    line: line_num,
+                                locations.push(ErrorLocation::new(
+                                    file.to_string(),
+                                    line_num,
                                     col,
-                                    error_code: String::new(),
-                                    message: format!("test {name} panicked"),
-                                    severity: "error".to_string(),
-                                });
+                                    String::new(),
+                                    format!("test {name} panicked"),
+                                    "error".to_string(),
+                                ));
                             }
                         }
                         break;
@@ -522,14 +660,14 @@ fn parse_pytest_output(output: &str, exit_code: Option<i32>, truncated: bool) ->
             });
 
             if is_relevant && !file.is_empty() && line_num > 0 && result.error_locations.len() < 20 {
-                result.error_locations.push(ErrorLocation {
-                    file: file.to_string(),
-                    line: line_num,
-                    col: 0,
-                    error_code: String::new(),
-                    message: if func.is_empty() { String::new() } else { format!("in {func}") },
-                    severity: "error".to_string(),
-                });
+                result.error_locations.push(ErrorLocation::new(
+                    file.to_string(),
+                    line_num,
+                    0,
+                    String::new(),
+                    if func.is_empty() { String::new() } else { format!("in {func}") },
+                    "error".to_string(),
+                ));
             }
         }
     }
@@ -628,14 +766,7 @@ fn parse_go_output(output: &str, exit_code: Option<i32>, truncated: bool) -> Bui
                 } else {
                     format!("{}: {}", current_test, msg)
                 };
-                result.error_locations.push(ErrorLocation {
-                    file: file.to_string(),
-                    line: line_num,
-                    col: 0,
-                    error_code: String::new(),
-                    message: full_msg,
-                    severity: "error".to_string(),
-                });
+                result.error_locations.push(ErrorLocation::new(file.to_string(), line_num, 0, String::new(), full_msg, "error".to_string()));
             }
         }
     }
@@ -687,14 +818,14 @@ fn extract_generic_errors(output: &str) -> (Vec<String>, Vec<ErrorLocation>) {
                 errors.push(format!("[{code}] {msg}"));
             }
             if locations.len() < 20 {
-                locations.push(ErrorLocation {
-                    file: file.to_string(),
-                    line: line_num,
+                locations.push(ErrorLocation::new(
+                    file.to_string(),
+                    line_num,
                     col,
-                    error_code: code.to_string(),
-                    message: msg.to_string(),
-                    severity: "error".to_string(),
-                });
+                    code.to_string(),
+                    msg.to_string(),
+                    "error".to_string(),
+                ));
             }
             continue;
         }
@@ -710,14 +841,14 @@ fn extract_generic_errors(output: &str) -> (Vec<String>, Vec<ErrorLocation>) {
                 errors.push(msg.to_string());
             }
             if locations.len() < 20 {
-                locations.push(ErrorLocation {
-                    file: file.to_string(),
-                    line: line_num,
+                locations.push(ErrorLocation::new(
+                    file.to_string(),
+                    line_num,
                     col,
-                    error_code: String::new(),
-                    message: msg.to_string(),
-                    severity: severity.to_string(),
-                });
+                    String::new(),
+                    msg.to_string(),
+                    severity.to_string(),
+                ));
             }
             continue;
         }
@@ -938,14 +1069,14 @@ exit status 1
             framework: "cargo".to_string(),
             error_count: 1,
             error_messages: vec!["cannot find value `foo`".to_string()],
-            error_locations: vec![ErrorLocation {
-                file: "src/main.rs".to_string(),
-                line: 10,
-                col: 5,
-                error_code: "E0425".to_string(),
-                message: "cannot find value `foo`".to_string(),
-                severity: "error".to_string(),
-            }],
+            error_locations: vec![ErrorLocation::new(
+                "src/main.rs".to_string(),
+                10,
+                5,
+                "E0425".to_string(),
+                "cannot find value `foo`".to_string(),
+                "error".to_string(),
+            )],
             summary: "1 compilation error(s)".to_string(),
             ..Default::default()
         };
@@ -1049,5 +1180,161 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored
         assert_eq!(loc.line, 42, "line should be 42");
         assert_eq!(loc.col, 9, "col should be 9");
         assert!(loc.message.contains("my_test"), "message should reference test name");
+    }
+
+    // ─── Error classification tests ────────────────────────────────────
+
+    #[test]
+    fn classify_rust_trivial_missing_import() {
+        let (class, hint) = classify_and_hint("E0425", "cannot find value `HashMap` in this scope");
+        assert_eq!(class, ErrorClass::Trivial);
+        assert!(hint.contains("HashMap"), "hint should mention the identifier: {hint}");
+        assert!(hint.contains("import"), "hint should suggest import: {hint}");
+    }
+
+    #[test]
+    fn classify_rust_trivial_missing_crate() {
+        let (class, hint) = classify_and_hint("E0433", "failed to resolve: use of undeclared crate or module `serde`");
+        assert_eq!(class, ErrorClass::Trivial);
+        assert!(hint.contains("Cargo.toml"), "hint should mention Cargo.toml: {hint}");
+    }
+
+    #[test]
+    fn classify_rust_fixable_type_mismatch() {
+        let (class, hint) = classify_and_hint("E0308", "mismatched types: expected &str, found String");
+        assert_eq!(class, ErrorClass::Fixable);
+        assert!(hint.contains("to_string") || hint.contains("as_str"), "hint should suggest conversion: {hint}");
+    }
+
+    #[test]
+    fn classify_rust_fixable_option_mismatch() {
+        let (class, hint) = classify_and_hint("E0308", "expected Option<i32>, found i32");
+        assert_eq!(class, ErrorClass::Fixable);
+        assert!(hint.contains("Some"), "hint should suggest Some: {hint}");
+    }
+
+    #[test]
+    fn classify_rust_complex_borrow() {
+        for code in &["E0382", "E0505", "E0502"] {
+            let (class, _hint) = classify_and_hint(code, "value moved here");
+            assert_eq!(class, ErrorClass::Complex, "code {code} should be Complex");
+        }
+    }
+
+    #[test]
+    fn classify_rust_complex_lifetime() {
+        let (class, hint) = classify_and_hint("E0597", "borrowed value does not live long enough");
+        assert_eq!(class, ErrorClass::Complex);
+        assert!(hint.contains("lifetime"), "hint should mention lifetime: {hint}");
+    }
+
+    #[test]
+    fn classify_unknown_code_by_message() {
+        let (class, _) = classify_and_hint("", "unused variable: `x`");
+        assert_eq!(class, ErrorClass::Trivial);
+
+        let (class, _) = classify_and_hint("", "import 'foo' not found");
+        assert_eq!(class, ErrorClass::Trivial);
+
+        let (class, _) = classify_and_hint("", "syntax error: unexpected token '}'");
+        assert_eq!(class, ErrorClass::Fixable);
+
+        let (class, _) = classify_and_hint("", "assertion failed: expected 5, got 3");
+        assert_eq!(class, ErrorClass::Complex);
+    }
+
+    #[test]
+    fn classify_extract_identifier() {
+        assert_eq!(extract_identifier("cannot find value `foo` in scope"), Some("foo"));
+        assert_eq!(extract_identifier("no backticks here"), None);
+        assert_eq!(extract_identifier("found `Bar` not defined"), Some("Bar"));
+    }
+
+    #[test]
+    fn enhanced_output_shows_classification_summary() {
+        let result = BuildTestResult {
+            passed: false,
+            error_count: 3,
+            error_messages: vec!["E0425".into(), "E0308".into(), "E0382".into()],
+            error_locations: vec![
+                ErrorLocation::new("src/a.rs".into(), 1, 0, "E0425".into(), "cannot find value `x`".into(), "error".into()),
+                ErrorLocation::new("src/b.rs".into(), 2, 0, "E0308".into(), "mismatched types".into(), "error".into()),
+                ErrorLocation::new("src/c.rs".into(), 3, 0, "E0382".into(), "value moved".into(), "error".into()),
+            ],
+            summary: "3 errors".into(),
+            ..Default::default()
+        };
+        let output = result.to_enhanced_output("");
+        assert!(output.contains("trivial"), "should show trivial count: {output}");
+        assert!(output.contains("fixable"), "should show fixable count: {output}");
+        assert!(output.contains("complex"), "should show complex count: {output}");
+    }
+
+    #[test]
+    fn enhanced_output_shows_hints() {
+        let result = BuildTestResult {
+            passed: false,
+            error_count: 1,
+            error_messages: vec!["cannot find value `foo`".into()],
+            error_locations: vec![ErrorLocation::new(
+                "src/main.rs".into(), 10, 5, "E0425".into(),
+                "cannot find value `foo`".into(), "error".into(),
+            )],
+            summary: "1 error".into(),
+            ..Default::default()
+        };
+        let output = result.to_enhanced_output("");
+        assert!(output.contains("💡"), "should show hint icon: {output}");
+        assert!(output.contains("import"), "hint should mention import: {output}");
+        assert!(output.contains("🔧"), "trivial should get wrench icon: {output}");
+    }
+
+    #[test]
+    fn enhanced_output_cascading_detection() {
+        let result = BuildTestResult {
+            passed: false,
+            error_count: 4,
+            error_messages: vec!["err1".into(), "err2".into(), "err3".into(), "err4".into()],
+            error_locations: vec![
+                ErrorLocation::new("src/same.rs".into(), 10, 0, "E0425".into(), "err1".into(), "error".into()),
+                ErrorLocation::new("src/same.rs".into(), 20, 0, "E0308".into(), "err2".into(), "error".into()),
+                ErrorLocation::new("src/same.rs".into(), 30, 0, "E0599".into(), "err3".into(), "error".into()),
+            ],
+            summary: "3 errors in same file".into(),
+            ..Default::default()
+        };
+        let output = result.to_enhanced_output("");
+        assert!(output.contains("cascading") || output.contains("first error"),
+            "should detect cascading errors in same file: {output}");
+    }
+
+    #[test]
+    fn errorlocation_new_auto_classifies() {
+        let loc = ErrorLocation::new("f.rs".into(), 1, 0, "E0425".into(), "cannot find value `x`".into(), "error".into());
+        assert_eq!(loc.class, ErrorClass::Trivial);
+        assert!(!loc.hint.is_empty());
+
+        let loc2 = ErrorLocation::new("f.rs".into(), 1, 0, "E0382".into(), "value moved".into(), "error".into());
+        assert_eq!(loc2.class, ErrorClass::Complex);
+
+        let loc3 = ErrorLocation::new("f.rs".into(), 1, 0, "".into(), "random error".into(), "error".into());
+        assert_eq!(loc3.class, ErrorClass::Fixable);
+    }
+
+    #[test]
+    fn rust_error_gets_classified_in_parse() {
+        let output = r#"
+error[E0425]: cannot find value `nonexistent` in this scope
+  --> src/main.rs:10:5
+   |
+10 |     nonexistent;
+   |     ^^^^^^^^^^^ not found in this scope
+"#;
+        let result = parse_build_test_output(output, Some(101));
+        assert!(!result.error_locations.is_empty());
+        let loc = &result.error_locations[0];
+        assert_eq!(loc.error_code, "E0425");
+        assert_eq!(loc.class, ErrorClass::Trivial, "E0425 should be trivial");
+        assert!(!loc.hint.is_empty(), "should have a hint");
     }
 }
