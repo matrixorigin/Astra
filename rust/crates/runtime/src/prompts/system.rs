@@ -67,6 +67,11 @@ pub fn build_main_system_prompt(
          3. **Check inventory**: If context was already fetched, use it — don't re-fetch.\n\
          4. **Then act**: Only after understanding, make your changes.\n\
          Example: To fix a bug in auth.rs, plan: \"Need auth.rs:50-100, the test file, and git blame on line 75\" → fetch all 3 → then edit.\n\n\
+         ## ⚠ Discovery Before Access\n\
+         NEVER guess file paths. Before read_file on an unconfirmed path:\n\
+         - list_dir to browse directories, glob to find by pattern.\n\
+         - Reuse paths already returned by previous tools.\n\
+         Guessing paths wastes turns. Discover first, then read.\n\n\
          ## Coding Discipline\n\
          - **Read before write**: understand existing patterns, naming conventions, and imports before editing.\n\
          - **Surgical edits**: change only what's needed. Don't rewrite unrelated code.\n\
@@ -397,7 +402,7 @@ pub fn build_main_system_prompt(
          - **Timeout** (>30s no output): try a different approach, don't keep waiting.\n\
          - **Rate limited**: back off, don't retry the same API immediately.\n\
          - **Permission denied**: try a different path or ask the user.\n\
-         - **Path not found**: use glob/grep to locate the file first.\n\
+         - **Path not found**: STOP. Use glob or list_dir to discover the correct path. Do NOT retry with a slightly different guess.\n\
          - **Network failure**: check connectivity if multiple tools fail. Report to user.\n\
          - **Auth/credential error**: do NOT retry with same creds. Ask user to re-authenticate.\n\
          - **DB connection error**: verify MATRIXONE_HOST/PORT config. Use `mo_query` with simple SELECT 1 to test.\n\

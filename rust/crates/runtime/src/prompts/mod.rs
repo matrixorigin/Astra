@@ -221,14 +221,28 @@ mod tests {
             1.0,
             None,
         );
-        // Full prompt with all sections should be under ~2100 tokens (~8400 chars)
-        // Enhanced prompt adds: Planning Protocol, Context Strategy, Coding Discipline,
-        // Parallel Tool Calls, Token Efficiency, Plan Execution, Code Navigation, Build/Test,
-        // Git Workflow. These extra ~400 tokens pay for themselves in fewer wasted turns.
+        // Full prompt with all sections should be under ~2150 tokens (~8600 chars)
+        // Enhanced prompt adds: Planning Protocol, Context Strategy, Discovery Before Access,
+        // Coding Discipline, Parallel Tool Calls, Token Efficiency, Plan Execution.
+        // The extra ~50 tokens for discovery-first discipline pay for themselves in fewer path errors.
         assert!(
-            p.len() < 8400,
-            "compressed prompt should be under 8400 chars, got {}",
+            p.len() < 8600,
+            "compressed prompt should be under 8600 chars, got {}",
             p.len()
+        );
+    }
+
+    /// Discovery Before Access guidance prevents LLMs from guessing file paths.
+    #[test]
+    fn prompt_includes_discovery_before_access() {
+        let p = build_main_system_prompt(&["read_file", "list_dir", "glob"], "", 1.0, None);
+        assert!(
+            p.contains("Discovery Before Access"),
+            "should include discovery-first discipline section"
+        );
+        assert!(
+            p.contains("NEVER guess file paths"),
+            "should warn against guessing paths"
         );
     }
 
