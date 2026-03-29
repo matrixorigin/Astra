@@ -559,72 +559,110 @@ pub(super) async fn handle_info_command(
 
         "/turn" => {
             if let Some(ref ev) = state.last_turn_event {
+                let total_ms = ev.duration_ms.unwrap_or(1) as f64;
                 let sep = "─".repeat(42);
-                eprintln!("\n  {}", format!("─── Turn {} Details {sep}", ev.turn.unwrap_or(0)).cyan());
+                eprintln!("\n  {}", format!("─── Turn {} Trace {sep}", ev.turn.unwrap_or(0)).cyan());
                 
-                // Basic info
-                eprintln!("  {:<12}  {}", "timestamp".cyan(), ev.ts.as_str().dim());
-                if let Some(ref m) = ev.model {
-                    eprintln!("  {:<12}  {}", "model".cyan(), m.as_str().dim());
-                }
+                // Calculate tool time
+                let tool_time_ms: u64 = ev.tool_calls.as_ref()
+                    .map(|calls| calls.iter().map(|tc| tc.ms).sum())
+                    .unwrap_or(0);
+                let llm_time_ms = ev.duration_ms.unwrap_or(0).saturating_sub(tool_time_ms);
+                
+                // Summary line
                 if let Some(ms) = ev.duration_ms {
-                    let secs = ms as f64 / 1000.0;
-                    eprintln!("  {:<12}  {}", "duration".cyan(), format!("{secs:.2}s ({ms}ms)").dim());
+                    eprintln!("  {} {}", "Total:".bold(), format!("{:.2}s", ms as f64 / 1000.0).bold());
                 }
-                
-                // Tokens
                 eprintln!();
-                eprintln!("  {}", "Tokens".bold());
-                if let Some(t) = ev.tokens_in {
-                    eprintln!("    {:<10}  {}", "input".cyan(), t.to_string().dim());
-                }
-                if let Some(t) = ev.tokens_out {
-                    eprintln!("    {:<10}  {}", "output".cyan(), t.to_string().dim());
-                }
-                if let Some(t) = ev.tokens_in.zip(ev.tokens_out).map(|(i, o)| i + o) {
-                    eprintln!("    {:<10}  {}", "total".cyan(), t.to_string().bold());
-                }
-                if let Some(p) = ev.budget_pressure {
-                    let pressure_str = if p < 0.3 {
-                        format!("{:.0}% (normal)", p * 100.0).green()
-                    } else if p < 0.6 {
-                        format!("{:.0}% (trimming)", p * 100.0).yellow()
-                    } else {
-                        format!("{:.0}% (aggressive)", p * 100.0).red()
-                    };
-                    eprintln!("    {:<10}  {}", "pressure".cyan(), pressure_str);
+                
+                // Timeline visualization
+                eprintln!("  {}", "Timeline".bold());
+                let bar_width = 40;
+                
+                // LLM portion
+                let llm_pct = (llm_time_ms as f64 / total_ms * 100.0) as u32;
+                let llm_bar_len = (llm_pct as usize * bar_width / 100).max(1);
+                let llm_bar = "█".repeat(llm_bar_len);
+                eprintln!("    {:<12} {:>6}ms {:>3}%  {}", 
+                    "LLM".cyan(), llm_time_ms, llm_pct, llm_bar.blue());
+                
+                // Per-tool bars
+                if let Some(ref calls) = ev.tool_calls {
+                    for tc in calls {
+                        let pct = (tc.ms as f64 / total_ms * 100.0) as u32;
+                        let bar_len = (pct as usize * bar_width / 100).max(1);
+                        let bar = if tc.ok { "█".repeat(bar_len).green() } else { "█".repeat(bar_len).red() };
+                        let status = if tc.ok { " " } else { "!" };
+                        eprintln!("    {:<12} {:>6}ms {:>3}%  {}{}", 
+                            tc.name.as_str().cyan(), tc.ms, pct, bar, status);
+                    }
                 }
                 
-                // Tools
-                if ev.tool_count.unwrap_or(0) > 0 {
-                    eprintln!();
-                    eprintln!("  {}", "Tools".bold());
-                    if let Some(ref selected) = ev.tools_selected {
-                        eprintln!("    {:<10}  {}", "selected".cyan(), format!("{} tools", selected.len()).dim());
-                    }
-                    if let Some(ref used) = ev.tools_used {
-                        eprintln!("    {:<10}  {}", "called".cyan(), used.join(", ").dim());
-                    }
-                    if let Some(ref calls) = ev.tool_calls {
-                        eprintln!();
-                        for tc in calls {
-                            let status = if tc.ok { "✓".green() } else { "✗".red() };
-                            let timing = format!("{}ms", tc.ms);
-                            eprintln!("    {} {:<20} {}", status, tc.name.as_str().cyan(), timing.dim());
-                            if let Some(ref err) = tc.error {
-                                let err_preview = if err.len() > 60 { format!("{}…", &err[..60]) } else { err.clone() };
-                                eprintln!("      {}", err_preview.red());
-                            }
+                eprintln!();
+                
+                // Detailed trace view (OpenTrace style)
+                eprintln!("  {}", "Trace".bold());
+                let mut offset = 0u64;
+                
+                // LLM call
+                eprintln!("    {} {} LLM request", 
+                    format!("[{:>5}ms]", offset).dim(), "├─".dim());
+                if let Some(ref m) = ev.model {
+                    eprintln!("    {}    {} model: {}", " ".repeat(8), "│".dim(), m.as_str().dim());
+                }
+                if let Some(t_in) = ev.tokens_in {
+                    eprintln!("    {}    {} input: {} tokens", " ".repeat(8), "│".dim(), t_in.to_string().dim());
+                }
+                if let Some(t_out) = ev.tokens_out {
+                    eprintln!("    {}    {} output: {} tokens", " ".repeat(8), "│".dim(), t_out.to_string().dim());
+                }
+                offset += llm_time_ms;
+                eprintln!("    {} {} LLM complete ({}ms)", 
+                    format!("[{:>5}ms]", offset).dim(), "│".dim(), llm_time_ms.to_string().yellow());
+                
+                // Tool calls
+                if let Some(ref calls) = ev.tool_calls {
+                    for (i, tc) in calls.iter().enumerate() {
+                        let is_last = i == calls.len() - 1;
+                        let branch = if is_last { "└─" } else { "├─" };
+                        let status = if tc.ok { "✓".green() } else { "✗".red() };
+                        eprintln!("    {} {} {} {}", 
+                            format!("[{:>5}ms]", offset).dim(), 
+                            branch.dim(),
+                            status,
+                            tc.name.as_str().cyan());
+                        if let Some(ref err) = tc.error {
+                            let err_preview = if err.len() > 50 { format!("{}…", &err[..50]) } else { err.clone() };
+                            let sub_branch = if is_last { "   " } else { "│  " };
+                            eprintln!("    {}    {} {}", " ".repeat(8), sub_branch.dim(), err_preview.red());
                         }
+                        offset += tc.ms;
+                        let sub_branch = if is_last { "   " } else { "│  " };
+                        eprintln!("    {}    {} complete ({}ms)", 
+                            format!("[{:>5}ms]", offset).dim(), 
+                            sub_branch.dim(),
+                            tc.ms.to_string().dim());
                     }
                 }
                 
-                // User input preview
-                if let Some(ref input) = ev.user_input {
-                    eprintln!();
-                    eprintln!("  {}", "Input".bold());
-                    let preview = if input.len() > 100 { format!("{}…", &input[..100]) } else { input.clone() };
-                    eprintln!("    {}", preview.dim());
+                eprintln!();
+                
+                // Breakdown summary
+                eprintln!("  {}", "Breakdown".bold());
+                let llm_note = if llm_pct > 80 { "← bottleneck".yellow().to_string() } else { String::new() };
+                eprintln!("    {:<12} {:>6}ms  {:>3}%  {}", 
+                    "LLM".cyan(), llm_time_ms, llm_pct, llm_note);
+                let tool_pct = 100u32.saturating_sub(llm_pct);
+                let tool_note = if tool_pct > 80 { "← bottleneck".yellow().to_string() } else { String::new() };
+                eprintln!("    {:<12} {:>6}ms  {:>3}%  {}", 
+                    "Tools".cyan(), tool_time_ms, tool_pct, tool_note);
+                
+                // Tokens per second
+                if let (Some(t_out), Some(ms)) = (ev.tokens_out, ev.duration_ms) {
+                    if ms > 0 {
+                        let tps = t_out as f64 / (ms as f64 / 1000.0);
+                        eprintln!("    {:<12} {:>6.1} tokens/s", "Throughput".cyan(), tps);
+                    }
                 }
                 
                 eprintln!("  {}", "─".repeat(56).cyan().dim());
