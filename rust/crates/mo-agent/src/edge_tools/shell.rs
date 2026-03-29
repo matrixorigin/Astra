@@ -210,7 +210,11 @@ impl ToolExecutor {
                         if delta_summary.is_empty() {
                             return parsed.to_enhanced_output(&result);
                         }
-                        return format!("{}\n\n{}", delta_summary, parsed.to_enhanced_output(&result));
+                        return format!(
+                            "{}\n\n{}",
+                            delta_summary,
+                            parsed.to_enhanced_output(&result)
+                        );
                     }
 
                     result
@@ -1194,7 +1198,10 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let grep_output = "nonexistent.xyz:10:some content";
         let result = annotate_grep_with_scope(grep_output, root);
-        assert_eq!(result, grep_output, "unknown files should pass through unchanged");
+        assert_eq!(
+            result, grep_output,
+            "unknown files should pass through unchanged"
+        );
     }
 
     #[test]
@@ -1209,7 +1216,10 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let grep_output = "-- separator --\nsome random line";
         let result = annotate_grep_with_scope(grep_output, root);
-        assert!(result.contains("-- separator --"), "should preserve non-match lines");
+        assert!(
+            result.contains("-- separator --"),
+            "should preserve non-match lines"
+        );
     }
 
     #[test]

@@ -54,7 +54,14 @@ pub struct FixSuggestion {
 }
 
 impl FixSuggestion {
-    fn new(file: &str, action: &str, line: usize, new_text: &str, explanation: &str, confidence: f64) -> Self {
+    fn new(
+        file: &str,
+        action: &str,
+        line: usize,
+        new_text: &str,
+        explanation: &str,
+        confidence: f64,
+    ) -> Self {
         Self {
             file: file.to_string(),
             action: action.to_string(),
@@ -81,7 +88,10 @@ pub struct AppliedFix {
 }
 
 /// Apply a single fix to a file. Returns Ok(description) on success.
-pub fn apply_fix(fix: &FixSuggestion, project_root: &std::path::Path) -> Result<AppliedFix, String> {
+pub fn apply_fix(
+    fix: &FixSuggestion,
+    project_root: &std::path::Path,
+) -> Result<AppliedFix, String> {
     let file_path = if std::path::Path::new(&fix.file).is_absolute() {
         std::path::PathBuf::from(&fix.file)
     } else {
@@ -95,7 +105,11 @@ pub fn apply_fix(fix: &FixSuggestion, project_root: &std::path::Path) -> Result<
     let new_content = match fix.action.as_str() {
         "delete_line" => {
             if fix.line == 0 || fix.line > lines.len() {
-                return Err(format!("Line {} out of range (file has {} lines)", fix.line, lines.len()));
+                return Err(format!(
+                    "Line {} out of range (file has {} lines)",
+                    fix.line,
+                    lines.len()
+                ));
             }
             let mut result: Vec<&str> = Vec::with_capacity(lines.len());
             for (i, line) in lines.iter().enumerate() {
@@ -107,7 +121,11 @@ pub fn apply_fix(fix: &FixSuggestion, project_root: &std::path::Path) -> Result<
         }
         "replace" => {
             if fix.line == 0 || fix.line > lines.len() {
-                return Err(format!("Line {} out of range (file has {} lines)", fix.line, lines.len()));
+                return Err(format!(
+                    "Line {} out of range (file has {} lines)",
+                    fix.line,
+                    lines.len()
+                ));
             }
             let mut result: Vec<String> = Vec::with_capacity(lines.len());
             for (i, line) in lines.iter().enumerate() {
@@ -121,7 +139,11 @@ pub fn apply_fix(fix: &FixSuggestion, project_root: &std::path::Path) -> Result<
         }
         "insert_line" => {
             if fix.line == 0 || fix.line > lines.len() + 1 {
-                return Err(format!("Insert line {} out of range (file has {} lines)", fix.line, lines.len()));
+                return Err(format!(
+                    "Insert line {} out of range (file has {} lines)",
+                    fix.line,
+                    lines.len()
+                ));
             }
             let mut result: Vec<String> = Vec::with_capacity(lines.len() + 1);
             for (i, line) in lines.iter().enumerate() {
@@ -173,8 +195,10 @@ fn find_import_insertion_point(lines: &[&str]) -> usize {
     let mut last_import = 0;
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if trimmed.starts_with("use ") || trimmed.starts_with("import ")
-            || trimmed.starts_with("from ") || trimmed.starts_with("require(")
+        if trimmed.starts_with("use ")
+            || trimmed.starts_with("import ")
+            || trimmed.starts_with("from ")
+            || trimmed.starts_with("require(")
             || trimmed.starts_with("const ") && trimmed.contains("require(")
         {
             last_import = i + 1; // insert after this line
@@ -199,9 +223,7 @@ pub fn apply_auto_fixes(
         .collect();
 
     // Sort by file, then by line descending (so deletions don't shift later lines)
-    eligible.sort_by(|a, b| {
-        a.file.cmp(&b.file).then(b.line.cmp(&a.line))
-    });
+    eligible.sort_by(|a, b| a.file.cmp(&b.file).then(b.line.cmp(&a.line)));
 
     for fix in eligible {
         match apply_fix(fix, project_root) {
@@ -214,14 +236,21 @@ pub fn apply_auto_fixes(
 }
 
 /// Format applied fixes into a human-readable report section.
-pub fn format_auto_fix_report(applied: &[AppliedFix], errors: &[String], iteration: usize) -> String {
+pub fn format_auto_fix_report(
+    applied: &[AppliedFix],
+    errors: &[String],
+    iteration: usize,
+) -> String {
     let mut out = String::new();
     out.push_str(&format!("\n── Auto-Fix Iteration {} ──\n", iteration));
     if applied.is_empty() {
         out.push_str("  No fixes applied.\n");
     } else {
         for af in applied {
-            out.push_str(&format!("  ✓ {} L{}: {} ({})\n", af.file, af.line, af.explanation, af.action));
+            out.push_str(&format!(
+                "  ✓ {} L{}: {} ({})\n",
+                af.file, af.line, af.explanation, af.action
+            ));
         }
     }
     for e in errors {
@@ -244,7 +273,9 @@ pub fn suggest_fix(error: &ErrorLocation, source_lines: &[&str]) -> Vec<FixSugge
                 // Suggest common std imports
                 if let Some(import) = suggest_rust_import(name) {
                     fixes.push(FixSuggestion::new(
-                        &error.file, "add_import", 1,
+                        &error.file,
+                        "add_import",
+                        1,
                         &format!("use {};", import),
                         &format!("Add missing import for `{}`", name),
                         0.8,
@@ -259,7 +290,9 @@ pub fn suggest_fix(error: &ErrorLocation, source_lines: &[&str]) -> Vec<FixSugge
                 let err_line = error.line.saturating_sub(1);
                 if err_line < source_lines.len() {
                     fixes.push(FixSuggestion::new(
-                        &error.file, "insert_line", error.line,
+                        &error.file,
+                        "insert_line",
+                        error.line,
                         &format!("            {}: Default::default(),", field),
                         &format!("Add missing field `{}` with default value", field),
                         0.6,
@@ -276,7 +309,9 @@ pub fn suggest_fix(error: &ErrorLocation, source_lines: &[&str]) -> Vec<FixSugge
                     let line = source_lines[err_idx];
                     let new_line = line.replace(name, &format!("_{}", name));
                     fixes.push(FixSuggestion::new(
-                        &error.file, "replace", error.line,
+                        &error.file,
+                        "replace",
+                        error.line,
                         &new_line,
                         &format!("Prefix unused variable `{}` with underscore", name),
                         0.9,
@@ -288,7 +323,10 @@ pub fn suggest_fix(error: &ErrorLocation, source_lines: &[&str]) -> Vec<FixSugge
         // ── Rust: Unused import ──
         _ if error.message.contains("unused import") => {
             fixes.push(FixSuggestion::new(
-                &error.file, "delete_line", error.line, "",
+                &error.file,
+                "delete_line",
+                error.line,
+                "",
                 "Remove unused import",
                 0.9,
             ));
@@ -299,10 +337,14 @@ pub fn suggest_fix(error: &ErrorLocation, source_lines: &[&str]) -> Vec<FixSugge
             let err_idx = error.line.saturating_sub(1);
             if err_idx < source_lines.len() {
                 let line = source_lines[err_idx];
-                if error.message.contains("expected `String`") || error.message.contains("expected struct `String`") {
+                if error.message.contains("expected `String`")
+                    || error.message.contains("expected struct `String`")
+                {
                     // Need String, got &str → add .to_string()
                     fixes.push(FixSuggestion::new(
-                        &error.file, "replace", error.line,
+                        &error.file,
+                        "replace",
+                        error.line,
                         &format!("{}  // consider adding .to_string()", line.trim_end()),
                         "Add .to_string() to convert &str to String",
                         0.5,
@@ -310,7 +352,9 @@ pub fn suggest_fix(error: &ErrorLocation, source_lines: &[&str]) -> Vec<FixSugge
                 } else {
                     // Need &str, got String → add .as_str() or &
                     fixes.push(FixSuggestion::new(
-                        &error.file, "replace", error.line,
+                        &error.file,
+                        "replace",
+                        error.line,
                         &format!("{}  // consider adding .as_str() or &", line.trim_end()),
                         "Add .as_str() or & to convert String to &str",
                         0.5,
@@ -323,7 +367,9 @@ pub fn suggest_fix(error: &ErrorLocation, source_lines: &[&str]) -> Vec<FixSugge
         "E0046" => {
             if let Some(method) = extract_identifier(&error.message) {
                 fixes.push(FixSuggestion::new(
-                    &error.file, "insert_line", error.line,
+                    &error.file,
+                    "insert_line",
+                    error.line,
                     &format!("    fn {}(&self) {{ todo!() }}", method),
                     &format!("Add stub for missing trait method `{}`", method),
                     0.6,
@@ -335,8 +381,13 @@ pub fn suggest_fix(error: &ErrorLocation, source_lines: &[&str]) -> Vec<FixSugge
         "TS2304" => {
             if let Some(name) = extract_identifier(&error.message) {
                 fixes.push(FixSuggestion::new(
-                    &error.file, "add_import", 1,
-                    &format!("import {{ {} }} from './';  // TODO: specify module path", name),
+                    &error.file,
+                    "add_import",
+                    1,
+                    &format!(
+                        "import {{ {} }} from './';  // TODO: specify module path",
+                        name
+                    ),
                     &format!("Add import for `{}`", name),
                     0.4,
                 ));
@@ -347,7 +398,11 @@ pub fn suggest_fix(error: &ErrorLocation, source_lines: &[&str]) -> Vec<FixSugge
     }
 
     // Sort by confidence descending
-    fixes.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+    fixes.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     fixes
 }
 
@@ -394,9 +449,26 @@ pub enum ErrorClass {
 
 impl ErrorLocation {
     /// Create a new ErrorLocation with automatic classification and hints.
-    fn new(file: String, line: usize, col: usize, error_code: String, message: String, severity: String) -> Self {
+    fn new(
+        file: String,
+        line: usize,
+        col: usize,
+        error_code: String,
+        message: String,
+        severity: String,
+    ) -> Self {
         let (class, hint) = classify_and_hint(&error_code, &message);
-        Self { file, line, col, error_code, message, severity, class, hint, scope: String::new() }
+        Self {
+            file,
+            line,
+            col,
+            error_code,
+            message,
+            severity,
+            class,
+            hint,
+            scope: String::new(),
+        }
     }
 }
 
@@ -478,22 +550,28 @@ impl BuildTestResult {
             }
 
             // Look for cascade patterns within this file
-            let locs: Vec<&ErrorLocation> = indices.iter().map(|&i| &self.error_locations[i]).collect();
+            let locs: Vec<&ErrorLocation> =
+                indices.iter().map(|&i| &self.error_locations[i]).collect();
 
             // Pattern 1: Import cascade — one missing import causes multiple "not found"
             let import_codes = ["E0425", "E0433", "E0412", "E0432"];
-            let import_errors: Vec<usize> = indices.iter()
+            let import_errors: Vec<usize> = indices
+                .iter()
                 .filter(|&&i| import_codes.contains(&self.error_locations[i].error_code.as_str()))
                 .copied()
                 .collect();
 
             if import_errors.len() >= 2 {
                 // Check if they reference the same identifier
-                let identifiers: Vec<Option<&str>> = import_errors.iter()
+                let identifiers: Vec<Option<&str>> = import_errors
+                    .iter()
                     .map(|&i| extract_identifier(&self.error_locations[i].message))
                     .collect();
                 let first_id = identifiers[0];
-                let same_id_count = identifiers.iter().filter(|id| **id == first_id && id.is_some()).count();
+                let same_id_count = identifiers
+                    .iter()
+                    .filter(|id| **id == first_id && id.is_some())
+                    .count();
 
                 if same_id_count >= 2 {
                     let id_name = first_id.unwrap_or("unknown");
@@ -521,7 +599,9 @@ impl BuildTestResult {
                     is_cascade: true,
                     cascade_hint: format!(
                         "{} errors likely cascade from line {} — fix `{}` first",
-                        indices.len(), first.line, first.message.chars().take(50).collect::<String>()
+                        indices.len(),
+                        first.line,
+                        first.message.chars().take(50).collect::<String>()
                     ),
                 });
                 continue;
@@ -529,7 +609,8 @@ impl BuildTestResult {
 
             // Pattern 3: Same scope cascade — errors in the same function
             if !locs[0].scope.is_empty() {
-                let same_scope: Vec<usize> = indices.iter()
+                let same_scope: Vec<usize> = indices
+                    .iter()
                     .filter(|&&i| self.error_locations[i].scope == locs[0].scope)
                     .copied()
                     .collect();
@@ -557,7 +638,11 @@ impl BuildTestResult {
                 member_indices: indices.clone(),
                 is_cascade: indices.len() >= 3,
                 cascade_hint: if indices.len() >= 3 {
-                    format!("{} errors in file — fix line {} first, others may resolve", indices.len(), locs[0].line)
+                    format!(
+                        "{} errors in file — fix line {} first, others may resolve",
+                        indices.len(),
+                        locs[0].line
+                    )
                 } else {
                     String::new()
                 },
@@ -566,7 +651,8 @@ impl BuildTestResult {
 
         // Sort groups: cascades first (most impactful), then by member count desc
         groups.sort_by(|a, b| {
-            b.is_cascade.cmp(&a.is_cascade)
+            b.is_cascade
+                .cmp(&a.is_cascade)
                 .then(b.member_indices.len().cmp(&a.member_indices.len()))
         });
 
@@ -681,9 +767,21 @@ impl BuildTestResult {
             parts.push(String::new());
 
             // Classify errors for the LLM: show fixable count
-            let trivial_count = self.error_locations.iter().filter(|l| l.class == ErrorClass::Trivial).count();
-            let fixable_count = self.error_locations.iter().filter(|l| l.class == ErrorClass::Fixable).count();
-            let complex_count = self.error_locations.iter().filter(|l| l.class == ErrorClass::Complex).count();
+            let trivial_count = self
+                .error_locations
+                .iter()
+                .filter(|l| l.class == ErrorClass::Trivial)
+                .count();
+            let fixable_count = self
+                .error_locations
+                .iter()
+                .filter(|l| l.class == ErrorClass::Fixable)
+                .count();
+            let complex_count = self
+                .error_locations
+                .iter()
+                .filter(|l| l.class == ErrorClass::Complex)
+                .count();
 
             if trivial_count + fixable_count > 0 {
                 parts.push(format!(
@@ -735,15 +833,25 @@ impl BuildTestResult {
                 };
                 parts.push(format!(
                     "  {}. {}:{}{}{} {}{}{}{}",
-                    rank + 1, loc.file, loc.line, col_part, code_part,
-                    loc.message, class_tag, scope_part, root_marker
+                    rank + 1,
+                    loc.file,
+                    loc.line,
+                    col_part,
+                    code_part,
+                    loc.message,
+                    class_tag,
+                    scope_part,
+                    root_marker
                 ));
                 if !loc.hint.is_empty() {
                     parts.push(format!("     💡 {}", loc.hint));
                 }
             }
             if self.error_locations.len() > 10 {
-                parts.push(format!("  ... and {} more locations", self.error_locations.len() - 10));
+                parts.push(format!(
+                    "  ... and {} more locations",
+                    self.error_locations.len() - 10
+                ));
             }
         }
 
@@ -853,10 +961,15 @@ impl BuildTestDelta {
             parts.push(format!("⏳ {} still present", self.persistent_errors.len()));
         }
         if self.regressed {
-            parts.push("⚠ Regression — more errors than before. Consider reverting last change.".into());
+            parts.push(
+                "⚠ Regression — more errors than before. Consider reverting last change.".into(),
+            );
         }
         if self.progress_pct > 0.0 {
-            parts.push(format!("Progress: {:.0}% of original errors resolved", self.progress_pct));
+            parts.push(format!(
+                "Progress: {:.0}% of original errors resolved",
+                self.progress_pct
+            ));
         }
         parts.join("\n")
     }
@@ -895,11 +1008,8 @@ impl BuildTestTracker {
     /// `BuildTestDelta` should be prepended to the tool output so the
     /// LLM can see what changed since its last fix attempt.
     pub fn record(&mut self, result: &BuildTestResult, command: &str) -> BuildTestDelta {
-        let current_sigs: HashSet<String> = result
-            .error_locations
-            .iter()
-            .map(error_signature)
-            .collect();
+        let current_sigs: HashSet<String> =
+            result.error_locations.iter().map(error_signature).collect();
 
         let delta = if self.iteration == 0 && !self.previous_sigs.is_empty() || self.iteration > 0 {
             // Subsequent run — compute delta
@@ -907,7 +1017,8 @@ impl BuildTestTracker {
                 .difference(&self.previous_sigs)
                 .cloned()
                 .collect();
-            let fixed_errors: Vec<String> = self.previous_sigs
+            let fixed_errors: Vec<String> = self
+                .previous_sigs
                 .difference(&current_sigs)
                 .cloned()
                 .collect();
@@ -981,40 +1092,105 @@ fn classify_and_hint(error_code: &str, message: &str) -> (ErrorClass, String) {
         "E0425" => {
             // cannot find value — usually missing import
             if let Some(name) = extract_identifier(message) {
-                return (ErrorClass::Trivial, format!("Add `use` import for `{name}`, or check spelling"));
+                return (
+                    ErrorClass::Trivial,
+                    format!("Add `use` import for `{name}`, or check spelling"),
+                );
             }
-            (ErrorClass::Trivial, "Add missing import or check spelling".into())
+            (
+                ErrorClass::Trivial,
+                "Add missing import or check spelling".into(),
+            )
         }
-        "E0433" => (ErrorClass::Trivial, "Add missing `use` or crate dependency in Cargo.toml".into()),
-        "E0432" => (ErrorClass::Trivial, "Fix import path — module or item doesn't exist at that path".into()),
-        "E0412" => (ErrorClass::Trivial, "Type not found — add missing `use` import".into()),
-        "E0603" => (ErrorClass::Trivial, "Item is private — add `pub` to definition or use a public re-export".into()),
+        "E0433" => (
+            ErrorClass::Trivial,
+            "Add missing `use` or crate dependency in Cargo.toml".into(),
+        ),
+        "E0432" => (
+            ErrorClass::Trivial,
+            "Fix import path — module or item doesn't exist at that path".into(),
+        ),
+        "E0412" => (
+            ErrorClass::Trivial,
+            "Type not found — add missing `use` import".into(),
+        ),
+        "E0603" => (
+            ErrorClass::Trivial,
+            "Item is private — add `pub` to definition or use a public re-export".into(),
+        ),
 
         // Fixable: LLM can reason about these
         "E0308" => {
             // Mismatched types
             if message.contains("&str") && message.contains("String") {
-                (ErrorClass::Fixable, "String/&str mismatch — use `.to_string()` or `&*s` / `.as_str()`".into())
+                (
+                    ErrorClass::Fixable,
+                    "String/&str mismatch — use `.to_string()` or `&*s` / `.as_str()`".into(),
+                )
             } else if message.contains("Option") {
-                (ErrorClass::Fixable, "Wrap in Some() or unwrap with .unwrap_or()".into())
+                (
+                    ErrorClass::Fixable,
+                    "Wrap in Some() or unwrap with .unwrap_or()".into(),
+                )
             } else {
-                (ErrorClass::Fixable, "Check expected vs actual type — may need conversion or different return".into())
+                (
+                    ErrorClass::Fixable,
+                    "Check expected vs actual type — may need conversion or different return"
+                        .into(),
+                )
             }
         }
-        "E0277" => (ErrorClass::Fixable, "Trait not satisfied — implement the trait or add a bound".into()),
-        "E0599" => (ErrorClass::Fixable, "Method not found — check spelling, or the type may need a different impl/import".into()),
-        "E0061" => (ErrorClass::Fixable, "Wrong number of arguments — check function signature".into()),
-        "E0063" => (ErrorClass::Fixable, "Missing struct fields — add the required fields".into()),
-        "E0609" => (ErrorClass::Fixable, "No field on type — check struct definition for correct field name".into()),
-        "E0107" => (ErrorClass::Fixable, "Wrong number of type arguments — check generic parameters".into()),
-        "E0369" => (ErrorClass::Fixable, "Operator not implemented — derive trait or implement manually".into()),
-        "E0046" => (ErrorClass::Fixable, "Missing trait method — implement the required method".into()),
+        "E0277" => (
+            ErrorClass::Fixable,
+            "Trait not satisfied — implement the trait or add a bound".into(),
+        ),
+        "E0599" => (
+            ErrorClass::Fixable,
+            "Method not found — check spelling, or the type may need a different impl/import"
+                .into(),
+        ),
+        "E0061" => (
+            ErrorClass::Fixable,
+            "Wrong number of arguments — check function signature".into(),
+        ),
+        "E0063" => (
+            ErrorClass::Fixable,
+            "Missing struct fields — add the required fields".into(),
+        ),
+        "E0609" => (
+            ErrorClass::Fixable,
+            "No field on type — check struct definition for correct field name".into(),
+        ),
+        "E0107" => (
+            ErrorClass::Fixable,
+            "Wrong number of type arguments — check generic parameters".into(),
+        ),
+        "E0369" => (
+            ErrorClass::Fixable,
+            "Operator not implemented — derive trait or implement manually".into(),
+        ),
+        "E0046" => (
+            ErrorClass::Fixable,
+            "Missing trait method — implement the required method".into(),
+        ),
 
         // Complex: requires deep understanding
-        "E0382" | "E0505" | "E0502" => (ErrorClass::Complex, "Borrow/move error — restructure ownership or use .clone()".into()),
-        "E0597" => (ErrorClass::Complex, "Value doesn't live long enough — restructure lifetimes".into()),
-        "E0106" => (ErrorClass::Complex, "Missing lifetime — add explicit lifetime annotations".into()),
-        "E0495" => (ErrorClass::Complex, "Conflicting lifetime requirements — simplify borrowing structure".into()),
+        "E0382" | "E0505" | "E0502" => (
+            ErrorClass::Complex,
+            "Borrow/move error — restructure ownership or use .clone()".into(),
+        ),
+        "E0597" => (
+            ErrorClass::Complex,
+            "Value doesn't live long enough — restructure lifetimes".into(),
+        ),
+        "E0106" => (
+            ErrorClass::Complex,
+            "Missing lifetime — add explicit lifetime annotations".into(),
+        ),
+        "E0495" => (
+            ErrorClass::Complex,
+            "Conflicting lifetime requirements — simplify borrowing structure".into(),
+        ),
 
         _ => {
             // Fallback: classify by message patterns
@@ -1028,23 +1204,45 @@ fn classify_by_message(message: &str) -> (ErrorClass, String) {
     let lower = message.to_lowercase();
 
     // Python / TypeScript / Go common patterns
-    if lower.contains("import") && (lower.contains("not found") || lower.contains("cannot find") || lower.contains("no module")) {
-        return (ErrorClass::Trivial, "Missing import — add the correct import statement".into());
+    if lower.contains("import")
+        && (lower.contains("not found")
+            || lower.contains("cannot find")
+            || lower.contains("no module"))
+    {
+        return (
+            ErrorClass::Trivial,
+            "Missing import — add the correct import statement".into(),
+        );
     }
     if lower.contains("undefined") || lower.contains("is not defined") {
-        return (ErrorClass::Fixable, "Undefined variable/function — check spelling or add import".into());
+        return (
+            ErrorClass::Fixable,
+            "Undefined variable/function — check spelling or add import".into(),
+        );
     }
     if lower.contains("type") && lower.contains("not assignable") {
-        return (ErrorClass::Fixable, "Type mismatch — check expected vs actual type".into());
+        return (
+            ErrorClass::Fixable,
+            "Type mismatch — check expected vs actual type".into(),
+        );
     }
     if lower.contains("unused") {
-        return (ErrorClass::Trivial, "Unused variable — prefix with _ or remove".into());
+        return (
+            ErrorClass::Trivial,
+            "Unused variable — prefix with _ or remove".into(),
+        );
     }
     if lower.contains("syntax error") || lower.contains("unexpected token") {
-        return (ErrorClass::Fixable, "Syntax error — check for missing brackets, semicolons, or typos".into());
+        return (
+            ErrorClass::Fixable,
+            "Syntax error — check for missing brackets, semicolons, or typos".into(),
+        );
     }
     if lower.contains("assertion") || lower.contains("expected") && lower.contains("got") {
-        return (ErrorClass::Complex, "Test assertion failure — check logic and expected values".into());
+        return (
+            ErrorClass::Complex,
+            "Test assertion failure — check logic and expected values".into(),
+        );
     }
 
     (ErrorClass::Fixable, String::new())
@@ -1230,8 +1428,14 @@ fn parse_cargo_output(output: &str, exit_code: Option<i32>, truncated: bool) -> 
             for j in (i + 1)..lines.len().min(i + 4) {
                 if let Some(loc_cap) = CARGO_LOCATION_RE.captures(lines[j]) {
                     let file = loc_cap.get(1).map(|m| m.as_str()).unwrap_or("");
-                    let line_num: usize = loc_cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
-                    let col: usize = loc_cap.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+                    let line_num: usize = loc_cap
+                        .get(2)
+                        .and_then(|m| m.as_str().parse().ok())
+                        .unwrap_or(0);
+                    let col: usize = loc_cap
+                        .get(3)
+                        .and_then(|m| m.as_str().parse().ok())
+                        .unwrap_or(0);
 
                     if !file.is_empty() && line_num > 0 && result.error_locations.len() < 20 {
                         result.error_locations.push(ErrorLocation::new(
@@ -1246,7 +1450,10 @@ fn parse_cargo_output(output: &str, exit_code: Option<i32>, truncated: bool) -> 
                     break;
                 }
             }
-        } else if line.starts_with("error:") && !line.contains("could not compile") && !line.contains("aborting due to") {
+        } else if line.starts_with("error:")
+            && !line.contains("could not compile")
+            && !line.contains("aborting due to")
+        {
             // Plain error: without code
             let msg = line.strip_prefix("error:").unwrap_or(line).trim();
             if !msg.is_empty() && result.error_messages.len() < 10 {
@@ -1256,8 +1463,14 @@ fn parse_cargo_output(output: &str, exit_code: Option<i32>, truncated: bool) -> 
             for j in (i + 1)..lines.len().min(i + 4) {
                 if let Some(loc_cap) = CARGO_LOCATION_RE.captures(lines[j]) {
                     let file = loc_cap.get(1).map(|m| m.as_str()).unwrap_or("");
-                    let line_num: usize = loc_cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
-                    let col: usize = loc_cap.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+                    let line_num: usize = loc_cap
+                        .get(2)
+                        .and_then(|m| m.as_str().parse().ok())
+                        .unwrap_or(0);
+                    let col: usize = loc_cap
+                        .get(3)
+                        .and_then(|m| m.as_str().parse().ok())
+                        .unwrap_or(0);
                     if !file.is_empty() && line_num > 0 && result.error_locations.len() < 20 {
                         result.error_locations.push(ErrorLocation::new(
                             file.to_string(),
@@ -1347,8 +1560,14 @@ fn extract_cargo_failed_tests(output: &str, locations: &mut Vec<ErrorLocation>) 
                         // Extract panic location
                         if let Some(pcap) = PANIC_LOCATION_RE.captures(next_line) {
                             let file = pcap.get(1).map(|m| m.as_str()).unwrap_or("");
-                            let line_num: usize = pcap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
-                            let col: usize = pcap.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+                            let line_num: usize = pcap
+                                .get(2)
+                                .and_then(|m| m.as_str().parse().ok())
+                                .unwrap_or(0);
+                            let col: usize = pcap
+                                .get(3)
+                                .and_then(|m| m.as_str().parse().ok())
+                                .unwrap_or(0);
                             if !file.is_empty() && line_num > 0 && locations.len() < 20 {
                                 locations.push(ErrorLocation::new(
                                     file.to_string(),
@@ -1418,21 +1637,32 @@ fn parse_pytest_output(output: &str, exit_code: Option<i32>, truncated: bool) ->
         // Extract traceback file locations (last File line before assertion error)
         if let Some(cap) = PYTHON_TRACEBACK_RE.captures(line) {
             let file = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-            let line_num: usize = cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+            let line_num: usize = cap
+                .get(2)
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(0);
             let func = cap.get(3).map(|m| m.as_str()).unwrap_or("");
 
             // Only include if the next few lines contain an assertion or error
             let is_relevant = lines.iter().skip(i + 1).take(3).any(|l| {
-                l.contains("AssertionError") || l.contains("assert ") || l.contains("Error") || l.contains("raise ")
+                l.contains("AssertionError")
+                    || l.contains("assert ")
+                    || l.contains("Error")
+                    || l.contains("raise ")
             });
 
-            if is_relevant && !file.is_empty() && line_num > 0 && result.error_locations.len() < 20 {
+            if is_relevant && !file.is_empty() && line_num > 0 && result.error_locations.len() < 20
+            {
                 result.error_locations.push(ErrorLocation::new(
                     file.to_string(),
                     line_num,
                     0,
                     String::new(),
-                    if func.is_empty() { String::new() } else { format!("in {func}") },
+                    if func.is_empty() {
+                        String::new()
+                    } else {
+                        format!("in {func}")
+                    },
                     "error".to_string(),
                 ));
             }
@@ -1517,7 +1747,12 @@ fn parse_go_output(output: &str, exit_code: Option<i32>, truncated: bool) -> Bui
             result.tests_passed += 1;
         } else if line.starts_with("--- FAIL:") {
             result.tests_failed += 1;
-            current_test = line.trim_start_matches("--- FAIL: ").split(' ').next().unwrap_or("").to_string();
+            current_test = line
+                .trim_start_matches("--- FAIL: ")
+                .split(' ')
+                .next()
+                .unwrap_or("")
+                .to_string();
             if result.error_messages.len() < 10 {
                 result.error_messages.push(line.trim().to_string());
             }
@@ -1525,7 +1760,10 @@ fn parse_go_output(output: &str, exit_code: Option<i32>, truncated: bool) -> Bui
             result.tests_skipped += 1;
         } else if let Some(cap) = GO_TEST_LOCATION_RE.captures(line) {
             let file = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-            let line_num: usize = cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+            let line_num: usize = cap
+                .get(2)
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(0);
             let msg = cap.get(3).map(|m| m.as_str()).unwrap_or("");
             if !file.is_empty() && line_num > 0 && result.error_locations.len() < 20 {
                 let full_msg = if current_test.is_empty() {
@@ -1533,7 +1771,14 @@ fn parse_go_output(output: &str, exit_code: Option<i32>, truncated: bool) -> Bui
                 } else {
                     format!("{}: {}", current_test, msg)
                 };
-                result.error_locations.push(ErrorLocation::new(file.to_string(), line_num, 0, String::new(), full_msg, "error".to_string()));
+                result.error_locations.push(ErrorLocation::new(
+                    file.to_string(),
+                    line_num,
+                    0,
+                    String::new(),
+                    full_msg,
+                    "error".to_string(),
+                ));
             }
         }
     }
@@ -1577,8 +1822,14 @@ fn extract_generic_errors(output: &str) -> (Vec<String>, Vec<ErrorLocation>) {
         // Try TypeScript error format first
         if let Some(cap) = TS_ERROR_RE.captures(line) {
             let file = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-            let line_num: usize = cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
-            let col: usize = cap.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+            let line_num: usize = cap
+                .get(2)
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(0);
+            let col: usize = cap
+                .get(3)
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(0);
             let code = cap.get(4).map(|m| m.as_str()).unwrap_or("");
             let msg = cap.get(5).map(|m| m.as_str()).unwrap_or("");
             if errors.len() < 10 {
@@ -1600,8 +1851,14 @@ fn extract_generic_errors(output: &str) -> (Vec<String>, Vec<ErrorLocation>) {
         // Try generic file:line:col: error format
         if let Some(cap) = GENERIC_LOCATION_RE.captures(line) {
             let file = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-            let line_num: usize = cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
-            let col: usize = cap.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+            let line_num: usize = cap
+                .get(2)
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(0);
+            let col: usize = cap
+                .get(3)
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(0);
             let severity = cap.get(4).map(|m| m.as_str()).unwrap_or("error");
             let msg = cap.get(5).map(|m| m.as_str()).unwrap_or("");
             if errors.len() < 10 {
@@ -1626,7 +1883,9 @@ fn extract_generic_errors(output: &str) -> (Vec<String>, Vec<ErrorLocation>) {
             if !trimmed.is_empty() && errors.len() < 10 {
                 if trimmed.len() > 200 {
                     let mut end = 200;
-                    while !trimmed.is_char_boundary(end) && end > 0 { end -= 1; }
+                    while !trimmed.is_char_boundary(end) && end > 0 {
+                        end -= 1;
+                    }
                     errors.push(format!("{}...", &trimmed[..end]));
                 } else {
                     errors.push(trimmed.to_string());
@@ -1729,10 +1988,19 @@ error: could not compile `myproject` due to 2 previous errors
         assert!(!result.passed);
         assert_eq!(result.framework, "cargo");
         assert_eq!(result.error_count, 2);
-        assert!(result.error_messages.iter().any(|m| m.contains("cannot find value")));
+        assert!(
+            result
+                .error_messages
+                .iter()
+                .any(|m| m.contains("cannot find value"))
+        );
 
         // Verify error locations extracted
-        assert_eq!(result.error_locations.len(), 2, "should extract 2 error locations");
+        assert_eq!(
+            result.error_locations.len(),
+            2,
+            "should extract 2 error locations"
+        );
         let loc0 = &result.error_locations[0];
         assert_eq!(loc0.file, "src/main.rs");
         assert_eq!(loc0.line, 10);
@@ -1849,9 +2117,18 @@ exit status 1
             ..Default::default()
         };
         let output = result.to_enhanced_output("");
-        assert!(output.contains("Locations"), "should have Locations section: {output}");
-        assert!(output.contains("src/main.rs:10:5"), "should show file:line:col: {output}");
-        assert!(output.contains("[E0425]"), "should show error code: {output}");
+        assert!(
+            output.contains("Locations"),
+            "should have Locations section: {output}"
+        );
+        assert!(
+            output.contains("src/main.rs:10:5"),
+            "should show file:line:col: {output}"
+        );
+        assert!(
+            output.contains("[E0425]"),
+            "should show error code: {output}"
+        );
     }
 
     #[test]
@@ -1872,7 +2149,10 @@ exit status 1
         assert!(!result.passed);
         assert_eq!(result.framework, "go");
         assert_eq!(result.tests_failed, 1);
-        assert!(!result.error_locations.is_empty(), "should extract go test locations");
+        assert!(
+            !result.error_locations.is_empty(),
+            "should extract go test locations"
+        );
         assert_eq!(result.error_locations[0].file, "main_test.go");
         assert_eq!(result.error_locations[0].line, 25);
     }
@@ -1918,7 +2198,10 @@ src/helper.c:15:3: warning: implicit conversion
             ..Default::default()
         };
         let output = result.to_enhanced_output("");
-        assert!(!output.contains("Locations"), "should not show Locations when empty");
+        assert!(
+            !output.contains("Locations"),
+            "should not show Locations when empty"
+        );
     }
 
     #[test]
@@ -1947,7 +2230,10 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored
         assert_eq!(loc.file, "src/lib.rs", "file should be src/lib.rs");
         assert_eq!(loc.line, 42, "line should be 42");
         assert_eq!(loc.col, 9, "col should be 9");
-        assert!(loc.message.contains("my_test"), "message should reference test name");
+        assert!(
+            loc.message.contains("my_test"),
+            "message should reference test name"
+        );
     }
 
     // ─── Error classification tests ────────────────────────────────────
@@ -1956,22 +2242,38 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored
     fn classify_rust_trivial_missing_import() {
         let (class, hint) = classify_and_hint("E0425", "cannot find value `HashMap` in this scope");
         assert_eq!(class, ErrorClass::Trivial);
-        assert!(hint.contains("HashMap"), "hint should mention the identifier: {hint}");
-        assert!(hint.contains("import"), "hint should suggest import: {hint}");
+        assert!(
+            hint.contains("HashMap"),
+            "hint should mention the identifier: {hint}"
+        );
+        assert!(
+            hint.contains("import"),
+            "hint should suggest import: {hint}"
+        );
     }
 
     #[test]
     fn classify_rust_trivial_missing_crate() {
-        let (class, hint) = classify_and_hint("E0433", "failed to resolve: use of undeclared crate or module `serde`");
+        let (class, hint) = classify_and_hint(
+            "E0433",
+            "failed to resolve: use of undeclared crate or module `serde`",
+        );
         assert_eq!(class, ErrorClass::Trivial);
-        assert!(hint.contains("Cargo.toml"), "hint should mention Cargo.toml: {hint}");
+        assert!(
+            hint.contains("Cargo.toml"),
+            "hint should mention Cargo.toml: {hint}"
+        );
     }
 
     #[test]
     fn classify_rust_fixable_type_mismatch() {
-        let (class, hint) = classify_and_hint("E0308", "mismatched types: expected &str, found String");
+        let (class, hint) =
+            classify_and_hint("E0308", "mismatched types: expected &str, found String");
         assert_eq!(class, ErrorClass::Fixable);
-        assert!(hint.contains("to_string") || hint.contains("as_str"), "hint should suggest conversion: {hint}");
+        assert!(
+            hint.contains("to_string") || hint.contains("as_str"),
+            "hint should suggest conversion: {hint}"
+        );
     }
 
     #[test]
@@ -1993,7 +2295,10 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored
     fn classify_rust_complex_lifetime() {
         let (class, hint) = classify_and_hint("E0597", "borrowed value does not live long enough");
         assert_eq!(class, ErrorClass::Complex);
-        assert!(hint.contains("lifetime"), "hint should mention lifetime: {hint}");
+        assert!(
+            hint.contains("lifetime"),
+            "hint should mention lifetime: {hint}"
+        );
     }
 
     #[test]
@@ -2013,7 +2318,10 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored
 
     #[test]
     fn classify_extract_identifier() {
-        assert_eq!(extract_identifier("cannot find value `foo` in scope"), Some("foo"));
+        assert_eq!(
+            extract_identifier("cannot find value `foo` in scope"),
+            Some("foo")
+        );
         assert_eq!(extract_identifier("no backticks here"), None);
         assert_eq!(extract_identifier("found `Bar` not defined"), Some("Bar"));
     }
@@ -2025,17 +2333,47 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored
             error_count: 3,
             error_messages: vec!["E0425".into(), "E0308".into(), "E0382".into()],
             error_locations: vec![
-                ErrorLocation::new("src/a.rs".into(), 1, 0, "E0425".into(), "cannot find value `x`".into(), "error".into()),
-                ErrorLocation::new("src/b.rs".into(), 2, 0, "E0308".into(), "mismatched types".into(), "error".into()),
-                ErrorLocation::new("src/c.rs".into(), 3, 0, "E0382".into(), "value moved".into(), "error".into()),
+                ErrorLocation::new(
+                    "src/a.rs".into(),
+                    1,
+                    0,
+                    "E0425".into(),
+                    "cannot find value `x`".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/b.rs".into(),
+                    2,
+                    0,
+                    "E0308".into(),
+                    "mismatched types".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/c.rs".into(),
+                    3,
+                    0,
+                    "E0382".into(),
+                    "value moved".into(),
+                    "error".into(),
+                ),
             ],
             summary: "3 errors".into(),
             ..Default::default()
         };
         let output = result.to_enhanced_output("");
-        assert!(output.contains("trivial"), "should show trivial count: {output}");
-        assert!(output.contains("fixable"), "should show fixable count: {output}");
-        assert!(output.contains("complex"), "should show complex count: {output}");
+        assert!(
+            output.contains("trivial"),
+            "should show trivial count: {output}"
+        );
+        assert!(
+            output.contains("fixable"),
+            "should show fixable count: {output}"
+        );
+        assert!(
+            output.contains("complex"),
+            "should show complex count: {output}"
+        );
     }
 
     #[test]
@@ -2045,16 +2383,26 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored
             error_count: 1,
             error_messages: vec!["cannot find value `foo`".into()],
             error_locations: vec![ErrorLocation::new(
-                "src/main.rs".into(), 10, 5, "E0425".into(),
-                "cannot find value `foo`".into(), "error".into(),
+                "src/main.rs".into(),
+                10,
+                5,
+                "E0425".into(),
+                "cannot find value `foo`".into(),
+                "error".into(),
             )],
             summary: "1 error".into(),
             ..Default::default()
         };
         let output = result.to_enhanced_output("");
         assert!(output.contains("💡"), "should show hint icon: {output}");
-        assert!(output.contains("import"), "hint should mention import: {output}");
-        assert!(output.contains("🔧"), "trivial should get wrench icon: {output}");
+        assert!(
+            output.contains("import"),
+            "hint should mention import: {output}"
+        );
+        assert!(
+            output.contains("🔧"),
+            "trivial should get wrench icon: {output}"
+        );
     }
 
     #[test]
@@ -2064,29 +2412,76 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored
             error_count: 4,
             error_messages: vec!["err1".into(), "err2".into(), "err3".into(), "err4".into()],
             error_locations: vec![
-                ErrorLocation::new("src/same.rs".into(), 10, 0, "E0425".into(), "err1".into(), "error".into()),
-                ErrorLocation::new("src/same.rs".into(), 20, 0, "E0308".into(), "err2".into(), "error".into()),
-                ErrorLocation::new("src/same.rs".into(), 30, 0, "E0599".into(), "err3".into(), "error".into()),
+                ErrorLocation::new(
+                    "src/same.rs".into(),
+                    10,
+                    0,
+                    "E0425".into(),
+                    "err1".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/same.rs".into(),
+                    20,
+                    0,
+                    "E0308".into(),
+                    "err2".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/same.rs".into(),
+                    30,
+                    0,
+                    "E0599".into(),
+                    "err3".into(),
+                    "error".into(),
+                ),
             ],
             summary: "3 errors in same file".into(),
             ..Default::default()
         };
         let output = result.to_enhanced_output("");
-        assert!(output.contains("Cascading") || output.contains("cascade"),
-            "should detect cascading errors in same file: {output}");
-        assert!(output.contains("ROOT CAUSE"), "should mark root cause: {output}");
+        assert!(
+            output.contains("Cascading") || output.contains("cascade"),
+            "should detect cascading errors in same file: {output}"
+        );
+        assert!(
+            output.contains("ROOT CAUSE"),
+            "should mark root cause: {output}"
+        );
     }
 
     #[test]
     fn errorlocation_new_auto_classifies() {
-        let loc = ErrorLocation::new("f.rs".into(), 1, 0, "E0425".into(), "cannot find value `x`".into(), "error".into());
+        let loc = ErrorLocation::new(
+            "f.rs".into(),
+            1,
+            0,
+            "E0425".into(),
+            "cannot find value `x`".into(),
+            "error".into(),
+        );
         assert_eq!(loc.class, ErrorClass::Trivial);
         assert!(!loc.hint.is_empty());
 
-        let loc2 = ErrorLocation::new("f.rs".into(), 1, 0, "E0382".into(), "value moved".into(), "error".into());
+        let loc2 = ErrorLocation::new(
+            "f.rs".into(),
+            1,
+            0,
+            "E0382".into(),
+            "value moved".into(),
+            "error".into(),
+        );
         assert_eq!(loc2.class, ErrorClass::Complex);
 
-        let loc3 = ErrorLocation::new("f.rs".into(), 1, 0, "".into(), "random error".into(), "error".into());
+        let loc3 = ErrorLocation::new(
+            "f.rs".into(),
+            1,
+            0,
+            "".into(),
+            "random error".into(),
+            "error".into(),
+        );
         assert_eq!(loc3.class, ErrorClass::Fixable);
     }
 
@@ -2185,9 +2580,30 @@ error[E0425]: cannot find value `nonexistent` in this scope
     fn analyze_import_cascade_same_identifier() {
         let result = BuildTestResult {
             error_locations: vec![
-                ErrorLocation::new("src/a.rs".into(), 10, 1, "E0425".into(), "cannot find value `Foo`".into(), "error".into()),
-                ErrorLocation::new("src/a.rs".into(), 20, 1, "E0425".into(), "cannot find value `Foo`".into(), "error".into()),
-                ErrorLocation::new("src/a.rs".into(), 30, 1, "E0433".into(), "cannot find `Foo` in this scope".into(), "error".into()),
+                ErrorLocation::new(
+                    "src/a.rs".into(),
+                    10,
+                    1,
+                    "E0425".into(),
+                    "cannot find value `Foo`".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/a.rs".into(),
+                    20,
+                    1,
+                    "E0425".into(),
+                    "cannot find value `Foo`".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/a.rs".into(),
+                    30,
+                    1,
+                    "E0433".into(),
+                    "cannot find `Foo` in this scope".into(),
+                    "error".into(),
+                ),
             ],
             ..Default::default()
         };
@@ -2196,22 +2612,50 @@ error[E0425]: cannot find value `nonexistent` in this scope
         let cascade = groups.iter().find(|g| g.is_cascade);
         assert!(cascade.is_some(), "should detect import cascade");
         let c = cascade.unwrap();
-        assert!(c.cascade_hint.contains("Foo"), "hint should mention the identifier: {}", c.cascade_hint);
+        assert!(
+            c.cascade_hint.contains("Foo"),
+            "hint should mention the identifier: {}",
+            c.cascade_hint
+        );
     }
 
     #[test]
     fn analyze_trivial_first_cascade() {
         let result = BuildTestResult {
             error_locations: vec![
-                ErrorLocation::new("src/b.rs".into(), 5, 1, "E0432".into(), "unresolved import".into(), "error".into()),
-                ErrorLocation::new("src/b.rs".into(), 15, 1, "E0308".into(), "mismatched types".into(), "error".into()),
-                ErrorLocation::new("src/b.rs".into(), 25, 1, "E0599".into(), "method not found".into(), "error".into()),
+                ErrorLocation::new(
+                    "src/b.rs".into(),
+                    5,
+                    1,
+                    "E0432".into(),
+                    "unresolved import".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/b.rs".into(),
+                    15,
+                    1,
+                    "E0308".into(),
+                    "mismatched types".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/b.rs".into(),
+                    25,
+                    1,
+                    "E0599".into(),
+                    "method not found".into(),
+                    "error".into(),
+                ),
             ],
             ..Default::default()
         };
         let groups = result.analyze_error_groups();
         let cascade = groups.iter().find(|g| g.is_cascade);
-        assert!(cascade.is_some(), "trivial-first with 3 errors should cascade");
+        assert!(
+            cascade.is_some(),
+            "trivial-first with 3 errors should cascade"
+        );
         let c = cascade.unwrap();
         assert_eq!(c.root_index, 0, "root should be the first (trivial) error");
     }
@@ -2220,29 +2664,70 @@ error[E0425]: cannot find value `nonexistent` in this scope
     fn analyze_no_cascade_two_errors() {
         let result = BuildTestResult {
             error_locations: vec![
-                ErrorLocation::new("src/c.rs".into(), 10, 1, "E0308".into(), "type mismatch".into(), "error".into()),
-                ErrorLocation::new("src/c.rs".into(), 20, 1, "E0277".into(), "trait not satisfied".into(), "error".into()),
+                ErrorLocation::new(
+                    "src/c.rs".into(),
+                    10,
+                    1,
+                    "E0308".into(),
+                    "type mismatch".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/c.rs".into(),
+                    20,
+                    1,
+                    "E0277".into(),
+                    "trait not satisfied".into(),
+                    "error".into(),
+                ),
             ],
             ..Default::default()
         };
         let groups = result.analyze_error_groups();
         // 2 errors, first is Fixable (not Trivial), so no cascade
-        assert!(groups.iter().all(|g| !g.is_cascade), "2 non-trivial errors should not be cascade");
+        assert!(
+            groups.iter().all(|g| !g.is_cascade),
+            "2 non-trivial errors should not be cascade"
+        );
     }
 
     #[test]
     fn analyze_multi_file_groups() {
         let result = BuildTestResult {
             error_locations: vec![
-                ErrorLocation::new("src/a.rs".into(), 10, 1, "E0425".into(), "not found".into(), "error".into()),
-                ErrorLocation::new("src/b.rs".into(), 20, 1, "E0308".into(), "type mismatch".into(), "error".into()),
-                ErrorLocation::new("src/c.rs".into(), 30, 1, "E0599".into(), "method not found".into(), "error".into()),
+                ErrorLocation::new(
+                    "src/a.rs".into(),
+                    10,
+                    1,
+                    "E0425".into(),
+                    "not found".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/b.rs".into(),
+                    20,
+                    1,
+                    "E0308".into(),
+                    "type mismatch".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/c.rs".into(),
+                    30,
+                    1,
+                    "E0599".into(),
+                    "method not found".into(),
+                    "error".into(),
+                ),
             ],
             ..Default::default()
         };
         let groups = result.analyze_error_groups();
         assert_eq!(groups.len(), 3, "each file should be its own group");
-        assert!(groups.iter().all(|g| !g.is_cascade), "single error per file = no cascade");
+        assert!(
+            groups.iter().all(|g| !g.is_cascade),
+            "single error per file = no cascade"
+        );
     }
 
     #[test]
@@ -2250,11 +2735,39 @@ error[E0425]: cannot find value `nonexistent` in this scope
         let result = BuildTestResult {
             error_locations: vec![
                 // File A: cascade (trivial root)
-                ErrorLocation::new("src/a.rs".into(), 5, 1, "E0425".into(), "cannot find value `X`".into(), "error".into()),
-                ErrorLocation::new("src/a.rs".into(), 15, 1, "E0308".into(), "type mismatch".into(), "error".into()),
-                ErrorLocation::new("src/a.rs".into(), 25, 1, "E0599".into(), "method not found".into(), "error".into()),
+                ErrorLocation::new(
+                    "src/a.rs".into(),
+                    5,
+                    1,
+                    "E0425".into(),
+                    "cannot find value `X`".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/a.rs".into(),
+                    15,
+                    1,
+                    "E0308".into(),
+                    "type mismatch".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/a.rs".into(),
+                    25,
+                    1,
+                    "E0599".into(),
+                    "method not found".into(),
+                    "error".into(),
+                ),
                 // File B: standalone complex error
-                ErrorLocation::new("src/b.rs".into(), 10, 1, "E0382".into(), "value moved".into(), "error".into()),
+                ErrorLocation::new(
+                    "src/b.rs".into(),
+                    10,
+                    1,
+                    "E0382".into(),
+                    "value moved".into(),
+                    "error".into(),
+                ),
             ],
             ..Default::default()
         };
@@ -2270,9 +2783,30 @@ error[E0425]: cannot find value `nonexistent` in this scope
     fn fix_order_trivial_before_fixable() {
         let result = BuildTestResult {
             error_locations: vec![
-                ErrorLocation::new("src/a.rs".into(), 10, 1, "E0308".into(), "type mismatch".into(), "error".into()),
-                ErrorLocation::new("src/b.rs".into(), 20, 1, "E0425".into(), "not found".into(), "error".into()),
-                ErrorLocation::new("src/c.rs".into(), 30, 1, "E0382".into(), "value moved".into(), "error".into()),
+                ErrorLocation::new(
+                    "src/a.rs".into(),
+                    10,
+                    1,
+                    "E0308".into(),
+                    "type mismatch".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/b.rs".into(),
+                    20,
+                    1,
+                    "E0425".into(),
+                    "not found".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/c.rs".into(),
+                    30,
+                    1,
+                    "E0382".into(),
+                    "value moved".into(),
+                    "error".into(),
+                ),
             ],
             ..Default::default()
         };
@@ -2281,8 +2815,14 @@ error[E0425]: cannot find value `nonexistent` in this scope
         let trivial_pos = order.iter().position(|&i| i == 1).unwrap();
         let fixable_pos = order.iter().position(|&i| i == 0).unwrap();
         let complex_pos = order.iter().position(|&i| i == 2).unwrap();
-        assert!(trivial_pos < fixable_pos, "trivial should be before fixable");
-        assert!(fixable_pos < complex_pos, "fixable should be before complex");
+        assert!(
+            trivial_pos < fixable_pos,
+            "trivial should be before fixable"
+        );
+        assert!(
+            fixable_pos < complex_pos,
+            "fixable should be before complex"
+        );
     }
 
     #[test]
@@ -2290,14 +2830,31 @@ error[E0425]: cannot find value `nonexistent` in this scope
         let result = BuildTestResult {
             passed: false,
             error_locations: vec![
-                ErrorLocation::new("src/a.rs".into(), 10, 5, "E0308".into(), "type mismatch".into(), "error".into()),
-                ErrorLocation::new("src/b.rs".into(), 20, 1, "E0425".into(), "not found".into(), "error".into()),
+                ErrorLocation::new(
+                    "src/a.rs".into(),
+                    10,
+                    5,
+                    "E0308".into(),
+                    "type mismatch".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/b.rs".into(),
+                    20,
+                    1,
+                    "E0425".into(),
+                    "not found".into(),
+                    "error".into(),
+                ),
             ],
             ..Default::default()
         };
         let output = result.to_enhanced_output("");
         // Should show numbered list
-        assert!(output.contains("1."), "should have numbered errors: {output}");
+        assert!(
+            output.contains("1."),
+            "should have numbered errors: {output}"
+        );
         assert!(output.contains("2."), "should have second error: {output}");
     }
 
@@ -2306,23 +2863,60 @@ error[E0425]: cannot find value `nonexistent` in this scope
         let result = BuildTestResult {
             passed: false,
             error_locations: vec![
-                ErrorLocation::new("src/a.rs".into(), 5, 1, "E0425".into(), "cannot find `X`".into(), "error".into()),
-                ErrorLocation::new("src/a.rs".into(), 15, 1, "E0308".into(), "type mismatch".into(), "error".into()),
-                ErrorLocation::new("src/a.rs".into(), 25, 1, "E0599".into(), "method not found".into(), "error".into()),
+                ErrorLocation::new(
+                    "src/a.rs".into(),
+                    5,
+                    1,
+                    "E0425".into(),
+                    "cannot find `X`".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/a.rs".into(),
+                    15,
+                    1,
+                    "E0308".into(),
+                    "type mismatch".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "src/a.rs".into(),
+                    25,
+                    1,
+                    "E0599".into(),
+                    "method not found".into(),
+                    "error".into(),
+                ),
             ],
             ..Default::default()
         };
         let output = result.to_enhanced_output("");
-        assert!(output.contains("ROOT CAUSE"), "should mark root cause in cascade: {output}");
-        assert!(output.contains("cascade"), "should show cascade hint: {output}");
+        assert!(
+            output.contains("ROOT CAUSE"),
+            "should mark root cause in cascade: {output}"
+        );
+        assert!(
+            output.contains("cascade"),
+            "should show cascade hint: {output}"
+        );
     }
 
     // ═══════════════════════ BuildTestTracker Tests ═══════════════════════
 
     fn make_errors(specs: &[(&str, &str, &str)]) -> Vec<ErrorLocation> {
-        specs.iter().map(|(file, code, msg)| {
-            ErrorLocation::new(file.to_string(), 10, 1, code.to_string(), msg.to_string(), "error".into())
-        }).collect()
+        specs
+            .iter()
+            .map(|(file, code, msg)| {
+                ErrorLocation::new(
+                    file.to_string(),
+                    10,
+                    1,
+                    code.to_string(),
+                    msg.to_string(),
+                    "error".into(),
+                )
+            })
+            .collect()
     }
 
     fn make_result(errors: Vec<ErrorLocation>) -> BuildTestResult {
@@ -2361,9 +2955,7 @@ error[E0425]: cannot find value `nonexistent` in this scope
         tracker.record(&r1, "cargo build");
 
         // Second run: only 1 error (fixed E0425)
-        let r2 = make_result(make_errors(&[
-            ("src/b.rs", "E0308", "mismatched types"),
-        ]));
+        let r2 = make_result(make_errors(&[("src/b.rs", "E0308", "mismatched types")]));
         let delta = tracker.record(&r2, "cargo build");
 
         assert_eq!(delta.iteration, 1);
@@ -2377,15 +2969,15 @@ error[E0425]: cannot find value `nonexistent` in this scope
     #[test]
     fn tracker_detects_new_errors() {
         let mut tracker = BuildTestTracker::new();
-        let r1 = make_result(make_errors(&[
-            ("src/a.rs", "E0425", "cannot find value `foo`"),
-        ]));
+        let r1 = make_result(make_errors(&[(
+            "src/a.rs",
+            "E0425",
+            "cannot find value `foo`",
+        )]));
         tracker.record(&r1, "cargo build");
 
         // Fixed old error but introduced a new one
-        let r2 = make_result(make_errors(&[
-            ("src/c.rs", "E0277", "trait not satisfied"),
-        ]));
+        let r2 = make_result(make_errors(&[("src/c.rs", "E0277", "trait not satisfied")]));
         let delta = tracker.record(&r2, "cargo build");
 
         assert_eq!(delta.new_errors.len(), 1);
@@ -2397,9 +2989,11 @@ error[E0425]: cannot find value `nonexistent` in this scope
     #[test]
     fn tracker_detects_regression() {
         let mut tracker = BuildTestTracker::new();
-        let r1 = make_result(make_errors(&[
-            ("src/a.rs", "E0425", "cannot find value `foo`"),
-        ]));
+        let r1 = make_result(make_errors(&[(
+            "src/a.rs",
+            "E0425",
+            "cannot find value `foo`",
+        )]));
         tracker.record(&r1, "cargo build");
 
         // Introduced MORE errors than before
@@ -2414,7 +3008,10 @@ error[E0425]: cannot find value `nonexistent` in this scope
         assert_eq!(delta.new_errors.len(), 2);
         assert_eq!(delta.persistent_errors.len(), 1);
         let summary = delta.to_summary();
-        assert!(summary.contains("Regression"), "should warn about regression: {summary}");
+        assert!(
+            summary.contains("Regression"),
+            "should warn about regression: {summary}"
+        );
     }
 
     #[test]
@@ -2438,18 +3035,22 @@ error[E0425]: cannot find value `nonexistent` in this scope
     #[test]
     fn tracker_command_change_resets() {
         let mut tracker = BuildTestTracker::new();
-        let r1 = make_result(make_errors(&[
-            ("src/a.rs", "E0425", "cannot find value `foo`"),
-        ]));
+        let r1 = make_result(make_errors(&[(
+            "src/a.rs",
+            "E0425",
+            "cannot find value `foo`",
+        )]));
         tracker.record(&r1, "cargo build");
         assert_eq!(tracker.iterations(), 1);
 
         // Different command — should reset
         assert!(tracker.command_changed("cargo test"));
         tracker.reset();
-        let r2 = make_result(make_errors(&[
-            ("src/a.rs", "E0425", "cannot find value `foo`"),
-        ]));
+        let r2 = make_result(make_errors(&[(
+            "src/a.rs",
+            "E0425",
+            "cannot find value `foo`",
+        )]));
         let delta = tracker.record(&r2, "cargo test");
         assert_eq!(delta.iteration, 0); // Fresh start
     }
@@ -2476,9 +3077,7 @@ error[E0425]: cannot find value `nonexistent` in this scope
         assert!((d2.progress_pct - 50.0).abs() < 0.001);
 
         // Fix 1 more
-        let r3 = make_result(make_errors(&[
-            ("src/d.rs", "E0599", "method not found"),
-        ]));
+        let r3 = make_result(make_errors(&[("src/d.rs", "E0599", "method not found")]));
         let d3 = tracker.record(&r3, "cargo build");
         assert_eq!(d3.fixed_errors.len(), 1);
         assert!((d3.progress_pct - 75.0).abs() < 0.001);
@@ -2487,8 +3086,22 @@ error[E0425]: cannot find value `nonexistent` in this scope
 
     #[test]
     fn tracker_error_signature_ignores_line_number() {
-        let loc1 = ErrorLocation::new("src/a.rs".into(), 10, 1, "E0425".into(), "cannot find value `foo`".into(), "error".into());
-        let loc2 = ErrorLocation::new("src/a.rs".into(), 20, 1, "E0425".into(), "cannot find value `foo`".into(), "error".into());
+        let loc1 = ErrorLocation::new(
+            "src/a.rs".into(),
+            10,
+            1,
+            "E0425".into(),
+            "cannot find value `foo`".into(),
+            "error".into(),
+        );
+        let loc2 = ErrorLocation::new(
+            "src/a.rs".into(),
+            20,
+            1,
+            "E0425".into(),
+            "cannot find value `foo`".into(),
+            "error".into(),
+        );
         assert_eq!(error_signature(&loc1), error_signature(&loc2));
     }
 
@@ -2543,7 +3156,12 @@ error[E0425]: cannot find value `nonexistent` in this scope
     #[test]
     fn fix_unused_import() {
         let err = make_error("src/lib.rs", 2, "", "unused import: `HashMap`");
-        let source = vec!["use std::io;", "use std::collections::HashMap;", "", "fn main() {}"];
+        let source = vec![
+            "use std::io;",
+            "use std::collections::HashMap;",
+            "",
+            "fn main() {}",
+        ];
         let fixes = suggest_fix(&err, &source);
         assert_eq!(fixes.len(), 1);
         assert_eq!(fixes[0].action, "delete_line");
@@ -2553,7 +3171,12 @@ error[E0425]: cannot find value `nonexistent` in this scope
 
     #[test]
     fn fix_missing_import_hashmap() {
-        let err = make_error("src/main.rs", 5, "E0425", "cannot find value `HashMap` in this scope");
+        let err = make_error(
+            "src/main.rs",
+            5,
+            "E0425",
+            "cannot find value `HashMap` in this scope",
+        );
         let source = vec!["fn main() {", "    let m = HashMap::new();", "}"];
         let fixes = suggest_fix(&err, &source);
         assert_eq!(fixes.len(), 1);
@@ -2564,7 +3187,12 @@ error[E0425]: cannot find value `nonexistent` in this scope
 
     #[test]
     fn fix_missing_import_arc() {
-        let err = make_error("src/lib.rs", 1, "E0433", "failed to resolve: use of undeclared type `Arc`");
+        let err = make_error(
+            "src/lib.rs",
+            1,
+            "E0433",
+            "failed to resolve: use of undeclared type `Arc`",
+        );
         let source = vec!["let a = Arc::new(42);"];
         let fixes = suggest_fix(&err, &source);
         assert_eq!(fixes.len(), 1);
@@ -2573,7 +3201,12 @@ error[E0425]: cannot find value `nonexistent` in this scope
 
     #[test]
     fn fix_missing_field() {
-        let err = make_error("src/config.rs", 10, "E0063", "missing field `name` in initializer");
+        let err = make_error(
+            "src/config.rs",
+            10,
+            "E0063",
+            "missing field `name` in initializer",
+        );
         let source = vec![""; 20];
         let fixes = suggest_fix(&err, &source);
         assert_eq!(fixes.len(), 1);
@@ -2584,9 +3217,18 @@ error[E0425]: cannot find value `nonexistent` in this scope
 
     #[test]
     fn fix_string_str_mismatch_need_string() {
-        let err = make_error("src/lib.rs", 3, "E0308",
-            "mismatched types: expected `String`, found `&str`");
-        let source = vec!["fn f() {", "    let s: &str = \"hi\";", "    takes_string(s);", "}"];
+        let err = make_error(
+            "src/lib.rs",
+            3,
+            "E0308",
+            "mismatched types: expected `String`, found `&str`",
+        );
+        let source = vec![
+            "fn f() {",
+            "    let s: &str = \"hi\";",
+            "    takes_string(s);",
+            "}",
+        ];
         let fixes = suggest_fix(&err, &source);
         assert_eq!(fixes.len(), 1);
         assert!(fixes[0].new_text.contains(".to_string()"));
@@ -2594,9 +3236,18 @@ error[E0425]: cannot find value `nonexistent` in this scope
 
     #[test]
     fn fix_string_str_mismatch_need_ref() {
-        let err = make_error("src/lib.rs", 3, "E0308",
-            "mismatched types: expected `&str`, found struct `String`");
-        let source = vec!["fn f() {", "    let s = String::new();", "    takes_ref(s);", "}"];
+        let err = make_error(
+            "src/lib.rs",
+            3,
+            "E0308",
+            "mismatched types: expected `&str`, found struct `String`",
+        );
+        let source = vec![
+            "fn f() {",
+            "    let s = String::new();",
+            "    takes_ref(s);",
+            "}",
+        ];
         let fixes = suggest_fix(&err, &source);
         assert_eq!(fixes.len(), 1);
         assert!(fixes[0].new_text.contains(".as_str()"));
@@ -2604,8 +3255,12 @@ error[E0425]: cannot find value `nonexistent` in this scope
 
     #[test]
     fn fix_missing_trait_method() {
-        let err = make_error("src/impl.rs", 5, "E0046",
-            "not all trait items implemented, missing: `process`");
+        let err = make_error(
+            "src/impl.rs",
+            5,
+            "E0046",
+            "not all trait items implemented, missing: `process`",
+        );
         let source = vec!["impl Handler for MyType {", "}"];
         let fixes = suggest_fix(&err, &source);
         assert_eq!(fixes.len(), 1);
@@ -2615,8 +3270,7 @@ error[E0425]: cannot find value `nonexistent` in this scope
 
     #[test]
     fn fix_ts_missing_name() {
-        let err = make_error("src/app.ts", 3, "TS2304",
-            "Cannot find name 'Router'");
+        let err = make_error("src/app.ts", 3, "TS2304", "Cannot find name 'Router'");
         let source = vec!["const app = new Router();"];
         let fixes = suggest_fix(&err, &source);
         assert_eq!(fixes.len(), 1);
@@ -2647,9 +3301,14 @@ error[E0425]: cannot find value `nonexistent` in this scope
     #[test]
     fn fix_suggest_rust_import_coverage() {
         // Check several common types have import suggestions
-        for name in &["HashMap", "HashSet", "Arc", "Mutex", "PathBuf", "File", "Cow", "Rc"] {
-            assert!(suggest_rust_import(name).is_some(),
-                "Expected import suggestion for {}", name);
+        for name in &[
+            "HashMap", "HashSet", "Arc", "Mutex", "PathBuf", "File", "Cow", "Rc",
+        ] {
+            assert!(
+                suggest_rust_import(name).is_some(),
+                "Expected import suggestion for {}",
+                name
+            );
         }
         // Unknown type returns None
         assert!(suggest_rust_import("MyCustomType").is_none());
@@ -2676,9 +3335,20 @@ error[E0425]: cannot find value `nonexistent` in this scope
     fn apply_fix_replace_line() {
         let dir = tempdir().unwrap();
         let file = dir.path().join("test.rs");
-        std::fs::write(&file, "fn main() {\n    let x = 42;\n    println!(\"{}\", x);\n}\n").unwrap();
+        std::fs::write(
+            &file,
+            "fn main() {\n    let x = 42;\n    println!(\"{}\", x);\n}\n",
+        )
+        .unwrap();
 
-        let fix = FixSuggestion::new("test.rs", "replace", 2, "    let _x = 42;", "Prefix unused var", 0.9);
+        let fix = FixSuggestion::new(
+            "test.rs",
+            "replace",
+            2,
+            "    let _x = 42;",
+            "Prefix unused var",
+            0.9,
+        );
         let result = apply_fix(&fix, dir.path());
         assert!(result.is_ok());
         let content = std::fs::read_to_string(&file).unwrap();
@@ -2692,7 +3362,14 @@ error[E0425]: cannot find value `nonexistent` in this scope
         let file = dir.path().join("test.rs");
         std::fs::write(&file, "fn main() {\n    let x = HashMap::new();\n}\n").unwrap();
 
-        let fix = FixSuggestion::new("test.rs", "insert_line", 1, "use std::collections::HashMap;", "Add missing import", 0.8);
+        let fix = FixSuggestion::new(
+            "test.rs",
+            "insert_line",
+            1,
+            "use std::collections::HashMap;",
+            "Add missing import",
+            0.8,
+        );
         let result = apply_fix(&fix, dir.path());
         assert!(result.is_ok());
         let content = std::fs::read_to_string(&file).unwrap();
@@ -2703,16 +3380,30 @@ error[E0425]: cannot find value `nonexistent` in this scope
     fn apply_fix_add_import_after_existing() {
         let dir = tempdir().unwrap();
         let file = dir.path().join("test.rs");
-        std::fs::write(&file, "use std::io;\n\nfn main() {\n    let x = HashMap::new();\n}\n").unwrap();
+        std::fs::write(
+            &file,
+            "use std::io;\n\nfn main() {\n    let x = HashMap::new();\n}\n",
+        )
+        .unwrap();
 
-        let fix = FixSuggestion::new("test.rs", "add_import", 0, "use std::collections::HashMap;", "Add HashMap import", 0.8);
+        let fix = FixSuggestion::new(
+            "test.rs",
+            "add_import",
+            0,
+            "use std::collections::HashMap;",
+            "Add HashMap import",
+            0.8,
+        );
         let result = apply_fix(&fix, dir.path());
         assert!(result.is_ok());
         let content = std::fs::read_to_string(&file).unwrap();
         // New import should be after existing import
         let io_pos = content.find("use std::io;").unwrap();
         let hm_pos = content.find("use std::collections::HashMap;").unwrap();
-        assert!(hm_pos > io_pos, "New import should be after existing imports");
+        assert!(
+            hm_pos > io_pos,
+            "New import should be after existing imports"
+        );
     }
 
     #[test]
@@ -2760,18 +3451,32 @@ error[E0425]: cannot find value `nonexistent` in this scope
         ];
 
         let (applied, errors) = apply_auto_fixes(&fixes, dir.path());
-        assert_eq!(applied.len(), 1, "Only high-confidence fix should be applied");
+        assert_eq!(
+            applied.len(),
+            1,
+            "Only high-confidence fix should be applied"
+        );
         assert!(errors.is_empty());
         let content = std::fs::read_to_string(&file).unwrap();
-        assert!(!content.contains("use std::io;"), "High-confidence fix should delete line 1");
-        assert!(content.contains("use std::fs;"), "Low-confidence line 2 should remain");
+        assert!(
+            !content.contains("use std::io;"),
+            "High-confidence fix should delete line 1"
+        );
+        assert!(
+            content.contains("use std::fs;"),
+            "Low-confidence line 2 should remain"
+        );
     }
 
     #[test]
     fn apply_auto_fixes_reverse_line_order() {
         let dir = tempdir().unwrap();
         let file = dir.path().join("test.rs");
-        std::fs::write(&file, "use std::io;\nuse std::fs;\nuse std::net;\nfn main() {}\n").unwrap();
+        std::fs::write(
+            &file,
+            "use std::io;\nuse std::fs;\nuse std::net;\nfn main() {}\n",
+        )
+        .unwrap();
 
         let fixes = vec![
             FixSuggestion::new("test.rs", "delete_line", 1, "", "Delete line 1", 0.9),
@@ -2793,9 +3498,14 @@ error[E0425]: cannot find value `nonexistent` in this scope
         let file = dir.path().join("test.rs");
         std::fs::write(&file, "fn main() {}\n").unwrap();
 
-        let fixes = vec![
-            FixSuggestion::new("test.rs", "replace", 1, "fn main() { todo!() }", "Low", 0.3),
-        ];
+        let fixes = vec![FixSuggestion::new(
+            "test.rs",
+            "replace",
+            1,
+            "fn main() { todo!() }",
+            "Low",
+            0.3,
+        )];
 
         let (applied, _) = apply_auto_fixes(&fixes, dir.path());
         assert!(applied.is_empty());
@@ -2806,14 +3516,12 @@ error[E0425]: cannot find value `nonexistent` in this scope
 
     #[test]
     fn format_auto_fix_report_applied() {
-        let applied = vec![
-            AppliedFix {
-                file: "src/main.rs".to_string(),
-                action: "delete_line".to_string(),
-                line: 3,
-                explanation: "Remove unused import".to_string(),
-            },
-        ];
+        let applied = vec![AppliedFix {
+            file: "src/main.rs".to_string(),
+            action: "delete_line".to_string(),
+            line: 3,
+            explanation: "Remove unused import".to_string(),
+        }];
         let report = format_auto_fix_report(&applied, &[], 1);
         assert!(report.contains("Auto-Fix Iteration 1"));
         assert!(report.contains("✓ src/main.rs L3"));
@@ -2854,8 +3562,14 @@ error[E0425]: cannot find value `nonexistent` in this scope
 
     #[test]
     fn auto_fix_constants_are_sane() {
-        assert!(AUTO_FIX_CONFIDENCE_THRESHOLD >= 0.7, "Threshold should be high");
-        assert!(AUTO_FIX_CONFIDENCE_THRESHOLD <= 1.0, "Threshold should be ≤1.0");
+        assert!(
+            AUTO_FIX_CONFIDENCE_THRESHOLD >= 0.7,
+            "Threshold should be high"
+        );
+        assert!(
+            AUTO_FIX_CONFIDENCE_THRESHOLD <= 1.0,
+            "Threshold should be ≤1.0"
+        );
         assert!(AUTO_FIX_MAX_ITERATIONS >= 1, "At least 1 iteration");
         assert!(AUTO_FIX_MAX_ITERATIONS <= 5, "Max 5 iterations for safety");
     }
