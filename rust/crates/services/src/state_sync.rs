@@ -27,6 +27,49 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::Duration;
+
+// ─── Retry Configuration ────────────────────────────────────────────────────
+
+/// Maximum number of retry attempts for transient network errors.
+const MAX_RETRIES: u32 = 3;
+/// Initial backoff delay between retries.
+const INITIAL_BACKOFF_MS: u64 = 100;
+/// Maximum backoff delay (exponential backoff caps at this value).
+const MAX_BACKOFF_MS: u64 = 2000;
+
+/// Check if an error is likely transient and worth retrying.
+fn is_retryable_error(err: &sqlx::Error) -> bool {
+    match err {
+        // Connection errors are usually transient
+        sqlx::Error::Io(_) => true,
+        // Pool timeout - might resolve after brief wait
+        sqlx::Error::PoolTimedOut => true,
+        // Protocol errors might be transient network issues
+        sqlx::Error::Protocol(_) => true,
+        // Database errors - check for specific transient codes
+        sqlx::Error::Database(db_err) => {
+            // MySQL error codes for transient issues:
+            // 1040 = Too many connections
+            // 1205 = Lock wait timeout exceeded
+            // 1213 = Deadlock found
+            // 2006 = MySQL server has gone away
+            // 2013 = Lost connection to MySQL server
+            if let Some(code) = db_err.code() {
+                let code_str = code.to_string();
+                matches!(
+                    code_str.as_str(),
+                    "1040" | "1205" | "1213" | "2006" | "2013"
+                )
+            } else {
+                // Unknown database error - don't retry
+                false
+            }
+        }
+        // Other errors are not retryable
+        _ => false,
+    }
+}
 
 // ─── Sync Types ─────────────────────────────────────────────────────────────
 
@@ -344,80 +387,116 @@ impl StateSyncService for MatrixOneSyncService {
         let snapshot_id = uuid::Uuid::new_v4().to_string();
         let has_cal = if has_calibration { 1i32 } else { 0 };
 
-        // Two-step UPSERT: UPDATE existing row, then INSERT if no row existed.
-        // MatrixOne may not support ON DUPLICATE KEY UPDATE on UNIQUE keys,
-        // so we use an explicit UPDATE-then-INSERT pattern.
-        let updated = sqlx::query(
-            "UPDATE learning_snapshots SET \
-                snapshot_json = ?, \
-                entity_count = ?, \
-                pattern_count = ?, \
-                has_calibration = ?, \
-                version = version + 1, \
-                updated_at = NOW() \
-             WHERE user_id = ? AND profile_name = ?",
-        )
-        .bind(snapshot_json)
-        .bind(entity_count as i64)
-        .bind(pattern_count as i64)
-        .bind(has_cal)
-        .bind(user_id)
-        .bind(profile)
-        .execute(&self.pool)
-        .await;
+        // Retry loop with exponential backoff for transient network errors
+        let mut last_error = None;
+        let mut backoff_ms = INITIAL_BACKOFF_MS;
 
-        let result = match updated {
-            Ok(r) if r.rows_affected() > 0 => Ok(r),
-            Ok(_) => {
-                // No existing row — insert fresh
-                sqlx::query(
-                    "INSERT INTO learning_snapshots \
-                     (snapshot_id, user_id, profile_name, snapshot_json, entity_count, \
-                      pattern_count, has_calibration, version, created_at, updated_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())",
-                )
-                .bind(&snapshot_id)
-                .bind(user_id)
-                .bind(profile)
-                .bind(snapshot_json)
-                .bind(entity_count as i64)
-                .bind(pattern_count as i64)
-                .bind(has_cal)
-                .execute(&self.pool)
-                .await
-            }
-            Err(e) => Err(e),
-        };
+        for attempt in 0..=MAX_RETRIES {
+            // Two-step UPSERT: UPDATE existing row, then INSERT if no row existed.
+            // MatrixOne may not support ON DUPLICATE KEY UPDATE on UNIQUE keys,
+            // so we use an explicit UPDATE-then-INSERT pattern.
+            let updated = sqlx::query(
+                "UPDATE learning_snapshots SET \
+                    snapshot_json = ?, \
+                    entity_count = ?, \
+                    pattern_count = ?, \
+                    has_calibration = ?, \
+                    version = version + 1, \
+                    updated_at = NOW() \
+                 WHERE user_id = ? AND profile_name = ?",
+            )
+            .bind(snapshot_json)
+            .bind(entity_count as i64)
+            .bind(pattern_count as i64)
+            .bind(has_cal)
+            .bind(user_id)
+            .bind(profile)
+            .execute(&self.pool)
+            .await;
 
-        match result {
-            Ok(_) => {
-                self.log_sync(
-                    user_id,
-                    "",
-                    "learning",
-                    SyncDirection::Push,
-                    snapshot_json.len(),
-                    "success",
-                    None,
-                )
-                .await;
-                SyncResult::ok(SyncDirection::Push, "learning", 1)
-            }
-            Err(e) => {
-                let msg = format!("push_learning: {e}");
-                self.log_sync(
-                    user_id,
-                    "",
-                    "learning",
-                    SyncDirection::Push,
-                    0,
-                    "error",
-                    Some(&msg),
-                )
-                .await;
-                SyncResult::err(SyncDirection::Push, "learning", msg)
+            let result = match updated {
+                Ok(r) if r.rows_affected() > 0 => Ok(r),
+                Ok(_) => {
+                    // No existing row — insert fresh
+                    sqlx::query(
+                        "INSERT INTO learning_snapshots \
+                         (snapshot_id, user_id, profile_name, snapshot_json, entity_count, \
+                          pattern_count, has_calibration, version, created_at, updated_at) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())",
+                    )
+                    .bind(&snapshot_id)
+                    .bind(user_id)
+                    .bind(profile)
+                    .bind(snapshot_json)
+                    .bind(entity_count as i64)
+                    .bind(pattern_count as i64)
+                    .bind(has_cal)
+                    .execute(&self.pool)
+                    .await
+                }
+                Err(e) => Err(e),
+            };
+
+            match result {
+                Ok(_) => {
+                    self.log_sync(
+                        user_id,
+                        "",
+                        "learning",
+                        SyncDirection::Push,
+                        snapshot_json.len(),
+                        "success",
+                        None,
+                    )
+                    .await;
+                    return SyncResult::ok(SyncDirection::Push, "learning", 1);
+                }
+                Err(e) => {
+                    if attempt < MAX_RETRIES && is_retryable_error(&e) {
+                        eprintln!(
+                            "  ↻ push_learning retry {} of {}: {}",
+                            attempt + 1,
+                            MAX_RETRIES,
+                            &e
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                        last_error = Some(e);
+                        continue;
+                    }
+                    // Non-retryable or max retries exceeded
+                    let msg = format!("push_learning: {e}");
+                    self.log_sync(
+                        user_id,
+                        "",
+                        "learning",
+                        SyncDirection::Push,
+                        0,
+                        "error",
+                        Some(&msg),
+                    )
+                    .await;
+                    return SyncResult::err(SyncDirection::Push, "learning", msg);
+                }
             }
         }
+
+        // Max retries exceeded with retryable error
+        let msg = format!(
+            "push_learning: max retries exceeded: {}",
+            last_error.map(|e| e.to_string()).unwrap_or_default()
+        );
+        self.log_sync(
+            user_id,
+            "",
+            "learning",
+            SyncDirection::Push,
+            0,
+            "error",
+            Some(&msg),
+        )
+        .await;
+        SyncResult::err(SyncDirection::Push, "learning", msg)
     }
 
     async fn push_learning_versioned(
@@ -433,135 +512,199 @@ impl StateSyncService for MatrixOneSyncService {
         let snapshot_id = uuid::Uuid::new_v4().to_string();
         let has_cal = if has_calibration { 1i32 } else { 0 };
 
+        // Retry loop with exponential backoff for transient network errors
+        let mut backoff_ms = INITIAL_BACKOFF_MS;
+
         match expected_version {
             Some(ver) => {
-                // Optimistic lock: UPDATE only if version matches
-                let updated = sqlx::query(
-                    "UPDATE learning_snapshots SET \
-                        snapshot_json = ?, \
-                        entity_count = ?, \
-                        pattern_count = ?, \
-                        has_calibration = ?, \
-                        version = version + 1, \
-                        updated_at = NOW() \
-                     WHERE user_id = ? AND profile_name = ? AND version = ?",
-                )
-                .bind(snapshot_json)
-                .bind(entity_count as i64)
-                .bind(pattern_count as i64)
-                .bind(has_cal)
-                .bind(user_id)
-                .bind(profile)
-                .bind(ver)
-                .execute(&self.pool)
-                .await;
+                for attempt in 0..=MAX_RETRIES {
+                    // Optimistic lock: UPDATE only if version matches
+                    let updated = sqlx::query(
+                        "UPDATE learning_snapshots SET \
+                            snapshot_json = ?, \
+                            entity_count = ?, \
+                            pattern_count = ?, \
+                            has_calibration = ?, \
+                            version = version + 1, \
+                            updated_at = NOW() \
+                         WHERE user_id = ? AND profile_name = ? AND version = ?",
+                    )
+                    .bind(snapshot_json)
+                    .bind(entity_count as i64)
+                    .bind(pattern_count as i64)
+                    .bind(has_cal)
+                    .bind(user_id)
+                    .bind(profile)
+                    .bind(ver)
+                    .execute(&self.pool)
+                    .await;
 
-                match updated {
-                    Ok(r) if r.rows_affected() > 0 => {
-                        let new_ver = ver + 1;
-                        self.log_sync(
-                            user_id,
-                            "",
-                            "learning_versioned",
-                            SyncDirection::Push,
-                            snapshot_json.len(),
-                            "success",
-                            None,
-                        )
-                        .await;
-                        SyncResult::ok_with_version(SyncDirection::Push, "learning", 1, new_ver)
-                    }
-                    Ok(_) => {
-                        // No rows affected — version mismatch (conflict)
-                        self.log_sync(
-                            user_id,
-                            "",
-                            "learning_versioned",
-                            SyncDirection::Push,
-                            0,
-                            "conflict",
-                            Some(&format!("expected version {ver}")),
-                        )
-                        .await;
-                        SyncResult::conflict(
-                            SyncDirection::Push,
-                            "learning",
-                            format!("version conflict: expected {ver}, snapshot was modified by another session"),
-                        )
-                    }
-                    Err(e) => {
-                        let msg = format!("push_learning_versioned: {e}");
-                        self.log_sync(
-                            user_id,
-                            "",
-                            "learning_versioned",
-                            SyncDirection::Push,
-                            0,
-                            "error",
-                            Some(&msg),
-                        )
-                        .await;
-                        SyncResult::err(SyncDirection::Push, "learning", msg)
-                    }
-                }
-            }
-            None => {
-                // No expected version — create new (fail if exists)
-                let inserted = sqlx::query(
-                    "INSERT INTO learning_snapshots \
-                     (snapshot_id, user_id, profile_name, snapshot_json, entity_count, \
-                      pattern_count, has_calibration, version, created_at, updated_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())",
-                )
-                .bind(&snapshot_id)
-                .bind(user_id)
-                .bind(profile)
-                .bind(snapshot_json)
-                .bind(entity_count as i64)
-                .bind(pattern_count as i64)
-                .bind(has_cal)
-                .execute(&self.pool)
-                .await;
-
-                match inserted {
-                    Ok(_) => {
-                        self.log_sync(
-                            user_id,
-                            "",
-                            "learning_versioned",
-                            SyncDirection::Push,
-                            snapshot_json.len(),
-                            "success",
-                            None,
-                        )
-                        .await;
-                        SyncResult::ok_with_version(SyncDirection::Push, "learning", 1, 1)
-                    }
-                    Err(e) => {
-                        // Likely duplicate key — snapshot already exists
-                        let msg = format!("push_learning_versioned (new): {e}");
-                        let is_dup = msg.contains("Duplicate") || msg.contains("duplicate");
-                        self.log_sync(
-                            user_id,
-                            "",
-                            "learning_versioned",
-                            SyncDirection::Push,
-                            0,
-                            if is_dup { "conflict" } else { "error" },
-                            Some(&msg),
-                        )
-                        .await;
-                        if is_dup {
-                            SyncResult::conflict(
+                    match updated {
+                        Ok(r) if r.rows_affected() > 0 => {
+                            let new_ver = ver + 1;
+                            self.log_sync(
+                                user_id,
+                                "",
+                                "learning_versioned",
+                                SyncDirection::Push,
+                                snapshot_json.len(),
+                                "success",
+                                None,
+                            )
+                            .await;
+                            return SyncResult::ok_with_version(
                                 SyncDirection::Push,
                                 "learning",
-                                "snapshot already exists; use expected_version to update",
+                                1,
+                                new_ver,
+                            );
+                        }
+                        Ok(_) => {
+                            // No rows affected — version mismatch (conflict)
+                            // Don't retry conflicts — they need caller to pull fresh data
+                            self.log_sync(
+                                user_id,
+                                "",
+                                "learning_versioned",
+                                SyncDirection::Push,
+                                0,
+                                "conflict",
+                                Some(&format!("expected version {ver}")),
                             )
-                        } else {
-                            SyncResult::err(SyncDirection::Push, "learning", msg)
+                            .await;
+                            return SyncResult::conflict(
+                                SyncDirection::Push,
+                                "learning",
+                                format!(
+                                    "version conflict: expected {ver}, snapshot was modified by another session"
+                                ),
+                            );
+                        }
+                        Err(e) => {
+                            if attempt < MAX_RETRIES && is_retryable_error(&e) {
+                                eprintln!(
+                                    "  ↻ push_learning_versioned retry {} of {}: {}",
+                                    attempt + 1,
+                                    MAX_RETRIES,
+                                    &e
+                                );
+                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                                continue;
+                            }
+                            let msg = format!("push_learning_versioned: {e}");
+                            self.log_sync(
+                                user_id,
+                                "",
+                                "learning_versioned",
+                                SyncDirection::Push,
+                                0,
+                                "error",
+                                Some(&msg),
+                            )
+                            .await;
+                            return SyncResult::err(SyncDirection::Push, "learning", msg);
                         }
                     }
                 }
+                // Max retries exceeded (shouldn't reach here normally)
+                SyncResult::err(
+                    SyncDirection::Push,
+                    "learning",
+                    "push_learning_versioned: max retries exceeded",
+                )
+            }
+            None => {
+                // No expected version — create new (fail if exists)
+                for attempt in 0..=MAX_RETRIES {
+                    let inserted = sqlx::query(
+                        "INSERT INTO learning_snapshots \
+                         (snapshot_id, user_id, profile_name, snapshot_json, entity_count, \
+                          pattern_count, has_calibration, version, created_at, updated_at) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())",
+                    )
+                    .bind(&snapshot_id)
+                    .bind(user_id)
+                    .bind(profile)
+                    .bind(snapshot_json)
+                    .bind(entity_count as i64)
+                    .bind(pattern_count as i64)
+                    .bind(has_cal)
+                    .execute(&self.pool)
+                    .await;
+
+                    match inserted {
+                        Ok(_) => {
+                            self.log_sync(
+                                user_id,
+                                "",
+                                "learning_versioned",
+                                SyncDirection::Push,
+                                snapshot_json.len(),
+                                "success",
+                                None,
+                            )
+                            .await;
+                            return SyncResult::ok_with_version(
+                                SyncDirection::Push,
+                                "learning",
+                                1,
+                                1,
+                            );
+                        }
+                        Err(e) => {
+                            // Check for duplicate key (not retryable)
+                            let msg = format!("push_learning_versioned (new): {e}");
+                            let is_dup = msg.contains("Duplicate") || msg.contains("duplicate");
+                            if is_dup {
+                                self.log_sync(
+                                    user_id,
+                                    "",
+                                    "learning_versioned",
+                                    SyncDirection::Push,
+                                    0,
+                                    "conflict",
+                                    Some(&msg),
+                                )
+                                .await;
+                                return SyncResult::conflict(
+                                    SyncDirection::Push,
+                                    "learning",
+                                    "snapshot already exists; use expected_version to update",
+                                );
+                            }
+                            // Check for retryable network error
+                            if attempt < MAX_RETRIES && is_retryable_error(&e) {
+                                eprintln!(
+                                    "  ↻ push_learning_versioned (new) retry {} of {}: {}",
+                                    attempt + 1,
+                                    MAX_RETRIES,
+                                    &e
+                                );
+                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                                continue;
+                            }
+                            self.log_sync(
+                                user_id,
+                                "",
+                                "learning_versioned",
+                                SyncDirection::Push,
+                                0,
+                                "error",
+                                Some(&msg),
+                            )
+                            .await;
+                            return SyncResult::err(SyncDirection::Push, "learning", msg);
+                        }
+                    }
+                }
+                // Max retries exceeded
+                SyncResult::err(
+                    SyncDirection::Push,
+                    "learning",
+                    "push_learning_versioned (new): max retries exceeded",
+                )
             }
         }
     }
@@ -605,40 +748,66 @@ impl StateSyncService for MatrixOneSyncService {
         user_id: &str,
         profile: &str,
     ) -> Result<Option<VersionedSnapshot>, String> {
-        let row = sqlx::query(
-            "SELECT snapshot_json, version FROM learning_snapshots \
-             WHERE user_id = ? AND profile_name = ? \
-             ORDER BY updated_at DESC LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(profile)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| format!("pull_learning_versioned: {e}"))?;
+        // Retry loop with exponential backoff for transient network errors
+        let mut last_error = None;
+        let mut backoff_ms = INITIAL_BACKOFF_MS;
 
-        match row {
-            Some(row) => {
-                use sqlx::Row;
-                let json: String = row
-                    .try_get("snapshot_json")
-                    .map_err(|e| format!("pull_learning_versioned decode json: {e}"))?;
-                let version: i64 = row
-                    .try_get("version")
-                    .map_err(|e| format!("pull_learning_versioned decode version: {e}"))?;
-                self.log_sync(
-                    user_id,
-                    "",
-                    "learning_versioned",
-                    SyncDirection::Pull,
-                    json.len(),
-                    "success",
-                    None,
-                )
-                .await;
-                Ok(Some(VersionedSnapshot { json, version }))
+        for attempt in 0..=MAX_RETRIES {
+            let row = sqlx::query(
+                "SELECT snapshot_json, version FROM learning_snapshots \
+                 WHERE user_id = ? AND profile_name = ? \
+                 ORDER BY updated_at DESC LIMIT 1",
+            )
+            .bind(user_id)
+            .bind(profile)
+            .fetch_optional(&self.pool)
+            .await;
+
+            match row {
+                Ok(Some(row)) => {
+                    use sqlx::Row;
+                    let json: String = row
+                        .try_get("snapshot_json")
+                        .map_err(|e| format!("pull_learning_versioned decode json: {e}"))?;
+                    let version: i64 = row
+                        .try_get("version")
+                        .map_err(|e| format!("pull_learning_versioned decode version: {e}"))?;
+                    self.log_sync(
+                        user_id,
+                        "",
+                        "learning_versioned",
+                        SyncDirection::Pull,
+                        json.len(),
+                        "success",
+                        None,
+                    )
+                    .await;
+                    return Ok(Some(VersionedSnapshot { json, version }));
+                }
+                Ok(None) => return Ok(None),
+                Err(e) => {
+                    if attempt < MAX_RETRIES && is_retryable_error(&e) {
+                        eprintln!(
+                            "  ↻ pull_learning_versioned retry {} of {}: {}",
+                            attempt + 1,
+                            MAX_RETRIES,
+                            &e
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                        last_error = Some(e);
+                        continue;
+                    }
+                    return Err(format!("pull_learning_versioned: {e}"));
+                }
             }
-            None => Ok(None),
         }
+
+        // Max retries exceeded
+        Err(format!(
+            "pull_learning_versioned: max retries exceeded: {}",
+            last_error.map(|e| e.to_string()).unwrap_or_default()
+        ))
     }
 
     async fn push_preference(&self, user_id: &str, key: &str, value: &str) -> SyncResult {
@@ -1151,5 +1320,60 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.new_version, Some(5));
         assert!(!result.is_conflict);
+    }
+
+    // ── Retry logic tests ──
+
+    #[test]
+    fn is_retryable_error_io_errors() {
+        // IO errors should be retryable
+        let io_err = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset",
+        ));
+        assert!(is_retryable_error(&io_err));
+    }
+
+    #[test]
+    fn is_retryable_error_pool_timeout() {
+        // Pool timeout should be retryable
+        let timeout_err = sqlx::Error::PoolTimedOut;
+        assert!(is_retryable_error(&timeout_err));
+    }
+
+    #[test]
+    fn is_retryable_error_protocol() {
+        // Protocol errors should be retryable
+        let proto_err = sqlx::Error::Protocol("unexpected packet".to_string());
+        assert!(is_retryable_error(&proto_err));
+    }
+
+    #[test]
+    fn is_retryable_error_non_retryable() {
+        // Column decode errors are not retryable
+        let decode_err = sqlx::Error::ColumnDecode {
+            index: "0".to_string(),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bad data",
+            )),
+        };
+        assert!(!is_retryable_error(&decode_err));
+
+        // Type mismatch errors are not retryable
+        let type_err = sqlx::Error::TypeNotFound {
+            type_name: "unknown".to_string(),
+        };
+        assert!(!is_retryable_error(&type_err));
+    }
+
+    #[test]
+    fn retry_constants_are_reasonable() {
+        // Verify retry constants are within expected ranges
+        assert!(MAX_RETRIES >= 2 && MAX_RETRIES <= 5);
+        assert!(INITIAL_BACKOFF_MS >= 50 && INITIAL_BACKOFF_MS <= 500);
+        assert!(MAX_BACKOFF_MS >= 1000 && MAX_BACKOFF_MS <= 5000);
+        // Ensure max backoff is greater than initial
+        assert!(MAX_BACKOFF_MS > INITIAL_BACKOFF_MS);
     }
 }

@@ -1438,6 +1438,492 @@ fn is_non_code_node(kind: &str) -> bool {
         || kind == "concatenated_string"
 }
 
+// ─── Type Member Extraction ─────────────────────────────────────────────────
+
+/// A field, property, or variant belonging to a type definition.
+#[derive(Debug, Clone)]
+pub struct Member {
+    /// Member name (e.g., "name", "age", "Variant")
+    pub name: String,
+    /// Member kind: "field", "method", "variant", "property"
+    pub kind: String,
+    /// Type annotation if available (e.g., "String", "usize", "Option<i32>")
+    pub type_annotation: String,
+    /// Line number (1-indexed)
+    pub line: usize,
+    /// Visibility/access (e.g., "pub", "pub(crate)", "private", "protected")
+    pub visibility: String,
+    /// Default value or initializer if present
+    pub default_value: String,
+}
+
+/// Extract members (fields, methods, variants) from a type definition at a
+/// specific line in the source. Finds the enclosing struct/class/enum/interface
+/// and returns its members.
+pub fn extract_members(source: &str, lang: Language, type_line: usize) -> Vec<Member> {
+    let mut parser = tree_sitter::Parser::new();
+    let language = match lang {
+        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
+        Language::Python => tree_sitter_python::LANGUAGE.into(),
+        Language::TypeScript | Language::JavaScript => {
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+        }
+        Language::Go => tree_sitter_go::LANGUAGE.into(),
+        Language::Java => tree_sitter_java::LANGUAGE.into(),
+        Language::C | Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+    };
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+    let tree = match parser.parse(source, None) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    // Find the type node at the given line
+    let target_row = type_line.saturating_sub(1);
+    let root = tree.root_node();
+    let type_node = find_type_node_at_line(root, target_row, lang);
+
+    match type_node {
+        Some(node) => match lang {
+            Language::Rust => extract_rust_members(node, source),
+            Language::Python => extract_python_members(node, source),
+            Language::TypeScript | Language::JavaScript => extract_ts_members(node, source),
+            Language::Go => extract_go_members(node, source),
+            _ => Vec::new(),
+        },
+        None => Vec::new(),
+    }
+}
+
+fn find_type_node_at_line(
+    root: tree_sitter::Node,
+    target_row: usize,
+    lang: Language,
+) -> Option<tree_sitter::Node> {
+    let type_kinds: &[&str] = match lang {
+        Language::Rust => &["struct_item", "enum_item", "trait_item"],
+        Language::Python => &["class_definition"],
+        Language::TypeScript | Language::JavaScript => &[
+            "class_declaration",
+            "interface_declaration",
+            "type_alias_declaration",
+        ],
+        Language::Go => &["type_declaration", "type_spec"],
+        Language::Java => &["class_declaration", "interface_declaration", "enum_declaration"],
+        _ => &[],
+    };
+
+    find_node_at_line_by_kinds(root, target_row, type_kinds)
+}
+
+fn find_node_at_line_by_kinds<'a>(
+    node: tree_sitter::Node<'a>,
+    target_row: usize,
+    kinds: &[&str],
+) -> Option<tree_sitter::Node<'a>> {
+    if kinds.contains(&node.kind()) && node.start_position().row == target_row {
+        return Some(node);
+    }
+    // Also match if target is within the node's range (user points at any line)
+    if kinds.contains(&node.kind())
+        && target_row >= node.start_position().row
+        && target_row <= node.end_position().row
+    {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(found) = find_node_at_line_by_kinds(child, target_row, kinds) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn extract_rust_members(node: tree_sitter::Node, source: &str) -> Vec<Member> {
+    let mut members = Vec::new();
+    let mut cursor = node.walk();
+
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "field_declaration_list" => {
+                let mut fc = child.walk();
+                for field in child.children(&mut fc) {
+                    if field.kind() == "field_declaration" {
+                        let vis = extract_rust_visibility(field, source);
+                        let name = get_child_text(field, "field_identifier", source)
+                            .unwrap_or_default();
+                        let type_ann = get_child_text(field, "type_identifier", source)
+                            .or_else(|| get_child_by_kind_text(field, source))
+                            .unwrap_or_default();
+                        members.push(Member {
+                            name,
+                            kind: "field".to_string(),
+                            type_annotation: type_ann,
+                            line: field.start_position().row + 1,
+                            visibility: vis,
+                            default_value: String::new(),
+                        });
+                    }
+                }
+            }
+            "enum_variant_list" => {
+                let mut vc = child.walk();
+                for variant in child.children(&mut vc) {
+                    if variant.kind() == "enum_variant" {
+                        let name = get_child_text(variant, "identifier", source)
+                            .unwrap_or_default();
+                        members.push(Member {
+                            name,
+                            kind: "variant".to_string(),
+                            type_annotation: String::new(),
+                            line: variant.start_position().row + 1,
+                            visibility: "pub".to_string(),
+                            default_value: String::new(),
+                        });
+                    }
+                }
+            }
+            "declaration_list" => {
+                // Trait items (method signatures)
+                let mut dc = child.walk();
+                for item in child.children(&mut dc) {
+                    if item.kind() == "function_item" || item.kind() == "function_signature_item" {
+                        let name = get_child_text(item, "identifier", source)
+                            .unwrap_or_default();
+                        let sig = get_signature_line(item, source);
+                        members.push(Member {
+                            name,
+                            kind: "method".to_string(),
+                            type_annotation: sig,
+                            line: item.start_position().row + 1,
+                            visibility: String::new(),
+                            default_value: String::new(),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    members
+}
+
+fn extract_rust_visibility(node: tree_sitter::Node, source: &str) -> String {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "visibility_modifier" {
+            return child
+                .utf8_text(source.as_bytes())
+                .unwrap_or("pub")
+                .to_string();
+        }
+    }
+    String::new()
+}
+
+fn get_child_by_kind_text(node: tree_sitter::Node, source: &str) -> Option<String> {
+    // For complex types (generic_type, reference_type, etc.), get the full text
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let k = child.kind();
+        if k.ends_with("_type") || k == "generic_type" || k == "scoped_type_identifier" {
+            return Some(
+                child
+                    .utf8_text(source.as_bytes())
+                    .ok()?
+                    .to_string(),
+            );
+        }
+    }
+    None
+}
+
+fn extract_python_members(node: tree_sitter::Node, source: &str) -> Vec<Member> {
+    let mut members = Vec::new();
+    // Look at the class body for assignments and methods
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "block" {
+            let mut bc = child.walk();
+            for stmt in child.children(&mut bc) {
+                match stmt.kind() {
+                    "function_definition" => {
+                        let name = get_child_text(stmt, "identifier", source)
+                            .unwrap_or_default();
+                        let sig = get_signature_line(stmt, source);
+                        members.push(Member {
+                            name,
+                            kind: "method".to_string(),
+                            type_annotation: sig,
+                            line: stmt.start_position().row + 1,
+                            visibility: String::new(),
+                            default_value: String::new(),
+                        });
+                    }
+                    "expression_statement" => {
+                        // Class-level assignments like: name: str = "default"
+                        let text = stmt
+                            .utf8_text(source.as_bytes())
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string();
+                        if let Some(colon_pos) = text.find(':') {
+                            let name = text[..colon_pos].trim().to_string();
+                            let rest = text[colon_pos + 1..].trim();
+                            let (type_ann, default) = if let Some(eq_pos) = rest.find('=') {
+                                (
+                                    rest[..eq_pos].trim().to_string(),
+                                    rest[eq_pos + 1..].trim().to_string(),
+                                )
+                            } else {
+                                (rest.to_string(), String::new())
+                            };
+                            if !name.is_empty()
+                                && !name.contains(' ')
+                                && !name.starts_with('#')
+                            {
+                                members.push(Member {
+                                    name,
+                                    kind: "property".to_string(),
+                                    type_annotation: type_ann,
+                                    line: stmt.start_position().row + 1,
+                                    visibility: String::new(),
+                                    default_value: default,
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    members
+}
+
+fn extract_ts_members(node: tree_sitter::Node, source: &str) -> Vec<Member> {
+    let mut members = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "class_body" || child.kind() == "interface_body"
+            || child.kind() == "object_type"
+        {
+            let mut bc = child.walk();
+            for item in child.children(&mut bc) {
+                match item.kind() {
+                    "method_definition" | "method_signature" => {
+                        let name = get_child_text(item, "property_identifier", source)
+                            .unwrap_or_default();
+                        let sig = get_signature_line(item, source);
+                        members.push(Member {
+                            name,
+                            kind: "method".to_string(),
+                            type_annotation: sig,
+                            line: item.start_position().row + 1,
+                            visibility: extract_ts_visibility(item, source),
+                            default_value: String::new(),
+                        });
+                    }
+                    "public_field_definition" | "property_signature" => {
+                        let name = get_child_text(item, "property_identifier", source)
+                            .unwrap_or_default();
+                        let type_ann = get_child_text(item, "type_annotation", source)
+                            .map(|t| t.trim_start_matches(':').trim().to_string())
+                            .unwrap_or_default();
+                        members.push(Member {
+                            name,
+                            kind: "property".to_string(),
+                            type_annotation: type_ann,
+                            line: item.start_position().row + 1,
+                            visibility: extract_ts_visibility(item, source),
+                            default_value: String::new(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    members
+}
+
+fn extract_ts_visibility(node: tree_sitter::Node, source: &str) -> String {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "accessibility_modifier" {
+            return child
+                .utf8_text(source.as_bytes())
+                .unwrap_or("public")
+                .to_string();
+        }
+    }
+    String::new()
+}
+
+fn extract_go_members(node: tree_sitter::Node, source: &str) -> Vec<Member> {
+    let mut members = Vec::new();
+    let mut cursor = node.walk();
+
+    for child in node.children(&mut cursor) {
+        if child.kind() == "type_spec" {
+            // Recurse into the type_spec to find struct_type or interface_type
+            let mut tc = child.walk();
+            for type_child in child.children(&mut tc) {
+                match type_child.kind() {
+                    "struct_type" => {
+                        let mut fc = type_child.walk();
+                        for field_list in type_child.children(&mut fc) {
+                            if field_list.kind() == "field_declaration_list" {
+                                let mut flc = field_list.walk();
+                                for field in field_list.children(&mut flc) {
+                                    if field.kind() == "field_declaration" {
+                                        let name = get_child_text(field, "field_identifier", source)
+                                            .unwrap_or_default();
+                                        let type_ann = field
+                                            .utf8_text(source.as_bytes())
+                                            .unwrap_or_default()
+                                            .trim()
+                                            .to_string();
+                                        // Remove the name from front to get type
+                                        let type_part = type_ann
+                                            .strip_prefix(&name)
+                                            .unwrap_or(&type_ann)
+                                            .trim()
+                                            .to_string();
+                                        members.push(Member {
+                                            name,
+                                            kind: "field".to_string(),
+                                            type_annotation: type_part,
+                                            line: field.start_position().row + 1,
+                                            visibility: String::new(),
+                                            default_value: String::new(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "interface_type" => {
+                        let mut ic = type_child.walk();
+                        for method_list in type_child.children(&mut ic) {
+                            if method_list.kind() == "method_spec_list" || method_list.kind() == "method_spec" {
+                                let text = method_list
+                                    .utf8_text(source.as_bytes())
+                                    .unwrap_or_default()
+                                    .trim()
+                                    .to_string();
+                                if !text.is_empty() && !text.starts_with('{') && !text.starts_with('}') {
+                                    members.push(Member {
+                                        name: text.split('(').next().unwrap_or("").trim().to_string(),
+                                        kind: "method".to_string(),
+                                        type_annotation: text,
+                                        line: method_list.start_position().row + 1,
+                                        visibility: String::new(),
+                                        default_value: String::new(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    members
+}
+
+// ─── Implementation / Type Hierarchy ────────────────────────────────────────
+
+/// An implementation relationship found in source code.
+#[derive(Debug, Clone)]
+pub struct ImplRelation {
+    /// The trait/interface being implemented
+    pub trait_name: String,
+    /// The type implementing it
+    pub type_name: String,
+    /// File where the impl was found
+    pub file: String,
+    /// Line number of the impl block
+    pub line: usize,
+}
+
+/// Find impl blocks in a Rust source file.
+/// Returns all `impl Trait for Type` relationships.
+pub fn find_rust_impls(source: &str, file_path: &str) -> Vec<ImplRelation> {
+    let mut parser = tree_sitter::Parser::new();
+    let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+    if parser.set_language(&lang).is_err() {
+        return Vec::new();
+    }
+    let tree = match parser.parse(source, None) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let mut impls = Vec::new();
+    collect_rust_impls(tree.root_node(), source, file_path, &mut impls);
+    impls
+}
+
+fn collect_rust_impls(
+    node: tree_sitter::Node,
+    source: &str,
+    file_path: &str,
+    impls: &mut Vec<ImplRelation>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "impl_item" {
+            // Check if this is `impl Trait for Type`
+            let text = child
+                .utf8_text(source.as_bytes())
+                .unwrap_or_default();
+            let first_line = text.lines().next().unwrap_or("");
+
+            if let Some(for_pos) = first_line.find(" for ") {
+                // impl TRAIT for TYPE
+                let before_for = &first_line[..for_pos];
+                let after_for = &first_line[for_pos + 5..];
+
+                let trait_name = before_for
+                    .strip_prefix("impl ")
+                    .unwrap_or(before_for)
+                    .trim()
+                    .split('<')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+
+                let type_name = after_for
+                    .split('{')
+                    .next()
+                    .unwrap_or(after_for)
+                    .split('<')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+
+                if !trait_name.is_empty() && !type_name.is_empty() {
+                    impls.push(ImplRelation {
+                        trait_name,
+                        type_name,
+                        file: file_path.to_string(),
+                        line: child.start_position().row + 1,
+                    });
+                }
+            }
+        }
+        collect_rust_impls(child, source, file_path, impls);
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

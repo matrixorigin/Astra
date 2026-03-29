@@ -463,6 +463,37 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "extract_members",
+                "description": "Extract fields, methods, and variants from a struct/class/enum/interface/trait definition. Returns typed member list with visibility and default values. Useful for understanding type structure, adding missing fields, or generating constructors.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file": {"type": "string", "description": "File containing the type definition"},
+                        "line": {"type": "integer", "description": "Line number within the type definition (any line inside the struct/class/enum)"}
+                    },
+                    "required": ["file", "line"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "type_hierarchy",
+                "description": "Find implementation relationships: what traits/interfaces a type implements, or what types implement a given trait/interface. Searches across the project using AST parsing.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Trait or type name to search for"},
+                        "direction": {"type": "string", "enum": ["implementations", "supertypes"], "description": "implementations: find types that implement this trait. supertypes: find traits this type implements. Default: implementations"},
+                        "include": {"type": "string", "description": "File glob filter e.g. '*.rs' (optional)"}
+                    },
+                    "required": ["name"]
+                }
+            }
+        }),
         // ── Build/Test tool ─────────────────────────────────────────────
         json!({
             "type": "function",
@@ -1142,6 +1173,8 @@ impl ToolExecutor {
             "call_graph" => self.call_graph(args),
             "rename_symbol" => self.rename_symbol(args),
             "dead_code" => self.dead_code(args),
+            "extract_members" => self.extract_members(args),
+            "type_hierarchy" => self.type_hierarchy(args),
             "run_build_test" => self.run_build_test(args),
             "symbols" => self.symbols(args),
             "mo_query" => self.mo_query(args),
@@ -1556,6 +1589,36 @@ impl ToolExecutor {
         }
 
         result
+    }
+
+    fn collect_files_with_glob(&self, root: &std::path::Path, glob_pat: &str, files: &mut Vec<std::path::PathBuf>) {
+        let skip_dirs = ["node_modules", "target", "vendor", "dist", "__pycache__", ".git"];
+        let pat = glob_pat.trim_start_matches('*');
+
+        let mut dirs_to_visit = vec![root.to_path_buf()];
+        while let Some(dir) = dirs_to_visit.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with('.') || skip_dirs.contains(&name_str.as_ref()) {
+                    continue;
+                }
+                let ft = entry.file_type().ok();
+                if ft.map(|t| t.is_dir()).unwrap_or(false) {
+                    dirs_to_visit.push(entry.path());
+                } else if ft.map(|t| t.is_file()).unwrap_or(false) {
+                    let file_name = entry.path().file_name()
+                        .unwrap_or_default().to_string_lossy().to_string();
+                    if file_name.ends_with(pat) {
+                        files.push(entry.path());
+                        if files.len() >= 500 {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Find where a symbol is defined across the codebase using tree-sitter.
@@ -2209,6 +2272,147 @@ impl ToolExecutor {
                 parts.first().and_then(|s| s.parse::<usize>().ok())
             })
             .sum()
+    }
+
+    // ── extract_members tool ─────────────────────────────────────────────────
+
+    fn extract_members(&self, args: &Value) -> String {
+        let file = match args.get("file").and_then(Value::as_str) {
+            Some(f) => match self.resolve_checked(f) {
+                Ok(safe) => safe,
+                Err(e) => return e,
+            },
+            None => return "Error: missing 'file'".to_string(),
+        };
+
+        let line = match args.get("line").and_then(Value::as_u64) {
+            Some(l) => l as usize,
+            None => return "Error: missing 'line'".to_string(),
+        };
+
+        let lang = match code_intel::detect_language(&file) {
+            Some(l) => l,
+            None => {
+                return "Error: unsupported language (supported: rs, py, ts, js, go)".to_string()
+            }
+        };
+
+        let source = match std::fs::read_to_string(&file) {
+            Ok(s) => s,
+            Err(e) => return format!("Error: {e}"),
+        };
+
+        let members = code_intel::extract_members(&source, lang, line);
+
+        if members.is_empty() {
+            return format!("No type definition found at line {line} in {}", file.display());
+        }
+
+        let mut parts = Vec::new();
+        let rel_path = file
+            .strip_prefix(&self.project_root)
+            .unwrap_or(&file)
+            .display();
+        parts.push(format!("Members of type at {}:{}", rel_path, line));
+        parts.push(String::new());
+
+        for m in &members {
+            let vis = if m.visibility.is_empty() {
+                String::new()
+            } else {
+                format!("{} ", m.visibility)
+            };
+            let type_str = if m.type_annotation.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", m.type_annotation)
+            };
+            let default_str = if m.default_value.is_empty() {
+                String::new()
+            } else {
+                format!(" = {}", m.default_value)
+            };
+            parts.push(format!(
+                "  L{:<4} {}{}{}{} ({})",
+                m.line, vis, m.name, type_str, default_str, m.kind
+            ));
+        }
+
+        parts.push(format!("\nTotal: {} members", members.len()));
+        parts.join("\n")
+    }
+
+    // ── type_hierarchy tool ──────────────────────────────────────────────────
+
+    fn type_hierarchy(&self, args: &Value) -> String {
+        let name = match args.get("name").and_then(Value::as_str) {
+            Some(n) if !n.trim().is_empty() => n.trim(),
+            _ => return "Error: missing 'name'".to_string(),
+        };
+        let direction = args
+            .get("direction")
+            .and_then(Value::as_str)
+            .unwrap_or("implementations");
+        let include_glob = args.get("include").and_then(Value::as_str).unwrap_or("*.rs");
+
+        // Collect Rust source files
+        let mut files = Vec::new();
+        self.collect_files_with_glob(&self.project_root, include_glob, &mut files);
+
+        let mut all_impls: Vec<code_intel::ImplRelation> = Vec::new();
+        for file in &files {
+            if let Ok(source) = std::fs::read_to_string(file) {
+                let rel_path = file
+                    .strip_prefix(&self.project_root)
+                    .unwrap_or(file)
+                    .to_string_lossy()
+                    .to_string();
+                let impls = code_intel::find_rust_impls(&source, &rel_path);
+                all_impls.extend(impls);
+            }
+        }
+
+        let mut results: Vec<String> = Vec::new();
+
+        match direction {
+            "supertypes" => {
+                // Find traits that `name` implements
+                results.push(format!("Traits implemented by `{}`:", name));
+                let mut found = false;
+                for imp in &all_impls {
+                    if imp.type_name == name {
+                        results.push(format!(
+                            "  impl {} — {}:{}",
+                            imp.trait_name, imp.file, imp.line
+                        ));
+                        found = true;
+                    }
+                }
+                if !found {
+                    results.push(format!("  (no trait implementations found for `{}`)", name));
+                }
+            }
+            _ => {
+                // Find types that implement `name`
+                results.push(format!("Types implementing `{}`:", name));
+                let mut found = false;
+                for imp in &all_impls {
+                    if imp.trait_name == name {
+                        results.push(format!(
+                            "  {} — {}:{}",
+                            imp.type_name, imp.file, imp.line
+                        ));
+                        found = true;
+                    }
+                }
+                if !found {
+                    results.push(format!("  (no implementations found for `{}`)", name));
+                }
+            }
+        }
+
+        results.push(format!("\nScanned {} files", files.len()));
+        results.join("\n")
     }
 
     fn call_graph(&self, args: &Value) -> String {
@@ -4546,5 +4750,188 @@ fn documented_fn() -> i32 {
         let source = "fn bar() {}\nfn foo() {}\n";
         let doc = code_intel::extract_doc_comment(source, code_intel::Language::Rust, 2);
         assert!(doc.is_empty(), "no doc should be empty: {doc}");
+    }
+
+    // ── extract_members tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn extract_members_rust_struct() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "pub struct Config {\n    pub name: String,\n    pub port: u16,\n    timeout: Option<u64>,\n}\n";
+        std::fs::write(dir.path().join("config.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("extract_members", &json!({
+            "file": "config.rs", "line": 1
+        })).await;
+
+        assert!(result.contains("name"), "should list name field: {result}");
+        assert!(result.contains("port"), "should list port field: {result}");
+        assert!(result.contains("timeout"), "should list timeout field: {result}");
+        assert!(result.contains("3 members"), "should report 3 members: {result}");
+    }
+
+    #[tokio::test]
+    async fn extract_members_rust_enum() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "pub enum Color {\n    Red,\n    Green,\n    Blue,\n}\n";
+        std::fs::write(dir.path().join("color.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("extract_members", &json!({
+            "file": "color.rs", "line": 1
+        })).await;
+
+        assert!(result.contains("Red"), "should list Red: {result}");
+        assert!(result.contains("Blue"), "should list Blue: {result}");
+        assert!(result.contains("variant"), "should report as variant: {result}");
+    }
+
+    #[tokio::test]
+    async fn extract_members_python_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "class User:\n    name: str\n    age: int = 0\n    def greet(self):\n        pass\n";
+        std::fs::write(dir.path().join("user.py"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("extract_members", &json!({
+            "file": "user.py", "line": 1
+        })).await;
+
+        assert!(result.contains("name"), "should list name: {result}");
+        assert!(result.contains("greet"), "should list greet method: {result}");
+    }
+
+    #[tokio::test]
+    async fn extract_members_no_type_at_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "fn main() {\n    println!(\"hello\");\n}\n";
+        std::fs::write(dir.path().join("main.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("extract_members", &json!({
+            "file": "main.rs", "line": 1
+        })).await;
+
+        assert!(result.contains("No type definition"), "should report no type: {result}");
+    }
+
+    #[tokio::test]
+    async fn extract_members_line_inside_struct() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "struct Point {\n    x: f64,\n    y: f64,\n}\n";
+        std::fs::write(dir.path().join("point.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        // Point at line 2 (inside the struct, not at its start)
+        let result = executor.execute("extract_members", &json!({
+            "file": "point.rs", "line": 2
+        })).await;
+
+        assert!(result.contains("x"), "should find members even pointing inside: {result}");
+        assert!(result.contains("y"), "should find y: {result}");
+    }
+
+    // ── type_hierarchy tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn type_hierarchy_finds_implementations() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = r#"trait Serialize {
+    fn serialize(&self) -> String;
+}
+
+struct User { name: String }
+struct Config { port: u16 }
+
+impl Serialize for User {
+    fn serialize(&self) -> String { self.name.clone() }
+}
+
+impl Serialize for Config {
+    fn serialize(&self) -> String { format!("{}", self.port) }
+}
+"#;
+        std::fs::write(dir.path().join("types.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("type_hierarchy", &json!({
+            "name": "Serialize"
+        })).await;
+
+        assert!(result.contains("User"), "should find User impl: {result}");
+        assert!(result.contains("Config"), "should find Config impl: {result}");
+        assert!(result.contains("implementing"), "should say implementing: {result}");
+    }
+
+    #[tokio::test]
+    async fn type_hierarchy_finds_supertypes() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = r#"trait Display {
+    fn display(&self);
+}
+trait Debug {
+    fn debug(&self);
+}
+struct Foo;
+impl Display for Foo {
+    fn display(&self) {}
+}
+impl Debug for Foo {
+    fn debug(&self) {}
+}
+"#;
+        std::fs::write(dir.path().join("foo.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("type_hierarchy", &json!({
+            "name": "Foo",
+            "direction": "supertypes"
+        })).await;
+
+        assert!(result.contains("Display"), "should find Display trait: {result}");
+        assert!(result.contains("Debug"), "should find Debug trait: {result}");
+    }
+
+    #[tokio::test]
+    async fn type_hierarchy_no_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "struct Lonely;\n";
+        std::fs::write(dir.path().join("lonely.rs"), code).unwrap();
+
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.execute("type_hierarchy", &json!({
+            "name": "NonExistent"
+        })).await;
+
+        assert!(result.contains("no implementations"), "should report none: {result}");
+    }
+
+    #[test]
+    fn code_intel_extract_members_rust_trait() {
+        let source = "trait Handler {\n    fn handle(&self);\n    fn reset(&mut self);\n}\n";
+        let members = code_intel::extract_members(source, code_intel::Language::Rust, 1);
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].name, "handle");
+        assert_eq!(members[0].kind, "method");
+        assert_eq!(members[1].name, "reset");
+    }
+
+    #[test]
+    fn code_intel_find_rust_impls() {
+        let source = r#"
+trait Foo {}
+trait Bar {}
+struct MyType;
+impl Foo for MyType {}
+impl Bar for MyType {}
+impl MyType {
+    fn new() -> Self { Self }
+}
+"#;
+        let impls = code_intel::find_rust_impls(source, "src/lib.rs");
+        assert_eq!(impls.len(), 2, "should find 2 trait impls, not inherent: {:?}", impls);
+        assert!(impls.iter().any(|i| i.trait_name == "Foo" && i.type_name == "MyType"));
+        assert!(impls.iter().any(|i| i.trait_name == "Bar" && i.type_name == "MyType"));
     }
 }
