@@ -21,6 +21,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/stats", "Session analytics: turns, tokens, errors"),
     ("/tools", "Tool performance: calls, timing, success rate"),
     ("/health", "Tool health dashboard"),
+    ("/sync", "Cloud sync status across all domains"),
     // ── Advanced ──────────────────────────────────────────────────────────
     ("/doctor", "Run diagnostics"),
     ("/version", "Show version info"),
@@ -308,6 +309,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/resume" => Some("[session_id]"),
         "/stats" => Some("[history]"),
         "/health" => Some("[detail]"),
+        "/sync" => Some("[log]"),
         _ => None,
     }
 }
@@ -813,7 +815,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
         (
             "🔭",
             "Observability",
-            &["/explain", "/turn", "/stats", "/tools", "/health"],
+            &["/explain", "/turn", "/stats", "/tools", "/health", "/sync"],
         ),
         (
             "📋",
@@ -1815,7 +1817,7 @@ mod tests {
         // in SLASH_COMMANDS.
         let groups: &[&[&str]] = &[
             &["/help", "/model", "/clear", "/history", "/copy", "/exit"],
-            &["/explain", "/turn", "/stats", "/tools", "/health"],
+            &["/explain", "/turn", "/stats", "/tools", "/health", "/sync"],
             &["/session", "/resume", "/plan"],
             &["/skill"],
             &["/doctor", "/version"],

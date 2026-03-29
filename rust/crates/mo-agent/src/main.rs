@@ -408,6 +408,8 @@ struct ReplState {
     cloud_learning_version: Option<i64>,
     /// Last turn's journal event — for /turn command display.
     last_turn_event: Option<session_journal::JournalEvent>,
+    /// Unified sync orchestrator — tracks sync state across all domains.
+    sync_orchestrator: Option<mo_agent_services::SyncOrchestrator>,
 }
 
 impl Default for ReplState {
@@ -447,6 +449,7 @@ impl Default for ReplState {
             last_turn_interrupted: false,
             cloud_learning_version: None,
             last_turn_event: None,
+            sync_orchestrator: None,
         }
     }
 }
@@ -1151,6 +1154,141 @@ fn format_sync_age(ts: &str) -> String {
             }
         }
         Err(_) => ts.to_string(), // Fallback: show raw timestamp
+    }
+}
+
+/// Handle `/sync` command — show unified sync state across all domains.
+fn handle_sync_command(arg: &str, state: &ReplState) {
+    let show_log = arg.trim() == "log";
+
+    eprintln!(
+        "\n{}",
+        "─── Sync Engine Status ─────────────────────────".bold()
+    );
+
+    let orch = match &state.sync_orchestrator {
+        Some(o) => o,
+        None => {
+            eprintln!(
+                "  {} {}",
+                "○".dim(),
+                "Sync orchestrator not initialized (no cloud connection)".dim()
+            );
+            eprintln!(
+                "{}",
+                "────────────────────────────────────────────────".dim()
+            );
+            eprintln!();
+            return;
+        }
+    };
+
+    // Cloud availability
+    let cloud_status = if orch.is_cloud_available() {
+        "● Connected".green().to_string()
+    } else {
+        "○ Offline".dim().to_string()
+    };
+    eprintln!("  Cloud: {cloud_status}");
+    eprintln!();
+
+    // Per-domain status
+    eprintln!(
+        "  {:<14} {:<12} {:>8} {:>8} {:>8} {:>8}",
+        "Domain".bold(),
+        "State".bold(),
+        "Pushes".bold(),
+        "Pulls".bold(),
+        "Conflicts".bold(),
+        "Errors".bold(),
+    );
+    let mut domains = orch.status_summary();
+    domains.sort_by_key(|(d, _)| format!("{d}"));
+    for (domain, sync_state) in &domains {
+        let state_str = match sync_state {
+            mo_agent_services::SyncState::Clean => "✓ clean".green().to_string(),
+            mo_agent_services::SyncState::Dirty => "● dirty".yellow().to_string(),
+            mo_agent_services::SyncState::Syncing => "↻ syncing".cyan().to_string(),
+            mo_agent_services::SyncState::Pulling => "↓ pulling".cyan().to_string(),
+            mo_agent_services::SyncState::Conflict { .. } => "⚠ conflict".red().to_string(),
+            mo_agent_services::SyncState::Error { retry_count, .. } => {
+                format!("✗ error({})", retry_count).red().to_string()
+            }
+        };
+        let stats = orch.domain_stats(*domain).unwrap_or_default();
+        eprintln!(
+            "  {:<14} {:<12} {:>8} {:>8} {:>8} {:>8}",
+            format!("{domain}").cyan(),
+            state_str,
+            stats.pushes,
+            stats.pulls,
+            stats.conflicts,
+            stats.errors,
+        );
+    }
+
+    // Sync event log
+    if show_log {
+        let events = orch.event_log();
+        if events.is_empty() {
+            eprintln!("\n  {}", "No sync events yet.".dim());
+        } else {
+            eprintln!(
+                "\n{}",
+                "─── Sync Event Log ─────────────────────────────".bold()
+            );
+            eprintln!(
+                "  {:<10} {:<12} {:<8} {:>8} {:>10}",
+                "Domain".bold(),
+                "Operation".bold(),
+                "Result".bold(),
+                "Duration".bold(),
+                "Bytes".bold(),
+            );
+            for event in events.iter().rev().take(20) {
+                let op_str = format!("{:?}", event.operation).to_lowercase();
+                let result = if event.success {
+                    "✓ ok".green().to_string()
+                } else {
+                    event
+                        .error
+                        .as_deref()
+                        .unwrap_or("fail")
+                        .red()
+                        .to_string()
+                };
+                eprintln!(
+                    "  {:<10} {:<12} {:<8} {:>6}ms {:>10}",
+                    format!("{}", event.domain),
+                    op_str,
+                    result,
+                    event.duration_ms,
+                    if event.bytes_transferred > 0 {
+                        format_bytes(event.bytes_transferred)
+                    } else {
+                        "-".to_string()
+                    },
+                );
+            }
+        }
+    } else {
+        eprintln!("\n  {}", "Use /sync log for event history.".dim());
+    }
+
+    eprintln!(
+        "{}",
+        "────────────────────────────────────────────────".dim()
+    );
+    eprintln!();
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{}B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 
@@ -2248,6 +2386,10 @@ async fn handle_slash_command(
             handle_health_command(arg, state).await;
         }
 
+        "/sync" => {
+            handle_sync_command(arg, state);
+        }
+
         "/exit" | "/quit" => {
             eprintln!("{}", "  Goodbye.".dim());
             return Ok(true);
@@ -2372,6 +2514,53 @@ async fn run_chat_repl(
     state.tool_health_entries = cross_session_health_entries.clone();
     if state.synced_tool_health_entries.is_empty() {
         state.synced_tool_health_entries = cross_session_health_entries;
+    }
+
+    // ── Initialize unified sync orchestrator ───────────────────────────────
+    {
+        use mo_agent_services::DomainAdapter as _;
+        let transport: std::sync::Arc<dyn mo_agent_services::CloudTransport> =
+            if let Some(ref pool) = state.matrixone_pool {
+                let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(
+                    pool.as_ref().clone(),
+                );
+                std::sync::Arc::new(sync_adapters::MatrixOneTransport::new(
+                    std::sync::Arc::new(svc),
+                    profile.unwrap_or("default"),
+                ))
+            } else {
+                std::sync::Arc::new(mo_agent_services::NoopTransport)
+            };
+        let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+        let mut orch = mo_agent_services::SyncOrchestrator::new(transport, user_id);
+
+        // Register Learning adapter
+        let learning_adapter = sync_adapters::LearningAdapter::new(
+            pipeline_modules.entity_graph.clone(),
+            pipeline_modules.pattern_library.clone(),
+            pipeline_modules.calibrator.clone(),
+            std::sync::Arc::new(std::sync::Mutex::new(state.tool_health_entries.clone())),
+        );
+        // Set initial envelope state from cloud pull
+        if let Some(v) = state.cloud_learning_version {
+            let mut env = learning_adapter.envelope();
+            env.mark_pulled(v as u64);
+            learning_adapter.set_envelope(env);
+        }
+        orch.register(
+            Box::new(learning_adapter),
+            mo_agent_services::SyncPolicy::learning(),
+        );
+
+        // Register Event adapter
+        let event_adapter =
+            sync_adapters::EventAdapter::new(state.ingestion_sender.clone());
+        orch.register(
+            Box::new(event_adapter),
+            mo_agent_services::SyncPolicy::events(),
+        );
+
+        state.sync_orchestrator = Some(orch);
     }
 
     let profile_name_str = profile.unwrap_or("default").to_string();
@@ -2585,6 +2774,18 @@ async fn run_chat_repl(
                         .await
                         {
                             state.cloud_learning_version = Some(new_version);
+                            // Update orchestrator envelope to reflect the push
+                            if let Some(ref orch) = state.sync_orchestrator {
+                                if let Some(mut env) =
+                                    orch.envelope(mo_agent_services::SyncDomain::Learning)
+                                {
+                                    env.mark_synced(new_version as u64);
+                                    orch.update_envelope(
+                                        mo_agent_services::SyncDomain::Learning,
+                                        env,
+                                    );
+                                }
+                            }
                         }
                         // On conflict, we skip this push — the final push at session end
                         // will resolve conflicts via pull-merge-push cycle

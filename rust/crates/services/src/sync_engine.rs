@@ -942,6 +942,42 @@ impl SyncOrchestrator {
         self.cloud_available
     }
 
+    /// Update the sync envelope for a domain from an external sync operation.
+    /// Used when legacy sync functions (try_cloud_push, etc.) succeed and need
+    /// to reflect their state into the orchestrator's tracking.
+    pub fn update_envelope(&self, domain: SyncDomain, envelope: SyncEnvelope) {
+        if let Some(adapter) = self.adapters.get(&domain) {
+            adapter.set_envelope(envelope);
+        }
+    }
+
+    /// Record an external sync event in the log.
+    /// Used when legacy sync functions complete and need to be tracked.
+    pub fn log_external_event(
+        &mut self,
+        domain: SyncDomain,
+        op: SyncOperation,
+        success: bool,
+        duration_ms: u64,
+        bytes: u64,
+        error: Option<&str>,
+    ) {
+        if self.event_log.len() >= 100 {
+            self.event_log.remove(0);
+        }
+        self.event_log.push(SyncEvent {
+            domain,
+            operation: op,
+            success,
+            duration_ms,
+            bytes_transferred: bytes,
+            version_before: None,
+            version_after: None,
+            error: error.map(|s| s.to_string()),
+            timestamp: epoch_secs(),
+        });
+    }
+
     fn log_event(
         &mut self,
         domain: SyncDomain,
