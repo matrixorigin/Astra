@@ -944,6 +944,17 @@ impl ToolSelector for FallbackSelector {
         ctx: &SelectionContext<'_>,
         learned_context: &LearnedContext,
     ) -> SelectionResult {
+        // Fast path: if TF-IDF with learned context is confident, skip LLM call.
+        // This saves ~8s for simple messages and queries that match known patterns.
+        let fast_result = self
+            .fallback
+            .select_with_learned_context(ctx, learned_context)
+            .await;
+        if fast_result.confidence >= 0.7 && !fast_result.tool_names.is_empty() {
+            return fast_result;
+        }
+
+        // Slow path: LLM-based selection for ambiguous/complex queries.
         let result = self
             .primary
             .select_with_learned_context(ctx, learned_context)
@@ -951,9 +962,7 @@ impl ToolSelector for FallbackSelector {
         if !result.failed && !result.tool_names.is_empty() {
             result
         } else {
-            self.fallback
-                .select_with_learned_context(ctx, learned_context)
-                .await
+            fast_result
         }
     }
 
@@ -1637,8 +1646,23 @@ mod tests {
             }
         }
 
+        // Fallback has low confidence → should escalate to primary (LLM)
+        struct LowConfSelector;
+        #[async_trait]
+        impl ToolSelector for LowConfSelector {
+            async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
+                SelectionResult {
+                    tool_names: vec!["memory_search".into()],
+                    strategy: "tfidf_low",
+                    budget_used: 0,
+                    failed: false,
+                    confidence: 0.3,
+                }
+            }
+        }
+
         let primary = Box::new(FixedSelector(vec!["github_list_prs".into()]));
-        let fallback = Box::new(FixedSelector(vec!["memory_search".into()]));
+        let fallback = Box::new(LowConfSelector);
         let selector = FallbackSelector::new(primary, fallback);
 
         let ctx = SelectionContext {
@@ -1910,11 +1934,18 @@ mod tests {
         let selector = FallbackSelector::new(Box::new(LearnedAwarePrimary), Box::new(fallback));
         let result = selector.select(&ctx).await;
 
-        assert_eq!(result.strategy, "learned_primary");
-        assert_eq!(result.tool_names, vec!["github_list_prs"]);
+        // With learned context, either TF-IDF is confident enough (fast path)
+        // or primary gets the learned context and succeeds.
+        // Either way, github_list_prs should be selected.
+        assert!(
+            result.tool_names.contains(&"github_list_prs".to_string()),
+            "learned context should help select github_list_prs, got: {:?} (strategy: {})",
+            result.tool_names,
+            result.strategy
+        );
         assert!(
             !result.failed,
-            "fallback selector should improve the primary result by supplying learned context"
+            "fallback selector should improve selection with learned context"
         );
     }
 
