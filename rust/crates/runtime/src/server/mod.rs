@@ -30,6 +30,7 @@ mod router_builder;
 mod run_handlers;
 mod session_handlers;
 mod state_builder;
+mod task_handlers;
 mod ws_handler;
 mod platform_handlers;
 

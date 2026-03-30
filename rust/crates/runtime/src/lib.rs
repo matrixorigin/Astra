@@ -137,6 +137,10 @@ pub use mo_agent_services::{
     },
     sandbox::{DatabaseSandboxService, SandboxRecord, SandboxService, UnconfiguredSandboxService},
     session_journal,
+    task_orchestrator::{
+        MatrixOneTaskService, TaskCreateRequest, TaskRecord, TaskService, TaskStatus,
+        UnconfiguredTaskService,
+    },
     skill_config::{
         DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,
     },

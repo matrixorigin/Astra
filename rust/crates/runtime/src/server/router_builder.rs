@@ -420,6 +420,23 @@ pub(super) fn build_router(state: AppState) -> Router {
         )
         // Run list
         .route("/runs", get(run_handlers::list_runs_handler))
+        // Tasks / Plans
+        .route(
+            "/tasks",
+            get(task_handlers::list_tasks_handler).post(task_handlers::create_task_handler),
+        )
+        .route(
+            "/tasks/{task_id}",
+            get(task_handlers::get_task_handler),
+        )
+        .route(
+            "/tasks/{task_id}/progress",
+            get(task_handlers::task_progress_handler),
+        )
+        .route(
+            "/tasks/{task_id}/status",
+            axum::routing::put(task_handlers::update_task_status_handler),
+        )
         .route(
             "/introspection/skills",
             get(introspection::get_skills_introspection_handler),
@@ -504,6 +521,7 @@ mod tests {
             ("workflows", "/workflows"),
             ("platform", "/platform/"),
             ("runs", "/runs"),
+            ("tasks", "/tasks"),
         ];
         for (group, prefix) in groups {
             assert!(
@@ -527,6 +545,7 @@ mod tests {
             "ws_handler::",
             "reflect_handlers::",
             "platform_handlers::",
+            "task_handlers::",
         ];
         for module in &modules {
             assert!(

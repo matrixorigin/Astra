@@ -60,6 +60,7 @@ pub struct AppState {
     pub(crate) turn_observer_worker: Arc<dyn TurnObserverWorker>,
     pub(crate) turn_auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
     pub(crate) turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
+    pub(crate) task_service: Arc<dyn TaskService>,
     pub(crate) run_lifecycle_service: Arc<dyn RunLifecycleService>,
     pub(crate) admin_authorizer: Arc<dyn AdminAuthorizer>,
     pub(crate) admin_initializer: Arc<dyn AdminInitializer>,
@@ -119,6 +120,7 @@ impl AppState {
             turn_observer_worker: Arc::new(NoopTurnObserverWorker),
             turn_auxiliary_event_writer: Arc::new(NoopTurnAuxiliaryEventWriter),
             turn_session_activity_writer: Arc::new(NoopTurnSessionActivityWriter),
+            task_service: Arc::new(UnconfiguredTaskService),
             run_lifecycle_service: Arc::new(UnconfiguredRunLifecycleService),
             admin_authorizer: Arc::new(auth::UnconfiguredAdminAuthorizer),
             admin_initializer: Arc::new(auth::UnconfiguredAdminInitializer),
@@ -372,6 +374,11 @@ impl AppState {
         run_lifecycle_service: Arc<dyn RunLifecycleService>,
     ) -> Self {
         self.run_lifecycle_service = run_lifecycle_service;
+        self
+    }
+
+    pub fn with_task_service(mut self, task_service: Arc<dyn TaskService>) -> Self {
+        self.task_service = task_service;
         self
     }
 

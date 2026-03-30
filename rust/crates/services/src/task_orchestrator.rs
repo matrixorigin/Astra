@@ -1373,6 +1373,60 @@ impl TaskService for LocalTaskService {
     }
 }
 
+// ─── Unconfigured Fallback ──────────────────────────────────────────────────
+
+/// Placeholder service used when no database or local backend is wired.
+pub struct UnconfiguredTaskService;
+
+#[async_trait]
+impl TaskService for UnconfiguredTaskService {
+    async fn create_task(&self, _: &str, _: &str, _: TaskCreateRequest) -> Result<String, String> {
+        Err("task service not configured".into())
+    }
+    async fn get_task(&self, _: &str) -> Result<Option<TaskRecord>, String> {
+        Err("task service not configured".into())
+    }
+    async fn list_tasks(&self, _: &str, _: Option<TaskStatus>) -> Result<Vec<TaskRecord>, String> {
+        Err("task service not configured".into())
+    }
+    async fn update_status(&self, _: &str, _: TaskStatus) -> Result<(), String> {
+        Err("task service not configured".into())
+    }
+    async fn update_progress(&self, _: &str, _: u32, _: u32, _: u32) -> Result<(), String> {
+        Err("task service not configured".into())
+    }
+    async fn save_checkpoint(&self, _: &str, _: &TaskCheckpoint) -> Result<(), String> {
+        Err("task service not configured".into())
+    }
+    async fn update_plan(&self, _: &str, _: &TaskPlan) -> Result<(), String> {
+        Err("task service not configured".into())
+    }
+    async fn fail_task(&self, _: &str, _: &str) -> Result<(), String> {
+        Err("task service not configured".into())
+    }
+    async fn complete_task(&self, _: &str) -> Result<(), String> {
+        Err("task service not configured".into())
+    }
+    async fn record_feedback(&self, _: &str, _: u8, _: TaskOutcome, _: Option<i32>) -> Result<(), String> {
+        Err("task service not configured".into())
+    }
+    async fn increment_replan_count(&self, _: &str) -> Result<(), String> {
+        Err("task service not configured".into())
+    }
+    async fn extract_template(&self, _: &str, _: &str) -> Result<Option<String>, String> {
+        Err("task service not configured".into())
+    }
+    async fn recommend_templates(&self, _: &str, _: &str, _: Option<&str>, _: usize) -> Result<Vec<TemplateRecommendation>, String> {
+        Err("task service not configured".into())
+    }
+    async fn get_learning_stats(&self, _: &str, _: &str) -> Result<LearningStats, String> {
+        Err("task service not configured".into())
+    }
+    async fn record_template_usage(&self, _: &str) -> Result<(), String> {
+        Err("task service not configured".into())
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

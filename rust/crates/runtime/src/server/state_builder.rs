@@ -138,7 +138,10 @@ pub(super) async fn build_server_state(
     .with_admin_user_role_manager(Arc::new(DatabaseAdminUserRoleManager::new(
         settings.matrixone.clone(),
     )))
-    .with_turn_learning_writer(learning_writer.clone());
+    .with_turn_learning_writer(learning_writer.clone())
+    .with_task_service(Arc::new(
+        MatrixOneTaskService::from_shared(&shared_pool),
+    ));
 
     // Wire chat turn bridge: prefer explicit URL override, fall back to in-process Rust impl.
     // Note: with_chat_turn_bridge_url auto-wires the learning writer from AppState.

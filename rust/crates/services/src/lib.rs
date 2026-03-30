@@ -125,7 +125,7 @@ pub use sync_engine::{
 };
 pub use task_orchestrator::{
     LocalTaskService, MatrixOneTaskService, SubtaskPlan, TaskCheckpoint, TaskCreateRequest,
-    TaskOutcome, TaskPlan, TaskRecord, TaskService, TaskStatus,
+    TaskOutcome, TaskPlan, TaskRecord, TaskService, TaskStatus, UnconfiguredTaskService,
 };
 pub use triggers::{
     DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService,
