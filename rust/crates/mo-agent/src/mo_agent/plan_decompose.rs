@@ -174,24 +174,22 @@ pub fn analyze_project(root: &Path) -> ProjectContext {
         ctx.test_framework = Some("go test".into());
     }
 
-    // Detect git branch and status
-    let head_file = root.join(".git").join("HEAD");
-    if let Ok(head) = std::fs::read_to_string(&head_file) {
-        if let Some(branch) = head.trim().strip_prefix("ref: refs/heads/") {
-            ctx.git_branch = Some(branch.to_string());
+    // Detect git branch and status (supports worktrees)
+    let git_dir = resolve_git_dir(root);
+    if let Some(ref gd) = git_dir {
+        let head_file = gd.join("HEAD");
+        if let Ok(head) = std::fs::read_to_string(&head_file) {
+            if let Some(branch) = head.trim().strip_prefix("ref: refs/heads/") {
+                ctx.git_branch = Some(branch.to_string());
+            }
         }
 
-        // Check for uncommitted changes by looking at git index
-        let git_dir = root.join(".git");
-        if git_dir.exists() {
-            // Simple heuristic: check if index file exists and has recent mtime
-            let index_file = git_dir.join("index");
-            ctx.has_uncommitted_changes = index_file.exists();
+        // Simple heuristic: check if index file exists
+        let index_file = gd.join("index");
+        ctx.has_uncommitted_changes = index_file.exists();
 
-            // Count dirty files by checking worktree against index (simplified)
-            // This is a fast approximation - not as accurate as `git status`
-            ctx.git_dirty_count = count_dirty_files(root);
-        }
+        // Count dirty files by checking worktree against index (simplified)
+        ctx.git_dirty_count = count_dirty_files(root);
     }
 
     // Count test files
@@ -316,6 +314,24 @@ fn count_test_files_in_src(dir: &Path, max_depth: usize) -> usize {
         count
     }
     inner(dir, 0, max_depth)
+}
+
+/// Resolve the actual git directory path.
+/// Handles both regular repos (.git is a directory) and worktrees (.git is a file pointing to the actual git dir).
+fn resolve_git_dir(root: &Path) -> Option<std::path::PathBuf> {
+    let git_path = root.join(".git");
+    if git_path.is_dir() {
+        return Some(git_path);
+    }
+    // Worktree: .git is a file containing "gitdir: /path/to/.git/worktrees/name"
+    if git_path.is_file() {
+        if let Ok(content) = std::fs::read_to_string(&git_path) {
+            if let Some(gd) = content.trim().strip_prefix("gitdir: ") {
+                return Some(std::path::PathBuf::from(gd));
+            }
+        }
+    }
+    None
 }
 
 /// Simple heuristic to count dirty files (not as accurate as git status).
