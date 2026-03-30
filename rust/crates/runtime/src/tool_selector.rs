@@ -945,33 +945,27 @@ impl ToolSelector for FallbackSelector {
         learned_context: &LearnedContext,
     ) -> SelectionResult {
         // Fast path: if TF-IDF with learned context is confident, skip LLM call.
-        // This saves ~8s for simple messages and queries that match known patterns.
         let fast_result = self
             .fallback
             .select_with_learned_context(ctx, learned_context)
             .await;
 
-        // TF-IDF confident with tools → use directly
-        if fast_result.confidence >= 0.7 && !fast_result.tool_names.is_empty() {
-            return fast_result;
-        }
-
-        // TF-IDF says "conversational / no tools needed" → trust it, don't waste
-        // 8s on LLM selector that will also return nothing for "hi", "thanks", etc.
-        // Check: no dynamic tools selected (only pinned defaults like bash/read_file).
-        if fast_result.confidence >= 0.5 {
-            return fast_result;
-        }
         let has_dynamic_tools = fast_result.tool_names.iter().any(|n| {
             !crate::tool_registry::TOOL_CATALOG
                 .iter()
                 .any(|t| t.pinned && t.name == n.as_str())
         });
+
+        // High confidence with dynamic tools → trust TF-IDF
+        if fast_result.confidence >= 0.7 && has_dynamic_tools {
+            return fast_result;
+        }
+        // No dynamic tools (conversational / pinned-only) → no point asking LLM
         if !has_dynamic_tools {
             return fast_result;
         }
 
-        // Slow path: TF-IDF uncertain about which tools → ask LLM.
+        // Low/mid confidence WITH dynamic tools → ask LLM for better selection.
         let result = self
             .primary
             .select_with_learned_context(ctx, learned_context)
