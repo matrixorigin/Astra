@@ -478,37 +478,58 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
     // If no session_id given, list and let user pick
     let effective_arg;
     if arg.is_empty() {
-        // Try cloud sessions first, fallback to local journals
-        let mut cloud_sessions = svc
+        // Merge cloud + local sessions, deduplicate, sort by recency
+        let cloud_sessions = svc
             .list_resumable_sessions(user_id)
             .await
             .unwrap_or_default();
+        let local_ids = session_journal::list_sessions_by_time(20).unwrap_or_default();
 
-        // Fallback: merge local journal sessions not already in cloud list
-        if let Ok(local_ids) = session_journal::list_sessions_by_time(10) {
-            let cloud_ids: std::collections::HashSet<_> = cloud_sessions
-                .iter()
-                .map(|s| s.session_id.clone())
-                .collect();
-            for sid in local_ids.into_iter().rev() {
-                if !cloud_ids.contains(&sid) {
-                    cloud_sessions.push(mo_agent_services::session_restore::RestoredSession {
-                        session_id: sid,
-                        turn_count: 0,
-                        last_status: "local".to_string(),
-                        title: None,
-                        ..Default::default()
-                    });
+        // Build merged map: session_id → RestoredSession (cloud wins on metadata)
+        let mut merged: std::collections::HashMap<
+            String,
+            mo_agent_services::session_restore::RestoredSession,
+        > = std::collections::HashMap::new();
+
+        // Insert local sessions first (lower priority)
+        for sid in &local_ids {
+            merged.entry(sid.clone()).or_insert_with(|| {
+                mo_agent_services::session_restore::RestoredSession {
+                    session_id: sid.clone(),
+                    turn_count: 0,
+                    last_status: "local".to_string(),
+                    ..Default::default()
                 }
-            }
+            });
         }
 
-        if cloud_sessions.is_empty() {
+        // Cloud sessions override local (richer metadata: title, turn_count, status)
+        for s in cloud_sessions {
+            merged.insert(s.session_id.clone(), s);
+        }
+
+        // Sort by local file order (newest first), cloud-only sessions appended at front
+        let mut result: Vec<_> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        // Local order first (already sorted by mtime)
+        for sid in &local_ids {
+            if let Some(s) = merged.remove(sid) {
+                seen.insert(sid.clone());
+                result.push(s);
+            }
+        }
+        // Remaining cloud-only sessions at the front (they're newer if not local)
+        let mut cloud_only: Vec<_> = merged.into_values().collect();
+        cloud_only.sort_by(|a, b| b.turn_count.cmp(&a.turn_count));
+        result.splice(0..0, cloud_only);
+
+        if result.is_empty() {
             eprintln!("{}", "  No resumable sessions found.".dim());
             return;
         }
 
-        let sessions = &cloud_sessions[..cloud_sessions.len().min(10)];
+        let sessions = &result[..result.len().min(10)];
         eprintln!(
             "\n{}",
             "─── Resumable Sessions ──────────────────────────".bold()
@@ -520,13 +541,20 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             } else {
                 format!(" {title}")
             };
+            let source = if s.restored_from_cloud {
+                "cloud"
+            } else if s.last_status == "local" {
+                "local"
+            } else {
+                &s.last_status
+            };
             eprintln!(
                 "  {}  {}{}  ({} turns, {})",
                 format!("[{}]", i + 1).cyan().bold(),
                 s.session_id.as_str().cyan(),
                 title_part,
                 s.turn_count,
-                s.last_status.as_str().dim(),
+                source.dim(),
             );
         }
         eprintln!();
