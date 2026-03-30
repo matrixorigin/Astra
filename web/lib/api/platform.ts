@@ -1,10 +1,14 @@
-import { apiFetch, getWebDataMode, type WebDataMode } from '@/lib/api/client';
-import { mockPlatformSnapshot } from '@/lib/api/mock-data';
+import { apiFetch, apiPost, getWebDataMode, type WebDataMode } from '@/lib/api/client';
+import { mockPlatformSnapshot, mockRunList } from '@/lib/api/mock-data';
 import type {
   AgentSummary,
   EventSummary,
   HealthSummary,
   OverviewData,
+  RunListData,
+  RunSummary,
+  SessionActivityData,
+  SessionActivityEntry,
   SessionSummary,
 } from '@/lib/models/platform';
 
@@ -68,6 +72,42 @@ type ApiReflectResponse = {
   report?: string;
   summary?: string;
   diagnosis?: string;
+};
+
+type ApiPlatformSnapshot = {
+  health: ApiHealthResponse;
+  agents: ApiAgentListResponse;
+  sessions: ApiSessionListResponse;
+  events: ApiEventListResponse;
+  timestamp: string;
+};
+
+type ApiRunStatus = {
+  run_id: string;
+  session_id: string;
+  status: string;
+  waiting_for?: string;
+  events_count: number;
+};
+
+type ApiRunListResponse = {
+  runs: ApiRunStatus[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+type ApiSessionActivityEntry = {
+  log_id: string;
+  action: string;
+  details: unknown;
+  created_at: string;
+};
+
+type ApiSessionActivityResponse = {
+  session_id: string;
+  activities: ApiSessionActivityEntry[];
+  total: number;
 };
 
 function readStringArray(value: unknown): string[] {
@@ -171,6 +211,18 @@ export async function getOverviewData(): Promise<OverviewData> {
     return mockPlatformSnapshot;
   }
 
+  // Try the aggregated snapshot endpoint first (single round-trip).
+  try {
+    const snapshot = await apiFetch<ApiPlatformSnapshot>('/platform/snapshot');
+    const health = normalizeHealth(snapshot.health);
+    const agents = snapshot.agents.agents.map(normalizeAgent);
+    const sessions = snapshot.sessions.sessions.map(normalizeSession);
+    const events = snapshot.events.events.map(normalizeEvent);
+    return buildOverviewData(health, agents, sessions, events);
+  } catch {
+    // Fall back to individual endpoints if snapshot is unavailable.
+  }
+
   const [health, agents, sessions, events] = await Promise.all([
     apiFetch<ApiHealthResponse>('/health'),
     apiFetch<ApiAgentListResponse>('/agents'),
@@ -253,5 +305,77 @@ export async function getSessionWorkspace(sessionId: string): Promise<{
     events: events.events.map(normalizeEvent),
     reflection: reflectionText,
     reflectionError: reflectionResult.ok ? undefined : reflectionResult.error,
+  };
+}
+
+// ── Run list ────────────────────────────────────────────────────────────────
+
+function normalizeRun(run: ApiRunStatus): RunSummary {
+  return {
+    runId: run.run_id,
+    sessionId: run.session_id,
+    status: run.status,
+    waitingFor: run.waiting_for,
+    eventsCount: run.events_count,
+  };
+}
+
+export async function getRuns(limit = 50, offset = 0): Promise<RunListData> {
+  if ((await getWebDataMode()) === 'demo') {
+    return mockRunList;
+  }
+
+  const response = await apiFetch<ApiRunListResponse>(`/runs?limit=${limit}&offset=${offset}`);
+  return {
+    runs: response.runs.map(normalizeRun),
+    total: response.total,
+    limit: response.limit,
+    offset: response.offset,
+  };
+}
+
+// ── Session actions ─────────────────────────────────────────────────────────
+
+export async function resumeSession(sessionId: string): Promise<SessionSummary> {
+  const response = await apiPost<ApiSession>(`/sessions/${sessionId}/resume`);
+  return normalizeSession(response);
+}
+
+export async function cancelSession(sessionId: string): Promise<SessionSummary> {
+  const response = await apiPost<ApiSession>(`/sessions/${sessionId}/cancel`);
+  return normalizeSession(response);
+}
+
+export async function closeSession(sessionId: string): Promise<SessionSummary> {
+  const response = await apiPost<ApiSession>(`/sessions/${sessionId}/close`);
+  return normalizeSession(response);
+}
+
+// ── Session activity audit ──────────────────────────────────────────────────
+
+function normalizeActivityEntry(entry: ApiSessionActivityEntry): SessionActivityEntry {
+  return {
+    logId: entry.log_id,
+    action: entry.action,
+    details: entry.details,
+    createdAt: entry.created_at,
+  };
+}
+
+export async function getSessionActivity(
+  sessionId: string,
+  limit = 100,
+): Promise<SessionActivityData> {
+  if ((await getWebDataMode()) === 'demo') {
+    return { sessionId, activities: [], total: 0 };
+  }
+
+  const response = await apiFetch<ApiSessionActivityResponse>(
+    `/sessions/${sessionId}/activity?limit=${limit}`,
+  );
+  return {
+    sessionId: response.session_id,
+    activities: response.activities.map(normalizeActivityEntry),
+    total: response.total,
   };
 }

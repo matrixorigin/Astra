@@ -1,10 +1,95 @@
 'use client';
 
 import Link from 'next/link';
-import { useMemo, useState } from 'react';
+import { useMemo, useState, useTransition } from 'react';
 import type { SessionSummary } from '@/lib/models/platform';
+import {
+  resumeSessionAction,
+  cancelSessionAction,
+  closeSessionAction,
+} from '@/lib/actions/session-actions';
 
-export function SessionsTableClient({ sessions }: { sessions: SessionSummary[] }) {
+function SessionActionButtons({
+  session,
+  demoMode,
+}: {
+  session: SessionSummary;
+  demoMode: boolean;
+}) {
+  const [isPending, startTransition] = useTransition();
+  const [message, setMessage] = useState<string | null>(null);
+
+  const handleAction = (action: (id: string) => Promise<{ ok: boolean; error?: string }>) => {
+    setMessage(null);
+    startTransition(async () => {
+      const result = await action(session.id);
+      if (!result.ok) {
+        setMessage(result.error ?? 'Action failed');
+      }
+    });
+  };
+
+  const canResume = session.status === 'paused' || session.status === 'waiting';
+  const canCancel =
+    session.status === 'active' || session.status === 'paused' || session.status === 'waiting';
+  const canClose = session.status !== 'closed' && session.status !== 'cancelled';
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <Link
+        href={`/sessions/${session.id}`}
+        className="rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-200 hover:border-sky-400/40 hover:text-sky-300"
+      >
+        Details
+      </Link>
+      <Link
+        href={`/workspace?sessionId=${session.id}`}
+        className="rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-200 hover:border-sky-400/40 hover:text-sky-300"
+      >
+        Workspace
+      </Link>
+      {!demoMode && canResume ? (
+        <button
+          type="button"
+          disabled={isPending}
+          onClick={() => handleAction(resumeSessionAction)}
+          className="rounded-full border border-emerald-700/60 px-3 py-1 text-xs text-emerald-300 hover:border-emerald-500 hover:text-emerald-200 disabled:opacity-50"
+        >
+          {isPending ? '…' : 'Resume'}
+        </button>
+      ) : null}
+      {!demoMode && canCancel ? (
+        <button
+          type="button"
+          disabled={isPending}
+          onClick={() => handleAction(cancelSessionAction)}
+          className="rounded-full border border-amber-700/60 px-3 py-1 text-xs text-amber-300 hover:border-amber-500 hover:text-amber-200 disabled:opacity-50"
+        >
+          {isPending ? '…' : 'Cancel'}
+        </button>
+      ) : null}
+      {!demoMode && canClose ? (
+        <button
+          type="button"
+          disabled={isPending}
+          onClick={() => handleAction(closeSessionAction)}
+          className="rounded-full border border-red-700/60 px-3 py-1 text-xs text-red-300 hover:border-red-500 hover:text-red-200 disabled:opacity-50"
+        >
+          {isPending ? '…' : 'Close'}
+        </button>
+      ) : null}
+      {message ? <span className="text-xs text-red-400">{message}</span> : null}
+    </div>
+  );
+}
+
+export function SessionsTableClient({
+  sessions,
+  demoMode = false,
+}: {
+  sessions: SessionSummary[];
+  demoMode?: boolean;
+}) {
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
 
@@ -69,20 +154,7 @@ export function SessionsTableClient({ sessions }: { sessions: SessionSummary[] }
                 <td className="px-4 py-4 text-slate-300">{session.eventCount}</td>
                 <td className="px-4 py-4 text-slate-300">{session.updatedAt ?? session.createdAt}</td>
                 <td className="px-4 py-4">
-                  <div className="flex flex-wrap gap-2">
-                    <Link
-                      href={`/sessions/${session.id}`}
-                      className="rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-200 hover:border-sky-400/40 hover:text-sky-300"
-                    >
-                      Details
-                    </Link>
-                    <Link
-                      href={`/workspace?sessionId=${session.id}`}
-                      className="rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-200 hover:border-sky-400/40 hover:text-sky-300"
-                    >
-                      Workspace
-                    </Link>
-                  </div>
+                  <SessionActionButtons session={session} demoMode={demoMode} />
                 </td>
               </tr>
             ))}

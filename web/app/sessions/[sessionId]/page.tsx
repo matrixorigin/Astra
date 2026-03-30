@@ -1,10 +1,11 @@
 import Link from 'next/link';
 import { getWebConfigurationMessage } from '@/lib/api/client';
-import { getSessionWorkspace } from '@/lib/api/platform';
+import { getSessionWorkspace, getSessionActivity } from '@/lib/api/platform';
 import { SectionCard } from '@/components/dashboard/section-card';
 import { StatusCallout } from '@/components/dashboard/status-callout';
 import { EventLogViewer } from '@/components/events/event-log-viewer';
 import { SessionFlowGraph } from '@/components/graph/session-flow-graph';
+import { SessionDetailActions } from '@/components/sessions/session-detail-actions';
 import { getRuntimeConfig } from '@/lib/runtime-config';
 
 export const dynamic = 'force-dynamic';
@@ -30,7 +31,10 @@ export default async function SessionDetailPage({
   }
 
   const { sessionId } = await params;
-  const workspace = await getSessionWorkspace(sessionId);
+  const [workspace, activity] = await Promise.all([
+    getSessionWorkspace(sessionId),
+    getSessionActivity(sessionId).catch(() => null),
+  ]);
 
   return (
     <div className="space-y-6">
@@ -82,6 +86,9 @@ export default async function SessionDetailPage({
               >
                 Back to sessions
               </Link>
+              {mode !== 'demo' ? (
+                <SessionDetailActions session={workspace.session} />
+              ) : null}
             </div>
           </div>
         </div>
@@ -103,6 +110,35 @@ export default async function SessionDetailPage({
           </div>
         ) : null}
       </SectionCard>
+
+      {activity && activity.activities.length > 0 ? (
+        <SectionCard
+          title="Activity timeline"
+          description={`${activity.total} audit entries recorded for this session.`}
+        >
+          <div className="space-y-2">
+            {activity.activities.map((entry) => (
+              <div
+                key={entry.logId}
+                className="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-3"
+              >
+                <div className="mt-1 h-2 w-2 shrink-0 rounded-full bg-sky-500" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium text-white">{entry.action}</p>
+                  {entry.details ? (
+                    <p className="mt-1 truncate text-xs text-slate-400">
+                      {typeof entry.details === 'string'
+                        ? entry.details
+                        : JSON.stringify(entry.details)}
+                    </p>
+                  ) : null}
+                  <p className="mt-1 text-xs text-slate-500">{entry.createdAt}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </SectionCard>
+      ) : null}
 
       <SectionCard
         title="Session logs"

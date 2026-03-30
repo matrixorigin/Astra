@@ -1,4 +1,4 @@
-import type { OverviewData } from '@/lib/models/platform';
+import type { OverviewData, RunListData } from '@/lib/models/platform';
 
 export const mockPlatformSnapshot: OverviewData = {
   health: {
@@ -105,4 +105,31 @@ export const mockPlatformSnapshot: OverviewData = {
       createdAt: '37 min ago',
     },
   ],
+};
+
+export const mockRunList: RunListData = {
+  runs: [
+    {
+      runId: 'run_a01',
+      sessionId: 'sess_8d2',
+      status: 'running',
+      eventsCount: 12,
+    },
+    {
+      runId: 'run_a02',
+      sessionId: 'sess_9k4',
+      status: 'waiting',
+      waitingFor: 'user_approval',
+      eventsCount: 5,
+    },
+    {
+      runId: 'run_a03',
+      sessionId: 'sess_1fa',
+      status: 'completed',
+      eventsCount: 31,
+    },
+  ],
+  total: 3,
+  limit: 50,
+  offset: 0,
 };

@@ -50,3 +50,31 @@ export type OverviewData = {
   sessions: SessionSummary[];
   events: EventSummary[];
 };
+
+export type RunSummary = {
+  runId: string;
+  sessionId: string;
+  status: string;
+  waitingFor?: string;
+  eventsCount: number;
+};
+
+export type RunListData = {
+  runs: RunSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+export type SessionActivityEntry = {
+  logId: string;
+  action: string;
+  details: unknown;
+  createdAt: string;
+};
+
+export type SessionActivityData = {
+  sessionId: string;
+  activities: SessionActivityEntry[];
+  total: number;
+};

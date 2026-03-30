@@ -39,7 +39,7 @@ export default async function SessionsPage() {
         </div>
       ) : null}
 
-      <SessionsTableClient sessions={sessions} />
+      <SessionsTableClient sessions={sessions} demoMode={mode === 'demo'} />
     </SectionCard>
   );
 }
