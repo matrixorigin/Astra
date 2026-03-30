@@ -401,6 +401,13 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/introspection/memory",
             get(introspection::get_memory_introspection_handler),
         )
+        // Platform snapshot (aggregated dashboard data)
+        .route(
+            "/platform/snapshot",
+            get(platform_handlers::platform_snapshot_handler),
+        )
+        // Run list
+        .route("/runs", get(run_handlers::list_runs_handler))
         .route(
             "/introspection/skills",
             get(introspection::get_skills_introspection_handler),
@@ -483,6 +490,8 @@ mod tests {
             ("marketplace", "/marketplace/"),
             ("sandbox", "/sandbox"),
             ("workflows", "/workflows"),
+            ("platform", "/platform/"),
+            ("runs", "/runs"),
         ];
         for (group, prefix) in groups {
             assert!(
@@ -505,6 +514,7 @@ mod tests {
             "run_handlers::",
             "ws_handler::",
             "reflect_handlers::",
+            "platform_handlers::",
         ];
         for module in &modules {
             assert!(

@@ -46,3 +46,16 @@ pub(super) async fn cancel_run_handler(
         .await?;
     Ok(Json(CancelRunResponse::from(result)))
 }
+
+pub(super) async fn list_runs_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RunListQuery>,
+) -> Result<Json<RunListResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let runs = state
+        .run_lifecycle_service
+        .list_runs(user.user_id, query.limit, query.offset)
+        .await?;
+    Ok(Json(RunListResponse::from(runs)))
+}

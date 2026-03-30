@@ -34,6 +34,13 @@ pub trait RunLifecycleService: Send + Sync {
         run_id: String,
         user_id: String,
     ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)>;
+
+    async fn list_runs(
+        &self,
+        user_id: String,
+        limit: u32,
+        offset: u32,
+    ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -75,6 +82,14 @@ pub struct RunStatusRecord {
 pub struct CancelRunRecord {
     pub run_id: String,
     pub status: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunListRecord {
+    pub runs: Vec<RunStatusRecord>,
+    pub total: i64,
+    pub limit: u32,
+    pub offset: u32,
 }
 
 pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::Value {
@@ -215,6 +230,18 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
         _run_id: String,
         _user_id: String,
     ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Run lifecycle service not configured",
+        ))
+    }
+
+    async fn list_runs(
+        &self,
+        _user_id: String,
+        _limit: u32,
+        _offset: u32,
+    ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response(
             StatusCode::NOT_IMPLEMENTED,
             "Run lifecycle service not configured",

@@ -8,8 +8,8 @@ use axum::{
 use mo_agent_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, CancelRunRecord, ChatRequestData, ChatRunRecord,
-    ChatStreamRecord, ErrorResponse, HealthChecker, RunLifecycleService, RunStatusRecord,
-    ServiceInfo, build_app,
+    ChatStreamRecord, ErrorResponse, HealthChecker, RunLifecycleService, RunListRecord,
+    RunStatusRecord, ServiceInfo, build_app,
 };
 use serde::Deserialize;
 use tower::util::ServiceExt;
@@ -310,6 +310,20 @@ impl RunLifecycleService for StubRunLifecycleService {
             )),
             _ => unreachable!("unexpected run_id for cancel_run"),
         }
+    }
+
+    async fn list_runs(
+        &self,
+        _user_id: String,
+        _limit: u32,
+        _offset: u32,
+    ) -> Result<RunListRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        Ok(RunListRecord {
+            runs: vec![],
+            total: 0,
+            limit: 50,
+            offset: 0,
+        })
     }
 }
 

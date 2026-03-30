@@ -31,6 +31,7 @@ mod run_handlers;
 mod session_handlers;
 mod state_builder;
 mod ws_handler;
+mod platform_handlers;
 
 use self::{
     bridge_prep::prepare_chat_turn_bridge_body,

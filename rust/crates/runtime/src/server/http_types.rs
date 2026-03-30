@@ -155,6 +155,22 @@ pub(super) struct CancelRunResponse {
     pub(super) status: String,
 }
 
+#[derive(Deserialize, Default)]
+pub(super) struct RunListQuery {
+    #[serde(default = "default_run_list_limit")]
+    pub(super) limit: u32,
+    #[serde(default)]
+    pub(super) offset: u32,
+}
+
+#[derive(Serialize, PartialEq, Eq)]
+pub(super) struct RunListResponse {
+    pub(super) runs: Vec<RunStatusResponse>,
+    pub(super) total: i64,
+    pub(super) limit: u32,
+    pub(super) offset: u32,
+}
+
 #[derive(Serialize, PartialEq, Eq)]
 pub(super) struct HealthResponse {
     pub(super) status: String,
@@ -458,6 +474,21 @@ impl From<CancelRunRecord> for CancelRunResponse {
     }
 }
 
+impl From<RunListRecord> for RunListResponse {
+    fn from(value: RunListRecord) -> Self {
+        Self {
+            runs: value
+                .runs
+                .into_iter()
+                .map(RunStatusResponse::from)
+                .collect(),
+            total: value.total,
+            limit: value.limit,
+            offset: value.offset,
+        }
+    }
+}
+
 impl From<AuthUserRecord> for AuthUserResponse {
     fn from(value: AuthUserRecord) -> Self {
         Self {
@@ -505,6 +536,10 @@ pub(super) fn default_max_candidates() -> u32 {
 }
 
 pub(super) fn default_session_limit() -> u32 {
+    50
+}
+
+pub(super) fn default_run_list_limit() -> u32 {
     50
 }
 

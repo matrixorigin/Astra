@@ -132,7 +132,7 @@ pub use mo_agent_services::{
     replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService},
     runs::{
         CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
-        RunStatusRecord,
+        RunListRecord, RunStatusRecord,
     },
     sandbox::{DatabaseSandboxService, SandboxRecord, SandboxService, UnconfiguredSandboxService},
     session_journal,
