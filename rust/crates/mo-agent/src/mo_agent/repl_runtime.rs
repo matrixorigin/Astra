@@ -85,158 +85,44 @@ pub(super) fn create_tool_selector_with_quality(
     (selector, modules)
 }
 
-pub(super) async fn ensure_repl_authenticated(
-    client: &reqwest::Client,
-    base: &str,
-    profile: Option<&str>,
-) -> Result<(), String> {
+/// Best-effort silent auth: validate existing token or try refresh.
+/// Never blocks or prompts — just ensures credentials are fresh if possible.
+pub(super) async fn try_silent_auth(client: &reqwest::Client, base: &str, profile: Option<&str>) {
     let creds = load_credentials();
     let name = profile_name(profile, &creds);
     let prof = creds.profiles.get(&name);
 
-    // ── 1. Try existing access_token ───────────────────────────────────────
+    // Try existing access_token
     if let Some(token) = prof.and_then(|p| p.access_token.as_ref()) {
-        // Quick validation: /auth/me — catch expired tokens early
         match client
             .get(format!("{base}/auth/me"))
-            .headers(auth_headers(token)?)
+            .headers(match auth_headers(token) {
+                Ok(h) => h,
+                Err(_) => return,
+            })
             .timeout(std::time::Duration::from_secs(3))
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() => return Ok(()),
+            Ok(resp) if resp.status().is_success() => return,
             Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
                 // Token expired — try refresh below
             }
-            Ok(_) => return Ok(()), // Non-401 errors: proceed anyway (server issues)
-            Err(_) => {
-                eprintln!(
-                    "{}",
-                    "  ⚠ Network unavailable, using cached credentials.".dim()
-                );
-                return Ok(());
-            }
+            _ => return, // Network error or non-401: proceed with cached creds
         }
+    } else {
+        // No token at all — user will see "not logged in" in banner
+        return;
     }
 
-    // ── 2. Try refresh_token if access_token is expired ────────────────────
-    if let Some(refresh) = prof.and_then(|p| p.refresh_token.as_ref()) {
-        match try_refresh_token(client, base, profile, refresh).await {
-            Ok(_) => {
-                eprintln!("  {} Token refreshed", "✓".green());
-                return Ok(());
-            }
-            Err(_) => {
-                // Refresh failed — fall through to interactive login
-                eprintln!("{}", "  ⚠ Session expired, login required.".dim());
-            }
-        }
+    // Try refresh_token
+    if let Some(refresh) = prof.and_then(|p| p.refresh_token.as_ref())
+        && try_refresh_token(client, base, profile, refresh)
+            .await
+            .is_ok()
+    {
+        eprintln!("  {} Token refreshed", "✓".green());
     }
-
-    // ── 3. Interactive auth (first-time or expired credentials) ────────────
-    eprintln!();
-    eprintln!(
-        "  {}  {}",
-        "Welcome to mo-agent!".cyan().bold(),
-        "Sign in to get started.".dim()
-    );
-    eprintln!();
-
-    // Check if user has a stored username (returning user)
-    let has_account = prof.and_then(|p| p.username.as_ref()).is_some();
-
-    if has_account {
-        // Returning user with expired session — go straight to login
-        let stored_username = prof
-            .and_then(|p| p.username.as_ref())
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        eprintln!(
-            "  {} {}",
-            "Session expired for".dim(),
-            stored_username.bold()
-        );
-        eprintln!();
-
-        print!("  {} ", "Password:".bold());
-        io::stdout().flush().map_err(|e| e.to_string())?;
-        let pw = rpassword::read_password().map_err(|e| format!("Could not read password: {e}"))?;
-        if pw.trim().is_empty() {
-            return Err("Authentication cancelled.".to_string());
-        }
-        do_login(client, base, profile, stored_username, pw.trim()).await?;
-        eprintln!("  {} {}", "✓".green().bold(), "Logged in!".green());
-        return Ok(());
-    }
-
-    // New user — offer login or register
-    eprintln!("  {}  Login with existing account", "L".cyan().bold());
-    eprintln!("  {}  Register a new account", "R".cyan().bold());
-    eprintln!("  {}  {}", "Q".cyan().bold(), "Quit".dim());
-    eprintln!();
-    print!("  {} ", "Choice (L/R/Q):".bold());
-    io::stdout().flush().map_err(|e| e.to_string())?;
-    let mut choice = String::new();
-    io::stdin()
-        .read_line(&mut choice)
-        .map_err(|e| e.to_string())?;
-    match choice.trim().to_lowercase().as_str() {
-        "l" | "login" | "1" => {
-            eprintln!();
-            print!("  {} ", "Username:".bold());
-            io::stdout().flush().ok();
-            let mut un = String::new();
-            io::stdin().read_line(&mut un).ok();
-            if un.trim().is_empty() {
-                return Err("Authentication cancelled.".to_string());
-            }
-            print!("  {} ", "Password:".bold());
-            io::stdout().flush().ok();
-            let pw =
-                rpassword::read_password().map_err(|e| format!("Could not read password: {e}"))?;
-            if pw.trim().is_empty() {
-                return Err("Authentication cancelled.".to_string());
-            }
-            do_login(client, base, profile, un.trim(), pw.trim()).await?;
-            eprintln!("  {} {}", "✓".green().bold(), "Logged in!".green());
-        }
-        "r" | "register" | "2" => {
-            eprintln!();
-            print!("  {} ", "Username:".bold());
-            io::stdout().flush().ok();
-            let mut un = String::new();
-            io::stdin().read_line(&mut un).ok();
-            if un.trim().is_empty() {
-                return Err("Registration cancelled.".to_string());
-            }
-            print!("  {} ", "Email:   ".bold());
-            io::stdout().flush().ok();
-            let mut em = String::new();
-            io::stdin().read_line(&mut em).ok();
-            if em.trim().is_empty() {
-                return Err("Registration cancelled.".to_string());
-            }
-            print!("  {} ", "Password:".bold());
-            io::stdout().flush().ok();
-            let pw =
-                rpassword::read_password().map_err(|e| format!("Could not read password: {e}"))?;
-            if pw.trim().is_empty() {
-                return Err("Registration cancelled.".to_string());
-            }
-            do_register(client, base, un.trim(), em.trim(), pw.trim()).await?;
-            do_login(client, base, profile, un.trim(), pw.trim()).await?;
-            eprintln!(
-                "  {} {}",
-                "✓".green().bold(),
-                "Account created! You're all set.".green()
-            );
-        }
-        _ => {
-            return Err("Authentication cancelled.".to_string());
-        }
-    }
-
-    Ok(())
 }
 
 /// Try to refresh an expired access token using the stored refresh_token.

@@ -93,7 +93,7 @@ use stream_render::{StreamRenderState, TurnResult, dispatch_turn_event_block};
 
 use repl_runtime::{
     build_repl_editor, create_tool_selector, create_tool_selector_with_quality,
-    current_access_token, ensure_repl_authenticated, initialize_repl_state, print_repl_banner,
+    current_access_token, initialize_repl_state, print_repl_banner, try_silent_auth,
 };
 use repl_turn::{ReplTurnContext, handle_chat_input};
 use repl_ui::{
@@ -2621,12 +2621,10 @@ async fn run_chat_repl(
     profile: Option<&str>,
     initial_model: Option<&str>,
 ) -> Result<(), String> {
-    if let Err(e) = ensure_repl_authenticated(client, base, profile).await {
-        if e.contains("cancelled") || e.contains("exited before authentication") {
-            return Ok(());
-        }
-        return Err(e);
-    }
+    // Try silent auth (validate/refresh token) but don't block entry.
+    // If not authenticated, user can still explore — operations that need
+    // auth will prompt "Not logged in. Use /login."
+    try_silent_auth(client, base, profile).await;
 
     let (mut editor, hist_path) = build_repl_editor()?;
     let mut state = initialize_repl_state(profile, initial_model);
