@@ -2,6 +2,7 @@ import { getWebConfigurationMessage } from '@/lib/api/client';
 import { getRuns } from '@/lib/api/platform';
 import { SectionCard } from '@/components/dashboard/section-card';
 import { StatusCallout } from '@/components/dashboard/status-callout';
+import { RunsLiveSection } from '@/components/streaming/runs-live-section';
 import { getRuntimeConfig } from '@/lib/runtime-config';
 
 export const dynamic = 'force-dynamic';
@@ -34,6 +35,20 @@ export default async function RunsPage() {
 
   return (
     <div className="space-y-6">
+      {/* Live streaming panel for active runs (live mode only) */}
+      {mode === 'live' && config.apiUrl && config.accessToken ? (
+        <SectionCard
+          title="Live stream"
+          description="Real-time event stream from active runs."
+        >
+          <RunsLiveSection
+            runs={runList.runs}
+            apiUrl={config.apiUrl}
+            token={config.accessToken}
+          />
+        </SectionCard>
+      ) : null}
+
       <SectionCard
         title="Runs"
         description={`${runList.total} total run${runList.total !== 1 ? 's' : ''} tracked by the platform.`}
