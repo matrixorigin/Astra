@@ -569,6 +569,7 @@ mod tests {
             turns_compacted: None,
             facts_stored: None,
             tools_selected: Some(vec!["github_list_prs".into()]),
+            selected_skills: Some(vec!["tune-performance".into()]),
             tools_used: Some(vec!["github_list_prs".into()]),
             tool_calls: None,
             budget_used: None,

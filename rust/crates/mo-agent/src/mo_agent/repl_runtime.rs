@@ -661,6 +661,7 @@ mod tests {
                 )
                 .with_tool_selection(
                     vec!["github_ci_status".into()],
+                    vec![],
                     vec!["github_ci_status".into()],
                     30,
                 ),
@@ -681,6 +682,7 @@ mod tests {
                 )
                 .with_tool_selection(
                     vec!["github_list_prs".into()],
+                    vec![],
                     vec!["github_list_prs".into()],
                     35,
                 ),
@@ -724,6 +726,7 @@ mod tests {
                 )
                 .with_tool_selection(
                     vec!["git_log".into()],
+                    vec![],
                     vec!["git_log".into()],
                     10,
                 ),
@@ -753,6 +756,7 @@ mod tests {
                 )
                 .with_tool_selection(
                     vec!["github_ci_status".into()],
+                    vec![],
                     vec!["github_ci_status".into()],
                     20,
                 ),

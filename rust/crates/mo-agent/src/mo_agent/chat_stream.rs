@@ -389,6 +389,16 @@ fn print_explain_report(turns: &[serde_json::Value], verbose: bool) {
             .and_then(|v| v.as_u64())
             .map(|v| v.to_string())
             .unwrap_or_else(|| "?".to_string());
+        let selected_skills = turn
+            .get("selected_skills")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
         let available = turn
             .get("tools_available")
             .and_then(|v| v.as_u64())
@@ -409,6 +419,9 @@ fn print_explain_report(turns: &[serde_json::Value], verbose: bool) {
             .filter(|value| !value.is_null())
         {
             tool_info.push_str(&format!(" ⚠fallback:{fallback}"));
+        }
+        if !selected_skills.is_empty() {
+            tool_info.push_str(&format!("  skills=[{selected_skills}]"));
         }
         eprintln!(
             "{}",
@@ -841,6 +854,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     let mut first_selector_strategy: Option<String> = None;
     let mut selector_tokens_in: u64 = 0;
     let mut selector_tokens_out: u64 = 0;
+    let mut all_selected_skills: Vec<String> = Vec::new();
 
     for _turn in 0..max_turns {
         if remaining_turns == 0 {
@@ -1122,6 +1136,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         // Load skill instructions if LLM selected any skills
         let skill_instructions: Option<String> = if !selected_skills.is_empty() {
             let mut instructions = Vec::new();
+            let mut activated_skills = Vec::new();
             if let Ok(mut reg) = skill_registry.try_write() {
                 for skill_name in &selected_skills {
                     // Load instructions if not already loaded
@@ -1132,7 +1147,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     // Get the instruction text
                     if let Some(skill) = reg.get(skill_name) {
                         if let Some(text) = skill.instruction_text() {
-                            eprintln!("  {} Skill selected by LLM: {}", "▶".cyan(), skill_name.as_str().cyan());
+                            activated_skills.push(skill_name.clone());
                             instructions.push(format!("## Skill: {}\n\n{}", skill_name, text));
                         }
                     }
@@ -1141,11 +1156,23 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             if instructions.is_empty() {
                 None
             } else {
+                if !quiet {
+                    eprintln!(
+                        "  {} Using skill: {}",
+                        "◆".cyan(),
+                        activated_skills.join(", ").cyan()
+                    );
+                }
                 Some(instructions.join("\n\n---\n\n"))
             }
         } else {
             None
         };
+        for skill_name in &selected_skills {
+            if !all_selected_skills.contains(skill_name) {
+                all_selected_skills.push(skill_name.clone());
+            }
+        }
         
         // Inject skill instructions into payload if LLM selected any skills
         if let Some(ref instructions) = skill_instructions {
@@ -2256,6 +2283,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         completion_tokens: total_completion,
         tool_calls_count: total_tool_calls,
         tools_selected: report.tools_selected,
+        selected_skills: all_selected_skills,
         tools_used: all_tools_used.into_iter().collect(),
         tool_call_records,
         budget_used: report.budget_used,

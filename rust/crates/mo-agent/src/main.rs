@@ -305,6 +305,8 @@ struct StreamResult {
     tool_calls_count: u32,
     /// Tool names selected for LLM (first turn selection report).
     tools_selected: Vec<String>,
+    /// Skill names selected by the LLM during tool selection.
+    selected_skills: Vec<String>,
     /// Tool names actually invoked by LLM across all turns.
     tools_used: Vec<String>,
     /// Per-tool-call audit records: name, ok, ms, error.

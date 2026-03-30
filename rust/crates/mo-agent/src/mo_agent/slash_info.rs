@@ -624,6 +624,15 @@ pub(super) async fn handle_info_command(
                         "(prompt assembly)".dim()
                     );
                 }
+                if let Some(ref skills) = ev.selected_skills
+                    && !skills.is_empty()
+                {
+                    eprintln!(
+                        "  {} {}",
+                        "Skills:".cyan(),
+                        skills.join(", ").cyan()
+                    );
+                }
                 eprintln!();
 
                 // Timeline visualization
@@ -702,6 +711,16 @@ pub(super) async fn handle_info_command(
                             strat,
                             if sel > 3000 { "  ← slow" } else { "" }
                         );
+                        if let Some(ref skills) = ev.selected_skills
+                            && !skills.is_empty()
+                        {
+                            eprintln!(
+                                "    {} {}   selected skills: {}",
+                                format!("[{:>5}ms]", offset).dim(),
+                                "│ ".dim(),
+                                skills.join(", ").cyan()
+                            );
+                        }
                     }
                     offset = ctx;
                     eprintln!(

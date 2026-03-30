@@ -406,6 +406,9 @@ pub struct JournalEvent {
     /// Tool names selected for the LLM request (for turn events).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools_selected: Option<Vec<String>>,
+    /// Skill names selected for the LLM request (for turn events).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_skills: Option<Vec<String>>,
     /// Tool names actually called by the LLM (for turn events).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools_used: Option<Vec<String>>,
@@ -700,6 +703,7 @@ impl JournalEvent {
             turns_compacted: None,
             facts_stored: None,
             tools_selected: None,
+            selected_skills: None,
             tools_used: None,
             tool_calls: None,
             budget_used: None,
@@ -807,10 +811,14 @@ impl JournalEvent {
     pub fn with_tool_selection(
         mut self,
         tools_selected: Vec<String>,
+        selected_skills: Vec<String>,
         tools_used: Vec<String>,
         budget_used: u32,
     ) -> Self {
         self.tools_selected = Some(tools_selected);
+        if !selected_skills.is_empty() {
+            self.selected_skills = Some(selected_skills);
+        }
         self.tools_used = Some(tools_used);
         self.budget_used = Some(budget_used);
         self
@@ -1125,6 +1133,7 @@ mod tests {
         )
         .with_tool_selection(
             vec!["bash".into(), "github_list_prs".into(), "read_file".into()],
+            vec!["tune-performance".into()],
             vec!["github_list_prs".into()],
             45,
         )
@@ -1132,6 +1141,7 @@ mod tests {
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tools_selected.as_ref().unwrap().len(), 3);
+        assert_eq!(parsed.selected_skills.as_ref().unwrap(), &["tune-performance"]);
         assert_eq!(parsed.tools_used.as_ref().unwrap(), &["github_list_prs"]);
         assert_eq!(parsed.budget_used, Some(45));
         assert_eq!(parsed.budget_pressure, Some(0.6));
@@ -1188,6 +1198,7 @@ mod tests {
                 )
                 .with_tool_selection(
                     vec!["bash".into(), "github_list_prs".into()],
+                    vec![],
                     vec!["github_list_prs".into()],
                     35,
                 )
@@ -1209,6 +1220,7 @@ mod tests {
         let turn = &events[1];
         assert_eq!(turn.event_type, JournalEventType::Turn);
         assert_eq!(turn.tools_selected.as_ref().unwrap().len(), 2);
+        assert!(turn.selected_skills.is_none());
         assert_eq!(turn.tools_used.as_ref().unwrap(), &["github_list_prs"]);
         assert_eq!(turn.budget_used, Some(35));
         assert_eq!(turn.budget_pressure, Some(0.3));
@@ -1285,6 +1297,7 @@ mod tests {
         )
         .with_tool_selection(
             vec!["github_list_prs".into()],
+            vec![],
             vec!["github_list_prs".into()],
             20,
         )

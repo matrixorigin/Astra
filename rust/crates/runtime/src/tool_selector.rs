@@ -181,6 +181,12 @@ pub trait ToolSelector: Send + Sync {
         LearnedContext::default()
     }
 
+    /// Check if this selector has skills registered for selection.
+    /// Default is false (empty) — only LlmToolSelector has skills.
+    fn selected_skills_empty(&self) -> bool {
+        true
+    }
+
     /// Access the underlying tool registry for schema/cost queries.
     /// Returns the default registry if the selector doesn't own one.
     fn registry(&self) -> &ToolRegistry {
@@ -923,7 +929,7 @@ impl LlmToolSelector {
                     // InProcess bridge format
                     if let Some(t) = chunk.get("type").and_then(Value::as_str) {
                         if t == "text_delta"
-                            && let Some(d) = chunk.get("text").and_then(Value::as_str)
+                            && let Some(d) = chunk.get("content").and_then(Value::as_str)
                         {
                             text.push_str(d);
                         }
@@ -955,11 +961,21 @@ impl ToolSelector for LlmToolSelector {
             .await
     }
 
+    fn selected_skills_empty(&self) -> bool {
+        self.skill_names.is_empty()
+    }
+
     async fn select_with_learned_context(
         &self,
         ctx: &SelectionContext<'_>,
         learned_context: &LearnedContext,
     ) -> SelectionResult {
+        // Debug: log skill_names and catalog_summary presence
+        if std::env::var("MO_DEBUG_SKILLS").is_ok() {
+            eprintln!("[DEBUG] LlmToolSelector skill_names: {:?}", self.skill_names);
+            eprintln!("[DEBUG] Catalog includes skills: {}", self.catalog_summary.contains("[SKILL]"));
+        }
+        
         let messages = build_tool_select_prompt(
             ctx.query,
             ctx.recent_tools,
@@ -970,6 +986,13 @@ impl ToolSelector for LlmToolSelector {
         match self.call_llm(messages).await {
             Ok((text, tin, tout)) => {
                 let names = parse_tool_names_from_llm(&text);
+                
+                // Debug: log LLM raw response and parsed names
+                if std::env::var("MO_DEBUG_SKILLS").is_ok() {
+                    eprintln!("[DEBUG] LLM raw response: {:?}", text);
+                    eprintln!("[DEBUG] LLM parsed names: {:?}", names);
+                }
+                
                 let valid_tools: std::collections::HashSet<&str> =
                     TOOL_CATALOG.iter().map(|t| t.name).collect();
                 
@@ -1010,8 +1033,11 @@ impl ToolSelector for LlmToolSelector {
                     selected_skills,
                 }
             }
-            Err(_e) => {
+            Err(e) => {
                 // LLM call failed — signal fallback
+                if std::env::var("MO_DEBUG_SKILLS").is_ok() {
+                    eprintln!("[DEBUG] LLM tool selection error: {}", e);
+                }
                 SelectionResult {
                     tool_names: vec![],
                     strategy: "llm_error",
@@ -1079,17 +1105,24 @@ impl ToolSelector for FallbackSelector {
         if fast_result.confidence >= 0.7 && has_dynamic_tools {
             return fast_result;
         }
-        // No dynamic tools (conversational / pinned-only) → no point asking LLM
-        if !has_dynamic_tools {
+
+        // Skills require semantic LLM selection. If the primary selector has
+        // skills registered, we must still ask it even when TF-IDF only found
+        // pinned tools or no dynamic tools.
+        let primary_has_skills = !self.primary.selected_skills_empty();
+
+        // No dynamic tools and no skills → no point asking primary.
+        if !has_dynamic_tools && !primary_has_skills {
             return fast_result;
         }
 
-        // Low/mid confidence WITH dynamic tools → ask LLM for better selection.
+        // Low/mid confidence with dynamic tools, or any available skills →
+        // ask the primary selector for a better result.
         let result = self
             .primary
             .select_with_learned_context(ctx, learned_context)
             .await;
-        if !result.failed && !result.tool_names.is_empty() {
+        if !result.failed && (!result.tool_names.is_empty() || !result.selected_skills.is_empty()) {
             result
         } else {
             fast_result
@@ -1838,6 +1871,44 @@ mod tests {
         let selector = FallbackSelector::new(Box::new(PanicSelector), Box::new(PinnedOnlySelector));
         let result = selector.select(&make_ctx("hi")).await;
         assert_eq!(result.strategy, "tfidf_conversational");
+    }
+
+    #[tokio::test]
+    async fn fallback_uses_primary_for_skill_only_selection_when_primary_has_skills() {
+        struct SkillPrimary;
+        #[async_trait]
+        impl ToolSelector for SkillPrimary {
+            async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
+                SelectionResult {
+                    tool_names: vec![],
+                    strategy: "llm_skill",
+                    budget_used: 0,
+                    failed: false,
+                    confidence: 0.9,
+                    selector_tokens_in: 0,
+                    selector_tokens_out: 0,
+                    selected_skills: vec!["tune-performance".into()],
+                }
+            }
+
+            fn selected_skills_empty(&self) -> bool {
+                false
+            }
+        }
+
+        struct PinnedOnlySelector;
+        #[async_trait]
+        impl ToolSelector for PinnedOnlySelector {
+            async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
+                fixed_result(vec!["bash".into()], "tfidf_conversational", 0.1)
+            }
+        }
+
+        let selector = FallbackSelector::new(Box::new(SkillPrimary), Box::new(PinnedOnlySelector));
+        let result = selector.select(&make_ctx("tune performance")).await;
+        assert_eq!(result.strategy, "llm_skill");
+        assert!(result.tool_names.is_empty());
+        assert_eq!(result.selected_skills, vec!["tune-performance"]);
     }
 
     #[tokio::test]

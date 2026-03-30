@@ -338,6 +338,7 @@ fn apply_turn_success(
         )
         .with_tool_selection(
             result.tools_selected.clone(),
+            result.selected_skills.clone(),
             result.tools_used.clone(),
             result.budget_used,
         )
