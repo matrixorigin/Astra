@@ -938,7 +938,7 @@ impl PlanModeState {
     /// Memory protocol content for storing the active plan
     pub fn to_memory_content(&self) -> String {
         format!(
-            "[plan:active] Goal: {}\n\n{}",
+            "[@plan/active] Goal: {}\n\n{}",
             self.goal,
             serde_json::to_string_pretty(&self.plan).unwrap_or_default()
         )
@@ -947,7 +947,7 @@ impl PlanModeState {
     /// Memory protocol content for a completed plan
     pub fn to_completed_memory(&self) -> String {
         format!(
-            "[plan:completed] Goal: {}\nStatus: {} subtasks\n\n{}",
+            "[@plan/completed] Goal: {}\nStatus: {} subtasks\n\n{}",
             self.goal,
             self.plan.subtasks.len(),
             serde_json::to_string_pretty(&self.plan).unwrap_or_default()
@@ -3361,11 +3361,11 @@ Done!"#;
         });
 
         let content = ps.to_memory_content();
-        assert!(content.starts_with("[plan:active]"));
+        assert!(content.starts_with("[@plan/active]"));
         assert!(content.contains("Deploy app"));
 
         let completed = ps.to_completed_memory();
-        assert!(completed.starts_with("[plan:completed]"));
+        assert!(completed.starts_with("[@plan/completed]"));
         assert!(completed.contains("1 subtasks"));
     }
 
