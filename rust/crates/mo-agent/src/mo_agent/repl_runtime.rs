@@ -275,13 +275,14 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     let creds = load_credentials();
     let pname = profile_name(profile, &creds);
     let p = creds.profiles.get(&pname);
-    let user_display = p
-        .and_then(|p| p.username.as_deref())
-        .unwrap_or("not logged in");
-    // Session: show "new" for fresh sessions, truncated ID for resumed
+    let logged_in = p.and_then(|p| p.access_token.as_ref()).is_some();
+    let user_display = match (p.and_then(|p| p.username.as_deref()), logged_in) {
+        (Some(name), true) => name.to_string(),
+        (Some(name), false) => format!("{name} (not logged in)"),
+        (None, _) => "not logged in".to_string(),
+    };
     let session_display = banner_session_display(state);
     let model_display = state.model.as_deref().unwrap_or("auto");
-    let logged_in = p.and_then(|p| p.access_token.as_ref()).is_some();
     let version = env!("CARGO_PKG_VERSION");
 
     let lines_plain = [

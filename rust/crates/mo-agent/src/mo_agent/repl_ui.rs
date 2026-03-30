@@ -14,6 +14,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/exit", "Exit the REPL"),
     // ── Account ───────────────────────────────────────────────────────────
     ("/login", "Authenticate with the API"),
+    ("/register", "Register a new account"),
     ("/logout", "Logout from the API"),
     // ── Observability ─────────────────────────────────────────────────────
     ("/explain", "Toggle explain mode (show reasoning)"),
@@ -821,7 +822,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
         ("📋", "Session", &["/session", "/resume", "/plan"]),
         ("🧠", "Skills", &["/skill"]),
         ("🔧", "Diagnostics", &["/doctor", "/version"]),
-        ("🔑", "Account", &["/login", "/logout"]),
+        ("🔑", "Account", &["/login", "/register", "/logout"]),
     ];
 
     for (icon, title, commands) in groups {
@@ -1810,7 +1811,7 @@ mod tests {
             &["/session", "/resume", "/plan"],
             &["/skill"],
             &["/doctor", "/version"],
-            &["/login", "/logout"],
+            &["/login", "/register", "/logout"],
         ];
         let known: std::collections::HashSet<&str> =
             SLASH_COMMANDS.iter().map(|(cmd, _)| *cmd).collect();
