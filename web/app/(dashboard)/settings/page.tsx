@@ -5,7 +5,7 @@ export default function SettingsPage() {
   return (
     <SectionCard
       title="Settings"
-      description="Configure API connectivity, login state, and saved runtime tokens for the frontend."
+      description="Manage backend connection, authentication, and runtime tokens."
     >
       <RuntimeSettingsPanel />
     </SectionCard>
