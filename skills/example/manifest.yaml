@@ -10,6 +10,23 @@ instructions_file: SKILL.md
 # Tools this skill provides (optional, can also be in SKILL.md allowed_tools)
 tools: []
 
+# MCP servers for external tools (example configuration)
+# Uncomment to enable filesystem access via MCP
+# mcp_servers:
+#   - name: filesystem
+#     description: "File system access"
+#     transport:
+#       type: stdio
+#       command: ["npx", "@modelcontextprotocol/server-filesystem"]
+#       args: ["/workspace"]
+#   - name: github
+#     description: "GitHub API access"
+#     transport:
+#       type: stdio
+#       command: ["npx", "@modelcontextprotocol/server-github"]
+#       env:
+#         GITHUB_TOKEN: "$GITHUB_TOKEN"
+
 # No tables needed for this example
 tables: []
 

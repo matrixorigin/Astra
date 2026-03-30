@@ -35,6 +35,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
 
+use crate::mcp_client::{McpServerConfig, Transport};
 use crate::skill_instructions::{SkillInstruction, SkillMetadata, parse_skill_md};
 
 // ─── Manifest Types ─────────────────────────────────────────────────────────
@@ -54,6 +55,9 @@ pub struct ToolManifest {
     /// Inline instructions (alternative to instructions_file).
     #[serde(default)]
     pub instructions: Option<String>,
+    /// MCP servers to connect to for external tools.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
     // Existing fields (not parsed here, just tolerated)
     #[serde(default)]
     pub tables: Vec<String>,
@@ -251,6 +255,16 @@ impl LoadedSkill {
     /// Get instruction text (Level 2 content).
     pub fn instruction_text(&self) -> Option<&str> {
         self.instructions.as_ref().map(|i| i.instructions.as_str())
+    }
+
+    /// Get MCP server configurations for this skill.
+    pub fn mcp_servers(&self) -> &[McpServerConfig] {
+        &self.manifest.mcp_servers
+    }
+
+    /// Check if this skill has MCP servers configured.
+    pub fn has_mcp_servers(&self) -> bool {
+        !self.manifest.mcp_servers.is_empty()
     }
 }
 
@@ -819,5 +833,62 @@ tools: []
         let inst = skill.instructions.unwrap();
         // Description should be properly escaped and parsed back
         assert!(inst.description.contains("quote"));
+    }
+
+    #[test]
+    fn manifest_with_mcp_servers() {
+        use tempfile::TempDir;
+
+        let manifest_with_mcp = r#"
+name: mcp-skill
+version: "1.0.0"
+description: "Skill with MCP servers"
+mcp_servers:
+  - name: filesystem
+    description: "File access"
+    transport:
+      type: stdio
+      command: ["npx", "@modelcontextprotocol/server-filesystem"]
+      args: ["/workspace"]
+  - name: github
+    description: "GitHub access"
+    enabled: false
+    transport:
+      type: stdio
+      command: ["npx", "@modelcontextprotocol/server-github"]
+      env:
+        GITHUB_TOKEN: "test-token"
+tools: []
+"#;
+
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("mcp-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("manifest.yaml"), manifest_with_mcp).unwrap();
+
+        let skill = load_skill(&skill_dir).unwrap();
+        assert_eq!(skill.name, "mcp-skill");
+        assert!(skill.has_mcp_servers());
+        assert_eq!(skill.mcp_servers().len(), 2);
+
+        let fs_server = &skill.mcp_servers()[0];
+        assert_eq!(fs_server.name, "filesystem");
+        assert!(fs_server.enabled);
+        match &fs_server.transport {
+            Transport::Stdio { command, args, .. } => {
+                assert_eq!(command[0], "npx");
+                assert_eq!(args[0], "/workspace");
+            }
+        }
+
+        let gh_server = &skill.mcp_servers()[1];
+        assert_eq!(gh_server.name, "github");
+        assert!(!gh_server.enabled); // Explicitly disabled
+    }
+
+    #[test]
+    fn manifest_without_mcp_servers() {
+        let manifest = parse_manifest(SAMPLE_MANIFEST).unwrap();
+        assert!(manifest.mcp_servers.is_empty());
     }
 }
