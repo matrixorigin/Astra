@@ -485,7 +485,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             .unwrap_or_default();
 
         // Fallback: merge local journal sessions not already in cloud list
-        if let Ok(local_ids) = session_journal::list_sessions() {
+        if let Ok(local_ids) = session_journal::list_sessions_by_time() {
             let cloud_ids: std::collections::HashSet<_> = cloud_sessions
                 .iter()
                 .map(|s| s.session_id.clone())
@@ -514,13 +514,17 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             "─── Resumable Sessions ──────────────────────────".bold()
         );
         for (i, s) in sessions.iter().enumerate() {
-            let title = s.title.as_deref().unwrap_or("untitled");
-            let short_id = &s.session_id[..8.min(s.session_id.len())];
+            let title = s.title.as_deref().unwrap_or("");
+            let title_part = if title.is_empty() {
+                String::new()
+            } else {
+                format!(" {title}")
+            };
             eprintln!(
-                "  {}  {} {} ({} turns, {})",
+                "  {}  {}{}  ({} turns, {})",
                 format!("[{}]", i + 1).cyan().bold(),
-                short_id.dim(),
-                title,
+                s.session_id.as_str().cyan(),
+                title_part,
                 s.turn_count,
                 s.last_status.as_str().dim(),
             );

@@ -545,6 +545,29 @@ pub fn list_sessions() -> std::io::Result<Vec<String>> {
     Ok(sessions)
 }
 
+/// List local session IDs sorted by file modification time (most recent first).
+pub fn list_sessions_by_time() -> std::io::Result<Vec<String>> {
+    let dir = journal_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries: Vec<(String, std::time::SystemTime)> = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(sid) = name.strip_suffix(".jsonl") {
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            entries.push((sid.to_string(), mtime));
+        }
+    }
+    entries.sort_by(|a, b| b.1.cmp(&a.1)); // newest first
+    Ok(entries.into_iter().map(|(sid, _)| sid).collect())
+}
+
 /// Resolve a session id to an exact journal filename stem.
 ///
 /// Accepts:

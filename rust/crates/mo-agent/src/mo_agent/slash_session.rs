@@ -16,7 +16,7 @@ pub(super) fn resolve_journal_target_session(
         Ok((sid.clone(), false))
     } else {
         // No active session — list local journals and let user pick
-        let sessions = session_journal::list_sessions().unwrap_or_default();
+        let sessions = session_journal::list_sessions_by_time().unwrap_or_default();
         if sessions.is_empty() {
             return Err("  No sessions found.".to_string());
         }
@@ -25,12 +25,11 @@ pub(super) fn resolve_journal_target_session(
             "─── Available Sessions ──────────────────────────".bold()
         );
         let show = sessions.len().min(10);
-        for (i, sid) in sessions.iter().rev().take(show).enumerate() {
-            let short = &sid[..8.min(sid.len())];
+        for (i, sid) in sessions.iter().take(show).enumerate() {
             eprintln!(
                 "  {}  {}",
                 format!("[{}]", i + 1).cyan().bold(),
-                short.dim()
+                sid.as_str().cyan()
             );
         }
         eprintln!();
@@ -39,11 +38,10 @@ pub(super) fn resolve_journal_target_session(
         let mut input = String::new();
         if std::io::stdin().read_line(&mut input).is_ok()
             && let Ok(n) = input.trim().parse::<usize>()
+            && n >= 1
+            && n <= show
         {
-            let reversed: Vec<_> = sessions.iter().rev().take(show).collect();
-            if n >= 1 && n <= reversed.len() {
-                return Ok((reversed[n - 1].clone(), false));
-            }
+            return Ok((sessions[n - 1].clone(), false));
         }
         Err("  Cancelled.".to_string())
     }
@@ -56,7 +54,7 @@ pub(super) fn handle_session_command(arg: &str, state: &ReplState) {
     };
     match sub_cmd {
         "" => {
-            // Default: show session info
+            // Show session info + available subcommands
             let sid = state.session_id.as_deref().unwrap_or("none");
             let mdl = state.model.as_deref().unwrap_or("default");
             eprintln!(
@@ -83,6 +81,11 @@ pub(super) fn handle_session_command(arg: &str, state: &ReplState) {
                     j.path().display().to_string().cyan()
                 );
             }
+            eprintln!();
+            eprintln!(
+                "  {}",
+                "Subcommands: /session history · errors · export · list".dim()
+            );
             eprintln!();
         }
         "history" => {
