@@ -31,6 +31,7 @@ export function EventLogViewer({
     <div className="space-y-4">
       <div className="grid gap-3 md:grid-cols-[1fr_220px]">
         <input
+          type="search"
           value={query}
           onChange={(event) => setQuery(event.target.value)}
           placeholder="Filter logs by event type, summary, or session id"

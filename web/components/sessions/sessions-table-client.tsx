@@ -112,6 +112,7 @@ export function SessionsTableClient({
     <div className="space-y-4">
       <div className="grid gap-3 md:grid-cols-[1fr_220px]">
         <input
+          type="search"
           value={query}
           onChange={(event) => setQuery(event.target.value)}
           placeholder="Search by title, session id, owner, or agent id"
@@ -130,7 +131,7 @@ export function SessionsTableClient({
         </select>
       </div>
 
-      <div className="overflow-hidden rounded-2xl border border-slate-800">
+      <div className="overflow-x-auto rounded-2xl border border-slate-800">
         <table className="min-w-full divide-y divide-slate-800 text-left text-sm">
           <thead className="bg-slate-950/80 text-slate-400">
             <tr>
