@@ -163,7 +163,7 @@ const LLM_RETRY_BASE_MS: u64 = 1000;
 
 // ── System Prompt Cache ──────────────────────────────────────────────────────
 // The system prompt is ~1.2K tokens and identical for most turns within a session
-// (same tool set, same task type). Cache by (tool_names_hash, task_type, confidence_bucket).
+// (same tool set, same task type, same profile/learned hints). Cache by tool/task/confidence/profile.
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -172,7 +172,12 @@ fn prompt_cache() -> &'static Mutex<HashMap<u64, String>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn prompt_cache_key(tool_names: &[&str], task_type: Option<&str>, confidence: f64) -> u64 {
+fn prompt_cache_key(
+    tool_names: &[&str],
+    task_type: Option<&str>,
+    confidence: f64,
+    profile_desc: &str,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for name in tool_names {
@@ -182,6 +187,7 @@ fn prompt_cache_key(tool_names: &[&str], task_type: Option<&str>, confidence: f6
     // Bucket confidence: 0.0-0.3 = "low", 0.3-1.0 = "normal"
     let bucket = if confidence < 0.3 { "low" } else { "normal" };
     bucket.hash(&mut hasher);
+    profile_desc.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -191,7 +197,7 @@ fn cached_system_prompt(
     confidence: f64,
     task_type: Option<&str>,
 ) -> String {
-    let key = prompt_cache_key(tool_names, task_type, confidence);
+    let key = prompt_cache_key(tool_names, task_type, confidence, profile_desc);
     if let Ok(cache) = prompt_cache().lock()
         && let Some(cached) = cache.get(&key)
     {
@@ -740,11 +746,21 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 .and_then(|m| m.get("content").and_then(Value::as_str))
                 .unwrap_or("");
 
-            let task_type = prompts::detect_task_type(user_content_for_signal);
+            let learned_context_hint = edge_profile
+                .get("learned_context_hint")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(|hint| format!("\n\n## Learned Runtime Context\n{hint}"))
+                .unwrap_or_default();
+            let task_type = edge_profile
+                .get("selection_task_type")
+                .and_then(Value::as_str)
+                .or_else(|| prompts::detect_task_type(user_content_for_signal));
+            let profile_with_hints = format!("{profile_desc}{skill_hint}{learned_context_hint}");
 
             let system_prompt_content = cached_system_prompt(
                 &tool_names,
-                &format!("{profile_desc}{skill_hint}"),
+                &profile_with_hints,
                 selection_confidence,
                 task_type,
             );
@@ -1455,6 +1471,18 @@ mod tests {
         let lines = vec!["[@pref/active] memoria = matrixorigin/Memoria".to_string()];
         let section = build_memory_section(&lines).unwrap();
         assert!(section.starts_with("## User Memories"), "got: {section}");
+    }
+
+    #[test]
+    fn prompt_cache_key_includes_profile_context() {
+        let key_plain = prompt_cache_key(&["bash"], Some("implementation"), 0.8, "");
+        let key_learned = prompt_cache_key(
+            &["bash"],
+            Some("implementation"),
+            0.8,
+            "\n\n## Learned Runtime Context\nmatrixorigin => github",
+        );
+        assert_ne!(key_plain, key_learned);
     }
 
     #[test]
