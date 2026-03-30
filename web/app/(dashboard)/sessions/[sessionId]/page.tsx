@@ -1,11 +1,18 @@
 import Link from 'next/link';
 import { getWebConfigurationMessage } from '@/lib/api/client';
-import { getSessionWorkspace, getSessionActivity } from '@/lib/api/platform';
+import {
+  getSessionWorkspace,
+  getSessionActivity,
+  getDecisionTrace,
+  getMemoryIntrospection,
+} from '@/lib/api/platform';
 import { SectionCard } from '@/components/dashboard/section-card';
 import { StatusCallout } from '@/components/dashboard/status-callout';
 import { EventLogViewer } from '@/components/events/event-log-viewer';
 import { SessionFlowGraph } from '@/components/graph/session-flow-graph';
 import { SessionDetailActions } from '@/components/sessions/session-detail-actions';
+import { DecisionTracePanel } from '@/components/sessions/decision-trace-panel';
+import { MemoryIntrospectionPanel } from '@/components/sessions/memory-introspection-panel';
 import { getRuntimeConfig } from '@/lib/runtime-config';
 
 export const dynamic = 'force-dynamic';
@@ -31,9 +38,11 @@ export default async function SessionDetailPage({
   }
 
   const { sessionId } = await params;
-  const [workspace, activity] = await Promise.all([
+  const [workspace, activity, decisionTrace, memoryData] = await Promise.all([
     getSessionWorkspace(sessionId),
     getSessionActivity(sessionId).catch(() => null),
+    getDecisionTrace(sessionId).catch(() => null),
+    getMemoryIntrospection(sessionId).catch(() => null),
   ]);
 
   return (
@@ -110,6 +119,26 @@ export default async function SessionDetailPage({
           </div>
         ) : null}
       </SectionCard>
+
+      {/* Decision trace */}
+      {decisionTrace ? (
+        <SectionCard
+          title="Decision trace"
+          description="Root-cause analysis and tool selection insights for this session."
+        >
+          <DecisionTracePanel data={decisionTrace} />
+        </SectionCard>
+      ) : null}
+
+      {/* Memory introspection */}
+      {memoryData ? (
+        <SectionCard
+          title="Memory introspection"
+          description="Episodic, semantic, and procedural memory statistics."
+        >
+          <MemoryIntrospectionPanel data={memoryData} />
+        </SectionCard>
+      ) : null}
 
       {activity && activity.activities.length > 0 ? (
         <SectionCard

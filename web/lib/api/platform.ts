@@ -2,14 +2,17 @@ import { apiFetch, apiPost, getWebDataMode, type WebDataMode } from '@/lib/api/c
 import { mockPlatformSnapshot, mockRunList } from '@/lib/api/mock-data';
 import type {
   AgentSummary,
+  DecisionTraceData,
   EventSummary,
   HealthSummary,
+  MemoryIntrospectionData,
   OverviewData,
   RunListData,
   RunSummary,
   SessionActivityData,
   SessionActivityEntry,
   SessionSummary,
+  SkillsIntrospectionData,
 } from '@/lib/models/platform';
 
 type ApiHealthResponse = {
@@ -430,6 +433,193 @@ export async function getTaskProgress(
   if (mode !== 'live') return null;
   try {
     return await apiFetch<ApiTaskProgressResponse>(`/tasks/${taskId}/progress`);
+  } catch {
+    return null;
+  }
+}
+
+// ── Decision trace ──
+
+type ApiDecisionTraceResponse = {
+  session_id: string;
+  focus: string;
+  overview: {
+    total_events: number;
+    total_decisions: number;
+    duration_minutes: number | null;
+    unique_skills_used: number;
+    error_count: number;
+    error_rate_pct: number;
+    top_event_types: [string, number][];
+    top_skills: [string, number][];
+  };
+  diagnoses: {
+    category: string;
+    severity: string;
+    summary: string;
+    samples: string[];
+    occurrences: number;
+    affected_tool: string;
+    fix_hint: string;
+  }[];
+  insights: {
+    severity: string;
+    category: string;
+    message: string;
+    evidence: string;
+  }[];
+  recommendations: string[];
+};
+
+function normalizeDecisionTrace(raw: ApiDecisionTraceResponse): DecisionTraceData {
+  return {
+    sessionId: raw.session_id,
+    focus: raw.focus,
+    overview: {
+      totalEvents: raw.overview.total_events,
+      totalDecisions: raw.overview.total_decisions,
+      durationMinutes: raw.overview.duration_minutes,
+      uniqueSkillsUsed: raw.overview.unique_skills_used,
+      errorCount: raw.overview.error_count,
+      errorRatePct: raw.overview.error_rate_pct,
+      topEventTypes: raw.overview.top_event_types,
+      topSkills: raw.overview.top_skills,
+    },
+    diagnoses: raw.diagnoses.map((d) => ({
+      category: d.category,
+      severity: d.severity as 'critical' | 'warning' | 'info',
+      summary: d.summary,
+      samples: d.samples,
+      occurrences: d.occurrences,
+      affectedTool: d.affected_tool,
+      fixHint: d.fix_hint,
+    })),
+    insights: raw.insights.map((i) => ({
+      severity: i.severity as 'critical' | 'warning' | 'info',
+      category: i.category,
+      message: i.message,
+      evidence: i.evidence,
+    })),
+    recommendations: raw.recommendations,
+  };
+}
+
+export async function getDecisionTrace(
+  sessionId: string,
+  opts?: { lastN?: number; question?: string },
+): Promise<DecisionTraceData | null> {
+  const mode = await getWebDataMode();
+  if (mode !== 'live') return null;
+  try {
+    const qs = new URLSearchParams();
+    if (opts?.lastN) qs.set('last_n', String(opts.lastN));
+    if (opts?.question) qs.set('question', opts.question);
+    const suffix = qs.toString() ? `?${qs}` : '';
+    const raw = await apiFetch<ApiDecisionTraceResponse>(
+      `/chat/session/${sessionId}/decision-trace${suffix}`,
+    );
+    return normalizeDecisionTrace(raw);
+  } catch {
+    return null;
+  }
+}
+
+// ── Introspection: memory ──
+
+type ApiMemoryIntrospectionResponse = {
+  episodic: {
+    turns: number;
+    total_events: number;
+    tool_intensity: string;
+    session_depth: string;
+  };
+  semantic: {
+    ctx_snapshots: number;
+    peak_tokens: number;
+    context_managed_tokens: number | null;
+    last_assembly_ms: number | null;
+    llm_prompt_tokens: number | null;
+    llm_completion_tokens: number | null;
+    llm_total_tokens: number | null;
+    health: Record<string, unknown> | null;
+  };
+  procedural: {
+    skill_selections: number;
+    accuracy_rate: number | null;
+  };
+  profile: string[] | null;
+};
+
+function normalizeMemoryIntrospection(
+  raw: ApiMemoryIntrospectionResponse,
+): MemoryIntrospectionData {
+  return {
+    episodic: {
+      turns: raw.episodic.turns,
+      totalEvents: raw.episodic.total_events,
+      toolIntensity: raw.episodic.tool_intensity,
+      sessionDepth: raw.episodic.session_depth,
+    },
+    semantic: {
+      ctxSnapshots: raw.semantic.ctx_snapshots,
+      peakTokens: raw.semantic.peak_tokens,
+      contextManagedTokens: raw.semantic.context_managed_tokens,
+      lastAssemblyMs: raw.semantic.last_assembly_ms,
+      llmPromptTokens: raw.semantic.llm_prompt_tokens,
+      llmCompletionTokens: raw.semantic.llm_completion_tokens,
+      llmTotalTokens: raw.semantic.llm_total_tokens,
+      health: raw.semantic.health,
+    },
+    procedural: {
+      skillSelections: raw.procedural.skill_selections,
+      accuracyRate: raw.procedural.accuracy_rate,
+    },
+    profile: raw.profile,
+  };
+}
+
+export async function getMemoryIntrospection(
+  sessionId: string,
+): Promise<MemoryIntrospectionData | null> {
+  const mode = await getWebDataMode();
+  if (mode !== 'live') return null;
+  try {
+    const raw = await apiFetch<ApiMemoryIntrospectionResponse>(
+      `/introspection/memory?session_id=${sessionId}`,
+    );
+    return normalizeMemoryIntrospection(raw);
+  } catch {
+    return null;
+  }
+}
+
+// ── Introspection: skills ──
+
+export async function getSkillsIntrospection(): Promise<SkillsIntrospectionData | null> {
+  const mode = await getWebDataMode();
+  if (mode !== 'live') return null;
+  try {
+    return await apiFetch<SkillsIntrospectionData>('/introspection/skills');
+  } catch {
+    return null;
+  }
+}
+
+// ── Introspection: context trend ──
+
+export async function getContextTrend(
+  sessionId: string,
+  opts?: { turns?: number; contextWindow?: number },
+): Promise<Record<string, unknown> | null> {
+  const mode = await getWebDataMode();
+  if (mode !== 'live') return null;
+  try {
+    const qs = new URLSearchParams({ session_id: sessionId });
+    if (opts?.turns) qs.set('turns', String(opts.turns));
+    if (opts?.contextWindow) qs.set('context_window', String(opts.contextWindow));
+    return await apiFetch<Record<string, unknown>>(
+      `/introspection/context/trend?${qs}`,
+    );
   } catch {
     return null;
   }

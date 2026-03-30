@@ -78,3 +78,86 @@ export type SessionActivityData = {
   activities: SessionActivityEntry[];
   total: number;
 };
+
+// ── Decision trace types ──
+
+export type SessionOverview = {
+  totalEvents: number;
+  totalDecisions: number;
+  durationMinutes: number | null;
+  uniqueSkillsUsed: number;
+  errorCount: number;
+  errorRatePct: number;
+  topEventTypes: [string, number][];
+  topSkills: [string, number][];
+};
+
+export type Diagnosis = {
+  category: string;
+  severity: 'critical' | 'warning' | 'info';
+  summary: string;
+  samples: string[];
+  occurrences: number;
+  affectedTool: string;
+  fixHint: string;
+};
+
+export type Insight = {
+  severity: 'critical' | 'warning' | 'info';
+  category: string;
+  message: string;
+  evidence: string;
+};
+
+export type DecisionTraceData = {
+  sessionId: string;
+  focus: string;
+  overview: SessionOverview;
+  diagnoses: Diagnosis[];
+  insights: Insight[];
+  recommendations: string[];
+};
+
+// ── Introspection types ──
+
+export type EpisodicStats = {
+  turns: number;
+  totalEvents: number;
+  toolIntensity: string;
+  sessionDepth: string;
+};
+
+export type SemanticStats = {
+  ctxSnapshots: number;
+  peakTokens: number;
+  contextManagedTokens: number | null;
+  lastAssemblyMs: number | null;
+  llmPromptTokens: number | null;
+  llmCompletionTokens: number | null;
+  llmTotalTokens: number | null;
+  health: Record<string, unknown> | null;
+};
+
+export type ProceduralStats = {
+  skillSelections: number;
+  accuracyRate: number | null;
+};
+
+export type MemoryIntrospectionData = {
+  episodic: EpisodicStats;
+  semantic: SemanticStats;
+  procedural: ProceduralStats;
+  profile: string[] | null;
+};
+
+export type SkillInfo = {
+  name: string;
+  version: string;
+  description: string;
+  category: string;
+};
+
+export type SkillsIntrospectionData = {
+  installed: SkillInfo[];
+  cloud: SkillInfo[];
+};

@@ -9,6 +9,7 @@ const navigation = [
   { href: '/runs', label: 'Runs' },
   { href: '/events', label: 'Events' },
   { href: '/plans', label: 'Plans' },
+  { href: '/introspection', label: 'Introspection' },
   { href: '/workspace', label: 'Workspace' },
   { href: '/settings', label: 'Settings' },
 ];
