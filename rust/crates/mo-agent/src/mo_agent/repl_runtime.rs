@@ -314,14 +314,13 @@ fn restore_session_state_from_journal(session_id: &str) -> RestoredSessionState 
     restored
 }
 
-fn random_tip(logged_in: bool) -> &'static str {
+fn random_tips(logged_in: bool) -> [&'static str; 2] {
     use std::time::SystemTime;
 
     const TIPS: &[&str] = &[
         "Type / to browse all commands",
         "Ctrl+R to search command history",
         "Alt+Enter for multi-line input",
-        "/keys to see all keyboard shortcuts",
         "/explain toggles reasoning visibility",
         "/plan to decompose complex tasks into steps",
         "/stats shows session token usage",
@@ -330,14 +329,15 @@ fn random_tip(logged_in: bool) -> &'static str {
         "/resume to continue a previous session",
         "/session to see current session info",
         "/learn to see learning insights",
-        "End a line with \\ to continue on the next line",
+        "End a line with \\ to continue on next line",
         "/doctor runs diagnostics if something feels off",
         "/sync shows cloud sync status",
     ];
 
     const TIPS_NOT_LOGGED_IN: &[&str] = &[
-        "/login to authenticate, /register to create an account",
-        "Most features require login — try /register to get started",
+        "/login to authenticate with existing account",
+        "/register to create a new account",
+        "Most features require login to work",
     ];
 
     let pool = if logged_in { TIPS } else { TIPS_NOT_LOGGED_IN };
@@ -345,7 +345,16 @@ fn random_tip(logged_in: bool) -> &'static str {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as usize)
         .unwrap_or(0);
-    pool[seed % pool.len()]
+    let i = seed % pool.len();
+    let j = (i + 1 + seed / pool.len()) % pool.len();
+    // Ensure two different tips
+    let j = if j == i { (i + 1) % pool.len() } else { j };
+    [pool[i], pool[j]]
+}
+
+/// Approximate display width: ASCII = 1, emoji/CJK = 2.
+fn display_width(s: &str) -> usize {
+    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
 }
 
 pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
@@ -362,8 +371,9 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     let model_display = state.model.as_deref().unwrap_or("auto");
     let version = env!("CARGO_PKG_VERSION");
 
-    let tip = random_tip(logged_in);
-    let tip_plain = format!("  💡 {tip}");
+    let [tip1, tip2] = random_tips(logged_in);
+    let tip1_plain = format!("  💡 {tip1}");
+    let tip2_plain = format!("  💡 {tip2}");
 
     let lines_plain = [
         format!("  mo-agent  v{version}"),
@@ -371,11 +381,12 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
             "  profile: {}  user: {}  model: {}  session: {}",
             pname, user_display, model_display, session_display
         ),
-        tip_plain,
+        tip1_plain,
+        tip2_plain,
     ];
     let w = lines_plain
         .iter()
-        .map(|l| l.chars().count())
+        .map(|l| display_width(l))
         .max()
         .unwrap_or(60)
         + 2;
@@ -397,11 +408,12 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
             model_display.cyan(),
             session_display.as_str().dim(),
         ),
-        format!("  💡 {}", tip.dim()),
+        format!("  💡 {}", tip1.dim()),
+        format!("  💡 {}", tip2.dim()),
     ];
 
-    let row = |colored: &str, plain_len: usize| {
-        let pad = w.saturating_sub(plain_len);
+    let row = |colored: &str, plain_width: usize| {
+        let pad = w.saturating_sub(plain_width);
         format!("{} {colored}{} {}", "│".cyan(), " ".repeat(pad), "│".cyan())
     };
 
@@ -410,10 +422,11 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     eprintln!();
     print_startup_logo();
     eprintln!("{}", format!("╭{hr}╮").cyan());
-    eprintln!("{}", row(&lines_colored[0], lines_plain[0].chars().count()));
-    eprintln!("{}", row(&lines_colored[1], lines_plain[1].chars().count()));
+    eprintln!("{}", row(&lines_colored[0], display_width(&lines_plain[0])));
+    eprintln!("{}", row(&lines_colored[1], display_width(&lines_plain[1])));
     eprintln!("{}", format!("├{hr}┤").cyan().dim());
-    eprintln!("{}", row(&lines_colored[2], lines_plain[2].chars().count()));
+    eprintln!("{}", row(&lines_colored[2], display_width(&lines_plain[2])));
+    eprintln!("{}", row(&lines_colored[3], display_width(&lines_plain[3])));
     eprintln!("{}", format!("╰{hr}╯").cyan());
     eprintln!();
 }
