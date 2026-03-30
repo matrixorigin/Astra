@@ -1788,13 +1788,16 @@ name: evaluate-session
 description: "Agent self-assessment skill that evaluates performance metrics for a session"
 user_invocable: true
 triggers:
-  - evaluate
   - evaluate session
   - session metrics
-  - performance
-  - efficiency
-  - how efficient
+  - session performance
+  - session efficiency
+  - how efficient was
   - analyze session
+  - session evaluation
+  - 评估会话
+  - 会话性能
+  - 会话效率
 allowed_tools:
   - bash
   - read_file
@@ -1819,18 +1822,22 @@ Query the agent_events table.
         let skill = registry.get("evaluate-session").expect("skill should exist");
         assert_eq!(skill.metadata.description, "Agent self-assessment skill that evaluates performance metrics for a session");
         assert!(skill.metadata.user_invocable);
-        assert_eq!(skill.metadata.triggers.len(), 7);
+        assert_eq!(skill.metadata.triggers.len(), 10);
         
-        // Test various trigger phrases
+        // Test various trigger phrases - now more precise (session-specific)
         let test_cases = [
-            ("evaluate this session", true),
-            ("how efficient was I", true),
-            ("check performance metrics", true),
+            ("evaluate session please", true),
+            ("how efficient was I in this session", true),
+            ("session metrics analysis", true),
             ("analyze session data", true),
-            ("evaluate session 123", true),
-            ("session metrics please", true),
+            ("check session performance", true),
+            ("会话性能怎么样", true),
+            ("评估会话效率", true),
+            // These should NOT match (too generic)
+            ("evaluate this stock", false),  
+            ("评估一下股票", false),
+            ("performance review", false),
             ("hello world", false),
-            ("help me write code", false),
         ];
         
         for (message, should_match) in test_cases {
