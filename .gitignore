@@ -79,7 +79,7 @@ trustmem_cloud_v1/data/
 feedback_export.jsonl
 
 review/
-plans/
+/plans/
 
 # VCR cassettes (optional - commit them for CI)
 # fixtures/vcr_cassettes/*.yaml
