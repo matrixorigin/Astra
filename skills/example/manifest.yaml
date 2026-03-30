@@ -1,0 +1,28 @@
+# skills/example/manifest.yaml
+name: example
+version: "1.0.0"
+description: "Example skill demonstrating SKILL.md integration"
+author: "mo-agent-engine"
+
+# Reference to SKILL.md for detailed instructions
+instructions_file: SKILL.md
+
+# Tools this skill provides (optional, can also be in SKILL.md allowed_tools)
+tools: []
+
+# No tables needed for this example
+tables: []
+
+# Example settings
+settings:
+  - name: review_depth
+    type: string
+    default: "standard"
+    description: "Review depth: quick, standard, thorough"
+
+# No secrets needed
+secrets: []
+
+# Dependencies
+requires: []
+depends_on: []
