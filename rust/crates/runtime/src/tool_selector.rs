@@ -134,6 +134,9 @@ pub struct SelectionResult {
     /// 1.0 = highly confident (multiple signals, strong TF-IDF match).
     /// Used to gate system prompt behavior (e.g., "ask for clarification" advisory).
     pub confidence: f64,
+    /// LLM tokens consumed by the selector itself (0 for TF-IDF).
+    pub selector_tokens_in: u64,
+    pub selector_tokens_out: u64,
 }
 
 /// Strategy for selecting tools from the catalog.
@@ -641,6 +644,8 @@ impl ToolSelector for TfIdfSelector {
             budget_used: report.budget_used,
             failed: false,
             confidence,
+            selector_tokens_in: 0,
+            selector_tokens_out: 0,
         }
     }
 
@@ -784,7 +789,8 @@ impl LlmToolSelector {
     }
 
     /// Make a lightweight SSE call and collect the full response text.
-    async fn call_llm(&self, messages: Vec<Value>) -> Result<String, String> {
+    /// Returns (text, tokens_in, tokens_out).
+    async fn call_llm(&self, messages: Vec<Value>) -> Result<(String, u64, u64), String> {
         let mut payload = serde_json::json!({
             "messages": messages,
         });
@@ -812,6 +818,8 @@ impl LlmToolSelector {
         // Collect SSE text events
         let full_body = resp.text().await.map_err(|e| e.to_string())?;
         let mut text = String::new();
+        let mut tin: u64 = 0;
+        let mut tout: u64 = 0;
         for line in full_body.lines() {
             if let Some(data) = line.strip_prefix("data: ") {
                 if data == "[DONE]" {
@@ -828,6 +836,17 @@ impl LlmToolSelector {
                     {
                         text.push_str(delta);
                     }
+                    // Usage in final chunk
+                    if let Some(usage) = chunk.get("usage") {
+                        tin = usage
+                            .get("prompt_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        tout = usage
+                            .get("completion_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                    }
                     // InProcess bridge format
                     if let Some(t) = chunk.get("type").and_then(Value::as_str) {
                         if t == "text_delta"
@@ -838,13 +857,21 @@ impl LlmToolSelector {
                         if t == "_inprocess_summary"
                             && let Some(ft) = chunk.get("full_text").and_then(Value::as_str)
                         {
-                            return Ok(ft.to_string());
+                            tin = chunk
+                                .get("prompt_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            tout = chunk
+                                .get("completion_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            return Ok((ft.to_string(), tin, tout));
                         }
                     }
                 }
             }
         }
-        Ok(text)
+        Ok((text, tin, tout))
     }
 }
 
@@ -868,30 +895,32 @@ impl ToolSelector for LlmToolSelector {
         );
 
         match self.call_llm(messages).await {
-            Ok(text) => {
+            Ok((text, tin, tout)) => {
                 let mut names = parse_tool_names_from_llm(&text);
-                // Validate: only keep names that exist in TOOL_CATALOG
                 let valid: std::collections::HashSet<&str> =
                     TOOL_CATALOG.iter().map(|t| t.name).collect();
                 names.retain(|n| valid.contains(n.as_str()));
 
                 if names.is_empty() {
-                    // LLM returned nothing useful — signal fallback
                     return SelectionResult {
                         tool_names: vec![],
                         strategy: "llm_empty",
                         budget_used: 0,
                         failed: true,
                         confidence: 0.0,
+                        selector_tokens_in: tin,
+                        selector_tokens_out: tout,
                     };
                 }
 
                 SelectionResult {
                     tool_names: names,
                     strategy: "llm",
-                    budget_used: 0, // caller computes from actual schemas
+                    budget_used: 0,
                     failed: false,
-                    confidence: 0.9, // LLM selection is high confidence
+                    confidence: 0.9,
+                    selector_tokens_in: tin,
+                    selector_tokens_out: tout,
                 }
             }
             Err(_e) => {
@@ -902,6 +931,8 @@ impl ToolSelector for LlmToolSelector {
                     budget_used: 0,
                     failed: true,
                     confidence: 0.0,
+                    selector_tokens_in: 0,
+                    selector_tokens_out: 0,
                 }
             }
         }
@@ -1653,6 +1684,8 @@ mod tests {
                     budget_used: 0,
                     failed: false,
                     confidence: 0.9,
+                    selector_tokens_in: 0,
+                    selector_tokens_out: 0,
                 }
             }
         }
@@ -1668,6 +1701,8 @@ mod tests {
                     budget_used: 0,
                     failed: false,
                     confidence: 0.3,
+                    selector_tokens_in: 0,
+                    selector_tokens_out: 0,
                 }
             }
         }
@@ -1705,6 +1740,8 @@ mod tests {
                     budget_used: 0,
                     failed: true,
                     confidence: 0.0,
+                    selector_tokens_in: 0,
+                    selector_tokens_out: 0,
                 }
             }
         }
@@ -1718,6 +1755,8 @@ mod tests {
                     budget_used: 100,
                     failed: false,
                     confidence: 0.5,
+                    selector_tokens_in: 0,
+                    selector_tokens_out: 0,
                 }
             }
         }
@@ -1756,6 +1795,8 @@ mod tests {
                     budget_used: 0,
                     failed: true,
                     confidence: 0.0,
+                    selector_tokens_in: 0,
+                    selector_tokens_out: 0,
                 }
             }
         }
@@ -1773,6 +1814,8 @@ mod tests {
                     budget_used: 0,
                     failed: true,
                     confidence: 0.0,
+                    selector_tokens_in: 0,
+                    selector_tokens_out: 0,
                 }
             }
 
@@ -1797,6 +1840,8 @@ mod tests {
                         budget_used: 0,
                         failed: false,
                         confidence: 0.8,
+                        selector_tokens_in: 0,
+                        selector_tokens_out: 0,
                     }
                 } else {
                     SelectionResult {
@@ -1805,6 +1850,8 @@ mod tests {
                         budget_used: 0,
                         failed: true,
                         confidence: 0.0,
+                        selector_tokens_in: 0,
+                        selector_tokens_out: 0,
                     }
                 }
             }
@@ -1859,6 +1906,8 @@ mod tests {
                     budget_used: 0,
                     failed: true,
                     confidence: 0.0,
+                    selector_tokens_in: 0,
+                    selector_tokens_out: 0,
                 }
             }
 
@@ -1882,6 +1931,8 @@ mod tests {
                         budget_used: 0,
                         failed: false,
                         confidence: 0.9,
+                        selector_tokens_in: 0,
+                        selector_tokens_out: 0,
                     }
                 } else {
                     SelectionResult {
@@ -1890,6 +1941,8 @@ mod tests {
                         budget_used: 0,
                         failed: true,
                         confidence: 0.0,
+                        selector_tokens_in: 0,
+                        selector_tokens_out: 0,
                     }
                 }
             }

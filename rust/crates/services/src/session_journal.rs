@@ -439,6 +439,11 @@ pub struct JournalEvent {
     /// Tool selection time in milliseconds (subset of context_ms).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selector_ms: Option<u64>,
+    /// LLM tokens consumed by tool selector (0 = TF-IDF only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector_tokens_in: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector_tokens_out: Option<u64>,
     /// Memoria search time in milliseconds (subset of context_ms).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memoria_ms: Option<u64>,
@@ -706,6 +711,8 @@ impl JournalEvent {
             context_ms: None,
             selector_strategy: None,
             selector_ms: None,
+            selector_tokens_in: None,
+            selector_tokens_out: None,
             memoria_ms: None,
         }
     }
@@ -850,6 +857,15 @@ impl JournalEvent {
     /// Set tool selection time.
     pub fn with_selector_time(mut self, selector_ms: Option<u64>) -> Self {
         self.selector_ms = selector_ms;
+        self
+    }
+
+    /// Set tool selector LLM token usage.
+    pub fn with_selector_tokens(mut self, tokens_in: u64, tokens_out: u64) -> Self {
+        if tokens_in > 0 || tokens_out > 0 {
+            self.selector_tokens_in = Some(tokens_in);
+            self.selector_tokens_out = Some(tokens_out);
+        }
         self
     }
 

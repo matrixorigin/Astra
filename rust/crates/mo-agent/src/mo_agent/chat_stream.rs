@@ -836,6 +836,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     let mut first_memoria_ms: Option<u64> = None;
     let mut first_selector_ms: Option<u64> = None;
     let mut first_selector_strategy: Option<String> = None;
+    let mut selector_tokens_in: u64 = 0;
+    let mut selector_tokens_out: u64 = 0;
 
     for _turn in 0..max_turns {
         if remaining_turns == 0 {
@@ -1038,6 +1040,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     sel_result.strategy, sel_result.confidence
                 ));
             }
+            selector_tokens_in += sel_result.selector_tokens_in;
+            selector_tokens_out += sel_result.selector_tokens_out;
             let conf = sel_result.confidence;
             let (schemas, report) = tool_selector::resolve_schemas_with_pressure(
                 &registry,
@@ -2213,6 +2217,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         context_ms: first_context_assembly_ms,
         selector_strategy: first_selector_strategy,
         selector_ms: first_selector_ms,
+        selector_tokens_in,
+        selector_tokens_out,
         memoria_ms: first_memoria_ms,
     })
 }

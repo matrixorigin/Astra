@@ -580,6 +580,8 @@ mod tests {
             context_ms: None,
             selector_strategy: None,
             selector_ms: None,
+            selector_tokens_in: None,
+            selector_tokens_out: None,
             memoria_ms: None,
         }
     }

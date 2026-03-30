@@ -318,6 +318,9 @@ struct StreamResult {
     selector_strategy: Option<String>,
     /// Tool selection time in milliseconds (subset of context_ms).
     selector_ms: Option<u64>,
+    /// LLM tokens consumed by tool selector (0 if TF-IDF only).
+    selector_tokens_in: u64,
+    selector_tokens_out: u64,
     /// Memoria search time in milliseconds (subset of context_ms).
     memoria_ms: Option<u64>,
 }

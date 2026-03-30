@@ -342,6 +342,7 @@ fn apply_turn_success(
         .with_context_time(result.context_ms)
         .with_selector_strategy(result.selector_strategy.clone())
         .with_selector_time(result.selector_ms)
+        .with_selector_tokens(result.selector_tokens_in, result.selector_tokens_out)
         .with_memoria_time(result.memoria_ms);
 
         // Store for /turn command

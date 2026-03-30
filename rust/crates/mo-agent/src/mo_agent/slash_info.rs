@@ -727,11 +727,18 @@ pub(super) async fn handle_info_command(
                     );
                 }
                 if let Some(t_in) = ev.tokens_in {
+                    let sel_note = match (ev.selector_tokens_in, ev.selector_tokens_out) {
+                        (Some(si), Some(so)) if si > 0 || so > 0 => {
+                            format!(" (+selector: {}→{})", si, so)
+                        }
+                        _ => String::new(),
+                    };
                     eprintln!(
-                        "    {}    {} input: {} tokens",
+                        "    {}    {} input: {} tokens{}",
                         " ".repeat(8),
                         "│".dim(),
-                        t_in.to_string().dim()
+                        t_in.to_string().dim(),
+                        sel_note.dim()
                     );
                 }
                 // Show TTFT inline
