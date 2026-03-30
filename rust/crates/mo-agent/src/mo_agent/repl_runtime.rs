@@ -87,6 +87,7 @@ pub(super) fn create_tool_selector_with_quality(
 
 /// Best-effort silent auth: validate existing token or try refresh.
 /// Never blocks or prompts — just ensures credentials are fresh if possible.
+/// Clears stale credentials when the server rejects them.
 pub(super) async fn try_silent_auth(client: &reqwest::Client, base: &str, profile: Option<&str>) {
     let creds = load_credentials();
     let name = profile_name(profile, &creds);
@@ -105,24 +106,33 @@ pub(super) async fn try_silent_auth(client: &reqwest::Client, base: &str, profil
             .await
         {
             Ok(resp) if resp.status().is_success() => return,
-            Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                // Token expired — try refresh below
+            Ok(resp) if resp.status().is_client_error() => {
+                // 4xx (401 expired, 404 user gone, etc.) — token is invalid
             }
-            _ => return, // Network error or non-401: proceed with cached creds
+            _ => return, // Network error or 5xx: proceed with cached creds
         }
     } else {
-        // No token at all — user will see "not logged in" in banner
         return;
     }
 
-    // Try refresh_token
+    // Try refresh_token first
     if let Some(refresh) = prof.and_then(|p| p.refresh_token.as_ref())
         && try_refresh_token(client, base, profile, refresh)
             .await
             .is_ok()
     {
         eprintln!("  {} Token refreshed", "✓".green());
+        return;
     }
+
+    // Refresh failed or no refresh token — clear stale credentials
+    let mut creds = load_credentials();
+    let name = profile_name(profile, &creds);
+    if let Some(p) = creds.profiles.get_mut(&name) {
+        p.access_token = None;
+        p.refresh_token = None;
+    }
+    let _ = save_credentials(&creds);
 }
 
 /// Try to refresh an expired access token using the stored refresh_token.
