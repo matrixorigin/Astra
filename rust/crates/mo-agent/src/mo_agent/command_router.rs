@@ -1,16 +1,36 @@
 use super::*;
 use std::io::Read;
 
+/// Exit codes for CLI commands (for scripting integration)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExitCode {
+    /// Success (0)
+    Success = 0,
+    /// Tool execution failure (1) - at least one tool call failed
+    ToolFailure = 1,
+    /// Force stop (2) - agent was force-stopped due to errors/stalls
+    ForceStop = 2,
+    /// API/network error (3) - failed to communicate with server
+    ApiError = 3,
+}
+
+impl From<ExitCode> for i32 {
+    fn from(code: ExitCode) -> i32 {
+        code as i32
+    }
+}
+
 pub(super) async fn execute_cli_command(
     command: Option<Command>,
     profile: Option<String>,
     client: &reqwest::Client,
     base: &str,
-) -> Result<(), String> {
+) -> Result<ExitCode, String> {
     match command {
         // No subcommand → interactive REPL (Codex-style default)
         None | Some(Command::Interactive) => {
-            run_chat_repl(client, base, profile.as_deref(), None).await
+            run_chat_repl(client, base, profile.as_deref(), None).await?;
+            Ok(ExitCode::Success)
         }
 
         // Inline message: mo-agent "what is the answer to life?"
@@ -63,12 +83,12 @@ pub(super) async fn execute_cli_command(
                 }
                 Err(e) => return Err(e),
             };
-            if let Some(sid) = sr.session_id {
+            if let Some(ref sid) = sr.session_id {
                 let p = creds.profiles.entry(name).or_default();
-                p.last_session_id = Some(sid);
+                p.last_session_id = Some(sid.clone());
                 save_credentials(&creds)?;
             }
-            Ok(())
+            Ok(compute_exit_code(&sr))
         }
 
         Some(Command::Register(args)) => {
@@ -104,7 +124,7 @@ pub(super) async fn execute_cli_command(
                 "{}",
                 "  ✓  Logged in. Run `mo-agent` to start chatting.".green()
             );
-            Ok(())
+            Ok(ExitCode::Success)
         }
 
         Some(Command::Login(args)) => {
@@ -121,7 +141,7 @@ pub(super) async fn execute_cli_command(
                 "{}",
                 "  ✓  Logged in. Run `mo-agent` to start chatting.".green()
             );
-            Ok(())
+            Ok(ExitCode::Success)
         }
 
         Some(Command::Whoami) => {
@@ -138,7 +158,7 @@ pub(super) async fn execute_cli_command(
                 return Err(read_api_error(status, &body));
             }
             print_json_or_raw(&body);
-            Ok(())
+            Ok(ExitCode::Success)
         }
 
         Some(Command::Refresh) => {
@@ -179,7 +199,7 @@ pub(super) async fn execute_cli_command(
             entry.refresh_token = Some(new_refresh.to_string());
             save_credentials(&creds)?;
             println!("token refreshed");
-            Ok(())
+            Ok(ExitCode::Success)
         }
 
         Some(Command::Logout) => {
@@ -212,7 +232,7 @@ pub(super) async fn execute_cli_command(
             }
             save_credentials(&creds)?;
             print_json_or_raw(&body);
-            Ok(())
+            Ok(ExitCode::Success)
         }
 
         Some(Command::Health) => {
@@ -227,7 +247,7 @@ pub(super) async fn execute_cli_command(
                 return Err(read_api_error(status, &body));
             }
             print_json_or_raw(&body);
-            Ok(())
+            Ok(ExitCode::Success)
         }
 
         Some(Command::Chat(args)) => {
@@ -247,8 +267,9 @@ pub(super) async fn execute_cli_command(
                 m
             } else {
                 // No message → start REPL with optional pre-set session/model
-                return run_chat_repl(client, base, profile.as_deref(), args.model.as_deref())
-                    .await;
+                run_chat_repl(client, base, profile.as_deref(), args.model.as_deref())
+                    .await?;
+                return Ok(ExitCode::Success);
             };
 
             let (mut creds, name, _, token) = get_profile_and_token(profile.as_deref())?;
@@ -322,6 +343,8 @@ pub(super) async fn execute_cli_command(
 
             // Output result
             if args.json {
+                // Compute exit code for JSON output
+                let exit_code = compute_exit_code(&sr);
                 // Pure JSON output for scripting
                 let json_output = serde_json::json!({
                     "session_id": sr.session_id,
@@ -334,15 +357,18 @@ pub(super) async fn execute_cli_command(
                     "ttft_ms": sr.ttft_ms,
                     "context_ms": sr.context_ms,
                     "selector_strategy": sr.selector_strategy,
+                    "exit_code": i32::from(exit_code),
+                    "success": exit_code == ExitCode::Success,
                 });
                 println!("{}", serde_json::to_string_pretty(&json_output).unwrap());
+                return Ok(exit_code);
             } else if quiet {
                 // Quiet mode: just print the text without formatting
                 println!("{}", sr.full_text);
             }
             // Normal mode output is already handled by stream_chat_sse
 
-            Ok(())
+            Ok(compute_exit_code(&sr))
         }
 
         Some(Command::Replay(args)) => {
@@ -380,7 +406,7 @@ pub(super) async fn execute_cli_command(
                 }
                 print_json_or_raw(&compare_body);
             }
-            Ok(())
+            Ok(ExitCode::Success)
         }
 
         Some(Command::Session(SessionCmd::List(args))) => {
@@ -405,7 +431,7 @@ pub(super) async fn execute_cli_command(
                 return Err(read_api_error(status, &body));
             }
             print_json_or_raw(&body);
-            Ok(())
+            Ok(ExitCode::Success)
         }
 
         Some(Command::Session(SessionCmd::Show(args))) => {
@@ -422,7 +448,7 @@ pub(super) async fn execute_cli_command(
                 return Err(read_api_error(status, &body));
             }
             print_json_or_raw(&body);
-            Ok(())
+            Ok(ExitCode::Success)
         }
 
         Some(Command::Session(SessionCmd::Close(args))) => {
@@ -447,7 +473,7 @@ pub(super) async fn execute_cli_command(
                 let _ = clear_profile_last_session(profile.as_deref());
             }
             print_json_or_raw(&body);
-            Ok(())
+            Ok(ExitCode::Success)
         }
 
         Some(Command::Session(SessionCmd::Delete(args))) => {
@@ -476,7 +502,7 @@ pub(super) async fn execute_cli_command(
             } else {
                 print_json_or_raw(&body);
             }
-            Ok(())
+            Ok(ExitCode::Success)
         }
 
         Some(Command::Model(ModelCmd::List)) => {
@@ -493,7 +519,7 @@ pub(super) async fn execute_cli_command(
                 return Err(read_api_error(status, &body));
             }
             print_json_or_raw(&body);
-            Ok(())
+            Ok(ExitCode::Success)
         }
 
         Some(Command::Model(ModelCmd::Show(args))) => {
@@ -510,7 +536,7 @@ pub(super) async fn execute_cli_command(
                 return Err(read_api_error(status, &body));
             }
             print_json_or_raw(&body);
-            Ok(())
+            Ok(ExitCode::Success)
         }
 
         Some(Command::Skill(SkillCmd::List(args))) => {
@@ -531,7 +557,7 @@ pub(super) async fn execute_cli_command(
                 return Err(read_api_error(status, &body));
             }
             print_json_or_raw(&body);
-            Ok(())
+            Ok(ExitCode::Success)
         }
 
         Some(Command::Skill(SkillCmd::Show(args))) => {
@@ -549,7 +575,7 @@ pub(super) async fn execute_cli_command(
                 return Err(read_api_error(status, &body));
             }
             print_json_or_raw(&body);
-            Ok(())
+            Ok(ExitCode::Success)
         }
 
         Some(Command::Skill(SkillCmd::Status(args))) => {
@@ -567,7 +593,7 @@ pub(super) async fn execute_cli_command(
                 return Err(read_api_error(status, &body));
             }
             print_json_or_raw(&body);
-            Ok(())
+            Ok(ExitCode::Success)
         }
 
         Some(Command::Skill(SkillCmd::Register(args))) => {
@@ -610,7 +636,26 @@ pub(super) async fn execute_cli_command(
                 return Err(read_api_error(status, &body));
             }
             print_json_or_raw(&body);
-            Ok(())
+            Ok(ExitCode::Success)
         }
     }
+}
+
+/// Compute exit code from StreamResult based on tool failures and force stops.
+fn compute_exit_code(sr: &StreamResult) -> ExitCode {
+    // Check for force stop (highest priority)
+    for ve in &sr.verdict_events {
+        if ve.force_stop {
+            return ExitCode::ForceStop;
+        }
+    }
+
+    // Check for tool failures
+    for record in &sr.tool_call_records {
+        if !record.ok {
+            return ExitCode::ToolFailure;
+        }
+    }
+
+    ExitCode::Success
 }
