@@ -497,11 +497,11 @@ fn apply_turn_success(
             let _ = mo_agent_services::session_workspace::write_workspace(&ws);
         }
 
-        // Log stall events to journal
-        for (stall_type, turn_num) in &result.stall_events {
+        // Log stall events to journal (use state.turn for user turn, not internal loop turn)
+        for (stall_type, _) in &result.stall_events {
             let stall_event = session_journal::JournalEvent::stall_detected(
                 state.session_id.as_deref(),
-                *turn_num,
+                state.turn as u32,
                 stall_type,
                 0, // nudge_count not tracked per-event; stall_type conveys severity
                 0.0,
@@ -511,11 +511,11 @@ fn apply_turn_success(
             enqueue_ingestion(state, &stall_event);
         }
 
-        // Log TurnGuard verdict events to journal (non-Healthy only)
+        // Log TurnGuard verdict events to journal (use state.turn for user turn)
         for ve in &result.verdict_events {
             let verdict_event = session_journal::JournalEvent::turn_guard_verdict(
                 state.session_id.as_deref(),
-                ve.turn,
+                state.turn as u32,
                 &ve.severity,
                 &ve.injections,
                 &ve.avoid_tools,

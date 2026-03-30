@@ -1000,6 +1000,12 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             &boost_terms,
         );
 
+        let learned_context = selector.learned_context(message, recent_tools);
+        let learned_context_hint = learned_context.prompt_fragment();
+        let learned_task_type = learned_context
+            .task_archetype
+            .map(|task_type| format!("{task_type:?}").to_lowercase());
+
         let (turn_schemas, selection_report, selection_confidence) = if tool_results.is_empty() {
             let turn_count = history.len() as u32 + 1;
             let sel_ctx = tool_selector::SelectionContext {
@@ -1102,6 +1108,13 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 payload["edge_profile"]["recommended_tools"] = serde_json::json!(dynamic_tools);
                 payload["edge_profile"]["selection_confidence"] =
                     serde_json::json!(selection_confidence);
+            }
+            if !learned_context_hint.is_empty() {
+                payload["edge_profile"]["learned_context_hint"] =
+                    serde_json::json!(learned_context_hint);
+            }
+            if let Some(task_type) = learned_task_type.as_ref() {
+                payload["edge_profile"]["selection_task_type"] = serde_json::json!(task_type);
             }
         }
         // Dynamic schema restriction: remove tools that were stall-restricted
@@ -2141,6 +2154,32 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         budget_total: 0,
     });
 
+    // Deduplicate stall events by type (keep only one of each type per user turn).
+    // The internal _turn numbers were used for in-loop deduplication; for journal
+    // output, we normalize all turn numbers to 0 (repl_turn.rs will use state.turn).
+    let deduped_stall_events: Vec<(String, u32)> = {
+        let mut seen = std::collections::HashSet::new();
+        stall_events
+            .into_iter()
+            .filter(|(stall_type, _)| seen.insert(stall_type.clone()))
+            .map(|(stall_type, _)| (stall_type, 0)) // turn will be filled by repl_turn
+            .collect()
+    };
+
+    // Deduplicate verdict events by severity (keep only the first of each severity).
+    // Same rationale: internal turn numbers are loop-internal, not user turns.
+    let deduped_verdict_events: Vec<VerdictEvent> = {
+        let mut seen = std::collections::HashSet::new();
+        verdict_events
+            .into_iter()
+            .filter(|ve| seen.insert(ve.severity.clone()))
+            .map(|mut ve| {
+                ve.turn = 0; // turn will be filled by repl_turn
+                ve
+            })
+            .collect()
+    };
+
     Ok(StreamResult {
         session_id: current_session_id,
         run_id: current_run_id,
@@ -2153,8 +2192,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         tool_call_records,
         budget_used: report.budget_used,
         budget_pressure: first_budget_pressure,
-        stall_events,
-        verdict_events,
+        stall_events: deduped_stall_events,
+        verdict_events: deduped_verdict_events,
         step_recorder_summary: Some(step_recorder.summary()),
         // Export tool health with merged historical entries to preserve unused tools
         tool_health_export: turn_guard.health.export_merged(tool_health_entries),
