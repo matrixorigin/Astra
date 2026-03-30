@@ -57,18 +57,14 @@ export async function apiFetch<T>(path: string): Promise<T> {
 }
 
 /**
- * Like apiFetch but returns `null` on 401/403 instead of throwing.
- * Useful for read-only pages that should degrade gracefully without auth.
+ * Like apiFetch but returns `null` on any API error instead of throwing.
+ * Useful for read-only pages that should degrade gracefully.
  */
 export async function tryApiFetch<T>(path: string): Promise<T | null> {
   try {
     return await apiFetch<T>(path);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : '';
-    if (msg.includes('Not authenticated') || msg.includes('401') || msg.includes('403')) {
-      return null;
-    }
-    throw err;
+  } catch {
+    return null;
   }
 }
 
