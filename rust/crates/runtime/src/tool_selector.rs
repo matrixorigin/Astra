@@ -1872,6 +1872,7 @@ mod tests {
                     confidence: 0.3,
                     selector_tokens_in: 0,
                     selector_tokens_out: 0,
+                    selected_skills: vec![],
                 }
             }
         }
@@ -1911,6 +1912,7 @@ mod tests {
                     confidence: 0.0,
                     selector_tokens_in: 0,
                     selector_tokens_out: 0,
+                    selected_skills: vec![],
                 }
             }
         }
@@ -1926,6 +1928,7 @@ mod tests {
                     confidence: 0.5,
                     selector_tokens_in: 0,
                     selector_tokens_out: 0,
+                    selected_skills: vec![],
                 }
             }
         }
@@ -1966,6 +1969,7 @@ mod tests {
                     confidence: 0.0,
                     selector_tokens_in: 0,
                     selector_tokens_out: 0,
+                    selected_skills: vec![],
                 }
             }
         }
@@ -1985,6 +1989,7 @@ mod tests {
                     confidence: 0.0,
                     selector_tokens_in: 0,
                     selector_tokens_out: 0,
+                    selected_skills: vec![],
                 }
             }
 
@@ -2011,6 +2016,7 @@ mod tests {
                         confidence: 0.8,
                         selector_tokens_in: 0,
                         selector_tokens_out: 0,
+                        selected_skills: vec![],
                     }
                 } else {
                     SelectionResult {
@@ -2021,6 +2027,7 @@ mod tests {
                         confidence: 0.0,
                         selector_tokens_in: 0,
                         selector_tokens_out: 0,
+                        selected_skills: vec![],
                     }
                 }
             }
@@ -2077,6 +2084,7 @@ mod tests {
                     confidence: 0.0,
                     selector_tokens_in: 0,
                     selector_tokens_out: 0,
+                    selected_skills: vec![],
                 }
             }
 
@@ -2102,6 +2110,7 @@ mod tests {
                         confidence: 0.9,
                         selector_tokens_in: 0,
                         selector_tokens_out: 0,
+                        selected_skills: vec![],
                     }
                 } else {
                     SelectionResult {
@@ -2112,6 +2121,7 @@ mod tests {
                         confidence: 0.0,
                         selector_tokens_in: 0,
                         selector_tokens_out: 0,
+                        selected_skills: vec![],
                     }
                 }
             }
