@@ -438,6 +438,10 @@ struct ReplState {
     pattern_library: Option<
         std::sync::Arc<std::sync::Mutex<mo_agent_runtime::pipeline::pattern::PatternLibrary>>,
     >,
+    /// Skill registry for progressive loading and context injection.
+    skill_registry: std::sync::Arc<std::sync::RwLock<skill_instructions::SkillRegistry>>,
+    /// MCP client manager for external tool servers.
+    mcp_manager: std::sync::Arc<std::sync::RwLock<mcp_client::McpClientManager>>,
 }
 
 impl Default for ReplState {
@@ -479,6 +483,12 @@ impl Default for ReplState {
             last_turn_event: None,
             sync_orchestrator: None,
             pattern_library: None,
+            skill_registry: std::sync::Arc::new(std::sync::RwLock::new(
+                skill_instructions::SkillRegistry::new(),
+            )),
+            mcp_manager: std::sync::Arc::new(std::sync::RwLock::new(
+                mcp_client::McpClientManager::new(),
+            )),
         }
     }
 }
@@ -2898,6 +2908,9 @@ async fn run_chat_repl(
 
     // Store pattern library reference for /learn command
     state.pattern_library = Some(pipeline_modules.pattern_library.clone());
+    // Store skill registry and MCP manager from pipeline initialization
+    state.skill_registry = pipeline_modules.skill_registry.clone();
+    state.mcp_manager = pipeline_modules.mcp_manager.clone();
 
     let profile_name_str = profile.unwrap_or("default").to_string();
 
@@ -3736,6 +3749,7 @@ mod tests {
             selector: &selector,
             recent_tools: &[],
             tool_health_entries: &[],
+            skill_instructions: None,
         })
         .await
         .unwrap();
@@ -3777,6 +3791,7 @@ mod tests {
             selector: &selector,
             recent_tools: &[],
             tool_health_entries: &[],
+            skill_instructions: None,
         })
         .await;
         assert!(result.is_err());
@@ -3834,6 +3849,7 @@ mod tests {
             selector: &selector,
             recent_tools: &[],
             tool_health_entries: &[],
+            skill_instructions: None,
         })
         .await
         .unwrap();

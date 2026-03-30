@@ -17,6 +17,10 @@ pub(super) struct PipelineModules {
     pub calibrator: std::sync::Arc<
         std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
     >,
+    /// Skill registry for progressive loading.
+    pub skill_registry: std::sync::Arc<std::sync::RwLock<skill_instructions::SkillRegistry>>,
+    /// MCP client manager for external tool servers.
+    pub mcp_manager: std::sync::Arc<std::sync::RwLock<mcp_client::McpClientManager>>,
 }
 
 pub(super) fn create_tool_selector_with_quality(
@@ -57,10 +61,35 @@ pub(super) fn create_tool_selector_with_quality(
         .with_pattern_library(pattern_library.clone())
         .with_progressive_calibrator(calibrator.clone());
 
+    // Initialize skill registry with progressive loading
+    let skill_registry =
+        std::sync::Arc::new(std::sync::RwLock::new(skill_instructions::SkillRegistry::new()));
+
+    // Discover and register skill metadata from skills/ directories
+    let skills_paths = [
+        std::path::PathBuf::from("skills"),
+        dirs::home_dir()
+            .map(|h| h.join(".mo-agent").join("skills"))
+            .unwrap_or_default(),
+    ];
+    for skills_path in &skills_paths {
+        if skills_path.is_dir() {
+            if let Ok(mut reg) = skill_registry.write() {
+                skill_instructions::discover_and_register_metadata(skills_path, &mut reg);
+            }
+        }
+    }
+
+    // Initialize MCP client manager (connections happen async later)
+    let mcp_manager =
+        std::sync::Arc::new(std::sync::RwLock::new(mcp_client::McpClientManager::new()));
+
     let modules = PipelineModules {
         entity_graph,
         pattern_library,
         calibrator,
+        skill_registry,
+        mcp_manager,
     };
 
     let creds = load_credentials();

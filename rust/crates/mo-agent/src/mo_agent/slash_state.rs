@@ -148,6 +148,7 @@ pub(super) async fn handle_state_command(
                     selector,
                     recent_tools: &[],
                     tool_health_entries: &[],
+                    skill_instructions: None,
                 }) => r,
                 _ = tokio::signal::ctrl_c() => {
                     eprintln!("{}", "  Interrupted.".dim());
@@ -222,6 +223,7 @@ pub(super) async fn handle_state_command(
                         selector,
                         recent_tools: &[],
                         tool_health_entries: &[],
+                        skill_instructions: None,
                     })
                     .await;
 
@@ -275,6 +277,7 @@ pub(super) async fn handle_state_command(
                                 selector,
                                 recent_tools: &[],
                                 tool_health_entries: &[],
+                                skill_instructions: None,
                             })
                             .await;
                             if let Ok(sr2) = synth_result {

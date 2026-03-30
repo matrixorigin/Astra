@@ -720,6 +720,8 @@ pub(super) struct ChatTurnParams<'a> {
     pub(super) recent_tools: &'a [String],
     pub(super) tool_health_entries:
         &'a [mo_agent_runtime::pipeline::persistence::ToolHealthEntry],
+    /// Skill instructions to inject into context (loaded on demand).
+    pub(super) skill_instructions: Option<&'a str>,
 }
 
 /// Full edge-cloud agentic loop: sends message, executes tools, loops until done.
@@ -741,6 +743,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         selector,
         recent_tools,
         tool_health_entries,
+        skill_instructions,
     } = p;
     let start = Instant::now();
     let term_width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
@@ -890,6 +893,11 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             if !skill_names.is_empty() {
                 payload["edge_profile"]["active_skills"] = serde_json::json!(skill_names);
             }
+        }
+        // Inject skill instructions into edge_profile for context enrichment.
+        // These are step-by-step instructions loaded from SKILL.md files.
+        if let Some(instructions) = skill_instructions {
+            payload["edge_profile"]["skill_instructions"] = serde_json::json!(instructions);
         }
         // Tool selection via pluggable ToolSelector strategy.
         // First turn: selector decides which tools. Follow-up turns: also pin

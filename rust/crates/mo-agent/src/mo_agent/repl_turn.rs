@@ -172,6 +172,7 @@ async fn maybe_auto_compact(
         selector: ctx.selector,
         recent_tools: &[],
         tool_health_entries: &[],
+        skill_instructions: None,
     })
     .await;
 
@@ -281,6 +282,7 @@ async fn run_chat_turn(
             selector: ctx.selector,
             recent_tools: &state.recent_tools,
             tool_health_entries: &state.tool_health_entries,
+            skill_instructions: None, // TODO: Load from skill_registry based on active skill
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             eprintln!("\n{}", "  Interrupted.".dim());

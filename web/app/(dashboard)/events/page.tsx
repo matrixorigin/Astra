@@ -2,6 +2,7 @@ import { getWebConfigurationMessage } from '@/lib/api/client';
 import { getEvents } from '@/lib/api/platform';
 import { SectionCard } from '@/components/dashboard/section-card';
 import { StatusCallout } from '@/components/dashboard/status-callout';
+import { EventLogViewer } from '@/components/events/event-log-viewer';
 import { getRuntimeConfig } from '@/lib/runtime-config';
 
 export const dynamic = 'force-dynamic';
@@ -22,12 +23,12 @@ export default async function EventsPage() {
     );
   }
 
-  const events = await getEvents(30);
+  const events = await getEvents(50);
 
   return (
     <SectionCard
       title="Events"
-      description="A first-pass event stream view for audit, replay, and run inspection."
+      description={`${events.length} event records loaded. Filter by type or search by content.`}
     >
       {mode === 'demo' ? (
         <div className="mb-5">
@@ -38,22 +39,10 @@ export default async function EventsPage() {
         </div>
       ) : null}
 
-      <div className="space-y-3">
-        {events.map((event) => (
-          <div key={event.id} className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <p className="font-medium text-white">{event.type}</p>
-                <p className="mt-1 text-sm text-slate-400">{event.summary}</p>
-              </div>
-              <div className="text-right text-xs text-slate-500">
-                <p>{event.createdAt}</p>
-                <p>{event.sessionId}</p>
-              </div>
-            </div>
-          </div>
-        ))}
-      </div>
+      <EventLogViewer
+        events={events}
+        emptyMessage="No events found matching the current filters."
+      />
     </SectionCard>
   );
 }
