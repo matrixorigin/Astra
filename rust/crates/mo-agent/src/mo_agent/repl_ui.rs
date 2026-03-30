@@ -28,6 +28,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/doctor", "Run diagnostics"),
     ("/version", "Show version info"),
     ("/session", "Show current session info"),
+    ("/session history", "View session conversation history"),
+    ("/session errors", "View session errors"),
+    ("/session export", "Export session data"),
+    ("/session list", "List recent sessions"),
     ("/skill", "Skill management: /skill [list|new|dev|test]"),
 ];
 
@@ -819,7 +823,19 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
             "Observability",
             &["/explain", "/turn", "/stats", "/tools", "/health", "/sync"],
         ),
-        ("📋", "Session", &["/session", "/resume", "/plan"]),
+        (
+            "📋",
+            "Session",
+            &[
+                "/session",
+                "/session history",
+                "/session errors",
+                "/session export",
+                "/session list",
+                "/resume",
+                "/plan",
+            ],
+        ),
         ("🧠", "Skills", &["/skill"]),
         ("🔧", "Diagnostics", &["/doctor", "/version"]),
         ("🔑", "Account", &["/login", "/register", "/logout"]),
@@ -1808,7 +1824,15 @@ mod tests {
         let groups: &[&[&str]] = &[
             &["/help", "/model", "/clear", "/history", "/copy", "/exit"],
             &["/explain", "/turn", "/stats", "/tools", "/health", "/sync"],
-            &["/session", "/resume", "/plan"],
+            &[
+                "/session",
+                "/session history",
+                "/session errors",
+                "/session export",
+                "/session list",
+                "/resume",
+                "/plan",
+            ],
             &["/skill"],
             &["/doctor", "/version"],
             &["/login", "/register", "/logout"],

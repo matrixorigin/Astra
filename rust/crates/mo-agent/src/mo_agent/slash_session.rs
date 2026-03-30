@@ -16,7 +16,7 @@ pub(super) fn resolve_journal_target_session(
         Ok((sid.clone(), false))
     } else {
         // No active session — list local journals and let user pick
-        let sessions = session_journal::list_sessions_by_time().unwrap_or_default();
+        let sessions = session_journal::list_sessions_by_time(10).unwrap_or_default();
         if sessions.is_empty() {
             return Err("  No sessions found.".to_string());
         }

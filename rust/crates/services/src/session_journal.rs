@@ -546,12 +546,17 @@ pub fn list_sessions() -> std::io::Result<Vec<String>> {
 }
 
 /// List local session IDs sorted by file modification time (most recent first).
-pub fn list_sessions_by_time() -> std::io::Result<Vec<String>> {
+/// Only returns the `limit` most recent sessions to avoid scanning all files.
+pub fn list_sessions_by_time(limit: usize) -> std::io::Result<Vec<String>> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
     let dir = journal_dir();
     if !dir.exists() {
         return Ok(Vec::new());
     }
-    let mut entries: Vec<(String, std::time::SystemTime)> = Vec::new();
+    // Min-heap of (mtime, sid) — keeps only the `limit` newest entries
+    let mut heap: BinaryHeap<Reverse<(std::time::SystemTime, String)>> = BinaryHeap::new();
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -561,11 +566,19 @@ pub fn list_sessions_by_time() -> std::io::Result<Vec<String>> {
                 .metadata()
                 .and_then(|m| m.modified())
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            entries.push((sid.to_string(), mtime));
+            if heap.len() < limit {
+                heap.push(Reverse((mtime, sid.to_string())));
+            } else if let Some(&Reverse((min_time, _))) = heap.peek()
+                && mtime > min_time
+            {
+                heap.pop();
+                heap.push(Reverse((mtime, sid.to_string())));
+            }
         }
     }
-    entries.sort_by(|a, b| b.1.cmp(&a.1)); // newest first
-    Ok(entries.into_iter().map(|(sid, _)| sid).collect())
+    let mut items: Vec<_> = heap.into_iter().map(|Reverse(item)| item).collect();
+    items.sort_by(|a, b| b.0.cmp(&a.0)); // newest first by mtime
+    Ok(items.into_iter().map(|(_, sid)| sid).collect())
 }
 
 /// Resolve a session id to an exact journal filename stem.

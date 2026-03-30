@@ -485,7 +485,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             .unwrap_or_default();
 
         // Fallback: merge local journal sessions not already in cloud list
-        if let Ok(local_ids) = session_journal::list_sessions_by_time() {
+        if let Ok(local_ids) = session_journal::list_sessions_by_time(10) {
             let cloud_ids: std::collections::HashSet<_> = cloud_sessions
                 .iter()
                 .map(|s| s.session_id.clone())
