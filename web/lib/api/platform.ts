@@ -1,4 +1,4 @@
-import { apiFetch, apiPost, getWebDataMode, type WebDataMode } from '@/lib/api/client';
+import { apiFetch, apiPost, tryApiFetch, getWebDataMode, type WebDataMode } from '@/lib/api/client';
 import { mockPlatformSnapshot, mockRunList } from '@/lib/api/mock-data';
 import type {
   AgentSummary,
@@ -222,28 +222,30 @@ export async function getOverviewData(): Promise<OverviewData> {
 
   // Try the aggregated snapshot endpoint first (single round-trip).
   try {
-    const snapshot = await apiFetch<ApiPlatformSnapshot>('/platform/snapshot');
-    const health = normalizeHealth(snapshot.health);
-    const agents = snapshot.agents.agents.map(normalizeAgent);
-    const sessions = snapshot.sessions.sessions.map(normalizeSession);
-    const events = snapshot.events.events.map(normalizeEvent);
-    return buildOverviewData(health, agents, sessions, events);
+    const snapshot = await tryApiFetch<ApiPlatformSnapshot>('/platform/snapshot');
+    if (snapshot) {
+      const health = normalizeHealth(snapshot.health);
+      const agents = snapshot.agents.agents.map(normalizeAgent);
+      const sessions = snapshot.sessions.sessions.map(normalizeSession);
+      const events = snapshot.events.events.map(normalizeEvent);
+      return buildOverviewData(health, agents, sessions, events);
+    }
   } catch {
     // Fall back to individual endpoints if snapshot is unavailable.
   }
 
   const [health, agents, sessions, events] = await Promise.all([
-    apiFetch<ApiHealthResponse>('/health'),
-    apiFetch<ApiAgentListResponse>('/agents'),
-    apiFetch<ApiSessionListResponse>('/sessions?limit=8'),
-    apiFetch<ApiEventListResponse>('/events?limit=8'),
+    tryApiFetch<ApiHealthResponse>('/health'),
+    tryApiFetch<ApiAgentListResponse>('/agents'),
+    tryApiFetch<ApiSessionListResponse>('/sessions?limit=8'),
+    tryApiFetch<ApiEventListResponse>('/events?limit=8'),
   ]);
 
   return buildOverviewData(
-    normalizeHealth(health),
-    agents.agents.map(normalizeAgent),
-    sessions.sessions.map(normalizeSession),
-    events.events.map(normalizeEvent),
+    health ? normalizeHealth(health) : { status: 'unknown', database: 'unknown', persistOk: 0, persistFail: 0 },
+    agents ? agents.agents.map(normalizeAgent) : [],
+    sessions ? sessions.sessions.map(normalizeSession) : [],
+    events ? events.events.map(normalizeEvent) : [],
   );
 }
 
@@ -252,8 +254,8 @@ export async function getAgents(): Promise<AgentSummary[]> {
     return mockPlatformSnapshot.agents;
   }
 
-  const response = await apiFetch<ApiAgentListResponse>('/agents');
-  return response.agents.map(normalizeAgent);
+  const response = await tryApiFetch<ApiAgentListResponse>('/agents');
+  return response ? response.agents.map(normalizeAgent) : [];
 }
 
 export async function getSessions(limit = 50): Promise<SessionSummary[]> {
@@ -261,8 +263,8 @@ export async function getSessions(limit = 50): Promise<SessionSummary[]> {
     return mockPlatformSnapshot.sessions;
   }
 
-  const response = await apiFetch<ApiSessionListResponse>(`/sessions?limit=${limit}`);
-  return response.sessions.map(normalizeSession);
+  const response = await tryApiFetch<ApiSessionListResponse>(`/sessions?limit=${limit}`);
+  return response ? response.sessions.map(normalizeSession) : [];
 }
 
 export async function getEvents(limit = 50): Promise<EventSummary[]> {
@@ -270,8 +272,8 @@ export async function getEvents(limit = 50): Promise<EventSummary[]> {
     return mockPlatformSnapshot.events;
   }
 
-  const response = await apiFetch<ApiEventListResponse>(`/events?limit=${limit}`);
-  return response.events.map(normalizeEvent);
+  const response = await tryApiFetch<ApiEventListResponse>(`/events?limit=${limit}`);
+  return response ? response.events.map(normalizeEvent) : [];
 }
 
 export async function getSessionWorkspace(sessionId: string): Promise<{
@@ -334,7 +336,10 @@ export async function getRuns(limit = 50, offset = 0): Promise<RunListData> {
     return mockRunList;
   }
 
-  const response = await apiFetch<ApiRunListResponse>(`/runs?limit=${limit}&offset=${offset}`);
+  const response = await tryApiFetch<ApiRunListResponse>(`/runs?limit=${limit}&offset=${offset}`);
+  if (!response) {
+    return { runs: [], total: 0, limit, offset };
+  }
   return {
     runs: response.runs.map(normalizeRun),
     total: response.total,
@@ -379,9 +384,12 @@ export async function getSessionActivity(
     return { sessionId, activities: [], total: 0 };
   }
 
-  const response = await apiFetch<ApiSessionActivityResponse>(
+  const response = await tryApiFetch<ApiSessionActivityResponse>(
     `/sessions/${sessionId}/activity?limit=${limit}`,
   );
+  if (!response) {
+    return { sessionId, activities: [], total: 0 };
+  }
   return {
     sessionId: response.session_id,
     activities: response.activities.map(normalizeActivityEntry),
@@ -417,7 +425,8 @@ export async function getTasks(
     return { tasks: [], total: 0 };
   }
   const qs = statusFilter ? `?status=${statusFilter}` : '';
-  return apiFetch<ApiTaskListResponse>(`/tasks${qs}`);
+  const result = await tryApiFetch<ApiTaskListResponse>(`/tasks${qs}`);
+  return result ?? { tasks: [], total: 0 };
 }
 
 export async function getTask(
