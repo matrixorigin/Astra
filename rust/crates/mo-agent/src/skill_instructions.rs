@@ -337,3 +337,578 @@ echo "code block"
         assert!(skill.instructions.contains("- List item 1"));
     }
 }
+
+// ── Progressive Loading Registry ──
+
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+/// A skill entry that supports progressive loading.
+#[derive(Debug, Clone)]
+pub struct ProgressiveSkill {
+    /// Level 1: Metadata (always loaded).
+    pub metadata: SkillMetadata,
+    /// Level 2: Full instructions (loaded on demand).
+    instructions: Option<SkillInstruction>,
+    /// Level 3: Resources (loaded on demand).
+    resources: Option<SkillResources>,
+    /// Path to skill directory (for lazy loading).
+    skill_dir: Option<std::path::PathBuf>,
+    /// Current load level.
+    pub load_level: SkillLoadLevel,
+}
+
+/// Level 3 resources: templates, scripts, and external files.
+#[derive(Debug, Clone, Default)]
+pub struct SkillResources {
+    /// Template files (name -> content).
+    pub templates: HashMap<String, String>,
+    /// Script files (name -> content).
+    pub scripts: HashMap<String, String>,
+    /// Total tokens for resources.
+    pub resource_tokens: u32,
+}
+
+impl ProgressiveSkill {
+    /// Create from metadata only (Level 1).
+    pub fn from_metadata(metadata: SkillMetadata, skill_dir: Option<std::path::PathBuf>) -> Self {
+        Self {
+            metadata,
+            instructions: None,
+            resources: None,
+            skill_dir,
+            load_level: SkillLoadLevel::Metadata,
+        }
+    }
+
+    /// Create with full instructions (Level 2).
+    pub fn from_instructions(instruction: SkillInstruction, skill_dir: Option<std::path::PathBuf>) -> Self {
+        let metadata = SkillMetadata::from(&instruction);
+        Self {
+            metadata,
+            instructions: Some(instruction),
+            resources: None,
+            skill_dir,
+            load_level: SkillLoadLevel::Instructions,
+        }
+    }
+
+    /// Get skill name.
+    pub fn name(&self) -> &str {
+        &self.metadata.name
+    }
+
+    /// Get description.
+    pub fn description(&self) -> &str {
+        &self.metadata.description
+    }
+
+    /// Get triggers.
+    pub fn triggers(&self) -> &[String] {
+        &self.metadata.triggers
+    }
+
+    /// Check if instructions are loaded.
+    pub fn has_instructions(&self) -> bool {
+        self.instructions.is_some()
+    }
+
+    /// Get instructions if loaded.
+    pub fn instructions(&self) -> Option<&SkillInstruction> {
+        self.instructions.as_ref()
+    }
+
+    /// Get instruction text if loaded.
+    pub fn instruction_text(&self) -> Option<&str> {
+        self.instructions.as_ref().map(|i| i.instructions.as_str())
+    }
+
+    /// Get allowed tools (from instructions if loaded, else empty).
+    pub fn allowed_tools(&self) -> Vec<String> {
+        self.instructions
+            .as_ref()
+            .map(|i| i.allowed_tools.clone())
+            .unwrap_or_default()
+    }
+
+    /// Total tokens currently loaded.
+    pub fn loaded_tokens(&self) -> u32 {
+        let metadata_tokens = self.metadata.metadata_tokens;
+        let instruction_tokens = self.instructions.as_ref().map(|i| i.instruction_tokens).unwrap_or(0);
+        let resource_tokens = self.resources.as_ref().map(|r| r.resource_tokens).unwrap_or(0);
+        metadata_tokens + instruction_tokens + resource_tokens
+    }
+
+    /// Load to Level 2 (instructions) if not already loaded.
+    pub fn load_instructions(&mut self) -> Result<(), String> {
+        if self.instructions.is_some() {
+            return Ok(());
+        }
+
+        let skill_dir = self.skill_dir.as_ref()
+            .ok_or("No skill directory set for lazy loading")?;
+
+        // Try SKILL.md first
+        let skill_md_path = skill_dir.join("SKILL.md");
+        if skill_md_path.exists() {
+            let content = std::fs::read_to_string(&skill_md_path)
+                .map_err(|e| format!("Failed to read SKILL.md: {e}"))?;
+            let instruction = parse_skill_md(&content)?;
+            self.instructions = Some(instruction);
+            self.load_level = SkillLoadLevel::Instructions;
+            return Ok(());
+        }
+
+        Err("No SKILL.md found for this skill".to_string())
+    }
+
+    /// Load to Level 3 (resources) if not already loaded.
+    pub fn load_resources(&mut self) -> Result<(), String> {
+        // First ensure instructions are loaded
+        self.load_instructions()?;
+
+        if self.resources.is_some() {
+            return Ok(());
+        }
+
+        let skill_dir = self.skill_dir.as_ref()
+            .ok_or("No skill directory set for lazy loading")?;
+
+        let mut resources = SkillResources::default();
+
+        // Load templates/ directory
+        let templates_dir = skill_dir.join("templates");
+        if templates_dir.exists() {
+            for entry in std::fs::read_dir(&templates_dir).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let path = entry.path();
+                if path.is_file() {
+                    let name = path.file_name().unwrap().to_string_lossy().to_string();
+                    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                    resources.resource_tokens += (content.len() as u32) / 4;
+                    resources.templates.insert(name, content);
+                }
+            }
+        }
+
+        // Load scripts/ directory
+        let scripts_dir = skill_dir.join("scripts");
+        if scripts_dir.exists() {
+            for entry in std::fs::read_dir(&scripts_dir).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let path = entry.path();
+                if path.is_file() {
+                    let name = path.file_name().unwrap().to_string_lossy().to_string();
+                    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                    resources.resource_tokens += (content.len() as u32) / 4;
+                    resources.scripts.insert(name, content);
+                }
+            }
+        }
+
+        self.resources = Some(resources);
+        self.load_level = SkillLoadLevel::Resources;
+        Ok(())
+    }
+
+    /// Get resources if loaded.
+    pub fn resources(&self) -> Option<&SkillResources> {
+        self.resources.as_ref()
+    }
+}
+
+/// Registry for managing skills with progressive loading.
+#[derive(Debug, Default)]
+pub struct SkillRegistry {
+    /// Skills indexed by name.
+    skills: HashMap<String, ProgressiveSkill>,
+    /// Total metadata tokens loaded.
+    metadata_tokens: u32,
+    /// Token budget for metadata (Level 1).
+    metadata_budget: u32,
+}
+
+impl SkillRegistry {
+    /// Create a new skill registry with default budget.
+    pub fn new() -> Self {
+        Self {
+            skills: HashMap::new(),
+            metadata_tokens: 0,
+            metadata_budget: 10_000, // ~100 skills at ~100 tokens each
+        }
+    }
+
+    /// Create with custom token budget.
+    pub fn with_budget(metadata_budget: u32) -> Self {
+        Self {
+            skills: HashMap::new(),
+            metadata_tokens: 0,
+            metadata_budget,
+        }
+    }
+
+    /// Register a skill at Level 1 (metadata only).
+    pub fn register_metadata(&mut self, metadata: SkillMetadata, skill_dir: Option<std::path::PathBuf>) -> Result<(), String> {
+        let tokens = metadata.metadata_tokens;
+        if self.metadata_tokens + tokens > self.metadata_budget {
+            return Err(format!(
+                "Metadata budget exceeded: {} + {} > {}",
+                self.metadata_tokens, tokens, self.metadata_budget
+            ));
+        }
+
+        let name = metadata.name.clone();
+        let skill = ProgressiveSkill::from_metadata(metadata, skill_dir);
+        self.skills.insert(name, skill);
+        self.metadata_tokens += tokens;
+        Ok(())
+    }
+
+    /// Register a skill with full instructions (Level 2).
+    pub fn register_instructions(&mut self, instruction: SkillInstruction, skill_dir: Option<std::path::PathBuf>) {
+        let name = instruction.name.clone();
+        let skill = ProgressiveSkill::from_instructions(instruction, skill_dir);
+        // Don't count instruction tokens against metadata budget
+        self.metadata_tokens += skill.metadata.metadata_tokens;
+        self.skills.insert(name, skill);
+    }
+
+    /// Get a skill by name.
+    pub fn get(&self, name: &str) -> Option<&ProgressiveSkill> {
+        self.skills.get(name)
+    }
+
+    /// Get a mutable skill by name.
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut ProgressiveSkill> {
+        self.skills.get_mut(name)
+    }
+
+    /// Find skills matching a trigger keyword.
+    pub fn find_by_trigger(&self, trigger: &str) -> Vec<&ProgressiveSkill> {
+        let trigger_lower = trigger.to_lowercase();
+        self.skills
+            .values()
+            .filter(|s| s.metadata.triggers.iter().any(|t| t.to_lowercase() == trigger_lower))
+            .collect()
+    }
+
+    /// List all skill names.
+    pub fn skill_names(&self) -> Vec<&str> {
+        self.skills.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// List all skills.
+    pub fn all_skills(&self) -> Vec<&ProgressiveSkill> {
+        self.skills.values().collect()
+    }
+
+    /// Get total metadata tokens loaded.
+    pub fn metadata_tokens(&self) -> u32 {
+        self.metadata_tokens
+    }
+
+    /// Get remaining metadata budget.
+    pub fn remaining_budget(&self) -> u32 {
+        self.metadata_budget.saturating_sub(self.metadata_tokens)
+    }
+
+    /// Load instructions for a skill (Level 2).
+    pub fn load_instructions(&mut self, name: &str) -> Result<(), String> {
+        let skill = self.skills.get_mut(name)
+            .ok_or_else(|| format!("Skill not found: {name}"))?;
+        skill.load_instructions()
+    }
+
+    /// Load resources for a skill (Level 3).
+    pub fn load_resources(&mut self, name: &str) -> Result<(), String> {
+        let skill = self.skills.get_mut(name)
+            .ok_or_else(|| format!("Skill not found: {name}"))?;
+        skill.load_resources()
+    }
+
+    /// Number of registered skills.
+    pub fn len(&self) -> usize {
+        self.skills.len()
+    }
+
+    /// Check if registry is empty.
+    pub fn is_empty(&self) -> bool {
+        self.skills.is_empty()
+    }
+}
+
+/// Thread-safe skill registry wrapper.
+pub type SharedSkillRegistry = Arc<RwLock<SkillRegistry>>;
+
+/// Create a new shared skill registry.
+pub fn new_shared_registry() -> SharedSkillRegistry {
+    Arc::new(RwLock::new(SkillRegistry::new()))
+}
+
+/// Discover skills from a directory and register metadata only (Level 1).
+pub fn discover_and_register_metadata(
+    skills_dir: &Path,
+    registry: &mut SkillRegistry,
+) -> Vec<String> {
+    let mut registered = Vec::new();
+
+    let Ok(entries) = std::fs::read_dir(skills_dir) else {
+        return registered;
+    };
+
+    for entry in entries.flatten() {
+        let skill_dir = entry.path();
+        if !skill_dir.is_dir() {
+            continue;
+        }
+
+        let skill_md_path = skill_dir.join("SKILL.md");
+        if skill_md_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&skill_md_path) {
+                if let Ok(instruction) = parse_skill_md(&content) {
+                    let metadata = SkillMetadata::from(&instruction);
+                    let name = metadata.name.clone();
+                    if registry.register_metadata(metadata, Some(skill_dir)).is_ok() {
+                        registered.push(name);
+                    }
+                }
+            }
+        }
+    }
+
+    registered
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn registry_basic_operations() {
+        let mut registry = SkillRegistry::new();
+        
+        let metadata = SkillMetadata {
+            name: "test".to_string(),
+            description: "Test skill".to_string(),
+            user_invocable: true,
+            triggers: vec!["test".to_string()],
+            metadata_tokens: 50,
+        };
+        
+        registry.register_metadata(metadata, None).unwrap();
+        
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get("test").is_some());
+        assert_eq!(registry.metadata_tokens(), 50);
+    }
+
+    #[test]
+    fn registry_budget_enforcement() {
+        let mut registry = SkillRegistry::with_budget(100);
+        
+        let metadata1 = SkillMetadata {
+            name: "skill1".to_string(),
+            description: "First".to_string(),
+            user_invocable: true,
+            triggers: vec![],
+            metadata_tokens: 60,
+        };
+        
+        let metadata2 = SkillMetadata {
+            name: "skill2".to_string(),
+            description: "Second".to_string(),
+            user_invocable: true,
+            triggers: vec![],
+            metadata_tokens: 60,
+        };
+        
+        registry.register_metadata(metadata1, None).unwrap();
+        let result = registry.register_metadata(metadata2, None);
+        
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("budget exceeded"));
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn registry_find_by_trigger() {
+        let mut registry = SkillRegistry::new();
+        
+        registry.register_metadata(SkillMetadata {
+            name: "review".to_string(),
+            description: "Code review".to_string(),
+            user_invocable: true,
+            triggers: vec!["review".to_string(), "audit".to_string()],
+            metadata_tokens: 50,
+        }, None).unwrap();
+        
+        registry.register_metadata(SkillMetadata {
+            name: "debug".to_string(),
+            description: "Debug helper".to_string(),
+            user_invocable: true,
+            triggers: vec!["debug".to_string(), "troubleshoot".to_string()],
+            metadata_tokens: 50,
+        }, None).unwrap();
+        
+        let found = registry.find_by_trigger("review");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name(), "review");
+        
+        let found = registry.find_by_trigger("AUDIT"); // case-insensitive
+        assert_eq!(found.len(), 1);
+        
+        let found = registry.find_by_trigger("unknown");
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn progressive_skill_lazy_loading() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        
+        let skill_md = r#"---
+name: review
+description: "Code review skill"
+triggers:
+  - review
+allowed_tools:
+  - read_file
+---
+# Review Process
+
+1. Check the diff
+2. Find issues
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+        
+        // Create at Level 1
+        let mut skill = ProgressiveSkill::from_metadata(
+            SkillMetadata {
+                name: "review".to_string(),
+                description: "Code review skill".to_string(),
+                user_invocable: true,
+                triggers: vec!["review".to_string()],
+                metadata_tokens: 50,
+            },
+            Some(skill_dir),
+        );
+        
+        assert_eq!(skill.load_level, SkillLoadLevel::Metadata);
+        assert!(!skill.has_instructions());
+        
+        // Load to Level 2
+        skill.load_instructions().unwrap();
+        assert_eq!(skill.load_level, SkillLoadLevel::Instructions);
+        assert!(skill.has_instructions());
+        assert!(skill.instruction_text().unwrap().contains("Review Process"));
+        assert_eq!(skill.allowed_tools(), vec!["read_file"]);
+    }
+
+    #[test]
+    fn progressive_skill_resource_loading() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("generator");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::create_dir_all(skill_dir.join("templates")).unwrap();
+        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        
+        let skill_md = r#"---
+name: generator
+description: "Code generator"
+---
+Generate code from templates.
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+        std::fs::write(skill_dir.join("templates/component.tsx"), "export const {{name}} = () => {}").unwrap();
+        std::fs::write(skill_dir.join("scripts/setup.sh"), "#!/bin/bash\necho setup").unwrap();
+        
+        let mut skill = ProgressiveSkill::from_metadata(
+            SkillMetadata {
+                name: "generator".to_string(),
+                description: "Code generator".to_string(),
+                user_invocable: true,
+                triggers: vec![],
+                metadata_tokens: 40,
+            },
+            Some(skill_dir),
+        );
+        
+        // Load to Level 3
+        skill.load_resources().unwrap();
+        assert_eq!(skill.load_level, SkillLoadLevel::Resources);
+        
+        let resources = skill.resources().unwrap();
+        assert!(resources.templates.contains_key("component.tsx"));
+        assert!(resources.scripts.contains_key("setup.sh"));
+        assert!(resources.resource_tokens > 0);
+    }
+
+    #[test]
+    fn discover_and_register_metadata_works() {
+        let dir = TempDir::new().unwrap();
+        
+        // Create two skills
+        for name in ["review", "debug"] {
+            let skill_dir = dir.path().join(name);
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            let content = format!(r#"---
+name: {name}
+description: "{name} skill"
+triggers:
+  - {name}
+---
+Instructions for {name}.
+"#);
+            std::fs::write(skill_dir.join("SKILL.md"), content).unwrap();
+        }
+        
+        let mut registry = SkillRegistry::new();
+        let registered = discover_and_register_metadata(dir.path(), &mut registry);
+        
+        assert_eq!(registered.len(), 2);
+        assert_eq!(registry.len(), 2);
+        
+        // Should be at Level 1 only
+        let skill = registry.get("review").unwrap();
+        assert_eq!(skill.load_level, SkillLoadLevel::Metadata);
+        assert!(!skill.has_instructions());
+    }
+
+    #[test]
+    fn loaded_tokens_tracking() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("test");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        
+        let skill_md = r#"---
+name: test
+description: "Test skill with long instructions"
+---
+This is a longer instruction text that should contribute to the token count.
+We want to verify that loaded_tokens() returns the correct cumulative total.
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+        
+        let mut skill = ProgressiveSkill::from_metadata(
+            SkillMetadata {
+                name: "test".to_string(),
+                description: "Test".to_string(),
+                user_invocable: true,
+                triggers: vec![],
+                metadata_tokens: 30,
+            },
+            Some(skill_dir),
+        );
+        
+        // Level 1: metadata only
+        let level1_tokens = skill.loaded_tokens();
+        assert_eq!(level1_tokens, 30);
+        
+        // Level 2: instructions loaded
+        skill.load_instructions().unwrap();
+        let level2_tokens = skill.loaded_tokens();
+        assert!(level2_tokens > level1_tokens);
+    }
+}
