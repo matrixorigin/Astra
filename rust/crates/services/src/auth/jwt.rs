@@ -3,7 +3,6 @@ use chrono::{Duration as ChronoDuration, Utc};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use mo_agent_core::{ErrorResponse, JwtSettings, error_response, internal_error};
 use serde::{Deserialize, Serialize};
-
 pub(super) fn decode_jwt_claims_with_detail(
     token: &str,
     settings: &JwtSettings,
@@ -53,6 +52,8 @@ pub(super) struct JwtTokenClaims {
     pub(super) token_type: String,
     pub(super) exp: usize,
     pub(super) iat: usize,
+    /// Random JWT ID — ensures tokens issued in the same second are unique.
+    pub(super) jti: String,
 }
 
 pub(super) fn create_jwt_token(
@@ -63,6 +64,7 @@ pub(super) fn create_jwt_token(
     let now = Utc::now();
     claims.iat = now.timestamp() as usize;
     claims.exp = (now + expires_in).timestamp() as usize;
+    claims.jti = uuid::Uuid::new_v4().to_string();
     let algorithm =
         parse_jwt_algorithm(&settings.algorithm).map_err(|error| error.1.detail.clone())?;
     encode(
@@ -103,6 +105,7 @@ mod tests {
             token_type: token_type.into(),
             exp: 0,
             iat: 0,
+            jti: String::new(),
         }
     }
 
@@ -217,6 +220,7 @@ mod tests {
             token_type: "access".into(),
             exp: 0,
             iat: 0,
+            jti: String::new(),
         };
         let token = create_jwt_token(&settings, claims, ChronoDuration::minutes(30)).unwrap();
         let decoded = unwrap_jwt(decode_jwt_claims(&token, &settings));
@@ -251,5 +255,25 @@ mod tests {
         assert!(exp > iat);
         // 5 minutes = 300 seconds
         assert_eq!(exp - iat, 300);
+    }
+
+    #[test]
+    fn two_tokens_for_same_user_are_unique() {
+        // Regression: same user logging in twice in the same second must produce
+        // different tokens (and thus different token_hash values in the DB).
+        let settings = test_settings("HS256");
+        let t1 = create_jwt_token(
+            &settings,
+            make_claims("u1", "refresh"),
+            ChronoDuration::days(7),
+        )
+        .unwrap();
+        let t2 = create_jwt_token(
+            &settings,
+            make_claims("u1", "refresh"),
+            ChronoDuration::days(7),
+        )
+        .unwrap();
+        assert_ne!(t1, t2, "tokens must differ due to unique jti");
     }
 }

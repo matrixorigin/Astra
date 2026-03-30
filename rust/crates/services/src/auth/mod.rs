@@ -249,6 +249,7 @@ impl DatabaseAuthService {
                 token_type: "access".to_string(),
                 exp: 0,
                 iat: 0,
+                jti: String::new(),
             },
             ChronoDuration::minutes(i64::from(self.jwt.access_token_expire_minutes)),
         )
@@ -263,6 +264,7 @@ impl DatabaseAuthService {
                 token_type: "refresh".to_string(),
                 exp: 0,
                 iat: 0,
+                jti: String::new(),
             },
             ChronoDuration::days(i64::from(self.jwt.refresh_token_expire_days)),
         )
