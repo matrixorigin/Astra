@@ -426,7 +426,7 @@ RESTORE ACCOUNT FROM SNAPSHOT plan_baseline_sp;
 
 MatrixOne has **native vector data type** (`vecf32`, `vecf64`) with IVFFlat index support — no external extension needed.
 
-> **Note**: Use IVFFlat indexes for vector search. HNSW exists but IVFFlat is the recommended production index type.
+> **Note**: Use IVFFlat indexes for vector search (`CREATE INDEX ... USING ivfflat ... lists=N`). IVFFlat is the production-ready index type for approximate nearest neighbor queries.
 
 ```sql
 -- Store agent memory with embeddings
@@ -720,7 +720,7 @@ WHERE task_id = @target_task
 
 ## 8. Multi-Agent Coordination Protocol
 
-### 12.1 Agent Registry
+### 8.1 Agent Registry
 
 Every agent instance registers with the cloud on startup and maintains a heartbeat:
 
@@ -753,7 +753,7 @@ pub enum AgentStatus {
 
 **Heartbeat protocol**: Agent sends `POST /agents/{agent_id}/heartbeat` every 30s. Cloud marks as Dead if no heartbeat for `lease_ttl_secs`. Dead agent's tasks become reclaimable.
 
-### 12.2 Coordination Patterns
+### 8.2 Coordination Patterns
 
 Three patterns, matching existing design docs but with concrete implementation:
 
@@ -796,7 +796,7 @@ If revision_needed:
   Loop until approved or max_iterations reached
 ```
 
-### 12.3 Communication Model
+### 8.3 Communication Model
 
 Agents do **not** communicate directly. All communication is through cloud-persisted events:
 
@@ -816,11 +816,11 @@ Agent A ──event──▶ agent_events table ──query──▶ Agent B
 
 ## 9. Task Leasing & Distributed Execution
 
-### 12.1 The Problem
+### 9.1 The Problem
 
 Current `TaskRecord` has `user_id` but no agent ownership. Two agents can read the same task and start working on it simultaneously, producing conflicting results.
 
-### 12.2 Task Lease Model
+### 9.2 Task Lease Model
 
 ```rust
 pub struct TaskLease {
@@ -913,7 +913,7 @@ pub struct TaskCheckpoint {
 
 **Why both are needed**: A database Snapshot captures "what the data looks like" but not "what the agent was doing." TaskCheckpoint captures "agent was on subtask 3, already ran tests 1-5, next step is test 6." The `snapshot_name` field links the two: restore the Snapshot first (database state), then load TaskCheckpoint (domain state).
 
-### 12.4 Distributed Plan Execution
+### 9.5 Distributed Plan Execution
 
 ```rust
 pub struct DistributedPlan {
@@ -965,14 +965,14 @@ All subtasks Done → Plan Completed
 
 ## 10. Learning Convergence for Multi-Agent
 
-### 12.1 The Challenge
+### 10.1 The Challenge
 
 Current learning sync assumes **single writer per user per profile**. With multiple agents:
 - Agent A observes entity "React" used with tool `read_file` (confidence: 0.8)
 - Agent B observes entity "React" used with tool `grep` (confidence: 0.6)
 - Both push deltas to cloud simultaneously
 
-### 12.2 Merge Strategies (Already Designed, Need Implementation)
+### 10.2 Merge Strategies (Already Designed, Need Implementation)
 
 | Data Type | Merge Strategy | Rationale |
 |-----------|---------------|-----------|
@@ -1020,7 +1020,7 @@ Cloud (on push):
 
 **Why both levels are needed**: `DATA BRANCH MERGE` handles row-level identity (detect which entities were modified by both agents). But it cannot decide that "higher observation_count wins" — that's a domain-specific rule. The database detects structural conflicts; Rust resolves semantic conflicts.
 
-### 12.4 Confidence Gate for Learned Context
+### 10.4 Confidence Gate for Learned Context
 
 Already implemented in `tool_selector.rs`:
 
@@ -1037,7 +1037,7 @@ This gate becomes more important with multi-agent: observations from other agent
 
 ## 11. Token Efficiency at Scale
 
-### 12.1 Current Token Budget
+### 11.1 Current Token Budget
 
 ```
 System prompt:     ~2,000 tokens (identity, constraints, capabilities)
@@ -1049,7 +1049,7 @@ Memory injection:  ~100-2,400 tokens (intent-driven loading)
 Total overhead:    ~3,750-6,190 tokens (before conversation)
 ```
 
-### 12.2 Optimization Strategies
+### 11.2 Optimization Strategies
 
 #### Strategy 1: Intent-Driven Memory Loading (Implemented)
 ```
@@ -1094,7 +1094,7 @@ Low confidence (<60%): Full context (~150K tokens)
   └── Everything including comments/docs
 ```
 
-### 12.3 Multi-Agent Token Efficiency
+### 11.3 Multi-Agent Token Efficiency
 
 When running N agents, total token cost scales as O(N) naively. Optimizations:
 
@@ -1348,8 +1348,8 @@ mo-agent Orchestrator
 
 | Task | Effort | Dependency |
 |------|--------|------------|
-| MatrixOne materialized views for entity/pattern convergence | Medium | Phase 3 |
-| Weighted aggregation for Calibrator (SQL, not Rust) | Small | Materialized views |
+| MatrixOne HTAP aggregation queries for entity/pattern convergence | Medium | Phase 3 |
+| Weighted aggregation for Calibrator (SQL, not Rust) | Small | HTAP queries |
 | Cross-agent confidence decay tuning | Medium | Aggregation |
 | CDC-based event routing between agents | Large | Phase 3 |
 | Integration tests: 2-agent concurrent learning | Large | All above |

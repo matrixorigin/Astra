@@ -450,8 +450,8 @@ DATA BRANCH DIFF spec_approach_c.code_changes AGAINST workspace.code_changes;
 
 -- Step 5: Pick the winner, merge it, discard the rest
 DATA BRANCH MERGE spec_approach_b.code_changes INTO workspace.code_changes;
-DATA BRANCH DELETE DATABASE spec_approach_a;
-DATA BRANCH DELETE DATABASE spec_approach_c;
+DROP DATABASE spec_approach_a;
+DROP DATABASE spec_approach_c;
 
 -- If ALL approaches fail: instant rollback to pre-speculation state
 RESTORE DATABASE workspace FROM SNAPSHOT before_risky_change;
@@ -898,7 +898,7 @@ The current `multi-agent-cloud-runtime.md` §7 identifies the right features but
 |----------------|------------------------|----------------------|
 | **Lease-based task ownership (§9)** | + Data branches per agent | **Leases claim tasks** (who works on what); **branches isolate state** (each agent's data workspace). Lease → branch creation → work → merge → lease release. Both needed. |
 | **Direct DB access for data sharing** | + Publication/Subscription | **Pub/Sub for read-only shared context** (plans, learning state); **direct DB for agent's own writes**. Agents subscribe to orchestrator data without credentials. |
-| **JSON TaskCheckpoint (§9.3)** | + Snapshot + PITR | **Snapshots capture full database state** (all tables, atomic); **TaskCheckpoint captures domain semantics** (which subtask, which tools ran, dedup list). Use Snapshot for database-level rollback, TaskCheckpoint for task resumption logic. |
+| **JSON TaskCheckpoint (§9.4)** | + Snapshot + PITR | **Snapshots capture full database state** (all tables, atomic); **TaskCheckpoint captures domain semantics** (which subtask, which tools ran, dedup list). Use Snapshot for database-level rollback, TaskCheckpoint for task resumption logic. |
 | **3-way merge in Rust (§10.2)** | + DATA BRANCH MERGE | **DATA BRANCH MERGE for row-level conflict detection** (structural); **Rust merge for semantic conflict resolution** (observation-count-wins, weighted average). DB detects conflicts, app resolves them. |
 | **Filesystem isolation (§13.2)** | + Git worktree (filesystem) + Git4Data (data) | **Dual version control**: `git worktree` = per-agent working directory (concurrent filesystem access); Git4Data = per-agent data branch. Both use branch/merge/diff. Together = complete isolated workspace. Cherry-pick merge coming. |
 | **Separate vector DB** | → Native VECF32 + IVFFlat + BM25 | **Full replacement**: single-query hybrid retrieval eliminates Pinecone + Elasticsearch. No application-level fusion needed. |
