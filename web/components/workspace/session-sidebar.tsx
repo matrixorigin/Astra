@@ -158,11 +158,13 @@ export function SessionSidebar({
                     : 'bg-amber-400';
 
               return (
-                <button
+                <div
                   key={s.session_id}
-                  type="button"
+                  role="button"
+                  tabIndex={0}
                   onClick={() => onSelectSession(s.session_id)}
-                  className={`group w-full rounded-lg px-3 py-2.5 text-left transition-colors ${
+                  onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onSelectSession(s.session_id); }}
+                  className={`group w-full cursor-pointer rounded-lg px-3 py-2.5 text-left transition-colors ${
                     isActive
                       ? 'bg-sky-600/15 border border-sky-500/30'
                       : 'hover:bg-slate-800/50 border border-transparent'
@@ -221,7 +223,7 @@ export function SessionSidebar({
                       minute: '2-digit',
                     })}
                   </p>
-                </button>
+                </div>
               );
             })}
           </div>
