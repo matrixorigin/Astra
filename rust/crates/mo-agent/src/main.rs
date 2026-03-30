@@ -780,8 +780,30 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             }
         }
         Ok(None) => {
-            eprintln!("{}", format!("  Session '{arg}' not found.").yellow());
-            eprintln!("{}", "  Use /resume to see available sessions.".dim());
+            // Service didn't find workspace/cloud data, but journal may exist
+            match session_journal::read_journal(&session_id) {
+                Ok(events) if !events.is_empty() => {
+                    let turn_count = events
+                        .iter()
+                        .filter(|e| e.event_type == session_journal::JournalEventType::Turn)
+                        .count() as u32;
+                    state.session_id = Some(session_id.clone());
+                    state.turn = turn_count;
+                    state.history = repl_runtime::restore_history_from_journal(&session_id);
+                    repl_turn::initialize_journal_pub(state, &session_id);
+                    repl_turn::persist_last_session_id(profile, &session_id);
+                    eprintln!(
+                        "  {} Resumed session {} (journal, {} turns)",
+                        "✓".green(),
+                        &session_id[..8.min(session_id.len())].cyan(),
+                        turn_count,
+                    );
+                }
+                _ => {
+                    eprintln!("{}", format!("  Session '{arg}' not found.").yellow());
+                    eprintln!("{}", "  Use /resume to see available sessions.".dim());
+                }
+            }
         }
         Err(e) => {
             let hint = if e.to_string().contains("not found") {

@@ -562,6 +562,10 @@ pub fn list_sessions_by_time(limit: usize) -> std::io::Result<Vec<String>> {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if let Some(sid) = name.strip_suffix(".jsonl") {
+            // Skip test-generated sessions
+            if sid.starts_with("test-") || sid.starts_with("new-sess-") {
+                continue;
+            }
             let mtime = entry
                 .metadata()
                 .and_then(|m| m.modified())
