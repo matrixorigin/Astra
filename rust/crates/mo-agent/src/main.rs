@@ -85,7 +85,7 @@ use cli_utils::{
     prompt_password_masked, read_api_error, resumable_last_session_id, save_credentials,
     tool_call_detail, tool_result_summary, truncate_str, urlencoding,
 };
-use command_router::execute_cli_command;
+use command_router::{execute_cli_command, ExitCode};
 use permission_manager::PermissionManager;
 use stream_render::{Spinner, consume_turn_sse};
 #[cfg(test)]
@@ -3262,7 +3262,7 @@ async fn run_chat_repl(
 // ════════════════════════════════════════════════════════════════ main ════
 
 #[tokio::main]
-async fn main() -> Result<(), String> {
+async fn main() {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
     let client = reqwest::Client::builder()
@@ -3307,7 +3307,15 @@ async fn main() -> Result<(), String> {
         }
     }
 
-    execute_cli_command(command, profile, &client, &base).await
+    match execute_cli_command(command, profile, &client, &base).await {
+        Ok(exit_code) => {
+            std::process::exit(i32::from(exit_code));
+        }
+        Err(e) => {
+            eprintln!("{}", format!("Error: {e}").red());
+            std::process::exit(i32::from(ExitCode::ApiError));
+        }
+    }
 }
 
 #[cfg(test)]
