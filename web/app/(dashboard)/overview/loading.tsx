@@ -1,6 +1,6 @@
-import { SkeletonPageHeader, SkeletonStatCards, SkeletonCard, SkeletonBox } from '@/components/loading/skeletons';
+import { SkeletonPageHeader, SkeletonStatCards, SkeletonCard } from '@/components/loading/skeletons';
 
-export default function DashboardLoading() {
+export default function OverviewLoading() {
   return (
     <div className="space-y-6">
       <SkeletonPageHeader />
@@ -9,7 +9,6 @@ export default function DashboardLoading() {
         <SkeletonCard />
         <SkeletonCard />
       </div>
-      <SkeletonBox className="h-48" />
     </div>
   );
 }
