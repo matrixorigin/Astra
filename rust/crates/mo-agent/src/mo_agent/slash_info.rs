@@ -603,15 +603,23 @@ pub(super) async fn handle_info_command(
                     );
                 }
                 if let Some(ctx) = ev.context_ms {
-                    let mem_part = ev
-                        .memoria_ms
-                        .map(|m| format!(" (memoria: {}ms)", m))
-                        .unwrap_or_default();
+                    let mut parts = Vec::new();
+                    if let Some(sel) = ev.selector_ms {
+                        parts.push(format!("selector: {}ms", sel));
+                    }
+                    if let Some(m) = ev.memoria_ms {
+                        parts.push(format!("memoria: {}ms", m));
+                    }
+                    let detail = if parts.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", parts.join(", "))
+                    };
                     eprintln!(
                         "  {} {}ms{}  {}",
                         "Context:".cyan(),
                         ctx,
-                        mem_part,
+                        detail,
                         "(prompt assembly)".dim()
                     );
                 }
@@ -681,6 +689,15 @@ pub(super) async fn handle_info_command(
                             format!("[{:>5}ms]", offset).dim(),
                             "│ ".dim(),
                             mem
+                        );
+                    }
+                    if let Some(sel) = ev.selector_ms {
+                        eprintln!(
+                            "    {} {}   tool selection ({}ms){}",
+                            format!("[{:>5}ms]", offset).dim(),
+                            "│ ".dim(),
+                            sel,
+                            if sel > 3000 { "  ← slow" } else { "" }
                         );
                     }
                     offset = ctx;

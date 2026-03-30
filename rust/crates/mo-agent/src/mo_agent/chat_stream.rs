@@ -834,6 +834,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     // Track first turn's context assembly time for observability
     let mut first_context_assembly_ms: Option<u64> = None;
     let mut first_memoria_ms: Option<u64> = None;
+    let mut first_selector_ms: Option<u64> = None;
 
     for _turn in 0..max_turns {
         if remaining_turns == 0 {
@@ -1013,6 +1014,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             .map(|task_type| format!("{task_type:?}").to_lowercase());
 
         let (turn_schemas, selection_report, selection_confidence) = if tool_results.is_empty() {
+            let sel_start = Instant::now();
             let turn_count = history.len() as u32 + 1;
             let sel_ctx = tool_selector::SelectionContext {
                 query: message,
@@ -1028,6 +1030,9 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             let sel_result = selector
                 .select_with_learned_context(&sel_ctx, &learned_context)
                 .await;
+            if first_selector_ms.is_none() {
+                first_selector_ms = Some(sel_start.elapsed().as_millis() as u64);
+            }
             let conf = sel_result.confidence;
             let (schemas, report) = tool_selector::resolve_schemas_with_pressure(
                 &registry,
@@ -2201,6 +2206,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         last_heavy_checkpoint,
         ttft_ms: first_ttft_ms,
         context_ms: first_context_assembly_ms,
+        selector_ms: first_selector_ms,
         memoria_ms: first_memoria_ms,
     })
 }
