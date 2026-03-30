@@ -935,6 +935,15 @@ impl ToolSelector for FallbackSelector {
 
     async fn select(&self, ctx: &SelectionContext<'_>) -> SelectionResult {
         let learned_context = self.fallback.learned_context(ctx.query, ctx.recent_tools);
+        self.select_with_learned_context(ctx, &learned_context)
+            .await
+    }
+
+    async fn select_with_learned_context(
+        &self,
+        ctx: &SelectionContext<'_>,
+        learned_context: &LearnedContext,
+    ) -> SelectionResult {
         let result = self
             .primary
             .select_with_learned_context(ctx, &learned_context)
@@ -1695,6 +1704,110 @@ mod tests {
         let result = selector.select(&ctx).await;
         assert_eq!(result.strategy, "tfidf");
         assert_eq!(result.tool_names, vec!["memory_search"]);
+    }
+
+    #[tokio::test]
+    async fn fallback_select_with_learned_context_reuses_provided_context() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct EmptyPrimary;
+        #[async_trait]
+        impl ToolSelector for EmptyPrimary {
+            async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
+                SelectionResult {
+                    tool_names: vec![],
+                    strategy: "empty_primary",
+                    budget_used: 0,
+                    failed: true,
+                    confidence: 0.0,
+                }
+            }
+        }
+
+        struct SpyFallback {
+            learned_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl ToolSelector for SpyFallback {
+            async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
+                SelectionResult {
+                    tool_names: vec![],
+                    strategy: "spy_fallback_plain",
+                    budget_used: 0,
+                    failed: true,
+                    confidence: 0.0,
+                }
+            }
+
+            fn learned_context(&self, _query: &str, _recent_tools: &[String]) -> LearnedContext {
+                self.learned_calls.fetch_add(1, Ordering::SeqCst);
+                LearnedContext::default()
+            }
+
+            async fn select_with_learned_context(
+                &self,
+                _ctx: &SelectionContext<'_>,
+                learned_context: &LearnedContext,
+            ) -> SelectionResult {
+                if learned_context
+                    .tool_hints
+                    .iter()
+                    .any(|hint| hint.contains("github_list_prs"))
+                {
+                    SelectionResult {
+                        tool_names: vec!["github_list_prs".into()],
+                        strategy: "spy_fallback_learned",
+                        budget_used: 0,
+                        failed: false,
+                        confidence: 0.8,
+                    }
+                } else {
+                    SelectionResult {
+                        tool_names: vec![],
+                        strategy: "spy_fallback_plain",
+                        budget_used: 0,
+                        failed: true,
+                        confidence: 0.0,
+                    }
+                }
+            }
+        }
+
+        let learned_calls = Arc::new(AtomicUsize::new(0));
+        let selector = FallbackSelector::new(
+            Box::new(EmptyPrimary),
+            Box::new(SpyFallback {
+                learned_calls: learned_calls.clone(),
+            }),
+        );
+        let ctx = SelectionContext {
+            query: "matrixorigin 最新 pr",
+            turn_count: 1,
+            recent_tools: &[],
+            budget_tokens: 800,
+            boost_terms: vec![],
+            budget_pressure: 0.0,
+            memory_domain_hints: vec![],
+            restricted_tools: vec![],
+            file_context: vec![],
+        };
+
+        let provided = LearnedContext {
+            task_archetype: Some(TaskType::Fetch),
+            entity_hints: vec![],
+            pattern_hints: vec![],
+            calibration_hints: vec![],
+            tool_hints: vec!["Tool history: prefer 'github_list_prs'".into()],
+        };
+        let result = selector.select_with_learned_context(&ctx, &provided).await;
+        assert_eq!(result.strategy, "spy_fallback_learned");
+        assert_eq!(result.tool_names, vec!["github_list_prs"]);
+        assert_eq!(
+            learned_calls.load(Ordering::SeqCst),
+            0,
+            "provided learned context should be reused without recomputing fallback context"
+        );
     }
 
     #[tokio::test]

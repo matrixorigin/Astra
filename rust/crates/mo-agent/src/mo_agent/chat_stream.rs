@@ -1019,7 +1019,9 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 restricted_tools: restricted_vec.clone(),
                 file_context: file_context.clone(),
             };
-            let sel_result = selector.select(&sel_ctx).await;
+            let sel_result = selector
+                .select_with_learned_context(&sel_ctx, &learned_context)
+                .await;
             let conf = sel_result.confidence;
             let (schemas, report) = tool_selector::resolve_schemas_with_pressure(
                 &registry,
@@ -1041,7 +1043,9 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 restricted_tools: restricted_vec,
                 file_context: file_context.clone(),
             };
-            let sel_result = selector.select(&sel_ctx).await;
+            let sel_result = selector
+                .select_with_learned_context(&sel_ctx, &learned_context)
+                .await;
             let conf = sel_result.confidence;
             let (mut selected, mut report) = tool_selector::resolve_schemas_with_pressure(
                 &registry,
