@@ -325,7 +325,77 @@ CREATE PUBLICATION review_data DATABASE review_db
 - **Secure multi-agent data sharing**: No credential sharing, no API middleware — database handles isolation and replication
 - **Collective learning without data copying**: All agents subscribe to the converged learning state; orchestrator manages convergence
 - **SQL-powered coordination queries**: Agents query their subscribed view with full SQL power
-- **Note**: For event signaling (Agent A → "done" → Agent B), use orchestrator's event table within the publication. Agents poll their subscription view with `created_at > @last_seen` — latency depends on replication lag, not polling frequency
+
+### Creative Patterns: Making Pub/Sub Work for Agent Coordination
+
+Even though pub/sub is replication (not event streaming), several powerful coordination patterns emerge:
+
+**Pattern 1: Dual-Publication Bidirectional Communication**
+```sql
+-- Orchestrator → Agents: publish task assignments + shared context
+CREATE PUBLICATION plan_out DATABASE orchestrator_db
+  TABLE task_assignments, shared_context, event_log
+  ACCOUNT agent_coder_acct, agent_reviewer_acct;
+
+-- Agent → Orchestrator: each agent publishes its results back
+-- @session: agent_coder_acct
+CREATE PUBLICATION coder_results DATABASE coder_output_db
+  TABLE code_changes, status_updates
+  ACCOUNT sys;  -- Orchestrator subscribes to agent output
+
+-- @session: sys (orchestrator)
+CREATE DATABASE coder_feed FROM agent_coder_acct PUBLICATION coder_results;
+CREATE DATABASE reviewer_feed FROM agent_reviewer_acct PUBLICATION reviewer_results;
+
+-- Orchestrator now has real-time view of ALL agents' output
+-- No polling each agent's DB — subscription handles replication
+SELECT 'coder' AS agent, status, updated_at FROM coder_feed.status_updates
+UNION ALL
+SELECT 'reviewer', status, updated_at FROM reviewer_feed.status_updates
+ORDER BY updated_at DESC;
+```
+
+**Pattern 2: Status Board — Orchestrator Subscribes to All Agents**
+```sql
+-- Each agent publishes a "heartbeat" database with its status table
+-- @session: agent_coder_acct
+CREATE TABLE status_db.heartbeat (
+    agent_id VARCHAR(36), status VARCHAR(20), current_task VARCHAR(36),
+    progress_pct FLOAT, last_active DATETIME(6)
+);
+CREATE PUBLICATION coder_heartbeat DATABASE status_db ACCOUNT sys;
+
+-- Orchestrator subscribes to ALL agent heartbeats
+CREATE DATABASE hb_coder FROM agent_coder_acct PUBLICATION coder_heartbeat;
+CREATE DATABASE hb_reviewer FROM agent_reviewer_acct PUBLICATION reviewer_heartbeat;
+CREATE DATABASE hb_tester FROM agent_tester_acct PUBLICATION tester_heartbeat;
+
+-- Orchestrator dashboard: single query across all agents
+SELECT * FROM hb_coder.heartbeat
+UNION ALL SELECT * FROM hb_reviewer.heartbeat
+UNION ALL SELECT * FROM hb_tester.heartbeat;
+```
+
+**Pattern 3: Event Log in Published Database (Simulated Event Stream)**
+```sql
+-- Orchestrator includes an append-only event_log table in its publication
+CREATE TABLE orchestrator_db.event_log (
+    event_id VARCHAR(36) PRIMARY KEY,
+    event_type VARCHAR(30),
+    source_agent VARCHAR(36),
+    target_agent VARCHAR(36),
+    payload JSON,
+    created_at DATETIME(6) DEFAULT NOW(6),
+    INDEX idx_target_time (target_agent, created_at)
+);
+
+-- Agents poll their subscription view (local, no remote roundtrip)
+-- @session: agent_coder_acct
+SELECT * FROM coordination.event_log
+WHERE target_agent = 'agent_coder' AND created_at > @last_seen_ts
+ORDER BY created_at;
+-- Fast: polling a LOCAL replicated table, not a remote database
+```
 
 ---
 
@@ -498,10 +568,11 @@ CREATE TABLE agent_memory (
     turn_number   INT,
     created_at    DATETIME(6),
 
-    -- HNSW deferred: use brute-force L2_DISTANCE for now
-    -- INDEX idx_vec USING HNSW ON (embedding) OP_TYPE "vector_l2_ops",  -- future
+    -- IVFFlat index for approximate nearest neighbor search
     FULLTEXT INDEX ft_content (content)
 );
+-- Create IVFFlat vector index separately
+CREATE INDEX idx_vec USING ivfflat ON agent_memory(embedding) lists=100 op_type "vector_l2_ops";
 
 -- ╔══════════════════════════════════════════════════════════════════╗
 -- ║  THE ONE QUERY THAT REPLACES THREE SYSTEMS                      ║
@@ -802,7 +873,7 @@ SELECT * FROM coder_ws.code_changes {snapshot = 'before_review'};
 
 **Count the systems this replaces**:
 - ❌ Credential sharing for data access → ✅ PUBLICATION/SUBSCRIPTION (network-isolated sharing)
-- ❌ Pinecone (vector search) → ✅ VECF32 + L2_DISTANCE (HNSW deferred)
+- ❌ Pinecone (vector search) → ✅ VECF32 + IVFFlat INDEX
 - ❌ Elasticsearch (fulltext) → ✅ FULLTEXT INDEX + BM25
 - ❌ S3 SDK (artifact storage) → ✅ STAGE + DATALINK
 - ❌ Application-level locks → ✅ DATA BRANCH (isolation)
@@ -825,7 +896,7 @@ The current `multi-agent-cloud-runtime.md` §7 identifies the right features but
 | JSON blob checkpoints in LONGTEXT (§7.5) | Snapshot + PITR at database level | Zero-copy, atomic, complete — includes all tables, not just one JSON field |
 | Application-level 3-way merge in Rust (§10.2) | `DATA BRANCH MERGE` with SQL-level conflict detection | Push merge complexity into the database engine |
 | Git worktree per agent for isolation (§13.2) | Multi-tenant account per agent | Stronger isolation (SQL-level), includes data isolation not just filesystem |
-| Separate vector DB consideration (§7.2) | Native VECF32 + BM25 fulltext in one query | Eliminates external dependency, enables fused ranking (HNSW deferred) |
+| Separate vector DB consideration (§7.2) | Native VECF32 + IVFFlat + BM25 fulltext in one query | Eliminates external dependency, enables fused ranking |
 | S3 client for artifacts (§7.6) | Stage + DataLink + fulltext on external files | Eliminates SDK code, enables SQL search over S3 artifacts |
 
 ### The Key Architectural Shift
@@ -845,7 +916,7 @@ This inverts the dependency. The "smart" part of multi-agent coordination moves 
 | 2 | **Stage+DataLink+Fulltext** | Separate systems for storage, indexing, search | SQL as federated query engine over all artifacts | Fulltext index on external S3 files |
 | 3 | **Pub/Sub** | Direct DB access + credential sharing | Secure data sharing via publication/subscription | Network-isolated, selective, auditable sharing |
 | 4 | **Snapshot+PITR+Git4Data** | Serialize-try-deserialize, one path at a time | Parallel speculative execution with instant rollback | Branched speculation + continuous time-travel |
-| 5 | **Vector+Fulltext+SQL** | Three systems + application fusion layer | One query: BM25 + vector + SQL filters | Fused ranking in single statement (HNSW deferred) |
+| 5 | **Vector+Fulltext+SQL** | Three systems + application fusion layer | One query: BM25 + IVFFlat + SQL filters | Fused ranking in single statement |
 | 6 | **Multi-tenant Accounts** | Row-level security (filter on shared data) | SQL-level isolation (separate namespaces) | True account isolation with publication sharing |
 
 **The bottom line**: An agent runtime designed from scratch around MatrixOne wouldn't have a "storage layer" — MatrixOne would BE the runtime, with a thin Rust shell for LLM API calls and local tool execution. This is not an incremental improvement over using PostgreSQL. It's a fundamentally different architecture that no other agent framework can replicate, because no other database has these primitives.

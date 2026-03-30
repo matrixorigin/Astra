@@ -424,9 +424,9 @@ RESTORE ACCOUNT FROM SNAPSHOT plan_baseline_sp;
 
 ### 7.2 Vector Search: Native Embedding-Based Memory Retrieval
 
-MatrixOne has **native vector data type** (`vecf32`, `vecf64`) with index support — no external extension needed.
+MatrixOne has **native vector data type** (`vecf32`, `vecf64`) with IVFFlat index support — no external extension needed.
 
-> **Note**: HNSW/IVFFlat indexes exist but are not yet recommended for production workloads. Use brute-force `L2_DISTANCE` for now; add HNSW when maturity improves.
+> **Note**: Use IVFFlat indexes for vector search. HNSW exists but IVFFlat is the recommended production index type.
 
 ```sql
 -- Store agent memory with embeddings
@@ -440,11 +440,12 @@ CREATE TABLE agent_memories (
     created_at    DATETIME(6) DEFAULT NOW(6),
     INDEX idx_user (user_id),
     FULLTEXT INDEX ft_content (content)                -- BM25 fulltext for hybrid retrieval
-    -- HNSW index omitted: use brute-force L2_DISTANCE for now
-    -- INDEX idx_vec USING HNSW ON (embedding) OP_TYPE "vector_l2_ops"  -- future
 );
 
--- Semantic memory retrieval: brute-force vector similarity (no HNSW)
+-- Create IVFFlat index for approximate nearest neighbor search
+CREATE INDEX idx_vec USING ivfflat ON agent_memories(embedding) lists=100 op_type "vector_l2_ops";
+
+-- Semantic memory retrieval via IVFFlat index
 SELECT memory_id, content, confidence,
        L2_DISTANCE(embedding, @query_embedding) AS distance
 FROM agent_memories
@@ -453,7 +454,7 @@ WHERE user_id = @user_id
 ORDER BY L2_DISTANCE(embedding, @query_embedding) ASC
 LIMIT 10;
 
--- Hybrid retrieval: vector similarity + BM25 fulltext in one query
+-- Hybrid retrieval: IVFFlat vector similarity + BM25 fulltext in one query
 -- This is the key advantage: no Pinecone + Elasticsearch + fusion layer
 SELECT m.memory_id, m.content,
        L2_DISTANCE(m.embedding, @query_embedding) AS semantic_dist,
@@ -464,7 +465,7 @@ ORDER BY (0.7 * (1.0 / (1.0 + semantic_dist)) + 0.3 * text_score) DESC
 LIMIT 10;
 ```
 
-**Why this matters**: Memory retrieval is the #1 latency bottleneck in agent runtimes. Even without HNSW, MatrixOne handles vector similarity AND BM25 ranking **in a single query**, eliminating the Pinecone + Elasticsearch + application-level fusion pattern used by everyone else. When HNSW matures, this becomes a single-index hybrid search with no code changes.
+**Why this matters**: Memory retrieval is the #1 latency bottleneck in agent runtimes. MatrixOne handles IVFFlat vector similarity AND BM25 ranking **in a single query**, eliminating the Pinecone + Elasticsearch + application-level fusion pattern used by everyone else.
 
 ### 7.3 Fulltext Search with BM25: Document-Scale Knowledge Base
 
@@ -703,7 +704,7 @@ WHERE task_id = @target_task
 | MatrixOne Feature | Agent Subsystem | Replaces | Competitive Gap |
 |-------------------|----------------|----------|-----------------|
 | **Git4Data** (branch/merge/diff) | Multi-agent plan execution | Application-level conflict resolution | No equivalent in any database |
-| **Vector** (vecf32 + L2_DISTANCE) | Memory retrieval, RAG | External vector DB (Pinecone) | Native, no extension (HNSW deferred) |
+| **Vector** (vecf32 + IVFFlat) | Memory retrieval, RAG | External vector DB (Pinecone) | Native, no extension needed |
 | **Fulltext** (BM25 + DataLink) | Knowledge base search | Elasticsearch + application code | Single-query hybrid search |
 | **Pub/Sub** (publication) | Cross-agent data sharing | Direct DB access + credentials | Network-isolated replication |
 | **Snapshot** | Agent checkpointing | JSON blob in LONGTEXT column | Instant, atomic, zero-copy |
