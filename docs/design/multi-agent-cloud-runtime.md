@@ -39,7 +39,7 @@ mo-agent is an **Agentic Runtime** — a managed execution environment where eve
 Agent Decision = f(prompt@version, skill@version, context@snapshot, memory@state, llm_params)
 ```
 
-**Current state**: A mature single-agent, local-first system with production-ready learning sync, event ingestion, session management, and a 55-tool edge toolkit. The runtime implements a 5-stage cognitive pipeline (Perceive→Plan→Execute→Evaluate→Reflect) with progressive self-calibration.
+**Current state**: A mature single-agent, local-first system with production-ready learning sync, event ingestion, session management, and a 50-tool edge toolkit. The runtime implements a 5-stage cognitive pipeline (Perceive→Plan→Execute→Evaluate→Reflect) with progressive self-calibration.
 
 **Target state**: A **headless cloud runtime** where:
 - The server is the single source of truth — all cognitive capabilities exposed via API
@@ -94,9 +94,9 @@ Agent Decision = f(prompt@version, skill@version, context@snapshot, memory@state
 
 ```
 rust/crates/
-├── mo-agent/        # Edge runtime: CLI REPL, 55 tools, sync adapters, plan decomposition
+├── mo-agent/        # Edge runtime: CLI REPL, 50 tools, sync adapters, plan decomposition
 │   ├── main.rs              # Entry point, REPL loop, session management
-│   ├── edge_tools.rs        # 55 tools: bash, file ops, git (gix), code intel, web, memory
+│   ├── edge_tools.rs        # 50 tools: bash, file ops, git (gix), code intel, web, memory
 │   ├── mo_agent/
 │   │   ├── chat_stream.rs   # SSE streaming, LLM integration, event persistence
 │   │   ├── repl_turn.rs     # Single turn execution
@@ -182,7 +182,7 @@ Clean ──write──▶ Dirty ──push──▶ Syncing ──ok──▶ C
 
 | Component | Status | Evidence |
 |-----------|--------|----------|
-| Edge tool execution (55 tools) | ✅ Production | All tools implemented, no stubs |
+| Edge tool execution (50 tools) | ✅ Production | All tools implemented, no stubs |
 | Session journal + workspace | ✅ Production | Append-only JSONL, version tracking |
 | Event ingestion (async batch) | ✅ Production | Backpressure, idempotent, at-least-once |
 | Learning sync (EntityGraph) | ✅ Production | Delta support, optimistic locking, gzip compression |
@@ -439,6 +439,37 @@ A **headless cloud runtime** is an agent runtime that has no UI, no local filesy
 | Permission manager | `permission_manager.rs` | Local approval UX |
 | REPL UI + rendering | `repl_ui.rs`, `stream_render.rs` | Terminal rendering |
 
+#### Open Design Challenges
+
+The headless cloud runtime introduces **three challenges** that are not yet fully addressed:
+
+**1. Latency amplification from tool callbacks**
+
+Each tool invocation adds a cloud→edge→cloud network round-trip. For tools like `read_file` (~1ms local), this could add 50-200ms per call. A 5-tool turn adds 250ms-1s.
+
+*Mitigation strategies (to be designed)*:
+- **Batch tool invocations**: Cloud groups multiple independent tool calls into one callback
+- **Speculative execution**: Edge pre-executes likely follow-up reads while waiting for cloud
+- **Tool result caching**: Edge caches recently-read files; cloud sends cache-check instead of re-read
+- **Latency threshold**: Tools below a latency threshold run on the current bridge model (inline); tools above threshold (bash, build, test) use async callback
+
+**2. Offline degradation**
+
+The headless model requires cloud connectivity for every LLM call. The "local-first" claim must be qualified:
+- **Local-first for state**: Session journal, learning snapshot, tool execution all work offline ✅
+- **Cloud-required for cognition**: LLM calls, tool selection, plan decomposition require cloud ⚠️
+- **Degradation mode**: When cloud is unreachable, edge executor can replay last plan step, continue running approved tools, or queue messages for later. But it cannot start new cognitive work.
+- **Future**: Local small model fallback for basic tool selection when cloud is unreachable
+
+**3. Connection resilience**
+
+What happens when edge disconnects mid-tool-execution?
+- Tool execution is idempotent at the edge level (file reads, bash commands)
+- Cloud tracks pending tool requests with `request_id` and timeout
+- Edge reconnects → re-fetches pending requests → resubmits results
+- If edge fails to reconnect within lease TTL, cloud marks the turn as failed and allows retry
+- **Must be designed**: Reconnection protocol with request deduplication
+
 ### 5.4 Responsibility Split: What Moves Where
 
 A precise mapping of every responsibility in the current `mo-agent` CLI to its target location:
@@ -462,7 +493,7 @@ A precise mapping of every responsibility in the current `mo-agent` CLI to its t
 
 | Responsibility | Current Owner | Target Owner | Notes |
 |---------------|--------------|-------------|-------|
-| 55 local tools | `mo-agent` `edge_tools.rs` + subdirs | Edge executor process | Packaged as standalone |
+| 50 local tools | `mo-agent` `edge_tools.rs` + subdirs | Edge executor process | Packaged as standalone |
 | Tool invocation → result | Inline in `chat_stream.rs` | Edge executor via callback API | Cloud sends tool request, edge returns result |
 | Permission gates (bash, write) | `permission_manager.rs` | Edge executor local UX | User approves locally |
 | MCP server management | `mcp_client.rs` | Edge executor | User's MCP servers |
@@ -1030,6 +1061,25 @@ pub enum AgentStatus {
 
 **Heartbeat protocol**: Agent sends `POST /agents/{agent_id}/heartbeat` every 30s. Cloud marks as Dead if no heartbeat for `lease_ttl_secs`. Dead agent's tasks become reclaimable.
 
+#### Implementation Gap (Current vs Target)
+
+The current `AgentRecord` (`services/src/agents.rs:29-39`) has basic fields (`agent_id`, `name`, `agent_type: String`, `is_active: bool`, `agent_config: JSON`) but is **missing critical multi-agent fields**:
+
+| Field | Target Design | Current Implementation | Status |
+|-------|--------------|----------------------|--------|
+| `agent_id` | UUID | ✅ `agent_id: String` | Done |
+| `agent_type` | Enum (User/System/Orchestrator) | ⚠️ `agent_type: String` | Needs enum |
+| `capabilities` | `Vec<String>` tool names | ❌ Missing | **Blocker**: Can't route tasks to capable agents |
+| `status` | Enum (Active/Idle/Draining/Dead) | ⚠️ `is_active: bool` | Needs state machine |
+| `last_heartbeat` | Epoch timestamp | ❌ Missing | **Blocker**: Can't detect dead agents |
+| `lease_ttl_secs` | Default 60s | ❌ Missing | Needed for lease expiry |
+| `max_concurrent_tasks` | Capacity declaration | ❌ Missing | Needed for load balancing |
+| `current_task_count` | Current load | ❌ Missing | Needed for routing |
+
+**Routes exist** (`router_builder.rs:130-139`): `/agents` CRUD endpoints work, but no `/agents/{id}/heartbeat` endpoint.
+
+**Effort estimate**: ~3-4 days to add missing fields, heartbeat endpoint, and Dead-agent detection cron.
+
 ### 8.2 Coordination Patterns
 
 Three patterns, matching existing design docs but with concrete implementation:
@@ -1096,6 +1146,17 @@ Agent A ──event──▶ agent_events table ──query──▶ Agent B
 ### 9.1 The Problem
 
 Current `TaskRecord` has `user_id` but no agent ownership. Two agents can read the same task and start working on it simultaneously, producing conflicting results.
+
+#### Current TaskRecord vs Target
+
+Current `TaskRecord` (`services/src/task_orchestrator.rs`) has:
+- ✅ `task_id`, `user_id`, `status` (Pending/InProgress/Paused/Completed/Failed), `checkpoint`
+- ❌ No `agent_id` — tasks aren't owned by specific agents
+- ❌ No `lease_version` — no CAS operations for safe concurrent access
+- ❌ No `expires_at` — no lease expiry
+- ❌ No `/tasks/{id}/lease` endpoint in `router_builder.rs`
+
+**Gap**: Task leasing is **entirely design-only**. The `TaskLease` struct, lease protocol, and all lease endpoints described below need to be implemented from scratch. This is the **single largest blocker** for multi-agent coordination.
 
 ### 9.2 Task Lease Model
 
@@ -1251,13 +1312,20 @@ Current learning sync assumes **single writer per user per profile**. With multi
 
 ### 10.2 Merge Strategies (Already Designed, Need Implementation)
 
-| Data Type | Merge Strategy | Rationale |
-|-----------|---------------|-----------|
-| **EntityGraph** | Union merge, observation-count-wins | More observations = higher confidence |
-| **PatternLibrary** | Union merge (combine patterns) | Different agents see different patterns |
-| **Calibrator** | Weighted average by observation count | More data = more reliable threshold |
-| **ToolQuality** | Weighted merge by invocation count | More invocations = better signal |
-| **Preferences** | Last-writer-wins (timestamp) | User intent is singular |
+| Data Type | Merge Strategy | Rationale | Implementation Status |
+|-----------|---------------|-----------|----------------------|
+| **EntityGraph** | Union merge, observation-count-wins | More observations = higher confidence | ✅ `entity.rs:278-290` — `merge()` implemented, takes higher observation count |
+| **PatternLibrary** | Union merge (combine patterns) | Different agents see different patterns | ✅ `pattern.rs` — `merge()` implemented, combines unique patterns |
+| **Calibrator** | Weighted average by observation count | More data = more reliable threshold | ✅ `calibration.rs` — `merge()` implemented |
+| **ToolQuality** | Weighted merge by invocation count | More invocations = better signal | ⚠️ Partial |
+| **Preferences** | Last-writer-wins (timestamp) | User intent is singular | ❌ Not implemented |
+
+**Critical limitation**: All merge functions are **2-way only** (local + remote). For true multi-agent convergence with 3+ agents, need either:
+- **Version vectors** to detect which observation is newer (not just "bigger count")
+- **Per-agent scoping** so agent A's learning about "React + read_file" doesn't overwrite agent B's equally-valid "React + grep" preference
+- **3-way merge** using a common ancestor snapshot (current `merge()` has no ancestor parameter)
+
+These merge functions are correct for the single-user/multiple-sessions case. For true multi-agent, they need extension.
 
 ### 10.3 Multi-Agent Learning Protocol
 
@@ -1319,7 +1387,7 @@ This gate becomes more important with multi-agent: observations from other agent
 ```
 System prompt:     ~2,000 tokens (identity, constraints, capabilities)
 Learned context:   ~250-290 tokens (max 3 entity + 2 pattern + 2 calibration + 2 tool hints)
-Tool catalog:      ~1,500 tokens (55 tools, compact descriptions)
+Tool catalog:      ~1,500 tokens (50 tools, compact descriptions)
 Conversation:      Variable (elastic zone)
 Memory injection:  ~100-2,400 tokens (intent-driven loading)
 ────────────────────────────────────────────
@@ -1528,7 +1596,7 @@ mo-agent already supports MCP servers for tool discovery. Deepen this:
 
 ```
 Edge Runtime
-├── 55 built-in tools (edge_tools.rs)
+├── 50 built-in tools (edge_tools.rs)
 ├── MCP Server discovery (mcp_tools.rs)
 │   ├── Local MCP servers (filesystem, git, database tools)
 │   └── Remote MCP servers (cloud APIs, SaaS integrations)
@@ -1659,8 +1727,8 @@ mo-agent Orchestrator
 | Cross-session learning | ❌ | ❌ | ❌ | ❌ | ❌ | Optional | ✅ EntityGraph | ✅ Multi-agent merge |
 | Multi-agent | ❌ | ❌ | ❌ | ❌ | ✅ Shared state | ✅ Role-based | ⚠️ Basic delegation | ✅ Leased tasks |
 | Durable tasks | ❌ | Session resume | ❌ | ✅ Container | ✅ Checkpoints | ❌ | ⚠️ Record only | ✅ Event-sourced |
-| Tool count | ~4 fixed | ~10 | LSP-based | Shell + browser | Pluggable | Pluggable | 55 (production) | 55+ |
-| Code intelligence | Trained model | None native | AST + LSP | Shell grep | None | None | 10 tree-sitter tools | 10+ |
+| Tool count | ~4 fixed | ~10 | LSP-based | Shell + browser | Pluggable | Pluggable | 50 (production) | 50+ |
+| Code intelligence | Trained model | Tree-sitter + model | AST + LSP | Claude-backed shell | None | None | 10 tree-sitter tools | 10+ |
 | Token efficiency | ~60% | ~40% (200K window) | ~95% (symbol) | ~50% | Per-thread | Full replay | ~90% (intent-driven) | ~95% (progressive) |
 | Self-correction | Basic repair | None | LSP validation | Reflection loop | Node retry | Callback | StallGuard + ErrorRecovery | + Drift detection |
 | Privacy (local-first) | ❌ Cloud only | ✅ | ✅ | ⚠️ Container | Configurable | Configurable | ✅ | ✅ |
