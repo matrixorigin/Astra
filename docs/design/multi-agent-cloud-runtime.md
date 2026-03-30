@@ -1163,37 +1163,58 @@ All events carry:
 
 When multiple agents execute on the same edge node, they share a filesystem. Agent A running `bash("npm install")` while Agent B runs `write_file("package.json")` creates race conditions and data corruption.
 
-### 13.2 Isolation Model
+### 13.2 Dual Version Control: Git Worktree + Git4Data
 
-Multi-agent isolation addresses **two concerns**: filesystem isolation (code/build artifacts) and data isolation (learning state, metrics, events).
+Multi-agent isolation leverages **two parallel version control systems** — one for filesystem, one for data — both using the branch/merge/diff paradigm:
 
-| Concern | Edge (same machine) | Cloud (separate containers) |
-|---------|--------------------|-----------------------------|
-| **Filesystem** | `git branch` per agent + checkout | `git clone --branch` per container |
-| **Data** | MatrixOne data branches (Git4Data) | MatrixOne multi-tenant accounts |
+| Layer | Mechanism | Branch | Merge | Diff | Rollback |
+|-------|-----------|--------|-------|------|----------|
+| **Filesystem** | `git worktree` | Per-agent working directory | `git merge` | `git diff` | `git reset` |
+| **Data** | Git4Data | Per-agent database branch | `DATA BRANCH MERGE` | `DATA BRANCH DIFF` | `RESTORE FROM SNAPSHOT` |
 
-**Edge multi-agent** (lightweight, most common):
+**Why worktree (not just branch)**: Multiple agents run **concurrently** on the same machine. `git branch` alone requires checkout to switch — agents would block each other. `git worktree` gives each agent its own working directory linked to the same repo, enabling true parallel filesystem access.
+
+**Combined architecture**:
 ```
-Agent A: git checkout -b agent-a-work → operates on its branch
-Agent B: git checkout -b agent-b-work → operates on its branch
-Merge:   git merge agent-a-work agent-b-work → standard git merge
+project_root/
+├── .git/                              # shared git repo
+├── worktrees/
+│   ├── agent-A/                       # git worktree (filesystem branch)
+│   │   └── (full project files)       #   Agent A modifies files here
+│   └── agent-B/                       # git worktree (filesystem branch)
+│       └── (full project files)       #   Agent B modifies files here
+│
+└── MatrixOne
+    ├── agent_a_branch/                # Git4Data branch (data branch)
+    │   └── learning, events, metrics  #   Agent A's isolated data
+    ├── agent_b_branch/                # Git4Data branch (data branch)
+    │   └── learning, events, metrics  #   Agent B's isolated data
+    └── workspace (main)               # Merge target for both
 ```
-No worktree needed — agents coordinate via branches and stash/checkout. Filesystem conflicts are rare when agents work on different subtasks with non-overlapping file scopes.
 
-**Cloud multi-agent** (full isolation):
+**The lifecycle mirrors git perfectly**:
 ```
-Container A: git clone --branch main → independent filesystem
-Container B: git clone --branch main → independent filesystem
-Each container also gets its own MO account for data isolation.
+1. SETUP:   git worktree add worktrees/agent-A -b agent-a-work
+            DATA BRANCH CREATE DATABASE agent_a_branch FROM workspace;
+
+2. EXECUTE: Agent A works freely in worktrees/agent-A/ (filesystem)
+            Agent A writes to agent_a_branch (data)
+            Both completely isolated from Agent B.
+
+3. REVIEW:  git diff main..agent-a-work                    (filesystem diff)
+            DATA BRANCH DIFF agent_a_branch AGAINST workspace (data diff)
+
+4. MERGE:   git merge agent-a-work                         (filesystem merge)
+            DATA BRANCH MERGE agent_a_branch INTO workspace  (data merge)
+            Cherry-pick semantics (coming soon) for selective data merge.
+
+5. CLEANUP: git worktree remove worktrees/agent-A
+            DROP DATABASE agent_a_branch;  -- or keep for audit
 ```
 
-**Data isolation** is handled entirely by MatrixOne:
-- Each agent works on its own **data branch** (Git4Data)
-- Merge via `DATA BRANCH MERGE` (native 3-way merge with LCA)
-- Coming soon: **cherry-pick semantics** — selectively merge specific changes, not full branch
-- Accounts provide SQL-level namespace isolation (structurally impossible to access other agent's data)
+**Why this is powerful**: Git and Git4Data complement each other — git handles code versioning, Git4Data handles data versioning. Together, they give each agent a **complete isolated workspace** (files + data) with structured merge at both levels. No other agent framework has this dual version control capability.
 
-For **cloud background agents**: container + MO account (both filesystem and data fully isolated).
+For **cloud agents**: container-per-agent (filesystem isolation via clone) + Git4Data branch (data isolation). Same data-level patterns, different filesystem mechanism.
 
 ### 13.3 Agent Permission Model
 
