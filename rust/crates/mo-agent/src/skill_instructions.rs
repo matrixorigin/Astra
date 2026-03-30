@@ -911,4 +911,354 @@ We want to verify that loaded_tokens() returns the correct cumulative total.
         let level2_tokens = skill.loaded_tokens();
         assert!(level2_tokens > level1_tokens);
     }
+
+    // ============================================================================
+    // Integration Tests - Full pipeline from discovery to invocation
+    // ============================================================================
+
+    #[test]
+    fn integration_full_skill_lifecycle() {
+        // Tests the complete flow: discover -> register -> load instructions -> load resources
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("my-skill");
+        std::fs::create_dir_all(skill_dir.join("templates")).unwrap();
+        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+
+        let skill_md = r#"---
+name: my-skill
+description: "A comprehensive skill for testing"
+user_invocable: true
+triggers:
+  - my-skill
+  - custom
+allowed_tools:
+  - bash
+  - read_file
+  - write_file
+---
+# My Skill Instructions
+
+This is a comprehensive skill that demonstrates the full lifecycle.
+
+## Step 1: Setup
+- Initialize the environment
+- Validate prerequisites
+
+## Step 2: Execute
+- Run the main logic
+- Handle errors gracefully
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+        std::fs::write(skill_dir.join("templates/config.yaml"), "key: value").unwrap();
+        std::fs::write(skill_dir.join("scripts/init.sh"), "#!/bin/bash\necho init").unwrap();
+
+        // Phase 1: Discover and register metadata only
+        let mut registry = SkillRegistry::with_budget(5000);
+        let registered = discover_and_register_metadata(dir.path(), &mut registry);
+        
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0], "my-skill");
+        
+        let skill = registry.get("my-skill").unwrap();
+        assert_eq!(skill.load_level, SkillLoadLevel::Metadata);
+        assert!(!skill.has_instructions());
+        
+        // Phase 2: Load instructions on invocation
+        let skill = registry.get_mut("my-skill").unwrap();
+        skill.load_instructions().unwrap();
+        
+        assert_eq!(skill.load_level, SkillLoadLevel::Instructions);
+        assert!(skill.has_instructions());
+        assert!(skill.instruction_text().unwrap().contains("My Skill Instructions"));
+        assert_eq!(skill.allowed_tools(), vec!["bash", "read_file", "write_file"]);
+        
+        // Phase 3: Load resources on demand
+        let skill = registry.get_mut("my-skill").unwrap();
+        skill.load_resources().unwrap();
+        
+        assert_eq!(skill.load_level, SkillLoadLevel::Resources);
+        let resources = skill.resources().unwrap();
+        assert!(resources.templates.contains_key("config.yaml"));
+        assert!(resources.scripts.contains_key("init.sh"));
+        assert!(resources.templates.get("config.yaml").unwrap().contains("key: value"));
+    }
+
+    #[test]
+    fn integration_multiple_skills_budget_tracking() {
+        let dir = TempDir::new().unwrap();
+        
+        // Create 5 skills with different token sizes
+        let skills_config = [
+            ("small", "Small", 10),
+            ("medium", "Medium skill with a longer description", 50),
+            ("large", "Large skill with very detailed description for testing purposes", 100),
+            ("extra", "Extra skill", 20),
+            ("final", "Final skill", 15),
+        ];
+        
+        for (name, desc, _) in &skills_config {
+            let skill_dir = dir.path().join(name);
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            let content = format!(r#"---
+name: {name}
+description: "{desc}"
+triggers:
+  - {name}
+---
+Instructions for {name}.
+"#);
+            std::fs::write(skill_dir.join("SKILL.md"), content).unwrap();
+        }
+        
+        // Register all skills
+        let mut registry = SkillRegistry::new();
+        discover_and_register_metadata(dir.path(), &mut registry);
+        
+        assert_eq!(registry.len(), 5);
+        
+        // Verify total metadata tokens are tracked
+        let total_metadata_tokens = registry.metadata_tokens();
+        assert!(total_metadata_tokens > 0);
+        
+        // Verify we can find skills by different triggers
+        for (name, _, _) in &skills_config {
+            let found = registry.find_by_trigger(name);
+            assert_eq!(found.len(), 1, "Should find skill by trigger: {}", name);
+        }
+    }
+
+    #[test]
+    fn integration_skill_without_triggers() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("internal");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        
+        // Skill with no triggers - can only be invoked explicitly
+        let skill_md = r#"---
+name: internal
+description: "Internal helper skill, not trigger-invocable"
+user_invocable: false
+---
+This skill is used internally and should not be triggered by keywords.
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+        
+        let mut registry = SkillRegistry::new();
+        discover_and_register_metadata(dir.path(), &mut registry);
+        
+        let skill = registry.get("internal").unwrap();
+        assert!(!skill.metadata.user_invocable);
+        assert!(skill.metadata.triggers.is_empty());
+        
+        // Should not be found by any trigger
+        assert!(registry.find_by_trigger("internal").is_empty());
+        assert!(registry.find_by_trigger("helper").is_empty());
+    }
+
+    #[test]
+    fn integration_empty_resources_directory() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("empty-resources");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        // Create empty templates and scripts directories
+        std::fs::create_dir_all(skill_dir.join("templates")).unwrap();
+        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        
+        let skill_md = r#"---
+name: empty-resources
+description: "Skill with empty resource directories"
+---
+This skill has templates/ and scripts/ but they are empty.
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+        
+        let mut skill = ProgressiveSkill::from_metadata(
+            SkillMetadata {
+                name: "empty-resources".to_string(),
+                description: "Test".to_string(),
+                user_invocable: true,
+                triggers: vec![],
+                metadata_tokens: 20,
+            },
+            Some(skill_dir),
+        );
+        
+        skill.load_resources().unwrap();
+        
+        let resources = skill.resources().unwrap();
+        assert!(resources.templates.is_empty());
+        assert!(resources.scripts.is_empty());
+        assert_eq!(resources.resource_tokens, 0);
+    }
+
+    #[test]
+    fn integration_flat_resource_files() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("flat");
+        std::fs::create_dir_all(skill_dir.join("templates")).unwrap();
+        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        
+        let skill_md = r#"---
+name: flat
+description: "Skill with flat resource directories"
+---
+Flat resources test.
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+        std::fs::write(skill_dir.join("templates/base.tsx"), "// base template").unwrap();
+        std::fs::write(skill_dir.join("templates/App.tsx"), "// React App").unwrap();
+        std::fs::write(skill_dir.join("scripts/helper.sh"), "#!/bin/bash\necho helper").unwrap();
+        
+        let mut skill = ProgressiveSkill::from_metadata(
+            SkillMetadata {
+                name: "flat".to_string(),
+                description: "Test".to_string(),
+                user_invocable: true,
+                triggers: vec![],
+                metadata_tokens: 20,
+            },
+            Some(skill_dir),
+        );
+        
+        skill.load_resources().unwrap();
+        
+        let resources = skill.resources().unwrap();
+        // Only immediate children are loaded (no nested directories)
+        assert!(resources.templates.contains_key("base.tsx"));
+        assert!(resources.templates.contains_key("App.tsx"));
+        assert!(resources.scripts.contains_key("helper.sh"));
+        assert_eq!(resources.templates.len(), 2);
+        assert_eq!(resources.scripts.len(), 1);
+    }
+
+    #[test]
+    fn integration_special_characters_in_description() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("special");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        
+        let skill_md = r#"---
+name: special
+description: "Handles \"quotes\", newlines\n, and special chars: <>&"
+triggers:
+  - special
+---
+Instructions with special characters: <>&"'
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+        
+        let content = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        let result = parse_skill_md(&content);
+        
+        assert!(result.is_ok());
+        let skill = result.unwrap();
+        assert!(skill.description.contains("quotes"));
+        assert!(skill.instructions.contains("<>&"));
+    }
+
+    #[test]
+    fn integration_idempotent_loading() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("idempotent");
+        std::fs::create_dir_all(skill_dir.join("templates")).unwrap();
+        
+        let skill_md = r#"---
+name: idempotent
+description: "Test idempotent loading"
+---
+Instructions here.
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+        std::fs::write(skill_dir.join("templates/test.txt"), "template content").unwrap();
+        
+        let mut skill = ProgressiveSkill::from_metadata(
+            SkillMetadata {
+                name: "idempotent".to_string(),
+                description: "Test".to_string(),
+                user_invocable: true,
+                triggers: vec![],
+                metadata_tokens: 20,
+            },
+            Some(skill_dir),
+        );
+        
+        // Load instructions multiple times - should be idempotent
+        skill.load_instructions().unwrap();
+        let tokens_after_first = skill.loaded_tokens();
+        
+        skill.load_instructions().unwrap();
+        let tokens_after_second = skill.loaded_tokens();
+        
+        assert_eq!(tokens_after_first, tokens_after_second);
+        
+        // Load resources multiple times
+        skill.load_resources().unwrap();
+        let tokens_after_resources = skill.loaded_tokens();
+        
+        skill.load_resources().unwrap();
+        let tokens_final = skill.loaded_tokens();
+        
+        assert_eq!(tokens_after_resources, tokens_final);
+    }
+
+    #[test]
+    fn integration_registry_all_skills() {
+        let dir = TempDir::new().unwrap();
+        
+        for name in ["skill-a", "skill-b", "skill-c"] {
+            let skill_dir = dir.path().join(name);
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            let content = format!(r#"---
+name: {name}
+description: "Description for {name}"
+user_invocable: true
+triggers:
+  - {name}
+---
+Instructions.
+"#);
+            std::fs::write(skill_dir.join("SKILL.md"), content).unwrap();
+        }
+        
+        let mut registry = SkillRegistry::new();
+        discover_and_register_metadata(dir.path(), &mut registry);
+        
+        let all_skills = registry.all_skills();
+        assert_eq!(all_skills.len(), 3);
+        
+        let names: Vec<_> = all_skills.iter().map(|s| s.name()).collect();
+        assert!(names.contains(&"skill-a"));
+        assert!(names.contains(&"skill-b"));
+        assert!(names.contains(&"skill-c"));
+    }
+
+    #[test]
+    fn integration_case_insensitive_trigger_matching() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("case-test");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        
+        let skill_md = r#"---
+name: case-test
+description: "Test case-insensitive triggers"
+triggers:
+  - Review
+  - CODE_REVIEW
+  - checkStyle
+---
+Test instructions.
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+        
+        let mut registry = SkillRegistry::new();
+        discover_and_register_metadata(dir.path(), &mut registry);
+        
+        // All variations should find the skill
+        assert_eq!(registry.find_by_trigger("review").len(), 1);
+        assert_eq!(registry.find_by_trigger("REVIEW").len(), 1);
+        assert_eq!(registry.find_by_trigger("code_review").len(), 1);
+        assert_eq!(registry.find_by_trigger("CODE_REVIEW").len(), 1);
+        assert_eq!(registry.find_by_trigger("checkstyle").len(), 1);
+        assert_eq!(registry.find_by_trigger("CHECKSTYLE").len(), 1);
+    }
 }

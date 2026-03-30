@@ -400,4 +400,235 @@ transport:
         assert!(config.enabled);
         assert!(config.description.is_empty());
     }
+
+    // ============================================================================
+    // Integration Tests - MCP Configuration and Schema Handling
+    // ============================================================================
+
+    #[test]
+    fn manager_operations() {
+        let mut manager = McpClientManager::new();
+
+        // Empty manager should have no servers
+        assert!(manager.connected_servers().is_empty());
+        assert!(manager.all_tools().is_empty());
+        assert!(manager.find_tool("any_tool").is_none());
+
+        // Disconnect non-existent server should return false
+        assert!(!manager.disconnect("nonexistent"));
+    }
+
+    #[test]
+    fn transport_stdio_config_parsing() {
+        let yaml = r#"
+name: filesystem
+description: "Local filesystem access"
+enabled: true
+transport:
+  type: stdio
+  command: ["npx", "@modelcontextprotocol/server-filesystem"]
+  args: ["--root", "/tmp"]
+  env:
+    DEBUG: "true"
+    LOG_LEVEL: "info"
+"#;
+        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.name, "filesystem");
+        assert_eq!(config.description, "Local filesystem access");
+        assert!(config.enabled);
+
+        match config.transport {
+            Transport::Stdio { command, args, env } => {
+                assert_eq!(command, vec!["npx", "@modelcontextprotocol/server-filesystem"]);
+                assert_eq!(args, vec!["--root", "/tmp"]);
+                assert_eq!(env.get("DEBUG"), Some(&"true".to_string()));
+                assert_eq!(env.get("LOG_LEVEL"), Some(&"info".to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn transport_stdio_minimal_config() {
+        let yaml = r#"
+name: simple
+transport:
+  type: stdio
+  command: ["python", "-m", "mcp_server"]
+"#;
+        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.name, "simple");
+        assert!(config.enabled); // default
+        assert!(config.description.is_empty()); // default
+
+        match config.transport {
+            Transport::Stdio { command, args, env } => {
+                assert_eq!(command, vec!["python", "-m", "mcp_server"]);
+                assert!(args.is_empty()); // default
+                assert!(env.is_empty()); // default
+            }
+        }
+    }
+
+    #[test]
+    fn multiple_server_configs() {
+        let yaml = r#"
+mcp_servers:
+  - name: filesystem
+    transport:
+      type: stdio
+      command: ["npx", "@modelcontextprotocol/server-filesystem"]
+
+  - name: github
+    description: "GitHub operations"
+    transport:
+      type: stdio
+      command: ["npx", "@modelcontextprotocol/server-github"]
+      env:
+        GITHUB_TOKEN: "${GITHUB_TOKEN}"
+
+  - name: disabled
+    enabled: false
+    transport:
+      type: stdio
+      command: ["echo"]
+"#;
+
+        #[derive(serde::Deserialize)]
+        struct ConfigList {
+            mcp_servers: Vec<McpServerConfig>,
+        }
+
+        let configs: ConfigList = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(configs.mcp_servers.len(), 3);
+
+        let fs = &configs.mcp_servers[0];
+        assert_eq!(fs.name, "filesystem");
+        assert!(fs.enabled);
+
+        let gh = &configs.mcp_servers[1];
+        assert_eq!(gh.name, "github");
+        assert_eq!(gh.description, "GitHub operations");
+
+        let disabled = &configs.mcp_servers[2];
+        assert!(!disabled.enabled);
+    }
+
+    #[test]
+    fn mcp_tool_to_schema_complex() {
+        use std::sync::Arc;
+        let schema_map: serde_json::Map<String, serde_json::Value> = serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The file path to read"
+                },
+                "encoding": {
+                    "type": "string",
+                    "enum": ["utf8", "base64"],
+                    "default": "utf8"
+                }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }))
+        .unwrap();
+
+        let tool = Tool::new(
+            "read_file",
+            "Read the contents of a file at the specified path",
+            Arc::new(schema_map),
+        );
+
+        let schema = mcp_tool_to_schema("fs", &tool);
+
+        // Verify structure
+        assert!(schema.is_object());
+        let func = schema["function"].as_object().unwrap();
+
+        // Name should be prefixed
+        assert_eq!(func["name"], "mcp_fs_read_file");
+
+        // Description preserved
+        assert_eq!(func["description"], "Read the contents of a file at the specified path");
+
+        // Parameters schema preserved
+        let params = func["parameters"].as_object().unwrap();
+        assert_eq!(params["type"], "object");
+        assert!(params.contains_key("properties"));
+        assert!(params.contains_key("required"));
+    }
+
+    #[test]
+    fn mcp_tool_to_schema_empty_schema() {
+        use std::sync::Arc;
+        let empty_schema: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+
+        let tool = Tool::new("simple_action", "Performs a simple action", Arc::new(empty_schema));
+
+        let schema = mcp_tool_to_schema("server", &tool);
+        let func = schema["function"].as_object().unwrap();
+
+        assert_eq!(func["name"], "mcp_server_simple_action");
+        assert!(func["parameters"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn extract_result_text_multiple_contents() {
+        use rmcp::model::{Content, RawContent};
+
+        let result = CallToolResult::success(vec![
+            Content::new(RawContent::text("Line 1"), None),
+            Content::new(RawContent::text("Line 2"), None),
+            Content::new(RawContent::text("Line 3"), None),
+        ]);
+
+        let text = extract_result_text(&result);
+        assert_eq!(text, "Line 1\nLine 2\nLine 3");
+    }
+
+    #[test]
+    fn extract_result_text_empty() {
+        let result = CallToolResult::success(vec![]);
+
+        let text = extract_result_text(&result);
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn config_roundtrip_yaml() {
+        let original = McpServerConfig {
+            name: "test-server".to_string(),
+            transport: Transport::Stdio {
+                command: vec!["node".to_string(), "server.js".to_string()],
+                args: vec!["--port".to_string(), "8080".to_string()],
+                env: [
+                    ("API_KEY".to_string(), "secret123".to_string()),
+                    ("DEBUG".to_string(), "1".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            description: "A test MCP server".to_string(),
+            enabled: true,
+        };
+
+        let yaml = serde_yaml::to_string(&original).unwrap();
+        let parsed: McpServerConfig = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(parsed.name, original.name);
+        assert_eq!(parsed.description, original.description);
+        assert_eq!(parsed.enabled, original.enabled);
+
+        match (original.transport, parsed.transport) {
+            (Transport::Stdio { command: c1, args: a1, env: e1 }, Transport::Stdio { command: c2, args: a2, env: e2 }) => {
+                assert_eq!(c1, c2);
+                assert_eq!(a1, a2);
+                assert_eq!(e1, e2);
+            }
+        }
+    }
 }

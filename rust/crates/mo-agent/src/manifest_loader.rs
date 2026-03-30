@@ -891,4 +891,312 @@ tools: []
         let manifest = parse_manifest(SAMPLE_MANIFEST).unwrap();
         assert!(manifest.mcp_servers.is_empty());
     }
+
+    // ============================================================================
+    // Integration Tests - Complete skill loading pipeline
+    // ============================================================================
+
+    #[test]
+    fn integration_full_skill_with_all_features() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("complete-skill");
+        std::fs::create_dir_all(skill_dir.join("templates")).unwrap();
+        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+
+        // Manifest with all features
+        let manifest = r#"
+name: complete-skill
+version: "2.0.0"
+description: "A complete skill demonstrating all features"
+tools:
+  - name: analyze
+    description: "Analyze code"
+    parameters:
+      - name: path
+        type: string
+        description: "The path to analyze"
+    required:
+      - path
+mcp_servers:
+  - name: code-analyzer
+    description: "External code analysis"
+    transport:
+      type: stdio
+      command: ["python", "-m", "code_analyzer"]
+"#;
+
+        // SKILL.md with detailed instructions
+        let skill_md = r#"---
+name: complete-skill
+description: "A complete skill demonstrating all features"
+user_invocable: true
+triggers:
+  - complete
+  - all-features
+allowed_tools:
+  - read_file
+  - write_file
+  - bash
+---
+# Complete Skill Instructions
+
+This skill demonstrates all the features of the skill system.
+
+## Prerequisites
+- Ensure the codebase is checked out
+- Run any setup scripts needed
+
+## Step 1: Analysis
+1. Read the target files
+2. Parse the code structure
+3. Identify areas for improvement
+
+## Step 2: Implementation
+Apply the suggested changes carefully.
+"#;
+
+        std::fs::write(skill_dir.join("manifest.yaml"), manifest).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+        std::fs::write(skill_dir.join("templates/report.md"), "# Report\n{{ content }}").unwrap();
+        std::fs::write(skill_dir.join("scripts/analyze.sh"), "#!/bin/bash\necho analyzing").unwrap();
+
+        let skill = load_skill(&skill_dir).unwrap();
+
+        // Verify manifest loaded correctly
+        assert_eq!(skill.name, "complete-skill");
+        assert_eq!(skill.manifest.version, "2.0.0");
+        assert_eq!(skill.manifest.tools.len(), 1);
+        assert!(skill.has_mcp_servers());
+        assert_eq!(skill.mcp_servers().len(), 1);
+
+        // Verify SKILL.md instructions loaded
+        assert!(skill.instructions.is_some());
+        let inst = skill.instructions.as_ref().unwrap();
+        assert_eq!(inst.triggers.len(), 2);
+        assert!(inst.triggers.contains(&"complete".to_string()));
+        assert_eq!(inst.allowed_tools.len(), 3);
+        assert!(inst.instructions.contains("Complete Skill Instructions"));
+    }
+
+    #[test]
+    fn integration_discover_skills_mixed_formats() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+
+        // Skill 1: manifest.yaml only
+        let skill1_dir = dir.path().join("manifest-only");
+        std::fs::create_dir_all(&skill1_dir).unwrap();
+        std::fs::write(
+            skill1_dir.join("manifest.yaml"),
+            r#"
+name: manifest-only
+version: "1.0.0"
+description: "Skill with manifest only"
+tools: []
+"#,
+        )
+        .unwrap();
+
+        // Skill 2: SKILL.md only (should still be discovered via discover_and_register_metadata)
+        let skill2_dir = dir.path().join("skill-md-only");
+        std::fs::create_dir_all(&skill2_dir).unwrap();
+        std::fs::write(
+            skill2_dir.join("SKILL.md"),
+            r#"---
+name: skill-md-only
+description: "Skill with SKILL.md only"
+triggers:
+  - simple
+---
+Simple instructions.
+"#,
+        )
+        .unwrap();
+
+        // Skill 3: Both manifest.yaml and SKILL.md
+        let skill3_dir = dir.path().join("both");
+        std::fs::create_dir_all(&skill3_dir).unwrap();
+        std::fs::write(
+            skill3_dir.join("manifest.yaml"),
+            r#"
+name: both
+version: "1.0.0"
+description: "Skill with both files"
+tools: []
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            skill3_dir.join("SKILL.md"),
+            r#"---
+name: both
+description: "Skill with both files"
+triggers:
+  - combined
+---
+Combined instructions.
+"#,
+        )
+        .unwrap();
+
+        // discover_skills should find skills with manifest.yaml
+        let discovered = discover_skills(dir.path());
+        let names: Vec<_> = discovered.iter().map(|s| s.name.as_str()).collect();
+
+        // Should find manifest-only and both (which have manifest.yaml)
+        assert!(names.contains(&"manifest-only"));
+        assert!(names.contains(&"both"));
+        // Note: skill-md-only doesn't have manifest.yaml, so discover_skills won't find it
+        // (it would need to be discovered via skill_instructions::discover_and_register_metadata)
+    }
+
+    #[test]
+    fn integration_skill_with_inline_and_file_instructions() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("inline-test");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+
+        // Manifest with inline instructions - these take precedence
+        let manifest = r#"
+name: inline-test
+version: "1.0.0"
+description: "Test inline instructions"
+instructions: |
+  Inline instructions from manifest.
+  These take precedence over SKILL.md.
+tools: []
+"#;
+
+        // SKILL.md exists but inline takes precedence
+        let skill_md = r#"---
+name: inline-test
+description: "Test inline instructions"
+---
+SKILL.md instructions (not used when inline exists).
+"#;
+
+        std::fs::write(skill_dir.join("manifest.yaml"), manifest).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+
+        let skill = load_skill(&skill_dir).unwrap();
+
+        // Inline instructions take precedence over SKILL.md
+        assert!(skill.instructions.is_some());
+        let inst = skill.instructions.as_ref().unwrap();
+        assert!(inst.instructions.contains("Inline instructions"));
+        assert!(!inst.instructions.contains("not used"));
+    }
+
+    #[test]
+    fn integration_skill_fallback_to_skill_md() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("fallback-test");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+
+        // Manifest WITHOUT inline instructions
+        let manifest = r#"
+name: fallback-test
+version: "1.0.0"
+description: "Test SKILL.md fallback"
+tools: []
+"#;
+
+        // SKILL.md should be loaded when no inline instructions
+        let skill_md = r#"---
+name: fallback-test
+description: "Test SKILL.md fallback"
+---
+SKILL.md instructions loaded because no inline.
+"#;
+
+        std::fs::write(skill_dir.join("manifest.yaml"), manifest).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+
+        let skill = load_skill(&skill_dir).unwrap();
+
+        // SKILL.md should be loaded when no inline instructions exist
+        assert!(skill.instructions.is_some());
+        let inst = skill.instructions.as_ref().unwrap();
+        assert!(inst.instructions.contains("SKILL.md instructions"));
+    }
+
+    #[test]
+    fn integration_skill_fields_preserved() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("fields-test");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+
+        let manifest = r#"
+name: fields-test
+version: "1.0.0"
+description: "Test field preservation"
+author: "Test Author"
+table_prefix: "test_"
+tools:
+  - name: test-tool
+    description: "A test tool"
+"#;
+
+        std::fs::write(skill_dir.join("manifest.yaml"), manifest).unwrap();
+
+        let skill = load_skill(&skill_dir).unwrap();
+
+        assert_eq!(skill.manifest.author, Some("Test Author".to_string()));
+        assert_eq!(skill.manifest.table_prefix, Some("test_".to_string()));
+        assert_eq!(skill.manifest.tools.len(), 1);
+        assert_eq!(skill.manifest.tools[0].name, "test-tool");
+    }
+
+    #[test]
+    fn integration_enabled_mcp_servers_only() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("mcp-enabled");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+
+        let manifest = r#"
+name: mcp-enabled
+version: "1.0.0"
+description: "Test MCP server filtering"
+mcp_servers:
+  - name: enabled-server
+    enabled: true
+    transport:
+      type: stdio
+      command: ["echo", "enabled"]
+  - name: disabled-server
+    enabled: false
+    transport:
+      type: stdio
+      command: ["echo", "disabled"]
+  - name: default-enabled
+    transport:
+      type: stdio
+      command: ["echo", "default"]
+tools: []
+"#;
+
+        std::fs::write(skill_dir.join("manifest.yaml"), manifest).unwrap();
+
+        let skill = load_skill(&skill_dir).unwrap();
+
+        assert_eq!(skill.mcp_servers().len(), 3);
+
+        // Check enabled states
+        let enabled = skill.mcp_servers().iter().filter(|s| s.enabled).count();
+        let disabled = skill.mcp_servers().iter().filter(|s| !s.enabled).count();
+
+        assert_eq!(enabled, 2); // enabled-server and default-enabled (default = true)
+        assert_eq!(disabled, 1); // disabled-server
+    }
 }
