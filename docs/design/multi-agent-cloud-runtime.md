@@ -390,15 +390,227 @@ pub struct RestoredSession {
 
 > *"Other agent runtimes store state in a database. mo-agent thinks in its database."*
 
-MatrixOne is an HTAP (Hybrid Transactional/Analytical Processing) cloud-native database — the company's core product. mo-agent must be a **showcase** of MatrixOne's capabilities, not treat it as a generic SQL store. The HTAP nature enables both transactional state management (sessions, leases, events) AND real-time analytical workloads (learning convergence, drift detection, cost forecasting) **in a single engine, without ETL pipelines**.
+MatrixOne is not just a storage backend — it is the **computational backbone** of the agent runtime. As a cloud-native HTAP database with unique features (Git4Data, Stage, Vector, Fulltext, Pub/Sub, Snapshot, PITR, native multi-tenancy), MatrixOne enables capabilities that **no other agent runtime can replicate** using PostgreSQL, MySQL, or SQLite.
 
-### 12.1 Learning Convergence via Materialized Aggregation
+### 7.1 Git4Data: Data Branching for Agent Experiments
+
+MatrixOne's Git4Data provides Git-like version control for data — branching, merging, diffing at the table/database level. This is **unique to MatrixOne** (no equivalent in PostgreSQL/MySQL).
+
+**Use case: Multi-agent plan execution with safe rollback**
+
+```sql
+-- Before a multi-agent plan executes, snapshot the current state
+CREATE SNAPSHOT plan_baseline_sp FOR DATABASE agent_workspace;
+
+-- Each agent works on its own data branch
+DATA BRANCH CREATE DATABASE agent_a_workspace FROM agent_workspace {snapshot="plan_baseline_sp"};
+DATA BRANCH CREATE DATABASE agent_b_workspace FROM agent_workspace {snapshot="plan_baseline_sp"};
+
+-- Agents execute independently in their branches...
+
+-- After execution, diff to see what changed
+DATA BRANCH DIFF agent_a_workspace.learning_observations {snapshot="after_a"}
+  AGAINST agent_workspace.learning_observations {snapshot="plan_baseline_sp"};
+
+-- Merge agent results back to main workspace
+DATA BRANCH MERGE agent_a_workspace.results INTO agent_workspace.results;
+DATA BRANCH MERGE agent_b_workspace.results INTO agent_workspace.results;
+
+-- If anything goes wrong, restore from snapshot
+RESTORE ACCOUNT FROM SNAPSHOT plan_baseline_sp;
+```
+
+**Why this matters**: Agents can experiment on data branches without risk. Merge conflicts are resolved at the database level with three-way merge (LCA detection), not in application Rust code. No other agent runtime has this capability.
+
+### 7.2 Vector Search: Native Embedding-Based Memory Retrieval
+
+MatrixOne has **native vector data type** with HNSW and IVFFlat indexes — no external extension needed.
+
+```sql
+-- Store agent memory with embeddings
+CREATE TABLE agent_memories (
+    memory_id     VARCHAR(36) PRIMARY KEY,
+    user_id       VARCHAR(36) NOT NULL,
+    content       TEXT NOT NULL,
+    embedding     vecf32(1536),                        -- OpenAI embedding dimension
+    memory_type   VARCHAR(20),                         -- episodic, semantic, procedural
+    confidence    FLOAT DEFAULT 1.0,
+    created_at    DATETIME(6) DEFAULT NOW(6),
+    INDEX idx_user (user_id),
+    INDEX idx_vec USING HNSW ON (embedding) OP_TYPE "vector_l2_ops"
+);
+
+-- Semantic memory retrieval: find memories similar to current context
+SELECT memory_id, content, confidence,
+       L2_DISTANCE(embedding, @query_embedding) AS distance
+FROM agent_memories
+WHERE user_id = @user_id
+  AND confidence > 0.30
+ORDER BY L2_DISTANCE(embedding, @query_embedding) ASC
+LIMIT 10;
+
+-- Hybrid retrieval: vector similarity + fulltext keyword matching
+SELECT m.memory_id, m.content,
+       L2_DISTANCE(m.embedding, @query_embedding) AS semantic_dist,
+       MATCH(m.content) AGAINST(@keywords IN NATURAL LANGUAGE MODE) AS text_score
+FROM agent_memories m
+WHERE m.user_id = @user_id
+ORDER BY (0.7 * (1.0 / (1.0 + semantic_dist)) + 0.3 * text_score) DESC
+LIMIT 10;
+```
+
+**Why this matters**: Memory retrieval is the #1 latency bottleneck in agent runtimes. MatrixOne handles both vector similarity AND full-text ranking **in a single query**, eliminating the need for external vector databases (Pinecone, Weaviate) or separate full-text engines (Elasticsearch).
+
+### 7.3 Fulltext Search with BM25: Document-Scale Knowledge Base
+
+MatrixOne's fulltext supports **multiple ranking algorithms** (TF-IDF, BM25) and can index **external files via DataLink**.
+
+```sql
+-- Agent knowledge base with external document indexing
+CREATE TABLE agent_knowledge (
+    doc_id        VARCHAR(36) PRIMARY KEY,
+    title         TEXT,
+    content       LONGTEXT,
+    source_file   DATALINK,                            -- Reference to external file
+    FULLTEXT INDEX ft_content (title, content),
+    FULLTEXT INDEX ft_file (source_file)               -- Index external file content!
+);
+
+-- Insert with DataLink to external documentation
+INSERT INTO agent_knowledge VALUES
+    ('d1', 'API Guide', NULL, 'stage://docs/api-guide.md'),
+    ('d2', 'Setup Guide', NULL, 'stage://docs/setup.md');
+
+-- BM25-ranked search across both inline content and external files
+SET ft_relevancy_algorithm = "BM25";
+SELECT doc_id, title,
+       MATCH(title, content) AGAINST('authentication token refresh' IN NATURAL LANGUAGE MODE) AS relevance
+FROM agent_knowledge
+WHERE MATCH(title, content) AGAINST('authentication token refresh')
+ORDER BY relevance DESC LIMIT 5;
+
+-- Boolean mode for precise queries
+SELECT doc_id FROM agent_knowledge
+WHERE MATCH(title, content) AGAINST('+authentication +token -deprecated' IN BOOLEAN MODE);
+```
+
+**Why this matters**: Agents need to search large codebases and documentation. MatrixOne's DataLink enables indexing **external files on S3/Stage without loading them into the database**, providing Elasticsearch-grade search without a separate system.
+
+### 7.4 Publication/Subscription: Push-Based Inter-Agent Events
+
+MatrixOne's native pub/sub enables **real-time event routing** between agents without polling:
+
+```sql
+-- Cloud account publishes agent events for subscribing agents
+CREATE PUBLICATION agent_events_pub DATABASE agent_events_db
+    ACCOUNT agent_a_account, agent_b_account
+    COMMENT 'Real-time event routing for multi-agent coordination';
+
+-- Agent B subscribes (sees events in real-time)
+-- @session: agent_b_account
+CREATE DATABASE event_feed FROM sys PUBLICATION agent_events_pub;
+
+-- Agent B queries events relevant to its tasks
+SELECT * FROM event_feed.agent_events
+WHERE causal_chain_id = @my_plan_id
+  AND created_at > @last_poll_time
+ORDER BY created_at;
+```
+
+**Architecture shift**: This replaces the polling model in §8.3 with push-based delivery:
+```
+Agent A writes event → agent_events table → PUBLICATION
+                                                │
+                                     ┌──────────┴──────────┐
+                                     ▼                     ▼
+                              Agent B account         Agent C account
+                              (SUBSCRIPTION)          (SUBSCRIPTION)
+                              sees event instantly    sees event instantly
+```
+
+**Why this matters**: Polling-based event routing adds 1-5 second latency. Pub/sub reduces inter-agent latency to **near-zero** because subscribers read from a replicated view that updates transactionally with the publisher.
+
+### 7.5 Snapshot + PITR: Agent Checkpoint & Time-Travel
+
+MatrixOne's Snapshot and PITR provide **database-level checkpointing** that's far more powerful than application-level JSON checkpoints:
+
+```sql
+-- Create checkpoint before risky agent operation
+CREATE SNAPSHOT checkpoint_turn_42 FOR DATABASE agent_workspace;
+
+-- Configure automatic PITR for agent workspace (7-day retention)
+CREATE PITR agent_pitr FOR DATABASE agent_workspace RANGE 7 'd';
+
+-- If agent corrupts data, restore instantly
+RESTORE DATABASE agent_workspace FROM SNAPSHOT checkpoint_turn_42;
+
+-- Time-travel query: what did the learning state look like 2 hours ago?
+-- (via PITR within retention window)
+SELECT * FROM agent_workspace.learning_observations
+    {snapshot = "checkpoint_turn_42"};
+```
+
+**Why this matters**: Current TaskCheckpoint is a JSON blob stored in a LONGTEXT column. MatrixOne's snapshots provide **zero-copy, instant database-level checkpoints** — faster, more complete, and atomic across all tables.
+
+### 7.6 Stage: Cloud-Native Artifact Storage
+
+MatrixOne's Stage provides unified access to external storage (S3, OSS, local filesystem):
+
+```sql
+-- Configure artifact storage for agent outputs
+CREATE STAGE agent_artifacts URL = 's3://mo-agent-artifacts/'
+    CREDENTIALS = {'AWS_KEY_ID'='...', 'AWS_SECRET_KEY'='...'};
+
+-- Agent stores build artifacts
+SELECT build_log INTO OUTFILE 'stage://agent_artifacts/session_123/build.log'
+FROM agent_events WHERE session_id = 'session_123' AND event_type = 'build_output';
+
+-- Agent loads context from external knowledge base
+LOAD DATA INFILE 'stage://agent_artifacts/shared/codebase_index.parquet'
+INTO TABLE codebase_symbols;
+
+-- Nested stage for per-project organization
+CREATE STAGE project_alpha_stage URL = 'stage://agent_artifacts/projects/alpha/';
+```
+
+**Why this matters**: Agents produce artifacts (build logs, code diffs, test results) that need durable storage. Stage eliminates application-level S3 client code — the database handles cloud storage natively.
+
+### 7.7 Multi-Tenant Accounts: Native Agent Isolation
+
+MatrixOne's account system provides **complete data isolation** per agent or per customer:
+
+```sql
+-- Create isolated account per customer (SaaS model)
+CREATE ACCOUNT customer_acme ADMIN_NAME 'admin' IDENTIFIED BY '...';
+CREATE ACCOUNT customer_beta ADMIN_NAME 'admin' IDENTIFIED BY '...';
+
+-- Each customer's agents operate in complete isolation
+-- @session: customer_acme
+CREATE DATABASE workspace;
+CREATE TABLE workspace.agent_sessions (...);
+-- customer_beta cannot see customer_acme's data
+
+-- Platform-level analytics across all tenants (sys account only)
+-- @session: sys account
+SELECT account_name,
+       COUNT(DISTINCT session_id) AS active_sessions,
+       SUM(token_usage_total) AS total_tokens
+FROM system_metrics.agent_usage
+GROUP BY account_name;
+
+-- Share reference data via cluster tables
+CREATE CLUSTER TABLE shared_plan_templates (...);
+-- All accounts can read, only sys can write
+```
+
+**Why this matters**: PostgreSQL multi-tenancy requires row-level security policies (error-prone). MatrixOne provides **SQL-level account isolation** — agents in different accounts literally cannot see each other's tables.
+
+### 7.8 Learning Convergence via HTAP Aggregation
 
 Instead of implementing 3-way merge in Rust application code, push learning convergence **into MatrixOne**:
 
 ```sql
--- Cross-agent entity confidence convergence
--- HTAP: reads TP writes from multiple agents, runs AP aggregation in real-time
+-- Cross-agent entity confidence convergence (HTAP: TP writes + AP aggregation)
 CREATE VIEW learning_entity_convergence AS
 SELECT entity_name, domain,
        SUM(observation_count) AS total_observations,
@@ -406,29 +618,11 @@ SELECT entity_name, domain,
        COUNT(DISTINCT agent_id) AS contributing_agents,
        MAX(last_observed) AS freshest_observation
 FROM learning_observations
-WHERE decayed_confidence > 0.30   -- confidence gate (matches MIN_LEARNED_ENTITY_CONFIDENCE)
+WHERE decayed_confidence > 0.30   -- confidence gate
 GROUP BY entity_name, domain;
 
--- Pattern library union merge
-CREATE VIEW learning_pattern_convergence AS
-SELECT tool_chain, domain,
-       SUM(success_count) AS total_successes,
-       SUM(failure_count) AS total_failures,
-       SUM(success_count) * 1.0 / NULLIF(SUM(success_count) + SUM(failure_count), 0) AS success_rate,
-       COUNT(DISTINCT agent_id) AS contributing_agents
-FROM learning_patterns
-GROUP BY tool_chain, domain;
-```
-
-**Why this matters**: Each agent writes observations transactionally. The aggregation view provides a **consistent, real-time merged state** that any agent can read — no application-level merge conflicts, no 3-way diff. MatrixOne's HTAP engine handles the TP writes and AP reads simultaneously.
-
-### 12.2 Drift Detection via Window Functions
-
-Current drift detection runs in Rust as a moving average. MatrixOne can do this **continuously**:
-
-```sql
--- Tool selection drift detection — continuous analytical query
-SELECT tool_name, session_id,
+-- Tool selection drift detection via window functions
+SELECT tool_name,
        AVG(success_rate) OVER (
            ORDER BY created_at ROWS BETWEEN 10 PRECEDING AND CURRENT ROW
        ) AS recent_avg,
@@ -439,24 +633,20 @@ FROM tool_invocation_metrics
 WHERE user_id = ?
 HAVING ABS(recent_avg - baseline_avg) > 0.3;
 
--- Calibration axis drift: detect when intent thresholds are becoming stale
-SELECT intent_type,
-       AVG(predicted_confidence) AS avg_predicted,
-       AVG(actual_outcome) AS avg_actual,
-       ABS(AVG(predicted_confidence) - AVG(actual_outcome)) AS calibration_gap
-FROM calibration_feedback
-WHERE created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
-GROUP BY intent_type
-HAVING calibration_gap > 0.15;
+-- Time-windowed metrics aggregation for agent health
+SELECT _wstart, _wend,
+       COUNT(*) AS event_count,
+       AVG(latency_ms) AS avg_latency,
+       MAX(latency_ms) AS p99_latency
+FROM agent_events
+WHERE created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)
+INTERVAL(created_at, 5, minute) FILL(value, 0);
 ```
 
-### 12.3 Atomic Lease Operations (No Background Worker)
-
-§9's lease protocol describes a background job polling every 30s. MatrixOne can handle lease expiry **atomically at claim time**:
+### 7.9 Atomic Lease Operations (No Background Worker)
 
 ```sql
 -- Atomic lease claim with implicit expiry: no background worker needed
--- Uses MatrixOne's transactional guarantees for CAS operation
 UPDATE task_leases
 SET agent_id = @claiming_agent,
     lease_version = lease_version + 1,
@@ -469,80 +659,22 @@ WHERE task_id = @target_task
 -- If UPDATE affected 0 rows → lease held by another active agent → 409 Conflict
 ```
 
-This eliminates the background lease expiry worker entirely. Stale leases are implicitly reclaimed on the next claim attempt.
+### 7.10 MatrixOne Feature → Agent Subsystem Mapping
 
-### 12.4 Observability via HTAP Dashboards
-
-Every health metric from §12 should be a **materialized view** in MatrixOne:
-
-```sql
--- Real-time agent health dashboard (single HTAP query across TP + AP)
-CREATE VIEW agent_health_dashboard AS
-SELECT
-    r.agent_id, r.agent_type, r.status,
-    TIMESTAMPDIFF(SECOND, r.last_heartbeat, NOW(6)) AS heartbeat_age_secs,
-    -- Lease health (AP aggregation over TP data)
-    COUNT(CASE WHEN l.expires_at < NOW(6) THEN 1 END) AS expired_leases,
-    -- Event ingestion lag
-    (SELECT COUNT(*) FROM agent_events e
-     WHERE e.agent_id = r.agent_id AND e.created_at > DATE_SUB(NOW(), INTERVAL 5 MINUTE)
-    ) AS recent_events_5m,
-    -- Sync conflict rate (last hour)
-    (SELECT COALESCE(
-        SUM(CASE WHEN status = 'conflict' THEN 1 ELSE 0 END) * 100.0 /
-        NULLIF(COUNT(*), 0), 0)
-     FROM session_sync_log s
-     WHERE s.user_id = r.user_id AND s.created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)
-    ) AS conflict_rate_pct
-FROM agent_registry r
-LEFT JOIN task_leases l ON r.agent_id = l.agent_id
-GROUP BY r.agent_id;
-```
-
-### 12.5 Multi-Tenant Agent Isolation
-
-MatrixOne supports **native multi-tenancy**. Each agent or agent group can operate in its own database context:
-
-```sql
--- Create isolated namespace per agent team/project
-CREATE DATABASE IF NOT EXISTS agent_workspace_{project_id};
-
--- Agent's learning data is naturally isolated
--- Cross-project analytics still possible via MatrixOne's cross-database queries
-SELECT * FROM agent_workspace_alpha.learning_observations lo
-UNION ALL
-SELECT * FROM agent_workspace_beta.learning_observations lo;
-```
-
-### 12.6 Event Routing via CDC
-
-Current inter-agent communication (§8.3) uses polling. MatrixOne's CDC (Change Data Capture) can push events to subscribing agents:
-
-```
-Agent A writes event → agent_events table
-                            │
-                      MatrixOne CDC stream
-                            │
-                     ┌──────┴──────┐
-                     ▼             ▼
-              Agent B (subscribed  Agent C (subscribed
-               to task_id = X)     to causal_chain = Y)
-```
-
-This transforms the architecture from poll-based to **push-based** event routing, reducing inter-agent latency from seconds (polling interval) to milliseconds (CDC propagation).
-
-### 12.7 MatrixOne Feature Mapping Summary
-
-| Subsystem | Current (Generic SQL) | Target (MatrixOne-Native) | Benefit |
-|-----------|----------------------|--------------------------|---------|
-| Learning merge | Rust 3-way merge code | Materialized view aggregation | No merge conflicts, real-time convergence |
-| Drift detection | Application moving average | Window function continuous query | Database-powered, no Rust overhead |
-| Lease expiry | Background worker (30s poll) | Atomic CAS at claim time | Eliminates background worker |
-| Health metrics | Application-computed | Materialized views | Zero-cost observability dashboard |
-| Agent isolation | `user_id` column filter | Multi-tenant database namespaces | Native isolation, cross-query analytics |
-| Event routing | Poll `agent_events` table | CDC push-based streaming | Millisecond inter-agent latency |
-| Decision analytics | Row-level SELECT queries | Columnar AP scans on event store | Fast analytical queries on audit trail |
-| Cost forecasting | Not implemented | AP query over token_usage JSON | Real-time budget tracking across agents |
+| MatrixOne Feature | Agent Subsystem | Replaces | Competitive Gap |
+|-------------------|----------------|----------|-----------------|
+| **Git4Data** (branch/merge/diff) | Multi-agent plan execution | Application-level conflict resolution | No equivalent in any database |
+| **Vector** (vecf32 + HNSW) | Memory retrieval, RAG | External vector DB (Pinecone) | Native, no extension needed |
+| **Fulltext** (BM25 + DataLink) | Knowledge base search | Elasticsearch + application code | Single-query hybrid search |
+| **Pub/Sub** (publication) | Inter-agent event routing | Polling-based event queries | Near-zero latency push |
+| **Snapshot** | Agent checkpointing | JSON blob in LONGTEXT column | Instant, atomic, zero-copy |
+| **PITR** | Session recovery, time-travel | Manual WAL management | Declarative retention policies |
+| **Stage** | Artifact storage (S3/OSS) | Application S3 client | SQL-native cloud storage |
+| **Multi-Tenant Accounts** | Customer/agent isolation | Row-level security policies | SQL-level account isolation |
+| **Time Window** (INTERVAL/FILL) | Metrics aggregation | Application-level windowing | Native time-series syntax |
+| **DataLink** | External file indexing | Load-then-index pipeline | Lazy-load, index-in-place |
+| **HTAP** | Learning convergence + drift | Separate OLTP + OLAP systems | Single engine, no ETL |
+| **Window Functions** | Drift detection, calibration | Rust moving average code | Database-powered analytics |
 
 ---
 
