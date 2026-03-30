@@ -1991,11 +1991,9 @@ async fn try_cloud_push_versioned(
             );
         }
         if let Some(v) = result.new_version {
-            eprintln!("{}", format!("  ✓ Learning synced to cloud (v{})", v).dim());
             return Some(v);
         }
-        eprintln!("{}", "  ✓ Learning synced to cloud".dim());
-    } else {
+    } else if !result.message.is_empty() {
         eprintln!(
             "{}",
             format!("  ⚠ Cloud push skipped: {}", result.message).dim()
@@ -2182,10 +2180,7 @@ async fn try_cloud_push_preferences(state: &ReplState) {
         }
     }
     if synced > 0 {
-        eprintln!(
-            "{}",
-            format!("  ✓ Synced {synced} preferences to cloud").dim()
-        );
+        // Silently succeed — only warn on failure
     }
 }
 
@@ -2591,6 +2586,15 @@ async fn handle_slash_command(
 
         "/exit" | "/quit" => {
             eprintln!("{}", "  Goodbye.".dim());
+            if state.turn > 0
+                && let Some(ref sid) = state.session_id
+            {
+                let short = if sid.len() > 8 { &sid[..8] } else { sid };
+                eprintln!(
+                    "{}",
+                    format!("  Session {short}… saved. To resume: /resume {sid}").dim()
+                );
+            }
             return Ok(true);
         }
 
@@ -3034,6 +3038,16 @@ async fn run_chat_repl(
                 // Graceful ingestion shutdown: drop sender so worker flushes remaining buffer
                 if let Some(sender) = state.ingestion_sender.take() {
                     sender.shutdown();
+                }
+                // Show resume hint if session had any turns
+                if state.turn > 0
+                    && let Some(ref sid) = state.session_id
+                {
+                    let short = if sid.len() > 8 { &sid[..8] } else { sid };
+                    eprintln!(
+                        "{}",
+                        format!("  Session {short}… saved. To resume: /resume {sid}").dim()
+                    );
                 }
                 if state.session_id.is_some() {
                     let _ = clear_profile_last_session(profile);
