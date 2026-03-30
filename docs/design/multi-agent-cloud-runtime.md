@@ -857,9 +857,47 @@ pub struct TaskLease {
 
 **Key design decision**: Leases use optimistic locking (`lease_version` CAS), not distributed locks. This avoids deadlocks and works with MatrixOne's HTAP model.
 
-### 12.3 Checkpoint-Based Resumption
+### 9.3 Lease + Data Branch Lifecycle
 
-When a lease expires (agent died), the next agent can resume from the checkpoint:
+Leases and Git4Data branches serve **complementary purposes**: leases manage task ownership (who works on what), branches manage data isolation (each agent works in its own database space). The combined flow:
+
+```
+1. CLAIM:    Agent A claims task via lease protocol
+                │
+2. BRANCH:   Orchestrator creates data branch for Agent A
+             DATA BRANCH CREATE DATABASE agent_a_ws FROM workspace;
+                │
+3. EXECUTE:  Agent A works freely in agent_a_ws (no conflicts possible)
+             Creates Snapshot checkpoints within its branch as needed
+                │
+4. COMPLETE: Agent A finishes → orchestrator reviews via DIFF
+             DATA BRANCH DIFF agent_a_ws.results AGAINST workspace.results;
+                │
+5. MERGE:    DATA BRANCH MERGE agent_a_ws.results INTO workspace.results;
+             (structural merge by DB, semantic conflicts resolved in Rust)
+                │
+6. RELEASE:  Agent A releases lease → branch cleaned up
+             DROP DATABASE agent_a_ws;  -- or keep for audit
+```
+
+**Crash recovery** (lease expires):
+```
+1. Lease expires → task marked as reclaimable
+2. Agent B claims task via lease
+3. Agent B inspects abandoned branch (agent_a_ws still exists)
+4. DATA BRANCH DIFF agent_a_ws AGAINST workspace → see partial work
+5. Agent B decides: resume from branch (keep partial work) or restart
+6. If restart: RESTORE DATABASE agent_a_ws FROM SNAPSHOT plan_baseline;
+```
+
+### 9.4 Checkpoint-Based Resumption
+
+Checkpoints operate at **two levels**, each handling different concerns:
+
+| Level | Mechanism | What It Captures | Use Case |
+|-------|-----------|-----------------|----------|
+| **Database** | `CREATE SNAPSHOT` | All table state, atomic, zero-copy | Rollback on failure, time-travel queries |
+| **Domain** | `TaskCheckpoint` (Rust struct) | Subtask progress, tool dedup list, semantic state | Which subtask to resume, which tools already ran |
 
 ```rust
 pub struct TaskCheckpoint {
@@ -869,14 +907,11 @@ pub struct TaskCheckpoint {
     pub state: serde_json::Map<String, serde_json::Value>,  // Arbitrary state
     pub tools_executed: Vec<String>,                          // For dedup
     pub artifacts_produced: Vec<String>,                      // File paths
+    pub snapshot_name: Option<String>,                        // Link to MO Snapshot
 }
 ```
 
-The resuming agent:
-1. Claims the task via lease protocol
-2. Loads checkpoint state
-3. Validates artifacts (do the files still exist? are they consistent?)
-4. Continues from `active_subtask_id` rather than restarting
+**Why both are needed**: A database Snapshot captures "what the data looks like" but not "what the agent was doing." TaskCheckpoint captures "agent was on subtask 3, already ran tests 1-5, next step is test 6." The `snapshot_name` field links the two: restore the Snapshot first (database state), then load TaskCheckpoint (domain state).
 
 ### 12.4 Distributed Plan Execution
 
@@ -947,26 +982,43 @@ Current learning sync assumes **single writer per user per profile**. With multi
 | **ToolQuality** | Weighted merge by invocation count | More invocations = better signal |
 | **Preferences** | Last-writer-wins (timestamp) | User intent is singular |
 
-### 12.3 Multi-Agent Learning Protocol
+### 10.3 Multi-Agent Learning Protocol
+
+Learning merge operates at **two levels**: structural (database) and semantic (application).
 
 ```
 Agent A (edge):
   1. Pull learning snapshot at session start (version V)
-  2. Accumulate local observations during session
+  2. Accumulate local observations in its data branch
   3. At session end, export delta (since V)
   4. Push delta with expected_version=V
 
 Cloud (on push):
   IF current_version == expected_version:
-    Apply delta, increment version → V+1
+    Apply delta directly, increment version → V+1
   ELSE (conflict: another agent pushed first):
-    1. Compute 3-way merge: base(V) + delta_A + delta_B
-    2. For entities: keep higher observation_count
-    3. For patterns: union of both pattern sets
-    4. For calibration: weighted average
-    5. Store merged result as V+2
-    6. Return merged snapshot to Agent A for local update
+    ┌─────────────────────────────────────────────────────────┐
+    │  STEP 1: Structural merge (MatrixOne DATA BRANCH MERGE) │
+    │  ──────────────────────────────────────────────────────  │
+    │  DATA BRANCH DIFF agent_a.learning AGAINST cloud.learning│
+    │  → Identifies conflicting rows (same entity, both changed)│
+    │  → Non-conflicting rows merged automatically              │
+    │                                                           │
+    │  STEP 2: Semantic merge (Rust application logic)          │
+    │  ──────────────────────────────────────────────────────  │
+    │  For each conflicting entity:                             │
+    │    EntityGraph → keep higher observation_count            │
+    │    PatternLibrary → union of both pattern sets            │
+    │    Calibrator → weighted average by observation count     │
+    │    ToolQuality → weighted merge by invocation count       │
+    │    Preferences → last-writer-wins (timestamp)             │
+    │                                                           │
+    │  Store merged result as V+2                               │
+    │  Return merged snapshot to Agent A for local update       │
+    └─────────────────────────────────────────────────────────┘
 ```
+
+**Why both levels are needed**: `DATA BRANCH MERGE` handles row-level identity (detect which entities were modified by both agents). But it cannot decide that "higher observation_count wins" — that's a domain-specific rule. The database detects structural conflicts; Rust resolves semantic conflicts.
 
 ### 12.4 Confidence Gate for Learned Context
 
@@ -1111,34 +1163,40 @@ All events carry:
 
 When multiple agents execute on the same edge node, they share a filesystem. Agent A running `bash("npm install")` while Agent B runs `write_file("package.json")` creates race conditions and data corruption.
 
-### 13.2 Filesystem Isolation Model
+### 13.2 Two-Layer Isolation Model
 
-Three options, ordered by isolation strength:
+Multi-agent isolation requires addressing **two separate concerns**: filesystem isolation (code/build artifacts) and data isolation (learning state, metrics, events). No single mechanism handles both.
 
-| Model | Mechanism | Overhead | Isolation |
-|-------|-----------|----------|-----------|
-| **File-scope locking** | SubtaskPlan.files used as advisory locks | ~0 | Weak (tools can escape scope) |
-| **Git worktree per agent** | Each agent gets a `git worktree` branch | ~1s setup, ~disk | Medium (git manages merge) |
-| **Container per agent** | Each agent runs in lightweight container | ~2-5s setup | Strong (full OS isolation) |
+| Concern | Mechanism | What It Isolates |
+|---------|-----------|-----------------|
+| **Filesystem** | Git worktree per agent | Code files, build output, test artifacts, npm/cargo caches |
+| **Data** | MatrixOne multi-tenant account per agent | Learning state, event logs, metrics, checkpoints, memory |
 
-**Recommended approach**: **Git worktree per agent** for edge multi-agent:
+**Combined architecture**:
 
 ```
-project_root/
-├── .git/                         # shared git repo
+Edge Node
+├── .git/                               # shared git repo
 ├── worktrees/
-│   ├── agent-A/                  # git worktree for Agent A
-│   │   └── (full project copy)
-│   └── agent-B/                  # git worktree for Agent B
-│       └── (full project copy)
+│   ├── agent-A/                        # filesystem isolation
+│   │   └── (full project copy)         # Agent A's code workspace
+│   └── agent-B/
+│       └── (full project copy)         # Agent B's code workspace
+│
+└── MatrixOne
+    ├── agent_a_acct/                   # data isolation
+    │   └── workspace DB (learning, events, metrics)
+    ├── agent_b_acct/
+    │   └── workspace DB
+    └── sys/ (orchestrator)
+        └── publications → shared plans, learning state
 ```
 
-- Each agent operates on its own worktree branch
-- On subtask completion, changes are committed to the agent's branch
-- Plan merge phase uses `git merge` to combine branches
-- Merge conflicts → escalate to adversarial review or human
+- **Git worktree** handles: `bash("npm install")`, `write_file("src/auth.rs")`, `git_commit(...)` — all filesystem operations are isolated per worktree branch
+- **MO accounts** handle: agent memory, learning observations, event logs, tool metrics — all data operations are SQL-level isolated per account
+- **On completion**: git worktree changes → `git merge` into main; data branch → `DATA BRANCH MERGE` into orchestrator workspace
 
-For **cloud background agents**: container-per-agent (mount repo clone into isolated container).
+For **cloud background agents**: container-per-agent (mount repo clone into isolated container) + MO account (same data isolation model).
 
 ### 13.3 Agent Permission Model
 

@@ -887,24 +887,54 @@ SELECT * FROM coder_ws.code_changes {snapshot = 'before_review'};
 
 ## 8. What This Means for the Existing Design
 
-The current `multi-agent-cloud-runtime.md` §7 identifies the right features but doesn't go far enough. The implications:
+The current `multi-agent-cloud-runtime.md` §7 identifies the right features but doesn't go far enough. However, MatrixOne features **complement** existing design patterns — they don't wholesale replace them. The architecture has two concern layers:
 
-| Current Design Decision | MatrixOne-Native Alternative | Why Change |
-|------------------------|------------------------------|------------|
-| Lease-based task ownership (§9) | Data branches per agent — no leases needed | Branches provide stronger isolation than leases. Agents can't conflict because they work in separate branches. |
-| Direct DB access for data sharing | Publication/Subscription for data sharing | Agents don't need orchestrator credentials; selective, auditable sharing |
-| JSON blob checkpoints in LONGTEXT (§7.5) | Snapshot + PITR at database level | Zero-copy, atomic, complete — includes all tables, not just one JSON field |
-| Application-level 3-way merge in Rust (§10.2) | `DATA BRANCH MERGE` with SQL-level conflict detection | Push merge complexity into the database engine |
-| Git worktree per agent for isolation (§13.2) | Multi-tenant account per agent | Stronger isolation (SQL-level), includes data isolation not just filesystem |
-| Separate vector DB consideration (§7.2) | Native VECF32 + IVFFlat + BM25 fulltext in one query | Eliminates external dependency, enables fused ranking |
-| S3 client for artifacts (§7.6) | Stage + DataLink + fulltext on external files | Eliminates SDK code, enables SQL search over S3 artifacts |
+- **Execution & Interaction** (Rust runtime): LLM calls, 55-tool execution, permission enforcement, stall detection, token budgets, MCP/SSE streaming
+- **State & Coordination** (MatrixOne): data isolation, checkpointing, artifact storage, learning convergence, time-travel, shared context
 
-### The Key Architectural Shift
+### Where MatrixOne Strengthens the Existing Design
 
-**Before**: Rust runtime does coordination logic, MatrixOne stores results  
-**After**: MatrixOne handles coordination/isolation/events/memory, Rust runtime does LLM calls and tool execution
+| Current Design | + MatrixOne Enhancement | Combined Architecture |
+|----------------|------------------------|----------------------|
+| **Lease-based task ownership (§9)** | + Data branches per agent | **Leases claim tasks** (who works on what); **branches isolate state** (each agent's data workspace). Lease → branch creation → work → merge → lease release. Both needed. |
+| **Direct DB access for data sharing** | + Publication/Subscription | **Pub/Sub for read-only shared context** (plans, learning state); **direct DB for agent's own writes**. Agents subscribe to orchestrator data without credentials. |
+| **JSON TaskCheckpoint (§9.3)** | + Snapshot + PITR | **Snapshots capture full database state** (all tables, atomic); **TaskCheckpoint captures domain semantics** (which subtask, which tools ran, dedup list). Use Snapshot for database-level rollback, TaskCheckpoint for task resumption logic. |
+| **3-way merge in Rust (§10.2)** | + DATA BRANCH MERGE | **DATA BRANCH MERGE for row-level conflict detection** (structural); **Rust merge for semantic conflict resolution** (observation-count-wins, weighted average). DB detects conflicts, app resolves them. |
+| **Git worktree per agent (§13.2)** | + Multi-tenant accounts | **Worktrees isolate filesystem** (code, build artifacts); **accounts isolate database state** (learning, events, metrics). Both needed for different concerns — filesystem ≠ data. |
+| **Separate vector DB** | → Native VECF32 + IVFFlat + BM25 | **Full replacement**: single-query hybrid retrieval eliminates Pinecone + Elasticsearch. No application-level fusion needed. |
+| **S3 client for artifacts** | → Stage + DataLink + fulltext | **Full replacement**: SQL-native artifact storage with fulltext search over external files. Eliminates SDK code. |
 
-This inverts the dependency. The "smart" part of multi-agent coordination moves from 10,000 lines of Rust (sync engine, conflict resolver, event router, checkpoint manager) into ~100 SQL statements that leverage MatrixOne's native primitives.
+### The Key Architectural Insight
+
+**Not**: "MatrixOne replaces Rust logic" (this was overstated in our earlier analysis)  
+**Instead**: "MatrixOne handles **state management and coordination**; Rust handles **execution and interaction**"
+
+This is a **responsibility split**, not a replacement:
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                     Rust Runtime (~15K lines)                   │
+│  • LLM orchestration (streaming, retries, function calls)      │
+│  • 55-tool execution (bash, file I/O, git, code intel)         │
+│  • Permission enforcement, user approval flows                  │
+│  • Stall detection, token budget management                     │
+│  • MCP protocol, SSE streaming to clients                       │
+│  • Task lease protocol (claim/renew/release)                    │
+│  • Semantic merge strategies (domain-specific resolution)       │
+│  • TaskCheckpoint: domain state (subtask, tools, dedup)         │
+│                                                                 │
+├────────────────────────────────────────────────────────────────┤
+│                     MatrixOne (SQL primitives)                  │
+│  • Data branches: per-agent isolated workspace                  │
+│  • Snapshot + PITR: database-level checkpoint & rollback        │
+│  • Pub/Sub: secure cross-agent data sharing                     │
+│  • Vector + Fulltext: unified memory retrieval                  │
+│  • Stage + DataLink: artifact storage & federated search        │
+│  • Multi-tenant accounts: SQL-level data isolation              │
+│  • HTAP analytics: learning convergence, drift detection        │
+│  • Time Window: metrics aggregation                             │
+└────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
