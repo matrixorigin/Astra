@@ -8,6 +8,7 @@ const navigation = [
   { href: '/sessions', label: 'Sessions' },
   { href: '/runs', label: 'Runs' },
   { href: '/events', label: 'Events' },
+  { href: '/plans', label: 'Plans' },
   { href: '/workspace', label: 'Workspace' },
   { href: '/settings', label: 'Settings' },
 ];
