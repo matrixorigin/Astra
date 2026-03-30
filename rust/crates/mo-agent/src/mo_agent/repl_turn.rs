@@ -265,6 +265,9 @@ async fn run_chat_turn(
     message: &str,
     session_id: Option<&str>,
 ) -> TurnAttempt {
+    // Detect skill triggers and load instructions if matched
+    let skill_instructions = detect_skill_triggers(state, message);
+    
     tokio::select! {
         result = stream_chat_sse(ChatTurnParams {
             client: ctx.client,
@@ -282,12 +285,28 @@ async fn run_chat_turn(
             selector: ctx.selector,
             recent_tools: &state.recent_tools,
             tool_health_entries: &state.tool_health_entries,
-            skill_instructions: None, // TODO: Load from skill_registry based on active skill
+            skill_instructions: skill_instructions.as_deref(),
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             eprintln!("\n{}", "  Interrupted.".dim());
             TurnAttempt::Interrupted
         }
+    }
+}
+
+/// Detect skill triggers in the user message and load instructions if matched.
+fn detect_skill_triggers(state: &mut ReplState, message: &str) -> Option<String> {
+    // Try to acquire write lock (non-blocking to avoid deadlocks)
+    let mut registry = state.skill_registry.try_write().ok()?;
+    
+    // Use the skill_instructions module to detect and load
+    let result = crate::skill_instructions::load_triggered_skill_instructions(&mut registry, message);
+    
+    if let Some((skill_name, instructions)) = result {
+        eprintln!("  {} Skill triggered: {}", "▶".cyan(), skill_name.cyan());
+        Some(instructions)
+    } else {
+        None
     }
 }
 
