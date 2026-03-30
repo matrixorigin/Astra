@@ -596,7 +596,7 @@ pub fn count_turns(session_id: &str) -> u32 {
     std::io::BufReader::new(file)
         .lines()
         .map_while(|l| l.ok())
-        .filter(|l| l.contains("\"Turn\""))
+        .filter(|l| l.contains("\"type\":\"turn\""))
         .count() as u32
 }
 
