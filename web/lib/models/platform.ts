@@ -217,7 +217,7 @@ export type SloDashboardData = {
 export type MemoryHealthData = {
   totalMemories: number;
   knowledgeEntries: number;
-  lastGovernanceRun: string;
+  lastGovernanceRun: string | null;
   healthy: boolean;
 };
 

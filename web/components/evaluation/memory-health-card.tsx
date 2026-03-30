@@ -26,7 +26,7 @@ export function MemoryHealthCard({
           />
           <Stat label="Total memories" value={String(health.totalMemories)} />
           <Stat label="Knowledge entries" value={String(health.knowledgeEntries)} />
-          <Stat label="Last governance run" value={health.lastGovernanceRun.slice(0, 16)} />
+          <Stat label="Last governance run" value={health.lastGovernanceRun?.slice(0, 16) ?? '—'} />
         </>
       )}
       {metrics && (

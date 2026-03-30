@@ -38,8 +38,28 @@ export default async function SessionDetailPage({
   }
 
   const { sessionId } = await params;
-  const [workspace, activity, decisionTrace, memoryData] = await Promise.all([
-    getSessionWorkspace(sessionId),
+
+  let workspace;
+  try {
+    workspace = await getSessionWorkspace(sessionId);
+  } catch {
+    return (
+      <SectionCard title="Session not found" description="The requested session could not be loaded.">
+        <StatusCallout
+          title="Session unavailable"
+          message={`Could not load session "${sessionId}". It may not exist or you may need to log in.`}
+          tone="warning"
+        />
+        <div className="mt-4">
+          <Link href="/sessions" className="text-sm text-sky-400 hover:text-sky-300">
+            ← Back to sessions
+          </Link>
+        </div>
+      </SectionCard>
+    );
+  }
+
+  const [activity, decisionTrace, memoryData] = await Promise.all([
     getSessionActivity(sessionId).catch(() => null),
     getDecisionTrace(sessionId).catch(() => null),
     getMemoryIntrospection(sessionId).catch(() => null),
