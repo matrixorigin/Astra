@@ -679,6 +679,97 @@ pub fn discover_and_register_metadata(
     registered
 }
 
+/// Detect skill triggers in a message and return matching skill names.
+/// 
+/// This function performs word-level matching - triggers must appear as whole words
+/// in the message (case-insensitive). Returns skill names sorted by trigger specificity
+/// (longer triggers first).
+pub fn detect_triggers_in_message(registry: &SkillRegistry, message: &str) -> Vec<String> {
+    let message_lower = message.to_lowercase();
+    let words: Vec<&str> = message_lower.split_whitespace().collect();
+    
+    let mut matches: Vec<(String, usize)> = Vec::new();
+    
+    for skill in registry.all_skills() {
+        for trigger in &skill.metadata.triggers {
+            let trigger_lower = trigger.to_lowercase();
+            // Check if trigger appears as a word in the message
+            // Single-word triggers: must match exactly as a word
+            // Multi-word triggers (with hyphens/underscores): check word boundary
+            if words.contains(&trigger_lower.as_str()) 
+                || is_word_boundary_match(&message_lower, &trigger_lower)
+            {
+                matches.push((skill.name().to_string(), trigger.len()));
+                break; // One match per skill is enough
+            }
+        }
+    }
+    
+    // Sort by trigger length (longer = more specific) descending
+    matches.sort_by(|a, b| b.1.cmp(&a.1));
+    matches.into_iter().map(|(name, _)| name).collect()
+}
+
+/// Check if a pattern appears at word boundaries in text.
+/// A word boundary is the start/end of text or a non-alphanumeric character.
+fn is_word_boundary_match(text: &str, pattern: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = text[start..].find(pattern) {
+        let abs_pos = start + pos;
+        let end_pos = abs_pos + pattern.len();
+        
+        // Check start boundary
+        let start_ok = abs_pos == 0 || !text[..abs_pos].chars().last().map_or(false, |c| c.is_alphanumeric());
+        
+        // Check end boundary  
+        let end_ok = end_pos == text.len() || !text[end_pos..].chars().next().map_or(false, |c| c.is_alphanumeric());
+        
+        if start_ok && end_ok {
+            return true;
+        }
+        
+        start = abs_pos + 1;
+        if start >= text.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// Load skill instructions for the first matching trigger in a message.
+/// 
+/// Returns the skill name and instruction text if a trigger is found and
+/// instructions can be loaded. This performs lazy loading - instructions
+/// are only read from disk when needed.
+pub fn load_triggered_skill_instructions(
+    registry: &mut SkillRegistry,
+    message: &str,
+) -> Option<(String, String)> {
+    // Detect which skills are triggered
+    let triggered = {
+        // Use immutable borrow for detection
+        detect_triggers_in_message(registry, message)
+    };
+    
+    // Try to load instructions for the first triggered skill
+    for skill_name in triggered {
+        // Load instructions if not already loaded
+        if let Err(e) = registry.load_instructions(&skill_name) {
+            eprintln!("  ⚠ Failed to load skill instructions for {}: {}", skill_name, e);
+            continue;
+        }
+        
+        // Get the instruction text
+        if let Some(skill) = registry.get(&skill_name) {
+            if let Some(text) = skill.instruction_text() {
+                return Some((skill_name, text.to_string()));
+            }
+        }
+    }
+    
+    None
+}
+
 #[cfg(test)]
 mod registry_tests {
     use super::*;
@@ -1260,5 +1351,165 @@ Test instructions.
         assert_eq!(registry.find_by_trigger("CODE_REVIEW").len(), 1);
         assert_eq!(registry.find_by_trigger("checkstyle").len(), 1);
         assert_eq!(registry.find_by_trigger("CHECKSTYLE").len(), 1);
+    }
+
+    // ============================================================================
+    // Trigger Detection Tests
+    // ============================================================================
+
+    #[test]
+    fn detect_triggers_simple_word_match() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        
+        let skill_md = r#"---
+name: review
+description: "Code review skill"
+triggers:
+  - review
+  - code-review
+---
+Instructions.
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+        
+        let mut registry = SkillRegistry::new();
+        discover_and_register_metadata(dir.path(), &mut registry);
+        
+        // Should match when trigger appears as word
+        let matches = detect_triggers_in_message(&registry, "please review this PR");
+        assert_eq!(matches, vec!["review"]);
+        
+        // Should match case-insensitively
+        let matches = detect_triggers_in_message(&registry, "REVIEW the changes");
+        assert_eq!(matches, vec!["review"]);
+        
+        // Should not match partial words
+        let matches = detect_triggers_in_message(&registry, "previewing the code");
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn detect_triggers_multiple_skills() {
+        let dir = TempDir::new().unwrap();
+        
+        // Create two skills with different triggers
+        for (name, triggers) in [("review", "review"), ("debug", "debug")] {
+            let skill_dir = dir.path().join(name);
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            let content = format!(r#"---
+name: {name}
+description: "{name} skill"
+triggers:
+  - {triggers}
+---
+Instructions for {name}.
+"#);
+            std::fs::write(skill_dir.join("SKILL.md"), content).unwrap();
+        }
+        
+        let mut registry = SkillRegistry::new();
+        discover_and_register_metadata(dir.path(), &mut registry);
+        
+        // Should find both when both triggers present
+        let matches = detect_triggers_in_message(&registry, "review and debug this code");
+        assert_eq!(matches.len(), 2);
+        assert!(matches.contains(&"review".to_string()));
+        assert!(matches.contains(&"debug".to_string()));
+        
+        // Should find only one
+        let matches = detect_triggers_in_message(&registry, "please debug this");
+        assert_eq!(matches, vec!["debug"]);
+    }
+
+    #[test]
+    fn detect_triggers_longer_triggers_first() {
+        let dir = TempDir::new().unwrap();
+        
+        // Create skill with both short and long triggers
+        let skill_dir = dir.path().join("review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let skill_md = r#"---
+name: review
+description: "Review skill"
+triggers:
+  - review
+  - code-review
+  - security-review
+---
+Instructions.
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+        
+        let mut registry = SkillRegistry::new();
+        discover_and_register_metadata(dir.path(), &mut registry);
+        
+        // Longer trigger should be detected (security-review vs review)
+        let matches = detect_triggers_in_message(&registry, "do a security-review");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0], "review");
+    }
+
+    #[test]
+    fn load_triggered_skill_loads_instructions() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("myskill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        
+        let skill_md = r#"---
+name: myskill
+description: "My skill"
+triggers:
+  - analyze
+---
+# Analysis Steps
+
+1. First step
+2. Second step
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+        
+        let mut registry = SkillRegistry::new();
+        discover_and_register_metadata(dir.path(), &mut registry);
+        
+        // Initially at metadata level
+        assert!(!registry.get("myskill").unwrap().has_instructions());
+        
+        // Load via trigger detection
+        let result = load_triggered_skill_instructions(&mut registry, "please analyze this");
+        
+        assert!(result.is_some());
+        let (name, text) = result.unwrap();
+        assert_eq!(name, "myskill");
+        assert!(text.contains("Analysis Steps"));
+        assert!(text.contains("First step"));
+        
+        // Should now have instructions loaded
+        assert!(registry.get("myskill").unwrap().has_instructions());
+    }
+
+    #[test]
+    fn load_triggered_skill_no_match() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        
+        let skill_md = r#"---
+name: review
+description: "Review skill"
+triggers:
+  - review
+---
+Instructions.
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+        
+        let mut registry = SkillRegistry::new();
+        discover_and_register_metadata(dir.path(), &mut registry);
+        
+        // No trigger match
+        let result = load_triggered_skill_instructions(&mut registry, "hello world");
+        assert!(result.is_none());
     }
 }
