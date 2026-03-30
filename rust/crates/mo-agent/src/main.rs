@@ -759,6 +759,15 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             // restore_history_from_journal already handles session segmentation (only reads after latest session_start)
             state.history = repl_runtime::restore_history_from_journal(&session_id);
 
+            // Restore last turn event for /turn command
+            if let Ok(events) = session_journal::read_journal(&session_id) {
+                state.last_turn_event = events
+                    .iter()
+                    .rev()
+                    .find(|e| e.event_type == session_journal::JournalEventType::Turn)
+                    .cloned();
+            }
+
             // Restore plan execution state from workspace snapshot
             if let Some(ref json) = restored.executing_plan_json {
                 state.executing_plan = serde_json::from_str(json).ok();
@@ -820,6 +829,12 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                         .iter()
                         .filter(|e| e.event_type == session_journal::JournalEventType::Turn)
                         .count() as u32;
+                    // Restore last turn event for /turn command
+                    state.last_turn_event = events
+                        .iter()
+                        .rev()
+                        .find(|e| e.event_type == session_journal::JournalEventType::Turn)
+                        .cloned();
                     state.session_id = None; // new session on next message
                     state.turn = turn_count;
                     state.history = repl_runtime::restore_history_from_journal(&session_id);

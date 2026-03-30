@@ -1664,4 +1664,128 @@ mod tests {
         );
         assert_eq!(parsed2.metadata.as_ref().unwrap()["progress_pct"], 100);
     }
+
+    // ── count_turns tests ──────────────────────────────────────────────
+
+    #[test]
+    fn count_turns_counts_only_turn_events() {
+        let dir = tempfile::tempdir().unwrap();
+        // Override journal_dir by writing directly
+        let sid = format!("count-test-{}", uuid::Uuid::new_v4());
+        let path = dir.path().join(format!("{sid}.jsonl"));
+
+        // Write mixed event types
+        let lines = [
+            r#"{"type":"session_start","ts":"2026-01-01T00:00:00Z","session_id":"s"}"#,
+            r#"{"type":"turn","ts":"2026-01-01T00:00:01Z","session_id":"s","turn":1}"#,
+            r#"{"type":"checkpoint","ts":"2026-01-01T00:00:02Z","session_id":"s"}"#,
+            r#"{"type":"turn","ts":"2026-01-01T00:00:03Z","session_id":"s","turn":2}"#,
+            r#"{"type":"session_end","ts":"2026-01-01T00:00:04Z","session_id":"s"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        // count_turns reads from journal_dir(), so test via the actual function
+        // by writing to the real journal dir
+        let real_path = journal_dir().join(format!("{sid}.jsonl"));
+        std::fs::create_dir_all(journal_dir()).ok();
+        std::fs::write(&real_path, lines.join("\n")).unwrap();
+
+        let count = count_turns(&sid);
+        assert_eq!(count, 2, "should count exactly 2 turn events");
+
+        // Cleanup
+        let _ = std::fs::remove_file(&real_path);
+    }
+
+    #[test]
+    fn count_turns_returns_zero_for_missing_session() {
+        assert_eq!(count_turns("nonexistent-session-xyz-999"), 0);
+    }
+
+    #[test]
+    fn count_turns_ignores_checkpoint_and_other_types() {
+        let sid = format!("count-no-turns-{}", uuid::Uuid::new_v4());
+        let real_path = journal_dir().join(format!("{sid}.jsonl"));
+        std::fs::create_dir_all(journal_dir()).ok();
+        std::fs::write(
+            &real_path,
+            r#"{"type":"session_start","ts":"2026-01-01T00:00:00Z"}
+{"type":"checkpoint","ts":"2026-01-01T00:00:01Z"}
+{"type":"session_end","ts":"2026-01-01T00:00:02Z"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(count_turns(&sid), 0);
+        let _ = std::fs::remove_file(&real_path);
+    }
+
+    // ── list_sessions_by_time tests ────────────────────────────────────
+
+    #[test]
+    fn list_sessions_by_time_filters_test_prefixes() {
+        std::fs::create_dir_all(journal_dir()).ok();
+
+        // Create test-prefixed and real session files
+        let real_sid = format!("real-session-{}", uuid::Uuid::new_v4());
+        let test_sid = format!("test-session-{}", uuid::Uuid::new_v4());
+        let new_sess = format!("new-sess-{}", uuid::Uuid::new_v4());
+
+        let real_path = journal_dir().join(format!("{real_sid}.jsonl"));
+        let test_path = journal_dir().join(format!("{test_sid}.jsonl"));
+        let new_path = journal_dir().join(format!("{new_sess}.jsonl"));
+
+        std::fs::write(&real_path, "{}").unwrap();
+        std::fs::write(&test_path, "{}").unwrap();
+        std::fs::write(&new_path, "{}").unwrap();
+
+        let sessions = list_sessions_by_time(100).unwrap();
+        assert!(
+            sessions.contains(&real_sid),
+            "real session should be listed"
+        );
+        assert!(
+            !sessions.contains(&test_sid),
+            "test- prefix should be filtered"
+        );
+        assert!(
+            !sessions.contains(&new_sess),
+            "new-sess- prefix should be filtered"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_file(&real_path);
+        let _ = std::fs::remove_file(&test_path);
+        let _ = std::fs::remove_file(&new_path);
+    }
+
+    #[test]
+    fn list_sessions_by_time_respects_limit() {
+        std::fs::create_dir_all(journal_dir()).ok();
+
+        let mut created = Vec::new();
+        for i in 0..5 {
+            let sid = format!("limit-test-{i}-{}", uuid::Uuid::new_v4());
+            let path = journal_dir().join(format!("{sid}.jsonl"));
+            std::fs::write(&path, "{}").unwrap();
+            // Stagger mtime slightly
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            created.push((sid, path));
+        }
+
+        let sessions = list_sessions_by_time(3).unwrap();
+        let our_sessions: Vec<_> = sessions
+            .iter()
+            .filter(|s| s.starts_with("limit-test-"))
+            .collect();
+        assert!(
+            our_sessions.len() <= 3,
+            "should return at most 3 of our sessions, got {}",
+            our_sessions.len()
+        );
+
+        // Cleanup
+        for (_, path) in &created {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
