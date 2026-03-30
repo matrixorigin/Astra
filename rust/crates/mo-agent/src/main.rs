@@ -3292,21 +3292,6 @@ async fn main() {
         command,
     } = cli;
 
-    // Set MEMORIA_API_KEY from credentials if not already set
-    if std::env::var("MEMORIA_API_KEY").is_err() {
-        let creds = load_credentials();
-        let name = profile_name(profile.as_deref(), &creds);
-        if let Some(key) = creds
-            .profiles
-            .get(&name)
-            .and_then(|p| p.memoria_api_key.as_deref())
-        {
-            unsafe {
-                std::env::set_var("MEMORIA_API_KEY", key);
-            }
-        }
-    }
-
     match execute_cli_command(command, profile, &client, &base).await {
         Ok(exit_code) => {
             std::process::exit(i32::from(exit_code));

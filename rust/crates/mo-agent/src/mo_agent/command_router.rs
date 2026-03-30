@@ -262,8 +262,15 @@ pub(super) async fn execute_cli_command(
                 std::io::stdin()
                     .read_to_string(&mut buf)
                     .map_err(|e| format!("failed to read stdin: {e}"))?;
-                buf.trim().to_string()
+                let msg = buf.trim().to_string();
+                if msg.is_empty() {
+                    return Err("message cannot be empty (stdin was empty or whitespace-only)".to_string());
+                }
+                msg
             } else if let Some(m) = args.message {
+                if m.trim().is_empty() {
+                    return Err("message cannot be empty".to_string());
+                }
                 m
             } else {
                 // No message → start REPL with optional pre-set session/model

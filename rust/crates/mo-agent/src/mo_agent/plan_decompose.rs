@@ -318,6 +318,7 @@ fn count_test_files_in_src(dir: &Path, max_depth: usize) -> usize {
 
 /// Resolve the actual git directory path.
 /// Handles both regular repos (.git is a directory) and worktrees (.git is a file pointing to the actual git dir).
+/// Returns None if no valid git directory is found.
 fn resolve_git_dir(root: &Path) -> Option<std::path::PathBuf> {
     let git_path = root.join(".git");
     if git_path.is_dir() {
@@ -327,7 +328,11 @@ fn resolve_git_dir(root: &Path) -> Option<std::path::PathBuf> {
     if git_path.is_file() {
         if let Ok(content) = std::fs::read_to_string(&git_path) {
             if let Some(gd) = content.trim().strip_prefix("gitdir: ") {
-                return Some(std::path::PathBuf::from(gd));
+                let path = std::path::PathBuf::from(gd);
+                // Validate the path exists and has expected git structure
+                if path.exists() && path.join("HEAD").exists() {
+                    return Some(path);
+                }
             }
         }
     }
