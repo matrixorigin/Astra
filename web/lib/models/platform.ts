@@ -161,3 +161,76 @@ export type SkillsIntrospectionData = {
   installed: SkillInfo[];
   cloud: SkillInfo[];
 };
+
+// ── Evaluation types ──
+
+export type QualityTrendPoint = {
+  date: string;
+  avgScore: number;
+  count: number;
+  model: string;
+};
+
+export type QualityTrendData = {
+  points: QualityTrendPoint[];
+  overallAvg: number;
+  totalEvents: number;
+};
+
+export type DriftSignal = {
+  model: string;
+  templateId: string;
+  currentAvg: number;
+  previousAvg: number;
+  delta: number;
+  severity: 'critical' | 'warning' | 'info';
+  sampleCount: number;
+};
+
+export type DriftData = {
+  signals: DriftSignal[];
+  checkedAt: string;
+};
+
+export type TrustReportData = {
+  agentId: string;
+  periodDays: number;
+  totalChecks: number;
+  safeCount: number;
+  trustRatio: number;
+  hallucinationRate: number;
+};
+
+export type SloAgent = {
+  agentId: string;
+  sloName: string;
+  target: number;
+  actual: number;
+  met: boolean;
+};
+
+export type SloDashboardData = {
+  periodDays: number;
+  agents: SloAgent[];
+};
+
+export type MemoryHealthData = {
+  totalMemories: number;
+  knowledgeEntries: number;
+  lastGovernanceRun: string;
+  healthy: boolean;
+};
+
+export type MemoryMetricsData = {
+  totalMemories: number;
+  avgConfidence: number;
+  staleCount: number;
+};
+
+export type ObservabilityMetricsData = {
+  agentId: string;
+  periodDays: number;
+  decision: { avgQuality: number; totalDecisions: number };
+  session: { uniqueSessions: number; avgTurnsPerSession: number };
+  skill: { totalInvocations: number; successCount: number; successRate: number };
+};
