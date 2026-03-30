@@ -442,6 +442,8 @@ struct ReplState {
     skill_registry: std::sync::Arc<std::sync::RwLock<skill_instructions::SkillRegistry>>,
     /// MCP client manager for external tool servers.
     mcp_manager: std::sync::Arc<std::sync::RwLock<mcp_client::McpClientManager>>,
+    /// Skill classification cache for LLM-based skill detection.
+    skill_classification_cache: skill_instructions::SkillClassificationCache,
 }
 
 impl Default for ReplState {
@@ -489,6 +491,7 @@ impl Default for ReplState {
             mcp_manager: std::sync::Arc::new(std::sync::RwLock::new(
                 mcp_client::McpClientManager::new(),
             )),
+            skill_classification_cache: skill_instructions::SkillClassificationCache::default(),
         }
     }
 }

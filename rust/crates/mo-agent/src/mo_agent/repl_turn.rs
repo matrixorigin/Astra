@@ -295,6 +295,7 @@ async fn run_chat_turn(
 }
 
 /// Detect skill triggers in the user message and load instructions if matched.
+/// Uses hybrid detection: keyword match with command-intent heuristic.
 fn detect_skill_triggers(state: &mut ReplState, message: &str) -> Option<String> {
     // Try to acquire write lock (non-blocking to avoid deadlocks)
     let mut registry = match state.skill_registry.try_write() {
@@ -310,15 +311,49 @@ fn detect_skill_triggers(state: &mut ReplState, message: &str) -> Option<String>
         return None;
     }
     
-    // Use the skill_instructions module to detect and load
-    let result = crate::skill_instructions::load_triggered_skill_instructions(&mut registry, message);
+    // Stage 1: Try keyword match (fast, free)
+    let skill_name = crate::skill_instructions::detect_skill_hybrid_sync(&registry, message);
     
-    if let Some((skill_name, instructions)) = result {
-        eprintln!("  {} Skill triggered: {}", "▶".cyan(), skill_name.cyan());
-        Some(instructions)
-    } else {
-        None
+    // If keyword match found, load and return instructions
+    if let Some(name) = skill_name {
+        // Load instructions if not already loaded
+        if let Err(e) = registry.load_instructions(&name) {
+            eprintln!("  ⚠ Failed to load skill instructions for {}: {}", name, e);
+            return None;
+        }
+        
+        // Get the instruction text
+        if let Some(skill) = registry.get(&name) {
+            if let Some(text) = skill.instruction_text() {
+                eprintln!("  {} Skill triggered: {}", "▶".cyan(), name.cyan());
+                return Some(text.to_string());
+            }
+        }
     }
+    
+    // Stage 2: If no keyword match but message looks like a command,
+    // check cache or log for potential LLM classification
+    // (LLM fallback would go here when implemented)
+    if crate::skill_instructions::looks_like_command(message) && registry.len() > 0 {
+        // Check cache first
+        if let Some(cached_skill) = state.skill_classification_cache.get(message) {
+            if let Some(name) = cached_skill {
+                if let Err(e) = registry.load_instructions(&name) {
+                    eprintln!("  ⚠ Failed to load skill instructions for {}: {}", name, e);
+                    return None;
+                }
+                if let Some(skill) = registry.get(&name) {
+                    if let Some(text) = skill.instruction_text() {
+                        eprintln!("  {} Skill triggered (cached): {}", "▶".cyan(), name.cyan());
+                        return Some(text.to_string());
+                    }
+                }
+            }
+        }
+        // TODO: LLM classification fallback when lightweight endpoint is available
+    }
+    
+    None
 }
 
 fn apply_turn_success(
