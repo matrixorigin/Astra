@@ -1,7 +1,7 @@
 # Multi-Agent Cloud Runtime Architecture
 
 > **Status**: Living Design Document  
-> **Version**: 1.1 (post-review revision)  
+> **Version**: 1.2 (headless cloud runtime + thin client split)  
 > **Scope**: Edge-cloud state management, multi-agent orchestration, and cloud-scale execution  
 > **Audience**: Core contributors, architecture reviewers
 
@@ -14,6 +14,9 @@
 3. [Current Architecture: What We Have](#3-current-architecture-what-we-have)
 4. [Gap Analysis: Design vs Implementation](#4-gap-analysis-design-vs-implementation)
 5. [Target Architecture: Multi-Agent Cloud Runtime](#5-target-architecture-multi-agent-cloud-runtime)
+   - 5.3 [Headless Cloud Runtime: Client-Runtime Decoupling](#53-headless-cloud-runtime-client-runtime-decoupling)
+   - 5.4 [Responsibility Split: What Moves Where](#54-responsibility-split-what-moves-where)
+   - 5.5 [Thin Client Protocol](#55-thin-client-protocol)
 6. [Edge-Cloud State Model](#6-edge-cloud-state-model)
 7. [MatrixOne-Native Acceleration](#7-matrixone-native-acceleration)
 8. [Multi-Agent Coordination Protocol](#8-multi-agent-coordination-protocol)
@@ -38,11 +41,13 @@ Agent Decision = f(prompt@version, skill@version, context@snapshot, memory@state
 
 **Current state**: A mature single-agent, local-first system with production-ready learning sync, event ingestion, session management, and a 55-tool edge toolkit. The runtime implements a 5-stage cognitive pipeline (Perceive→Plan→Execute→Evaluate→Reflect) with progressive self-calibration.
 
-**Target state**: A multi-agent cloud runtime where:
+**Target state**: A **headless cloud runtime** where:
+- The server is the single source of truth — all cognitive capabilities exposed via API
+- Thin clients (CLI, Web, IDE) share the same protocol (§5.5) and are stateless
+- Edge executors run local tools (bash, fs, git) and return results via callback
 - Multiple agents coordinate on complex tasks via structured protocols
 - Tasks are leased, checkpointed, and resumable across agent failures
 - Learning converges across agents via conflict-free merge strategies
-- Edge nodes drive execution while cloud provides orchestration, persistence, and governance
 
 **Key differentiators vs industry**:
 - **MatrixOne as the agent brain** — other runtimes store state in a database; mo-agent *thinks* in its database. HTAP enables transactional state (leases, sessions) AND analytical workloads (learning convergence, drift detection, cost forecasting) without ETL
@@ -190,6 +195,40 @@ Clean ──write──▶ Dirty ──push──▶ Syncing ──ok──▶ C
 | Multi-agent coordination | ❌ Design only | Fan-out/pipeline patterns documented but not wired |
 | Durable long-running tasks | ❌ Design only | AgentRun record exists; RunEngine not wired |
 
+### 3.4 Architectural Debt: Layer Violations
+
+Code-level audit reveals **5 components stuck in the wrong layer** that block multi-client and multi-agent progress:
+
+| Component | Current Layer | Evidence | Should Be | Why It Matters |
+|-----------|--------------|----------|-----------|---------------|
+| **SyncOrchestrator** | `mo-agent` `ReplState` | `main.rs:436` | Cloud service state | CLI session holds cloud sync — can't share across Web/IDE clients |
+| **MatrixOne pool** | `mo-agent` `ReplState` | `main.rs:406` | Service layer | DB connection pool is infrastructure, not CLI concern |
+| **Event ingestion sender** | `mo-agent` `ReplState` | `main.rs:402` | Service layer | Cloud event publishing is not a CLI responsibility |
+| **LearningAdapter bridge** | `mo-agent` `sync_adapters.rs` | Lines 26-80: bridges `runtime::pipeline::EntityGraph` with `services::SyncEngine` | `services` or new `bridge` crate | Forced into CLI because services can't depend on runtime (correct direction), but adapter should not be in a client crate |
+| **InProcessChatTurnBridge** | `runtime` `turn/bridge_inprocess.rs` | Lines 564-600: embeds `MatrixOneSettings`, decrypts API keys, queries `infra_llm_models` table | `services` or dedicated `llm-bridge` crate | Runtime (cognitive engine) should not contain database schemas or key decryption |
+
+**Crate size confirms the imbalance** (lines of Rust code):
+
+| Crate | LOC | Role | Assessment |
+|-------|----:|------|-----------|
+| `mo-agent` | 53,878 | CLI — should be thin | **Too heavy**: holds cloud infra, LLM prep, plan decomposition |
+| `runtime` | 56,748 | Cognitive engine + HTTP API | Mostly correct; InProcessBridge is the outlier |
+| `services` | 26,441 | Cloud backend | Clean; only depends on `core` |
+| `core` | ~2,000 | Shared config/types | ✅ Correct |
+
+**Dependency graph** (verified, acyclic):
+```
+mo-agent ──▶ runtime ──▶ services ──▶ core
+   └──────────────────────▶ services
+   └──────────────────────────────────▶ core
+```
+
+The graph is correct (no cycles), but `mo-agent` being the **only crate that can bridge runtime↔services** creates a bottleneck: any new client (Web, IDE) would need to duplicate the bridging code or depend on `mo-agent`.
+
+**Two binary targets already exist** (good foundation):
+- `mo-agent` (CLI): `crates/mo-agent/src/main.rs` — 5,198 lines, REPL + edge tools
+- `mo-agent-server` (API): `crates/runtime/src/main.rs` — 11 lines, pure HTTP server
+
 ---
 
 ## 4. Gap Analysis: Design vs Implementation
@@ -238,64 +277,302 @@ Clean ──write──▶ Dirty ──push──▶ Syncing ──ok──▶ C
 
 ### 5.2 Architectural Layers
 
+The target is a **three-tier architecture** where the cloud runtime is the brain, thin clients are the face, and edge executors are the hands:
+
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                              CLIENTS                                     │
-│  CLI (mo-agent) │ IDE Plugin │ Web UI │ SDK │ Webhook                    │
-│  All speak the same /chat/turn SSE protocol                             │
+│                         THIN CLIENTS                                     │
+│  CLI (mo-agent) │ Web UI │ IDE Plugin │ SDK │ Webhook                    │
+│                                                                          │
+│  All speak the same Thin Client Protocol (§5.5):                         │
+│  • SSE stream for chat turns                                             │
+│  • REST for state CRUD (sessions, memory, plans, skills)                 │
+│  • WebSocket for real-time collaboration                                 │
+│  • Tool approval/rejection callbacks                                     │
+│                                                                          │
+│  Clients are STATELESS — no LLM config, no sync orchestration,           │
+│  no learning state. They render, dispatch, and relay.                     │
 └────────────────────┬─────────────────────────────────────────────────────┘
-                     │
+                     │ Thin Client Protocol (SSE + REST + WS)
 ┌────────────────────▼─────────────────────────────────────────────────────┐
-│                         EDGE RUNTIME                                     │
-│  EdgeChatLoop │ 55 Local Tools │ MCP Servers │ Permission System         │
-│  Drives agentic loop. Executes tools locally. Syncs state to cloud.     │
+│                    HEADLESS CLOUD RUNTIME                                 │
 │                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐     │
-│  │ Cognitive Pipeline: Perceive → Plan → Execute → Evaluate → Reflect │  │
-│  │ FallbackSelector (TF-IDF + LLM) │ LearnedContext │ StallGuard    │  │
-│  └─────────────────────────────────────────────────────────────────┘     │
+│  ┌────────────────────────────────────────────────────────────────┐      │
+│  │  Control Plane                                                  │      │
+│  │  API Gateway │ Auth │ Rate Limit │ Agent Registry │ Task Router │      │
+│  └────────┬───────────────────────────────────────────────────────┘      │
+│           │                                                              │
+│  ┌────────▼───────────────────────────────────────────────────────┐      │
+│  │  Cognitive Engine (today: runtime crate)                        │      │
+│  │  ├── FallbackSelector (TF-IDF + LLM tool selection)            │      │
+│  │  ├── StallGuard + ErrorRecovery + Circuit Breaker               │      │
+│  │  ├── LearnedContext (EntityGraph, PatternLibrary, Calibrator)    │      │
+│  │  ├── Prompt Cache + Token Budget Management                     │      │
+│  │  └── LLM Orchestration (model resolution, key decryption)       │      │
+│  └────────┬───────────────────────────────────────────────────────┘      │
+│           │                                                              │
+│  ┌────────▼───────────────────────────────────────────────────────┐      │
+│  │  State Plane (today: services crate)                            │      │
+│  │  ├── Session lifecycle (create, restore, checkpoint, replay)     │      │
+│  │  ├── Task orchestration (plan, lease, checkpoint, resume)        │      │
+│  │  ├── Memory / Skill / Context CRUD                               │      │
+│  │  ├── Sync engine (5 domains: Learning, Events, Tasks, etc.)      │      │
+│  │  ├── Approval workflow (tool gate, plan approval, escalation)    │      │
+│  │  └── Event ingestion (batch, idempotent, at-least-once)          │      │
+│  └────────┬───────────────────────────────────────────────────────┘      │
+│           │                                                              │
+│  ┌────────▼───────────────────────────────────────────────────────┐      │
+│  │  Storage Layer (MatrixOne HTAP)                                 │      │
+│  │  Sessions │ Events │ Tasks │ Leases │ Learning │ Preferences     │      │
+│  └────────────────────────────────────────────────────────────────┘      │
 │                                                                          │
-│  ┌──────────────────────────────────────────────────┐                   │
-│  │ SyncOrchestrator                                  │                   │
-│  │ ├── LearningAdapter  (✅ production)              │                   │
-│  │ ├── EventAdapter     (→ wire to batch ingestion)  │                   │
-│  │ ├── TaskAdapter      (→ implement lease protocol) │                   │
-│  │ ├── TemplateAdapter  (→ cold start bootstrap)     │                   │
-│  │ └── PreferenceAdapter(→ bidirectional sync)       │                   │
-│  └──────────────────────────────────────────────────┘                   │
 └────────────────────┬─────────────────────────────────────────────────────┘
-                     │ SSE + REST (/chat/turn, /sync/*, /tasks/*)
+                     │ Tool Execution Requests (JSON-RPC / gRPC)
 ┌────────────────────▼─────────────────────────────────────────────────────┐
-│                       CLOUD PLATFORM                                     │
+│                      EDGE EXECUTORS                                      │
 │                                                                          │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                   │
-│  │ API Gateway   │  │ Task Router  │  │ Agent Registry│                  │
-│  │ Auth, Rate    │  │ Lease Mgmt   │  │ Heartbeat    │                   │
-│  │ Limit, Route  │  │ Priority Q   │  │ Capabilities │                   │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘                   │
-│         │                  │                  │                           │
-│  ┌──────▼──────────────────▼──────────────────▼───────┐                  │
-│  │               Orchestration Layer                   │                  │
-│  │  SessionOrchestrator │ PlanExecutor │ LearningCtrl  │                 │
-│  │  ConflictResolver │ DriftDetector │ FeedbackMiner   │                 │
-│  └──────────────────────┬─────────────────────────────┘                  │
-│                         │                                                │
-│  ┌──────────────────────▼─────────────────────────────┐                  │
-│  │                 Storage Layer                       │                  │
-│  │  MatrixOne (HTAP) │ Redis (cache) │ S3 (artifacts)  │                │
-│  │                                                     │                 │
-│  │  Tables:                                            │                 │
-│  │  ├── agent_sessions    (session lifecycle)          │                 │
-│  │  ├── agent_events      (append-only audit trail)    │                 │
-│  │  ├── agent_tasks       (task records + checkpoints) │                 │
-│  │  ├── learning_snapshots(gzip+base64, versioned)     │                 │
-│  │  ├── plan_templates    (reusable plan patterns)     │                 │
-│  │  ├── user_preferences  (model, explain mode, etc.)  │                 │
-│  │  ├── agent_registry    (NEW: agent capabilities)    │                 │
-│  │  └── task_leases       (NEW: distributed ownership) │                 │
-│  └────────────────────────────────────────────────────┘                  │
+│  One per client session. Runs on user's machine (or cloud sandbox).      │
+│                                                                          │
+│  ┌──────────────────────────────────────────────────────────────────┐    │
+│  │  Local Tool Runtime                                               │    │
+│  │  ├── bash / shell execution                                       │    │
+│  │  ├── File system read/write                                       │    │
+│  │  ├── Git operations (gix, pure Rust)                              │    │
+│  │  ├── Code intelligence (tree-sitter, 10 AST tools)               │    │
+│  │  ├── MCP server connections                                       │    │
+│  │  └── Build/test loop with error delta tracking                    │    │
+│  └──────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  Edge executor is DUMB — it receives tool invocations, runs them         │
+│  locally, and returns results. No LLM calls, no state management.        │
+│                                                                          │
+│  Privacy boundary: code, credentials, and filesystem never leave edge.   │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
+
+**Key insight**: Today, `mo-agent` CLI is simultaneously a thin client, cognitive engine, AND edge executor (53,878 LOC). The target separates these into independently deployable components sharing a common protocol.
+
+### 5.3 Headless Cloud Runtime: Client-Runtime Decoupling
+
+#### The Problem
+
+The current architecture tightly couples the CLI to the agent runtime. Evidence:
+
+1. **`chat_stream.rs` (3,342 lines)** in `mo-agent` contains the entire LLM interaction loop — stall detection, token budgeting, schema pruning, parallel tool dispatch, response guards. This is the **core cognitive capability**, not a CLI concern.
+
+2. **`ReplState` in `main.rs:380-447`** holds infrastructure state that belongs in a server:
+   ```rust
+   // These fields are in the CLI's REPL state — they should be server-side:
+   sync_orchestrator: Option<SyncOrchestrator>,      // cloud sync coordination
+   matrixone_pool: Option<Arc<sqlx::Pool<MySql>>>,   // database connection pool
+   ingestion_sender: Option<IngestionSender>,         // cloud event publishing
+   learning_snapshot: Option<String>,                 // cloud learning data
+   ```
+
+3. **`sync_adapters.rs` (861 lines)** bridges `runtime::pipeline::EntityGraph` with `services::SyncEngine`, but lives in `mo-agent` because it's the only crate that depends on both runtime and services. This forces any new client to duplicate the bridging logic.
+
+4. **`InProcessChatTurnBridge` (`bridge_inprocess.rs:564`)** embeds MatrixOne database queries and API key decryption directly in the runtime crate. The cognitive engine should not know about infrastructure secrets.
+
+#### The Solution: Headless Cloud Runtime
+
+A **headless cloud runtime** is an agent runtime that has no UI, no local filesystem access, and no client-specific code. It provides all cognitive capabilities via API:
+
+```
+                  ┌─────────────────────────────┐
+                  │   Headless Cloud Runtime     │
+                  │                               │
+  CLI ────────────▶  /chat/stream   (SSE)        │
+  Web ────────────▶  /sessions/*    (REST)       │
+  IDE ────────────▶  /memory/*      (REST)       │
+  SDK ────────────▶  /tools/invoke  (callback)   │
+                  │  /tasks/*       (REST)       │
+                  │  /plans/*       (REST)       │
+                  │  /skills/*      (REST)       │
+                  │  /approval/*    (WS)         │
+                  │                               │
+                  │  All clients share:           │
+                  │  • Same auth (JWT)            │
+                  │  • Same protocol              │
+                  │  • Same state plane           │
+                  │  • Same cognitive engine       │
+                  └──────────────┬────────────────┘
+                                 │
+                   Tool execution callback
+                                 │
+                  ┌──────────────▼────────────────┐
+                  │   Edge Executor (per client)   │
+                  │   bash, fs, git, code_intel    │
+                  │   Registered via /agents/edge  │
+                  └───────────────────────────────┘
+```
+
+**What "headless" means concretely**:
+- The server binary (`mo-agent-server`) becomes the single source of truth for all agent state
+- LLM calls happen server-side only (not in CLI)
+- Tool selection, stall detection, token budgeting — all server-side
+- CLI sends user messages and receives structured events (tool requests, text chunks, plan updates)
+- Edge executor is a lightweight process that registers its tool capabilities and executes tool invocations
+
+#### What Must Move (with code evidence)
+
+| Component | From | To | Evidence | Effort |
+|-----------|------|----|----------|--------|
+| `chat_stream.rs` core loop | `mo-agent` | `runtime` server handler | 3,342 lines of LLM orchestration in CLI crate | Large |
+| `plan_decompose.rs` | `mo-agent` | `runtime` or `services` | 5,680 lines of plan logic in CLI crate | Large |
+| `sync_adapters.rs` | `mo-agent` | `services` (new `bridge` module) | 861 lines bridging runtime↔services, stuck in CLI | Medium |
+| `SyncOrchestrator` construction | `ReplState` (`main.rs:436`) | `AppState` (`state_builder.rs`) | CLI holds cloud sync state | Small |
+| `MatrixOne pool` | `ReplState` (`main.rs:406`) | `AppState` (already has `shared_pool`) | Duplicate pool in CLI | Small |
+| `IngestionSender` | `ReplState` (`main.rs:402`) | Server-side event pipeline | CLI publishes cloud events directly | Small |
+| `InProcessChatTurnBridge` | `runtime/turn/` | `services` or `llm-bridge` crate | Embeds DB schema + key decryption at line 86-120 | Medium |
+| Skill registry + loader | `chat_stream.rs:723` | `runtime` `SkillService` | Skill loading is cognitive, not CLI | Medium |
+
+#### What Stays on Edge (must NOT move)
+
+| Component | File | Why It Stays |
+|-----------|------|-------------|
+| `bash` tool execution | `edge_tools.rs` | Runs on user's machine, privacy |
+| File system read/write | `edge_tools.rs` | Local filesystem access |
+| Git operations (gix) | `edge_tools/git_gix.rs` | Local repo, no network dependency |
+| Code intelligence | `edge_tools/code_intel.rs` | Tree-sitter AST parsing, local files |
+| Build/test loop | `edge_tools/build_test.rs` | Local build toolchain |
+| MCP server connections | `mcp_client.rs` | User's MCP servers |
+| Permission manager | `permission_manager.rs` | Local approval UX |
+| REPL UI + rendering | `repl_ui.rs`, `stream_render.rs` | Terminal rendering |
+
+### 5.4 Responsibility Split: What Moves Where
+
+A precise mapping of every responsibility in the current `mo-agent` CLI to its target location:
+
+#### Cloud (Headless Runtime) — Control Plane + State Plane
+
+| Responsibility | Current Owner | Target Owner | Notes |
+|---------------|--------------|-------------|-------|
+| LLM model resolution & API key management | `bridge_inprocess.rs:64-120` | `services` `ModelService` | DB queries + decryption belong in service layer |
+| Chat turn orchestration (stall, budget, guard) | `chat_stream.rs` (3,342 LOC) | `runtime` server handler | Core cognitive loop |
+| Tool selection (TF-IDF + LLM) | `runtime` `tool_selector.rs` | `runtime` (stays) | Already server-side ✅ |
+| Session lifecycle (create, restore, checkpoint) | Split: `services` + `main.rs` | `services` (consolidate) | Remove `ReplState` session fields |
+| Task/plan state machine | `services` `task_orchestrator.rs` | `services` (stays) | Already server-side ✅ |
+| Plan decomposition | `mo-agent` `plan_decompose.rs` | `runtime` or `services` | 5,680 LOC of planning logic in CLI |
+| Learning sync + merge | `mo-agent` `sync_adapters.rs` | `services` new `bridge` module | Unblock multi-client |
+| Event ingestion | `mo-agent` `ReplState` | `services` (already has `IngestionWorker`) | Remove from CLI |
+| Memory/skill/context CRUD | `runtime` route handlers | `runtime` (stays) | Already server-side ✅ |
+| Approval workflow | Not implemented | `services` new module | Cloud-resident for multi-client |
+
+#### Edge (Executor) — Tool Runtime
+
+| Responsibility | Current Owner | Target Owner | Notes |
+|---------------|--------------|-------------|-------|
+| 55 local tools | `mo-agent` `edge_tools.rs` + subdirs | Edge executor process | Packaged as standalone |
+| Tool invocation → result | Inline in `chat_stream.rs` | Edge executor via callback API | Cloud sends tool request, edge returns result |
+| Permission gates (bash, write) | `permission_manager.rs` | Edge executor local UX | User approves locally |
+| MCP server management | `mcp_client.rs` | Edge executor | User's MCP servers |
+| Build/test error tracking | `build_test.rs` | Edge executor | Local build state |
+
+#### Thin Client — Render + Dispatch
+
+| Responsibility | Current Owner | Target Owner | Notes |
+|---------------|--------------|-------------|-------|
+| User input (text, slash commands) | `main.rs` REPL | Thin client | Parse → dispatch to cloud API |
+| SSE stream rendering | `stream_render.rs` | Thin client | Render cloud events |
+| Session switching | `slash_session.rs` | Thin client → cloud API | Client calls `/sessions/*` |
+| Memory management | `slash_memory.rs` | Thin client → cloud API | Client calls `/memory/*` |
+
+### 5.5 Thin Client Protocol
+
+All clients (CLI, Web, IDE) share a single protocol to interact with the headless cloud runtime:
+
+#### Chat Turn Protocol (SSE)
+
+```
+POST /chat/stream
+Content-Type: application/json
+Authorization: Bearer <jwt>
+
+{
+  "session_id": "s-123",
+  "message": "Fix the login bug",
+  "edge_executor_id": "edge-abc",    // NEW: which edge can execute tools
+  "capabilities": ["bash", "fs", "git", "code_intel"]  // NEW: available tools
+}
+
+← SSE stream:
+event: session_info
+data: {"session_id": "s-123", "run_id": "r-456"}
+
+event: tool_request        // NEW: cloud asks edge to run a tool
+data: {"request_id": "tr-1", "tool": "bash", "args": {"command": "ls -la"}}
+
+event: text_delta
+data: {"content": "I'll check the directory structure..."}
+
+event: plan_update
+data: {"subtask_id": "st-1", "status": "in_progress"}
+
+event: approval_required   // NEW: cloud pauses for user approval
+data: {"request_id": "ap-1", "tool": "write_file", "path": "src/auth.rs"}
+
+event: done
+data: {"tokens_used": 4500}
+```
+
+#### Tool Execution Callback (Edge → Cloud)
+
+```
+POST /tools/result
+Authorization: Bearer <jwt>
+X-Mo-Edge-Id: edge-abc
+
+{
+  "request_id": "tr-1",
+  "status": "success",
+  "output": "total 24\ndrwxr-xr-x  5 user user 4096 ...",
+  "duration_ms": 45
+}
+```
+
+#### Approval Callback (Client → Cloud)
+
+```
+POST /approval/respond
+Authorization: Bearer <jwt>
+
+{
+  "request_id": "ap-1",
+  "decision": "allow",          // "allow" | "deny" | "allow_session"
+  "reason": "User approved"
+}
+```
+
+#### State CRUD (REST, shared by all clients)
+
+```
+GET    /sessions                         # list sessions
+POST   /sessions                         # create session
+GET    /sessions/{id}                    # get session details
+DELETE /sessions/{id}                    # end session
+POST   /sessions/{id}/replay            # replay session
+
+GET    /memory/search?q=...             # search memories
+POST   /memory/store                    # store memory
+POST   /memory/feedback                 # relevance feedback
+
+GET    /tasks                           # list tasks
+POST   /tasks                           # create task
+PATCH  /tasks/{id}                      # update task status
+POST   /tasks/{id}/checkpoint           # save checkpoint
+
+GET    /skills                          # list available skills
+POST   /skills/{id}/configure           # configure skill
+
+GET    /context                         # get current context window
+POST   /context/prune                   # manual context pruning
+
+GET    /plans/{id}                      # get plan state
+POST   /plans/{id}/approve              # approve plan step
+POST   /plans/{id}/resume               # resume paused plan
+```
+
+> **Note**: Many of these routes already exist in `router_builder.rs` (~50 routes). The gap is that today's CLI bypasses them (calling internal Rust functions directly) and the Web UI only uses ~15 routes as read-only GETs. The thin client protocol makes all clients go through the same API surface.
 
 ---
 
@@ -1291,19 +1568,36 @@ mo-agent Orchestrator
 
 ## 15. Migration Path
 
-> **Note**: Phase ordering prioritizes **durable execution** (Phase 2) before multi-agent coordination (Phases 3-4), because multi-agent is useless without durable execution — agents that die when HTTP connections close cannot be coordinated.
+> **Note**: Phase ordering begins with **crate restructuring** (Phase 0) because the current layer violations block all multi-client and multi-agent work. Phase 0 is purely mechanical (move code, no new features) and unblocks everything else.
+
+### Phase 0: Crate Restructuring (Headless Runtime Enablement)
+
+**Goal**: Move cloud-side logic out of `mo-agent` CLI into server-side crates. After this phase, `mo-agent` is a thin client that speaks the same protocol as Web and IDE.
+
+| Task | Effort | Dependency | Code Evidence |
+|------|--------|------------|---------------|
+| Move `sync_adapters.rs` (861 LOC) to `services` as `bridge` module | Medium | None | `mo-agent/sync_adapters.rs` bridges runtime↔services |
+| Move `SyncOrchestrator` construction from `ReplState` to `AppState` | Small | sync_adapters move | `main.rs:436`, `state_builder.rs:140` |
+| Move `IngestionSender` from `ReplState` to server-side event pipeline | Small | None | `main.rs:402` |
+| Remove `matrixone_pool` from `ReplState` (use server's `shared_pool`) | Small | None | `main.rs:406`, `app_state.rs:81` already has `shared_pool` |
+| Extract `InProcessChatTurnBridge` model resolution to `services` `ModelService` | Medium | None | `bridge_inprocess.rs:64-120` queries DB directly |
+| Move `plan_decompose.rs` (5,680 LOC) to `runtime` or `services` | Large | sync_adapters move | Core planning logic in CLI crate |
+| Refactor `chat_stream.rs` (3,342 LOC): extract cognitive loop to `runtime`, keep CLI rendering in `mo-agent` | Large | plan_decompose move | LLM orchestration in CLI crate |
+| Implement tool execution callback protocol (cloud → edge) | Medium | chat_stream refactor | Enables headless operation |
+| Add `edge_executor_id` to chat turn protocol | Small | callback protocol | Identifies which edge runs tools |
+
+**Success criteria**: `mo-agent` CLI can be deleted and replaced with a 500-line thin client that calls the same APIs as the Web UI. All cognitive logic runs server-side.
 
 ### Phase 1: Complete Single-Agent Foundation
 
-**Goal**: Fill stub implementations, make all 5 sync domains operational.
+**Goal**: Fill stub implementations, make all 5 sync domains operational. Depends on Phase 0 (adapters now in `services`).
 
 | Task | Effort | Dependency |
 |------|--------|------------|
-| Wire EventAdapter to IngestionSender | Small | None |
-| Implement TaskAdapter with lease protocol | Medium | New `task_leases` table |
-| Implement TemplateAdapter (read-only pull) | Small | None |
-| Implement PreferenceAdapter (bidirectional) | Small | None |
-| Fix unreachable code in FallbackSelector:962-972 | Small | None |
+| Wire EventAdapter to IngestionSender (now both in `services`) | Small | Phase 0 |
+| Implement TaskAdapter with lease protocol | Medium | Phase 0, new `task_leases` table |
+| Implement TemplateAdapter (read-only pull) | Small | Phase 0 |
+| Implement PreferenceAdapter (bidirectional) | Small | Phase 0 |
 
 ### Phase 2: Durable Long-Running Tasks
 
@@ -1376,25 +1670,31 @@ mo-agent Orchestrator
 
 ## Appendix B: Key File References
 
-| Area | File | Key Lines |
-|------|------|-----------|
-| Sync engine | `services/src/sync_engine.rs` | DomainAdapter trait, SyncOrchestrator, SyncEnvelope |
-| Learning sync | `services/src/state_sync.rs` | StateSyncService, optimistic locking, gzip |
-| Event ingestion | `services/src/event_ingestion.rs` | IngestionWorker, batch flush, idempotency |
-| Session restore | `services/src/session_restore.rs` | HybridRestoreService, RestoredSession |
-| Session journal | `services/src/session_journal.rs` | JournalWriter, append-only JSONL |
-| Task orchestrator | `services/src/task_orchestrator.rs` | TaskRecord, TaskCheckpoint, SubtaskPlan |
-| Sync adapters | `mo-agent/src/mo_agent/sync_adapters.rs` | LearningAdapter (prod), EventAdapter (stub), TaskAdapter (stub) |
-| Tool selector | `runtime/src/tool_selector.rs` | LearnedContext, FallbackSelector, confidence gate |
-| Bridge | `runtime/src/turn/bridge_inprocess.rs` | Prompt cache, learned context injection |
-| Chat stream | `mo-agent/src/mo_agent/chat_stream.rs` | Edge orchestration loop, parallel tool execution |
-| Entity graph | `runtime/src/pipeline/entity.rs` | EntityKnowledge, decayed_confidence |
-| Pattern library | `runtime/src/pipeline/pattern.rs` | ToolChainPattern, drift detection |
-| Calibrator | `runtime/src/pipeline/calibration.rs` | ProgressiveCalibrator, 3-axis thresholds |
-| Stall detection | `runtime/src/turn/stall.rs` | TurnGuard, intent drift, name stall |
-| Error recovery | `runtime/src/turn/error_recovery.rs` | ErrorCategory, escalation thresholds |
-| Code intelligence | `mo-agent/src/edge_tools/code_intel.rs` | 10 AST tools, tree-sitter, PARSER_CACHE |
-| Git (pure Rust) | `mo-agent/src/edge_tools/git_gix.rs` | 8 git tools via gix, no binary dependency |
+| Area | File | Key Lines | Layer |
+|------|------|-----------|-------|
+| Sync engine | `services/src/sync_engine.rs` | DomainAdapter trait, SyncOrchestrator, SyncEnvelope | services ✅ |
+| Learning sync | `services/src/state_sync.rs` | StateSyncService, optimistic locking, gzip | services ✅ |
+| Event ingestion | `services/src/event_ingestion.rs` | IngestionWorker, batch flush, idempotency | services ✅ |
+| Session restore | `services/src/session_restore.rs` | HybridRestoreService, RestoredSession | services ✅ |
+| Session journal | `services/src/session_journal.rs` | JournalWriter, append-only JSONL | services ✅ |
+| Task orchestrator | `services/src/task_orchestrator.rs` | TaskRecord, TaskCheckpoint, SubtaskPlan | services ✅ |
+| Sync adapters | `mo-agent/src/mo_agent/sync_adapters.rs` | LearningAdapter (prod), EventAdapter (stub), TaskAdapter (stub) | ⚠️ Should move to services |
+| Tool selector | `runtime/src/tool_selector.rs` | LearnedContext, FallbackSelector, confidence gate | runtime ✅ |
+| Bridge (in-process) | `runtime/src/turn/bridge_inprocess.rs` | Prompt cache, learned context injection, LLM model resolution | ⚠️ Model resolution should move to services |
+| Bridge (HTTP) | `runtime/src/turn/bridge/mod.rs` | HttpChatTurnBridge, forwards to external service | runtime ✅ |
+| Chat stream | `mo-agent/src/mo_agent/chat_stream.rs` | Edge orchestration loop, parallel tool execution | ⚠️ Core loop should move to runtime |
+| Plan decompose | `mo-agent/src/mo_agent/plan_decompose.rs` | Long-horizon planning, subtask generation | ⚠️ Should move to runtime/services |
+| Entity graph | `runtime/src/pipeline/entity.rs` | EntityKnowledge, decayed_confidence | runtime ✅ |
+| Pattern library | `runtime/src/pipeline/pattern.rs` | ToolChainPattern, drift detection | runtime ✅ |
+| Calibrator | `runtime/src/pipeline/calibration.rs` | ProgressiveCalibrator, 3-axis thresholds | runtime ✅ |
+| Stall detection | `runtime/src/turn/stall.rs` | TurnGuard, intent drift, name stall | runtime ✅ |
+| Error recovery | `runtime/src/turn/error_recovery.rs` | ErrorCategory, escalation thresholds | runtime ✅ |
+| Code intelligence | `mo-agent/src/edge_tools/code_intel.rs` | 10 AST tools, tree-sitter, PARSER_CACHE | edge ✅ (stays) |
+| Git (pure Rust) | `mo-agent/src/edge_tools/git_gix.rs` | 8 git tools via gix, no binary dependency | edge ✅ (stays) |
+| App state | `runtime/src/app_state.rs` | AppState: 30+ service traits, turn writers, bridge | runtime ✅ |
+| Server builder | `runtime/src/server/state_builder.rs` | Pipeline learning writer, bridge wiring | runtime ✅ |
+| Router | `runtime/src/server/router_builder.rs` | 50+ HTTP routes, the thin client API surface | runtime ✅ |
+| Web proxy | `web/app/api/backend/[...path]/route.ts` | Server-side proxy, httpOnly cookie auth | web ✅ |
 
 ---
 
@@ -1447,4 +1747,4 @@ CREATE TABLE task_leases (
 
 ---
 
-*This document is the source of truth for multi-agent cloud runtime architecture. It supersedes aspirational descriptions in individual design docs where they conflict with the implementation-grounded analysis here. The design leverages MatrixOne's HTAP capabilities as the core competitive moat — not just as storage, but as the computational backbone for learning convergence, drift detection, and real-time observability.*
+*This document is the source of truth for multi-agent cloud runtime architecture. It supersedes aspirational descriptions in individual design docs where they conflict with the implementation-grounded analysis here. The design leverages MatrixOne's HTAP capabilities as the core competitive moat — not just as storage, but as the computational backbone for learning convergence, drift detection, and real-time observability. The v1.2 revision introduces the **headless cloud runtime** architecture: a three-tier split (thin clients + cloud runtime + edge executors) that enables multi-client support (CLI, Web, IDE) and is prerequisite to multi-agent coordination.*
