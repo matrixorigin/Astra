@@ -39,6 +39,13 @@ pub use session::{
 };
 use validation::validate_register_request;
 
+fn is_duplicate_key_error(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db_err) => db_err.code().as_deref() == Some("1062"),
+        _ => false,
+    }
+}
+
 #[async_trait]
 pub trait AuthService: Send + Sync {
     async fn register(
@@ -329,22 +336,31 @@ impl AuthService for DatabaseAuthService {
 
         if let Err(error) = insert_result {
             tx.rollback().await.ok();
-            let message = error.to_string();
-            if message.contains("Duplicate entry") {
-                if message.contains(&request.username) {
+            if is_duplicate_key_error(&error) {
+                if self
+                    .fetch_user_by_username(&pool, &request.username)
+                    .await
+                    .map_err(internal_error)?
+                    .is_some()
+                {
                     return Err(error_response(
                         StatusCode::BAD_REQUEST,
                         "Username already exists",
                     ));
                 }
-                if message.contains(&request.email) {
+                if self
+                    .fetch_user_by_email(&pool, &request.email)
+                    .await
+                    .map_err(internal_error)?
+                    .is_some()
+                {
                     return Err(error_response(
                         StatusCode::BAD_REQUEST,
                         "Email already exists",
                     ));
                 }
             }
-            return Err(internal_error(message));
+            return Err(internal_error(error));
         }
 
         query(

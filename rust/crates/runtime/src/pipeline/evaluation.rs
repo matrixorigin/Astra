@@ -117,7 +117,7 @@ pub fn evaluate_turn(
     // ─── Empty output detection ─────────────────────────────────────────
     let empty_outputs = tool_calls
         .iter()
-        .filter(|tc| tc.ok && tc.output_bytes.map_or(false, |b| b < 10))
+        .filter(|tc| tc.ok && tc.output_bytes.is_some_and(|b| b < 10))
         .count();
     if empty_outputs > 0 {
         signals.push(EvalSignal::EmptyToolOutput);
@@ -218,10 +218,11 @@ mod tests {
         let eval = evaluate_turn(&calls, 0, false, 0.3, false);
         assert!(!eval.success);
         assert!(eval.quality < 0.4, "quality={}", eval.quality);
-        assert!(eval
-            .signals
-            .iter()
-            .any(|s| matches!(s, EvalSignal::ToolErrorRate(r) if *r > 0.9)));
+        assert!(
+            eval.signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::ToolErrorRate(r) if *r > 0.9))
+        );
     }
 
     #[test]
@@ -276,9 +277,11 @@ mod tests {
         let low_pressure = evaluate_turn(&calls, 0, false, 0.3, false);
         let high_pressure = evaluate_turn(&calls, 0, false, 0.85, false);
         assert!(high_pressure.quality < low_pressure.quality);
-        assert!(high_pressure
-            .signals
-            .contains(&EvalSignal::HighBudgetPressure));
+        assert!(
+            high_pressure
+                .signals
+                .contains(&EvalSignal::HighBudgetPressure)
+        );
     }
 
     #[test]
@@ -290,10 +293,11 @@ mod tests {
             ok_call("grep"),
         ];
         let eval = evaluate_turn(&calls, 0, false, 0.3, false);
-        assert!(eval
-            .signals
-            .iter()
-            .any(|s| matches!(s, EvalSignal::RepeatToolCall(n) if n == "bash")));
+        assert!(
+            eval.signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::RepeatToolCall(n) if n == "bash"))
+        );
     }
 
     #[test]
@@ -301,7 +305,13 @@ mod tests {
         let calls = vec![empty_call("read_file"), ok_call("bash")];
         let eval = evaluate_turn(&calls, 0, false, 0.3, false);
         assert!(eval.signals.contains(&EvalSignal::EmptyToolOutput));
-        let all_ok = evaluate_turn(&[ok_call("read_file"), ok_call("bash")], 0, false, 0.3, false);
+        let all_ok = evaluate_turn(
+            &[ok_call("read_file"), ok_call("bash")],
+            0,
+            false,
+            0.3,
+            false,
+        );
         assert!(eval.quality < all_ok.quality);
     }
 

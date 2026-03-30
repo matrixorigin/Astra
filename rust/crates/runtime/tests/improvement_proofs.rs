@@ -8483,10 +8483,7 @@ mod turnguard_e2e_proofs {
             .record_error(mo_agent_runtime::turn::error_recovery::ErrorCategory::Unknown);
         let verdict = guard.evaluate();
         assert_eq!(verdict.severity, VerdictSeverity::Critical);
-        assert!(
-            verdict.force_stop,
-            "3 nudges + 2 errors SHOULD force_stop"
-        );
+        assert!(verdict.force_stop, "3 nudges + 2 errors SHOULD force_stop");
     }
 
     // ── Scenario P: Healthy session produces minimal verdict ─────────────────

@@ -818,22 +818,10 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
             "Observability",
             &["/explain", "/turn", "/stats", "/tools", "/health", "/sync"],
         ),
-        (
-            "📋",
-            "Session",
-            &["/session", "/resume", "/plan"],
-        ),
-        (
-            "🧠",
-            "Skills",
-            &["/skill"],
-        ),
+        ("📋", "Session", &["/session", "/resume", "/plan"]),
+        ("🧠", "Skills", &["/skill"]),
         ("🔧", "Diagnostics", &["/doctor", "/version"]),
-        (
-            "🔑",
-            "Account",
-            &["/login", "/logout"],
-        ),
+        ("🔑", "Account", &["/login", "/logout"]),
     ];
 
     for (icon, title, commands) in groups {

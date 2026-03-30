@@ -70,10 +70,10 @@ mod slash_session;
 mod slash_skill;
 #[path = "mo_agent/slash_state.rs"]
 mod slash_state;
-#[path = "mo_agent/sync_adapters.rs"]
-mod sync_adapters;
 #[path = "mo_agent/stream_render.rs"]
 mod stream_render;
+#[path = "mo_agent/sync_adapters.rs"]
+mod sync_adapters;
 
 use auth_flow::{clear_profile_last_session, do_login, do_register};
 use chat_stream::{
@@ -411,8 +411,9 @@ struct ReplState {
     /// Unified sync orchestrator — tracks sync state across all domains.
     sync_orchestrator: Option<mo_agent_services::SyncOrchestrator>,
     /// Shared pattern library reference for /learn command.
-    pattern_library:
-        Option<std::sync::Arc<std::sync::Mutex<mo_agent_runtime::pipeline::pattern::PatternLibrary>>>,
+    pattern_library: Option<
+        std::sync::Arc<std::sync::Mutex<mo_agent_runtime::pipeline::pattern::PatternLibrary>>,
+    >,
 }
 
 impl Default for ReplState {
@@ -1287,12 +1288,7 @@ fn handle_sync_command(arg: &str, state: &ReplState) {
                 let result = if event.success {
                     "✓ ok".green().to_string()
                 } else {
-                    event
-                        .error
-                        .as_deref()
-                        .unwrap_or("fail")
-                        .red()
-                        .to_string()
+                    event.error.as_deref().unwrap_or("fail").red().to_string()
                 };
                 eprintln!(
                     "  {:<10} {:<12} {:<8} {:>6}ms {:>10}",
@@ -1402,11 +1398,7 @@ fn handle_learn_command(arg: &str, state: &ReplState) {
             if reports.is_empty() {
                 eprintln!("  {} No drifting patterns detected", "✓".green());
             } else {
-                eprintln!(
-                    "  {} {} pattern(s) drifting:",
-                    "⚠".yellow(),
-                    reports.len()
-                );
+                eprintln!("  {} {} pattern(s) drifting:", "⚠".yellow(), reports.len());
                 eprintln!();
                 for r in &reports {
                     let severity = if r.is_critical {
@@ -1445,10 +1437,7 @@ fn handle_learn_command(arg: &str, state: &ReplState) {
                 "─── Exploration Opportunities ──────────────────".bold()
             );
             if opps.is_empty() {
-                eprintln!(
-                    "  {} All domains have sufficient confidence",
-                    "✓".green()
-                );
+                eprintln!("  {} All domains have sufficient confidence", "✓".green());
             } else {
                 for opp in &opps {
                     let reason_str = match opp.reason {
@@ -1469,10 +1458,7 @@ fn handle_learn_command(arg: &str, state: &ReplState) {
                         opp.pattern_count,
                     );
                     if !opp.known_tools.is_empty() {
-                        eprintln!(
-                            "    Known tools: {}",
-                            opp.known_tools.join(", ").dim()
-                        );
+                        eprintln!("    Known tools: {}", opp.known_tools.join(", ").dim());
                     }
                 }
             }
@@ -1554,8 +1540,7 @@ async fn run_plan_execution(
             let rounds = state.plan_execution_rounds;
 
             if pct == 100 {
-                let summary =
-                    plan_decompose::PlanExecutionSummary::from_plan(&plan, &goal, rounds);
+                let summary = plan_decompose::PlanExecutionSummary::from_plan(&plan, &goal, rounds);
                 eprintln!();
                 eprint!("{}", summary.format());
 
@@ -1586,17 +1571,17 @@ async fn run_plan_execution(
                     pct,
                     blocked.join(", ")
                 );
-                
+
                 // Detect and suggest replan
                 let failed: Vec<(&str, &str)> = vec![];
                 if let Some(suggestion) = plan_decompose::detect_replan_needed(
-                    &plan, 
-                    state.plan_execution_rounds, 
-                    &failed
+                    &plan,
+                    state.plan_execution_rounds,
+                    &failed,
                 ) {
                     eprintln!("{}", plan_decompose::format_replan_suggestion(&suggestion));
                 }
-                
+
                 // Keep plan for potential resume
                 state.executing_plan = Some(plan);
             }
@@ -1687,10 +1672,7 @@ async fn run_plan_execution(
 
             if is_step_by_step {
                 eprintln!();
-                eprintln!(
-                    "{}  Execute this subtask? (y/n/skip/abort)",
-                    "❓".yellow()
-                );
+                eprintln!("{}  Execute this subtask? (y/n/skip/abort)", "❓".yellow());
                 // Put plan back before waiting for input
                 state.executing_plan = Some(plan);
 
@@ -1704,7 +1686,7 @@ async fn run_plan_execution(
                             // Take plan back, mark as skipped (keep as pending), continue
                             plan = state.executing_plan.take().unwrap();
                             if let Some(st) = plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
-                                st.status = TaskStatus::Pending;  // Keep pending, skip for now
+                                st.status = TaskStatus::Pending; // Keep pending, skip for now
                             }
                             continue;
                         }
@@ -1776,8 +1758,7 @@ async fn run_plan_execution(
                         .subtasks
                         .iter()
                         .filter(|s| {
-                            s.status == TaskStatus::Pending
-                                || s.status == TaskStatus::InProgress
+                            s.status == TaskStatus::Pending || s.status == TaskStatus::InProgress
                         })
                         .count();
                     eprintln!(
@@ -1799,27 +1780,27 @@ async fn run_plan_execution(
             };
 
             // Mark just-completed subtask as completed before next in group
-            if let Some(st) = plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
-                if st.status == TaskStatus::InProgress {
-                    st.status = TaskStatus::Completed;
-                    let title = st.title.clone();
-                    let pct = plan.progress_pct();
-                    eprintln!("\n{}  Subtask done: {} ({}%)", "✓".green(), title, pct);
+            if let Some(st) = plan.subtasks.iter_mut().find(|s| s.id == *next_id)
+                && st.status == TaskStatus::InProgress
+            {
+                st.status = TaskStatus::Completed;
+                let title = st.title.clone();
+                let pct = plan.progress_pct();
+                eprintln!("\n{}  Subtask done: {} ({}%)", "✓".green(), title, pct);
 
-                    // Journal: subtask completed
-                    if let Some(ref mut j) = state.journal {
-                        let evt = mo_agent_services::session_journal::JournalEvent::plan_progress(
-                            state.session_id.as_deref(),
-                            state.turn,
-                            next_id,
-                            &title,
-                            "completed",
-                            pct,
-                            plan.subtasks.len(),
-                            plan.items_done() as usize,
-                        );
-                        let _ = j.append(&evt);
-                    }
+                // Journal: subtask completed
+                if let Some(ref mut j) = state.journal {
+                    let evt = mo_agent_services::session_journal::JournalEvent::plan_progress(
+                        state.session_id.as_deref(),
+                        state.turn,
+                        next_id,
+                        &title,
+                        "completed",
+                        pct,
+                        plan.subtasks.len(),
+                        plan.items_done() as usize,
+                    );
+                    let _ = j.append(&evt);
                 }
             }
         }
@@ -2545,7 +2526,8 @@ async fn handle_slash_command(
 
         "/session" => handle_session_command(arg, state),
 
-        "/history" | "/search" | "/copy" | "/doctor" | "/context" | "/version" | "/rewind" | "/turn" => {
+        "/history" | "/search" | "/copy" | "/doctor" | "/context" | "/version" | "/rewind"
+        | "/turn" => {
             handle_info_command(cmd, arg, client, base, state, token).await?;
         }
 
@@ -2737,9 +2719,8 @@ async fn run_chat_repl(
         use mo_agent_services::DomainAdapter as _;
         let transport: std::sync::Arc<dyn mo_agent_services::CloudTransport> =
             if let Some(ref pool) = state.matrixone_pool {
-                let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(
-                    pool.as_ref().clone(),
-                );
+                let svc =
+                    mo_agent_services::state_sync::MatrixOneSyncService::new(pool.as_ref().clone());
                 std::sync::Arc::new(sync_adapters::MatrixOneTransport::new(
                     std::sync::Arc::new(svc),
                     profile.unwrap_or("default"),
@@ -2769,8 +2750,7 @@ async fn run_chat_repl(
         );
 
         // Register Event adapter
-        let event_adapter =
-            sync_adapters::EventAdapter::new(state.ingestion_sender.clone());
+        let event_adapter = sync_adapters::EventAdapter::new(state.ingestion_sender.clone());
         orch.register(
             Box::new(event_adapter),
             mo_agent_services::SyncPolicy::events(),
@@ -2912,15 +2892,18 @@ async fn run_chat_repl(
                             );
                         }
                     }
-                    
+
                     // Auto plan detection: suggest plan mode for complex tasks
                     let mut should_proceed_normal = true;
-                    let line_for_plan = line.clone();  // Clone early to avoid borrow issues
+                    let line_for_plan = line.clone(); // Clone early to avoid borrow issues
                     if let Some(reason) = plan_decompose::should_suggest_plan_mode(&line) {
                         eprintln!();
                         eprintln!("{}  {}", "📋".yellow(), reason);
-                        eprintln!("{}  This task might benefit from planning. Enter plan mode? (y/n)", "💡".cyan());
-                        
+                        eprintln!(
+                            "{}  This task might benefit from planning. Enter plan mode? (y/n)",
+                            "💡".cyan()
+                        );
+
                         // Read user response
                         let mut response = String::new();
                         if std::io::stdin().read_line(&mut response).is_ok() {
@@ -2931,16 +2914,23 @@ async fn run_chat_repl(
                                     .unwrap_or_else(|_| std::path::PathBuf::from("."));
                                 let context = plan_decompose::analyze_project(&project_root);
                                 let goal_display = line_for_plan.clone();
-                                let plan_state = plan_decompose::PlanModeState::new(line_for_plan.clone(), context);
-                                
+                                let plan_state = plan_decompose::PlanModeState::new(
+                                    line_for_plan.clone(),
+                                    context,
+                                );
+
                                 eprintln!();
-                                eprintln!("{}  Entering plan mode for: {}", "📋".green(), goal_display.cyan());
+                                eprintln!(
+                                    "{}  Entering plan mode for: {}",
+                                    "📋".green(),
+                                    goal_display.cyan()
+                                );
                                 eprintln!("{}  Generating plan...", "⋯".dim());
-                                
+
                                 // Trigger plan generation (set goal, plan will be generated in plan mode)
                                 state.plan_mode = Some(plan_state);
                                 should_proceed_normal = false;
-                                
+
                                 // Call handle_plan_mode_input to generate the plan
                                 handle_plan_mode_input(
                                     line_for_plan,
@@ -2955,7 +2945,7 @@ async fn run_chat_repl(
                             }
                         }
                     }
-                    
+
                     if should_proceed_normal {
                         handle_chat_input(
                             line,
@@ -2994,16 +2984,12 @@ async fn run_chat_repl(
                         {
                             state.cloud_learning_version = Some(new_version);
                             // Update orchestrator envelope to reflect the push
-                            if let Some(ref orch) = state.sync_orchestrator {
-                                if let Some(mut env) =
+                            if let Some(ref orch) = state.sync_orchestrator
+                                && let Some(mut env) =
                                     orch.envelope(mo_agent_services::SyncDomain::Learning)
-                                {
-                                    env.mark_synced(new_version as u64);
-                                    orch.update_envelope(
-                                        mo_agent_services::SyncDomain::Learning,
-                                        env,
-                                    );
-                                }
+                            {
+                                env.mark_synced(new_version as u64);
+                                orch.update_envelope(mo_agent_services::SyncDomain::Learning, env);
                             }
                         }
                         // On conflict, we skip this push — the final push at session end

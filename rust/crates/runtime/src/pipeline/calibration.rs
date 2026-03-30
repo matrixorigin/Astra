@@ -147,7 +147,7 @@ impl ProgressiveCalibrator {
         // - was_corrected=true: explicit correction happened
         // - feedback < 50: user unhappy, treat as implicit correction
         let effective_correction =
-            was_corrected || user_feedback_score.map_or(false, |score| score < 50);
+            was_corrected || user_feedback_score.is_some_and(|score| score < 50);
 
         self.per_intent
             .entry(intent.to_string())

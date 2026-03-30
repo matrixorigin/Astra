@@ -185,25 +185,28 @@ impl ToolExecutor {
         // Tier 2 (10s): fast read commands — cat, head, file stat
         // Tier 3 (15s): search/traversal — grep, find, ripgrep
         // Tier 4 (30s): everything else (build, test, network)
-        let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or_else(|| {
-            let cmd_base = command.trim_start().split_whitespace().next().unwrap_or("");
-            match cmd_base {
-                // Tier 1: instant — no real I/O
-                "echo" | "printf" | "true" | "false" | "pwd" | "whoami" | "date"
-                | "basename" | "dirname" | "which" | "env" | "hostname" | "uname"
-                | "id" | "tty" | "nproc" | "arch" | "yes" => 5.0,
-                // Tier 2: fast reads — single file or dir stat
-                "cat" | "head" | "tail" | "wc" | "stat" | "file" | "ls" | "readlink"
-                | "realpath" | "md5sum" | "sha256sum" | "du" | "df" | "touch"
-                | "mkdir" | "cp" | "mv" | "rm" | "ln" | "chmod" | "chown" => 10.0,
-                // Tier 3: search/traversal — scan many files but bounded
-                "grep" | "rg" | "find" | "fd" | "ag" | "awk" | "sed" | "sort"
-                | "uniq" | "cut" | "tr" | "diff" | "comm" | "xargs" | "tree"
-                | "jq" | "yq" | "column" | "tee" => 15.0,
-                // Tier 4: everything else (compilation, network, etc.)
-                _ => 30.0,
-            }
-        });
+        let timeout_secs = args
+            .get("timeout")
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| {
+                let cmd_base = command.split_whitespace().next().unwrap_or("");
+                match cmd_base {
+                    // Tier 1: instant — no real I/O
+                    "echo" | "printf" | "true" | "false" | "pwd" | "whoami" | "date"
+                    | "basename" | "dirname" | "which" | "env" | "hostname" | "uname" | "id"
+                    | "tty" | "nproc" | "arch" | "yes" => 5.0,
+                    // Tier 2: fast reads — single file or dir stat
+                    "cat" | "head" | "tail" | "wc" | "stat" | "file" | "ls" | "readlink"
+                    | "realpath" | "md5sum" | "sha256sum" | "du" | "df" | "touch" | "mkdir"
+                    | "cp" | "mv" | "rm" | "ln" | "chmod" | "chown" => 10.0,
+                    // Tier 3: search/traversal — scan many files but bounded
+                    "grep" | "rg" | "find" | "fd" | "ag" | "awk" | "sed" | "sort" | "uniq"
+                    | "cut" | "tr" | "diff" | "comm" | "xargs" | "tree" | "jq" | "yq"
+                    | "column" | "tee" => 15.0,
+                    // Tier 4: everything else (compilation, network, etc.)
+                    _ => 30.0,
+                }
+            });
 
         match self.run_shell_output(command, timeout_secs) {
             Err(error) => error,
@@ -487,39 +490,38 @@ fn annotate_grep_with_scope(grep_output: &str, project_root: &std::path::Path) -
     for line in grep_output.lines() {
         // Parse grep output: file:line:content or file-line-content (context)
         // Only annotate primary matches (colon separator), not context (dash separator)
-        if let Some((file_part, rest)) = line.split_once(':') {
-            if let Some((line_num_str, _content)) = rest.split_once(':') {
-                if let Ok(line_num) = line_num_str.trim().parse::<usize>() {
-                    let file_path = if std::path::Path::new(file_part).is_absolute() {
-                        file_part.to_string()
-                    } else {
-                        project_root.join(file_part).to_string_lossy().to_string()
-                    };
+        if let Some((file_part, rest)) = line.split_once(':')
+            && let Some((line_num_str, _content)) = rest.split_once(':')
+            && let Ok(line_num) = line_num_str.trim().parse::<usize>()
+        {
+            let file_path = if std::path::Path::new(file_part).is_absolute() {
+                file_part.to_string()
+            } else {
+                project_root.join(file_part).to_string_lossy().to_string()
+            };
 
-                    let cached = file_cache.entry(file_path.clone()).or_insert_with(|| {
-                        let path = std::path::Path::new(&file_path);
-                        let lang = detect_language(path)?;
-                        let source = std::fs::read_to_string(path).ok()?;
-                        Some((source, lang))
-                    });
+            let cached = file_cache.entry(file_path.clone()).or_insert_with(|| {
+                let path = std::path::Path::new(&file_path);
+                let lang = detect_language(path)?;
+                let source = std::fs::read_to_string(path).ok()?;
+                Some((source, lang))
+            });
 
-                    if let Some((source, lang)) = cached {
-                        let ctx = scope_at_line(source, *lang, line_num);
-                        let scope_str = if ctx.breadcrumbs.len() > 1 {
-                            ctx.breadcrumbs.join(" > ")
-                        } else if let Some(ref sym) = ctx.symbol {
-                            sym.name.clone()
-                        } else {
-                            String::new()
-                        };
-                        if !scope_str.is_empty() {
-                            result.push_str(line);
-                            result.push_str("  // in ");
-                            result.push_str(&scope_str);
-                            result.push('\n');
-                            continue;
-                        }
-                    }
+            if let Some((source, lang)) = cached {
+                let ctx = scope_at_line(source, *lang, line_num);
+                let scope_str = if ctx.breadcrumbs.len() > 1 {
+                    ctx.breadcrumbs.join(" > ")
+                } else if let Some(ref sym) = ctx.symbol {
+                    sym.name.clone()
+                } else {
+                    String::new()
+                };
+                if !scope_str.is_empty() {
+                    result.push_str(line);
+                    result.push_str("  // in ");
+                    result.push_str(&scope_str);
+                    result.push('\n');
+                    continue;
                 }
             }
         }
@@ -720,9 +722,7 @@ mod tests {
         let executor = test_executor();
         // Use a unique marker file to detect if the child survived
         let marker = format!("/tmp/mo_test_pgid_{}", std::process::id());
-        let cmd = format!(
-            "bash -c 'sleep 10 && touch {marker}' & wait"
-        );
+        let cmd = format!("bash -c 'sleep 10 && touch {marker}' & wait");
         let result = executor.bash(&serde_json::json!({"command": cmd, "timeout": 0.3}));
         assert!(result.contains("timed out"), "got: {result}");
         // Give a moment for any surviving child to act
@@ -753,7 +753,10 @@ mod tests {
 
         // Explicit timeout overrides tier
         let r = executor.bash(&serde_json::json!({"command": "sleep 10", "timeout": 0.1}));
-        assert!(r.contains("timed out"), "explicit timeout should override tier");
+        assert!(
+            r.contains("timed out"),
+            "explicit timeout should override tier"
+        );
     }
 
     #[test]

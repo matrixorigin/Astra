@@ -819,11 +819,11 @@ pub fn prune_schema(mut schema: Value, level: PruneLevel) -> Value {
     // Prune function description
     match level {
         PruneLevel::Light => {
-            if let Some(Value::String(desc)) = func.get("description") {
-                if desc.len() > 80 {
-                    let truncated = truncate_at_boundary(desc, 80);
-                    func["description"] = Value::String(truncated);
-                }
+            if let Some(Value::String(desc)) = func.get("description")
+                && desc.len() > 80
+            {
+                let truncated = truncate_at_boundary(desc, 80);
+                func["description"] = Value::String(truncated);
             }
         }
         PruneLevel::Medium | PruneLevel::Aggressive => {
@@ -849,18 +849,18 @@ pub fn prune_schema(mut schema: Value, level: PruneLevel) -> Value {
             std::collections::HashSet::new()
         };
 
-        if let Some(props) = params.get_mut("properties") {
-            if let Some(obj) = props.as_object_mut() {
-                // Aggressive: strip optional params (keep only required)
-                if level == PruneLevel::Aggressive && !required_names.is_empty() {
-                    obj.retain(|name, _| required_names.contains(name));
-                }
+        if let Some(props) = params.get_mut("properties")
+            && let Some(obj) = props.as_object_mut()
+        {
+            // Aggressive: strip optional params (keep only required)
+            if level == PruneLevel::Aggressive && !required_names.is_empty() {
+                obj.retain(|name, _| required_names.contains(name));
+            }
 
-                // Light/Medium/Aggressive: remove param descriptions
-                for (_name, prop) in obj.iter_mut() {
-                    if let Some(p) = prop.as_object_mut() {
-                        p.remove("description");
-                    }
+            // Light/Medium/Aggressive: remove param descriptions
+            for (_name, prop) in obj.iter_mut() {
+                if let Some(p) = prop.as_object_mut() {
+                    p.remove("description");
                 }
             }
         }

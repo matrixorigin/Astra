@@ -171,7 +171,7 @@ impl ToolChainPattern {
 
     /// Whether this pattern is drifting (recent performance significantly worse).
     pub fn is_drifting(&self) -> bool {
-        self.drift_score().map_or(false, |s| s >= 1.0)
+        self.drift_score().is_some_and(|s| s >= 1.0)
     }
 }
 
@@ -671,10 +671,8 @@ impl PatternLibrary {
 
         // Check each task type for low-confidence areas
         for (&task_type, keys) in &self.type_index {
-            let patterns: Vec<&ToolChainPattern> = keys
-                .iter()
-                .filter_map(|k| self.patterns.get(k))
-                .collect();
+            let patterns: Vec<&ToolChainPattern> =
+                keys.iter().filter_map(|k| self.patterns.get(k)).collect();
 
             if patterns.is_empty() {
                 continue;
@@ -751,7 +749,11 @@ impl PatternLibrary {
         let drifting = self.detect_drift().len();
 
         let avg_success = if total_patterns > 0 {
-            self.patterns.values().map(|p| p.success_rate()).sum::<f64>() / total_patterns as f64
+            self.patterns
+                .values()
+                .map(|p| p.success_rate())
+                .sum::<f64>()
+                / total_patterns as f64
         } else {
             0.0
         };
@@ -1910,8 +1912,7 @@ mod tests {
 
     #[test]
     fn drift_score_none_when_insufficient_data() {
-        let mut p =
-            ToolChainPattern::new("a".to_string(), tools(&["a"]), TaskType::Code, None);
+        let mut p = ToolChainPattern::new("a".to_string(), tools(&["a"]), TaskType::Code, None);
         p.success_count = 3;
         p.failure_count = 0;
         // Only 3 total observations < DRIFT_MIN_OBSERVATIONS (6)
@@ -1920,8 +1921,7 @@ mod tests {
 
     #[test]
     fn drift_score_none_when_no_recent_data() {
-        let mut p =
-            ToolChainPattern::new("a".to_string(), tools(&["a"]), TaskType::Code, None);
+        let mut p = ToolChainPattern::new("a".to_string(), tools(&["a"]), TaskType::Code, None);
         p.success_count = 10;
         p.failure_count = 0;
         // No recent_outcomes pushed
@@ -1930,8 +1930,7 @@ mod tests {
 
     #[test]
     fn drift_score_zero_when_consistent() {
-        let mut p =
-            ToolChainPattern::new("a".to_string(), tools(&["a"]), TaskType::Code, None);
+        let mut p = ToolChainPattern::new("a".to_string(), tools(&["a"]), TaskType::Code, None);
         p.success_count = 10;
         p.failure_count = 0;
         // Recent outcomes all success — matches historical
@@ -1944,8 +1943,7 @@ mod tests {
 
     #[test]
     fn drift_score_high_when_recent_failures() {
-        let mut p =
-            ToolChainPattern::new("a".to_string(), tools(&["a"]), TaskType::Code, None);
+        let mut p = ToolChainPattern::new("a".to_string(), tools(&["a"]), TaskType::Code, None);
         p.success_count = 10;
         p.failure_count = 0;
         // Historical: 100% success. Recent: all failures → big drift
@@ -1959,8 +1957,7 @@ mod tests {
 
     #[test]
     fn drift_score_moderate_when_mixed() {
-        let mut p =
-            ToolChainPattern::new("a".to_string(), tools(&["a"]), TaskType::Code, None);
+        let mut p = ToolChainPattern::new("a".to_string(), tools(&["a"]), TaskType::Code, None);
         p.success_count = 8;
         p.failure_count = 2;
         // Historical: 80% success. Recent: 60% success → moderate drift
@@ -1971,7 +1968,10 @@ mod tests {
             p.push_outcome(false);
         }
         let drift = p.drift_score().unwrap();
-        assert!(drift > 0.0 && drift < 1.0, "Moderate drift expected, got {drift}");
+        assert!(
+            drift > 0.0 && drift < 1.0,
+            "Moderate drift expected, got {drift}"
+        );
         assert!(!p.is_drifting());
     }
 
@@ -2018,7 +2018,10 @@ mod tests {
         let demoted = lib.auto_demote_drifting();
         if demoted > 0 {
             let after = lib.patterns.get(&key).unwrap().failure_count;
-            assert!(after > before, "Failure count should increase after demotion");
+            assert!(
+                after > before,
+                "Failure count should increase after demotion"
+            );
         }
     }
 
@@ -2028,12 +2031,28 @@ mod tests {
     fn exploration_opportunities_cold_start() {
         let mut lib = PatternLibrary::new();
         // Only 2 observations — cold start
-        lib.record_outcome(&tools(&["new_tool"]), TaskType::Memory, None, true, 0.5, None);
-        lib.record_outcome(&tools(&["new_tool"]), TaskType::Memory, None, false, 0.0, None);
+        lib.record_outcome(
+            &tools(&["new_tool"]),
+            TaskType::Memory,
+            None,
+            true,
+            0.5,
+            None,
+        );
+        lib.record_outcome(
+            &tools(&["new_tool"]),
+            TaskType::Memory,
+            None,
+            false,
+            0.0,
+            None,
+        );
 
         let opps = lib.exploration_opportunities();
         assert!(
-            opps.iter().any(|o| o.task_type == TaskType::Memory && o.reason == ExplorationReason::ColdStart),
+            opps.iter().any(
+                |o| o.task_type == TaskType::Memory && o.reason == ExplorationReason::ColdStart
+            ),
             "Cold start area should be flagged: {opps:?}"
         );
     }
@@ -2043,15 +2062,30 @@ mod tests {
         let mut lib = PatternLibrary::new();
         // Lots of observations but low success rate
         for _ in 0..2 {
-            lib.record_outcome(&tools(&["bad"]), TaskType::Fetch, Some(DomainHint::Web), true, 0.3, None);
+            lib.record_outcome(
+                &tools(&["bad"]),
+                TaskType::Fetch,
+                Some(DomainHint::Web),
+                true,
+                0.3,
+                None,
+            );
         }
         for _ in 0..8 {
-            lib.record_outcome(&tools(&["bad"]), TaskType::Fetch, Some(DomainHint::Web), false, 0.0, None);
+            lib.record_outcome(
+                &tools(&["bad"]),
+                TaskType::Fetch,
+                Some(DomainHint::Web),
+                false,
+                0.0,
+                None,
+            );
         }
 
         let opps = lib.exploration_opportunities();
         assert!(
-            opps.iter().any(|o| o.reason == ExplorationReason::LowSuccess),
+            opps.iter()
+                .any(|o| o.reason == ExplorationReason::LowSuccess),
             "Low success area should be flagged: {opps:?}"
         );
     }
@@ -2084,8 +2118,7 @@ mod tests {
 
     #[test]
     fn recent_outcomes_window_caps_at_drift_window() {
-        let mut p =
-            ToolChainPattern::new("a".to_string(), tools(&["a"]), TaskType::Code, None);
+        let mut p = ToolChainPattern::new("a".to_string(), tools(&["a"]), TaskType::Code, None);
         for _ in 0..20 {
             p.push_outcome(true);
         }

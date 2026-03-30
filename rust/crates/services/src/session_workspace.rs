@@ -366,7 +366,10 @@ mod tests {
     #[test]
     fn workspace_plan_state_round_trip() {
         let mut ws = WorkspaceMetadata::with_context("plan-sess", "gpt-4", "/tmp", Some("main"));
-        ws.executing_plan_json = Some(r#"{"subtasks":[{"id":"s1","title":"task 1","status":"InProgress","depends_on":[]}]}"#.to_string());
+        ws.executing_plan_json = Some(
+            r#"{"subtasks":[{"id":"s1","title":"task 1","status":"InProgress","depends_on":[]}]}"#
+                .to_string(),
+        );
         ws.plan_goal = Some("Implement feature X".to_string());
         ws.plan_config_json = Some(r#"{"step_by_step":true,"auto_execute":false}"#.to_string());
         ws.plan_execution_rounds = 3;

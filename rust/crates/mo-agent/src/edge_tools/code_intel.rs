@@ -451,17 +451,17 @@ fn extract_ts_symbols(
             }
             "lexical_declaration" | "variable_declaration" => {
                 // const/let/var declarations
-                if let Some(decl) = child.child_by_field_name("declarator") {
-                    if let Some(name) = get_child_text(decl, "identifier", source) {
-                        symbols.push(Symbol {
-                            name,
-                            kind: SymbolKind::Variable,
-                            start_line: child.start_position().row + 1,
-                            end_line: child.end_position().row + 1,
-                            signature: get_signature_line(child, source),
-                            parent: parent.map(String::from),
-                        });
-                    }
+                if let Some(decl) = child.child_by_field_name("declarator")
+                    && let Some(name) = get_child_text(decl, "identifier", source)
+                {
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::Variable,
+                        start_line: child.start_position().row + 1,
+                        end_line: child.end_position().row + 1,
+                        signature: get_signature_line(child, source),
+                        parent: parent.map(String::from),
+                    });
                 }
             }
             _ => {
@@ -509,24 +509,24 @@ fn extract_go_symbols(
             }
             "type_declaration" => {
                 // Could be struct, interface, or type alias
-                if let Some(spec) = child.child(1) {
-                    if let Some(name) = get_child_text(spec, "type_identifier", source) {
-                        let kind = if spec.kind() == "struct_type" {
-                            SymbolKind::Struct
-                        } else if spec.kind() == "interface_type" {
-                            SymbolKind::Interface
-                        } else {
-                            SymbolKind::Type
-                        };
-                        symbols.push(Symbol {
-                            name,
-                            kind,
-                            start_line: child.start_position().row + 1,
-                            end_line: child.end_position().row + 1,
-                            signature: get_signature_line(child, source),
-                            parent: parent.map(String::from),
-                        });
-                    }
+                if let Some(spec) = child.child(1)
+                    && let Some(name) = get_child_text(spec, "type_identifier", source)
+                {
+                    let kind = if spec.kind() == "struct_type" {
+                        SymbolKind::Struct
+                    } else if spec.kind() == "interface_type" {
+                        SymbolKind::Interface
+                    } else {
+                        SymbolKind::Type
+                    };
+                    symbols.push(Symbol {
+                        name,
+                        kind,
+                        start_line: child.start_position().row + 1,
+                        end_line: child.end_position().row + 1,
+                        signature: get_signature_line(child, source),
+                        parent: parent.map(String::from),
+                    });
                 }
             }
             "const_declaration" | "var_declaration" => {
@@ -627,17 +627,17 @@ fn extract_java_symbols(
                 // Extract field names (may have multiple declarators)
                 let mut decl_cursor = child.walk();
                 for decl_child in child.children(&mut decl_cursor) {
-                    if decl_child.kind() == "variable_declarator" {
-                        if let Some(name) = get_child_text(decl_child, "identifier", source) {
-                            symbols.push(Symbol {
-                                name,
-                                kind: SymbolKind::Variable,
-                                start_line: child.start_position().row + 1,
-                                end_line: child.end_position().row + 1,
-                                signature: get_signature_line(child, source),
-                                parent: parent.map(String::from),
-                            });
-                        }
+                    if decl_child.kind() == "variable_declarator"
+                        && let Some(name) = get_child_text(decl_child, "identifier", source)
+                    {
+                        symbols.push(Symbol {
+                            name,
+                            kind: SymbolKind::Variable,
+                            start_line: child.start_position().row + 1,
+                            end_line: child.end_position().row + 1,
+                            signature: get_signature_line(child, source),
+                            parent: parent.map(String::from),
+                        });
                     }
                 }
             }
@@ -662,17 +662,17 @@ fn extract_cpp_symbols(
         match child.kind() {
             "function_definition" => {
                 // Try to get function name from declarator
-                if let Some(decl) = child.child_by_field_name("declarator") {
-                    if let Some(name) = extract_cpp_declarator_name(decl, source) {
-                        symbols.push(Symbol {
-                            name,
-                            kind: SymbolKind::Function,
-                            start_line: child.start_position().row + 1,
-                            end_line: child.end_position().row + 1,
-                            signature: get_signature_line(child, source),
-                            parent: parent.map(String::from),
-                        });
-                    }
+                if let Some(decl) = child.child_by_field_name("declarator")
+                    && let Some(name) = extract_cpp_declarator_name(decl, source)
+                {
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::Function,
+                        start_line: child.start_position().row + 1,
+                        end_line: child.end_position().row + 1,
+                        signature: get_signature_line(child, source),
+                        parent: parent.map(String::from),
+                    });
                 }
             }
             "declaration" => {
@@ -986,12 +986,12 @@ fn collect_calls(
         Language::Ruby => kind == "call" || kind == "method_call",
     };
 
-    if is_call {
-        if let Some(cs) = parse_call_site(node, source, lang) {
-            if cs.line >= start_line && cs.line <= end_line {
-                calls.push(cs);
-            }
-        }
+    if is_call
+        && let Some(cs) = parse_call_site(node, source, lang)
+        && cs.line >= start_line
+        && cs.line <= end_line
+    {
+        calls.push(cs);
     }
 
     // Recurse into children
@@ -1273,10 +1273,10 @@ pub fn extract_doc_comment(source: &str, lang: Language, symbol_line: usize) -> 
     }
 
     // For Python, check for docstring INSIDE the function body
-    if lang == Language::Python {
-        if let Some(docstring) = extract_python_docstring(&lines, symbol_line) {
-            return docstring;
-        }
+    if lang == Language::Python
+        && let Some(docstring) = extract_python_docstring(&lines, symbol_line)
+    {
+        return docstring;
     }
 
     // Walk backward collecting comment lines
@@ -1286,7 +1286,7 @@ pub fn extract_doc_comment(source: &str, lang: Language, symbol_line: usize) -> 
         // symbol_line is 1-indexed, so line before it is at index symbol_line - 2
     }
     // Convert to 0-indexed
-    let start_idx = symbol_line.checked_sub(2).unwrap_or(0);
+    let start_idx = symbol_line.saturating_sub(2);
 
     // Check for block comment first (/** ... */)
     if start_idx < lines.len() {
@@ -1383,10 +1383,10 @@ pub fn extract_doc_comment(source: &str, lang: Language, symbol_line: usize) -> 
 
     doc_lines.reverse();
     // Trim leading/trailing blank lines
-    while doc_lines.first().map_or(false, |l| l.is_empty()) {
+    while doc_lines.first().is_some_and(|l| l.is_empty()) {
         doc_lines.remove(0);
     }
-    while doc_lines.last().map_or(false, |l| l.is_empty()) {
+    while doc_lines.last().is_some_and(|l| l.is_empty()) {
         doc_lines.pop();
     }
     doc_lines.join("\n")
@@ -1421,8 +1421,8 @@ fn extract_python_docstring(lines: &[&str], symbol_line: usize) -> Option<String
         if !first_content.is_empty() {
             doc_lines.push(first_content.to_string());
         }
-        for j in (body_start + 1)..lines.len() {
-            let line = lines[j].trim();
+        for line in lines.iter().skip(body_start + 1) {
+            let line = line.trim();
             if line.contains(quote) {
                 let content = line.trim_end_matches(quote).trim();
                 if !content.is_empty() {
@@ -2053,10 +2053,10 @@ fn extract_rust_use_names(path: &str) -> Vec<String> {
             .collect();
     }
     // Handle `use std::collections::HashMap;`
-    if let Some(last) = path.rsplit("::").next() {
-        if last != "*" {
-            return vec![last.split(" as ").next().unwrap_or(last).trim().to_string()];
-        }
+    if let Some(last) = path.rsplit("::").next()
+        && last != "*"
+    {
+        return vec![last.split(" as ").next().unwrap_or(last).trim().to_string()];
     }
     Vec::new()
 }
@@ -2160,24 +2160,26 @@ fn extract_ts_imports(node: tree_sitter::Node, source: &str) -> Vec<ImportStatem
             let mut names = Vec::new();
             let is_wildcard = text.contains("* as ");
 
-            if let Some(brace_start) = text.find('{') {
-                if let Some(brace_end) = text.find('}') {
-                    let inner = &text[brace_start + 1..brace_end];
-                    for name in inner.split(',') {
-                        let n = name.trim().split(" as ").next().unwrap_or("").trim();
-                        if !n.is_empty() {
-                            names.push(n.to_string());
-                        }
+            if let Some(brace_start) = text.find('{')
+                && let Some(brace_end) = text.find('}')
+            {
+                let inner = &text[brace_start + 1..brace_end];
+                for name in inner.split(',') {
+                    let n = name.trim().split(" as ").next().unwrap_or("").trim();
+                    if !n.is_empty() {
+                        names.push(n.to_string());
                     }
                 }
             }
             // Default import: `import Foo from '...'`
             if names.is_empty() && !is_wildcard {
                 let after_import = text.trim_start_matches("import ").trim();
-                if let Some(name) = after_import.split_whitespace().next() {
-                    if name != "{" && name != "*" && name != "type" {
-                        names.push(name.to_string());
-                    }
+                if let Some(name) = after_import.split_whitespace().next()
+                    && name != "{"
+                    && name != "*"
+                    && name != "type"
+                {
+                    names.push(name.to_string());
                 }
             }
 
@@ -2892,10 +2894,12 @@ from module import *
 
         let collections = imports.iter().find(|i| i.path == "collections");
         assert!(collections.is_some(), "should find collections import");
-        assert!(collections
-            .unwrap()
-            .names
-            .contains(&"OrderedDict".to_string()));
+        assert!(
+            collections
+                .unwrap()
+                .names
+                .contains(&"OrderedDict".to_string())
+        );
 
         let wildcard = imports.iter().find(|i| i.is_wildcard);
         assert!(wildcard.is_some(), "should find wildcard import");
@@ -2912,14 +2916,14 @@ import type { Config } from './config';
         let imports = extract_imports(source, Language::TypeScript);
         assert!(imports.len() >= 3, "found: {:?}", imports);
 
-        let react = imports.iter().find(|i| {
-            i.path == "react" && i.names.contains(&"React".to_string())
-        });
+        let react = imports
+            .iter()
+            .find(|i| i.path == "react" && i.names.contains(&"React".to_string()));
         assert!(react.is_some(), "should find default React import");
 
-        let hooks = imports.iter().find(|i| {
-            i.path == "react" && i.names.contains(&"useState".to_string())
-        });
+        let hooks = imports
+            .iter()
+            .find(|i| i.path == "react" && i.names.contains(&"useState".to_string()));
         assert!(hooks.is_some(), "should find named React imports");
 
         let wildcard = imports.iter().find(|i| i.is_wildcard);
@@ -2946,10 +2950,7 @@ import (
 
         let filepath = imports.iter().find(|i| i.path == "path/filepath");
         assert!(filepath.is_some(), "should find path/filepath import");
-        assert!(filepath
-            .unwrap()
-            .names
-            .contains(&"filepath".to_string()));
+        assert!(filepath.unwrap().names.contains(&"filepath".to_string()));
     }
 
     #[test]

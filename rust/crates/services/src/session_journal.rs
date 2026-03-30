@@ -321,7 +321,7 @@ pub mod state_delta {
             // After many updates, overhead will be high until compaction
             // This verifies the measurement works
             assert!(overhead > 0.0, "Should have overhead after updates");
-            
+
             // After compaction, overhead should be reduced
             acc.compact();
             let after = acc.overhead_percentage();
@@ -851,6 +851,7 @@ impl JournalEvent {
     }
 
     /// Build a plan progress event — emitted when a subtask starts, completes, or plan finishes.
+    #[allow(clippy::too_many_arguments)]
     pub fn plan_progress(
         session_id: Option<&str>,
         turn: u32,
@@ -1391,10 +1392,12 @@ mod tests {
         assert_eq!(meta["total_cache_hits"], 1);
         assert_eq!(meta["flaky_tools"], 1);
         // injection_preview should truncate to first injection
-        assert!(meta["injection_preview"]
-            .as_str()
-            .unwrap()
-            .contains("CRITICAL"));
+        assert!(
+            meta["injection_preview"]
+                .as_str()
+                .unwrap()
+                .contains("CRITICAL")
+        );
     }
 
     #[test]

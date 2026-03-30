@@ -1326,10 +1326,10 @@ impl ToolExecutor {
         };
 
         // Sandbox check
-        if let Some(ref policy) = self.sandbox_policy {
-            if let Err(e) = validate_path(policy, path_str) {
-                return format!("Sandbox: path blocked: {e}");
-            }
+        if let Some(ref policy) = self.sandbox_policy
+            && let Err(e) = validate_path(policy, path_str)
+        {
+            return format!("Sandbox: path blocked: {e}");
         }
 
         if !path.exists() {
@@ -1356,10 +1356,10 @@ impl ToolExecutor {
         let mut symbols = code_intel::extract_symbols(&content, lang);
 
         // Apply pattern filter if provided
-        if let Some(pattern) = args.get("pattern").and_then(Value::as_str) {
-            if let Ok(re) = regex::Regex::new(pattern) {
-                symbols.retain(|s| re.is_match(&s.name));
-            }
+        if let Some(pattern) = args.get("pattern").and_then(Value::as_str)
+            && let Ok(re) = regex::Regex::new(pattern)
+        {
+            symbols.retain(|s| re.is_match(&s.name));
         }
 
         // Apply kind filter if provided
@@ -1648,14 +1648,13 @@ impl ToolExecutor {
                 let ft = entry.file_type().ok();
                 if ft.map(|t| t.is_dir()).unwrap_or(false) {
                     dirs_to_visit.push(entry.path());
-                } else if ft.map(|t| t.is_file()).unwrap_or(false) {
-                    if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
-                        if extensions.contains(&ext) {
-                            result.push(entry.path());
-                            if result.len() >= max_files {
-                                return result;
-                            }
-                        }
+                } else if ft.map(|t| t.is_file()).unwrap_or(false)
+                    && let Some(ext) = entry.path().extension().and_then(|e| e.to_str())
+                    && extensions.contains(&ext)
+                {
+                    result.push(entry.path());
+                    if result.len() >= max_files {
+                        return result;
                     }
                 }
             }
@@ -1765,10 +1764,7 @@ impl ToolExecutor {
         let last_segment = path_segments.last().unwrap_or(&"");
         for (idx, file_path) in file_paths.iter().enumerate() {
             let path_str = file_path.to_string_lossy();
-            let file_stem = file_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
+            let file_stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
             // Exact stem match (e.g., import "config" → config.rs/config.py)
             if file_stem.eq_ignore_ascii_case(last_segment) {
@@ -1949,21 +1945,20 @@ impl ToolExecutor {
             } else {
                 self.project_root.join(ctx_file)
             };
-            if ctx_path.exists() {
-                if let Some(ctx_lang) = code_intel::detect_language(&ctx_path) {
-                    if let Ok(ctx_content) = fs::read_to_string(&ctx_path) {
-                        let imports = code_intel::extract_imports(&ctx_content, ctx_lang);
-                        // Find imports that reference the target symbol
-                        for import in &imports {
-                            let matches_symbol = import.names.iter().any(|n| n == symbol)
-                                || import.is_wildcard
-                                || import.path.ends_with(symbol);
-                            if matches_symbol {
-                                let candidates =
-                                    self.resolve_import_to_files(import, ctx_lang, &file_paths);
-                                import_priority_indices.extend(candidates);
-                            }
-                        }
+            if ctx_path.exists()
+                && let Some(ctx_lang) = code_intel::detect_language(&ctx_path)
+                && let Ok(ctx_content) = fs::read_to_string(&ctx_path)
+            {
+                let imports = code_intel::extract_imports(&ctx_content, ctx_lang);
+                // Find imports that reference the target symbol
+                for import in &imports {
+                    let matches_symbol = import.names.iter().any(|n| n == symbol)
+                        || import.is_wildcard
+                        || import.path.ends_with(symbol);
+                    if matches_symbol {
+                        let candidates =
+                            self.resolve_import_to_files(import, ctx_lang, &file_paths);
+                        import_priority_indices.extend(candidates);
                     }
                 }
             }
@@ -1972,58 +1967,55 @@ impl ToolExecutor {
         import_priority_indices.dedup();
 
         // Helper closure: scan a file for matching definitions
-        let scan_file =
-            |path: &std::path::PathBuf, project_root: &Path| -> Vec<(String, bool)> {
-                let mut hits = Vec::new();
-                let lang = match code_intel::detect_language(path) {
-                    Some(l) => l,
-                    None => return hits,
-                };
-                let content = match fs::read_to_string(path) {
-                    Ok(c) => c,
-                    Err(_) => return hits,
-                };
-                let symbols = code_intel::extract_symbols(&content, lang);
-                for sym in &symbols {
-                    if pattern.is_match(&sym.name)
-                        && definition_kinds.contains(&sym.kind.as_str())
-                    {
-                        let rel_path = path.strip_prefix(project_root).unwrap_or(path).display();
-                        let parent_info = sym
-                            .parent
-                            .as_ref()
-                            .map(|p| format!(" (in {p})"))
-                            .unwrap_or_default();
-
-                        let doc = code_intel::extract_doc_comment(&content, lang, sym.start_line);
-                        let doc_info = if doc.is_empty() {
-                            String::new()
-                        } else {
-                            let doc_lines: Vec<&str> = doc.lines().take(5).collect();
-                            let truncated = if doc.lines().count() > 5 {
-                                "\n    ..."
-                            } else {
-                                ""
-                            };
-                            format!("\n    📝 {}{}", doc_lines.join("\n    "), truncated)
-                        };
-
-                        hits.push((
-                            format!(
-                                "{}:{} [{}]{} {}{}",
-                                rel_path,
-                                sym.start_line,
-                                sym.kind.as_str(),
-                                parent_info,
-                                sym.signature,
-                                doc_info
-                            ),
-                            false,
-                        ));
-                    }
-                }
-                hits
+        let scan_file = |path: &std::path::PathBuf, project_root: &Path| -> Vec<(String, bool)> {
+            let mut hits = Vec::new();
+            let lang = match code_intel::detect_language(path) {
+                Some(l) => l,
+                None => return hits,
             };
+            let content = match fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => return hits,
+            };
+            let symbols = code_intel::extract_symbols(&content, lang);
+            for sym in &symbols {
+                if pattern.is_match(&sym.name) && definition_kinds.contains(&sym.kind.as_str()) {
+                    let rel_path = path.strip_prefix(project_root).unwrap_or(path).display();
+                    let parent_info = sym
+                        .parent
+                        .as_ref()
+                        .map(|p| format!(" (in {p})"))
+                        .unwrap_or_default();
+
+                    let doc = code_intel::extract_doc_comment(&content, lang, sym.start_line);
+                    let doc_info = if doc.is_empty() {
+                        String::new()
+                    } else {
+                        let doc_lines: Vec<&str> = doc.lines().take(5).collect();
+                        let truncated = if doc.lines().count() > 5 {
+                            "\n    ..."
+                        } else {
+                            ""
+                        };
+                        format!("\n    📝 {}{}", doc_lines.join("\n    "), truncated)
+                    };
+
+                    hits.push((
+                        format!(
+                            "{}:{} [{}]{} {}{}",
+                            rel_path,
+                            sym.start_line,
+                            sym.kind.as_str(),
+                            parent_info,
+                            sym.signature,
+                            doc_info
+                        ),
+                        false,
+                    ));
+                }
+            }
+            hits
+        };
 
         // Scan import-priority files first
         let mut scanned_indices: std::collections::HashSet<usize> =
@@ -2067,10 +2059,7 @@ impl ToolExecutor {
                 ));
                 body_parts.push(import_results.join("\n"));
                 if !results.is_empty() {
-                    body_parts.push(format!(
-                        "\n\n## Other definitions ({})\n",
-                        results.len()
-                    ));
+                    body_parts.push(format!("\n\n## Other definitions ({})\n", results.len()));
                     body_parts.push(results.join("\n"));
                 }
             } else {
@@ -2081,7 +2070,10 @@ impl ToolExecutor {
                 "# Definitions of '{}' ({} found, {} files scanned)\n\n",
                 symbol, total_found, files_scanned
             );
-            truncate_output(format!("{}{}", header, body_parts.join("")), tool_output_limit())
+            truncate_output(
+                format!("{}{}", header, body_parts.join("")),
+                tool_output_limit(),
+            )
         }
     }
 
@@ -2273,7 +2265,7 @@ impl ToolExecutor {
         if !new_name
             .chars()
             .next()
-            .map_or(false, |c| c.is_alphabetic() || c == '_')
+            .is_some_and(|c| c.is_alphabetic() || c == '_')
             || !new_name.chars().all(|c| c.is_alphanumeric() || c == '_')
         {
             return format!("Error: '{}' is not a valid identifier", new_name);
@@ -2893,7 +2885,7 @@ impl ToolExecutor {
                 .as_ref()
                 .map(|p| format!(" (in {})", p))
                 .unwrap_or_default();
-            parts.push(format!(""));
+            parts.push(String::new());
             parts.push(format!(
                 "▸ {} {}{}",
                 sym.kind.as_str(),
@@ -2910,7 +2902,7 @@ impl ToolExecutor {
             // Doc comment
             let doc = code_intel::extract_doc_comment(&source, lang, sym.start_line);
             if !doc.is_empty() {
-                parts.push(format!(""));
+                parts.push(String::new());
                 for doc_line in doc.lines().take(5) {
                     parts.push(format!("  📝 {}", doc_line));
                 }
@@ -2927,7 +2919,7 @@ impl ToolExecutor {
             ) {
                 let members = code_intel::extract_members(&source, lang, sym.start_line);
                 if !members.is_empty() {
-                    parts.push(format!(""));
+                    parts.push(String::new());
                     parts.push(format!("  Members ({}):", members.len()));
                     for m in members.iter().take(10) {
                         let type_str = if m.type_annotation.is_empty() {
@@ -2950,7 +2942,7 @@ impl ToolExecutor {
             ) {
                 let calls = code_intel::extract_calls(&source, lang, sym.start_line, sym.end_line);
                 if !calls.is_empty() {
-                    parts.push(format!(""));
+                    parts.push(String::new());
                     let call_names: Vec<String> = calls
                         .iter()
                         .take(8)
@@ -4838,11 +4830,8 @@ fn helper() {}
             line: 1,
             is_wildcard: false,
         };
-        let candidates = executor.resolve_import_to_files(
-            &import,
-            code_intel::Language::TypeScript,
-            &files,
-        );
+        let candidates =
+            executor.resolve_import_to_files(&import, code_intel::Language::TypeScript, &files);
         assert!(
             candidates.contains(&1),
             "should resolve to config.ts (index 1): {:?}",

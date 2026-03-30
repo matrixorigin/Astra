@@ -571,159 +571,274 @@ pub(super) async fn handle_info_command(
             if let Some(ref ev) = state.last_turn_event {
                 let total_ms = ev.duration_ms.unwrap_or(1) as f64;
                 let sep = "─".repeat(42);
-                eprintln!("\n  {}", format!("─── Turn {} Trace {sep}", ev.turn.unwrap_or(0)).cyan());
-                
+                eprintln!(
+                    "\n  {}",
+                    format!("─── Turn {} Trace {sep}", ev.turn.unwrap_or(0)).cyan()
+                );
+
                 // Calculate tool time
-                let tool_time_ms: u64 = ev.tool_calls.as_ref()
+                let tool_time_ms: u64 = ev
+                    .tool_calls
+                    .as_ref()
                     .map(|calls| calls.iter().map(|tc| tc.ms).sum())
                     .unwrap_or(0);
                 let llm_time_ms = ev.duration_ms.unwrap_or(0).saturating_sub(tool_time_ms);
-                
+
                 // Summary line
                 if let Some(ms) = ev.duration_ms {
-                    eprintln!("  {} {}", "Total:".bold(), format!("{:.2}s", ms as f64 / 1000.0).bold());
+                    eprintln!(
+                        "  {} {}",
+                        "Total:".bold(),
+                        format!("{:.2}s", ms as f64 / 1000.0).bold()
+                    );
                 }
-                
+
                 // TTFT and context time if available
                 if let Some(ttft) = ev.ttft_ms {
-                    eprintln!("  {} {}ms {}", "TTFT:".cyan(), ttft, "(time to first token)".dim());
+                    eprintln!(
+                        "  {} {}ms {}",
+                        "TTFT:".cyan(),
+                        ttft,
+                        "(time to first token)".dim()
+                    );
                 }
                 if let Some(ctx) = ev.context_ms {
-                    eprintln!("  {} {}ms {}", "Context:".cyan(), ctx, "(prompt assembly)".dim());
+                    eprintln!(
+                        "  {} {}ms {}",
+                        "Context:".cyan(),
+                        ctx,
+                        "(prompt assembly)".dim()
+                    );
                 }
                 eprintln!();
-                
+
                 // Timeline visualization
                 eprintln!("  {}", "Timeline".bold());
                 let bar_width = 40;
-                
+
                 // LLM portion
                 let llm_pct = (llm_time_ms as f64 / total_ms * 100.0) as u32;
                 let llm_bar_len = (llm_pct as usize * bar_width / 100).max(1);
                 let llm_bar = "█".repeat(llm_bar_len);
-                eprintln!("    {:<12} {:>6}ms {:>3}%  {}", 
-                    "LLM".cyan(), llm_time_ms, llm_pct, llm_bar.blue());
-                
+                eprintln!(
+                    "    {:<12} {:>6}ms {:>3}%  {}",
+                    "LLM".cyan(),
+                    llm_time_ms,
+                    llm_pct,
+                    llm_bar.blue()
+                );
+
                 // Per-tool bars with I/O sizes
                 if let Some(ref calls) = ev.tool_calls {
                     for tc in calls {
                         let pct = (tc.ms as f64 / total_ms * 100.0) as u32;
                         let bar_len = (pct as usize * bar_width / 100).max(1);
-                        let bar = if tc.ok { "█".repeat(bar_len).green() } else { "█".repeat(bar_len).red() };
+                        let bar = if tc.ok {
+                            "█".repeat(bar_len).green()
+                        } else {
+                            "█".repeat(bar_len).red()
+                        };
                         let status = if tc.ok { " " } else { "!" };
                         let io_info = match (tc.input_bytes, tc.output_bytes) {
-                            (Some(i), Some(o)) => format!(" [{}/{}B]", format_bytes(i), format_bytes(o)),
+                            (Some(i), Some(o)) => {
+                                format!(" [{}/{}B]", format_bytes(i), format_bytes(o))
+                            }
                             _ => String::new(),
                         };
-                        eprintln!("    {:<12} {:>6}ms {:>3}%  {}{}{}", 
-                            tc.name.as_str().cyan(), tc.ms, pct, bar, status, io_info.dim());
+                        eprintln!(
+                            "    {:<12} {:>6}ms {:>3}%  {}{}{}",
+                            tc.name.as_str().cyan(),
+                            tc.ms,
+                            pct,
+                            bar,
+                            status,
+                            io_info.dim()
+                        );
                     }
                 }
-                
+
                 eprintln!();
-                
+
                 // Detailed trace view (OpenTrace style)
                 eprintln!("  {}", "Trace".bold());
                 let mut offset = 0u64;
-                
+
                 // Context assembly (if available)
                 if let Some(ctx) = ev.context_ms {
-                    eprintln!("    {} {} Context assembly", 
-                        format!("[{:>5}ms]", offset).dim(), "├─".dim());
+                    eprintln!(
+                        "    {} {} Context assembly",
+                        format!("[{:>5}ms]", offset).dim(),
+                        "├─".dim()
+                    );
                     offset = ctx;
-                    eprintln!("    {} {} complete ({}ms)", 
-                        format!("[{:>5}ms]", offset).dim(), "│".dim(), ctx.to_string().dim());
+                    eprintln!(
+                        "    {} {} complete ({}ms)",
+                        format!("[{:>5}ms]", offset).dim(),
+                        "│".dim(),
+                        ctx.to_string().dim()
+                    );
                 }
-                
+
                 // LLM call
-                eprintln!("    {} {} LLM request", 
-                    format!("[{:>5}ms]", offset).dim(), "├─".dim());
+                eprintln!(
+                    "    {} {} LLM request",
+                    format!("[{:>5}ms]", offset).dim(),
+                    "├─".dim()
+                );
                 if let Some(ref m) = ev.model {
-                    eprintln!("    {}    {} model: {}", " ".repeat(8), "│".dim(), m.as_str().dim());
+                    eprintln!(
+                        "    {}    {} model: {}",
+                        " ".repeat(8),
+                        "│".dim(),
+                        m.as_str().dim()
+                    );
                 }
                 if let Some(t_in) = ev.tokens_in {
-                    eprintln!("    {}    {} input: {} tokens", " ".repeat(8), "│".dim(), t_in.to_string().dim());
+                    eprintln!(
+                        "    {}    {} input: {} tokens",
+                        " ".repeat(8),
+                        "│".dim(),
+                        t_in.to_string().dim()
+                    );
                 }
                 // Show TTFT inline
                 if let Some(ttft) = ev.ttft_ms {
                     let ttft_offset = offset + ttft;
-                    eprintln!("    {} {} first token (TTFT: {}ms)", 
-                        format!("[{:>5}ms]", ttft_offset).dim(), "│".dim(), ttft.to_string().yellow());
+                    eprintln!(
+                        "    {} {} first token (TTFT: {}ms)",
+                        format!("[{:>5}ms]", ttft_offset).dim(),
+                        "│".dim(),
+                        ttft.to_string().yellow()
+                    );
                 }
                 if let Some(t_out) = ev.tokens_out {
-                    eprintln!("    {}    {} output: {} tokens", " ".repeat(8), "│".dim(), t_out.to_string().dim());
+                    eprintln!(
+                        "    {}    {} output: {} tokens",
+                        " ".repeat(8),
+                        "│".dim(),
+                        t_out.to_string().dim()
+                    );
                 }
                 offset += llm_time_ms;
-                eprintln!("    {} {} LLM complete ({}ms)", 
-                    format!("[{:>5}ms]", offset).dim(), "│".dim(), llm_time_ms.to_string().yellow());
-                
+                eprintln!(
+                    "    {} {} LLM complete ({}ms)",
+                    format!("[{:>5}ms]", offset).dim(),
+                    "│".dim(),
+                    llm_time_ms.to_string().yellow()
+                );
+
                 // Tool calls
                 if let Some(ref calls) = ev.tool_calls {
                     for (i, tc) in calls.iter().enumerate() {
                         let is_last = i == calls.len() - 1;
                         let branch = if is_last { "└─" } else { "├─" };
                         let status = if tc.ok { "✓".green() } else { "✗".red() };
-                        
+
                         // Build I/O size annotation
                         let io_info = match (tc.input_bytes, tc.output_bytes) {
-                            (Some(i), Some(o)) => format!(" (in:{} out:{})", format_bytes(i), format_bytes(o)),
+                            (Some(i), Some(o)) => {
+                                format!(" (in:{} out:{})", format_bytes(i), format_bytes(o))
+                            }
                             (Some(i), None) => format!(" (in:{})", format_bytes(i)),
                             (None, Some(o)) => format!(" (out:{})", format_bytes(o)),
                             (None, None) => String::new(),
                         };
-                        
-                        eprintln!("    {} {} {} {}{}", 
-                            format!("[{:>5}ms]", offset).dim(), 
+
+                        eprintln!(
+                            "    {} {} {} {}{}",
+                            format!("[{:>5}ms]", offset).dim(),
                             branch.dim(),
                             status,
                             tc.name.as_str().cyan(),
-                            io_info.dim());
-                        
+                            io_info.dim()
+                        );
+
                         // Show args preview if available
                         if let Some(ref args) = tc.args_preview {
                             let sub_branch = if is_last { "   " } else { "│  " };
-                            let args_truncated = if args.len() > 60 { format!("{}…", &args[..59]) } else { args.clone() };
-                            eprintln!("    {}    {} {}", " ".repeat(8), sub_branch.dim(), args_truncated.dim());
+                            let args_truncated = if args.len() > 60 {
+                                format!("{}…", &args[..59])
+                            } else {
+                                args.clone()
+                            };
+                            eprintln!(
+                                "    {}    {} {}",
+                                " ".repeat(8),
+                                sub_branch.dim(),
+                                args_truncated.dim()
+                            );
                         }
-                        
+
                         if let Some(ref err) = tc.error {
-                            let err_preview = if err.len() > 50 { format!("{}…", &err[..50]) } else { err.clone() };
+                            let err_preview = if err.len() > 50 {
+                                format!("{}…", &err[..50])
+                            } else {
+                                err.clone()
+                            };
                             let sub_branch = if is_last { "   " } else { "│  " };
-                            eprintln!("    {}    {} {}", " ".repeat(8), sub_branch.dim(), err_preview.red());
+                            eprintln!(
+                                "    {}    {} {}",
+                                " ".repeat(8),
+                                sub_branch.dim(),
+                                err_preview.red()
+                            );
                         }
                         offset += tc.ms;
                         let sub_branch = if is_last { "   " } else { "│  " };
-                        eprintln!("    {}    {} complete ({}ms)", 
-                            format!("[{:>5}ms]", offset).dim(), 
+                        eprintln!(
+                            "    {}    {} complete ({}ms)",
+                            format!("[{:>5}ms]", offset).dim(),
                             sub_branch.dim(),
-                            tc.ms.to_string().dim());
+                            tc.ms.to_string().dim()
+                        );
                     }
                 }
-                
+
                 eprintln!();
-                
+
                 // Breakdown summary
                 eprintln!("  {}", "Breakdown".bold());
-                let llm_note = if llm_pct > 80 { "← bottleneck".yellow().to_string() } else { String::new() };
-                eprintln!("    {:<12} {:>6}ms  {:>3}%  {}", 
-                    "LLM".cyan(), llm_time_ms, llm_pct, llm_note);
+                let llm_note = if llm_pct > 80 {
+                    "← bottleneck".yellow().to_string()
+                } else {
+                    String::new()
+                };
+                eprintln!(
+                    "    {:<12} {:>6}ms  {:>3}%  {}",
+                    "LLM".cyan(),
+                    llm_time_ms,
+                    llm_pct,
+                    llm_note
+                );
                 let tool_pct = 100u32.saturating_sub(llm_pct);
-                let tool_note = if tool_pct > 80 { "← bottleneck".yellow().to_string() } else { String::new() };
-                eprintln!("    {:<12} {:>6}ms  {:>3}%  {}", 
-                    "Tools".cyan(), tool_time_ms, tool_pct, tool_note);
-                
+                let tool_note = if tool_pct > 80 {
+                    "← bottleneck".yellow().to_string()
+                } else {
+                    String::new()
+                };
+                eprintln!(
+                    "    {:<12} {:>6}ms  {:>3}%  {}",
+                    "Tools".cyan(),
+                    tool_time_ms,
+                    tool_pct,
+                    tool_note
+                );
+
                 // Tokens per second
-                if let (Some(t_out), Some(ms)) = (ev.tokens_out, ev.duration_ms) {
-                    if ms > 0 {
-                        let tps = t_out as f64 / (ms as f64 / 1000.0);
-                        eprintln!("    {:<12} {:>6.1} tokens/s", "Throughput".cyan(), tps);
-                    }
+                if let (Some(t_out), Some(ms)) = (ev.tokens_out, ev.duration_ms)
+                    && ms > 0
+                {
+                    let tps = t_out as f64 / (ms as f64 / 1000.0);
+                    eprintln!("    {:<12} {:>6.1} tokens/s", "Throughput".cyan(), tps);
                 }
-                
+
                 eprintln!("  {}", "─".repeat(56).cyan().dim());
                 eprintln!();
             } else {
-                eprintln!("{}", "  No turn data yet. Complete a conversation turn first.".dim());
+                eprintln!(
+                    "{}",
+                    "  No turn data yet. Complete a conversation turn first.".dim()
+                );
             }
         }
 

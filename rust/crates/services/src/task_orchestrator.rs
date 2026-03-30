@@ -201,7 +201,7 @@ impl TaskOutcome {
             Self::Cancelled => "cancelled",
         }
     }
-    
+
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "success" => Some(Self::Success),
@@ -317,7 +317,7 @@ pub trait TaskService: Send + Sync {
 
     /// Mark task as completed.
     async fn complete_task(&self, task_id: &str) -> Result<(), String>;
-    
+
     /// Record user feedback for learning.
     async fn record_feedback(
         &self,
@@ -326,12 +326,12 @@ pub trait TaskService: Send + Sync {
         outcome: TaskOutcome,
         completion_time_sec: Option<i32>,
     ) -> Result<(), String>;
-    
+
     /// Increment replan count.
     async fn increment_replan_count(&self, task_id: &str) -> Result<(), String>;
-    
+
     // ─── Learning Methods ───
-    
+
     /// Extract a template from a successful task (rating >= 4 or inferred success).
     /// Returns the template_id if created.
     async fn extract_template(
@@ -339,7 +339,7 @@ pub trait TaskService: Send + Sync {
         task_id: &str,
         goal_pattern: &str,
     ) -> Result<Option<String>, String>;
-    
+
     /// Recommend templates for a goal based on similarity and success rate.
     async fn recommend_templates(
         &self,
@@ -348,14 +348,14 @@ pub trait TaskService: Send + Sync {
         project_type: Option<&str>,
         limit: usize,
     ) -> Result<Vec<TemplateRecommendation>, String>;
-    
+
     /// Get learning stats for a goal pattern.
     async fn get_learning_stats(
         &self,
         user_id: &str,
         goal_pattern: &str,
     ) -> Result<LearningStats, String>;
-    
+
     /// Increment template use count (called when a template is instantiated).
     async fn record_template_usage(&self, template_id: &str) -> Result<(), String>;
 }
@@ -366,6 +366,14 @@ pub trait TaskService: Send + Sync {
 pub struct MatrixOneTaskService {
     pool: sqlx::Pool<sqlx::MySql>,
 }
+
+const AGENT_TASK_SELECT_COLUMNS: &str = "task_id, user_id, session_id, parent_task_id, title, description, \
+     status, progress_pct, items_done, items_total, plan_json, checkpoint_json, \
+     error_message, user_rating, completion_time_sec, replan_count, auto_adjustments, \
+     outcome, project_type, goal_pattern, \
+     CAST(created_at AS CHAR) AS created_at, \
+     CAST(updated_at AS CHAR) AS updated_at, \
+     completed_at";
 
 impl MatrixOneTaskService {
     pub fn new(pool: sqlx::Pool<sqlx::MySql>) -> Self {
@@ -392,7 +400,7 @@ impl MatrixOneTaskService {
             .and_then(|j| serde_json::from_str(j).ok());
 
         let status_str: String = row.try_get("status").map_err(|e| e.to_string())?;
-        
+
         // Learning fields (may not exist in older schemas)
         let outcome_str: Option<String> = row.try_get("outcome").ok().flatten();
         let outcome = outcome_str.as_deref().and_then(TaskOutcome::parse);
@@ -469,11 +477,13 @@ impl TaskService for MatrixOneTaskService {
     }
 
     async fn get_task(&self, task_id: &str) -> Result<Option<TaskRecord>, String> {
-        let row = sqlx::query("SELECT * FROM agent_tasks WHERE task_id = ?")
-            .bind(task_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| format!("get_task: {e}"))?;
+        let row = sqlx::query(&format!(
+            "SELECT {AGENT_TASK_SELECT_COLUMNS} FROM agent_tasks WHERE task_id = ?"
+        ))
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("get_task: {e}"))?;
 
         match row {
             Some(ref r) => Ok(Some(Self::record_from_row(r)?)),
@@ -487,29 +497,19 @@ impl TaskService for MatrixOneTaskService {
         status_filter: Option<TaskStatus>,
     ) -> Result<Vec<TaskRecord>, String> {
         let rows = if let Some(status) = status_filter {
-            sqlx::query(
-                "SELECT task_id, user_id, session_id, parent_task_id, title, description, \
-                 status, progress_pct, items_done, items_total, plan_json, checkpoint_json, \
-                 error_message, \
-                 CAST(created_at AS CHAR) AS created_at, \
-                 CAST(updated_at AS CHAR) AS updated_at, \
-                 completed_at \
-                 FROM agent_tasks WHERE user_id = ? AND status = ? ORDER BY updated_at DESC",
-            )
+            sqlx::query(&format!(
+                "SELECT {AGENT_TASK_SELECT_COLUMNS} \
+                 FROM agent_tasks WHERE user_id = ? AND status = ? ORDER BY updated_at DESC"
+            ))
             .bind(user_id)
             .bind(status.as_str())
             .fetch_all(&self.pool)
             .await
         } else {
-            sqlx::query(
-                "SELECT task_id, user_id, session_id, parent_task_id, title, description, \
-                 status, progress_pct, items_done, items_total, plan_json, checkpoint_json, \
-                 error_message, \
-                 CAST(created_at AS CHAR) AS created_at, \
-                 CAST(updated_at AS CHAR) AS updated_at, \
-                 completed_at \
-                 FROM agent_tasks WHERE user_id = ? ORDER BY updated_at DESC",
-            )
+            sqlx::query(&format!(
+                "SELECT {AGENT_TASK_SELECT_COLUMNS} \
+                 FROM agent_tasks WHERE user_id = ? ORDER BY updated_at DESC"
+            ))
             .bind(user_id)
             .fetch_all(&self.pool)
             .await
@@ -520,21 +520,29 @@ impl TaskService for MatrixOneTaskService {
     }
 
     async fn update_status(&self, task_id: &str, status: TaskStatus) -> Result<(), String> {
-        let completed_at = if status.is_terminal() {
-            "NOW()"
-        } else {
-            "NULL"
-        };
-        let sql = format!(
-            "UPDATE agent_tasks SET status = ?, updated_at = NOW(), completed_at = {} WHERE task_id = ?",
-            completed_at
-        );
-        sqlx::query(&sql)
+        if status.is_terminal() {
+            sqlx::query(
+                "UPDATE agent_tasks \
+                 SET status = ?, updated_at = NOW(), completed_at = NOW() \
+                 WHERE task_id = ?",
+            )
             .bind(status.as_str())
             .bind(task_id)
             .execute(&self.pool)
             .await
             .map_err(|e| format!("update_status: {e}"))?;
+        } else {
+            sqlx::query(
+                "UPDATE agent_tasks \
+                 SET status = ?, updated_at = NOW(), completed_at = NULL \
+                 WHERE task_id = ?",
+            )
+            .bind(status.as_str())
+            .bind(task_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("update_status: {e}"))?;
+        }
         Ok(())
     }
 
@@ -620,7 +628,7 @@ impl TaskService for MatrixOneTaskService {
         .map_err(|e| format!("complete_task: {e}"))?;
         Ok(())
     }
-    
+
     async fn record_feedback(
         &self,
         task_id: &str,
@@ -641,7 +649,7 @@ impl TaskService for MatrixOneTaskService {
         .map_err(|e| format!("record_feedback: {e}"))?;
         Ok(())
     }
-    
+
     async fn increment_replan_count(&self, task_id: &str) -> Result<(), String> {
         sqlx::query(
             "UPDATE agent_tasks SET replan_count = replan_count + 1, updated_at = NOW() WHERE task_id = ?",
@@ -652,36 +660,38 @@ impl TaskService for MatrixOneTaskService {
         .map_err(|e| format!("increment_replan_count: {e}"))?;
         Ok(())
     }
-    
+
     async fn extract_template(
         &self,
         task_id: &str,
         goal_pattern: &str,
     ) -> Result<Option<String>, String> {
         use sqlx::Row;
-        
+
         // Fetch the task
-        let task = self.get_task(task_id).await?
+        let task = self
+            .get_task(task_id)
+            .await?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
-        
+
         // Check if task is eligible for template extraction
         // Criteria: rating >= 4 OR (completed AND replan_count <= 1)
         let eligible = task.user_rating.map(|r| r >= 4).unwrap_or(false)
             || (task.status == TaskStatus::Completed && task.replan_count <= 1);
-        
+
         if !eligible || task.plan.is_none() {
             return Ok(None);
         }
-        
+
         let plan = task.plan.as_ref().unwrap();
         let template_id = uuid::Uuid::new_v4().to_string();
-        let template_json = serde_json::to_string(plan)
-            .map_err(|e| format!("serialize plan: {e}"))?;
-        
+        let template_json =
+            serde_json::to_string(plan).map_err(|e| format!("serialize plan: {e}"))?;
+
         // Check if similar template exists
         let existing: Option<String> = sqlx::query(
             "SELECT template_id FROM plan_templates \
-             WHERE user_id = ? AND goal_pattern = ? AND project_type <=> ? LIMIT 1"
+             WHERE user_id = ? AND goal_pattern = ? AND project_type <=> ? LIMIT 1",
         )
         .bind(&task.user_id)
         .bind(goal_pattern)
@@ -689,9 +699,8 @@ impl TaskService for MatrixOneTaskService {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| format!("check existing template: {e}"))?
-        .map(|row| row.try_get("template_id").ok())
-        .flatten();
-        
+        .and_then(|row| row.try_get("template_id").ok());
+
         if let Some(existing_id) = existing {
             // Update existing template with better version
             let rating = task.user_rating.unwrap_or(4) as f32;
@@ -702,7 +711,7 @@ impl TaskService for MatrixOneTaskService {
                  avg_completion_time = COALESCE(?, avg_completion_time), \
                  use_count = use_count + 1, \
                  updated_at = NOW() \
-                 WHERE template_id = ?"
+                 WHERE template_id = ?",
             )
             .bind(&template_json)
             .bind(rating / 5.0)
@@ -711,17 +720,17 @@ impl TaskService for MatrixOneTaskService {
             .execute(&self.pool)
             .await
             .map_err(|e| format!("update template: {e}"))?;
-            
+
             return Ok(Some(existing_id));
         }
-        
+
         // Insert new template
         let success_rate = task.user_rating.map(|r| r as f32 / 5.0).unwrap_or(0.8);
         sqlx::query(
             "INSERT INTO plan_templates \
              (template_id, user_id, goal_pattern, project_type, template_json, \
               success_rate, avg_completion_time, use_count, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())"
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())",
         )
         .bind(&template_id)
         .bind(&task.user_id)
@@ -733,10 +742,10 @@ impl TaskService for MatrixOneTaskService {
         .execute(&self.pool)
         .await
         .map_err(|e| format!("insert template: {e}"))?;
-        
+
         Ok(Some(template_id))
     }
-    
+
     async fn recommend_templates(
         &self,
         user_id: &str,
@@ -745,23 +754,25 @@ impl TaskService for MatrixOneTaskService {
         limit: usize,
     ) -> Result<Vec<TemplateRecommendation>, String> {
         use sqlx::Row;
-        
+
         // Extract keywords from goal for matching
-        let keywords: Vec<&str> = goal.split_whitespace()
+        let keywords: Vec<&str> = goal
+            .split_whitespace()
             .filter(|w| w.len() > 2)
             .take(5)
             .collect();
-        
+
         if keywords.is_empty() {
             return Ok(vec![]);
         }
-        
+
         // Build LIKE conditions for keyword matching
-        let like_conditions: Vec<String> = keywords.iter()
+        let like_conditions: Vec<String> = keywords
+            .iter()
             .map(|k| format!("goal_pattern LIKE '%{}%'", k.replace('\'', "''")))
             .collect();
         let like_clause = like_conditions.join(" OR ");
-        
+
         // Query: user's templates first, then global high-success templates
         let query = format!(
             "SELECT template_id, user_id, goal_pattern, project_type, template_json, \
@@ -776,7 +787,7 @@ impl TaskService for MatrixOneTaskService {
              LIMIT ?",
             like_clause
         );
-        
+
         let rows = sqlx::query(&query)
             .bind(user_id)
             .bind(user_id)
@@ -786,25 +797,25 @@ impl TaskService for MatrixOneTaskService {
             .fetch_all(&self.pool)
             .await
             .map_err(|e| format!("query templates: {e}"))?;
-        
+
         let mut recommendations = Vec::new();
         for row in rows {
-            let template_json: String = row.try_get("template_json")
+            let template_json: String = row
+                .try_get("template_json")
                 .map_err(|e| format!("get template_json: {e}"))?;
-            let template_plan: TaskPlan = serde_json::from_str(&template_json)
-                .map_err(|e| format!("parse template: {e}"))?;
-            
+            let template_plan: TaskPlan =
+                serde_json::from_str(&template_json).map_err(|e| format!("parse template: {e}"))?;
+
             let is_own: i32 = row.try_get("is_own").unwrap_or(0);
-            let goal_pattern: String = row.try_get("goal_pattern")
-                .map_err(|e| e.to_string())?;
-            
+            let goal_pattern: String = row.try_get("goal_pattern").map_err(|e| e.to_string())?;
+
             let reason = if is_own == 1 {
                 format!("Your successful pattern: {}", goal_pattern)
             } else {
                 let use_count: i32 = row.try_get("use_count").unwrap_or(0);
                 format!("Community pattern ({}x used): {}", use_count, goal_pattern)
             };
-            
+
             recommendations.push(TemplateRecommendation {
                 template: PlanTemplate {
                     template_id: row.try_get("template_id").map_err(|e| e.to_string())?,
@@ -822,32 +833,34 @@ impl TaskService for MatrixOneTaskService {
                 reason,
             });
         }
-        
+
         Ok(recommendations)
     }
-    
+
     async fn get_learning_stats(
         &self,
         user_id: &str,
         goal_pattern: &str,
     ) -> Result<LearningStats, String> {
         use sqlx::Row;
-        
+
         // Extract keywords for pattern matching
-        let keywords: Vec<&str> = goal_pattern.split_whitespace()
+        let keywords: Vec<&str> = goal_pattern
+            .split_whitespace()
             .filter(|w| w.len() > 2)
             .take(3)
             .collect();
-        
+
         if keywords.is_empty() {
             return Ok(LearningStats::default());
         }
-        
-        let like_conditions: Vec<String> = keywords.iter()
+
+        let like_conditions: Vec<String> = keywords
+            .iter()
             .map(|k| format!("title LIKE '%{}%'", k.replace('\'', "''")))
             .collect();
         let like_clause = like_conditions.join(" OR ");
-        
+
         let query = format!(
             "SELECT \
              COUNT(*) as total_tasks, \
@@ -858,20 +871,22 @@ impl TaskService for MatrixOneTaskService {
              WHERE user_id = ? AND ({})",
             like_clause
         );
-        
+
         let row = sqlx::query(&query)
             .bind(user_id)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| format!("query stats: {e}"))?;
-        
+
         let total_tasks: i64 = row.try_get("total_tasks").unwrap_or(0);
         let completed_tasks: i64 = row.try_get("completed_tasks").unwrap_or(0);
         let avg_rating: Option<f32> = row.try_get("avg_rating").ok().flatten();
-        let avg_replan_count: f32 = row.try_get("avg_replan_count").ok()
+        let avg_replan_count: f32 = row
+            .try_get("avg_replan_count")
+            .ok()
             .flatten()
             .unwrap_or(0.0);
-        
+
         // Infer success rate from completion and replan metrics
         let inferred_success_rate = if total_tasks == 0 {
             0.0
@@ -880,7 +895,7 @@ impl TaskService for MatrixOneTaskService {
             let replan_penalty = (avg_replan_count / 3.0).min(1.0);
             (completion_factor * (1.0 - replan_penalty * 0.3)).clamp(0.0, 1.0)
         };
-        
+
         Ok(LearningStats {
             total_tasks: total_tasks as u32,
             completed_tasks: completed_tasks as u32,
@@ -889,11 +904,11 @@ impl TaskService for MatrixOneTaskService {
             inferred_success_rate,
         })
     }
-    
+
     async fn record_template_usage(&self, template_id: &str) -> Result<(), String> {
         sqlx::query(
             "UPDATE plan_templates SET use_count = use_count + 1, updated_at = NOW() \
-             WHERE template_id = ?"
+             WHERE template_id = ?",
         )
         .bind(template_id)
         .execute(&self.pool)
@@ -1097,7 +1112,7 @@ impl TaskService for LocalTaskService {
         record.completed_at = Some(now);
         self.save_task(&record)
     }
-    
+
     async fn record_feedback(
         &self,
         task_id: &str,
@@ -1114,7 +1129,7 @@ impl TaskService for LocalTaskService {
         record.updated_at = chrono::Utc::now().to_rfc3339();
         self.save_task(&record)
     }
-    
+
     async fn increment_replan_count(&self, task_id: &str) -> Result<(), String> {
         let mut record = self
             .load_task(task_id)?
@@ -1123,33 +1138,35 @@ impl TaskService for LocalTaskService {
         record.updated_at = chrono::Utc::now().to_rfc3339();
         self.save_task(&record)
     }
-    
+
     // ─── Learning Methods (Local Storage) ───
-    
+
     async fn extract_template(
         &self,
         task_id: &str,
         goal_pattern: &str,
     ) -> Result<Option<String>, String> {
-        let task = self.load_task(task_id)?
+        let task = self
+            .load_task(task_id)?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
-        
+
         // Check eligibility
         let eligible = task.user_rating.map(|r| r >= 4).unwrap_or(false)
             || (task.status == TaskStatus::Completed && task.replan_count <= 1);
-        
+
         if !eligible || task.plan.is_none() {
             return Ok(None);
         }
-        
+
         // Store template locally
         let template_id = uuid::Uuid::new_v4().to_string();
-        let templates_dir = self.tasks_dir.parent()
+        let templates_dir = self
+            .tasks_dir
+            .parent()
             .unwrap_or(&self.tasks_dir)
             .join("templates");
-        std::fs::create_dir_all(&templates_dir)
-            .map_err(|e| format!("mkdir templates: {e}"))?;
-        
+        std::fs::create_dir_all(&templates_dir).map_err(|e| format!("mkdir templates: {e}"))?;
+
         let template = PlanTemplate {
             template_id: template_id.clone(),
             user_id: Some(task.user_id.clone()),
@@ -1162,16 +1179,15 @@ impl TaskService for LocalTaskService {
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
-        
+
         let path = templates_dir.join(format!("{}.json", template_id));
         let json = serde_json::to_string_pretty(&template)
             .map_err(|e| format!("serialize template: {e}"))?;
-        std::fs::write(&path, &json)
-            .map_err(|e| format!("write template: {e}"))?;
-        
+        std::fs::write(&path, &json).map_err(|e| format!("write template: {e}"))?;
+
         Ok(Some(template_id))
     }
-    
+
     async fn recommend_templates(
         &self,
         _user_id: &str,
@@ -1179,128 +1195,140 @@ impl TaskService for LocalTaskService {
         project_type: Option<&str>,
         limit: usize,
     ) -> Result<Vec<TemplateRecommendation>, String> {
-        let templates_dir = self.tasks_dir.parent()
+        let templates_dir = self
+            .tasks_dir
+            .parent()
             .unwrap_or(&self.tasks_dir)
             .join("templates");
-        
+
         if !templates_dir.exists() {
             return Ok(vec![]);
         }
-        
-        let keywords: Vec<&str> = goal.split_whitespace()
-            .filter(|w| w.len() > 2)
-            .collect();
-        
+
+        let keywords: Vec<&str> = goal.split_whitespace().filter(|w| w.len() > 2).collect();
+
         let mut recommendations = Vec::new();
-        
+
         // Read all templates and score them
         if let Ok(entries) = std::fs::read_dir(&templates_dir) {
             for entry in entries.flatten() {
-                if entry.path().extension().map(|e| e == "json").unwrap_or(false) {
-                    if let Ok(data) = std::fs::read_to_string(entry.path()) {
-                        if let Ok(template) = serde_json::from_str::<PlanTemplate>(&data) {
-                            // Score based on keyword match
-                            let pattern_lower = template.goal_pattern.to_lowercase();
-                            let matches = keywords.iter()
-                                .filter(|k| pattern_lower.contains(&k.to_lowercase()))
-                                .count();
-                            
-                            if matches == 0 {
-                                continue;
-                            }
-                            
-                            // Check project type
-                            if let Some(pt) = project_type {
-                                if let Some(ref tpt) = template.project_type {
-                                    if !tpt.eq_ignore_ascii_case(pt) {
-                                        continue;
-                                    }
-                                }
-                            }
-                            
-                            let score = (matches as f32 / keywords.len().max(1) as f32) * 0.5
-                                + template.success_rate * 0.3
-                                + (template.use_count.min(10) as f32 / 10.0) * 0.2;
-                            
-                            recommendations.push(TemplateRecommendation {
-                                score,
-                                reason: format!("Local pattern: {}", template.goal_pattern),
-                                template,
-                            });
-                        }
+                if entry
+                    .path()
+                    .extension()
+                    .map(|e| e == "json")
+                    .unwrap_or(false)
+                    && let Ok(data) = std::fs::read_to_string(entry.path())
+                    && let Ok(template) = serde_json::from_str::<PlanTemplate>(&data)
+                {
+                    // Score based on keyword match
+                    let pattern_lower = template.goal_pattern.to_lowercase();
+                    let matches = keywords
+                        .iter()
+                        .filter(|k| pattern_lower.contains(&k.to_lowercase()))
+                        .count();
+
+                    if matches == 0 {
+                        continue;
                     }
+
+                    // Check project type
+                    if let Some(pt) = project_type
+                        && let Some(ref tpt) = template.project_type
+                        && !tpt.eq_ignore_ascii_case(pt)
+                    {
+                        continue;
+                    }
+
+                    let score = (matches as f32 / keywords.len().max(1) as f32) * 0.5
+                        + template.success_rate * 0.3
+                        + (template.use_count.min(10) as f32 / 10.0) * 0.2;
+
+                    recommendations.push(TemplateRecommendation {
+                        score,
+                        reason: format!("Local pattern: {}", template.goal_pattern),
+                        template,
+                    });
                 }
             }
         }
-        
+
         // Sort by score descending
-        recommendations.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        recommendations.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         recommendations.truncate(limit);
-        
+
         Ok(recommendations)
     }
-    
+
     async fn get_learning_stats(
         &self,
         _user_id: &str,
         goal_pattern: &str,
     ) -> Result<LearningStats, String> {
-        let keywords: Vec<&str> = goal_pattern.split_whitespace()
+        let keywords: Vec<&str> = goal_pattern
+            .split_whitespace()
             .filter(|w| w.len() > 2)
             .collect();
-        
+
         if keywords.is_empty() {
             return Ok(LearningStats::default());
         }
-        
+
         let mut total_tasks = 0u32;
         let mut completed_tasks = 0u32;
         let mut rating_sum = 0.0f32;
         let mut rating_count = 0u32;
         let mut replan_sum = 0u32;
-        
+
         // Scan all task files
         if let Ok(entries) = std::fs::read_dir(&self.tasks_dir) {
             for entry in entries.flatten() {
-                if entry.path().extension().map(|e| e == "json").unwrap_or(false) {
-                    if let Ok(data) = std::fs::read_to_string(entry.path()) {
-                        if let Ok(task) = serde_json::from_str::<TaskRecord>(&data) {
-                            // Check if task matches pattern
-                            let title_lower = task.title.to_lowercase();
-                            let matches = keywords.iter()
-                                .any(|k| title_lower.contains(&k.to_lowercase()));
-                            
-                            if !matches {
-                                continue;
-                            }
-                            
-                            total_tasks += 1;
-                            if task.status == TaskStatus::Completed {
-                                completed_tasks += 1;
-                            }
-                            if let Some(r) = task.user_rating {
-                                rating_sum += r as f32;
-                                rating_count += 1;
-                            }
-                            replan_sum += task.replan_count;
-                        }
+                if entry
+                    .path()
+                    .extension()
+                    .map(|e| e == "json")
+                    .unwrap_or(false)
+                    && let Ok(data) = std::fs::read_to_string(entry.path())
+                    && let Ok(task) = serde_json::from_str::<TaskRecord>(&data)
+                {
+                    // Check if task matches pattern
+                    let title_lower = task.title.to_lowercase();
+                    let matches = keywords
+                        .iter()
+                        .any(|k| title_lower.contains(&k.to_lowercase()));
+
+                    if !matches {
+                        continue;
                     }
+
+                    total_tasks += 1;
+                    if task.status == TaskStatus::Completed {
+                        completed_tasks += 1;
+                    }
+                    if let Some(r) = task.user_rating {
+                        rating_sum += r as f32;
+                        rating_count += 1;
+                    }
+                    replan_sum += task.replan_count;
                 }
             }
         }
-        
+
         let avg_rating = if rating_count > 0 {
             Some(rating_sum / rating_count as f32)
         } else {
             None
         };
-        
+
         let avg_replan_count = if total_tasks > 0 {
             replan_sum as f32 / total_tasks as f32
         } else {
             0.0
         };
-        
+
         let inferred_success_rate = if total_tasks == 0 {
             0.0
         } else {
@@ -1308,7 +1336,7 @@ impl TaskService for LocalTaskService {
             let replan_penalty = (avg_replan_count / 3.0).min(1.0);
             (completion_factor * (1.0 - replan_penalty * 0.3)).clamp(0.0, 1.0)
         };
-        
+
         Ok(LearningStats {
             total_tasks,
             completed_tasks,
@@ -1317,30 +1345,30 @@ impl TaskService for LocalTaskService {
             inferred_success_rate,
         })
     }
-    
+
     async fn record_template_usage(&self, template_id: &str) -> Result<(), String> {
-        let templates_dir = self.tasks_dir.parent()
+        let templates_dir = self
+            .tasks_dir
+            .parent()
             .unwrap_or(&self.tasks_dir)
             .join("templates");
         let path = templates_dir.join(format!("{}.json", template_id));
-        
+
         if !path.exists() {
             return Err(format!("template not found: {template_id}"));
         }
-        
-        let data = std::fs::read_to_string(&path)
-            .map_err(|e| format!("read template: {e}"))?;
-        let mut template: PlanTemplate = serde_json::from_str(&data)
-            .map_err(|e| format!("parse template: {e}"))?;
-        
+
+        let data = std::fs::read_to_string(&path).map_err(|e| format!("read template: {e}"))?;
+        let mut template: PlanTemplate =
+            serde_json::from_str(&data).map_err(|e| format!("parse template: {e}"))?;
+
         template.use_count += 1;
         template.updated_at = chrono::Utc::now().to_rfc3339();
-        
+
         let json = serde_json::to_string_pretty(&template)
             .map_err(|e| format!("serialize template: {e}"))?;
-        std::fs::write(&path, &json)
-            .map_err(|e| format!("write template: {e}"))?;
-        
+        std::fs::write(&path, &json).map_err(|e| format!("write template: {e}"))?;
+
         Ok(())
     }
 }
@@ -1858,130 +1886,199 @@ mod tests {
         let resumed = svc.get_task(&tid).await.unwrap().unwrap();
         assert_eq!(resumed.status, TaskStatus::InProgress);
     }
-    
+
     // ── Learning functionality tests ──
-    
+
     #[tokio::test]
     async fn learning_stats_empty_for_no_matches() {
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = LocalTaskService::new(tmp.path().to_path_buf());
-        
+
         // No tasks exist
-        let stats = svc.get_learning_stats("user1", "refactor auth").await.unwrap();
+        let stats = svc
+            .get_learning_stats("user1", "refactor auth")
+            .await
+            .unwrap();
         assert_eq!(stats.total_tasks, 0);
         assert_eq!(stats.inferred_success_rate, 0.0);
     }
-    
+
     #[tokio::test]
     async fn learning_stats_computes_from_tasks() {
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = LocalTaskService::new(tmp.path().to_path_buf());
-        
+
         // Create some matching tasks
-        let tid1 = svc.create_task("user1", "s1", TaskCreateRequest {
-            title: "refactor auth module".into(),
-            ..Default::default()
-        }).await.unwrap();
+        let tid1 = svc
+            .create_task(
+                "user1",
+                "s1",
+                TaskCreateRequest {
+                    title: "refactor auth module".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         svc.complete_task(&tid1).await.unwrap();
-        svc.record_feedback(&tid1, 5, TaskOutcome::Success, Some(600)).await.unwrap();
-        
-        let tid2 = svc.create_task("user1", "s2", TaskCreateRequest {
-            title: "refactor auth handlers".into(),
-            ..Default::default()
-        }).await.unwrap();
+        svc.record_feedback(&tid1, 5, TaskOutcome::Success, Some(600))
+            .await
+            .unwrap();
+
+        let tid2 = svc
+            .create_task(
+                "user1",
+                "s2",
+                TaskCreateRequest {
+                    title: "refactor auth handlers".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         svc.complete_task(&tid2).await.unwrap();
-        
-        let stats = svc.get_learning_stats("user1", "refactor auth").await.unwrap();
+
+        let stats = svc
+            .get_learning_stats("user1", "refactor auth")
+            .await
+            .unwrap();
         assert_eq!(stats.total_tasks, 2);
         assert_eq!(stats.completed_tasks, 2);
         assert!(stats.inferred_success_rate > 0.9);
     }
-    
+
     #[tokio::test]
     async fn template_extraction_requires_eligibility() {
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = LocalTaskService::new(tmp.path().to_path_buf());
-        
+
         // Create task without high rating
-        let tid = svc.create_task("user1", "s1", TaskCreateRequest {
-            title: "test task".into(),
-            plan: Some(TaskPlan {
-                subtasks: vec![SubtaskPlan {
-                    id: "s1".into(),
-                    title: "Step 1".into(),
+        let tid = svc
+            .create_task(
+                "user1",
+                "s1",
+                TaskCreateRequest {
+                    title: "test task".into(),
+                    plan: Some(TaskPlan {
+                        subtasks: vec![SubtaskPlan {
+                            id: "s1".into(),
+                            title: "Step 1".into(),
+                            ..Default::default()
+                        }],
+                        notes: None,
+                    }),
                     ..Default::default()
-                }],
-                notes: None,
-            }),
-            ..Default::default()
-        }).await.unwrap();
-        
+                },
+            )
+            .await
+            .unwrap();
+
         // Not eligible (no rating, not completed)
         let template_id = svc.extract_template(&tid, "test *").await.unwrap();
         assert!(template_id.is_none());
-        
+
         // Complete with low rating
         svc.complete_task(&tid).await.unwrap();
-        svc.record_feedback(&tid, 2, TaskOutcome::Partial, None).await.unwrap();
-        
+        svc.record_feedback(&tid, 2, TaskOutcome::Partial, None)
+            .await
+            .unwrap();
+
         // Still not eligible (low rating, but completed with low replan)
         // Actually this SHOULD be eligible since completed + replan_count <= 1
         let template_id = svc.extract_template(&tid, "test *").await.unwrap();
         assert!(template_id.is_some());
     }
-    
+
     #[tokio::test]
     async fn template_recommendation_finds_matches() {
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = LocalTaskService::new(tmp.path().to_path_buf());
-        
+
         // Create task and extract template
-        let tid = svc.create_task("user1", "s1", TaskCreateRequest {
-            title: "add authentication".into(),
-            plan: Some(TaskPlan {
-                subtasks: vec![
-                    SubtaskPlan { id: "s1".into(), title: "Setup JWT".into(), ..Default::default() },
-                    SubtaskPlan { id: "s2".into(), title: "Add middleware".into(), ..Default::default() },
-                ],
-                notes: None,
-            }),
-            project_type: Some("Rust".into()),
-            ..Default::default()
-        }).await.unwrap();
+        let tid = svc
+            .create_task(
+                "user1",
+                "s1",
+                TaskCreateRequest {
+                    title: "add authentication".into(),
+                    plan: Some(TaskPlan {
+                        subtasks: vec![
+                            SubtaskPlan {
+                                id: "s1".into(),
+                                title: "Setup JWT".into(),
+                                ..Default::default()
+                            },
+                            SubtaskPlan {
+                                id: "s2".into(),
+                                title: "Add middleware".into(),
+                                ..Default::default()
+                            },
+                        ],
+                        notes: None,
+                    }),
+                    project_type: Some("Rust".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         svc.complete_task(&tid).await.unwrap();
-        svc.record_feedback(&tid, 5, TaskOutcome::Success, Some(1200)).await.unwrap();
-        svc.extract_template(&tid, "add authentication").await.unwrap();
-        
+        svc.record_feedback(&tid, 5, TaskOutcome::Success, Some(1200))
+            .await
+            .unwrap();
+        svc.extract_template(&tid, "add authentication")
+            .await
+            .unwrap();
+
         // Should find the template
-        let recs = svc.recommend_templates("user1", "add auth module", Some("Rust"), 5).await.unwrap();
+        let recs = svc
+            .recommend_templates("user1", "add auth module", Some("Rust"), 5)
+            .await
+            .unwrap();
         assert!(!recs.is_empty(), "Should find matching template");
         assert!(recs[0].template.goal_pattern.contains("authentication"));
     }
-    
+
     #[tokio::test]
     async fn template_usage_increments_count() {
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = LocalTaskService::new(tmp.path().to_path_buf());
-        
+
         // Create and extract template
-        let tid = svc.create_task("user1", "s1", TaskCreateRequest {
-            title: "test".into(),
-            plan: Some(TaskPlan {
-                subtasks: vec![SubtaskPlan { id: "s1".into(), title: "Step".into(), ..Default::default() }],
-                notes: None,
-            }),
-            ..Default::default()
-        }).await.unwrap();
+        let tid = svc
+            .create_task(
+                "user1",
+                "s1",
+                TaskCreateRequest {
+                    title: "test".into(),
+                    plan: Some(TaskPlan {
+                        subtasks: vec![SubtaskPlan {
+                            id: "s1".into(),
+                            title: "Step".into(),
+                            ..Default::default()
+                        }],
+                        notes: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         svc.complete_task(&tid).await.unwrap();
-        svc.record_feedback(&tid, 5, TaskOutcome::Success, None).await.unwrap();
+        svc.record_feedback(&tid, 5, TaskOutcome::Success, None)
+            .await
+            .unwrap();
         let template_id = svc.extract_template(&tid, "test").await.unwrap().unwrap();
-        
+
         // Use the template
         svc.record_template_usage(&template_id).await.unwrap();
         svc.record_template_usage(&template_id).await.unwrap();
-        
+
         // Check count increased
-        let recs = svc.recommend_templates("user1", "test", None, 5).await.unwrap();
+        let recs = svc
+            .recommend_templates("user1", "test", None, 5)
+            .await
+            .unwrap();
         assert!(!recs.is_empty());
         assert!(recs[0].template.use_count >= 2);
     }

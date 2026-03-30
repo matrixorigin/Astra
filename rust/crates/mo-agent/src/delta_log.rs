@@ -4,10 +4,12 @@
 //! with monotonic versioning instead of overwriting full state. This enables
 //! efficient incremental sync and reduces memory overhead.
 
+#![cfg_attr(not(test), allow(dead_code))]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Operation type for state mutations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,7 +89,8 @@ impl ChangeAccumulator {
         initial_version: u64,
         state: HashMap<String, serde_json::Value>,
     ) -> Self {
-        let key_versions: HashMap<_, _> = state.keys().map(|k| (k.clone(), initial_version)).collect();
+        let key_versions: HashMap<_, _> =
+            state.keys().map(|k| (k.clone(), initial_version)).collect();
         Self {
             version_counter,
             entries: Vec::new(),
@@ -118,7 +121,8 @@ impl ChangeAccumulator {
 
         let version = self.next_version();
         let timestamp_ms = current_timestamp_ms();
-        let json_value = serde_json::to_value(value).map_err(|e| DeltaError::SerializationError(e.to_string()))?;
+        let json_value = serde_json::to_value(value)
+            .map_err(|e| DeltaError::SerializationError(e.to_string()))?;
 
         // Update state
         self.state.insert(key.clone(), json_value.clone());
@@ -156,7 +160,8 @@ impl ChangeAccumulator {
 
         let version = self.next_version();
         let timestamp_ms = current_timestamp_ms();
-        let json_value = serde_json::to_value(value).map_err(|e| DeltaError::SerializationError(e.to_string()))?;
+        let json_value = serde_json::to_value(value)
+            .map_err(|e| DeltaError::SerializationError(e.to_string()))?;
 
         // Update state
         self.state.insert(key.clone(), json_value.clone());
@@ -219,11 +224,6 @@ impl ChangeAccumulator {
         self.state.contains_key(key)
     }
 
-    /// Get the current state as a snapshot.
-    pub fn snapshot(&self) -> &HashMap<String, serde_json::Value> {
-        &self.state
-    }
-
     /// Get all delta entries since a specific version (exclusive).
     pub fn deltas_since(&self, since_version: u64) -> Vec<&DeltaEntry> {
         self.entries
@@ -255,22 +255,35 @@ impl ChangeAccumulator {
     /// Get the approximate memory overhead of the delta log.
     /// Returns (delta_log_bytes, state_bytes, total_bytes).
     pub fn memory_usage(&self) -> (usize, usize, usize) {
-        let state_bytes = self.state.iter().map(|(k, v)| {
-            k.len() + serde_json::to_string(v).map(|s| s.len()).unwrap_or(0)
-        }).sum::<usize>();
+        let state_bytes = self
+            .state
+            .iter()
+            .map(|(k, v)| k.len() + serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
+            .sum::<usize>();
 
-        let delta_bytes = self.entries.iter().map(|e| {
-            let base = e.key.len() + std::mem::size_of::<DeltaEntry>();
-            let value_bytes = e.value.as_ref()
-                .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
-                .unwrap_or(0);
-            base + value_bytes
-        }).sum::<usize>();
+        let delta_bytes = self
+            .entries
+            .iter()
+            .map(|e| {
+                let base = e.key.len() + std::mem::size_of::<DeltaEntry>();
+                let value_bytes = e
+                    .value
+                    .as_ref()
+                    .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
+                    .unwrap_or(0);
+                base + value_bytes
+            })
+            .sum::<usize>();
 
         let overhead = std::mem::size_of::<Self>()
-            + self.key_versions.capacity() * (std::mem::size_of::<String>() + std::mem::size_of::<u64>());
+            + self.key_versions.capacity()
+                * (std::mem::size_of::<String>() + std::mem::size_of::<u64>());
 
-        (delta_bytes, state_bytes, delta_bytes + state_bytes + overhead)
+        (
+            delta_bytes,
+            state_bytes,
+            delta_bytes + state_bytes + overhead,
+        )
     }
 
     /// Calculate memory overhead percentage compared to full state size.
@@ -395,7 +408,6 @@ pub enum DeltaError {
     KeyAlreadyExists(String),
     KeyNotFound(String),
     SerializationError(String),
-    VersionConflict { expected: u64, actual: u64 },
 }
 
 impl std::fmt::Display for DeltaError {
@@ -404,9 +416,6 @@ impl std::fmt::Display for DeltaError {
             DeltaError::KeyAlreadyExists(key) => write!(f, "Key already exists: {}", key),
             DeltaError::KeyNotFound(key) => write!(f, "Key not found: {}", key),
             DeltaError::SerializationError(e) => write!(f, "Serialization error: {}", e),
-            DeltaError::VersionConflict { expected, actual } => {
-                write!(f, "Version conflict: expected {}, got {}", expected, actual)
-            }
         }
     }
 }
@@ -433,7 +442,10 @@ mod tests {
         let version = acc.create("key1", "value1").unwrap();
 
         assert_eq!(version, 1);
-        assert_eq!(acc.get("key1"), Some(&serde_json::Value::String("value1".to_string())));
+        assert_eq!(
+            acc.get("key1"),
+            Some(&serde_json::Value::String("value1".to_string()))
+        );
         assert_eq!(acc.delta_count(), 1);
         assert_eq!(acc.key_version("key1"), Some(1));
     }
@@ -454,7 +466,10 @@ mod tests {
         let version = acc.update("key1", "value2").unwrap();
 
         assert_eq!(version, 2);
-        assert_eq!(acc.get("key1"), Some(&serde_json::Value::String("value2".to_string())));
+        assert_eq!(
+            acc.get("key1"),
+            Some(&serde_json::Value::String("value2".to_string()))
+        );
         assert_eq!(acc.delta_count(), 2);
         assert_eq!(acc.key_version("key1"), Some(2));
     }
@@ -474,7 +489,7 @@ mod tests {
 
         assert_eq!(version, 2);
         assert_eq!(acc.get("key1"), None);
-        assert_eq!(acc.contains_key("key1"), false);
+        assert!(!acc.contains_key("key1"));
         assert_eq!(acc.delta_count(), 2);
     }
 
@@ -543,16 +558,19 @@ mod tests {
 
         let overhead = acc.overhead_percentage();
         println!("Memory overhead: {:.2}%", overhead);
-        
+
         // After many updates, overhead will be high until compaction
         // This test verifies the measurement works, not a specific threshold
         assert!(overhead > 0.0, "Should have some overhead after updates");
-        
+
         // After compaction, overhead should be reduced
         acc.compact();
         let after_compact = acc.overhead_percentage();
         println!("After compaction: {:.2}%", after_compact);
-        assert!(after_compact < overhead, "Compaction should reduce overhead");
+        assert!(
+            after_compact < overhead,
+            "Compaction should reduce overhead"
+        );
     }
 
     #[test]
@@ -569,7 +587,10 @@ mod tests {
         acc.compact();
         let after_count = acc.delta_count();
 
-        assert!(after_count < before_count, "Compaction should reduce delta count");
+        assert!(
+            after_count < before_count,
+            "Compaction should reduce delta count"
+        );
         assert_eq!(after_count, 1); // Only latest update should remain
     }
 
@@ -615,8 +636,14 @@ mod tests {
 
         let applied = acc.apply_deltas(&external_deltas).unwrap();
         assert_eq!(applied.len(), 2);
-        assert_eq!(acc.get("remote_key"), Some(&serde_json::json!("remote_value")));
-        assert_eq!(acc.get("local_key"), Some(&serde_json::json!("updated_value")));
+        assert_eq!(
+            acc.get("remote_key"),
+            Some(&serde_json::json!("remote_value"))
+        );
+        assert_eq!(
+            acc.get("local_key"),
+            Some(&serde_json::json!("updated_value"))
+        );
     }
 
     #[test]
@@ -670,7 +697,8 @@ mod tests {
         let mut acc = ChangeAccumulator::new();
 
         for i in 0..100 {
-            acc.create(format!("key{}", i), format!("value{}", i)).unwrap();
+            acc.create(format!("key{}", i), format!("value{}", i))
+                .unwrap();
         }
 
         assert_eq!(acc.delta_count(), 100);

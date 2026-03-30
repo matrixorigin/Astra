@@ -149,38 +149,41 @@ pub(super) async fn handle_memory_domain_command(
                 // Toggle: /plan with no args enters or exits plan mode
                 "" => {
                     use super::plan_decompose::{
-                        PlanModeState, format_plan_entry_card, format_plan,
+                        PlanModeState, format_plan, format_plan_entry_card,
                     };
-                    
+
                     // If already in plan mode, exit
                     if state.plan_mode.is_some() {
                         // Save state before exiting
-                        if let Some(ref ps) = state.plan_mode {
-                            if let Err(e) = ps.save_to_file(&PlanModeState::state_path()) {
-                                eprintln!("  {} Failed to save plan state: {e}", "⚠".yellow());
-                            }
+                        if let Some(ref ps) = state.plan_mode
+                            && let Err(e) = ps.save_to_file(&PlanModeState::state_path())
+                        {
+                            eprintln!("  {} Failed to save plan state: {e}", "⚠".yellow());
                         }
                         state.plan_mode = None;
                         eprintln!("  {} Exited plan mode", "←".cyan());
                         return Ok(());
                     }
-                    
+
                     // Try to load saved plan
-                    let saved_plan = PlanModeState::load_from_file(&PlanModeState::state_path()).ok();
-                    
+                    let saved_plan =
+                        PlanModeState::load_from_file(&PlanModeState::state_path()).ok();
+
                     // Display entry card
                     eprintln!();
-                    let card = format_plan_entry_card(
-                        saved_plan.as_ref(),
-                        state.executing_plan.as_ref(),
-                    );
+                    let card =
+                        format_plan_entry_card(saved_plan.as_ref(), state.executing_plan.as_ref());
                     eprintln!("{}", card);
-                    
+
                     // Restore saved plan or create new
                     if let Some(plan) = saved_plan {
                         state.plan_mode = Some(plan);
                         if let Some(ref ps) = state.plan_mode {
-                            eprintln!("  {} Restored saved plan: {}", "↩".cyan(), ps.goal.as_str().cyan());
+                            eprintln!(
+                                "  {} Restored saved plan: {}",
+                                "↩".cyan(),
+                                ps.goal.as_str().cyan()
+                            );
                             eprintln!();
                             let formatted = format_plan(&ps.plan);
                             eprintln!("{formatted}");
@@ -191,7 +194,10 @@ pub(super) async fn handle_memory_domain_command(
                             .unwrap_or_else(|_| std::path::PathBuf::from("."));
                         let context = super::plan_decompose::analyze_project(&project_root);
                         state.plan_mode = Some(PlanModeState::new(String::new(), context));
-                        eprintln!("  {} Entered plan mode. Describe your goal to start planning.", "→".cyan());
+                        eprintln!(
+                            "  {} Entered plan mode. Describe your goal to start planning.",
+                            "→".cyan()
+                        );
                     }
                 }
                 "show" => {
@@ -359,22 +365,16 @@ pub(super) async fn handle_memory_domain_command(
 
                                     // Extract text_delta content from SSE data
                                     for line in event_str.lines() {
-                                        if let Some(data) = line.strip_prefix("data: ") {
-                                            if let Ok(json) =
+                                        if let Some(data) = line.strip_prefix("data: ")
+                                            && let Ok(json) =
                                                 serde_json::from_str::<serde_json::Value>(data)
-                                            {
-                                                // Check for text_delta type with content field
-                                                if json.get("type").and_then(|v| v.as_str())
-                                                    == Some("text_delta")
-                                                {
-                                                    if let Some(content) =
-                                                        json.get("content").and_then(|v| v.as_str())
-                                                    {
-                                                        full_text.push_str(content);
-                                                        eprint!("{}", content); // Stream output
-                                                    }
-                                                }
-                                            }
+                                            && json.get("type").and_then(|v| v.as_str())
+                                                == Some("text_delta")
+                                            && let Some(content) =
+                                                json.get("content").and_then(|v| v.as_str())
+                                        {
+                                            full_text.push_str(content);
+                                            eprint!("{}", content); // Stream output
                                         }
                                     }
                                 }
@@ -468,20 +468,15 @@ pub(super) async fn handle_memory_domain_command(
                                 if let Ok(bytes) = chunk {
                                     let event_str = String::from_utf8_lossy(&bytes);
                                     for line in event_str.lines() {
-                                        if let Some(data) = line.strip_prefix("data: ") {
-                                            if let Ok(json) =
+                                        if let Some(data) = line.strip_prefix("data: ")
+                                            && let Ok(json) =
                                                 serde_json::from_str::<serde_json::Value>(data)
-                                            {
-                                                if json.get("type").and_then(|v| v.as_str())
-                                                    == Some("text_delta")
-                                                {
-                                                    if let Some(content) =
-                                                        json.get("content").and_then(|v| v.as_str())
-                                                    {
-                                                        full_text.push_str(content);
-                                                    }
-                                                }
-                                            }
+                                            && json.get("type").and_then(|v| v.as_str())
+                                                == Some("text_delta")
+                                            && let Some(content) =
+                                                json.get("content").and_then(|v| v.as_str())
+                                        {
+                                            full_text.push_str(content);
                                         }
                                     }
                                 }
@@ -574,15 +569,17 @@ pub(super) async fn handle_memory_domain_command(
                     if let Some(ref svc) = state.task_service {
                         use mo_agent_services::TaskService;
                         let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
-                        
+
                         match svc.list_tasks(user_id, None).await {
                             Ok(tasks) => {
-                                let with_plans: Vec<_> = tasks.iter()
-                                    .filter(|t| t.plan.is_some())
-                                    .collect();
-                                
+                                let with_plans: Vec<_> =
+                                    tasks.iter().filter(|t| t.plan.is_some()).collect();
+
                                 if with_plans.is_empty() {
-                                    eprintln!("  {} No cloud plans found. Use /plan auto <goal> to create one.", "⚠".yellow());
+                                    eprintln!(
+                                        "  {} No cloud plans found. Use /plan auto <goal> to create one.",
+                                        "⚠".yellow()
+                                    );
                                 } else {
                                     eprintln!("\n{}  Cloud Plans", "☁️".cyan());
                                     eprintln!("{}", "─".repeat(50));
@@ -595,7 +592,8 @@ pub(super) async fn handle_memory_domain_command(
                                             _ => "○",
                                         };
                                         let short_id = &t.task_id[..8.min(t.task_id.len())];
-                                        let subtask_count = t.plan.as_ref().map(|p| p.subtasks.len()).unwrap_or(0);
+                                        let subtask_count =
+                                            t.plan.as_ref().map(|p| p.subtasks.len()).unwrap_or(0);
                                         let project_type = t.project_type.as_deref().unwrap_or("?");
                                         eprintln!(
                                             "  {} {} {} [{}] ({} subtasks, {})",
@@ -608,7 +606,10 @@ pub(super) async fn handle_memory_domain_command(
                                         );
                                     }
                                     eprintln!();
-                                    eprintln!("  {} Use /plan load <id> to restore a cloud plan", "💡".cyan());
+                                    eprintln!(
+                                        "  {} Use /plan load <id> to restore a cloud plan",
+                                        "💡".cyan()
+                                    );
                                 }
                             }
                             Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
@@ -620,29 +621,30 @@ pub(super) async fn handle_memory_domain_command(
                 "load" if !sub_arg.is_empty() => {
                     // Load a specific plan from cloud by task_id (or prefix)
                     if let Some(ref svc) = state.task_service {
+                        use super::plan_decompose::{PlanModeState, analyze_project, format_plan};
                         use mo_agent_services::TaskService;
-                        use super::plan_decompose::{PlanModeState, format_plan, analyze_project};
-                        
+
                         let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
                         let query = sub_arg.trim();
-                        
+
                         // Find task by ID prefix or title substring
                         match svc.list_tasks(user_id, None).await {
                             Ok(tasks) => {
                                 let found = tasks.iter().find(|t| {
-                                    t.task_id.starts_with(query) || 
-                                    t.title.to_lowercase().contains(&query.to_lowercase())
+                                    t.task_id.starts_with(query)
+                                        || t.title.to_lowercase().contains(&query.to_lowercase())
                                 });
-                                
+
                                 match found {
                                     Some(task) if task.plan.is_some() => {
                                         let plan = task.plan.as_ref().unwrap().clone();
                                         let project_root = std::env::current_dir()
                                             .unwrap_or_else(|_| std::path::PathBuf::from("."));
                                         let context = analyze_project(&project_root);
-                                        let mut ps = PlanModeState::new(task.title.clone(), context);
+                                        let mut ps =
+                                            PlanModeState::new(task.title.clone(), context);
                                         ps.set_plan(plan.clone());
-                                        
+
                                         state.plan_mode = Some(ps);
                                         let short_id = &task.task_id[..8.min(task.task_id.len())];
                                         eprintln!();
@@ -661,11 +663,22 @@ pub(super) async fn handle_memory_domain_command(
                                         );
                                     }
                                     Some(_) => {
-                                        eprintln!("  {} Task '{}' has no plan", "⚠".yellow(), query);
+                                        eprintln!(
+                                            "  {} Task '{}' has no plan",
+                                            "⚠".yellow(),
+                                            query
+                                        );
                                     }
                                     None => {
-                                        eprintln!("  {} No task found matching '{}'", "⚠".yellow(), query);
-                                        eprintln!("  {} Use /plan cloud to list available plans", "💡".cyan());
+                                        eprintln!(
+                                            "  {} No task found matching '{}'",
+                                            "⚠".yellow(),
+                                            query
+                                        );
+                                        eprintln!(
+                                            "  {} Use /plan cloud to list available plans",
+                                            "💡".cyan()
+                                        );
                                     }
                                 }
                             }
@@ -681,52 +694,77 @@ pub(super) async fn handle_memory_domain_command(
                     eprintln!("{}", crate::plan_decompose::format_plan_list(&plans));
                     eprintln!("  {} Built-in templates:", "📋".cyan());
                     for t in &templates {
-                        eprintln!("    • {} — {} [{}]", t.name, t.description,
-                            t.languages.join(", "));
+                        eprintln!(
+                            "    • {} — {} [{}]",
+                            t.name,
+                            t.description,
+                            t.languages.join(", ")
+                        );
                     }
                     eprintln!("  Use /plan template <name> <goal> to instantiate");
                     // Also hint about cloud if available
                     if state.task_service.is_some() {
-                        eprintln!("  {} Use /plan cloud to list cloud-synced plans", "☁️".cyan());
+                        eprintln!(
+                            "  {} Use /plan cloud to list cloud-synced plans",
+                            "☁️".cyan()
+                        );
                     }
                 }
                 "template" if !sub_arg.is_empty() => {
                     let parts: Vec<&str> = sub_arg.splitn(2, ' ').collect();
                     let name = parts[0];
-                    let goal = if parts.len() > 1 { parts[1] } else { "implement this feature" };
+                    let goal = if parts.len() > 1 {
+                        parts[1]
+                    } else {
+                        "implement this feature"
+                    };
                     match crate::plan_decompose::instantiate_template(name, goal) {
                         Some(plan) => {
-                            eprintln!("  {} Template '{}' instantiated with {} subtasks",
-                                "✓".green(), name, plan.subtasks.len());
+                            eprintln!(
+                                "  {} Template '{}' instantiated with {} subtasks",
+                                "✓".green(),
+                                name,
+                                plan.subtasks.len()
+                            );
                             eprintln!("{}", crate::plan_decompose::format_plan(&plan));
                             // Enter plan mode with this template
                             let project_root = std::env::current_dir()
                                 .unwrap_or_else(|_| std::path::PathBuf::from("."));
                             let context = crate::plan_decompose::analyze_project(&project_root);
                             let mut ps = crate::plan_decompose::PlanModeState::new(
-                                goal.to_string(), context);
+                                goal.to_string(),
+                                context,
+                            );
                             ps.set_plan(plan);
                             state.plan_mode = Some(ps);
-                            eprintln!("  {} Entered plan mode. Type 'execute' to run, 'exit' to leave.",
-                                "💡".cyan());
+                            eprintln!(
+                                "  {} Entered plan mode. Type 'execute' to run, 'exit' to leave.",
+                                "💡".cyan()
+                            );
                         }
                         None => {
                             let names: Vec<_> = crate::plan_decompose::builtin_templates()
-                                .iter().map(|t| t.name.clone()).collect();
-                            eprintln!("  {} Template '{}' not found. Available: {}",
-                                "⚠".yellow(), name, names.join(", "));
+                                .iter()
+                                .map(|t| t.name.clone())
+                                .collect();
+                            eprintln!(
+                                "  {} Template '{}' not found. Available: {}",
+                                "⚠".yellow(),
+                                name,
+                                names.join(", ")
+                            );
                         }
                     }
                 }
                 "rate" if !sub_arg.is_empty() => {
                     // Record user feedback for the current/last executed plan
                     let rating_str = sub_arg.trim();
-                    
+
                     if rating_str == "skip" {
                         eprintln!("  {} Feedback skipped", "⚠".yellow());
                         return Ok(());
                     }
-                    
+
                     let rating: u8 = match rating_str.parse() {
                         Ok(r) if (1..=5).contains(&r) => r,
                         _ => {
@@ -734,24 +772,28 @@ pub(super) async fn handle_memory_domain_command(
                             return Ok(());
                         }
                     };
-                    
+
                     // Find the task to rate - use the most recent task for current goal
                     if let Some(ref svc) = state.task_service {
-                        use mo_agent_services::{TaskService, TaskOutcome};
+                        use mo_agent_services::{TaskOutcome, TaskService};
                         let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
-                        
+
                         // Find task by current plan goal or executing plan goal
-                        let goal = state.plan_mode.as_ref().map(|ps| ps.goal.clone())
+                        let goal = state
+                            .plan_mode
+                            .as_ref()
+                            .map(|ps| ps.goal.clone())
                             .or_else(|| state.executing_plan_goal.clone());
-                        
+
                         if let Some(goal_text) = goal {
                             match svc.list_tasks(user_id, None).await {
                                 Ok(tasks) => {
                                     // Find the most recent task matching the goal
-                                    let found = tasks.iter()
+                                    let found = tasks
+                                        .iter()
                                         .filter(|t| t.title == goal_text)
                                         .max_by_key(|t| &t.created_at);
-                                    
+
                                     if let Some(task) = found {
                                         // Determine outcome based on plan completion
                                         let outcome = if let Some(ref ps) = state.plan_mode {
@@ -773,21 +815,32 @@ pub(super) async fn handle_memory_domain_command(
                                                 TaskOutcome::Failed
                                             }
                                         };
-                                        
-                                        match svc.record_feedback(&task.task_id, rating, outcome, None).await {
+
+                                        match svc
+                                            .record_feedback(&task.task_id, rating, outcome, None)
+                                            .await
+                                        {
                                             Ok(_) => {
-                                                let stars = "★".repeat(rating as usize) + &"☆".repeat(5 - rating as usize);
+                                                let stars = "★".repeat(rating as usize)
+                                                    + &"☆".repeat(5 - rating as usize);
                                                 eprintln!(
                                                     "  {} Feedback recorded: {} ({})",
                                                     "✓".green(),
                                                     stars.yellow(),
                                                     outcome.as_str()
                                                 );
-                                                
+
                                                 // Auto-extract template if rating >= 4
                                                 if rating >= 4 {
-                                                    let goal_pattern = extract_goal_pattern(&goal_text);
-                                                    match svc.extract_template(&task.task_id, &goal_pattern).await {
+                                                    let goal_pattern =
+                                                        extract_goal_pattern(&goal_text);
+                                                    match svc
+                                                        .extract_template(
+                                                            &task.task_id,
+                                                            &goal_pattern,
+                                                        )
+                                                        .await
+                                                    {
                                                         Ok(Some(template_id)) => {
                                                             eprintln!(
                                                                 "  {} Template extracted: {} → {}",
@@ -798,17 +851,28 @@ pub(super) async fn handle_memory_domain_command(
                                                         }
                                                         Ok(None) => {} // Not eligible
                                                         Err(e) => {
-                                                            eprintln!("  {} Template extraction failed: {}", "⚠".yellow(), e);
+                                                            eprintln!(
+                                                                "  {} Template extraction failed: {}",
+                                                                "⚠".yellow(),
+                                                                e
+                                                            );
                                                         }
                                                     }
                                                 }
                                             }
                                             Err(e) => {
-                                                eprintln!("  {} Could not record feedback: {}", "⚠".yellow(), e);
+                                                eprintln!(
+                                                    "  {} Could not record feedback: {}",
+                                                    "⚠".yellow(),
+                                                    e
+                                                );
                                             }
                                         }
                                     } else {
-                                        eprintln!("  {} No task found for current goal", "⚠".yellow());
+                                        eprintln!(
+                                            "  {} No task found for current goal",
+                                            "⚠".yellow()
+                                        );
                                     }
                                 }
                                 Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
@@ -832,25 +896,42 @@ pub(super) async fn handle_memory_domain_command(
                     } else {
                         Some(sub_arg.to_string())
                     };
-                    
+
                     if let Some(goal) = query_goal {
                         if let Some(ref svc) = state.task_service {
                             use mo_agent_services::TaskService;
                             let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
-                            let project_type = state.plan_mode.as_ref()
+                            let project_type = state
+                                .plan_mode
+                                .as_ref()
                                 .and_then(|ps| ps.context.languages.first())
                                 .map(|s| s.as_str());
-                            
-                            match svc.recommend_templates(user_id, &goal, project_type, 5).await {
+
+                            match svc
+                                .recommend_templates(user_id, &goal, project_type, 5)
+                                .await
+                            {
                                 Ok(recommendations) => {
                                     if recommendations.is_empty() {
-                                        eprintln!("  {} No templates found for: {}", "📋".dim(), goal.dim());
-                                        eprintln!("  {} Complete more plans and rate them to build templates!", "💡".cyan());
+                                        eprintln!(
+                                            "  {} No templates found for: {}",
+                                            "📋".dim(),
+                                            goal.dim()
+                                        );
+                                        eprintln!(
+                                            "  {} Complete more plans and rate them to build templates!",
+                                            "💡".cyan()
+                                        );
                                     } else {
-                                        eprintln!("  {} Recommended templates for: {}", "📋".cyan(), goal.cyan());
+                                        eprintln!(
+                                            "  {} Recommended templates for: {}",
+                                            "📋".cyan(),
+                                            goal.cyan()
+                                        );
                                         eprintln!();
                                         for (i, rec) in recommendations.iter().enumerate() {
-                                            let stars = "★".repeat((rec.template.success_rate * 5.0) as usize);
+                                            let stars = "★"
+                                                .repeat((rec.template.success_rate * 5.0) as usize);
                                             eprintln!(
                                                 "  [{}] {} {} ({}x used)",
                                                 (i + 1).to_string().cyan(),
@@ -859,11 +940,22 @@ pub(super) async fn handle_memory_domain_command(
                                                 rec.template.use_count
                                             );
                                             let reason_ref = &rec.reason;
-                                            eprintln!("      {} {}", "→".dim(), reason_ref.as_str().dim());
-                                            eprintln!("      {} {} subtasks", "📝".dim(), rec.template.template.subtasks.len());
+                                            eprintln!(
+                                                "      {} {}",
+                                                "→".dim(),
+                                                reason_ref.as_str().dim()
+                                            );
+                                            eprintln!(
+                                                "      {} {} subtasks",
+                                                "📝".dim(),
+                                                rec.template.template.subtasks.len()
+                                            );
                                         }
                                         eprintln!();
-                                        eprintln!("  {} Use '/plan use <n>' to apply a template", "💡".cyan());
+                                        eprintln!(
+                                            "  {} Use '/plan use <n>' to apply a template",
+                                            "💡".cyan()
+                                        );
                                     }
                                 }
                                 Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
@@ -882,27 +974,44 @@ pub(super) async fn handle_memory_domain_command(
                     } else {
                         Some(sub_arg.to_string())
                     };
-                    
+
                     if let Some(pattern) = query_pattern {
                         if let Some(ref svc) = state.task_service {
                             use mo_agent_services::TaskService;
                             let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
-                            
+
                             match svc.get_learning_stats(user_id, &pattern).await {
                                 Ok(stats) => {
-                                    eprintln!("  {} Learning Stats: {}", "📊".cyan(), pattern.cyan());
+                                    eprintln!(
+                                        "  {} Learning Stats: {}",
+                                        "📊".cyan(),
+                                        pattern.cyan()
+                                    );
                                     eprintln!();
                                     eprintln!("  Total tasks:     {}", stats.total_tasks);
-                                    eprintln!("  Completed:       {} ({:.0}%)", 
+                                    eprintln!(
+                                        "  Completed:       {} ({:.0}%)",
                                         stats.completed_tasks,
-                                        if stats.total_tasks > 0 { stats.completed_tasks as f32 / stats.total_tasks as f32 * 100.0 } else { 0.0 }
+                                        if stats.total_tasks > 0 {
+                                            stats.completed_tasks as f32 / stats.total_tasks as f32
+                                                * 100.0
+                                        } else {
+                                            0.0
+                                        }
                                     );
                                     if let Some(avg) = stats.avg_rating {
                                         let stars = "★".repeat(avg.round() as usize);
-                                        eprintln!("  Avg rating:      {} ({:.1})", stars.yellow(), avg);
+                                        eprintln!(
+                                            "  Avg rating:      {} ({:.1})",
+                                            stars.yellow(),
+                                            avg
+                                        );
                                     }
                                     eprintln!("  Avg replans:     {:.1}", stats.avg_replan_count);
-                                    eprintln!("  Success rate:    {:.0}% (inferred)", stats.inferred_success_rate * 100.0);
+                                    eprintln!(
+                                        "  Success rate:    {:.0}% (inferred)",
+                                        stats.inferred_success_rate * 100.0
+                                    );
                                 }
                                 Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
                             }
@@ -918,8 +1027,10 @@ pub(super) async fn handle_memory_domain_command(
                         eprintln!("  ─── Version History ───");
                         eprintln!("{}", ps.version_history.format_log());
                     } else {
-                        eprintln!("  {} Not in plan mode. Use /plan enter <goal> first.",
-                            "⚠".yellow());
+                        eprintln!(
+                            "  {} Not in plan mode. Use /plan enter <goal> first.",
+                            "⚠".yellow()
+                        );
                     }
                 }
                 "timeline" => {
@@ -927,12 +1038,16 @@ pub(super) async fn handle_memory_domain_command(
                         eprintln!("  ─── Execution Timeline ───");
                         if ps.timeline.events.is_empty() {
                             eprintln!("  {} No events recorded yet", "(empty)".dim());
-                            eprintln!("  {} Events are recorded during plan execution", "💡".cyan());
+                            eprintln!(
+                                "  {} Events are recorded during plan execution",
+                                "💡".cyan()
+                            );
                         } else {
                             eprintln!("{}", ps.timeline.format_display());
                             // Show summary
                             eprintln!("  ─────────────────────────");
-                            eprintln!("  Completed: {} | Failed: {} | Replans: {}",
+                            eprintln!(
+                                "  Completed: {} | Failed: {} | Replans: {}",
                                 ps.timeline.completed_subtask_count().to_string().green(),
                                 ps.timeline.failed_subtask_count().to_string().red(),
                                 ps.timeline.replan_count()
@@ -949,7 +1064,9 @@ pub(super) async fn handle_memory_domain_command(
                     if let Some(ref ps) = state.plan_mode {
                         let parts: Vec<&str> = sub_arg.split_whitespace().collect();
                         if parts.len() == 2 {
-                            if let (Ok(from), Ok(to)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                            if let (Ok(from), Ok(to)) =
+                                (parts[0].parse::<u32>(), parts[1].parse::<u32>())
+                            {
                                 match ps.version_history.diff_versions(from, to) {
                                     Ok(diff) => eprintln!("{}", diff.format()),
                                     Err(e) => eprintln!("  {} {}", "⚠".yellow(), e),
@@ -984,92 +1101,112 @@ pub(super) async fn handle_memory_domain_command(
                 "replan" => {
                     // Regenerate plan based on current state and issues
                     use super::plan_decompose::{
-                        detect_replan_needed, generate_replan_prompt, format_plan,
-                        parse_plan_response, ReplanReason,
+                        ReplanReason, detect_replan_needed, format_plan, generate_replan_prompt,
+                        parse_plan_response,
                     };
-                    
+
                     let Some(ref mut ps) = state.plan_mode else {
                         // Check if there's an executing plan to replan
-                        if let Some(ref exec_plan) = state.executing_plan {
-                            eprintln!("  {} Replan from executing plan not yet supported", "⚠".yellow());
-                            eprintln!("  {} Pause execution first with Ctrl+C, then enter plan mode", "💡".cyan());
+                        if state.executing_plan.is_some() {
+                            eprintln!(
+                                "  {} Replan from executing plan not yet supported",
+                                "⚠".yellow()
+                            );
+                            eprintln!(
+                                "  {} Pause execution first with Ctrl+C, then enter plan mode",
+                                "💡".cyan()
+                            );
                         } else {
                             eprintln!("  {} Not in plan mode. Use /plan first.", "⚠".yellow());
                         }
                         return Ok(());
                     };
-                    
+
                     let Some(tok) = token else {
                         eprintln!("  {} Not logged in. Run /login first.", "✗".red());
                         return Ok(());
                     };
-                    
+
                     // Determine reason for replan
                     let reason = if !sub_arg.is_empty() {
                         // User provided reason
                         ReplanReason::UserRequest
                     } else {
                         // Auto-detect reason
-                        let failed: Vec<(&str, &str)> = vec![];  // TODO: track failed subtasks
+                        let failed: Vec<(&str, &str)> = vec![]; // TODO: track failed subtasks
                         match detect_replan_needed(&ps.plan, state.plan_execution_rounds, &failed) {
                             Some(suggestion) => suggestion.reason,
                             None => ReplanReason::UserRequest,
                         }
                     };
-                    
+
                     eprintln!();
                     eprintln!("  {} Replanning: {}", "🔄".yellow(), reason.format());
                     eprintln!("  {} Generating revised plan...", "⋯".dim());
-                    
+
                     let prompt = generate_replan_prompt(&ps.goal, &ps.plan, &reason, &ps.context);
                     let payload = serde_json::json!({
                         "messages": [{"role": "user", "content": prompt}],
                         "session_id": state.session_id.clone(),
                     });
-                    
+
                     let resp = client
                         .post(format!("{base}/chat/turn"))
                         .bearer_auth(tok)
                         .json(&payload)
                         .send()
                         .await;
-                    
+
                     match resp {
                         Ok(r) if r.status().is_success() => {
                             let mut full_text = String::new();
                             let mut stream = r.bytes_stream();
                             use futures_util::StreamExt;
-                            
+
                             while let Some(chunk) = stream.next().await {
                                 if let Ok(bytes) = chunk {
                                     let event_str = String::from_utf8_lossy(&bytes);
                                     for line in event_str.lines() {
-                                        if let Some(data) = line.strip_prefix("data: ") {
-                                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                                                if let Some(content) = json.get("content").and_then(|v| v.as_str()) {
-                                                    full_text.push_str(content);
-                                                }
-                                            }
+                                        if let Some(data) = line.strip_prefix("data: ")
+                                            && let Ok(json) =
+                                                serde_json::from_str::<serde_json::Value>(data)
+                                            && let Some(content) =
+                                                json.get("content").and_then(|v| v.as_str())
+                                        {
+                                            full_text.push_str(content);
                                         }
                                     }
                                 }
                             }
-                            
+
                             match parse_plan_response(&full_text) {
                                 Ok(new_plan) => {
                                     // Keep completed subtasks, update pending ones
                                     let old_version = ps.version_history.current_version;
-                                    ps.update_plan(new_plan, &format!("Replan: {}", reason.format()));
-                                    let _ = ps.save_to_file(&super::plan_decompose::PlanModeState::state_path());
-                                    
+                                    ps.update_plan(
+                                        new_plan,
+                                        &format!("Replan: {}", reason.format()),
+                                    );
+                                    let _ = ps.save_to_file(
+                                        &super::plan_decompose::PlanModeState::state_path(),
+                                    );
+
                                     eprintln!();
-                                    eprintln!("  {} Plan updated (v{} → v{})", 
-                                        "✓".green(), old_version, ps.version_history.current_version);
+                                    eprintln!(
+                                        "  {} Plan updated (v{} → v{})",
+                                        "✓".green(),
+                                        old_version,
+                                        ps.version_history.current_version
+                                    );
                                     eprintln!();
                                     eprintln!("{}", format_plan(&ps.plan));
                                     eprintln!();
-                                    eprintln!("  {} Use '/plan diff {} {}' to see changes", 
-                                        "💡".cyan(), old_version, ps.version_history.current_version);
+                                    eprintln!(
+                                        "  {} Use '/plan diff {} {}' to see changes",
+                                        "💡".cyan(),
+                                        old_version,
+                                        ps.version_history.current_version
+                                    );
                                 }
                                 Err(e) => {
                                     eprintln!("  {} Failed to parse replan: {}", "✗".red(), e);
@@ -1083,15 +1220,15 @@ pub(super) async fn handle_memory_domain_command(
                             eprintln!("  {} Request failed: {}", "✗".red(), e);
                         }
                     }
-                    
+
                     // Increment replan count in cloud if available
                     if let Some(ref svc) = state.task_service {
                         use mo_agent_services::TaskService;
                         let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
-                        if let Ok(tasks) = svc.list_tasks(user_id, None).await {
-                            if let Some(task) = tasks.iter().find(|t| t.title == ps.goal) {
-                                let _ = svc.increment_replan_count(&task.task_id).await;
-                            }
+                        if let Ok(tasks) = svc.list_tasks(user_id, None).await
+                            && let Some(task) = tasks.iter().find(|t| t.title == ps.goal)
+                        {
+                            let _ = svc.increment_replan_count(&task.task_id).await;
                         }
                     }
                 }
@@ -1106,9 +1243,8 @@ pub(super) async fn handle_memory_domain_command(
                 "auto" if !sub_arg.is_empty() => {
                     // Auto mode: decompose + preview + execute in one shot
                     use super::plan_decompose::{
-                        analyze_project, decomposition_prompt,
+                        PlanExecutionConfig, analyze_project, decomposition_prompt,
                         format_execution_preview, format_plan, parse_plan_response,
-                        PlanExecutionConfig,
                     };
 
                     let Some(tok) = token else {
@@ -1121,7 +1257,11 @@ pub(super) async fn handle_memory_domain_command(
                     eprintln!("  {} Analyzing project...", "⋯".dim());
                     let context = analyze_project(&project_root);
                     let prompt = decomposition_prompt(sub_arg, &context);
-                    eprintln!("  {} Decomposing and auto-executing: {}", "🚀".cyan(), sub_arg);
+                    eprintln!(
+                        "  {} Decomposing and auto-executing: {}",
+                        "🚀".cyan(),
+                        sub_arg
+                    );
 
                     let payload = serde_json::json!({
                         "messages": [{"role": "user", "content": prompt}],
@@ -1144,20 +1284,15 @@ pub(super) async fn handle_memory_domain_command(
                                 if let Ok(bytes) = chunk {
                                     let event_str = String::from_utf8_lossy(&bytes);
                                     for line in event_str.lines() {
-                                        if let Some(data) = line.strip_prefix("data: ") {
-                                            if let Ok(json) =
+                                        if let Some(data) = line.strip_prefix("data: ")
+                                            && let Ok(json) =
                                                 serde_json::from_str::<serde_json::Value>(data)
-                                            {
-                                                if json.get("type").and_then(|v| v.as_str())
-                                                    == Some("text_delta")
-                                                {
-                                                    if let Some(content) =
-                                                        json.get("content").and_then(|v| v.as_str())
-                                                    {
-                                                        full_text.push_str(content);
-                                                    }
-                                                }
-                                            }
+                                            && json.get("type").and_then(|v| v.as_str())
+                                                == Some("text_delta")
+                                            && let Some(content) =
+                                                json.get("content").and_then(|v| v.as_str())
+                                        {
+                                            full_text.push_str(content);
                                         }
                                     }
                                 }
@@ -1176,8 +1311,10 @@ pub(super) async fn handle_memory_domain_command(
                                         plan.subtasks.len()
                                     );
 
-                                    state.plan_execution_config =
-                                        Some(PlanExecutionConfig { auto_execute: true, ..Default::default() });
+                                    state.plan_execution_config = Some(PlanExecutionConfig {
+                                        auto_execute: true,
+                                        ..Default::default()
+                                    });
                                     state.executing_plan_goal = Some(sub_arg.to_string());
                                     state.plan_execution_rounds = 0;
                                     state.executing_plan = Some(plan);
@@ -1195,10 +1332,7 @@ pub(super) async fn handle_memory_domain_command(
                             }
                         }
                         Ok(r) => {
-                            eprintln!(
-                                "{}",
-                                format!("  ✗ LLM call failed ({})", r.status()).red()
-                            );
+                            eprintln!("{}", format!("  ✗ LLM call failed ({})", r.status()).red());
                         }
                         Err(e) => {
                             eprintln!("{}", format!("  ✗ Request failed: {e}").red());
@@ -1206,9 +1340,7 @@ pub(super) async fn handle_memory_domain_command(
                     }
                 }
                 _ => {
-                    eprintln!(
-                        "  Usage: /plan [list | history]"
-                    );
+                    eprintln!("  Usage: /plan [list | history]");
                     eprintln!("  In plan mode, just describe your goal - no commands needed.");
                 }
             }
@@ -1229,10 +1361,10 @@ pub async fn handle_plan_mode_input(
     base: &str,
 ) -> Result<(), String> {
     use super::plan_decompose::{
-        PlanModeState, format_plan, parse_plan_response, decomposition_prompt,
-        format_project_context, parse_plan_entry_choice, PlanEntryChoice,
-        format_clarification_question, parse_clarification_response, 
-        detect_clarification_questions, PendingClarifications, ClarificationAnswer,
+        ClarificationAnswer, PendingClarifications, PlanEntryChoice, PlanModeState,
+        decomposition_prompt, detect_clarification_questions, format_clarification_question,
+        format_plan, format_project_context, parse_clarification_response, parse_plan_entry_choice,
+        parse_plan_response,
     };
 
     let plan_state = match state.plan_mode.as_mut() {
@@ -1242,121 +1374,123 @@ pub async fn handle_plan_mode_input(
             return Ok(());
         }
     };
-    
+
     // Handle pending clarification questions first
-    if let Some(ref mut pending) = plan_state.pending_clarifications {
-        if let Some(question) = pending.next_question().cloned() {
-            // Parse user's answer
-            let answer = parse_clarification_response(&input, &question);
-            match answer {
-                ClarificationAnswer::Selected(idx) => {
-                    let selected = &question.options[idx];
-                    pending.record_answer(selected.clone());
-                    eprintln!("  {} Selected: {}", "✓".green(), selected);
-                }
-                ClarificationAnswer::Freeform(text) => {
-                    pending.record_answer(text.clone());
-                    eprintln!("  {} Answer: {}", "✓".green(), text);
-                }
-                ClarificationAnswer::Invalid(msg) => {
-                    eprintln!("  {} {}", "✗".red(), msg);
-                    eprintln!();
-                    eprint!("{}", format_clarification_question(&question));
-                    return Ok(());
-                }
+    if let Some(ref mut pending) = plan_state.pending_clarifications
+        && let Some(question) = pending.next_question().cloned()
+    {
+        // Parse user's answer
+        let answer = parse_clarification_response(&input, &question);
+        match answer {
+            ClarificationAnswer::Selected(idx) => {
+                let selected = &question.options[idx];
+                pending.record_answer(selected.clone());
+                eprintln!("  {} Selected: {}", "✓".green(), selected);
             }
-            
-            // Check if more questions remain
-            if let Some(next_q) = pending.next_question() {
+            ClarificationAnswer::Freeform(text) => {
+                pending.record_answer(text.clone());
+                eprintln!("  {} Answer: {}", "✓".green(), text);
+            }
+            ClarificationAnswer::Invalid(msg) => {
+                eprintln!("  {} {}", "✗".red(), msg);
                 eprintln!();
-                eprint!("{}", format_clarification_question(next_q));
-                let _ = plan_state.save_to_file(&PlanModeState::state_path());
+                eprint!("{}", format_clarification_question(&question));
                 return Ok(());
             }
-            
-            // All questions answered - regenerate plan with clarifications
+        }
+
+        // Check if more questions remain
+        if let Some(next_q) = pending.next_question() {
             eprintln!();
-            eprintln!("  {} All clarifications answered. Regenerating plan...", "🔄".cyan());
-            
-            let answers_context = pending.format_for_prompt();
-            let goal_with_context = format!(
-                "{}\n\n## Clarifications from user:\n{}",
-                plan_state.goal, answers_context
-            );
-            
-            // Clear pending and regenerate
-            plan_state.pending_clarifications = None;
-            
-            let Some(tok) = token else {
-                eprintln!("  {} Not logged in. Run /login first.", "✗".red());
-                return Ok(());
-            };
-            
-            let prompt = decomposition_prompt(&goal_with_context, &plan_state.context);
-            let payload = serde_json::json!({
-                "messages": [{"role": "user", "content": prompt}],
-                "session_id": state.session_id.clone(),
-            });
-            
-            let resp = client
-                .post(format!("{base}/chat/turn"))
-                .bearer_auth(tok)
-                .json(&payload)
-                .send()
-                .await;
-            
-            match resp {
-                Ok(r) if r.status().is_success() => {
-                    let mut full_text = String::new();
-                    let mut stream = r.bytes_stream();
-                    use futures_util::StreamExt;
-                    
-                    eprintln!("  {} Thinking...", "🧠".cyan());
-                    
-                    while let Some(chunk) = stream.next().await {
-                        if let Ok(bytes) = chunk {
-                            let event_str = String::from_utf8_lossy(&bytes);
-                            for line in event_str.lines() {
-                                if let Some(data) = line.strip_prefix("data: ") {
-                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                                        if let Some(content) = json.get("content").and_then(|v| v.as_str()) {
-                                            full_text.push_str(content);
-                                        }
-                                    }
-                                }
+            eprint!("{}", format_clarification_question(next_q));
+            let _ = plan_state.save_to_file(&PlanModeState::state_path());
+            return Ok(());
+        }
+
+        // All questions answered - regenerate plan with clarifications
+        eprintln!();
+        eprintln!(
+            "  {} All clarifications answered. Regenerating plan...",
+            "🔄".cyan()
+        );
+
+        let answers_context = pending.format_for_prompt();
+        let goal_with_context = format!(
+            "{}\n\n## Clarifications from user:\n{}",
+            plan_state.goal, answers_context
+        );
+
+        // Clear pending and regenerate
+        plan_state.pending_clarifications = None;
+
+        let Some(tok) = token else {
+            eprintln!("  {} Not logged in. Run /login first.", "✗".red());
+            return Ok(());
+        };
+
+        let prompt = decomposition_prompt(&goal_with_context, &plan_state.context);
+        let payload = serde_json::json!({
+            "messages": [{"role": "user", "content": prompt}],
+            "session_id": state.session_id.clone(),
+        });
+
+        let resp = client
+            .post(format!("{base}/chat/turn"))
+            .bearer_auth(tok)
+            .json(&payload)
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let mut full_text = String::new();
+                let mut stream = r.bytes_stream();
+                use futures_util::StreamExt;
+
+                eprintln!("  {} Thinking...", "🧠".cyan());
+
+                while let Some(chunk) = stream.next().await {
+                    if let Ok(bytes) = chunk {
+                        let event_str = String::from_utf8_lossy(&bytes);
+                        for line in event_str.lines() {
+                            if let Some(data) = line.strip_prefix("data: ")
+                                && let Ok(json) = serde_json::from_str::<serde_json::Value>(data)
+                                && let Some(content) = json.get("content").and_then(|v| v.as_str())
+                            {
+                                full_text.push_str(content);
                             }
                         }
                     }
-                    
-                    // Parse and set plan (no clarification check in regeneration)
-                    match parse_plan_response(&full_text) {
-                        Ok(plan) => {
-                            plan_state.set_plan(plan);
-                            let _ = plan_state.save_to_file(&PlanModeState::state_path());
-                            
-                            eprintln!();
-                            eprintln!("{}", format_plan(&plan_state.plan));
-                            eprintln!();
-                            eprintln!("  {} Commands:", "💡".cyan());
-                            eprintln!("    'go' or 'execute' → Run the plan");
-                            eprintln!("    'step' → Run step-by-step with confirmation");
-                            eprintln!("    Or describe changes to modify the plan");
-                        }
-                        Err(e) => {
-                            eprintln!("  {} Failed to parse plan: {}", "✗".red(), e);
-                        }
+                }
+
+                // Parse and set plan (no clarification check in regeneration)
+                match parse_plan_response(&full_text) {
+                    Ok(plan) => {
+                        plan_state.set_plan(plan);
+                        let _ = plan_state.save_to_file(&PlanModeState::state_path());
+
+                        eprintln!();
+                        eprintln!("{}", format_plan(&plan_state.plan));
+                        eprintln!();
+                        eprintln!("  {} Commands:", "💡".cyan());
+                        eprintln!("    'go' or 'execute' → Run the plan");
+                        eprintln!("    'step' → Run step-by-step with confirmation");
+                        eprintln!("    Or describe changes to modify the plan");
+                    }
+                    Err(e) => {
+                        eprintln!("  {} Failed to parse plan: {}", "✗".red(), e);
                     }
                 }
-                Ok(r) => {
-                    eprintln!("  {} LLM call failed ({})", "✗".red(), r.status());
-                }
-                Err(e) => {
-                    eprintln!("  {} Request failed: {}", "✗".red(), e);
-                }
             }
-            
-            return Ok(());
+            Ok(r) => {
+                eprintln!("  {} LLM call failed ({})", "✗".red(), r.status());
+            }
+            Err(e) => {
+                eprintln!("  {} Request failed: {}", "✗".red(), e);
+            }
         }
+
+        return Ok(());
     }
 
     // Check for exit commands
@@ -1368,12 +1502,12 @@ pub async fn handle_plan_mode_input(
         state.plan_mode = None;
         return Ok(());
     }
-    
+
     // Handle entry choices (when goal is empty - fresh plan mode)
     if plan_state.goal.is_empty() {
         let has_plan = !plan_state.plan.subtasks.is_empty();
         let choice = parse_plan_entry_choice(&input, has_plan, state.executing_plan.is_some());
-        
+
         match choice {
             PlanEntryChoice::Exit => {
                 eprintln!();
@@ -1390,12 +1524,15 @@ pub async fn handle_plan_mode_input(
                 // Clear current plan, prompt for new goal
                 plan_state.plan = Default::default();
                 plan_state.goal = String::new();
-                eprintln!("  {} Plan cleared. Describe what you want to do:", "🔄".yellow());
+                eprintln!(
+                    "  {} Plan cleared. Describe what you want to do:",
+                    "🔄".yellow()
+                );
                 return Ok(());
             }
             PlanEntryChoice::Resume => {
                 // Resume paused execution
-                if let Some(ref paused) = state.executing_plan {
+                if state.executing_plan.is_some() {
                     eprintln!("  {} Resuming plan execution...", "▶".cyan());
                 }
                 return Ok(());
@@ -1412,87 +1549,88 @@ pub async fn handle_plan_mode_input(
                     eprintln!("  {} Not logged in. Run /login first.", "✗".red());
                     return Ok(());
                 };
-                
+
                 plan_state.goal = goal.clone();
-                
+
                 // Show project context
                 eprintln!();
                 eprintln!("{}", format_project_context(&plan_state.context));
                 eprintln!();
-                
+
                 // Streaming plan generation with real-time output
                 eprintln!("  {} Thinking...", "🧠".cyan());
                 eprintln!();
-                
+
                 let prompt = decomposition_prompt(&goal, &plan_state.context);
                 let payload = serde_json::json!({
                     "messages": [{"role": "user", "content": prompt}],
                     "session_id": state.session_id.clone(),
                 });
-                
+
                 let resp = client
                     .post(format!("{base}/chat/turn"))
                     .bearer_auth(tok)
                     .json(&payload)
                     .send()
                     .await;
-                
+
                 match resp {
                     Ok(r) if r.status().is_success() => {
                         let mut full_text = String::new();
                         let mut stream = r.bytes_stream();
                         use futures_util::StreamExt;
-                        
+
                         // Track streaming state
                         let mut in_thinking = false;
                         let mut in_plan_json = false;
                         let mut chars_since_nl = 0;
-                        
+
                         while let Some(chunk) = stream.next().await {
                             if let Ok(bytes) = chunk {
                                 let event_str = String::from_utf8_lossy(&bytes);
                                 for line in event_str.lines() {
-                                    if let Some(data) = line.strip_prefix("data: ") {
-                                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                                            if json.get("type").and_then(|v| v.as_str()) == Some("text_delta") {
-                                                if let Some(content) = json.get("content").and_then(|v| v.as_str()) {
-                                                    full_text.push_str(content);
-                                                    
-                                                    // Stream thinking process to user (before JSON)
-                                                    for ch in content.chars() {
-                                                        // Detect start of JSON plan
-                                                        if ch == '{' && !in_thinking && !in_plan_json {
-                                                            in_plan_json = true;
-                                                            eprintln!();
-                                                            eprintln!();
-                                                            eprint!("  {} Parsing plan", "⚙".dim());
-                                                            continue;
-                                                        }
-                                                        
-                                                        if in_plan_json {
-                                                            // Show progress dots during JSON parsing
-                                                            if ch == ',' || ch == '}' {
-                                                                eprint!(".");
-                                                            }
-                                                            continue;
-                                                        }
-                                                        
-                                                        // Stream thinking text
-                                                        if !in_thinking && chars_since_nl == 0 {
-                                                            in_thinking = true;
-                                                            eprint!("  ");
-                                                        }
-                                                        
-                                                        eprint!("{}", ch);
-                                                        
-                                                        if ch == '\n' {
-                                                            chars_since_nl = 0;
-                                                            in_thinking = false;
-                                                        } else {
-                                                            chars_since_nl += 1;
-                                                        }
-                                                    }
+                                    if let Some(data) = line.strip_prefix("data: ")
+                                        && let Ok(json) =
+                                            serde_json::from_str::<serde_json::Value>(data)
+                                        && json.get("type").and_then(|v| v.as_str())
+                                            == Some("text_delta")
+                                        && let Some(content) =
+                                            json.get("content").and_then(|v| v.as_str())
+                                    {
+                                        full_text.push_str(content);
+
+                                        // Stream thinking process to user (before JSON)
+                                        for ch in content.chars() {
+                                            // Detect start of JSON plan
+                                            if ch == '{' && !in_thinking && !in_plan_json {
+                                                in_plan_json = true;
+                                                eprintln!();
+                                                eprintln!();
+                                                eprint!("  {} Parsing plan", "⚙".dim());
+                                                continue;
+                                            }
+
+                                            if in_plan_json {
+                                                // Show progress dots during JSON parsing
+                                                if ch == ',' || ch == '}' {
+                                                    eprint!(".");
                                                 }
+                                                continue;
+                                            }
+
+                                            // Stream thinking text
+                                            if !in_thinking && chars_since_nl == 0 {
+                                                in_thinking = true;
+                                                eprint!("  ");
+                                            }
+
+                                            eprint!("{}", ch);
+
+                                            if ch == '\n' {
+                                                chars_since_nl = 0;
+                                                in_thinking = false;
+                                            } else {
+                                                chars_since_nl += 1;
                                             }
                                         }
                                     }
@@ -1500,20 +1638,23 @@ pub async fn handle_plan_mode_input(
                             }
                         }
                         eprintln!();
-                        
+
                         // Check for clarification questions first
                         if let Some(questions) = detect_clarification_questions(&full_text) {
                             // LLM is asking for clarification instead of producing plan
                             eprintln!();
-                            eprintln!("  {} Need clarification before generating plan:", "❓".yellow());
+                            eprintln!(
+                                "  {} Need clarification before generating plan:",
+                                "❓".yellow()
+                            );
                             eprintln!();
-                            
+
                             let pending = PendingClarifications {
                                 questions: questions.clone(),
                                 answers: Vec::new(),
                             };
                             plan_state.pending_clarifications = Some(pending);
-                            
+
                             // Show first question
                             eprint!("{}", format_clarification_question(&questions[0]));
                             let _ = plan_state.save_to_file(&PlanModeState::state_path());
@@ -1523,7 +1664,7 @@ pub async fn handle_plan_mode_input(
                                 Ok(plan) => {
                                     plan_state.set_plan(plan);
                                     let _ = plan_state.save_to_file(&PlanModeState::state_path());
-                                    
+
                                     eprintln!();
                                     eprintln!("{}", format_plan(&plan_state.plan));
                                     eprintln!();
@@ -1545,77 +1686,74 @@ pub async fn handle_plan_mode_input(
                         eprintln!("  {} Request failed: {}", "✗".red(), e);
                     }
                 }
-                
+
                 return Ok(());
             }
         }
     }
 
     // Check for "done <id>" — mark subtask completed
-    if let Some(done_id) = input_lower.strip_prefix("done ").map(|s| s.trim()) {
-        if !done_id.is_empty() {
-            match plan_state.complete_subtask(done_id) {
-                Ok(title) => {
-                    let pct = plan_state.plan.progress_pct();
-                    let done_count = plan_state.plan.items_done();
-                    let total_count = plan_state.plan.subtasks.len();
-                    eprintln!("  {} Completed: {} ({}%)", "✓".green(), title, pct);
-                    // Save updated state locally
-                    let _ = plan_state.save_to_file(&PlanModeState::state_path());
-                    
-                    // Sync progress to cloud if available
+    if let Some(done_id) = input_lower.strip_prefix("done ").map(|s| s.trim())
+        && !done_id.is_empty()
+    {
+        match plan_state.complete_subtask(done_id) {
+            Ok(title) => {
+                let pct = plan_state.plan.progress_pct();
+                let done_count = plan_state.plan.items_done();
+                let total_count = plan_state.plan.subtasks.len();
+                eprintln!("  {} Completed: {} ({}%)", "✓".green(), title, pct);
+                // Save updated state locally
+                let _ = plan_state.save_to_file(&PlanModeState::state_path());
+
+                // Sync progress to cloud if available
+                if let Some(ref svc) = state.task_service {
+                    use mo_agent_services::TaskService;
+                    let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
+                    let goal = &plan_state.goal;
+
+                    // Find matching cloud task and update progress
+                    if let Ok(tasks) = svc.list_tasks(user_id, None).await
+                        && let Some(task) = tasks.iter().find(|t| &t.title == goal)
+                    {
+                        // Update plan and progress in cloud
+                        let _ = svc.update_plan(&task.task_id, &plan_state.plan).await;
+                        let _ = svc
+                            .update_progress(&task.task_id, pct, done_count, total_count as u32)
+                            .await;
+                    }
+                }
+
+                // Show remaining ready tasks
+                let ready = plan_state.plan.ready_subtasks();
+                if !ready.is_empty() {
+                    eprintln!("  {} Next ready:", "→".cyan());
+                    for st in &ready {
+                        eprintln!("    {} [{}] {}", "○".dim(), st.id, st.title);
+                    }
+                } else if plan_state.plan.progress_pct() == 100 {
+                    eprintln!("  {} All tasks complete!", "🎉".green());
+                    // Complete the cloud task
                     if let Some(ref svc) = state.task_service {
                         use mo_agent_services::TaskService;
                         let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
                         let goal = &plan_state.goal;
-                        
-                        // Find matching cloud task and update progress
-                        if let Ok(tasks) = svc.list_tasks(user_id, None).await {
-                            if let Some(task) = tasks.iter().find(|t| &t.title == goal) {
-                                // Update plan and progress in cloud
-                                let _ = svc.update_plan(&task.task_id, &plan_state.plan).await;
-                                let _ = svc.update_progress(
-                                    &task.task_id,
-                                    pct,
-                                    done_count,
-                                    total_count as u32,
-                                ).await;
-                            }
+                        if let Ok(tasks) = svc.list_tasks(user_id, None).await
+                            && let Some(task) = tasks.iter().find(|t| &t.title == goal)
+                        {
+                            let _ = svc.complete_task(&task.task_id).await;
                         }
                     }
-                    
-                    // Show remaining ready tasks
-                    let ready = plan_state.plan.ready_subtasks();
-                    if !ready.is_empty() {
-                        eprintln!("  {} Next ready:", "→".cyan());
-                        for st in &ready {
-                            eprintln!("    {} [{}] {}", "○".dim(), st.id, st.title);
-                        }
-                    } else if plan_state.plan.progress_pct() == 100 {
-                        eprintln!("  {} All tasks complete!", "🎉".green());
-                        // Complete the cloud task
-                        if let Some(ref svc) = state.task_service {
-                            use mo_agent_services::TaskService;
-                            let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
-                            let goal = &plan_state.goal;
-                            if let Ok(tasks) = svc.list_tasks(user_id, None).await {
-                                if let Some(task) = tasks.iter().find(|t| &t.title == goal) {
-                                    let _ = svc.complete_task(&task.task_id).await;
-                                }
-                            }
-                        }
-                        // Prompt for feedback
-                        eprintln!();
-                        eprintln!(
-                            "  {} Rate this plan (1-5)? Or 'skip' to skip: /plan rate <1-5>",
-                            "💡".cyan()
-                        );
-                    }
+                    // Prompt for feedback
+                    eprintln!();
+                    eprintln!(
+                        "  {} Rate this plan (1-5)? Or 'skip' to skip: /plan rate <1-5>",
+                        "💡".cyan()
+                    );
                 }
-                Err(e) => eprintln!("  {} {}", "⚠".yellow(), e),
             }
-            return Ok(());
+            Err(e) => eprintln!("  {} {}", "⚠".yellow(), e),
         }
+        return Ok(());
     }
 
     // Check for "status" — show current progress
@@ -1636,7 +1774,7 @@ pub async fn handle_plan_mode_input(
 
     // Check for execute command
     if PlanModeState::is_execute_command(&input) {
-        use super::plan_decompose::{format_execution_preview, PlanExecutionConfig};
+        use super::plan_decompose::{PlanExecutionConfig, format_execution_preview};
 
         let plan = plan_state.plan.clone();
         let goal = plan_state.goal.clone();
@@ -1653,7 +1791,11 @@ pub async fn handle_plan_mode_input(
             let session_id = state.session_id.as_deref().unwrap_or("no-session");
 
             // Extract project_type from context
-            let project_type = plan_state.context.languages.first().map(|s| s.to_lowercase());
+            let project_type = plan_state
+                .context
+                .languages
+                .first()
+                .map(|s| s.to_lowercase());
 
             // Extract goal_pattern: normalize the goal for pattern matching
             let goal_pattern = Some(extract_goal_pattern(&goal));
@@ -1684,7 +1826,11 @@ pub async fn handle_plan_mode_input(
             }
         }
 
-        eprintln!("{}  Auto-executing plan ({} subtasks)...", "🚀".green(), plan.subtasks.len());
+        eprintln!(
+            "{}  Auto-executing plan ({} subtasks)...",
+            "🚀".green(),
+            plan.subtasks.len()
+        );
         eprintln!();
 
         // Store execution config for auto mode (go = automatic)
@@ -1704,7 +1850,7 @@ pub async fn handle_plan_mode_input(
 
     // Check for step-by-step execute command
     if input.trim().to_lowercase().starts_with("step") || input.trim() == "逐步执行" {
-        use super::plan_decompose::{format_execution_preview, PlanExecutionConfig};
+        use super::plan_decompose::{PlanExecutionConfig, format_execution_preview};
 
         let plan = plan_state.plan.clone();
         let goal = plan_state.goal.clone();
@@ -1885,8 +2031,21 @@ pub async fn handle_plan_mode_input(
 fn extract_goal_pattern(goal: &str) -> String {
     // Common task verbs to preserve
     let task_verbs = [
-        "add", "fix", "implement", "create", "update", "refactor", "remove", "delete",
-        "optimize", "improve", "migrate", "integrate", "test", "document", "configure",
+        "add",
+        "fix",
+        "implement",
+        "create",
+        "update",
+        "refactor",
+        "remove",
+        "delete",
+        "optimize",
+        "improve",
+        "migrate",
+        "integrate",
+        "test",
+        "document",
+        "configure",
     ];
 
     // Normalize to lowercase and split
@@ -1903,18 +2062,14 @@ fn extract_goal_pattern(goal: &str) -> String {
         let word = words[i];
 
         // Keep task verbs
-        if task_verbs.contains(&word) {
-            pattern_parts.push(word.to_string());
-        }
-        // Keep common structural words
-        else if ["for", "to", "in", "with", "from", "by", "the", "a", "an"].contains(&word) {
-            pattern_parts.push(word.to_string());
-        }
-        // Keep technology/domain keywords
-        else if [
-            "api", "endpoint", "database", "file", "module", "function", "class", "test",
-            "config", "error", "logging", "auth", "user", "data", "cache", "queue",
-        ].contains(&word) {
+        if task_verbs.contains(&word)
+            || ["for", "to", "in", "with", "from", "by", "the", "a", "an"].contains(&word)
+            || [
+                "api", "endpoint", "database", "file", "module", "function", "class", "test",
+                "config", "error", "logging", "auth", "user", "data", "cache", "queue",
+            ]
+            .contains(&word)
+        {
             pattern_parts.push(word.to_string());
         }
         // Replace specific identifiers with wildcard

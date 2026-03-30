@@ -179,7 +179,7 @@ pub fn save_snapshot(profile: &str, snapshot: &LearningSnapshot) -> Result<(), S
     // Atomic write: tmp file + rename
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &json).map_err(|e| format!("write: {e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
 
     Ok(())
 }
@@ -206,7 +206,7 @@ pub fn save_sync_metadata_to(path: &Path, metadata: &LearningSyncMetadata) -> Re
 
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &json).map_err(|e| format!("write: {e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
 
     Ok(())
 }
@@ -440,45 +440,45 @@ pub fn export_dirty_from_modules(
     };
 
     // Export dirty entities
-    if let Ok(graph) = entity_graph.lock() {
-        if graph.has_dirty() {
-            delta.baseline_epoch = graph.last_sync_epoch();
-            let dirty_entities = graph.export_dirty();
-            for ent in dirty_entities {
-                if let Ok(json) = serde_json::to_value(&ent) {
-                    delta.entity_deltas.push(json);
-                    delta.delta_count += 1;
-                }
+    if let Ok(graph) = entity_graph.lock()
+        && graph.has_dirty()
+    {
+        delta.baseline_epoch = graph.last_sync_epoch();
+        let dirty_entities = graph.export_dirty();
+        for ent in dirty_entities {
+            if let Ok(json) = serde_json::to_value(&ent) {
+                delta.entity_deltas.push(json);
+                delta.delta_count += 1;
             }
         }
     }
 
     // Export dirty patterns
-    if let Ok(library) = pattern_library.lock() {
-        if library.has_dirty() {
-            if delta.baseline_epoch == 0 {
-                delta.baseline_epoch = library.last_sync_epoch();
-            }
-            let dirty_patterns = library.export_dirty();
-            for pat in dirty_patterns {
-                if let Ok(json) = serde_json::to_value(&pat) {
-                    delta.pattern_deltas.push(json);
-                    delta.delta_count += 1;
-                }
+    if let Ok(library) = pattern_library.lock()
+        && library.has_dirty()
+    {
+        if delta.baseline_epoch == 0 {
+            delta.baseline_epoch = library.last_sync_epoch();
+        }
+        let dirty_patterns = library.export_dirty();
+        for pat in dirty_patterns {
+            if let Ok(json) = serde_json::to_value(&pat) {
+                delta.pattern_deltas.push(json);
+                delta.delta_count += 1;
             }
         }
     }
 
     // Export calibration if dirty (always sent in full since it's small)
-    if let Ok(cal) = calibrator.lock() {
-        if cal.has_dirty() {
-            if delta.baseline_epoch == 0 {
-                delta.baseline_epoch = cal.last_sync_epoch();
-            }
-            if let Ok(json) = serde_json::to_value(&cal.export()) {
-                delta.calibration = Some(json);
-                delta.delta_count += 1;
-            }
+    if let Ok(cal) = calibrator.lock()
+        && cal.has_dirty()
+    {
+        if delta.baseline_epoch == 0 {
+            delta.baseline_epoch = cal.last_sync_epoch();
+        }
+        if let Ok(json) = serde_json::to_value(cal.export()) {
+            delta.calibration = Some(json);
+            delta.delta_count += 1;
         }
     }
 
@@ -522,41 +522,41 @@ pub fn export_dirty_learning_from_modules(
         delta_count: 0,
     };
 
-    if let Ok(graph) = entity_graph.lock() {
-        if graph.has_dirty() {
-            delta.baseline_epoch = graph.last_sync_epoch();
-            for ent in graph.export_dirty() {
-                if let Ok(json) = serde_json::to_value(&ent) {
-                    delta.entity_deltas.push(json);
-                    delta.delta_count += 1;
-                }
-            }
-        }
-    }
-
-    if let Ok(library) = pattern_library.lock() {
-        if library.has_dirty() {
-            if delta.baseline_epoch == 0 {
-                delta.baseline_epoch = library.last_sync_epoch();
-            }
-            for pat in library.export_dirty() {
-                if let Ok(json) = serde_json::to_value(&pat) {
-                    delta.pattern_deltas.push(json);
-                    delta.delta_count += 1;
-                }
-            }
-        }
-    }
-
-    if let Ok(cal) = calibrator.lock() {
-        if cal.has_dirty() {
-            if delta.baseline_epoch == 0 {
-                delta.baseline_epoch = cal.last_sync_epoch();
-            }
-            if let Ok(json) = serde_json::to_value(&cal.export()) {
-                delta.calibration = Some(json);
+    if let Ok(graph) = entity_graph.lock()
+        && graph.has_dirty()
+    {
+        delta.baseline_epoch = graph.last_sync_epoch();
+        for ent in graph.export_dirty() {
+            if let Ok(json) = serde_json::to_value(&ent) {
+                delta.entity_deltas.push(json);
                 delta.delta_count += 1;
             }
+        }
+    }
+
+    if let Ok(library) = pattern_library.lock()
+        && library.has_dirty()
+    {
+        if delta.baseline_epoch == 0 {
+            delta.baseline_epoch = library.last_sync_epoch();
+        }
+        for pat in library.export_dirty() {
+            if let Ok(json) = serde_json::to_value(&pat) {
+                delta.pattern_deltas.push(json);
+                delta.delta_count += 1;
+            }
+        }
+    }
+
+    if let Ok(cal) = calibrator.lock()
+        && cal.has_dirty()
+    {
+        if delta.baseline_epoch == 0 {
+            delta.baseline_epoch = cal.last_sync_epoch();
+        }
+        if let Ok(json) = serde_json::to_value(cal.export()) {
+            delta.calibration = Some(json);
+            delta.delta_count += 1;
         }
     }
 

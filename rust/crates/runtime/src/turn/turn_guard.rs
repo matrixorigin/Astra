@@ -571,7 +571,16 @@ mod tests {
 
         // Fresh guard: trigger divergence (8 exploration rounds, all different)
         let mut guard2 = TurnGuard::new();
-        let tools = ["bash", "read_file", "grep", "list_dir", "glob", "bash", "read_file", "grep"];
+        let tools = [
+            "bash",
+            "read_file",
+            "grep",
+            "list_dir",
+            "glob",
+            "bash",
+            "read_file",
+            "grep",
+        ];
         for (i, tool) in tools.iter().enumerate() {
             guard2.record_tool_calls(&[make_tool_call(tool, &format!(r#"{{"arg":"val{}"}}"#, i))]);
         }
@@ -592,7 +601,10 @@ mod tests {
         // 3 nudges, 0 errors → still Warning (not Critical without errors)
         guard.nudge_count = 3;
         let v = guard.evaluate();
-        assert!(!v.force_stop, "pure stalls without errors should not force_stop");
+        assert!(
+            !v.force_stop,
+            "pure stalls without errors should not force_stop"
+        );
 
         // 3 nudges + 2 errors → Critical → force_stop
         for _ in 0..2 {

@@ -7,21 +7,18 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use serde_json;
 
 use mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator;
 use mo_agent_runtime::pipeline::entity::EntityGraph;
 use mo_agent_runtime::pipeline::pattern::PatternLibrary;
-use mo_agent_runtime::pipeline::persistence::{
-    self, LearningSnapshot, ToolHealthEntry,
-};
+use mo_agent_runtime::pipeline::persistence::{self, LearningSnapshot, ToolHealthEntry};
 
 use mo_agent_services::event_ingestion;
 use mo_agent_services::state_sync::StateSyncService;
 use mo_agent_services::sync_engine::sha256_checksum;
 use mo_agent_services::{
-    CloudTransport, DomainAdapter, MergeResult, PayloadFormat, PullResult, PushResult,
-    SyncDomain, SyncEnvelope, SyncError, SyncPayload, TaskService,
+    CloudTransport, DomainAdapter, MergeResult, PayloadFormat, PullResult, PushResult, SyncDomain,
+    SyncEnvelope, SyncError, SyncPayload, TaskService,
 };
 
 // ─── Learning Adapter ──────────────────────────────────────────────────────────
@@ -128,24 +125,15 @@ impl DomainAdapter for LearningAdapter {
     }
 
     fn merge_remote(&self, remote: &SyncPayload) -> Result<MergeResult, SyncError> {
-        let snapshot: LearningSnapshot =
-            serde_json::from_slice(&remote.data).map_err(|e| {
-                SyncError::permanent(
-                    SyncDomain::Learning,
-                    format!("deserialize remote snapshot: {e}"),
-                )
-            })?;
+        let snapshot: LearningSnapshot = serde_json::from_slice(&remote.data).map_err(|e| {
+            SyncError::permanent(
+                SyncDomain::Learning,
+                format!("deserialize remote snapshot: {e}"),
+            )
+        })?;
 
-        let before_entities = self
-            .entity_graph
-            .lock()
-            .map(|g| g.len())
-            .unwrap_or(0);
-        let before_patterns = self
-            .pattern_library
-            .lock()
-            .map(|l| l.len())
-            .unwrap_or(0);
+        let before_entities = self.entity_graph.lock().map(|g| g.len()).unwrap_or(0);
+        let before_patterns = self.pattern_library.lock().map(|l| l.len()).unwrap_or(0);
 
         persistence::merge_into_modules(
             &snapshot,
@@ -155,32 +143,25 @@ impl DomainAdapter for LearningAdapter {
         );
 
         // Merge tool health entries (most-recent-updated wins)
-        if !snapshot.tool_health.is_empty() {
-            if let Ok(mut local_health) = self.tool_health.lock() {
-                for remote_entry in &snapshot.tool_health {
-                    if let Some(local) =
-                        local_health.iter_mut().find(|h| h.name == remote_entry.name)
-                    {
-                        if remote_entry.last_updated_epoch > local.last_updated_epoch {
-                            *local = remote_entry.clone();
-                        }
-                    } else {
-                        local_health.push(remote_entry.clone());
+        if !snapshot.tool_health.is_empty()
+            && let Ok(mut local_health) = self.tool_health.lock()
+        {
+            for remote_entry in &snapshot.tool_health {
+                if let Some(local) = local_health
+                    .iter_mut()
+                    .find(|h| h.name == remote_entry.name)
+                {
+                    if remote_entry.last_updated_epoch > local.last_updated_epoch {
+                        *local = remote_entry.clone();
                     }
+                } else {
+                    local_health.push(remote_entry.clone());
                 }
             }
         }
 
-        let after_entities = self
-            .entity_graph
-            .lock()
-            .map(|g| g.len())
-            .unwrap_or(0);
-        let after_patterns = self
-            .pattern_library
-            .lock()
-            .map(|l| l.len())
-            .unwrap_or(0);
+        let after_entities = self.entity_graph.lock().map(|g| g.len()).unwrap_or(0);
+        let after_patterns = self.pattern_library.lock().map(|l| l.len()).unwrap_or(0);
 
         let added = (after_entities.saturating_sub(before_entities)
             + after_patterns.saturating_sub(before_patterns)) as u32;
@@ -201,14 +182,11 @@ impl DomainAdapter for LearningAdapter {
         remote: &SyncPayload,
     ) -> Result<SyncPayload, SyncError> {
         // Strategy: merge both — deserialize both, union local items not in remote
-        let mut local_snap: LearningSnapshot =
-            serde_json::from_slice(&local.data).map_err(|e| {
-                SyncError::permanent(SyncDomain::Learning, format!("deser local: {e}"))
-            })?;
-        let remote_snap: LearningSnapshot =
-            serde_json::from_slice(&remote.data).map_err(|e| {
-                SyncError::permanent(SyncDomain::Learning, format!("deser remote: {e}"))
-            })?;
+        let mut local_snap: LearningSnapshot = serde_json::from_slice(&local.data)
+            .map_err(|e| SyncError::permanent(SyncDomain::Learning, format!("deser local: {e}")))?;
+        let remote_snap: LearningSnapshot = serde_json::from_slice(&remote.data).map_err(|e| {
+            SyncError::permanent(SyncDomain::Learning, format!("deser remote: {e}"))
+        })?;
 
         // Merge remote entities into local (remote wins on duplicate by recency)
         let remote_entity_names: std::collections::HashSet<String> = remote_snap
@@ -296,10 +274,7 @@ impl DomainAdapter for LearningAdapter {
         }
         // Verify deserialization succeeds
         let _: LearningSnapshot = serde_json::from_slice(&payload.data).map_err(|e| {
-            SyncError::permanent(
-                SyncDomain::Learning,
-                format!("invalid payload: {e}"),
-            )
+            SyncError::permanent(SyncDomain::Learning, format!("invalid payload: {e}"))
         })?;
         Ok(())
     }
@@ -384,13 +359,9 @@ impl CloudTransport for MatrixOneTransport {
                 })?;
 
                 // Deserialize to count entities/patterns for the legacy API
-                let snapshot: LearningSnapshot =
-                    serde_json::from_str(&json_str).map_err(|e| {
-                        SyncError::permanent(
-                            SyncDomain::Learning,
-                            format!("deserialize for push: {e}"),
-                        )
-                    })?;
+                let snapshot: LearningSnapshot = serde_json::from_str(&json_str).map_err(|e| {
+                    SyncError::permanent(SyncDomain::Learning, format!("deserialize for push: {e}"))
+                })?;
 
                 let entity_count = snapshot.entities.len() as u32;
                 let pattern_count = snapshot.patterns.len() as u32;
@@ -422,8 +393,7 @@ impl CloudTransport for MatrixOneTransport {
                     })
                 } else if result.is_conflict {
                     // On conflict, pull the remote payload so the orchestrator can resolve
-                    let remote_payload =
-                        self.pull(user_id, SyncDomain::Learning).await?.payload;
+                    let remote_payload = self.pull(user_id, SyncDomain::Learning).await?.payload;
                     Ok(PushResult {
                         success: false,
                         new_version: None,
@@ -442,11 +412,7 @@ impl CloudTransport for MatrixOneTransport {
         }
     }
 
-    async fn pull(
-        &self,
-        user_id: &str,
-        domain: SyncDomain,
-    ) -> Result<PullResult, SyncError> {
+    async fn pull(&self, user_id: &str, domain: SyncDomain) -> Result<PullResult, SyncError> {
         match domain {
             SyncDomain::Learning => {
                 let versioned = self
@@ -590,11 +556,13 @@ impl DomainAdapter for EventAdapter {
 ///
 /// Tasks sync individually (push on change, pull at session start).
 /// This is primarily a pass-through adapter for observability.
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct TaskAdapter {
     _task_service: Arc<dyn TaskService>,
     envelope: Arc<Mutex<SyncEnvelope>>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl TaskAdapter {
     pub fn new(task_service: Arc<dyn TaskService>) -> Self {
         Self {
@@ -672,7 +640,7 @@ impl DomainAdapter for TaskAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mo_agent_services::{NoopTransport, SyncState};
+    use mo_agent_services::NoopTransport;
 
     fn make_test_learning_adapter() -> LearningAdapter {
         let entity_graph = Arc::new(Mutex::new(EntityGraph::default()));
@@ -864,13 +832,15 @@ mod tests {
         assert!(!adapter.has_dirty_data());
         assert!(adapter.export_full().is_err());
         assert!(adapter.export_delta().unwrap().is_none());
-        let result = adapter.merge_remote(&SyncPayload {
-            data: vec![],
-            format: PayloadFormat::Full,
-            checksum: String::new(),
-            item_count: 0,
-            compressed: false,
-        }).unwrap();
+        let result = adapter
+            .merge_remote(&SyncPayload {
+                data: vec![],
+                format: PayloadFormat::Full,
+                checksum: String::new(),
+                item_count: 0,
+                compressed: false,
+            })
+            .unwrap();
         assert_eq!(result.items_added, 0);
         assert_eq!(result.items_updated, 0);
         assert_eq!(result.items_removed, 0);
@@ -878,8 +848,9 @@ mod tests {
 
     #[test]
     fn task_adapter_passthrough() {
-        let task_svc: Arc<dyn TaskService> =
-            Arc::new(mo_agent_services::LocalTaskService::new(std::path::PathBuf::from(".")));
+        let task_svc: Arc<dyn TaskService> = Arc::new(mo_agent_services::LocalTaskService::new(
+            std::path::PathBuf::from("."),
+        ));
         let adapter = TaskAdapter::new(task_svc);
         assert_eq!(adapter.domain(), SyncDomain::Tasks);
         assert!(!adapter.has_dirty_data());

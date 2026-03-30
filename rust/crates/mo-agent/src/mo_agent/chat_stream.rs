@@ -9,27 +9,29 @@ use mo_agent_runtime::pipeline::step_protocol::{
 /// Returns a compact string highlighting the most relevant parameters.
 fn make_args_preview(tool_name: &str, args: &serde_json::Value) -> Option<String> {
     let max_len = 80;
-    
+
     let preview = match tool_name {
         // File operations - show path
-        "read_file" | "write_file" | "delete_file" | "str_replace" | "multi_edit" => {
-            args.get("path").and_then(|v| v.as_str()).map(|s| s.to_string())
-        }
+        "read_file" | "write_file" | "delete_file" | "str_replace" | "multi_edit" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         // Search operations - show pattern and path
         "grep" => {
             let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
             Some(format!("/{pattern}/ in {path}"))
         }
-        "glob" => {
-            args.get("pattern").and_then(|v| v.as_str()).map(|s| s.to_string())
-        }
+        "glob" => args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         // Shell commands - show command
-        "shell_exec" | "bash" => {
-            args.get("command").or_else(|| args.get("cmd"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        }
+        "shell_exec" | "bash" => args
+            .get("command")
+            .or_else(|| args.get("cmd"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         // Git operations - show relevant refs/files
         "git_diff" => {
             let base = args.get("base").and_then(|v| v.as_str()).unwrap_or("HEAD");
@@ -39,37 +41,38 @@ fn make_args_preview(tool_name: &str, args: &serde_json::Value) -> Option<String
                 None => Some(base.to_string()),
             }
         }
-        "git_log" | "git_show" => {
-            args.get("ref").or_else(|| args.get("commit"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        }
-        "git_blame" => {
-            args.get("file").and_then(|v| v.as_str()).map(|s| s.to_string())
-        }
+        "git_log" | "git_show" => args
+            .get("ref")
+            .or_else(|| args.get("commit"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        "git_blame" => args
+            .get("file")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         // Memory operations - show query
-        "memory_search" | "memory_retrieve" => {
-            args.get("query").and_then(|v| v.as_str()).map(|s| s.to_string())
-        }
-        "memory_store" => {
-            args.get("content").and_then(|v| v.as_str()).map(|s| s.to_string())
-        }
+        "memory_search" | "memory_retrieve" => args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        "memory_store" => args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         // Web operations
-        "web_fetch" => {
-            args.get("url").and_then(|v| v.as_str()).map(|s| s.to_string())
-        }
+        "web_fetch" => args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         // Default: try to extract the first string value
-        _ => {
-            args.as_object()
-                .and_then(|obj| {
-                    obj.values()
-                        .filter_map(|v| v.as_str())
-                        .next()
-                        .map(|s| s.to_string())
-                })
-        }
+        _ => args.as_object().and_then(|obj| {
+            obj.values()
+                .filter_map(|v| v.as_str())
+                .next()
+                .map(|s| s.to_string())
+        }),
     };
-    
+
     // Truncate if needed
     preview.map(|s| {
         if s.len() > max_len {
@@ -837,10 +840,10 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         }
         remaining_turns = remaining_turns.saturating_sub(1);
         step_recorder.begin_turn(_turn as u32);
-        
+
         // Track context assembly time
         let assembly_start = Instant::now();
-        
+
         // Build request payload
         let git_branch = std::process::Command::new("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -1404,22 +1407,24 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         let pre_results: Vec<PreExecutionResult> = if parallel_batch {
             let timeout_dur = std::time::Duration::from_millis(per_tool_timeout_ms);
             let exec_ref = &executor;
-            let futs: Vec<_> = turn_result.tool_calls.iter().map(|tc| {
-                let name = tc
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let args = tc
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Object(Default::default()));
-                async move {
-                    match tokio::time::timeout(timeout_dur, exec_ref.execute(name, &args)).await {
-                        Ok(result) => PreExecutionResult::Completed(result),
-                        Err(_) => PreExecutionResult::TimedOut,
+            let futs: Vec<_> = turn_result
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let args = tc
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Object(Default::default()));
+                    async move {
+                        match tokio::time::timeout(timeout_dur, exec_ref.execute(name, &args)).await
+                        {
+                            Ok(result) => PreExecutionResult::Completed(result),
+                            Err(_) => PreExecutionResult::TimedOut,
+                        }
                     }
-                }
-            }).collect();
+                })
+                .collect();
             futures_util::future::join_all(futs).await
         } else {
             Vec::new()
@@ -1798,7 +1803,9 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             }
 
             // Record per-tool-call audit entry
-            let args_size = serde_json::to_string(&args).map(|s| s.len() as u32).unwrap_or(0);
+            let args_size = serde_json::to_string(&args)
+                .map(|s| s.len() as u32)
+                .unwrap_or(0);
             let result_size = result_str.len() as u32;
             let args_preview = make_args_preview(&name, &args);
             tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
@@ -2937,7 +2944,9 @@ mod tests {
         // ENOSPC with error-indicator prefix — should match
         assert!(is_resource_limit_output("Error: ENOSPC"));
         assert!(is_resource_limit_output("error writing file: enospc"));
-        assert!(is_resource_limit_output("failed to write: ENOSPC (disk full)"));
+        assert!(is_resource_limit_output(
+            "failed to write: ENOSPC (disk full)"
+        ));
     }
 
     #[test]
@@ -3103,10 +3112,18 @@ if let Err(e) = writeln!(file, "{line}") {
     #[test]
     fn parallel_safe_includes_all_read_only_tools() {
         let must_be_parallel = [
-            "read_file", "list_dir", "glob", "grep",
-            "git_status", "git_diff", "git_log",
-            "github_list_prs", "github_get_pr",
-            "memory_retrieve", "memory_search", "web_fetch",
+            "read_file",
+            "list_dir",
+            "glob",
+            "grep",
+            "git_status",
+            "git_diff",
+            "git_log",
+            "github_list_prs",
+            "github_get_pr",
+            "memory_retrieve",
+            "memory_search",
+            "web_fetch",
         ];
         for tool in &must_be_parallel {
             assert!(
@@ -3119,10 +3136,19 @@ if let Err(e) = writeln!(file, "{line}") {
     #[test]
     fn parallel_safe_excludes_mutating_tools() {
         let must_not_be_parallel = [
-            "bash", "write_file", "str_replace", "delete_file", "multi_edit",
-            "git_commit", "git_stash", "git_checkout_file",
-            "memory_store", "memory_purge", "memory_correct",
-            "github_create_issue", "run_build_test",
+            "bash",
+            "write_file",
+            "str_replace",
+            "delete_file",
+            "multi_edit",
+            "git_commit",
+            "git_stash",
+            "git_checkout_file",
+            "memory_store",
+            "memory_purge",
+            "memory_correct",
+            "github_create_issue",
+            "run_build_test",
         ];
         for tool in &must_not_be_parallel {
             assert!(
@@ -3135,7 +3161,7 @@ if let Err(e) = writeln!(file, "{line}") {
     #[test]
     fn parallel_batch_detection_requires_two_plus() {
         // Single tool → no parallel batch
-        let single = vec![serde_json::json!({"name": "read_file", "arguments": {}})];
+        let single = [serde_json::json!({"name": "read_file", "arguments": {}})];
         let is_parallel = single.len() > 1
             && single.iter().all(|tc| {
                 tc.get("name")
@@ -3143,12 +3169,15 @@ if let Err(e) = writeln!(file, "{line}") {
                     .map(|n| PARALLEL_SAFE_TOOLS.contains(&n))
                     .unwrap_or(false)
             });
-        assert!(!is_parallel, "single tool should not trigger parallel batch");
+        assert!(
+            !is_parallel,
+            "single tool should not trigger parallel batch"
+        );
     }
 
     #[test]
     fn parallel_batch_detects_all_safe_tools() {
-        let batch = vec![
+        let batch = [
             serde_json::json!({"name": "read_file", "arguments": {"path": "a.rs"}}),
             serde_json::json!({"name": "glob", "arguments": {"pattern": "*.rs"}}),
             serde_json::json!({"name": "web_fetch", "arguments": {"url": "https://example.com"}}),
@@ -3160,12 +3189,15 @@ if let Err(e) = writeln!(file, "{line}") {
                     .map(|n| PARALLEL_SAFE_TOOLS.contains(&n))
                     .unwrap_or(false)
             });
-        assert!(is_parallel, "all read-only tools should trigger parallel batch");
+        assert!(
+            is_parallel,
+            "all read-only tools should trigger parallel batch"
+        );
     }
 
     #[test]
     fn parallel_batch_rejected_with_mutating_tool() {
-        let batch = vec![
+        let batch = [
             serde_json::json!({"name": "read_file", "arguments": {"path": "a.rs"}}),
             serde_json::json!({"name": "bash", "arguments": {"command": "echo hi"}}),
         ];
@@ -3175,7 +3207,7 @@ if let Err(e) = writeln!(file, "{line}") {
                     .and_then(|v| v.as_str())
                     .map(|n| PARALLEL_SAFE_TOOLS.contains(&n))
                     .unwrap_or(false)
-        });
+            });
         assert!(!is_parallel, "bash should prevent parallel batch");
     }
 

@@ -23,9 +23,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             display_name VARCHAR(100) NULL,
             is_active SMALLINT NOT NULL DEFAULT 1,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            last_login_at DATETIME(6) NULL,
-            INDEX idx_auth_users_username (username),
-            INDEX idx_auth_users_email (email)
+            last_login_at DATETIME(6) NULL
         )",
     )
     .execute(&pool)
@@ -50,28 +48,11 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             UNIQUE KEY uq_auth_user_roles_user_role (user_id, role_id),
             INDEX idx_auth_user_roles_user_id (user_id),
-            INDEX idx_auth_user_roles_role_id (role_id),
-            CONSTRAINT fk_user_roles_user FOREIGN KEY (user_id) REFERENCES auth_users(user_id) ON DELETE CASCADE,
-            CONSTRAINT fk_user_roles_role FOREIGN KEY (role_id) REFERENCES auth_roles(role_id) ON DELETE CASCADE
+            INDEX idx_auth_user_roles_role_id (role_id)
         )",
     )
     .execute(&pool)
     .await?;
-    // Add FK constraints for existing tables that predate this migration (ignore if already present)
-    query(
-        "ALTER TABLE auth_user_roles ADD CONSTRAINT fk_user_roles_user \
-         FOREIGN KEY (user_id) REFERENCES auth_users(user_id) ON DELETE CASCADE",
-    )
-    .execute(&pool)
-    .await
-    .ok();
-    query(
-        "ALTER TABLE auth_user_roles ADD CONSTRAINT fk_user_roles_role \
-         FOREIGN KEY (role_id) REFERENCES auth_roles(role_id) ON DELETE CASCADE",
-    )
-    .execute(&pool)
-    .await
-    .ok();
 
     query(
         "CREATE TABLE IF NOT EXISTS auth_refresh_tokens (
@@ -82,21 +63,14 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             expires_at DATETIME(6) NOT NULL,
             is_revoked SMALLINT NOT NULL DEFAULT 0,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_auth_refresh_tokens_user_id (user_id),
+            UNIQUE KEY uq_auth_refresh_tokens_hash (token_hash),
+            INDEX idx_auth_refresh_tokens_user_expires (user_id, expires_at),
             INDEX idx_auth_refresh_tokens_expires_at (expires_at),
-            INDEX idx_auth_refresh_tokens_prefix (token_prefix),
-            CONSTRAINT fk_refresh_tokens_user FOREIGN KEY (user_id) REFERENCES auth_users(user_id) ON DELETE CASCADE
+            INDEX idx_auth_refresh_tokens_prefix (token_prefix)
         )",
     )
     .execute(&pool)
     .await?;
-    query(
-        "ALTER TABLE auth_refresh_tokens ADD CONSTRAINT fk_refresh_tokens_user \
-         FOREIGN KEY (user_id) REFERENCES auth_users(user_id) ON DELETE CASCADE",
-    )
-    .execute(&pool)
-    .await
-    .ok();
 
     query(
         "CREATE TABLE IF NOT EXISTS auth_tokens (
@@ -128,8 +102,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             details JSON NULL,
             ip_address VARCHAR(45) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_auth_audit_logs_user_id (user_id),
-            INDEX idx_auth_audit_logs_created_at (created_at)
+            INDEX idx_auth_audit_logs_user_created (user_id, created_at)
         )",
     )
     .execute(&pool)
@@ -153,21 +126,13 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             ended_at DATETIME(6) NULL,
             last_active_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_agent_sessions_user_id (user_id),
-            INDEX idx_agent_sessions_agent_id (agent_id),
-            INDEX idx_agent_sessions_status (status),
-            CONSTRAINT fk_sessions_user FOREIGN KEY (user_id) REFERENCES auth_users(user_id) ON DELETE CASCADE
+            INDEX idx_agent_sessions_user_status_updated (user_id, status, updated_at),
+            INDEX idx_agent_sessions_user_last_active (user_id, last_active_at),
+            INDEX idx_agent_sessions_agent_status (agent_id, status)
         )",
     )
     .execute(&pool)
     .await?;
-    query(
-        "ALTER TABLE agent_sessions ADD CONSTRAINT fk_sessions_user \
-         FOREIGN KEY (user_id) REFERENCES auth_users(user_id) ON DELETE CASCADE",
-    )
-    .execute(&pool)
-    .await
-    .ok();
 
     query(
         "CREATE TABLE IF NOT EXISTS agent_events (
@@ -188,11 +153,11 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             skill_version VARCHAR(64) NULL,
             reasoning_content LONGTEXT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_agent_events_session_id (session_id),
-            INDEX idx_agent_events_user_id (user_id),
-            INDEX idx_agent_events_event_type (event_type),
+            INDEX idx_agent_events_session_created (session_id, created_at),
+            INDEX idx_agent_events_session_type_created (session_id, event_type, created_at),
+            INDEX idx_agent_events_user_created (user_id, created_at),
             INDEX idx_agent_events_causal_chain_id (causal_chain_id),
-            INDEX idx_agent_events_created_at (created_at)
+            INDEX idx_agent_events_skill_created (skill_name, created_at)
         )",
     )
     .execute(&pool)
@@ -208,9 +173,8 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             llm_request_id VARCHAR(64) NULL,
             llm_response_id VARCHAR(64) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_ctx_snapshots_session_id (session_id),
-            INDEX idx_ctx_snapshots_event_id (event_id),
-            INDEX idx_ctx_snapshots_created_at (created_at)
+            INDEX idx_ctx_snapshots_session_created (session_id, created_at),
+            INDEX idx_ctx_snapshots_event_id (event_id)
         )",
     )
     .execute(&pool)
@@ -227,10 +191,9 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             model_params JSON NULL,
             model_used VARCHAR(128) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_ctx_decisions_session_id (session_id),
+            INDEX idx_ctx_decisions_session_type_created (session_id, decision_type, created_at),
             INDEX idx_ctx_decisions_event_id (event_id),
-            INDEX idx_ctx_decisions_type (decision_type),
-            INDEX idx_ctx_decisions_created_at (created_at)
+            INDEX idx_ctx_decisions_context_capture_id (context_capture_id)
         )",
     )
     .execute(&pool)
@@ -250,9 +213,8 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             execution_time_ms BIGINT NULL,
             user_feedback_score BIGINT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_skill_selection_session_id (session_id),
-            INDEX idx_skill_selection_skill_name (skill_name),
-            INDEX idx_skill_selection_created_at (created_at)
+            INDEX idx_skill_selection_session_created (session_id, created_at),
+            INDEX idx_skill_selection_skill_created (skill_name, created_at)
         )",
     )
     .execute(&pool)
@@ -296,8 +258,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             created_by VARCHAR(36) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_infra_llm_models_provider (provider),
-            INDEX idx_infra_llm_models_is_active (is_active)
+            INDEX idx_infra_llm_models_active_provider_name (is_active, provider, model_name)
         )",
     )
     .execute(&pool)
@@ -318,7 +279,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             UNIQUE KEY idx_learning_user_profile (user_id, profile_name),
-            INDEX idx_learning_updated (updated_at)
+            INDEX idx_learning_user_updated (user_id, updated_at)
         )",
     )
     .execute(&pool)
@@ -348,8 +309,8 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             status VARCHAR(20) NOT NULL DEFAULT 'pending',
             error_message TEXT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_sync_user_session (user_id, session_id),
-            INDEX idx_sync_status (status)
+            INDEX idx_sync_user_session_created (user_id, session_id, created_at),
+            INDEX idx_sync_user_status_created (user_id, status, created_at)
         )",
     )
     .execute(&pool)
@@ -376,9 +337,9 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             created_by VARCHAR(36) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_skill_name (skill_name),
-            INDEX idx_skill_active (is_active, status),
-            INDEX idx_skill_source (source)
+            UNIQUE KEY uq_skill_name_version (skill_name, version),
+            INDEX idx_skill_active_name (is_active, status, skill_name),
+            INDEX idx_skill_source_name (source, skill_name)
         )",
     )
     .execute(&pool)
@@ -401,33 +362,24 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             plan_json LONGTEXT NULL,
             checkpoint_json LONGTEXT NULL,
             error_message TEXT NULL,
+            user_rating TINYINT NULL,
+            completion_time_sec INT NULL,
+            replan_count INT NOT NULL DEFAULT 0,
+            auto_adjustments INT NOT NULL DEFAULT 0,
+            outcome VARCHAR(20) NULL,
+            project_type VARCHAR(50) NULL,
+            goal_pattern VARCHAR(500) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             completed_at DATETIME(6) NULL,
-            INDEX idx_tasks_user_id (user_id),
-            INDEX idx_tasks_session_id (session_id),
-            INDEX idx_tasks_parent (parent_task_id),
-            INDEX idx_tasks_status (status),
-            CONSTRAINT fk_tasks_user FOREIGN KEY (user_id) REFERENCES auth_users(user_id) ON DELETE CASCADE
+            INDEX idx_tasks_user_status_updated (user_id, status, updated_at),
+            INDEX idx_tasks_user_updated (user_id, updated_at),
+            INDEX idx_tasks_session_updated (session_id, updated_at),
+            INDEX idx_tasks_parent_updated (parent_task_id, updated_at)
         )",
     )
     .execute(&pool)
     .await?;
-
-    // ── Learning fields for agent_tasks (idempotent migration) ──
-    // These columns support plan feedback and learning
-    for alter in [
-        "ALTER TABLE agent_tasks ADD COLUMN user_rating TINYINT NULL",
-        "ALTER TABLE agent_tasks ADD COLUMN completion_time_sec INT NULL",
-        "ALTER TABLE agent_tasks ADD COLUMN replan_count INT NOT NULL DEFAULT 0",
-        "ALTER TABLE agent_tasks ADD COLUMN auto_adjustments INT NOT NULL DEFAULT 0",
-        "ALTER TABLE agent_tasks ADD COLUMN outcome VARCHAR(20) NULL",
-        "ALTER TABLE agent_tasks ADD COLUMN project_type VARCHAR(50) NULL",
-        "ALTER TABLE agent_tasks ADD COLUMN goal_pattern VARCHAR(500) NULL",
-    ] {
-        // Ignore "duplicate column" errors for idempotency
-        let _ = query(alter).execute(&pool).await;
-    }
 
     // ── Plan templates table (learning successful patterns) ──
     query(
@@ -442,9 +394,8 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             use_count INT NOT NULL DEFAULT 0,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_tpl_user (user_id),
-            INDEX idx_tpl_pattern (goal_pattern),
-            INDEX idx_tpl_project_type (project_type)
+            INDEX idx_tpl_user_goal_project (user_id, goal_pattern, project_type),
+            INDEX idx_tpl_project_success (project_type, success_rate)
         )",
     )
     .execute(&pool)
@@ -466,8 +417,8 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             error_count INT NOT NULL DEFAULT 0,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             UNIQUE KEY idx_ckpt_session_number (session_id, number),
-            INDEX idx_ckpt_user (user_id),
-            INDEX idx_ckpt_created (created_at)
+            INDEX idx_ckpt_session_turn (session_id, turn),
+            INDEX idx_ckpt_user_created (user_id, created_at)
         )",
     )
     .execute(&pool)
@@ -485,7 +436,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             is_error SMALLINT NOT NULL DEFAULT 0,
             cached_at BIGINT NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_idempotency_step (step_id),
+            INDEX idx_idempotency_step_tool (step_id, tool_index),
             INDEX idx_idempotency_hash (content_hash)
         )",
     )

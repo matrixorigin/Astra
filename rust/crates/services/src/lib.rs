@@ -88,8 +88,8 @@ pub use models::{
 };
 pub use protocol::{
     ApplyDeltaRequest, ApplyDeltaResponse, ApplyOptions, Checkpoint, CheckpointOptions,
-    CheckpointTriggers, Conflict, ConflictResolution, DeltaBatch, DeltaEngine, DeltaError,
-    DeltaOp, DeltaOpType, DeltaRange, FallbackThresholds, GetChangesRequest, GetChangesResponse,
+    CheckpointTriggers, Conflict, ConflictResolution, DeltaBatch, DeltaEngine, DeltaError, DeltaOp,
+    DeltaOpType, DeltaRange, FallbackThresholds, GetChangesRequest, GetChangesResponse,
     GetStateRequest, IncrementalSyncProtocol, StateRef, StateRefType, StateSnapshot, SyncMetrics,
     SyncType, Tombstone, VersionVector, endpoints, grpc_methods, should_fallback_to_full_sync,
 };

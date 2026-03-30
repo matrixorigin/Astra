@@ -1020,8 +1020,10 @@ mod tests {
         assert!(!detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW));
 
         record_server_tool_signatures(&mut tool_sigs, &calls, window);
-        assert!(!detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW),
-            "2 identical calls should not trigger stall with window=3");
+        assert!(
+            !detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW),
+            "2 identical calls should not trigger stall with window=3"
+        );
 
         record_server_tool_signatures(&mut tool_sigs, &calls, window);
         assert!(

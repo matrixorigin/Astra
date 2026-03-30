@@ -17,6 +17,13 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+fn is_duplicate_key_error(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db_err) => db_err.code().as_deref() == Some("1062"),
+        _ => false,
+    }
+}
+
 // ─── Restored Session State ─────────────────────────────────────────────────
 
 /// The reconstructed state needed to resume a session.
@@ -153,11 +160,11 @@ impl HybridRestoreService {
 
                 // Extract plan state from metadata JSON
                 let metadata_str: Option<String> = row.try_get("metadata").ok().flatten();
-                let (plan_json, plan_goal, plan_config, plan_rounds) =
-                    match metadata_str.as_deref() {
-                        Some(m) if !m.is_empty() => extract_plan_from_metadata(m),
-                        _ => (None, None, None, 0),
-                    };
+                let (plan_json, plan_goal, plan_config, plan_rounds) = match metadata_str.as_deref()
+                {
+                    Some(m) if !m.is_empty() => extract_plan_from_metadata(m),
+                    _ => (None, None, None, 0),
+                };
 
                 Ok(Some(RestoredSession {
                     session_id: session_id.to_string(),
@@ -446,18 +453,12 @@ pub async fn push_checkpoint_to_cloud(
     let tools_json =
         serde_json::to_string(&checkpoint.tools_used).unwrap_or_else(|_| "[]".to_string());
 
-    sqlx::query(
-        "INSERT INTO session_checkpoints \
-         (checkpoint_id, session_id, user_id, number, turn, title, summary, \
-          tools_json, total_tokens, had_stalls, error_count, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW()) \
-         ON DUPLICATE KEY UPDATE \
-           summary = VALUES(summary), total_tokens = VALUES(total_tokens)",
+    let updated = sqlx::query(
+        "UPDATE session_checkpoints SET \
+            turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
+            had_stalls = ?, error_count = ? \
+         WHERE session_id = ? AND number = ?",
     )
-    .bind(&checkpoint_id)
-    .bind(session_id)
-    .bind(user_id)
-    .bind(checkpoint.number as i32)
     .bind(checkpoint.turn as i32)
     .bind(&checkpoint.title)
     .bind(&checkpoint.summary)
@@ -465,9 +466,58 @@ pub async fn push_checkpoint_to_cloud(
     .bind(checkpoint.total_tokens as i64)
     .bind(if checkpoint.had_stalls { 1i32 } else { 0 })
     .bind(checkpoint.error_count as i32)
+    .bind(session_id)
+    .bind(checkpoint.number as i32)
     .execute(pool)
     .await
-    .map_err(|e| format!("push_checkpoint: {e}"))?;
+    .map_err(|e| format!("push_checkpoint update: {e}"))?;
+
+    if updated.rows_affected() == 0 {
+        let inserted = sqlx::query(
+            "INSERT INTO session_checkpoints \
+             (checkpoint_id, session_id, user_id, number, turn, title, summary, \
+              tools_json, total_tokens, had_stalls, error_count, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+        )
+        .bind(&checkpoint_id)
+        .bind(session_id)
+        .bind(user_id)
+        .bind(checkpoint.number as i32)
+        .bind(checkpoint.turn as i32)
+        .bind(&checkpoint.title)
+        .bind(&checkpoint.summary)
+        .bind(&tools_json)
+        .bind(checkpoint.total_tokens as i64)
+        .bind(if checkpoint.had_stalls { 1i32 } else { 0 })
+        .bind(checkpoint.error_count as i32)
+        .execute(pool)
+        .await;
+
+        if let Err(e) = inserted {
+            if is_duplicate_key_error(&e) {
+                sqlx::query(
+                    "UPDATE session_checkpoints SET \
+                        turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
+                        had_stalls = ?, error_count = ? \
+                     WHERE session_id = ? AND number = ?",
+                )
+                .bind(checkpoint.turn as i32)
+                .bind(&checkpoint.title)
+                .bind(&checkpoint.summary)
+                .bind(&tools_json)
+                .bind(checkpoint.total_tokens as i64)
+                .bind(if checkpoint.had_stalls { 1i32 } else { 0 })
+                .bind(checkpoint.error_count as i32)
+                .bind(session_id)
+                .bind(checkpoint.number as i32)
+                .execute(pool)
+                .await
+                .map_err(|err| format!("push_checkpoint retry update: {err}"))?;
+            } else {
+                return Err(format!("push_checkpoint insert: {e}"));
+            }
+        }
+    }
 
     Ok(())
 }
@@ -489,26 +539,63 @@ pub async fn push_step_checkpoint_to_cloud(
 ) -> Result<(), String> {
     let checkpoint_id = uuid::Uuid::new_v4().to_string();
 
-    sqlx::query(
-        "INSERT INTO session_checkpoints \
-         (checkpoint_id, session_id, user_id, number, turn, title, summary, \
-          tools_json, state_json, total_tokens, had_stalls, error_count, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, NOW()) \
-         ON DUPLICATE KEY UPDATE \
-           state_json = VALUES(state_json), tools_json = VALUES(tools_json)",
+    let updated = sqlx::query(
+        "UPDATE session_checkpoints SET \
+            turn = ?, title = ?, summary = ?, tools_json = ?, state_json = ? \
+         WHERE session_id = ? AND number = ?",
     )
-    .bind(&checkpoint_id)
-    .bind(session_id)
-    .bind(user_id)
-    .bind(checkpoint_number as i32)
     .bind(turn as i32)
     .bind(title)
     .bind(tier)
     .bind(tools_json)
     .bind(state_json)
+    .bind(session_id)
+    .bind(checkpoint_number as i32)
     .execute(pool)
     .await
-    .map_err(|e| format!("push_step_checkpoint: {e}"))?;
+    .map_err(|e| format!("push_step_checkpoint update: {e}"))?;
+
+    if updated.rows_affected() == 0 {
+        let inserted = sqlx::query(
+            "INSERT INTO session_checkpoints \
+             (checkpoint_id, session_id, user_id, number, turn, title, summary, \
+              tools_json, state_json, total_tokens, had_stalls, error_count, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, NOW())",
+        )
+        .bind(&checkpoint_id)
+        .bind(session_id)
+        .bind(user_id)
+        .bind(checkpoint_number as i32)
+        .bind(turn as i32)
+        .bind(title)
+        .bind(tier)
+        .bind(tools_json)
+        .bind(state_json)
+        .execute(pool)
+        .await;
+
+        if let Err(e) = inserted {
+            if is_duplicate_key_error(&e) {
+                sqlx::query(
+                    "UPDATE session_checkpoints SET \
+                        turn = ?, title = ?, summary = ?, tools_json = ?, state_json = ? \
+                     WHERE session_id = ? AND number = ?",
+                )
+                .bind(turn as i32)
+                .bind(title)
+                .bind(tier)
+                .bind(tools_json)
+                .bind(state_json)
+                .bind(session_id)
+                .bind(checkpoint_number as i32)
+                .execute(pool)
+                .await
+                .map_err(|err| format!("push_step_checkpoint retry update: {err}"))?;
+            } else {
+                return Err(format!("push_step_checkpoint insert: {e}"));
+            }
+        }
+    }
 
     Ok(())
 }
@@ -582,14 +669,12 @@ pub async fn push_plan_state_to_cloud(
 
     let metadata_json = serde_json::Value::Object(metadata).to_string();
 
-    sqlx::query(
-        "UPDATE agent_sessions SET metadata = ?, updated_at = NOW() WHERE session_id = ?",
-    )
-    .bind(&metadata_json)
-    .bind(session_id)
-    .execute(pool)
-    .await
-    .map_err(|e| format!("push_plan_state: {e}"))?;
+    sqlx::query("UPDATE agent_sessions SET metadata = ?, updated_at = NOW() WHERE session_id = ?")
+        .bind(&metadata_json)
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("push_plan_state: {e}"))?;
 
     Ok(())
 }

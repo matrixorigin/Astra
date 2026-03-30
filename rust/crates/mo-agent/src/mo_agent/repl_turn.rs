@@ -340,10 +340,10 @@ fn apply_turn_success(
         .with_plan_subtask(state.current_plan_subtask_id.as_deref())
         .with_ttft(result.ttft_ms)
         .with_context_time(result.context_ms);
-        
+
         // Store for /turn command
         state.last_turn_event = Some(turn_event.clone());
-        
+
         if let Err(e) = journal.append(&turn_event) {
             mo_agent_core::agent_warn!("journal", "failed to write turn event: {e}");
         }
@@ -356,10 +356,14 @@ fn apply_turn_success(
             ws.record_turn(result.prompt_tokens, result.completion_tokens);
 
             // Persist plan state to workspace for session resume
-            ws.executing_plan_json = state.executing_plan.as_ref()
+            ws.executing_plan_json = state
+                .executing_plan
+                .as_ref()
                 .and_then(|p| serde_json::to_string(p).ok());
             ws.plan_goal = state.executing_plan_goal.clone();
-            ws.plan_config_json = state.plan_execution_config.as_ref()
+            ws.plan_config_json = state
+                .plan_execution_config
+                .as_ref()
                 .and_then(|c| serde_json::to_string(c).ok());
             ws.plan_execution_rounds = state.plan_execution_rounds;
 
@@ -550,7 +554,7 @@ fn apply_turn_success(
 
     // Record turn outcome for pipeline learning (entity graph, patterns, calibration)
     {
-        use mo_agent_runtime::pipeline::evaluation::{evaluate_turn, ToolCallInfo};
+        use mo_agent_runtime::pipeline::evaluation::{ToolCallInfo, evaluate_turn};
         use mo_agent_runtime::pipeline::routing::RoutingEngine;
         let routing = RoutingEngine::analyze(line, state.turn, &state.recent_tools, &[], vec![]);
         let is_live_query = looks_like_live_query_with_context(line, &state.recent_tools);

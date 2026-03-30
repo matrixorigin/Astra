@@ -71,10 +71,11 @@ impl fmt::Display for SyncDomain {
 ///                                       ▼
 ///                                   Conflict ──resolve──▶ Dirty
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SyncState {
     /// Local and cloud are consistent (or cloud is unavailable and we don't care).
+    #[default]
     Clean,
     /// Local has unpushed changes.
     Dirty,
@@ -88,16 +89,7 @@ pub enum SyncState {
     /// Pull in progress.
     Pulling,
     /// Unrecoverable error — needs manual intervention or auto-retry.
-    Error {
-        retry_count: u8,
-        last_error: String,
-    },
-}
-
-impl Default for SyncState {
-    fn default() -> Self {
-        Self::Clean
-    }
+    Error { retry_count: u8, last_error: String },
 }
 
 impl SyncState {
@@ -384,11 +376,7 @@ pub trait CloudTransport: Send + Sync {
     ) -> Result<PushResult, SyncError>;
 
     /// Pull the latest payload from cloud for the given domain.
-    async fn pull(
-        &self,
-        user_id: &str,
-        domain: SyncDomain,
-    ) -> Result<PullResult, SyncError>;
+    async fn pull(&self, user_id: &str, domain: SyncDomain) -> Result<PullResult, SyncError>;
 
     /// Check if cloud is reachable.
     async fn health_check(&self) -> bool;
@@ -415,11 +403,7 @@ impl CloudTransport for NoopTransport {
         })
     }
 
-    async fn pull(
-        &self,
-        _user_id: &str,
-        _domain: SyncDomain,
-    ) -> Result<PullResult, SyncError> {
+    async fn pull(&self, _user_id: &str, _domain: SyncDomain) -> Result<PullResult, SyncError> {
         Ok(PullResult {
             payload: None,
             version: None,
@@ -672,7 +656,14 @@ impl SyncOrchestrator {
                 envelope.mark_error(e.message.clone());
                 adapter.set_envelope(envelope);
 
-                self.log_event(domain, SyncOperation::Pull, false, start, 0, Some(&e.message));
+                self.log_event(
+                    domain,
+                    SyncOperation::Pull,
+                    false,
+                    start,
+                    0,
+                    Some(&e.message),
+                );
                 return DomainSyncResult::error(domain, e.message);
             }
             Err(_) => {
@@ -768,7 +759,11 @@ impl SyncOrchestrator {
             }
 
             // Check if it's a conflict and we have retries left
-            if result.error.as_deref().map(|e| e.contains("conflict")).unwrap_or(false)
+            if result
+                .error
+                .as_deref()
+                .map(|e| e.contains("conflict"))
+                .unwrap_or(false)
                 && attempt < max_retries
             {
                 // Pull fresh data, merge, then retry
@@ -829,7 +824,8 @@ impl SyncOrchestrator {
         // Push with timeout
         let push_result = tokio::time::timeout(
             Duration::from_secs(policy.timeout_secs),
-            self.transport.push(&self.user_id, domain, &payload, expected_version),
+            self.transport
+                .push(&self.user_id, domain, &payload, expected_version),
         )
         .await;
 

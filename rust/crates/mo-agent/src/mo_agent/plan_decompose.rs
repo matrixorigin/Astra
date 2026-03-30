@@ -180,26 +180,28 @@ pub fn analyze_project(root: &Path) -> ProjectContext {
         if let Some(branch) = head.trim().strip_prefix("ref: refs/heads/") {
             ctx.git_branch = Some(branch.to_string());
         }
-        
+
         // Check for uncommitted changes by looking at git index
         let git_dir = root.join(".git");
         if git_dir.exists() {
             // Simple heuristic: check if index file exists and has recent mtime
             let index_file = git_dir.join("index");
             ctx.has_uncommitted_changes = index_file.exists();
-            
+
             // Count dirty files by checking worktree against index (simplified)
             // This is a fast approximation - not as accurate as `git status`
             ctx.git_dirty_count = count_dirty_files(root);
         }
     }
-    
+
     // Count test files
     ctx.test_file_count = count_test_files(root);
 
     // Build structure summary and key directories
     let mut dirs = Vec::new();
-    let key_dir_names = ["src", "lib", "tests", "test", "spec", "examples", "docs", "benches"];
+    let key_dir_names = [
+        "src", "lib", "tests", "test", "spec", "examples", "docs", "benches",
+    ];
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -227,7 +229,7 @@ pub fn analyze_project(root: &Path) -> ProjectContext {
 /// Count test files in a project (simplified heuristic).
 fn count_test_files(root: &Path) -> usize {
     let mut count = 0;
-    
+
     // Common test directories
     let test_dirs = ["tests", "test", "spec", "__tests__"];
     for dir in &test_dirs {
@@ -236,22 +238,26 @@ fn count_test_files(root: &Path) -> usize {
             count += count_files_in_dir(&test_path, 3);
         }
     }
-    
+
     // Also count files matching test patterns in src
     let src_path = root.join("src");
     if src_path.is_dir() {
         count += count_test_files_in_src(&src_path, 4);
     }
-    
+
     count
 }
 
 /// Count files in a directory up to max_depth.
 fn count_files_in_dir(dir: &Path, max_depth: usize) -> usize {
     fn inner(dir: &Path, depth: usize, max_depth: usize) -> usize {
-        if depth > max_depth { return 0; }
-        let Ok(entries) = std::fs::read_dir(dir) else { return 0; };
-        
+        if depth > max_depth {
+            return 0;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+
         let mut count = 0;
         for entry in entries.flatten() {
             let path = entry.path();
@@ -260,8 +266,12 @@ fn count_files_in_dir(dir: &Path, max_depth: usize) -> usize {
             } else if path.is_dir() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                if !name_str.starts_with('.') && !matches!(name_str.as_ref(), 
-                    "node_modules" | "target" | "venv" | "__pycache__") {
+                if !name_str.starts_with('.')
+                    && !matches!(
+                        name_str.as_ref(),
+                        "node_modules" | "target" | "venv" | "__pycache__"
+                    )
+                {
                     count += inner(&path, depth + 1, max_depth);
                 }
             }
@@ -274,18 +284,25 @@ fn count_files_in_dir(dir: &Path, max_depth: usize) -> usize {
 /// Count test files in src directory (files matching *_test.rs, test_*.py, etc.)
 fn count_test_files_in_src(dir: &Path, max_depth: usize) -> usize {
     fn inner(dir: &Path, depth: usize, max_depth: usize) -> usize {
-        if depth > max_depth { return 0; }
-        let Ok(entries) = std::fs::read_dir(dir) else { return 0; };
-        
+        if depth > max_depth {
+            return 0;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+
         let mut count = 0;
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() {
                 let name = entry.file_name().to_string_lossy().to_lowercase();
                 // Common test file patterns
-                if name.contains("_test.") || name.contains(".test.") 
-                    || name.contains("_spec.") || name.contains(".spec.")
-                    || name.starts_with("test_") {
+                if name.contains("_test.")
+                    || name.contains(".test.")
+                    || name.contains("_spec.")
+                    || name.contains(".spec.")
+                    || name.starts_with("test_")
+                {
                     count += 1;
                 }
             } else if path.is_dir() {
@@ -341,21 +358,19 @@ fn collect_source_files(
         let path = entry.path();
         if path.is_dir() {
             collect_source_files(root, &path, depth + 1, max_depth, out);
-        } else if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if source_exts.contains(&ext) {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        let lines = content.lines().count();
-                        if lines > 20 {
-                            let rel = path
-                                .strip_prefix(root)
-                                .unwrap_or(&path)
-                                .display()
-                                .to_string();
-                            out.push((rel, lines));
-                        }
-                    }
-                }
+        } else if path.is_file()
+            && let Some(ext) = path.extension().and_then(|e| e.to_str())
+            && source_exts.contains(&ext)
+            && let Ok(content) = std::fs::read_to_string(&path)
+        {
+            let lines = content.lines().count();
+            if lines > 20 {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                out.push((rel, lines));
             }
         }
     }
@@ -533,10 +548,10 @@ fn extract_json(response: &str) -> String {
     }
 
     // Look for raw JSON object
-    if let Some(start) = response.find('{') {
-        if let Some(end) = response.rfind('}') {
-            return response[start..=end].to_string();
-        }
+    if let Some(start) = response.find('{')
+        && let Some(end) = response.rfind('}')
+    {
+        return response[start..=end].to_string();
     }
 
     response.to_string()
@@ -710,7 +725,9 @@ impl PlanModeState {
 
     /// Rollback to a specific plan version.
     pub fn rollback_to_version(&mut self, version: u32) -> Result<String, String> {
-        let v = self.version_history.get_version(version)
+        let v = self
+            .version_history
+            .get_version(version)
             .ok_or_else(|| format!("Version {} not found", version))?;
         let plan = v.plan.clone();
         let summary = format!("Rollback to v{}", version);
@@ -772,7 +789,7 @@ impl PlanModeState {
                 prompt.push_str(&format!("User {}: {}\n", i + 1, u));
                 prompt.push_str(&format!("Assistant {}: {}\n", i + 1, a));
             }
-            prompt.push_str("\n");
+            prompt.push('\n');
         }
 
         prompt.push_str(&format!("## User Request\n{}\n\n", user_message));
@@ -814,29 +831,32 @@ Keep responses concise. The plan JSON must be valid if provided."#,
 pub fn should_suggest_plan_mode(input: &str) -> Option<&'static str> {
     let lower = input.to_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
-    
+
     // Skip if input is very short (likely a question or simple command)
     // For Chinese text, count characters instead of words
-    let is_short = if input.chars().any(|c| c >= '\u{4e00}' && c <= '\u{9fff}') {
+    let is_short = if input
+        .chars()
+        .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+    {
         // Chinese: count non-whitespace characters
         input.chars().filter(|c| !c.is_whitespace()).count() < 6
     } else {
         // English: count words
         words.len() < 4
     };
-    
+
     if is_short {
         return None;
     }
-    
+
     // Multi-step indicators
-    let has_multi_step = lower.contains(" and ") 
+    let has_multi_step = lower.contains(" and ")
         || lower.contains(" then ")
         || lower.contains("，然后")
         || lower.contains("然后")
         || lower.contains("并且")
         || lower.contains("同时");
-    
+
     // Large scope indicators
     let has_large_scope = lower.contains("refactor")
         || lower.contains("重构")
@@ -848,7 +868,7 @@ pub fn should_suggest_plan_mode(input: &str) -> Option<&'static str> {
         || lower.contains("构建")
         || lower.contains("create")
         || lower.contains("创建");
-    
+
     // Feature-level work
     let has_feature_keywords = lower.contains("feature")
         || lower.contains("功能")
@@ -859,14 +879,14 @@ pub fn should_suggest_plan_mode(input: &str) -> Option<&'static str> {
         || lower.contains("service")  // singular
         || lower.contains("services") // plural
         || lower.contains("服务");
-    
+
     // Test + implementation pattern
     let mentions_tests = lower.contains("test") || lower.contains("测试");
-    let mentions_impl = lower.contains("implement") 
-        || lower.contains("add") 
+    let mentions_impl = lower.contains("implement")
+        || lower.contains("add")
         || lower.contains("create")
         || lower.contains("添加");
-    
+
     // Complexity indicators
     let mentions_multiple = lower.contains("multiple")
         || lower.contains("several")
@@ -875,39 +895,42 @@ pub fn should_suggest_plan_mode(input: &str) -> Option<&'static str> {
         || lower.contains("一些")
         || lower.contains("files")
         || lower.contains("文件");
-    
+
     // Decision logic
     if has_multi_step && (has_large_scope || has_feature_keywords) {
         return Some("Multi-step task with significant scope detected");
     }
-    
+
     if has_multi_step && mentions_tests {
         return Some("Multi-step task with testing detected");
     }
-    
+
     if mentions_tests && mentions_impl {
         return Some("Implementation + testing workflow detected");
     }
-    
+
     if has_large_scope && mentions_multiple {
         return Some("Large-scale change affecting multiple files");
     }
-    
+
     if has_large_scope && has_feature_keywords {
         return Some("Feature-level change detected");
     }
-    
+
     // Long input with action verbs often indicates complex task
-    let is_long = if input.chars().any(|c| c >= '\u{4e00}' && c <= '\u{9fff}') {
+    let is_long = if input
+        .chars()
+        .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+    {
         input.chars().filter(|c| !c.is_whitespace()).count() >= 20
     } else {
         words.len() >= 15
     };
-    
+
     if is_long && (has_large_scope || has_feature_keywords) {
         return Some("Complex task description detected");
     }
-    
+
     None
 }
 
@@ -935,8 +958,7 @@ impl PlanModeState {
     pub fn save_to_file(&self, path: &Path) -> Result<(), String> {
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create plan directory: {e}"))?;
+            std::fs::create_dir_all(parent).map_err(|e| format!("create plan directory: {e}"))?;
         }
         let json =
             serde_json::to_string_pretty(self).map_err(|e| format!("serialize plan state: {e}"))?;
@@ -963,7 +985,7 @@ impl PlanModeState {
         let path = Self::state_path();
         let _ = std::fs::remove_file(path);
     }
-    
+
     /// Directory for storing all plans.
     pub fn plans_dir() -> std::path::PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -971,12 +993,12 @@ impl PlanModeState {
             .join(".mo-agent")
             .join("plans")
     }
-    
+
     /// Generate a unique plan ID from the goal.
     pub fn generate_plan_id(goal: &str) -> String {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        
+
         // Create a slug from the goal (first few words)
         let slug: String = goal
             .split_whitespace()
@@ -987,7 +1009,7 @@ impl PlanModeState {
             .filter(|c| c.is_alphanumeric() || *c == '-')
             .take(30)
             .collect();
-        
+
         // Add a short hash for uniqueness
         let mut hasher = DefaultHasher::new();
         goal.hash(&mut hasher);
@@ -997,40 +1019,39 @@ impl PlanModeState {
             .unwrap_or(0);
         ts.hash(&mut hasher);
         let hash = hasher.finish();
-        
+
         if slug.is_empty() {
             format!("plan-{:08x}", hash as u32)
         } else {
             format!("{}-{:04x}", slug.to_lowercase(), (hash & 0xFFFF) as u16)
         }
     }
-    
+
     /// Save this plan to the plans directory with a generated ID.
     pub fn save_to_plans_dir(&self) -> Result<String, String> {
         let plans_dir = Self::plans_dir();
-        std::fs::create_dir_all(&plans_dir)
-            .map_err(|e| format!("create plans dir: {e}"))?;
-        
+        std::fs::create_dir_all(&plans_dir).map_err(|e| format!("create plans dir: {e}"))?;
+
         let plan_id = Self::generate_plan_id(&self.goal);
         let path = plans_dir.join(format!("{}.json", plan_id));
         self.save_to_file(&path)?;
-        
+
         Ok(plan_id)
     }
-    
+
     /// Load a plan from the plans directory by ID.
     pub fn load_from_plans_dir(plan_id: &str) -> Result<Self, String> {
         let path = Self::plans_dir().join(format!("{}.json", plan_id));
         Self::load_from_file(&path)
     }
-    
+
     /// List all saved plans in the plans directory.
     pub fn list_saved_plans() -> Vec<SavedPlanInfo> {
         let plans_dir = Self::plans_dir();
         let Ok(entries) = std::fs::read_dir(&plans_dir) else {
             return Vec::new();
         };
-        
+
         let mut plans = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
@@ -1040,7 +1061,7 @@ impl PlanModeState {
             let Some(name) = path.file_stem().and_then(|n| n.to_str()) else {
                 continue;
             };
-            
+
             if let Ok(state) = Self::load_from_file(&path) {
                 let status = if state.plan.progress_pct() == 100 {
                     "completed"
@@ -1049,17 +1070,17 @@ impl PlanModeState {
                 } else {
                     "pending"
                 };
-                
+
                 plans.push(SavedPlanInfo {
                     name: name.to_string(),
                     goal: state.goal,
-                    progress_pct: state.plan.progress_pct() as u32,
+                    progress_pct: state.plan.progress_pct(),
                     subtask_count: state.plan.subtasks.len(),
                     status: status.to_string(),
                 });
             }
         }
-        
+
         // Sort by progress (in-progress first, then pending, then completed)
         plans.sort_by(|a, b| {
             let order = |s: &str| match s {
@@ -1068,13 +1089,14 @@ impl PlanModeState {
                 "completed" => 2,
                 _ => 3,
             };
-            order(&a.status).cmp(&order(&b.status))
+            order(&a.status)
+                .cmp(&order(&b.status))
                 .then_with(|| b.progress_pct.cmp(&a.progress_pct))
         });
-        
+
         plans
     }
-    
+
     /// Delete a saved plan by ID.
     pub fn delete_saved_plan(plan_id: &str) -> Result<(), String> {
         let path = Self::plans_dir().join(format!("{}.json", plan_id));
@@ -1090,7 +1112,7 @@ pub fn format_plan_mode_prompt() -> &'static str {
 // ─── Plan Mode Entry Card ────────────────────────────────────────────────────
 
 /// Format the plan mode entry card shown when user enters /plan.
-/// 
+///
 /// Shows:
 /// - Active plan status if any
 /// - Smart options based on state
@@ -1099,23 +1121,21 @@ pub fn format_plan_entry_card(
     paused_plan: Option<&TaskPlan>,
 ) -> String {
     let mut out = String::new();
-    
+
     out.push_str("┌─────────────────────────────────────────────────────┐\n");
     out.push_str("│  📋 Plan Mode                                        │\n");
     out.push_str("│  ─────────────────────────────────────────────────  │\n");
-    
+
     if let Some(ps) = active_plan {
         // Show active plan summary
         let pct = ps.plan.progress_pct();
-        let done = ps.plan.items_done();
-        let total = ps.plan.subtasks.len();
-        
+
         out.push_str(&format!(
             "│  Active: \"{}\" ({}% done)        \n",
             truncate_str(&ps.goal, 35),
             pct
         ));
-        
+
         // Show task tree (max 4 items)
         for (i, st) in ps.plan.subtasks.iter().take(4).enumerate() {
             let icon = match st.status {
@@ -1137,7 +1157,7 @@ pub fn format_plan_entry_card(
                 ps.plan.subtasks.len() - 4
             ));
         }
-        
+
         out.push_str("│                                                      │\n");
         out.push_str("│  Options: [1] continue  [2] restart  [3] new  [4] exit │\n");
     } else if let Some(paused) = paused_plan {
@@ -1155,9 +1175,9 @@ pub fn format_plan_entry_card(
         out.push_str("│                                                      │\n");
         out.push_str("│  Describe what you want to do:                       │\n");
     }
-    
+
     out.push_str("└─────────────────────────────────────────────────────┘\n");
-    
+
     out
 }
 
@@ -1176,12 +1196,12 @@ pub enum PlanEntryChoice {
 pub fn parse_plan_entry_choice(input: &str, has_active: bool, has_paused: bool) -> PlanEntryChoice {
     let trimmed = input.trim();
     let lower = trimmed.to_lowercase();
-    
+
     // Check for explicit commands
     if lower == "exit" || lower == "quit" || lower == "4" {
         return PlanEntryChoice::Exit;
     }
-    
+
     if has_active {
         // [1] continue [2] restart [3] new [4] exit
         match trimmed {
@@ -1199,7 +1219,7 @@ pub fn parse_plan_entry_choice(input: &str, has_active: bool, has_paused: bool) 
             _ => {}
         }
     }
-    
+
     // Anything else is a goal description
     PlanEntryChoice::Goal(trimmed.to_string())
 }
@@ -1229,7 +1249,7 @@ pub struct ClarificationQuestion {
 }
 
 /// Category of clarification to help UI formatting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ClarificationCategory {
     /// Scope: what features to include/exclude
@@ -1239,21 +1259,16 @@ pub enum ClarificationCategory {
     /// Behavior: how should X behave in edge cases
     Behavior,
     /// Technical: specific technical decisions
+    #[default]
     Technical,
     /// Confirmation: yes/no confirmation
     Confirmation,
 }
 
-impl Default for ClarificationCategory {
-    fn default() -> Self {
-        ClarificationCategory::Technical
-    }
-}
-
 /// Format a clarification question for CLI display.
 pub fn format_clarification_question(q: &ClarificationQuestion) -> String {
     let mut out = String::new();
-    
+
     // Category icon
     let icon = match q.category {
         ClarificationCategory::Scope => "📦",
@@ -1262,10 +1277,10 @@ pub fn format_clarification_question(q: &ClarificationQuestion) -> String {
         ClarificationCategory::Technical => "🔧",
         ClarificationCategory::Confirmation => "❓",
     };
-    
+
     out.push_str(&format!("  {} {}\n", icon, q.question));
-    out.push_str("\n");
-    
+    out.push('\n');
+
     for (i, opt) in q.options.iter().enumerate() {
         let num = i + 1;
         let is_default = q.default == Some(i);
@@ -1273,33 +1288,36 @@ pub fn format_clarification_question(q: &ClarificationQuestion) -> String {
         let suffix = if is_default { " (default)" } else { "" };
         out.push_str(&format!("  {} [{}] {}{}\n", marker, num, opt, suffix));
     }
-    
+
     out.push_str("\n  Enter number or describe alternative: ");
     out
 }
 
 /// Parse user's response to a clarification question.
-pub fn parse_clarification_response(input: &str, question: &ClarificationQuestion) -> ClarificationAnswer {
+pub fn parse_clarification_response(
+    input: &str,
+    question: &ClarificationQuestion,
+) -> ClarificationAnswer {
     let trimmed = input.trim();
-    
+
     // Empty input with default
     if trimmed.is_empty() {
         if let Some(default_idx) = question.default {
             return ClarificationAnswer::Selected(default_idx);
         }
-        return ClarificationAnswer::Invalid("Please enter a number or describe your choice".to_string());
+        return ClarificationAnswer::Invalid(
+            "Please enter a number or describe your choice".to_string(),
+        );
     }
-    
+
     // Try to parse as number
     if let Ok(num) = trimmed.parse::<usize>() {
         if num >= 1 && num <= question.options.len() {
             return ClarificationAnswer::Selected(num - 1);
         }
-        return ClarificationAnswer::Invalid(format!(
-            "Please enter 1-{}", question.options.len()
-        ));
+        return ClarificationAnswer::Invalid(format!("Please enter 1-{}", question.options.len()));
     }
-    
+
     // Treat as freeform answer
     ClarificationAnswer::Freeform(trimmed.to_string())
 }
@@ -1329,18 +1347,18 @@ impl PendingClarifications {
     pub fn next_question(&self) -> Option<&ClarificationQuestion> {
         self.questions.get(self.answers.len())
     }
-    
+
     /// Record an answer and return true if all questions answered.
     pub fn record_answer(&mut self, answer: String) -> bool {
         self.answers.push(answer);
         self.answers.len() >= self.questions.len()
     }
-    
+
     /// Check if all questions have been answered.
     pub fn is_complete(&self) -> bool {
         self.answers.len() >= self.questions.len()
     }
-    
+
     /// Format all Q&A pairs for inclusion in a prompt.
     pub fn format_for_prompt(&self) -> String {
         let mut out = String::new();
@@ -1355,26 +1373,29 @@ impl PendingClarifications {
 /// Returns parsed questions if found, None otherwise.
 pub fn detect_clarification_questions(llm_text: &str) -> Option<Vec<ClarificationQuestion>> {
     // Look for JSON array of questions or structured question format
-    
+
     // Try JSON array format first
-    if let Some(start) = llm_text.find("[{\"question\"") {
-        if let Some(end) = llm_text[start..].rfind(']') {
-            let json_str = &llm_text[start..start+end+1];
-            if let Ok(questions) = serde_json::from_str::<Vec<ClarificationQuestion>>(json_str) {
-                if !questions.is_empty() {
-                    return Some(questions);
-                }
-            }
+    if let Some(start) = llm_text.find("[{\"question\"")
+        && let Some(end) = llm_text[start..].rfind(']')
+    {
+        let json_str = &llm_text[start..start + end + 1];
+        if let Ok(questions) = serde_json::from_str::<Vec<ClarificationQuestion>>(json_str)
+            && !questions.is_empty()
+        {
+            return Some(questions);
         }
     }
-    
+
     // Try CLARIFICATION: marker format
     if llm_text.contains("CLARIFICATION:") || llm_text.contains("QUESTION:") {
         let mut questions = Vec::new();
-        
+
         for line in llm_text.lines() {
             let line = line.trim();
-            if let Some(q_text) = line.strip_prefix("CLARIFICATION:").or_else(|| line.strip_prefix("QUESTION:")) {
+            if let Some(q_text) = line
+                .strip_prefix("CLARIFICATION:")
+                .or_else(|| line.strip_prefix("QUESTION:"))
+            {
                 // Simple question without options - treat as yes/no
                 questions.push(ClarificationQuestion {
                     question: q_text.trim().to_string(),
@@ -1384,12 +1405,12 @@ pub fn detect_clarification_questions(llm_text: &str) -> Option<Vec<Clarificatio
                 });
             }
         }
-        
+
         if !questions.is_empty() {
             return Some(questions);
         }
     }
-    
+
     None
 }
 
@@ -1398,44 +1419,54 @@ pub fn detect_clarification_questions(llm_text: &str) -> Option<Vec<Clarificatio
 /// Format project context for display in plan mode.
 pub fn format_project_context(ctx: &ProjectContext) -> String {
     let mut out = String::new();
-    
+
     out.push_str("  📁 Project Context\n");
-    
+
     // Type detection
     let project_type = if ctx.entry_points.contains(&"Cargo.toml".to_string()) {
         "Rust"
     } else if ctx.entry_points.contains(&"package.json".to_string()) {
         "Node.js"
-    } else if ctx.entry_points.contains(&"pyproject.toml".to_string()) 
-        || ctx.entry_points.contains(&"setup.py".to_string()) {
+    } else if ctx.entry_points.contains(&"pyproject.toml".to_string())
+        || ctx.entry_points.contains(&"setup.py".to_string())
+    {
         "Python"
     } else if ctx.entry_points.contains(&"go.mod".to_string()) {
         "Go"
     } else {
         "Unknown"
     };
-    
+
     let test_cmd = ctx.test_framework.as_deref().unwrap_or("unknown");
-    out.push_str(&format!("  ├─ Type: {} workspace ({})\n", project_type, test_cmd));
-    
+    out.push_str(&format!(
+        "  ├─ Type: {} workspace ({})\n",
+        project_type, test_cmd
+    ));
+
     // Languages
     if !ctx.languages.is_empty() {
         out.push_str(&format!("  ├─ Languages: {}\n", ctx.languages.join(", ")));
     }
-    
+
     // Key directories
     if !ctx.key_directories.is_empty() {
-        out.push_str(&format!("  ├─ Key dirs: {}\n", ctx.key_directories.join(", ")));
+        out.push_str(&format!(
+            "  ├─ Key dirs: {}\n",
+            ctx.key_directories.join(", ")
+        ));
     }
-    
+
     // File counts
     let test_info = if ctx.test_file_count > 0 {
         format!(" ({} test files)", ctx.test_file_count)
     } else {
         String::new()
     };
-    out.push_str(&format!("  ├─ Source files: {}{}\n", ctx.source_file_count, test_info));
-    
+    out.push_str(&format!(
+        "  ├─ Source files: {}{}\n",
+        ctx.source_file_count, test_info
+    ));
+
     // Git info
     if let Some(ref branch) = ctx.git_branch {
         let dirty_info = if ctx.has_uncommitted_changes {
@@ -1451,7 +1482,7 @@ pub fn format_project_context(ctx: &ProjectContext) -> String {
     } else {
         out.push_str("  └─ Git: not detected\n");
     }
-    
+
     out
 }
 
@@ -1472,49 +1503,64 @@ pub enum TreeViewMode {
 /// Format a plan as a compact tree with progress indicators.
 pub fn format_plan_tree(plan: &TaskPlan, mode: TreeViewMode) -> String {
     let mut out = String::new();
-    
+
     let done = plan.items_done() as usize;
     let total = plan.subtasks.len();
     let pct = plan.progress_pct();
-    
+
     // Header with progress bar
     out.push_str(&format_progress_header(pct, done, total));
     out.push('\n');
-    
+
     // Task tree
-    let ready: std::collections::HashSet<_> = plan.ready_subtasks()
+    let ready: std::collections::HashSet<_> = plan
+        .ready_subtasks()
         .iter()
         .map(|st| st.id.clone())
         .collect();
-    
+
     for (i, st) in plan.subtasks.iter().enumerate() {
         let is_last = i == plan.subtasks.len() - 1;
         let prefix = if is_last { "└─" } else { "├─" };
         let icon = status_icon(&st.status, ready.contains(&st.id));
         let effort = effort_badge(&st.effort);
-        
+
         match mode {
             TreeViewMode::Compact => {
                 out.push_str(&format!("  {} {} {}{}\n", prefix, icon, st.title, effort));
             }
             TreeViewMode::Detailed => {
-                out.push_str(&format!("  {} {} {} [{}]{}\n", prefix, icon, st.title, st.id, effort));
+                out.push_str(&format!(
+                    "  {} {} {} [{}]{}\n",
+                    prefix, icon, st.title, st.id, effort
+                ));
                 let cont_prefix = if is_last { "   " } else { "│  " };
                 if let Some(ref desc) = st.description {
-                    out.push_str(&format!("  {}   └─ {}\n", cont_prefix, truncate_str(desc, 50)));
+                    out.push_str(&format!(
+                        "  {}   └─ {}\n",
+                        cont_prefix,
+                        truncate_str(desc, 50)
+                    ));
                 }
                 if !st.files.is_empty() {
                     out.push_str(&format!("  {}   📁 {}\n", cont_prefix, st.files.join(", ")));
                 }
             }
             TreeViewMode::Progress => {
-                let task_pct = if st.status == TaskStatus::Completed { 100 } else { 0 };
+                let task_pct = if st.status == TaskStatus::Completed {
+                    100
+                } else {
+                    0
+                };
                 let bar = mini_progress_bar(task_pct, 10);
-                out.push_str(&format!("  {} {} {} {}{}\n", prefix, icon, bar, st.title, effort));
+                out.push_str(&format!(
+                    "  {} {} {} {}{}\n",
+                    prefix, icon, bar, st.title, effort
+                ));
             }
         }
     }
-    
+
     out
 }
 
@@ -1699,7 +1745,10 @@ impl PlanExecutionSummary {
             out.push_str(&format!("│ Failed:    {}\n", self.failed));
         }
         if self.parallel_rounds > 0 {
-            out.push_str(&format!("│ Rounds:    {} (parallel-aware)\n", self.parallel_rounds));
+            out.push_str(&format!(
+                "│ Rounds:    {} (parallel-aware)\n",
+                self.parallel_rounds
+            ));
         }
         if !self.execution_order.is_empty() {
             out.push_str(&format!(
@@ -1732,7 +1781,10 @@ pub fn format_execution_preview(plan: &TaskPlan) -> String {
     // Show parallel groups
     if analysis.groups.len() > 1 || analysis.groups.first().map(|g| g.len()).unwrap_or(0) > 1 {
         out.push_str("│\n");
-        out.push_str(&format!("│ Parallel Groups ({} rounds):\n", analysis.groups.len()));
+        out.push_str(&format!(
+            "│ Parallel Groups ({} rounds):\n",
+            analysis.groups.len()
+        ));
         for (i, group) in analysis.groups.iter().enumerate() {
             let names: Vec<_> = group
                 .iter()
@@ -1759,7 +1811,9 @@ pub fn format_execution_preview(plan: &TaskPlan) -> String {
         for c in &analysis.conflicts {
             out.push_str(&format!(
                 "│   {} ↔ {} ({})\n",
-                c.subtask_a, c.subtask_b, c.shared_files.join(", ")
+                c.subtask_a,
+                c.subtask_b,
+                c.shared_files.join(", ")
             ));
         }
     }
@@ -1895,35 +1949,48 @@ impl PlanVersionHistory {
 
     /// Show a compact diff between two versions (by listing changed subtask IDs).
     pub fn diff_versions(&self, from: u32, to: u32) -> Result<PlanDiff, String> {
-        let v_from = self.get_version(from)
+        let v_from = self
+            .get_version(from)
             .ok_or_else(|| format!("Version {} not found", from))?;
-        let v_to = self.get_version(to)
+        let v_to = self
+            .get_version(to)
             .ok_or_else(|| format!("Version {} not found", to))?;
 
-        let old_ids: std::collections::HashSet<&str> = v_from.plan.subtasks.iter()
-            .map(|s| s.id.as_str()).collect();
-        let new_ids: std::collections::HashSet<&str> = v_to.plan.subtasks.iter()
-            .map(|s| s.id.as_str()).collect();
+        let old_ids: std::collections::HashSet<&str> =
+            v_from.plan.subtasks.iter().map(|s| s.id.as_str()).collect();
+        let new_ids: std::collections::HashSet<&str> =
+            v_to.plan.subtasks.iter().map(|s| s.id.as_str()).collect();
 
-        let added: Vec<String> = new_ids.difference(&old_ids).map(|s| s.to_string()).collect();
-        let removed: Vec<String> = old_ids.difference(&new_ids).map(|s| s.to_string()).collect();
+        let added: Vec<String> = new_ids
+            .difference(&old_ids)
+            .map(|s| s.to_string())
+            .collect();
+        let removed: Vec<String> = old_ids
+            .difference(&new_ids)
+            .map(|s| s.to_string())
+            .collect();
 
         // Detect modified (same ID but different title/description/deps)
         let mut modified = Vec::new();
         for st_new in &v_to.plan.subtasks {
-            if let Some(st_old) = v_from.plan.subtasks.iter().find(|s| s.id == st_new.id) {
-                if st_new.title != st_old.title
+            if let Some(st_old) = v_from.plan.subtasks.iter().find(|s| s.id == st_new.id)
+                && (st_new.title != st_old.title
                     || st_new.description != st_old.description
                     || st_new.depends_on != st_old.depends_on
                     || st_new.effort != st_old.effort
-                    || st_new.files != st_old.files
-                {
-                    modified.push(st_new.id.clone());
-                }
+                    || st_new.files != st_old.files)
+            {
+                modified.push(st_new.id.clone());
             }
         }
 
-        Ok(PlanDiff { from_version: from, to_version: to, added, removed, modified })
+        Ok(PlanDiff {
+            from_version: from,
+            to_version: to,
+            added,
+            removed,
+            modified,
+        })
     }
 
     /// Format a compact version log for display.
@@ -1933,8 +2000,13 @@ impl PlanVersionHistory {
         }
         let mut out = String::new();
         for v in self.versions.iter().rev().take(10) {
-            out.push_str(&format!("  v{}: {} ({} subtasks) — {}\n",
-                v.version, v.change_summary, v.plan.subtasks.len(), v.timestamp));
+            out.push_str(&format!(
+                "  v{}: {} ({} subtasks) — {}\n",
+                v.version,
+                v.change_summary,
+                v.plan.subtasks.len(),
+                v.timestamp
+            ));
         }
         out
     }
@@ -1956,7 +2028,10 @@ impl PlanDiff {
     }
 
     pub fn format(&self) -> String {
-        let mut out = format!("  Plan diff v{} → v{}:\n", self.from_version, self.to_version);
+        let mut out = format!(
+            "  Plan diff v{} → v{}:\n",
+            self.from_version, self.to_version
+        );
         for id in &self.added {
             out.push_str(&format!("    + {}\n", id));
         }
@@ -1996,11 +2071,23 @@ pub enum TimelineEventKind {
     /// A subtask started
     SubtaskStarted { subtask_id: String, title: String },
     /// A subtask completed successfully
-    SubtaskCompleted { subtask_id: String, title: String, duration_sec: u64 },
+    SubtaskCompleted {
+        subtask_id: String,
+        title: String,
+        duration_sec: u64,
+    },
     /// A subtask failed
-    SubtaskFailed { subtask_id: String, title: String, error: String },
+    SubtaskFailed {
+        subtask_id: String,
+        title: String,
+        error: String,
+    },
     /// A subtask was skipped
-    SubtaskSkipped { subtask_id: String, title: String, reason: String },
+    SubtaskSkipped {
+        subtask_id: String,
+        title: String,
+        reason: String,
+    },
     /// Plan was modified/replanned
     Replan { reason: String, changes: String },
     /// User provided feedback/rating
@@ -2014,7 +2101,10 @@ pub enum TimelineEventKind {
     /// A discovery/observation during execution
     Discovery { message: String },
     /// Git commit associated with changes
-    GitCommit { commit_hash: String, message: String },
+    GitCommit {
+        commit_hash: String,
+        message: String,
+    },
 }
 
 /// A single event in the execution timeline.
@@ -2035,18 +2125,18 @@ impl TimelineEvent {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        
+
         // Convert to HH:MM format (simplified - assumes local time)
         let hours = (now / 3600) % 24;
         let minutes = (now / 60) % 60;
-        
+
         Self {
             timestamp: now.to_string(),
             time_display: format!("{:02}:{:02}", hours, minutes),
             event,
         }
     }
-    
+
     /// Format event for display
     pub fn format_display(&self) -> String {
         let icon = match &self.event {
@@ -2060,44 +2150,59 @@ impl TimelineEvent {
             TimelineEventKind::UserRating { .. } => "⭐",
             TimelineEventKind::ExecutionPaused { .. } => "⏸",
             TimelineEventKind::ExecutionResumed => "▶",
-            TimelineEventKind::PlanCompleted { success, .. } => if *success { "✅" } else { "❌" },
+            TimelineEventKind::PlanCompleted { success, .. } => {
+                if *success {
+                    "✅"
+                } else {
+                    "❌"
+                }
+            }
             TimelineEventKind::Discovery { .. } => "⚠",
             TimelineEventKind::GitCommit { .. } => "📦",
         };
-        
+
         let desc = match &self.event {
-            TimelineEventKind::PlanCreated { subtask_count } => 
-                format!("Plan created ({} subtasks)", subtask_count),
-            TimelineEventKind::ExecutionStarted { mode } => 
-                format!("Started {} execution", mode),
-            TimelineEventKind::SubtaskStarted { title, .. } => 
-                format!("Started: {}", title),
-            TimelineEventKind::SubtaskCompleted { title, duration_sec, .. } => 
-                format!("{} ({} sec)", title, duration_sec),
-            TimelineEventKind::SubtaskFailed { title, error, .. } => 
-                format!("{} - {}", title, error),
-            TimelineEventKind::SubtaskSkipped { title, reason, .. } => 
-                format!("Skipped: {} ({})", title, reason),
-            TimelineEventKind::Replan { reason, .. } => 
-                format!("Replan: {}", reason),
-            TimelineEventKind::UserRating { rating } => 
-                format!("Rating: {}/5", rating),
-            TimelineEventKind::ExecutionPaused { reason } => 
-                format!("Paused: {}", reason),
-            TimelineEventKind::ExecutionResumed => 
-                "Resumed".to_string(),
-            TimelineEventKind::PlanCompleted { success, duration_sec } => 
-                if *success { 
-                    format!("Completed ({} sec total)", duration_sec) 
-                } else { 
-                    format!("Failed ({} sec total)", duration_sec) 
-                },
-            TimelineEventKind::Discovery { message } => 
-                format!("Discovered: {}", message),
-            TimelineEventKind::GitCommit { commit_hash, message } => 
-                format!("Commit {}: {}", &commit_hash[..7.min(commit_hash.len())], message),
+            TimelineEventKind::PlanCreated { subtask_count } => {
+                format!("Plan created ({} subtasks)", subtask_count)
+            }
+            TimelineEventKind::ExecutionStarted { mode } => format!("Started {} execution", mode),
+            TimelineEventKind::SubtaskStarted { title, .. } => format!("Started: {}", title),
+            TimelineEventKind::SubtaskCompleted {
+                title,
+                duration_sec,
+                ..
+            } => format!("{} ({} sec)", title, duration_sec),
+            TimelineEventKind::SubtaskFailed { title, error, .. } => {
+                format!("{} - {}", title, error)
+            }
+            TimelineEventKind::SubtaskSkipped { title, reason, .. } => {
+                format!("Skipped: {} ({})", title, reason)
+            }
+            TimelineEventKind::Replan { reason, .. } => format!("Replan: {}", reason),
+            TimelineEventKind::UserRating { rating } => format!("Rating: {}/5", rating),
+            TimelineEventKind::ExecutionPaused { reason } => format!("Paused: {}", reason),
+            TimelineEventKind::ExecutionResumed => "Resumed".to_string(),
+            TimelineEventKind::PlanCompleted {
+                success,
+                duration_sec,
+            } => {
+                if *success {
+                    format!("Completed ({} sec total)", duration_sec)
+                } else {
+                    format!("Failed ({} sec total)", duration_sec)
+                }
+            }
+            TimelineEventKind::Discovery { message } => format!("Discovered: {}", message),
+            TimelineEventKind::GitCommit {
+                commit_hash,
+                message,
+            } => format!(
+                "Commit {}: {}",
+                &commit_hash[..7.min(commit_hash.len())],
+                message
+            ),
         };
-        
+
         format!("{}  {} {}", self.time_display, icon, desc)
     }
 }
@@ -2117,7 +2222,7 @@ impl ExecutionTimeline {
     /// Record a new event.
     pub fn record(&mut self, kind: TimelineEventKind) {
         let event = TimelineEvent::new(kind);
-        
+
         // Track start/end timestamps
         match &event.event {
             TimelineEventKind::PlanCreated { .. } => {
@@ -2128,63 +2233,71 @@ impl ExecutionTimeline {
             }
             _ => {}
         }
-        
+
         self.events.push(event);
     }
-    
+
     /// Record plan creation.
     pub fn plan_created(&mut self, subtask_count: usize) {
         self.record(TimelineEventKind::PlanCreated { subtask_count });
     }
-    
+
     /// Record execution start.
     pub fn execution_started(&mut self, auto_mode: bool) {
-        let mode = if auto_mode { "auto".to_string() } else { "step".to_string() };
+        let mode = if auto_mode {
+            "auto".to_string()
+        } else {
+            "step".to_string()
+        };
         self.record(TimelineEventKind::ExecutionStarted { mode });
     }
-    
+
     /// Record subtask start.
     pub fn subtask_started(&mut self, subtask_id: &str, title: &str) {
-        self.record(TimelineEventKind::SubtaskStarted { 
-            subtask_id: subtask_id.to_string(), 
-            title: title.to_string() 
+        self.record(TimelineEventKind::SubtaskStarted {
+            subtask_id: subtask_id.to_string(),
+            title: title.to_string(),
         });
     }
-    
+
     /// Record subtask completion.
     pub fn subtask_completed(&mut self, subtask_id: &str, title: &str, duration_sec: u64) {
-        self.record(TimelineEventKind::SubtaskCompleted { 
-            subtask_id: subtask_id.to_string(), 
+        self.record(TimelineEventKind::SubtaskCompleted {
+            subtask_id: subtask_id.to_string(),
             title: title.to_string(),
-            duration_sec 
+            duration_sec,
         });
     }
-    
+
     /// Record subtask failure.
     pub fn subtask_failed(&mut self, subtask_id: &str, title: &str, error: &str) {
-        self.record(TimelineEventKind::SubtaskFailed { 
-            subtask_id: subtask_id.to_string(), 
+        self.record(TimelineEventKind::SubtaskFailed {
+            subtask_id: subtask_id.to_string(),
             title: title.to_string(),
-            error: error.to_string()
+            error: error.to_string(),
         });
     }
-    
+
     /// Record a discovery/observation.
     pub fn discovery(&mut self, message: &str) {
-        self.record(TimelineEventKind::Discovery { message: message.to_string() });
-    }
-    
-    /// Record a git commit.
-    pub fn git_commit(&mut self, commit_hash: &str, message: &str) {
-        self.record(TimelineEventKind::GitCommit { 
-            commit_hash: commit_hash.to_string(),
-            message: message.to_string()
+        self.record(TimelineEventKind::Discovery {
+            message: message.to_string(),
         });
     }
-    
+
+    /// Record a git commit.
+    pub fn git_commit(&mut self, commit_hash: &str, message: &str) {
+        self.record(TimelineEventKind::GitCommit {
+            commit_hash: commit_hash.to_string(),
+            message: message.to_string(),
+        });
+    }
+
     /// Record plan completion.
     pub fn plan_completed(&mut self, success: bool) {
-        let duration_sec = self.start_timestamp.as_ref()
+        let duration_sec = self
+            .start_timestamp
+            .as_ref()
             .and_then(|s| s.parse::<u64>().ok())
             .map(|start| {
                 let now = std::time::SystemTime::now()
@@ -2194,16 +2307,19 @@ impl ExecutionTimeline {
                 now.saturating_sub(start)
             })
             .unwrap_or(0);
-        
-        self.record(TimelineEventKind::PlanCompleted { success, duration_sec });
+
+        self.record(TimelineEventKind::PlanCompleted {
+            success,
+            duration_sec,
+        });
     }
-    
+
     /// Format timeline for display.
     pub fn format_display(&self) -> String {
         if self.events.is_empty() {
             return "  (no events recorded)".to_string();
         }
-        
+
         let mut out = String::new();
         for event in &self.events {
             out.push_str("  ");
@@ -2212,7 +2328,7 @@ impl ExecutionTimeline {
         }
         out
     }
-    
+
     /// Get total duration in seconds (if completed).
     pub fn total_duration_sec(&self) -> Option<u64> {
         match (self.start_timestamp.as_ref(), self.end_timestamp.as_ref()) {
@@ -2221,23 +2337,32 @@ impl ExecutionTimeline {
                 let end_sec = end.parse::<u64>().ok()?;
                 Some(end_sec.saturating_sub(start_sec))
             }
-            _ => None
+            _ => None,
         }
     }
-    
+
     /// Count completed subtasks.
     pub fn completed_subtask_count(&self) -> usize {
-        self.events.iter().filter(|e| matches!(e.event, TimelineEventKind::SubtaskCompleted { .. })).count()
+        self.events
+            .iter()
+            .filter(|e| matches!(e.event, TimelineEventKind::SubtaskCompleted { .. }))
+            .count()
     }
-    
+
     /// Count failed subtasks.
     pub fn failed_subtask_count(&self) -> usize {
-        self.events.iter().filter(|e| matches!(e.event, TimelineEventKind::SubtaskFailed { .. })).count()
+        self.events
+            .iter()
+            .filter(|e| matches!(e.event, TimelineEventKind::SubtaskFailed { .. }))
+            .count()
     }
-    
+
     /// Count replans.
     pub fn replan_count(&self) -> usize {
-        self.events.iter().filter(|e| matches!(e.event, TimelineEventKind::Replan { .. })).count()
+        self.events
+            .iter()
+            .filter(|e| matches!(e.event, TimelineEventKind::Replan { .. }))
+            .count()
     }
 }
 
@@ -2266,7 +2391,11 @@ pub fn analyze_parallelism(plan: &TaskPlan) -> ParallelGroups {
     let ready = plan.ready_subtasks();
     if ready.len() <= 1 {
         return ParallelGroups {
-            groups: if ready.is_empty() { vec![] } else { vec![vec![ready[0].id.clone()]] },
+            groups: if ready.is_empty() {
+                vec![]
+            } else {
+                vec![vec![ready[0].id.clone()]]
+            },
             conflicts: vec![],
         };
     }
@@ -2275,7 +2404,9 @@ pub fn analyze_parallelism(plan: &TaskPlan) -> ParallelGroups {
     let mut conflicts = Vec::new();
     for i in 0..ready.len() {
         for j in (i + 1)..ready.len() {
-            let shared: Vec<String> = ready[i].files.iter()
+            let shared: Vec<String> = ready[i]
+                .files
+                .iter()
                 .filter(|f| ready[j].files.contains(f))
                 .cloned()
                 .collect();
@@ -2291,20 +2422,23 @@ pub fn analyze_parallelism(plan: &TaskPlan) -> ParallelGroups {
 
     // Build groups: use a simple greedy coloring approach
     // conflicting subtasks can't be in the same group
-    let conflict_pairs: std::collections::HashSet<(String, String)> = conflicts.iter()
-        .flat_map(|c| vec![
-            (c.subtask_a.clone(), c.subtask_b.clone()),
-            (c.subtask_b.clone(), c.subtask_a.clone()),
-        ])
+    let conflict_pairs: std::collections::HashSet<(String, String)> = conflicts
+        .iter()
+        .flat_map(|c| {
+            vec![
+                (c.subtask_a.clone(), c.subtask_b.clone()),
+                (c.subtask_b.clone(), c.subtask_a.clone()),
+            ]
+        })
         .collect();
 
     let mut groups: Vec<Vec<String>> = Vec::new();
     for st in &ready {
         let mut placed = false;
         for group in groups.iter_mut() {
-            let has_conflict = group.iter().any(|g_id| {
-                conflict_pairs.contains(&(g_id.clone(), st.id.clone()))
-            });
+            let has_conflict = group
+                .iter()
+                .any(|g_id| conflict_pairs.contains(&(g_id.clone(), st.id.clone())));
             if !has_conflict {
                 group.push(st.id.clone());
                 placed = true;
@@ -2327,7 +2461,10 @@ pub fn format_parallelism(analysis: &ParallelGroups) -> String {
         if analysis.groups.is_empty() {
             out.push_str("  No ready subtasks.\n");
         } else {
-            out.push_str(&format!("  Sequential: {}\n", analysis.groups[0].join(", ")));
+            out.push_str(&format!(
+                "  Sequential: {}\n",
+                analysis.groups[0].join(", ")
+            ));
         }
         return out;
     }
@@ -2335,15 +2472,24 @@ pub fn format_parallelism(analysis: &ParallelGroups) -> String {
     out.push_str("  ┌── Parallel Execution Groups ──\n");
     for (i, group) in analysis.groups.iter().enumerate() {
         let label = if group.len() > 1 { "║" } else { "│" };
-        out.push_str(&format!("  {} Group {}: {}\n", label, i + 1, group.join(" + ")));
+        out.push_str(&format!(
+            "  {} Group {}: {}\n",
+            label,
+            i + 1,
+            group.join(" + ")
+        ));
     }
     out.push_str("  └────────────────────────────────\n");
 
     if !analysis.conflicts.is_empty() {
         out.push_str("  ⚠ File conflicts:\n");
         for c in &analysis.conflicts {
-            out.push_str(&format!("    {} ↔ {} on: {}\n",
-                c.subtask_a, c.subtask_b, c.shared_files.join(", ")));
+            out.push_str(&format!(
+                "    {} ↔ {} on: {}\n",
+                c.subtask_a,
+                c.subtask_b,
+                c.shared_files.join(", ")
+            ));
         }
     }
 
@@ -2374,10 +2520,16 @@ impl ReplanReason {
                 format!("Subtask '{}' failed: {}", subtask_id, error)
             }
             Self::DependencyDeadlock { blocked_ids } => {
-                format!("Dependency deadlock: {} subtasks blocked", blocked_ids.len())
+                format!(
+                    "Dependency deadlock: {} subtasks blocked",
+                    blocked_ids.len()
+                )
             }
             Self::FileConflicts { conflict_count } => {
-                format!("{} file conflicts preventing parallel execution", conflict_count)
+                format!(
+                    "{} file conflicts preventing parallel execution",
+                    conflict_count
+                )
             }
             Self::SlowExecution { rounds, expected } => {
                 format!("Execution slow: {} rounds (expected {})", rounds, expected)
@@ -2392,17 +2544,17 @@ impl ReplanReason {
 pub struct ReplanSuggestion {
     pub reason: ReplanReason,
     pub suggested_action: String,
-    pub auto_applicable: bool,  // Can be applied without user confirmation
+    pub auto_applicable: bool, // Can be applied without user confirmation
 }
 
 /// Detect if a replan is needed based on current plan state.
 pub fn detect_replan_needed(
     plan: &TaskPlan,
     execution_rounds: usize,
-    failed_subtasks: &[(&str, &str)],  // (subtask_id, error_message)
+    failed_subtasks: &[(&str, &str)], // (subtask_id, error_message)
 ) -> Option<ReplanSuggestion> {
     use mo_agent_services::task_orchestrator::TaskStatus;
-    
+
     // 1. Check for failed subtasks
     if let Some((id, error)) = failed_subtasks.first() {
         return Some(ReplanSuggestion {
@@ -2417,7 +2569,7 @@ pub fn detect_replan_needed(
             auto_applicable: false,
         });
     }
-    
+
     // 2. Check for dependency deadlock
     let pending: Vec<&str> = plan
         .subtasks
@@ -2425,19 +2577,20 @@ pub fn detect_replan_needed(
         .filter(|s| s.status == TaskStatus::Pending)
         .map(|s| s.id.as_str())
         .collect();
-    
+
     let ready = plan.ready_subtasks();
-    
+
     // If there are pending subtasks but none are ready, we have a deadlock
     if !pending.is_empty() && ready.is_empty() {
         let blocked_ids: Vec<String> = pending.iter().map(|s| s.to_string()).collect();
         return Some(ReplanSuggestion {
             reason: ReplanReason::DependencyDeadlock { blocked_ids },
-            suggested_action: "Review dependencies and remove or reorder blocked subtasks".to_string(),
+            suggested_action: "Review dependencies and remove or reorder blocked subtasks"
+                .to_string(),
             auto_applicable: false,
         });
     }
-    
+
     // 3. Check for excessive file conflicts
     let analysis = analyze_parallelism(plan);
     if analysis.conflicts.len() >= 3 {
@@ -2445,11 +2598,12 @@ pub fn detect_replan_needed(
             reason: ReplanReason::FileConflicts {
                 conflict_count: analysis.conflicts.len(),
             },
-            suggested_action: "Split subtasks to reduce file overlap or merge related subtasks".to_string(),
+            suggested_action: "Split subtasks to reduce file overlap or merge related subtasks"
+                .to_string(),
             auto_applicable: false,
         });
     }
-    
+
     // 4. Check for slow execution
     let expected_rounds = plan.subtasks.len();
     if execution_rounds > expected_rounds * 2 && execution_rounds >= 6 {
@@ -2462,7 +2616,7 @@ pub fn detect_replan_needed(
             auto_applicable: false,
         });
     }
-    
+
     None
 }
 
@@ -2474,15 +2628,15 @@ pub fn generate_replan_prompt(
     context: &ProjectContext,
 ) -> String {
     use mo_agent_services::task_orchestrator::TaskStatus;
-    
+
     let mut prompt = String::with_capacity(2048);
-    
+
     prompt.push_str("You are replanning a task that encountered issues during execution.\n\n");
-    
+
     prompt.push_str("## Original Goal\n");
     prompt.push_str(original_goal);
     prompt.push_str("\n\n");
-    
+
     prompt.push_str("## Current Plan Status\n");
     for st in &current_plan.subtasks {
         let status_icon = match st.status {
@@ -2492,23 +2646,26 @@ pub fn generate_replan_prompt(
             TaskStatus::Pending => "⏳",
             _ => "○",
         };
-        prompt.push_str(&format!("- {} [{}] {} (deps: {:?})\n", 
-            status_icon, st.id, st.title, st.depends_on));
+        prompt.push_str(&format!(
+            "- {} [{}] {} (deps: {:?})\n",
+            status_icon, st.id, st.title, st.depends_on
+        ));
     }
-    prompt.push_str("\n");
-    
+    prompt.push('\n');
+
     prompt.push_str("## Problem Encountered\n");
     prompt.push_str(&reason.format());
     prompt.push_str("\n\n");
-    
+
     prompt.push_str("## Project Context\n");
     prompt.push_str(&format!("- Languages: {}\n", context.languages.join(", ")));
     if let Some(ref branch) = context.git_branch {
         prompt.push_str(&format!("- Git branch: {}\n", branch));
     }
-    prompt.push_str("\n");
-    
-    prompt.push_str(r#"## Instructions
+    prompt.push('\n');
+
+    prompt.push_str(
+        r#"## Instructions
 Generate a revised plan that:
 1. Keeps completed subtasks as-is (do NOT modify them)
 2. Addresses the problem by modifying pending/failed subtasks
@@ -2523,19 +2680,20 @@ Return JSON in the same format as the original plan:
   "notes": "Explanation of changes made"
 }
 ```
-"#);
-    
+"#,
+    );
+
     prompt
 }
 
 /// Format replan suggestion for CLI display.
 pub fn format_replan_suggestion(suggestion: &ReplanSuggestion) -> String {
     let mut out = String::new();
-    out.push_str("\n");
+    out.push('\n');
     out.push_str("  ⚠️ Replan Suggested\n");
     out.push_str(&format!("  Reason: {}\n", suggestion.reason.format()));
     out.push_str(&format!("  Action: {}\n", suggestion.suggested_action));
-    out.push_str("\n");
+    out.push('\n');
     out.push_str("  Type '/plan replan' to regenerate the plan\n");
     out
 }
@@ -2697,17 +2855,23 @@ pub fn suggest_templates(context: &ProjectContext, goal: &str) -> Vec<&'static s
 
     for t in &templates {
         // Language match
-        let lang_match = t.languages.is_empty() || t.languages.iter().any(|l|
-            context.languages.iter().any(|cl| cl.eq_ignore_ascii_case(l))
-        );
+        let lang_match = t.languages.is_empty()
+            || t.languages.iter().any(|l| {
+                context
+                    .languages
+                    .iter()
+                    .any(|cl| cl.eq_ignore_ascii_case(l))
+            });
         if !lang_match {
             continue;
         }
 
         // Goal keyword match
-        let name_match = goal_lower.contains(&t.name.replace('-', " "))
-            || goal_lower.contains(&t.name);
-        let desc_match = t.description.split_whitespace()
+        let name_match =
+            goal_lower.contains(&t.name.replace('-', " ")) || goal_lower.contains(&t.name);
+        let desc_match = t
+            .description
+            .split_whitespace()
             .any(|w| w.len() > 3 && goal_lower.contains(&w.to_lowercase()));
 
         if name_match || desc_match {
@@ -2764,38 +2928,41 @@ pub fn list_saved_plans() -> Vec<SavedPlanInfo> {
 
     // Check for active plan state
     let state_path = plans_dir.join("plan_state.json");
-    if state_path.exists() {
-        if let Ok(state) = PlanModeState::load_from_file(&state_path) {
-            result.push(SavedPlanInfo {
-                name: "active".to_string(),
-                goal: state.goal,
-                progress_pct: state.plan.progress_pct(),
-                subtask_count: state.plan.subtasks.len(),
-                status: if state.plan.progress_pct() == 100 { "completed" } else { "active" }.to_string(),
-            });
-        }
+    if state_path.exists()
+        && let Ok(state) = PlanModeState::load_from_file(&state_path)
+    {
+        result.push(SavedPlanInfo {
+            name: "active".to_string(),
+            goal: state.goal,
+            progress_pct: state.plan.progress_pct(),
+            subtask_count: state.plan.subtasks.len(),
+            status: if state.plan.progress_pct() == 100 {
+                "completed"
+            } else {
+                "active"
+            }
+            .to_string(),
+        });
     }
 
     // Check for plan templates in templates dir
     let templates_dir = plans_dir.join("plan_templates");
-    if templates_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&templates_dir) {
-            for entry in entries.flatten() {
-                if let Some(ext) = entry.path().extension() {
-                    if ext == "json" {
-                        if let Ok(data) = std::fs::read_to_string(entry.path()) {
-                            if let Ok(tmpl) = serde_json::from_str::<PlanTemplate>(&data) {
-                                result.push(SavedPlanInfo {
-                                    name: tmpl.name,
-                                    goal: tmpl.description,
-                                    progress_pct: 0,
-                                    subtask_count: tmpl.subtasks.len(),
-                                    status: "template".to_string(),
-                                });
-                            }
-                        }
-                    }
-                }
+    if templates_dir.exists()
+        && let Ok(entries) = std::fs::read_dir(&templates_dir)
+    {
+        for entry in entries.flatten() {
+            if let Some(ext) = entry.path().extension()
+                && ext == "json"
+                && let Ok(data) = std::fs::read_to_string(entry.path())
+                && let Ok(tmpl) = serde_json::from_str::<PlanTemplate>(&data)
+            {
+                result.push(SavedPlanInfo {
+                    name: tmpl.name,
+                    goal: tmpl.description,
+                    progress_pct: 0,
+                    subtask_count: tmpl.subtasks.len(),
+                    status: "template".to_string(),
+                });
             }
         }
     }
@@ -2828,11 +2995,16 @@ pub fn format_plan_list(plans: &[SavedPlanInfo]) -> String {
             "template" => "📋",
             _ => "·",
         };
-        let done_count = (p.subtask_count as u32 * p.progress_pct / 100.max(1)) as usize;
-        out.push_str(&format!("  {} {} — {} ({}%, {}/{} subtasks)\n",
-            status_icon, p.name, truncate_str(&p.goal, 40), p.progress_pct, 
+        let done_count = (p.subtask_count as u32 * p.progress_pct / 100) as usize;
+        out.push_str(&format!(
+            "  {} {} — {} ({}%, {}/{} subtasks)\n",
+            status_icon,
+            p.name,
+            truncate_str(&p.goal, 40),
+            p.progress_pct,
             done_count,
-            p.subtask_count));
+            p.subtask_count
+        ));
     }
     out.push_str("  └────────────────\n");
     out
@@ -3781,7 +3953,9 @@ Done!"#;
         let mut history = PlanVersionHistory::default();
         let plan = TaskPlan {
             subtasks: vec![SubtaskPlan {
-                id: "a".into(), title: "A".into(), ..Default::default()
+                id: "a".into(),
+                title: "A".into(),
+                ..Default::default()
             }],
             notes: None,
         };
@@ -3804,8 +3978,16 @@ Done!"#;
 
         let plan_v1 = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() },
-                SubtaskPlan { id: "b".into(), title: "B".into(), ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "A".into(),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "B".into(),
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
@@ -3813,8 +3995,16 @@ Done!"#;
 
         let plan_v2 = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "A modified".into(), ..Default::default() },
-                SubtaskPlan { id: "c".into(), title: "C new".into(), ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "A modified".into(),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "c".into(),
+                    title: "C new".into(),
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
@@ -3822,15 +4012,25 @@ Done!"#;
 
         let diff = history.diff_versions(1, 2).unwrap();
         assert!(diff.added.contains(&"c".to_string()), "c should be added");
-        assert!(diff.removed.contains(&"b".to_string()), "b should be removed");
-        assert!(diff.modified.contains(&"a".to_string()), "a should be modified");
+        assert!(
+            diff.removed.contains(&"b".to_string()),
+            "b should be removed"
+        );
+        assert!(
+            diff.modified.contains(&"a".to_string()),
+            "a should be modified"
+        );
     }
 
     #[test]
     fn version_diff_no_changes() {
         let mut history = PlanVersionHistory::default();
         let plan = TaskPlan {
-            subtasks: vec![SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() }],
+            subtasks: vec![SubtaskPlan {
+                id: "a".into(),
+                title: "A".into(),
+                ..Default::default()
+            }],
             notes: None,
         };
         history.record(&plan, "v1");
@@ -3849,7 +4049,10 @@ Done!"#;
     #[test]
     fn version_log_format() {
         let mut history = PlanVersionHistory::default();
-        let plan = TaskPlan { subtasks: vec![], notes: None };
+        let plan = TaskPlan {
+            subtasks: vec![],
+            notes: None,
+        };
         history.record(&plan, "Created");
         history.record(&plan, "Added tasks");
 
@@ -3866,9 +4069,21 @@ Done!"#;
     fn parallel_groups_no_deps_all_parallel() {
         let plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() },
-                SubtaskPlan { id: "b".into(), title: "B".into(), ..Default::default() },
-                SubtaskPlan { id: "c".into(), title: "C".into(), ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "A".into(),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "B".into(),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "c".into(),
+                    title: "C".into(),
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
@@ -3884,17 +4099,20 @@ Done!"#;
         let plan = TaskPlan {
             subtasks: vec![
                 SubtaskPlan {
-                    id: "a".into(), title: "A".into(),
+                    id: "a".into(),
+                    title: "A".into(),
                     files: vec!["src/main.rs".into()],
                     ..Default::default()
                 },
                 SubtaskPlan {
-                    id: "b".into(), title: "B".into(),
+                    id: "b".into(),
+                    title: "B".into(),
                     files: vec!["src/main.rs".into(), "src/lib.rs".into()],
                     ..Default::default()
                 },
                 SubtaskPlan {
-                    id: "c".into(), title: "C".into(),
+                    id: "c".into(),
+                    title: "C".into(),
                     files: vec!["src/other.rs".into()],
                     ..Default::default()
                 },
@@ -3903,19 +4121,29 @@ Done!"#;
         };
 
         let analysis = analyze_parallelism(&plan);
-        assert!(analysis.conflicts.len() >= 1, "should detect a-b conflict");
-        assert!(analysis.conflicts[0].shared_files.contains(&"src/main.rs".to_string()));
+        assert!(!analysis.conflicts.is_empty(), "should detect a-b conflict");
+        assert!(
+            analysis.conflicts[0]
+                .shared_files
+                .contains(&"src/main.rs".to_string())
+        );
 
         // a and b should be in different groups, c can go with either
-        assert!(analysis.groups.len() >= 2, "should split conflicting subtasks: {:?}", analysis.groups);
+        assert!(
+            analysis.groups.len() >= 2,
+            "should split conflicting subtasks: {:?}",
+            analysis.groups
+        );
     }
 
     #[test]
     fn parallel_groups_single_subtask() {
         let plan = TaskPlan {
-            subtasks: vec![
-                SubtaskPlan { id: "only".into(), title: "Only one".into(), ..Default::default() },
-            ],
+            subtasks: vec![SubtaskPlan {
+                id: "only".into(),
+                title: "Only one".into(),
+                ..Default::default()
+            }],
             notes: None,
         };
 
@@ -3929,9 +4157,14 @@ Done!"#;
     fn parallel_groups_respects_dependency_filter() {
         let plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() },
                 SubtaskPlan {
-                    id: "b".into(), title: "B".into(),
+                    id: "a".into(),
+                    title: "A".into(),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "B".into(),
                     depends_on: vec!["a".into()],
                     ..Default::default()
                 },
@@ -3948,10 +4181,7 @@ Done!"#;
     #[test]
     fn format_parallelism_display() {
         let analysis = ParallelGroups {
-            groups: vec![
-                vec!["a".into(), "c".into()],
-                vec!["b".into()],
-            ],
+            groups: vec![vec!["a".into(), "c".into()], vec!["b".into()]],
             conflicts: vec![FileConflict {
                 subtask_a: "a".into(),
                 subtask_b: "b".into(),
@@ -3964,7 +4194,10 @@ Done!"#;
         assert!(output.contains("a + c"), "group 1 should have a and c");
         assert!(output.contains("Group 2"), "should have second group");
         assert!(output.contains("⚠"), "should show conflict warning");
-        assert!(output.contains("src/main.rs"), "should show conflicting file");
+        assert!(
+            output.contains("src/main.rs"),
+            "should show conflicting file"
+        );
     }
 
     // ═══════════════════════════ Plan Template Tests ═════════════════════════
@@ -3986,9 +4219,13 @@ Done!"#;
             let ids: Vec<&str> = template.subtasks.iter().map(|s| s.id.as_str()).collect();
             for st in &template.subtasks {
                 for dep in &st.depends_on {
-                    assert!(ids.contains(&dep.as_str()),
+                    assert!(
+                        ids.contains(&dep.as_str()),
                         "Template '{}': subtask '{}' depends on '{}' which doesn't exist",
-                        template.name, st.id, dep);
+                        template.name,
+                        st.id,
+                        dep
+                    );
                 }
             }
         }
@@ -4075,8 +4312,11 @@ Done!"#;
     #[test]
     fn plan_diff_empty_format() {
         let diff = PlanDiff {
-            from_version: 1, to_version: 2,
-            added: vec![], removed: vec![], modified: vec![],
+            from_version: 1,
+            to_version: 2,
+            added: vec![],
+            removed: vec![],
+            modified: vec![],
         };
         assert!(diff.is_empty());
         assert!(diff.format().contains("no changes"));
@@ -4091,29 +4331,34 @@ Done!"#;
             subtasks: vec![
                 // Group 1: a and b are independent, can run in parallel
                 SubtaskPlan {
-                    id: "a".into(), title: "Step A".into(),
+                    id: "a".into(),
+                    title: "Step A".into(),
                     files: vec!["src/a.rs".into()],
                     ..Default::default()
                 },
                 SubtaskPlan {
-                    id: "b".into(), title: "Step B".into(),
+                    id: "b".into(),
+                    title: "Step B".into(),
                     files: vec!["src/b.rs".into()],
                     ..Default::default()
                 },
                 // Group 2: c depends on a, d depends on b
                 SubtaskPlan {
-                    id: "c".into(), title: "Step C".into(),
+                    id: "c".into(),
+                    title: "Step C".into(),
                     depends_on: vec!["a".into()],
                     ..Default::default()
                 },
                 SubtaskPlan {
-                    id: "d".into(), title: "Step D".into(),
+                    id: "d".into(),
+                    title: "Step D".into(),
                     depends_on: vec!["b".into()],
                     ..Default::default()
                 },
                 // Group 3: e depends on c and d
                 SubtaskPlan {
-                    id: "e".into(), title: "Step E".into(),
+                    id: "e".into(),
+                    title: "Step E".into(),
                     depends_on: vec!["c".into(), "d".into()],
                     ..Default::default()
                 },
@@ -4144,7 +4389,12 @@ Done!"#;
             execution_rounds.push(round);
         }
 
-        assert_eq!(execution_rounds.len(), 3, "should have 3 rounds: {:?}", execution_rounds);
+        assert_eq!(
+            execution_rounds.len(),
+            3,
+            "should have 3 rounds: {:?}",
+            execution_rounds
+        );
         // Round 1: a and b (no conflicts, no deps)
         assert!(execution_rounds[0].contains(&"a".to_string()));
         assert!(execution_rounds[0].contains(&"b".to_string()));
@@ -4161,17 +4411,20 @@ Done!"#;
         let mut plan = TaskPlan {
             subtasks: vec![
                 SubtaskPlan {
-                    id: "a".into(), title: "A".into(),
+                    id: "a".into(),
+                    title: "A".into(),
                     files: vec!["shared.rs".into()],
                     ..Default::default()
                 },
                 SubtaskPlan {
-                    id: "b".into(), title: "B".into(),
+                    id: "b".into(),
+                    title: "B".into(),
                     files: vec!["shared.rs".into()],
                     ..Default::default()
                 },
                 SubtaskPlan {
-                    id: "c".into(), title: "C".into(),
+                    id: "c".into(),
+                    title: "C".into(),
                     files: vec!["other.rs".into()],
                     ..Default::default()
                 },
@@ -4181,7 +4434,11 @@ Done!"#;
 
         let analysis = analyze_parallelism(&plan);
         // a and b conflict on shared.rs, so they should be in different groups
-        assert!(analysis.groups.len() >= 2, "conflicting tasks should split: {:?}", analysis.groups);
+        assert!(
+            analysis.groups.len() >= 2,
+            "conflicting tasks should split: {:?}",
+            analysis.groups
+        );
         assert!(!analysis.conflicts.is_empty());
 
         // Simulate group-by-group execution
@@ -4200,7 +4457,11 @@ Done!"#;
         }
 
         // All 3 tasks should complete, but in at least 2 rounds due to conflict
-        assert!(rounds.len() >= 2, "file conflict should force multiple rounds: {:?}", rounds);
+        assert!(
+            rounds.len() >= 2,
+            "file conflict should force multiple rounds: {:?}",
+            rounds
+        );
         assert_eq!(plan.progress_pct(), 100);
     }
 
@@ -4209,11 +4470,23 @@ Done!"#;
         // Linear dependency chain: a → b → c
         let mut plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() },
-                SubtaskPlan { id: "b".into(), title: "B".into(),
-                    depends_on: vec!["a".into()], ..Default::default() },
-                SubtaskPlan { id: "c".into(), title: "C".into(),
-                    depends_on: vec!["b".into()], ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "A".into(),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "B".into(),
+                    depends_on: vec!["a".into()],
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "c".into(),
+                    title: "C".into(),
+                    depends_on: vec!["b".into()],
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
@@ -4246,26 +4519,48 @@ Done!"#;
 
         // set_plan should auto-record version
         ps.set_plan(TaskPlan {
-            subtasks: vec![SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() }],
+            subtasks: vec![SubtaskPlan {
+                id: "a".into(),
+                title: "A".into(),
+                ..Default::default()
+            }],
             notes: None,
         });
         assert_eq!(ps.version_history.current_version, 1);
 
         // update_plan should also record
-        ps.update_plan(TaskPlan {
-            subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() },
-                SubtaskPlan { id: "b".into(), title: "B".into(), ..Default::default() },
-            ],
-            notes: None,
-        }, "Added subtask b");
+        ps.update_plan(
+            TaskPlan {
+                subtasks: vec![
+                    SubtaskPlan {
+                        id: "a".into(),
+                        title: "A".into(),
+                        ..Default::default()
+                    },
+                    SubtaskPlan {
+                        id: "b".into(),
+                        title: "B".into(),
+                        ..Default::default()
+                    },
+                ],
+                notes: None,
+            },
+            "Added subtask b",
+        );
         assert_eq!(ps.version_history.current_version, 2);
 
         // Rollback should work
         let result = ps.rollback_to_version(1);
         assert!(result.is_ok());
-        assert_eq!(ps.plan.subtasks.len(), 1, "should rollback to v1 with 1 subtask");
-        assert_eq!(ps.version_history.current_version, 3, "rollback creates new version");
+        assert_eq!(
+            ps.plan.subtasks.len(),
+            1,
+            "should rollback to v1 with 1 subtask"
+        );
+        assert_eq!(
+            ps.version_history.current_version, 3,
+            "rollback creates new version"
+        );
     }
 
     #[test]
@@ -4276,7 +4571,11 @@ Done!"#;
         let ctx = ProjectContext::default();
         let mut ps = PlanModeState::new("test".into(), ctx);
         ps.set_plan(TaskPlan {
-            subtasks: vec![SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() }],
+            subtasks: vec![SubtaskPlan {
+                id: "a".into(),
+                title: "A".into(),
+                ..Default::default()
+            }],
             notes: None,
         });
         ps.save_to_file(&path).unwrap();
@@ -4292,10 +4591,18 @@ Done!"#;
     fn execution_preview_format_basic() {
         let plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "A".into(),
-                    effort: Some("small".into()), ..Default::default() },
-                SubtaskPlan { id: "b".into(), title: "B".into(),
-                    effort: Some("medium".into()), ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "A".into(),
+                    effort: Some("small".into()),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "B".into(),
+                    effort: Some("medium".into()),
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
@@ -4310,12 +4617,24 @@ Done!"#;
     fn execution_preview_shows_parallel_groups() {
         let plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "A".into(),
-                    files: vec!["a.rs".into()], ..Default::default() },
-                SubtaskPlan { id: "b".into(), title: "B".into(),
-                    files: vec!["b.rs".into()], ..Default::default() },
-                SubtaskPlan { id: "c".into(), title: "C".into(),
-                    depends_on: vec!["a".into()], ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "A".into(),
+                    files: vec!["a.rs".into()],
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "B".into(),
+                    files: vec!["b.rs".into()],
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "c".into(),
+                    title: "C".into(),
+                    depends_on: vec!["a".into()],
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
@@ -4328,10 +4647,18 @@ Done!"#;
     fn execution_preview_shows_file_conflicts() {
         let plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "A".into(),
-                    files: vec!["shared.rs".into()], ..Default::default() },
-                SubtaskPlan { id: "b".into(), title: "B".into(),
-                    files: vec!["shared.rs".into()], ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "A".into(),
+                    files: vec!["shared.rs".into()],
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "B".into(),
+                    files: vec!["shared.rs".into()],
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
@@ -4344,10 +4671,18 @@ Done!"#;
     fn execution_summary_complete_plan() {
         let plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "A".into(),
-                    status: TaskStatus::Completed, ..Default::default() },
-                SubtaskPlan { id: "b".into(), title: "B".into(),
-                    status: TaskStatus::Completed, ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "A".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "B".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
@@ -4366,12 +4701,24 @@ Done!"#;
     fn execution_summary_partial_with_failures() {
         let plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "A".into(),
-                    status: TaskStatus::Completed, ..Default::default() },
-                SubtaskPlan { id: "b".into(), title: "B".into(),
-                    status: TaskStatus::Failed, ..Default::default() },
-                SubtaskPlan { id: "c".into(), title: "C".into(),
-                    status: TaskStatus::Pending, ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "A".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "B".into(),
+                    status: TaskStatus::Failed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "c".into(),
+                    title: "C".into(),
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
@@ -4387,10 +4734,18 @@ Done!"#;
     fn execution_summary_paused() {
         let plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "A".into(),
-                    status: TaskStatus::Completed, ..Default::default() },
-                SubtaskPlan { id: "b".into(), title: "B".into(),
-                    status: TaskStatus::InProgress, ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "A".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "B".into(),
+                    status: TaskStatus::InProgress,
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
@@ -4401,28 +4756,73 @@ Done!"#;
 
     #[test]
     fn parse_execution_confirmation_variants() {
-        assert_eq!(parse_execution_confirmation("y"), ExecutionConfirmation::Execute);
-        assert_eq!(parse_execution_confirmation("yes"), ExecutionConfirmation::Execute);
-        assert_eq!(parse_execution_confirmation("go"), ExecutionConfirmation::Execute);
-        assert_eq!(parse_execution_confirmation("确认"), ExecutionConfirmation::Execute);
-        assert_eq!(parse_execution_confirmation("s"), ExecutionConfirmation::StepByStep);
-        assert_eq!(parse_execution_confirmation("step"), ExecutionConfirmation::StepByStep);
-        assert_eq!(parse_execution_confirmation("e"), ExecutionConfirmation::Edit);
-        assert_eq!(parse_execution_confirmation("edit"), ExecutionConfirmation::Edit);
-        assert_eq!(parse_execution_confirmation("n"), ExecutionConfirmation::Cancel);
-        assert_eq!(parse_execution_confirmation("no"), ExecutionConfirmation::Cancel);
-        assert_eq!(parse_execution_confirmation(""), ExecutionConfirmation::Cancel);
+        assert_eq!(
+            parse_execution_confirmation("y"),
+            ExecutionConfirmation::Execute
+        );
+        assert_eq!(
+            parse_execution_confirmation("yes"),
+            ExecutionConfirmation::Execute
+        );
+        assert_eq!(
+            parse_execution_confirmation("go"),
+            ExecutionConfirmation::Execute
+        );
+        assert_eq!(
+            parse_execution_confirmation("确认"),
+            ExecutionConfirmation::Execute
+        );
+        assert_eq!(
+            parse_execution_confirmation("s"),
+            ExecutionConfirmation::StepByStep
+        );
+        assert_eq!(
+            parse_execution_confirmation("step"),
+            ExecutionConfirmation::StepByStep
+        );
+        assert_eq!(
+            parse_execution_confirmation("e"),
+            ExecutionConfirmation::Edit
+        );
+        assert_eq!(
+            parse_execution_confirmation("edit"),
+            ExecutionConfirmation::Edit
+        );
+        assert_eq!(
+            parse_execution_confirmation("n"),
+            ExecutionConfirmation::Cancel
+        );
+        assert_eq!(
+            parse_execution_confirmation("no"),
+            ExecutionConfirmation::Cancel
+        );
+        assert_eq!(
+            parse_execution_confirmation(""),
+            ExecutionConfirmation::Cancel
+        );
     }
 
     #[test]
     fn parse_subtask_confirmation_variants() {
-        assert_eq!(parse_subtask_confirmation("y"), SubtaskConfirmation::Execute);
-        assert_eq!(parse_subtask_confirmation("yes"), SubtaskConfirmation::Execute);
+        assert_eq!(
+            parse_subtask_confirmation("y"),
+            SubtaskConfirmation::Execute
+        );
+        assert_eq!(
+            parse_subtask_confirmation("yes"),
+            SubtaskConfirmation::Execute
+        );
         assert_eq!(parse_subtask_confirmation(""), SubtaskConfirmation::Execute); // default = yes
         assert_eq!(parse_subtask_confirmation("s"), SubtaskConfirmation::Skip);
-        assert_eq!(parse_subtask_confirmation("skip"), SubtaskConfirmation::Skip);
+        assert_eq!(
+            parse_subtask_confirmation("skip"),
+            SubtaskConfirmation::Skip
+        );
         assert_eq!(parse_subtask_confirmation("q"), SubtaskConfirmation::Quit);
-        assert_eq!(parse_subtask_confirmation("quit"), SubtaskConfirmation::Quit);
+        assert_eq!(
+            parse_subtask_confirmation("quit"),
+            SubtaskConfirmation::Quit
+        );
     }
 
     #[test]
@@ -4454,12 +4854,24 @@ Done!"#;
     fn execution_summary_order_tracks_completed() {
         let plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "x".into(), title: "X".into(),
-                    status: TaskStatus::Completed, ..Default::default() },
-                SubtaskPlan { id: "y".into(), title: "Y".into(),
-                    status: TaskStatus::Pending, ..Default::default() },
-                SubtaskPlan { id: "z".into(), title: "Z".into(),
-                    status: TaskStatus::Completed, ..Default::default() },
+                SubtaskPlan {
+                    id: "x".into(),
+                    title: "X".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "y".into(),
+                    title: "Y".into(),
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "z".into(),
+                    title: "Z".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
@@ -4473,12 +4885,24 @@ Done!"#;
         // All large = High effort
         let plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "A".into(),
-                    effort: Some("large".into()), ..Default::default() },
-                SubtaskPlan { id: "b".into(), title: "B".into(),
-                    effort: Some("large".into()), ..Default::default() },
-                SubtaskPlan { id: "c".into(), title: "C".into(),
-                    effort: Some("large".into()), ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "A".into(),
+                    effort: Some("large".into()),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "B".into(),
+                    effort: Some("large".into()),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "c".into(),
+                    title: "C".into(),
+                    effort: Some("large".into()),
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
@@ -4487,10 +4911,12 @@ Done!"#;
 
         // All small = Low effort
         let plan2 = TaskPlan {
-            subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "A".into(),
-                    effort: Some("small".into()), ..Default::default() },
-            ],
+            subtasks: vec![SubtaskPlan {
+                id: "a".into(),
+                title: "A".into(),
+                effort: Some("small".into()),
+                ..Default::default()
+            }],
             notes: None,
         };
         let preview2 = format_execution_preview(&plan2);
@@ -4505,16 +4931,27 @@ Done!"#;
         let mut ps = PlanModeState::new("Add authentication".into(), ctx);
         ps.set_plan(TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "1".into(), title: "User model".into(),
-                    status: TaskStatus::Completed, ..Default::default() },
-                SubtaskPlan { id: "2".into(), title: "JWT middleware".into(),
-                    status: TaskStatus::InProgress, ..Default::default() },
-                SubtaskPlan { id: "3".into(), title: "Tests".into(),
-                    ..Default::default() },
+                SubtaskPlan {
+                    id: "1".into(),
+                    title: "User model".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "2".into(),
+                    title: "JWT middleware".into(),
+                    status: TaskStatus::InProgress,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "3".into(),
+                    title: "Tests".into(),
+                    ..Default::default()
+                },
             ],
             notes: None,
         });
-        
+
         let card = format_plan_entry_card(Some(&ps), None);
         assert!(card.contains("Plan Mode"));
         assert!(card.contains("Add authentication"));
@@ -4530,11 +4967,23 @@ Done!"#;
 
     #[test]
     fn parse_plan_entry_choice_with_active() {
-        assert_eq!(parse_plan_entry_choice("1", true, false), PlanEntryChoice::Continue);
-        assert_eq!(parse_plan_entry_choice("continue", true, false), PlanEntryChoice::Continue);
-        assert_eq!(parse_plan_entry_choice("2", true, false), PlanEntryChoice::Restart);
-        assert_eq!(parse_plan_entry_choice("exit", true, false), PlanEntryChoice::Exit);
-        
+        assert_eq!(
+            parse_plan_entry_choice("1", true, false),
+            PlanEntryChoice::Continue
+        );
+        assert_eq!(
+            parse_plan_entry_choice("continue", true, false),
+            PlanEntryChoice::Continue
+        );
+        assert_eq!(
+            parse_plan_entry_choice("2", true, false),
+            PlanEntryChoice::Restart
+        );
+        assert_eq!(
+            parse_plan_entry_choice("exit", true, false),
+            PlanEntryChoice::Exit
+        );
+
         // Unrecognized input becomes a goal
         let choice = parse_plan_entry_choice("add user auth", true, false);
         match choice {
@@ -4551,9 +5000,12 @@ Done!"#;
             PlanEntryChoice::Goal(g) => assert_eq!(g, "add caching"),
             _ => panic!("Expected Goal variant"),
         }
-        
+
         // Exit still works
-        assert_eq!(parse_plan_entry_choice("exit", false, false), PlanEntryChoice::Exit);
+        assert_eq!(
+            parse_plan_entry_choice("exit", false, false),
+            PlanEntryChoice::Exit
+        );
     }
 
     #[test]
@@ -4568,7 +5020,7 @@ Done!"#;
             git_branch: Some("main".into()),
             ..Default::default()
         };
-        
+
         let formatted = format_project_context(&ctx);
         assert!(formatted.contains("Rust workspace"));
         assert!(formatted.contains("cargo test"));
@@ -4586,7 +5038,7 @@ Done!"#;
             default: Some(0),
             category: ClarificationCategory::Technical,
         };
-        
+
         let formatted = format_clarification_question(&q);
         assert!(formatted.contains("Which database"));
         assert!(formatted.contains("[1] PostgreSQL"));
@@ -4604,7 +5056,7 @@ Done!"#;
             category: ClarificationCategory::Scope,
         };
         assert!(format_clarification_question(&scope).contains("📦"));
-        
+
         let approach = ClarificationQuestion {
             question: "test".into(),
             options: vec![],
@@ -4622,11 +5074,20 @@ Done!"#;
             default: None,
             category: ClarificationCategory::Technical,
         };
-        
-        assert_eq!(parse_clarification_response("1", &q), ClarificationAnswer::Selected(0));
-        assert_eq!(parse_clarification_response("2", &q), ClarificationAnswer::Selected(1));
-        assert_eq!(parse_clarification_response("3", &q), ClarificationAnswer::Selected(2));
-        
+
+        assert_eq!(
+            parse_clarification_response("1", &q),
+            ClarificationAnswer::Selected(0)
+        );
+        assert_eq!(
+            parse_clarification_response("2", &q),
+            ClarificationAnswer::Selected(1)
+        );
+        assert_eq!(
+            parse_clarification_response("3", &q),
+            ClarificationAnswer::Selected(2)
+        );
+
         // Out of range
         match parse_clarification_response("4", &q) {
             ClarificationAnswer::Invalid(_) => {}
@@ -4642,9 +5103,12 @@ Done!"#;
             default: Some(1),
             category: ClarificationCategory::Technical,
         };
-        
+
         // Empty input uses default
-        assert_eq!(parse_clarification_response("", &q), ClarificationAnswer::Selected(1));
+        assert_eq!(
+            parse_clarification_response("", &q),
+            ClarificationAnswer::Selected(1)
+        );
     }
 
     #[test]
@@ -4655,7 +5119,7 @@ Done!"#;
             default: None,
             category: ClarificationCategory::Technical,
         };
-        
+
         // Non-numeric input is freeform
         assert_eq!(
             parse_clarification_response("use redis instead", &q),
@@ -4682,13 +5146,19 @@ Done!"#;
             ],
             answers: vec![],
         };
-        
+
         assert!(!pc.is_complete());
-        assert_eq!(pc.next_question().map(|q| &q.question), Some(&"Q1?".to_string()));
-        
+        assert_eq!(
+            pc.next_question().map(|q| &q.question),
+            Some(&"Q1?".to_string())
+        );
+
         assert!(!pc.record_answer("Answer 1".into()));
-        assert_eq!(pc.next_question().map(|q| &q.question), Some(&"Q2?".to_string()));
-        
+        assert_eq!(
+            pc.next_question().map(|q| &q.question),
+            Some(&"Q2?".to_string())
+        );
+
         assert!(pc.record_answer("Answer 2".into()));
         assert!(pc.is_complete());
         assert!(pc.next_question().is_none());
@@ -4697,17 +5167,15 @@ Done!"#;
     #[test]
     fn pending_clarifications_format_for_prompt() {
         let pc = PendingClarifications {
-            questions: vec![
-                ClarificationQuestion {
-                    question: "Database?".into(),
-                    options: vec![],
-                    default: None,
-                    category: ClarificationCategory::Technical,
-                },
-            ],
+            questions: vec![ClarificationQuestion {
+                question: "Database?".into(),
+                options: vec![],
+                default: None,
+                category: ClarificationCategory::Technical,
+            }],
             answers: vec!["PostgreSQL".into()],
         };
-        
+
         let formatted = pc.format_for_prompt();
         assert!(formatted.contains("Q: Database?"));
         assert!(formatted.contains("A: PostgreSQL"));
@@ -4718,7 +5186,7 @@ Done!"#;
         let llm_text = r#"I need some clarification:
 [{"question":"Which auth method?","options":["JWT","Session"],"default":0,"category":"technical"}]
 "#;
-        
+
         let questions = detect_clarification_questions(llm_text);
         assert!(questions.is_some());
         let qs = questions.unwrap();
@@ -4730,7 +5198,7 @@ Done!"#;
     #[test]
     fn detect_clarification_marker_format() {
         let llm_text = "Before proceeding, I need to know:\nCLARIFICATION: Should we support SSO?";
-        
+
         let questions = detect_clarification_questions(llm_text);
         assert!(questions.is_some());
         let qs = questions.unwrap();
@@ -4752,12 +5220,16 @@ Done!"#;
     fn generate_plan_id_from_goal() {
         let id1 = PlanModeState::generate_plan_id("Add user authentication");
         assert!(id1.starts_with("add-user-authentication-"), "got: {}", id1);
-        assert!(id1.len() > 25 && id1.len() < 40, "reasonable length: {}", id1);
-        
+        assert!(
+            id1.len() > 25 && id1.len() < 40,
+            "reasonable length: {}",
+            id1
+        );
+
         // Empty goal
         let id2 = PlanModeState::generate_plan_id("");
         assert!(id2.starts_with("plan-"), "empty goal: {}", id2);
-        
+
         // Special characters get filtered
         let id3 = PlanModeState::generate_plan_id("Fix bug #123 & add tests!");
         assert!(!id3.contains('#'));
@@ -4769,7 +5241,7 @@ Done!"#;
     fn save_and_load_plan_to_temp_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("test-plan.json");
-        
+
         let ctx = ProjectContext {
             root: "/test".into(),
             entry_points: vec!["Cargo.toml".into()],
@@ -4778,17 +5250,25 @@ Done!"#;
         let mut state = PlanModeState::new("Test goal".into(), ctx);
         state.set_plan(TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() },
-                SubtaskPlan { id: "b".into(), title: "B".into(), 
-                    depends_on: vec!["a".into()], ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "A".into(),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "B".into(),
+                    depends_on: vec!["a".into()],
+                    ..Default::default()
+                },
             ],
             notes: Some("Test notes".into()),
         });
-        
+
         // Save
         state.save_to_file(&path).expect("save should succeed");
         assert!(path.exists());
-        
+
         // Load
         let loaded = PlanModeState::load_from_file(&path).expect("load should succeed");
         assert_eq!(loaded.goal, "Test goal");
@@ -4822,7 +5302,7 @@ Done!"#;
                 status: "pending".into(),
             },
         ];
-        
+
         let formatted = format_plan_list(&plans);
         // In progress should appear with ▶
         assert!(formatted.contains("▶ plan-in-progress"));
@@ -4838,17 +5318,29 @@ Done!"#;
     fn format_plan_tree_compact() {
         let plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "Task A".into(),
-                    status: TaskStatus::Completed, ..Default::default() },
-                SubtaskPlan { id: "b".into(), title: "Task B".into(),
-                    status: TaskStatus::InProgress, effort: Some("medium".into()),
-                    ..Default::default() },
-                SubtaskPlan { id: "c".into(), title: "Task C".into(),
-                    depends_on: vec!["b".into()], ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "Task A".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "Task B".into(),
+                    status: TaskStatus::InProgress,
+                    effort: Some("medium".into()),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "c".into(),
+                    title: "Task C".into(),
+                    depends_on: vec!["b".into()],
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
-        
+
         let tree = format_plan_tree(&plan, TreeViewMode::Compact);
         assert!(tree.contains("Progress"), "should have progress header");
         assert!(tree.contains("33%"), "should show 33% (1/3)");
@@ -4861,18 +5353,16 @@ Done!"#;
     #[test]
     fn format_plan_tree_detailed() {
         let plan = TaskPlan {
-            subtasks: vec![
-                SubtaskPlan {
-                    id: "setup".into(),
-                    title: "Setup database".into(),
-                    description: Some("Configure PostgreSQL connection".into()),
-                    files: vec!["src/db.rs".into()],
-                    ..Default::default()
-                },
-            ],
+            subtasks: vec![SubtaskPlan {
+                id: "setup".into(),
+                title: "Setup database".into(),
+                description: Some("Configure PostgreSQL connection".into()),
+                files: vec!["src/db.rs".into()],
+                ..Default::default()
+            }],
             notes: None,
         };
-        
+
         let tree = format_plan_tree(&plan, TreeViewMode::Detailed);
         assert!(tree.contains("[setup]"), "should show ID");
         assert!(tree.contains("PostgreSQL"), "should show description");
@@ -4883,14 +5373,21 @@ Done!"#;
     fn format_plan_tree_progress_bars() {
         let plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "Done".into(),
-                    status: TaskStatus::Completed, ..Default::default() },
-                SubtaskPlan { id: "b".into(), title: "Pending".into(),
-                    ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "Done".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "Pending".into(),
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
-        
+
         let tree = format_plan_tree(&plan, TreeViewMode::Progress);
         // Progress mode shows mini bars per task
         assert!(tree.contains("▓"), "completed task should have filled bar");
@@ -4901,18 +5398,32 @@ Done!"#;
     fn format_status_line_compact() {
         let plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), title: "A".into(),
-                    status: TaskStatus::Completed, ..Default::default() },
-                SubtaskPlan { id: "b".into(), title: "B".into(),
-                    status: TaskStatus::Completed, ..Default::default() },
-                SubtaskPlan { id: "c".into(), title: "C".into(),
-                    ..Default::default() },
-                SubtaskPlan { id: "d".into(), title: "D".into(),
-                    ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    title: "A".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    title: "B".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "c".into(),
+                    title: "C".into(),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "d".into(),
+                    title: "D".into(),
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
-        
+
         let line = format_status_line(&plan);
         assert!(line.contains("50%"));
         assert!(line.contains("2/4"));
@@ -4923,38 +5434,46 @@ Done!"#;
         // 0%
         let bar0 = progress_bar(0, 10);
         assert_eq!(bar0, "[░░░░░░░░░░]");
-        
+
         // 50%
         let bar50 = progress_bar(50, 10);
         assert_eq!(bar50, "[█████░░░░░]");
-        
+
         // 100%
         let bar100 = progress_bar(100, 10);
         assert_eq!(bar100, "[██████████]");
     }
-    
+
     #[test]
     fn should_suggest_plan_mode_multi_step() {
         // Multi-step with large scope
         assert!(should_suggest_plan_mode("implement authentication and then add tests").is_some());
-        assert!(should_suggest_plan_mode("refactor the module and then migrate the database").is_some());
+        assert!(
+            should_suggest_plan_mode("refactor the module and then migrate the database").is_some()
+        );
         assert!(should_suggest_plan_mode("重构代码，然后添加测试").is_some());
     }
-    
+
     #[test]
     fn should_suggest_plan_mode_impl_and_test() {
         // Implementation + testing pattern
-        assert!(should_suggest_plan_mode("implement the API endpoint and write tests for it").is_some());
-        assert!(should_suggest_plan_mode("add user authentication with comprehensive tests").is_some());
+        assert!(
+            should_suggest_plan_mode("implement the API endpoint and write tests for it").is_some()
+        );
+        assert!(
+            should_suggest_plan_mode("add user authentication with comprehensive tests").is_some()
+        );
     }
-    
+
     #[test]
     fn should_suggest_plan_mode_large_scope() {
         // Large scope with multiple files
         assert!(should_suggest_plan_mode("refactor multiple files in the auth module").is_some());
-        assert!(should_suggest_plan_mode("migrate all services to the new database schema").is_some());
+        assert!(
+            should_suggest_plan_mode("migrate all services to the new database schema").is_some()
+        );
     }
-    
+
     #[test]
     fn should_suggest_plan_mode_short_input_skipped() {
         // Short inputs should not trigger plan mode
@@ -4962,18 +5481,18 @@ Done!"#;
         assert!(should_suggest_plan_mode("add test").is_none());
         assert!(should_suggest_plan_mode("what is this").is_none());
     }
-    
+
     #[test]
     fn should_suggest_plan_mode_simple_questions_skipped() {
         // Simple questions should not trigger
         assert!(should_suggest_plan_mode("how does this work").is_none());
         assert!(should_suggest_plan_mode("explain the code").is_none());
     }
-    
+
     #[test]
     fn detect_replan_deadlock() {
-        use mo_agent_services::task_orchestrator::{TaskPlan, SubtaskPlan, TaskStatus};
-        
+        use mo_agent_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+
         // Create plan with circular dependency (a -> b -> a)
         let plan = TaskPlan {
             subtasks: vec![
@@ -4994,17 +5513,20 @@ Done!"#;
             ],
             notes: None,
         };
-        
+
         let result = detect_replan_needed(&plan, 0, &[]);
         assert!(result.is_some());
         let suggestion = result.unwrap();
-        assert!(matches!(suggestion.reason, ReplanReason::DependencyDeadlock { .. }));
+        assert!(matches!(
+            suggestion.reason,
+            ReplanReason::DependencyDeadlock { .. }
+        ));
     }
-    
+
     #[test]
     fn detect_replan_failed_subtask() {
-        use mo_agent_services::task_orchestrator::{TaskPlan, SubtaskPlan, TaskStatus};
-        
+        use mo_agent_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+
         let plan = TaskPlan {
             subtasks: vec![SubtaskPlan {
                 id: "test".to_string(),
@@ -5014,18 +5536,21 @@ Done!"#;
             }],
             notes: None,
         };
-        
+
         let failed = vec![("test", "compilation error")];
         let result = detect_replan_needed(&plan, 0, &failed);
         assert!(result.is_some());
         let suggestion = result.unwrap();
-        assert!(matches!(suggestion.reason, ReplanReason::SubtaskFailed { .. }));
+        assert!(matches!(
+            suggestion.reason,
+            ReplanReason::SubtaskFailed { .. }
+        ));
     }
-    
+
     #[test]
     fn detect_replan_none_for_healthy_plan() {
-        use mo_agent_services::task_orchestrator::{TaskPlan, SubtaskPlan, TaskStatus};
-        
+        use mo_agent_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+
         let plan = TaskPlan {
             subtasks: vec![
                 SubtaskPlan {
@@ -5045,37 +5570,37 @@ Done!"#;
             ],
             notes: None,
         };
-        
+
         // Healthy plan with no issues
         let result = detect_replan_needed(&plan, 1, &[]);
         assert!(result.is_none());
     }
-    
+
     // ═══════════════════════ Execution Timeline Tests ════════════════════════
-    
+
     #[test]
     fn timeline_records_events() {
         let mut timeline = ExecutionTimeline::default();
-        
+
         timeline.plan_created(3);
         timeline.execution_started(true);
         timeline.subtask_started("s1", "Setup");
         timeline.subtask_completed("s1", "Setup", 60);
         timeline.discovery("Found existing config");
-        
+
         assert_eq!(timeline.events.len(), 5);
         assert_eq!(timeline.completed_subtask_count(), 1);
         assert!(timeline.start_timestamp.is_some());
     }
-    
+
     #[test]
     fn timeline_format_display() {
         let mut timeline = ExecutionTimeline::default();
-        
+
         timeline.plan_created(2);
         timeline.subtask_completed("s1", "First task", 30);
         timeline.subtask_failed("s2", "Second task", "timeout");
-        
+
         let display = timeline.format_display();
         assert!(display.contains("📋"), "should have plan created icon");
         assert!(display.contains("✓"), "should have completed icon");
@@ -5084,50 +5609,50 @@ Done!"#;
         assert!(display.contains("Second task"));
         assert!(display.contains("timeout"));
     }
-    
+
     #[test]
     fn timeline_counts() {
         let mut timeline = ExecutionTimeline::default();
-        
+
         timeline.subtask_completed("s1", "A", 10);
         timeline.subtask_completed("s2", "B", 20);
         timeline.subtask_failed("s3", "C", "error");
-        timeline.record(TimelineEventKind::Replan { 
-            reason: "user request".into(), 
-            changes: "added task".into() 
+        timeline.record(TimelineEventKind::Replan {
+            reason: "user request".into(),
+            changes: "added task".into(),
         });
-        timeline.record(TimelineEventKind::Replan { 
-            reason: "conflict".into(), 
-            changes: "modified".into() 
+        timeline.record(TimelineEventKind::Replan {
+            reason: "conflict".into(),
+            changes: "modified".into(),
         });
-        
+
         assert_eq!(timeline.completed_subtask_count(), 2);
         assert_eq!(timeline.failed_subtask_count(), 1);
         assert_eq!(timeline.replan_count(), 2);
     }
-    
+
     #[test]
     fn timeline_git_commit() {
         let mut timeline = ExecutionTimeline::default();
-        
+
         timeline.git_commit("abc1234567890", "feat: add auth");
-        
+
         let display = timeline.format_display();
         assert!(display.contains("📦"), "should have commit icon");
         assert!(display.contains("abc1234"), "should have short hash");
         assert!(display.contains("feat: add auth"));
     }
-    
+
     #[test]
     fn timeline_plan_completed() {
         let mut timeline = ExecutionTimeline::default();
-        
+
         timeline.plan_created(2);
         // Simulate some delay (we can't actually delay in tests, but the logic works)
         timeline.plan_completed(true);
-        
+
         assert!(timeline.end_timestamp.is_some());
-        
+
         let display = timeline.format_display();
         assert!(display.contains("✅"), "should have success icon");
     }

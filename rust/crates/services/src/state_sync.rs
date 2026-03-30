@@ -78,6 +78,13 @@ fn is_retryable_error(err: &sqlx::Error) -> bool {
     }
 }
 
+fn is_duplicate_key_error(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db_err) => db_err.code().as_deref() == Some("1062"),
+        _ => false,
+    }
+}
+
 /// Compress a JSON payload with gzip and encode it as base64 for storage.
 fn compress_json_payload(json: &str) -> Result<String, String> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -109,19 +116,17 @@ fn sync_log_retain_limit(status: &str) -> Option<usize> {
     }
 }
 
-fn build_sync_log_prune_query(retain: usize) -> String {
-    format!(
-        "DELETE FROM session_sync_log \
-         WHERE user_id = ? AND status = ? \
-           AND sync_id NOT IN ( \
-               SELECT sync_id FROM ( \
-                   SELECT sync_id FROM session_sync_log \
-                   WHERE user_id = ? AND status = ? \
-                   ORDER BY created_at DESC \
-                   LIMIT {retain} \
-               ) AS keepers \
-           )"
-    )
+fn build_sync_log_prune_query() -> &'static str {
+    "DELETE FROM session_sync_log \
+     WHERE user_id = ? AND status = ? \
+       AND sync_id NOT IN ( \
+           SELECT sync_id FROM ( \
+               SELECT sync_id FROM session_sync_log \
+               WHERE user_id = ? AND status = ? \
+               ORDER BY created_at DESC \
+               LIMIT ? \
+           ) AS keepers \
+       )"
 }
 
 // ─── Sync Types ─────────────────────────────────────────────────────────────
@@ -335,6 +340,7 @@ pub trait StateSyncService: Send + Sync {
     /// - `success=true, new_version=Some(v)` on success
     /// - `success=false, is_conflict=true` if version mismatch (another session pushed)
     /// - `success=false, is_conflict=false` on other errors
+    #[allow(clippy::too_many_arguments)]
     async fn push_learning_versioned(
         &self,
         user_id: &str,
@@ -475,8 +481,8 @@ impl StateSyncService for LocalOnlySyncService {
 
 /// Full cloud sync via MatrixOne database.
 ///
-/// Uses sqlx connection pool for async operations. Implements UPSERT semantics
-/// via INSERT ... ON DUPLICATE KEY UPDATE for idempotent push operations.
+/// Uses sqlx connection pool for async operations. Strongly-consistent state uses
+/// explicit update/insert flows, while audit-style records remain append-only.
 ///
 /// Tables used:
 /// - `learning_snapshots` — cross-session learning state
@@ -524,20 +530,20 @@ impl MatrixOneSyncService {
         .execute(&self.pool)
         .await;
 
-        if inserted.is_ok() {
-            if let Some(retain) = sync_log_retain_limit(status) {
-                self.prune_sync_logs(user_id, status, retain).await;
-            }
+        if inserted.is_ok()
+            && let Some(retain) = sync_log_retain_limit(status)
+        {
+            self.prune_sync_logs(user_id, status, retain).await;
         }
     }
 
     async fn prune_sync_logs(&self, user_id: &str, status: &str, retain: usize) {
-        let query = build_sync_log_prune_query(retain);
-        let _ = sqlx::query(&query)
+        let _ = sqlx::query(build_sync_log_prune_query())
             .bind(user_id)
             .bind(status)
             .bind(user_id)
             .bind(status)
+            .bind(retain as i64)
             .execute(&self.pool)
             .await;
     }
@@ -566,9 +572,6 @@ impl StateSyncService for MatrixOneSyncService {
         let mut backoff_ms = INITIAL_BACKOFF_MS;
 
         for attempt in 0..=MAX_RETRIES {
-            // Two-step UPSERT: UPDATE existing row, then INSERT if no row existed.
-            // MatrixOne may not support ON DUPLICATE KEY UPDATE on UNIQUE keys,
-            // so we use an explicit UPDATE-then-INSERT pattern.
             let updated = sqlx::query(
                 "UPDATE learning_snapshots SET \
                     snapshot_json = ?, \
@@ -591,11 +594,10 @@ impl StateSyncService for MatrixOneSyncService {
             let result = match updated {
                 Ok(r) if r.rows_affected() > 0 => Ok(r),
                 Ok(_) => {
-                    // No existing row — insert fresh
-                    sqlx::query(
+                    let inserted = sqlx::query(
                         "INSERT INTO learning_snapshots \
                          (snapshot_id, user_id, profile_name, snapshot_json, entity_count, \
-                          pattern_count, has_calibration, version, created_at, updated_at) \
+                           pattern_count, has_calibration, version, created_at, updated_at) \
                          VALUES (?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())",
                     )
                     .bind(&snapshot_id)
@@ -606,7 +608,32 @@ impl StateSyncService for MatrixOneSyncService {
                     .bind(pattern_count as i64)
                     .bind(has_cal)
                     .execute(&self.pool)
-                    .await
+                    .await;
+
+                    match inserted {
+                        Ok(r) => Ok(r),
+                        Err(e) if is_duplicate_key_error(&e) => {
+                            sqlx::query(
+                                "UPDATE learning_snapshots SET \
+                                    snapshot_json = ?, \
+                                    entity_count = ?, \
+                                    pattern_count = ?, \
+                                    has_calibration = ?, \
+                                    version = version + 1, \
+                                    updated_at = NOW() \
+                                 WHERE user_id = ? AND profile_name = ?",
+                            )
+                            .bind(&compressed_snapshot)
+                            .bind(entity_count as i64)
+                            .bind(pattern_count as i64)
+                            .bind(has_cal)
+                            .bind(user_id)
+                            .bind(profile)
+                            .execute(&self.pool)
+                            .await
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
                 Err(e) => Err(e),
             };
@@ -831,10 +858,8 @@ impl StateSyncService for MatrixOneSyncService {
                             );
                         }
                         Err(e) => {
-                            // Check for duplicate key (not retryable)
                             let msg = format!("push_learning_versioned (new): {e}");
-                            let is_dup = msg.contains("Duplicate") || msg.contains("duplicate");
-                            if is_dup {
+                            if is_duplicate_key_error(&e) {
                                 self.log_sync(
                                     user_id,
                                     "",
@@ -998,17 +1023,48 @@ impl StateSyncService for MatrixOneSyncService {
     async fn push_preference(&self, user_id: &str, key: &str, value: &str) -> SyncResult {
         let pref_id = uuid::Uuid::new_v4().to_string();
 
-        let result = sqlx::query(
-            "INSERT INTO user_preferences (pref_id, user_id, pref_key, pref_value, updated_at) \
-             VALUES (?, ?, ?, ?, NOW()) \
-             ON DUPLICATE KEY UPDATE pref_value = VALUES(pref_value), updated_at = NOW()",
+        let update_result = sqlx::query(
+            "UPDATE user_preferences SET pref_value = ?, updated_at = NOW() \
+             WHERE user_id = ? AND pref_key = ?",
         )
-        .bind(&pref_id)
+        .bind(value)
         .bind(user_id)
         .bind(key)
-        .bind(value)
         .execute(&self.pool)
         .await;
+
+        let result = match update_result {
+            Ok(r) if r.rows_affected() > 0 => Ok(r),
+            Ok(_) => {
+                let inserted = sqlx::query(
+                    "INSERT INTO user_preferences (pref_id, user_id, pref_key, pref_value, updated_at) \
+                     VALUES (?, ?, ?, ?, NOW())",
+                )
+                .bind(&pref_id)
+                .bind(user_id)
+                .bind(key)
+                .bind(value)
+                .execute(&self.pool)
+                .await;
+
+                match inserted {
+                    Ok(r) => Ok(r),
+                    Err(e) if is_duplicate_key_error(&e) => {
+                        sqlx::query(
+                            "UPDATE user_preferences SET pref_value = ?, updated_at = NOW() \
+                             WHERE user_id = ? AND pref_key = ?",
+                        )
+                        .bind(value)
+                        .bind(user_id)
+                        .bind(key)
+                        .execute(&self.pool)
+                        .await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        };
 
         match result {
             Ok(_) => SyncResult::ok(SyncDirection::Push, "preference", 1),
@@ -1183,17 +1239,17 @@ impl StateSyncService for MatrixOneSyncService {
         };
 
         // Check version for conflict
-        if let Some(expected) = expected_version {
-            if current_version != expected {
-                return SyncResult::conflict(
-                    SyncDirection::Push,
-                    "delta",
-                    format!(
-                        "version mismatch: expected {}, found {}",
-                        expected, current_version
-                    ),
-                );
-            }
+        if let Some(expected) = expected_version
+            && current_version != expected
+        {
+            return SyncResult::conflict(
+                SyncDirection::Push,
+                "delta",
+                format!(
+                    "version mismatch: expected {}, found {}",
+                    expected, current_version
+                ),
+            );
         }
 
         // Step 2: Parse and merge
@@ -1205,25 +1261,21 @@ impl StateSyncService for MatrixOneSyncService {
         };
 
         // Step 3: Push merged result with optimistic locking
-        let result = self
-            .push_learning_versioned(
-                user_id,
-                profile,
-                &merged_json,
-                delta.entity_deltas.len() as u32,
-                delta.pattern_deltas.len() as u32,
-                delta.calibration.is_some(),
-                Some(current_version),
-            )
-            .await;
-
         // Note: Delta sync stats could be logged at the caller level
         // delta_items = delta.delta_count
         // delta_size = delta.approx_size()
         // full_size = merged_json.len()
         // reduction_pct = 100 - (delta_size * 100 / full_size.max(1))
-
-        result
+        self.push_learning_versioned(
+            user_id,
+            profile,
+            &merged_json,
+            delta.entity_deltas.len() as u32,
+            delta.pattern_deltas.len() as u32,
+            delta.calibration.is_some(),
+            Some(current_version),
+        )
+        .await
     }
 }
 
@@ -1508,13 +1560,13 @@ mod tests {
 
     #[test]
     fn prune_query_keeps_latest_rows_for_user_and_status() {
-        let query = build_sync_log_prune_query(17);
+        let query = build_sync_log_prune_query();
 
         assert!(query.contains("DELETE FROM session_sync_log"));
         assert!(query.contains("WHERE user_id = ? AND status = ?"));
         assert!(query.contains("SELECT sync_id FROM session_sync_log"));
         assert!(query.contains("ORDER BY created_at DESC"));
-        assert!(query.contains("LIMIT 17"));
+        assert!(query.contains("LIMIT ?"));
     }
 
     #[tokio::test]
@@ -1791,11 +1843,14 @@ mod tests {
 
     #[test]
     fn retry_constants_are_reasonable() {
+        let max_retries = std::hint::black_box(MAX_RETRIES);
+        let initial_backoff_ms = std::hint::black_box(INITIAL_BACKOFF_MS);
+        let max_backoff_ms = std::hint::black_box(MAX_BACKOFF_MS);
         // Verify retry constants are within expected ranges
-        assert!(MAX_RETRIES >= 2 && MAX_RETRIES <= 5);
-        assert!(INITIAL_BACKOFF_MS >= 50 && INITIAL_BACKOFF_MS <= 500);
-        assert!(MAX_BACKOFF_MS >= 1000 && MAX_BACKOFF_MS <= 5000);
+        assert!((2..=5).contains(&max_retries));
+        assert!((50..=500).contains(&initial_backoff_ms));
+        assert!((1000..=5000).contains(&max_backoff_ms));
         // Ensure max backoff is greater than initial
-        assert!(MAX_BACKOFF_MS > INITIAL_BACKOFF_MS);
+        assert!(max_backoff_ms > initial_backoff_ms);
     }
 }

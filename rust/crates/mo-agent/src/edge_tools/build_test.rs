@@ -475,8 +475,6 @@ impl ErrorLocation {
 /// A group of related errors (same file or cascading from a root cause).
 #[derive(Debug)]
 pub struct ErrorGroup {
-    /// File where this group of errors occurs
-    pub file: String,
     /// The root-cause error (first/most upstream in the cascade)
     pub root_index: usize,
     /// Indices of all errors in this group (including root)
@@ -536,11 +534,10 @@ impl BuildTestResult {
         }
 
         let mut groups = Vec::new();
-        for (file, indices) in &by_file {
+        for indices in by_file.values() {
             if indices.len() < 2 {
                 // Single error in file — trivial group, no cascade
                 groups.push(ErrorGroup {
-                    file: file.to_string(),
                     root_index: indices[0],
                     member_indices: indices.clone(),
                     is_cascade: false,
@@ -576,7 +573,6 @@ impl BuildTestResult {
                 if same_id_count >= 2 {
                     let id_name = first_id.unwrap_or("unknown");
                     groups.push(ErrorGroup {
-                        file: file.to_string(),
                         root_index: import_errors[0],
                         member_indices: import_errors,
                         is_cascade: true,
@@ -593,7 +589,6 @@ impl BuildTestResult {
             let first = &locs[0];
             if first.class == ErrorClass::Trivial && locs.len() >= 3 {
                 groups.push(ErrorGroup {
-                    file: file.to_string(),
                     root_index: indices[0],
                     member_indices: indices.clone(),
                     is_cascade: true,
@@ -616,7 +611,6 @@ impl BuildTestResult {
                     .collect();
                 if same_scope.len() >= 3 {
                     groups.push(ErrorGroup {
-                        file: file.to_string(),
                         root_index: same_scope[0],
                         member_indices: same_scope.clone(),
                         is_cascade: true,
@@ -633,7 +627,6 @@ impl BuildTestResult {
 
             // Generic cluster: 3+ errors in same file
             groups.push(ErrorGroup {
-                file: file.to_string(),
                 root_index: indices[0],
                 member_indices: indices.clone(),
                 is_cascade: indices.len() >= 3,
@@ -1080,6 +1073,7 @@ impl BuildTestTracker {
     }
 
     /// How many iterations have been recorded.
+    #[allow(dead_code)]
     pub fn iterations(&self) -> usize {
         self.iteration
     }
@@ -1439,8 +1433,8 @@ fn parse_cargo_output(output: &str, exit_code: Option<i32>, truncated: bool) -> 
             }
 
             // Look for location on the next few lines (usually line i+1)
-            for j in (i + 1)..lines.len().min(i + 4) {
-                if let Some(loc_cap) = CARGO_LOCATION_RE.captures(lines[j]) {
+            for line in lines.iter().take(lines.len().min(i + 4)).skip(i + 1) {
+                if let Some(loc_cap) = CARGO_LOCATION_RE.captures(line) {
                     let file = loc_cap.get(1).map(|m| m.as_str()).unwrap_or("");
                     let line_num: usize = loc_cap
                         .get(2)
@@ -1474,8 +1468,8 @@ fn parse_cargo_output(output: &str, exit_code: Option<i32>, truncated: bool) -> 
                 result.error_messages.push(msg.to_string());
             }
             // Check for location
-            for j in (i + 1)..lines.len().min(i + 4) {
-                if let Some(loc_cap) = CARGO_LOCATION_RE.captures(lines[j]) {
+            for line in lines.iter().take(lines.len().min(i + 4)).skip(i + 1) {
+                if let Some(loc_cap) = CARGO_LOCATION_RE.captures(line) {
                     let file = loc_cap.get(1).map(|m| m.as_str()).unwrap_or("");
                     let line_num: usize = loc_cap
                         .get(2)
@@ -1560,45 +1554,45 @@ fn extract_cargo_failed_tests(output: &str, locations: &mut Vec<ErrorLocation>) 
 
     for (i, line) in lines.iter().enumerate() {
         // Look for "---- test_name stdout ----" pattern
-        if line.contains("---- ") && line.contains(" stdout ----") {
-            if let Some(name) = line
+        if line.contains("---- ")
+            && line.contains(" stdout ----")
+            && let Some(name) = line
                 .strip_prefix("---- ")
                 .and_then(|s| s.strip_suffix(" stdout ----"))
-            {
-                let mut msg = name.to_string();
-                // Scan next lines for assertion/panic details
-                for next_line in lines.iter().skip(i + 1).take(10) {
-                    if next_line.contains("assertion") || next_line.contains("panicked at") {
-                        msg = format!("{}: {}", name, next_line.trim());
+        {
+            let mut msg = name.to_string();
+            // Scan next lines for assertion/panic details
+            for next_line in lines.iter().skip(i + 1).take(10) {
+                if next_line.contains("assertion") || next_line.contains("panicked at") {
+                    msg = format!("{}: {}", name, next_line.trim());
 
-                        // Extract panic location
-                        if let Some(pcap) = PANIC_LOCATION_RE.captures(next_line) {
-                            let file = pcap.get(1).map(|m| m.as_str()).unwrap_or("");
-                            let line_num: usize = pcap
-                                .get(2)
-                                .and_then(|m| m.as_str().parse().ok())
-                                .unwrap_or(0);
-                            let col: usize = pcap
-                                .get(3)
-                                .and_then(|m| m.as_str().parse().ok())
-                                .unwrap_or(0);
-                            if !file.is_empty() && line_num > 0 && locations.len() < 20 {
-                                locations.push(ErrorLocation::new(
-                                    file.to_string(),
-                                    line_num,
-                                    col,
-                                    String::new(),
-                                    format!("test {name} panicked"),
-                                    "error".to_string(),
-                                ));
-                            }
+                    // Extract panic location
+                    if let Some(pcap) = PANIC_LOCATION_RE.captures(next_line) {
+                        let file = pcap.get(1).map(|m| m.as_str()).unwrap_or("");
+                        let line_num: usize = pcap
+                            .get(2)
+                            .and_then(|m| m.as_str().parse().ok())
+                            .unwrap_or(0);
+                        let col: usize = pcap
+                            .get(3)
+                            .and_then(|m| m.as_str().parse().ok())
+                            .unwrap_or(0);
+                        if !file.is_empty() && line_num > 0 && locations.len() < 20 {
+                            locations.push(ErrorLocation::new(
+                                file.to_string(),
+                                line_num,
+                                col,
+                                String::new(),
+                                format!("test {name} panicked"),
+                                "error".to_string(),
+                            ));
                         }
-                        break;
                     }
+                    break;
                 }
-                if failed.len() < 10 {
-                    failed.push(msg);
-                }
+            }
+            if failed.len() < 10 {
+                failed.push(msg);
             }
         }
     }
@@ -1726,10 +1720,10 @@ fn parse_jest_output(output: &str, exit_code: Option<i32>, truncated: bool) -> B
 
     // Extract failed test descriptions
     for line in output.lines() {
-        if line.trim().starts_with("✕") || line.trim().starts_with("×") {
-            if result.error_messages.len() < 10 {
-                result.error_messages.push(line.trim().to_string());
-            }
+        if (line.trim().starts_with("✕") || line.trim().starts_with("×"))
+            && result.error_messages.len() < 10
+        {
+            result.error_messages.push(line.trim().to_string());
         }
     }
 
@@ -3576,16 +3570,12 @@ error[E0425]: cannot find value `nonexistent` in this scope
 
     #[test]
     fn auto_fix_constants_are_sane() {
-        assert!(
-            AUTO_FIX_CONFIDENCE_THRESHOLD >= 0.7,
-            "Threshold should be high"
-        );
-        assert!(
-            AUTO_FIX_CONFIDENCE_THRESHOLD <= 1.0,
-            "Threshold should be ≤1.0"
-        );
-        assert!(AUTO_FIX_MAX_ITERATIONS >= 1, "At least 1 iteration");
-        assert!(AUTO_FIX_MAX_ITERATIONS <= 5, "Max 5 iterations for safety");
+        let threshold = std::hint::black_box(AUTO_FIX_CONFIDENCE_THRESHOLD);
+        let max_iterations = std::hint::black_box(AUTO_FIX_MAX_ITERATIONS);
+        assert!(threshold >= 0.7);
+        assert!(threshold <= 1.0);
+        assert!(max_iterations >= 1);
+        assert!(max_iterations <= 5);
     }
 
     #[test]
@@ -3709,9 +3699,30 @@ error[E0425]: cannot find value `nonexistent` in this scope
         let r1 = BuildTestResult {
             error_count: 3,
             error_locations: vec![
-                ErrorLocation::new("a.rs".into(), 1, 0, "E0425".into(), "err1".into(), "error".into()),
-                ErrorLocation::new("a.rs".into(), 2, 0, "E0308".into(), "err2".into(), "error".into()),
-                ErrorLocation::new("b.rs".into(), 1, 0, "E0599".into(), "err3".into(), "error".into()),
+                ErrorLocation::new(
+                    "a.rs".into(),
+                    1,
+                    0,
+                    "E0425".into(),
+                    "err1".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "a.rs".into(),
+                    2,
+                    0,
+                    "E0308".into(),
+                    "err2".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "b.rs".into(),
+                    1,
+                    0,
+                    "E0599".into(),
+                    "err3".into(),
+                    "error".into(),
+                ),
             ],
             ..Default::default()
         };
@@ -3722,25 +3733,67 @@ error[E0425]: cannot find value `nonexistent` in this scope
         let r2 = BuildTestResult {
             error_count: 2,
             error_locations: vec![
-                ErrorLocation::new("a.rs".into(), 1, 0, "E0425".into(), "err1".into(), "error".into()),
-                ErrorLocation::new("c.rs".into(), 5, 0, "E0277".into(), "err4".into(), "error".into()),
+                ErrorLocation::new(
+                    "a.rs".into(),
+                    1,
+                    0,
+                    "E0425".into(),
+                    "err1".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "c.rs".into(),
+                    5,
+                    0,
+                    "E0277".into(),
+                    "err4".into(),
+                    "error".into(),
+                ),
             ],
             ..Default::default()
         };
         let d2 = tracker.record(&r2, "cargo test");
         assert_eq!(d2.iteration, 1);
         assert_eq!(d2.fixed_errors.len(), 2); // err2 and err3 gone
-        assert_eq!(d2.new_errors.len(), 1);   // err4 is new
-        assert!(!d2.regressed);                // 2 < 3
+        assert_eq!(d2.new_errors.len(), 1); // err4 is new
+        assert!(!d2.regressed); // 2 < 3
 
         // Third run: regression (4 errors)
         let r3 = BuildTestResult {
             error_count: 4,
             error_locations: vec![
-                ErrorLocation::new("a.rs".into(), 1, 0, "E0425".into(), "err1".into(), "error".into()),
-                ErrorLocation::new("c.rs".into(), 5, 0, "E0277".into(), "err4".into(), "error".into()),
-                ErrorLocation::new("d.rs".into(), 1, 0, "E0412".into(), "err5".into(), "error".into()),
-                ErrorLocation::new("d.rs".into(), 2, 0, "E0433".into(), "err6".into(), "error".into()),
+                ErrorLocation::new(
+                    "a.rs".into(),
+                    1,
+                    0,
+                    "E0425".into(),
+                    "err1".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "c.rs".into(),
+                    5,
+                    0,
+                    "E0277".into(),
+                    "err4".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "d.rs".into(),
+                    1,
+                    0,
+                    "E0412".into(),
+                    "err5".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "d.rs".into(),
+                    2,
+                    0,
+                    "E0433".into(),
+                    "err6".into(),
+                    "error".into(),
+                ),
             ],
             ..Default::default()
         };
@@ -3756,13 +3809,48 @@ error[E0425]: cannot find value `nonexistent` in this scope
             error_count: 5,
             error_locations: vec![
                 // Complex error
-                ErrorLocation::new("a.rs".into(), 100, 0, "E0277".into(), "trait not satisfied".into(), "error".into()),
+                ErrorLocation::new(
+                    "a.rs".into(),
+                    100,
+                    0,
+                    "E0277".into(),
+                    "trait not satisfied".into(),
+                    "error".into(),
+                ),
                 // Trivial import errors (cascade root at index 1)
-                ErrorLocation::new("b.rs".into(), 1, 0, "E0425".into(), "cannot find `Vec`".into(), "error".into()),
-                ErrorLocation::new("b.rs".into(), 5, 0, "E0425".into(), "cannot find `Vec`".into(), "error".into()),
-                ErrorLocation::new("b.rs".into(), 10, 0, "E0425".into(), "cannot find `Vec`".into(), "error".into()),
+                ErrorLocation::new(
+                    "b.rs".into(),
+                    1,
+                    0,
+                    "E0425".into(),
+                    "cannot find `Vec`".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "b.rs".into(),
+                    5,
+                    0,
+                    "E0425".into(),
+                    "cannot find `Vec`".into(),
+                    "error".into(),
+                ),
+                ErrorLocation::new(
+                    "b.rs".into(),
+                    10,
+                    0,
+                    "E0425".into(),
+                    "cannot find `Vec`".into(),
+                    "error".into(),
+                ),
                 // Fixable error
-                ErrorLocation::new("c.rs".into(), 20, 0, "E0308".into(), "type mismatch".into(), "error".into()),
+                ErrorLocation::new(
+                    "c.rs".into(),
+                    20,
+                    0,
+                    "E0308".into(),
+                    "type mismatch".into(),
+                    "error".into(),
+                ),
             ],
             ..Default::default()
         };
@@ -3771,6 +3859,9 @@ error[E0425]: cannot find value `nonexistent` in this scope
         assert_eq!(order[0], 1, "Cascade root (b.rs:1) should be first");
         // Complex error should be last
         let complex_pos = order.iter().position(|&i| i == 0).unwrap();
-        assert!(complex_pos > 2, "Complex error should come after trivial/fixable");
+        assert!(
+            complex_pos > 2,
+            "Complex error should come after trivial/fixable"
+        );
     }
 }

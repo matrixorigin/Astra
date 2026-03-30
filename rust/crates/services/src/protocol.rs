@@ -24,7 +24,6 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use thiserror::Error;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -182,9 +181,7 @@ impl DeltaBatch {
 
     /// Approximate size in bytes.
     pub fn approx_size(&self) -> usize {
-        serde_json::to_string(self)
-            .map(|s| s.len())
-            .unwrap_or(0)
+        serde_json::to_string(self).map(|s| s.len()).unwrap_or(0)
     }
 
     /// Validate the delta batch.
@@ -396,21 +393,16 @@ pub enum SyncType {
 }
 
 /// Conflict resolution strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ConflictResolution {
     /// Server value wins (default).
+    #[default]
     ServerWins,
     /// Client value wins.
     ClientWins,
     /// Attempt deep merge.
     Merge,
-}
-
-impl Default for ConflictResolution {
-    fn default() -> Self {
-        Self::ServerWins
-    }
 }
 
 /// Apply delta options.
@@ -519,25 +511,25 @@ pub struct GetStateRequest {
 pub enum DeltaError {
     #[error("invalid version: {0}")]
     InvalidVersion(String),
-    
+
     #[error("invalid checkpoint: {0}")]
     InvalidCheckpoint(String),
-    
+
     #[error("version conflict: expected {expected}, found {actual}")]
     VersionConflict { expected: i64, actual: i64 },
-    
+
     #[error("delta too large: {size} bytes exceeds threshold {threshold}")]
     DeltaTooLarge { size: usize, threshold: usize },
-    
+
     #[error("version expired: {version} older than oldest available {oldest}")]
     VersionExpired { version: i64, oldest: i64 },
-    
+
     #[error("validation failed: {0}")]
     ValidationFailed(String),
-    
+
     #[error("checkpoint not found: {0}")]
     CheckpointNotFound(String),
-    
+
     #[error("operation not allowed: {0}")]
     OperationNotAllowed(String),
 }
@@ -650,10 +642,7 @@ pub struct DeltaEngine;
 
 impl DeltaEngine {
     /// Apply a delta batch to a state value.
-    pub fn apply(
-        state: &mut serde_json::Value,
-        batch: &DeltaBatch,
-    ) -> Result<u32, DeltaError> {
+    pub fn apply(state: &mut serde_json::Value, batch: &DeltaBatch) -> Result<u32, DeltaError> {
         let mut applied = 0u32;
 
         for op in &batch.operations {
@@ -665,10 +654,7 @@ impl DeltaEngine {
     }
 
     /// Apply a single delta operation.
-    pub fn apply_op(
-        state: &mut serde_json::Value,
-        op: &DeltaOp,
-    ) -> Result<(), DeltaError> {
+    pub fn apply_op(state: &mut serde_json::Value, op: &DeltaOp) -> Result<(), DeltaError> {
         match op.op {
             DeltaOpType::Add => Self::apply_add(state, &op.path, op.value.as_ref()),
             DeltaOpType::Replace => Self::apply_replace(state, &op.path, op.value.as_ref()),
@@ -682,9 +668,8 @@ impl DeltaEngine {
         path: &str,
         value: Option<&serde_json::Value>,
     ) -> Result<(), DeltaError> {
-        let value = value.ok_or_else(|| {
-            DeltaError::ValidationFailed("add operation requires value".into())
-        })?;
+        let value = value
+            .ok_or_else(|| DeltaError::ValidationFailed("add operation requires value".into()))?;
 
         let ptr = json_pointer(path)?;
         let parent = Self::get_parent_mut(state, &ptr)?;
@@ -712,10 +697,12 @@ impl DeltaEngine {
                     }
                     arr.insert(idx, value.clone());
                 }
-                _ => return Err(DeltaError::ValidationFailed(format!(
-                    "cannot add to non-container at '{}'",
-                    path
-                ))),
+                _ => {
+                    return Err(DeltaError::ValidationFailed(format!(
+                        "cannot add to non-container at '{}'",
+                        path
+                    )));
+                }
             }
         } else {
             // Empty path - replace root
@@ -765,24 +752,21 @@ impl DeltaEngine {
                     }
                     arr[idx] = value.clone();
                 }
-                _ => return Err(DeltaError::ValidationFailed(format!(
-                    "cannot replace in non-container at '{}'",
-                    path
-                ))),
+                _ => {
+                    return Err(DeltaError::ValidationFailed(format!(
+                        "cannot replace in non-container at '{}'",
+                        path
+                    )));
+                }
             }
         }
 
         Ok(())
     }
 
-    fn apply_remove(
-        state: &mut serde_json::Value,
-        path: &str,
-    ) -> Result<(), DeltaError> {
+    fn apply_remove(state: &mut serde_json::Value, path: &str) -> Result<(), DeltaError> {
         if path.is_empty() || path == "/" {
-            return Err(DeltaError::ValidationFailed(
-                "cannot remove root".into(),
-            ));
+            return Err(DeltaError::ValidationFailed("cannot remove root".into()));
         }
 
         let ptr = json_pointer(path)?;
@@ -814,9 +798,8 @@ impl DeltaEngine {
         path: &str,
         value: Option<&serde_json::Value>,
     ) -> Result<(), DeltaError> {
-        let value = value.ok_or_else(|| {
-            DeltaError::ValidationFailed("merge operation requires value".into())
-        })?;
+        let value = value
+            .ok_or_else(|| DeltaError::ValidationFailed("merge operation requires value".into()))?;
 
         if path.is_empty() || path == "/" {
             match (state, value) {
@@ -850,10 +833,12 @@ impl DeltaEngine {
                         map.insert(key.to_string(), value.clone());
                     }
                 }
-                _ => return Err(DeltaError::ValidationFailed(format!(
-                    "cannot merge into non-object at '{}'",
-                    path
-                ))),
+                _ => {
+                    return Err(DeltaError::ValidationFailed(format!(
+                        "cannot merge into non-object at '{}'",
+                        path
+                    )));
+                }
             }
         }
 
@@ -871,8 +856,7 @@ impl DeltaEngine {
         let mut current = state;
         let parent_len = ptr.len().saturating_sub(1);
 
-        for i in 0..parent_len {
-            let key = &ptr[i];
+        for key in ptr.iter().take(parent_len) {
             current = navigate_mut(current, key)?;
         }
 
@@ -886,8 +870,8 @@ fn json_pointer(path: &str) -> Result<Vec<String>, DeltaError> {
         return Ok(Vec::new());
     }
 
-    let path = if path.starts_with('/') {
-        &path[1..]
+    let path = if let Some(stripped) = path.strip_prefix('/') {
+        stripped
     } else {
         path
     };
@@ -906,11 +890,9 @@ fn navigate_mut<'a>(
     key: &str,
 ) -> Result<&'a mut serde_json::Value, DeltaError> {
     match parent {
-        serde_json::Value::Object(map) => {
-            map.get_mut(key).ok_or_else(|| {
-                DeltaError::ValidationFailed(format!("path segment '{}' not found", key))
-            })
-        }
+        serde_json::Value::Object(map) => map.get_mut(key).ok_or_else(|| {
+            DeltaError::ValidationFailed(format!("path segment '{}' not found", key))
+        }),
         serde_json::Value::Array(arr) => {
             let idx = key.parse::<usize>().map_err(|_| {
                 DeltaError::ValidationFailed(format!("invalid array index: {}", key))
@@ -919,17 +901,21 @@ fn navigate_mut<'a>(
                 DeltaError::ValidationFailed(format!("array index {} out of bounds", idx))
             })
         }
-        _ => Err(DeltaError::ValidationFailed(format!(
-            "cannot navigate into non-container"
-        ))),
+        _ => Err(DeltaError::ValidationFailed(
+            "cannot navigate into non-container".to_string(),
+        )),
     }
 }
 
 /// Deep merge source object into target.
-fn merge_objects(target: &mut serde_json::Map<String, serde_json::Value>, source: &serde_json::Map<String, serde_json::Value>) {
+fn merge_objects(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    source: &serde_json::Map<String, serde_json::Value>,
+) {
     for (key, value) in source {
         if let Some(existing) = target.get_mut(key) {
-            if let (serde_json::Value::Object(t), serde_json::Value::Object(s)) = (existing, value) {
+            if let (serde_json::Value::Object(t), serde_json::Value::Object(s)) = (existing, value)
+            {
                 merge_objects(t, s);
             } else {
                 target.insert(key.clone(), value.clone());
@@ -1228,16 +1214,16 @@ mod tests {
     #[test]
     fn fallback_thresholds() {
         let thresholds = FallbackThresholds::default();
-        
+
         // Delta is 60% of full state - should fallback
         assert!(should_fallback_to_full_sync(60, 100, 10, 10, &thresholds));
-        
+
         // Delta is 40% of full state - should not fallback
         assert!(!should_fallback_to_full_sync(40, 100, 10, 10, &thresholds));
-        
+
         // Too many operations
         assert!(should_fallback_to_full_sync(10, 100, 600, 10, &thresholds));
-        
+
         // Large version gap
         assert!(should_fallback_to_full_sync(10, 100, 10, 200, &thresholds));
     }
@@ -1251,12 +1237,18 @@ mod tests {
 
     #[test]
     fn error_codes() {
-        let err = DeltaError::VersionConflict { expected: 1, actual: 2 };
+        let err = DeltaError::VersionConflict {
+            expected: 1,
+            actual: 2,
+        };
         assert_eq!(err.status_code(), 409);
         assert!(err.is_retryable());
         assert_eq!(err.error_code(), "version_conflict");
 
-        let err = DeltaError::DeltaTooLarge { size: 100, threshold: 50 };
+        let err = DeltaError::DeltaTooLarge {
+            size: 100,
+            threshold: 50,
+        };
         assert_eq!(err.status_code(), 409);
         assert!(!err.is_retryable());
         assert_eq!(err.error_code(), "delta_too_large");
@@ -1268,7 +1260,10 @@ mod tests {
 
     #[test]
     fn conflict_resolution_default() {
-        assert_eq!(ConflictResolution::default(), ConflictResolution::ServerWins);
+        assert_eq!(
+            ConflictResolution::default(),
+            ConflictResolution::ServerWins
+        );
     }
 
     #[test]

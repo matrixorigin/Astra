@@ -8,6 +8,13 @@ use mo_agent_core::{
 };
 use sha2::Digest;
 
+fn is_duplicate_key_error(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db_err) => db_err.code().as_deref() == Some("1062"),
+        _ => false,
+    }
+}
+
 // ── Data types ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
@@ -490,12 +497,11 @@ impl SkillService for DatabaseSkillService {
             .as_ref()
             .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "{}".into()));
 
-        query(
+        let insert_result = query(
             "INSERT INTO skills_registry \
              (skill_id, skill_name, version, description, triggers, dependencies, manifest, \
-              category, priority, is_active, status, source, is_public, created_by, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', 'user', 1, ?, NOW(), NOW()) \
-             ON DUPLICATE KEY UPDATE version = ?, description = ?, updated_at = NOW()"
+               category, priority, is_active, status, source, is_public, created_by, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', 'user', 1, ?, NOW(), NOW())"
         )
         .bind(&skill_id)
         .bind(&request.name)
@@ -507,11 +513,18 @@ impl SkillService for DatabaseSkillService {
         .bind(&request.category)
         .bind(request.priority)
         .bind(&user_id)
-        .bind(&request.version)
-        .bind(&request.description)
         .execute(&pool)
-        .await
-        .map_err(internal_error)?;
+        .await;
+
+        if let Err(error) = insert_result {
+            if is_duplicate_key_error(&error) {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    format!("Skill '{}' already exists", skill_id),
+                ));
+            }
+            return Err(internal_error(error));
+        }
 
         Ok(serde_json::json!({
             "skill_id": skill_id,

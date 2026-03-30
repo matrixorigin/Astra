@@ -356,20 +356,19 @@ impl ToolExecutor {
                 }
 
                 // Scope context for the first edit location
-                if let Some(lang) = super::code_intel::detect_language(&path) {
-                    if let Some(first_old) = edits
+                if let Some(lang) = super::code_intel::detect_language(&path)
+                    && let Some(first_old) = edits
                         .first()
                         .and_then(|e| e.get("old_str"))
                         .and_then(Value::as_str)
-                    {
-                        let edit_line = content[..content.find(first_old).unwrap_or(0)]
-                            .matches('\n')
-                            .count()
-                            + 1;
-                        let scope = super::code_intel::scope_at_line(&working, lang, edit_line);
-                        if !scope.breadcrumbs.is_empty() {
-                            result.push_str(&format!("\n📍 {}", scope.breadcrumbs.join(" > ")));
-                        }
+                {
+                    let edit_line = content[..content.find(first_old).unwrap_or(0)]
+                        .matches('\n')
+                        .count()
+                        + 1;
+                    let scope = super::code_intel::scope_at_line(&working, lang, edit_line);
+                    if !scope.breadcrumbs.is_empty() {
+                        result.push_str(&format!("\n📍 {}", scope.breadcrumbs.join(" > ")));
                     }
                 }
 
@@ -477,8 +476,7 @@ impl ToolExecutor {
                 let mut best_score = similarity_score(&target_name, &name_str);
 
                 // If candidate is a hidden file, also compare without leading dot
-                if name_str.starts_with('.') {
-                    let without_dot = &name_str[1..];
+                if let Some(without_dot) = name_str.strip_prefix('.') {
                     best_score = best_score.max(similarity_score(&target_name, without_dot));
                 }
 

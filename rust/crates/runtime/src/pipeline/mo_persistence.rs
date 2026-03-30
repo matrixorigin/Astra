@@ -27,6 +27,13 @@ fn epoch_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn is_duplicate_key_error(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db_err) => db_err.code().as_deref() == Some("1062"),
+        _ => false,
+    }
+}
+
 // ─── DDL ─────────────────────────────────────────────────────────────────────
 
 /// DDL for the idempotency cache table. Called from ensure_core_schema().
@@ -122,30 +129,65 @@ impl MatrixOneCheckpointWriter {
         let tools_json = "[]".to_string();
         let turn = step.execution.cursor.slots.len() as i32;
 
-        sqlx::query(
-            "INSERT INTO session_checkpoints \
-             (checkpoint_id, session_id, user_id, number, turn, title, summary, tools_json, state_json, total_tokens, had_stalls, error_count) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0) \
-             ON DUPLICATE KEY UPDATE \
-                title = VALUES(title), \
-                summary = VALUES(summary), \
-                tools_json = VALUES(tools_json), \
-                state_json = VALUES(state_json), \
-                total_tokens = VALUES(total_tokens)",
+        let updated = sqlx::query(
+            "UPDATE session_checkpoints SET \
+                turn = ?, title = ?, summary = ?, tools_json = ?, state_json = ?, total_tokens = ? \
+             WHERE session_id = ? AND number = ?",
         )
-        .bind(&checkpoint_id)
-        .bind(&self.session_id)
-        .bind(&self.user_id)
-        .bind(self.checkpoint_counter as i32)
         .bind(turn)
         .bind(&title)
         .bind(tier_str)
         .bind(&tools_json)
         .bind(&state_json)
-        .bind(0i64) // total_tokens placeholder
+        .bind(0i64)
+        .bind(&self.session_id)
+        .bind(self.checkpoint_counter as i32)
         .execute(&self.pool)
         .await
-        .map_err(|e| format!("checkpoint write: {e}"))?;
+        .map_err(|e| format!("checkpoint update: {e}"))?;
+
+        if updated.rows_affected() == 0 {
+            let inserted = sqlx::query(
+                "INSERT INTO session_checkpoints \
+                 (checkpoint_id, session_id, user_id, number, turn, title, summary, tools_json, state_json, total_tokens, had_stalls, error_count) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)",
+            )
+            .bind(&checkpoint_id)
+            .bind(&self.session_id)
+            .bind(&self.user_id)
+            .bind(self.checkpoint_counter as i32)
+            .bind(turn)
+            .bind(&title)
+            .bind(tier_str)
+            .bind(&tools_json)
+            .bind(&state_json)
+            .bind(0i64)
+            .execute(&self.pool)
+            .await;
+
+            if let Err(e) = inserted {
+                if is_duplicate_key_error(&e) {
+                    sqlx::query(
+                        "UPDATE session_checkpoints SET \
+                            turn = ?, title = ?, summary = ?, tools_json = ?, state_json = ?, total_tokens = ? \
+                         WHERE session_id = ? AND number = ?",
+                    )
+                    .bind(turn)
+                    .bind(&title)
+                    .bind(tier_str)
+                    .bind(&tools_json)
+                    .bind(&state_json)
+                    .bind(0i64)
+                    .bind(&self.session_id)
+                    .bind(self.checkpoint_counter as i32)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|err| format!("checkpoint retry update: {err}"))?;
+                } else {
+                    return Err(format!("checkpoint insert: {e}"));
+                }
+            }
+        }
 
         Ok(())
     }
@@ -279,26 +321,57 @@ impl MatrixOneIdempotencyCache {
     ) -> Result<(), String> {
         let cache_key = key.cache_key();
 
-        sqlx::query(
-            "INSERT INTO step_idempotency_cache \
-             (cache_key, step_id, tool_index, content_hash, tool_name, output, is_error, cached_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-             ON DUPLICATE KEY UPDATE \
-                output = VALUES(output), \
-                is_error = VALUES(is_error), \
-                cached_at = VALUES(cached_at)",
+        let updated = sqlx::query(
+            "UPDATE step_idempotency_cache SET \
+                tool_name = ?, output = ?, is_error = ?, cached_at = ? \
+             WHERE cache_key = ?",
         )
-        .bind(&cache_key)
-        .bind(&key.step_id)
-        .bind(key.tool_index as i32)
-        .bind(&key.content_hash)
         .bind(&result.tool_name)
         .bind(&result.output)
         .bind(if result.is_error { 1i16 } else { 0i16 })
         .bind(result.cached_at as i64)
+        .bind(&cache_key)
         .execute(&self.pool)
         .await
-        .map_err(|e| format!("idempotency record: {e}"))?;
+        .map_err(|e| format!("idempotency update: {e}"))?;
+
+        if updated.rows_affected() == 0 {
+            let inserted = sqlx::query(
+                "INSERT INTO step_idempotency_cache \
+                 (cache_key, step_id, tool_index, content_hash, tool_name, output, is_error, cached_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&cache_key)
+            .bind(&key.step_id)
+            .bind(key.tool_index as i32)
+            .bind(&key.content_hash)
+            .bind(&result.tool_name)
+            .bind(&result.output)
+            .bind(if result.is_error { 1i16 } else { 0i16 })
+            .bind(result.cached_at as i64)
+            .execute(&self.pool)
+            .await;
+
+            if let Err(e) = inserted {
+                if is_duplicate_key_error(&e) {
+                    sqlx::query(
+                        "UPDATE step_idempotency_cache SET \
+                            tool_name = ?, output = ?, is_error = ?, cached_at = ? \
+                         WHERE cache_key = ?",
+                    )
+                    .bind(&result.tool_name)
+                    .bind(&result.output)
+                    .bind(if result.is_error { 1i16 } else { 0i16 })
+                    .bind(result.cached_at as i64)
+                    .bind(&cache_key)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|err| format!("idempotency retry update: {err}"))?;
+                } else {
+                    return Err(format!("idempotency insert: {e}"));
+                }
+            }
+        }
 
         self.local_cache.insert(cache_key, result);
         Ok(())
