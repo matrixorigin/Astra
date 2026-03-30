@@ -44,15 +44,7 @@ export function RuntimeSettingsPanel() {
 
   const loadUser = useCallback(async () => {
     try {
-      const res = await fetch('/api/runtime-config', { cache: 'no-store' });
-      const cfg = (await res.json()) as RuntimeConfigResponse;
-      if (!cfg.apiUrl || !cfg.hasAccessToken) {
-        setUser(null);
-        return;
-      }
-      const meRes = await fetch(`${cfg.apiUrl}/auth/me`, {
-        headers: { Authorization: `Bearer ${document.cookie.match(/mo_agent_access_token=([^;]+)/)?.[1] ?? ''}` },
-      });
+      const meRes = await fetch('/api/runtime-auth/me', { cache: 'no-store' });
       if (meRes.ok) {
         setUser(await meRes.json());
       } else {
@@ -133,38 +125,14 @@ export function RuntimeSettingsPanel() {
     setBusy(true);
     setStatus(null);
     try {
-      const cfgRes = await fetch('/api/runtime-config', { cache: 'no-store' });
-      const cfg = (await cfgRes.json()) as RuntimeConfigResponse;
-      if (!cfg.apiUrl || !cfg.hasRefreshToken) {
-        setStatus({ text: 'No refresh token available. Please log in again.', type: 'error' });
-        setBusy(false);
-        return;
-      }
-      // Call the auth refresh server action indirectly via the runtime-config
-      const refreshRes = await fetch(`${cfg.apiUrl}/auth/refresh`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          refresh_token: document.cookie.match(/mo_agent_refresh_token=([^;]+)/)?.[1] ?? '',
-        }),
-      });
-      if (refreshRes.ok) {
-        const data = await refreshRes.json();
-        // Save the new tokens via runtime-config POST
-        await fetch('/api/runtime-config', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            apiUrl: cfg.apiUrl,
-            accessToken: data.access_token,
-            refreshToken: data.refresh_token,
-          }),
-        });
+      const res = await fetch('/api/runtime-auth/refresh', { method: 'POST' });
+      const data = await res.json();
+      if (res.ok) {
         setStatus({ text: 'Access token refreshed successfully.', type: 'success' });
         await loadConfig();
         await loadUser();
       } else {
-        setStatus({ text: 'Token refresh failed. Please log in again.', type: 'error' });
+        setStatus({ text: data.error ?? 'Token refresh failed. Please log in again.', type: 'error' });
       }
     } catch {
       setStatus({ text: 'Token refresh failed. Network error.', type: 'error' });

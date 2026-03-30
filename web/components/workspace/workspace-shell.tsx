@@ -78,7 +78,13 @@ export function WorkspaceShell({
           <div className="flex items-center gap-3">
             <h2 className="text-sm font-medium text-white">Agent workspace</h2>
             <ConnectionStatus
-              state={chat.isStreaming ? 'connected' : 'disconnected'}
+              state={
+                chat.connectionState === 'streaming'
+                  ? 'connected'
+                  : chat.connectionState === 'error'
+                    ? 'error'
+                    : 'disconnected'
+              }
             />
           </div>
           <div className="flex items-center gap-3 text-xs text-slate-500">
@@ -125,7 +131,9 @@ export function WorkspaceShell({
         {/* Input */}
         <ChatInput
           onSend={chat.sendMessage}
+          onStop={chat.stop}
           disabled={chat.isStreaming}
+          isStreaming={chat.isStreaming}
           placeholder={
             displaySessionId
               ? 'Send a message…'

@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   ChatConfig,
   ChatMessage,
@@ -9,7 +9,6 @@ import type {
   PlanState,
   PlanSubtask,
   TokenUsage,
-  ThinkingBlock,
 } from '@/lib/workspace/types';
 import type { StreamEvent } from '@/lib/streaming/types';
 
@@ -26,9 +25,13 @@ const EMPTY_USAGE: TokenUsage = {
   cacheReadTokens: 0,
 };
 
+export type ConnectionState = 'idle' | 'streaming' | 'error';
+
 type UseChatStreamReturn = WorkspaceState & {
   sendMessage: (content: string) => void;
+  stop: () => void;
   reset: () => void;
+  connectionState: ConnectionState;
 };
 
 /**
@@ -44,6 +47,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
   const [error, setError] = useState<string | null>(null);
   const [plan, setPlan] = useState<PlanState | null>(null);
   const [usage, setUsage] = useState<TokenUsage>(EMPTY_USAGE);
+  const [connectionState, setConnectionState] = useState<ConnectionState>('idle');
 
   // Refs for mutable state during stream processing
   const controllerRef = useRef<AbortController | null>(null);
@@ -51,6 +55,39 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
   const accumulatedTextRef = useRef('');
   const accumulatedThinkingRef = useRef('');
   const toolCallMapRef = useRef<Map<string, ToolCall>>(new Map());
+  // Track config.sessionId to detect external changes
+  const configSessionIdRef = useRef(config.sessionId);
+
+  // Reset state when config.sessionId changes externally (session switch)
+  useEffect(() => {
+    if (configSessionIdRef.current !== config.sessionId) {
+      configSessionIdRef.current = config.sessionId;
+      // Abort any in-flight request
+      controllerRef.current?.abort();
+      controllerRef.current = null;
+      // Clear all state for the new session
+      setMessages([]);
+      setToolCalls([]);
+      setSessionId(config.sessionId ?? null);
+      setRunId(null);
+      setIsStreaming(false);
+      setError(null);
+      setPlan(null);
+      setUsage(EMPTY_USAGE);
+      setConnectionState('idle');
+      accumulatedTextRef.current = '';
+      accumulatedThinkingRef.current = '';
+      toolCallMapRef.current.clear();
+    }
+  }, [config.sessionId]);
+
+  // Abort in-flight request on unmount
+  useEffect(() => {
+    return () => {
+      controllerRef.current?.abort();
+      controllerRef.current = null;
+    };
+  }, []);
 
   const processEvent = useCallback(
     (event: StreamEvent) => {
@@ -207,12 +244,14 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
             ),
           );
           setIsStreaming(false);
+          setConnectionState('idle');
           break;
         }
 
         case 'error': {
           setError(event.message);
           setIsStreaming(false);
+          setConnectionState('error');
           break;
         }
 
@@ -227,12 +266,30 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
     [],
   );
 
+  const stop = useCallback(() => {
+    controllerRef.current?.abort();
+    controllerRef.current = null;
+    // Mark the current assistant message as done
+    const id = assistantIdRef.current;
+    if (id) {
+      const finalTools = Array.from(toolCallMapRef.current.values());
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === id ? { ...m, streaming: false, toolCalls: finalTools.length > 0 ? finalTools : undefined } : m,
+        ),
+      );
+    }
+    setIsStreaming(false);
+    setConnectionState('idle');
+  }, []);
+
   const sendMessage = useCallback(
     (content: string) => {
       if (isStreaming) return;
 
       setError(null);
       setIsStreaming(true);
+      setConnectionState('streaming');
 
       const userMsg: ChatMessage = {
         id: uid(),
@@ -318,11 +375,16 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
           }
 
           setIsStreaming(false);
+          setConnectionState('idle');
         })
         .catch((err) => {
-          if (err instanceof DOMException && err.name === 'AbortError') return;
+          if (err instanceof DOMException && err.name === 'AbortError') {
+            // User stopped — don't show as error
+            return;
+          }
           setError(err instanceof Error ? err.message : 'Unknown streaming error');
           setIsStreaming(false);
+          setConnectionState('error');
         });
     },
     [isStreaming, sessionId, config, processEvent],
@@ -339,6 +401,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
     setError(null);
     setPlan(null);
     setUsage(EMPTY_USAGE);
+    setConnectionState('idle');
     accumulatedTextRef.current = '';
     accumulatedThinkingRef.current = '';
     toolCallMapRef.current.clear();
@@ -353,7 +416,9 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
     error,
     plan,
     usage,
+    connectionState,
     sendMessage,
+    stop,
     reset,
   };
 }

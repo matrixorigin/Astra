@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useEffect } from 'react';
+import { useRef, useEffect, useCallback } from 'react';
 import type { ChatMessage } from '@/lib/workspace/types';
 import { MarkdownRenderer } from './markdown-renderer';
 import { ThinkingBlock } from './thinking-block';
@@ -68,16 +68,29 @@ export function ChatThread({
   className?: string;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const isNearBottomRef = useRef(true);
 
+  // Track whether user is near the bottom (within 100px)
+  const handleScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    isNearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
+  }, []);
+
+  // Only auto-scroll if user hasn't scrolled up
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) {
+    if (el && isNearBottomRef.current) {
       el.scrollTop = el.scrollHeight;
     }
   }, [messages]);
 
   return (
-    <div ref={scrollRef} className={`flex-1 overflow-y-auto p-4 ${className}`}>
+    <div
+      ref={scrollRef}
+      onScroll={handleScroll}
+      className={`flex-1 overflow-y-auto p-4 ${className}`}
+    >
       {messages.length === 0 ? (
         <div className="flex h-full flex-col items-center justify-center gap-3">
           <div className="flex h-12 w-12 items-center justify-center rounded-full bg-slate-800/50">
