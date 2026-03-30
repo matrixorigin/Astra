@@ -1,4 +1,5 @@
 use super::*;
+use std::io::Read;
 
 pub(super) async fn execute_cli_command(
     command: Option<Command>,
@@ -230,11 +231,26 @@ pub(super) async fn execute_cli_command(
         }
 
         Some(Command::Chat(args)) => {
-            // No message → start REPL with optional pre-set session/model
-            let Some(message) = args.message else {
+            // Handle --no-color: set NO_COLOR environment variable for crossterm
+            if args.no_color {
+                unsafe { std::env::set_var("NO_COLOR", "1"); }
+            }
+
+            // Determine message source: --stdin, -m, or start REPL
+            let message = if args.stdin {
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .map_err(|e| format!("failed to read stdin: {e}"))?;
+                buf.trim().to_string()
+            } else if let Some(m) = args.message {
+                m
+            } else {
+                // No message → start REPL with optional pre-set session/model
                 return run_chat_repl(client, base, profile.as_deref(), args.model.as_deref())
                     .await;
             };
+
             let (mut creds, name, _, token) = get_profile_and_token(profile.as_deref())?;
             let session_id = args
                 .session_id
@@ -247,6 +263,12 @@ pub(super) async fn execute_cli_command(
             } else {
                 ExplainMode::Off
             };
+
+            // --json implies --quiet
+            let quiet = args.quiet || args.json;
+            // When quiet, don't render markdown (no terminal formatting)
+            let render_md = is_tty && !quiet;
+
             let sr = match stream_chat_sse(ChatTurnParams {
                 client,
                 base,
@@ -255,11 +277,11 @@ pub(super) async fn execute_cli_command(
                 session_id: session_id.as_deref(),
                 model: args.model.as_deref(),
                 explain: explain_mode,
-                render_md: is_tty,
+                render_md,
                 history: &[],
                 perm_manager: &mut pm,
-                verbose_mode: true,
-                quiet: false,
+                verbose_mode: !quiet,
+                quiet,
                 selector: &*selector.0,
                 recent_tools: &[],
                 tool_health_entries: &[],
@@ -277,11 +299,11 @@ pub(super) async fn execute_cli_command(
                         session_id: None,
                         model: args.model.as_deref(),
                         explain: explain_mode,
-                        render_md: is_tty,
+                        render_md,
                         history: &[],
                         perm_manager: &mut pm,
-                        verbose_mode: true,
-                        quiet: false,
+                        verbose_mode: !quiet,
+                        quiet,
                         selector: &*selector.0,
                         recent_tools: &[],
                         tool_health_entries: &[],
@@ -290,11 +312,36 @@ pub(super) async fn execute_cli_command(
                 }
                 Err(e) => return Err(e),
             };
-            if let Some(sid) = sr.session_id {
+
+            // Save session for resumption
+            if let Some(sid) = &sr.session_id {
                 let p = creds.profiles.entry(name).or_default();
-                p.last_session_id = Some(sid);
+                p.last_session_id = Some(sid.clone());
                 save_credentials(&creds)?;
             }
+
+            // Output result
+            if args.json {
+                // Pure JSON output for scripting
+                let json_output = serde_json::json!({
+                    "session_id": sr.session_id,
+                    "run_id": sr.run_id,
+                    "text": sr.full_text,
+                    "prompt_tokens": sr.prompt_tokens,
+                    "completion_tokens": sr.completion_tokens,
+                    "tool_calls_count": sr.tool_calls_count,
+                    "tools_used": sr.tools_used,
+                    "ttft_ms": sr.ttft_ms,
+                    "context_ms": sr.context_ms,
+                    "selector_strategy": sr.selector_strategy,
+                });
+                println!("{}", serde_json::to_string_pretty(&json_output).unwrap());
+            } else if quiet {
+                // Quiet mode: just print the text without formatting
+                println!("{}", sr.full_text);
+            }
+            // Normal mode output is already handled by stream_chat_sse
+
             Ok(())
         }
 

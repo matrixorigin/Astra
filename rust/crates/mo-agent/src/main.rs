@@ -179,6 +179,18 @@ struct ChatArgs {
     explain: bool,
     #[arg(short = 'y', long = "auto-approve", default_value_t = false)]
     auto_approve: bool,
+    /// Suppress spinner and progress output (result still printed)
+    #[arg(long, default_value_t = false)]
+    quiet: bool,
+    /// Output result as JSON (implies --quiet)
+    #[arg(long, default_value_t = false)]
+    json: bool,
+    /// Read message from stdin instead of -m
+    #[arg(long, default_value_t = false)]
+    stdin: bool,
+    /// Disable ANSI colors in output
+    #[arg(long, default_value_t = false)]
+    no_color: bool,
 }
 
 #[derive(Subcommand, Debug)]
