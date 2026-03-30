@@ -1,9 +1,11 @@
+use std::io::Write;
+
 use super::*;
 
 pub(super) fn resolve_journal_target_session(
     sub_arg: &str,
     state: &ReplState,
-    missing_active_msg: &str,
+    _missing_active_msg: &str,
 ) -> Result<(String, bool), String> {
     if !sub_arg.is_empty() {
         let requested = sub_arg.trim();
@@ -13,7 +15,37 @@ pub(super) fn resolve_journal_target_session(
     } else if let Some(ref sid) = state.session_id {
         Ok((sid.clone(), false))
     } else {
-        Err(format!("{}", missing_active_msg.yellow()))
+        // No active session — list local journals and let user pick
+        let sessions = session_journal::list_sessions().unwrap_or_default();
+        if sessions.is_empty() {
+            return Err("  No sessions found.".to_string());
+        }
+        eprintln!(
+            "\n{}",
+            "─── Available Sessions ──────────────────────────".bold()
+        );
+        let show = sessions.len().min(10);
+        for (i, sid) in sessions.iter().rev().take(show).enumerate() {
+            let short = &sid[..8.min(sid.len())];
+            eprintln!(
+                "  {}  {}",
+                format!("[{}]", i + 1).cyan().bold(),
+                short.dim()
+            );
+        }
+        eprintln!();
+        eprint!("  {} ", "Select (number or Enter to cancel):".bold());
+        let _ = std::io::stderr().flush();
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_ok()
+            && let Ok(n) = input.trim().parse::<usize>()
+        {
+            let reversed: Vec<_> = sessions.iter().rev().take(show).collect();
+            if n >= 1 && n <= reversed.len() {
+                return Ok((reversed[n - 1].clone(), false));
+            }
+        }
+        Err("  Cancelled.".to_string())
     }
 }
 

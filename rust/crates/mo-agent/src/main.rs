@@ -475,40 +475,60 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
         None => HybridRestoreService::local_only(),
     };
 
-    // If no session_id given, list resumable sessions
+    // If no session_id given, list and let user pick
+    let effective_arg;
     if arg.is_empty() {
         match svc.list_resumable_sessions(user_id).await {
             Ok(sessions) if sessions.is_empty() => {
-                eprintln!(
-                    "{}",
-                    "  No resumable sessions. Use /resume <session_id>.".dim()
-                );
+                eprintln!("{}", "  No resumable sessions found.".dim());
+                return;
             }
             Ok(sessions) => {
                 eprintln!(
                     "\n{}",
                     "─── Resumable Sessions ──────────────────────────".bold()
                 );
-                for s in &sessions {
+                for (i, s) in sessions.iter().enumerate() {
                     let title = s.title.as_deref().unwrap_or("untitled");
                     let short_id = &s.session_id[..8.min(s.session_id.len())];
                     eprintln!(
-                        "  {} {} ({} turns, {})",
-                        short_id.cyan(),
+                        "  {}  {} {} ({} turns, {})",
+                        format!("[{}]", i + 1).cyan().bold(),
+                        short_id.dim(),
                         title,
                         s.turn_count,
                         s.last_status.as_str().dim(),
                     );
                 }
-                eprintln!("  Use /resume <session_id> to restore.\n");
+                eprintln!();
+                eprint!("  {} ", "Select (number or Enter to cancel):".bold());
+                std::io::Write::flush(&mut std::io::stderr()).ok();
+                let mut input = String::new();
+                if std::io::stdin().read_line(&mut input).is_ok() {
+                    if let Ok(n) = input.trim().parse::<usize>() {
+                        if n >= 1 && n <= sessions.len() {
+                            effective_arg = sessions[n - 1].session_id.clone();
+                        } else {
+                            eprintln!("{}", "  Cancelled.".dim());
+                            return;
+                        }
+                    } else {
+                        eprintln!("{}", "  Cancelled.".dim());
+                        return;
+                    }
+                } else {
+                    return;
+                }
             }
             Err(e) => {
                 eprintln!("{}", format!("  ✗ Could not list sessions: {e}").red());
-                eprintln!("{}", "  Check /doctor for connectivity status.".dim());
+                return;
             }
         }
-        return;
+    } else {
+        effective_arg = arg.to_string();
     }
+    let arg = effective_arg.as_str();
 
     // Resolve prefix via local journal first
     let session_id = match session_journal::resolve_session_id(arg) {
