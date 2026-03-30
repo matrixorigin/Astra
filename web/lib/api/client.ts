@@ -10,15 +10,19 @@ export async function getWebDataMode(): Promise<WebDataMode> {
 export async function apiFetch<T>(path: string): Promise<T> {
   const config = await getRuntimeConfig();
 
-  if (config.mode !== 'live' || !config.apiUrl || !config.accessToken) {
+  if (config.mode !== 'live' || !config.apiUrl) {
     throw new Error(getWebConfigurationMessage());
   }
 
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (config.accessToken) {
+    headers['Authorization'] = `Bearer ${config.accessToken}`;
+  }
+
   const response = await fetch(new URL(path, config.apiUrl).toString(), {
-    headers: {
-      Authorization: `Bearer ${config.accessToken}`,
-      'Content-Type': 'application/json',
-    },
+    headers,
     cache: 'no-store',
   });
 
@@ -41,16 +45,20 @@ export async function apiFetch<T>(path: string): Promise<T> {
 export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
   const config = await getRuntimeConfig();
 
-  if (config.mode !== 'live' || !config.apiUrl || !config.accessToken) {
+  if (config.mode !== 'live' || !config.apiUrl) {
     throw new Error(getWebConfigurationMessage());
+  }
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (config.accessToken) {
+    headers['Authorization'] = `Bearer ${config.accessToken}`;
   }
 
   const response = await fetch(new URL(path, config.apiUrl).toString(), {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${config.accessToken}`,
-      'Content-Type': 'application/json',
-    },
+    headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
     cache: 'no-store',
   });

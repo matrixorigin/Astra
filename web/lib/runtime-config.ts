@@ -36,6 +36,8 @@ export function maskToken(token?: string): string | undefined {
   return `${token.slice(0, 4)}••••${token.slice(-4)}`;
 }
 
+export const DEFAULT_API_URL = 'http://localhost:8000';
+
 export async function getRuntimeConfig(): Promise<RuntimeConfig> {
   const cookieStore = await cookies();
   const cookieDemo = cookieStore.get(DEMO_MODE_COOKIE)?.value === 'true';
@@ -58,20 +60,10 @@ export async function getRuntimeConfig(): Promise<RuntimeConfig> {
     };
   }
 
-  if (cookieApiUrl && cookieAccessToken) {
-    return {
-      mode: 'live',
-      source: 'cookie',
-      demoMode: false,
-      apiUrl: cookieApiUrl,
-      accessToken: cookieAccessToken,
-      refreshToken: cookieRefreshToken,
-      hasAccessToken: true,
-      hasRefreshToken: Boolean(cookieRefreshToken),
-      maskedAccessToken: maskToken(cookieAccessToken),
-      message: 'Using saved runtime API configuration from frontend settings.',
-    };
-  }
+  // Resolve API URL: cookie > env > default
+  const apiUrl = cookieApiUrl ?? process.env.MO_AGENT_API_URL ?? DEFAULT_API_URL;
+  const accessToken = cookieAccessToken ?? process.env.MO_AGENT_ACCESS_TOKEN;
+  const refreshToken = cookieRefreshToken;
 
   const envDemo = process.env.MO_AGENT_WEB_DEMO === 'true';
   if (envDemo) {
@@ -79,37 +71,35 @@ export async function getRuntimeConfig(): Promise<RuntimeConfig> {
       mode: 'demo',
       source: 'env',
       demoMode: true,
-      apiUrl: process.env.MO_AGENT_API_URL,
-      accessToken: process.env.MO_AGENT_ACCESS_TOKEN,
-      refreshToken: undefined,
-      hasAccessToken: Boolean(process.env.MO_AGENT_ACCESS_TOKEN),
-      hasRefreshToken: false,
-      maskedAccessToken: maskToken(process.env.MO_AGENT_ACCESS_TOKEN),
+      apiUrl,
+      accessToken,
+      refreshToken,
+      hasAccessToken: Boolean(accessToken),
+      hasRefreshToken: Boolean(refreshToken),
+      maskedAccessToken: maskToken(accessToken),
       message: 'Demo mode is enabled from environment variables.',
     };
   }
 
-  if (process.env.MO_AGENT_API_URL && process.env.MO_AGENT_ACCESS_TOKEN) {
-    return {
-      mode: 'live',
-      source: 'env',
-      demoMode: false,
-      apiUrl: process.env.MO_AGENT_API_URL,
-      accessToken: process.env.MO_AGENT_ACCESS_TOKEN,
-      refreshToken: undefined,
-      hasAccessToken: true,
-      hasRefreshToken: false,
-      maskedAccessToken: maskToken(process.env.MO_AGENT_ACCESS_TOKEN),
-      message: 'Using runtime API configuration from environment variables.',
-    };
-  }
+  // Live mode: API URL is always available (defaults to localhost:8000)
+  const source: 'cookie' | 'env' | 'none' = cookieApiUrl
+    ? 'cookie'
+    : process.env.MO_AGENT_API_URL
+      ? 'env'
+      : 'none';
 
   return {
-    mode: 'unconfigured',
-    source: 'none',
+    mode: 'live',
+    source,
     demoMode: false,
-    hasAccessToken: false,
-    hasRefreshToken: false,
-    message: getWebConfigurationMessage(),
+    apiUrl,
+    accessToken,
+    refreshToken,
+    hasAccessToken: Boolean(accessToken),
+    hasRefreshToken: Boolean(refreshToken),
+    maskedAccessToken: maskToken(accessToken),
+    message: accessToken
+      ? `Connected to ${apiUrl} with authentication.`
+      : `Connected to ${apiUrl} without authentication. Login for full access.`,
   };
 }
