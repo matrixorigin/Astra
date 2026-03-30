@@ -230,102 +230,102 @@ WHERE MATCH(file_ref) AGAINST('database migration pattern')
 
 ---
 
-## 3. Pub/Sub (PUBLICATION/SUBSCRIPTION): Event-Driven Agent Choreography
+## 3. Pub/Sub (PUBLICATION/SUBSCRIPTION): Cross-Agent Data Sharing & Coordination
+
+> **⚠️ Reality Check**: MatrixOne pub/sub is **database-level replication**, not event streaming (Kafka/Redis). Publishers share entire databases or specific tables with subscriber accounts. Subscribers get a **read-only, transactionally-consistent view** of published data. This is still powerful for agent coordination — but the mechanism is data sharing, not message passing.
 
 ### The Old Pattern
 
 ```
-LangGraph:   Agents communicate via shared state channels
-             Agent B polls the state graph to see if Agent A wrote something
-             Latency: next tick of the graph executor (100ms-seconds)
+LangGraph:   Agents share in-process state channels
+             Direct memory access — fast but no isolation
+             Multiple agents = multiple processes = need Redis/etc.
 
-CrewAI:      Sequential handoff — Agent A finishes, framework passes to Agent B
-             No real-time communication — strictly pipeline
-             "Parallel" = independent execution with no inter-agent awareness
+CrewAI:      Sequential handoff — Agent A finishes, output passed to Agent B
+             No real-time data sharing
+             "Parallel" = independent execution, manually reassemble
 
-Devin:       No multi-agent communication
-             Single agent, single container
+Devin:       Single agent per container
+             Data sharing = write files to shared volume
+             No structured data sharing
 
-Every framework: polling, callback queues, or webhook endpoints
+Every framework: Direct DB access requires credential sharing
+                 OR a middleware API layer for data exchange
 ```
 
-The fundamental problem: **polling wastes resources and adds latency; webhooks require network infrastructure; callbacks require shared memory.** None of these are native to the data layer.
+The fundamental problem: **agents either share too much (in-process state, security risk) or too little (file-based exchange, no structure). There's no middle ground for "share specific data with specific agents, securely."**
 
-### The New Pattern: Database-Native Event Choreography
+### The New Pattern: Database-Native Data Sharing with Network Isolation
 
 ```sql
--- SYSTEM ACCOUNT: Create a publication for orchestration events
-CREATE PUBLICATION orchestration_events
-  DATABASE event_bus
+-- ORCHESTRATOR (sys account): Publish coordination data
+CREATE PUBLICATION plan_coordination
+  DATABASE orchestrator_db
+  TABLE task_assignments, plan_definitions, shared_knowledge
   ACCOUNT agent_coder_acct, agent_tester_acct, agent_reviewer_acct;
 
--- AGENT_CODER ACCOUNT: Subscribe to receive orchestration events
-CREATE DATABASE my_events FROM sys PUBLICATION orchestration_events;
+-- AGENT_CODER (own account): Subscribe to get read-only view
+CREATE DATABASE coord FROM sys PUBLICATION plan_coordination;
 
--- Now agent_coder can read from my_events tables as if they were local.
--- When the orchestrator INSERTs an event, agent_coder sees it
--- via its subscription — NO polling, NO webhook, NO message queue.
+-- Agent reads assigned tasks — sees real-time updates from orchestrator
+SELECT * FROM coord.task_assignments
+WHERE assigned_agent = 'coder' AND status = 'pending';
 
--- THE CHOREOGRAPHY PATTERN:
--- Step 1: Orchestrator creates a task assignment
-INSERT INTO event_bus.task_events (task_id, event_type, target_agent, payload)
-VALUES ('t-42', 'task_assigned', 'agent_coder', '{"subtask": "implement auth"}');
+-- Agent reads shared context that orchestrator published
+SELECT * FROM coord.shared_knowledge
+WHERE domain = 'authentication' ORDER BY confidence DESC;
 
--- Step 2: agent_coder sees it immediately in its subscription
--- @session: agent_coder_acct
-SELECT * FROM my_events.task_events
-WHERE target_agent = 'agent_coder' AND event_type = 'task_assigned';
--- This returns the row the orchestrator just inserted
+-- ORCHESTRATOR: Publish learning state for cross-agent knowledge sharing
+CREATE PUBLICATION learning_pub
+  DATABASE learning_db
+  TABLE entity_graph, pattern_library
+  ACCOUNT ALL;  -- All agents benefit from collective learning
 
--- Step 3: agent_coder completes work, publishes result back
--- (agent_coder has its OWN publication for results)
-INSERT INTO coder_results.task_events (task_id, event_type, payload)
-VALUES ('t-42', 'task_completed', '{"files_changed": ["src/auth.rs"]}');
-
--- Step 4: Orchestrator and agent_tester both subscribe to coder_results
--- They see the completion event and can act on it
+-- ANY AGENT: Subscribe and use collective learning
+CREATE DATABASE shared_learning FROM sys PUBLICATION learning_pub;
+SELECT * FROM shared_learning.entity_graph
+WHERE entity_name = 'React' AND confidence > 0.5;
 ```
 
-### Why This Is Fundamentally Different
+### Why This Is Still Fundamentally Different
 
-**It's not "use pub/sub for notifications." It's "agent coordination IS data subscription."**
+**It's not event streaming, but it IS a unique data sharing primitive.**
 
-1. **No message broker needed**: Redis, RabbitMQ, Kafka — none required. The database IS the event bus. Events are just rows in tables, visible to subscribers via SQL. This eliminates an entire infrastructure layer.
+1. **Network isolation without API middleware**: Agents don't need orchestrator's database credentials. They subscribe and get their own view. This is a **security architecture** — agents can't execute arbitrary SQL against the orchestrator's database.
 
-2. **Subscription IS the coordination protocol**: The orchestrator doesn't need to implement routing logic. It publishes to a database. Which agents see which events is determined by `ACCOUNT` clauses in the publication. Adding a new agent to the coordination? `ALTER PUBLICATION ... ACCOUNT ADD new_agent_acct;`
+2. **Selective sharing via table lists**: `TABLE task_assignments, shared_knowledge` — the orchestrator controls exactly which tables are visible. Internal tables (agent scores, cost tracking) remain private.
 
-3. **Events are queryable, not consumable**: Unlike message queues where consumption deletes messages, pub/sub subscriptions give read-only SQL access to the published tables. Agents can run complex queries over the event history:
+3. **Events are queryable, not consumable**: Unlike message queues where consumption deletes messages, pub/sub subscriptions give read-only SQL access to the published tables. Agents can run complex queries over the data:
 
 ```sql
--- Agent B: "What did all agents do in the last hour for my plan?"
-SELECT agent_id, event_type, COUNT(*), MAX(created_at)
-FROM my_events.task_events
-WHERE plan_id = 'plan-7' AND created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)
-GROUP BY agent_id, event_type;
+-- Agent: "What tasks were assigned in the last hour?"
+SELECT agent_id, task_type, COUNT(*), MAX(assigned_at)
+FROM coord.task_assignments
+WHERE assigned_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)
+GROUP BY agent_id, task_type;
 ```
 
-4. **Multi-tier event routing without fan-out logic**:
+4. **Multi-tier sharing for organizational hierarchy**:
 
 ```sql
--- Tier 1: Global events (all agents see)
-CREATE PUBLICATION global_events DATABASE global_bus ACCOUNT ALL;
+-- Tier 1: Global shared resources (all agents)
+CREATE PUBLICATION global_resources DATABASE shared_db ACCOUNT ALL;
 
--- Tier 2: Team-specific events
-CREATE PUBLICATION frontend_events DATABASE frontend_bus
+-- Tier 2: Team-specific data (subset of agents)
+CREATE PUBLICATION frontend_context DATABASE frontend_db
   ACCOUNT agent_ui_coder, agent_ui_tester;
 
--- Tier 3: Pair-specific events (adversarial review)
-CREATE PUBLICATION review_channel DATABASE review_bus
+-- Tier 3: Pair-specific (adversarial review pair)
+CREATE PUBLICATION review_data DATABASE review_db
   ACCOUNT agent_proposer, agent_reviewer;
-
--- Each tier is a separate publication. No routing logic in application code.
 ```
 
 ### What This Enables for Coding Agent Quality
 
-- **Near-zero latency coordination**: Agent B reacts to Agent A's output within one transaction commit, not one polling cycle
-- **Elimination of message infrastructure**: No Redis, no Kafka, no webhook endpoints — the database handles all event routing
-- **SQL-powered event analytics**: "Which coordination events caused the longest delays?" → single query over the event bus tables
+- **Secure multi-agent data sharing**: No credential sharing, no API middleware — database handles isolation and replication
+- **Collective learning without data copying**: All agents subscribe to the converged learning state; orchestrator manages convergence
+- **SQL-powered coordination queries**: Agents query their subscribed view with full SQL power
+- **Note**: For event signaling (Agent A → "done" → Agent B), use orchestrator's event table within the publication. Agents poll their subscription view with `created_at > @last_seen` — latency depends on replication lag, not polling frequency
 
 ---
 
@@ -498,7 +498,8 @@ CREATE TABLE agent_memory (
     turn_number   INT,
     created_at    DATETIME(6),
 
-    INDEX idx_vec USING HNSW ON (embedding) OP_TYPE "vector_l2_ops",
+    -- HNSW deferred: use brute-force L2_DISTANCE for now
+    -- INDEX idx_vec USING HNSW ON (embedding) OP_TYPE "vector_l2_ops",  -- future
     FULLTEXT INDEX ft_content (content)
 );
 
@@ -800,17 +801,16 @@ SELECT * FROM coder_ws.code_changes {snapshot = 'before_review'};
 ```
 
 **Count the systems this replaces**:
-- ❌ Redis/Kafka (event routing) → ✅ PUBLICATION/SUBSCRIPTION
-- ❌ Pinecone (vector search) → ✅ VECF32 + HNSW INDEX
+- ❌ Credential sharing for data access → ✅ PUBLICATION/SUBSCRIPTION (network-isolated sharing)
+- ❌ Pinecone (vector search) → ✅ VECF32 + L2_DISTANCE (HNSW deferred)
 - ❌ Elasticsearch (fulltext) → ✅ FULLTEXT INDEX + BM25
 - ❌ S3 SDK (artifact storage) → ✅ STAGE + DATALINK
 - ❌ Application-level locks → ✅ DATA BRANCH (isolation)
 - ❌ Application-level checkpoints → ✅ SNAPSHOT + PITR
 - ❌ Row-level security → ✅ Multi-tenant ACCOUNTS
 - ❌ Application-level merge logic → ✅ DATA BRANCH MERGE
-- ❌ Application-level event routing → ✅ PUBLICATION routing
 
-**9 infrastructure concerns collapsed into SQL primitives.**
+**8 infrastructure concerns collapsed into SQL primitives.**
 
 ---
 
@@ -821,13 +821,12 @@ The current `multi-agent-cloud-runtime.md` §7 identifies the right features but
 | Current Design Decision | MatrixOne-Native Alternative | Why Change |
 |------------------------|------------------------------|------------|
 | Lease-based task ownership (§9) | Data branches per agent — no leases needed | Branches provide stronger isolation than leases. Agents can't conflict because they work in separate branches. |
-| Polling-based event routing (§8.3) | Pub/Sub publications per coordination tier | Eliminates polling latency and application-level routing |
+| Direct DB access for data sharing | Publication/Subscription for data sharing | Agents don't need orchestrator credentials; selective, auditable sharing |
 | JSON blob checkpoints in LONGTEXT (§7.5) | Snapshot + PITR at database level | Zero-copy, atomic, complete — includes all tables, not just one JSON field |
 | Application-level 3-way merge in Rust (§10.2) | `DATA BRANCH MERGE` with SQL-level conflict detection | Push merge complexity into the database engine |
 | Git worktree per agent for isolation (§13.2) | Multi-tenant account per agent | Stronger isolation (SQL-level), includes data isolation not just filesystem |
-| Separate vector DB consideration (§7.2) | Native VECF32 + HNSW + fulltext in one query | Eliminates external dependency, enables fused ranking |
+| Separate vector DB consideration (§7.2) | Native VECF32 + BM25 fulltext in one query | Eliminates external dependency, enables fused ranking (HNSW deferred) |
 | S3 client for artifacts (§7.6) | Stage + DataLink + fulltext on external files | Eliminates SDK code, enables SQL search over S3 artifacts |
-| Application-level event routing | Publication per coordination pattern | Database handles routing, filtering, and access control |
 
 ### The Key Architectural Shift
 
@@ -840,13 +839,13 @@ This inverts the dependency. The "smart" part of multi-agent coordination moves 
 
 ## Summary: The Six Paradigm Shifts
 
-| # | Feature | Old Paradigm | New Paradigm | No Other DB Can Do This |
-|---|---------|-------------|-------------|------------------------|
+| # | Feature | Old Paradigm | New Paradigm | Unique Advantage |
+|---|---------|-------------|-------------|------------------|
 | 1 | **Git4Data** | Locks, leases, conflict resolution in app code | Branch-and-merge: agents work independently, merge results | Three-way data merge with LCA detection |
 | 2 | **Stage+DataLink+Fulltext** | Separate systems for storage, indexing, search | SQL as federated query engine over all artifacts | Fulltext index on external S3 files |
-| 3 | **Pub/Sub** | Polling, webhooks, message queues | Database-native event routing via publications | SQL-queryable event subscriptions |
+| 3 | **Pub/Sub** | Direct DB access + credential sharing | Secure data sharing via publication/subscription | Network-isolated, selective, auditable sharing |
 | 4 | **Snapshot+PITR+Git4Data** | Serialize-try-deserialize, one path at a time | Parallel speculative execution with instant rollback | Branched speculation + continuous time-travel |
-| 5 | **Vector+Fulltext+SQL** | Three systems + application fusion layer | One query, three modalities, fused ranking | BM25 + HNSW + SQL filters in single statement |
+| 5 | **Vector+Fulltext+SQL** | Three systems + application fusion layer | One query: BM25 + vector + SQL filters | Fused ranking in single statement (HNSW deferred) |
 | 6 | **Multi-tenant Accounts** | Row-level security (filter on shared data) | SQL-level isolation (separate namespaces) | True account isolation with publication sharing |
 
 **The bottom line**: An agent runtime designed from scratch around MatrixOne wouldn't have a "storage layer" — MatrixOne would BE the runtime, with a thin Rust shell for LLM API calls and local tool execution. This is not an incremental improvement over using PostgreSQL. It's a fundamentally different architecture that no other agent framework can replicate, because no other database has these primitives.

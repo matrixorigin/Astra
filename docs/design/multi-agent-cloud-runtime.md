@@ -424,7 +424,9 @@ RESTORE ACCOUNT FROM SNAPSHOT plan_baseline_sp;
 
 ### 7.2 Vector Search: Native Embedding-Based Memory Retrieval
 
-MatrixOne has **native vector data type** with HNSW and IVFFlat indexes — no external extension needed.
+MatrixOne has **native vector data type** (`vecf32`, `vecf64`) with index support — no external extension needed.
+
+> **Note**: HNSW/IVFFlat indexes exist but are not yet recommended for production workloads. Use brute-force `L2_DISTANCE` for now; add HNSW when maturity improves.
 
 ```sql
 -- Store agent memory with embeddings
@@ -437,10 +439,12 @@ CREATE TABLE agent_memories (
     confidence    FLOAT DEFAULT 1.0,
     created_at    DATETIME(6) DEFAULT NOW(6),
     INDEX idx_user (user_id),
-    INDEX idx_vec USING HNSW ON (embedding) OP_TYPE "vector_l2_ops"
+    FULLTEXT INDEX ft_content (content)                -- BM25 fulltext for hybrid retrieval
+    -- HNSW index omitted: use brute-force L2_DISTANCE for now
+    -- INDEX idx_vec USING HNSW ON (embedding) OP_TYPE "vector_l2_ops"  -- future
 );
 
--- Semantic memory retrieval: find memories similar to current context
+-- Semantic memory retrieval: brute-force vector similarity (no HNSW)
 SELECT memory_id, content, confidence,
        L2_DISTANCE(embedding, @query_embedding) AS distance
 FROM agent_memories
@@ -449,7 +453,8 @@ WHERE user_id = @user_id
 ORDER BY L2_DISTANCE(embedding, @query_embedding) ASC
 LIMIT 10;
 
--- Hybrid retrieval: vector similarity + fulltext keyword matching
+-- Hybrid retrieval: vector similarity + BM25 fulltext in one query
+-- This is the key advantage: no Pinecone + Elasticsearch + fusion layer
 SELECT m.memory_id, m.content,
        L2_DISTANCE(m.embedding, @query_embedding) AS semantic_dist,
        MATCH(m.content) AGAINST(@keywords IN NATURAL LANGUAGE MODE) AS text_score
@@ -459,7 +464,7 @@ ORDER BY (0.7 * (1.0 / (1.0 + semantic_dist)) + 0.3 * text_score) DESC
 LIMIT 10;
 ```
 
-**Why this matters**: Memory retrieval is the #1 latency bottleneck in agent runtimes. MatrixOne handles both vector similarity AND full-text ranking **in a single query**, eliminating the need for external vector databases (Pinecone, Weaviate) or separate full-text engines (Elasticsearch).
+**Why this matters**: Memory retrieval is the #1 latency bottleneck in agent runtimes. Even without HNSW, MatrixOne handles vector similarity AND BM25 ranking **in a single query**, eliminating the Pinecone + Elasticsearch + application-level fusion pattern used by everyone else. When HNSW matures, this becomes a single-index hybrid search with no code changes.
 
 ### 7.3 Fulltext Search with BM25: Document-Scale Knowledge Base
 
@@ -496,39 +501,73 @@ WHERE MATCH(title, content) AGAINST('+authentication +token -deprecated' IN BOOL
 
 **Why this matters**: Agents need to search large codebases and documentation. MatrixOne's DataLink enables indexing **external files on S3/Stage without loading them into the database**, providing Elasticsearch-grade search without a separate system.
 
-### 7.4 Publication/Subscription: Push-Based Inter-Agent Events
+### 7.4 Publication/Subscription: Cross-Agent Data Sharing
 
-MatrixOne's native pub/sub enables **real-time event routing** between agents without polling:
+> **Reality check**: MatrixOne pub/sub is **database-level replication**, not event streaming (Kafka/Redis). A publisher shares entire databases or specific tables with subscriber accounts. Subscribers get a **read-only, real-time view** of published data — changes are synchronized transactionally, but this is data sharing, not an event bus.
 
 ```sql
--- Cloud account publishes agent events for subscribing agents
-CREATE PUBLICATION agent_events_pub DATABASE agent_events_db
-    ACCOUNT agent_a_account, agent_b_account
-    COMMENT 'Real-time event routing for multi-agent coordination';
+-- Orchestrator publishes shared plan/context data for all agents
+-- @session: sys (orchestrator account)
+CREATE PUBLICATION shared_plan_data DATABASE orchestrator_db
+    TABLE plan_definitions, task_assignments, shared_context
+    ACCOUNT agent_coder_acct, agent_reviewer_acct
+    COMMENT 'Shared coordination data for multi-agent execution';
 
--- Agent B subscribes (sees events in real-time)
--- @session: agent_b_account
-CREATE DATABASE event_feed FROM sys PUBLICATION agent_events_pub;
+-- Agent subscribes to see orchestrator data in real-time
+-- @session: agent_coder_acct
+CREATE DATABASE coordination FROM sys PUBLICATION shared_plan_data;
 
--- Agent B queries events relevant to its tasks
-SELECT * FROM event_feed.agent_events
-WHERE causal_chain_id = @my_plan_id
-  AND created_at > @last_poll_time
+-- Agent reads plan assignments (real-time view of orchestrator's tables)
+SELECT * FROM coordination.task_assignments
+WHERE assigned_agent = 'agent_coder' AND status = 'pending';
+
+-- Agent reads shared context (updates from orchestrator visible immediately)
+SELECT * FROM coordination.shared_context
+WHERE plan_id = @current_plan;
+```
+
+**What pub/sub IS good for in mo-agent**:
+- **Shared reference data**: Orchestrator publishes plan templates, task assignments, shared context. Agents subscribe and see updates in real-time without polling.
+- **Learning knowledge sharing**: Publish converged learning state (entity graph, pattern library) so all agents benefit from each other's experience.
+- **Cross-tenant data federation**: Platform-level shared resources (model configs, prompt templates) published to all customer accounts.
+
+**What pub/sub is NOT**:
+- ❌ Event streaming / message queue (use `INSERT` into event tables + poll for that)
+- ❌ Bidirectional — subscribers cannot write back to publisher's tables
+- ❌ Per-row event notification — it replicates entire table state, not individual events
+
+```
+Orchestrator writes plan → plan table updated → PUBLICATION
+                                                     │
+                                          ┌──────────┴──────────┐
+                                          ▼                     ▼
+                                   Agent A account         Agent B account
+                                   (SUBSCRIPTION)          (SUBSCRIPTION)
+                                   reads plan data         reads plan data
+                                   (real-time view)        (real-time view)
+```
+
+**For event routing** (Agent A signals "task done" to Agent B), use a simpler pattern:
+```sql
+-- Event table in orchestrator DB (included in publication)
+CREATE TABLE task_events (
+    event_id   VARCHAR(36) PRIMARY KEY,
+    task_id    VARCHAR(36),
+    event_type VARCHAR(30),
+    source     VARCHAR(36),
+    payload    JSON,
+    created_at DATETIME(6) DEFAULT NOW(6),
+    INDEX idx_task (task_id, created_at)
+);
+
+-- Orchestrator writes event → agents see it via subscription view
+-- Agents poll their subscription view with timestamp filter:
+SELECT * FROM coordination.task_events
+WHERE task_id = @my_task AND created_at > @last_seen
 ORDER BY created_at;
 ```
 
-**Architecture shift**: This replaces the polling model in §8.3 with push-based delivery:
-```
-Agent A writes event → agent_events table → PUBLICATION
-                                                │
-                                     ┌──────────┴──────────┐
-                                     ▼                     ▼
-                              Agent B account         Agent C account
-                              (SUBSCRIPTION)          (SUBSCRIPTION)
-                              sees event instantly    sees event instantly
-```
-
-**Why this matters**: Polling-based event routing adds 1-5 second latency. Pub/sub reduces inter-agent latency to **near-zero** because subscribers read from a replicated view that updates transactionally with the publisher.
+**Why this matters**: Pub/sub eliminates the need for agents to connect directly to the orchestrator's database. Each agent reads from its own subscription — the database handles replication. Compared to polling the orchestrator's table directly, this provides **network isolation** (agents don't need orchestrator credentials) and **automatic data distribution**.
 
 ### 7.5 Snapshot + PITR: Agent Checkpoint & Time-Travel
 
@@ -664,9 +703,9 @@ WHERE task_id = @target_task
 | MatrixOne Feature | Agent Subsystem | Replaces | Competitive Gap |
 |-------------------|----------------|----------|-----------------|
 | **Git4Data** (branch/merge/diff) | Multi-agent plan execution | Application-level conflict resolution | No equivalent in any database |
-| **Vector** (vecf32 + HNSW) | Memory retrieval, RAG | External vector DB (Pinecone) | Native, no extension needed |
+| **Vector** (vecf32 + L2_DISTANCE) | Memory retrieval, RAG | External vector DB (Pinecone) | Native, no extension (HNSW deferred) |
 | **Fulltext** (BM25 + DataLink) | Knowledge base search | Elasticsearch + application code | Single-query hybrid search |
-| **Pub/Sub** (publication) | Inter-agent event routing | Polling-based event queries | Near-zero latency push |
+| **Pub/Sub** (publication) | Cross-agent data sharing | Direct DB access + credentials | Network-isolated replication |
 | **Snapshot** | Agent checkpointing | JSON blob in LONGTEXT column | Instant, atomic, zero-copy |
 | **PITR** | Session recovery, time-travel | Manual WAL management | Declarative retention policies |
 | **Stage** | Artifact storage (S3/OSS) | Application S3 client | SQL-native cloud storage |
