@@ -1512,4 +1512,105 @@ Instructions.
         let result = load_triggered_skill_instructions(&mut registry, "hello world");
         assert!(result.is_none());
     }
+
+    #[test]
+    fn integration_evaluate_session_skill_format() {
+        // Test with the actual evaluate-session SKILL.md format
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("evaluate_session");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        
+        // This mirrors the actual skills/evaluate_session/SKILL.md format
+        let skill_md = r#"---
+name: evaluate-session
+description: "Agent self-assessment skill that evaluates performance metrics for a session"
+user_invocable: true
+triggers:
+  - evaluate
+  - evaluate session
+  - session metrics
+  - performance
+  - efficiency
+  - how efficient
+  - analyze session
+allowed_tools:
+  - bash
+  - read_file
+---
+# Evaluate Session Skill
+
+When asked to evaluate a session's performance, follow this approach...
+
+## 1. Identify the Target Session
+Determine which session to evaluate.
+
+## 2. Gather Session Data
+Query the agent_events table.
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+        
+        let mut registry = SkillRegistry::new();
+        discover_and_register_metadata(dir.path(), &mut registry);
+        
+        // Verify skill was discovered
+        assert_eq!(registry.len(), 1);
+        let skill = registry.get("evaluate-session").expect("skill should exist");
+        assert_eq!(skill.metadata.description, "Agent self-assessment skill that evaluates performance metrics for a session");
+        assert!(skill.metadata.user_invocable);
+        assert_eq!(skill.metadata.triggers.len(), 7);
+        
+        // Test various trigger phrases
+        let test_cases = [
+            ("evaluate this session", true),
+            ("how efficient was I", true),
+            ("check performance metrics", true),
+            ("analyze session data", true),
+            ("evaluate session 123", true),
+            ("session metrics please", true),
+            ("hello world", false),
+            ("help me write code", false),
+        ];
+        
+        for (message, should_match) in test_cases {
+            let matches = detect_triggers_in_message(&registry, message);
+            if should_match {
+                assert!(!matches.is_empty(), "Expected trigger match for: {}", message);
+                assert_eq!(matches[0], "evaluate-session");
+            } else {
+                assert!(matches.is_empty(), "Expected no match for: {}", message);
+            }
+        }
+        
+        // Test full load flow
+        let result = load_triggered_skill_instructions(&mut registry, "evaluate my session performance");
+        assert!(result.is_some());
+        let (name, instructions) = result.unwrap();
+        assert_eq!(name, "evaluate-session");
+        assert!(instructions.contains("Evaluate Session Skill"));
+        assert!(instructions.contains("Identify the Target Session"));
+    }
+
+    #[test]
+    fn integration_real_skills_directory() {
+        // Test with the actual skills directory if it exists
+        let skills_dir = std::path::Path::new("../../../skills");
+        if !skills_dir.exists() {
+            // Skip if not running from the expected location
+            return;
+        }
+        
+        let mut registry = SkillRegistry::new();
+        let registered = discover_and_register_metadata(skills_dir, &mut registry);
+        
+        // We should find at least the example and evaluate_session skills
+        assert!(registered.len() >= 1, "Should find at least 1 skill, found: {:?}", registered);
+        
+        // Check if evaluate-session was found (if SKILL.md exists)
+        if registered.contains(&"evaluate-session".to_string()) {
+            let skill = registry.get("evaluate-session").unwrap();
+            assert!(skill.metadata.triggers.contains(&"evaluate".to_string()) ||
+                    skill.metadata.triggers.contains(&"performance".to_string()));
+        }
+    }
 }
+
