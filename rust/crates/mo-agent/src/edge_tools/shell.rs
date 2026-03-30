@@ -12,7 +12,10 @@ fn shell_escape(s: &str) -> String {
 /// - The tokio runtime shuts down mid-execution
 ///
 /// Returns the Output on success, or an error message on failure/timeout.
-fn run_command_with_cleanup(cmd: &mut Command, timeout_secs: f64) -> Result<std::process::Output, String> {
+fn run_command_with_cleanup(
+    cmd: &mut Command,
+    timeout_secs: f64,
+) -> Result<std::process::Output, String> {
     // Create a new process group so we can kill the entire tree on timeout/signal.
     // This prevents orphaned child processes from becoming zombies.
     #[cfg(unix)]
@@ -1080,8 +1083,7 @@ mod tests {
         // Test that run_command_with_cleanup properly kills the entire process group
         let marker = format!("/tmp/mo_test_cleanup_{}", std::process::id());
         let mut cmd = Command::new("bash");
-        cmd.arg("-c")
-            .arg(format!("sleep 10 && touch {marker}"));
+        cmd.arg("-c").arg(format!("sleep 10 && touch {marker}"));
 
         let result = run_command_with_cleanup(&mut cmd, 0.2);
         assert!(result.is_err(), "should timeout");
