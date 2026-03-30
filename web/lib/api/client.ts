@@ -7,6 +7,16 @@ export async function getWebDataMode(): Promise<WebDataMode> {
   return config.mode;
 }
 
+/** Extract user ID from a JWT access token (no verification — server validates). */
+function extractUserIdFromJwt(token: string): string | null {
+  try {
+    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+    return (payload.sub as string) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export async function apiFetch<T>(path: string): Promise<T> {
   const config = await getRuntimeConfig();
 
@@ -19,6 +29,10 @@ export async function apiFetch<T>(path: string): Promise<T> {
   };
   if (config.accessToken) {
     headers['Authorization'] = `Bearer ${config.accessToken}`;
+    const userId = extractUserIdFromJwt(config.accessToken);
+    if (userId) {
+      headers['X-User-Id'] = userId;
+    }
   }
 
   const response = await fetch(new URL(path, config.apiUrl).toString(), {
@@ -70,6 +84,10 @@ export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
   };
   if (config.accessToken) {
     headers['Authorization'] = `Bearer ${config.accessToken}`;
+    const userId = extractUserIdFromJwt(config.accessToken);
+    if (userId) {
+      headers['X-User-Id'] = userId;
+    }
   }
 
   const response = await fetch(new URL(path, config.apiUrl).toString(), {

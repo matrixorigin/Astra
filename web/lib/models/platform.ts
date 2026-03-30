@@ -234,3 +234,55 @@ export type ObservabilityMetricsData = {
   session: { uniqueSessions: number; avgTurnsPerSession: number };
   skill: { totalInvocations: number; successCount: number; successRate: number };
 };
+
+// ── Model types ──
+
+export type ModelPricing = {
+  prompt: number;
+  completion: number;
+};
+
+export type ModelQuirks = {
+  preserveReasoningContent: boolean;
+  noParallelToolCalls: boolean;
+  toolChoiceRequired: boolean;
+  strictToolCallIds: boolean;
+  noSystemMessage: boolean;
+  systemAsUserPrefix: boolean;
+};
+
+export type ModelSummary = {
+  modelId: string;
+  name: string;
+  provider: string;
+  baseUrl: string;
+  description: string | null;
+  isActive: boolean;
+  contextWindow: number | null;
+  maxCompletionTokens: number | null;
+  inputModalities: string[];
+  outputModalities: string[];
+  supportedParameters: string[];
+  pricing: ModelPricing;
+  architecture: string | null;
+  tags: string[];
+  quirks: ModelQuirks;
+};
+
+export type ModelDetail = ModelSummary;
+
+// ── Decision audit types ──
+
+export type DecisionSummary = {
+  id: string;
+  type: string;
+  status: string;
+  timestamp: string;
+};
+
+export type DecisionListData = {
+  decisions: DecisionSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+};

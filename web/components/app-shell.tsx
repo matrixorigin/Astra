@@ -5,9 +5,11 @@ import { UserBadge } from '@/components/auth/user-badge';
 const navigation = [
   { href: '/overview', label: 'Overview' },
   { href: '/agents', label: 'Agents' },
+  { href: '/models', label: 'Models' },
   { href: '/sessions', label: 'Sessions' },
   { href: '/runs', label: 'Runs' },
   { href: '/events', label: 'Events' },
+  { href: '/decisions', label: 'Decisions' },
   { href: '/plans', label: 'Plans' },
   { href: '/introspection', label: 'Introspection' },
   { href: '/evaluation', label: 'Evaluation' },
