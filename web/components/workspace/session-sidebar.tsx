@@ -33,7 +33,7 @@ export function SessionSidebar({
   const fetchSessions = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetch(new URL('/sessions?limit=50', config.apiUrl).toString(), {
+      const res = await fetch(`/api/backend/sessions?limit=50`, {
         headers: { Authorization: `Bearer ${config.token}` },
       });
       if (!res.ok) return;
@@ -51,7 +51,7 @@ export function SessionSidebar({
     } finally {
       setLoading(false);
     }
-  }, [config.apiUrl, config.token]);
+  }, [config.token]);
 
   useEffect(() => {
     fetchSessions();
@@ -60,19 +60,16 @@ export function SessionSidebar({
   const handleAction = useCallback(
     async (sessionId: string, action: 'close' | 'resume') => {
       try {
-        await fetch(
-          new URL(`/sessions/${sessionId}/${action}`, config.apiUrl).toString(),
-          {
-            method: 'POST',
-            headers: { Authorization: `Bearer ${config.token}` },
-          },
-        );
+        await fetch(`/api/backend/sessions/${sessionId}/${action}`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${config.token}` },
+        });
         fetchSessions();
       } catch {
         // Fail silently
       }
     },
-    [config.apiUrl, config.token, fetchSessions],
+    [config.token, fetchSessions],
   );
 
   if (collapsed) {

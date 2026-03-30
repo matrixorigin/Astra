@@ -266,7 +266,11 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
         model: config.model ?? undefined,
       });
 
-      fetch(new URL('/chat/stream', config.apiUrl).toString(), {
+      // Use Next.js rewrite proxy to avoid CORS issues
+      // /api/backend/chat/stream → backend's /chat/stream
+      const streamUrl = `/api/backend/chat/stream`;
+
+      fetch(streamUrl, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${config.token}`,
