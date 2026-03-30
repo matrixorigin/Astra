@@ -1,7 +1,7 @@
 # Multi-Agent Cloud Runtime Architecture
 
 > **Status**: Living Design Document  
-> **Version**: 1.0  
+> **Version**: 1.1 (post-review revision)  
 > **Scope**: Edge-cloud state management, multi-agent orchestration, and cloud-scale execution  
 > **Audience**: Core contributors, architecture reviewers
 
@@ -15,13 +15,16 @@
 4. [Gap Analysis: Design vs Implementation](#4-gap-analysis-design-vs-implementation)
 5. [Target Architecture: Multi-Agent Cloud Runtime](#5-target-architecture-multi-agent-cloud-runtime)
 6. [Edge-Cloud State Model](#6-edge-cloud-state-model)
-7. [Multi-Agent Coordination Protocol](#7-multi-agent-coordination-protocol)
-8. [Task Leasing & Distributed Execution](#8-task-leasing--distributed-execution)
-9. [Learning Convergence for Multi-Agent](#9-learning-convergence-for-multi-agent)
-10. [Token Efficiency at Scale](#10-token-efficiency-at-scale)
-11. [Observability & Trust](#11-observability--trust)
-12. [Migration Path](#12-migration-path)
-13. [Appendix: Industry Comparison Matrix](#appendix-a-industry-comparison-matrix)
+7. [MatrixOne-Native Acceleration](#7-matrixone-native-acceleration)
+8. [Multi-Agent Coordination Protocol](#8-multi-agent-coordination-protocol)
+9. [Task Leasing & Distributed Execution](#9-task-leasing--distributed-execution)
+10. [Learning Convergence for Multi-Agent](#10-learning-convergence-for-multi-agent)
+11. [Token Efficiency at Scale](#11-token-efficiency-at-scale)
+12. [Observability & Trust](#12-observability--trust)
+13. [Agent Safety & Isolation](#13-agent-safety--isolation)
+14. [External Interop: A2A & MCP](#14-external-interop-a2a--mcp)
+15. [Migration Path](#15-migration-path)
+16. [Appendix: Industry Comparison Matrix](#appendix-a-industry-comparison-matrix)
 
 ---
 
@@ -42,8 +45,9 @@ Agent Decision = f(prompt@version, skill@version, context@snapshot, memory@state
 - Edge nodes drive execution while cloud provides orchestration, persistence, and governance
 
 **Key differentiators vs industry**:
+- **MatrixOne as the agent brain** — other runtimes store state in a database; mo-agent *thinks* in its database. HTAP enables transactional state (leases, sessions) AND analytical workloads (learning convergence, drift detection, cost forecasting) without ETL
 - **Cross-session learning** (no competitor does this — Codex, Claude Code, Cursor, Devin all start fresh)
-- **Edge-cloud split execution** (tools local, reasoning cloud — unlike Codex's full-cloud or Claude's full-local)
+- **Edge-cloud split execution** (tools local for interactive coding; cloud sandbox for background tasks — combines Claude Code's privacy with Codex's durability)
 - **Self-improving tool selection** (TF-IDF + LLM hybrid with progressive calibration)
 - **Durable long-horizon tasks** (event-sourced state machine, not request-bound)
 
@@ -382,9 +386,169 @@ pub struct RestoredSession {
 
 ---
 
-## 7. Multi-Agent Coordination Protocol
+## 7. MatrixOne-Native Acceleration
 
-### 7.1 Agent Registry
+> *"Other agent runtimes store state in a database. mo-agent thinks in its database."*
+
+MatrixOne is an HTAP (Hybrid Transactional/Analytical Processing) cloud-native database — the company's core product. mo-agent must be a **showcase** of MatrixOne's capabilities, not treat it as a generic SQL store. The HTAP nature enables both transactional state management (sessions, leases, events) AND real-time analytical workloads (learning convergence, drift detection, cost forecasting) **in a single engine, without ETL pipelines**.
+
+### 12.1 Learning Convergence via Materialized Aggregation
+
+Instead of implementing 3-way merge in Rust application code, push learning convergence **into MatrixOne**:
+
+```sql
+-- Cross-agent entity confidence convergence
+-- HTAP: reads TP writes from multiple agents, runs AP aggregation in real-time
+CREATE VIEW learning_entity_convergence AS
+SELECT entity_name, domain,
+       SUM(observation_count) AS total_observations,
+       SUM(observation_count * confidence) / SUM(observation_count) AS weighted_confidence,
+       COUNT(DISTINCT agent_id) AS contributing_agents,
+       MAX(last_observed) AS freshest_observation
+FROM learning_observations
+WHERE decayed_confidence > 0.30   -- confidence gate (matches MIN_LEARNED_ENTITY_CONFIDENCE)
+GROUP BY entity_name, domain;
+
+-- Pattern library union merge
+CREATE VIEW learning_pattern_convergence AS
+SELECT tool_chain, domain,
+       SUM(success_count) AS total_successes,
+       SUM(failure_count) AS total_failures,
+       SUM(success_count) * 1.0 / NULLIF(SUM(success_count) + SUM(failure_count), 0) AS success_rate,
+       COUNT(DISTINCT agent_id) AS contributing_agents
+FROM learning_patterns
+GROUP BY tool_chain, domain;
+```
+
+**Why this matters**: Each agent writes observations transactionally. The aggregation view provides a **consistent, real-time merged state** that any agent can read — no application-level merge conflicts, no 3-way diff. MatrixOne's HTAP engine handles the TP writes and AP reads simultaneously.
+
+### 12.2 Drift Detection via Window Functions
+
+Current drift detection runs in Rust as a moving average. MatrixOne can do this **continuously**:
+
+```sql
+-- Tool selection drift detection — continuous analytical query
+SELECT tool_name, session_id,
+       AVG(success_rate) OVER (
+           ORDER BY created_at ROWS BETWEEN 10 PRECEDING AND CURRENT ROW
+       ) AS recent_avg,
+       AVG(success_rate) OVER (
+           ORDER BY created_at ROWS BETWEEN 100 PRECEDING AND 11 PRECEDING
+       ) AS baseline_avg
+FROM tool_invocation_metrics
+WHERE user_id = ?
+HAVING ABS(recent_avg - baseline_avg) > 0.3;
+
+-- Calibration axis drift: detect when intent thresholds are becoming stale
+SELECT intent_type,
+       AVG(predicted_confidence) AS avg_predicted,
+       AVG(actual_outcome) AS avg_actual,
+       ABS(AVG(predicted_confidence) - AVG(actual_outcome)) AS calibration_gap
+FROM calibration_feedback
+WHERE created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
+GROUP BY intent_type
+HAVING calibration_gap > 0.15;
+```
+
+### 12.3 Atomic Lease Operations (No Background Worker)
+
+§9's lease protocol describes a background job polling every 30s. MatrixOne can handle lease expiry **atomically at claim time**:
+
+```sql
+-- Atomic lease claim with implicit expiry: no background worker needed
+-- Uses MatrixOne's transactional guarantees for CAS operation
+UPDATE task_leases
+SET agent_id = @claiming_agent,
+    lease_version = lease_version + 1,
+    leased_at = NOW(6),
+    expires_at = DATE_ADD(NOW(6), INTERVAL @ttl_secs SECOND)
+WHERE task_id = @target_task
+  AND (expires_at < NOW(6)                    -- expired lease (auto-reclaim)
+       OR agent_id = @claiming_agent);        -- own lease renewal
+
+-- If UPDATE affected 0 rows → lease held by another active agent → 409 Conflict
+```
+
+This eliminates the background lease expiry worker entirely. Stale leases are implicitly reclaimed on the next claim attempt.
+
+### 12.4 Observability via HTAP Dashboards
+
+Every health metric from §12 should be a **materialized view** in MatrixOne:
+
+```sql
+-- Real-time agent health dashboard (single HTAP query across TP + AP)
+CREATE VIEW agent_health_dashboard AS
+SELECT
+    r.agent_id, r.agent_type, r.status,
+    TIMESTAMPDIFF(SECOND, r.last_heartbeat, NOW(6)) AS heartbeat_age_secs,
+    -- Lease health (AP aggregation over TP data)
+    COUNT(CASE WHEN l.expires_at < NOW(6) THEN 1 END) AS expired_leases,
+    -- Event ingestion lag
+    (SELECT COUNT(*) FROM agent_events e
+     WHERE e.agent_id = r.agent_id AND e.created_at > DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+    ) AS recent_events_5m,
+    -- Sync conflict rate (last hour)
+    (SELECT COALESCE(
+        SUM(CASE WHEN status = 'conflict' THEN 1 ELSE 0 END) * 100.0 /
+        NULLIF(COUNT(*), 0), 0)
+     FROM session_sync_log s
+     WHERE s.user_id = r.user_id AND s.created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)
+    ) AS conflict_rate_pct
+FROM agent_registry r
+LEFT JOIN task_leases l ON r.agent_id = l.agent_id
+GROUP BY r.agent_id;
+```
+
+### 12.5 Multi-Tenant Agent Isolation
+
+MatrixOne supports **native multi-tenancy**. Each agent or agent group can operate in its own database context:
+
+```sql
+-- Create isolated namespace per agent team/project
+CREATE DATABASE IF NOT EXISTS agent_workspace_{project_id};
+
+-- Agent's learning data is naturally isolated
+-- Cross-project analytics still possible via MatrixOne's cross-database queries
+SELECT * FROM agent_workspace_alpha.learning_observations lo
+UNION ALL
+SELECT * FROM agent_workspace_beta.learning_observations lo;
+```
+
+### 12.6 Event Routing via CDC
+
+Current inter-agent communication (§8.3) uses polling. MatrixOne's CDC (Change Data Capture) can push events to subscribing agents:
+
+```
+Agent A writes event → agent_events table
+                            │
+                      MatrixOne CDC stream
+                            │
+                     ┌──────┴──────┐
+                     ▼             ▼
+              Agent B (subscribed  Agent C (subscribed
+               to task_id = X)     to causal_chain = Y)
+```
+
+This transforms the architecture from poll-based to **push-based** event routing, reducing inter-agent latency from seconds (polling interval) to milliseconds (CDC propagation).
+
+### 12.7 MatrixOne Feature Mapping Summary
+
+| Subsystem | Current (Generic SQL) | Target (MatrixOne-Native) | Benefit |
+|-----------|----------------------|--------------------------|---------|
+| Learning merge | Rust 3-way merge code | Materialized view aggregation | No merge conflicts, real-time convergence |
+| Drift detection | Application moving average | Window function continuous query | Database-powered, no Rust overhead |
+| Lease expiry | Background worker (30s poll) | Atomic CAS at claim time | Eliminates background worker |
+| Health metrics | Application-computed | Materialized views | Zero-cost observability dashboard |
+| Agent isolation | `user_id` column filter | Multi-tenant database namespaces | Native isolation, cross-query analytics |
+| Event routing | Poll `agent_events` table | CDC push-based streaming | Millisecond inter-agent latency |
+| Decision analytics | Row-level SELECT queries | Columnar AP scans on event store | Fast analytical queries on audit trail |
+| Cost forecasting | Not implemented | AP query over token_usage JSON | Real-time budget tracking across agents |
+
+---
+
+## 8. Multi-Agent Coordination Protocol
+
+### 12.1 Agent Registry
 
 Every agent instance registers with the cloud on startup and maintains a heartbeat:
 
@@ -417,7 +581,7 @@ pub enum AgentStatus {
 
 **Heartbeat protocol**: Agent sends `POST /agents/{agent_id}/heartbeat` every 30s. Cloud marks as Dead if no heartbeat for `lease_ttl_secs`. Dead agent's tasks become reclaimable.
 
-### 7.2 Coordination Patterns
+### 12.2 Coordination Patterns
 
 Three patterns, matching existing design docs but with concrete implementation:
 
@@ -460,7 +624,7 @@ If revision_needed:
   Loop until approved or max_iterations reached
 ```
 
-### 7.3 Communication Model
+### 12.3 Communication Model
 
 Agents do **not** communicate directly. All communication is through cloud-persisted events:
 
@@ -478,13 +642,13 @@ Agent A ──event──▶ agent_events table ──query──▶ Agent B
 
 ---
 
-## 8. Task Leasing & Distributed Execution
+## 9. Task Leasing & Distributed Execution
 
-### 8.1 The Problem
+### 12.1 The Problem
 
 Current `TaskRecord` has `user_id` but no agent ownership. Two agents can read the same task and start working on it simultaneously, producing conflicting results.
 
-### 8.2 Task Lease Model
+### 12.2 Task Lease Model
 
 ```rust
 pub struct TaskLease {
@@ -521,7 +685,7 @@ pub struct TaskLease {
 
 **Key design decision**: Leases use optimistic locking (`lease_version` CAS), not distributed locks. This avoids deadlocks and works with MatrixOne's HTAP model.
 
-### 8.3 Checkpoint-Based Resumption
+### 12.3 Checkpoint-Based Resumption
 
 When a lease expires (agent died), the next agent can resume from the checkpoint:
 
@@ -542,7 +706,7 @@ The resuming agent:
 3. Validates artifacts (do the files still exist? are they consistent?)
 4. Continues from `active_subtask_id` rather than restarting
 
-### 8.4 Distributed Plan Execution
+### 12.4 Distributed Plan Execution
 
 ```rust
 pub struct DistributedPlan {
@@ -592,16 +756,16 @@ All subtasks Done → Plan Completed
 
 ---
 
-## 9. Learning Convergence for Multi-Agent
+## 10. Learning Convergence for Multi-Agent
 
-### 9.1 The Challenge
+### 12.1 The Challenge
 
 Current learning sync assumes **single writer per user per profile**. With multiple agents:
 - Agent A observes entity "React" used with tool `read_file` (confidence: 0.8)
 - Agent B observes entity "React" used with tool `grep` (confidence: 0.6)
 - Both push deltas to cloud simultaneously
 
-### 9.2 Merge Strategies (Already Designed, Need Implementation)
+### 12.2 Merge Strategies (Already Designed, Need Implementation)
 
 | Data Type | Merge Strategy | Rationale |
 |-----------|---------------|-----------|
@@ -611,7 +775,7 @@ Current learning sync assumes **single writer per user per profile**. With multi
 | **ToolQuality** | Weighted merge by invocation count | More invocations = better signal |
 | **Preferences** | Last-writer-wins (timestamp) | User intent is singular |
 
-### 9.3 Multi-Agent Learning Protocol
+### 12.3 Multi-Agent Learning Protocol
 
 ```
 Agent A (edge):
@@ -632,7 +796,7 @@ Cloud (on push):
     6. Return merged snapshot to Agent A for local update
 ```
 
-### 9.4 Confidence Gate for Learned Context
+### 12.4 Confidence Gate for Learned Context
 
 Already implemented in `tool_selector.rs`:
 
@@ -647,9 +811,9 @@ This gate becomes more important with multi-agent: observations from other agent
 
 ---
 
-## 10. Token Efficiency at Scale
+## 11. Token Efficiency at Scale
 
-### 10.1 Current Token Budget
+### 12.1 Current Token Budget
 
 ```
 System prompt:     ~2,000 tokens (identity, constraints, capabilities)
@@ -661,7 +825,7 @@ Memory injection:  ~100-2,400 tokens (intent-driven loading)
 Total overhead:    ~3,750-6,190 tokens (before conversation)
 ```
 
-### 10.2 Optimization Strategies
+### 12.2 Optimization Strategies
 
 #### Strategy 1: Intent-Driven Memory Loading (Implemented)
 ```
@@ -706,7 +870,7 @@ Low confidence (<60%): Full context (~150K tokens)
   └── Everything including comments/docs
 ```
 
-### 10.3 Multi-Agent Token Efficiency
+### 12.3 Multi-Agent Token Efficiency
 
 When running N agents, total token cost scales as O(N) naively. Optimizations:
 
@@ -717,9 +881,9 @@ When running N agents, total token cost scales as O(N) naively. Optimizations:
 
 ---
 
-## 11. Observability & Trust
+## 12. Observability & Trust
 
-### 11.1 Decision Audit Trail
+### 12.1 Decision Audit Trail
 
 Every decision is reconstructable:
 ```
@@ -735,7 +899,7 @@ decision_id → {
 }
 ```
 
-### 11.2 Multi-Agent Observability
+### 12.2 Multi-Agent Observability
 
 ```
 causal_chain_id links all events in a multi-agent workflow:
@@ -755,7 +919,7 @@ All events carry:
 - `parent_event_id` (direct causality)
 - `created_at` (DATETIME(6) — microsecond precision)
 
-### 11.3 Health Metrics
+### 12.3 Health Metrics
 
 | Metric | Source | Alert Threshold |
 |--------|--------|-----------------|
@@ -769,7 +933,117 @@ All events carry:
 
 ---
 
-## 12. Migration Path
+## 13. Agent Safety & Isolation
+
+### 13.1 The Problem
+
+When multiple agents execute on the same edge node, they share a filesystem. Agent A running `bash("npm install")` while Agent B runs `write_file("package.json")` creates race conditions and data corruption.
+
+### 13.2 Filesystem Isolation Model
+
+Three options, ordered by isolation strength:
+
+| Model | Mechanism | Overhead | Isolation |
+|-------|-----------|----------|-----------|
+| **File-scope locking** | SubtaskPlan.files used as advisory locks | ~0 | Weak (tools can escape scope) |
+| **Git worktree per agent** | Each agent gets a `git worktree` branch | ~1s setup, ~disk | Medium (git manages merge) |
+| **Container per agent** | Each agent runs in lightweight container | ~2-5s setup | Strong (full OS isolation) |
+
+**Recommended approach**: **Git worktree per agent** for edge multi-agent:
+
+```
+project_root/
+├── .git/                         # shared git repo
+├── worktrees/
+│   ├── agent-A/                  # git worktree for Agent A
+│   │   └── (full project copy)
+│   └── agent-B/                  # git worktree for Agent B
+│       └── (full project copy)
+```
+
+- Each agent operates on its own worktree branch
+- On subtask completion, changes are committed to the agent's branch
+- Plan merge phase uses `git merge` to combine branches
+- Merge conflicts → escalate to adversarial review or human
+
+For **cloud background agents**: container-per-agent (mount repo clone into isolated container).
+
+### 13.3 Agent Permission Model
+
+| Agent Type | bash | write_file | git_commit | network | delegate |
+|-----------|------|-----------|-----------|---------|----------|
+| **User** | ✅ (with user approval) | ✅ | ✅ | ✅ | ❌ (default) |
+| **System** | ❌ (read-only tools) | ❌ | ❌ | ✅ (cloud APIs) | ❌ |
+| **Orchestrator** | ❌ | ❌ | ❌ | ✅ | ✅ |
+
+System agents (regression, audit, tuning) are **read-only** — they can analyze but not modify the codebase. This prevents a compromised system agent from corrupting user work.
+
+### 13.4 Blast Radius Containment
+
+If an agent fails catastrophically (infinite loop, disk fill, memory exhaustion):
+1. **Resource limits**: Per-agent CPU/memory/disk caps (enforced by cgroup if containerized, or ulimit if worktree)
+2. **Error budget**: ToolHealthTracker already caps errors per session. Extend to per-agent scope.
+3. **Lease expiry**: Dead agent's lease expires, work is reclaimable by another agent
+4. **Worktree cleanup**: Failed agent's worktree can be discarded without affecting other agents or main branch
+
+---
+
+## 14. External Interop: A2A & MCP
+
+### 14.1 Why Interop Matters
+
+The agent ecosystem is standardizing. Google's A2A (Agent-to-Agent) protocol and Anthropic's MCP (Model Context Protocol) are becoming interop standards. Being proprietary-only means:
+- Cannot federate with external agents (customer's existing agent fleet)
+- Cannot leverage the growing MCP tool ecosystem (1000+ MCP servers)
+- Risk of ecosystem lock-out as standards solidify
+
+### 14.2 MCP as Tool Extension Surface
+
+mo-agent already supports MCP servers for tool discovery. Deepen this:
+
+```
+Edge Runtime
+├── 55 built-in tools (edge_tools.rs)
+├── MCP Server discovery (mcp_tools.rs)
+│   ├── Local MCP servers (filesystem, git, database tools)
+│   └── Remote MCP servers (cloud APIs, SaaS integrations)
+└── Tool registry unifies all sources
+```
+
+**Key enhancement**: MCP tools should be first-class citizens in the ToolRegistry, eligible for learned context boosting, quality tracking, and selection optimization — not just pass-through wrappers.
+
+### 14.3 A2A for Multi-Platform Agent Federation
+
+When mo-agent needs to coordinate with agents on other platforms:
+
+```
+mo-agent Orchestrator
+    │
+    ├── mo-agent Worker A (native protocol)
+    ├── mo-agent Worker B (native protocol)
+    └── External Agent C (A2A protocol)
+        ├── AgentCard discovery (/.well-known/agent.json)
+        ├── Task creation (POST /tasks)
+        └── Result streaming (SSE /tasks/{id}/events)
+```
+
+**Implementation strategy**: A2A adapter that translates between mo-agent's internal event model and A2A's task/message format. This is a **bridge**, not a replacement — internal coordination remains native for performance.
+
+### 14.4 Interop Priority
+
+| Standard | Priority | Rationale |
+|----------|----------|-----------|
+| **MCP tools** | ✅ Already supported | Extend to first-class registry integration |
+| **MCP sampling** | 🟡 High | Let external tools request LLM completions through mo-agent |
+| **A2A Agent Cards** | 🟡 High | Publish mo-agent capabilities for external discovery |
+| **A2A Task protocol** | 🟢 Medium | Accept tasks from external orchestrators |
+| **OpenAI Agents SDK** | 🟢 Low | Compatibility layer if demand emerges |
+
+---
+
+## 15. Migration Path
+
+> **Note**: Phase ordering prioritizes **durable execution** (Phase 2) before multi-agent coordination (Phases 3-4), because multi-agent is useless without durable execution — agents that die when HTTP connections close cannot be coordinated.
 
 ### Phase 1: Complete Single-Agent Foundation
 
@@ -783,54 +1057,54 @@ All events carry:
 | Implement PreferenceAdapter (bidirectional) | Small | None |
 | Fix unreachable code in FallbackSelector:962-972 | Small | None |
 
-### Phase 2: Agent Registry & Task Leasing
+### Phase 2: Durable Long-Running Tasks
+
+**Goal**: Tasks can span hours/days with pause/resume across agent lifetimes. This is prerequisite to multi-agent — agents that die when HTTP connections close cannot be coordinated.
+
+| Task | Effort | Dependency |
+|------|--------|------------|
+| Wire RunEngine into ChatLoop | Large | Phase 1 |
+| AsyncToolRegistry for job submission | Medium | RunEngine |
+| Event-based resumption triggers | Medium | RunEngine |
+| Cloud sandbox mode for background agents | Large | RunEngine |
+| Webhook integration for external events | Medium | Triggers |
+
+### Phase 3: Agent Registry & Task Leasing
 
 **Goal**: Multiple agents can safely claim and execute tasks without conflicts.
 
 | Task | Effort | Dependency |
 |------|--------|------------|
-| Create `agent_registry` table + heartbeat endpoint | Medium | Phase 1 |
-| Create `task_leases` table + lease protocol endpoints | Medium | Phase 1 |
+| Create `agent_registry` table + heartbeat endpoint | Medium | Phase 2 |
+| Create `task_leases` table + atomic CAS claim (MatrixOne-native) | Medium | Phase 2 |
 | Add `agent_id` to TaskRecord ownership model | Small | agent_registry |
-| Background lease expiry worker | Small | task_leases |
+| Git worktree isolation for multi-agent edge | Medium | agent_registry |
 | Lease-aware TaskAdapter sync | Medium | task_leases |
 
-### Phase 3: Distributed Plan Execution
+### Phase 4: Distributed Plan Execution
 
-**Goal**: Plans can be decomposed and executed across multiple agents.
+**Goal**: Plans can be decomposed and executed across multiple agents. Prioritize adversarial review (highest proven value for coding), then pipeline, then fan-out.
 
 | Task | Effort | Dependency |
 |------|--------|------------|
-| DistributedPlan struct + PlanConstraints | Small | Phase 2 |
-| Plan executor: dependency-ordered subtask dispatch | Large | Phase 2 |
-| Fan-out coordination (parallel subtask execution) | Medium | Plan executor |
-| Pipeline coordination (sequential with handoff) | Medium | Plan executor |
-| Plan merge logic (combine subtask results) | Medium | Fan-out/Pipeline |
-| Cost budget enforcement across agents | Small | Plan executor |
+| DistributedPlan struct + PlanConstraints | Small | Phase 3 |
+| **Phase 4a**: Adversarial review coordination (propose-review-revise) | Medium | Phase 3 |
+| **Phase 4b**: Pipeline coordination (sequential with handoff) | Medium | Phase 4a |
+| **Phase 4c**: Fan-out coordination (parallel with git-merge) | Large | Phase 4b |
+| Plan merge logic (combine subtask results) | Medium | Phase 4b/4c |
+| Cost budget enforcement across agents (MatrixOne AP query) | Small | Plan executor |
 
-### Phase 4: Multi-Agent Learning Convergence
+### Phase 5: Multi-Agent Learning Convergence
 
 **Goal**: Learning from multiple agents converges correctly without data loss.
 
 | Task | Effort | Dependency |
 |------|--------|------------|
-| 3-way merge for EntityGraph conflicts | Medium | Phase 2 |
-| Weighted average merge for Calibrator | Small | 3-way merge |
-| Union merge for PatternLibrary | Small | 3-way merge |
-| Cross-agent confidence decay tuning | Medium | All merges |
-| Integration tests: 2-agent concurrent learning | Large | All merges |
-
-### Phase 5: Durable Long-Running Tasks
-
-**Goal**: Tasks can span hours/days with pause/resume across agent lifetimes.
-
-| Task | Effort | Dependency |
-|------|--------|------------|
-| Wire RunEngine into ChatLoop | Large | Phase 2 |
-| AsyncToolRegistry for job submission | Medium | RunEngine |
-| Event-based resumption triggers | Medium | RunEngine |
-| Webhook integration for external events | Medium | Triggers |
-| Multi-day workflow tests | Large | All above |
+| MatrixOne materialized views for entity/pattern convergence | Medium | Phase 3 |
+| Weighted aggregation for Calibrator (SQL, not Rust) | Small | Materialized views |
+| Cross-agent confidence decay tuning | Medium | Aggregation |
+| CDC-based event routing between agents | Large | Phase 3 |
+| Integration tests: 2-agent concurrent learning | Large | All above |
 
 ---
 
@@ -925,4 +1199,4 @@ CREATE TABLE task_leases (
 
 ---
 
-*This document is the source of truth for multi-agent cloud runtime architecture. It supersedes aspirational descriptions in individual design docs where they conflict with the implementation-grounded analysis here.*
+*This document is the source of truth for multi-agent cloud runtime architecture. It supersedes aspirational descriptions in individual design docs where they conflict with the implementation-grounded analysis here. The design leverages MatrixOne's HTAP capabilities as the core competitive moat — not just as storage, but as the computational backbone for learning convergence, drift detection, and real-time observability.*
