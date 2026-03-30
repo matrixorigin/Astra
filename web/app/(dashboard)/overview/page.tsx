@@ -7,6 +7,7 @@ import { StatCard } from '@/components/dashboard/stat-card';
 import { StatusCallout } from '@/components/dashboard/status-callout';
 import { StatusBar } from '@/components/dashboard/status-bar';
 import { EventBreakdownChart } from '@/components/dashboard/event-breakdown-chart';
+import { LiveActivityCard } from '@/components/dashboard/live-activity-card';
 import { getRuntimeConfig } from '@/lib/runtime-config';
 
 export const dynamic = 'force-dynamic';
@@ -141,6 +142,13 @@ export default async function OverviewPage() {
           trend={health.status === 'ok' ? 'up' : 'down'}
         />
       </section>
+
+      {/* Live activity indicator (live mode only) */}
+      {mode === 'live' && config.apiUrl && config.accessToken ? (
+        <section>
+          <LiveActivityCard apiUrl={config.apiUrl} token={config.accessToken} />
+        </section>
+      ) : null}
 
       {/* Distribution charts */}
       <section className="grid gap-6 lg:grid-cols-2">

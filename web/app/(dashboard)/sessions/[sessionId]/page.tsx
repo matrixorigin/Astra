@@ -13,6 +13,7 @@ import { SessionFlowGraph } from '@/components/graph/session-flow-graph';
 import { SessionDetailActions } from '@/components/sessions/session-detail-actions';
 import { DecisionTracePanel } from '@/components/sessions/decision-trace-panel';
 import { MemoryIntrospectionPanel } from '@/components/sessions/memory-introspection-panel';
+import { SessionLiveEvents } from '@/components/sessions/session-live-events';
 import { getRuntimeConfig } from '@/lib/runtime-config';
 
 export const dynamic = 'force-dynamic';
@@ -139,6 +140,20 @@ export default async function SessionDetailPage({
           </div>
         ) : null}
       </SectionCard>
+
+      {/* Live run events (live mode only) */}
+      {mode === 'live' && config.apiUrl && config.accessToken ? (
+        <SectionCard
+          title="Live run events"
+          description="Real-time event stream from active runs in this session."
+        >
+          <SessionLiveEvents
+            sessionId={sessionId}
+            apiUrl={config.apiUrl}
+            token={config.accessToken}
+          />
+        </SectionCard>
+      ) : null}
 
       {/* Decision trace */}
       {decisionTrace ? (

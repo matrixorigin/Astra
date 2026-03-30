@@ -3,6 +3,7 @@ import { getRuns } from '@/lib/api/platform';
 import { SectionCard } from '@/components/dashboard/section-card';
 import { StatusCallout } from '@/components/dashboard/status-callout';
 import { RunsLiveSection } from '@/components/streaming/runs-live-section';
+import { RunsLivePanel } from '@/components/runs/runs-live-panel';
 import { getRuntimeConfig } from '@/lib/runtime-config';
 
 export const dynamic = 'force-dynamic';
@@ -96,6 +97,16 @@ export default async function RunsPage() {
           </div>
         )}
       </SectionCard>
+
+      {/* Polling-based live activity panel (live mode only) */}
+      {mode === 'live' && config.apiUrl && config.accessToken ? (
+        <SectionCard
+          title="Live activity"
+          description="Auto-discovers active runs and streams their events in real time."
+        >
+          <RunsLivePanel apiUrl={config.apiUrl} token={config.accessToken} />
+        </SectionCard>
+      ) : null}
     </div>
   );
 }
