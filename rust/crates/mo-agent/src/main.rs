@@ -92,8 +92,9 @@ use stream_render::{Spinner, consume_turn_sse};
 use stream_render::{StreamRenderState, TurnResult, dispatch_turn_event_block};
 
 use repl_runtime::{
-    build_repl_editor, create_tool_selector, create_tool_selector_with_quality,
-    current_access_token, initialize_repl_state, print_repl_banner, try_silent_auth,
+    build_repl_editor, check_server_has_models, create_tool_selector,
+    create_tool_selector_with_quality, current_access_token, initialize_repl_state,
+    print_repl_banner, try_silent_auth,
 };
 use repl_turn::{ReplTurnContext, handle_chat_input};
 use repl_ui::{
@@ -2761,7 +2762,26 @@ async fn run_chat_repl(
     state.pattern_library = Some(pipeline_modules.pattern_library.clone());
 
     let profile_name_str = profile.unwrap_or("default").to_string();
+
+    // Pre-flight: check if server has any LLM models configured
+    if let Some(token) = current_access_token(profile) {
+        let has_models = check_server_has_models(client, base, &token).await;
+        if !has_models {
+            state.model = Some("⚠ none".to_string());
+        }
+    }
+
     print_repl_banner(profile, &state);
+
+    if state.model.as_deref() == Some("⚠ none") {
+        eprintln!(
+            "  {}  {}",
+            "⚠".yellow(),
+            "No LLM model configured on server. Run: mo-admin model add".yellow()
+        );
+        eprintln!();
+        state.model = None; // reset so chat uses "auto" for actual requests
+    }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     loop {

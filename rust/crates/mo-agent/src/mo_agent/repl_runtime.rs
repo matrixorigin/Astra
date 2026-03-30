@@ -85,6 +85,39 @@ pub(super) fn create_tool_selector_with_quality(
     (selector, modules)
 }
 
+/// Quick check whether the server has at least one LLM model configured.
+/// Returns `true` on network errors (optimistic — don't block startup).
+pub(super) async fn check_server_has_models(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+) -> bool {
+    let resp = match client
+        .get(format!("{base}/models"))
+        .headers(match auth_headers(token) {
+            Ok(h) => h,
+            Err(_) => return true,
+        })
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return true,
+    };
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return true,
+    };
+    if let Some(arr) = body.as_array() {
+        return !arr.is_empty();
+    }
+    if let Some(arr) = body.get("models").and_then(|v| v.as_array()) {
+        return !arr.is_empty();
+    }
+    true
+}
+
 /// Best-effort silent auth: validate existing token or try refresh.
 /// Never blocks or prompts — just ensures credentials are fresh if possible.
 /// Clears stale credentials when the server rejects them.
