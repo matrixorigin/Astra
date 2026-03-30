@@ -20,9 +20,9 @@ pub(super) struct PipelineModules {
 }
 
 pub(super) fn create_tool_selector_with_quality(
-    client: &reqwest::Client,
-    base: &str,
-    profile: Option<&str>,
+    _client: &reqwest::Client,
+    _base: &str,
+    _profile: Option<&str>,
     quality_tracker: Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
     confidence_calibrator: Option<
         std::sync::Arc<mo_agent_runtime::turn::routing_metrics::ConfidenceCalibrator>,
@@ -63,24 +63,10 @@ pub(super) fn create_tool_selector_with_quality(
         calibrator,
     };
 
-    let creds = load_credentials();
-    let name = profile_name(profile, &creds);
-    let token = creds
-        .profiles
-        .get(&name)
-        .and_then(|p| p.access_token.as_ref())
-        .cloned();
-
-    let selector: Box<dyn tool_selector::ToolSelector> = match token {
-        Some(tok) => {
-            let llm = tool_selector::LlmToolSelector::new(client.clone(), base.to_string(), tok);
-            Box::new(tool_selector::FallbackSelector::new(
-                Box::new(llm),
-                Box::new(tfidf),
-            ))
-        }
-        None => Box::new(tfidf),
-    };
+    // TF-IDF + learned context is fast (<10ms) and accurate enough.
+    // LlmToolSelector added 8s per turn by making a full /chat/turn roundtrip
+    // just to pick tools — not worth it.
+    let selector: Box<dyn tool_selector::ToolSelector> = Box::new(tfidf);
 
     (selector, modules)
 }
