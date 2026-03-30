@@ -1,19 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ACCESS_TOKEN_COOKIE, API_URL_COOKIE, DEMO_MODE_COOKIE, REFRESH_TOKEN_COOKIE } from '@/lib/runtime-config';
+import { ACCESS_TOKEN_COOKIE, API_URL_COOKIE, DEFAULT_API_URL, DEMO_MODE_COOKIE, REFRESH_TOKEN_COOKIE } from '@/lib/runtime-config';
 
 type LoginBody = {
-  apiUrl: string;
+  apiUrl?: string;
   username: string;
   password: string;
 };
 
 export async function POST(request: NextRequest) {
   const body = (await request.json()) as LoginBody;
-  const apiUrl = body.apiUrl?.trim();
+  const apiUrl = body.apiUrl?.trim() || DEFAULT_API_URL;
 
-  if (!apiUrl || !body.username || !body.password) {
+  if (!body.username || !body.password) {
     return NextResponse.json(
-      { error: 'apiUrl, username, and password are required.' },
+      { error: 'username and password are required.' },
       { status: 400 },
     );
   }
