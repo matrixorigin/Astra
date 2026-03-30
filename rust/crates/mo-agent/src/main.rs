@@ -478,52 +478,71 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
     // If no session_id given, list and let user pick
     let effective_arg;
     if arg.is_empty() {
-        match svc.list_resumable_sessions(user_id).await {
-            Ok(sessions) if sessions.is_empty() => {
-                eprintln!("{}", "  No resumable sessions found.".dim());
-                return;
-            }
-            Ok(sessions) => {
-                eprintln!(
-                    "\n{}",
-                    "─── Resumable Sessions ──────────────────────────".bold()
-                );
-                for (i, s) in sessions.iter().enumerate() {
-                    let title = s.title.as_deref().unwrap_or("untitled");
-                    let short_id = &s.session_id[..8.min(s.session_id.len())];
-                    eprintln!(
-                        "  {}  {} {} ({} turns, {})",
-                        format!("[{}]", i + 1).cyan().bold(),
-                        short_id.dim(),
-                        title,
-                        s.turn_count,
-                        s.last_status.as_str().dim(),
-                    );
+        // Try cloud sessions first, fallback to local journals
+        let mut cloud_sessions = svc
+            .list_resumable_sessions(user_id)
+            .await
+            .unwrap_or_default();
+
+        // Fallback: merge local journal sessions not already in cloud list
+        if let Ok(local_ids) = session_journal::list_sessions() {
+            let cloud_ids: std::collections::HashSet<_> = cloud_sessions
+                .iter()
+                .map(|s| s.session_id.clone())
+                .collect();
+            for sid in local_ids.into_iter().rev() {
+                if !cloud_ids.contains(&sid) {
+                    cloud_sessions.push(mo_agent_services::session_restore::RestoredSession {
+                        session_id: sid,
+                        turn_count: 0,
+                        last_status: "local".to_string(),
+                        title: None,
+                        ..Default::default()
+                    });
                 }
-                eprintln!();
-                eprint!("  {} ", "Select (number or Enter to cancel):".bold());
-                std::io::Write::flush(&mut std::io::stderr()).ok();
-                let mut input = String::new();
-                if std::io::stdin().read_line(&mut input).is_ok() {
-                    if let Ok(n) = input.trim().parse::<usize>() {
-                        if n >= 1 && n <= sessions.len() {
-                            effective_arg = sessions[n - 1].session_id.clone();
-                        } else {
-                            eprintln!("{}", "  Cancelled.".dim());
-                            return;
-                        }
-                    } else {
-                        eprintln!("{}", "  Cancelled.".dim());
-                        return;
-                    }
+            }
+        }
+
+        if cloud_sessions.is_empty() {
+            eprintln!("{}", "  No resumable sessions found.".dim());
+            return;
+        }
+
+        let sessions = &cloud_sessions[..cloud_sessions.len().min(10)];
+        eprintln!(
+            "\n{}",
+            "─── Resumable Sessions ──────────────────────────".bold()
+        );
+        for (i, s) in sessions.iter().enumerate() {
+            let title = s.title.as_deref().unwrap_or("untitled");
+            let short_id = &s.session_id[..8.min(s.session_id.len())];
+            eprintln!(
+                "  {}  {} {} ({} turns, {})",
+                format!("[{}]", i + 1).cyan().bold(),
+                short_id.dim(),
+                title,
+                s.turn_count,
+                s.last_status.as_str().dim(),
+            );
+        }
+        eprintln!();
+        eprint!("  {} ", "Select (number or Enter to cancel):".bold());
+        std::io::Write::flush(&mut std::io::stderr()).ok();
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_ok() {
+            if let Ok(n) = input.trim().parse::<usize>() {
+                if n >= 1 && n <= sessions.len() {
+                    effective_arg = sessions[n - 1].session_id.clone();
                 } else {
+                    eprintln!("{}", "  Cancelled.".dim());
                     return;
                 }
-            }
-            Err(e) => {
-                eprintln!("{}", format!("  ✗ Could not list sessions: {e}").red());
+            } else {
+                eprintln!("{}", "  Cancelled.".dim());
                 return;
             }
+        } else {
+            return;
         }
     } else {
         effective_arg = arg.to_string();
