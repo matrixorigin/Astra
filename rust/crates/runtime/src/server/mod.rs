@@ -7,12 +7,13 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::Response,
     routing::{delete, get, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE};
 use chrono::Utc;
+use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 use uuid::Uuid;
 
 use super::*;
@@ -44,7 +45,19 @@ use self::{
 mod chat_route;
 
 pub fn build_app(state: AppState) -> Router {
-    router_builder::build_router(state)
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::any())
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers(AllowHeaders::any())
+        .expose_headers([HeaderName::from_static("x-request-id")]);
+
+    router_builder::build_router(state).layer(cors)
 }
 
 pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
