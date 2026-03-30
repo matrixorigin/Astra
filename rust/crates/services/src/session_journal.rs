@@ -585,6 +585,21 @@ pub fn list_sessions_by_time(limit: usize) -> std::io::Result<Vec<String>> {
     Ok(items.into_iter().map(|(_, sid)| sid).collect())
 }
 
+/// Count turn events in a journal without fully parsing all events.
+pub fn count_turns(session_id: &str) -> u32 {
+    use std::io::BufRead;
+    let path = journal_dir().join(format!("{session_id}.jsonl"));
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    std::io::BufReader::new(file)
+        .lines()
+        .map_while(|l| l.ok())
+        .filter(|l| l.contains("\"Turn\""))
+        .count() as u32
+}
+
 /// Resolve a session id to an exact journal filename stem.
 ///
 /// Accepts:

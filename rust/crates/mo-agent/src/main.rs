@@ -496,7 +496,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             merged.entry(sid.clone()).or_insert_with(|| {
                 mo_agent_services::session_restore::RestoredSession {
                     session_id: sid.clone(),
-                    turn_count: 0,
+                    turn_count: session_journal::count_turns(sid),
                     last_status: "local".to_string(),
                     ..Default::default()
                 }
@@ -523,6 +523,9 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
         let mut cloud_only: Vec<_> = merged.into_values().collect();
         cloud_only.sort_by(|a, b| b.turn_count.cmp(&a.turn_count));
         result.splice(0..0, cloud_only);
+
+        // Filter out empty sessions (0 turns = nothing to resume)
+        result.retain(|s| s.turn_count > 0);
 
         if result.is_empty() {
             eprintln!("{}", "  No resumable sessions found.".dim());
@@ -808,23 +811,23 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             }
         }
         Ok(None) => {
-            // Service didn't find workspace/cloud data, but journal may exist
+            // Service didn't find workspace/cloud data, but journal may exist.
+            // Don't reuse the old session_id — server doesn't know it.
+            // Restore history as context for a new session.
             match session_journal::read_journal(&session_id) {
                 Ok(events) if !events.is_empty() => {
                     let turn_count = events
                         .iter()
                         .filter(|e| e.event_type == session_journal::JournalEventType::Turn)
                         .count() as u32;
-                    state.session_id = Some(session_id.clone());
+                    state.session_id = None; // new session on next message
                     state.turn = turn_count;
                     state.history = repl_runtime::restore_history_from_journal(&session_id);
-                    repl_turn::initialize_journal_pub(state, &session_id);
-                    repl_turn::persist_last_session_id(profile, &session_id);
                     eprintln!(
-                        "  {} Resumed session {} (journal, {} turns)",
+                        "  {} Restored {} turns from journal {}. Next message starts a new session.",
                         "✓".green(),
-                        &session_id[..8.min(session_id.len())].cyan(),
                         turn_count,
+                        &session_id[..8.min(session_id.len())].cyan(),
                     );
                 }
                 _ => {
