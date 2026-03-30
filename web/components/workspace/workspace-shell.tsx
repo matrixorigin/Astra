@@ -1,16 +1,19 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { useChatStream } from '@/hooks/use-chat-stream';
 import { ChatThread } from './chat-thread';
 import { ChatInput } from './chat-input';
 import { ToolTimeline } from './tool-timeline';
+import { SessionSidebar } from './session-sidebar';
+import { PlanProgressPanel } from './plan-progress';
+import { TokenUsageBar } from './token-usage-bar';
 import type { ChatConfig } from '@/lib/workspace/types';
 import type { SessionSummary, EventSummary } from '@/lib/models/platform';
 import { ConnectionStatus } from '@/components/streaming/connection-status';
 import { EventLogViewer } from '@/components/events/event-log-viewer';
 
-type SidePanel = 'tools' | 'events' | 'context';
+type SidePanel = 'tools' | 'plan' | 'events' | 'context';
 
 export function WorkspaceShell({
   config,
@@ -23,13 +26,51 @@ export function WorkspaceShell({
   events?: EventSummary[];
   reflection?: string;
 }) {
-  const chat = useChatStream(config);
+  const [activeConfig, setActiveConfig] = useState<ChatConfig>(config);
+  const chat = useChatStream(activeConfig);
   const [sidePanel, setSidePanel] = useState<SidePanel>('tools');
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
-  const displaySessionId = chat.sessionId ?? config.sessionId ?? null;
+  const displaySessionId = chat.sessionId ?? activeConfig.sessionId ?? null;
+
+  const handleSelectSession = useCallback(
+    (sessionId: string) => {
+      chat.reset();
+      setActiveConfig((prev) => ({ ...prev, sessionId }));
+      // Update URL without full reload
+      const url = new URL(window.location.href);
+      url.searchParams.set('sessionId', sessionId);
+      window.history.pushState({}, '', url.toString());
+    },
+    [chat],
+  );
+
+  const handleNewSession = useCallback(() => {
+    chat.reset();
+    setActiveConfig((prev) => ({ ...prev, sessionId: undefined }));
+    const url = new URL(window.location.href);
+    url.searchParams.delete('sessionId');
+    window.history.pushState({}, '', url.toString());
+  }, [chat]);
+
+  // Auto-switch to plan tab when plan appears
+  const effectiveSidePanel =
+    sidePanel === 'tools' && chat.plan && chat.toolCalls.length === 0
+      ? 'plan'
+      : sidePanel;
 
   return (
-    <div className="flex h-[calc(100vh-8rem)] flex-col overflow-hidden rounded-2xl border border-slate-800 lg:flex-row">
+    <div className="flex h-[calc(100vh-8rem)] overflow-hidden rounded-2xl border border-slate-800">
+      {/* Session sidebar */}
+      <SessionSidebar
+        config={activeConfig}
+        currentSessionId={displaySessionId}
+        onSelectSession={handleSelectSession}
+        onNewSession={handleNewSession}
+        collapsed={sidebarCollapsed}
+        onToggle={() => setSidebarCollapsed(!sidebarCollapsed)}
+      />
+
       {/* Chat column */}
       <div className="flex min-w-0 flex-1 flex-col">
         {/* Header */}
@@ -41,12 +82,27 @@ export function WorkspaceShell({
             />
           </div>
           <div className="flex items-center gap-3 text-xs text-slate-500">
-            {displaySessionId ? <span>session: {displaySessionId}</span> : null}
-            {chat.runId ? <span>run: {chat.runId}</span> : null}
+            {displaySessionId ? (
+              <span className="max-w-[120px] truncate" title={displaySessionId}>
+                {displaySessionId.slice(0, 8)}…
+              </span>
+            ) : null}
+            {chat.runId ? (
+              <span className="max-w-[120px] truncate" title={chat.runId}>
+                run: {chat.runId.slice(0, 8)}…
+              </span>
+            ) : null}
+            <button
+              type="button"
+              onClick={handleNewSession}
+              className="rounded-md px-2 py-1 text-slate-400 hover:bg-slate-800 hover:text-white"
+            >
+              New
+            </button>
             <button
               type="button"
               onClick={chat.reset}
-              className="text-slate-400 hover:text-white"
+              className="rounded-md px-2 py-1 text-slate-400 hover:bg-slate-800 hover:text-white"
             >
               Reset
             </button>
@@ -63,42 +119,46 @@ export function WorkspaceShell({
         {/* Chat thread */}
         <ChatThread messages={chat.messages} />
 
+        {/* Token usage */}
+        <TokenUsageBar usage={chat.usage} />
+
         {/* Input */}
         <ChatInput
           onSend={chat.sendMessage}
           disabled={chat.isStreaming}
           placeholder={
             displaySessionId
-              ? `Message session ${displaySessionId}…`
+              ? 'Send a message…'
               : 'Send a message to start a new session…'
           }
         />
       </div>
 
       {/* Side panel */}
-      <div className="flex w-full flex-col border-t border-slate-800 lg:w-96 lg:border-l lg:border-t-0">
+      <div className="hidden w-96 flex-col border-l border-slate-800 lg:flex">
         {/* Panel tabs */}
         <div className="flex border-b border-slate-800 bg-slate-950/80">
           {(
             [
-              { key: 'tools', label: 'Tools', count: chat.toolCalls.length },
-              { key: 'events', label: 'Events', count: events?.length ?? 0 },
-              { key: 'context', label: 'Context' },
-            ] as const
+              { key: 'tools' as const, label: 'Tools', count: chat.toolCalls.length },
+              { key: 'plan' as const, label: 'Plan', count: chat.plan?.subtasks.length ?? 0 },
+              { key: 'events' as const, label: 'Events', count: events?.length ?? 0 },
+              { key: 'context' as const, label: 'Context' },
+            ]
           ).map((tab) => (
             <button
               key={tab.key}
               type="button"
               onClick={() => setSidePanel(tab.key)}
-              className={`flex-1 px-3 py-3 text-xs font-medium ${
-                sidePanel === tab.key
+              className={`flex-1 px-2 py-3 text-xs font-medium ${
+                effectiveSidePanel === tab.key
                   ? 'border-b-2 border-sky-500 text-sky-300'
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
               {tab.label}
-              {'count' in tab && tab.count > 0 ? (
-                <span className="ml-1.5 rounded-full bg-slate-800 px-1.5 py-0.5 text-[10px]">
+              {'count' in tab && (tab.count ?? 0) > 0 ? (
+                <span className="ml-1 rounded-full bg-slate-800 px-1.5 py-0.5 text-[10px]">
                   {tab.count}
                 </span>
               ) : null}
@@ -108,9 +168,19 @@ export function WorkspaceShell({
 
         {/* Panel content */}
         <div className="flex-1 overflow-y-auto">
-          {sidePanel === 'tools' ? (
+          {effectiveSidePanel === 'tools' ? (
             <ToolTimeline toolCalls={chat.toolCalls} />
-          ) : sidePanel === 'events' ? (
+          ) : effectiveSidePanel === 'plan' ? (
+            chat.plan ? (
+              <PlanProgressPanel plan={chat.plan} />
+            ) : (
+              <div className="flex flex-col items-center justify-center p-6 text-center">
+                <p className="text-xs text-slate-500">
+                  No active plan. Plans will appear when the agent creates one.
+                </p>
+              </div>
+            )
+          ) : effectiveSidePanel === 'events' ? (
             <div className="p-4">
               {events && events.length > 0 ? (
                 <EventLogViewer events={events} emptyMessage="No events." />

@@ -51,6 +51,24 @@ function eventSummary(event: StreamEvent): string {
       return event.message;
     case 'explain':
       return event.content.slice(0, 120) + (event.content.length > 120 ? '…' : '');
+    case 'thinking_delta':
+      return 'Thinking…';
+    case 'thinking_done':
+      return 'Thinking complete';
+    case 'plan_created':
+      return `Plan: ${event.plan.title ?? 'created'} (${event.plan.subtasks.length} tasks)`;
+    case 'plan_revised':
+      return `Plan revised (${event.plan.subtasks.length} tasks)`;
+    case 'plan_step_start':
+      return `Step: ${event.step}`;
+    case 'plan_step_done':
+      return `Step done: ${event.step}`;
+    case 'agent_delegated':
+      return `Delegated to ${event.agent_id}: ${event.task}`;
+    case 'agent_progress':
+      return `Agent ${event.agent_id}: ${event.progress}`;
+    case 'agent_completed':
+      return `Agent ${event.agent_id} completed`;
   }
 }
 

@@ -1,13 +1,30 @@
 'use client';
 
 import { useCallback, useRef, useState } from 'react';
-import type { ChatConfig, ChatMessage, ToolCall, WorkspaceState } from '@/lib/workspace/types';
+import type {
+  ChatConfig,
+  ChatMessage,
+  ToolCall,
+  WorkspaceState,
+  PlanState,
+  PlanSubtask,
+  TokenUsage,
+  ThinkingBlock,
+} from '@/lib/workspace/types';
 import type { StreamEvent } from '@/lib/streaming/types';
 
 let nextId = 0;
 function uid(): string {
   return `msg_${Date.now()}_${++nextId}`;
 }
+
+const EMPTY_USAGE: TokenUsage = {
+  promptTokens: 0,
+  completionTokens: 0,
+  totalTokens: 0,
+  cacheCreationTokens: 0,
+  cacheReadTokens: 0,
+};
 
 type UseChatStreamReturn = WorkspaceState & {
   sendMessage: (content: string) => void;
@@ -16,8 +33,7 @@ type UseChatStreamReturn = WorkspaceState & {
 
 /**
  * Hook that manages a streaming chat conversation via POST /chat/stream (SSE).
- * Each call to `sendMessage` adds a user message, opens an SSE connection, and
- * incrementally builds the assistant response.
+ * Handles text, thinking, tool calls, plan events, and token usage.
  */
 export function useChatStream(config: ChatConfig): UseChatStreamReturn {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -26,21 +42,22 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
   const [runId, setRunId] = useState<string | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [plan, setPlan] = useState<PlanState | null>(null);
+  const [usage, setUsage] = useState<TokenUsage>(EMPTY_USAGE);
 
   // Refs for mutable state during stream processing
   const controllerRef = useRef<AbortController | null>(null);
   const assistantIdRef = useRef<string>('');
   const accumulatedTextRef = useRef('');
+  const accumulatedThinkingRef = useRef('');
   const toolCallMapRef = useRef<Map<string, ToolCall>>(new Map());
 
   const processEvent = useCallback(
     (event: StreamEvent) => {
       switch (event.type) {
         case 'session_info': {
-          const sid = event.session_id;
-          const rid = event.run_id ?? null;
-          setSessionId(sid);
-          setRunId(rid);
+          setSessionId(event.session_id);
+          setRunId(event.run_id ?? null);
           break;
         }
 
@@ -50,6 +67,32 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
           const id = assistantIdRef.current;
           setMessages((prev) =>
             prev.map((m) => (m.id === id ? { ...m, content: text } : m)),
+          );
+          break;
+        }
+
+        case 'thinking_delta': {
+          accumulatedThinkingRef.current += event.content;
+          const thinking = accumulatedThinkingRef.current;
+          const id = assistantIdRef.current;
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === id
+                ? { ...m, thinking: { content: thinking, done: false } }
+                : m,
+            ),
+          );
+          break;
+        }
+
+        case 'thinking_done': {
+          const id = assistantIdRef.current;
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === id && m.thinking
+                ? { ...m, thinking: { ...m.thinking, done: true } }
+                : m,
+            ),
           );
           break;
         }
@@ -82,13 +125,83 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
           break;
         }
 
+        case 'usage': {
+          setUsage((prev) => ({
+            promptTokens: prev.promptTokens + event.prompt_tokens,
+            completionTokens: prev.completionTokens + event.completion_tokens,
+            totalTokens:
+              prev.totalTokens + event.prompt_tokens + event.completion_tokens,
+            cacheCreationTokens:
+              prev.cacheCreationTokens +
+              (event.cache_creation_input_tokens ?? 0),
+            cacheReadTokens:
+              prev.cacheReadTokens + (event.cache_read_input_tokens ?? 0),
+          }));
+          break;
+        }
+
+        case 'plan_created':
+        case 'plan_revised': {
+          const subtasks: PlanSubtask[] = event.plan.subtasks.map((s) => ({
+            id: s.id,
+            title: s.title,
+            status: (s.status as PlanSubtask['status']) ?? 'pending',
+          }));
+          setPlan({
+            planId: event.plan.plan_id,
+            title: event.plan.title,
+            subtasks,
+          });
+          break;
+        }
+
+        case 'plan_step_start': {
+          setPlan((prev) => {
+            if (!prev) return prev;
+            return {
+              ...prev,
+              activeStepId: event.subtask_id ?? event.step,
+              subtasks: prev.subtasks.map((s) =>
+                s.id === event.subtask_id || s.title === event.step
+                  ? { ...s, status: 'running' as const }
+                  : s,
+              ),
+            };
+          });
+          break;
+        }
+
+        case 'plan_step_done': {
+          setPlan((prev) => {
+            if (!prev) return prev;
+            return {
+              ...prev,
+              activeStepId:
+                prev.activeStepId === (event.subtask_id ?? event.step)
+                  ? undefined
+                  : prev.activeStepId,
+              subtasks: prev.subtasks.map((s) =>
+                s.id === event.subtask_id || s.title === event.step
+                  ? { ...s, status: 'done' as const }
+                  : s,
+              ),
+            };
+          });
+          break;
+        }
+
         case 'turn_complete': {
           const id = assistantIdRef.current;
           const finalTools = Array.from(toolCallMapRef.current.values());
           setMessages((prev) =>
             prev.map((m) =>
               m.id === id
-                ? { ...m, streaming: false, toolCalls: finalTools.length > 0 ? finalTools : undefined }
+                ? {
+                    ...m,
+                    streaming: false,
+                    toolCalls:
+                      finalTools.length > 0 ? finalTools : undefined,
+                  }
                 : m,
             ),
           );
@@ -102,10 +215,11 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
           break;
         }
 
-        case 'usage':
+        case 'agent_delegated':
+        case 'agent_progress':
+        case 'agent_completed':
         case 'warning':
         case 'explain':
-          // Non-critical — no UI update needed
           break;
       }
     },
@@ -119,7 +233,6 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
       setError(null);
       setIsStreaming(true);
 
-      // Add user message
       const userMsg: ChatMessage = {
         id: uid(),
         role: 'user',
@@ -127,7 +240,6 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
         timestamp: Date.now(),
       };
 
-      // Prepare placeholder assistant message
       const assistantMsg: ChatMessage = {
         id: uid(),
         role: 'assistant',
@@ -137,12 +249,12 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
       };
       assistantIdRef.current = assistantMsg.id;
       accumulatedTextRef.current = '';
+      accumulatedThinkingRef.current = '';
       toolCallMapRef.current.clear();
       setToolCalls([]);
 
       setMessages((prev) => [...prev, userMsg, assistantMsg]);
 
-      // Open SSE connection
       const controller = new AbortController();
       controllerRef.current = controller;
 
@@ -200,7 +312,6 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
             }
           }
 
-          // Stream ended — mark complete if not already
           setIsStreaming(false);
         })
         .catch((err) => {
@@ -221,7 +332,10 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
     setRunId(null);
     setIsStreaming(false);
     setError(null);
+    setPlan(null);
+    setUsage(EMPTY_USAGE);
     accumulatedTextRef.current = '';
+    accumulatedThinkingRef.current = '';
     toolCallMapRef.current.clear();
   }, [config.sessionId]);
 
@@ -232,6 +346,8 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
     toolCalls,
     isStreaming,
     error,
+    plan,
+    usage,
     sendMessage,
     reset,
   };
