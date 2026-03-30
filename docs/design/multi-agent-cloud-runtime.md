@@ -420,7 +420,7 @@ DATA BRANCH MERGE agent_b_workspace.results INTO agent_workspace.results;
 RESTORE ACCOUNT FROM SNAPSHOT plan_baseline_sp;
 ```
 
-**Why this matters**: Agents can experiment on data branches without risk. Merge conflicts are resolved at the database level with three-way merge (LCA detection), not in application Rust code. No other agent runtime has this capability.
+**Why this matters**: Agents can experiment on data branches without risk. Merge conflicts are resolved at the database level with three-way merge (LCA detection), not in application Rust code. **Cherry-pick semantics** (coming soon) will enable selective merge — pick specific rows/changes from a branch, not just full merge. No other agent runtime has this capability.
 
 ### 7.2 Vector Search: Native Embedding-Based Memory Retrieval
 
@@ -1163,40 +1163,37 @@ All events carry:
 
 When multiple agents execute on the same edge node, they share a filesystem. Agent A running `bash("npm install")` while Agent B runs `write_file("package.json")` creates race conditions and data corruption.
 
-### 13.2 Two-Layer Isolation Model
+### 13.2 Isolation Model
 
-Multi-agent isolation requires addressing **two separate concerns**: filesystem isolation (code/build artifacts) and data isolation (learning state, metrics, events). No single mechanism handles both.
+Multi-agent isolation addresses **two concerns**: filesystem isolation (code/build artifacts) and data isolation (learning state, metrics, events).
 
-| Concern | Mechanism | What It Isolates |
-|---------|-----------|-----------------|
-| **Filesystem** | Git worktree per agent | Code files, build output, test artifacts, npm/cargo caches |
-| **Data** | MatrixOne multi-tenant account per agent | Learning state, event logs, metrics, checkpoints, memory |
+| Concern | Edge (same machine) | Cloud (separate containers) |
+|---------|--------------------|-----------------------------|
+| **Filesystem** | `git branch` per agent + checkout | `git clone --branch` per container |
+| **Data** | MatrixOne data branches (Git4Data) | MatrixOne multi-tenant accounts |
 
-**Combined architecture**:
-
+**Edge multi-agent** (lightweight, most common):
 ```
-Edge Node
-├── .git/                               # shared git repo
-├── worktrees/
-│   ├── agent-A/                        # filesystem isolation
-│   │   └── (full project copy)         # Agent A's code workspace
-│   └── agent-B/
-│       └── (full project copy)         # Agent B's code workspace
-│
-└── MatrixOne
-    ├── agent_a_acct/                   # data isolation
-    │   └── workspace DB (learning, events, metrics)
-    ├── agent_b_acct/
-    │   └── workspace DB
-    └── sys/ (orchestrator)
-        └── publications → shared plans, learning state
+Agent A: git checkout -b agent-a-work → operates on its branch
+Agent B: git checkout -b agent-b-work → operates on its branch
+Merge:   git merge agent-a-work agent-b-work → standard git merge
+```
+No worktree needed — agents coordinate via branches and stash/checkout. Filesystem conflicts are rare when agents work on different subtasks with non-overlapping file scopes.
+
+**Cloud multi-agent** (full isolation):
+```
+Container A: git clone --branch main → independent filesystem
+Container B: git clone --branch main → independent filesystem
+Each container also gets its own MO account for data isolation.
 ```
 
-- **Git worktree** handles: `bash("npm install")`, `write_file("src/auth.rs")`, `git_commit(...)` — all filesystem operations are isolated per worktree branch
-- **MO accounts** handle: agent memory, learning observations, event logs, tool metrics — all data operations are SQL-level isolated per account
-- **On completion**: git worktree changes → `git merge` into main; data branch → `DATA BRANCH MERGE` into orchestrator workspace
+**Data isolation** is handled entirely by MatrixOne:
+- Each agent works on its own **data branch** (Git4Data)
+- Merge via `DATA BRANCH MERGE` (native 3-way merge with LCA)
+- Coming soon: **cherry-pick semantics** — selectively merge specific changes, not full branch
+- Accounts provide SQL-level namespace isolation (structurally impossible to access other agent's data)
 
-For **cloud background agents**: container-per-agent (mount repo clone into isolated container) + MO account (same data isolation model).
+For **cloud background agents**: container + MO account (both filesystem and data fully isolated).
 
 ### 13.3 Agent Permission Model
 
