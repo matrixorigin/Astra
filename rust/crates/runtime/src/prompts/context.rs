@@ -201,7 +201,6 @@ impl ContextBudget {
     }
 
     /// Whether the given token count exceeds the compact trigger.
-    /// Backward-compatible: uses CompactHistory-level threshold (75%).
     pub fn should_compact(&self, estimated_tokens: usize) -> bool {
         estimated_tokens > self.compact_trigger()
     }

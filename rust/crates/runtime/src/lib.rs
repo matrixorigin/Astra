@@ -140,7 +140,7 @@ pub use mo_agent_services::{
         DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,
     },
     skills::{DatabaseSkillService, SkillRecord, SkillService, UnconfiguredSkillService},
-    streaming::{DatabaseStreamingService, StreamingService, UnconfiguredStreamingService},
+    streaming::{StreamingService, UnconfiguredStreamingService},
     triggers::{DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService},
     workflows::{
         DatabaseWorkflowService, UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowRunRecord,
@@ -200,7 +200,7 @@ pub use turn::{
     activity::{SessionActivityUpdatePlan, build_session_activity_update_plan},
     cache::SessionCache,
     cloud::{
-        compaction::{compact_cloud_loop_messages, compact_tiered},
+        compaction::compact_tiered,
         history::compact_cloud_loop_history,
         iteration::{CloudLoopIterationPlan, plan_cloud_loop_iteration},
         prefilter::{CloudSkillCandidatePlan, plan_cloud_skill_candidates},

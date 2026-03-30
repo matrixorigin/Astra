@@ -1,22 +1,6 @@
 use crate::prompts::CompactionTier;
 use serde_json::Value;
 
-/// Original binary compaction — truncates tool results when total exceeds budget.
-/// Kept for backward compatibility with contract tests.
-pub fn compact_cloud_loop_messages(
-    messages: &[Value],
-    budget_chars: usize,
-    keep_chars: usize,
-) -> Vec<Value> {
-    compact_tiered(
-        messages,
-        budget_chars,
-        keep_chars,
-        CompactionTier::CompactHistory,
-        4,
-    )
-}
-
 /// Tier-aware compaction: applies progressively more aggressive strategies.
 ///
 /// * `Normal` — no compaction, return messages unchanged.
@@ -232,14 +216,5 @@ mod tests {
         let msgs = vec![user("small"), tool("tiny")];
         let result = compact_tiered(&msgs, 100_000, 100, CompactionTier::AggressivePrune, 4);
         assert_eq!(result, msgs);
-    }
-
-    #[test]
-    fn backward_compat_with_original() {
-        // compact_cloud_loop_messages should still work as before
-        let msgs = vec![tool(&"a".repeat(5000)), tool(&"b".repeat(100))];
-        let result = compact_cloud_loop_messages(&msgs, 50, 2000);
-        let first = result[0].get("content").unwrap().as_str().unwrap();
-        assert!(first.contains("[compacted"));
     }
 }

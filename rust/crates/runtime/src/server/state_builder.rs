@@ -64,7 +64,7 @@ pub(super) async fn build_server_state(
     .with_replay_service(Arc::new(
         DatabaseReplayService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))
-    .with_streaming_service(Arc::new(DatabaseStreamingService))
+    .with_streaming_service(Arc::new(UnconfiguredStreamingService))
     .with_skill_service(Arc::new(
         DatabaseSkillService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))

@@ -635,7 +635,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
         let selection_confidence = payload
             .get("selection_confidence")
             .and_then(Value::as_f64)
-            .unwrap_or(1.0); // Default: high confidence (backward compat)
+            .unwrap_or(1.0); // Default: high confidence
         let edge_profile = payload
             .get("edge_profile")
             .and_then(Value::as_object)

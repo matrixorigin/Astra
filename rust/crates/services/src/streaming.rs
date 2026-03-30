@@ -33,37 +33,6 @@ pub struct StreamChatRequestData {
     pub max_candidates: Option<i64>,
 }
 
-// ── Database implementation (deprecated stub) ────────────────────────────────
-
-#[derive(Clone, Debug)]
-pub struct DatabaseStreamingService;
-
-impl Default for DatabaseStreamingService {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DatabaseStreamingService {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-#[async_trait]
-impl StreamingService for DatabaseStreamingService {
-    async fn stream_chat(
-        &self,
-        _user_id: String,
-        _request: StreamChatRequestData,
-    ) -> Result<StreamChatResponse, (StatusCode, Json<ErrorResponse>)> {
-        Ok(StreamChatResponse {
-            status: "deprecated".into(),
-            message: "Use /chat/stream instead".into(),
-        })
-    }
-}
-
 // ── Noop implementation ──────────────────────────────────────────────────────
 
 pub struct UnconfiguredStreamingService;

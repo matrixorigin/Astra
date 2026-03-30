@@ -92,8 +92,8 @@ impl StreamingService for InMemoryStreamingService {
         _request: StreamChatRequestData,
     ) -> Result<StreamChatResponse, (StatusCode, Json<ErrorResponse>)> {
         Ok(StreamChatResponse {
-            status: "deprecated".to_string(),
-            message: "Use /chat/stream instead".to_string(),
+            status: "ok".to_string(),
+            message: "test response".to_string(),
         })
     }
 }
@@ -130,8 +130,8 @@ async fn stream_chat_returns_deprecation_response_shape() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let json = response_json(resp).await;
-    assert_eq!(json["status"], "deprecated");
-    assert_eq!(json["message"], "Use /chat/stream instead");
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["message"], "test response");
 }
 
 #[tokio::test]

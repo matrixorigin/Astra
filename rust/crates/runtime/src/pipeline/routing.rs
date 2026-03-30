@@ -81,12 +81,9 @@ pub enum ToolFilter {
 // ─── RoutingDecision ─────────────────────────────────────────────────────────
 
 /// Unified routing decision — single analysis pass, shared by all consumers.
-///
-/// Embeds `ConversationState` for backward compatibility with scoring.rs
-/// while adding richer classification, memory integration, and strategy hints.
 #[derive(Debug, Clone)]
 pub struct RoutingDecision {
-    /// Legacy signal extraction (backward-compatible with scoring.rs).
+    /// Signal extraction for tool scoring.
     pub conversation_state: ConversationState,
 
     /// Enriched task classification.

@@ -431,7 +431,7 @@ impl ToolRegistry {
             parts.join(" ")
         };
 
-        // Use the routing's embedded ConversationState for backward-compatible scoring.
+        // Use the routing's ConversationState for scoring.
         // Pass memory domain hints for gate softening in tool relevance scoring.
         // When budget_pressure > 0 or co-occurrence data exists, apply the full
         // co-occurrence-aware scoring pipeline for maximum selection quality.

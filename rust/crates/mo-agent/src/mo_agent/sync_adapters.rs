@@ -358,7 +358,7 @@ impl CloudTransport for MatrixOneTransport {
                     SyncError::permanent(SyncDomain::Learning, format!("invalid UTF-8: {e}"))
                 })?;
 
-                // Deserialize to count entities/patterns for the legacy API
+                // Deserialize to count entities/patterns for the push API
                 let snapshot: LearningSnapshot = serde_json::from_str(&json_str).map_err(|e| {
                     SyncError::permanent(SyncDomain::Learning, format!("deserialize for push: {e}"))
                 })?;
@@ -367,7 +367,7 @@ impl CloudTransport for MatrixOneTransport {
                 let pattern_count = snapshot.patterns.len() as u32;
                 let has_calibration = snapshot.calibration.is_some();
 
-                // Convert u64 → Option<i64> for the legacy versioned API
+                // Convert u64 → Option<i64> for the versioned API
                 let expected_i64 = expected_version.map(|v| v as i64);
 
                 let result = self

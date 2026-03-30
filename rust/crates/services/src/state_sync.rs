@@ -314,23 +314,8 @@ pub struct SyncStatus {
 /// 3. Call `push_learning_versioned(expected_version=version)` to push
 /// 4. If another session pushed in between, returns `is_conflict=true`
 /// 5. On conflict, re-pull, re-merge, and retry
-///
-/// The non-versioned `push_learning` method always succeeds (last-writer-wins).
 #[async_trait]
 pub trait StateSyncService: Send + Sync {
-    /// Push local learning snapshot to cloud (last-writer-wins, no version check).
-    ///
-    /// Use `push_learning_versioned` for concurrent-safe updates.
-    async fn push_learning(
-        &self,
-        user_id: &str,
-        profile: &str,
-        snapshot_json: &str,
-        entity_count: u32,
-        pattern_count: u32,
-        has_calibration: bool,
-    ) -> SyncResult;
-
     /// Push local learning snapshot with optimistic locking.
     ///
     /// - `expected_version`: The version returned by the last `pull_learning_versioned`.
@@ -351,9 +336,6 @@ pub trait StateSyncService: Send + Sync {
         has_calibration: bool,
         expected_version: Option<i64>,
     ) -> SyncResult;
-
-    /// Pull learning snapshot from cloud (without version).
-    async fn pull_learning(&self, user_id: &str, profile: &str) -> Result<Option<String>, String>;
 
     /// Pull learning snapshot with version for optimistic locking.
     ///
@@ -407,18 +389,6 @@ pub struct LocalOnlySyncService;
 
 #[async_trait]
 impl StateSyncService for LocalOnlySyncService {
-    async fn push_learning(
-        &self,
-        _user_id: &str,
-        _profile: &str,
-        _snapshot_json: &str,
-        _entity_count: u32,
-        _pattern_count: u32,
-        _has_calibration: bool,
-    ) -> SyncResult {
-        SyncResult::ok(SyncDirection::Push, "learning", 0)
-    }
-
     async fn push_learning_versioned(
         &self,
         _user_id: &str,
@@ -431,14 +401,6 @@ impl StateSyncService for LocalOnlySyncService {
     ) -> SyncResult {
         // Local-only: always succeeds with version 0
         SyncResult::ok_with_version(SyncDirection::Push, "learning", 0, 0)
-    }
-
-    async fn pull_learning(
-        &self,
-        _user_id: &str,
-        _profile: &str,
-    ) -> Result<Option<String>, String> {
-        Ok(None)
     }
 
     async fn pull_learning_versioned(
@@ -551,155 +513,6 @@ impl MatrixOneSyncService {
 
 #[async_trait]
 impl StateSyncService for MatrixOneSyncService {
-    async fn push_learning(
-        &self,
-        user_id: &str,
-        profile: &str,
-        snapshot_json: &str,
-        entity_count: u32,
-        pattern_count: u32,
-        has_calibration: bool,
-    ) -> SyncResult {
-        let snapshot_id = uuid::Uuid::new_v4().to_string();
-        let has_cal = if has_calibration { 1i32 } else { 0 };
-        let compressed_snapshot = match compress_json_payload(snapshot_json) {
-            Ok(value) => value,
-            Err(e) => return SyncResult::err(SyncDirection::Push, "learning", e),
-        };
-
-        // Retry loop with exponential backoff for transient network errors
-        let mut last_error = None;
-        let mut backoff_ms = INITIAL_BACKOFF_MS;
-
-        for attempt in 0..=MAX_RETRIES {
-            let updated = sqlx::query(
-                "UPDATE learning_snapshots SET \
-                    snapshot_json = ?, \
-                    entity_count = ?, \
-                    pattern_count = ?, \
-                    has_calibration = ?, \
-                    version = version + 1, \
-                    updated_at = NOW() \
-                 WHERE user_id = ? AND profile_name = ?",
-            )
-            .bind(&compressed_snapshot)
-            .bind(entity_count as i64)
-            .bind(pattern_count as i64)
-            .bind(has_cal)
-            .bind(user_id)
-            .bind(profile)
-            .execute(&self.pool)
-            .await;
-
-            let result = match updated {
-                Ok(r) if r.rows_affected() > 0 => Ok(r),
-                Ok(_) => {
-                    let inserted = sqlx::query(
-                        "INSERT INTO learning_snapshots \
-                         (snapshot_id, user_id, profile_name, snapshot_json, entity_count, \
-                           pattern_count, has_calibration, version, created_at, updated_at) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())",
-                    )
-                    .bind(&snapshot_id)
-                    .bind(user_id)
-                    .bind(profile)
-                    .bind(&compressed_snapshot)
-                    .bind(entity_count as i64)
-                    .bind(pattern_count as i64)
-                    .bind(has_cal)
-                    .execute(&self.pool)
-                    .await;
-
-                    match inserted {
-                        Ok(r) => Ok(r),
-                        Err(e) if is_duplicate_key_error(&e) => {
-                            sqlx::query(
-                                "UPDATE learning_snapshots SET \
-                                    snapshot_json = ?, \
-                                    entity_count = ?, \
-                                    pattern_count = ?, \
-                                    has_calibration = ?, \
-                                    version = version + 1, \
-                                    updated_at = NOW() \
-                                 WHERE user_id = ? AND profile_name = ?",
-                            )
-                            .bind(&compressed_snapshot)
-                            .bind(entity_count as i64)
-                            .bind(pattern_count as i64)
-                            .bind(has_cal)
-                            .bind(user_id)
-                            .bind(profile)
-                            .execute(&self.pool)
-                            .await
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-                Err(e) => Err(e),
-            };
-
-            match result {
-                Ok(_) => {
-                    self.log_sync(
-                        user_id,
-                        "",
-                        "learning",
-                        SyncDirection::Push,
-                        compressed_snapshot.len(),
-                        "success",
-                        None,
-                    )
-                    .await;
-                    return SyncResult::ok(SyncDirection::Push, "learning", 1);
-                }
-                Err(e) => {
-                    if attempt < MAX_RETRIES && is_retryable_error(&e) {
-                        eprintln!(
-                            "  ↻ push_learning retry {} of {}: {}",
-                            attempt + 1,
-                            MAX_RETRIES,
-                            &e
-                        );
-                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                        backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
-                        last_error = Some(e);
-                        continue;
-                    }
-                    // Non-retryable or max retries exceeded
-                    let msg = format!("push_learning: {e}");
-                    self.log_sync(
-                        user_id,
-                        "",
-                        "learning",
-                        SyncDirection::Push,
-                        0,
-                        "error",
-                        Some(&msg),
-                    )
-                    .await;
-                    return SyncResult::err(SyncDirection::Push, "learning", msg);
-                }
-            }
-        }
-
-        // Max retries exceeded with retryable error
-        let msg = format!(
-            "push_learning: max retries exceeded: {}",
-            last_error.map(|e| e.to_string()).unwrap_or_default()
-        );
-        self.log_sync(
-            user_id,
-            "",
-            "learning",
-            SyncDirection::Push,
-            0,
-            "error",
-            Some(&msg),
-        )
-        .await;
-        SyncResult::err(SyncDirection::Push, "learning", msg)
-    }
-
     async fn push_learning_versioned(
         &self,
         user_id: &str,
@@ -909,42 +722,6 @@ impl StateSyncService for MatrixOneSyncService {
                     "push_learning_versioned (new): max retries exceeded",
                 )
             }
-        }
-    }
-
-    async fn pull_learning(&self, user_id: &str, profile: &str) -> Result<Option<String>, String> {
-        let row = sqlx::query(
-            "SELECT snapshot_json FROM learning_snapshots \
-             WHERE user_id = ? AND profile_name = ? \
-             ORDER BY updated_at DESC LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(profile)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| format!("pull_learning: {e}"))?;
-
-        match row {
-            Some(row) => {
-                use sqlx::Row;
-                let json: String = row
-                    .try_get("snapshot_json")
-                    .map_err(|e| format!("pull_learning decode: {e}"))?;
-                let decompressed = decompress_json_payload(&json)
-                    .map_err(|e| format!("pull_learning unzip: {e}"))?;
-                self.log_sync(
-                    user_id,
-                    "",
-                    "learning",
-                    SyncDirection::Pull,
-                    json.len(),
-                    "success",
-                    None,
-                )
-                .await;
-                Ok(Some(decompressed))
-            }
-            None => Ok(None),
         }
     }
 
@@ -1442,10 +1219,10 @@ mod tests {
     // ── LocalOnlySyncService ──
 
     #[tokio::test]
-    async fn local_only_push_succeeds() {
+    async fn local_only_push_versioned_succeeds() {
         let svc = LocalOnlySyncService;
         let result = svc
-            .push_learning("user1", "default", "{}", 0, 0, false)
+            .push_learning_versioned("user1", "default", "{}", 0, 0, false, None)
             .await;
         assert!(result.success);
     }
@@ -1453,7 +1230,7 @@ mod tests {
     #[tokio::test]
     async fn local_only_pull_returns_none() {
         let svc = LocalOnlySyncService;
-        let result = svc.pull_learning("user1", "default").await;
+        let result = svc.pull_learning_versioned("user1", "default").await;
         assert!(result.unwrap().is_none());
     }
 
@@ -1679,19 +1456,18 @@ mod tests {
     async fn local_only_push_learning_is_noop_but_succeeds() {
         let svc = LocalOnlySyncService;
 
-        // Push with actual data
         let result = svc
-            .push_learning(
+            .push_learning_versioned(
                 "user1",
                 "default",
                 r#"{"entities":[{"name":"test","count":5}]}"#,
                 1,
                 0,
                 true,
+                None,
             )
             .await;
 
-        // Should succeed (no-op)
         assert!(result.success, "LocalOnly should always succeed");
         assert_eq!(result.items_synced, 0, "LocalOnly doesn't actually sync");
     }
@@ -1700,9 +1476,8 @@ mod tests {
     async fn local_only_pull_learning_returns_none_for_any_user() {
         let svc = LocalOnlySyncService;
 
-        // Try pulling for different users/profiles
-        let result1 = svc.pull_learning("user1", "default").await;
-        let result2 = svc.pull_learning("user2", "work").await;
+        let result1 = svc.pull_learning_versioned("user1", "default").await;
+        let result2 = svc.pull_learning_versioned("user2", "work").await;
 
         assert!(result1.unwrap().is_none());
         assert!(result2.unwrap().is_none());

@@ -197,16 +197,10 @@ impl MemoryEntry {
 
     /// Parse from wire format. Returns None if the content doesn't match.
     ///
-    /// Accepted formats:
-    /// - `[@ns/status] body`        (v1 protocol)
-    /// - `[ns:status] body`         (legacy, for backward compatibility)
-    /// - `[ns:] body`               (legacy plan format)
-    /// - `[Session Summary]\nbody`  (legacy compact format)
-    /// - `[Auto-compact Summary]\n` (legacy auto-compact format)
+    /// Accepted format: `[@ns/status] body`
     pub fn parse(content: &str) -> Option<Self> {
         let trimmed = content.trim();
 
-        // ── v1 format: [@ns/status] body ──
         if trimmed.starts_with("[@")
             && let Some(close) = trimmed.find(']')
         {
@@ -219,50 +213,6 @@ impl MemoryEntry {
                     body,
                 });
             }
-        }
-
-        // ── Legacy: [Session Summary] or [Auto-compact Summary] ──
-        if trimmed.starts_with("[Session Summary]") {
-            let body = trimmed
-                .strip_prefix("[Session Summary]")
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            return Some(Self::new(NS_EPISODE, ST_SUMMARY, &body));
-        }
-        if trimmed.starts_with("[Auto-compact Summary]") {
-            let body = trimmed
-                .strip_prefix("[Auto-compact Summary]")
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            return Some(Self::new(NS_EPISODE, ST_AUTO, &body));
-        }
-
-        // ── Legacy: [task:status] body ──
-        if trimmed.starts_with("[task:")
-            && let Some(close) = trimmed.find(']')
-        {
-            let status_part = &trimmed[6..close]; // e.g. "pending" or "done"
-            let body = trimmed[close + 1..].trim().to_string();
-            let status = if status_part.is_empty() {
-                ST_PENDING
-            } else {
-                status_part
-            };
-            return Some(Self {
-                ns: NS_TASK.to_string(),
-                status: status.to_string(),
-                body,
-            });
-        }
-
-        // ── Legacy: [plan:] body ──
-        if trimmed.starts_with("[plan:")
-            && let Some(close) = trimmed.find(']')
-        {
-            let body = trimmed[close + 1..].trim().to_string();
-            return Some(Self::new(NS_PLAN, ST_ACTIVE, &body));
         }
 
         None // unstructured memory — no tag

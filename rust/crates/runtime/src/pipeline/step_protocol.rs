@@ -878,7 +878,7 @@ impl StepCheckpoint {
         }))
     }
 
-    /// v2-compat constructor (creates Heavy by default for backward compat)
+    /// Convenience constructor (creates Heavy by default).
     pub fn new(
         step_id: String,
         task_id: String,

@@ -86,7 +86,6 @@ pub struct LearningSnapshot {
     /// Calibration data.
     pub calibration: Option<CalibrationExport>,
     /// Persistent tool health data (cross-session error budgets).
-    /// Optional for backward compatibility with existing snapshots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_health: Vec<ToolHealthEntry>,
 }

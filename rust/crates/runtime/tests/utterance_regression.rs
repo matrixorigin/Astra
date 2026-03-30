@@ -2202,7 +2202,7 @@ mod trigger_quality {
             !wf.triggers.contains(&"保存"),
             "write_file should use '保存文件' not bare '保存'"
         );
-        // memory_store should have "保存" for backward compat
+        // memory_store should have "保存" as primary save trigger
         assert!(
             ms.triggers.contains(&"保存"),
             "memory_store should keep '保存' as primary save trigger"

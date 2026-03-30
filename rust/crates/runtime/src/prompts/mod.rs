@@ -451,45 +451,6 @@ mod tests {
     }
 
     #[test]
-    fn entry_parse_legacy_task() {
-        use memory_proto::*;
-        let e = MemoryEntry::parse("[task:pending] Old task").unwrap();
-        assert_eq!(e.ns, NS_TASK);
-        assert_eq!(e.status, ST_PENDING);
-        assert_eq!(e.body, "Old task");
-
-        let e2 = MemoryEntry::parse("[task:done] Finished").unwrap();
-        assert_eq!(e2.status, ST_DONE);
-    }
-
-    #[test]
-    fn entry_parse_legacy_plan() {
-        use memory_proto::*;
-        let e = MemoryEntry::parse("[plan:] My plan text").unwrap();
-        assert_eq!(e.ns, NS_PLAN);
-        assert_eq!(e.status, ST_ACTIVE);
-        assert_eq!(e.body, "My plan text");
-    }
-
-    #[test]
-    fn entry_parse_legacy_session_summary() {
-        use memory_proto::*;
-        let e = MemoryEntry::parse("[Session Summary]\n### Goals\nFix auth").unwrap();
-        assert_eq!(e.ns, NS_EPISODE);
-        assert_eq!(e.status, ST_SUMMARY);
-        assert!(e.body.contains("### Goals"));
-    }
-
-    #[test]
-    fn entry_parse_legacy_auto_compact() {
-        use memory_proto::*;
-        let e = MemoryEntry::parse("[Auto-compact Summary]\nSummary text").unwrap();
-        assert_eq!(e.ns, NS_EPISODE);
-        assert_eq!(e.status, ST_AUTO);
-        assert!(e.body.contains("Summary text"));
-    }
-
-    #[test]
     fn entry_parse_unstructured_returns_none() {
         use memory_proto::MemoryEntry;
         assert!(MemoryEntry::parse("just a random fact").is_none());
@@ -654,32 +615,6 @@ mod tests {
         let parsed = MemoryEntry::parse(&encoded).unwrap();
         assert!(parsed.body.contains("### Goals"));
         assert!(parsed.body.contains("### Status"));
-    }
-
-    #[test]
-    fn legacy_compat_all_formats() {
-        use memory_proto::*;
-        // All legacy formats should parse AND the re-encoded form should be v1
-        let legacy_cases = [
-            "[task:pending] Old task",
-            "[task:done] Done task",
-            "[plan:] My plan",
-            "[Session Summary]\nGoals here",
-            "[Auto-compact Summary]\nAuto text",
-        ];
-        for input in &legacy_cases {
-            let entry =
-                MemoryEntry::parse(input).unwrap_or_else(|| panic!("should parse legacy: {input}"));
-            let re_encoded = entry.encode();
-            assert!(
-                re_encoded.starts_with("[@"),
-                "re-encoded should be v1: {re_encoded}"
-            );
-            // Round-trip the v1 encoding
-            let re_parsed = MemoryEntry::parse(&re_encoded).unwrap();
-            assert_eq!(re_parsed.ns, entry.ns);
-            assert_eq!(re_parsed.status, entry.status);
-        }
     }
 
     // ── EntryMeta provenance tests ──────────────────────────────────

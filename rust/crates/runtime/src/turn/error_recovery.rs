@@ -144,16 +144,12 @@ pub fn classify_error(error_str: &str) -> ErrorCategory {
 pub fn max_tool_retries() -> usize {
     mo_agent_core::RuntimeLimits::global().max_tool_retries
 }
-/// Keep the constant for backward compatibility in tests.
-pub const MAX_TOOL_RETRIES: usize = 2;
 
 /// Base delay for retry backoff (milliseconds).
 /// Override with `MO_RETRY_BASE_MS` env var.
 pub fn retry_base_ms() -> u64 {
     mo_agent_core::RuntimeLimits::global().retry_base_ms
 }
-/// Keep the constant for backward compatibility in tests.
-pub const RETRY_BASE_MS: u64 = 500;
 
 /// Determine if and how to retry a failed tool call.
 pub fn should_retry(category: ErrorCategory, attempt: usize) -> Option<u64> {
