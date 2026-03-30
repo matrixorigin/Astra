@@ -1672,6 +1672,85 @@ mod tests {
 
     // ── FallbackSelector ──
 
+    fn make_ctx(query: &'static str) -> SelectionContext<'static> {
+        SelectionContext {
+            query,
+            turn_count: 1,
+            recent_tools: &[],
+            budget_tokens: 800,
+            boost_terms: vec![],
+            budget_pressure: 0.0,
+            memory_domain_hints: vec![],
+            restricted_tools: vec![],
+            file_context: vec![],
+        }
+    }
+
+    fn fixed_result(
+        tools: Vec<String>,
+        strategy: &'static str,
+        confidence: f64,
+    ) -> SelectionResult {
+        SelectionResult {
+            tool_names: tools,
+            strategy,
+            budget_used: 0,
+            failed: false,
+            confidence,
+            selector_tokens_in: 0,
+            selector_tokens_out: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_skips_primary_when_tfidf_high_confidence_with_dynamic_tools() {
+        // High confidence + dynamic tool → TF-IDF result used directly, primary never called
+        struct PanicSelector;
+        #[async_trait]
+        impl ToolSelector for PanicSelector {
+            async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
+                panic!("primary should not be called when TF-IDF is confident");
+            }
+        }
+
+        struct HighConfSelector;
+        #[async_trait]
+        impl ToolSelector for HighConfSelector {
+            async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
+                fixed_result(vec!["github_list_prs".into()], "tfidf_high", 0.8)
+            }
+        }
+
+        let selector = FallbackSelector::new(Box::new(PanicSelector), Box::new(HighConfSelector));
+        let result = selector.select(&make_ctx("list prs")).await;
+        assert_eq!(result.strategy, "tfidf_high");
+    }
+
+    #[tokio::test]
+    async fn fallback_skips_primary_for_pinned_only_result() {
+        // No dynamic tools (only pinned like bash/memory_search) → skip primary regardless of confidence
+        struct PanicSelector;
+        #[async_trait]
+        impl ToolSelector for PanicSelector {
+            async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
+                panic!("primary should not be called for pinned-only selection");
+            }
+        }
+
+        struct PinnedOnlySelector;
+        #[async_trait]
+        impl ToolSelector for PinnedOnlySelector {
+            async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
+                // bash is pinned — no dynamic tools
+                fixed_result(vec!["bash".into()], "tfidf_conversational", 0.1)
+            }
+        }
+
+        let selector = FallbackSelector::new(Box::new(PanicSelector), Box::new(PinnedOnlySelector));
+        let result = selector.select(&make_ctx("hi")).await;
+        assert_eq!(result.strategy, "tfidf_conversational");
+    }
+
     #[tokio::test]
     async fn fallback_uses_primary_when_successful() {
         struct FixedSelector(Vec<String>);
