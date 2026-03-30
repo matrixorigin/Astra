@@ -10,6 +10,11 @@ triggers:
   - efficiency
   - how efficient
   - analyze session
+  - 评估
+  - 评估会话
+  - 会话性能
+  - 性能分析
+  - 效率
 allowed_tools:
   - bash
   - read_file

@@ -75,7 +75,11 @@ pub(super) fn create_tool_selector_with_quality(
     for skills_path in &skills_paths {
         if skills_path.is_dir() {
             if let Ok(mut reg) = skill_registry.write() {
-                skill_instructions::discover_and_register_metadata(skills_path, &mut reg);
+                let registered = skill_instructions::discover_and_register_metadata(skills_path, &mut reg);
+                if !registered.is_empty() {
+                    eprintln!("  {} Discovered {} skills from {:?}: {:?}", 
+                        "✓".green(), registered.len(), skills_path, registered);
+                }
             }
         }
     }

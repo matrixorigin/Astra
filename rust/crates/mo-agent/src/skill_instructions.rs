@@ -712,28 +712,59 @@ pub fn detect_triggers_in_message(registry: &SkillRegistry, message: &str) -> Ve
 
 /// Check if a pattern appears at word boundaries in text.
 /// A word boundary is the start/end of text or a non-alphanumeric character.
+/// For CJK patterns, we use substring matching since CJK doesn't have word boundaries.
 fn is_word_boundary_match(text: &str, pattern: &str) -> bool {
-    let mut start = 0;
-    while let Some(pos) = text[start..].find(pattern) {
-        let abs_pos = start + pos;
+    // For CJK patterns, use simple substring matching
+    // CJK characters are self-delimiting (each character is meaningful)
+    if pattern.chars().any(is_cjk_char) {
+        return text.contains(pattern);
+    }
+    
+    // For ASCII/Latin patterns, use word boundary matching
+    let mut search_start = 0;
+    while search_start < text.len() {
+        let search_slice = &text[search_start..];
+        let Some(pos) = search_slice.find(pattern) else {
+            break;
+        };
+        
+        let abs_pos = search_start + pos;
         let end_pos = abs_pos + pattern.len();
         
-        // Check start boundary
-        let start_ok = abs_pos == 0 || !text[..abs_pos].chars().last().map_or(false, |c| c.is_alphanumeric());
+        // Check start boundary (character before match)
+        let start_ok = abs_pos == 0 || {
+            let prev_slice = &text[..abs_pos];
+            prev_slice.chars().last().map_or(true, |c| !c.is_ascii_alphanumeric())
+        };
         
-        // Check end boundary  
-        let end_ok = end_pos == text.len() || !text[end_pos..].chars().next().map_or(false, |c| c.is_alphanumeric());
+        // Check end boundary (character after match)
+        let end_ok = end_pos >= text.len() || {
+            let next_slice = &text[end_pos..];
+            next_slice.chars().next().map_or(true, |c| !c.is_ascii_alphanumeric())
+        };
         
         if start_ok && end_ok {
             return true;
         }
         
-        start = abs_pos + 1;
-        if start >= text.len() {
-            break;
-        }
+        // Move past this occurrence (properly handle UTF-8)
+        search_start = abs_pos + text[abs_pos..].chars().next().map_or(1, |c| c.len_utf8());
     }
     false
+}
+
+/// Check if a character is CJK (Chinese, Japanese, Korean).
+fn is_cjk_char(c: char) -> bool {
+    matches!(c,
+        '\u{4E00}'..='\u{9FFF}' |  // CJK Unified Ideographs
+        '\u{3400}'..='\u{4DBF}' |  // CJK Unified Ideographs Extension A
+        '\u{20000}'..='\u{2A6DF}' | // CJK Unified Ideographs Extension B
+        '\u{F900}'..='\u{FAFF}' |  // CJK Compatibility Ideographs
+        '\u{3000}'..='\u{303F}' |  // CJK Symbols and Punctuation
+        '\u{3040}'..='\u{309F}' |  // Hiragana
+        '\u{30A0}'..='\u{30FF}' |  // Katakana
+        '\u{AC00}'..='\u{D7AF}'    // Hangul Syllables
+    )
 }
 
 /// Load skill instructions for the first matching trigger in a message.
@@ -768,6 +799,237 @@ pub fn load_triggered_skill_instructions(
     }
     
     None
+}
+
+// ============================================================================
+// Hybrid Skill Detection (Keyword + LLM Fallback)
+// ============================================================================
+
+use std::time::{Duration, Instant};
+
+/// Cache entry for LLM skill classification results.
+#[derive(Debug, Clone)]
+struct ClassificationCacheEntry {
+    skill_name: Option<String>,
+    timestamp: Instant,
+}
+
+/// Cache for LLM skill classification results.
+/// Thread-safe wrapper with TTL-based expiration.
+pub struct SkillClassificationCache {
+    entries: HashMap<String, ClassificationCacheEntry>,
+    ttl: Duration,
+}
+
+impl SkillClassificationCache {
+    /// Create a new cache with the given TTL (default: 5 minutes).
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl,
+        }
+    }
+
+    /// Get a cached classification result if not expired.
+    pub fn get(&self, message: &str) -> Option<Option<String>> {
+        let key = normalize_message(message);
+        if let Some(entry) = self.entries.get(&key) {
+            if entry.timestamp.elapsed() < self.ttl {
+                return Some(entry.skill_name.clone());
+            }
+        }
+        None
+    }
+
+    /// Cache a classification result.
+    pub fn insert(&mut self, message: &str, skill_name: Option<String>) {
+        let key = normalize_message(message);
+        self.entries.insert(key, ClassificationCacheEntry {
+            skill_name,
+            timestamp: Instant::now(),
+        });
+    }
+
+    /// Clear expired entries.
+    pub fn cleanup(&mut self) {
+        self.entries.retain(|_, entry| entry.timestamp.elapsed() < self.ttl);
+    }
+}
+
+impl Default for SkillClassificationCache {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(300)) // 5 minutes
+    }
+}
+
+/// Normalize a message for cache key comparison.
+fn normalize_message(message: &str) -> String {
+    message.trim().to_lowercase()
+}
+
+/// Check if a message looks like a command/request (vs greeting/statement).
+/// Commands typically contain imperative verbs, questions, or task-oriented phrases.
+pub fn looks_like_command(message: &str) -> bool {
+    let msg_lower = message.to_lowercase();
+    
+    // Imperative/request indicators
+    let command_patterns = [
+        // English imperatives
+        "please", "help", "show", "list", "find", "search", "get", "check",
+        "analyze", "evaluate", "review", "debug", "fix", "create", "make",
+        "run", "execute", "start", "stop", "update", "delete", "add",
+        // Chinese imperatives
+        "请", "帮", "查", "找", "看", "显示", "列出", "搜索", "获取",
+        "分析", "评估", "审查", "调试", "修复", "创建", "运行", "执行",
+        // Question indicators
+        "what", "how", "why", "where", "when", "which", "can you", "could you",
+        "什么", "怎么", "为什么", "哪", "能", "可以",
+        // Task suffixes
+        "一下", "吧", "下",
+    ];
+    
+    for pattern in &command_patterns {
+        if msg_lower.contains(pattern) {
+            return true;
+        }
+    }
+    
+    // Question mark indicates a question/request
+    if message.contains('?') || message.contains('？') {
+        return true;
+    }
+    
+    // Very short messages are likely not commands
+    if message.len() < 5 {
+        return false;
+    }
+    
+    // Messages with code-like content are likely commands
+    if message.contains("```") || message.contains("```") {
+        return true;
+    }
+    
+    false
+}
+
+/// Build a classification prompt for the LLM.
+pub fn build_classification_prompt(registry: &SkillRegistry, message: &str) -> String {
+    let mut skills_desc = String::new();
+    for skill in registry.all_skills() {
+        if skill.metadata.user_invocable {
+            skills_desc.push_str(&format!(
+                "- {}: {}\n",
+                skill.metadata.name, skill.metadata.description
+            ));
+        }
+    }
+    
+    format!(
+r#"You are a skill classifier. Given a user message, determine which skill (if any) should handle it.
+
+Available skills:
+{skills_desc}
+User message: "{message}"
+
+Reply with ONLY the skill name that best matches the user's intent, or "none" if no skill applies.
+Do not explain. Just output the skill name or "none"."#
+    )
+}
+
+/// Parse the LLM's classification response.
+pub fn parse_classification_response(response: &str, registry: &SkillRegistry) -> Option<String> {
+    let response_clean = response.trim().to_lowercase();
+    
+    // Check for "none" response
+    if response_clean == "none" || response_clean.is_empty() {
+        return None;
+    }
+    
+    // Try to match against known skill names
+    for skill in registry.all_skills() {
+        let skill_name_lower = skill.metadata.name.to_lowercase();
+        if response_clean.contains(&skill_name_lower) {
+            return Some(skill.metadata.name.clone());
+        }
+    }
+    
+    // If response looks like a skill name but wasn't found, return None
+    None
+}
+
+/// Hybrid skill detection: keyword match first, then LLM fallback.
+/// 
+/// This function tries keyword matching first (fast, free), then falls back
+/// to LLM classification for messages that look like commands but didn't
+/// match any keyword triggers.
+/// 
+/// # Arguments
+/// * `registry` - The skill registry
+/// * `message` - User message to classify
+/// * `cache` - Optional classification cache
+/// * `llm_classify` - Async function to call LLM for classification
+/// 
+/// # Returns
+/// The name of the matched skill, or None if no match.
+pub async fn detect_skill_hybrid<F, Fut>(
+    registry: &SkillRegistry,
+    message: &str,
+    cache: Option<&mut SkillClassificationCache>,
+    llm_classify: F,
+) -> Option<String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    // Stage 1: Try keyword match (fast, free)
+    let keyword_matches = detect_triggers_in_message(registry, message);
+    if !keyword_matches.is_empty() {
+        return Some(keyword_matches[0].clone());
+    }
+    
+    // Stage 2: Check if message looks like a command
+    if !looks_like_command(message) {
+        return None;
+    }
+    
+    // Stage 3: Check cache
+    if let Some(cache) = cache.as_ref() {
+        if let Some(cached_result) = cache.get(message) {
+            return cached_result;
+        }
+    }
+    
+    // Stage 4: LLM classification
+    let prompt = build_classification_prompt(registry, message);
+    match llm_classify(prompt).await {
+        Ok(response) => {
+            let result = parse_classification_response(&response, registry);
+            // Cache the result
+            if let Some(cache) = cache {
+                cache.insert(message, result.clone());
+            }
+            result
+        }
+        Err(e) => {
+            eprintln!("  ⚠ LLM skill classification failed: {}", e);
+            None
+        }
+    }
+}
+
+/// Synchronous version of hybrid detection (keyword only, no LLM fallback).
+/// Use this when you can't make async calls.
+pub fn detect_skill_hybrid_sync(
+    registry: &SkillRegistry,
+    message: &str,
+) -> Option<String> {
+    // Only keyword match in sync mode
+    let keyword_matches = detect_triggers_in_message(registry, message);
+    if !keyword_matches.is_empty() {
+        Some(keyword_matches[0].clone())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1611,6 +1873,154 @@ Query the agent_events table.
             assert!(skill.metadata.triggers.contains(&"evaluate".to_string()) ||
                     skill.metadata.triggers.contains(&"performance".to_string()));
         }
+    }
+
+    // ============================================================================
+    // Hybrid Detection Tests
+    // ============================================================================
+
+    #[test]
+    fn looks_like_command_english() {
+        // Commands should be detected
+        assert!(looks_like_command("please help me with this"));
+        assert!(looks_like_command("show me the files"));
+        assert!(looks_like_command("can you analyze this?"));
+        assert!(looks_like_command("what is the status?"));
+        assert!(looks_like_command("run the tests"));
+        assert!(looks_like_command("debug this error"));
+        
+        // Non-commands should not be detected
+        assert!(!looks_like_command("hi"));
+        assert!(!looks_like_command("ok"));
+        assert!(!looks_like_command("yes"));
+        assert!(!looks_like_command("no"));
+    }
+
+    #[test]
+    fn looks_like_command_chinese() {
+        // Chinese commands should be detected
+        assert!(looks_like_command("请帮我查一下"));
+        assert!(looks_like_command("分析一下这个"));
+        assert!(looks_like_command("评估一下会话"));
+        assert!(looks_like_command("这是什么？"));
+        assert!(looks_like_command("怎么解决这个问题"));
+        assert!(looks_like_command("运行测试吧"));
+    }
+
+    #[test]
+    fn classification_cache_basic() {
+        let mut cache = SkillClassificationCache::new(Duration::from_secs(60));
+        
+        // Insert and retrieve
+        cache.insert("test message", Some("skill-a".to_string()));
+        assert_eq!(cache.get("test message"), Some(Some("skill-a".to_string())));
+        
+        // Case insensitive
+        assert_eq!(cache.get("TEST MESSAGE"), Some(Some("skill-a".to_string())));
+        
+        // Non-existent
+        assert_eq!(cache.get("other message"), None);
+        
+        // None values
+        cache.insert("no skill", None);
+        assert_eq!(cache.get("no skill"), Some(None));
+    }
+
+    #[test]
+    fn build_classification_prompt_format() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("test-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        
+        let skill_md = r#"---
+name: test-skill
+description: "A test skill"
+user_invocable: true
+triggers:
+  - test
+---
+Instructions.
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+        
+        let mut registry = SkillRegistry::new();
+        discover_and_register_metadata(dir.path(), &mut registry);
+        
+        let prompt = build_classification_prompt(&registry, "run a test");
+        
+        assert!(prompt.contains("test-skill"));
+        assert!(prompt.contains("A test skill"));
+        assert!(prompt.contains("run a test"));
+        assert!(prompt.contains("none"));
+    }
+
+    #[test]
+    fn parse_classification_response_variants() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        
+        let skill_md = r#"---
+name: my-skill
+description: "My skill"
+user_invocable: true
+triggers:
+  - test
+---
+Instructions.
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+        
+        let mut registry = SkillRegistry::new();
+        discover_and_register_metadata(dir.path(), &mut registry);
+        
+        // Exact match
+        assert_eq!(parse_classification_response("my-skill", &registry), Some("my-skill".to_string()));
+        
+        // With whitespace
+        assert_eq!(parse_classification_response("  my-skill  ", &registry), Some("my-skill".to_string()));
+        
+        // Case insensitive
+        assert_eq!(parse_classification_response("MY-SKILL", &registry), Some("my-skill".to_string()));
+        
+        // None response
+        assert_eq!(parse_classification_response("none", &registry), None);
+        assert_eq!(parse_classification_response("NONE", &registry), None);
+        assert_eq!(parse_classification_response("", &registry), None);
+        
+        // Unknown skill
+        assert_eq!(parse_classification_response("unknown-skill", &registry), None);
+    }
+
+    #[test]
+    fn detect_skill_hybrid_sync_keyword_match() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        
+        let skill_md = r#"---
+name: review
+description: "Code review skill"
+user_invocable: true
+triggers:
+  - review
+  - 审查
+---
+Instructions.
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+        
+        let mut registry = SkillRegistry::new();
+        discover_and_register_metadata(dir.path(), &mut registry);
+        
+        // English trigger
+        assert_eq!(detect_skill_hybrid_sync(&registry, "please review this"), Some("review".to_string()));
+        
+        // Chinese trigger
+        assert_eq!(detect_skill_hybrid_sync(&registry, "审查一下代码"), Some("review".to_string()));
+        
+        // No match
+        assert_eq!(detect_skill_hybrid_sync(&registry, "hello world"), None);
     }
 }
 

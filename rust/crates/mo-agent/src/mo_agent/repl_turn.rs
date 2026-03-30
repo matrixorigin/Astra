@@ -297,7 +297,18 @@ async fn run_chat_turn(
 /// Detect skill triggers in the user message and load instructions if matched.
 fn detect_skill_triggers(state: &mut ReplState, message: &str) -> Option<String> {
     // Try to acquire write lock (non-blocking to avoid deadlocks)
-    let mut registry = state.skill_registry.try_write().ok()?;
+    let mut registry = match state.skill_registry.try_write() {
+        Ok(r) => r,
+        Err(_) => {
+            // Lock contention - skill detection skipped this turn
+            return None;
+        }
+    };
+    
+    // Check if registry has any skills
+    if registry.len() == 0 {
+        return None;
+    }
     
     // Use the skill_instructions module to detect and load
     let result = crate::skill_instructions::load_triggered_skill_instructions(&mut registry, message);
