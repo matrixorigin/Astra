@@ -6,6 +6,7 @@ import {
   API_URL_COOKIE,
   ACCESS_TOKEN_COOKIE,
   REFRESH_TOKEN_COOKIE,
+  DEFAULT_API_URL,
 } from '@/lib/runtime-config';
 
 type AuthTokens = {
@@ -29,8 +30,8 @@ type ActionResult = {
 
 const TOKEN_MAX_AGE = 365 * 24 * 60 * 60; // 1 year for cookie persistence
 
-function getApiUrl(cookieStore: Awaited<ReturnType<typeof cookies>>): string | null {
-  return cookieStore.get(API_URL_COOKIE)?.value ?? process.env.MO_AGENT_API_URL ?? null;
+function getApiUrl(cookieStore: Awaited<ReturnType<typeof cookies>>): string {
+  return cookieStore.get(API_URL_COOKIE)?.value ?? process.env.MO_AGENT_API_URL ?? DEFAULT_API_URL;
 }
 
 async function saveTokens(tokens: AuthTokens): Promise<void> {
@@ -60,9 +61,6 @@ export async function loginAction(
 
   const cookieStore = await cookies();
   const apiUrl = getApiUrl(cookieStore);
-  if (!apiUrl) {
-    return { ok: false, error: 'API URL not configured. Go to Settings first.' };
-  }
 
   try {
     const response = await fetch(new URL('/auth/login', apiUrl).toString(), {
@@ -99,9 +97,6 @@ export async function registerAction(
 
   const cookieStore = await cookies();
   const apiUrl = getApiUrl(cookieStore);
-  if (!apiUrl) {
-    return { ok: false, error: 'API URL not configured. Go to Settings first.' };
-  }
 
   try {
     const response = await fetch(new URL('/auth/register', apiUrl).toString(), {
@@ -151,7 +146,7 @@ export async function refreshTokenAction(): Promise<ActionResult> {
   const apiUrl = getApiUrl(cookieStore);
   const refreshToken = cookieStore.get(REFRESH_TOKEN_COOKIE)?.value;
 
-  if (!apiUrl || !refreshToken) {
+  if (!refreshToken) {
     return { ok: false, error: 'No refresh token available.' };
   }
 
@@ -179,7 +174,7 @@ export async function getCurrentUser(): Promise<AuthUser | null> {
   const apiUrl = getApiUrl(cookieStore);
   const accessToken = cookieStore.get(ACCESS_TOKEN_COOKIE)?.value;
 
-  if (!apiUrl || !accessToken) return null;
+  if (!accessToken) return null;
 
   try {
     const response = await fetch(new URL('/auth/me', apiUrl).toString(), {
