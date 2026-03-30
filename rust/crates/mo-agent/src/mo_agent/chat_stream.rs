@@ -835,6 +835,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     let mut first_context_assembly_ms: Option<u64> = None;
     let mut first_memoria_ms: Option<u64> = None;
     let mut first_selector_ms: Option<u64> = None;
+    let mut first_selector_strategy: Option<String> = None;
 
     for _turn in 0..max_turns {
         if remaining_turns == 0 {
@@ -1032,6 +1033,10 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 .await;
             if first_selector_ms.is_none() {
                 first_selector_ms = Some(sel_start.elapsed().as_millis() as u64);
+                first_selector_strategy = Some(format!(
+                    "{} (conf={:.2})",
+                    sel_result.strategy, sel_result.confidence
+                ));
             }
             let conf = sel_result.confidence;
             let (schemas, report) = tool_selector::resolve_schemas_with_pressure(
@@ -2206,6 +2211,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         last_heavy_checkpoint,
         ttft_ms: first_ttft_ms,
         context_ms: first_context_assembly_ms,
+        selector_strategy: first_selector_strategy,
         selector_ms: first_selector_ms,
         memoria_ms: first_memoria_ms,
     })

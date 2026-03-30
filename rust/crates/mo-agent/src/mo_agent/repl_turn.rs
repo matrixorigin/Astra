@@ -340,6 +340,7 @@ fn apply_turn_success(
         .with_plan_subtask(state.current_plan_subtask_id.as_deref())
         .with_ttft(result.ttft_ms)
         .with_context_time(result.context_ms)
+        .with_selector_strategy(result.selector_strategy.clone())
         .with_selector_time(result.selector_ms)
         .with_memoria_time(result.memoria_ms);
 

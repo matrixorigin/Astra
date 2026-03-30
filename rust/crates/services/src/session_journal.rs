@@ -433,6 +433,9 @@ pub struct JournalEvent {
     /// Context assembly time in milliseconds (prompt building).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_ms: Option<u64>,
+    /// Tool selection strategy used (e.g. "tfidf", "llm", "tfidf_fast").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector_strategy: Option<String>,
     /// Tool selection time in milliseconds (subset of context_ms).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selector_ms: Option<u64>,
@@ -701,6 +704,7 @@ impl JournalEvent {
             plan_subtask_id: None,
             ttft_ms: None,
             context_ms: None,
+            selector_strategy: None,
             selector_ms: None,
             memoria_ms: None,
         }
@@ -846,6 +850,12 @@ impl JournalEvent {
     /// Set tool selection time.
     pub fn with_selector_time(mut self, selector_ms: Option<u64>) -> Self {
         self.selector_ms = selector_ms;
+        self
+    }
+
+    /// Set tool selection strategy.
+    pub fn with_selector_strategy(mut self, strategy: Option<String>) -> Self {
+        self.selector_strategy = strategy;
         self
     }
 

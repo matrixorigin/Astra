@@ -605,7 +605,8 @@ pub(super) async fn handle_info_command(
                 if let Some(ctx) = ev.context_ms {
                     let mut parts = Vec::new();
                     if let Some(sel) = ev.selector_ms {
-                        parts.push(format!("selector: {}ms", sel));
+                        let strat = ev.selector_strategy.as_deref().unwrap_or("?");
+                        parts.push(format!("selector: {}ms [{}]", sel, strat));
                     }
                     if let Some(m) = ev.memoria_ms {
                         parts.push(format!("memoria: {}ms", m));
@@ -692,11 +693,13 @@ pub(super) async fn handle_info_command(
                         );
                     }
                     if let Some(sel) = ev.selector_ms {
+                        let strat = ev.selector_strategy.as_deref().unwrap_or("unknown");
                         eprintln!(
-                            "    {} {}   tool selection ({}ms){}",
+                            "    {} {}   tool selection ({}ms, {}){}",
                             format!("[{:>5}ms]", offset).dim(),
                             "│ ".dim(),
                             sel,
+                            strat,
                             if sel > 3000 { "  ← slow" } else { "" }
                         );
                     }

@@ -314,6 +314,8 @@ struct StreamResult {
     ttft_ms: Option<u64>,
     /// Context assembly time in milliseconds.
     context_ms: Option<u64>,
+    /// Tool selection strategy used.
+    selector_strategy: Option<String>,
     /// Tool selection time in milliseconds (subset of context_ms).
     selector_ms: Option<u64>,
     /// Memoria search time in milliseconds (subset of context_ms).

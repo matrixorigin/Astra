@@ -950,11 +950,28 @@ impl ToolSelector for FallbackSelector {
             .fallback
             .select_with_learned_context(ctx, learned_context)
             .await;
+
+        // TF-IDF confident with tools → use directly
         if fast_result.confidence >= 0.7 && !fast_result.tool_names.is_empty() {
             return fast_result;
         }
 
-        // Slow path: LLM-based selection for ambiguous/complex queries.
+        // TF-IDF says "conversational / no tools needed" → trust it, don't waste
+        // 8s on LLM selector that will also return nothing for "hi", "thanks", etc.
+        // Check: no dynamic tools selected (only pinned defaults like bash/read_file).
+        if fast_result.confidence >= 0.5 {
+            return fast_result;
+        }
+        let has_dynamic_tools = fast_result.tool_names.iter().any(|n| {
+            !crate::tool_registry::TOOL_CATALOG
+                .iter()
+                .any(|t| t.pinned && t.name == n.as_str())
+        });
+        if !has_dynamic_tools {
+            return fast_result;
+        }
+
+        // Slow path: TF-IDF uncertain about which tools → ask LLM.
         let result = self
             .primary
             .select_with_learned_context(ctx, learned_context)
@@ -1646,13 +1663,13 @@ mod tests {
             }
         }
 
-        // Fallback has low confidence → should escalate to primary (LLM)
+        // Fallback has low confidence with dynamic tool → should escalate to primary (LLM)
         struct LowConfSelector;
         #[async_trait]
         impl ToolSelector for LowConfSelector {
             async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
                 SelectionResult {
-                    tool_names: vec!["memory_search".into()],
+                    tool_names: vec!["github_list_prs".into()],
                     strategy: "tfidf_low",
                     budget_used: 0,
                     failed: false,
@@ -1677,6 +1694,7 @@ mod tests {
             file_context: vec![],
         };
         let result = selector.select(&ctx).await;
+        // Primary should be called because fallback had dynamic tools with low confidence
         assert_eq!(result.strategy, "fixed");
         assert_eq!(result.tool_names, vec!["github_list_prs"]);
     }
