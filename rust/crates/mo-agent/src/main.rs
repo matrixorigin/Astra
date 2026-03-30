@@ -3752,7 +3752,7 @@ mod tests {
             selector: &selector,
             recent_tools: &[],
             tool_health_entries: &[],
-            skill_instructions: None,
+            skill_registry: crate::skill_instructions::empty_registry(),
         })
         .await
         .unwrap();
@@ -3794,7 +3794,7 @@ mod tests {
             selector: &selector,
             recent_tools: &[],
             tool_health_entries: &[],
-            skill_instructions: None,
+            skill_registry: crate::skill_instructions::empty_registry(),
         })
         .await;
         assert!(result.is_err());
@@ -3852,7 +3852,7 @@ mod tests {
             selector: &selector,
             recent_tools: &[],
             tool_health_entries: &[],
-            skill_instructions: None,
+            skill_registry: crate::skill_instructions::empty_registry(),
         })
         .await
         .unwrap();

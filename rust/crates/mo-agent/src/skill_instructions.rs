@@ -645,6 +645,14 @@ pub fn new_shared_registry() -> SharedSkillRegistry {
     Arc::new(RwLock::new(SkillRegistry::new()))
 }
 
+/// Empty skill registry for contexts where skills are not needed.
+/// Uses lazy static initialization.
+pub fn empty_registry() -> &'static SharedSkillRegistry {
+    static EMPTY: std::sync::LazyLock<SharedSkillRegistry> =
+        std::sync::LazyLock::new(|| Arc::new(RwLock::new(SkillRegistry::new())));
+    &EMPTY
+}
+
 /// Discover skills from a directory and register metadata only (Level 1).
 pub fn discover_and_register_metadata(
     skills_dir: &Path,
@@ -1877,8 +1885,10 @@ Query the agent_events table.
         // Check if evaluate-session was found (if SKILL.md exists)
         if registered.contains(&"evaluate-session".to_string()) {
             let skill = registry.get("evaluate-session").unwrap();
-            assert!(skill.metadata.triggers.contains(&"evaluate".to_string()) ||
-                    skill.metadata.triggers.contains(&"performance".to_string()));
+            // Triggers are now optional - LLM selects by semantic understanding
+            // Just verify the skill has a name and description
+            assert!(!skill.metadata.name.is_empty());
+            assert!(!skill.metadata.description.is_empty());
         }
     }
 

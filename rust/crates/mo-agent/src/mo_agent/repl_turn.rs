@@ -172,7 +172,7 @@ async fn maybe_auto_compact(
         selector: ctx.selector,
         recent_tools: &[],
         tool_health_entries: &[],
-        skill_instructions: None,
+        skill_registry: &state.skill_registry,
     })
     .await;
 
@@ -265,8 +265,9 @@ async fn run_chat_turn(
     message: &str,
     session_id: Option<&str>,
 ) -> TurnAttempt {
-    // Detect skill triggers and load instructions if matched
-    let skill_instructions = detect_skill_triggers(state, message);
+    // NOTE: Skill selection is now done by LLM during tool selection.
+    // The skill_registry is passed to stream_chat_sse for loading instructions
+    // when the LLM selects a skill.
     
     tokio::select! {
         result = stream_chat_sse(ChatTurnParams {
@@ -285,75 +286,13 @@ async fn run_chat_turn(
             selector: ctx.selector,
             recent_tools: &state.recent_tools,
             tool_health_entries: &state.tool_health_entries,
-            skill_instructions: skill_instructions.as_deref(),
+            skill_registry: &state.skill_registry,
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             eprintln!("\n{}", "  Interrupted.".dim());
             TurnAttempt::Interrupted
         }
     }
-}
-
-/// Detect skill triggers in the user message and load instructions if matched.
-/// Uses hybrid detection: keyword match with command-intent heuristic.
-fn detect_skill_triggers(state: &mut ReplState, message: &str) -> Option<String> {
-    // Try to acquire write lock (non-blocking to avoid deadlocks)
-    let mut registry = match state.skill_registry.try_write() {
-        Ok(r) => r,
-        Err(_) => {
-            // Lock contention - skill detection skipped this turn
-            return None;
-        }
-    };
-    
-    // Check if registry has any skills
-    if registry.len() == 0 {
-        return None;
-    }
-    
-    // Stage 1: Try keyword match (fast, free)
-    let skill_name = crate::skill_instructions::detect_skill_hybrid_sync(&registry, message);
-    
-    // If keyword match found, load and return instructions
-    if let Some(name) = skill_name {
-        // Load instructions if not already loaded
-        if let Err(e) = registry.load_instructions(&name) {
-            eprintln!("  ⚠ Failed to load skill instructions for {}: {}", name, e);
-            return None;
-        }
-        
-        // Get the instruction text
-        if let Some(skill) = registry.get(&name) {
-            if let Some(text) = skill.instruction_text() {
-                eprintln!("  {} Skill triggered: {}", "▶".cyan(), name.cyan());
-                return Some(text.to_string());
-            }
-        }
-    }
-    
-    // Stage 2: If no keyword match but message looks like a command,
-    // check cache or log for potential LLM classification
-    // (LLM fallback would go here when implemented)
-    if crate::skill_instructions::looks_like_command(message) && registry.len() > 0 {
-        // Check cache first
-        if let Some(cached_skill) = state.skill_classification_cache.get(message) {
-            if let Some(name) = cached_skill {
-                if let Err(e) = registry.load_instructions(&name) {
-                    eprintln!("  ⚠ Failed to load skill instructions for {}: {}", name, e);
-                    return None;
-                }
-                if let Some(skill) = registry.get(&name) {
-                    if let Some(text) = skill.instruction_text() {
-                        eprintln!("  {} Skill triggered (cached): {}", "▶".cyan(), name.cyan());
-                        return Some(text.to_string());
-                    }
-                }
-            }
-        }
-        // TODO: LLM classification fallback when lightweight endpoint is available
-    }
-    
-    None
 }
 
 fn apply_turn_success(

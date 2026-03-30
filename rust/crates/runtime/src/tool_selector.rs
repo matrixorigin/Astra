@@ -137,6 +137,31 @@ pub struct SelectionResult {
     /// LLM tokens consumed by the selector itself (0 for TF-IDF).
     pub selector_tokens_in: u64,
     pub selector_tokens_out: u64,
+    /// Skills selected by LLM (skill names that should have instructions loaded).
+    /// Empty for TF-IDF fallback (skills require semantic understanding).
+    pub selected_skills: Vec<String>,
+}
+
+impl Default for SelectionResult {
+    fn default() -> Self {
+        Self {
+            tool_names: vec![],
+            strategy: "default",
+            budget_used: 0,
+            failed: false,
+            confidence: 0.0,
+            selector_tokens_in: 0,
+            selector_tokens_out: 0,
+            selected_skills: vec![],
+        }
+    }
+}
+
+/// Skill metadata for tool selection (lightweight, ~50 tokens per skill).
+#[derive(Debug, Clone)]
+pub struct SkillCatalogEntry {
+    pub name: String,
+    pub description: String,
 }
 
 /// Strategy for selecting tools from the catalog.
@@ -646,6 +671,7 @@ impl ToolSelector for TfIdfSelector {
             confidence,
             selector_tokens_in: 0,
             selector_tokens_out: 0,
+            selected_skills: vec![], // TF-IDF doesn't select skills (requires semantic understanding)
         }
     }
 
@@ -708,12 +734,43 @@ fn build_catalog_summary() -> String {
         .join("\n")
 }
 
+/// Build skill catalog summary for LLM tool selector.
+/// Skills are prefixed with [SKILL] to distinguish from tools.
+fn build_skill_catalog_summary(skills: &[SkillCatalogEntry]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+    skills
+        .iter()
+        .map(|s| {
+            format!(
+                "- [SKILL] {}: {}",
+                s.name,
+                s.description.split('.').next().unwrap_or(&s.description)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Build combined catalog (tools + skills) for LLM.
+fn build_combined_catalog(skills: &[SkillCatalogEntry]) -> String {
+    let tools = build_catalog_summary();
+    let skills_summary = build_skill_catalog_summary(skills);
+    if skills_summary.is_empty() {
+        tools
+    } else {
+        format!("{}\n\n# Skills (select when task matches):\n{}", tools, skills_summary)
+    }
+}
+
 /// System prompt for the tool selection LLM call.
 const TOOL_SELECT_SYSTEM: &str = "\
-You are a tool selector. Given the user's query and context, decide which tools are needed.
-Return ONLY a JSON array of tool names. Select 1-5 tools. Do not explain.
+You are a tool selector. Given the user's query and context, decide which tools and skills are needed.
+Return ONLY a JSON array of names. Select 1-5 items total. Do not explain.
 Pinned tools (bash, read_file, write_file, str_replace, list_dir, grep, glob) are always available — do NOT include them.
-Only select from the dynamic tools listed below.";
+Skills are prefixed with [SKILL] in the catalog. Include the skill name (without prefix) if the task matches.
+Only select from the dynamic tools and skills listed below.";
 
 fn build_tool_select_prompt(
     query: &str,
@@ -721,7 +778,7 @@ fn build_tool_select_prompt(
     learned_context: &LearnedContext,
     catalog: &str,
 ) -> Vec<Value> {
-    let system = format!("{}\n\nDynamic tools:\n{}", TOOL_SELECT_SYSTEM, catalog);
+    let system = format!("{}\n\nDynamic tools and skills:\n{}", TOOL_SELECT_SYSTEM, catalog);
     let mut user_msg = format!("Query: {}", query);
     if !recent_tools.is_empty() {
         user_msg.push_str(&format!("\nRecently used: {:?}", recent_tools));
@@ -769,6 +826,8 @@ pub struct LlmToolSelector {
     token: String,
     model: Option<String>,
     catalog_summary: String,
+    /// Skill names registered for selection (used to filter LLM response).
+    skill_names: std::collections::HashSet<String>,
 }
 
 impl LlmToolSelector {
@@ -780,12 +839,26 @@ impl LlmToolSelector {
             token,
             model: None,
             catalog_summary,
+            skill_names: std::collections::HashSet::new(),
         }
     }
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
         self
+    }
+
+    /// Register skills for selection. Call this after skills are discovered.
+    pub fn with_skills(mut self, skills: Vec<SkillCatalogEntry>) -> Self {
+        self.skill_names = skills.iter().map(|s| s.name.clone()).collect();
+        self.catalog_summary = build_combined_catalog(&skills);
+        self
+    }
+
+    /// Update skill catalog (e.g., when skills are dynamically loaded).
+    pub fn update_skills(&mut self, skills: &[SkillCatalogEntry]) {
+        self.skill_names = skills.iter().map(|s| s.name.clone()).collect();
+        self.catalog_summary = build_combined_catalog(skills);
     }
 
     /// Make a lightweight SSE call and collect the full response text.
@@ -896,12 +969,24 @@ impl ToolSelector for LlmToolSelector {
 
         match self.call_llm(messages).await {
             Ok((text, tin, tout)) => {
-                let mut names = parse_tool_names_from_llm(&text);
-                let valid: std::collections::HashSet<&str> =
+                let names = parse_tool_names_from_llm(&text);
+                let valid_tools: std::collections::HashSet<&str> =
                     TOOL_CATALOG.iter().map(|t| t.name).collect();
-                names.retain(|n| valid.contains(n.as_str()));
+                
+                // Separate tools from skills
+                let mut tool_names = Vec::new();
+                let mut selected_skills = Vec::new();
+                
+                for name in names {
+                    if valid_tools.contains(name.as_str()) {
+                        tool_names.push(name);
+                    } else if self.skill_names.contains(&name) {
+                        selected_skills.push(name);
+                    }
+                    // Ignore unknown names
+                }
 
-                if names.is_empty() {
+                if tool_names.is_empty() && selected_skills.is_empty() {
                     return SelectionResult {
                         tool_names: vec![],
                         strategy: "llm_empty",
@@ -910,17 +995,19 @@ impl ToolSelector for LlmToolSelector {
                         confidence: 0.0,
                         selector_tokens_in: tin,
                         selector_tokens_out: tout,
+                        selected_skills: vec![],
                     };
                 }
 
                 SelectionResult {
-                    tool_names: names,
+                    tool_names,
                     strategy: "llm",
                     budget_used: 0,
                     failed: false,
                     confidence: 0.9,
                     selector_tokens_in: tin,
                     selector_tokens_out: tout,
+                    selected_skills,
                 }
             }
             Err(_e) => {
@@ -933,6 +1020,7 @@ impl ToolSelector for LlmToolSelector {
                     confidence: 0.0,
                     selector_tokens_in: 0,
                     selector_tokens_out: 0,
+                    selected_skills: vec![],
                 }
             }
         }
@@ -1699,6 +1787,7 @@ mod tests {
             confidence,
             selector_tokens_in: 0,
             selector_tokens_out: 0,
+            selected_skills: vec![],
         }
     }
 
@@ -1765,6 +1854,7 @@ mod tests {
                     confidence: 0.9,
                     selector_tokens_in: 0,
                     selector_tokens_out: 0,
+                    selected_skills: vec![],
                 }
             }
         }
@@ -1782,6 +1872,7 @@ mod tests {
                     confidence: 0.3,
                     selector_tokens_in: 0,
                     selector_tokens_out: 0,
+                    selected_skills: vec![],
                 }
             }
         }
@@ -1821,6 +1912,7 @@ mod tests {
                     confidence: 0.0,
                     selector_tokens_in: 0,
                     selector_tokens_out: 0,
+                    selected_skills: vec![],
                 }
             }
         }
@@ -1836,6 +1928,7 @@ mod tests {
                     confidence: 0.5,
                     selector_tokens_in: 0,
                     selector_tokens_out: 0,
+                    selected_skills: vec![],
                 }
             }
         }
@@ -1876,6 +1969,7 @@ mod tests {
                     confidence: 0.0,
                     selector_tokens_in: 0,
                     selector_tokens_out: 0,
+                    selected_skills: vec![],
                 }
             }
         }
@@ -1895,6 +1989,7 @@ mod tests {
                     confidence: 0.0,
                     selector_tokens_in: 0,
                     selector_tokens_out: 0,
+                    selected_skills: vec![],
                 }
             }
 
@@ -1921,6 +2016,7 @@ mod tests {
                         confidence: 0.8,
                         selector_tokens_in: 0,
                         selector_tokens_out: 0,
+                        selected_skills: vec![],
                     }
                 } else {
                     SelectionResult {
@@ -1931,6 +2027,7 @@ mod tests {
                         confidence: 0.0,
                         selector_tokens_in: 0,
                         selector_tokens_out: 0,
+                        selected_skills: vec![],
                     }
                 }
             }
@@ -1987,6 +2084,7 @@ mod tests {
                     confidence: 0.0,
                     selector_tokens_in: 0,
                     selector_tokens_out: 0,
+                    selected_skills: vec![],
                 }
             }
 
@@ -2012,6 +2110,7 @@ mod tests {
                         confidence: 0.9,
                         selector_tokens_in: 0,
                         selector_tokens_out: 0,
+                        selected_skills: vec![],
                     }
                 } else {
                     SelectionResult {
@@ -2022,6 +2121,7 @@ mod tests {
                         confidence: 0.0,
                         selector_tokens_in: 0,
                         selector_tokens_out: 0,
+                        selected_skills: vec![],
                     }
                 }
             }
