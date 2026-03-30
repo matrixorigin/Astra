@@ -3,8 +3,8 @@
 export type StreamEventType =
   | 'session_info'
   | 'text_delta'
-  | 'thinking_delta'
-  | 'thinking_done'
+  | 'reasoning_delta'
+  | 'reasoning_done'
   | 'tool_call_start'
   | 'tool_call_end'
   | 'usage'
@@ -48,6 +48,9 @@ export type UsageEvent = {
   type: 'usage';
   prompt_tokens: number;
   completion_tokens: number;
+  cache_creation_tokens?: number;
+  cache_read_tokens?: number;
+  // Also accept alternative field names from backend
   cache_creation_input_tokens?: number;
   cache_read_input_tokens?: number;
 };
@@ -76,12 +79,12 @@ export type ExplainEvent = {
 };
 
 export type ThinkingDeltaEvent = {
-  type: 'thinking_delta';
+  type: 'reasoning_delta';
   content: string;
 };
 
 export type ThinkingDoneEvent = {
-  type: 'thinking_done';
+  type: 'reasoning_done';
 };
 
 export type PlanCreatedEvent = {

@@ -71,7 +71,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
           break;
         }
 
-        case 'thinking_delta': {
+        case 'reasoning_delta': {
           accumulatedThinkingRef.current += event.content;
           const thinking = accumulatedThinkingRef.current;
           const id = assistantIdRef.current;
@@ -85,7 +85,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
           break;
         }
 
-        case 'thinking_done': {
+        case 'reasoning_done': {
           const id = assistantIdRef.current;
           setMessages((prev) =>
             prev.map((m) =>
@@ -133,9 +133,10 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
               prev.totalTokens + event.prompt_tokens + event.completion_tokens,
             cacheCreationTokens:
               prev.cacheCreationTokens +
-              (event.cache_creation_input_tokens ?? 0),
+              (event.cache_creation_tokens ?? event.cache_creation_input_tokens ?? 0),
             cacheReadTokens:
-              prev.cacheReadTokens + (event.cache_read_input_tokens ?? 0),
+              prev.cacheReadTokens +
+              (event.cache_read_tokens ?? event.cache_read_input_tokens ?? 0),
           }));
           break;
         }

@@ -51,9 +51,9 @@ function eventSummary(event: StreamEvent): string {
       return event.message;
     case 'explain':
       return event.content.slice(0, 120) + (event.content.length > 120 ? '…' : '');
-    case 'thinking_delta':
+    case 'reasoning_delta':
       return 'Thinking…';
-    case 'thinking_done':
+    case 'reasoning_done':
       return 'Thinking complete';
     case 'plan_created':
       return `Plan: ${event.plan.title ?? 'created'} (${event.plan.subtasks.length} tasks)`;

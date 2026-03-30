@@ -42,7 +42,9 @@ export function SessionSidebar({
         ? data
         : Array.isArray(data.sessions)
           ? data.sessions
-          : [];
+          : Array.isArray(data.data)
+            ? data.data
+            : [];
       setSessions(items);
     } catch {
       // Fail silently
