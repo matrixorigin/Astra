@@ -501,7 +501,7 @@ fn apply_turn_success(
         for (stall_type, _) in &result.stall_events {
             let stall_event = session_journal::JournalEvent::stall_detected(
                 state.session_id.as_deref(),
-                state.turn as u32,
+                state.turn,
                 stall_type,
                 0, // nudge_count not tracked per-event; stall_type conveys severity
                 0.0,
@@ -515,7 +515,7 @@ fn apply_turn_success(
         for ve in &result.verdict_events {
             let verdict_event = session_journal::JournalEvent::turn_guard_verdict(
                 state.session_id.as_deref(),
-                state.turn as u32,
+                state.turn,
                 &ve.severity,
                 &ve.injections,
                 &ve.avoid_tools,
