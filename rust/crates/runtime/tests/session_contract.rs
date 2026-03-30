@@ -13,8 +13,8 @@ use axum::{
 use mo_agent_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo,
-    SessionCreateRequestData, SessionListFilter, SessionListRecord, SessionRecord, SessionService,
-    SessionUpdateRequestData, build_app,
+    SessionActivityRecord, SessionCreateRequestData, SessionListFilter, SessionListRecord,
+    SessionRecord, SessionService, SessionUpdateRequestData, build_app,
 };
 use serde::Deserialize;
 use tower::util::ServiceExt;
@@ -355,6 +355,20 @@ impl SessionService for StubSessionService {
 
         state.sessions.remove(&session_id);
         Ok(())
+    }
+
+    async fn get_session_activity(
+        &self,
+        session_id: String,
+        _user_id: String,
+        _limit: u32,
+        _offset: u32,
+    ) -> Result<SessionActivityRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        Ok(SessionActivityRecord {
+            session_id,
+            activities: vec![],
+            total: 0,
+        })
     }
 }
 

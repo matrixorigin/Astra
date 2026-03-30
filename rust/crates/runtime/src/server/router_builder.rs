@@ -64,6 +64,18 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/sessions/{session_id}/close",
             post(session_handlers::close_session_handler),
         )
+        .route(
+            "/sessions/{session_id}/resume",
+            post(session_handlers::resume_session_handler),
+        )
+        .route(
+            "/sessions/{session_id}/cancel",
+            post(session_handlers::cancel_session_handler),
+        )
+        .route(
+            "/sessions/{session_id}/activity",
+            get(session_handlers::session_activity_handler),
+        )
         .route("/admin/init", post(admin_handlers::admin_init_handler))
         .route(
             "/admin/audit",

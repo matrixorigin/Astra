@@ -75,6 +75,29 @@ pub(super) struct SessionListQuery {
     pub(super) offset: u32,
 }
 
+#[derive(Deserialize, Default)]
+pub(super) struct SessionActivityQuery {
+    #[serde(default = "default_session_activity_limit")]
+    pub(super) limit: u32,
+    #[serde(default)]
+    pub(super) offset: u32,
+}
+
+#[derive(Serialize, PartialEq, Eq)]
+pub(super) struct SessionActivityEntry {
+    pub(super) log_id: String,
+    pub(super) action: String,
+    pub(super) details: serde_json::Value,
+    pub(super) created_at: String,
+}
+
+#[derive(Serialize, PartialEq, Eq)]
+pub(super) struct SessionActivityResponse {
+    pub(super) session_id: String,
+    pub(super) activities: Vec<SessionActivityEntry>,
+    pub(super) total: i64,
+}
+
 #[derive(Serialize, PartialEq, Eq)]
 pub(super) struct AuthUserResponse {
     pub(super) user_id: String,
@@ -442,6 +465,25 @@ impl From<SessionListRecord> for SessionListResponse {
     }
 }
 
+impl From<SessionActivityRecord> for SessionActivityResponse {
+    fn from(value: SessionActivityRecord) -> Self {
+        Self {
+            session_id: value.session_id,
+            activities: value
+                .activities
+                .into_iter()
+                .map(|e| SessionActivityEntry {
+                    log_id: e.log_id,
+                    action: e.action,
+                    details: e.details,
+                    created_at: e.created_at,
+                })
+                .collect(),
+            total: value.total,
+        }
+    }
+}
+
 impl From<ChatRunRecord> for ChatResponse {
     fn from(value: ChatRunRecord) -> Self {
         Self {
@@ -541,6 +583,10 @@ pub(super) fn default_session_limit() -> u32 {
 
 pub(super) fn default_run_list_limit() -> u32 {
     50
+}
+
+pub(super) fn default_session_activity_limit() -> u32 {
+    100
 }
 
 pub(super) fn default_prompt_optimization_type() -> String {

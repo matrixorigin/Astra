@@ -107,3 +107,65 @@ pub(super) async fn close_session_handler(
         .await?;
     Ok(Json(SessionResponse::from(session)))
 }
+
+pub(super) async fn resume_session_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let session = state
+        .session_service
+        .update_session(
+            session_id,
+            user.user_id,
+            SessionUpdateRequestData {
+                title: None,
+                metadata: None,
+                status: Some("active".to_string()),
+            },
+        )
+        .await?;
+    Ok(Json(SessionResponse::from(session)))
+}
+
+pub(super) async fn cancel_session_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let session = state
+        .session_service
+        .update_session(
+            session_id,
+            user.user_id,
+            SessionUpdateRequestData {
+                title: None,
+                metadata: None,
+                status: Some("cancelled".to_string()),
+            },
+        )
+        .await?;
+    Ok(Json(SessionResponse::from(session)))
+}
+
+pub(super) async fn session_activity_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<SessionActivityQuery>,
+) -> Result<Json<SessionActivityResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    // Verify ownership first.
+    let _ = state
+        .session_service
+        .get_session(session_id.clone(), user.user_id.clone())
+        .await?;
+
+    let activities = state
+        .session_service
+        .get_session_activity(session_id, user.user_id, query.limit, query.offset)
+        .await?;
+    Ok(Json(SessionActivityResponse::from(activities)))
+}

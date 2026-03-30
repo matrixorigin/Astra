@@ -39,6 +39,14 @@ pub trait SessionService: Send + Sync {
         session_id: String,
         user_id: String,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)>;
+
+    async fn get_session_activity(
+        &self,
+        session_id: String,
+        user_id: String,
+        limit: u32,
+        offset: u32,
+    ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -84,6 +92,21 @@ pub struct SessionListRecord {
     pub total: i64,
     pub limit: u32,
     pub offset: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionActivityEntryRecord {
+    pub log_id: String,
+    pub action: String,
+    pub details: serde_json::Value,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionActivityRecord {
+    pub session_id: String,
+    pub activities: Vec<SessionActivityEntryRecord>,
+    pub total: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -370,6 +393,59 @@ impl SessionService for DatabaseSessionService {
         log_session_audit(&pool, &user_id, "session_delete", &session_id, details).await;
         Ok(())
     }
+
+    async fn get_session_activity(
+        &self,
+        session_id: String,
+        _user_id: String,
+        limit: u32,
+        offset: u32,
+    ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+
+        let count_row = query(
+            "SELECT COUNT(*) as cnt FROM auth_audit_logs \
+             WHERE resource_type = 'session' AND resource_id = ?",
+        )
+        .bind(&session_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(internal_error)?;
+        let total: i64 = count_row.try_get("cnt").unwrap_or(0);
+
+        let rows = query(
+            "SELECT log_id, action, details, created_at FROM auth_audit_logs \
+             WHERE resource_type = 'session' AND resource_id = ? \
+             ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        )
+        .bind(&session_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&pool)
+        .await
+        .map_err(internal_error)?;
+
+        let activities = rows
+            .iter()
+            .map(|row| {
+                let details_str: String = row.try_get("details").unwrap_or_default();
+                let details = serde_json::from_str(&details_str)
+                    .unwrap_or(serde_json::Value::Null);
+                SessionActivityEntryRecord {
+                    log_id: row.try_get("log_id").unwrap_or_default(),
+                    action: row.try_get("action").unwrap_or_default(),
+                    details,
+                    created_at: row.try_get::<String, _>("created_at").unwrap_or_default(),
+                }
+            })
+            .collect();
+
+        Ok(SessionActivityRecord {
+            session_id,
+            activities,
+            total,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -426,6 +502,19 @@ impl SessionService for UnconfiguredSessionService {
         _session_id: String,
         _user_id: String,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Session service not configured",
+        ))
+    }
+
+    async fn get_session_activity(
+        &self,
+        _session_id: String,
+        _user_id: String,
+        _limit: u32,
+        _offset: u32,
+    ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response(
             StatusCode::NOT_IMPLEMENTED,
             "Session service not configured",

@@ -13,8 +13,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE};
 use mo_agent_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthUserRecord, ChatTurnBridge, ErrorResponse, HealthChecker, ServiceInfo,
-    SessionActivityUpdatePlan, SessionCache, SessionCreateRequestData, SessionListFilter,
-    SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
+    SessionActivityRecord, SessionActivityUpdatePlan, SessionCache, SessionCreateRequestData,
+    SessionListFilter, SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
     TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnCoreEventWriter,
     TurnCorePersistOutcome, TurnCorePersistPlan, TurnDecisionAuditRecord, TurnHookDbPersistPlan,
     TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker, TurnReflectionLessonRecord,
@@ -651,6 +651,16 @@ impl SessionService for StubSessionService {
         _session_id: String,
         _user_id: String,
     ) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!()
+    }
+
+    async fn get_session_activity(
+        &self,
+        _session_id: String,
+        _user_id: String,
+        _limit: u32,
+        _offset: u32,
+    ) -> Result<SessionActivityRecord, (StatusCode, axum::Json<ErrorResponse>)> {
         unreachable!()
     }
 }

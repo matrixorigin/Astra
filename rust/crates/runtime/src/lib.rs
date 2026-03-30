@@ -94,8 +94,9 @@ pub use mo_agent_services::{
         AuthTokenRecord, AuthUserRecord, DatabaseAdminAuditReader, DatabaseAdminAuthorizer,
         DatabaseAdminFeedbackStatsReader, DatabaseAdminInitializer, DatabaseAdminTokenReader,
         DatabaseAdminTokenWriter, DatabaseAdminUserRoleManager, DatabaseAuthService,
-        DatabaseSessionService, FernetTokenEncryptor, SessionCreateRequestData, SessionListFilter,
-        SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
+        DatabaseSessionService, FernetTokenEncryptor, SessionActivityRecord, SessionCreateRequestData,
+        SessionListFilter, SessionListRecord, SessionRecord, SessionService,
+        SessionUpdateRequestData,
     },
     branches::{BranchService, DatabaseBranchService, UnconfiguredBranchService},
     context::{

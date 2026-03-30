@@ -10,8 +10,8 @@ use axum::{
 use mo_agent_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, ChatTurnBridge, ErrorResponse, HealthChecker, ServiceInfo,
-    SessionCreateRequestData, SessionListFilter, SessionListRecord, SessionRecord, SessionService,
-    SessionUpdateRequestData, TurnAuxiliaryEventWriter, TurnCoreEventWriter, TurnHookDbWriter,
+    SessionActivityRecord, SessionCreateRequestData, SessionListFilter, SessionListRecord,
+    SessionRecord, SessionService, SessionUpdateRequestData, TurnAuxiliaryEventWriter, TurnCoreEventWriter, TurnHookDbWriter,
     TurnObserverWorker, TurnReflectionLessonWriter, TurnReflectionStateStore,
     TurnSessionActivityWriter, TurnToolEventWriter, build_app,
 };
@@ -158,6 +158,20 @@ impl SessionService for StubSessionService {
         _user_id: String,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         Ok(())
+    }
+
+    async fn get_session_activity(
+        &self,
+        _session_id: String,
+        _user_id: String,
+        _limit: u32,
+        _offset: u32,
+    ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
+        Ok(SessionActivityRecord {
+            session_id: String::new(),
+            activities: vec![],
+            total: 0,
+        })
     }
 }
 
