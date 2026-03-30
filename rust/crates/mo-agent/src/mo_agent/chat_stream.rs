@@ -833,6 +833,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
 
     // Track first turn's context assembly time for observability
     let mut first_context_assembly_ms: Option<u64> = None;
+    let mut first_memoria_ms: Option<u64> = None;
 
     for _turn in 0..max_turns {
         if remaining_turns == 0 {
@@ -922,7 +923,12 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         // Memory results are re-ranked by TF-IDF cosine similarity to filter
         // irrelevant memories before boost term extraction (Phase A.2).
         {
+            let mem_start = Instant::now();
             let memory_contents = executor.memory_boost_search(message, 5).await;
+            let mem_elapsed = mem_start.elapsed().as_millis() as u64;
+            if first_memoria_ms.is_none() {
+                first_memoria_ms = Some(mem_elapsed);
+            }
             if !memory_contents.is_empty() {
                 // Bridge memory→preferred_repos: extract owner/repo references
                 // from memory content so tool executor can resolve bare repo names.
@@ -2195,6 +2201,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         last_heavy_checkpoint,
         ttft_ms: first_ttft_ms,
         context_ms: first_context_assembly_ms,
+        memoria_ms: first_memoria_ms,
     })
 }
 

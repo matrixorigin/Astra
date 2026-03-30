@@ -603,10 +603,15 @@ pub(super) async fn handle_info_command(
                     );
                 }
                 if let Some(ctx) = ev.context_ms {
+                    let mem_part = ev
+                        .memoria_ms
+                        .map(|m| format!(" (memoria: {}ms)", m))
+                        .unwrap_or_default();
                     eprintln!(
-                        "  {} {}ms {}",
+                        "  {} {}ms{}  {}",
                         "Context:".cyan(),
                         ctx,
+                        mem_part,
                         "(prompt assembly)".dim()
                     );
                 }
@@ -670,6 +675,14 @@ pub(super) async fn handle_info_command(
                         format!("[{:>5}ms]", offset).dim(),
                         "├─".dim()
                     );
+                    if let Some(mem) = ev.memoria_ms {
+                        eprintln!(
+                            "    {} {}   memoria search ({}ms)",
+                            format!("[{:>5}ms]", offset).dim(),
+                            "│ ".dim(),
+                            mem
+                        );
+                    }
                     offset = ctx;
                     eprintln!(
                         "    {} {} complete ({}ms)",

@@ -433,6 +433,9 @@ pub struct JournalEvent {
     /// Context assembly time in milliseconds (prompt building).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_ms: Option<u64>,
+    /// Memoria search time in milliseconds (subset of context_ms).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memoria_ms: Option<u64>,
 }
 
 /// Event type discriminator.
@@ -695,6 +698,7 @@ impl JournalEvent {
             plan_subtask_id: None,
             ttft_ms: None,
             context_ms: None,
+            memoria_ms: None,
         }
     }
 
@@ -826,6 +830,12 @@ impl JournalEvent {
     /// Set context assembly time (prompt building).
     pub fn with_context_time(mut self, context_ms: Option<u64>) -> Self {
         self.context_ms = context_ms;
+        self
+    }
+
+    /// Set memoria search time.
+    pub fn with_memoria_time(mut self, memoria_ms: Option<u64>) -> Self {
+        self.memoria_ms = memoria_ms;
         self
     }
 

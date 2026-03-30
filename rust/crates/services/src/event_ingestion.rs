@@ -578,6 +578,7 @@ mod tests {
             plan_subtask_id: None,
             ttft_ms: None,
             context_ms: None,
+            memoria_ms: None,
         }
     }
 

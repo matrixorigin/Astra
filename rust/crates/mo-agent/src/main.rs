@@ -314,6 +314,8 @@ struct StreamResult {
     ttft_ms: Option<u64>,
     /// Context assembly time in milliseconds.
     context_ms: Option<u64>,
+    /// Memoria search time in milliseconds (subset of context_ms).
+    memoria_ms: Option<u64>,
 }
 
 /// Structured audit record for a TurnGuard verdict.
