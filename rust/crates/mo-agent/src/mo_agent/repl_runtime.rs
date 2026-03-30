@@ -88,14 +88,6 @@ pub(super) fn create_tool_selector_with_quality(
     let mcp_manager =
         std::sync::Arc::new(std::sync::RwLock::new(mcp_client::McpClientManager::new()));
 
-    let modules = PipelineModules {
-        entity_graph,
-        pattern_library,
-        calibrator,
-        skill_registry,
-        mcp_manager,
-    };
-
     let creds = load_credentials();
     let name = profile_name(profile, &creds);
     let token = creds
@@ -104,11 +96,36 @@ pub(super) fn create_tool_selector_with_quality(
         .and_then(|p| p.access_token.as_ref())
         .cloned();
 
+    // Build skill catalog entries for tool selection (before moving skill_registry)
+    let skill_catalog: Vec<tool_selector::SkillCatalogEntry> = {
+        match skill_registry.read() {
+            Ok(reg) => reg
+                .all_skills()
+                .iter()
+                .map(|s| tool_selector::SkillCatalogEntry {
+                    name: s.metadata.name.clone(),
+                    description: s.metadata.description.clone(),
+                })
+                .collect(),
+            Err(_) => vec![],
+        }
+    };
+
+    let modules = PipelineModules {
+        entity_graph,
+        pattern_library,
+        calibrator,
+        skill_registry,
+        mcp_manager,
+    };
+
     // Use LLM selector only when logged in, with TF-IDF as fast fallback.
     // FallbackSelector tries LLM first; if it fails or returns empty, uses TF-IDF.
     let selector: Box<dyn tool_selector::ToolSelector> = match token {
         Some(tok) => {
-            let llm = tool_selector::LlmToolSelector::new(client.clone(), base.to_string(), tok);
+            // Register skills with LLM selector so it can include them in selection
+            let llm = tool_selector::LlmToolSelector::new(client.clone(), base.to_string(), tok)
+                .with_skills(skill_catalog);
             Box::new(tool_selector::FallbackSelector::new(
                 Box::new(llm),
                 Box::new(tfidf),

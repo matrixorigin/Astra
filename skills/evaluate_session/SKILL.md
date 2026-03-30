@@ -1,23 +1,7 @@
 ---
 name: evaluate-session
-description: "Agent self-assessment skill that evaluates performance metrics for a session"
+description: "Agent self-assessment skill that evaluates performance metrics for a session. Use when user asks about session performance, efficiency, or wants metrics analysis."
 user_invocable: true
-triggers:
-  # English triggers - session-specific
-  - evaluate session
-  - session metrics
-  - session performance
-  - session efficiency
-  - how efficient was
-  - analyze session
-  - session evaluation
-  # Chinese triggers - session-specific  
-  - 评估会话
-  - 会话性能
-  - 会话效率
-  - 评估这个session
-  - session性能
-  - session效率
 allowed_tools:
   - bash
   - read_file

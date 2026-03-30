@@ -720,8 +720,8 @@ pub(super) struct ChatTurnParams<'a> {
     pub(super) recent_tools: &'a [String],
     pub(super) tool_health_entries:
         &'a [mo_agent_runtime::pipeline::persistence::ToolHealthEntry],
-    /// Skill instructions to inject into context (loaded on demand).
-    pub(super) skill_instructions: Option<&'a str>,
+    /// Skill registry for loading instructions when LLM selects a skill.
+    pub(super) skill_registry: &'a crate::skill_instructions::SharedSkillRegistry,
 }
 
 /// Full edge-cloud agentic loop: sends message, executes tools, loops until done.
@@ -743,7 +743,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         selector,
         recent_tools,
         tool_health_entries,
-        skill_instructions,
+        skill_registry,
     } = p;
     let start = Instant::now();
     let term_width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
@@ -894,11 +894,9 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 payload["edge_profile"]["active_skills"] = serde_json::json!(skill_names);
             }
         }
-        // Inject skill instructions into edge_profile for context enrichment.
-        // These are step-by-step instructions loaded from SKILL.md files.
-        if let Some(instructions) = skill_instructions {
-            payload["edge_profile"]["skill_instructions"] = serde_json::json!(instructions);
-        }
+        // NOTE: Skill instructions are now injected after tool selection (see below)
+        // when LLM-based selection chooses a skill.
+        
         // Tool selection via pluggable ToolSelector strategy.
         // First turn: selector decides which tools. Follow-up turns: also pin
         // tools the LLM already invoked so they remain available.
@@ -1024,6 +1022,9 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             .task_archetype
             .map(|task_type| format!("{task_type:?}").to_lowercase());
 
+        // Variables to capture selection results including skills
+        let mut selected_skills: Vec<String> = Vec::new();
+        
         let (turn_schemas, selection_report, selection_confidence) = if tool_results.is_empty() {
             let sel_start = Instant::now();
             let turn_count = history.len() as u32 + 1;
@@ -1050,6 +1051,10 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             }
             selector_tokens_in += sel_result.selector_tokens_in;
             selector_tokens_out += sel_result.selector_tokens_out;
+            
+            // Capture selected skills from LLM selection
+            selected_skills = sel_result.selected_skills.clone();
+            
             let conf = sel_result.confidence;
             let (schemas, report) = tool_selector::resolve_schemas_with_pressure(
                 &registry,
@@ -1074,6 +1079,12 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             let sel_result = selector
                 .select_with_learned_context(&sel_ctx, &learned_context)
                 .await;
+            
+            // Capture selected skills (may be new skills in follow-up)
+            if !sel_result.selected_skills.is_empty() {
+                selected_skills = sel_result.selected_skills.clone();
+            }
+            
             let conf = sel_result.confidence;
             let (mut selected, mut report) = tool_selector::resolve_schemas_with_pressure(
                 &registry,
@@ -1107,6 +1118,40 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             }
             (selected, report, conf)
         };
+        
+        // Load skill instructions if LLM selected any skills
+        let skill_instructions: Option<String> = if !selected_skills.is_empty() {
+            let mut instructions = Vec::new();
+            if let Ok(mut reg) = skill_registry.try_write() {
+                for skill_name in &selected_skills {
+                    // Load instructions if not already loaded
+                    if let Err(e) = reg.load_instructions(skill_name) {
+                        eprintln!("  {} Failed to load skill {}: {}", "⚠".yellow(), skill_name, e);
+                        continue;
+                    }
+                    // Get the instruction text
+                    if let Some(skill) = reg.get(skill_name) {
+                        if let Some(text) = skill.instruction_text() {
+                            eprintln!("  {} Skill selected by LLM: {}", "▶".cyan(), skill_name.as_str().cyan());
+                            instructions.push(format!("## Skill: {}\n\n{}", skill_name, text));
+                        }
+                    }
+                }
+            }
+            if instructions.is_empty() {
+                None
+            } else {
+                Some(instructions.join("\n\n---\n\n"))
+            }
+        } else {
+            None
+        };
+        
+        // Inject skill instructions into payload if LLM selected any skills
+        if let Some(ref instructions) = skill_instructions {
+            payload["edge_profile"]["skill_instructions"] = serde_json::json!(instructions);
+        }
+        
         if first_selection_report.is_none() {
             first_selection_report = Some(selection_report);
             first_budget_pressure = budget_pressure;
