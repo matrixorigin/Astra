@@ -116,26 +116,44 @@ export default async function SessionDetailPage({
           title="Activity timeline"
           description={`${activity.total} audit entries recorded for this session.`}
         >
-          <div className="space-y-2">
-            {activity.activities.map((entry) => (
-              <div
-                key={entry.logId}
-                className="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-3"
-              >
-                <div className="mt-1 h-2 w-2 shrink-0 rounded-full bg-sky-500" />
-                <div className="min-w-0 flex-1">
-                  <p className="text-sm font-medium text-white">{entry.action}</p>
-                  {entry.details ? (
-                    <p className="mt-1 truncate text-xs text-slate-400">
-                      {typeof entry.details === 'string'
-                        ? entry.details
-                        : JSON.stringify(entry.details)}
-                    </p>
-                  ) : null}
-                  <p className="mt-1 text-xs text-slate-500">{entry.createdAt}</p>
-                </div>
-              </div>
-            ))}
+          <div className="relative pl-6">
+            {/* Timeline rail */}
+            <div className="absolute left-[9px] top-0 bottom-0 w-px bg-slate-800" />
+
+            <div className="space-y-1">
+              {activity.activities.map((entry, i) => {
+                const isLast = i === activity.activities.length - 1;
+                const dotColor = entry.action.includes('error') || entry.action.includes('fail')
+                  ? 'bg-red-500'
+                  : entry.action.includes('complete') || entry.action.includes('success')
+                    ? 'bg-green-500'
+                    : entry.action.includes('start') || entry.action.includes('create')
+                      ? 'bg-sky-500'
+                      : 'bg-slate-500';
+
+                return (
+                  <div key={entry.logId} className="relative flex items-start gap-3 pb-3">
+                    {/* Timeline dot */}
+                    <div
+                      className={`absolute left-[-15px] top-3 h-2.5 w-2.5 rounded-full ring-2 ring-slate-950 ${dotColor}`}
+                    />
+                    <div className={`min-w-0 flex-1 rounded-xl border border-slate-800 bg-slate-950/70 p-3 ${isLast ? '' : ''}`}>
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-sm font-medium text-white">{entry.action}</p>
+                        <p className="shrink-0 text-xs text-slate-500">{entry.createdAt}</p>
+                      </div>
+                      {entry.details ? (
+                        <p className="mt-1 truncate text-xs text-slate-400">
+                          {typeof entry.details === 'string'
+                            ? entry.details
+                            : JSON.stringify(entry.details)}
+                        </p>
+                      ) : null}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         </SectionCard>
       ) : null}

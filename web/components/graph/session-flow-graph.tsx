@@ -1,97 +1,190 @@
+'use client';
+
+import { useMemo, useState, useCallback } from 'react';
+import {
+  ReactFlow,
+  Background,
+  Controls,
+  MiniMap,
+  Panel,
+  useNodesState,
+  useEdgesState,
+  type Node,
+  type Edge,
+  type ColorMode,
+} from '@xyflow/react';
+import '@xyflow/react/dist/style.css';
+
 import type { EventSummary } from '@/lib/models/platform';
 
-type GraphNode = {
-  id: string;
-  label: string;
-  subtitle: string;
-  x: number;
-  y: number;
-  tone: 'session' | 'event' | 'agent';
-};
+/* ── Layout constants ── */
+const COL_SESSION = 0;
+const COL_EVENT = 320;
+const COL_AGENT = 640;
+const ROW_H = 90;
+const NODE_GAP = 16;
 
-type GraphEdge = {
-  from: string;
-  to: string;
+/* ── Color helpers ── */
+const eventTypeColors: Record<string, { bg: string; border: string }> = {
+  session_start:   { bg: '#052e16', border: '#22c55e' },
+  session_end:     { bg: '#450a0a', border: '#ef4444' },
+  turn:            { bg: '#0c4a6e', border: '#0ea5e9' },
+  tool_call:       { bg: '#422006', border: '#f59e0b' },
+  error:           { bg: '#450a0a', border: '#ef4444' },
+  plan_progress:   { bg: '#1e1b4b', border: '#8b5cf6' },
+  agent_delegated: { bg: '#2e1065', border: '#a78bfa' },
+  agent_completed: { bg: '#052e16', border: '#22c55e' },
 };
+const defaultEventColor = { bg: '#0f172a', border: '#334155' };
 
-function toneClasses(tone: GraphNode['tone']): string {
-  switch (tone) {
-    case 'session':
-      return 'border-sky-400/40 bg-sky-400/10 text-sky-100';
-    case 'agent':
-      return 'border-violet-400/40 bg-violet-400/10 text-violet-100';
-    default:
-      return 'border-slate-700 bg-slate-950/90 text-slate-100';
+function getEventColor(eventType: string) {
+  const lower = eventType.toLowerCase();
+  for (const [key, val] of Object.entries(eventTypeColors)) {
+    if (lower.includes(key)) return val;
   }
+  return defaultEventColor;
 }
 
-function buildGraph(
+/* ── Build React Flow graph ── */
+function buildSessionGraph(
   sessionId: string,
   sessionTitle: string,
   events: EventSummary[],
-): { nodes: GraphNode[]; edges: GraphEdge[]; height: number } {
-  const scopedEvents = events.slice(0, 6);
-  const agentIds = Array.from(
-    new Set(scopedEvents.map((event) => event.agentId).filter((value): value is string => Boolean(value))),
-  );
+): { nodes: Node[]; edges: Edge[] } {
+  const nodes: Node[] = [];
+  const edges: Edge[] = [];
 
-  const nodes: GraphNode[] = [
-    {
-      id: `session:${sessionId}`,
-      label: sessionTitle,
-      subtitle: sessionId,
-      x: 24,
-      y: 140,
-      tone: 'session',
+  // Session root node
+  const sessionNodeId = `session-${sessionId}`;
+  nodes.push({
+    id: sessionNodeId,
+    type: 'default',
+    position: { x: COL_SESSION, y: events.length * ROW_H / 2 - 40 },
+    data: {
+      label: (
+        <div className="text-left">
+          <div className="text-xs font-semibold uppercase tracking-wide text-sky-400">Session</div>
+          <div className="mt-0.5 text-sm font-medium text-white">{sessionTitle}</div>
+          <div className="mt-0.5 text-[10px] text-slate-500">{sessionId.slice(0, 12)}…</div>
+        </div>
+      ),
     },
-  ];
+    style: {
+      background: '#0c4a6e',
+      border: '2px solid #0ea5e9',
+      borderRadius: 12,
+      padding: '10px 14px',
+      width: 240,
+    },
+  });
 
-  const edges: GraphEdge[] = [];
-  const sessionNodeId = `session:${sessionId}`;
-
-  scopedEvents.forEach((event, index) => {
-    const eventNodeId = `event:${event.id}`;
+  // Agent nodes (deduplicated)
+  const agentIds = Array.from(
+    new Set(events.map((e) => e.agentId).filter((a): a is string => Boolean(a))),
+  );
+  const agentNodeIds = new Map<string, string>();
+  agentIds.forEach((agentId, i) => {
+    const nodeId = `agent-${agentId}`;
+    agentNodeIds.set(agentId, nodeId);
     nodes.push({
-      id: eventNodeId,
-      label: event.type,
-      subtitle: event.createdAt,
-      x: 300,
-      y: 24 + index * 104,
-      tone: 'event',
-    });
-    edges.push({
-      from: index === 0 ? sessionNodeId : `event:${scopedEvents[index - 1].id}`,
-      to: eventNodeId,
+      id: nodeId,
+      type: 'default',
+      position: { x: COL_AGENT, y: i * (ROW_H + NODE_GAP) + 40 },
+      data: {
+        label: (
+          <div className="text-left">
+            <div className="text-xs font-semibold uppercase tracking-wide text-purple-400">Agent</div>
+            <div className="mt-0.5 text-sm font-medium text-white">{agentId}</div>
+          </div>
+        ),
+      },
+      style: {
+        background: '#1e1b4b',
+        border: '2px dashed #8b5cf6',
+        borderRadius: 12,
+        padding: '10px 14px',
+        width: 200,
+      },
     });
   });
 
-  agentIds.forEach((agentId, index) => {
-    nodes.push({
-      id: `agent:${agentId}`,
-      label: agentId,
-      subtitle: 'agent',
-      x: 576,
-      y: 48 + index * 132,
-      tone: 'agent',
-    });
-  });
+  // Event nodes
+  const displayEvents = events.slice(0, 30); // Cap at 30 for performance
+  let prevEventNodeId: string | null = null;
 
-  scopedEvents.forEach((event) => {
-    if (event.agentId) {
+  displayEvents.forEach((event, i) => {
+    const nodeId = `event-${event.id}`;
+    const color = getEventColor(event.type);
+
+    nodes.push({
+      id: nodeId,
+      type: 'default',
+      position: { x: COL_EVENT, y: i * ROW_H },
+      data: {
+        label: (
+          <div className="text-left">
+            <div className="flex items-center gap-1.5">
+              <div
+                className="h-2 w-2 rounded-full"
+                style={{ backgroundColor: color.border }}
+              />
+              <span className="text-xs font-medium text-white">{event.type}</span>
+            </div>
+            <div className="mt-0.5 text-[10px] text-slate-400 truncate max-w-[200px]">
+              {event.summary || event.createdAt}
+            </div>
+          </div>
+        ),
+      },
+      style: {
+        background: color.bg,
+        border: `1.5px solid ${color.border}`,
+        borderRadius: 10,
+        padding: '8px 12px',
+        width: 240,
+      },
+    });
+
+    // Session → first event
+    if (i === 0) {
       edges.push({
-        from: `event:${event.id}`,
-        to: `agent:${event.agentId}`,
+        id: `e-session-first`,
+        source: sessionNodeId,
+        target: nodeId,
+        type: 'smoothstep',
+        style: { stroke: '#0ea5e9', strokeWidth: 2 },
+      });
+    }
+
+    // Sequential event chain
+    if (prevEventNodeId) {
+      edges.push({
+        id: `e-chain-${i}`,
+        source: prevEventNodeId,
+        target: nodeId,
+        type: 'smoothstep',
+        animated: false,
+        style: { stroke: '#334155', strokeWidth: 1.5 },
+      });
+    }
+    prevEventNodeId = nodeId;
+
+    // Event → Agent (if applicable)
+    if (event.agentId && agentNodeIds.has(event.agentId)) {
+      edges.push({
+        id: `e-agent-${event.id}`,
+        source: nodeId,
+        target: agentNodeIds.get(event.agentId)!,
+        type: 'smoothstep',
+        style: { stroke: '#8b5cf6', strokeWidth: 1.5, strokeDasharray: '4 3' },
       });
     }
   });
 
-  return {
-    nodes,
-    edges,
-    height: Math.max(280, scopedEvents.length * 104 + 40),
-  };
+  return { nodes, edges };
 }
 
+/* ── Main component ── */
 export function SessionFlowGraph({
   sessionId,
   sessionTitle,
@@ -101,61 +194,101 @@ export function SessionFlowGraph({
   sessionTitle: string;
   events: EventSummary[];
 }) {
+  const { nodes: initNodes, edges: initEdges } = useMemo(
+    () => buildSessionGraph(sessionId, sessionTitle, events),
+    [sessionId, sessionTitle, events],
+  );
+
+  const [nodes, , onNodesChange] = useNodesState(initNodes);
+  const [flowEdges, , onEdgesChange] = useEdgesState(initEdges);
+  const [selectedNode, setSelectedNode] = useState<Node | null>(null);
+
+  const onNodeClick = useCallback((_: React.MouseEvent, node: Node) => {
+    setSelectedNode((prev) => (prev?.id === node.id ? null : node));
+  }, []);
+
+  const onPaneClick = useCallback(() => setSelectedNode(null), []);
+
   if (events.length === 0) {
     return (
-      <div className="rounded-2xl border border-dashed border-slate-700 px-4 py-10 text-sm text-slate-400">
+      <div className="rounded-2xl border border-dashed border-slate-700 px-4 py-10 text-center text-sm text-slate-400">
         No graphable events yet for this session.
       </div>
     );
   }
 
-  const { nodes, edges, height } = buildGraph(sessionId, sessionTitle, events);
-  const nodeMap = new Map(nodes.map((node) => [node.id, node]));
+  // Count event types for the summary
+  const typeCounts = new Map<string, number>();
+  events.forEach((e) => typeCounts.set(e.type, (typeCounts.get(e.type) ?? 0) + 1));
 
   return (
-    <div className="overflow-x-auto">
-      <div
-        className="relative min-w-[860px] rounded-3xl border border-slate-800 bg-slate-950/70"
-        style={{ height }}
+    <div className="h-[500px] rounded-2xl border border-slate-800 bg-slate-950/70 overflow-hidden">
+      <ReactFlow
+        nodes={nodes}
+        edges={flowEdges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        onNodeClick={onNodeClick}
+        onPaneClick={onPaneClick}
+        colorMode={'dark' as ColorMode}
+        fitView
+        fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
+        proOptions={{ hideAttribution: true }}
+        minZoom={0.15}
+        maxZoom={2}
       >
-        <svg className="absolute inset-0 h-full w-full" aria-hidden="true">
-          {edges.map((edge, index) => {
-            const from = nodeMap.get(edge.from);
-            const to = nodeMap.get(edge.to);
+        <Background color="#1e293b" gap={20} size={1} />
+        <Controls
+          className="!bg-slate-900 !border-slate-700 !rounded-xl !shadow-xl [&>button]:!bg-slate-800 [&>button]:!border-slate-700 [&>button]:!text-slate-300 [&>button:hover]:!bg-slate-700"
+        />
+        <MiniMap
+          className="!bg-slate-900/80 !border-slate-700 !rounded-xl"
+          maskColor="rgba(2, 6, 23, 0.7)"
+        />
 
-            if (!from || !to) {
-              return null;
-            }
-
-            const x1 = from.x + 216;
-            const y1 = from.y + 34;
-            const x2 = to.x;
-            const y2 = to.y + 34;
-            const controlX = (x1 + x2) / 2;
-
-            return (
-              <path
-                key={`${edge.from}-${edge.to}-${index}`}
-                d={`M ${x1} ${y1} C ${controlX} ${y1}, ${controlX} ${y2}, ${x2} ${y2}`}
-                fill="none"
-                stroke="rgba(148, 163, 184, 0.45)"
-                strokeWidth="2"
-              />
-            );
-          })}
-        </svg>
-
-        {nodes.map((node) => (
-          <div
-            key={node.id}
-            className={`absolute w-[216px] rounded-2xl border px-4 py-3 shadow-lg ${toneClasses(node.tone)}`}
-            style={{ left: node.x, top: node.y }}
-          >
-            <p className="text-sm font-medium">{node.label}</p>
-            <p className="mt-1 text-xs opacity-75">{node.subtitle}</p>
+        <Panel position="top-left" className="!m-2">
+          <div className="rounded-lg border border-slate-700 bg-slate-900/90 px-3 py-2 backdrop-blur">
+            <p className="text-xs text-slate-400">
+              {events.length} events · {new Set(events.map((e) => e.agentId).filter(Boolean)).size} agents
+            </p>
+            <div className="mt-1 flex flex-wrap gap-1.5">
+              {Array.from(typeCounts.entries())
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 6)
+                .map(([type, count]) => {
+                  const color = getEventColor(type);
+                  return (
+                    <span
+                      key={type}
+                      className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px]"
+                      style={{ backgroundColor: color.bg, border: `1px solid ${color.border}`, color: '#e2e8f0' }}
+                    >
+                      {type} ({count})
+                    </span>
+                  );
+                })}
+            </div>
           </div>
-        ))}
-      </div>
+        </Panel>
+      </ReactFlow>
+
+      {/* Selected node detail popover */}
+      {selectedNode && (
+        <div className="absolute bottom-3 left-3 z-10 max-w-xs rounded-xl border border-slate-700 bg-slate-900/95 p-3 shadow-xl backdrop-blur">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-medium text-slate-300">Node detail</span>
+            <button
+              type="button"
+              onClick={() => setSelectedNode(null)}
+              className="text-slate-500 hover:text-white"
+              aria-label="Close"
+            >
+              ×
+            </button>
+          </div>
+          <p className="mt-1 text-xs text-slate-400 break-all">{selectedNode.id}</p>
+        </div>
+      )}
     </div>
   );
 }
