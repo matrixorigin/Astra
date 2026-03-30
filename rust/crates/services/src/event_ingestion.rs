@@ -60,6 +60,13 @@ pub struct IngestionEvent {
     pub llm_model_used: Option<String>,
     pub skill_name: Option<String>,
     pub metadata: Option<serde_json::Value>,
+    /// Original event timestamp from the journal (ISO 8601).
+    /// Used as `created_at` in the DB instead of `NOW()`.
+    pub created_at: String,
+    /// Parent event ID for causal chain linkage.
+    pub parent_event_id: Option<String>,
+    /// Causal chain root ID for grouping related events.
+    pub causal_chain_id: Option<String>,
 }
 
 impl IngestionEvent {
@@ -126,6 +133,9 @@ impl IngestionEvent {
             llm_model_used: event.model.clone(),
             skill_name: None,
             metadata: event.metadata.clone(),
+            created_at: event.ts.clone(),
+            parent_event_id: None,
+            causal_chain_id: None,
         }
     }
 
@@ -144,6 +154,7 @@ impl IngestionEvent {
         let main_event = Self::from_journal_event(event, user_id);
         let session_id = main_event.session_id.clone();
         let uid = main_event.user_id.clone();
+        let main_event_id = main_event.event_id.clone();
 
         let mut events = vec![main_event];
 
@@ -196,6 +207,9 @@ impl IngestionEvent {
                     llm_model_used: None,
                     skill_name: Some(tc.name.clone()),
                     metadata: Some(metadata),
+                    created_at: event.ts.clone(),
+                    parent_event_id: Some(main_event_id.clone()),
+                    causal_chain_id: Some(main_event_id.clone()),
                 });
             }
         }
@@ -236,6 +250,18 @@ pub struct IngestionStats {
     pub flush_count: u64,
     pub errors: u64,
     pub last_error: Option<String>,
+}
+
+/// Convert ISO 8601 / RFC 3339 timestamp to MySQL DATETIME(6) format.
+///
+/// `2025-01-15T10:30:00.123456+00:00` → `2025-01-15 10:30:00.123456`
+///
+/// Falls back to the original string if parsing fails (MySQL will use
+/// its own default or reject it, which is better than silent data loss).
+fn iso8601_to_mysql_datetime(ts: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+        .unwrap_or_else(|_| ts.to_string())
 }
 
 /// The background worker that batches and flushes events to MatrixOne.
@@ -348,12 +374,13 @@ impl EventIngestionWorker {
 
         // Multi-row INSERT IGNORE — single round-trip for the whole batch
         let placeholders: Vec<String> = (0..events.len())
-            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())".to_string())
+            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
             .collect();
         let sql = format!(
             "INSERT IGNORE INTO agent_events \
              (event_id, session_id, user_id, event_type, content, \
-              token_usage, llm_model_used, skill_name, metadata, created_at) \
+              token_usage, llm_model_used, skill_name, metadata, \
+              created_at, parent_event_id, causal_chain_id) \
              VALUES {}",
             placeholders.join(", ")
         );
@@ -369,13 +396,48 @@ impl EventIngestionWorker {
                 .bind(event.token_usage.as_ref().map(|v| v.to_string()))
                 .bind(&event.llm_model_used)
                 .bind(&event.skill_name)
-                .bind(event.metadata.as_ref().map(|v| v.to_string()));
+                .bind(event.metadata.as_ref().map(|v| v.to_string()))
+                .bind(iso8601_to_mysql_datetime(&event.created_at))
+                .bind(&event.parent_event_id)
+                .bind(&event.causal_chain_id);
         }
 
         query
             .execute(&self.pool)
             .await
             .map_err(|e| format!("batch insert ({} events): {e}", events.len()))?;
+
+        // Update event_count on agent_sessions for each affected session
+        let mut session_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for event in events {
+            *session_counts.entry(&event.session_id).or_default() += 1;
+        }
+        for (session_id, count) in &session_counts {
+            sqlx::query(
+                "UPDATE agent_sessions SET event_count = event_count + ? WHERE session_id = ?",
+            )
+            .bind(*count as i64)
+            .bind(*session_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("event_count update for {session_id}: {e}"))?;
+        }
+
+        // Close sessions that have a session_end event
+        for event in events {
+            if event.event_type == "session_end" {
+                sqlx::query(
+                    "UPDATE agent_sessions SET status = 'ended', ended_at = NOW() \
+                     WHERE session_id = ? AND status != 'ended'",
+                )
+                .bind(&event.session_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| format!("session close for {}: {e}", event.session_id))?;
+            }
+        }
+
         Ok(())
     }
 }
@@ -385,6 +447,24 @@ impl EventIngestionWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test helper: create a minimal IngestionEvent with required fields.
+    fn test_event(event_id: &str, session_id: &str, event_type: &str) -> IngestionEvent {
+        IngestionEvent {
+            event_id: event_id.into(),
+            session_id: session_id.into(),
+            user_id: "u1".into(),
+            event_type: event_type.into(),
+            content: None,
+            token_usage: None,
+            llm_model_used: None,
+            skill_name: None,
+            metadata: None,
+            created_at: "2025-01-15T10:30:00Z".into(),
+            parent_event_id: None,
+            causal_chain_id: None,
+        }
+    }
 
     #[test]
     fn ingestion_config_defaults() {
@@ -396,22 +476,49 @@ mod tests {
     }
 
     #[test]
+    fn iso8601_to_mysql_datetime_rfc3339() {
+        assert_eq!(
+            iso8601_to_mysql_datetime("2025-01-15T10:30:00+00:00"),
+            "2025-01-15 10:30:00.000000"
+        );
+    }
+
+    #[test]
+    fn iso8601_to_mysql_datetime_with_micros() {
+        assert_eq!(
+            iso8601_to_mysql_datetime("2025-01-15T10:30:00.123456+00:00"),
+            "2025-01-15 10:30:00.123456"
+        );
+    }
+
+    #[test]
+    fn iso8601_to_mysql_datetime_zulu() {
+        // chrono parses Z suffix as UTC
+        assert_eq!(
+            iso8601_to_mysql_datetime("2025-01-15T10:30:00Z"),
+            "2025-01-15 10:30:00.000000"
+        );
+    }
+
+    #[test]
+    fn iso8601_to_mysql_datetime_fallback() {
+        // Invalid input returns original string
+        assert_eq!(iso8601_to_mysql_datetime("not-a-date"), "not-a-date");
+    }
+
+    #[test]
     fn ingestion_event_json_roundtrip() {
-        let event = IngestionEvent {
-            event_id: "evt-1".into(),
-            session_id: "sess-1".into(),
-            user_id: "user-1".into(),
-            event_type: "turn_complete".into(),
-            content: Some("hello world".into()),
-            token_usage: Some(serde_json::json!({"input": 100, "output": 50})),
-            llm_model_used: Some("gpt-4".into()),
-            skill_name: None,
-            metadata: None,
-        };
+        let mut event = test_event("evt-1", "sess-1", "turn_complete");
+        event.user_id = "user-1".into();
+        event.content = Some("hello world".into());
+        event.token_usage = Some(serde_json::json!({"input": 100, "output": 50}));
+        event.llm_model_used = Some("gpt-4".into());
+
         let json = serde_json::to_string(&event).unwrap();
         let loaded: IngestionEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.event_id, "evt-1");
         assert_eq!(loaded.event_type, "turn_complete");
+        assert_eq!(loaded.created_at, "2025-01-15T10:30:00Z");
     }
 
     #[test]
@@ -428,48 +535,16 @@ mod tests {
     async fn sender_enqueue_without_worker_does_not_panic() {
         let (tx, _rx) = mpsc::channel(10);
         let sender = IngestionSender { tx };
-        // Channel is open but no worker reading — should not panic
-        sender.enqueue(IngestionEvent {
-            event_id: "e1".into(),
-            session_id: "s1".into(),
-            user_id: "u1".into(),
-            event_type: "test".into(),
-            content: None,
-            token_usage: None,
-            llm_model_used: None,
-            skill_name: None,
-            metadata: None,
-        });
+        sender.enqueue(test_event("e1", "s1", "test"));
     }
 
     #[tokio::test]
     async fn sender_enqueue_drops_when_channel_full() {
         let (tx, _rx) = mpsc::channel(1);
         let sender = IngestionSender { tx };
-        // Fill the channel
-        sender.enqueue(IngestionEvent {
-            event_id: "e1".into(),
-            session_id: "s1".into(),
-            user_id: "u1".into(),
-            event_type: "test".into(),
-            content: None,
-            token_usage: None,
-            llm_model_used: None,
-            skill_name: None,
-            metadata: None,
-        });
+        sender.enqueue(test_event("e1", "s1", "test"));
         // This should be silently dropped (channel full, try_send fails)
-        sender.enqueue(IngestionEvent {
-            event_id: "e2".into(),
-            session_id: "s1".into(),
-            user_id: "u1".into(),
-            event_type: "test".into(),
-            content: None,
-            token_usage: None,
-            llm_model_used: None,
-            skill_name: None,
-            metadata: None,
-        });
+        sender.enqueue(test_event("e2", "s1", "test"));
         // No panic = test passes
     }
 
@@ -517,6 +592,9 @@ mod tests {
         assert!(ingestion.event_type.contains("turn"));
         assert_eq!(ingestion.content.as_deref(), Some("list PRs"));
         assert_eq!(ingestion.llm_model_used.as_deref(), Some("gpt-4"));
+        assert_eq!(ingestion.created_at, "2025-01-15T10:30:00Z");
+        assert!(ingestion.parent_event_id.is_none());
+        assert!(ingestion.causal_chain_id.is_none());
 
         // Token usage present
         let usage = ingestion.token_usage.unwrap();
@@ -588,17 +666,7 @@ mod tests {
     async fn sender_shutdown_closes_channel() {
         let (tx, mut rx) = mpsc::channel(10);
         let sender = IngestionSender { tx };
-        sender.enqueue(IngestionEvent {
-            event_id: "e1".into(),
-            session_id: "s1".into(),
-            user_id: "u1".into(),
-            event_type: "test".into(),
-            content: None,
-            token_usage: None,
-            llm_model_used: None,
-            skill_name: None,
-            metadata: None,
-        });
+        sender.enqueue(test_event("e1", "s1", "test"));
         sender.shutdown();
         // After shutdown, recv should drain the one event then return None
         assert!(rx.recv().await.is_some());
@@ -663,6 +731,15 @@ mod tests {
             "got: {:?}",
             events[1].content
         );
+        assert_eq!(
+            events[1].parent_event_id.as_deref(),
+            Some(events[0].event_id.as_str())
+        );
+        assert_eq!(
+            events[1].causal_chain_id.as_deref(),
+            Some(events[0].event_id.as_str())
+        );
+        assert_eq!(events[1].created_at, events[0].created_at);
 
         // Third is failed tool → tool_error
         assert_eq!(events[2].event_type, "tool_error");
@@ -671,6 +748,10 @@ mod tests {
             events[2].content.as_ref().unwrap().contains("not found"),
             "got: {:?}",
             events[2].content
+        );
+        assert_eq!(
+            events[2].parent_event_id.as_deref(),
+            Some(events[0].event_id.as_str())
         );
     }
 
@@ -735,27 +816,15 @@ mod tests {
 
     #[tokio::test]
     async fn sender_enqueue_async_respects_backpressure() {
-        // Channel capacity = 3; enqueue 3 events async (should all succeed)
         let (tx, mut rx) = mpsc::channel(3);
         let sender = IngestionSender { tx };
 
         for i in 0..3 {
             sender
-                .enqueue_async(IngestionEvent {
-                    event_id: format!("e{i}"),
-                    session_id: "s1".into(),
-                    user_id: "u1".into(),
-                    event_type: "turn".into(),
-                    content: None,
-                    token_usage: None,
-                    llm_model_used: None,
-                    skill_name: None,
-                    metadata: None,
-                })
+                .enqueue_async(test_event(&format!("e{i}"), "s1", "turn"))
                 .await;
         }
 
-        // All 3 should be in the channel
         let mut received = 0;
         while rx.try_recv().is_ok() {
             received += 1;
@@ -765,34 +834,12 @@ mod tests {
 
     #[tokio::test]
     async fn sender_enqueue_drops_silently_when_full() {
-        // capacity=1: first enqueue fills it, second is silently dropped
         let (tx, mut rx) = mpsc::channel(1);
         let sender = IngestionSender { tx };
 
-        sender.enqueue(IngestionEvent {
-            event_id: "e1".into(),
-            session_id: "s1".into(),
-            user_id: "u1".into(),
-            event_type: "turn".into(),
-            content: None,
-            token_usage: None,
-            llm_model_used: None,
-            skill_name: None,
-            metadata: None,
-        });
-        sender.enqueue(IngestionEvent {
-            event_id: "e2".into(),
-            session_id: "s1".into(),
-            user_id: "u1".into(),
-            event_type: "turn".into(),
-            content: None,
-            token_usage: None,
-            llm_model_used: None,
-            skill_name: None,
-            metadata: None,
-        });
+        sender.enqueue(test_event("e1", "s1", "turn"));
+        sender.enqueue(test_event("e2", "s1", "turn"));
 
-        // Only 1 event should be in the channel (e2 was dropped)
         let first = rx.recv().await.unwrap();
         assert_eq!(first.event_id, "e1");
         assert!(rx.try_recv().is_err(), "e2 should have been dropped");
@@ -800,35 +847,30 @@ mod tests {
 
     #[test]
     fn insert_batch_sql_has_correct_placeholder_count() {
-        // Verify the SQL generation logic for multi-row INSERT
-        // Each event needs 9 bind params: event_id, session_id, user_id, event_type,
-        // content, token_usage, llm_model_used, skill_name, metadata
+        // Each event needs 12 bind params: event_id, session_id, user_id, event_type,
+        // content, token_usage, llm_model_used, skill_name, metadata,
+        // created_at, parent_event_id, causal_chain_id
         let n = 5;
         let placeholders: Vec<String> = (0..n)
-            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())".to_string())
+            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
             .collect();
         let sql = format!(
             "INSERT IGNORE INTO agent_events \
              (event_id, session_id, user_id, event_type, content, \
-              token_usage, llm_model_used, skill_name, metadata, created_at) \
+              token_usage, llm_model_used, skill_name, metadata, \
+              created_at, parent_event_id, causal_chain_id) \
              VALUES {}",
             placeholders.join(", ")
         );
 
-        // Should have exactly n placeholder groups
         assert_eq!(
-            sql.matches("(?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())").count(),
+            sql.matches("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").count(),
             n,
             "should have {n} placeholder groups"
         );
-        assert!(
-            sql.contains("INSERT IGNORE"),
-            "should use INSERT IGNORE for idempotency"
-        );
-        assert!(
-            sql.contains("agent_events"),
-            "should target agent_events table"
-        );
+        assert!(sql.contains("INSERT IGNORE"));
+        assert!(sql.contains("parent_event_id"));
+        assert!(sql.contains("causal_chain_id"));
     }
 
     #[test]

@@ -946,13 +946,13 @@ impl ToolSelector for FallbackSelector {
     ) -> SelectionResult {
         let result = self
             .primary
-            .select_with_learned_context(ctx, &learned_context)
+            .select_with_learned_context(ctx, learned_context)
             .await;
         if !result.failed && !result.tool_names.is_empty() {
             result
         } else {
             self.fallback
-                .select_with_learned_context(ctx, &learned_context)
+                .select_with_learned_context(ctx, learned_context)
                 .await
         }
     }

@@ -486,7 +486,6 @@ fn build_hook_db_persist_from_payload(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
     let tool_calls = object_array_maps(hook_payload, "tool_calls");
-    let tool_results = object_array_maps(hook_payload, "tool_results");
     let user_content = first_user_content(&messages).unwrap_or_default();
     let tool_call_names = tool_calls
         .iter()
@@ -545,22 +544,8 @@ fn build_hook_db_persist_from_payload(
             skill_name: first_tool_name.to_string(),
             skill_version: None,
             selection_method: "llm_tool_choice".to_string(),
-            execution_success: if should_backfill_same_turn_selection(
-                tool_results.len(),
-                tool_calls.len(),
-            ) {
-                Some(1)
-            } else {
-                None
-            },
-            execution_time_ms: if should_backfill_same_turn_selection(
-                tool_results.len(),
-                tool_calls.len(),
-            ) {
-                Some(0)
-            } else {
-                None
-            },
+            execution_success: None,
+            execution_time_ms: None,
         });
     let implicit_feedback = if !run_implicit_feedback {
         first_user_content(&messages).and_then(|user_content| {

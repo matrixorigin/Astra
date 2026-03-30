@@ -22,22 +22,5 @@
         "llm_response_id": "ev_llm"
       }
     }
-  ],
-  "same_turn_backfill_cases": [
-    {
-      "tool_results_len": 0,
-      "tool_calls_len": 1,
-      "expected": false
-    },
-    {
-      "tool_results_len": 1,
-      "tool_calls_len": 0,
-      "expected": false
-    },
-    {
-      "tool_results_len": 1,
-      "tool_calls_len": 2,
-      "expected": true
-    }
   ]
 }

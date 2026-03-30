@@ -18,7 +18,3 @@ pub fn build_snapshot_link_plan(
         llm_response_id: llm_response_event_id.map(ToString::to_string),
     })
 }
-
-pub fn should_backfill_same_turn_selection(tool_results_len: usize, tool_calls_len: usize) -> bool {
-    tool_results_len > 0 && tool_calls_len > 0
-}

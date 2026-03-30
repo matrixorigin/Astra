@@ -2029,21 +2029,12 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             }
 
             // Apply turn budget penalties based on severity.
-            // Dedup: skip verdict stall when a more specific stall (name_stall,
-            // intent_drift) already fired on this same turn.
-            let turn_already_stalled = stall_events.iter().any(|(_, t)| *t == _turn as u32);
             match verdict.severity {
                 VerdictSeverity::Critical => {
                     remaining_turns = remaining_turns.saturating_sub(5);
-                    if !turn_already_stalled {
-                        stall_events.push(("critical_escalation".to_string(), _turn as u32));
-                    }
                 }
                 VerdictSeverity::Warning => {
                     remaining_turns = remaining_turns.saturating_sub(2);
-                    if !turn_already_stalled {
-                        stall_events.push(("warning".to_string(), _turn as u32));
-                    }
                 }
                 _ => {}
             }

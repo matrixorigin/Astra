@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use mo_agent_runtime::{build_snapshot_link_plan, should_backfill_same_turn_selection};
+use mo_agent_runtime::build_snapshot_link_plan;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -13,16 +13,8 @@ struct SnapshotLinkCase {
 }
 
 #[derive(Deserialize)]
-struct SameTurnBackfillCase {
-    tool_results_len: usize,
-    tool_calls_len: usize,
-    expected: bool,
-}
-
-#[derive(Deserialize)]
 struct HookPlansContract {
     snapshot_link_cases: Vec<SnapshotLinkCase>,
-    same_turn_backfill_cases: Vec<SameTurnBackfillCase>,
 }
 
 fn load_contract() -> HookPlansContract {
@@ -46,16 +38,5 @@ fn build_snapshot_link_plan_matches_shared_contract() {
         )
         .map(|plan| serde_json::to_value(plan).expect("snapshot link plan should serialize"));
         assert_eq!(actual, case.expected);
-    }
-}
-
-#[test]
-fn should_backfill_same_turn_selection_matches_shared_contract() {
-    let contract = load_contract();
-    for case in contract.same_turn_backfill_cases {
-        assert_eq!(
-            should_backfill_same_turn_selection(case.tool_results_len, case.tool_calls_len),
-            case.expected
-        );
     }
 }

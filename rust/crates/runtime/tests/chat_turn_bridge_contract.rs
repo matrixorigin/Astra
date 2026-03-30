@@ -2433,8 +2433,8 @@ async fn http_chat_turn_bridge_persists_hook_db_writes_after_hook_success() {
     assert_eq!(skill_selection.selected_skills, vec!["bash".to_string()]);
     assert_eq!(skill_selection.skill_name, "bash");
     assert_eq!(skill_selection.selection_method, "llm_tool_choice");
-    assert_eq!(skill_selection.execution_success, Some(1));
-    assert_eq!(skill_selection.execution_time_ms, Some(0));
+    assert_eq!(skill_selection.execution_success, None);
+    assert_eq!(skill_selection.execution_time_ms, None);
     assert!(Uuid::parse_str(&skill_selection.event_id).is_ok());
     assert!(plan.implicit_feedback.is_none());
 

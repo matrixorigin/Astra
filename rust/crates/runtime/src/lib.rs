@@ -215,7 +215,7 @@ pub use turn::{
         merge_tool_results_into_history,
     },
     history_apply::apply_turn_inputs_to_history,
-    hook_plans::{SnapshotLinkPlan, build_snapshot_link_plan, should_backfill_same_turn_selection},
+    hook_plans::{SnapshotLinkPlan, build_snapshot_link_plan},
     implicit_feedback::{
         ImplicitSignal, detect_implicit_feedback_signal, implicit_feedback_rating,
     },
