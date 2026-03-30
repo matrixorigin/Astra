@@ -26,6 +26,7 @@ use mo_agent_services::session_journal;
 
 mod edge_tools;
 mod manifest_loader;
+mod skill_instructions;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use rustyline::{
     Cmd as RlCmd, CompletionType, ConditionalEventHandler, Config, Context, Editor,

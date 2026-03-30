@@ -3,6 +3,8 @@
 //! Extended manifest format supports `tools:` section alongside existing
 //! tables, settings, secrets, and resources declarations.
 //!
+//! Also supports SKILL.md files for detailed instructions (Claude Code style).
+//!
 #![allow(dead_code)] // Module provides future extensibility APIs
 //! Example manifest with tools:
 //! ```yaml
@@ -33,9 +35,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
 
+use crate::skill_instructions::{SkillInstruction, SkillMetadata, parse_skill_md};
+
 // ─── Manifest Types ─────────────────────────────────────────────────────────
 
-/// Skill manifest with optional tool declarations.
+/// Skill manifest with optional tool declarations and SKILL.md support.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ToolManifest {
     pub name: String,
@@ -44,6 +48,12 @@ pub struct ToolManifest {
     pub description: String,
     #[serde(default)]
     pub tools: Vec<ManifestToolDef>,
+    /// Path to SKILL.md file relative to manifest (e.g., "SKILL.md").
+    #[serde(default)]
+    pub instructions_file: Option<String>,
+    /// Inline instructions (alternative to instructions_file).
+    #[serde(default)]
+    pub instructions: Option<String>,
     // Existing fields (not parsed here, just tolerated)
     #[serde(default)]
     pub tables: Vec<String>,
@@ -196,6 +206,124 @@ pub fn parse_manifest(yaml: &str) -> Result<ToolManifest, String> {
     serde_yaml::from_str(yaml).map_err(|e| format!("Failed to parse manifest: {e}"))
 }
 
+// ─── Loaded Skill (Manifest + Instructions) ─────────────────────────────────
+
+/// A fully loaded skill with manifest and optional instructions.
+#[derive(Debug, Clone)]
+pub struct LoadedSkill {
+    /// Skill name (from manifest).
+    pub name: String,
+    /// Skill directory path.
+    pub path: std::path::PathBuf,
+    /// Parsed manifest.
+    pub manifest: ToolManifest,
+    /// Parsed SKILL.md instructions (if present).
+    pub instructions: Option<SkillInstruction>,
+    /// Metadata for quick access (Level 1).
+    pub metadata: SkillMetadata,
+}
+
+impl LoadedSkill {
+    /// Get the effective description (from instructions or manifest).
+    pub fn description(&self) -> &str {
+        self.instructions
+            .as_ref()
+            .map(|i| i.description.as_str())
+            .unwrap_or(&self.manifest.description)
+    }
+
+    /// Get triggers for skill selection.
+    pub fn triggers(&self) -> Vec<String> {
+        self.instructions
+            .as_ref()
+            .map(|i| i.triggers.clone())
+            .unwrap_or_default()
+    }
+
+    /// Get allowed tools (from SKILL.md).
+    pub fn allowed_tools(&self) -> Vec<String> {
+        self.instructions
+            .as_ref()
+            .map(|i| i.allowed_tools.clone())
+            .unwrap_or_default()
+    }
+
+    /// Get instruction text (Level 2 content).
+    pub fn instruction_text(&self) -> Option<&str> {
+        self.instructions.as_ref().map(|i| i.instructions.as_str())
+    }
+}
+
+/// Load a skill from a directory containing manifest.yaml and optional SKILL.md.
+pub fn load_skill(skill_dir: &Path) -> Result<LoadedSkill, String> {
+    let manifest_path = skill_dir.join("manifest.yaml");
+    let manifest = load_manifest(&manifest_path)?;
+
+    // Try to load SKILL.md
+    let instructions = load_skill_instructions(&manifest, skill_dir);
+
+    // Build metadata
+    let metadata = if let Some(ref inst) = instructions {
+        SkillMetadata::from(inst)
+    } else {
+        SkillMetadata {
+            name: manifest.name.clone(),
+            description: manifest.description.clone(),
+            triggers: Vec::new(),
+            user_invocable: true,
+            metadata_tokens: (manifest.name.len() + manifest.description.len()) as u32 / 4,
+        }
+    };
+
+    Ok(LoadedSkill {
+        name: manifest.name.clone(),
+        path: skill_dir.to_path_buf(),
+        manifest,
+        instructions,
+        metadata,
+    })
+}
+
+/// Escape a string for safe YAML double-quoted inclusion.
+fn escape_yaml_string(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+/// Load SKILL.md for a manifest (checks instructions_file or default SKILL.md).
+fn load_skill_instructions(manifest: &ToolManifest, skill_dir: &Path) -> Option<SkillInstruction> {
+    // Check for inline instructions first
+    if let Some(ref inline) = manifest.instructions {
+        // Wrap inline instructions in frontmatter format
+        // Escape special characters to produce valid YAML
+        let escaped_name = escape_yaml_string(&manifest.name);
+        let escaped_desc = escape_yaml_string(&manifest.description);
+        let content = format!(
+            "---\nname: \"{}\"\ndescription: \"{}\"\n---\n{}",
+            escaped_name, escaped_desc, inline
+        );
+        return parse_skill_md(&content).ok();
+    }
+
+    // Check for instructions_file path
+    let skill_md_path = if let Some(ref file) = manifest.instructions_file {
+        skill_dir.join(file)
+    } else {
+        // Default to SKILL.md
+        skill_dir.join("SKILL.md")
+    };
+
+    if skill_md_path.exists() {
+        let content = std::fs::read_to_string(&skill_md_path).ok()?;
+        parse_skill_md(&content).ok()
+    } else {
+        None
+    }
+}
+
 /// Discover all skill manifests under a skills directory.
 /// Returns `(skill_name, manifest)` pairs.
 pub fn discover_manifests(skills_dir: &Path) -> Vec<(String, ToolManifest)> {
@@ -216,6 +344,25 @@ pub fn discover_manifests(skills_dir: &Path) -> Vec<(String, ToolManifest)> {
         }
     }
     manifests
+}
+
+/// Discover and load all skills (with SKILL.md) under a skills directory.
+/// Returns fully loaded skills with instructions.
+pub fn discover_skills(skills_dir: &Path) -> Vec<LoadedSkill> {
+    let mut skills = Vec::new();
+    let entries = match std::fs::read_dir(skills_dir) {
+        Ok(e) => e,
+        Err(_) => return skills,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Ok(skill) = load_skill(&path) {
+                skills.push(skill);
+            }
+        }
+    }
+    skills
 }
 
 /// Load all manifests and register their tools into a PluginRegistry.
@@ -527,5 +674,150 @@ depends_on: []
         // Verify schemas are generated
         let schemas = registry.schemas();
         assert_eq!(schemas.len(), 2);
+    }
+
+    // ── SKILL.md integration ──
+
+    const SAMPLE_SKILL_MD: &str = r#"---
+name: code-review
+description: "Perform a comprehensive code review"
+user_invocable: true
+triggers:
+  - review
+  - audit
+allowed_tools:
+  - read_file
+  - git_diff
+---
+# Code Review
+
+Follow these steps:
+1. Check the diff
+2. Look for issues
+3. Provide feedback
+"#;
+
+    const MANIFEST_WITH_SKILL_MD: &str = r#"
+name: review
+version: "1.0.0"
+description: "Code review skill"
+instructions_file: SKILL.md
+tools: []
+"#;
+
+    #[test]
+    fn load_skill_with_skill_md() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("manifest.yaml"), MANIFEST_WITH_SKILL_MD).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), SAMPLE_SKILL_MD).unwrap();
+
+        let skill = load_skill(&skill_dir).unwrap();
+        assert_eq!(skill.name, "review");
+        assert!(skill.instructions.is_some());
+
+        let inst = skill.instructions.as_ref().unwrap();
+        assert_eq!(inst.name, "code-review");
+        assert_eq!(inst.triggers, vec!["review", "audit"]);
+        assert!(inst.user_invocable);
+        assert!(inst.instructions.contains("Follow these steps"));
+    }
+
+    #[test]
+    fn discover_skills_finds_skill_md() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("manifest.yaml"), MANIFEST_WITH_SKILL_MD).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), SAMPLE_SKILL_MD).unwrap();
+
+        let skills = discover_skills(dir.path());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "review");
+        assert!(skills[0].instructions.is_some());
+    }
+
+    #[test]
+    fn load_skill_without_skill_md() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("k8s");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("manifest.yaml"), SAMPLE_MANIFEST).unwrap();
+
+        let skill = load_skill(&skill_dir).unwrap();
+        assert_eq!(skill.name, "kubernetes");
+        assert!(skill.instructions.is_none());
+        // Should still have metadata from manifest
+        assert_eq!(skill.metadata.name, "kubernetes");
+    }
+
+    #[test]
+    fn loaded_skill_helpers_work() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("manifest.yaml"), MANIFEST_WITH_SKILL_MD).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), SAMPLE_SKILL_MD).unwrap();
+
+        let skill = load_skill(&skill_dir).unwrap();
+
+        // description() returns SKILL.md description
+        assert_eq!(skill.description(), "Perform a comprehensive code review");
+
+        // triggers() returns SKILL.md triggers
+        assert_eq!(skill.triggers(), vec!["review", "audit"]);
+
+        // allowed_tools() returns SKILL.md allowed_tools
+        assert_eq!(skill.allowed_tools(), vec!["read_file", "git_diff"]);
+
+        // instruction_text() returns markdown body
+        let text = skill.instruction_text().unwrap();
+        assert!(text.contains("Follow these steps"));
+    }
+
+    #[test]
+    fn escape_yaml_string_handles_special_chars() {
+        assert_eq!(escape_yaml_string("hello"), "hello");
+        assert_eq!(escape_yaml_string("say \"hi\""), "say \\\"hi\\\"");
+        assert_eq!(escape_yaml_string("line1\nline2"), "line1\\nline2");
+        assert_eq!(escape_yaml_string("tab\there"), "tab\\there");
+        assert_eq!(escape_yaml_string("back\\slash"), "back\\\\slash");
+    }
+
+    #[test]
+    fn inline_instructions_with_special_chars() {
+        use tempfile::TempDir;
+
+        // Manifest with special characters in description
+        let manifest_with_quotes = r#"
+name: vulnerable
+version: "1.0.0"
+description: 'Test with " quote and newline
+character'
+instructions: "These are inline instructions"
+tools: []
+"#;
+
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("vulnerable");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("manifest.yaml"), manifest_with_quotes).unwrap();
+
+        let skill = load_skill(&skill_dir).unwrap();
+        assert_eq!(skill.name, "vulnerable");
+        // Should successfully parse despite special characters
+        assert!(skill.instructions.is_some());
+        let inst = skill.instructions.unwrap();
+        // Description should be properly escaped and parsed back
+        assert!(inst.description.contains("quote"));
     }
 }
