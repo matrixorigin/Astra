@@ -314,6 +314,40 @@ fn restore_session_state_from_journal(session_id: &str) -> RestoredSessionState 
     restored
 }
 
+fn random_tip(logged_in: bool) -> &'static str {
+    use std::time::SystemTime;
+
+    const TIPS: &[&str] = &[
+        "Type / to browse all commands",
+        "Ctrl+R to search command history",
+        "Alt+Enter for multi-line input",
+        "/keys to see all keyboard shortcuts",
+        "/explain toggles reasoning visibility",
+        "/plan to decompose complex tasks into steps",
+        "/stats shows session token usage",
+        "/tools shows tool call performance",
+        "/health for tool health dashboard",
+        "/resume to continue a previous session",
+        "/session to see current session info",
+        "/learn to see learning insights",
+        "End a line with \\ to continue on the next line",
+        "/doctor runs diagnostics if something feels off",
+        "/sync shows cloud sync status",
+    ];
+
+    const TIPS_NOT_LOGGED_IN: &[&str] = &[
+        "/login to authenticate, /register to create an account",
+        "Most features require login — try /register to get started",
+    ];
+
+    let pool = if logged_in { TIPS } else { TIPS_NOT_LOGGED_IN };
+    let seed = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as usize)
+        .unwrap_or(0);
+    pool[seed % pool.len()]
+}
+
 pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     let creds = load_credentials();
     let pname = profile_name(profile, &creds);
@@ -328,13 +362,16 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     let model_display = state.model.as_deref().unwrap_or("auto");
     let version = env!("CARGO_PKG_VERSION");
 
+    let tip = random_tip(logged_in);
+    let tip_plain = format!("  💡 {tip}");
+
     let lines_plain = [
         format!("  mo-agent  v{version}"),
         format!(
             "  profile: {}  user: {}  model: {}  session: {}",
             pname, user_display, model_display, session_display
         ),
-        "  / commands · Ctrl+R search · Alt+Enter multi-line · /keys all shortcuts".to_string(),
+        tip_plain,
     ];
     let w = lines_plain
         .iter()
@@ -360,10 +397,7 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
             model_display.cyan(),
             session_display.as_str().dim(),
         ),
-        format!(
-            "  {}",
-            "/ commands · Ctrl+R search · Alt+Enter multi-line · /keys all shortcuts".dim()
-        ),
+        format!("  💡 {}", tip.dim()),
     ];
 
     let row = |colored: &str, plain_len: usize| {
