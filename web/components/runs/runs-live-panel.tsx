@@ -29,19 +29,12 @@ function normalizeRun(raw: RunListResponse['runs'][number]): RunSummary {
   };
 }
 
-export function RunsLivePanel({
-  apiUrl,
-  token,
-}: {
-  apiUrl: string;
-  token: string;
-}) {
+export function RunsLivePanel() {
   const [enabled, setEnabled] = useState(true);
 
   const fetcher = useCallback(async () => {
-    const res = await fetch(new URL('/runs?limit=5&offset=0', apiUrl).toString(), {
+    const res = await fetch('/api/backend/runs?limit=5&offset=0', {
       headers: {
-        Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
       cache: 'no-store',
@@ -49,7 +42,7 @@ export function RunsLivePanel({
     if (!res.ok) throw new Error(`Failed to fetch runs: ${res.status}`);
     const data = (await res.json()) as RunListResponse;
     return data.runs.map(normalizeRun);
-  }, [apiUrl, token]);
+  }, []);
 
   const { data: runs, error } = usePolling<RunSummary[]>({
     fetcher,
@@ -96,8 +89,6 @@ export function RunsLivePanel({
             ({newestActive.status})
           </p>
           <RunStreamViewer
-            apiUrl={apiUrl}
-            token={token}
             runId={newestActive.runId}
             title={`Live: ${newestActive.runId}`}
           />

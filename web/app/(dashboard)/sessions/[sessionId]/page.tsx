@@ -142,16 +142,12 @@ export default async function SessionDetailPage({
       </SectionCard>
 
       {/* Live run events (live mode only) */}
-      {mode === 'live' && config.apiUrl && config.accessToken ? (
+      {mode === 'live' && config.apiUrl ? (
         <SectionCard
           title="Live run events"
           description="Real-time event stream from active runs in this session."
         >
-          <SessionLiveEvents
-            sessionId={sessionId}
-            apiUrl={config.apiUrl}
-            token={config.accessToken}
-          />
+          <SessionLiveEvents sessionId={sessionId} />
         </SectionCard>
       ) : null}
 

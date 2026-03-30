@@ -144,9 +144,9 @@ export default async function OverviewPage() {
       </section>
 
       {/* Live activity indicator (live mode only) */}
-      {mode === 'live' && config.apiUrl && config.accessToken ? (
+      {mode === 'live' && config.apiUrl ? (
         <section>
-          <LiveActivityCard apiUrl={config.apiUrl} token={config.accessToken} />
+          <LiveActivityCard />
         </section>
       ) : null}
 

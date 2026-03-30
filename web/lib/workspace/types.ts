@@ -59,8 +59,6 @@ export type WorkspaceState = {
 };
 
 export type ChatConfig = {
-  apiUrl: string;
-  token: string;
   sessionId?: string;
   agentId?: string;
   model?: string;

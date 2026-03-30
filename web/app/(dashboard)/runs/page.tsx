@@ -37,16 +37,12 @@ export default async function RunsPage() {
   return (
     <div className="space-y-6">
       {/* Live streaming panel for active runs (live mode only) */}
-      {mode === 'live' && config.apiUrl && config.accessToken ? (
+      {mode === 'live' && config.apiUrl ? (
         <SectionCard
           title="Live stream"
           description="Real-time event stream from active runs."
         >
-          <RunsLiveSection
-            runs={runList.runs}
-            apiUrl={config.apiUrl}
-            token={config.accessToken}
-          />
+          <RunsLiveSection runs={runList.runs} />
         </SectionCard>
       ) : null}
 
@@ -99,12 +95,12 @@ export default async function RunsPage() {
       </SectionCard>
 
       {/* Polling-based live activity panel (live mode only) */}
-      {mode === 'live' && config.apiUrl && config.accessToken ? (
+      {mode === 'live' && config.apiUrl ? (
         <SectionCard
           title="Live activity"
           description="Auto-discovers active runs and streams their events in real time."
         >
-          <RunsLivePanel apiUrl={config.apiUrl} token={config.accessToken} />
+          <RunsLivePanel />
         </SectionCard>
       ) : null}
     </div>

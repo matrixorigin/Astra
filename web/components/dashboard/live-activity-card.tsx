@@ -12,24 +12,17 @@ type RunListResponse = {
   total: number;
 };
 
-export function LiveActivityCard({
-  apiUrl,
-  token,
-}: {
-  apiUrl: string;
-  token: string;
-}) {
+export function LiveActivityCard() {
   const fetcher = useCallback(async () => {
-    const res = await fetch(new URL('/runs?limit=5&offset=0', apiUrl).toString(), {
+    const res = await fetch('/api/backend/runs?limit=5&offset=0', {
       headers: {
-        Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
       cache: 'no-store',
     });
     if (!res.ok) throw new Error(`Failed to fetch runs: ${res.status}`);
     return (await res.json()) as RunListResponse;
-  }, [apiUrl, token]);
+  }, []);
 
   const { data } = usePolling<RunListResponse>({
     fetcher,

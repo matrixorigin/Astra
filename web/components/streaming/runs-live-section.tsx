@@ -6,12 +6,8 @@ import type { RunSummary } from '@/lib/models/platform';
 
 export function RunsLiveSection({
   runs,
-  apiUrl,
-  token,
 }: {
   runs: RunSummary[];
-  apiUrl: string;
-  token: string;
 }) {
   const activeRuns = runs.filter((r) => r.status === 'running' || r.status === 'waiting');
   const [selectedRunId, setSelectedRunId] = useState<string | null>(
@@ -49,8 +45,6 @@ export function RunsLiveSection({
 
       {selectedRunId ? (
         <RunStreamViewer
-          apiUrl={apiUrl}
-          token={token}
           runId={selectedRunId}
           title={`Streaming: ${selectedRunId}`}
         />

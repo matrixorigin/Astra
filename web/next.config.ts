@@ -11,16 +11,6 @@ if (!process.env.no_proxy?.includes('localhost')) {
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
-  // Proxy backend API calls through Next.js to avoid CORS issues
-  async rewrites() {
-    const backendUrl = process.env.MO_AGENT_API_URL ?? 'http://localhost:8000';
-    return [
-      {
-        source: '/api/backend/:path*',
-        destination: `${backendUrl}/:path*`,
-      },
-    ];
-  },
 };
 
 export default nextConfig;

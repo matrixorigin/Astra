@@ -58,8 +58,6 @@ export default async function WorkspacePage({
   }
 
   const chatConfig = {
-    apiUrl: config.apiUrl!,
-    token: config.accessToken!,
     sessionId: sessionId ?? undefined,
   };
 

@@ -63,7 +63,6 @@ export function WorkspaceShell({
     <div className="flex h-[calc(100vh-8rem)] overflow-hidden rounded-2xl border border-slate-800">
       {/* Session sidebar */}
       <SessionSidebar
-        config={activeConfig}
         currentSessionId={displaySessionId}
         onSelectSession={handleSelectSession}
         onNewSession={handleNewSession}

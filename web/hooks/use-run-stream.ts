@@ -7,8 +7,6 @@ import type { ConnectionState, StreamEvent } from '@/lib/streaming/types';
 const MAX_EVENTS = 500;
 
 type UseRunStreamOptions = {
-  apiUrl: string;
-  token: string;
   runId: string;
   /** Resume from this event index (for pagination). */
   lastIndex?: number;
@@ -25,8 +23,6 @@ type UseRunStreamReturn = {
 };
 
 export function useRunStream({
-  apiUrl,
-  token,
   runId,
   lastIndex = 0,
   autoConnect = true,
@@ -45,21 +41,20 @@ export function useRunStream({
   const connect = useCallback(() => {
     clientRef.current?.close();
 
-    const url = new URL(`/chat/runs/${runId}/stream`, apiUrl);
+    const url = new URL(`/api/backend/chat/runs/${runId}/stream`, window.location.origin);
     if (lastIndex > 0) {
       url.searchParams.set('last_index', String(lastIndex));
     }
 
     const client = new SSEClient({
       url: url.toString(),
-      token,
       onEvent: handleEvent,
       onStateChange: setConnectionState,
     });
 
     clientRef.current = client;
     void client.connect();
-  }, [apiUrl, token, runId, lastIndex, handleEvent]);
+  }, [runId, lastIndex, handleEvent]);
 
   const disconnect = useCallback(() => {
     clientRef.current?.close();

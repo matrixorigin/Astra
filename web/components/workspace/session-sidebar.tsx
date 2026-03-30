@@ -1,7 +1,6 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
-import type { ChatConfig } from '@/lib/workspace/types';
 
 type SessionItem = {
   session_id: string;
@@ -13,14 +12,12 @@ type SessionItem = {
 };
 
 export function SessionSidebar({
-  config,
   currentSessionId,
   onSelectSession,
   onNewSession,
   collapsed,
   onToggle,
 }: {
-  config: ChatConfig;
   currentSessionId: string | null;
   onSelectSession: (sessionId: string) => void;
   onNewSession: () => void;
@@ -33,9 +30,7 @@ export function SessionSidebar({
   const fetchSessions = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetch(`/api/backend/sessions?limit=50`, {
-        headers: { Authorization: `Bearer ${config.token}` },
-      });
+      const res = await fetch(`/api/backend/sessions?limit=50`);
       if (!res.ok) return;
       const data = await res.json();
       const items: SessionItem[] = Array.isArray(data)
@@ -51,7 +46,7 @@ export function SessionSidebar({
     } finally {
       setLoading(false);
     }
-  }, [config.token]);
+  }, []);
 
   useEffect(() => {
     fetchSessions();
@@ -62,14 +57,13 @@ export function SessionSidebar({
       try {
         await fetch(`/api/backend/sessions/${sessionId}/${action}`, {
           method: 'POST',
-          headers: { Authorization: `Bearer ${config.token}` },
         });
         fetchSessions();
       } catch {
         // Fail silently
       }
     },
-    [config.token, fetchSessions],
+    [fetchSessions],
   );
 
   if (collapsed) {

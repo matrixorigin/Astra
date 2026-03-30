@@ -37,11 +37,7 @@ export default function PlansPage() {
         return;
       }
 
-      const res = await fetch(`${config.apiUrl}/tasks`, {
-        headers: config.token
-          ? { Authorization: `Bearer ${config.token}` }
-          : {},
-      });
+      const res = await fetch('/api/backend/tasks', { cache: 'no-store' });
 
       if (res.ok) {
         const body = await res.json();
@@ -74,10 +70,8 @@ export default function PlansPage() {
         const config = await configRes.json();
         if (!config.apiUrl) return;
 
-        const res = await fetch(`${config.apiUrl}/tasks/${taskId}/progress`, {
-          headers: config.token
-            ? { Authorization: `Bearer ${config.token}` }
-            : {},
+        const res = await fetch(`/api/backend/tasks/${taskId}/progress`, {
+          cache: 'no-store',
         });
 
         if (res.ok) {
@@ -93,10 +87,8 @@ export default function PlansPage() {
           setGraphData(buildPlanGraphData(body.task, eventsRaw));
         } else {
           // Fallback: try fetching just the task
-          const taskRes = await fetch(`${config.apiUrl}/tasks/${taskId}`, {
-            headers: config.token
-              ? { Authorization: `Bearer ${config.token}` }
-              : {},
+          const taskRes = await fetch(`/api/backend/tasks/${taskId}`, {
+            cache: 'no-store',
           });
           if (taskRes.ok) {
             const taskBody = await taskRes.json();

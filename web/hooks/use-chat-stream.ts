@@ -323,14 +323,12 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
         model: config.model ?? undefined,
       });
 
-      // Use Next.js rewrite proxy to avoid CORS issues
-      // /api/backend/chat/stream → backend's /chat/stream
+      // Route through Next.js so auth stays server-side and the browser stays same-origin.
       const streamUrl = `/api/backend/chat/stream`;
 
       fetch(streamUrl, {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${config.token}`,
           'Content-Type': 'application/json',
           Accept: 'text/event-stream',
         },

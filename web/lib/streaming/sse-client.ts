@@ -2,7 +2,7 @@ import type { StreamEvent, ConnectionState } from './types';
 
 export type SSEClientOptions = {
   url: string;
-  token: string;
+  token?: string;
   onEvent: (event: StreamEvent) => void;
   onStateChange: (state: ConnectionState) => void;
   onRawLine?: (line: string) => void;
@@ -40,10 +40,14 @@ export class SSEClient {
 
     try {
       const response = await fetch(this.options.url, {
-        headers: {
-          Authorization: `Bearer ${this.options.token}`,
-          Accept: 'text/event-stream',
-        },
+        headers: this.options.token
+          ? {
+              Authorization: `Bearer ${this.options.token}`,
+              Accept: 'text/event-stream',
+            }
+          : {
+              Accept: 'text/event-stream',
+            },
         signal: this.controller.signal,
       });
 

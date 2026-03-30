@@ -15,17 +15,12 @@ type RunListResponse = {
 
 export function SessionLiveEvents({
   sessionId,
-  apiUrl,
-  token,
 }: {
   sessionId: string;
-  apiUrl: string;
-  token: string;
 }) {
   const fetcher = useCallback(async () => {
-    const res = await fetch(new URL('/runs?limit=5&offset=0', apiUrl).toString(), {
+    const res = await fetch('/api/backend/runs?limit=5&offset=0', {
       headers: {
-        Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
       cache: 'no-store',
@@ -39,7 +34,7 @@ export function SessionLiveEvents({
           (r.status === 'running' || r.status === 'waiting'),
       )
       .map((r) => r.run_id);
-  }, [apiUrl, token, sessionId]);
+  }, [sessionId]);
 
   const { data: activeRunIds, error } = usePolling<string[]>({
     fetcher,
@@ -70,8 +65,6 @@ export function SessionLiveEvents({
 
       {activeRunId ? (
         <RunStreamViewer
-          apiUrl={apiUrl}
-          token={token}
           runId={activeRunId}
           title={`Live: ${activeRunId}`}
         />
