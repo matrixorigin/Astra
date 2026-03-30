@@ -1045,6 +1045,8 @@ pub struct ToolExecutor {
     budget_pressure: std::sync::Mutex<f64>,
     /// Build/test iteration tracker — tracks error deltas across fix cycles.
     build_test_tracker: std::sync::Mutex<build_test::BuildTestTracker>,
+    /// Circuit breaker: skip Memoria calls after consecutive failures.
+    memoria_fail_count: std::sync::atomic::AtomicU32,
 }
 
 /// Extract owner/repo from git remote URLs in the given directory.
@@ -1115,6 +1117,7 @@ impl ToolExecutor {
             preferred_repos: std::sync::Mutex::new(preferred_repos),
             budget_pressure: std::sync::Mutex::new(0.0),
             build_test_tracker: std::sync::Mutex::new(build_test::BuildTestTracker::new()),
+            memoria_fail_count: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -3709,6 +3712,16 @@ impl ToolExecutor {
     }
 
     async fn memoria_call_with_timeout(&self, op: &str, args: &Value, timeout: Duration) -> String {
+        // Circuit breaker: skip after 2 consecutive failures (reset on success)
+        const MAX_FAILS: u32 = 2;
+        if self
+            .memoria_fail_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= MAX_FAILS
+        {
+            return json!({"error": "Memory service unavailable (circuit open)"}).to_string();
+        }
+
         // Build endpoint and payload
         let (endpoint, payload, auth_header) = if let (Some(cloud_base), Some(token)) =
             (&self.cloud_base, &self.cloud_token)
@@ -3808,10 +3821,22 @@ impl ToolExecutor {
                 .await
             {
                 Ok(resp) => match resp.text().await {
-                    Ok(text) => text,
-                    Err(e) => json!({"error": format!("read response: {e}")}).to_string(),
+                    Ok(text) => {
+                        self.memoria_fail_count
+                            .store(0, std::sync::atomic::Ordering::Relaxed);
+                        text
+                    }
+                    Err(e) => {
+                        self.memoria_fail_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        json!({"error": format!("read response: {e}")}).to_string()
+                    }
                 },
-                Err(e) => json!({"error": format!("memoria request failed: {e}")}).to_string(),
+                Err(e) => {
+                    self.memoria_fail_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    json!({"error": format!("memoria request failed: {e}")}).to_string()
+                }
             },
             Err(e) => json!({"error": format!("build client: {e}")}).to_string(),
         }
