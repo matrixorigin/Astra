@@ -17,10 +17,8 @@ use mo_agent_runtime::{
 };
 
 use crate::{
-    cli_utils::compact_or_raw,
-    edge_tools,
+    ExplainMode, StreamResult, VerdictEvent, cli_utils::compact_or_raw, edge_tools,
     stream_render::consume_turn_sse,
-    ExplainMode, StreamResult, VerdictEvent,
 };
 
 use super::super::{
@@ -34,6 +32,7 @@ use super::post_tool_round::{
 use super::prepare_turn_request::{
     PrepareChatTurnRequest, PrepareTurnTelemetry, prepare_chat_turn_payload,
 };
+use super::stall_preflight::{StallPreflightRequest, apply_stall_preflight};
 use super::tool_round::{HeadlessToolRoundRequest, run_headless_tool_round};
 
 pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResult, String> {
@@ -92,7 +91,6 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     let mut turn_sigs: Vec<std::collections::BTreeSet<String>> = Vec::new();
     let mut turn_tool_names: Vec<std::collections::HashSet<String>> = Vec::new();
     let mut forced_factual_retry = false;
-    const TOOL_NAME_STALL_WINDOW: usize = 3;
     let mut current_run_id: Option<String> = None;
     let mut stall_events: Vec<(String, u32)> = Vec::new();
     let mut verdict_events: Vec<VerdictEvent> = Vec::new();
@@ -300,47 +298,14 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         let tool_calls_for_guard =
             tool_calls_for_stall_guard(&turn_result.tool_calls, &turn_result.edge_tool_round);
 
-        // Stall & divergence detection via unified TurnGuard
-        {
-            use std::collections::BTreeSet;
-
-            let sig_set: BTreeSet<String> = tool_calls_for_guard
-                .iter()
-                .map(|tc| {
-                    let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let args = tc.get("arguments").cloned().unwrap_or_default();
-                    format!(
-                        "{}:{}",
-                        name,
-                        serde_json::to_string(&args).unwrap_or_default()
-                    )
-                })
-                .collect();
-            let name_set: HashSet<String> = tool_calls_for_guard
-                .iter()
-                .map(|tc| {
-                    tc.get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string()
-                })
-                .collect();
-            turn_sigs.push(sig_set);
-            turn_tool_names.push(name_set.clone());
-
-            // Feed tool call signatures into TurnGuard
-            turn_guard.record_tool_calls(&tool_calls_for_guard);
-
-            // Name-based stall detection (complementary to TurnGuard's signature stall)
-            let name_stall = turn_tool_names.len() >= TOOL_NAME_STALL_WINDOW
-                && turn_tool_names[turn_tool_names.len() - TOOL_NAME_STALL_WINDOW..]
-                    .windows(2)
-                    .all(|w| w[0] == w[1]);
-
-            if name_stall {
-                stall_events.push(("name_stall".to_string(), _turn as u32));
-            }
-        }
+        apply_stall_preflight(StallPreflightRequest {
+            turn_index: _turn as u32,
+            tool_calls_for_guard: &tool_calls_for_guard,
+            turn_sigs: &mut turn_sigs,
+            turn_tool_names: &mut turn_tool_names,
+            stall_events: &mut stall_events,
+            turn_guard: &mut turn_guard,
+        });
 
         // Assemble tool results from SSE `tool_request` only — legacy inline execution removed.
         run_headless_tool_round(HeadlessToolRoundRequest {

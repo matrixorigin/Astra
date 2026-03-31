@@ -7,6 +7,7 @@ mod post_tool_round;
 mod prepare_turn_request;
 mod run;
 mod skill_instructions_round;
+mod stall_preflight;
 mod tool_round;
 
 pub(crate) use run::stream_chat_sse;
