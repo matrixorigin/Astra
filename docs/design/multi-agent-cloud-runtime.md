@@ -19,6 +19,7 @@
    - 5.5 [Thin Client Protocol](#55-thin-client-protocol)
      - 5.5.1 [Reference implementation: `mo-thin-client`](#551-reference-implementation-mo-thin-client)
      - 5.5.2 [Lightweight edge executor](#552-lightweight-edge-executor)
+     - 5.5.3 [CLI registry and heartbeat environment](#553-cli-registry-and-heartbeat-environment)
 6. [Edge-Cloud State Model](#6-edge-cloud-state-model)
 7. [MatrixOne-Native Acceleration](#7-matrixone-native-acceleration)
 8. [Multi-Agent Coordination Protocol](#8-multi-agent-coordination-protocol)
@@ -664,6 +665,15 @@ open SSE (chat/stream with edge_executor_id + capabilities)
 This is the same protocol as CLI/Web/IDE **thin clients**; the edge differs only in **also** executing tools and posting callbacks. Today’s `mo-agent` CLI still bundles thin client + **`chat_stream` cognitive loop** + edge tools — `plan_decompose` / `sync_adapters` now live in **`runtime`**. Next step: extract the remaining `chat_stream` loop to the server and ship a **standalone light edge** (§5.5.2).
 
 **CLI wiring (current)**: each `/chat/turn` payload includes `edge_executor_id` (env `MO_EDGE_EXECUTOR_ID` or `edge-{uuid}` per process) and `capabilities` from [`builtin_capability_preset`](../../rust/crates/mo-thin-client/src/edge.rs). [`consume_turn_sse`](../../rust/crates/mo-agent/src/mo_agent/stream_render.rs) handles SSE in order: `tool_request` → execute → [`post_tool_result`](../../rust/crates/mo-thin-client/src/client.rs); `approval_required` → [`PermissionManager::resolve_cloud_approval`](../../rust/crates/mo-agent/src/mo_agent/permission_manager.rs) → [`post_approval`](../../rust/crates/mo-thin-client/src/client.rs). If the same tool+args also appears as `tool_call`, the agentic loop **reuses** `edge_callback_outputs` and skips a second local execution. The legacy `tool_call`-only path remains for servers that do not emit `tool_request`.
+
+#### 5.5.3 CLI registry and heartbeat environment
+
+After the REPL banner, if silent/auth left a valid access token, [`edge_lifecycle.rs`](../../rust/crates/mo-agent/src/mo_agent/edge_lifecycle.rs) (`register_and_start_heartbeat`) performs a single **`POST /agents/edge`** (typed [`EdgeRegisterRequest`](../../rust/crates/mo-thin-client/src/protocol.rs), same string for `edge_agent_id` and [`X-Mo-Edge-Id`](../../rust/crates/mo-thin-client/src/edge.rs) as `chat_stream`), optional enrichment of `hostname` / `worktree_path` from `HOSTNAME` or `COMPUTERNAME` and `std::env::current_dir()`, then a background loop of **`POST /agents/edge/heartbeat`**. Register failures are non-fatal (dim stderr; chat continues). On REPL exit the heartbeat task is **aborted**.
+
+| Variable | Behavior |
+|----------|----------|
+| `MO_EDGE_REGISTRY` | **Enabled** when unset or set to any value other than `0`, `false`, or `off` (exact string match). Set to one of those three to **disable** cloud register and heartbeat entirely (no HTTP, no background task). |
+| `MO_EDGE_HEARTBEAT_SECS` | Interval between heartbeats in seconds; default **120**. Set to **0** to register once (if enabled) but **not** start the background heartbeat task. Non-numeric values fall back to the default. |
 
 ---
 
