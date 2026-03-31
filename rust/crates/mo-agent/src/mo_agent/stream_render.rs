@@ -302,10 +302,8 @@ pub(super) async fn consume_turn_sse(
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else { break };
         buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(event_end) = buffer.find("\n\n") {
-            let event_str = buffer[..event_end].to_string();
-            buffer = buffer[event_end + 2..].to_string();
-
+        let blocks = mo_agent_runtime::turn::sse_blocks::drain_complete_sse_event_blocks(&mut buffer);
+        for event_str in blocks {
             // Capture TTFT on first text content
             if !first_token_recorded
                 && (event_str.contains("\"text_delta\"")

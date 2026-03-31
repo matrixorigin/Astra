@@ -1740,12 +1740,13 @@ mo-agent Orchestrator
 | Reuse hints in `make_args_preview` | ✅ Done (slice 5) | Tiny | **`edge_prompt_context`**: file/bash/grep previews share `tool_argument_hints` |
 | Canonical tool arg keys in hints layer | ✅ Done (slice 6) | Small | **`tool_argument_hints`**: only `path` and `command` (no `cmd`, `file_path`, `target_file`); cloud approval path + CLI prompts + journal previews aligned |
 | Extract SSE `data:` JSON line parser | ✅ Done (slice 7) | Small | **`runtime/src/turn/sse_data_lines.rs`** — `drain_sse_data_lines`, `finish_sse_data_buffer`, `parse_sse_data_json_events`; `bridge_inprocess` stream + lifecycle contract tests |
+| Extract SSE blank-line event blocks | ✅ Done (slice 8) | Small | **`runtime/src/turn/sse_blocks.rs`** — `drain_complete_sse_event_blocks` (`\n\n` / `\r\n\r\n`); CLI `consume_turn_sse` |
 | Implement tool execution callback protocol (cloud → edge) | ✅ Core path | Medium | §5.5 `/tools/result`, `tool_request` SSE; `chat_stream` **does not** re-execute tools for that path. |
 | Add `edge_executor_id` to chat turn protocol | ✅ | Small | Thin client + §5.5.2 light edge helpers. |
 | Move `SyncOrchestrator` construction from `ReplState` to `AppState` | ❌ Open | Small | Still wired in CLI `main.rs` for REPL session |
 | Move `IngestionSender` from `ReplState` to server pipeline | ❌ Open | Small | |
 | Remove `matrixone_pool` from `ReplState` (use server `shared_pool`) | ❌ Open | Small | `app_state.rs` already has `shared_pool` |
-| Refactor `chat_stream.rs`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–7** landed (through shared SSE `data:` JSON parsing for in-process bridge). Remaining: multi-turn loop, stall/TurnGuard, tool execution vs `bridge_inprocess` convergence |
+| Refactor `chat_stream.rs`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–8** landed (SSE line + blank-line framing shared where applicable). Remaining: multi-turn loop, stall/TurnGuard, tool execution vs `bridge_inprocess` convergence |
 
 **Success criteria** (unchanged): `mo-agent` CLI can be deleted and replaced with a ~500-line thin client; **not yet met** — `chat_stream` + `ReplState` infra fields remain.
 
@@ -1859,6 +1860,7 @@ mo-agent Orchestrator
 | Cloud approval policy | `runtime/src/turn/cloud_approval_policy.rs` | `CLOUD_APPROVAL_REQUIRED_TOOLS`, `CLOUD_APPROVAL_EXECUTE_TOOLS`, `cloud_gated_tool_kind` → CLI classify + cloud gate (sec. 5.5) | runtime ✅ |
 | Tool argument hints | `runtime/src/turn/tool_argument_hints.rs` | Normalize LLM `arguments`; **`path` + `command` only** for hints (approval, CLI, previews) | runtime ✅ |
 | SSE data JSON lines | `runtime/src/turn/sse_data_lines.rs` | Incremental `data:` line → JSON; `[DONE]`; EOF flush | runtime ✅ |
+| SSE event blocks | `runtime/src/turn/sse_blocks.rs` | Blank-line delimited event text (server / thin-client framing) | runtime ✅ |
 | Bridge (HTTP) | `runtime/src/turn/bridge/mod.rs` | HttpChatTurnBridge, forwards to external service | runtime ✅ |
 | Chat stream | `mo-agent/src/mo_agent/chat_stream.rs` | Multi-turn loop, headless tool assembly (§5.5) | ⚠️ Core loop should move to runtime |
 | Plan decompose | `runtime/src/plan_decompose.rs` | Long-horizon planning, subtask generation | runtime ✅ |

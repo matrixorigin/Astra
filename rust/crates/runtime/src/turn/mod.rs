@@ -34,6 +34,7 @@ pub mod session_cache;
 pub mod snapshot;
 pub mod stall;
 pub mod state;
+pub mod sse_blocks;
 pub mod sse_data_lines;
 pub mod stream_events;
 pub mod tail_persist;
