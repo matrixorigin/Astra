@@ -61,11 +61,7 @@ pub struct ServerAgenticLoopHost {
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     #[allow(dead_code)]
     user_id: String,
-    #[allow(dead_code)] // stored for future use (Session Memory updates)
     session_id: String,
-
-    // ── Session Memory for compaction ──
-    session_memory: Option<crate::turn::cloud::session_memory::SessionMemory>,
 
     // ── Output collection ──
     /// SSE events emitted during the turn, streamed to the client.
@@ -152,12 +148,6 @@ impl ServerAgenticLoopHostBuilder {
             })
             .collect();
 
-        // Try to load existing Session Memory for this session
-        let session_memory =
-            crate::turn::cloud::session_memory::SessionMemory::load_or_create_for_session(
-                &self.session_id,
-            );
-
         ServerAgenticLoopHost {
             matrixone: self.matrixone,
             encryptor: self.encryptor,
@@ -170,7 +160,6 @@ impl ServerAgenticLoopHostBuilder {
             edge_callback_ledger: self.edge_callback_ledger,
             user_id: self.user_id,
             session_id: self.session_id,
-            session_memory,
             emitted_events: Vec::new(),
         }
     }
@@ -293,19 +282,21 @@ impl ServerAgenticLoopHost {
         let tier = budget.compaction_tier(cache_est.total_tokens);
         let budget_chars = budget.effective_input_limit() * 4;
 
-        // Use Session Memory-aware compaction if available
-        let sm_config = crate::turn::cloud::session_memory::SmCompactConfig::default();
-        let autocompact_threshold = budget.effective_input_limit() / 2; // ~50% of budget
-
-        let compact_result = crate::turn::cloud::sm_compact::compact_with_session_memory_sync(
-            &state.messages,
-            self.session_memory.as_ref(),
-            &sm_config,
+        // Use Memoria-based compaction (sync fallback to pure truncation)
+        let memoria_config = crate::turn::cloud::memoria_compact::MemoriaCompactConfig::default();
+        let memoria_params = crate::turn::cloud::memoria_compact::MemoriaCompactParams {
             budget_chars,
-            2_000,
+            keep_chars: 2_000,
             tier,
-            budget.keep_recent_turns,
-            autocompact_threshold,
+            keep_recent_turns: budget.keep_recent_turns,
+            current_tokens: cache_est.total_tokens,
+        };
+
+        let compact_result = crate::turn::cloud::memoria_compact::compact_with_memoria_sync(
+            &state.messages,
+            Some(&self.session_id),
+            &memoria_config,
+            &memoria_params,
         );
 
         llm_messages.extend(compact_result.messages);
