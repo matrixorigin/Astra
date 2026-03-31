@@ -82,8 +82,6 @@ struct CliSseStreamHost<'a> {
     perm_manager: Option<std::ptr::NonNull<crate::permission_manager::PermissionManager>>,
     _pm: std::marker::PhantomData<&'a mut crate::permission_manager::PermissionManager>,
     render: StreamRenderState,
-    /// Collected outputs keyed by dedup signature (for headless tool round assembly).
-    pub edge_callback_outputs: std::collections::HashMap<String, String>,
     /// Ordered tool executions from this SSE stream.
     pub edge_tool_round: Vec<EdgeToolRoundEntry>,
 }
@@ -103,7 +101,6 @@ impl<'a> CliSseStreamHost<'a> {
             perm_manager: ctx.perm_manager,
             _pm: ctx._pm,
             render: StreamRenderState::new(),
-            edge_callback_outputs: std::collections::HashMap::new(),
             edge_tool_round: Vec::new(),
         }
     }
@@ -153,9 +150,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         } else {
             "Permission denied".to_string()
         };
-        let sig = mo_agent_runtime::turn::tool_result_semantics::tool_dedup_signature(tool, args);
-        self.edge_callback_outputs
-            .insert(sig, output.clone());
         self.edge_tool_round.push(EdgeToolRoundEntry {
             request_id: request_id.to_string(),
             tool: tool.to_string(),
@@ -290,11 +284,6 @@ pub(super) struct TurnResult {
     pub(super) core: ChatTurnSseAccum,
     /// Time to first token in milliseconds (streaming latency).
     pub(super) ttft_ms: Option<u64>,
-    /// Outputs from SSE `tool_request` (same key as [`mo_agent_runtime::turn::tool_result_semantics::tool_dedup_signature`]).
-    /// Populated by CliSseStreamHost during SSE consumption; consumed by CliAgenticLoopHost
-    /// when converting to runtime's HostTurnResult.
-    #[allow(dead_code)]
-    pub(super) edge_callback_outputs: std::collections::HashMap<String, String>,
     /// Ordered executions from this SSE stream (for rounds without legacy `tool_call` events).
     pub(super) edge_tool_round: Vec<EdgeToolRoundEntry>,
 }
@@ -319,7 +308,6 @@ impl TurnResult {
         Self {
             core: ChatTurnSseAccum::default(),
             ttft_ms: None,
-            edge_callback_outputs: std::collections::HashMap::new(),
             edge_tool_round: Vec::new(),
         }
     }
@@ -397,24 +385,19 @@ pub(super) async fn consume_turn_sse(
     );
 
     // Delegate to runtime's generic SSE consumer with the appropriate host
-    let (sse_result, edge_callback_outputs, edge_tool_round) = if let Some(ctx) = edge {
+    let (sse_result, edge_tool_round) = if let Some(ctx) = edge {
         let mut host = CliSseStreamHost::from_edge_ctx(ctx);
         let result = consume_sse_stream(&mut byte_stream, &mut host).await;
-        (result, host.edge_callback_outputs, host.edge_tool_round)
+        (result, host.edge_tool_round)
     } else {
         let mut host = NoopSseStreamHost;
         let result = consume_sse_stream(&mut byte_stream, &mut host).await;
-        (
-            result,
-            std::collections::HashMap::new(),
-            Vec::new(),
-        )
+        (result, Vec::new())
     };
 
     let result = TurnResult {
         core: sse_result.accum,
         ttft_ms: sse_result.ttft_ms,
-        edge_callback_outputs,
         edge_tool_round,
     };
 
