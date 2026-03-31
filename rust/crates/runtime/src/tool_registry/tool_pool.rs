@@ -99,6 +99,31 @@ pub struct ToolSelectionOutcome {
     pub materialized_names: Vec<String>,
 }
 
+/// Restore tool-search state from a message stream.
+///
+/// This reads `compact_metadata.discovered_tools` from compaction boundary markers and unions them
+/// into a `ToolSearchState`. The caller can then pass the restored state into
+/// [`select_two_phase_with_state`] to re-materialize previously discovered tools.
+pub fn restore_state_from_messages(messages: &[Value]) -> ToolSearchState {
+    let mut st = ToolSearchState::default();
+    for m in messages {
+        let tools = m
+            .get("compact_metadata")
+            .and_then(|cm| cm.get("discovered_tools"))
+            .and_then(Value::as_array);
+        if let Some(arr) = tools {
+            for t in arr {
+                if let Some(s) = t.as_str() {
+                    if !s.is_empty() {
+                        st.discovered.insert(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    st
+}
+
 /// A deny-rule hook, applied BEFORE ranking and materialization.
 pub trait ToolDenyPredicate {
     fn denied(&self, tool_name: &str) -> bool;
@@ -442,6 +467,32 @@ mod tests {
         // Silence unused warning for local index clone.
         index.clear();
         let _ = index;
+    }
+
+    #[test]
+    fn restore_state_from_compact_boundary_messages() {
+        let msgs = vec![
+            json!({
+                "role":"system",
+                "content":"[Conversation compacted automatically...]",
+                "compact_metadata": {
+                    "discovered_tools": ["mcp__k8s_logs", "mcp__special_tool"]
+                }
+            }),
+            json!({"role":"user","content":"hi"}),
+            json!({
+                "role":"system",
+                "content":"[Conversation compacted automatically...]",
+                "compact_metadata": {
+                    "discovered_tools": ["mcp__k8s_logs", "mcp__another"]
+                }
+            }),
+        ];
+        let st = restore_state_from_messages(&msgs);
+        assert!(st.discovered.contains("mcp__k8s_logs"));
+        assert!(st.discovered.contains("mcp__special_tool"));
+        assert!(st.discovered.contains("mcp__another"));
+        assert_eq!(st.discovered.len(), 3, "should union and dedupe");
     }
 }
 
