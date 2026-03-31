@@ -67,6 +67,10 @@ pub struct ToolPool<S: ToolSchemaStore> {
 pub struct ToolSearchConfig {
     pub max_candidates: usize,
     pub budget_tokens: u32,
+    /// Cap for carrying previously discovered tool names across compaction/replay.
+    /// These are attempted for materialization first (after pinned), but still
+    /// subject to deny rules and dynamic budget.
+    pub max_prior_discovered: usize,
 }
 
 impl Default for ToolSearchConfig {
@@ -74,8 +78,25 @@ impl Default for ToolSearchConfig {
         Self {
             max_candidates: 24,
             budget_tokens: super::scoring::DEFAULT_TOOL_BUDGET_TOKENS,
+            max_prior_discovered: 8,
         }
     }
+}
+
+/// Persisted tool-search state across turns/compaction boundaries.
+///
+/// This is the runtime-native equivalent of Claude Code's "discovered tools set".
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ToolSearchState {
+    /// Tools that have been materialized/selected previously in this conversation.
+    pub discovered: std::collections::BTreeSet<String>,
+}
+
+/// Outcome of a two-phase selection, including observability fields used in tests.
+#[derive(Debug, Clone)]
+pub struct ToolSelectionOutcome {
+    pub schemas: Vec<Value>,
+    pub materialized_names: Vec<String>,
 }
 
 /// A deny-rule hook, applied BEFORE ranking and materialization.
@@ -94,6 +115,17 @@ pub fn select_two_phase<S: ToolSchemaStore, D: ToolDenyPredicate>(
     query_terms: &[String],
     cfg: ToolSearchConfig,
 ) -> Vec<Value> {
+    select_two_phase_with_state(pool, deny, query_terms, cfg, None).schemas
+}
+
+/// Like [`select_two_phase`] but supports a persisted state that carries discovered tools.
+pub fn select_two_phase_with_state<S: ToolSchemaStore, D: ToolDenyPredicate>(
+    pool: &ToolPool<S>,
+    deny: &D,
+    query_terms: &[String],
+    cfg: ToolSearchConfig,
+    state: Option<&mut ToolSearchState>,
+) -> ToolSelectionOutcome {
     // Phase 0: filter denied tools out of the pool.
     let mut allowed: Vec<&SearchableToolMeta> = pool
         .index
@@ -108,6 +140,18 @@ pub fn select_two_phase<S: ToolSchemaStore, D: ToolDenyPredicate>(
         .filter(|m| m.pinned)
         .map(|m| m.name.clone())
         .collect();
+
+    // Carry discovered tools across turns/compaction (even if they are not in the current index).
+    if let Some(st) = state.as_ref() {
+        for n in st.discovered.iter().take(cfg.max_prior_discovered) {
+            if deny.denied(n) {
+                continue;
+            }
+            if !names.contains(n) {
+                names.push(n.clone());
+            }
+        }
+    }
 
     // Phase 2: rank remaining tools by simple overlap score on query terms.
     allowed.retain(|m| !m.pinned);
@@ -129,6 +173,7 @@ pub fn select_two_phase<S: ToolSchemaStore, D: ToolDenyPredicate>(
     // Token cost approximation: JSON bytes / 4.
     let mut selected = Vec::new();
     let mut used_dynamic = 0u32;
+    let mut materialized_names = Vec::new();
     for n in names {
         if let Some(schema) = pool.store.schema_by_name(&n) {
             let cost = (serde_json::to_string(&schema).map(|s| s.len()).unwrap_or(0) / 4) as u32;
@@ -140,9 +185,18 @@ pub fn select_two_phase<S: ToolSchemaStore, D: ToolDenyPredicate>(
                 used_dynamic += cost;
             }
             selected.push(schema);
+            materialized_names.push(n.clone());
         }
     }
-    selected
+    if let Some(st) = state {
+        for n in &materialized_names {
+            st.discovered.insert(n.clone());
+        }
+    }
+    ToolSelectionOutcome {
+        schemas: selected,
+        materialized_names,
+    }
 }
 
 fn overlap_score(terms: &[String], text: &str, name: &str) -> f64 {
@@ -234,6 +288,7 @@ mod tests {
             ToolSearchConfig {
                 max_candidates: 50,
                 budget_tokens: 50,
+                max_prior_discovered: 0,
             },
         );
         assert!(!out.is_empty());
@@ -274,7 +329,7 @@ mod tests {
                 &pool,
                 &deny,
                 &["github".to_string(), "pr".to_string(), "diff".to_string()],
-                ToolSearchConfig { max_candidates: 50, budget_tokens: 10_000 },
+                ToolSearchConfig { max_candidates: 50, budget_tokens: 10_000, max_prior_discovered: 0 },
             );
 
             for s in out {
@@ -313,6 +368,79 @@ mod tests {
             };
             prop_assert_eq!(names(a), names(b));
         }
+    }
+
+    #[test]
+    fn discovered_tools_roundtrip_and_materialize_even_if_not_in_index() {
+        let reg = ToolRegistry::new(mock_schemas());
+        let mut index: Vec<SearchableToolMeta> =
+            TOOL_CATALOG.iter().map(SearchableToolMeta::from_catalog).collect();
+
+        // A discovered tool that is NOT present in the current index.
+        let special = "mcp__special_tool";
+        let special_schema = json!({
+            "type":"function",
+            "function": {
+                "name": special,
+                "description": "special tool for k8s logs",
+                "parameters": {"type":"object","properties":{}}
+            }
+        });
+
+        // Build a store that contains the special tool schema but omit it from index.
+        struct Store {
+            reg: ToolRegistry,
+            extra_name: String,
+            extra_schema: Value,
+        }
+        impl ToolSchemaStore for Store {
+            fn schema_by_name(&self, name: &str) -> Option<Value> {
+                if name == self.extra_name {
+                    return Some(self.extra_schema.clone());
+                }
+                self.reg.schema_by_name(name).cloned()
+            }
+        }
+
+        let store = Store {
+            reg,
+            extra_name: special.to_string(),
+            extra_schema: special_schema,
+        };
+        let pool = ToolPool { index: index.clone(), store };
+
+        // State carries the discovered tool.
+        let mut state = ToolSearchState::default();
+        state.discovered.insert(special.to_string());
+
+        // "Compaction": serialize + deserialize.
+        let encoded = serde_json::to_string(&state).unwrap();
+        let mut restored: ToolSearchState = serde_json::from_str(&encoded).unwrap();
+
+        let outcome = select_two_phase_with_state(
+            &pool,
+            &DenyNone,
+            &["k8s".to_string(), "logs".to_string()],
+            ToolSearchConfig {
+                max_candidates: 0,
+                budget_tokens: 10_000,
+                max_prior_discovered: 8,
+            },
+            Some(&mut restored),
+        );
+
+        assert!(
+            outcome.materialized_names.contains(&special.to_string()),
+            "restored discovered tool should be materialized even if not in index"
+        );
+        assert!(
+            restored.discovered.contains(special),
+            "state should still contain discovered tool after selection"
+        );
+
+        // Silence unused warning for local index clone.
+        index.clear();
+        let _ = index;
     }
 }
 

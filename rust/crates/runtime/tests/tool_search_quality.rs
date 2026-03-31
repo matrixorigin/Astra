@@ -64,6 +64,20 @@ fn build_store_with_synthetic_tools(synthetic_count: usize) -> (MapStore, Vec<Se
         });
     }
 
+    // A specialized MCP tool that should beat baseline for a query that catalog doesn't cover well.
+    // Baseline selection doesn't consider non-catalog tools; two-phase does.
+    let name = "mcp__k8s_logs";
+    let short = "Fetch kubernetes cluster logs and pod events (k8s logs, kubectl logs)";
+    map.insert(name.to_string(), schema_for(name, short));
+    index.push(SearchableToolMeta {
+        name: name.to_string(),
+        short: short.to_string(),
+        intents: vec!["inspect"],
+        estimated_schema_tokens: 40,
+        pinned: false,
+        source: ToolSource::Mcp,
+    });
+
     (MapStore { map }, index)
 }
 
@@ -145,6 +159,10 @@ fn tool_search_quality_two_phase_not_worse_than_baseline() {
         Case {
             query: "create a new issue for this bug",
             used: &["github_create_issue"],
+        },
+        Case {
+            query: "check k8s logs for crashing pod",
+            used: &["mcp__k8s_logs"],
         },
     ];
 

@@ -11,7 +11,7 @@ use mo_agent_runtime::text_tokenize::{build_tf, tokenize};
 use mo_agent_runtime::tool_registry::ConversationState;
 use mo_agent_runtime::tool_registry::scoring::pre_filter_dynamic;
 use mo_agent_runtime::tool_registry::tool_pool::{
-    SearchableToolMeta, ToolPool, ToolSearchConfig, ToolSource, ToolDenyPredicate, select_two_phase,
+    select_two_phase, SearchableToolMeta, ToolDenyPredicate, ToolPool, ToolSearchConfig, ToolSource,
 };
 use mo_agent_runtime::tool_registry::TOOL_CATALOG;
 use mo_agent_runtime::turn::cloud::compaction::compact_tiered;
@@ -158,6 +158,7 @@ fn bench_two_phase_tool_pool(c: &mut Criterion) {
     let cfg = ToolSearchConfig {
         max_candidates: 24,
         budget_tokens: 1200,
+        max_prior_discovered: 0,
     };
 
     let mut group = c.benchmark_group("tool_pool_two_phase");
