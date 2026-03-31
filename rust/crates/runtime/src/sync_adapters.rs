@@ -1,17 +1,18 @@
-//! Domain adapters bridging mo-agent-runtime learning modules with the unified sync engine.
+//! Domain adapters bridging runtime pipeline learning modules with the unified sync engine.
 //!
-//! These adapters live in the `mo-agent` crate because they depend on both `mo-agent-services`
-//! (for sync engine traits) and `mo-agent-runtime` (for pipeline learning types). The services
-//! crate cannot depend on runtime, so the adapters must be wired here.
+//! Lives in `mo-agent-runtime` because `DomainAdapter` / `CloudTransport` are defined in
+//! `mo-agent-services` while `EntityGraph`, `PatternLibrary`, and persistence live here.
+//! Adding this module to `services` would require `services` → `runtime`, which cycles with
+//! `runtime` → `services`.
 
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator;
-use mo_agent_runtime::pipeline::entity::EntityGraph;
-use mo_agent_runtime::pipeline::pattern::PatternLibrary;
-use mo_agent_runtime::pipeline::persistence::{self, LearningSnapshot, ToolHealthEntry};
+use crate::pipeline::calibration::ProgressiveCalibrator;
+use crate::pipeline::entity::EntityGraph;
+use crate::pipeline::pattern::PatternLibrary;
+use crate::pipeline::persistence::{self, LearningSnapshot, ToolHealthEntry};
 
 use mo_agent_services::event_ingestion;
 use mo_agent_services::state_sync::StateSyncService;
@@ -471,15 +472,19 @@ impl CloudTransport for MatrixOneTransport {
 ///
 /// Events have their own batching mechanism via `EventIngestionWorker`.
 /// This adapter exists primarily for sync state observability.
+///
+/// When `sender` is [`Some`], it is typically a clone of the same [`IngestionSender`] held by
+/// [`crate::matrix_cloud_runtime::MatrixCloudRuntime`] (Phase 1 — shared queue for journal + future hooks).
 pub struct EventAdapter {
-    _sender: Option<event_ingestion::IngestionSender>,
+    #[allow(dead_code)]
+    sender: Option<event_ingestion::IngestionSender>,
     envelope: Arc<Mutex<SyncEnvelope>>,
 }
 
 impl EventAdapter {
     pub fn new(sender: Option<event_ingestion::IngestionSender>) -> Self {
         Self {
-            _sender: sender,
+            sender,
             envelope: Arc::new(Mutex::new(SyncEnvelope::new(SyncDomain::Events))),
         }
     }

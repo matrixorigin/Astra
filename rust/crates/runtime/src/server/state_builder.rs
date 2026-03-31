@@ -7,7 +7,7 @@ pub(super) async fn build_server_state(
     let shared_pool = SharedPool::new(&settings.matrixone).await?;
 
     // Build shared pipeline learning modules (server-wide singleton).
-    let learning_writer = build_pipeline_learning_writer();
+    let learning_stack = build_pipeline_learning_stack();
 
     let state = AppState::new(
         ServiceInfo::default(),
@@ -138,7 +138,7 @@ pub(super) async fn build_server_state(
     .with_admin_user_role_manager(Arc::new(DatabaseAdminUserRoleManager::new(
         settings.matrixone.clone(),
     )))
-    .with_turn_learning_writer(learning_writer.clone())
+    .with_turn_learning_writer(learning_stack.writer.clone())
     .with_task_service(Arc::new(
         MatrixOneTaskService::from_shared(&shared_pool),
     ));
@@ -152,23 +152,47 @@ pub(super) async fn build_server_state(
     } else {
         let encryptor =
             Arc::new(FernetTokenEncryptor::from_env().map_err(Box::<dyn std::error::Error>::from)?);
+        let edge_ledger = state.edge_callback_ledger.clone();
         state
             .with_chat_turn_bridge(Arc::new(
                 turn::bridge_inprocess::InProcessChatTurnBridge::new(
                     settings.matrixone.clone(),
                     encryptor,
                 )
-                .with_learning_writer(learning_writer),
+                .with_learning_writer(learning_stack.writer.clone())
+                .with_edge_callback_ledger(edge_ledger),
             ))
             .with_chat_turn_bridge_secret(settings.chat_turn_bridge_secret)
     };
     let state = state.with_memoria_config(settings.memoria_base_url, settings.memoria_master_key);
+
+    let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+    let matrix_rt = Arc::new(crate::matrix_cloud_runtime::MatrixCloudRuntime::attach(
+        shared_pool.clone(),
+        "default",
+        &user_id,
+        learning_stack.entity_graph.clone(),
+        learning_stack.pattern_library.clone(),
+        learning_stack.calibrator.clone(),
+        Arc::new(Mutex::new(Vec::new())),
+        None,
+    ));
+    let state = state.with_matrix_cloud_runtime(Some(matrix_rt));
     Ok(state)
+}
+
+/// Owns the same `Arc` pipeline module handles as [`PipelineLearningWriter`] for wiring
+/// [`crate::matrix_cloud_runtime::MatrixCloudRuntime`] without duplicate pools.
+pub(super) struct PipelineLearningStack {
+    pub writer: Arc<dyn TurnLearningWriter>,
+    pub entity_graph: Arc<Mutex<crate::pipeline::entity::EntityGraph>>,
+    pub pattern_library: Arc<Mutex<crate::pipeline::pattern::PatternLibrary>>,
+    pub calibrator: Arc<Mutex<crate::pipeline::calibration::ProgressiveCalibrator>>,
 }
 
 /// Creates pipeline modules (EntityGraph, PatternLibrary, ProgressiveCalibrator)
 /// and wires them into a PipelineLearningWriter for turn-outcome-driven learning.
-fn build_pipeline_learning_writer() -> Arc<dyn TurnLearningWriter> {
+fn build_pipeline_learning_stack() -> PipelineLearningStack {
     use crate::pipeline::{
         calibration::ProgressiveCalibrator,
         defaults::{default_calibration, default_entities, default_patterns},
@@ -179,11 +203,9 @@ fn build_pipeline_learning_writer() -> Arc<dyn TurnLearningWriter> {
 
     let entity_graph = Arc::new(Mutex::new(EntityGraph::new()));
     let pattern_library = Arc::new(Mutex::new(PatternLibrary::new()));
-    // Use 0.70 as initial threshold - a reasonable starting point that
-    // requires some confidence before auto-routing while allowing learning
+    // Use 0.70 as initial threshold — requires some confidence before auto-routing
     let calibrator = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.70)));
 
-    // Bootstrap with built-in defaults to avoid cold-start problem
     if let Ok(mut eg) = entity_graph.lock() {
         eg.merge(&default_entities());
     }
@@ -194,12 +216,18 @@ fn build_pipeline_learning_writer() -> Arc<dyn TurnLearningWriter> {
         cal.merge(&default_calibration());
     }
 
-    Arc::new(
+    let writer = Arc::new(
         PipelineLearningWriter::new()
-            .with_entity_graph(entity_graph)
-            .with_pattern_library(pattern_library)
-            .with_progressive_calibrator(calibrator),
-    )
+            .with_entity_graph(entity_graph.clone())
+            .with_pattern_library(pattern_library.clone())
+            .with_progressive_calibrator(calibrator.clone()),
+    );
+    PipelineLearningStack {
+        writer,
+        entity_graph,
+        pattern_library,
+        calibrator,
+    }
 }
 
 #[cfg(test)]
@@ -209,7 +237,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_pipeline_learning_writer_creates_functional_writer() {
-        let writer = build_pipeline_learning_writer();
+        let writer = build_pipeline_learning_stack().writer;
         // Should accept an outcome without panic
         let outcome = TurnLearningOutcome {
             query: "matrixorigin PR check".to_string(),
@@ -227,7 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_pipeline_learning_writer_learns_across_calls() {
-        let writer = build_pipeline_learning_writer();
+        let writer = build_pipeline_learning_stack().writer;
         // Record two outcomes to meet PatternLibrary minimum
         for i in 0..2 {
             let outcome = TurnLearningOutcome {
@@ -245,4 +273,13 @@ mod tests {
         }
         // No panics = writer accumulates state correctly
     }
+
+    #[test]
+    fn pipeline_learning_stack_shares_arcs_between_writer_and_fields() {
+        let s = build_pipeline_learning_stack();
+        assert_eq!(Arc::strong_count(&s.entity_graph), 2);
+        assert_eq!(Arc::strong_count(&s.pattern_library), 2);
+        assert_eq!(Arc::strong_count(&s.calibrator), 2);
+    }
+
 }

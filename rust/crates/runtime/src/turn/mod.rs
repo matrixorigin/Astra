@@ -1,7 +1,11 @@
 pub mod activity;
+#[cfg(feature = "bridge-e2e-hooks")]
+pub mod bridge_e2e_hooks;
 pub mod bridge_inprocess;
+pub mod edge_ledger;
 pub mod cache;
 pub mod cloud;
+pub mod cloud_tool_delivery;
 pub mod complete;
 pub mod contracts;
 pub mod counter;

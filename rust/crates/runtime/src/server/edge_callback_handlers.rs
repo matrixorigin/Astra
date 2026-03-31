@@ -1,9 +1,15 @@
 //! §5.5 edge callbacks: tool results and approval responses from thin clients / edge executors.
 //!
-//! Stores last callbacks in [`AppState::edge_callback_ledger`] for observability and future
-//! bridge integration; the chat-turn bridge does not consume this ledger yet.
+//! Entries are keyed `{user_id}:tool:{request_id}` / `{user_id}:approval:{request_id}`.
+//! [`InProcessChatTurnBridge`](crate::turn::bridge_inprocess::InProcessChatTurnBridge) and
+//! [`crate::turn::cloud_tool_delivery`] poll and `remove` keys until `turn_timeout_s` (user id from
+//! `x-mo-user-id` on the chat turn).
 
 use super::*;
+
+use crate::turn::edge_ledger::{
+    LEDGER_MAX_ENTRIES, approval_callback_key, tool_callback_key,
+};
 
 fn edge_id_from_headers(headers: &HeaderMap) -> String {
     headers
@@ -20,9 +26,9 @@ pub(super) async fn post_tool_result_handler(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let edge_id = edge_id_from_headers(&headers);
-    let key = format!("{}:tool:{}", user.user_id, body.request_id);
+    let key = tool_callback_key(&user.user_id, &body.request_id);
     let mut lock = state.edge_callback_ledger.lock().await;
-    if lock.len() >= 4096 {
+    if lock.len() >= LEDGER_MAX_ENTRIES {
         lock.clear();
     }
     lock.insert(
@@ -46,9 +52,9 @@ pub(super) async fn post_approval_respond_handler(
     Json(body): Json<mo_thin_client::ApprovalRespondRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let key = format!("{}:approval:{}", user.user_id, body.request_id);
+    let key = approval_callback_key(&user.user_id, &body.request_id);
     let mut lock = state.edge_callback_ledger.lock().await;
-    if lock.len() >= 4096 {
+    if lock.len() >= LEDGER_MAX_ENTRIES {
         lock.clear();
     }
     lock.insert(

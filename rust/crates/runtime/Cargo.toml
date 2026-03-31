@@ -3,6 +3,16 @@ name = "mo-agent-runtime"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+# Full `/chat/turn` ledger inject tests (see `tests/chat_turn_bridge_ledger_inject_e2e.rs`).
+bridge-e2e-hooks = []
+
+[[test]]
+name = "chat_turn_bridge_ledger_inject_e2e"
+path = "tests/chat_turn_bridge_ledger_inject_e2e.rs"
+required-features = ["bridge-e2e-hooks"]
+
 [[bin]]
 name = "mo-agent-server"
 path = "src/main.rs"
@@ -31,6 +41,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+futures-util.workspace = true
 tempfile = "3"
 tower.workspace = true
 

@@ -84,7 +84,8 @@ pub use marketplace::{
 };
 pub use models::{
     DatabaseModelService, ModelCreateRequestData, ModelRecord, ModelService,
-    ModelUpdateRequestData, PricingData, QuirksData, UnconfiguredModelService,
+    ModelUpdateRequestData, PricingData, QuirksData, ResolvedActiveLlmModel,
+    UnconfiguredModelService, resolve_active_llm_model,
 };
 pub use protocol::{
     ApplyDeltaRequest, ApplyDeltaResponse, ApplyOptions, Checkpoint, CheckpointOptions,

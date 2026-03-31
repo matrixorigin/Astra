@@ -152,3 +152,86 @@ pub fn build_edge_tool_call_event(tool_call: &Map<String, Value>) -> Map<String,
         ("arguments".to_string(), arguments),
     ])
 }
+
+/// §5.5 `approval_required` — `request_id` matches `POST /approval/respond` ledger keys.
+pub fn build_approval_required_event(
+    request_id: &str,
+    tool_name: &str,
+    path: Option<&str>,
+) -> Map<String, Value> {
+    let mut m = Map::from_iter([
+        (
+            "type".to_string(),
+            Value::String("approval_required".to_string()),
+        ),
+        (
+            "request_id".to_string(),
+            Value::String(request_id.to_string()),
+        ),
+        (
+            "tool".to_string(),
+            Value::String(tool_name.to_string()),
+        ),
+    ]);
+    if let Some(p) = path.filter(|s| !s.is_empty()) {
+        m.insert("path".to_string(), Value::String(p.to_string()));
+    }
+    m
+}
+
+/// §5.5 thin-client `tool_request` — `request_id` matches `POST /tools/result` and ledger keys.
+pub fn build_tool_request_event(tool_call: &Map<String, Value>) -> Map<String, Value> {
+    let edge = build_edge_tool_call_event(tool_call);
+    let request_id = tool_call
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let tool = edge
+        .get("name")
+        .cloned()
+        .unwrap_or_else(|| Value::String("?".to_string()));
+    let args = edge.get("arguments").cloned().unwrap_or(Value::Null);
+    Map::from_iter([
+        ("type".to_string(), Value::String("tool_request".to_string())),
+        ("request_id".to_string(), Value::String(request_id)),
+        ("tool".to_string(), tool),
+        ("args".to_string(), args),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn approval_required_includes_optional_path() {
+        let ev = build_approval_required_event("a1", "write_file", Some("p/x.rs"));
+        assert_eq!(ev.get("type").and_then(Value::as_str), Some("approval_required"));
+        assert_eq!(ev.get("request_id").and_then(Value::as_str), Some("a1"));
+        assert_eq!(ev.get("tool").and_then(Value::as_str), Some("write_file"));
+        assert_eq!(ev.get("path").and_then(Value::as_str), Some("p/x.rs"));
+    }
+
+    #[test]
+    fn tool_request_event_aligns_request_id_with_tool_call_id() {
+        let tc = Map::from_iter([
+            (
+                "id".to_string(),
+                Value::String("call_abc".to_string()),
+            ),
+            (
+                "function".to_string(),
+                json!({"name": "bash", "arguments": "{\"cmd\": \"ls\"}"}),
+            ),
+        ]);
+        let ev = build_tool_request_event(&tc);
+        assert_eq!(ev.get("type").and_then(Value::as_str), Some("tool_request"));
+        assert_eq!(
+            ev.get("request_id").and_then(Value::as_str),
+            Some("call_abc")
+        );
+        assert_eq!(ev.get("tool").and_then(Value::as_str), Some("bash"));
+    }
+}

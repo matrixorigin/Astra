@@ -22,6 +22,15 @@ pub(super) enum PendingEdgeWork {
     Approval(PendingApproval),
 }
 
+/// One tool executed from SSE `tool_request` (ordering preserved for synthetic `tool_calls`).
+#[derive(Debug, Clone)]
+pub(super) struct EdgeToolRoundEntry {
+    pub request_id: String,
+    pub tool: String,
+    pub args: serde_json::Value,
+    pub output: String,
+}
+
 /// When set, SSE `tool_request` / `approval_required` are handled and posted to the cloud API.
 ///
 /// `perm_manager` must point at the same [`crate::permission_manager::PermissionManager`] used for
@@ -71,13 +80,31 @@ async fn flush_pending_edge_work(
                         format!("  ⚡ tool_request: {} ({})", req.tool, req.request_id).dim()
                     );
                 }
+                let allowed = match ctx.perm_manager {
+                    Some(mut ptr) => unsafe { ptr.as_mut().check(&req.tool, &req.args) },
+                    None => true,
+                };
                 let start = std::time::Instant::now();
-                let output = ctx.executor.execute(&req.tool, &req.args).await;
+                let output = if allowed {
+                    ctx.executor.execute(&req.tool, &req.args).await
+                } else {
+                    "Permission denied".to_string()
+                };
                 let sig = crate::chat_stream::tool_dedup_signature(&req.tool, &req.args);
                 result
                     .edge_callback_outputs
                     .insert(sig, output.clone());
-                let status = tool_post_status(&output);
+                result.edge_tool_round.push(EdgeToolRoundEntry {
+                    request_id: req.request_id.clone(),
+                    tool: req.tool.clone(),
+                    args: req.args.clone(),
+                    output: output.clone(),
+                });
+                let status = if !allowed {
+                    "error"
+                } else {
+                    tool_post_status(&output)
+                };
                 let body = mo_thin_client::ToolResultRequest {
                     request_id: req.request_id,
                     status: status.to_string(),
@@ -193,6 +220,8 @@ pub(super) struct TurnResult {
     pub(super) ttft_ms: Option<u64>,
     /// Outputs from SSE `tool_request` (same key as [`crate::chat_stream::tool_dedup_signature`]).
     pub(super) edge_callback_outputs: std::collections::HashMap<String, String>,
+    /// Ordered executions from this SSE stream (for rounds without legacy `tool_call` events).
+    pub(super) edge_tool_round: Vec<EdgeToolRoundEntry>,
 }
 
 impl TurnResult {
@@ -211,6 +240,7 @@ impl TurnResult {
             error_message: None,
             ttft_ms: None,
             edge_callback_outputs: std::collections::HashMap::new(),
+            edge_tool_round: Vec::new(),
         }
     }
 }

@@ -20,8 +20,8 @@ use crossterm::{
     style::Stylize,
     terminal,
 };
-use mo_agent_runtime::{prompts, tool_registry, tool_selector};
-use mo_agent_services::event_ingestion;
+use mo_agent_core::SharedPool;
+use mo_agent_runtime::{plan_decompose, prompts, tool_registry, tool_selector};
 use mo_agent_services::session_journal;
 
 mod edge_tools;
@@ -51,8 +51,6 @@ mod cli_utils;
 mod command_router;
 #[path = "mo_agent/permission_manager.rs"]
 mod permission_manager;
-#[path = "mo_agent/plan_decompose.rs"]
-mod plan_decompose;
 #[path = "mo_agent/repl_runtime.rs"]
 mod repl_runtime;
 #[path = "mo_agent/repl_turn.rs"]
@@ -73,8 +71,6 @@ mod slash_skill;
 mod slash_state;
 #[path = "mo_agent/stream_render.rs"]
 mod stream_render;
-#[path = "mo_agent/sync_adapters.rs"]
-mod sync_adapters;
 
 use auth_flow::{clear_profile_last_session, do_login, do_register};
 use chat_stream::{
@@ -88,7 +84,6 @@ use cli_utils::{
 };
 use command_router::{execute_cli_command, ExitCode};
 use permission_manager::PermissionManager;
-use stream_render::Spinner;
 #[cfg(test)]
 use stream_render::{StreamRenderState, TurnResult, dispatch_turn_event_block};
 
@@ -399,12 +394,10 @@ struct ReplState {
     recent_tools: Vec<String>,
     /// Session-persistent permission manager — "always"/"skip" survives across turns.
     perm_manager: PermissionManager,
-    /// Async event ingestion sender for cloud push (None if MatrixOne unavailable).
-    ingestion_sender: Option<event_ingestion::IngestionSender>,
     /// User ID for event ingestion attribution.
     ingestion_user_id: Option<String>,
-    /// Shared MatrixOne pool for checkpoint push and cloud sync (None if unavailable).
-    matrixone_pool: Option<std::sync::Arc<sqlx::Pool<sqlx::MySql>>>,
+    /// Matrix pool + journal ingestion + sync orchestrator (None if MatrixOne unavailable).
+    matrix_runtime: Option<std::sync::Arc<mo_agent_runtime::MatrixCloudRuntime>>,
     /// Learning snapshot restored from cloud (to be merged into learning modules).
     learning_snapshot: Option<String>,
     /// Local task service for /task commands.
@@ -433,8 +426,6 @@ struct ReplState {
     cloud_learning_version: Option<i64>,
     /// Last turn's journal event — for /turn command display.
     last_turn_event: Option<session_journal::JournalEvent>,
-    /// Unified sync orchestrator — tracks sync state across all domains.
-    sync_orchestrator: Option<mo_agent_services::SyncOrchestrator>,
     /// Shared pattern library reference for /learn command.
     pattern_library: Option<
         std::sync::Arc<std::sync::Mutex<mo_agent_runtime::pipeline::pattern::PatternLibrary>>,
@@ -469,9 +460,8 @@ impl Default for ReplState {
             journal: None,
             recent_tools: Vec::new(),
             perm_manager: PermissionManager::new(false),
-            ingestion_sender: None,
             ingestion_user_id: None,
-            matrixone_pool: None,
+            matrix_runtime: None,
             learning_snapshot: None,
             task_service: None,
             tool_health_entries: Vec::new(),
@@ -485,7 +475,6 @@ impl Default for ReplState {
             last_turn_interrupted: false,
             cloud_learning_version: None,
             last_turn_event: None,
-            sync_orchestrator: None,
             pattern_library: None,
             skill_registry: std::sync::Arc::new(std::sync::RwLock::new(
                 skill_instructions::SkillRegistry::new(),
@@ -508,8 +497,8 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
     use mo_agent_services::session_restore::{HybridRestoreService, SessionRestoreService};
 
     let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
-    let svc = match &state.matrixone_pool {
-        Some(pool) => HybridRestoreService::new(pool.as_ref().clone()),
+    let svc = match &state.matrix_runtime {
+        Some(mc) => HybridRestoreService::new(mc.shared_pool().get().clone()),
         None => HybridRestoreService::local_only(),
     };
 
@@ -700,9 +689,10 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                 if state.recent_tools.is_empty() {
                     state.recent_tools = heavy.recent_tools;
                 }
-            } else if let Some(ref pool) = state.matrixone_pool {
+            } else if let Some(ref mc) = state.matrix_runtime {
                 // Cloud fallback: pull heavy checkpoint from MatrixOne
                 // (different device, local files not available)
+                let pool = mc.shared_pool().get();
                 match mo_agent_services::session_restore::pull_step_checkpoint_from_cloud(
                     pool,
                     &restored.session_id,
@@ -1234,7 +1224,7 @@ async fn handle_health_command(arg: &str, state: &ReplState) {
         "\n{}",
         "─── Cloud Sync ─────────────────────────────────".bold()
     );
-    match &state.matrixone_pool {
+    match &state.matrix_runtime {
         None => {
             eprintln!(
                 "  {} {}",
@@ -1243,9 +1233,10 @@ async fn handle_health_command(arg: &str, state: &ReplState) {
             );
             eprintln!("  {}", "Set MATRIXONE_HOST to enable cloud sync.".dim());
         }
-        Some(pool) => {
-            let svc =
-                mo_agent_services::state_sync::MatrixOneSyncService::new(pool.as_ref().clone());
+        Some(mc) => {
+            let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(
+                mc.shared_pool().get().clone(),
+            );
             let sync_status = mo_agent_services::state_sync::StateSyncService::status(&svc).await;
             display_sync_status(&sync_status);
         }
@@ -1354,22 +1345,20 @@ fn handle_sync_command(arg: &str, state: &ReplState) {
         "─── Sync Engine Status ─────────────────────────".bold()
     );
 
-    let orch = match &state.sync_orchestrator {
-        Some(o) => o,
-        None => {
-            eprintln!(
-                "  {} {}",
-                "○".dim(),
-                "Sync orchestrator not initialized (no cloud connection)".dim()
-            );
-            eprintln!(
-                "{}",
-                "────────────────────────────────────────────────".dim()
-            );
-            eprintln!();
-            return;
-        }
+    let Some(mc) = state.matrix_runtime.as_ref() else {
+        eprintln!(
+            "  {} {}",
+            "○".dim(),
+            "Sync orchestrator not initialized (no cloud connection)".dim()
+        );
+        eprintln!(
+            "{}",
+            "────────────────────────────────────────────────".dim()
+        );
+        eprintln!();
+        return;
     };
+    let orch = mc.sync_orchestrator_lock();
 
     // Cloud availability
     let cloud_status = if orch.is_cloud_available() {
@@ -2846,49 +2835,28 @@ async fn run_chat_repl(
         state.synced_tool_health_entries = cross_session_health_entries;
     }
 
-    // ── Initialize unified sync orchestrator ───────────────────────────────
+    // ── Matrix pool + ingestion + sync orchestrator (single bundle) ─────────
     {
-        use mo_agent_services::DomainAdapter as _;
-        let transport: std::sync::Arc<dyn mo_agent_services::CloudTransport> =
-            if let Some(ref pool) = state.matrixone_pool {
-                let svc =
-                    mo_agent_services::state_sync::MatrixOneSyncService::new(pool.as_ref().clone());
-                std::sync::Arc::new(sync_adapters::MatrixOneTransport::new(
-                    std::sync::Arc::new(svc),
+        let settings = mo_agent_runtime::matrix_settings_from_env();
+        state.matrix_runtime = match SharedPool::new(&settings).await {
+            Ok(pool) => {
+                let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+                let th = std::sync::Arc::new(std::sync::Mutex::new(
+                    state.tool_health_entries.clone(),
+                ));
+                Some(std::sync::Arc::new(mo_agent_runtime::MatrixCloudRuntime::attach(
+                    pool,
                     profile.unwrap_or("default"),
-                ))
-            } else {
-                std::sync::Arc::new(mo_agent_services::NoopTransport)
-            };
-        let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
-        let mut orch = mo_agent_services::SyncOrchestrator::new(transport, user_id);
-
-        // Register Learning adapter
-        let learning_adapter = sync_adapters::LearningAdapter::new(
-            pipeline_modules.entity_graph.clone(),
-            pipeline_modules.pattern_library.clone(),
-            pipeline_modules.calibrator.clone(),
-            std::sync::Arc::new(std::sync::Mutex::new(state.tool_health_entries.clone())),
-        );
-        // Set initial envelope state from cloud pull
-        if let Some(v) = state.cloud_learning_version {
-            let mut env = learning_adapter.envelope();
-            env.mark_pulled(v as u64);
-            learning_adapter.set_envelope(env);
-        }
-        orch.register(
-            Box::new(learning_adapter),
-            mo_agent_services::SyncPolicy::learning(),
-        );
-
-        // Register Event adapter
-        let event_adapter = sync_adapters::EventAdapter::new(state.ingestion_sender.clone());
-        orch.register(
-            Box::new(event_adapter),
-            mo_agent_services::SyncPolicy::events(),
-        );
-
-        state.sync_orchestrator = Some(orch);
+                    &user_id,
+                    pipeline_modules.entity_graph.clone(),
+                    pipeline_modules.pattern_library.clone(),
+                    pipeline_modules.calibrator.clone(),
+                    th,
+                    state.cloud_learning_version,
+                )))
+            }
+            Err(_) => None,
+        };
     }
 
     // Store pattern library reference for /learn command
@@ -3110,7 +3078,7 @@ async fn run_chat_repl(
 
                     // Periodic learning sync: push to cloud at checkpoint boundaries
                     // to prevent data loss on crash (every CHECKPOINT_INTERVAL turns)
-                    if state.matrixone_pool.is_some()
+                    if state.matrix_runtime.is_some()
                         && state.turn > 0
                         && state.turn.is_multiple_of(
                             mo_agent_services::session_checkpoint::CHECKPOINT_INTERVAL,
@@ -3131,12 +3099,17 @@ async fn run_chat_repl(
                         {
                             state.cloud_learning_version = Some(new_version);
                             // Update orchestrator envelope to reflect the push
-                            if let Some(ref orch) = state.sync_orchestrator
-                                && let Some(mut env) =
+                            if let Some(ref mc) = state.matrix_runtime {
+                                let orch = mc.sync_orchestrator_lock();
+                                if let Some(mut env) =
                                     orch.envelope(mo_agent_services::SyncDomain::Learning)
-                            {
-                                env.mark_synced(new_version as u64);
-                                orch.update_envelope(mo_agent_services::SyncDomain::Learning, env);
+                                {
+                                    env.mark_synced(new_version as u64);
+                                    orch.update_envelope(
+                                        mo_agent_services::SyncDomain::Learning,
+                                        env,
+                                    );
+                                }
                             }
                         }
                         // On conflict, we skip this push — the final push at session end
@@ -3161,8 +3134,8 @@ async fn run_chat_repl(
                     repl_turn::enqueue_ingestion_pub(&state, &end_event);
                 }
                 // Graceful ingestion shutdown: drop sender so worker flushes remaining buffer
-                if let Some(sender) = state.ingestion_sender.take() {
-                    sender.shutdown();
+                if let Some(mc) = state.matrix_runtime.as_ref() {
+                    mc.shutdown_ingestion();
                 }
                 // Show resume hint if session had any turns
                 if state.turn > 0
@@ -5022,8 +4995,8 @@ total_tokens_out: 500
             edge_tools::all_tool_schemas(),
         ));
         let mut state = ReplState::default();
-        // No matrixone_pool — should show "Offline" in cloud section
-        assert!(state.matrixone_pool.is_none());
+        // No matrix runtime — should show "Offline" in cloud section
+        assert!(state.matrix_runtime.is_none());
         let exit = handle_slash_command(
             "/health",
             &api,

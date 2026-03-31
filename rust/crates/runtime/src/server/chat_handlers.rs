@@ -218,6 +218,11 @@ pub(super) async fn dispatch_chat_turn_bridge(
             },
         );
     }
+    // Bridge E2E hooks (`bridge-e2e-hooks`): in-process bridge reads this header with env
+    // `MO_AGENT_BRIDGE_TEST_SECRET`; harmless if unset or header absent.
+    if let Some(v) = source_headers.get("x-mo-bridge-test-secret").cloned() {
+        bridge_headers.insert(HeaderName::from_static("x-mo-bridge-test-secret"), v);
+    }
 
     match state
         .chat_turn_bridge
@@ -271,6 +276,7 @@ mod tests {
             "x-mo-routing-meta-b64",
             "x-mo-force-intent",
             "x-mo-execution-state-b64",
+            "x-mo-bridge-test-secret",
         ];
         for name in headers {
             assert!(

@@ -187,60 +187,6 @@ const CACHEABLE_TOOLS: &[&str] = &[
     "get_agent_info",
 ];
 
-/// Tools safe to execute in parallel (read-only, no side effects).
-/// When all tool calls in a turn are in this set, they execute concurrently
-/// via `join_all` — giving real parallelism for async HTTP tools (github_*,
-/// memory_*) and graceful degradation for sync local tools.
-const PARALLEL_SAFE_TOOLS: &[&str] = &[
-    "read_file",
-    "list_dir",
-    "glob",
-    "grep",
-    "symbols",
-    "find_definition",
-    "find_references",
-    "call_graph",
-    "dead_code",
-    "extract_members",
-    "type_hierarchy",
-    "hover_info",
-    "symbol_search",
-    "git_status",
-    "git_diff",
-    "git_log",
-    "git_show",
-    "git_blame",
-    "git_file_history",
-    "git_contributors",
-    "git_log_search",
-    "github_list_prs",
-    "github_get_pr",
-    "github_ci_status",
-    "github_list_issues",
-    "github_get_issue",
-    "github_repo_stats",
-    "memory_retrieve",
-    "memory_search",
-    "memory_profile",
-    "web_fetch",
-    "get_agent_info",
-    "reflect",
-    "mo_query",
-];
-
-enum PreExecutionResult {
-    Completed(String),
-    TimedOut,
-}
-
-fn tool_timeout_message(name: &str, timeout_ms: u64) -> String {
-    format!(
-        "Tool '{}' took too long (>{}s). Consider retrying.",
-        name,
-        timeout_ms / 1000
-    )
-}
-
 /// Determine whether a tool result string indicates an error.
 ///
 /// For structured JSON results (our tools), checks `"ok": false` or a non-null
@@ -355,6 +301,73 @@ fn normalize_call_sig(name: &str, args: &serde_json::Value) -> String {
 /// Stable key for deduplicating `tool_request` (SSE) vs `tool_call` (same turn).
 pub(super) fn tool_dedup_signature(name: &str, args: &serde_json::Value) -> String {
     normalize_call_sig(name, args)
+}
+
+fn take_edge_output_for_tool_call(
+    name: &str,
+    args: &serde_json::Value,
+    round: &[crate::stream_render::EdgeToolRoundEntry],
+    consumed: &mut [bool],
+    by_sig: &HashMap<String, String>,
+) -> String {
+    let sig = tool_dedup_signature(name, args);
+    for (i, e) in round.iter().enumerate() {
+        if consumed[i] {
+            continue;
+        }
+        if tool_dedup_signature(&e.tool, &e.args) == sig {
+            consumed[i] = true;
+            return e.output.clone();
+        }
+    }
+    by_sig.get(&sig).cloned().unwrap_or_else(|| {
+        format!(
+            "Error: headless edge protocol — expected SSE `tool_request` before assistant `tool_call` for `{name}` (no matching edge execution in this turn)."
+        )
+    })
+}
+
+async fn hydrate_reflect_placeholder_if_needed(
+    api: &mo_thin_client::ThinClient,
+    token: &str,
+    current_session_id: Option<&String>,
+    name: &str,
+    args: &serde_json::Value,
+    mut result_str: String,
+) -> String {
+    if name == "reflect"
+        && result_str.contains("reflect_requires_session")
+        && let Some(sid) = current_session_id
+    {
+        let focus = args.get("focus").and_then(|v| v.as_str()).unwrap_or("auto");
+        let question = args.get("question").and_then(|v| v.as_str()).unwrap_or("");
+        let last_n = args.get("last_n").and_then(|v| v.as_i64()).unwrap_or(20);
+        let mut qp: Vec<String> = Vec::new();
+        if !focus.is_empty() && focus != "auto" {
+            qp.push(format!("focus={focus}"));
+        }
+        if !question.is_empty() {
+            qp.push(format!("question={}", urlencoding(question)));
+        }
+        qp.push(format!("last_n={last_n}"));
+        let rel = format!(
+            "{}?{}",
+            mo_thin_client::paths::chat_session_reflect(sid).trim_start_matches('/'),
+            qp.join("&")
+        );
+        match api.get_authed_path_text(token, &rel).await {
+            Ok(text) => {
+                result_str = text;
+            }
+            Err(mo_thin_client::ThinClientError::Api { status, .. }) => {
+                result_str = format!("{{\"error\": \"reflect HTTP {status}\"}}");
+            }
+            Err(e) => {
+                result_str = format!("{{\"error\": \"reflect failed: {e}\"}}");
+            }
+        }
+    }
+    result_str
 }
 
 fn normalize_args(val: &serde_json::Value) -> serde_json::Value {
@@ -1398,7 +1411,11 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         }
         total_prompt += turn_result.prompt_tokens;
         total_completion += turn_result.completion_tokens;
-        total_tool_calls += turn_result.tool_calls.len() as u32;
+        total_tool_calls += if !turn_result.tool_calls.is_empty() {
+            turn_result.tool_calls.len()
+        } else {
+            turn_result.edge_tool_round.len()
+        } as u32;
 
         // Record LLM token usage in step recorder
         step_recorder.record_tokens(turn_result.prompt_tokens, turn_result.completion_tokens);
@@ -1408,6 +1425,9 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 all_tools_used.insert(name.to_string());
             }
         }
+        for e in &turn_result.edge_tool_round {
+            all_tools_used.insert(e.tool.clone());
+        }
         has_any_usage = has_any_usage || turn_result.has_usage;
         explain_turns.extend(turn_result.explain_turns);
 
@@ -1415,7 +1435,9 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             return Err(err.clone());
         }
 
-        if !turn_result.has_tool_calls {
+        let round_has_edge_work =
+            !turn_result.tool_calls.is_empty() || !turn_result.edge_tool_round.is_empty();
+        if !round_has_edge_work {
             if should_force_factual_tool_retry(
                 message,
                 recent_tools,
@@ -1440,12 +1462,28 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             break;
         }
 
+        let tool_calls_for_guard: Vec<serde_json::Value> = if !turn_result.tool_calls.is_empty() {
+            turn_result.tool_calls.clone()
+        } else {
+            turn_result
+                .edge_tool_round
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    serde_json::json!({
+                        "id": format!("edge-{i}"),
+                        "name": e.tool,
+                        "arguments": e.args.clone(),
+                    })
+                })
+                .collect()
+        };
+
         // Stall & divergence detection via unified TurnGuard
         {
             use std::collections::BTreeSet;
 
-            let sig_set: BTreeSet<String> = turn_result
-                .tool_calls
+            let sig_set: BTreeSet<String> = tool_calls_for_guard
                 .iter()
                 .map(|tc| {
                     let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -1457,8 +1495,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     )
                 })
                 .collect();
-            let name_set: HashSet<String> = turn_result
-                .tool_calls
+            let name_set: HashSet<String> = tool_calls_for_guard
                 .iter()
                 .map(|tc| {
                     tc.get("name")
@@ -1471,7 +1508,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             turn_tool_names.push(name_set.clone());
 
             // Feed tool call signatures into TurnGuard
-            turn_guard.record_tool_calls(&turn_result.tool_calls);
+            turn_guard.record_tool_calls(&tool_calls_for_guard);
 
             // Name-based stall detection (complementary to TurnGuard's signature stall)
             let name_stall = turn_tool_names.len() >= TOOL_NAME_STALL_WINDOW
@@ -1484,95 +1521,92 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             }
         }
 
-        // Execute tool calls locally
+        // Assemble tool results from SSE `tool_request` only — legacy inline execution removed.
         tool_results = Vec::new();
-        // Don't clear messages — keep full history. Append assistant tool_calls message.
-        // Include reasoning_content when present: thinking models (Kimi-k2.5, DeepSeek-R1)
-        // require it on subsequent turns or they return HTTP 400.
-        let mut assistant_tc_msg = serde_json::json!({
-            "role": "assistant",
-            "content": null,
-            "tool_calls": turn_result.tool_calls.iter().map(|tc| {
-                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let args = tc.get("arguments").cloned().unwrap_or(serde_json::json!({}));
-                serde_json::json!({
-                    "id": id,
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": serde_json::to_string(&args)
-                            .unwrap_or_else(|_| r#"{"error":"argument serialization failed"}"#.to_string()),
-                    }
-                })
-            }).collect::<Vec<_>>(),
-        });
+
+        let mut assistant_tc_msg = if !turn_result.tool_calls.is_empty() {
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": turn_result.tool_calls.iter().map(|tc| {
+                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let args = tc.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+                    serde_json::json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": serde_json::to_string(&args)
+                                .unwrap_or_else(|_| r#"{"error":"argument serialization failed"}"#.to_string()),
+                        }
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        } else {
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": turn_result.edge_tool_round.iter().enumerate().map(|(i, e)| {
+                    let id = if e.request_id.is_empty() {
+                        format!("edge-{i}")
+                    } else {
+                        e.request_id.clone()
+                    };
+                    serde_json::json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": e.tool,
+                            "arguments": serde_json::to_string(&e.args)
+                                .unwrap_or_else(|_| "{}".to_string()),
+                        }
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        };
         if !turn_result.reasoning_content.is_empty() {
             assistant_tc_msg["reasoning_content"] =
                 serde_json::Value::String(turn_result.reasoning_content.clone());
         }
         messages.push(assistant_tc_msg);
 
-        // Deduplicate tool calls — skip exact (name, args) repeats within AND across turns
-        // Only cache idempotent read-only tools; side-effectful tools always re-execute
+        enum RoundToolItem {
+            ServerTc(usize),
+            Synthetic(usize),
+        }
+        let indices: Vec<RoundToolItem> = if !turn_result.tool_calls.is_empty() {
+            (0..turn_result.tool_calls.len())
+                .map(RoundToolItem::ServerTc)
+                .collect()
+        } else {
+            (0..turn_result.edge_tool_round.len())
+                .map(RoundToolItem::Synthetic)
+                .collect()
+        };
+
+        let tool_count = indices.len().max(1);
         let mut seen_calls: HashSet<String> = HashSet::new();
-        let tool_count = turn_result.tool_calls.len();
         step_recorder.begin_act(tool_count);
         let step_start_time = std::time::Instant::now();
         let step_timeout_ms = step_recorder.scheduling().timeout_ms;
+        let mut consumed_edge = vec![false; turn_result.edge_tool_round.len()];
+        let by_sig: &HashMap<String, String> = &turn_result.edge_callback_outputs;
 
-        // Pre-compute per-tool timeout (constant across tools in this batch)
-        let contract_for_timeout = step_recorder.scheduling();
-        let per_tool_timeout_ms = contract_for_timeout.effective_tool_timeout_ms(tool_count);
-
-        // ── Parallel pre-execution for read-only tool batches ──
-        // When all tools are parallel-safe and there are 2+, execute them
-        // concurrently upfront. For async HTTP tools (github_*, memory_*),
-        // this gives real I/O parallelism. For sync local tools, it degrades
-        // gracefully to sequential (no worse than before).
-        let parallel_batch = tool_count > 1
-            && turn_result.edge_callback_outputs.is_empty()
-            && turn_result.tool_calls.iter().all(|tc| {
-                tc.get("name")
-                    .and_then(|v| v.as_str())
-                    .map(|n| PARALLEL_SAFE_TOOLS.contains(&n))
-                    .unwrap_or(false)
-            });
-        let pre_results: Vec<PreExecutionResult> = if parallel_batch {
-            let timeout_dur = std::time::Duration::from_millis(per_tool_timeout_ms);
-            let exec_ref = &executor;
-            let futs: Vec<_> = turn_result
-                .tool_calls
-                .iter()
-                .map(|tc| {
-                    let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let args = tc
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Object(Default::default()));
-                    async move {
-                        match tokio::time::timeout(timeout_dur, exec_ref.execute(name, &args)).await
-                        {
-                            Ok(result) => PreExecutionResult::Completed(result),
-                            Err(_) => PreExecutionResult::TimedOut,
-                        }
-                    }
-                })
-                .collect();
-            futures_util::future::join_all(futs).await
-        } else {
-            Vec::new()
-        };
-
-        for (tc_idx, tc_event) in turn_result.tool_calls.iter().enumerate() {
-            // Step-level timeout: abort remaining tools if step time exceeded
+        for item in &indices {
             let step_elapsed_ms = step_start_time.elapsed().as_millis() as u64;
             if step_elapsed_ms > step_timeout_ms {
-                // Collect names of aborted tools for health tracking
-                let aborted_count = turn_result.tool_calls.len() - tool_results.len();
-                let aborted_tools: Vec<String> = turn_result.tool_calls[tool_results.len()..]
+                let aborted_count = indices.len() - tool_results.len();
+                let aborted_tools: Vec<String> = indices[tool_results.len()..]
                     .iter()
-                    .filter_map(|tc| tc.get("name").and_then(|v| v.as_str()).map(String::from))
+                    .map(|it| match it {
+                        RoundToolItem::ServerTc(i) => turn_result.tool_calls[*i]
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        RoundToolItem::Synthetic(i) => turn_result.edge_tool_round[*i].tool.clone(),
+                    })
                     .collect();
                 agent_warn!(
                     "step",
@@ -1586,67 +1620,43 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 break;
             }
 
-            let id = tc_event
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let name = tc_event
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let args_raw = tc_event
-                .get("arguments")
-                .cloned()
-                .unwrap_or(serde_json::Value::Object(Default::default()));
-            let args = match args_raw {
-                serde_json::Value::String(s) => {
-                    serde_json::from_str::<serde_json::Value>(&s).unwrap_or_else(|_| {
-                        serde_json::Value::Object(Default::default())
-                    })
+            let (id, name, args, from_synthetic) = match item {
+                RoundToolItem::ServerTc(i) => {
+                    let tc_event = &turn_result.tool_calls[*i];
+                    let id = tc_event
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = tc_event
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let args_raw = tc_event
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Object(Default::default()));
+                    let args = match args_raw {
+                        serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(&s)
+                            .unwrap_or_else(|_| serde_json::Value::Object(Default::default())),
+                        other => other,
+                    };
+                    (id, name, args, false)
                 }
-                other => other,
+                RoundToolItem::Synthetic(i) => {
+                    let e = &turn_result.edge_tool_round[*i];
+                    (
+                        format!("edge-{i}"),
+                        e.tool.clone(),
+                        e.args.clone(),
+                        true,
+                    )
+                }
             };
 
-            // Already satisfied via SSE `tool_request` + post_tool_result (§5.5 headless path)
-            let edge_sig = tool_dedup_signature(&name, &args);
-            if let Some(cached) = turn_result.edge_callback_outputs.get(&edge_sig) {
-                let note = format!("(edge callback — same tool+args as tool_request)\n{cached}");
-                if !quiet {
-                    eprintln!(
-                        "{}",
-                        format!("  ↻ {name} (edge_callback_outputs)").dim()
-                    );
-                }
-                messages.push(serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": id,
-                    "content": note,
-                }));
-                tool_results.push(serde_json::json!({
-                    "tool_call_id": id,
-                    "name": name,
-                    "result": note,
-                }));
-                tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
-                    name: name.clone(),
-                    ok: true,
-                    ms: 0,
-                    error: Some("edge_callback_dedup".to_string()),
-                    input_bytes: None,
-                    output_bytes: Some(note.len() as u32),
-                    args_preview: make_args_preview(&name, &args),
-                });
-                let call_sig = normalize_call_sig(&name, &args);
-                seen_calls.insert(call_sig);
-                continue;
-            }
-
-            // Skip exact duplicate (same tool + same args) within this turn
             let call_sig = normalize_call_sig(&name, &args);
             if !seen_calls.insert(call_sig.clone()) {
-                // Already ran this exact call this turn
                 let cached_tr = serde_json::json!({
                     "tool_call_id": id,
                     "name": name,
@@ -1670,7 +1680,6 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 continue;
             }
 
-            // Cross-turn dedup: for idempotent tools, check IdempotencyCache
             let idem_key = IdempotencyKey::semantic(&name, &args);
             if CACHEABLE_TOOLS.contains(&name.as_str())
                 && let Some(cached) = idempotency_cache.check(&idem_key)
@@ -1692,7 +1701,6 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     "name": name,
                     "result": cached_note,
                 }));
-                // Record cache hit with full slot tracking
                 let cache_key = idem_key.cache_key();
                 step_recorder.begin_tool_with_key(&name, &id, Some(&cache_key));
                 step_recorder.record_cache_hit(&name, cached.clone());
@@ -1709,7 +1717,21 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 continue;
             }
 
-            // Validate tool name against known schemas
+            let mut result_str = if from_synthetic {
+                match item {
+                    RoundToolItem::Synthetic(i) => turn_result.edge_tool_round[*i].output.clone(),
+                    _ => unreachable!(),
+                }
+            } else {
+                take_edge_output_for_tool_call(
+                    &name,
+                    &args,
+                    &turn_result.edge_tool_round,
+                    &mut consumed_edge,
+                    by_sig,
+                )
+            };
+
             if !valid_tool_names.contains(&name) {
                 let err_msg = format!(
                     "Unknown tool '{}'. Available: {}",
@@ -1749,36 +1771,16 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 continue;
             }
 
-            if !perm_manager.check(&name, &args) {
-                let denied_tr = serde_json::json!({
-                    "tool_call_id": id,
-                    "name": name,
-                    "result": "Permission denied",
-                });
-                messages.push(serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": id,
-                    "content": "Permission denied",
-                }));
-                tool_results.push(denied_tr);
-                tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
-                    name: name.clone(),
-                    ok: false,
-                    ms: 0,
-                    error: Some("permission_denied".to_string()),
-                    input_bytes: None,
-                    output_bytes: None,
-                    args_preview: make_args_preview(&name, &args),
-                });
-                continue;
-            }
+            result_str = hydrate_reflect_placeholder_if_needed(
+                api,
+                token,
+                current_session_id.as_ref(),
+                &name,
+                &args,
+                result_str,
+            )
+            .await;
 
-            // Start spinner
-            let spinner = if !quiet {
-                Some(Spinner::start(format!("  ● {name}")))
-            } else {
-                None
-            };
             let tool_start = Instant::now();
             let tool_idem_key = if CACHEABLE_TOOLS.contains(&name.as_str()) {
                 Some(idem_key.cache_key())
@@ -1787,96 +1789,16 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             };
             step_recorder.begin_tool_with_key(&name, &id, tool_idem_key.as_deref());
 
-            // Enforce per-tool timeout from scheduling contract,
-            // reconciled with RuntimeLimits for the more restrictive policy.
-            let contract = step_recorder.scheduling();
-            let limits = RuntimeLimits::global();
-            let tool_timeout_ms = contract.effective_tool_timeout_ms(tool_count);
-            let effective_retries = (contract.max_retries as usize).min(limits.max_tool_retries);
-            let mut tool_timed_out = false;
-
-            // Use pre-computed parallel result if available, else execute live
-            let mut result_str = match pre_results.get(tc_idx) {
-                Some(PreExecutionResult::Completed(pre)) => pre.clone(),
-                Some(PreExecutionResult::TimedOut) => {
-                    tool_timed_out = true;
-                    turn_guard.record_tool_timeout(&name);
-                    tool_timeout_message(&name, per_tool_timeout_ms)
-                }
-                None => {
-                    // Sequential execution (not a parallel batch)
-                    match tokio::time::timeout(
-                        std::time::Duration::from_millis(tool_timeout_ms),
-                        executor.execute(&name, &args),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            tool_timed_out = true;
-                            turn_guard.record_tool_timeout(&name);
-                            tool_timeout_message(&name, tool_timeout_ms)
-                        }
-                    }
-                }
-            };
-
-            // If the `reflect` tool returned a placeholder, call the server.
-            if name == "reflect"
-                && result_str.contains("reflect_requires_session")
-                && let Some(ref sid) = current_session_id
-            {
-                let focus = args.get("focus").and_then(|v| v.as_str()).unwrap_or("auto");
-                let question = args.get("question").and_then(|v| v.as_str()).unwrap_or("");
-                let last_n = args.get("last_n").and_then(|v| v.as_i64()).unwrap_or(20);
-                let mut qp: Vec<String> = Vec::new();
-                if !focus.is_empty() && focus != "auto" {
-                    qp.push(format!("focus={focus}"));
-                }
-                if !question.is_empty() {
-                    qp.push(format!("question={}", urlencoding(question)));
-                }
-                qp.push(format!("last_n={last_n}"));
-                let rel = format!(
-                    "{}?{}",
-                    mo_thin_client::paths::chat_session_reflect(sid).trim_start_matches('/'),
-                    qp.join("&")
-                );
-                match api.get_authed_path_text(token, &rel).await {
-                    Ok(text) => {
-                        result_str = text;
-                    }
-                    Err(mo_thin_client::ThinClientError::Api { status, .. }) => {
-                        result_str = format!("{{\"error\": \"reflect HTTP {status}\"}}");
-                    }
-                    Err(e) => {
-                        result_str = format!("{{\"error\": \"reflect failed: {e}\"}}");
-                    }
-                }
-            }
-            let tool_elapsed = tool_start.elapsed();
             let mut is_err = is_tool_error(&result_str);
+            let tool_already_restricted = restricted_tools.contains(&name);
             let mut resource_limit_recorded = false;
 
-            // Don't count errors from already-restricted tools toward escalation.
-            // The agent shouldn't be calling them (schema removes them), but if
-            // server returns a stale call, the failure is expected, not a new problem.
-            let tool_already_restricted = restricted_tools.contains(&name);
-
-            // Error recovery: classify, retry transient errors, track via TurnGuard.
-            // NOTE: error counting and health recording happen in record_tool_result()
-            // below — do NOT call turn_guard.errors.record_error() here to avoid
-            // double-counting (was a bug: 2 errors looked like 4, triggering premature
-            // escalation). Exception: resource-limit errors are fully handled here
-            // and skipped in record_tool_result() to prevent overwrite.
             if is_err && !tool_already_restricted {
                 use mo_agent_runtime::turn::error_recovery::{
                     build_recovery_message, classify_error,
                 };
                 let category = classify_error(&result_str);
 
-                // Resource-limit errors: immediately block the tool (the whole
-                // system is constrained — retrying only makes things worse)
                 if matches!(
                     category,
                     mo_agent_runtime::turn::error_recovery::ErrorCategory::ResourceLimit
@@ -1893,95 +1815,51 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     }
                 }
 
-                // Automatic retry for transient errors using scheduling contract
-                let mut retried_ok = false;
                 if matches!(
                     category,
                     mo_agent_runtime::turn::error_recovery::ErrorCategory::Transient
                 ) {
-                    for attempt in 0..effective_retries {
-                        let backoff_ms = contract.backoff_ms(attempt as u32);
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                        // Retry with same timeout as original attempt
-                        let retry_result = match tokio::time::timeout(
-                            std::time::Duration::from_millis(tool_timeout_ms),
-                            executor.execute(&name, &args),
-                        )
-                        .await
-                        {
-                            Ok(r) => r,
-                            Err(_) => format!(
-                                "Tool '{}' retry #{} took too long (>{}s)",
-                                name,
-                                attempt + 1,
-                                tool_timeout_ms / 1000
-                            ),
-                        };
-                        if !is_tool_error(&retry_result) {
-                            result_str = retry_result;
-                            retried_ok = true;
-                            turn_guard.errors.record_retry(true);
-                            if !quiet {
-                                eprintln!(
-                                    "{}",
-                                    format!("  ↻ {name} retry #{} succeeded", attempt + 1).green()
-                                );
-                            }
-                            break;
-                        }
-                        turn_guard.errors.record_retry(false);
-                    }
+                    turn_guard.errors.record_retry(false);
                 }
 
-                if !retried_ok {
-                    // Inject structured recovery message with alternatives
-                    let deprioritized = turn_guard.health.deprioritized_tools();
-                    let recovery_msg =
-                        build_recovery_message(&name, &result_str, category, &deprioritized);
-                    result_str.push_str(&format!("\n{recovery_msg}"));
-                }
+                let deprioritized = turn_guard.health.deprioritized_tools();
+                let recovery_msg =
+                    build_recovery_message(&name, &result_str, category, &deprioritized);
+                result_str.push_str(&format!("\n{recovery_msg}"));
             }
 
-            // Resource-limit scan for "successful" tool outputs.
-            // Any process-spawning tool can surface OS errors in stdout/stderr
-            // while returning exit code 0.  Skip already-restricted tools to
-            // avoid cascading double-penalties.
             if !is_err && !tool_already_restricted && is_resource_limit_output(&result_str) {
                 turn_guard.health.record_resource_limit_failure(&name);
                 turn_guard.errors.record_error(
                     mo_agent_runtime::turn::error_recovery::ErrorCategory::ResourceLimit,
                 );
                 restricted_tools.insert(name.clone());
-                is_err = true; // promote to error for downstream tracking
+                is_err = true;
                 resource_limit_recorded = true;
                 if !quiet {
                     eprintln!(
                         "{}",
-                        format!("  ⚠ {name}: resource limit detected in output — tool blocked")
-                            .dim()
+                        format!("  ⚠ {name}: resource limit detected in output — tool blocked").dim()
                     );
                 }
             }
 
-            // Record result in TurnGuard (handles health tracking + quality classification).
-            // Skip if already recorded as timeout or resource-limit — avoid double-counting.
-            let result_quality = if tool_timed_out || resource_limit_recorded {
+            let result_quality = if resource_limit_recorded {
                 mo_agent_runtime::turn::result_quality::ResultQuality::Error
             } else {
                 turn_guard.record_tool_result(&name, &result_str)
             };
 
-            // Inject immediate feedback for empty/truncated results
             if let Some(feedback) = turn_guard.result_feedback(&name, result_quality) {
                 result_str.push_str(&format!("\n{feedback}"));
             }
 
-            // Record per-tool-call audit entry
             let args_size = serde_json::to_string(&args)
                 .map(|s| s.len() as u32)
                 .unwrap_or(0);
             let result_size = result_str.len() as u32;
             let args_preview = make_args_preview(&name, &args);
+            let tool_elapsed = tool_start.elapsed();
             tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
                 name: name.clone(),
                 ok: !is_err,
@@ -2006,7 +1884,6 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 &result_str,
             );
 
-            // Light checkpoint after each tool completion (best-effort, non-blocking)
             if let Some(ref sid) = current_session_id
                 && let Some(light) = step_recorder.build_light_checkpoint()
             {
@@ -2018,44 +1895,53 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 );
             }
 
-            // Stop spinner, print final status with duration
-            if let Some(spinner) = spinner {
-                spinner.stop_clear();
+            if !is_err && CACHEABLE_TOOLS.contains(&name.as_str()) {
+                let cached_result = CachedToolResult {
+                    tool_name: name.clone(),
+                    output: result_str.clone(),
+                    is_error: false,
+                    cached_at: mo_agent_runtime::pipeline::step_protocol::epoch_ms(),
+                };
+                step_recorder.attach_cached_result(cached_result.clone());
+                idempotency_cache.record(&idem_key, cached_result);
+                if let Some((prev_turn, reason)) =
+                    semantic_dedup.check_and_record(&name, &args, &result_str, _turn)
+                {
+                    let hint = format!(
+                        "\n⚠ Note: this result is similar to a previous {} call (turn {}, {}). \
+                         Avoid re-fetching the same information.",
+                        name,
+                        prev_turn + 1,
+                        reason
+                    );
+                    result_str.push_str(&hint);
+                }
             }
-            let duration_str = if tool_elapsed.as_secs_f64() >= 1.0 {
-                format!("{:.1}s", tool_elapsed.as_secs_f64())
-            } else {
-                format!("{}ms", tool_elapsed.as_millis())
-            };
 
-            // Build a brief detail from tool args for the └ line
-            let detail = tool_call_detail(&name, &args);
-            // Build a brief summary from tool result (line counts, match counts, etc.)
-            let summary = if !is_err {
-                tool_result_summary(&name, &result_str)
-            } else {
-                None
-            };
-
-            if is_err {
-                if !quiet {
+            if !quiet {
+                let duration_str = if tool_elapsed.as_secs_f64() >= 1.0 {
+                    format!("{:.1}s", tool_elapsed.as_secs_f64())
+                } else {
+                    format!("{}ms", tool_elapsed.as_millis())
+                };
+                let detail = tool_call_detail(&name, &args);
+                let summary = if !is_err {
+                    tool_result_summary(&name, &result_str)
+                } else {
+                    None
+                };
+                if is_err {
                     eprintln!("{}", format!("  ✗ {name} ({duration_str})").red());
-                }
-                // Show first line of error on └ line
-                if !quiet && let Some(first_line) = result_str.lines().next() {
-                    let preview = if first_line.len() > 100 {
-                        format!("{}…", &first_line[..100])
-                    } else {
-                        first_line.to_string()
-                    };
-                    eprintln!("  {}", format!("└ Error: {preview}").dim());
-                }
-            } else {
-                if !quiet {
+                    if let Some(first_line) = result_str.lines().next() {
+                        let preview = if first_line.len() > 100 {
+                            format!("{}…", &first_line[..100])
+                        } else {
+                            first_line.to_string()
+                        };
+                        eprintln!("  {}", format!("└ Error: {preview}").dim());
+                    }
+                } else {
                     eprintln!("{}", format!("  ✓ {name} ({duration_str})").green());
-                }
-                // Compose └ line: detail + summary
-                if !quiet {
                     match (&detail, &summary) {
                         (Some(d), Some(s)) => {
                             eprintln!("  {}", format!("└ {d}  →  {s}").dim());
@@ -2071,37 +1957,11 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 }
             }
 
-            // Cache successful idempotent tool results via IdempotencyCache
-            if !is_err && CACHEABLE_TOOLS.contains(&name.as_str()) {
-                let cached_result = CachedToolResult {
-                    tool_name: name.clone(),
-                    output: result_str.clone(),
-                    is_error: false,
-                    cached_at: mo_agent_runtime::pipeline::step_protocol::epoch_ms(),
-                };
-                step_recorder.attach_cached_result(cached_result.clone());
-                idempotency_cache.record(&idem_key, cached_result);
-                // Record in semantic tracker for near-duplicate detection in future turns
-                if let Some((prev_turn, reason)) =
-                    semantic_dedup.check_and_record(&name, &args, &result_str, _turn)
-                {
-                    // Inject a hint so the LLM knows it's re-fetching similar data
-                    let hint = format!(
-                        "\n⚠ Note: this result is similar to a previous {} call (turn {}, {}). \
-                         Avoid re-fetching the same information.",
-                        name,
-                        prev_turn + 1,
-                        reason
-                    );
-                    result_str.push_str(&hint);
-                }
-            }
             let tr = serde_json::json!({
                 "tool_call_id": id,
                 "name": name,
                 "result": result_str,
             });
-            // Append tool result as a "tool" role message in history
             messages.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": id,
@@ -2109,17 +1969,14 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             }));
             tool_results.push(tr);
         }
-
         // ── Intent drift detection ──
         // Track per-turn tool names + args, detect when agent drifts from user's query
         {
-            let turn_names: Vec<String> = turn_result
-                .tool_calls
+            let turn_names: Vec<String> = tool_calls_for_guard
                 .iter()
                 .filter_map(|tc| tc.get("name").and_then(|v| v.as_str()).map(String::from))
                 .collect();
-            let turn_args_text: String = turn_result
-                .tool_calls
+            let turn_args_text: String = tool_calls_for_guard
                 .iter()
                 .filter_map(|tc| {
                     tc.get("arguments")
@@ -3302,118 +3159,5 @@ if let Err(e) = writeln!(file, "{line}") {
         assert!(restored.error.is_none());
         // error field should be absent when None (skip_serializing_if)
         assert!(!json.contains("error"));
-    }
-
-    // ── PARALLEL_SAFE_TOOLS classification ──
-
-    #[test]
-    fn parallel_safe_includes_all_read_only_tools() {
-        let must_be_parallel = [
-            "read_file",
-            "list_dir",
-            "glob",
-            "grep",
-            "git_status",
-            "git_diff",
-            "git_log",
-            "github_list_prs",
-            "github_get_pr",
-            "memory_retrieve",
-            "memory_search",
-            "web_fetch",
-        ];
-        for tool in &must_be_parallel {
-            assert!(
-                PARALLEL_SAFE_TOOLS.contains(tool),
-                "{tool} should be parallel-safe"
-            );
-        }
-    }
-
-    #[test]
-    fn parallel_safe_excludes_mutating_tools() {
-        let must_not_be_parallel = [
-            "bash",
-            "write_file",
-            "str_replace",
-            "delete_file",
-            "multi_edit",
-            "git_commit",
-            "git_stash",
-            "git_checkout_file",
-            "memory_store",
-            "memory_purge",
-            "memory_correct",
-            "github_create_issue",
-            "run_build_test",
-        ];
-        for tool in &must_not_be_parallel {
-            assert!(
-                !PARALLEL_SAFE_TOOLS.contains(tool),
-                "{tool} should NOT be parallel-safe"
-            );
-        }
-    }
-
-    #[test]
-    fn parallel_batch_detection_requires_two_plus() {
-        // Single tool → no parallel batch
-        let single = [serde_json::json!({"name": "read_file", "arguments": {}})];
-        let is_parallel = single.len() > 1
-            && single.iter().all(|tc| {
-                tc.get("name")
-                    .and_then(|v| v.as_str())
-                    .map(|n| PARALLEL_SAFE_TOOLS.contains(&n))
-                    .unwrap_or(false)
-            });
-        assert!(
-            !is_parallel,
-            "single tool should not trigger parallel batch"
-        );
-    }
-
-    #[test]
-    fn parallel_batch_detects_all_safe_tools() {
-        let batch = [
-            serde_json::json!({"name": "read_file", "arguments": {"path": "a.rs"}}),
-            serde_json::json!({"name": "glob", "arguments": {"pattern": "*.rs"}}),
-            serde_json::json!({"name": "web_fetch", "arguments": {"url": "https://example.com"}}),
-        ];
-        let is_parallel = batch.len() > 1
-            && batch.iter().all(|tc| {
-                tc.get("name")
-                    .and_then(|v| v.as_str())
-                    .map(|n| PARALLEL_SAFE_TOOLS.contains(&n))
-                    .unwrap_or(false)
-            });
-        assert!(
-            is_parallel,
-            "all read-only tools should trigger parallel batch"
-        );
-    }
-
-    #[test]
-    fn parallel_batch_rejected_with_mutating_tool() {
-        let batch = [
-            serde_json::json!({"name": "read_file", "arguments": {"path": "a.rs"}}),
-            serde_json::json!({"name": "bash", "arguments": {"command": "echo hi"}}),
-        ];
-        let is_parallel = batch.len() > 1
-            && batch.iter().all(|tc| {
-                tc.get("name")
-                    .and_then(|v| v.as_str())
-                    .map(|n| PARALLEL_SAFE_TOOLS.contains(&n))
-                    .unwrap_or(false)
-            });
-        assert!(!is_parallel, "bash should prevent parallel batch");
-    }
-
-    #[test]
-    fn tool_timeout_message_uses_provided_timeout() {
-        let pre_exec = tool_timeout_message("web_fetch", 2_000);
-        let sequential = tool_timeout_message("web_fetch", 9_000);
-
-        assert!(pre_exec.contains(">2s"));
-        assert!(sequential.contains(">9s"));
     }
 }

@@ -6,16 +6,11 @@ pub(super) struct ReplTurnContext<'a> {
     pub(super) selector: &'a dyn tool_selector::ToolSelector,
 }
 
-/// Enqueue a journal event for async cloud ingestion (if sender is available).
+/// Enqueue a journal event for async cloud ingestion (if matrix runtime is available).
 fn enqueue_ingestion(state: &ReplState, event: &session_journal::JournalEvent) {
-    if let Some(ref sender) = state.ingestion_sender {
-        let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
-        // Expand: Turn events with tool_call_records produce individual tool_call
-        // events alongside the main turn event, ensuring DB-level tool granularity.
-        for ingestion_event in event_ingestion::IngestionEvent::expand_journal_event(event, user_id)
-        {
-            sender.enqueue(ingestion_event);
-        }
+    let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
+    if let Some(mc) = state.matrix_runtime.as_ref() {
+        mc.enqueue_journal_events(user_id, event);
     }
 }
 
@@ -397,9 +392,9 @@ fn apply_turn_success(
                 let _ = mo_agent_services::session_checkpoint::write_checkpoint(sid, &cp);
 
                 // Push checkpoint to MatrixOne for cross-device availability
-                if let Some(ref pool) = state.matrixone_pool {
+                if let Some(ref mc) = state.matrix_runtime {
                     let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
-                    let pool = pool.clone();
+                    let pool = mc.shared_pool().get().clone();
                     let sid_owned = sid.to_string();
                     let user_id_owned = user_id.to_string();
                     let cp_clone = cp.clone();
@@ -425,12 +420,12 @@ fn apply_turn_success(
             }
 
             // Push Step Protocol heavy checkpoint to MatrixOne (full state for recovery)
-            if let Some(ref pool) = state.matrixone_pool
+            if let Some(ref mc) = state.matrix_runtime
                 && let Some(ref step_cp) = result.last_heavy_checkpoint
                 && let Ok(state_json) = serde_json::to_string(step_cp)
             {
                 let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
-                let pool = pool.clone();
+                let pool = mc.shared_pool().get().clone();
                 let sid_owned = sid.to_string();
                 let user_id_owned = user_id.to_string();
                 let cp_number = result
@@ -474,13 +469,13 @@ fn apply_turn_success(
             }
 
             // Push plan state to cloud at checkpoint boundaries
-            if let Some(ref pool) = state.matrixone_pool
+            if let Some(ref mc) = state.matrix_runtime
                 && mo_agent_services::session_checkpoint::should_checkpoint(
                     ws.turn_count,
                     mo_agent_services::session_checkpoint::CHECKPOINT_INTERVAL,
                 )
             {
-                let pool = pool.clone();
+                let pool = mc.shared_pool().get().clone();
                 let sid_owned = sid.to_string();
                 let plan_json = ws.executing_plan_json.clone();
                 let goal = ws.plan_goal.clone();
@@ -634,14 +629,8 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
         let start_event =
             session_journal::JournalEvent::session_start(Some(session_id), state.model.as_deref());
         let _ = journal.append(&start_event);
-        // Note: ingestion sender may not be ready yet on first call;
-        // enqueue_ingestion silently skips if sender is None
+        // enqueue_ingestion skips if matrix_runtime is None
         enqueue_ingestion(state, &start_event);
-    }
-
-    // Try to spawn the event ingestion worker (async, best-effort)
-    if state.ingestion_sender.is_none() {
-        try_init_ingestion(state);
     }
 
     // Initialize workspace metadata alongside journal
@@ -650,49 +639,6 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
         state.model.as_deref().unwrap_or("default"),
     );
     let _ = mo_agent_services::session_workspace::write_workspace(&ws);
-}
-
-/// Best-effort spawn of the EventIngestionWorker.
-/// Reads MATRIXONE_* env vars; if not set, ingestion is silently disabled.
-fn try_init_ingestion(state: &mut ReplState) {
-    let settings = mo_agent_core::config::MatrixOneSettings {
-        host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".into()),
-        port: std::env::var("MATRIXONE_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6001),
-        user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
-        password: std::env::var("MATRIXONE_PASSWORD")
-            .unwrap_or_else(|_| mo_agent_core::DEV_MATRIXONE_PASSWORD.into()),
-        database: std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "dev_agent".into()),
-    };
-
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-
-    // Spawn a task that connects and stores the sender
-    let (tx, rx) = std::sync::mpsc::channel();
-    handle.spawn(async move {
-        match mo_agent_core::connect_matrixone(&settings).await {
-            Ok(pool) => {
-                let pool_arc = std::sync::Arc::new(pool);
-                let config = event_ingestion::IngestionConfig::default();
-                let (sender, _stats, _handle) =
-                    event_ingestion::EventIngestionWorker::spawn((*pool_arc).clone(), config);
-                let _ = tx.send(Some((sender, pool_arc)));
-            }
-            Err(_) => {
-                let _ = tx.send(None);
-            }
-        }
-    });
-
-    // Give the pool connection a brief window to complete
-    if let Ok(Some((sender, pool))) = rx.recv_timeout(std::time::Duration::from_secs(3)) {
-        state.ingestion_sender = Some(sender);
-        state.matrixone_pool = Some(pool);
-    }
 }
 
 fn report_turn_error(state: &ReplState, line: &str, error: &str, turn_start: Instant) {

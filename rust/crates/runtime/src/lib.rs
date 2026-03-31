@@ -66,7 +66,10 @@ pub mod evaluation;
 pub mod introspection;
 pub mod pipeline;
 pub mod prompts;
+pub mod matrix_cloud_runtime;
+pub mod plan_decompose;
 pub mod server;
+pub mod sync_adapters;
 pub mod tool_registry;
 pub mod tool_selector;
 pub mod turn;
@@ -249,8 +252,8 @@ pub use turn::{
     },
     state::{new_session_entry, normalize_bridge_cache_entry, resolve_turn_identifiers},
     stream_events::{
-        build_edge_tool_call_event, build_firewall_warning_event, build_runtime_error_event,
-        build_stream_error_event,
+        build_approval_required_event, build_edge_tool_call_event, build_firewall_warning_event,
+        build_runtime_error_event, build_stream_error_event, build_tool_request_event,
     },
     tail_persist::{
         build_cached_assistant_message, build_persist_thread_args, build_turn_hook_args,
@@ -263,4 +266,8 @@ pub use turn::{
         RetrievalPlan, build_recent_retrieval_tail, compose_retrieval_view,
         extract_latest_user_query, plan_retrieval_inputs,
     },
+};
+
+pub use matrix_cloud_runtime::{
+    MatrixCloudRuntime, build_sync_orchestrator_with_adapters, matrix_settings_from_env,
 };

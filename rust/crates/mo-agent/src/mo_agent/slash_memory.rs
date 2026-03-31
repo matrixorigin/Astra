@@ -1,4 +1,5 @@
 use super::*;
+use mo_agent_runtime::plan_decompose;
 
 pub(super) async fn handle_memory_domain_command(
     cmd: &str,
@@ -137,7 +138,7 @@ pub(super) async fn handle_memory_domain_command(
             match subcmd {
                 // Toggle: /plan with no args enters or exits plan mode
                 "" => {
-                    use super::plan_decompose::{
+                    use plan_decompose::{
                         PlanModeState, format_plan, format_plan_entry_card,
                     };
 
@@ -181,7 +182,7 @@ pub(super) async fn handle_memory_domain_command(
                         // Create empty plan mode state - user will provide goal via conversation
                         let project_root = std::env::current_dir()
                             .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                        let context = super::plan_decompose::analyze_project(&project_root);
+                        let context = plan_decompose::analyze_project(&project_root);
                         state.plan_mode = Some(PlanModeState::new(String::new(), context));
                         eprintln!(
                             "  {} Entered plan mode. Describe your goal to start planning.",
@@ -273,7 +274,7 @@ pub(super) async fn handle_memory_domain_command(
                     let project_root =
                         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                     eprintln!("  {} Analyzing project structure...", "⋯".dim());
-                    let context = crate::plan_decompose::analyze_project(&project_root);
+                    let context = plan_decompose::analyze_project(&project_root);
 
                     eprintln!(
                         "  {} {} languages, {} files, {}",
@@ -284,7 +285,7 @@ pub(super) async fn handle_memory_domain_command(
                     );
 
                     // Generate the decomposition prompt
-                    let prompt = crate::plan_decompose::decomposition_prompt(sub_arg, &context);
+                    let prompt = plan_decompose::decomposition_prompt(sub_arg, &context);
 
                     // Store the goal in plan memory
                     let entry = prompts::memory_proto::MemoryEntry::new(
@@ -345,10 +346,10 @@ pub(super) async fn handle_memory_domain_command(
                             eprintln!(); // End streaming output
 
                             // Parse the plan from the response
-                            match crate::plan_decompose::parse_plan_response(&full_text) {
+                            match plan_decompose::parse_plan_response(&full_text) {
                                 Ok(plan) => {
                                     eprintln!();
-                                    eprint!("{}", crate::plan_decompose::format_plan(&plan));
+                                    eprint!("{}", plan_decompose::format_plan(&plan));
                                 }
                                 Err(e) => {
                                     eprintln!(
@@ -387,7 +388,7 @@ pub(super) async fn handle_memory_domain_command(
                 }
                 "enter" if !sub_arg.is_empty() => {
                     // Enter interactive plan mode (Kiro-style)
-                    use super::plan_decompose::{
+                    use plan_decompose::{
                         PlanModeState, analyze_project, decomposition_prompt, format_plan,
                         parse_plan_response,
                     };
@@ -489,7 +490,7 @@ pub(super) async fn handle_memory_domain_command(
                 }
                 "resume" => {
                     // Resume plan mode from saved state
-                    use super::plan_decompose::{PlanModeState, format_plan};
+                    use plan_decompose::{PlanModeState, format_plan};
                     let path = PlanModeState::state_path();
                     match PlanModeState::load_from_file(&path) {
                         Ok(ps) => {
@@ -516,7 +517,7 @@ pub(super) async fn handle_memory_domain_command(
                 "exit" => {
                     if state.plan_mode.is_some() {
                         state.plan_mode = None;
-                        super::plan_decompose::PlanModeState::clear_saved_state();
+                        plan_decompose::PlanModeState::clear_saved_state();
                         eprintln!("  {} Exited plan mode", "✓".green());
                     } else {
                         eprintln!("  ⚠️ Not in plan mode");
@@ -579,7 +580,7 @@ pub(super) async fn handle_memory_domain_command(
                 "load" if !sub_arg.is_empty() => {
                     // Load a specific plan from cloud by task_id (or prefix)
                     if let Some(ref svc) = state.task_service {
-                        use super::plan_decompose::{PlanModeState, analyze_project, format_plan};
+                        use plan_decompose::{PlanModeState, analyze_project, format_plan};
                         use mo_agent_services::TaskService;
 
                         let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
@@ -647,9 +648,9 @@ pub(super) async fn handle_memory_domain_command(
                     }
                 }
                 "list" => {
-                    let plans = crate::plan_decompose::list_saved_plans();
-                    let templates = crate::plan_decompose::builtin_templates();
-                    eprintln!("{}", crate::plan_decompose::format_plan_list(&plans));
+                    let plans = plan_decompose::list_saved_plans();
+                    let templates = plan_decompose::builtin_templates();
+                    eprintln!("{}", plan_decompose::format_plan_list(&plans));
                     eprintln!("  {} Built-in templates:", "📋".cyan());
                     for t in &templates {
                         eprintln!(
@@ -676,7 +677,7 @@ pub(super) async fn handle_memory_domain_command(
                     } else {
                         "implement this feature"
                     };
-                    match crate::plan_decompose::instantiate_template(name, goal) {
+                    match plan_decompose::instantiate_template(name, goal) {
                         Some(plan) => {
                             eprintln!(
                                 "  {} Template '{}' instantiated with {} subtasks",
@@ -684,12 +685,12 @@ pub(super) async fn handle_memory_domain_command(
                                 name,
                                 plan.subtasks.len()
                             );
-                            eprintln!("{}", crate::plan_decompose::format_plan(&plan));
+                            eprintln!("{}", plan_decompose::format_plan(&plan));
                             // Enter plan mode with this template
                             let project_root = std::env::current_dir()
                                 .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                            let context = crate::plan_decompose::analyze_project(&project_root);
-                            let mut ps = crate::plan_decompose::PlanModeState::new(
+                            let context = plan_decompose::analyze_project(&project_root);
+                            let mut ps = plan_decompose::PlanModeState::new(
                                 goal.to_string(),
                                 context,
                             );
@@ -701,7 +702,7 @@ pub(super) async fn handle_memory_domain_command(
                             );
                         }
                         None => {
-                            let names: Vec<_> = crate::plan_decompose::builtin_templates()
+                            let names: Vec<_> = plan_decompose::builtin_templates()
                                 .iter()
                                 .map(|t| t.name.clone())
                                 .collect();
@@ -1045,7 +1046,7 @@ pub(super) async fn handle_memory_domain_command(
                             match ps.rollback_to_version(version) {
                                 Ok(msg) => {
                                     eprintln!("  {} {}", "✓".green(), msg);
-                                    eprintln!("{}", crate::plan_decompose::format_plan(&ps.plan));
+                                    eprintln!("{}", plan_decompose::format_plan(&ps.plan));
                                 }
                                 Err(e) => eprintln!("  {} {}", "⚠".yellow(), e),
                             }
@@ -1058,7 +1059,7 @@ pub(super) async fn handle_memory_domain_command(
                 }
                 "replan" => {
                     // Regenerate plan based on current state and issues
-                    use super::plan_decompose::{
+                    use plan_decompose::{
                         ReplanReason, detect_replan_needed, format_plan, generate_replan_prompt,
                         parse_plan_response,
                     };
@@ -1141,7 +1142,7 @@ pub(super) async fn handle_memory_domain_command(
                                         &format!("Replan: {}", reason.format()),
                                     );
                                     let _ = ps.save_to_file(
-                                        &super::plan_decompose::PlanModeState::state_path(),
+                                        &plan_decompose::PlanModeState::state_path(),
                                     );
 
                                     eprintln!();
@@ -1187,15 +1188,15 @@ pub(super) async fn handle_memory_domain_command(
                 }
                 "parallel" => {
                     if let Some(ref ps) = state.plan_mode {
-                        let analysis = crate::plan_decompose::analyze_parallelism(&ps.plan);
-                        eprintln!("{}", crate::plan_decompose::format_parallelism(&analysis));
+                        let analysis = plan_decompose::analyze_parallelism(&ps.plan);
+                        eprintln!("{}", plan_decompose::format_parallelism(&analysis));
                     } else {
                         eprintln!("  {} Not in plan mode.", "⚠".yellow());
                     }
                 }
                 "auto" if !sub_arg.is_empty() => {
                     // Auto mode: decompose + preview + execute in one shot
-                    use super::plan_decompose::{
+                    use plan_decompose::{
                         PlanExecutionConfig, analyze_project, decomposition_prompt,
                         format_execution_preview, format_plan, parse_plan_response,
                     };
@@ -1306,7 +1307,7 @@ pub async fn handle_plan_mode_input(
     state: &mut ReplState,
     api: &mo_thin_client::ThinClient,
 ) -> Result<(), String> {
-    use super::plan_decompose::{
+    use plan_decompose::{
         ClarificationAnswer, PendingClarifications, PlanEntryChoice, PlanModeState,
         decomposition_prompt, detect_clarification_questions, format_clarification_question,
         format_plan, format_project_context, parse_clarification_response, parse_plan_entry_choice,
@@ -1710,7 +1711,7 @@ pub async fn handle_plan_mode_input(
 
     // Check for execute command
     if PlanModeState::is_execute_command(&input) {
-        use super::plan_decompose::{PlanExecutionConfig, format_execution_preview};
+        use plan_decompose::{PlanExecutionConfig, format_execution_preview};
 
         let plan = plan_state.plan.clone();
         let goal = plan_state.goal.clone();
@@ -1786,7 +1787,7 @@ pub async fn handle_plan_mode_input(
 
     // Check for step-by-step execute command
     if input.trim().to_lowercase().starts_with("step") || input.trim() == "逐步执行" {
-        use super::plan_decompose::{PlanExecutionConfig, format_execution_preview};
+        use plan_decompose::{PlanExecutionConfig, format_execution_preview};
 
         let plan = plan_state.plan.clone();
         let goal = plan_state.goal.clone();

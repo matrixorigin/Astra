@@ -96,6 +96,91 @@ pub struct ModelRecord {
     pub connectivity: Option<String>,
 }
 
+/// Decrypted credentials for the active (or preferred) row in `infra_llm_models`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedActiveLlmModel {
+    pub model_name: String,
+    pub api_key: String,
+    pub base_url: String,
+    pub provider: String,
+}
+
+/// Resolve the active LLM model from the database for in-process / server-side callers.
+///
+/// If `preferred` is `Some(name)`, selects that model when `is_active = 1`; otherwise uses
+/// the lexicographically first active model. When `pool` is `None`, opens an ephemeral
+/// single-connection pool from `matrixone`.
+pub async fn resolve_active_llm_model(
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    preferred: Option<&str>,
+    pool: Option<&sqlx::Pool<sqlx::MySql>>,
+) -> Result<ResolvedActiveLlmModel, String> {
+    let ephemeral;
+    let pool: &sqlx::Pool<sqlx::MySql> = match pool {
+        Some(p) => p,
+        None => {
+            ephemeral = sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(1)
+                .connect(&matrixone.database_url())
+                .await
+                .map_err(|e| format!("DB connect: {e}"))?;
+            &ephemeral
+        }
+    };
+
+    let row = if let Some(name) = preferred {
+        sqlx::query(
+            "SELECT model_name, api_key_encrypted, base_url, provider \
+             FROM infra_llm_models WHERE model_name = ? AND is_active = 1 LIMIT 1",
+        )
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("DB query: {e}"))?
+    } else {
+        None
+    };
+
+    let row = if row.is_none() {
+        sqlx::query(
+            "SELECT model_name, api_key_encrypted, base_url, provider \
+             FROM infra_llm_models WHERE is_active = 1 ORDER BY model_name LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("DB query fallback: {e}"))?
+    } else {
+        row
+    };
+
+    let row =
+        row.ok_or_else(|| "No active LLM model configured. Run: mo-admin model add".to_string())?;
+
+    let model_name: String = row.try_get("model_name").map_err(|e| e.to_string())?;
+    let encrypted: String = row
+        .try_get("api_key_encrypted")
+        .map_err(|e| e.to_string())?;
+    let base_url: String = row
+        .try_get("base_url")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    let provider: String = row
+        .try_get("provider")
+        .unwrap_or_else(|_| "openai".to_string());
+    let api_key = encryptor
+        .decrypt(&encrypted)
+        .map_err(|e| format!("Decrypt: {e}"))?;
+
+    Ok(ResolvedActiveLlmModel {
+        model_name,
+        api_key,
+        base_url,
+        provider,
+    })
+}
+
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
 #[async_trait]

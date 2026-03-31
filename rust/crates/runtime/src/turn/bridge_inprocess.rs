@@ -3,8 +3,9 @@
 /// Architecture:
 ///   Rust API (dispatch_chat_turn_bridge) injects context into headers:
 ///     x-mo-user-id, x-mo-session-id, x-mo-turn-chain-id, x-mo-user-query-event-id, ...
-///   This bridge reads those headers, calls the LLM, streams SSE back, and persists events.
-use std::{sync::Arc, time::Instant};
+///   This bridge reads those headers, calls the LLM, streams SSE back, persists events, and
+///   for each tool round blocks on [`super::edge_ledger`] until `POST /tools/result` (or timeout).
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use async_stream::stream;
 use axum::body::Body;
@@ -20,8 +21,15 @@ use crate::{
     TurnAuxiliaryEventWriter, TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan,
     TurnHookDbWriter, TurnObserverWorker, TurnReflectionLessonWriter, TurnReflectionStateStore,
     TurnSessionActivityWriter, TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
-    build_edge_tool_call_event, build_explain_event, build_stream_error_event, prompts,
+    build_explain_event, build_stream_error_event, prompts,
+    turn::cloud_tool_delivery::{
+        cloud_tool_requires_approval_for_delivery, sse_maps_through_tool_request,
+        tool_path_hint_for_delivery, wait_approval_ledger_for_tool,
+        wait_tool_result_ledger_for_tool,
+    },
+    turn::edge_ledger::{assistant_message_with_tool_calls, ensure_tool_call_ids},
     turn::persist::{build_tool_call_event_payload, build_tool_result_event_payload},
+    turn::stream_events::build_approval_required_event,
 };
 
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
@@ -55,78 +63,6 @@ fn render_sse(event: &Value) -> Bytes {
 
 fn render_sse_map(event: &Map<String, Value>) -> Bytes {
     render_sse(&Value::Object(event.clone()))
-}
-
-/// Resolve the first active model from DB, returning (model_name, api_key, base_url, provider).
-///
-/// Accepts an optional shared pool. When `None`, creates an ephemeral single-connection
-/// pool (fallback for contexts where AppState is unavailable).
-async fn resolve_active_model(
-    matrixone: &MatrixOneSettings,
-    encryptor: &FernetTokenEncryptor,
-    preferred: Option<&str>,
-    pool: Option<&sqlx::Pool<sqlx::MySql>>,
-) -> Result<(String, String, String, String), String> {
-    // Use shared pool if available; otherwise create ephemeral one
-    let ephemeral;
-    let pool: &sqlx::Pool<sqlx::MySql> = match pool {
-        Some(p) => p,
-        None => {
-            ephemeral = sqlx::mysql::MySqlPoolOptions::new()
-                .max_connections(1)
-                .connect(&matrixone.database_url())
-                .await
-                .map_err(|e| format!("DB connect: {e}"))?;
-            &ephemeral
-        }
-    };
-
-    let row = if let Some(name) = preferred {
-        sqlx::query(
-            "SELECT model_name, api_key_encrypted, base_url, provider \
-             FROM infra_llm_models WHERE model_name = ? AND is_active = 1 LIMIT 1",
-        )
-        .bind(name)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| format!("DB query: {e}"))?
-    } else {
-        None
-    };
-
-    let row = if row.is_none() {
-        sqlx::query(
-            "SELECT model_name, api_key_encrypted, base_url, provider \
-             FROM infra_llm_models WHERE is_active = 1 ORDER BY model_name LIMIT 1",
-        )
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| format!("DB query fallback: {e}"))?
-    } else {
-        row
-    };
-
-    let row =
-        row.ok_or_else(|| "No active LLM model configured. Run: mo-admin model add".to_string())?;
-
-    use sqlx::Row;
-    let model_name: String = row.try_get("model_name").map_err(|e| e.to_string())?;
-    let encrypted: String = row
-        .try_get("api_key_encrypted")
-        .map_err(|e| e.to_string())?;
-    let base_url: String = row
-        .try_get("base_url")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-    let provider: String = row
-        .try_get("provider")
-        .unwrap_or_else(|_| "openai".to_string());
-    let api_key = encryptor
-        .decrypt(&encrypted)
-        .map_err(|e| format!("Decrypt: {e}"))?;
-
-    Ok((model_name, api_key, base_url, provider))
 }
 
 /// Parse SSE data lines from a streaming response body.
@@ -164,7 +100,6 @@ const LLM_RETRY_BASE_MS: u64 = 1000;
 // ── System Prompt Cache ──────────────────────────────────────────────────────
 // The system prompt is ~1.2K tokens and identical for most turns within a session
 // (same tool set, same task type, same profile/learned hints). Cache by tool/task/confidence/profile.
-use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 fn prompt_cache() -> &'static Mutex<HashMap<u64, String>> {
@@ -569,6 +504,8 @@ pub struct InProcessChatTurnBridge {
     pub shared_pool: Option<Arc<sqlx::Pool<sqlx::MySql>>>,
     /// Pipeline learning writer — auto-updates EntityGraph/PatternLibrary/Calibrator.
     pub turn_learning_writer: Option<Arc<dyn crate::TurnLearningWriter>>,
+    /// Same `Arc` as [`crate::AppState::edge_callback_ledger`] — bridge takes tool callbacks here.
+    pub edge_callback_ledger: Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
 }
 
 impl InProcessChatTurnBridge {
@@ -578,6 +515,7 @@ impl InProcessChatTurnBridge {
             encryptor,
             shared_pool: None,
             turn_learning_writer: None,
+            edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -588,6 +526,14 @@ impl InProcessChatTurnBridge {
 
     pub fn with_learning_writer(mut self, writer: Arc<dyn crate::TurnLearningWriter>) -> Self {
         self.turn_learning_writer = Some(writer);
+        self
+    }
+
+    pub fn with_edge_callback_ledger(
+        mut self,
+        ledger: Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+    ) -> Self {
+        self.edge_callback_ledger = ledger;
         self
     }
 }
@@ -658,22 +604,56 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
         let encryptor = self.encryptor.clone();
         let shared_pool = self.shared_pool.clone();
         let turn_learning_writer = self.turn_learning_writer.clone();
+        let edge_callback_ledger = self.edge_callback_ledger.clone();
+
+        #[cfg(feature = "bridge-e2e-hooks")]
+        let bridge_e2e_for_stream: Option<Vec<Value>> =
+            if crate::turn::bridge_e2e_hooks::authorized(headers) {
+                payload
+                    .get("test_llm_rounds")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+            } else {
+                None
+            };
+        #[cfg(not(feature = "bridge-e2e-hooks"))]
+        let bridge_e2e_for_stream: Option<Vec<Value>> = None;
+
+        let bridge_e2e_capture = bridge_e2e_for_stream.clone();
 
         let stream = stream! {
             let turn_started = Instant::now();
             // Emit session_info first
             yield render_sse(&json!({"type": "session_info", "session_id": session_id}));
 
-            // Resolve LLM model
+            let bridge_e2e = bridge_e2e_capture;
+            let use_e2e_llm = bridge_e2e.as_ref().map(|r| !r.is_empty()).unwrap_or(false);
+
+            // Resolve LLM model (skipped when `test_llm_rounds` drives the turn — feature `bridge-e2e-hooks`).
             let pool_ref = shared_pool.as_deref();
-            let (model_name, api_key, base_url, provider) =
-                match resolve_active_model(&matrixone, &encryptor, model_override.as_deref(), pool_ref).await {
-                    Ok(m) => m,
+            let (model_name, api_key, base_url, provider) = if use_e2e_llm {
+                (
+                    "bridge-e2e-mock".to_string(),
+                    "unused".to_string(),
+                    "http://127.0.0.1:1".to_string(),
+                    "openai".to_string(),
+                )
+            } else {
+                match mo_agent_services::resolve_active_llm_model(
+                    &matrixone,
+                    encryptor.as_ref(),
+                    model_override.as_deref(),
+                    pool_ref,
+                )
+                .await
+                {
+                    Ok(m) => (m.model_name, m.api_key, m.base_url, m.provider),
                     Err(e) => {
                         yield render_sse_map(&build_stream_error_event(&e, "MODEL_NOT_AVAILABLE", false));
                         return;
                     }
-                };
+                }
+            };
 
             // Build LLM messages: system prompt + history + current messages + tool results
             let mut llm_messages: Vec<Value> = Vec::new();
@@ -810,77 +790,117 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
 
             llm_messages.extend(merged_messages);
 
-            // Cloud loop: call LLM, handle tool calls
+            // Cloud loop: every tool round waits on §5.5 ledger (`POST /tools/result`) then continues LLM.
+            let mut merged_tool_results: Vec<Value> = tool_results.clone();
+
             let mut full_text = String::new();
-            let mut final_tool_calls: Vec<Value> = Vec::new();
+            let mut all_round_tool_calls: Vec<Value> = Vec::new();
             let mut reasoning = String::new();
             let mut usage = Map::new();
             let mut resolved_model = model_name.clone();
-            let cloud_loop_turns: i64 = 1;
+            let mut cloud_loop_turns: i64 = 0;
             let mut llm_steps: Vec<Value> = Vec::new();
 
             let llm_started = Instant::now();
-            // Compute max output tokens from model budget
             let budget = crate::prompts::budget_for_model(Some(&model_name));
-            let max_output_tokens = (budget.model_limit as f64 * budget.output_reserve_ratio) as usize;
-            // Prune tool schemas under token pressure
+            let max_output_tokens =
+                (budget.model_limit as f64 * budget.output_reserve_ratio) as usize;
             let pruned_tools = prune_tool_schemas(&edge_tools, tier);
-            {
-                let llm_stream = match call_llm_stream(
-                    &llm_messages,
-                    &pruned_tools,
-                    &model_name,
-                    &api_key,
-                    &base_url,
-                    &provider,
-                    Some(max_output_tokens),
-                )
-                .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let kind = classify_llm_error(&e);
-                        yield render_sse_map(&build_stream_error_event(&e, kind, kind != "internal"));
-                        return;
-                    }
-                };
+            let ledger_wait = std::time::Duration::from_secs_f64(turn_timeout_s().max(1.0));
+            let max_rounds = crate::turn::routing::max_tool_rounds();
+            let round_limit: i64 = if use_e2e_llm {
+                bridge_e2e
+                    .as_ref()
+                    .map(|r| (r.len() as i64).clamp(1, max_rounds))
+                    .unwrap_or(1)
+            } else {
+                max_rounds
+            };
 
-                tokio::pin!(llm_stream);
+            for round_ix in 0i64..round_limit {
+                cloud_loop_turns += 1;
 
                 let loop_started = Instant::now();
                 let mut loop_tool_calls: Vec<Value> = Vec::new();
                 let mut loop_text = String::new();
                 let mut loop_reasoning = String::new();
 
-                while let Some(bytes) = llm_stream.next().await {
-                    // Parse the SSE event
-                    let text = String::from_utf8_lossy(&bytes);
-                    if let Some(data) = text.strip_prefix("data: ")
-                        && let Ok(event) = serde_json::from_str::<Value>(data.trim()) {
-                            let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
-                            match event_type {
-                                "_inprocess_summary" => {
-                                    // Internal summary — extract data, don't forward
-                                    loop_text = event.get("full_text").and_then(Value::as_str).unwrap_or("").to_string();
-                                    loop_reasoning = event.get("reasoning").and_then(Value::as_str).unwrap_or("").to_string();
-                                    loop_tool_calls = event.get("tool_calls").and_then(Value::as_array).cloned().unwrap_or_default();
-                                    if let Some(u) = event.get("usage").and_then(Value::as_object) {
-                                        usage = u.clone();
-                                    }
-                                    if let Some(m) = event.get("model_used").and_then(Value::as_str) {
-                                        resolved_model = m.to_string();
-                                    }
-                                }
-                                "text_delta" | "reasoning_delta" | "tool_call_start" | "usage" => {
-                                    // Forward to client
-                                    yield bytes;
-                                }
-                                _ => {}
-                            }
+                let e2e_round: Option<&Value> = if use_e2e_llm {
+                    bridge_e2e
+                        .as_ref()
+                        .and_then(|r| r.get(round_ix as usize))
+                } else {
+                    None
+                };
+
+                if let Some(round_val) = e2e_round {
+                    #[cfg(feature = "bridge-e2e-hooks")]
+                    {
+                        let (t, r, tc, u_delta) =
+                            crate::turn::bridge_e2e_hooks::parse_llm_round(round_val);
+                        loop_text = t;
+                        loop_reasoning = r;
+                        loop_tool_calls = tc;
+                        for (k, v) in u_delta {
+                            usage.insert(k, v);
                         }
+                    }
+                    #[cfg(not(feature = "bridge-e2e-hooks"))]
+                    {
+                        let _ = round_val;
+                    }
+                } else {
+                    let llm_stream = match call_llm_stream(
+                        &llm_messages,
+                        &pruned_tools,
+                        &model_name,
+                        &api_key,
+                        &base_url,
+                        &provider,
+                        Some(max_output_tokens),
+                    )
+                    .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let kind = classify_llm_error(&e);
+                            yield render_sse_map(&build_stream_error_event(&e, kind, kind != "internal"));
+                            return;
+                        }
+                    };
+
+                    tokio::pin!(llm_stream);
+
+                    while let Some(bytes) = llm_stream.next().await {
+                        let text = String::from_utf8_lossy(&bytes);
+                        if let Some(data) = text.strip_prefix("data: ")
+                            && let Ok(event) = serde_json::from_str::<Value>(data.trim()) {
+                                let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+                                match event_type {
+                                    "_inprocess_summary" => {
+                                        loop_text = event.get("full_text").and_then(Value::as_str).unwrap_or("").to_string();
+                                        loop_reasoning = event.get("reasoning").and_then(Value::as_str).unwrap_or("").to_string();
+                                        loop_tool_calls = event.get("tool_calls").and_then(Value::as_array).cloned().unwrap_or_default();
+                                        if let Some(u) = event.get("usage").and_then(Value::as_object) {
+                                            usage = u.clone();
+                                        }
+                                        if let Some(m) = event.get("model_used").and_then(Value::as_str) {
+                                            resolved_model = m.to_string();
+                                        }
+                                    }
+                                    "text_delta" | "reasoning_delta" | "tool_call_start" | "usage" => {
+                                        yield bytes;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                    }
                 }
 
                 full_text.push_str(&loop_text);
+                if use_e2e_llm && !loop_text.trim().is_empty() {
+                    yield render_sse(&json!({"type": "text_delta", "content": loop_text}));
+                }
                 if !loop_reasoning.is_empty() {
                     reasoning.push_str(&loop_reasoning);
                 }
@@ -893,20 +913,65 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 }));
 
                 if loop_tool_calls.is_empty() {
-                    // Final text answer — done
-                } else {
-                    // All tool calls are edge tools — emit to client
-                    final_tool_calls = loop_tool_calls;
+                    break;
                 }
-            }
-            let llm_duration_ms = llm_started.elapsed().as_millis() as i64;
 
-            // Emit edge tool calls to client
-            for tc in &final_tool_calls {
-                if let Some(tc_map) = tc.as_object() {
-                    yield render_sse_map(&build_edge_tool_call_event(tc_map));
+                ensure_tool_call_ids(&mut loop_tool_calls);
+
+                all_round_tool_calls.extend(loop_tool_calls.iter().cloned());
+
+                llm_messages.push(assistant_message_with_tool_calls(&loop_tool_calls));
+                for tc in loop_tool_calls.iter() {
+                    let Some(tc_map) = tc.as_object() else {
+                        continue;
+                    };
+                    let id = tc_map.get("id").and_then(Value::as_str).unwrap_or("");
+                    let tool_name = tc_map
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+
+                    if cloud_tool_requires_approval_for_delivery(tc) {
+                        let path = tool_path_hint_for_delivery(tc);
+                        yield render_sse_map(&build_approval_required_event(
+                            id,
+                            tool_name,
+                            path.as_deref(),
+                        ));
+                        match wait_approval_ledger_for_tool(
+                            &edge_callback_ledger,
+                            &user_id,
+                            tc,
+                            ledger_wait,
+                        )
+                        .await
+                        {
+                            Ok(()) => {}
+                            Err(part) => {
+                                merged_tool_results.extend(part.persist_tool_results);
+                                llm_messages.extend(part.tool_messages);
+                                continue;
+                            }
+                        }
+                    }
+
+                    for m in sse_maps_through_tool_request(tc) {
+                        yield render_sse_map(&m);
+                    }
+                    let tail = wait_tool_result_ledger_for_tool(
+                        &edge_callback_ledger,
+                        &user_id,
+                        tc,
+                        ledger_wait,
+                    )
+                    .await;
+                    merged_tool_results.extend(tail.persist_tool_results);
+                    llm_messages.extend(tail.tool_messages);
                 }
             }
+
+            let llm_duration_ms = llm_started.elapsed().as_millis() as i64;
 
             // Persist events (fire-and-forget)
             let user_content = messages.iter()
@@ -914,7 +979,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 .and_then(|m| m.get("content").and_then(Value::as_str))
                 .map(ToString::to_string);
 
-            let has_tool_calls = !final_tool_calls.is_empty();
+            let has_tool_calls = !all_round_tool_calls.is_empty();
             let llm_content = full_text.trim().to_string();
             let should_persist_llm = !llm_content.is_empty() || has_tool_calls;
 
@@ -955,7 +1020,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             // Build tool event records for persistence
             let tool_event_plan = {
                 let mut events = Vec::new();
-                for (index, tool_call) in final_tool_calls.iter().enumerate() {
+                for (index, tool_call) in all_round_tool_calls.iter().enumerate() {
                     if let Some(tc) = tool_call.as_object() {
                         let payload = build_tool_call_event_payload(tc, index, &reasoning);
                         events.push(TurnToolEventRecord {
@@ -978,7 +1043,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         });
                     }
                 }
-                for tool_result in tool_results.iter() {
+                for tool_result in merged_tool_results.iter() {
                     if let Some(tr) = tool_result.as_object() {
                         let payload =
                             build_tool_result_event_payload(tr, "edge", TOOL_RESULT_AUDIT_CHARS);
@@ -1083,9 +1148,9 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     &user_id,
                     &session_id,
                     &messages,
-                    &tool_results,
+                    &merged_tool_results,
                     &full_text,
-                    &final_tool_calls,
+                    &all_round_tool_calls,
                     None, // context_capture_id
                     Some(&resolved_model),
                     _agent_id.as_deref(),
@@ -1137,7 +1202,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             }
 
             if explain {
-                let tool_selection = final_tool_calls
+                let tool_selection = all_round_tool_calls
                     .first()
                     .and_then(Value::as_object)
                     .and_then(|tool_call| tool_call.get("function"))
@@ -1151,7 +1216,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         "duration_ms": llm_duration_ms,
                         "in": usage.get("prompt").and_then(Value::as_i64),
                         "out": usage.get("completion").and_then(Value::as_i64),
-                        "tool_calls": final_tool_calls.len(),
+                        "tool_calls": all_round_tool_calls.len(),
                     }));
                 }
                 let aux_tokens_in = usage.get("prompt").and_then(Value::as_i64);
@@ -1206,7 +1271,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     turn_started.elapsed().as_millis() as i64,
                     usage.get("prompt").and_then(Value::as_i64),
                     usage.get("completion").and_then(Value::as_i64),
-                    final_tool_calls.len(),
+                    all_round_tool_calls.len(),
                     edge_tools.len(),
                     tool_selection,
                     llm_steps,
