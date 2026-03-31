@@ -29,7 +29,7 @@ use mo_agent_services::runs::{
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
 use crate::pipeline::step_recorder::StepRecorder;
-use crate::turn::agentic_loop_host::{AgenticLoopState, run_agentic_loop_with_host};
+use crate::turn::agentic_loop_host::{AgenticLoopOutcome, AgenticLoopState, run_agentic_loop_with_host};
 
 use super::run_engine::RunEngine;
 use super::server_loop_host::ServerAgenticLoopHostBuilder;
@@ -569,6 +569,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             "event_type": "run_paused",
             "data": {}
         }));
+        // Drop the write lock before async delegation calls.
+        drop(runs);
+
         // Persist pause
         if let Some(engine) = &self.run_engine {
             let _ = engine
@@ -577,6 +580,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let _ = engine
                 .append_event(&run_id, json!({"event_type": "run_paused", "data": {}}))
                 .await;
+        }
+        // Cascade: pause all delegated sub-runs of this parent.
+        if let Some(de) = &self.delegation_engine {
+            de.pause_children_of(&run_id).await;
         }
         Ok(RunMutationRecord {
             run_id,
@@ -610,12 +617,19 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             "event_type": "run_resumed",
             "data": {}
         }));
+        // Drop the write lock before async delegation calls.
+        drop(runs);
+
         // Persist resume
         if let Some(engine) = &self.run_engine {
             let _ = engine.persist_status(&run_id, "running", None, None).await;
             let _ = engine
                 .append_event(&run_id, json!({"event_type": "run_resumed", "data": {}}))
                 .await;
+        }
+        // Cascade: resume all delegated sub-runs of this parent.
+        if let Some(de) = &self.delegation_engine {
+            de.resume_children_of(&run_id).await;
         }
         Ok(RunMutationRecord {
             run_id,
@@ -755,37 +769,71 @@ impl SubRunExecutor for ServerSubRunExecutor {
             recent_tools: Vec::new(),
             api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
-            cancel_flag: None,
+            cancel_flag: config.pause_flag.clone(),
             delegation_engine: None,
         };
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
 
         match outcome {
-            Ok(_) => Ok(mo_agent_services::coordination::AgentResult {
-                agent_id: config.agent_profile.agent_id,
-                run_id: config.run_id,
-                status: "completed".to_string(),
-                output: if loop_state.final_text.is_empty() {
-                    None
-                } else {
-                    Some(loop_state.final_text)
-                },
-                error: None,
-                prompt_tokens: loop_state.total_prompt,
-                completion_tokens: loop_state.total_completion,
-                tool_calls: loop_state.total_tool_calls,
-            }),
-            Err(err) => Ok(mo_agent_services::coordination::AgentResult {
-                agent_id: config.agent_profile.agent_id,
-                run_id: config.run_id,
-                status: "failed".to_string(),
-                output: None,
-                error: Some(err),
-                prompt_tokens: loop_state.total_prompt,
-                completion_tokens: loop_state.total_completion,
-                tool_calls: loop_state.total_tool_calls,
-            }),
+            Ok(AgenticLoopOutcome::Completed) => {
+                Ok(mo_agent_services::coordination::AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: if loop_state.final_text.is_empty() {
+                        None
+                    } else {
+                        Some(loop_state.final_text)
+                    },
+                    error: None,
+                    prompt_tokens: loop_state.total_prompt,
+                    completion_tokens: loop_state.total_completion,
+                    tool_calls: loop_state.total_tool_calls,
+                })
+            }
+            Ok(AgenticLoopOutcome::Cancelled) => {
+                // Cancelled via pause_flag — report as "paused" so the
+                // delegation engine can distinguish from hard errors.
+                Ok(mo_agent_services::coordination::AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: "paused".to_string(),
+                    output: if loop_state.final_text.is_empty() {
+                        None
+                    } else {
+                        Some(loop_state.final_text)
+                    },
+                    error: None,
+                    prompt_tokens: loop_state.total_prompt,
+                    completion_tokens: loop_state.total_completion,
+                    tool_calls: loop_state.total_tool_calls,
+                })
+            }
+            Ok(AgenticLoopOutcome::Waiting(reason)) => {
+                Ok(mo_agent_services::coordination::AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: "waiting".to_string(),
+                    output: Some(reason),
+                    error: None,
+                    prompt_tokens: loop_state.total_prompt,
+                    completion_tokens: loop_state.total_completion,
+                    tool_calls: loop_state.total_tool_calls,
+                })
+            }
+            Ok(AgenticLoopOutcome::Error(err)) | Err(err) => {
+                Ok(mo_agent_services::coordination::AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: "failed".to_string(),
+                    output: None,
+                    error: Some(err),
+                    prompt_tokens: loop_state.total_prompt,
+                    completion_tokens: loop_state.total_completion,
+                    tool_calls: loop_state.total_tool_calls,
+                })
+            }
         }
     }
 }
@@ -1410,6 +1458,14 @@ mod tests {
         assert!(
             source.contains("/chat/runs/{run_id}/delegations"),
             "Missing delegations list route"
+        );
+        assert!(
+            source.contains("/chat/runs/{run_id}/delegations/pause"),
+            "Missing delegations pause route"
+        );
+        assert!(
+            source.contains("/chat/runs/{run_id}/delegations/resume"),
+            "Missing delegations resume route"
         );
     }
 }

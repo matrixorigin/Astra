@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
@@ -47,6 +48,9 @@ pub struct SubRunConfig {
     pub previous_output: Option<String>,
     /// Context key-value pairs from the delegation request.
     pub context: HashMap<String, serde_json::Value>,
+    /// Cooperative pause flag — checked between turns by the sub-run loop.
+    /// When set to `true`, the sub-run should yield with status "paused".
+    pub pause_flag: Option<Arc<AtomicBool>>,
 }
 
 /// Trait for executing sub-runs as part of a delegation.
@@ -96,12 +100,14 @@ pub struct SubRunRecord {
     pub depth: u32,
 }
 
-/// In-memory tracker for delegation hierarchies.
+/// In-memory tracker for delegation hierarchies and pause state.
 pub struct DelegationTracker {
     /// delegation_id → sub-run records
     delegations: RwLock<HashMap<String, Vec<SubRunRecord>>>,
     /// run_id → parent_run_id (for quick lookups)
     parents: RwLock<HashMap<String, String>>,
+    /// run_id → cooperative pause flag (shared with the sub-run's loop)
+    pause_flags: RwLock<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl DelegationTracker {
@@ -109,6 +115,7 @@ impl DelegationTracker {
         Self {
             delegations: RwLock::new(HashMap::new()),
             parents: RwLock::new(HashMap::new()),
+            pause_flags: RwLock::new(HashMap::new()),
         }
     }
 
@@ -181,6 +188,116 @@ impl DelegationTracker {
             current = parent.clone();
         }
         chain
+    }
+
+    // ── Pause / Resume ──────────────────────────────────────────────────────
+
+    /// Register a cooperative pause flag for a sub-run.
+    ///
+    /// Returns the flag so the caller can pass it into [`SubRunConfig::pause_flag`].
+    pub async fn register_pause_flag(&self, run_id: &str) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.pause_flags
+            .write()
+            .await
+            .insert(run_id.to_string(), flag.clone());
+        flag
+    }
+
+    /// Get the pause flag for a sub-run, if registered.
+    pub async fn get_pause_flag(&self, run_id: &str) -> Option<Arc<AtomicBool>> {
+        self.pause_flags.read().await.get(run_id).cloned()
+    }
+
+    /// Set the pause flag for a single sub-run.
+    /// Returns `true` if the flag existed and was set.
+    pub async fn pause_sub_run(&self, run_id: &str) -> bool {
+        if let Some(flag) = self.pause_flags.read().await.get(run_id) {
+            flag.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear the pause flag for a single sub-run.
+    /// Returns `true` if the flag existed and was cleared.
+    pub async fn resume_sub_run(&self, run_id: &str) -> bool {
+        if let Some(flag) = self.pause_flags.read().await.get(run_id) {
+            flag.store(false, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Pause ALL sub-runs belonging to a delegation.
+    /// Returns the number of sub-runs paused.
+    pub async fn pause_delegation(&self, delegation_id: &str) -> usize {
+        let records = self.get_sub_runs(delegation_id).await;
+        let flags = self.pause_flags.read().await;
+        let mut count = 0;
+        for record in &records {
+            if let Some(flag) = flags.get(&record.run_id) {
+                flag.store(true, Ordering::SeqCst);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Resume ALL sub-runs belonging to a delegation.
+    /// Returns the number of sub-runs resumed.
+    pub async fn resume_delegation(&self, delegation_id: &str) -> usize {
+        let records = self.get_sub_runs(delegation_id).await;
+        let flags = self.pause_flags.read().await;
+        let mut count = 0;
+        for record in &records {
+            if let Some(flag) = flags.get(&record.run_id) {
+                flag.store(false, Ordering::SeqCst);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Pause ALL sub-runs that have a given parent run ID.
+    /// Returns the number of sub-runs paused.
+    pub async fn pause_children_of(&self, parent_run_id: &str) -> usize {
+        let children = self.get_children(parent_run_id).await;
+        let flags = self.pause_flags.read().await;
+        let mut count = 0;
+        for child_id in &children {
+            if let Some(flag) = flags.get(child_id) {
+                flag.store(true, Ordering::SeqCst);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Resume ALL sub-runs that have a given parent run ID.
+    /// Returns the number of sub-runs resumed.
+    pub async fn resume_children_of(&self, parent_run_id: &str) -> usize {
+        let children = self.get_children(parent_run_id).await;
+        let flags = self.pause_flags.read().await;
+        let mut count = 0;
+        for child_id in &children {
+            if let Some(flag) = flags.get(child_id) {
+                flag.store(false, Ordering::SeqCst);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Check if a sub-run is currently paused.
+    pub async fn is_paused(&self, run_id: &str) -> bool {
+        self.pause_flags
+            .read()
+            .await
+            .get(run_id)
+            .is_some_and(|f| f.load(Ordering::Relaxed))
     }
 }
 
@@ -321,6 +438,8 @@ impl DelegationEngine {
                 .persist_status(&sub_run_id, "running", Some("agent_execution"), None)
                 .await?;
 
+            let pause_flag = self.tracker.register_pause_flag(&sub_run_id).await;
+
             let profile = reg.get(agent_id).cloned().unwrap_or_else(|| {
                 AgentProfile::new(
                     agent_id,
@@ -342,6 +461,7 @@ impl DelegationEngine {
                 user_id: request.user_id.clone(),
                 previous_output: None,
                 context: request.context.clone(),
+                pause_flag: Some(pause_flag),
             });
         }
         drop(reg);
@@ -443,6 +563,8 @@ impl DelegationEngine {
                 .persist_status(&sub_run_id, "running", Some("agent_execution"), None)
                 .await?;
 
+            let pause_flag = self.tracker.register_pause_flag(&sub_run_id).await;
+
             let profile = reg.get(agent_id).cloned().unwrap_or_else(|| {
                 AgentProfile::new(
                     agent_id,
@@ -464,6 +586,7 @@ impl DelegationEngine {
                 user_id: request.user_id.clone(),
                 previous_output: previous_output.clone(),
                 context: request.context.clone(),
+                pause_flag: Some(pause_flag),
             };
 
             let result = match self.executor.execute(config).await {
@@ -555,6 +678,7 @@ impl DelegationEngine {
             self.run_engine
                 .persist_status(&prod_run_id, "running", Some("produce"), None)
                 .await?;
+            let prod_pause = self.tracker.register_pause_flag(&prod_run_id).await;
             self.run_engine
                 .append_event(
                     &prod_run_id,
@@ -575,6 +699,7 @@ impl DelegationEngine {
                 user_id: request.user_id.clone(),
                 previous_output: last_producer_output.clone(),
                 context: request.context.clone(),
+                pause_flag: Some(prod_pause.clone()),
             };
             let prod_result = match self.executor.execute(prod_config).await {
                 Ok(r) => {
@@ -621,6 +746,7 @@ impl DelegationEngine {
             self.run_engine
                 .persist_status(&rev_run_id, "running", Some("review"), None)
                 .await?;
+            let rev_pause = self.tracker.register_pause_flag(&rev_run_id).await;
             self.run_engine
                 .append_event(
                     &rev_run_id,
@@ -644,6 +770,7 @@ impl DelegationEngine {
                 user_id: request.user_id.clone(),
                 previous_output: last_producer_output.clone(),
                 context: request.context.clone(),
+                pause_flag: Some(rev_pause),
             };
             let rev_result = match self.executor.execute(rev_config).await {
                 Ok(r) => {
@@ -683,6 +810,62 @@ impl DelegationEngine {
     /// Get the delegation tracker for external queries.
     pub fn tracker(&self) -> &Arc<DelegationTracker> {
         &self.tracker
+    }
+
+    // ── Pause / Resume API ──────────────────────────────────────────────────
+
+    /// Pause all sub-runs belonging to a delegation.
+    ///
+    /// Sets cooperative pause flags — sub-runs check these between turns and
+    /// yield with status "paused" at the next turn boundary.
+    pub async fn pause_delegation(&self, delegation_id: &str) -> usize {
+        let count = self.tracker.pause_delegation(delegation_id).await;
+        // Persist pause status for each sub-run
+        for record in self.tracker.get_sub_runs(delegation_id).await {
+            let _ = self
+                .run_engine
+                .persist_status(&record.run_id, "paused", Some("delegation_pause"), None)
+                .await;
+        }
+        count
+    }
+
+    /// Resume all sub-runs belonging to a delegation.
+    ///
+    /// Clears cooperative pause flags so sub-runs continue executing.
+    pub async fn resume_delegation(&self, delegation_id: &str) -> usize {
+        let count = self.tracker.resume_delegation(delegation_id).await;
+        for record in self.tracker.get_sub_runs(delegation_id).await {
+            let _ = self
+                .run_engine
+                .persist_status(&record.run_id, "running", Some("delegation_resume"), None)
+                .await;
+        }
+        count
+    }
+
+    /// Pause all sub-runs spawned by a parent run (across all delegations).
+    pub async fn pause_children_of(&self, parent_run_id: &str) -> usize {
+        let count = self.tracker.pause_children_of(parent_run_id).await;
+        for child_id in self.tracker.get_children(parent_run_id).await {
+            let _ = self
+                .run_engine
+                .persist_status(&child_id, "paused", Some("parent_pause"), None)
+                .await;
+        }
+        count
+    }
+
+    /// Resume all sub-runs spawned by a parent run.
+    pub async fn resume_children_of(&self, parent_run_id: &str) -> usize {
+        let count = self.tracker.resume_children_of(parent_run_id).await;
+        for child_id in self.tracker.get_children(parent_run_id).await {
+            let _ = self
+                .run_engine
+                .persist_status(&child_id, "running", Some("parent_resume"), None)
+                .await;
+        }
+        count
     }
 }
 
@@ -1336,10 +1519,68 @@ mod tests {
             user_id: "u1".into(),
             previous_output: None,
             context: HashMap::new(),
+            pause_flag: None,
         };
 
         let result = executor.execute(config).await.unwrap();
         assert_eq!(result.status, "completed");
         assert!(result.output.unwrap().contains("hello world"));
+    }
+
+    #[tokio::test]
+    async fn pause_children_of_sets_flags_and_persists() {
+        let (_, engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
+
+        let req = fan_out_request(vec!["coder", "reviewer"]);
+        let result = de.execute(req, "orch").await.unwrap();
+        assert_eq!(result.agent_results.len(), 2);
+
+        // Pause all children of parent-1
+        let paused = de.pause_children_of("parent-1").await;
+        assert_eq!(paused, 2);
+
+        // Verify flags are set
+        for ar in &result.agent_results {
+            assert!(tracker.is_paused(&ar.run_id).await);
+            let run = engine.load_run(&ar.run_id).await.unwrap().unwrap();
+            assert_eq!(run.status, "paused");
+        }
+
+        // Resume all children
+        let resumed = de.resume_children_of("parent-1").await;
+        assert_eq!(resumed, 2);
+
+        for ar in &result.agent_results {
+            assert!(!tracker.is_paused(&ar.run_id).await);
+            let run = engine.load_run(&ar.run_id).await.unwrap().unwrap();
+            assert_eq!(run.status, "running");
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_delegation_by_id_sets_flags() {
+        let (_, engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
+
+        let req = fan_out_request(vec!["coder", "reviewer"]);
+        de.execute(req, "orch").await.unwrap();
+
+        let paused = de.pause_delegation("del-1").await;
+        assert_eq!(paused, 2);
+
+        let subs = tracker.get_sub_runs("del-1").await;
+        for sub in &subs {
+            assert!(tracker.is_paused(&sub.run_id).await);
+            let run = engine.load_run(&sub.run_id).await.unwrap().unwrap();
+            assert_eq!(run.status, "paused");
+        }
+
+        let resumed = de.resume_delegation("del-1").await;
+        assert_eq!(resumed, 2);
+
+        for sub in &subs {
+            assert!(!tracker.is_paused(&sub.run_id).await);
+            let run = engine.load_run(&sub.run_id).await.unwrap().unwrap();
+            assert_eq!(run.status, "running");
+        }
     }
 }
