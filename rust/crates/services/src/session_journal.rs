@@ -1141,7 +1141,10 @@ mod tests {
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tools_selected.as_ref().unwrap().len(), 3);
-        assert_eq!(parsed.selected_skills.as_ref().unwrap(), &["tune-performance"]);
+        assert_eq!(
+            parsed.selected_skills.as_ref().unwrap(),
+            &["tune-performance"]
+        );
         assert_eq!(parsed.tools_used.as_ref().unwrap(), &["github_list_prs"]);
         assert_eq!(parsed.budget_used, Some(45));
         assert_eq!(parsed.budget_pressure, Some(0.6));

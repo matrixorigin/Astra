@@ -1,8 +1,8 @@
 use std::{borrow::Cow, fs, path::PathBuf};
 
 use crossterm::style::Stylize;
-use mo_thin_client::paths;
 use mo_thin_client::ThinClient;
+use mo_thin_client::paths;
 use rustyline::{
     CompletionType, Config, Context, Editor, Helper,
     completion::{Completer, Pair},
@@ -92,10 +92,7 @@ impl Validator for AdminHelper {
 }
 impl Helper for AdminHelper {}
 
-pub(crate) async fn run_interactive(
-    api: &ThinClient,
-    profile: Option<&str>,
-) -> Result<(), String> {
+pub(crate) async fn run_interactive(api: &ThinClient, profile: Option<&str>) -> Result<(), String> {
     let history_path = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".mo-agent")

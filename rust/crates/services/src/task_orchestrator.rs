@@ -1413,7 +1413,13 @@ impl TaskService for UnconfiguredTaskService {
     async fn complete_task(&self, _: &str) -> Result<(), String> {
         Err("task service not configured".into())
     }
-    async fn record_feedback(&self, _: &str, _: u8, _: TaskOutcome, _: Option<i32>) -> Result<(), String> {
+    async fn record_feedback(
+        &self,
+        _: &str,
+        _: u8,
+        _: TaskOutcome,
+        _: Option<i32>,
+    ) -> Result<(), String> {
         Err("task service not configured".into())
     }
     async fn increment_replan_count(&self, _: &str) -> Result<(), String> {
@@ -1422,7 +1428,13 @@ impl TaskService for UnconfiguredTaskService {
     async fn extract_template(&self, _: &str, _: &str) -> Result<Option<String>, String> {
         Err("task service not configured".into())
     }
-    async fn recommend_templates(&self, _: &str, _: &str, _: Option<&str>, _: usize) -> Result<Vec<TemplateRecommendation>, String> {
+    async fn recommend_templates(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+        _: usize,
+    ) -> Result<Vec<TemplateRecommendation>, String> {
         Err("task service not configured".into())
     }
     async fn get_learning_stats(&self, _: &str, _: &str) -> Result<LearningStats, String> {

@@ -429,8 +429,7 @@ impl SessionService for DatabaseSessionService {
             .iter()
             .map(|row| {
                 let details_str: String = row.try_get("details").unwrap_or_default();
-                let details = serde_json::from_str(&details_str)
-                    .unwrap_or(serde_json::Value::Null);
+                let details = serde_json::from_str(&details_str).unwrap_or(serde_json::Value::Null);
                 SessionActivityEntryRecord {
                     log_id: row.try_get("log_id").unwrap_or_default(),
                     action: row.try_get("action").unwrap_or_default(),

@@ -6,9 +6,7 @@ use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use crate::task_orchestrator::{
-    MatrixOneTaskService, TaskRecord, AGENT_TASK_SELECT_COLUMNS,
-};
+use crate::task_orchestrator::{AGENT_TASK_SELECT_COLUMNS, MatrixOneTaskService, TaskRecord};
 
 // ─── Hold cache (process-local hint for lease-aware TaskAdapter export) ───────
 
@@ -104,10 +102,7 @@ pub async fn push_tasks_pack_held_mysql(
             }
         }
 
-        let plan_json = t
-            .plan
-            .as_ref()
-            .and_then(|p| serde_json::to_string(p).ok());
+        let plan_json = t.plan.as_ref().and_then(|p| serde_json::to_string(p).ok());
         let ckpt_json = t
             .checkpoint
             .as_ref()
@@ -450,13 +445,12 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
             .await
             .map_err(|e| format!("lease tx begin: {e}"))?;
 
-        let owner: Option<String> = sqlx::query_scalar(
-            "SELECT user_id FROM agent_tasks WHERE task_id = ? FOR UPDATE",
-        )
-        .bind(task_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| format!("lease task lock: {e}"))?;
+        let owner: Option<String> =
+            sqlx::query_scalar("SELECT user_id FROM agent_tasks WHERE task_id = ? FOR UPDATE")
+                .bind(task_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| format!("lease task lock: {e}"))?;
 
         let Some(owner_uid) = owner else {
             return Err("task not found".to_string());
@@ -529,11 +523,12 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
             .await
             .map_err(|e| format!("agent_tasks agent_id: {e}"))?;
 
-        let ver: i64 = sqlx::query_scalar("SELECT lease_version FROM task_leases WHERE task_id = ?")
-            .bind(task_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| format!("lease version read: {e}"))?;
+        let ver: i64 =
+            sqlx::query_scalar("SELECT lease_version FROM task_leases WHERE task_id = ?")
+                .bind(task_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| format!("lease version read: {e}"))?;
 
         let exp: String = sqlx::query_scalar(
             "SELECT CAST(expires_at AS CHAR) FROM task_leases WHERE task_id = ?",
@@ -730,9 +725,6 @@ mod unit_tests {
     #[tokio::test]
     async fn unconfigured_task_lease_errors() {
         let s = UnconfiguredTaskLeaseService;
-        assert!(s
-            .try_claim_lease("u", "t", "a", "e", 60)
-            .await
-            .is_err());
+        assert!(s.try_claim_lease("u", "t", "a", "e", 60).await.is_err());
     }
 }

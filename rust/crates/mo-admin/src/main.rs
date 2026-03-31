@@ -1,8 +1,8 @@
 use std::fs;
 
 use clap::Parser;
-use mo_thin_client::paths;
 use mo_thin_client::ThinClient;
+use mo_thin_client::paths;
 
 mod cli_args;
 mod credentials;
@@ -368,11 +368,7 @@ async fn main() -> Result<(), String> {
         Command::Skill(SkillCmd::Versions(args)) => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
             let body = api
-                .get_bearer_path_query_text(
-                    &token,
-                    &paths::skill_versions(&args.skill_name),
-                    &[],
-                )
+                .get_bearer_path_query_text(&token, &paths::skill_versions(&args.skill_name), &[])
                 .await
                 .map_err(map_thin_err)?;
             print_json_or_raw(&body);

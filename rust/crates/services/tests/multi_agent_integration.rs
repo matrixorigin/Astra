@@ -6,7 +6,7 @@
 //!
 //! Uses `MATRIXONE_*` env vars (after `dotenvy`) with the same defaults as local dev (`127.0.0.1:6001`, …).
 
-use mo_agent_core::{MatrixOneSettings, SharedPool, DEV_MATRIXONE_PASSWORD};
+use mo_agent_core::{DEV_MATRIXONE_PASSWORD, MatrixOneSettings, SharedPool};
 use mo_agent_services::multi_agent::{
     DatabaseEdgeRegistryService, DatabaseTaskLeaseService, EdgeRegistryService, LeaseClaimResult,
     TaskLeaseHoldCache, TaskLeaseService, push_tasks_pack_held_mysql,
@@ -43,9 +43,7 @@ async fn setup_pool() -> SharedPool {
     ensure_core_schema(&settings)
         .await
         .expect("ensure_core_schema; is MatrixOne up?");
-    SharedPool::new(&settings)
-        .await
-        .expect("SharedPool::new")
+    SharedPool::new(&settings).await.expect("SharedPool::new")
 }
 
 async fn cleanup_task(pool: &sqlx::Pool<sqlx::MySql>, task_id: &str) {
@@ -122,15 +120,18 @@ async fn task_lease_second_holder_gets_contested() {
     let task_id = Uuid::new_v4().to_string();
     cleanup_task(&pool, &task_id).await;
 
-    sqlx::query("INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')")
-        .bind(&task_id)
-        .bind(&user)
-        .bind("lease-it")
-        .execute(&pool)
-        .await
-        .expect("insert task");
+    sqlx::query(
+        "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
+    )
+    .bind(&task_id)
+    .bind(&user)
+    .bind("lease-it")
+    .execute(&pool)
+    .await
+    .expect("insert task");
 
-    let lease = DatabaseTaskLeaseService::new(pool.clone(), Arc::new(TaskLeaseHoldCache::default()));
+    let lease =
+        DatabaseTaskLeaseService::new(pool.clone(), Arc::new(TaskLeaseHoldCache::default()));
     let g = lease
         .try_claim_lease(&user, &task_id, "agent-alpha", "e1", 120)
         .await
@@ -143,8 +144,7 @@ async fn task_lease_second_holder_gets_contested() {
         .expect("claim b");
     match c {
         LeaseClaimResult::Contested {
-            holder_agent_id,
-            ..
+            holder_agent_id, ..
         } => assert_eq!(holder_agent_id, "agent-alpha"),
         other => panic!("expected Contested, got {other:?}"),
     }
@@ -161,13 +161,15 @@ async fn task_lease_parallel_claims_single_winner() {
     let task_id = Uuid::new_v4().to_string();
     cleanup_task(&pool, &task_id).await;
 
-    sqlx::query("INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')")
-        .bind(&task_id)
-        .bind(&user)
-        .bind("parallel-lease")
-        .execute(&pool)
-        .await
-        .expect("insert task");
+    sqlx::query(
+        "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
+    )
+    .bind(&task_id)
+    .bind(&user)
+    .bind("parallel-lease")
+    .execute(&pool)
+    .await
+    .expect("insert task");
 
     let n = 5usize;
     let barrier = Arc::new(Barrier::new(n));
@@ -179,12 +181,8 @@ async fn task_lease_parallel_claims_single_winner() {
         let barrier = barrier.clone();
         join.spawn(async move {
             barrier.wait().await;
-            let svc = DatabaseTaskLeaseService::new(
-                pool,
-                Arc::new(TaskLeaseHoldCache::default()),
-            );
-            svc
-                .try_claim_lease(&user, &task_id, &format!("agent-{i}"), "edge", 120)
+            let svc = DatabaseTaskLeaseService::new(pool, Arc::new(TaskLeaseHoldCache::default()));
+            svc.try_claim_lease(&user, &task_id, &format!("agent-{i}"), "edge", 120)
                 .await
         });
     }
@@ -240,15 +238,18 @@ async fn push_tasks_pack_held_accepts_holder_rejects_other() {
     let task_id = Uuid::new_v4().to_string();
     cleanup_task(&pool, &task_id).await;
 
-    sqlx::query("INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')")
-        .bind(&task_id)
-        .bind(&user)
-        .bind("push-pack")
-        .execute(&pool)
-        .await
-        .expect("insert task");
+    sqlx::query(
+        "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
+    )
+    .bind(&task_id)
+    .bind(&user)
+    .bind("push-pack")
+    .execute(&pool)
+    .await
+    .expect("insert task");
 
-    let lease = DatabaseTaskLeaseService::new(pool.clone(), Arc::new(TaskLeaseHoldCache::default()));
+    let lease =
+        DatabaseTaskLeaseService::new(pool.clone(), Arc::new(TaskLeaseHoldCache::default()));
     lease
         .try_claim_lease(&user, &task_id, "agent-push", "e1", 120)
         .await

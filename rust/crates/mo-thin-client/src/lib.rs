@@ -17,14 +17,15 @@ pub mod protocol;
 pub mod sse;
 
 pub use client::ThinClient;
+pub use edge::{
+    MO_EDGE_ID_HEADER, advertise_executor, builtin_capability_preset,
+    edge_register_with_capabilities,
+};
 pub use error::ThinClientError;
+pub use protocol::{
+    ApprovalDecision, ApprovalRespondRequest, ChatStreamRequest, EdgeHeartbeatRequest,
+    EdgeRegisterRequest, SessionCreateRequest, SessionUpdateRequest, StreamEvent,
+    TaskLeaseMutationRequest, ToolResultRequest, classify_stream_event,
+};
 /// SSE / buffered HTTP response from [`ThinClient::post_chat_turn`] (transport type for consumers like CLI stream rendering).
 pub use reqwest::Response as HttpResponse;
-pub use edge::{
-    advertise_executor, builtin_capability_preset, edge_register_with_capabilities, MO_EDGE_ID_HEADER,
-};
-pub use protocol::{
-    classify_stream_event, ApprovalDecision, ApprovalRespondRequest, ChatStreamRequest,
-    EdgeHeartbeatRequest, EdgeRegisterRequest, SessionCreateRequest, SessionUpdateRequest,
-    StreamEvent, TaskLeaseMutationRequest, ToolResultRequest,
-};

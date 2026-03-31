@@ -6,8 +6,8 @@ use std::time::Duration;
 use async_stream::stream;
 use futures_util::{Stream, StreamExt};
 use reqwest::{
-    header::{self, HeaderMap, HeaderValue},
     Client, Response, Url,
+    header::{self, HeaderMap, HeaderValue},
 };
 use serde_json::Value;
 
@@ -33,10 +33,9 @@ pub struct ThinClient {
 impl ThinClient {
     /// `base` is the server origin, e.g. `https://api.example.com` (trailing slash optional).
     pub fn new(base: &str, bearer_token: Option<String>) -> Result<Self, ThinClientError> {
-        let base = Url::parse(base).map_err(|_| ThinClientError::InvalidBaseUrl(base.to_string()))?;
-        let http = Client::builder()
-            .no_proxy()
-            .build()?;
+        let base =
+            Url::parse(base).map_err(|_| ThinClientError::InvalidBaseUrl(base.to_string()))?;
+        let http = Client::builder().no_proxy().build()?;
         Ok(Self {
             http,
             base,
@@ -282,7 +281,11 @@ impl ThinClient {
         Self::text_or_api(resp).await
     }
 
-    pub async fn get_model_text(&self, token: &str, model_name: &str) -> Result<String, ThinClientError> {
+    pub async fn get_model_text(
+        &self,
+        token: &str,
+        model_name: &str,
+    ) -> Result<String, ThinClientError> {
         let url = self.url(&paths::model(model_name))?;
         let resp = self
             .http
@@ -327,7 +330,11 @@ impl ThinClient {
         Self::text_or_api(resp).await
     }
 
-    pub async fn get_session_text(&self, token: &str, session_id: &str) -> Result<String, ThinClientError> {
+    pub async fn get_session_text(
+        &self,
+        token: &str,
+        session_id: &str,
+    ) -> Result<String, ThinClientError> {
         let url = self.url(&paths::session(session_id))?;
         let resp = self
             .http
@@ -353,7 +360,11 @@ impl ThinClient {
         Self::text_or_api(resp).await
     }
 
-    pub async fn delete_session_text(&self, token: &str, session_id: &str) -> Result<String, ThinClientError> {
+    pub async fn delete_session_text(
+        &self,
+        token: &str,
+        session_id: &str,
+    ) -> Result<String, ThinClientError> {
         let url = self.url(&paths::session(session_id))?;
         let resp = self
             .http
@@ -575,7 +586,11 @@ impl ThinClient {
         Self::text_or_api(resp).await
     }
 
-    pub async fn get_task_text(&self, token: &str, task_id: &str) -> Result<String, ThinClientError> {
+    pub async fn get_task_text(
+        &self,
+        token: &str,
+        task_id: &str,
+    ) -> Result<String, ThinClientError> {
         let url = self.url(&paths::task(task_id))?;
         let resp = self
             .http
@@ -796,9 +811,7 @@ impl ThinClient {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
-                return Err(ThinClientError::SseParse(format!(
-                    "HTTP {status}: {text}"
-                )));
+                return Err(ThinClientError::SseParse(format!("HTTP {status}: {text}")));
             }
             Ok(resp)
         };
@@ -1138,10 +1151,13 @@ mod tests {
 
         let client = ThinClient::new(&srv.uri(), Some("tok".into())).unwrap();
         let v = client
-            .create_session(None, &SessionCreateRequest {
-                title: Some("t".into()),
-                ..Default::default()
-            })
+            .create_session(
+                None,
+                &SessionCreateRequest {
+                    title: Some("t".into()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(v["session_id"], "new");
@@ -1177,7 +1193,9 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/tasks"))
             .and(header("authorization", "Bearer t"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"tasks": []})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"tasks": []})),
+            )
             .mount(&srv)
             .await;
 
@@ -1251,7 +1269,9 @@ mod tests {
             .and(path("/tasks/t1/lease/claim"))
             .and(header("authorization", "Bearer t"))
             .and(header("x-mo-edge-id", "edge-xyz"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status":"granted"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"status":"granted"})),
+            )
             .mount(&srv)
             .await;
 

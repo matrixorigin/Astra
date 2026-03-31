@@ -1,7 +1,7 @@
 //! Incremental Server-Sent Events parser for `data: {json}\\n\\n` frames (mo-agent server style).
 
 use crate::error::ThinClientError;
-use crate::protocol::{classify_stream_event, StreamEvent};
+use crate::protocol::{StreamEvent, classify_stream_event};
 use serde_json::Value;
 
 /// Accumulates bytes and emits complete SSE events.
@@ -70,9 +70,7 @@ fn find_event_separator(buf: &[u8]) -> Option<(usize, usize)> {
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Concatenate `data:` lines in one SSE event block into a single JSON string.

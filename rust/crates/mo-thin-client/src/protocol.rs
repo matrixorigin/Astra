@@ -271,10 +271,16 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
         "tool_request" => StreamEvent::ToolRequest {
             request_id: get_str(&obj, "request_id"),
             tool: get_str(&obj, "tool"),
-            args: obj.get("args").cloned().unwrap_or_else(|| Value::Object(Default::default())),
+            args: obj
+                .get("args")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Default::default())),
         },
         "plan_created" => StreamEvent::PlanCreated {
-            plan: obj.get("plan").cloned().unwrap_or_else(|| Value::Object(Default::default())),
+            plan: obj
+                .get("plan")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Default::default())),
         },
         "plan_step_start" => StreamEvent::PlanStepStart {
             step: obj.get("step").cloned().unwrap_or(Value::Null),
@@ -284,7 +290,10 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
             result: obj.get("result").cloned().unwrap_or(Value::Null),
         },
         "plan_revised" => StreamEvent::PlanRevised {
-            plan: obj.get("plan").cloned().unwrap_or_else(|| Value::Object(Default::default())),
+            plan: obj
+                .get("plan")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Default::default())),
         },
         "plan_update" => StreamEvent::PlanUpdate { raw },
         "agent_delegated" => StreamEvent::AgentDelegated {
@@ -303,10 +312,11 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
         "run_finished" => StreamEvent::RunFinished,
         "ping" => StreamEvent::Ping,
         "done" => StreamEvent::Done {
-            tokens_used: obj
-                .get("tokens_used")
-                .and_then(|v| v.as_u64())
-                .or_else(|| obj.get("tokens_used").and_then(|v| v.as_i64()).map(|i| i as u64)),
+            tokens_used: obj.get("tokens_used").and_then(|v| v.as_u64()).or_else(|| {
+                obj.get("tokens_used")
+                    .and_then(|v| v.as_i64())
+                    .map(|i| i as u64)
+            }),
             raw,
         },
         "approval_required" => StreamEvent::ApprovalRequired {

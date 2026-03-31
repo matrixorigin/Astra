@@ -973,13 +973,15 @@ impl StateSyncService for MatrixOneSyncService {
                 .map_err(|e| format!("pull_plan_templates_pack template_json: {e}"))?;
             let success_rate: f32 = row
                 .try_get::<f64, _>("success_rate")
-                .map_err(|e| format!("pull_plan_templates_pack success_rate: {e}"))? as f32;
+                .map_err(|e| format!("pull_plan_templates_pack success_rate: {e}"))?
+                as f32;
             let avg_completion_time: Option<i32> = row
                 .try_get("avg_completion_time")
                 .map_err(|e| format!("pull_plan_templates_pack avg_completion_time: {e}"))?;
             let use_count: i32 = row
                 .try_get::<i64, _>("use_count")
-                .map_err(|e| format!("pull_plan_templates_pack use_count: {e}"))? as i32;
+                .map_err(|e| format!("pull_plan_templates_pack use_count: {e}"))?
+                as i32;
             items.push(PlanTemplateSyncRow {
                 template_id,
                 user_id: user_id_col,
