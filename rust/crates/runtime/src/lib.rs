@@ -231,6 +231,10 @@ pub use turn::{
         },
         history::compact_cloud_loop_history,
         iteration::{CloudLoopIterationPlan, plan_cloud_loop_iteration},
+        memoria_compact::{
+            HttpMemoriaClient, MemoriaClient, MemoriaCompactConfig, MemoriaCompactParams,
+            MemoriaMemory, compact_with_memoria, compact_with_memoria_sync,
+        },
         prefilter::{CloudSkillCandidatePlan, plan_cloud_skill_candidates},
         session_memory::{
             SESSION_MEMORY_SECTIONS, SESSION_MEMORY_TEMPLATE, SessionMemory, SessionMemoryConfig,
