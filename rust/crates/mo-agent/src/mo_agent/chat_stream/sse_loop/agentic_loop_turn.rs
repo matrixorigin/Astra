@@ -1,18 +1,21 @@
 //! Single agentic iteration: outbound `/chat` payload (selector, skills, explain stderr), `/chat/turn`
 //! fetch + SSE consume, turn ingest, stall preflight, headless tool round, post-tool policy.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
 use crossterm::style::Stylize;
-use mo_agent_core::agent_warn;
 use mo_agent_runtime::{
-    pipeline::step_protocol::{IdempotencyKey, InMemoryIdempotencyCache, StepCheckpoint},
+    pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint},
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
     tool_registry::{self, ToolRegistry},
     tool_selector::{self, ToolSelector},
+    turn::agentic_headless_round::{
+        HeadlessRoundTerminal, HeadlessStderrStyle, NoopHeadlessTerminal,
+        run_agentic_headless_tool_round,
+    },
     turn::agentic_post_tool_policy::{
         AgenticPostToolIterationControl, AgenticPostToolPolicyRequest,
         apply_agentic_post_tool_policy, map_post_tool_policy_outcome,
@@ -47,38 +50,11 @@ use mo_agent_runtime::{
     },
     turn::chat_turn_selection_context::build_agentic_tool_selection_context,
     turn::chat_turn_step_plan::record_agentic_step_plan_after_payload_prep,
-    turn::edge_prompt_context::make_args_preview,
-    turn::headless_tool_assembly::{
-        CACHEABLE_TOOLS, HeadlessResolvedToolSlot, begin_headless_tool_round_opening,
-        headless_idempotency_hit_openai_pair, headless_openai_duplicate_within_turn_pair,
-        headless_unknown_local_tool_openai_pair, openai_tool_roundtrip_values,
-        resolve_headless_tool_slot, take_edge_output_for_tool_call,
-        unknown_local_tool_error_message,
-    },
-    turn::headless_tool_journal::{
-        journal_record_cross_turn_cache_hit, journal_record_duplicate_within_turn,
-        journal_record_executed_tool_call, journal_record_unknown_tool,
-    },
-    turn::headless_tool_postprocess::{
-        HeadlessCacheableRecordCtx, HeadlessOutputEnrichSignal, HeadlessStepDeadline,
-        append_headless_result_quality_feedback, enrich_headless_tool_output_for_errors_and_limits,
-        format_headless_tool_duration, record_headless_cacheable_success_and_semantic_hint,
-        try_write_light_headless_step_checkpoint,
-    },
-    turn::headless_tool_stderr_lines::{
-        headless_stderr_cache_hit_line, headless_stderr_error_preview_line,
-        headless_stderr_resource_limit_blocked, headless_stderr_resource_limit_in_output,
-        headless_stderr_tool_error_detail_line, headless_stderr_tool_error_header,
-        headless_stderr_tool_ok_footer_line, headless_stderr_tool_ok_header,
-        headless_stderr_unknown_tool_detail, headless_stderr_unknown_tool_header,
-    },
-    turn::hydrate_reflect::hydrate_reflect_placeholder_if_needed,
     turn::prepare_turn_explain_text::explain_stderr_payload_line_pair,
     turn::skill_instructions_merge::{
         merge_skill_instruction_bodies_for_chat, skill_instruction_activated_names_csv,
         skill_instruction_load_failed_message,
     },
-    turn::tool_result_semantics::{is_tool_error, tool_dedup_signature},
     turn::tool_schema_prune::pin_invoked_tool_schemas,
     turn::turn_guard::{TurnGuard, merge_deprioritized_tools_into_restricted},
 };
@@ -87,7 +63,7 @@ use serde_json::Value;
 
 use crate::{
     ExplainMode, VerdictEvent,
-    cli_utils::{compact_or_raw, tool_call_detail, tool_result_summary},
+    cli_utils::compact_or_raw,
     edge_tools::ToolExecutor,
     permission_manager::PermissionManager,
     skill_instructions::SharedSkillRegistry,
@@ -95,6 +71,20 @@ use crate::{
 };
 
 use super::super::edge_executor::edge_executor_instance_id;
+
+struct CrosstermHeadlessTerminal;
+
+impl HeadlessRoundTerminal for CrosstermHeadlessTerminal {
+    fn emit_line(&mut self, style: HeadlessStderrStyle, line: String) {
+        use crossterm::style::Stylize;
+        match style {
+            HeadlessStderrStyle::Dim => eprintln!("{}", line.dim()),
+            HeadlessStderrStyle::Red => eprintln!("{}", line.red()),
+            HeadlessStderrStyle::Green => eprintln!("{}", line.green()),
+            HeadlessStderrStyle::Yellow => eprintln!("{}", line.yellow()),
+        }
+    }
+}
 
 // ─── Outbound `/chat` JSON body (was `prepare_turn_request.rs`) ───────────────
 
@@ -478,281 +468,6 @@ async fn fetch_chat_turn_sse(ctx: ChatTurnSseFetchRequest<'_>) -> Result<TurnRes
     Ok(consume_turn_sse(resp, render_md, term_width, quiet, Some(edge_ctx)).await)
 }
 
-// ─── Headless tool round (was `tool_round.rs`) ─────────────────────────────────
-
-struct HeadlessToolRoundRequest<'a> {
-    turn_index: usize,
-    quiet: bool,
-    api: &'a mo_thin_client::ThinClient,
-    token: &'a str,
-    current_session_id: Option<&'a String>,
-    turn_result: &'a TurnResult,
-    messages: &'a mut Vec<serde_json::Value>,
-    tool_results: &'a mut Vec<serde_json::Value>,
-    valid_tool_names: &'a HashSet<String>,
-    restricted_tools: &'a mut HashSet<String>,
-    turn_guard: &'a mut TurnGuard,
-    step_recorder: &'a mut StepRecorder,
-    idempotency_cache: &'a mut InMemoryIdempotencyCache,
-    semantic_dedup: &'a mut SemanticDedup,
-    tool_call_records: &'a mut Vec<mo_agent_services::session_journal::ToolCallRecord>,
-}
-
-/// Clears `tool_results`, appends the assistant tool-call message, then fills `tool_results` and
-/// matching `tool` OpenAI messages for the next `/chat` request.
-async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
-    let HeadlessToolRoundRequest {
-        turn_index,
-        quiet,
-        api,
-        token,
-        current_session_id,
-        turn_result,
-        messages,
-        tool_results,
-        valid_tool_names,
-        restricted_tools,
-        turn_guard,
-        step_recorder,
-        idempotency_cache,
-        semantic_dedup,
-        tool_call_records,
-    } = ctx;
-
-    tool_results.clear();
-
-    let opening = begin_headless_tool_round_opening(
-        &turn_result.tool_calls,
-        &turn_result.edge_tool_round,
-        turn_result.reasoning_content.as_str(),
-    );
-    messages.push(opening.assistant_message);
-
-    let indices = opening.indices;
-    let tool_count = opening.tool_count;
-    let mut seen_calls: HashSet<String> = HashSet::new();
-    step_recorder.begin_act(tool_count);
-    let step_deadline =
-        HeadlessStepDeadline::from_scheduling_timeout_ms(step_recorder.scheduling().timeout_ms);
-    let mut consumed_edge = vec![false; turn_result.edge_tool_round.len()];
-    let by_sig: &HashMap<String, String> = &turn_result.edge_callback_outputs;
-
-    for item in &indices {
-        if let Some((aborted_count, aborted_tools)) = step_deadline.step_timeout_abort(
-            &indices,
-            tool_results.len(),
-            &turn_result.tool_calls,
-            |i| turn_result.edge_tool_round[i].tool.clone(),
-        ) {
-            agent_warn!(
-                "step",
-                "Step timeout exceeded: {}ms > {}ms, aborting {} tools: {:?}",
-                step_deadline.elapsed_ms(),
-                step_recorder.scheduling().timeout_ms,
-                aborted_count,
-                aborted_tools
-            );
-            turn_guard.record_step_abort(&aborted_tools);
-            break;
-        }
-
-        let slot = resolve_headless_tool_slot(*item, &turn_result.tool_calls, |i| {
-            let e = &turn_result.edge_tool_round[i];
-            (e.tool.clone(), e.args.clone())
-        });
-        let HeadlessResolvedToolSlot {
-            id,
-            name,
-            args,
-            synthetic_edge_index: synthetic_idx,
-        } = slot;
-
-        let call_sig = tool_dedup_signature(&name, &args);
-        if !seen_calls.insert(call_sig.clone()) {
-            let (tool_msg, tr) = headless_openai_duplicate_within_turn_pair(&id, &name);
-            messages.push(tool_msg);
-            tool_results.push(tr);
-            tool_call_records.push(journal_record_duplicate_within_turn(
-                name.clone(),
-                make_args_preview(&name, &args),
-            ));
-            continue;
-        }
-
-        let idem_key = IdempotencyKey::semantic(&name, &args);
-        if CACHEABLE_TOOLS.contains(&name.as_str())
-            && let Some(cached) = idempotency_cache.check(&idem_key)
-        {
-            if !quiet {
-                eprintln!("{}", headless_stderr_cache_hit_line(&name).dim());
-            }
-            let (tool_msg, tr) = headless_idempotency_hit_openai_pair(&id, &name, &cached.output);
-            messages.push(tool_msg);
-            tool_results.push(tr);
-            let cache_key = idem_key.cache_key();
-            step_recorder.begin_tool_with_key(&name, &id, Some(&cache_key));
-            step_recorder.record_cache_hit(&name, cached.clone());
-            turn_guard.record_cache_hit(&name);
-            tool_call_records.push(journal_record_cross_turn_cache_hit(
-                name.clone(),
-                cached.output.len() as u32,
-                make_args_preview(&name, &args),
-            ));
-            continue;
-        }
-
-        let mut result_str = if let Some(i) = synthetic_idx {
-            turn_result.edge_tool_round[i].output.clone()
-        } else {
-            take_edge_output_for_tool_call(
-                &name,
-                &args,
-                &turn_result.edge_tool_round,
-                &mut consumed_edge,
-                by_sig,
-            )
-        };
-
-        if !valid_tool_names.contains(&name) {
-            let err_msg = unknown_local_tool_error_message(&name, valid_tool_names);
-            if !quiet {
-                eprintln!("{}", headless_stderr_unknown_tool_header(&name).red());
-            }
-            if !quiet {
-                eprintln!("{}", headless_stderr_unknown_tool_detail(&err_msg).dim());
-            }
-            let (tool_msg, err_tr) =
-                headless_unknown_local_tool_openai_pair(&id, &name, valid_tool_names);
-            messages.push(tool_msg);
-            tool_results.push(err_tr);
-            tool_call_records.push(journal_record_unknown_tool(name.clone()));
-            continue;
-        }
-
-        result_str = hydrate_reflect_placeholder_if_needed(
-            api,
-            token,
-            current_session_id,
-            &name,
-            &args,
-            result_str,
-        )
-        .await;
-
-        let tool_start = Instant::now();
-        let tool_idem_key = if CACHEABLE_TOOLS.contains(&name.as_str()) {
-            Some(idem_key.cache_key())
-        } else {
-            None
-        };
-        step_recorder.begin_tool_with_key(&name, &id, tool_idem_key.as_deref());
-
-        let mut is_err = is_tool_error(&result_str);
-        let tool_already_restricted = restricted_tools.contains(&name);
-        let resource_limit_recorded = enrich_headless_tool_output_for_errors_and_limits(
-            &name,
-            &mut result_str,
-            &mut is_err,
-            tool_already_restricted,
-            turn_guard,
-            restricted_tools,
-            |sig| {
-                if quiet {
-                    return;
-                }
-                match sig {
-                    HeadlessOutputEnrichSignal::ResourceLimitBlocked { tool } => {
-                        eprintln!("{}", headless_stderr_resource_limit_blocked(&tool).yellow());
-                    }
-                    HeadlessOutputEnrichSignal::ResourceLimitDetectedInOutput { tool } => {
-                        eprintln!("{}", headless_stderr_resource_limit_in_output(&tool).dim());
-                    }
-                }
-            },
-        );
-        let _result_quality = append_headless_result_quality_feedback(
-            &name,
-            &mut result_str,
-            resource_limit_recorded,
-            turn_guard,
-        );
-
-        let args_size = serde_json::to_string(&args)
-            .map(|s| s.len() as u32)
-            .unwrap_or(0);
-        let args_preview = make_args_preview(&name, &args);
-        let tool_elapsed = tool_start.elapsed();
-        tool_call_records.push(journal_record_executed_tool_call(
-            name.clone(),
-            is_err,
-            tool_elapsed.as_millis() as u64,
-            args_size,
-            result_str.as_str(),
-            args_preview,
-        ));
-        step_recorder.complete_tool_with_result(
-            &name,
-            is_err,
-            tool_elapsed.as_millis() as u64,
-            false,
-            &result_str,
-        );
-
-        if let Some(sid) = current_session_id {
-            try_write_light_headless_step_checkpoint(sid, step_recorder);
-        }
-
-        if !is_err && CACHEABLE_TOOLS.contains(&name.as_str()) {
-            record_headless_cacheable_success_and_semantic_hint(
-                &name,
-                &args,
-                &idem_key,
-                HeadlessCacheableRecordCtx {
-                    result_str: &mut result_str,
-                    turn_index,
-                    idempotency_cache,
-                    step_recorder,
-                    semantic_dedup,
-                },
-            );
-        }
-
-        if !quiet {
-            let duration_str = format_headless_tool_duration(tool_elapsed);
-            let detail = tool_call_detail(&name, &args);
-            let summary = if !is_err {
-                tool_result_summary(&name, &result_str)
-            } else {
-                None
-            };
-            if is_err {
-                eprintln!(
-                    "{}",
-                    headless_stderr_tool_error_header(&name, &duration_str).red()
-                );
-                if let Some(first_line) = result_str.lines().next() {
-                    let preview = headless_stderr_error_preview_line(first_line, 100);
-                    eprintln!("{}", headless_stderr_tool_error_detail_line(&preview).dim());
-                }
-            } else {
-                eprintln!(
-                    "{}",
-                    headless_stderr_tool_ok_header(&name, &duration_str).green()
-                );
-                if let Some(line) =
-                    headless_stderr_tool_ok_footer_line(detail.as_deref(), summary.as_deref())
-                {
-                    eprintln!("{}", line.dim());
-                }
-            }
-        }
-
-        let (tool_msg, tr) = openai_tool_roundtrip_values(&id, &name, &result_str);
-        messages.push(tool_msg);
-        tool_results.push(tr);
-    }
-}
-
 // ─── Orchestrator: one full iteration ────────────────────────────────────────
 
 pub(crate) enum AgenticLoopTurnExit {
@@ -938,13 +653,23 @@ pub(crate) async fn run_agentic_loop_iteration(
         turn_guard,
     );
 
-    run_headless_tool_round(HeadlessToolRoundRequest {
+    let mut noop = NoopHeadlessTerminal;
+    let mut crossterm_term = CrosstermHeadlessTerminal;
+    let term: &mut dyn HeadlessRoundTerminal = if quiet {
+        &mut noop
+    } else {
+        &mut crossterm_term
+    };
+    run_agentic_headless_tool_round(
         turn_index,
         quiet,
         api,
         token,
-        current_session_id: current_session_id.as_ref(),
-        turn_result: &turn_result,
+        current_session_id.as_ref(),
+        &turn_result.tool_calls,
+        turn_result.edge_tool_round.as_slice(),
+        turn_result.reasoning_content.as_str(),
+        &turn_result.edge_callback_outputs,
         messages,
         tool_results,
         valid_tool_names,
@@ -954,7 +679,8 @@ pub(crate) async fn run_agentic_loop_iteration(
         idempotency_cache,
         semantic_dedup,
         tool_call_records,
-    })
+        term,
+    )
     .await;
     append_explain_turn_batch(explain_turns, turn_result.explain_turns.as_slice());
 

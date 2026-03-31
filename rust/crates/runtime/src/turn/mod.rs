@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod agentic_headless_round;
 pub mod agentic_post_tool_policy;
 pub mod agentic_prepare_payload;
 pub mod agentic_stall_preflight;
@@ -38,6 +39,7 @@ pub mod firewall;
 pub mod headless_tool_assembly;
 pub mod headless_tool_journal;
 pub mod headless_tool_postprocess;
+pub mod headless_tool_status_display;
 pub mod headless_tool_stderr_lines;
 pub mod history;
 pub mod history_apply;
