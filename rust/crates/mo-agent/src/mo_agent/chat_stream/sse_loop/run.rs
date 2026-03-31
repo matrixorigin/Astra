@@ -1,4 +1,4 @@
-//! Main SSE multi-turn agentic loop (`stream_chat_sse`).
+//! Multi-turn `/chat/stream` loop (`stream_chat_sse`), kept here so `sse_loop/` can split further without one monolithic file.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -47,7 +47,7 @@ use crate::{
     ExplainMode, StreamResult, VerdictEvent,
 };
 
-use super::{
+use super::super::{
     edge_executor::edge_executor_instance_id,
     explain_reports::{print_explain_report, print_verdict_report},
     hydrate_reflect::hydrate_reflect_placeholder_if_needed,
