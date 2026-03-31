@@ -239,25 +239,11 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     message,
                     &memory_contents,
                 );
-                if !ranked.is_empty() {
-                    // Use only relevant memories for boost term extraction.
-                    let virtual_history: Vec<(String, String)> = ranked
-                        .into_iter()
-                        .map(|(content, _score)| ("memory".to_string(), content))
-                        .collect();
-                    let memory_terms =
-                        mo_agent_runtime::turn::retrieval::extract_boost_terms_from_pairs(
-                            &virtual_history,
-                            message,
-                        );
-                    let existing: std::collections::HashSet<String> =
-                        boost_terms.iter().cloned().collect();
-                    for term in memory_terms {
-                        if !existing.contains(&term) {
-                            boost_terms.push(term);
-                        }
-                    }
-                }
+                mo_agent_runtime::turn::retrieval::append_boost_terms_from_ranked_memory(
+                    &mut boost_terms,
+                    message,
+                    &ranked,
+                );
             }
         }
 

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
@@ -456,6 +456,38 @@ fn adaptive_threshold(query: &str) -> f64 {
         21..=100 => MEMORY_RELEVANCE_THRESHOLD,
         _ => 0.03,
     }
+}
+
+/// Append terms from `additional` onto `into`, skipping anything already present in `into`
+/// or duplicated later in `additional`.
+pub fn merge_boost_terms_unique(
+    into: &mut Vec<String>,
+    additional: impl IntoIterator<Item = String>,
+) {
+    let mut seen: HashSet<String> = into.iter().cloned().collect();
+    for term in additional {
+        if seen.insert(term.clone()) {
+            into.push(term);
+        }
+    }
+}
+
+/// TF-IDF-ranked memory snippets → virtual `("memory", content)` history → entity boost terms,
+/// merged into `boost_terms`. No-op when `ranked` is empty.
+pub fn append_boost_terms_from_ranked_memory(
+    boost_terms: &mut Vec<String>,
+    user_query: &str,
+    ranked: &[(String, f64)],
+) {
+    if ranked.is_empty() {
+        return;
+    }
+    let virtual_history: Vec<(String, String)> = ranked
+        .iter()
+        .map(|(content, _score)| ("memory".to_string(), content.clone()))
+        .collect();
+    let memory_terms = extract_boost_terms_from_pairs(&virtual_history, user_query);
+    merge_boost_terms_unique(boost_terms, memory_terms);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -963,5 +995,41 @@ mod tests {
         if !ranked.is_empty() {
             assert!(ranked[0].0.contains("matrixone"));
         }
+    }
+
+    // ── Memory boost-term merge ──────────────────────────────────────────
+
+    #[test]
+    fn merge_boost_terms_unique_skips_existing_and_internal_dupes() {
+        let mut v = vec!["a".into(), "b".into()];
+        merge_boost_terms_unique(&mut v, ["c".into(), "a".into(), "c".into()]);
+        assert_eq!(v, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn append_boost_terms_from_ranked_memory_no_op_on_empty_ranked() {
+        let mut v = vec!["x".into()];
+        append_boost_terms_from_ranked_memory(&mut v, "hello", &[]);
+        assert_eq!(v, vec!["x"]);
+    }
+
+    #[test]
+    fn append_boost_terms_from_ranked_memory_extracts_from_virtual_history() {
+        // Same cold-start shape as `memory_boost_integration::cold_start_memory_provides_github_context`.
+        let query = "matrixorigin 最新情况";
+        let ranked = vec![(
+            "matrixorigin is a GitHub organization focused on cloud-native databases".to_string(),
+            0.99,
+        )];
+        let mut terms: Vec<String> = Vec::new();
+        append_boost_terms_from_ranked_memory(&mut terms, query, &ranked);
+        let has_github = terms
+            .iter()
+            .any(|t| *t == "github" || *t == "repo" || *t == "repository" || *t == "org");
+        assert!(
+            has_github,
+            "memory virtual-history path should yield GitHub-domain boost terms, got {:?}",
+            terms
+        );
     }
 }
