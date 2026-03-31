@@ -1,7 +1,7 @@
 use super::*;
 use futures_util::StreamExt;
 use mo_agent_runtime::turn::chat_turn_sse_dispatch::{
-    ChatTurnSseAccum, SseRenderEffect, dispatch_chat_turn_sse_event_block,
+    ChatTurnSseAccum, ChatTurnSseFramer, SseRenderEffect, dispatch_chat_turn_sse_event_block,
 };
 use std::ops::{Deref, DerefMut};
 
@@ -284,6 +284,26 @@ impl StreamRenderState {
     }
 }
 
+fn apply_sse_render_effects(
+    effects: Vec<SseRenderEffect>,
+    render: &mut StreamRenderState,
+    quiet: bool,
+) {
+    if quiet {
+        return;
+    }
+    for effect in effects {
+        match effect {
+            SseRenderEffect::StreamText(s) => {
+                print!("{s}");
+                let _ = io::stdout().flush();
+            }
+            SseRenderEffect::StopThinkingSpinner => render.stop_thinking(),
+            SseRenderEffect::StartThinkingSpinner => render.start_thinking(),
+        }
+    }
+}
+
 /// Consume one /chat/turn SSE stream, render text deltas, collect tool_calls.
 /// When `quiet` is true, all terminal output is suppressed but result.full_text is still captured.
 pub(super) async fn consume_turn_sse(
@@ -296,40 +316,24 @@ pub(super) async fn consume_turn_sse(
     let mut result = TurnResult::new();
     let mut render = StreamRenderState::new();
     let mut stream = resp.bytes_stream();
-    let mut buffer = String::new();
+    let mut framer = ChatTurnSseFramer::new();
     let mut pending_edge: Vec<ChatTurnEdgePending> = Vec::new();
-
-    // Track time to first token
-    let stream_start = std::time::Instant::now();
-    let mut first_token_recorded = false;
 
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else { break };
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        let blocks =
-            mo_agent_runtime::turn::sse_blocks::drain_complete_sse_event_blocks(&mut buffer);
-        for event_str in blocks {
-            // Capture TTFT on first text content
-            if !first_token_recorded
-                && (event_str.contains("\"text_delta\"")
-                    || event_str.contains("\"content_block_delta\""))
-            {
-                result.ttft_ms = Some(stream_start.elapsed().as_millis() as u64);
-                first_token_recorded = true;
-            }
-
-            dispatch_turn_event_block(
-                &event_str,
-                &mut result,
-                &mut render,
-                quiet,
-                &mut pending_edge,
-            );
+        for event_str in framer.push_lossy_bytes(chunk.as_ref()) {
+            let effects =
+                dispatch_chat_turn_sse_event_block(&event_str, &mut result.core, &mut pending_edge);
+            apply_sse_render_effects(effects, &mut render, quiet);
             flush_pending_edge_work(&mut pending_edge, edge.as_ref(), &mut result).await;
         }
     }
-    if !buffer.trim().is_empty() {
-        dispatch_turn_event_block(&buffer, &mut result, &mut render, quiet, &mut pending_edge);
+    let tail = framer.take_trailing_dispatch_blob();
+    result.ttft_ms = framer.ttft_ms;
+    if !tail.trim().is_empty() {
+        let effects =
+            dispatch_chat_turn_sse_event_block(&tail, &mut result.core, &mut pending_edge);
+        apply_sse_render_effects(effects, &mut render, quiet);
         flush_pending_edge_work(&mut pending_edge, edge.as_ref(), &mut result).await;
     }
 
@@ -398,6 +402,8 @@ pub(super) async fn consume_turn_sse(
     result
 }
 
+/// Used by `main` test module and stream_render unit tests; production path is [`consume_turn_sse`].
+#[allow(dead_code)]
 pub(super) fn dispatch_turn_event_block(
     block: &str,
     result: &mut TurnResult,
@@ -406,19 +412,7 @@ pub(super) fn dispatch_turn_event_block(
     pending_edge: &mut Vec<ChatTurnEdgePending>,
 ) {
     let effects = dispatch_chat_turn_sse_event_block(block, &mut result.core, pending_edge);
-    if quiet {
-        return;
-    }
-    for effect in effects {
-        match effect {
-            SseRenderEffect::StreamText(s) => {
-                print!("{s}");
-                let _ = io::stdout().flush();
-            }
-            SseRenderEffect::StopThinkingSpinner => render.stop_thinking(),
-            SseRenderEffect::StartThinkingSpinner => render.start_thinking(),
-        }
-    }
+    apply_sse_render_effects(effects, render, quiet);
 }
 
 #[cfg(test)]

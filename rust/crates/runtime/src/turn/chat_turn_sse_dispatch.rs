@@ -1,10 +1,11 @@
 //! JSON `type` dispatch for mo-agent `/chat/turn` SSE event blocks (blank-line framed).
 //!
 //! Shared between the CLI stream consumer and any future headless client: updates a structured
-//! accumulator and returns terminal UI hints. Parsing of `data:` lines and [`super::sse_blocks`]
-//! framing stays in the caller.
+//! accumulator and returns terminal UI hints. [`ChatTurnSseFramer`] turns arbitrary byte chunks
+//! into complete event blocks via [`super::sse_blocks`] and records time-to-first-token.
 
 use serde_json::Value;
+use std::time::Instant;
 
 /// State collected from one `/chat/turn` SSE stream (excluding edge executor bookkeeping).
 #[derive(Debug, Clone, Default)]
@@ -196,6 +197,62 @@ pub fn dispatch_chat_turn_sse_event_block(
     effects
 }
 
+/// Buffers lossy UTF-8 from a `/chat/turn` body stream, yields complete blank-line SSE blocks, and
+/// records [`ChatTurnSseFramer::ttft_ms`] on the first `text_delta` / `content_block_delta` payload.
+#[derive(Debug)]
+pub struct ChatTurnSseFramer {
+    buf: String,
+    stream_start: Instant,
+    pub ttft_ms: Option<u64>,
+    first_token_recorded: bool,
+}
+
+impl ChatTurnSseFramer {
+    pub fn new() -> Self {
+        Self {
+            buf: String::new(),
+            stream_start: Instant::now(),
+            ttft_ms: None,
+            first_token_recorded: false,
+        }
+    }
+
+    fn note_ttft_from_raw_event_text(&mut self, event_block: &str) {
+        if self.first_token_recorded {
+            return;
+        }
+        if event_block.contains("\"text_delta\"") || event_block.contains("\"content_block_delta\"")
+        {
+            self.ttft_ms = Some(self.stream_start.elapsed().as_millis() as u64);
+            self.first_token_recorded = true;
+        }
+    }
+
+    /// Append one HTTP chunk; returns every **complete** SSE event block (may be empty).
+    pub fn push_lossy_bytes(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.buf.push_str(&String::from_utf8_lossy(bytes));
+        let blocks = crate::turn::sse_blocks::drain_complete_sse_event_blocks(&mut self.buf);
+        for b in &blocks {
+            self.note_ttft_from_raw_event_text(b);
+        }
+        blocks
+    }
+
+    /// After the byte stream ends: run TTFT detection on any trailing bytes, then take the buffer
+    /// for a final [`dispatch_chat_turn_sse_event_block`] pass (partial event without `\n\n` yet).
+    pub fn take_trailing_dispatch_blob(&mut self) -> String {
+        let tail = std::mem::take(&mut self.buf);
+        self.note_ttft_from_raw_event_text(&tail);
+        tail
+    }
+}
+
+impl Default for ChatTurnSseFramer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,5 +420,26 @@ mod tests {
             }
             _ => panic!("expected ApprovalRequired"),
         }
+    }
+
+    #[test]
+    fn framer_splits_event_across_chunks() {
+        let ev = sse("session_info", ",\"session_id\":\"split-id\"");
+        let mid = ev.find("session").unwrap();
+        let mut f = ChatTurnSseFramer::new();
+        assert!(f.push_lossy_bytes(ev[..mid].as_bytes()).is_empty());
+        let blocks = f.push_lossy_bytes(ev[mid..].as_bytes());
+        assert_eq!(blocks.len(), 1);
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(&blocks[0], &mut a, &mut vec![]);
+        assert_eq!(a.session_id.as_deref(), Some("split-id"));
+    }
+
+    #[test]
+    fn framer_ttft_on_text_delta_block() {
+        let block = sse("text_delta", ",\"content\":\"x\"");
+        let mut f = ChatTurnSseFramer::new();
+        let _ = f.push_lossy_bytes(block.as_bytes());
+        assert!(f.ttft_ms.is_some());
     }
 }

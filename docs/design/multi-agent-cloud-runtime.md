@@ -1,7 +1,7 @@
 # Multi-Agent Cloud Runtime Architecture
 
 > **Status**: Living Design Document  
-> **Version**: 1.4.26 (Phase 0 partial: `/chat/turn` SSE JSON dispatch in `runtime::turn::chat_turn_sse_dispatch`; CLI `TurnResult` wraps `ChatTurnSseAccum` + edge fields)  
+> **Version**: 1.4.27 (Phase 0 partial: `ChatTurnSseFramer` in runtime — lossy byte chunks → SSE blocks + TTFT; `consume_turn_sse` drives dispatch + edge flush)  
 > **Scope**: Edge-cloud state management, multi-agent orchestration, and cloud-scale execution  
 > **Audience**: Core contributors, architecture reviewers
 
@@ -1740,7 +1740,7 @@ mo-agent Orchestrator
 | Reuse hints in `make_args_preview` | ✅ Done (slice 5) | Tiny | **`edge_prompt_context`**: file/bash/grep previews share `tool_argument_hints` |
 | Canonical tool arg keys in hints layer | ✅ Done (slice 6) | Small | **`tool_argument_hints`**: only `path` and `command` (no `cmd`, `file_path`, `target_file`); cloud approval path + CLI prompts + journal previews aligned |
 | Extract SSE `data:` JSON line parser | ✅ Done (slice 7) | Small | **`runtime/src/turn/sse_data_lines.rs`** — `drain_sse_data_lines`, `finish_sse_data_buffer`, `parse_sse_data_json_events`; `bridge_inprocess` stream + lifecycle contract tests |
-| Extract SSE blank-line event blocks | ✅ Done (slice 8) | Small | **`runtime/src/turn/sse_blocks.rs`** — `drain_complete_sse_event_blocks` (`\n\n` / `\r\n\r\n`); CLI `consume_turn_sse` |
+| Extract SSE blank-line event blocks | ✅ Done (slice 8) | Small | **`runtime/src/turn/sse_blocks.rs`** — `drain_complete_sse_event_blocks` (`\n\n` / `\r\n\r\n`); wired through **`ChatTurnSseFramer`** (slice 34) for `/chat/turn` |
 | Extract chat-turn factual / session heuristics | ✅ Done (slice 9) | Small | **`runtime/src/turn/chat_turn_heuristics.rs`** — `looks_like_factual_query`, `looks_like_live_query_with_context`, `should_force_factual_tool_retry`, `extract_repos_from_memory`, `is_session_not_found_error`; CLI `chat_stream` + `repl_turn` / `command_router` via `main` imports |
 | Extract headless tool round assembly (cache list, stall-guard shape, edge output match) | ✅ Done (slice 10) | Small | **`runtime/src/turn/headless_tool_assembly.rs`** — `CACHEABLE_TOOLS`, `EdgeToolRoundRow`, `take_edge_output_for_tool_call`, `tool_calls_for_stall_guard`; CLI `chat_stream` + `EdgeToolRoundEntry` impl in `stream_render` |
 | Extract boost-term → `DomainHint`, REPL history → OpenAI `messages`, stall schema filter | ✅ Done (slice 11) | Small | **`turn/boost_domain_hints.rs`** (`domain_hints_from_boost_terms`); **`turn/chat_history_openai.rs`** (`openai_messages_from_repl_history`); **`tool_schema_prune`** (`filter_tool_schemas_by_excluded_names`); CLI `chat_stream/sse_loop/run.rs` |
@@ -1766,12 +1766,13 @@ mo-agent Orchestrator
 | Consolidate agentic SSE session state + multi-turn driver + finalize | ✅ Done (slice 31) | Medium | **`sse_loop/agentic_sse_loop.rs`**: `AgenticSseLoopState`, `new` / `run_all_turns` / `into_stream_result`; **`run.rs`** thin `stream_chat_sse` |
 | Coalesce per-iteration modules + drop `stream_result_finalize` file | ✅ Done (slice 32) | Medium | **`agentic_loop_turn.rs`**: fetch + ingest + stall + post-tool (private); **`agentic_sse_loop.rs`**: `StreamResult` + sidecar eprint (private); removes 5 standalone `sse_loop/*.rs` |
 | Extract `/chat/turn` SSE `data:` JSON dispatch (accumulator + edge pending + render hints) | ✅ Done (slice 33) | Medium | **`runtime/turn/chat_turn_sse_dispatch.rs`**: `ChatTurnSseAccum`, `ChatTurnEdgePending`, `dispatch_chat_turn_sse_event_block`; CLI `stream_render::TurnResult` derefs to accum + `ttft_ms` / edge maps |
+| Extract `/chat/turn` SSE byte framing + TTFT alongside JSON dispatch | ✅ Done (slice 34) | Small | **`ChatTurnSseFramer`**: `push_lossy_bytes`, `take_trailing_dispatch_blob`; CLI `consume_turn_sse` calls runtime dispatch + `apply_sse_render_effects` |
 | Implement tool execution callback protocol (cloud → edge) | ✅ Core path | Medium | §5.5 `/tools/result`, `tool_request` SSE; `chat_stream` **does not** re-execute tools for that path. |
 | Add `edge_executor_id` to chat turn protocol | ✅ | Small | Thin client + §5.5.2 light edge helpers. |
 | Move `SyncOrchestrator` construction from `ReplState` to `AppState` | ✅ Done | — | **`MatrixCloudRuntime`** bundles `SharedPool` + `IngestionSender` + `SyncOrchestrator`; `ReplState` / `AppState` hold `Option<Arc<MatrixCloudRuntime>>` only (no separate orchestrator field) |
 | Move `IngestionSender` from `ReplState` to server pipeline | ✅ Done | — | Same bundle as row above; journal flush via `enqueue_journal_events` |
 | Remove `matrixone_pool` from `ReplState` (use server `shared_pool`) | ✅ Done | — | Superseded by `MatrixCloudRuntime::shared_pool()`; no `matrixone_pool` field on `ReplState` |
-| Refactor `chat_stream/`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–33** + **`sse_loop/`** + **`runtime/turn/chat_turn_sse_dispatch`**. Remaining: move multi-turn loop to server; align `consume_turn_sse` framing with `bridge_inprocess` byte path where practical |
+| Refactor `chat_stream/`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–34** + **`sse_loop/`** + **`runtime/turn/chat_turn_sse_dispatch`** (`ChatTurnSseFramer` + JSON dispatch). Remaining: move multi-turn loop to server; `bridge_inprocess` uses `sse_data_lines` vs blank-line events |
 
 **Success criteria** (unchanged): `mo-agent` CLI can be deleted and replaced with a ~500-line thin client; **not yet met** — `chat_stream` + `ReplState` infra fields remain.
 
@@ -1893,7 +1894,7 @@ mo-agent Orchestrator
 | Tool argument hints | `runtime/src/turn/tool_argument_hints.rs` | Normalize LLM `arguments`; **`path` + `command` only** for hints (approval, CLI, previews) | runtime ✅ |
 | SSE data JSON lines | `runtime/src/turn/sse_data_lines.rs` | Incremental `data:` line → JSON; `[DONE]`; EOF flush | runtime ✅ |
 | SSE event blocks | `runtime/src/turn/sse_blocks.rs` | Blank-line delimited event text (server / thin-client framing) | runtime ✅ |
-| `/chat/turn` SSE JSON dispatch | `runtime/src/turn/chat_turn_sse_dispatch.rs` | `ChatTurnSseAccum`, `ChatTurnEdgePending`, `dispatch_chat_turn_sse_event_block` (shared with CLI `consume_turn_sse`) | runtime ✅ |
+| `/chat/turn` SSE JSON dispatch | `runtime/src/turn/chat_turn_sse_dispatch.rs` | `ChatTurnSseAccum`, `ChatTurnEdgePending`, `ChatTurnSseFramer`, `dispatch_chat_turn_sse_event_block` (CLI `consume_turn_sse` + tests) | runtime ✅ |
 | Chat turn heuristics | `runtime/src/turn/chat_turn_heuristics.rs` | Factual-query guard, `openai_factual_tool_retry_user_message`, session-not-found, repo extraction from memory text | runtime ✅ |
 | Headless tool assembly | `runtime/src/turn/headless_tool_assembly.rs` | `CACHEABLE_TOOLS`, edge row → `tool_call` output match, `openai_assistant_with_tool_calls_message`, `openai_tool_roundtrip_values` | runtime ✅ |
 | Bridge (HTTP) | `runtime/src/turn/bridge/mod.rs` | HttpChatTurnBridge, forwards to external service | runtime ✅ |
