@@ -13,6 +13,9 @@ use mo_agent_runtime::{
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
     tool_registry::{self, ToolRegistry},
+    turn::agentic_turn_telemetry::{
+        format_token_count_compact, session_id_footer_abbrev, step_recorder_chat_ephemeral_run_id,
+    },
     turn::chat_history_openai::openai_messages_from_repl_history,
     turn::edge_prompt_context::detect_project_languages,
     turn::stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG,
@@ -103,7 +106,7 @@ impl AgenticSseLoopState {
         let max_turns = RuntimeLimits::global().max_turns;
         let step_recorder = StepRecorder::with_persistence(
             current_session_id.as_deref().unwrap_or("ephemeral"),
-            &format!("chat-{}", start.elapsed().as_millis()),
+            step_recorder_chat_ephemeral_run_id(start.elapsed().as_millis()).as_str(),
         );
 
         Self {
@@ -317,17 +320,8 @@ fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
     }
 
     let elapsed = start.elapsed().as_secs_f64();
-    let format_footer_tokens = |tokens: u64| -> String {
-        if tokens < 1000 {
-            format!("{}tok", tokens)
-        } else {
-            format!("{:.1}k", tokens as f64 / 1000.0)
-        }
-    };
     let model_tag = model.unwrap_or("auto");
-    let session_tag = current_session_id
-        .map(|s| if s.len() > 8 { &s[..8] } else { s })
-        .unwrap_or("?");
+    let session_tag = session_id_footer_abbrev(current_session_id);
     if verbose_mode && !quiet {
         eprintln!(
             "{}",
@@ -335,12 +329,12 @@ fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
                 "  ⏱ {:.1}s  ↓ {}  ↑ {}  model: {}  session: {}",
                 elapsed,
                 if has_any_usage {
-                    format_footer_tokens(total_completion)
+                    format_token_count_compact(total_completion)
                 } else {
                     "?".to_string()
                 },
                 if has_any_usage {
-                    format_footer_tokens(total_prompt)
+                    format_token_count_compact(total_prompt)
                 } else {
                     "?".to_string()
                 },

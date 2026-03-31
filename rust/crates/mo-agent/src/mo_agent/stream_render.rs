@@ -3,6 +3,10 @@ use futures_util::StreamExt;
 use mo_agent_runtime::turn::chat_turn_sse_dispatch::{
     ChatTurnSseAccum, ChatTurnSseFramer, SseRenderEffect, dispatch_chat_turn_sse_event_block,
 };
+use mo_agent_runtime::turn::sse_edge_stderr_lines::{
+    edge_sse_post_approval_fail_line, edge_sse_post_tool_result_fail_line,
+    edge_sse_thought_duration_line, edge_sse_tool_request_notice_line,
+};
 use mo_agent_runtime::turn::tool_result_semantics::cloud_tool_result_status_label;
 use std::ops::{Deref, DerefMut};
 
@@ -75,7 +79,7 @@ async fn flush_pending_edge_work(
                 if !ctx.quiet {
                     eprintln!(
                         "{}",
-                        format!("  ⚡ tool_request: {} ({})", tool, request_id).dim()
+                        edge_sse_tool_request_notice_line(&tool, &request_id).dim()
                     );
                 }
                 let allowed = match ctx.perm_manager {
@@ -115,7 +119,7 @@ async fn flush_pending_edge_work(
                     .await
                     && !ctx.quiet
                 {
-                    eprintln!("{}", format!("  ! post_tool_result: {e}").yellow());
+                    eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
                 }
             }
             ChatTurnEdgePending::ApprovalRequired {
@@ -141,7 +145,7 @@ async fn flush_pending_edge_work(
                 if let Err(e) = ctx.api.post_approval(Some(ctx.token), &body).await
                     && !ctx.quiet
                 {
-                    eprintln!("{}", format!("  ! post_approval: {e}").yellow());
+                    eprintln!("{}", edge_sse_post_approval_fail_line(e).yellow());
                 }
             }
         }
@@ -268,7 +272,7 @@ impl StreamRenderState {
             spinner.stop_clear();
             if let Some(start) = self.thinking_start.take() {
                 let elapsed = start.elapsed().as_secs_f64();
-                eprintln!("{}", format!("  ● Thought for {elapsed:.1}s").dim());
+                eprintln!("{}", edge_sse_thought_duration_line(elapsed).dim());
             }
         }
     }

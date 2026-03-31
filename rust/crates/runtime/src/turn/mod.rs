@@ -59,6 +59,7 @@ pub mod skill_instructions_merge;
 pub mod snapshot;
 pub mod sse_blocks;
 pub mod sse_data_lines;
+pub mod sse_edge_stderr_lines;
 pub mod stall;
 pub mod state;
 pub mod stream_events;
