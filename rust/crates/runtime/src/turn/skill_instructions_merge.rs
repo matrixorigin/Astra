@@ -46,9 +46,33 @@ pub fn merge_skill_instruction_bodies_for_chat(
     (outcomes, merged, activated)
 }
 
+/// Message after the warning glyph when a skill body failed to load (CLI prints `  ⚠ {this}`).
+#[must_use]
+pub fn skill_instruction_load_failed_message(skill_name: &str, err: &str) -> String {
+    format!("Failed to load skill {skill_name}: {err}")
+}
+
+/// Comma-separated activated skill names (CLI prints `◆ Using skill: …` with partial color).
+#[must_use]
+pub fn skill_instruction_activated_names_csv(activated_skills: &[String]) -> String {
+    activated_skills.join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stderr_line_shapes() {
+        assert_eq!(
+            skill_instruction_load_failed_message("x", "boom"),
+            "Failed to load skill x: boom"
+        );
+        assert_eq!(
+            skill_instruction_activated_names_csv(&["a".into(), "b".into()]),
+            "a, b"
+        );
+    }
 
     #[test]
     fn merge_skips_empty_and_collects_errors() {

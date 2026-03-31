@@ -72,7 +72,10 @@ use mo_agent_runtime::{
     },
     turn::hydrate_reflect::hydrate_reflect_placeholder_if_needed,
     turn::prepare_turn_explain_text::explain_stderr_payload_line_pair,
-    turn::skill_instructions_merge::merge_skill_instruction_bodies_for_chat,
+    turn::skill_instructions_merge::{
+        merge_skill_instruction_bodies_for_chat, skill_instruction_activated_names_csv,
+        skill_instruction_load_failed_message,
+    },
     turn::tool_result_semantics::{is_tool_error, tool_dedup_signature},
     turn::tool_schema_prune::pin_invoked_tool_schemas,
     turn::turn_guard::{TurnGuard, merge_deprioritized_tools_into_restricted},
@@ -361,10 +364,9 @@ fn load_skill_instructions_text(
     for o in outcomes {
         if let Err(e) = o.result {
             eprintln!(
-                "  {} Failed to load skill {}: {}",
+                "  {} {}",
                 "⚠".yellow(),
-                o.skill_name,
-                e
+                skill_instruction_load_failed_message(o.skill_name.as_str(), e.as_str())
             );
         }
     }
@@ -373,7 +375,7 @@ fn load_skill_instructions_text(
         eprintln!(
             "  {} Using skill: {}",
             "◆".cyan(),
-            activated_skills.join(", ").cyan()
+            skill_instruction_activated_names_csv(activated_skills.as_slice()).cyan()
         );
     }
     Some(merged)
