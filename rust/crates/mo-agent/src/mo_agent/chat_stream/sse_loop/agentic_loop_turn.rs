@@ -706,7 +706,7 @@ pub(crate) async fn run_agentic_loop_iteration(
         tool_call_records,
     })
     .await;
-    explain_turns.extend(turn_result.explain_turns);
+    explain_turns.extend(turn_result.explain_turns.iter().cloned());
 
     match apply_post_tool_turn_policy(PostToolTurnRequest {
         turn_index: turn_index as u32,

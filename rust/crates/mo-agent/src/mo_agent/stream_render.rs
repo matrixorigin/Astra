@@ -1,26 +1,11 @@
 use super::*;
 use futures_util::StreamExt;
+use mo_agent_runtime::turn::chat_turn_sse_dispatch::{
+    ChatTurnSseAccum, SseRenderEffect, dispatch_chat_turn_sse_event_block,
+};
+use std::ops::{Deref, DerefMut};
 
-/// Cloud → edge callback (§5.5 `tool_request`); drained asynchronously in [`consume_turn_sse`].
-#[derive(Debug, Clone)]
-pub(super) struct PendingToolRequest {
-    pub request_id: String,
-    pub tool: String,
-    pub args: serde_json::Value,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct PendingApproval {
-    pub request_id: String,
-    pub tool: String,
-    pub path: Option<String>,
-}
-
-#[derive(Debug)]
-pub(super) enum PendingEdgeWork {
-    Tool(PendingToolRequest),
-    Approval(PendingApproval),
-}
+pub use mo_agent_runtime::turn::chat_turn_sse_dispatch::ChatTurnEdgePending;
 
 /// One tool executed from SSE `tool_request` (ordering preserved for synthetic `tool_calls`).
 #[derive(Debug, Clone)]
@@ -76,7 +61,7 @@ fn tool_post_status(output: &str) -> &'static str {
 }
 
 async fn flush_pending_edge_work(
-    pending: &mut Vec<PendingEdgeWork>,
+    pending: &mut Vec<ChatTurnEdgePending>,
     edge: Option<&EdgeSseContext<'_>>,
     result: &mut TurnResult,
 ) {
@@ -89,34 +74,38 @@ async fn flush_pending_edge_work(
     };
     for item in std::mem::take(pending) {
         match item {
-            PendingEdgeWork::Tool(req) => {
-                if req.request_id.is_empty() || req.tool.is_empty() {
+            ChatTurnEdgePending::ToolRequest {
+                request_id,
+                tool,
+                args,
+            } => {
+                if request_id.is_empty() || tool.is_empty() {
                     continue;
                 }
                 if !ctx.quiet {
                     eprintln!(
                         "{}",
-                        format!("  ⚡ tool_request: {} ({})", req.tool, req.request_id).dim()
+                        format!("  ⚡ tool_request: {} ({})", tool, request_id).dim()
                     );
                 }
                 let allowed = match ctx.perm_manager {
-                    Some(mut ptr) => unsafe { ptr.as_mut().check(&req.tool, &req.args) },
+                    Some(mut ptr) => unsafe { ptr.as_mut().check(&tool, &args) },
                     None => true,
                 };
                 let start = std::time::Instant::now();
                 let output = if allowed {
-                    ctx.executor.execute(&req.tool, &req.args).await
+                    ctx.executor.execute(&tool, &args).await
                 } else {
                     "Permission denied".to_string()
                 };
                 let sig = mo_agent_runtime::turn::tool_result_semantics::tool_dedup_signature(
-                    &req.tool, &req.args,
+                    &tool, &args,
                 );
                 result.edge_callback_outputs.insert(sig, output.clone());
                 result.edge_tool_round.push(EdgeToolRoundEntry {
-                    request_id: req.request_id.clone(),
-                    tool: req.tool.clone(),
-                    args: req.args.clone(),
+                    request_id: request_id.clone(),
+                    tool: tool.clone(),
+                    args: args.clone(),
                     output: output.clone(),
                 });
                 let status = if !allowed {
@@ -125,7 +114,7 @@ async fn flush_pending_edge_work(
                     tool_post_status(&output)
                 };
                 let body = mo_thin_client::ToolResultRequest {
-                    request_id: req.request_id,
+                    request_id,
                     status: status.to_string(),
                     output: Some(output),
                     duration_ms: Some(start.elapsed().as_millis() as u64),
@@ -139,19 +128,23 @@ async fn flush_pending_edge_work(
                     eprintln!("{}", format!("  ! post_tool_result: {e}").yellow());
                 }
             }
-            PendingEdgeWork::Approval(ap) => {
-                if ap.request_id.is_empty() {
+            ChatTurnEdgePending::ApprovalRequired {
+                request_id,
+                tool,
+                path,
+            } => {
+                if request_id.is_empty() {
                     continue;
                 }
                 let decision = match ctx.perm_manager {
                     Some(mut ptr) => unsafe {
                         ptr.as_mut()
-                            .resolve_cloud_approval(&ap.tool, ap.path.as_deref(), ctx.quiet)
+                            .resolve_cloud_approval(&tool, path.as_deref(), ctx.quiet)
                     },
                     None => mo_thin_client::ApprovalDecision::Deny,
                 };
                 let body = mo_thin_client::ApprovalRespondRequest {
-                    request_id: ap.request_id,
+                    request_id,
                     decision,
                     reason: None,
                 };
@@ -223,18 +216,9 @@ impl Drop for Spinner {
 
 // ─── Turn result from one /chat/turn SSE stream ───────────────────────────────
 
+/// One turn: core fields from [`ChatTurnSseAccum`] plus CLI-only edge bookkeeping and TTFT.
 pub(super) struct TurnResult {
-    pub(super) session_id: Option<String>,
-    pub(super) run_id: Option<String>,
-    pub(super) full_text: String,
-    pub(super) reasoning_content: String, // thinking/reasoning captured from LLM (for thinking models)
-    pub(super) tool_calls: Vec<serde_json::Value>, // raw tool_call objects from server
-    pub(super) explain_turns: Vec<serde_json::Value>,
-    pub(super) has_tool_calls: bool,
-    pub(super) prompt_tokens: u64,
-    pub(super) completion_tokens: u64,
-    pub(super) has_usage: bool,
-    pub(super) error_message: Option<String>,
+    pub(super) core: ChatTurnSseAccum,
     /// Time to first token in milliseconds (streaming latency).
     pub(super) ttft_ms: Option<u64>,
     /// Outputs from SSE `tool_request` (same key as [`mo_agent_runtime::turn::tool_result_semantics::tool_dedup_signature`]).
@@ -243,20 +227,24 @@ pub(super) struct TurnResult {
     pub(super) edge_tool_round: Vec<EdgeToolRoundEntry>,
 }
 
+impl Deref for TurnResult {
+    type Target = ChatTurnSseAccum;
+
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+impl DerefMut for TurnResult {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.core
+    }
+}
+
 impl TurnResult {
     pub(super) fn new() -> Self {
         Self {
-            session_id: None,
-            run_id: None,
-            full_text: String::new(),
-            reasoning_content: String::new(),
-            tool_calls: Vec::new(),
-            explain_turns: Vec::new(),
-            has_tool_calls: false,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            has_usage: false,
-            error_message: None,
+            core: ChatTurnSseAccum::default(),
             ttft_ms: None,
             edge_callback_outputs: std::collections::HashMap::new(),
             edge_tool_round: Vec::new(),
@@ -309,7 +297,7 @@ pub(super) async fn consume_turn_sse(
     let mut render = StreamRenderState::new();
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
-    let mut pending_edge: Vec<PendingEdgeWork> = Vec::new();
+    let mut pending_edge: Vec<ChatTurnEdgePending> = Vec::new();
 
     // Track time to first token
     let stream_start = std::time::Instant::now();
@@ -415,149 +403,20 @@ pub(super) fn dispatch_turn_event_block(
     result: &mut TurnResult,
     render: &mut StreamRenderState,
     quiet: bool,
-    pending_edge: &mut Vec<PendingEdgeWork>,
+    pending_edge: &mut Vec<ChatTurnEdgePending>,
 ) {
-    for line in block.lines() {
-        let Some(data) = line.strip_prefix("data: ") else {
-            continue;
-        };
-        if data == "[DONE]" {
-            continue;
-        }
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
-            continue;
-        };
-        let etype = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        match etype {
-            "text_delta" => {
-                if !quiet {
-                    render.stop_thinking();
-                }
-                if let Some(content) = event.get("content").and_then(|v| v.as_str()) {
-                    if !quiet {
-                        print!("{content}");
-                        let _ = io::stdout().flush();
-                    }
-                    result.full_text.push_str(content);
-                }
+    let effects = dispatch_chat_turn_sse_event_block(block, &mut result.core, pending_edge);
+    if quiet {
+        return;
+    }
+    for effect in effects {
+        match effect {
+            SseRenderEffect::StreamText(s) => {
+                print!("{s}");
+                let _ = io::stdout().flush();
             }
-            "text_done" => {
-                if result.full_text.is_empty()
-                    && let Some(ft) = event.get("full_text").and_then(|v| v.as_str())
-                {
-                    result.full_text = ft.to_string();
-                }
-            }
-            "thinking_delta" | "reasoning_delta" => {
-                // Capture thinking/reasoning content for inclusion in assistant messages.
-                if !quiet {
-                    render.start_thinking();
-                }
-                if let Some(chunk) = event.get("content").and_then(|v| v.as_str()) {
-                    result.reasoning_content.push_str(chunk);
-                }
-            }
-            "thinking_done" | "reasoning_done" => {
-                if !quiet {
-                    render.stop_thinking();
-                }
-            }
-            "tool_call_start" => {
-                if !quiet {
-                    render.stop_thinking();
-                }
-            }
-            "tool_call" => {
-                result.tool_calls.push(event.clone());
-            }
-            "tool_request" => {
-                let request_id = event
-                    .get("request_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let tool = event
-                    .get("tool")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let args = event
-                    .get("args")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                if !request_id.is_empty() && !tool.is_empty() {
-                    pending_edge.push(PendingEdgeWork::Tool(PendingToolRequest {
-                        request_id,
-                        tool,
-                        args,
-                    }));
-                }
-            }
-            "approval_required" => {
-                let request_id = event
-                    .get("request_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let tool = event
-                    .get("tool")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let path = event
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .map(std::string::ToString::to_string);
-                if !request_id.is_empty() {
-                    pending_edge.push(PendingEdgeWork::Approval(PendingApproval {
-                        request_id,
-                        tool,
-                        path,
-                    }));
-                }
-            }
-            "explain" => {
-                result.explain_turns.push(event.clone());
-            }
-            "turn_complete" | "turn_done" => {
-                result.has_tool_calls = event
-                    .get("has_tool_calls")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-            }
-            "session_info" => {
-                if let Some(sid) = event.get("session_id").and_then(|v| v.as_str()) {
-                    result.session_id = Some(sid.to_string());
-                }
-            }
-            "usage" => {
-                result.prompt_tokens = event
-                    .get("prompt_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                result.completion_tokens = event
-                    .get("completion_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                result.has_usage = true;
-            }
-            "error" => {
-                let msg = event
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown error");
-                result.error_message = Some(format!("Error: {msg}"));
-            }
-            "run_started" => {
-                if let Some(rid) = event.get("run_id").and_then(|v| v.as_str()) {
-                    result.run_id = Some(rid.to_string());
-                }
-            }
-            _ => {
-                if let Some(rid) = event.get("run_id").and_then(|v| v.as_str()) {
-                    result.run_id = Some(rid.to_string());
-                }
-            }
+            SseRenderEffect::StopThinkingSpinner => render.stop_thinking(),
+            SseRenderEffect::StartThinkingSpinner => render.start_thinking(),
         }
     }
 }
@@ -570,8 +429,9 @@ mod tests {
         format!("data: {{\"type\":\"{event_type}\"{extra}}}\n\n")
     }
 
+    /// `dispatch_turn_event_block` with `quiet` must still fill the shared runtime accumulator.
     #[test]
-    fn text_delta_accumulates() {
+    fn dispatch_quiet_wires_runtime_accumulator() {
         let mut r = TurnResult::new();
         let mut s = StreamRenderState::new();
         let block = format!(
@@ -584,142 +444,6 @@ mod tests {
     }
 
     #[test]
-    fn session_info_captured() {
-        let mut r = TurnResult::new();
-        let mut s = StreamRenderState::new();
-        dispatch_turn_event_block(
-            &sse("session_info", ",\"session_id\":\"abc-123\""),
-            &mut r,
-            &mut s,
-            true,
-            &mut vec![],
-        );
-        assert_eq!(r.session_id.as_deref(), Some("abc-123"));
-    }
-
-    #[test]
-    fn usage_captured() {
-        let mut r = TurnResult::new();
-        let mut s = StreamRenderState::new();
-        dispatch_turn_event_block(
-            &sse("usage", ",\"prompt_tokens\":100,\"completion_tokens\":50"),
-            &mut r,
-            &mut s,
-            true,
-            &mut vec![],
-        );
-        assert!(r.has_usage);
-        assert_eq!(r.prompt_tokens, 100);
-        assert_eq!(r.completion_tokens, 50);
-    }
-
-    #[test]
-    fn tool_call_collected() {
-        let mut r = TurnResult::new();
-        let mut s = StreamRenderState::new();
-        dispatch_turn_event_block(
-            &sse("tool_call", ",\"function\":{\"name\":\"bash\"}"),
-            &mut r,
-            &mut s,
-            true,
-            &mut vec![],
-        );
-        assert_eq!(r.tool_calls.len(), 1);
-        assert_eq!(r.tool_calls[0]["function"]["name"].as_str(), Some("bash"));
-    }
-
-    #[test]
-    fn turn_complete_sets_has_tool_calls() {
-        let mut r = TurnResult::new();
-        let mut s = StreamRenderState::new();
-        dispatch_turn_event_block(
-            &sse("turn_complete", ",\"has_tool_calls\":true"),
-            &mut r,
-            &mut s,
-            true,
-            &mut vec![],
-        );
-        assert!(r.has_tool_calls);
-    }
-
-    #[test]
-    fn error_captured() {
-        let mut r = TurnResult::new();
-        let mut s = StreamRenderState::new();
-        dispatch_turn_event_block(
-            &sse("error", ",\"message\":\"rate limited\""),
-            &mut r,
-            &mut s,
-            true,
-            &mut vec![],
-        );
-        assert_eq!(r.error_message.as_deref(), Some("Error: rate limited"));
-    }
-
-    #[test]
-    fn run_started_captures_run_id() {
-        let mut r = TurnResult::new();
-        let mut s = StreamRenderState::new();
-        dispatch_turn_event_block(
-            &sse("run_started", ",\"run_id\":\"run-42\""),
-            &mut r,
-            &mut s,
-            true,
-            &mut vec![],
-        );
-        assert_eq!(r.run_id.as_deref(), Some("run-42"));
-    }
-
-    #[test]
-    fn done_marker_ignored() {
-        let mut r = TurnResult::new();
-        let mut s = StreamRenderState::new();
-        dispatch_turn_event_block("data: [DONE]\n\n", &mut r, &mut s, true, &mut vec![]);
-        assert!(r.full_text.is_empty());
-    }
-
-    #[test]
-    fn invalid_json_ignored() {
-        let mut r = TurnResult::new();
-        let mut s = StreamRenderState::new();
-        dispatch_turn_event_block(
-            "data: {invalid json}\n\n",
-            &mut r,
-            &mut s,
-            true,
-            &mut vec![],
-        );
-        assert!(r.full_text.is_empty());
-    }
-
-    #[test]
-    fn text_done_fallback_when_no_deltas() {
-        let mut r = TurnResult::new();
-        let mut s = StreamRenderState::new();
-        dispatch_turn_event_block(
-            &sse("text_done", ",\"full_text\":\"complete answer\""),
-            &mut r,
-            &mut s,
-            true,
-            &mut vec![],
-        );
-        assert_eq!(r.full_text, "complete answer");
-    }
-
-    #[test]
-    fn thinking_delta_captures_reasoning() {
-        let mut r = TurnResult::new();
-        let mut s = StreamRenderState::new();
-        let block = format!(
-            "{}{}",
-            sse("thinking_delta", ",\"content\":\"step 1\""),
-            sse("thinking_delta", ",\"content\":\" step 2\""),
-        );
-        dispatch_turn_event_block(&block, &mut r, &mut s, true, &mut vec![]);
-        assert_eq!(r.reasoning_content, "step 1 step 2");
-    }
-
-    #[test]
     fn tool_request_enqueues_pending() {
         let mut r = TurnResult::new();
         let mut s = StreamRenderState::new();
@@ -728,12 +452,16 @@ mod tests {
         dispatch_turn_event_block(block, &mut r, &mut s, true, &mut pending);
         assert_eq!(pending.len(), 1);
         match &pending[0] {
-            PendingEdgeWork::Tool(t) => {
-                assert_eq!(t.request_id, "tr-1");
-                assert_eq!(t.tool, "bash");
-                assert_eq!(t.args["command"], "echo x");
+            ChatTurnEdgePending::ToolRequest {
+                request_id,
+                tool,
+                args,
+            } => {
+                assert_eq!(request_id, "tr-1");
+                assert_eq!(tool, "bash");
+                assert_eq!(args["command"], "echo x");
             }
-            _ => panic!("expected Tool"),
+            _ => panic!("expected ToolRequest"),
         }
     }
 
@@ -746,12 +474,16 @@ mod tests {
         dispatch_turn_event_block(block, &mut r, &mut s, true, &mut pending);
         assert_eq!(pending.len(), 1);
         match &pending[0] {
-            PendingEdgeWork::Approval(a) => {
-                assert_eq!(a.request_id, "ap-1");
-                assert_eq!(a.tool, "write_file");
-                assert_eq!(a.path.as_deref(), Some("src/x.rs"));
+            ChatTurnEdgePending::ApprovalRequired {
+                request_id,
+                tool,
+                path,
+            } => {
+                assert_eq!(request_id, "ap-1");
+                assert_eq!(tool, "write_file");
+                assert_eq!(path.as_deref(), Some("src/x.rs"));
             }
-            _ => panic!("expected Approval"),
+            _ => panic!("expected ApprovalRequired"),
         }
     }
 }
