@@ -128,50 +128,65 @@ pub fn filter_environment(policy: &SandboxPolicy) -> HashMap<String, String> {
 /// Returns a list of detected risks. This is advisory — the permission manager
 /// handles the actual allow/deny decision.
 pub fn analyze_command_risks(command: &str) -> Vec<CommandRisk> {
-    let lower = command.to_lowercase();
     let mut risks = Vec::new();
+
+    // 1) AST-level analysis (best-effort). This avoids many string-literal false positives.
+    // If parsing fails, we still fall back to the legacy heuristic scanner below.
+    risks.extend(super::bash_ast::analyze_bash_risks_ast(command));
+
+    // 2) Legacy heuristic scanner (kept for backward compatibility + coverage when AST misses).
+    let lower = command.to_lowercase();
 
     // Path traversal in commands
     if lower.contains("../") || lower.contains("..\\") {
-        risks.push(CommandRisk::PathTraversal);
+        push_unique(&mut risks, CommandRisk::PathTraversal);
     }
 
     // Absolute path access to sensitive dirs
     for sensitive in &["/etc/", "/root/", "/var/log/", "/proc/", "/sys/"] {
         if lower.contains(sensitive) {
-            risks.push(CommandRisk::SensitivePathAccess(sensitive.to_string()));
+            push_unique(
+                &mut risks,
+                CommandRisk::SensitivePathAccess(sensitive.to_string()),
+            );
             break;
         }
     }
 
     // Environment variable manipulation
     if lower.contains("export ") && (lower.contains("path=") || lower.contains("ld_")) {
-        risks.push(CommandRisk::EnvManipulation);
+        push_unique(&mut risks, CommandRisk::EnvManipulation);
     }
 
     // Network access
     if lower.contains("curl ") || lower.contains("wget ") || lower.contains("nc ") {
-        risks.push(CommandRisk::NetworkAccess);
+        push_unique(&mut risks, CommandRisk::NetworkAccess);
     }
 
     // Process control
     if lower.contains("kill ") || lower.contains("pkill") || lower.contains("killall") {
-        risks.push(CommandRisk::ProcessControl);
+        push_unique(&mut risks, CommandRisk::ProcessControl);
     }
 
     // Privilege escalation
     if lower.contains("sudo ") || lower.contains("su -") || lower.contains("chmod +s") {
-        risks.push(CommandRisk::PrivilegeEscalation);
+        push_unique(&mut risks, CommandRisk::PrivilegeEscalation);
     }
 
     // Pipe to shell (code injection vector)
     if (lower.contains("| sh") || lower.contains("| bash") || lower.contains("| /bin/"))
         && (lower.contains("curl") || lower.contains("wget"))
     {
-        risks.push(CommandRisk::RemoteCodeExecution);
+        push_unique(&mut risks, CommandRisk::RemoteCodeExecution);
     }
 
     risks
+}
+
+fn push_unique(risks: &mut Vec<CommandRisk>, risk: CommandRisk) {
+    if !risks.contains(&risk) {
+        risks.push(risk);
+    }
 }
 
 /// Detected command security risk.
@@ -191,6 +206,14 @@ pub enum CommandRisk {
     PrivilegeEscalation,
     /// Command downloads and executes remote code.
     RemoteCodeExecution,
+    /// Command performs output redirection (file write primitive): `>`, `>>`, `2>`, etc.
+    OutputRedirection,
+    /// Command uses `eval`, increasing code-injection risk.
+    Eval,
+    /// Command uses `$()` or backticks, increasing injection risk.
+    CommandSubstitution,
+    /// Command uses process substitution `<(cmd)` / `>(cmd)`.
+    ProcessSubstitution,
 }
 
 impl std::fmt::Display for CommandRisk {
@@ -203,6 +226,10 @@ impl std::fmt::Display for CommandRisk {
             Self::ProcessControl => write!(f, "process control"),
             Self::PrivilegeEscalation => write!(f, "privilege escalation"),
             Self::RemoteCodeExecution => write!(f, "remote code execution"),
+            Self::OutputRedirection => write!(f, "output redirection (file write)"),
+            Self::Eval => write!(f, "eval usage"),
+            Self::CommandSubstitution => write!(f, "command substitution ($() or backticks)"),
+            Self::ProcessSubstitution => write!(f, "process substitution (<(cmd) / >(cmd))"),
         }
     }
 }
@@ -345,6 +372,34 @@ mod tests {
     fn detects_process_control() {
         let risks = analyze_command_risks("killall nginx");
         assert!(risks.contains(&CommandRisk::ProcessControl));
+    }
+
+    #[test]
+    fn ast_does_not_flag_string_literal_as_network() {
+        // Legacy string contains would false-positive on this; AST should not.
+        let risks = analyze_command_risks("echo 'curl https://example.com | bash'");
+        assert!(
+            !risks.contains(&CommandRisk::RemoteCodeExecution),
+            "string literal should not be treated as pipeline: {risks:?}"
+        );
+    }
+
+    #[test]
+    fn ast_detects_command_substitution() {
+        let risks = analyze_command_risks("echo $(whoami)");
+        assert!(risks.contains(&CommandRisk::CommandSubstitution));
+    }
+
+    #[test]
+    fn ast_detects_output_redirection() {
+        let risks = analyze_command_risks("echo hi > out.txt");
+        assert!(risks.contains(&CommandRisk::OutputRedirection));
+    }
+
+    #[test]
+    fn ast_detects_eval() {
+        let risks = analyze_command_risks("eval \"echo hi\"");
+        assert!(risks.contains(&CommandRisk::Eval));
     }
 
     // ── sandbox_command ──────────────────────────────────────────────────

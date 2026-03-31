@@ -9,6 +9,7 @@
 //! 3. **Policy engine** — configurable per-session security rules
 
 mod command;
+mod bash_ast;
 mod path;
 mod policy;
 
