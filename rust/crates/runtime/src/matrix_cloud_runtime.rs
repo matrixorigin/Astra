@@ -2,7 +2,7 @@
 //! [`SyncOrchestrator`] (learning, events, templates, preferences). Used by `mo-agent-server`
 //! [`AppState`] and by the CLI [`ReplState`] as a single `Arc` attachment.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use mo_agent_core::{MatrixOneSettings, SharedPool};
@@ -10,7 +10,7 @@ use mo_agent_services::{
     event_ingestion::{self, IngestionConfig, IngestionEvent},
     session_journal::JournalEvent,
     state_sync::{MatrixOneSyncService, PlanTemplateSyncRow},
-    CloudTransport, DomainAdapter, SyncOrchestrator, SyncPolicy,
+    CloudTransport, DomainAdapter, SyncOrchestrator, SyncPolicy, TaskLeaseHoldCache, TaskRecord,
 };
 
 use crate::pipeline::{
@@ -18,7 +18,8 @@ use crate::pipeline::{
     pattern::PatternLibrary,
 };
 use crate::sync_adapters::{
-    EventAdapter, LearningAdapter, MatrixOneTransport, PreferenceAdapter, TemplateAdapter,
+    EventAdapter, LearningAdapter, MatrixOneTransport, PreferenceAdapter, TaskAdapter,
+    TemplateAdapter,
 };
 
 /// Environment-driven MatrixOne settings (same defaults as legacy CLI `try_init_ingestion`).
@@ -45,6 +46,11 @@ pub struct MatrixCloudRuntime {
     preference_store: Arc<Mutex<BTreeMap<String, String>>>,
     /// Cached plan templates from last `pull_domain(Templates)`.
     template_cache: Arc<Mutex<Vec<PlanTemplateSyncRow>>>,
+    /// Phase 3: shared with HTTP lease handlers and [`TaskAdapter`] (process-local export filter).
+    pub lease_hold_cache: Arc<TaskLeaseHoldCache>,
+    task_mirror: Arc<Mutex<BTreeMap<String, TaskRecord>>>,
+    task_dirty: Arc<Mutex<HashSet<String>>>,
+    edge_agent_id: Arc<str>,
 }
 
 impl MatrixCloudRuntime {
@@ -58,7 +64,14 @@ impl MatrixCloudRuntime {
         calibrator: Arc<Mutex<ProgressiveCalibrator>>,
         tool_health: Arc<Mutex<Vec<ToolHealthEntry>>>,
         cloud_learning_version: Option<i64>,
+        lease_hold_cache: Arc<TaskLeaseHoldCache>,
     ) -> Self {
+        let edge_agent_id: Arc<str> = std::env::var("MO_EDGE_AGENT_ID")
+            .unwrap_or_else(|_| "mo-server".into())
+            .into();
+        let task_mirror = Arc::new(Mutex::new(BTreeMap::new()));
+        let task_dirty = Arc::new(Mutex::new(HashSet::new()));
+
         let pool = shared_pool.get().clone();
         let (sender, _stats, _jh) =
             event_ingestion::EventIngestionWorker::spawn(pool.clone(), IngestionConfig::default());
@@ -66,6 +79,7 @@ impl MatrixCloudRuntime {
         let transport: Arc<dyn CloudTransport> = Arc::new(MatrixOneTransport::new(
             sync_svc,
             profile.to_string(),
+            edge_agent_id.as_ref(),
         ));
         let mut orch = SyncOrchestrator::new(transport, user_id.to_string());
         let learning_adapter = LearningAdapter::new(
@@ -96,6 +110,15 @@ impl MatrixCloudRuntime {
             Box::new(PreferenceAdapter::new(Arc::clone(&preference_store))),
             SyncPolicy::preferences(),
         );
+        orch.register(
+            Box::new(TaskAdapter::new(
+                Arc::clone(&task_mirror),
+                Arc::clone(&task_dirty),
+                Arc::clone(&edge_agent_id),
+                Arc::clone(&lease_hold_cache),
+            )),
+            SyncPolicy::tasks(),
+        );
 
         Self {
             shared_pool,
@@ -103,6 +126,10 @@ impl MatrixCloudRuntime {
             sync_orchestrator: Mutex::new(orch),
             preference_store,
             template_cache,
+            lease_hold_cache,
+            task_mirror,
+            task_dirty,
+            edge_agent_id,
         }
     }
 
@@ -112,6 +139,20 @@ impl MatrixCloudRuntime {
 
     pub fn template_cache(&self) -> Arc<Mutex<Vec<PlanTemplateSyncRow>>> {
         Arc::clone(&self.template_cache)
+    }
+
+    pub fn edge_agent_id(&self) -> &str {
+        &self.edge_agent_id
+    }
+
+    /// Task mirror backing [`crate::sync_adapters::TaskAdapter`] (pull merge + export source).
+    pub fn task_sync_mirror(&self) -> Arc<Mutex<BTreeMap<String, TaskRecord>>> {
+        Arc::clone(&self.task_mirror)
+    }
+
+    /// Dirty task IDs for lease-filtered task sync export.
+    pub fn task_sync_dirty(&self) -> Arc<Mutex<HashSet<String>>> {
+        Arc::clone(&self.task_dirty)
     }
 
     pub fn shared_pool(&self) -> &SharedPool {
@@ -156,7 +197,12 @@ pub fn build_sync_orchestrator_with_adapters(
     calibrator: Arc<Mutex<ProgressiveCalibrator>>,
     tool_health: Arc<Mutex<Vec<ToolHealthEntry>>>,
     ingestion: mo_agent_services::event_ingestion::IngestionSender,
+    lease_hold_cache: Arc<TaskLeaseHoldCache>,
+    task_mirror: Arc<Mutex<BTreeMap<String, TaskRecord>>>,
+    task_dirty: Arc<Mutex<HashSet<String>>>,
+    edge_agent_id: impl Into<Arc<str>>,
 ) -> SyncOrchestrator {
+    let edge_agent_id: Arc<str> = edge_agent_id.into();
     let mut orch = SyncOrchestrator::new(transport, user_id.to_string());
     let learning_adapter = LearningAdapter::new(
         entity_graph,
@@ -179,6 +225,15 @@ pub fn build_sync_orchestrator_with_adapters(
         Box::new(PreferenceAdapter::new(preference_store)),
         SyncPolicy::preferences(),
     );
+    orch.register(
+        Box::new(TaskAdapter::new(
+            Arc::clone(&task_mirror),
+            Arc::clone(&task_dirty),
+            Arc::clone(&edge_agent_id),
+            Arc::clone(&lease_hold_cache),
+        )),
+        SyncPolicy::tasks(),
+    );
     orch
 }
 
@@ -198,6 +253,9 @@ mod tests {
     #[test]
     fn noop_transport_orchestrator_registers_learning_and_events() {
         let transport: Arc<dyn CloudTransport> = Arc::new(NoopTransport);
+        let lease = Arc::new(TaskLeaseHoldCache::default());
+        let mirror = Arc::new(Mutex::new(BTreeMap::new()));
+        let dirty = Arc::new(Mutex::new(HashSet::new()));
         let eg = Arc::new(Mutex::new(EntityGraph::new()));
         let pl = Arc::new(Mutex::new(PatternLibrary::new()));
         let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.7)));
@@ -210,12 +268,17 @@ mod tests {
             cal,
             th,
             IngestionSender::disconnected(),
+            Arc::clone(&lease),
+            Arc::clone(&mirror),
+            Arc::clone(&dirty),
+            "test-edge",
         );
         let domains: Vec<SyncDomain> = orch.status_summary().into_iter().map(|(d, _)| d).collect();
         assert!(domains.contains(&SyncDomain::Learning));
         assert!(domains.contains(&SyncDomain::Events));
         assert!(domains.contains(&SyncDomain::Templates));
         assert!(domains.contains(&SyncDomain::Preferences));
+        assert!(domains.contains(&SyncDomain::Tasks));
     }
 
 }

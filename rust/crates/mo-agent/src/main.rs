@@ -2844,6 +2844,7 @@ async fn run_chat_repl(
                 let th = std::sync::Arc::new(std::sync::Mutex::new(
                     state.tool_health_entries.clone(),
                 ));
+                let lease = std::sync::Arc::new(mo_agent_services::TaskLeaseHoldCache::default());
                 Some(std::sync::Arc::new(mo_agent_runtime::MatrixCloudRuntime::attach(
                     pool,
                     profile.unwrap_or("default"),
@@ -2853,6 +2854,7 @@ async fn run_chat_repl(
                     pipeline_modules.calibrator.clone(),
                     th,
                     state.cloud_learning_version,
+                    lease,
                 )))
             }
             Err(_) => None,

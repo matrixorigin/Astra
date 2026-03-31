@@ -5,6 +5,7 @@ pub(super) async fn build_server_state(
 ) -> Result<AppState, Box<dyn std::error::Error>> {
     ensure_core_schema(&settings.matrixone).await?;
     let shared_pool = SharedPool::new(&settings.matrixone).await?;
+    let lease_hold_cache = Arc::new(TaskLeaseHoldCache::default());
 
     // Build shared pipeline learning modules (server-wide singleton).
     let learning_stack = build_pipeline_learning_stack();
@@ -141,7 +142,14 @@ pub(super) async fn build_server_state(
     .with_turn_learning_writer(learning_stack.writer.clone())
     .with_task_service(Arc::new(
         MatrixOneTaskService::from_shared(&shared_pool),
-    ));
+    ))
+    .with_edge_registry_service(Arc::new(DatabaseEdgeRegistryService::from_shared(
+        &shared_pool,
+    )))
+    .with_task_lease_service(Arc::new(DatabaseTaskLeaseService::from_shared(
+        &shared_pool,
+        Arc::clone(&lease_hold_cache),
+    )));
 
     // Wire chat turn bridge: prefer explicit URL override, fall back to in-process Rust impl.
     // Note: with_chat_turn_bridge_url auto-wires the learning writer from AppState.
@@ -176,6 +184,7 @@ pub(super) async fn build_server_state(
         learning_stack.calibrator.clone(),
         Arc::new(Mutex::new(Vec::new())),
         None,
+        Arc::clone(&lease_hold_cache),
     ));
     let state = state.with_matrix_cloud_runtime(Some(matrix_rt));
     Ok(state)

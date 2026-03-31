@@ -12,6 +12,7 @@ pub mod introspection;
 pub mod jobs;
 pub mod learning;
 pub mod marketplace;
+pub mod multi_agent;
 pub mod models;
 pub mod protocol;
 pub mod reflect;
@@ -81,6 +82,11 @@ pub use learning::{
 };
 pub use marketplace::{
     DatabaseMarketplaceService, MarketplaceService, UnconfiguredMarketplaceService,
+};
+pub use multi_agent::{
+    DatabaseEdgeRegistryService, DatabaseTaskLeaseService, EdgeAgentRecord, EdgeRegistryService,
+    LeaseClaimResult, TaskLeaseHoldCache, TaskLeaseService, TaskLeaseView, TasksPackPushResult,
+    UnconfiguredEdgeRegistryService, UnconfiguredTaskLeaseService,
 };
 pub use models::{
     DatabaseModelService, ModelCreateRequestData, ModelRecord, ModelService,

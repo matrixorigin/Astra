@@ -125,6 +125,11 @@ pub use mo_agent_services::{
         LearningFeedbackService, UnconfiguredLearningFeedbackService,
     },
     marketplace::{DatabaseMarketplaceService, MarketplaceService, UnconfiguredMarketplaceService},
+    multi_agent::{
+        DatabaseEdgeRegistryService, DatabaseTaskLeaseService, EdgeRegistryService,
+        TaskLeaseHoldCache, TaskLeaseService, UnconfiguredEdgeRegistryService,
+        UnconfiguredTaskLeaseService,
+    },
     models::{
         DatabaseModelService, ModelCreateRequestData, ModelRecord, ModelService,
         ModelUpdateRequestData, PricingData, QuirksData, UnconfiguredModelService,

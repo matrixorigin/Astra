@@ -61,6 +61,8 @@ pub struct AppState {
     pub(crate) turn_auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
     pub(crate) turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
     pub(crate) task_service: Arc<dyn TaskService>,
+    pub(crate) edge_registry_service: Arc<dyn EdgeRegistryService>,
+    pub(crate) task_lease_service: Arc<dyn TaskLeaseService>,
     pub(crate) run_lifecycle_service: Arc<dyn RunLifecycleService>,
     pub(crate) admin_authorizer: Arc<dyn AdminAuthorizer>,
     pub(crate) admin_initializer: Arc<dyn AdminInitializer>,
@@ -133,6 +135,8 @@ impl AppState {
             turn_auxiliary_event_writer: Arc::new(NoopTurnAuxiliaryEventWriter),
             turn_session_activity_writer: Arc::new(NoopTurnSessionActivityWriter),
             task_service: Arc::new(UnconfiguredTaskService),
+            edge_registry_service: Arc::new(UnconfiguredEdgeRegistryService),
+            task_lease_service: Arc::new(UnconfiguredTaskLeaseService),
             run_lifecycle_service: Arc::new(UnconfiguredRunLifecycleService),
             admin_authorizer: Arc::new(auth::UnconfiguredAdminAuthorizer),
             admin_initializer: Arc::new(auth::UnconfiguredAdminInitializer),
@@ -393,6 +397,19 @@ impl AppState {
 
     pub fn with_task_service(mut self, task_service: Arc<dyn TaskService>) -> Self {
         self.task_service = task_service;
+        self
+    }
+
+    pub fn with_edge_registry_service(
+        mut self,
+        edge_registry_service: Arc<dyn EdgeRegistryService>,
+    ) -> Self {
+        self.edge_registry_service = edge_registry_service;
+        self
+    }
+
+    pub fn with_task_lease_service(mut self, task_lease_service: Arc<dyn TaskLeaseService>) -> Self {
+        self.task_lease_service = task_lease_service;
         self
     }
 

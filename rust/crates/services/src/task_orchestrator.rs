@@ -180,6 +180,9 @@ pub struct TaskRecord {
     pub project_type: Option<String>,
     #[serde(default)]
     pub goal_pattern: Option<String>,
+    /// Edge / worker that owns execution (Phase 3 lease + `agent_tasks.agent_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 /// Task outcome for learning.
@@ -367,10 +370,10 @@ pub struct MatrixOneTaskService {
     pool: sqlx::Pool<sqlx::MySql>,
 }
 
-const AGENT_TASK_SELECT_COLUMNS: &str = "task_id, user_id, session_id, parent_task_id, title, description, \
+pub(crate) const AGENT_TASK_SELECT_COLUMNS: &str = "task_id, user_id, session_id, parent_task_id, title, description, \
      status, progress_pct, items_done, items_total, plan_json, checkpoint_json, \
      error_message, user_rating, completion_time_sec, replan_count, auto_adjustments, \
-     outcome, project_type, goal_pattern, \
+     outcome, project_type, goal_pattern, agent_id, \
      CAST(created_at AS CHAR) AS created_at, \
      CAST(updated_at AS CHAR) AS updated_at, \
      completed_at";
@@ -386,7 +389,8 @@ impl MatrixOneTaskService {
         }
     }
 
-    fn record_from_row(row: &sqlx::mysql::MySqlRow) -> Result<TaskRecord, String> {
+    /// Parse a row from `agent_tasks` (shared with task pack sync / multi-agent helpers).
+    pub fn parse_mysql_row(row: &sqlx::mysql::MySqlRow) -> Result<TaskRecord, String> {
         use sqlx::Row;
 
         let plan_json: Option<String> = row.try_get("plan_json").ok().flatten();
@@ -430,6 +434,7 @@ impl MatrixOneTaskService {
             outcome,
             project_type: row.try_get("project_type").ok().flatten(),
             goal_pattern: row.try_get("goal_pattern").ok().flatten(),
+            agent_id: row.try_get("agent_id").ok().flatten(),
         })
     }
 }
@@ -486,7 +491,7 @@ impl TaskService for MatrixOneTaskService {
         .map_err(|e| format!("get_task: {e}"))?;
 
         match row {
-            Some(ref r) => Ok(Some(Self::record_from_row(r)?)),
+            Some(ref r) => Ok(Some(Self::parse_mysql_row(r)?)),
             None => Ok(None),
         }
     }
@@ -516,7 +521,7 @@ impl TaskService for MatrixOneTaskService {
         }
         .map_err(|e| format!("list_tasks: {e}"))?;
 
-        rows.iter().map(Self::record_from_row).collect()
+        rows.iter().map(Self::parse_mysql_row).collect()
     }
 
     async fn update_status(&self, task_id: &str, status: TaskStatus) -> Result<(), String> {
@@ -999,6 +1004,7 @@ impl TaskService for LocalTaskService {
             outcome: None,
             project_type: req.project_type,
             goal_pattern: req.goal_pattern,
+            agent_id: None,
         };
         self.save_task(&record)?;
         Ok(task_id)
@@ -1630,6 +1636,7 @@ mod tests {
             outcome: Some(TaskOutcome::Success),
             project_type: Some("Rust".into()),
             goal_pattern: Some("refactor *".into()),
+            agent_id: Some("edge-a".into()),
         };
         let json = serde_json::to_string(&record).unwrap();
         let loaded: TaskRecord = serde_json::from_str(&json).unwrap();
@@ -1638,6 +1645,7 @@ mod tests {
         assert_eq!(loaded.progress_pct, 50);
         assert_eq!(loaded.user_rating, Some(4));
         assert_eq!(loaded.outcome, Some(TaskOutcome::Success));
+        assert_eq!(loaded.agent_id.as_deref(), Some("edge-a"));
     }
 
     // ── LocalTaskService ──

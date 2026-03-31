@@ -381,6 +381,53 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .execute(&pool)
     .await?;
 
+    // Phase 3: optional `agent_id` on tasks (ALTER is idempotent across versions).
+    if let Err(e) = query("ALTER TABLE agent_tasks ADD COLUMN agent_id VARCHAR(128) NULL")
+        .execute(&pool)
+        .await
+    {
+        let msg = e.to_string();
+        if !msg.to_lowercase().contains("duplicate")
+            && !msg.to_lowercase().contains("already exists")
+        {
+            return Err(e);
+        }
+    }
+
+    query(
+        "CREATE TABLE IF NOT EXISTS edge_agent_registry (
+            registry_id VARCHAR(36) PRIMARY KEY,
+            user_id VARCHAR(36) NOT NULL,
+            edge_agent_id VARCHAR(128) NOT NULL,
+            edge_id VARCHAR(128) NOT NULL,
+            hostname VARCHAR(255) NULL,
+            worktree_path VARCHAR(512) NULL,
+            capabilities_json JSON NULL,
+            registered_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            last_heartbeat_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_edge_registry_user_agent (user_id, edge_agent_id),
+            INDEX idx_edge_registry_user_heartbeat (user_id, last_heartbeat_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS task_leases (
+            task_id VARCHAR(36) PRIMARY KEY,
+            user_id VARCHAR(36) NOT NULL,
+            holder_agent_id VARCHAR(128) NOT NULL,
+            holder_edge_id VARCHAR(128) NULL,
+            expires_at DATETIME(6) NOT NULL,
+            lease_version BIGINT NOT NULL DEFAULT 1,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_task_leases_user_expires (user_id, expires_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // ── Plan templates table (learning successful patterns) ──
     query(
         "CREATE TABLE IF NOT EXISTS plan_templates (

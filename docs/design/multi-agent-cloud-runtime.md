@@ -1748,6 +1748,8 @@ mo-agent Orchestrator
 
 **Goal**: Multiple agents can safely claim and execute tasks without conflicts.
 
+**Implemented (server)**: `edge_agent_registry` + `task_leases` tables (see `storage.rs`), `POST /agents/edge` and `POST /agents/edge/heartbeat`, task lease APIs under `/tasks/{task_id}/lease/*`, `agent_tasks.agent_id`, `StateSyncService::pull_tasks_pack` / `push_tasks_pack_held`, [`TaskAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) + [`MatrixOneTransport`](../../rust/crates/runtime/src/sync_adapters.rs) for [`SyncDomain::Tasks`](../../rust/crates/services/src/sync_engine.rs). Optional git worktree path is stored on registration (`worktree_path` on `edge_agent_registry`). Edge clients set `MO_EDGE_AGENT_ID` (and header `x-mo-edge-id`) consistently with lease claim bodies.
+
 | Task | Effort | Dependency |
 |------|--------|------------|
 | Create `agent_registry` table + heartbeat endpoint | Medium | Phase 2 |
@@ -1811,7 +1813,7 @@ mo-agent Orchestrator
 | Session restore | `services/src/session_restore.rs` | HybridRestoreService, RestoredSession | services ✅ |
 | Session journal | `services/src/session_journal.rs` | JournalWriter, append-only JSONL | services ✅ |
 | Task orchestrator | `services/src/task_orchestrator.rs` | TaskRecord, TaskCheckpoint, SubtaskPlan | services ✅ |
-| Sync adapters | `runtime/src/sync_adapters.rs` | LearningAdapter, EventAdapter (ingestion), TemplateAdapter (pull cache), PreferenceAdapter (bidirectional); Tasks → Phase 3 lease | runtime ✅ |
+| Sync adapters | `runtime/src/sync_adapters.rs` | LearningAdapter, EventAdapter (ingestion), TemplateAdapter (pull cache), PreferenceAdapter (bidirectional), TaskAdapter (lease-filtered tasks) | runtime ✅ |
 | Active LLM resolution | `services/src/models.rs` | `resolve_active_llm_model`, `ResolvedActiveLlmModel` | services ✅ |
 | Tool selector | `runtime/src/tool_selector.rs` | LearnedContext, FallbackSelector, confidence gate | runtime ✅ |
 | Bridge (in-process) | `runtime/src/turn/bridge_inprocess.rs` | Prompt cache, streaming LLM; calls `resolve_active_llm_model` | runtime ✅ (SQL out of bridge) |

@@ -7,6 +7,8 @@
 
 use super::*;
 
+use serde::Deserialize;
+
 use crate::turn::edge_ledger::{
     LEDGER_MAX_ENTRIES, approval_callback_key, tool_callback_key,
 };
@@ -71,35 +73,74 @@ pub(super) async fn post_approval_respond_handler(
     })))
 }
 
-/// Phase 3 placeholder: edge node registration (design `multi-agent-cloud-runtime.md`).
+#[derive(Deserialize)]
+pub(super) struct EdgeRegisterRequest {
+    pub edge_agent_id: String,
+    pub hostname: Option<String>,
+    pub worktree_path: Option<String>,
+    pub capabilities: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct EdgeHeartbeatRequest {
+    pub edge_agent_id: String,
+}
+
+/// `POST /agents/edge` — upsert `edge_agent_registry` (Phase 3).
 pub(super) async fn post_agents_edge_register_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    Json(body): Json<EdgeRegisterRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    if body.edge_agent_id.trim().is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "edge_agent_id required",
+        ));
+    }
     let edge_id = edge_id_from_headers(&headers);
+    let rec = state
+        .edge_registry_service
+        .register_or_update(
+            &user.user_id,
+            &body.edge_agent_id,
+            &edge_id,
+            body.hostname.as_deref(),
+            body.worktree_path.as_deref(),
+            body.capabilities,
+        )
+        .await
+        .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
     Ok(Json(serde_json::json!({
         "ok": true,
         "registered": true,
-        "user_id": user.user_id,
-        "edge_id": edge_id,
-        "note": "Registry persistence not wired; echo payload for forward-compat",
-        "payload": body,
+        "record": rec,
     })))
 }
 
 pub(super) async fn post_agents_edge_heartbeat_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    Json(body): Json<EdgeHeartbeatRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    if body.edge_agent_id.trim().is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "edge_agent_id required",
+        ));
+    }
     let edge_id = edge_id_from_headers(&headers);
+    state
+        .edge_registry_service
+        .heartbeat(&user.user_id, &body.edge_agent_id, &edge_id)
+        .await
+        .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
     Ok(Json(serde_json::json!({
         "ok": true,
         "user_id": user.user_id,
         "edge_id": edge_id,
-        "payload": body,
+        "edge_agent_id": body.edge_agent_id,
     })))
 }

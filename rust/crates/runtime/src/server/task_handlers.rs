@@ -70,12 +70,18 @@ pub(super) async fn get_task_handler(
 ) -> Result<Json<mo_agent_services::TaskRecord>, (StatusCode, Json<ErrorResponse>)> {
     let _user = state.auth_service.current_user(&headers).await?;
 
+    let user = state.auth_service.current_user(&headers).await?;
+
     let task = state
         .task_service
         .get_task(&task_id)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
+
+    if task.user_id != user.user_id {
+        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
+    }
 
     Ok(Json(task))
 }
@@ -88,7 +94,7 @@ pub(super) async fn task_progress_handler(
     Path(task_id): Path<String>,
     Query(query): Query<TaskProgressQuery>,
 ) -> Result<Json<TaskProgressResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _user = state.auth_service.current_user(&headers).await?;
+    let user = state.auth_service.current_user(&headers).await?;
 
     let task = state
         .task_service
@@ -96,6 +102,10 @@ pub(super) async fn task_progress_handler(
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
+
+    if task.user_id != user.user_id {
+        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
+    }
 
     // Read plan-progress events from the session journal.
     let session_id = query
@@ -156,7 +166,17 @@ pub(super) async fn update_task_status_handler(
     Path(task_id): Path<String>,
     Json(payload): Json<UpdateStatusRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let _user = state.auth_service.current_user(&headers).await?;
+    let user = state.auth_service.current_user(&headers).await?;
+
+    let task = state
+        .task_service
+        .get_task(&task_id)
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
+    if task.user_id != user.user_id {
+        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
+    }
 
     let status = parse_task_status(&payload.status)
         .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, format!("invalid status: {}", payload.status)))?;
@@ -168,6 +188,168 @@ pub(super) async fn update_task_status_handler(
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// ─── Phase 3 task leases ─────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub(super) struct LeaseClaimRequest {
+    pub edge_agent_id: String,
+    #[serde(default)]
+    pub ttl_sec: Option<i64>,
+}
+
+fn edge_id_header(headers: &HeaderMap) -> String {
+    headers
+        .get("x-mo-edge-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// `GET /tasks/{task_id}/lease`
+pub(super) async fn get_task_lease_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let task = state
+        .task_service
+        .get_task(&task_id)
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
+    if task.user_id != user.user_id {
+        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
+    }
+
+    let view = state
+        .task_lease_service
+        .get_lease(&user.user_id, &task_id)
+        .await
+        .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    Ok(Json(match view {
+        Some(v) => serde_json::to_value(v).unwrap_or_else(|_| serde_json::json!({})),
+        None => serde_json::json!({ "lease": null }),
+    }))
+}
+
+/// `POST /tasks/{task_id}/lease/claim`
+pub(super) async fn post_task_lease_claim_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+    Json(body): Json<LeaseClaimRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    if body.edge_agent_id.trim().is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "edge_agent_id required",
+        ));
+    }
+    let task = state
+        .task_service
+        .get_task(&task_id)
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
+    if task.user_id != user.user_id {
+        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
+    }
+
+    let edge_id = edge_id_header(&headers);
+    let ttl = body.ttl_sec.unwrap_or(300);
+    let result = state
+        .task_lease_service
+        .try_claim_lease(
+            &user.user_id,
+            &task_id,
+            &body.edge_agent_id,
+            &edge_id,
+            ttl,
+        )
+        .await
+        .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    Ok(Json(
+        serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({})),
+    ))
+}
+
+/// `POST /tasks/{task_id}/lease/release`
+pub(super) async fn post_task_lease_release_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+    Json(body): Json<LeaseClaimRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    if body.edge_agent_id.trim().is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "edge_agent_id required",
+        ));
+    }
+    let task = state
+        .task_service
+        .get_task(&task_id)
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
+    if task.user_id != user.user_id {
+        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
+    }
+
+    let released = state
+        .task_lease_service
+        .release_lease(&user.user_id, &task_id, &body.edge_agent_id)
+        .await
+        .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    Ok(Json(serde_json::json!({ "released": released })))
+}
+
+/// `POST /tasks/{task_id}/lease/renew`
+pub(super) async fn post_task_lease_renew_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+    Json(body): Json<LeaseClaimRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    if body.edge_agent_id.trim().is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "edge_agent_id required",
+        ));
+    }
+    let task = state
+        .task_service
+        .get_task(&task_id)
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
+    if task.user_id != user.user_id {
+        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
+    }
+
+    let edge_id = edge_id_header(&headers);
+    let ttl = body.ttl_sec.unwrap_or(300);
+    let view = state
+        .task_lease_service
+        .renew_lease(
+            &user.user_id,
+            &task_id,
+            &body.edge_agent_id,
+            &edge_id,
+            ttl,
+        )
+        .await
+        .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    Ok(Json(match view {
+        Some(v) => serde_json::to_value(v).unwrap_or_else(|_| serde_json::json!({})),
+        None => serde_json::json!({ "renewed": false }),
+    }))
 }
 
 // ─── Request bodies ─────────────────────────────────────────────────────────

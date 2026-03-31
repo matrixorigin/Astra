@@ -5,7 +5,7 @@
 //! Adding this module to `services` would require `services` → `runtime`, which cycles with
 //! `runtime` → `services`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -20,12 +20,19 @@ use mo_agent_services::state_sync::{PlanTemplateSyncRow, StateSyncService};
 use mo_agent_services::sync_engine::sha256_checksum;
 use mo_agent_services::{
     CloudTransport, DomainAdapter, MergeResult, PayloadFormat, PullResult, PushResult, SyncDomain,
-    SyncEnvelope, SyncError, SyncPayload,
+    SyncEnvelope, SyncError, SyncPayload, TaskLeaseHoldCache, TaskRecord,
 };
 
 fn payload_sync_version(data: &[u8]) -> u64 {
     let h = sha256_checksum(data);
     u64::from_str_radix(&h[..16], 16).unwrap_or(1)
+}
+
+/// Wire format for [`SyncDomain::Tasks`] push; pull uses a plain JSON array of [`TaskRecord`].
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TaskSyncPackBody {
+    holder_agent_id: String,
+    tasks: Vec<TaskRecord>,
 }
 
 // ─── Learning Adapter ──────────────────────────────────────────────────────────
@@ -338,13 +345,20 @@ impl DomainAdapter for LearningAdapter {
 pub struct MatrixOneTransport {
     sync_service: Arc<dyn StateSyncService>,
     profile: String,
+    /// Must match [`TaskSyncPackBody::holder_agent_id`] for [`SyncDomain::Tasks`] pushes.
+    tasks_holder_agent_id: String,
 }
 
 impl MatrixOneTransport {
-    pub fn new(sync_service: Arc<dyn StateSyncService>, profile: impl Into<String>) -> Self {
+    pub fn new(
+        sync_service: Arc<dyn StateSyncService>,
+        profile: impl Into<String>,
+        tasks_holder_agent_id: impl Into<String>,
+    ) -> Self {
         Self {
             sync_service,
             profile: profile.into(),
+            tasks_holder_agent_id: tasks_holder_agent_id.into(),
         }
     }
 }
@@ -448,6 +462,35 @@ impl CloudTransport for MatrixOneTransport {
                 SyncDomain::Templates,
                 "templates are cloud-sourced; edge does not push template packs",
             )),
+            SyncDomain::Tasks => {
+                let body: TaskSyncPackBody = serde_json::from_slice(&payload.data).map_err(|e| {
+                    SyncError::permanent(
+                        SyncDomain::Tasks,
+                        format!("deserialize tasks pack: {e}"),
+                    )
+                })?;
+                if body.holder_agent_id != self.tasks_holder_agent_id {
+                    return Err(SyncError::permanent(
+                        SyncDomain::Tasks,
+                        "holder_agent_id does not match this transport",
+                    ));
+                }
+                let inner = serde_json::to_string(&body.tasks).map_err(|e| {
+                    SyncError::permanent(SyncDomain::Tasks, format!("serialize tasks: {e}"))
+                })?;
+                self.sync_service
+                    .push_tasks_pack_held(user_id, &body.holder_agent_id, &inner)
+                    .await
+                    .map_err(|e| SyncError::transient(SyncDomain::Tasks, e))?;
+                let ver = payload_sync_version(&payload.data);
+                Ok(PushResult {
+                    success: true,
+                    new_version: Some(ver),
+                    is_conflict: false,
+                    remote_payload: None,
+                    message: "ok".to_string(),
+                })
+            }
             other => Err(SyncError::permanent(
                 other,
                 format!("MatrixOneTransport does not support domain {other:?}"),
@@ -531,6 +574,30 @@ impl CloudTransport for MatrixOneTransport {
                 let item_count = serde_json::from_slice::<serde_json::Value>(&data)
                     .ok()
                     .and_then(|v| v.as_array().map(|a| a.len() as u32))
+                    .unwrap_or(0);
+                let version = payload_sync_version(&data);
+                Ok(PullResult {
+                    payload: Some(SyncPayload {
+                        data,
+                        format: PayloadFormat::Full,
+                        checksum,
+                        item_count,
+                        compressed: false,
+                    }),
+                    version: Some(version),
+                    message: "ok".to_string(),
+                })
+            }
+            SyncDomain::Tasks => {
+                let json = self
+                    .sync_service
+                    .pull_tasks_pack(user_id)
+                    .await
+                    .map_err(|e| SyncError::transient(SyncDomain::Tasks, e))?;
+                let data = json.into_bytes();
+                let checksum = sha256_checksum(&data);
+                let item_count = serde_json::from_slice::<Vec<TaskRecord>>(&data)
+                    .map(|v| v.len() as u32)
                     .unwrap_or(0);
                 let version = payload_sync_version(&data);
                 Ok(PullResult {
@@ -905,6 +972,195 @@ impl DomainAdapter for PreferenceAdapter {
     }
 }
 
+// ─── Task Adapter (Phase 3: lease-filtered mirror) ───────────────────────────
+
+/// Local task mirror for [`SyncDomain::Tasks`]. Only tasks both **dirty** and **leased** in this
+/// process ([`TaskLeaseHoldCache`]) are exported, so unleased edges do not push conflicting rows.
+pub struct TaskAdapter {
+    mirror: Arc<Mutex<BTreeMap<String, TaskRecord>>>,
+    dirty: Arc<Mutex<HashSet<String>>>,
+    edge_agent_id: Arc<str>,
+    lease_holds: Arc<TaskLeaseHoldCache>,
+    envelope: Arc<Mutex<SyncEnvelope>>,
+}
+
+impl TaskAdapter {
+    pub fn new(
+        mirror: Arc<Mutex<BTreeMap<String, TaskRecord>>>,
+        dirty: Arc<Mutex<HashSet<String>>>,
+        edge_agent_id: impl Into<Arc<str>>,
+        lease_holds: Arc<TaskLeaseHoldCache>,
+    ) -> Self {
+        Self {
+            mirror,
+            dirty,
+            edge_agent_id: edge_agent_id.into(),
+            lease_holds,
+            envelope: Arc::new(Mutex::new(SyncEnvelope::new(SyncDomain::Tasks))),
+        }
+    }
+
+    pub fn mirror(&self) -> Arc<Mutex<BTreeMap<String, TaskRecord>>> {
+        Arc::clone(&self.mirror)
+    }
+
+    /// Mark a task id dirty for sync (e.g. after local edits). Caller should ensure a lease exists.
+    pub fn note_task_dirty(&self, task_id: impl AsRef<str>) {
+        let id = task_id.as_ref().to_string();
+        if let Ok(mut d) = self.dirty.lock() {
+            d.insert(id);
+        }
+        if let Ok(mut env) = self.envelope.lock() {
+            env.mark_dirty();
+        }
+    }
+}
+
+#[async_trait]
+impl DomainAdapter for TaskAdapter {
+    fn domain(&self) -> SyncDomain {
+        SyncDomain::Tasks
+    }
+
+    fn export_full(&self) -> Result<SyncPayload, SyncError> {
+        let held = self.lease_holds.held_task_ids_for_agent(&self.edge_agent_id);
+        let mirror = self
+            .mirror
+            .lock()
+            .map_err(|e| SyncError::permanent(SyncDomain::Tasks, format!("lock mirror: {e}")))?;
+        let dirty = self
+            .dirty
+            .lock()
+            .map_err(|e| SyncError::permanent(SyncDomain::Tasks, format!("lock dirty: {e}")))?;
+        let tasks: Vec<TaskRecord> = dirty
+            .iter()
+            .filter(|id| held.contains(*id))
+            .filter_map(|id| mirror.get(id).cloned())
+            .collect();
+        if tasks.is_empty() {
+            return Err(SyncError::permanent(
+                SyncDomain::Tasks,
+                "no leased dirty tasks to export",
+            ));
+        }
+        let body = TaskSyncPackBody {
+            holder_agent_id: self.edge_agent_id.to_string(),
+            tasks,
+        };
+        let data = serde_json::to_vec(&body).map_err(|e| {
+            SyncError::permanent(SyncDomain::Tasks, format!("serialize tasks pack: {e}"))
+        })?;
+        let item_count = body.tasks.len() as u32;
+        let checksum = sha256_checksum(&data);
+        Ok(SyncPayload {
+            data,
+            format: PayloadFormat::Full,
+            checksum,
+            item_count,
+            compressed: false,
+        })
+    }
+
+    fn export_delta(&self) -> Result<Option<SyncPayload>, SyncError> {
+        Ok(None)
+    }
+
+    fn merge_remote(&self, remote: &SyncPayload) -> Result<MergeResult, SyncError> {
+        let tasks: Vec<TaskRecord> = serde_json::from_slice(&remote.data)
+            .or_else(|_| {
+                serde_json::from_slice::<TaskSyncPackBody>(&remote.data).map(|b| b.tasks)
+            })
+            .map_err(|e| {
+                SyncError::permanent(
+                    SyncDomain::Tasks,
+                    format!("deserialize tasks pull pack: {e}"),
+                )
+            })?;
+        let n = tasks.len() as u32;
+        if let Ok(mut m) = self.mirror.lock() {
+            for t in tasks {
+                m.insert(t.task_id.clone(), t);
+            }
+        }
+        Ok(MergeResult {
+            items_added: n,
+            items_updated: 0,
+            items_removed: 0,
+            conflicts_auto_resolved: 0,
+        })
+    }
+
+    fn resolve_conflict(
+        &self,
+        _local: &SyncPayload,
+        remote: &SyncPayload,
+    ) -> Result<SyncPayload, SyncError> {
+        Ok(remote.clone())
+    }
+
+    fn validate(&self, payload: &SyncPayload) -> Result<(), SyncError> {
+        let computed = sha256_checksum(&payload.data);
+        if computed != payload.checksum {
+            return Err(SyncError::permanent(
+                SyncDomain::Tasks,
+                format!(
+                    "checksum mismatch: expected {}, got {}",
+                    payload.checksum, computed
+                ),
+            ));
+        }
+        let ok_array = serde_json::from_slice::<Vec<TaskRecord>>(&payload.data).is_ok();
+        let ok_pack = serde_json::from_slice::<TaskSyncPackBody>(&payload.data).is_ok();
+        if !ok_array && !ok_pack {
+            return Err(SyncError::permanent(
+                SyncDomain::Tasks,
+                "invalid tasks payload (expected task array or holder pack)",
+            ));
+        }
+        Ok(())
+    }
+
+    fn envelope(&self) -> SyncEnvelope {
+        self.envelope
+            .lock()
+            .map(|e| e.clone())
+            .unwrap_or_else(|_| SyncEnvelope::new(SyncDomain::Tasks))
+    }
+
+    fn set_envelope(&self, envelope: SyncEnvelope) {
+        if let Ok(mut e) = self.envelope.lock() {
+            *e = envelope;
+        }
+    }
+
+    fn has_dirty_data(&self) -> bool {
+        let held = self.lease_holds.held_task_ids_for_agent(&self.edge_agent_id);
+        let Ok(d) = self.dirty.lock() else {
+            return false;
+        };
+        let Ok(m) = self.mirror.lock() else {
+            return false;
+        };
+        d.iter()
+            .any(|id| held.contains(id) && m.contains_key(id))
+    }
+
+    fn estimated_size(&self) -> usize {
+        self.mirror
+            .lock()
+            .map(|m| m.values().map(|t| t.title.len() + 256).sum())
+            .unwrap_or(0)
+    }
+
+    fn clear_dirty(&self) -> Result<(), SyncError> {
+        let held = self.lease_holds.held_task_ids_for_agent(&self.edge_agent_id);
+        if let Ok(mut d) = self.dirty.lock() {
+            d.retain(|id| !held.contains(id));
+        }
+        Ok(())
+    }
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1176,5 +1432,56 @@ mod tests {
         let g = store.lock().unwrap();
         assert_eq!(g.get("k1"), Some(&"local".to_string()));
         assert_eq!(g.get("k2"), Some(&"cloud".to_string()));
+    }
+
+    #[test]
+    fn task_adapter_export_requires_lease_hold() {
+        use mo_agent_services::TaskStatus;
+
+        let mirror = Arc::new(Mutex::new(BTreeMap::new()));
+        let dirty = Arc::new(Mutex::new(HashSet::new()));
+        let holds = Arc::new(TaskLeaseHoldCache::default());
+        let adapter = TaskAdapter::new(
+            Arc::clone(&mirror),
+            Arc::clone(&dirty),
+            "agent-a",
+            Arc::clone(&holds),
+        );
+
+        mirror.lock().unwrap().insert(
+            "t1".into(),
+            TaskRecord {
+                task_id: "t1".into(),
+                user_id: "u1".into(),
+                session_id: None,
+                parent_task_id: None,
+                title: "x".into(),
+                description: None,
+                status: TaskStatus::Pending,
+                progress_pct: 0,
+                items_done: 0,
+                items_total: 0,
+                plan: None,
+                checkpoint: None,
+                error_message: None,
+                created_at: "a".into(),
+                updated_at: "b".into(),
+                completed_at: None,
+                user_rating: None,
+                completion_time_sec: None,
+                replan_count: 0,
+                auto_adjustments: 0,
+                outcome: None,
+                project_type: None,
+                goal_pattern: None,
+                agent_id: None,
+            },
+        );
+        adapter.note_task_dirty("t1");
+        assert!(adapter.export_full().is_err());
+
+        holds.record_hold("agent-a", "t1");
+        let payload = adapter.export_full().expect("export with hold");
+        assert!(!payload.data.is_empty());
     }
 }

@@ -448,6 +448,22 @@ pub(super) fn build_router(state: AppState) -> Router {
             get(task_handlers::get_task_handler),
         )
         .route(
+            "/tasks/{task_id}/lease/claim",
+            post(task_handlers::post_task_lease_claim_handler),
+        )
+        .route(
+            "/tasks/{task_id}/lease/release",
+            post(task_handlers::post_task_lease_release_handler),
+        )
+        .route(
+            "/tasks/{task_id}/lease/renew",
+            post(task_handlers::post_task_lease_renew_handler),
+        )
+        .route(
+            "/tasks/{task_id}/lease",
+            get(task_handlers::get_task_lease_handler),
+        )
+        .route(
             "/tasks/{task_id}/progress",
             get(task_handlers::task_progress_handler),
         )

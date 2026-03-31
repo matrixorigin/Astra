@@ -374,6 +374,17 @@ pub trait StateSyncService: Send + Sync {
     /// JSON array of [`PlanTemplateSyncRow`] for the user plus global rows (`user_id IS NULL`).
     async fn pull_plan_templates_pack(&self, user_id: &str) -> Result<String, String>;
 
+    /// JSON array of [`crate::task_orchestrator::TaskRecord`] for the user (`agent_tasks`).
+    async fn pull_tasks_pack(&self, user_id: &str) -> Result<String, String>;
+
+    /// Apply a task pack from an edge that holds valid leases (`holder_agent_id`).
+    async fn push_tasks_pack_held(
+        &self,
+        user_id: &str,
+        holder_agent_id: &str,
+        pack_json: &str,
+    ) -> Result<crate::multi_agent::TasksPackPushResult, String>;
+
     /// Push a delta snapshot containing only changed data.
     ///
     /// Delta sync reduces bandwidth by ~90%: full snapshot is ~40KB, delta is 2-5KB.
@@ -444,6 +455,19 @@ impl StateSyncService for LocalOnlySyncService {
 
     async fn pull_plan_templates_pack(&self, _user_id: &str) -> Result<String, String> {
         Ok("[]".to_string())
+    }
+
+    async fn pull_tasks_pack(&self, _user_id: &str) -> Result<String, String> {
+        Ok("[]".to_string())
+    }
+
+    async fn push_tasks_pack_held(
+        &self,
+        _user_id: &str,
+        _holder_agent_id: &str,
+        _pack_json: &str,
+    ) -> Result<crate::multi_agent::TasksPackPushResult, String> {
+        Ok(crate::multi_agent::TasksPackPushResult::default())
     }
 
     async fn push_delta(
@@ -968,6 +992,25 @@ impl StateSyncService for MatrixOneSyncService {
             });
         }
         serde_json::to_string(&items).map_err(|e| format!("pull_plan_templates_pack json: {e}"))
+    }
+
+    async fn pull_tasks_pack(&self, user_id: &str) -> Result<String, String> {
+        crate::multi_agent::pull_tasks_pack_mysql(&self.pool, user_id).await
+    }
+
+    async fn push_tasks_pack_held(
+        &self,
+        user_id: &str,
+        holder_agent_id: &str,
+        pack_json: &str,
+    ) -> Result<crate::multi_agent::TasksPackPushResult, String> {
+        crate::multi_agent::push_tasks_pack_held_mysql(
+            &self.pool,
+            user_id,
+            holder_agent_id,
+            pack_json,
+        )
+        .await
     }
 
     async fn status(&self) -> SyncStatus {
