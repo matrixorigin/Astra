@@ -904,14 +904,33 @@ fn tool_output_limit() -> usize {
     mo_agent_core::RuntimeLimits::global().tool_output_limit
 }
 
-/// Truncate tool output to `max_bytes`, appending a marker if truncated.
+/// Truncate tool output to `max_bytes`, cutting at a newline boundary when
+/// possible (avoids mid-line cuts that confuse the LLM). Inspired by Claude
+/// Code's `generatePreview` pattern.
 fn truncate_output(mut output: String, max_bytes: usize) -> String {
     if output.len() > max_bytes {
         let end = output.floor_char_boundary(max_bytes);
-        output.truncate(end);
+        // Prefer cutting at a newline within the last 50% of the budget
+        let cut = output[..end]
+            .rfind('\n')
+            .filter(|&pos| pos > end / 2)
+            .map(|pos| pos + 1) // include the newline
+            .unwrap_or(end);
+        output.truncate(cut);
         output.push_str("\n[truncated]");
     }
     output
+}
+
+/// Normalize empty/whitespace-only tool output to a short marker.
+/// Prevents model confusion from truly empty tool results.
+/// Inspired by Claude Code's `isToolResultContentEmpty` guard.
+fn normalize_empty_output(output: String, tool_name: &str) -> String {
+    if output.trim().is_empty() {
+        format!("({tool_name} completed with no output)")
+    } else {
+        output
+    }
 }
 
 /// Parse a grep output line to extract the file path and line number.
@@ -1459,7 +1478,8 @@ impl ToolExecutor {
             }
             _ => format!("Unknown tool: {name}"),
         };
-        // Global safety net: no tool output exceeds 50KB
+        // Normalize empty output, then apply global safety net
+        let output = normalize_empty_output(output, name);
         truncate_output(output, global_output_limit())
     }
 

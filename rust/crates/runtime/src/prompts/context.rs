@@ -4,6 +4,9 @@
 /// each on average — a single character often splits into 2 BPE tokens, but
 /// common bigrams merge back.  We use 3/2 integer arithmetic for accuracy
 /// without floating-point.  ASCII text averages ~4 bytes per token.
+///
+/// JSON content uses ~2 bytes per token due to many single-character tokens
+/// (`{`, `}`, `:`, `,`, `"`). Detected by leading `{` or `[`.
 pub fn estimate_str_tokens(s: &str) -> usize {
     let mut cjk_chars: usize = 0;
     let mut ascii_bytes: usize = 0;
@@ -19,8 +22,12 @@ pub fn estimate_str_tokens(s: &str) -> usize {
             ascii_bytes += ch.len_utf8();
         }
     }
-    // CJK: ~1.5 tokens per char (3*n/2). ASCII: ~4 bytes per token.
-    (cjk_chars * 3).div_ceil(2) + ascii_bytes / 4
+    // CJK: ~1.5 tokens per char (3*n/2).
+    let cjk_tokens = (cjk_chars * 3).div_ceil(2);
+    // JSON-like content: ~2 bytes/token. Regular text: ~4 bytes/token.
+    let first = s.as_bytes().first().copied().unwrap_or(0);
+    let ascii_divisor = if first == b'{' || first == b'[' { 2 } else { 4 };
+    cjk_tokens + ascii_bytes / ascii_divisor
 }
 
 /// Approximate token count with CJK-aware estimation.

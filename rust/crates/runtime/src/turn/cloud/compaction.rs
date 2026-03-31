@@ -217,7 +217,24 @@ pub fn compact_tiered_with_result(
             .get("content")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if content.chars().count() > trunc_limit {
+        if content.chars().count() <= trunc_limit {
+            continue;
+        }
+        // For CompactHistory+, replace large non-error tool results with a
+        // compact preview stub — the file can be re-read if needed.
+        // Inspired by Claude Code's microcompact pattern.
+        let line_count = content.lines().count();
+        if matches!(
+            tier,
+            CompactionTier::CompactHistory | CompactionTier::AggressivePrune
+        ) && !content.starts_with("Error")
+            && line_count > 5
+        {
+            let preview: String = content.lines().take(3).collect::<Vec<_>>().join("\n");
+            compacted[index]["content"] = Value::String(format!(
+                "{preview}\n...[{line_count} lines compacted — re-read file if needed]"
+            ));
+        } else {
             let truncated: String = content.chars().take(trunc_limit).collect();
             compacted[index]["content"] =
                 Value::String(truncated + "\n...[compacted for context budget]");
