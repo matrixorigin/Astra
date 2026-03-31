@@ -3,6 +3,7 @@ pub mod agents;
 pub mod auth;
 pub mod branches;
 pub mod context;
+pub mod coordination;
 pub mod data_versioning;
 pub mod decisions;
 pub mod evaluation;
@@ -44,6 +45,11 @@ pub use admin::{
 pub use agents::{
     AgentCreateRequestData, AgentListRecord, AgentRecord, AgentService, AgentUpdateRequestData,
     DatabaseAgentService, UnconfiguredAgentService,
+};
+pub use coordination::{
+    AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, AgentTrigger,
+    AggregationStrategy, CoordinationPattern, DelegationRequest, DelegationResult, PipelineStage,
+    aggregate_results,
 };
 pub use auth::{
     AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,

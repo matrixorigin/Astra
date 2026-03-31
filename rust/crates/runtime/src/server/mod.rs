@@ -35,6 +35,7 @@ mod session_handlers;
 pub mod server_loop_host;
 pub mod run_lifecycle;
 pub mod run_engine;
+pub mod delegation_engine;
 mod state_builder;
 mod task_handlers;
 mod ws_handler;

@@ -191,6 +191,7 @@ pub use introspection::{
 pub use server::{build_app, serve};
 pub use server::run_engine::RunEngine;
 pub use server::run_lifecycle::AgenticRunLifecycleService;
+pub use server::delegation_engine::{DelegationEngine, DelegationTracker};
 
 // ── Re-exports: turn engine ──────────────────────────────────────────────────
 
