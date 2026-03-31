@@ -9,24 +9,17 @@ use mo_agent_runtime::{
     tool_registry::{self},
     turn::chat_history_openai::openai_messages_from_repl_history,
     turn::edge_prompt_context::detect_project_languages,
-    turn::headless_tool_assembly::tool_calls_for_stall_guard,
 };
 
 use crate::{StreamResult, VerdictEvent, edge_tools};
 
 use super::super::ChatTurnParams;
-use super::fetch_chat_turn_sse::{ChatTurnSseFetchRequest, fetch_chat_turn_sse};
-use super::post_tool_round::{
-    PostToolTurnOutcome, PostToolTurnRequest, apply_post_tool_turn_policy,
+use super::agentic_loop_turn::{
+    AgenticLoopTurnExit, AgenticTurnRequest, run_agentic_loop_iteration,
 };
 use super::prepare_turn_request::PrepareTurnTelemetry;
-use super::stall_preflight::{StallPreflightRequest, apply_stall_preflight};
 use super::stream_result_finalize::{
     StreamLoopSidecarEprint, StreamResultBuild, build_stream_result, eprint_stream_loop_sidecars,
-};
-use super::tool_round::{HeadlessToolRoundRequest, run_headless_tool_round};
-use super::turn_result_ingest::{
-    TurnIngestOutcome, TurnResultIngestRequest, ingest_turn_sse_result,
 };
 
 pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResult, String> {
@@ -139,8 +132,9 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         remaining_turns = remaining_turns.saturating_sub(1);
         step_recorder.begin_turn(_turn as u32);
 
-        let assembly_start = Instant::now();
-        let turn_result = fetch_chat_turn_sse(ChatTurnSseFetchRequest {
+        match run_agentic_loop_iteration(AgenticTurnRequest {
+            turn_index: _turn,
+            max_turns,
             api,
             token,
             model,
@@ -155,16 +149,37 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             executor: &mut executor,
             selector,
             registry: &registry,
-            messages: &messages,
-            current_session_id: current_session_id.as_deref(),
-            tool_results: &tool_results,
+            messages: &mut messages,
+            current_session_id: &mut current_session_id,
+            tool_results: &mut tool_results,
             all_schemas: &all_schemas,
-            turn_guard: &turn_guard,
+            turn_guard: &mut turn_guard,
             restricted_tools: &mut restricted_tools,
             step_recorder: &mut step_recorder,
             skill_registry,
             file_context: &file_context,
-            assembly_start,
+            perm_manager,
+            valid_tool_names: &valid_tool_names,
+            idempotency_cache: &mut idempotency_cache,
+            semantic_dedup: &mut semantic_dedup,
+            turn_sigs: &mut turn_sigs,
+            turn_tool_names: &mut turn_tool_names,
+            stall_events: &mut stall_events,
+            intent_tool_turns: &mut intent_tool_turns,
+            verdict_events: &mut verdict_events,
+            remaining_turns: &mut remaining_turns,
+            last_heavy_checkpoint: &mut last_heavy_checkpoint,
+            tool_call_records: &mut tool_call_records,
+            first_ttft_ms: &mut first_ttft_ms,
+            current_run_id: &mut current_run_id,
+            final_text: &mut final_text,
+            total_prompt: &mut total_prompt,
+            total_completion: &mut total_completion,
+            total_tool_calls: &mut total_tool_calls,
+            all_tools_used: &mut all_tools_used,
+            has_any_usage: &mut has_any_usage,
+            forced_factual_retry: &mut forced_factual_retry,
+            explain_turns: &mut explain_turns,
             telem: PrepareTurnTelemetry {
                 first_memoria_ms: &mut first_memoria_ms,
                 first_selector_ms: &mut first_selector_ms,
@@ -176,91 +191,12 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 first_context_assembly_ms: &mut first_context_assembly_ms,
                 all_selected_skills: &mut all_selected_skills,
             },
-            perm_manager,
         })
-        .await?;
-
-        match ingest_turn_sse_result(TurnResultIngestRequest {
-            turn_result: &turn_result,
-            message,
-            recent_tools,
-            quiet,
-            first_ttft_ms: &mut first_ttft_ms,
-            current_session_id: &mut current_session_id,
-            current_run_id: &mut current_run_id,
-            final_text: &mut final_text,
-            total_prompt: &mut total_prompt,
-            total_completion: &mut total_completion,
-            total_tool_calls: &mut total_tool_calls,
-            step_recorder: &mut step_recorder,
-            all_tools_used: &mut all_tools_used,
-            has_any_usage: &mut has_any_usage,
-            forced_factual_retry: &mut forced_factual_retry,
-            messages: &mut messages,
-        }) {
-            TurnIngestOutcome::Fatal(e) => return Err(e),
-            TurnIngestOutcome::Break => break,
-            TurnIngestOutcome::Continue => continue,
-            TurnIngestOutcome::HasToolCalls => {}
-        }
-
-        let tool_calls_for_guard =
-            tool_calls_for_stall_guard(&turn_result.tool_calls, &turn_result.edge_tool_round);
-
-        apply_stall_preflight(StallPreflightRequest {
-            turn_index: _turn as u32,
-            tool_calls_for_guard: &tool_calls_for_guard,
-            turn_sigs: &mut turn_sigs,
-            turn_tool_names: &mut turn_tool_names,
-            stall_events: &mut stall_events,
-            turn_guard: &mut turn_guard,
-        });
-
-        // Assemble tool results from SSE `tool_request` only — legacy inline execution removed.
-        run_headless_tool_round(HeadlessToolRoundRequest {
-            turn_index: _turn,
-            quiet,
-            api,
-            token,
-            current_session_id: current_session_id.as_ref(),
-            turn_result: &turn_result,
-            messages: &mut messages,
-            tool_results: &mut tool_results,
-            valid_tool_names: &valid_tool_names,
-            restricted_tools: &mut restricted_tools,
-            turn_guard: &mut turn_guard,
-            step_recorder: &mut step_recorder,
-            idempotency_cache: &mut idempotency_cache,
-            semantic_dedup: &mut semantic_dedup,
-            tool_call_records: &mut tool_call_records,
-        })
-        .await;
-        explain_turns.extend(turn_result.explain_turns);
-
-        match apply_post_tool_turn_policy(PostToolTurnRequest {
-            turn_index: _turn as u32,
-            message,
-            tool_calls_for_guard: &tool_calls_for_guard,
-            intent_tool_turns: &mut intent_tool_turns,
-            messages: &mut messages,
-            stall_events: &mut stall_events,
-            turn_guard: &mut turn_guard,
-            verdict_events: &mut verdict_events,
-            restricted_tools: &mut restricted_tools,
-            remaining_turns: &mut remaining_turns,
-            step_recorder: &mut step_recorder,
-            current_session_id: current_session_id.as_ref(),
-            max_turns,
-            loop_turn: _turn,
-            recent_tools,
-            last_heavy_checkpoint: &mut last_heavy_checkpoint,
-        }) {
-            PostToolTurnOutcome::Abort(e) => return Err(e),
-            PostToolTurnOutcome::RetryLlmClearToolResults => {
-                tool_results = Vec::new();
-                continue;
-            }
-            PostToolTurnOutcome::ProceedEndTurn => step_recorder.end_turn(false),
+        .await
+        {
+            Ok(AgenticLoopTurnExit::BreakLoop) => break,
+            Ok(AgenticLoopTurnExit::ContinueIterating) => {}
+            Err(e) => return Err(e),
         }
     }
 
