@@ -14,6 +14,10 @@ use super::sse_blocks::SseBlankLineUtf8Buf;
 use super::sse_data_lines::{
     drain_sse_data_lines, finish_sse_data_buffer, json_events_from_sse_event_block,
 };
+use crate::bridge::rate_limit_cooldown::{
+    RateLimitAction, RateLimitCooldown, is_overload_status, is_rate_limit_status,
+    parse_retry_after_ms,
+};
 use crate::prompts;
 
 /// Maximum retries for transient LLM errors (429, 5xx, network).
@@ -21,8 +25,20 @@ pub(crate) const LLM_MAX_RETRIES: u32 = 3;
 /// Base delay between retries (doubles each attempt: 1s, 2s, 4s).
 pub(crate) const LLM_RETRY_BASE_MS: u64 = 1000;
 
+// ── Rate-Limit Cooldown ──────────────────────────────────────────────────────
+use std::sync::OnceLock;
+
+/// Global rate-limit cooldown tracker (shared across all LLM calls in this process).
+fn rate_limit_cooldown() -> &'static RateLimitCooldown {
+    static COOLDOWN: OnceLock<RateLimitCooldown> = OnceLock::new();
+    let fallback_enabled = std::env::var("MO_LLM_FALLBACK_ENABLED")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
+    COOLDOWN.get_or_init(|| RateLimitCooldown::new(fallback_enabled))
+}
+
 // ── System Prompt Cache ──────────────────────────────────────────────────────
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 fn prompt_cache() -> &'static Mutex<HashMap<u64, String>> {
     static CACHE: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
@@ -109,6 +125,8 @@ fn turn_timeout_s() -> f64 {
 /// Unlike `call_llm_stream` (which returns raw SSE bytes), this function
 /// parses the stream and returns the aggregated `LlmCallResult` directly.
 /// Used by `ServerAgenticLoopHost` for server-side agentic loops.
+///
+/// Honors rate-limit cooldown state and records 429/529 errors for tracking.
 pub(crate) async fn call_llm_and_collect(
     messages: &[Value],
     tools: &[Value],
@@ -118,6 +136,36 @@ pub(crate) async fn call_llm_and_collect(
     provider: &str,
     max_output_tokens: Option<usize>,
 ) -> Result<LlmCallResult, String> {
+    // Check rate-limit cooldown state before starting
+    let cooldown = rate_limit_cooldown();
+    match cooldown.check_request() {
+        RateLimitAction::Proceed => {}
+        RateLimitAction::WaitAndRetry { delay_ms } => {
+            mo_agent_core::agent_info!(
+                "llm",
+                "rate-limit cooldown: waiting {delay_ms}ms before request"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+        RateLimitAction::UseFallback { reason } => {
+            mo_agent_core::agent_warn!(
+                "llm",
+                "rate-limit cooldown: fallback requested ({}) but not implemented",
+                reason.as_str()
+            );
+        }
+        RateLimitAction::Reject {
+            reason,
+            reset_in_ms,
+        } => {
+            return Err(format!(
+                "Rate limit cooldown active ({}). Resets in {}s. Try again later.",
+                reason.as_str(),
+                reset_in_ms / 1000
+            ));
+        }
+    }
+
     let started = Instant::now();
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -173,16 +221,57 @@ pub(crate) async fn call_llm_and_collect(
 
         let status = response.status().as_u16();
         if response.status().is_success() {
+            // Success — record to cooldown tracker
+            cooldown.record_success();
             let byte_stream = response.bytes_stream();
             let result = collect_llm_stream(byte_stream, model_name, started).await;
             return Ok(result);
         }
 
+        // Parse retry-after header
+        let headers = response.headers();
+        let retry_after_ms = headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after_ms);
+
         let text = response.text().await.unwrap_or_default();
         last_err = format!("LLM error {status}: {text}");
-        if status == 429 || status >= 500 {
+
+        // Record rate-limit errors to cooldown tracker
+        if is_rate_limit_status(status) {
+            let action = cooldown.record_429(retry_after_ms);
+            mo_agent_core::agent_warn!(
+                "llm",
+                "rate limit (429): action={:?}, metrics={:?}",
+                action,
+                cooldown.metrics()
+            );
+            if let RateLimitAction::WaitAndRetry { delay_ms } = action {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
             continue;
         }
+
+        if is_overload_status(status) {
+            let action = cooldown.record_529(retry_after_ms);
+            mo_agent_core::agent_warn!(
+                "llm",
+                "server overload ({status}): action={:?}, metrics={:?}",
+                action,
+                cooldown.metrics()
+            );
+            if let RateLimitAction::WaitAndRetry { delay_ms } = action {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            continue;
+        }
+
+        // Other 5xx errors are retryable
+        if status >= 500 {
+            continue;
+        }
+
         return Err(last_err);
     }
 

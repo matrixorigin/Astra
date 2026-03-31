@@ -175,7 +175,8 @@ pub use app_state::{
 // ── Re-exports: bridge ───────────────────────────────────────────────────────
 
 pub use bridge::{
-    ChatTurnBridge, DatabaseTurnObserverWorker, DatabaseTurnReflectionLessonWriter,
+    ChatTurnBridge, CooldownReason, DatabaseTurnObserverWorker, DatabaseTurnReflectionLessonWriter,
+    RateLimitAction, RateLimitCooldown, RateLimitMetrics, RateLimitState,
     side_effects::{PERSIST_FAIL_COUNT, PERSIST_OK_COUNT},
 };
 

@@ -10,9 +10,13 @@ use self::side_effects::{
 };
 
 pub mod circuit_breaker;
+pub mod rate_limit_cooldown;
 pub mod sse_events;
 
 use self::circuit_breaker::{BridgeHealthMetrics, CircuitBreaker};
+pub use self::rate_limit_cooldown::{
+    CooldownReason, RateLimitAction, RateLimitCooldown, RateLimitMetrics, RateLimitState,
+};
 
 /// Header allow-list predicate: only `x-mo-*` and `authorization` headers
 /// are forwarded to the upstream bridge.
