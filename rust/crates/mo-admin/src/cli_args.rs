@@ -84,6 +84,10 @@ pub(crate) enum ModelCmd {
     Delete(ModelDeleteArgs),
     Check(ModelShowArgs),
     Load(ModelLoadArgs),
+    /// Update model fields (api-key, base-url, quirks, active status).
+    Update(ModelUpdateArgs),
+    /// Set the fallback model for rate-limit recovery.
+    SetFallback(ModelSetFallbackArgs),
 }
 
 #[derive(Args, Debug)]
@@ -94,6 +98,20 @@ pub(crate) struct ModelAddArgs {
     pub api_key: String,
     #[arg(long)]
     pub base_url: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ModelUpdateArgs {
+    pub model_name: String,
+    #[arg(long)]
+    pub api_key: Option<String>,
+    #[arg(long)]
+    pub base_url: Option<String>,
+    #[arg(long)]
+    pub active: Option<bool>,
+    /// JSON string for quirks, e.g. '{"fallback_model":"gpt-4o-mini"}'
+    #[arg(long)]
+    pub quirks: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -109,6 +127,14 @@ pub(crate) struct ModelDeleteArgs {
 #[derive(Args, Debug)]
 pub(crate) struct ModelLoadArgs {
     pub path: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ModelSetFallbackArgs {
+    /// Primary model name.
+    pub model_name: String,
+    /// Fallback model name (use "none" to clear).
+    pub fallback_model: String,
 }
 
 #[derive(Subcommand, Debug)]

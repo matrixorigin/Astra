@@ -133,6 +133,25 @@ impl ThinClient {
         Self::text_or_api(resp).await
     }
 
+    /// `PUT` with bearer, JSON body, returns response text.
+    pub async fn put_bearer_path_json_text(
+        &self,
+        token: &str,
+        path: &str,
+        body: &Value,
+    ) -> Result<String, ThinClientError> {
+        let url = self.url(path)?;
+        let resp = self
+            .http
+            .put(url)
+            .headers(Self::bearer_headers(token)?)
+            .header(header::CONTENT_TYPE, "application/json")
+            .json(body)
+            .send()
+            .await?;
+        Self::text_or_api(resp).await
+    }
+
     /// `POST` with bearer, empty body.
     pub async fn post_bearer_path_empty_text(
         &self,

@@ -303,6 +303,57 @@ async fn main() -> Result<(), String> {
             }
             Ok(())
         }
+        Command::Model(ModelCmd::Update(args)) => {
+            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let mut payload = serde_json::Map::new();
+            if let Some(key) = args.api_key {
+                payload.insert("api_key".into(), serde_json::json!(key));
+            }
+            if let Some(url) = args.base_url {
+                payload.insert("base_url".into(), serde_json::json!(url));
+            }
+            if let Some(active) = args.active {
+                payload.insert("is_active".into(), serde_json::json!(active));
+            }
+            if let Some(quirks_str) = args.quirks {
+                let quirks: serde_json::Value = serde_json::from_str(&quirks_str)
+                    .map_err(|e| format!("invalid quirks JSON: {e}"))?;
+                payload.insert("quirks".into(), quirks);
+            }
+            if payload.is_empty() {
+                return Err(
+                    "no fields to update (use --api-key, --base-url, --active, or --quirks)".into(),
+                );
+            }
+            let body = api
+                .put_bearer_path_json_text(
+                    &token,
+                    &paths::model(&args.model_name),
+                    &serde_json::Value::Object(payload),
+                )
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        }
+        Command::Model(ModelCmd::SetFallback(args)) => {
+            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            // "none" clears the fallback
+            let fallback = if args.fallback_model.eq_ignore_ascii_case("none") {
+                serde_json::json!(null)
+            } else {
+                serde_json::json!(args.fallback_model)
+            };
+            let payload = serde_json::json!({
+                "quirks": { "fallback_model": fallback }
+            });
+            let body = api
+                .put_bearer_path_json_text(&token, &paths::model(&args.model_name), &payload)
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        }
         Command::Token(TokenCmd::List(args)) => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
             let mut q: Vec<(&str, String)> = Vec::new();

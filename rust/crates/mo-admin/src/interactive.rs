@@ -36,6 +36,14 @@ const ADMIN_COMMANDS: &[(&str, &str)] = &[
         "Check model health  (e.g. model check <name>)",
     ),
     (
+        "model update",
+        "Update model fields  (e.g. model update <name> --quirks '{\"fallback_model\":\"gpt-4o-mini\"}')",
+    ),
+    (
+        "model set-fallback",
+        "Set fallback model  (e.g. model set-fallback <model> <fallback>)",
+    ),
+    (
         "user grant-role",
         "Grant role to user  (e.g. user grant-role <user> <role>)",
     ),
@@ -279,6 +287,77 @@ pub(crate) async fn run_interactive(api: &ThinClient, profile: Option<&str>) -> 
             let (_, _, _, token) = get_profile_and_token(profile)?;
             let body = api
                 .post_bearer_path_empty_text(&token, &paths::model_check(model_name.trim()))
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        } else if let Some(rest) = line.strip_prefix("model set-fallback ") {
+            let mut parts = rest.split_whitespace();
+            let model_name = parts.next().ok_or_else(|| {
+                "usage: model set-fallback <model_name> <fallback_model|none>".to_string()
+            })?;
+            let fallback = parts.next().ok_or_else(|| {
+                "usage: model set-fallback <model_name> <fallback_model|none>".to_string()
+            })?;
+            let (_, _, _, token) = get_profile_and_token(profile)?;
+            let fallback_val = if fallback.eq_ignore_ascii_case("none") {
+                serde_json::json!(null)
+            } else {
+                serde_json::json!(fallback)
+            };
+            let payload = serde_json::json!({ "quirks": { "fallback_model": fallback_val } });
+            let body = api
+                .put_bearer_path_json_text(&token, &paths::model(model_name), &payload)
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        } else if let Some(rest) = line.strip_prefix("model update ") {
+            // Parse inline flags: model update <name> [--api-key K] [--base-url U] [--active B] [--quirks JSON]
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            let model_name = parts.first().ok_or_else(|| "usage: model update <name> [--api-key K] [--base-url U] [--active B] [--quirks JSON]".to_string())?;
+            let mut payload = serde_json::Map::new();
+            let mut i = 1;
+            while i < parts.len() {
+                match parts[i] {
+                    "--api-key" if i + 1 < parts.len() => {
+                        payload.insert("api_key".into(), serde_json::json!(parts[i + 1]));
+                        i += 2;
+                    }
+                    "--base-url" if i + 1 < parts.len() => {
+                        payload.insert("base_url".into(), serde_json::json!(parts[i + 1]));
+                        i += 2;
+                    }
+                    "--active" if i + 1 < parts.len() => {
+                        let active = parts[i + 1]
+                            .parse::<bool>()
+                            .map_err(|_| "--active must be true/false".to_string())?;
+                        payload.insert("is_active".into(), serde_json::json!(active));
+                        i += 2;
+                    }
+                    "--quirks" if i + 1 < parts.len() => {
+                        // Collect remaining parts as the JSON string
+                        let json_str = parts[i + 1..].join(" ");
+                        let quirks: serde_json::Value = serde_json::from_str(&json_str)
+                            .map_err(|e| format!("invalid quirks JSON: {e}"))?;
+                        payload.insert("quirks".into(), quirks);
+                        break;
+                    }
+                    _ => {
+                        return Err(format!("unknown flag: {}", parts[i]));
+                    }
+                }
+            }
+            if payload.is_empty() {
+                return Err("no fields to update".into());
+            }
+            let (_, _, _, token) = get_profile_and_token(profile)?;
+            let body = api
+                .put_bearer_path_json_text(
+                    &token,
+                    &paths::model(model_name),
+                    &serde_json::Value::Object(payload),
+                )
                 .await
                 .map_err(map_thin_err)?;
             print_json_or_raw(&body);
