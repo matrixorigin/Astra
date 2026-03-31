@@ -17,7 +17,10 @@ use mo_agent_runtime::{
     },
     tool_selector,
     turn::boost_domain_hints::domain_hints_from_boost_terms,
-    turn::chat_history_openai::{openai_messages_from_repl_history, openai_user_content_message},
+    turn::chat_history_openai::{
+        append_openai_user_content_messages, openai_messages_from_repl_history,
+        openai_user_content_message,
+    },
     turn::chat_turn_edge_profile::{detect_active_system_skills_in_message, read_git_branch_abbrev},
     turn::chat_turn_payload::{
         chat_turn_base_payload, merge_active_skills_into_edge_profile,
@@ -1057,12 +1060,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
 
             // Inject all verdict messages (stall nudge, divergence correction,
             // tool health warnings, escalation messages, nudge-ignore warnings)
-            for injection in &verdict.injections {
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": injection
-                }));
-            }
+            append_openai_user_content_messages(&mut messages, &verdict.injections);
 
             // Restrict tools that TurnGuard says to avoid
             for tool in &verdict.avoid_tools {

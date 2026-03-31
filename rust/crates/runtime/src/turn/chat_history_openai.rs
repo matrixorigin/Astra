@@ -31,6 +31,13 @@ pub fn openai_user_content_message(content: &str) -> Value {
     json!({ "role": "user", "content": content })
 }
 
+/// Append TurnGuard / stall injection strings as consecutive `user` rows.
+pub fn append_openai_user_content_messages(messages: &mut Vec<Value>, contents: &[String]) {
+    for c in contents {
+        messages.push(openai_user_content_message(c));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +76,14 @@ mod tests {
         let v = openai_user_content_message("fix drift");
         assert_eq!(v["role"], "user");
         assert_eq!(v["content"], "fix drift");
+    }
+
+    #[test]
+    fn append_openai_user_content_messages_extends_vec() {
+        let mut m = vec![json!({"role":"assistant","content":"a"})];
+        append_openai_user_content_messages(&mut m, &[ "n1".into(), "n2".into() ]);
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[1]["content"], "n1");
+        assert_eq!(m[2]["content"], "n2");
     }
 }
