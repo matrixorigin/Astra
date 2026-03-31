@@ -1,9 +1,19 @@
 use crossterm::style::Stylize;
+use mo_agent_runtime::turn::explain_report_lines::{
+    EXPLAIN_REPORT_HEADER, REPORT_SEPARATOR_LINE, VERDICT_REPORT_HEADER,
+    explain_auxiliary_llm_call_line, explain_auxiliary_llm_header_line,
+    explain_content_preview_line, explain_l0_profile_line, explain_l1_retrieval_line,
+    explain_llm_tokens_suffix, explain_memory_candidate_line, explain_memory_total_line,
+    explain_phase_timing_line, explain_routing_active_line, explain_routing_skipped_line,
+    explain_step_generic_line, explain_step_llm_line, explain_tool_info_line, explain_totals_line,
+    explain_turn_summary_line, verdict_avoid_tools_line, verdict_event_summary_line,
+    verdict_injection_count_line, verdict_injection_preview_line, verdict_severity_icon,
+};
 
 use crate::VerdictEvent;
 
 pub(super) fn print_explain_report(turns: &[serde_json::Value], verbose: bool) {
-    eprintln!("\n{}", "── EXPLAIN ─────────────────────────────".dim());
+    eprintln!("\n{}", EXPLAIN_REPORT_HEADER.dim());
     let mut total_ms = 0i64;
     let mut total_prompt = 0i64;
     let mut total_completion = 0i64;
@@ -51,30 +61,21 @@ pub(super) fn print_explain_report(turns: &[serde_json::Value], verbose: bool) {
         let completion_s = completion
             .map(|v| v.to_string())
             .unwrap_or_else(|| "?".to_string());
-        let mut tool_info = format!("tools: {selected}/{available}");
-        if let Some(selection) = turn.get("tool_selection").filter(|value| !value.is_null()) {
-            tool_info.push_str(&format!(" → {selection}"));
-        }
-        if let Some(fallback) = turn
-            .get("tool_selection_fallback")
-            .filter(|value| !value.is_null())
-        {
-            tool_info.push_str(&format!(" ⚠fallback:{fallback}"));
-        }
-        if !selected_skills.is_empty() {
-            tool_info.push_str(&format!("  skills=[{selected_skills}]"));
-        }
+        let tool_info = explain_tool_info_line(
+            selected.as_str(),
+            available.as_str(),
+            turn.get("tool_selection")
+                .filter(|value| !value.is_null())
+                .map(|v| format!(" → {v}")),
+            turn.get("tool_selection_fallback")
+                .filter(|value| !value.is_null())
+                .map(|v| format!(" ⚠fallback:{v}")),
+            selected_skills.as_str(),
+        );
         eprintln!(
             "{}",
-            format!(
-                "Turn {}  {}ms  tokens: {}→{}  {}",
-                idx + 1,
-                ms,
-                prompt_s,
-                completion_s,
-                tool_info
-            )
-            .dim()
+            explain_turn_summary_line(idx + 1, ms, &prompt_s, &completion_s, tool_info.as_str())
+                .dim()
         );
 
         if let Some(routing) = turn.get("routing").and_then(|v| v.as_object()) {
@@ -83,7 +84,7 @@ pub(super) fn print_explain_report(turns: &[serde_json::Value], verbose: bool) {
                     .get("reason")
                     .and_then(|v| v.as_str())
                     .unwrap_or("?");
-                eprintln!("{}", format!("  ├─ routing  skipped ({reason})").dim());
+                eprintln!("{}", explain_routing_skipped_line(reason).dim());
             } else {
                 let intent = routing
                     .get("intent")
@@ -112,9 +113,12 @@ pub(super) fn print_explain_report(turns: &[serde_json::Value], verbose: bool) {
                 };
                 eprintln!(
                     "{}",
-                    format!(
-                        "  ├─ routing  {}  conf={}  tier={}  {:.0}ms  ~{}tok",
-                        intent, confidence_s, tier, latency_ms, est
+                    explain_routing_active_line(
+                        intent,
+                        confidence_s.as_str(),
+                        tier.as_str(),
+                        latency_ms,
+                        est.as_str(),
                     )
                     .dim()
                 );
@@ -132,11 +136,7 @@ pub(super) fn print_explain_report(turns: &[serde_json::Value], verbose: bool) {
                 let l0_ms = l0.get("ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 eprintln!(
                     "{}",
-                    format!(
-                        "  ├─ L0 profile  {}  {} tokens  {:.0}ms",
-                        loaded, l0_tokens, l0_ms
-                    )
-                    .dim()
+                    explain_l0_profile_line(loaded, l0_tokens, l0_ms).dim()
                 );
             }
             if let Some(ret) = memory.get("retrieval").and_then(|v| v.as_object()) {
@@ -172,14 +172,20 @@ pub(super) fn print_explain_report(turns: &[serde_json::Value], verbose: bool) {
                     .unwrap_or(0);
                 eprintln!(
                     "{}",
-                    format!(
-                        "  ├─ L1 retrieval  {:.0}ms  kw={}({}) vec={}({}) → {} → {}  {} tokens",
-                        ret_ms, kw_hit, p1, vec_hit, p2, merged, final_count, l1_tokens
+                    explain_l1_retrieval_line(
+                        ret_ms,
+                        kw_hit,
+                        p1,
+                        vec_hit,
+                        p2,
+                        merged,
+                        final_count,
+                        l1_tokens,
                     )
                     .dim()
                 );
             } else if let Some(mem_ms) = memory.get("total_ms").and_then(|v| v.as_f64()) {
-                eprintln!("{}", format!("  └─ memory total  {:.0}ms", mem_ms).dim());
+                eprintln!("{}", explain_memory_total_line(mem_ms).dim());
             }
         }
 
@@ -202,14 +208,10 @@ pub(super) fn print_explain_report(turns: &[serde_json::Value], verbose: bool) {
                         .map(|v| v.to_string())
                         .unwrap_or_else(|| "?".to_string());
                     let tc = step.get("tool_calls").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let suffix = if tc > 0 {
-                        format!("in={} out={} tool_calls={}", sin, sout, tc)
-                    } else {
-                        format!("in={} out={}", sin, sout)
-                    };
-                    eprintln!("{}", format!("  └─ LLM  {}ms  {}", dur, suffix).dim());
+                    let suffix = explain_llm_tokens_suffix(sin.as_str(), sout.as_str(), tc);
+                    eprintln!("{}", explain_step_llm_line(dur, suffix.as_str()).dim());
                 } else {
-                    eprintln!("{}", format!("  └─ {}  {}ms", label, dur).dim());
+                    eprintln!("{}", explain_step_generic_line(label, dur).dim());
                 }
             }
         }
@@ -227,18 +229,14 @@ pub(super) fn print_explain_report(turns: &[serde_json::Value], verbose: bool) {
                     tin.unwrap_or(0) + tout.unwrap_or(0)
                 })
                 .sum::<i64>();
+            let tokens_display = if aux_tokens_known {
+                aux_tokens.to_string()
+            } else {
+                "?".to_string()
+            };
             eprintln!(
                 "{}",
-                format!(
-                    "  ├─ auxiliary LLM  {} calls  {} tokens",
-                    aux.len(),
-                    if aux_tokens_known {
-                        aux_tokens.to_string()
-                    } else {
-                        "?".to_string()
-                    }
-                )
-                .dim()
+                explain_auxiliary_llm_header_line(aux.len(), tokens_display.as_str()).dim()
             );
             for call in aux {
                 let purpose = call.get("purpose").and_then(|v| v.as_str()).unwrap_or("?");
@@ -255,19 +253,19 @@ pub(super) fn print_explain_report(turns: &[serde_json::Value], verbose: bool) {
                     .unwrap_or_else(|| "?".to_string());
                 eprintln!(
                     "{}",
-                    format!("  │    {}  {}ms  {}→{}", purpose, ms, tin, tout).dim()
+                    explain_auxiliary_llm_call_line(purpose, ms, tin.as_str(), tout.as_str()).dim()
                 );
             }
         }
         if verbose {
             if let Some(preview) = turn.get("content_preview").and_then(|v| v.as_str()) {
-                eprintln!("{}", format!("  ├─ content  {}", preview).dim());
+                eprintln!("{}", explain_content_preview_line(preview).dim());
             }
             if let Some(phase_timing) = turn.get("phase_timing").and_then(|v| v.as_array()) {
                 for entry in phase_timing {
                     let step = entry.get("step").and_then(|v| v.as_str()).unwrap_or("?");
                     let ms = entry.get("ms").and_then(|v| v.as_i64()).unwrap_or(0);
-                    eprintln!("{}", format!("  ├─ phase  {}  {}ms", step, ms).dim());
+                    eprintln!("{}", explain_phase_timing_line(step, ms).dim());
                 }
             }
             if let Some(candidates) = turn
@@ -279,10 +277,7 @@ pub(super) fn print_explain_report(turns: &[serde_json::Value], verbose: bool) {
                 for cand in candidates {
                     let score = cand.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     let id = cand.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                    eprintln!(
-                        "{}",
-                        format!("  ├─ candidate  {}  score={:.3}", id, score).dim()
-                    );
+                    eprintln!("{}", explain_memory_candidate_line(id, score).dim());
                 }
             }
         }
@@ -299,13 +294,14 @@ pub(super) fn print_explain_report(turns: &[serde_json::Value], verbose: bool) {
     };
     eprintln!(
         "{}",
-        format!(
-            "Total: {}ms  tokens: {}→{}",
-            total_ms, total_prompt_s, total_completion_s
+        explain_totals_line(
+            total_ms,
+            total_prompt_s.as_str(),
+            total_completion_s.as_str()
         )
         .dim()
     );
-    eprintln!("{}", "─────────────────────────────────────────────".dim());
+    eprintln!("{}", REPORT_SEPARATOR_LINE.dim());
 }
 
 /// Print TurnGuard verdict details in explain mode.
@@ -313,44 +309,42 @@ pub(super) fn print_verdict_report(verdict_events: &[VerdictEvent], verbose: boo
     if verdict_events.is_empty() {
         return;
     }
-    eprintln!("\n{}", "── TURN GUARD ──────────────────────────".dim());
+    eprintln!("\n{}", VERDICT_REPORT_HEADER.dim());
     for ve in verdict_events {
-        let icon = match ve.severity.as_str() {
-            "critical" => "🛑",
-            "warning" => "⚠",
-            _ => "ℹ",
-        };
+        let icon = verdict_severity_icon(ve.severity.as_str());
         eprintln!(
             "{}",
-            format!(
-                "T{} {} {}  nudges={}  errors={}  deprioritized={}{}",
+            verdict_event_summary_line(
                 ve.turn,
                 icon,
-                ve.severity,
+                ve.severity.as_str(),
                 ve.nudge_count,
                 ve.total_errors,
                 ve.deprioritized_count,
-                if ve.force_stop { "  FORCE_STOP" } else { "" },
+                ve.force_stop,
             )
             .dim()
         );
         if !ve.avoid_tools.is_empty() {
             eprintln!(
                 "{}",
-                format!("  ├─ avoid: [{}]", ve.avoid_tools.join(", ")).dim()
+                verdict_avoid_tools_line(ve.avoid_tools.join(", ").as_str()).dim()
             );
         }
         if verbose {
             for (i, inj) in ve.injections.iter().enumerate() {
                 let preview: String = inj.chars().take(120).collect();
-                eprintln!("{}", format!("  ├─ injection[{}]: {}…", i, preview).dim());
+                eprintln!(
+                    "{}",
+                    verdict_injection_preview_line(i, preview.as_str()).dim()
+                );
             }
         } else if !ve.injections.is_empty() {
             eprintln!(
                 "{}",
-                format!("  └─ {} injection(s)", ve.injections.len()).dim()
+                verdict_injection_count_line(ve.injections.len()).dim()
             );
         }
     }
-    eprintln!("{}", "─────────────────────────────────────────────".dim());
+    eprintln!("{}", REPORT_SEPARATOR_LINE.dim());
 }

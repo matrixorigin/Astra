@@ -193,9 +193,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     let learned_context = ctx.selector.learned_context(ctx.message, ctx.recent_tools);
     let learned_context_hint = learned_context.prompt_fragment();
-    let learned_task_type = learned_context
-        .task_archetype
-        .map(|task_type| format!("{task_type:?}").to_lowercase());
+    let learned_task_type = learned_context.task_archetype_payload_token();
 
     let mut selected_skills: Vec<String> = Vec::new();
     let (turn_schemas, selection_report, selection_confidence) = if ctx.tool_results.is_empty() {

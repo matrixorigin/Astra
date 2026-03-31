@@ -92,6 +92,12 @@ impl LearnedContext {
             && self.tool_hints.is_empty()
     }
 
+    /// Lowercase `Debug` token for `/chat` payload (`learned_task_type` hint).
+    #[must_use]
+    pub fn task_archetype_payload_token(&self) -> Option<String> {
+        self.task_archetype.map(|t| format!("{t:?}").to_lowercase())
+    }
+
     pub fn prompt_fragment(&self) -> String {
         if self.is_empty() {
             return String::new();
@@ -1461,6 +1467,20 @@ mod tests {
         assert!(user_msg.contains("github_list_prs"));
         assert!(user_msg.contains("Calibration risk"));
         assert!(user_msg.contains("Tool history"));
+    }
+
+    #[test]
+    fn learned_context_task_archetype_payload_token_lowercase() {
+        let lc = LearnedContext {
+            task_archetype: Some(TaskType::Fetch),
+            ..Default::default()
+        };
+        assert_eq!(lc.task_archetype_payload_token().as_deref(), Some("fetch"));
+        assert!(
+            LearnedContext::default()
+                .task_archetype_payload_token()
+                .is_none()
+        );
     }
 
     #[test]
