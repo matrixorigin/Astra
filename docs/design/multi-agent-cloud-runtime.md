@@ -1,7 +1,7 @@
 # Multi-Agent Cloud Runtime Architecture
 
 > **Status**: Living Design Document  
-> **Version**: 1.4.1 (§5.5.2 + CLI `edge_executor_id` / SSE `tool_request` → `post_tool_result`)  
+> **Version**: 1.4.2 (§5.5 server routes `/tools/result`, `/approval/respond`, `/agents/edge*`; CLI approval + dedup)  
 > **Scope**: Edge-cloud state management, multi-agent orchestration, and cloud-scale execution  
 > **Audience**: Core contributors, architecture reviewers
 
@@ -624,7 +624,7 @@ Shared crate: `rust/crates/mo-thin-client` (dependency of `mo-agent-cli` and any
 - **`POST /chat/stream`** — preferred for typed streaming; body is [`ChatStreamRequest`](../../rust/crates/mo-thin-client/src/protocol.rs). Use `ThinClient::chat_stream` / `chat_stream_collect`.
 - **`POST /chat/turn`** — used by the current CLI agentic loop (tools, retries); same `Accept: text/event-stream`, JSON body shaped like the server’s chat-turn handler. Use `ThinClient::post_chat_turn` / `post_chat_turn_retry_429`.
 
-**§5.5 callbacks** — Client methods exist (`post_tool_result`, `post_approval`); wire to **`router_builder`** when those routes are added on the server (today they may 404 until implemented).
+**§5.5 callbacks** — `mo-agent-server` exposes `POST /tools/result`, `POST /approval/respond` (JWT + ledger in `AppState::edge_callback_ledger`; bridge correlation is future work). `POST /agents/edge` and `POST /agents/edge/heartbeat` are Phase 3 stubs. [`ThinClient`](../../rust/crates/mo-thin-client/src/client.rs): `post_tool_result`, `post_approval`, `post_agents_edge_register`, `post_agents_edge_heartbeat`.
 
 **Server-aligned additions (not all listed in the prose above):** `GET/POST /tasks`, `PUT /tasks/{id}/status`, `GET /tasks/{id}/progress`, `GET/POST /context`, `GET /context/{id}`, `POST /memory/retrieve`, `POST /chat/route` — path constants and `ThinClient` helpers live alongside the rest in `paths.rs` / `client.rs`.
 
@@ -646,7 +646,7 @@ The **edge** tier is intentionally **thin**: it is not a second copy of the cogn
 - Rust: [`advertise_executor`](../../rust/crates/mo-thin-client/src/edge.rs) on [`ChatStreamRequest`](../../rust/crates/mo-thin-client/src/protocol.rs) sets `edge_executor_id` and, if empty, fills [`builtin_capability_preset`](../../rust/crates/mo-thin-client/src/edge.rs) (`bash`, `fs`, `git`, `code_intel`).
 - Header constant: [`MO_EDGE_ID_HEADER`](../../rust/crates/mo-thin-client/src/edge.rs) (`X-Mo-Edge-Id`) — used by [`ThinClient::post_tool_result`](../../rust/crates/mo-thin-client/src/client.rs).
 
-**Registry (future)**: [`paths::AGENTS_EDGE`](../../rust/crates/mo-thin-client/src/paths.rs) and [`AGENTS_EDGE_HEARTBEAT`](../../rust/crates/mo-thin-client/src/paths.rs) are reserved for Phase 3 agent registry; servers may return 404 until wired.
+**Registry (stub)**: [`paths::AGENTS_EDGE`](../../rust/crates/mo-thin-client/src/paths.rs) / [`AGENTS_EDGE_HEARTBEAT`](../../rust/crates/mo-thin-client/src/paths.rs) are implemented as authenticated JSON echo endpoints until persistence + heartbeat TTL land in Phase 3.
 
 **Event loop (conceptual)**:
 
@@ -659,7 +659,7 @@ open SSE (chat/stream with edge_executor_id + capabilities)
 
 This is the same protocol as CLI/Web/IDE **thin clients**; the edge differs only in **also** executing tools and posting callbacks. Today’s `mo-agent` CLI still bundles thin client + cognitive loop + edge tools — splitting out a **standalone light edge** is the mechanical next step after the server owns `chat_stream` / `plan_decompose` (§5.3).
 
-**CLI wiring (current)**: each `/chat/turn` payload includes `edge_executor_id` (env `MO_EDGE_EXECUTOR_ID` or `edge-{uuid}` per process) and `capabilities` from [`builtin_capability_preset`](../../rust/crates/mo-thin-client/src/edge.rs). [`consume_turn_sse`](../../rust/crates/mo-agent/src/mo_agent/stream_render.rs) parses SSE `tool_request` events, runs [`ToolExecutor::execute`](../../rust/crates/mo-agent/src/edge_tools.rs), and calls [`ThinClient::post_tool_result`](../../rust/crates/mo-thin-client/src/client.rs) (best-effort if the route is not deployed yet). The existing `tool_call` → local execution path remains for today’s server; when the cloud runtime emits only `tool_request`, the legacy path can be retired server-side.
+**CLI wiring (current)**: each `/chat/turn` payload includes `edge_executor_id` (env `MO_EDGE_EXECUTOR_ID` or `edge-{uuid}` per process) and `capabilities` from [`builtin_capability_preset`](../../rust/crates/mo-thin-client/src/edge.rs). [`consume_turn_sse`](../../rust/crates/mo-agent/src/mo_agent/stream_render.rs) handles SSE in order: `tool_request` → execute → [`post_tool_result`](../../rust/crates/mo-thin-client/src/client.rs); `approval_required` → [`PermissionManager::resolve_cloud_approval`](../../rust/crates/mo-agent/src/mo_agent/permission_manager.rs) → [`post_approval`](../../rust/crates/mo-thin-client/src/client.rs). If the same tool+args also appears as `tool_call`, the agentic loop **reuses** `edge_callback_outputs` and skips a second local execution. The legacy `tool_call`-only path remains for servers that do not emit `tool_request`.
 
 ---
 
@@ -1820,6 +1820,7 @@ mo-agent Orchestrator
 | App state | `runtime/src/app_state.rs` | AppState: 30+ service traits, turn writers, bridge | runtime ✅ |
 | Server builder | `runtime/src/server/state_builder.rs` | Pipeline learning writer, bridge wiring | runtime ✅ |
 | Router | `runtime/src/server/router_builder.rs` | 50+ HTTP routes, the thin client API surface | runtime ✅ |
+| Edge §5.5 callbacks | `runtime/src/server/edge_callback_handlers.rs` | `/tools/result`, `/approval/respond`, `/agents/edge*` | runtime ✅ |
 | Web proxy | `web/app/api/backend/[...path]/route.ts` | Server-side proxy, httpOnly cookie auth | web ✅ |
 | Thin client (§5.5) | `mo-thin-client/src/{paths,protocol,client}.rs` | Shared HTTP+SSE; CLI and future clients | ✅ |
 | Light edge (§5.5.2) | `mo-thin-client/src/edge.rs` | `edge_executor_id` helpers, capability preset, `X-Mo-Edge-Id` | ✅ |

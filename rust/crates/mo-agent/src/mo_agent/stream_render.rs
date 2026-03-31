@@ -9,13 +9,31 @@ pub(super) struct PendingToolRequest {
     pub args: serde_json::Value,
 }
 
-/// When set, SSE `tool_request` events run locally and results are posted to `/tools/result`.
+#[derive(Debug, Clone)]
+pub(super) struct PendingApproval {
+    pub request_id: String,
+    pub tool: String,
+    pub path: Option<String>,
+}
+
+#[derive(Debug)]
+pub(super) enum PendingEdgeWork {
+    Tool(PendingToolRequest),
+    Approval(PendingApproval),
+}
+
+/// When set, SSE `tool_request` / `approval_required` are handled and posted to the cloud API.
+///
+/// `perm_manager` must point at the same [`crate::permission_manager::PermissionManager`] used for
+/// local tool checks; it must not be used elsewhere until [`consume_turn_sse`] returns.
 pub(super) struct EdgeSseContext<'a> {
     pub api: &'a mo_thin_client::ThinClient,
     pub token: &'a str,
     pub executor_id: &'a str,
     pub executor: &'a crate::edge_tools::ToolExecutor,
     pub quiet: bool,
+    pub perm_manager: Option<std::ptr::NonNull<crate::permission_manager::PermissionManager>>,
+    pub _pm: std::marker::PhantomData<&'a mut crate::permission_manager::PermissionManager>,
 }
 
 fn tool_post_status(output: &str) -> &'static str {
@@ -29,9 +47,10 @@ fn tool_post_status(output: &str) -> &'static str {
     }
 }
 
-async fn flush_pending_tool_requests(
-    pending: &mut Vec<PendingToolRequest>,
+async fn flush_pending_edge_work(
+    pending: &mut Vec<PendingEdgeWork>,
     edge: Option<&EdgeSseContext<'_>>,
+    result: &mut TurnResult,
 ) {
     if pending.is_empty() {
         return;
@@ -40,32 +59,62 @@ async fn flush_pending_tool_requests(
         pending.clear();
         return;
     };
-    for req in pending.drain(..) {
-        if req.request_id.is_empty() || req.tool.is_empty() {
-            continue;
-        }
-        if !ctx.quiet {
-            eprintln!(
-                "{}",
-                format!("  ⚡ tool_request: {} ({})", req.tool, req.request_id).dim()
-            );
-        }
-        let start = std::time::Instant::now();
-        let output = ctx.executor.execute(&req.tool, &req.args).await;
-        let status = tool_post_status(&output);
-        let body = mo_thin_client::ToolResultRequest {
-            request_id: req.request_id,
-            status: status.to_string(),
-            output: Some(output),
-            duration_ms: Some(start.elapsed().as_millis() as u64),
-        };
-        if let Err(e) = ctx
-            .api
-            .post_tool_result(Some(ctx.token), Some(ctx.executor_id), &body)
-            .await
-            && !ctx.quiet
-        {
-            eprintln!("{}", format!("  ! post_tool_result: {e}").yellow());
+    for item in std::mem::take(pending) {
+        match item {
+            PendingEdgeWork::Tool(req) => {
+                if req.request_id.is_empty() || req.tool.is_empty() {
+                    continue;
+                }
+                if !ctx.quiet {
+                    eprintln!(
+                        "{}",
+                        format!("  ⚡ tool_request: {} ({})", req.tool, req.request_id).dim()
+                    );
+                }
+                let start = std::time::Instant::now();
+                let output = ctx.executor.execute(&req.tool, &req.args).await;
+                let sig = crate::chat_stream::tool_dedup_signature(&req.tool, &req.args);
+                result
+                    .edge_callback_outputs
+                    .insert(sig, output.clone());
+                let status = tool_post_status(&output);
+                let body = mo_thin_client::ToolResultRequest {
+                    request_id: req.request_id,
+                    status: status.to_string(),
+                    output: Some(output),
+                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                };
+                if let Err(e) = ctx
+                    .api
+                    .post_tool_result(Some(ctx.token), Some(ctx.executor_id), &body)
+                    .await
+                    && !ctx.quiet
+                {
+                    eprintln!("{}", format!("  ! post_tool_result: {e}").yellow());
+                }
+            }
+            PendingEdgeWork::Approval(ap) => {
+                if ap.request_id.is_empty() {
+                    continue;
+                }
+                let decision = match ctx.perm_manager {
+                    Some(mut ptr) => unsafe {
+                        ptr.as_mut()
+                            .resolve_cloud_approval(&ap.tool, ap.path.as_deref(), ctx.quiet)
+                    },
+                    None => mo_thin_client::ApprovalDecision::Deny,
+                };
+                let body = mo_thin_client::ApprovalRespondRequest {
+                    request_id: ap.request_id,
+                    decision,
+                    reason: None,
+                };
+                if let Err(e) = ctx.api.post_approval(Some(ctx.token), &body).await
+                    && !ctx.quiet
+                {
+                    eprintln!("{}", format!("  ! post_approval: {e}").yellow());
+                }
+            }
         }
     }
 }
@@ -142,6 +191,8 @@ pub(super) struct TurnResult {
     pub(super) error_message: Option<String>,
     /// Time to first token in milliseconds (streaming latency).
     pub(super) ttft_ms: Option<u64>,
+    /// Outputs from SSE `tool_request` (same key as [`crate::chat_stream::tool_dedup_signature`]).
+    pub(super) edge_callback_outputs: std::collections::HashMap<String, String>,
 }
 
 impl TurnResult {
@@ -159,6 +210,7 @@ impl TurnResult {
             has_usage: false,
             error_message: None,
             ttft_ms: None,
+            edge_callback_outputs: std::collections::HashMap::new(),
         }
     }
 }
@@ -208,7 +260,7 @@ pub(super) async fn consume_turn_sse(
     let mut render = StreamRenderState::new();
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
-    let mut pending_tools: Vec<PendingToolRequest> = Vec::new();
+    let mut pending_edge: Vec<PendingEdgeWork> = Vec::new();
 
     // Track time to first token
     let stream_start = std::time::Instant::now();
@@ -235,9 +287,9 @@ pub(super) async fn consume_turn_sse(
                 &mut result,
                 &mut render,
                 quiet,
-                &mut pending_tools,
+                &mut pending_edge,
             );
-            flush_pending_tool_requests(&mut pending_tools, edge.as_ref()).await;
+            flush_pending_edge_work(&mut pending_edge, edge.as_ref(), &mut result).await;
         }
     }
     if !buffer.trim().is_empty() {
@@ -246,9 +298,9 @@ pub(super) async fn consume_turn_sse(
             &mut result,
             &mut render,
             quiet,
-            &mut pending_tools,
+            &mut pending_edge,
         );
-        flush_pending_tool_requests(&mut pending_tools, edge.as_ref()).await;
+        flush_pending_edge_work(&mut pending_edge, edge.as_ref(), &mut result).await;
     }
 
     // Ensure thinking spinner is cleaned up
@@ -321,7 +373,7 @@ pub(super) fn dispatch_turn_event_block(
     result: &mut TurnResult,
     render: &mut StreamRenderState,
     quiet: bool,
-    pending_tool_requests: &mut Vec<PendingToolRequest>,
+    pending_edge: &mut Vec<PendingEdgeWork>,
 ) {
     for line in block.lines() {
         let Some(data) = line.strip_prefix("data: ") else {
@@ -392,11 +444,34 @@ pub(super) fn dispatch_turn_event_block(
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
                 if !request_id.is_empty() && !tool.is_empty() {
-                    pending_tool_requests.push(PendingToolRequest {
+                    pending_edge.push(PendingEdgeWork::Tool(PendingToolRequest {
                         request_id,
                         tool,
                         args,
-                    });
+                    }));
+                }
+            }
+            "approval_required" => {
+                let request_id = event
+                    .get("request_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let tool = event
+                    .get("tool")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let path = event
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(std::string::ToString::to_string);
+                if !request_id.is_empty() {
+                    pending_edge.push(PendingEdgeWork::Approval(PendingApproval {
+                        request_id,
+                        tool,
+                        path,
+                    }));
                 }
             }
             "explain" => {
@@ -606,8 +681,33 @@ mod tests {
         );
         dispatch_turn_event_block(block, &mut r, &mut s, true, &mut pending);
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].request_id, "tr-1");
-        assert_eq!(pending[0].tool, "bash");
-        assert_eq!(pending[0].args["command"], "echo x");
+        match &pending[0] {
+            PendingEdgeWork::Tool(t) => {
+                assert_eq!(t.request_id, "tr-1");
+                assert_eq!(t.tool, "bash");
+                assert_eq!(t.args["command"], "echo x");
+            }
+            _ => panic!("expected Tool"),
+        }
+    }
+
+    #[test]
+    fn approval_required_enqueues_pending() {
+        let mut r = TurnResult::new();
+        let mut s = StreamRenderState::new();
+        let mut pending = Vec::new();
+        let block = concat!(
+            "data: {\"type\":\"approval_required\",\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"path\":\"src/x.rs\"}\n\n",
+        );
+        dispatch_turn_event_block(block, &mut r, &mut s, true, &mut pending);
+        assert_eq!(pending.len(), 1);
+        match &pending[0] {
+            PendingEdgeWork::Approval(a) => {
+                assert_eq!(a.request_id, "ap-1");
+                assert_eq!(a.tool, "write_file");
+                assert_eq!(a.path.as_deref(), Some("src/x.rs"));
+            }
+            _ => panic!("expected Approval"),
+        }
     }
 }

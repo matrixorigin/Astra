@@ -79,6 +79,8 @@ pub struct AppState {
     pub memoria_master_key: Option<String>,
     pub memoria_forwarder: Arc<dyn MemoriaForwarder>,
     pub shared_pool: Option<SharedPool>,
+    /// Last edge §5.5 callbacks (`/tools/result`, `/approval/respond`) keyed by `{user_id}:{kind}:{request_id}`.
+    pub(crate) edge_callback_ledger: Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
 }
 
 impl AppState {
@@ -138,6 +140,7 @@ impl AppState {
             memoria_master_key: std::env::var("MEMORIA_MASTER_KEY").ok(),
             memoria_forwarder: Arc::new(NoopMemoriaForwarder),
             shared_pool: None,
+            edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 

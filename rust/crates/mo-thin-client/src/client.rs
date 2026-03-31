@@ -958,6 +958,50 @@ impl ThinClient {
             .await?;
         Self::json_or_error(resp).await
     }
+
+    /// `POST /agents/edge` — register edge capabilities (Phase 3 stub; server echoes JSON).
+    pub async fn post_agents_edge_register(
+        &self,
+        bearer_override: Option<&str>,
+        edge_executor_id: Option<&str>,
+        body: &Value,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(paths::AGENTS_EDGE)?;
+        let mut req = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .json(body);
+        if let Some(id) = edge_executor_id
+            && let Ok(v) = HeaderValue::from_str(id)
+        {
+            req = req.header(MO_EDGE_ID_HEADER, v);
+        }
+        let resp = req.send().await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// `POST /agents/edge/heartbeat` — liveness ping (Phase 3 stub).
+    pub async fn post_agents_edge_heartbeat(
+        &self,
+        bearer_override: Option<&str>,
+        edge_executor_id: Option<&str>,
+        body: &Value,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(paths::AGENTS_EDGE_HEARTBEAT)?;
+        let mut req = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .json(body);
+        if let Some(id) = edge_executor_id
+            && let Ok(v) = HeaderValue::from_str(id)
+        {
+            req = req.header(MO_EDGE_ID_HEADER, v);
+        }
+        let resp = req.send().await?;
+        Self::json_or_error(resp).await
+    }
 }
 
 #[cfg(test)]

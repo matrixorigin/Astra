@@ -352,6 +352,11 @@ fn normalize_call_sig(name: &str, args: &serde_json::Value) -> String {
     )
 }
 
+/// Stable key for deduplicating `tool_request` (SSE) vs `tool_call` (same turn).
+pub(super) fn tool_dedup_signature(name: &str, args: &serde_json::Value) -> String {
+    normalize_call_sig(name, args)
+}
+
 fn normalize_args(val: &serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
     match val {
@@ -1324,6 +1329,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             executor_id: edge_executor_instance_id(),
             executor: &executor,
             quiet,
+            perm_manager: Some(std::ptr::NonNull::from(&mut *perm_manager)),
+            _pm: std::marker::PhantomData,
         };
         let turn_result = consume_turn_sse(
             resp,
@@ -1524,6 +1531,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         // this gives real I/O parallelism. For sync local tools, it degrades
         // gracefully to sequential (no worse than before).
         let parallel_batch = tool_count > 1
+            && turn_result.edge_callback_outputs.is_empty()
             && turn_result.tool_calls.iter().all(|tc| {
                 tc.get("name")
                     .and_then(|v| v.as_str())
@@ -1588,10 +1596,52 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let args = tc_event
+            let args_raw = tc_event
                 .get("arguments")
                 .cloned()
                 .unwrap_or(serde_json::Value::Object(Default::default()));
+            let args = match args_raw {
+                serde_json::Value::String(s) => {
+                    serde_json::from_str::<serde_json::Value>(&s).unwrap_or_else(|_| {
+                        serde_json::Value::Object(Default::default())
+                    })
+                }
+                other => other,
+            };
+
+            // Already satisfied via SSE `tool_request` + post_tool_result (§5.5 headless path)
+            let edge_sig = tool_dedup_signature(&name, &args);
+            if let Some(cached) = turn_result.edge_callback_outputs.get(&edge_sig) {
+                let note = format!("(edge callback — same tool+args as tool_request)\n{cached}");
+                if !quiet {
+                    eprintln!(
+                        "{}",
+                        format!("  ↻ {name} (edge_callback_outputs)").dim()
+                    );
+                }
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": note,
+                }));
+                tool_results.push(serde_json::json!({
+                    "tool_call_id": id,
+                    "name": name,
+                    "result": note,
+                }));
+                tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
+                    name: name.clone(),
+                    ok: true,
+                    ms: 0,
+                    error: Some("edge_callback_dedup".to_string()),
+                    input_bytes: None,
+                    output_bytes: Some(note.len() as u32),
+                    args_preview: make_args_preview(&name, &args),
+                });
+                let call_sig = normalize_call_sig(&name, &args);
+                seen_calls.insert(call_sig);
+                continue;
+            }
 
             // Skip exact duplicate (same tool + same args) within this turn
             let call_sig = normalize_call_sig(&name, &args);

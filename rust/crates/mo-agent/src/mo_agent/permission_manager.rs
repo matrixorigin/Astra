@@ -20,6 +20,57 @@ impl PermissionManager {
         }
     }
 
+    /// Resolve §5.5 `approval_required` for cloud-orchestrated tools (posts to `/approval/respond`).
+    pub(super) fn resolve_cloud_approval(
+        &mut self,
+        tool: &str,
+        path: Option<&str>,
+        quiet: bool,
+    ) -> mo_thin_client::ApprovalDecision {
+        use mo_thin_client::ApprovalDecision;
+        if quiet {
+            return if self.auto_approve {
+                ApprovalDecision::Allow
+            } else {
+                ApprovalDecision::Deny
+            };
+        }
+        if self.auto_approve {
+            return ApprovalDecision::Allow;
+        }
+        if let Some(&allowed) = self.session_overrides.get(tool) {
+            return if allowed {
+                ApprovalDecision::Allow
+            } else {
+                ApprovalDecision::Deny
+            };
+        }
+
+        eprintln!(
+            "{}",
+            format!("  ☁  Cloud approval required: {tool}").yellow()
+        );
+        if let Some(p) = path.filter(|s| !s.is_empty()) {
+            eprintln!("{}", format!("     path: {p}").dim());
+        }
+        match Self::prompt_approval() {
+            'y' => ApprovalDecision::Allow,
+            'a' => {
+                self.session_overrides.insert(tool.to_string(), true);
+                eprintln!(
+                    "{}",
+                    format!("  ✓ {tool}: allow_session (auto-allow this tool)").dim()
+                );
+                ApprovalDecision::AllowSession
+            }
+            's' => {
+                self.session_overrides.insert(tool.to_string(), false);
+                ApprovalDecision::Deny
+            }
+            _ => ApprovalDecision::Deny,
+        }
+    }
+
     fn classify(name: &str) -> SideEffect {
         match name {
             "shell" | "bash" | "run_command" | "exec" => SideEffect::Execute,
@@ -222,6 +273,24 @@ mod tests {
     use super::*;
 
     // ── classify ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_cloud_approval_quiet_denies_without_auto() {
+        let mut pm = PermissionManager::new(false);
+        assert!(matches!(
+            pm.resolve_cloud_approval("write_file", Some("x.rs"), true),
+            mo_thin_client::ApprovalDecision::Deny
+        ));
+    }
+
+    #[test]
+    fn resolve_cloud_approval_quiet_allows_when_auto() {
+        let mut pm = PermissionManager::new(true);
+        assert!(matches!(
+            pm.resolve_cloud_approval("write_file", Some("x.rs"), true),
+            mo_thin_client::ApprovalDecision::Allow
+        ));
+    }
 
     #[test]
     fn classify_bash_as_execute() {

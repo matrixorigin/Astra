@@ -30,6 +30,15 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route("/chat/stream", post(chat_handlers::chat_stream_handler))
         .route("/chat/turn", post(chat_handlers::chat_turn_handler))
         .route("/chat/route", post(chat_handlers::chat_route_handler))
+        // §5.5 edge callbacks (thin client / headless orchestration)
+        .route(
+            "/tools/result",
+            post(edge_callback_handlers::post_tool_result_handler),
+        )
+        .route(
+            "/approval/respond",
+            post(edge_callback_handlers::post_approval_respond_handler),
+        )
         // WebSocket endpoint for browser-based agent access
         .route("/chat/ws", get(ws_handler::ws_chat_handler))
         .route(
@@ -125,6 +134,15 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/learning/feedback",
             post(reflect_handlers::learning_feedback_handler),
+        )
+        // Edge registry (design §5.5 / Phase 3) — register before `/agents` POST
+        .route(
+            "/agents/edge/heartbeat",
+            post(edge_callback_handlers::post_agents_edge_heartbeat_handler),
+        )
+        .route(
+            "/agents/edge",
+            post(edge_callback_handlers::post_agents_edge_register_handler),
         )
         // Agents CRUD
         .route(
@@ -487,6 +505,8 @@ mod tests {
             "/chat/stream",
             "/chat/turn",
             "/chat/route",
+            "/tools/result",
+            "/approval/respond",
             "/chat/ws",
             "/sessions",
             "/admin/init",
@@ -537,6 +557,7 @@ mod tests {
         let modules = [
             "meta_handlers::",
             "auth_handlers::",
+            "edge_callback_handlers::",
             "chat_handlers::",
             "session_handlers::",
             "admin_handlers::",
