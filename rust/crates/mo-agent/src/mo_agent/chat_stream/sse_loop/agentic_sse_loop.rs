@@ -1,12 +1,14 @@
-//! Owns all agentic `/chat/turn` SSE loop state: bootstrap from [`ChatTurnParams`], `run_all_turns`, then `into_stream_result`.
+//! Owns all agentic `/chat/turn` SSE loop state: bootstrap, `run_all_turns`, post-loop sidecars, and `StreamResult` assembly.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
+use crossterm::style::Stylize;
 use crossterm::terminal;
 use mo_agent_core::RuntimeLimits;
 use mo_agent_runtime::{
+    pipeline::persistence::ToolHealthEntry,
     pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint},
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
@@ -19,16 +21,14 @@ use mo_agent_runtime::{
 use mo_agent_services::session_journal::ToolCallRecord;
 use serde_json::Value;
 
-use crate::{StreamResult, VerdictEvent, edge_tools};
+use crate::{ExplainMode, StreamResult, VerdictEvent, edge_tools};
 
 use super::super::ChatTurnParams;
+use super::super::explain_reports::{print_explain_report, print_verdict_report};
 use super::agentic_loop_turn::{
     AgenticLoopTurnExit, AgenticTurnRequest, run_agentic_loop_iteration,
 };
 use super::prepare_turn_request::PrepareTurnTelemetry;
-use super::stream_result_finalize::{
-    StreamLoopSidecarEprint, StreamResultBuild, build_stream_result, eprint_stream_loop_sidecars,
-};
 
 pub(crate) struct AgenticSseLoopState {
     start: Instant,
@@ -282,5 +282,190 @@ impl AgenticSseLoopState {
             selector_tokens_out: self.selector_tokens_out,
             memoria_ms: self.first_memoria_ms,
         })
+    }
+}
+
+// ─── Post-loop CLI + `StreamResult` (was `stream_result_finalize.rs`) ────────
+
+struct StreamLoopSidecarEprint<'a> {
+    explain: ExplainMode,
+    quiet: bool,
+    verbose_mode: bool,
+    start: Instant,
+    model: Option<&'a str>,
+    explain_turns: &'a [Value],
+    verdict_events: &'a [VerdictEvent],
+    has_any_usage: bool,
+    total_prompt: u64,
+    total_completion: u64,
+    current_session_id: Option<&'a str>,
+}
+
+fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
+    let StreamLoopSidecarEprint {
+        explain,
+        quiet,
+        verbose_mode,
+        start,
+        model,
+        explain_turns,
+        verdict_events,
+        has_any_usage,
+        total_prompt,
+        total_completion,
+        current_session_id,
+    } = ctx;
+
+    if explain != ExplainMode::Off && !explain_turns.is_empty() && !quiet {
+        print_explain_report(explain_turns, explain == ExplainMode::Verbose);
+    }
+    if explain != ExplainMode::Off && !verdict_events.is_empty() && !quiet {
+        print_verdict_report(verdict_events, explain == ExplainMode::Verbose);
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let format_footer_tokens = |tokens: u64| -> String {
+        if tokens < 1000 {
+            format!("{}tok", tokens)
+        } else {
+            format!("{:.1}k", tokens as f64 / 1000.0)
+        }
+    };
+    let model_tag = model.unwrap_or("auto");
+    let session_tag = current_session_id
+        .map(|s| if s.len() > 8 { &s[..8] } else { s })
+        .unwrap_or("?");
+    if verbose_mode && !quiet {
+        eprintln!(
+            "{}",
+            format!(
+                "  ⏱ {:.1}s  ↓ {}  ↑ {}  model: {}  session: {}",
+                elapsed,
+                if has_any_usage {
+                    format_footer_tokens(total_completion)
+                } else {
+                    "?".to_string()
+                },
+                if has_any_usage {
+                    format_footer_tokens(total_prompt)
+                } else {
+                    "?".to_string()
+                },
+                model_tag,
+                session_tag,
+            )
+            .dim()
+        );
+    }
+}
+
+struct StreamResultBuild<'a> {
+    tool_health_entries: &'a [ToolHealthEntry],
+    session_id: Option<String>,
+    run_id: Option<String>,
+    full_text: String,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    tool_calls_count: u32,
+    first_selection_report: Option<tool_registry::SelectionReport>,
+    selected_skills: Vec<String>,
+    tools_used: HashSet<String>,
+    tool_call_records: Vec<ToolCallRecord>,
+    budget_pressure: f64,
+    stall_events: Vec<(String, u32)>,
+    verdict_events: Vec<VerdictEvent>,
+    step_recorder: &'a StepRecorder,
+    turn_guard: &'a TurnGuard,
+    last_heavy_checkpoint: Option<StepCheckpoint>,
+    ttft_ms: Option<u64>,
+    context_ms: Option<u64>,
+    selector_strategy: Option<String>,
+    selector_ms: Option<u64>,
+    selector_tokens_in: u64,
+    selector_tokens_out: u64,
+    memoria_ms: Option<u64>,
+}
+
+fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
+    let StreamResultBuild {
+        tool_health_entries,
+        session_id,
+        run_id,
+        full_text,
+        prompt_tokens,
+        completion_tokens,
+        tool_calls_count,
+        first_selection_report,
+        selected_skills,
+        tools_used,
+        tool_call_records,
+        budget_pressure,
+        stall_events,
+        verdict_events,
+        step_recorder,
+        turn_guard,
+        last_heavy_checkpoint,
+        ttft_ms,
+        context_ms,
+        selector_strategy,
+        selector_ms,
+        selector_tokens_in,
+        selector_tokens_out,
+        memoria_ms,
+    } = ctx;
+
+    let report = first_selection_report.unwrap_or_else(|| tool_registry::SelectionReport {
+        tools_selected: Vec::new(),
+        selected_count: 0,
+        budget_used: 0,
+        budget_total: 0,
+    });
+
+    let deduped_stall_events: Vec<(String, u32)> = {
+        let mut seen = HashSet::new();
+        stall_events
+            .into_iter()
+            .filter(|(stall_type, _)| seen.insert(stall_type.clone()))
+            .map(|(stall_type, _)| (stall_type, 0))
+            .collect()
+    };
+
+    let deduped_verdict_events: Vec<VerdictEvent> = {
+        let mut seen = HashSet::new();
+        verdict_events
+            .into_iter()
+            .filter(|ve| seen.insert(ve.severity.clone()))
+            .map(|mut ve| {
+                ve.turn = 0;
+                ve
+            })
+            .collect()
+    };
+
+    StreamResult {
+        session_id,
+        run_id,
+        full_text,
+        prompt_tokens,
+        completion_tokens,
+        tool_calls_count,
+        tools_selected: report.tools_selected,
+        selected_skills,
+        tools_used: tools_used.into_iter().collect(),
+        tool_call_records,
+        budget_used: report.budget_used,
+        budget_pressure,
+        stall_events: deduped_stall_events,
+        verdict_events: deduped_verdict_events,
+        step_recorder_summary: Some(step_recorder.summary()),
+        tool_health_export: turn_guard.health.export_merged(tool_health_entries),
+        last_heavy_checkpoint,
+        ttft_ms,
+        context_ms,
+        selector_strategy,
+        selector_ms,
+        selector_tokens_in,
+        selector_tokens_out,
+        memoria_ms,
     }
 }
