@@ -6,5 +6,6 @@ mod explain_sidecar;
 mod prepare_turn_request;
 mod run;
 mod skill_instructions_round;
+mod tool_round;
 
 pub(crate) use run::stream_chat_sse;

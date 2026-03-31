@@ -1,16 +1,12 @@
 //! Multi-turn `/chat/stream` loop (`stream_chat_sse`), kept here so `sse_loop/` can split further without one monolithic file.
 
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-    time::Instant,
-};
+use std::{collections::HashSet, path::PathBuf, time::Instant};
 
 use crossterm::style::Stylize;
 use crossterm::terminal;
 use mo_agent_core::{RuntimeLimits, agent_warn};
 use mo_agent_runtime::{
-    pipeline::step_protocol::{CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache},
+    pipeline::step_protocol::InMemoryIdempotencyCache,
     tool_registry::{self},
     turn::chat_history_openai::{
         append_openai_user_content_messages, openai_messages_from_repl_history,
@@ -19,16 +15,12 @@ use mo_agent_runtime::{
     turn::chat_turn_heuristics::{
         openai_factual_tool_retry_user_message, should_force_factual_tool_retry,
     },
-    turn::edge_prompt_context::{detect_project_languages, make_args_preview},
-    turn::headless_tool_assembly::{
-        openai_assistant_with_tool_calls_message, openai_tool_roundtrip_values,
-        take_edge_output_for_tool_call, tool_calls_for_stall_guard, CACHEABLE_TOOLS,
-    },
-    turn::tool_result_semantics::{is_resource_limit_output, is_tool_error, tool_dedup_signature},
+    turn::edge_prompt_context::detect_project_languages,
+    turn::headless_tool_assembly::tool_calls_for_stall_guard,
 };
 
 use crate::{
-    cli_utils::{compact_or_raw, tool_call_detail, tool_result_summary},
+    cli_utils::compact_or_raw,
     edge_tools,
     stream_render::consume_turn_sse,
     ExplainMode, StreamResult, VerdictEvent,
@@ -37,10 +29,10 @@ use crate::{
 use super::prepare_turn_request::{
     prepare_chat_turn_payload, PrepareChatTurnRequest, PrepareTurnTelemetry,
 };
+use super::tool_round::{run_headless_tool_round, HeadlessToolRoundRequest};
 use super::super::{
     edge_executor::edge_executor_instance_id,
     explain_reports::{print_explain_report, print_verdict_report},
-    hydrate_reflect::hydrate_reflect_placeholder_if_needed,
     ChatTurnParams,
 };
 
@@ -281,7 +273,6 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             all_tools_used.insert(e.tool.clone());
         }
         has_any_usage = has_any_usage || turn_result.has_usage;
-        explain_turns.extend(turn_result.explain_turns);
 
         if let Some(ref err) = turn_result.error_message {
             return Err(err.clone());
@@ -357,383 +348,25 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         }
 
         // Assemble tool results from SSE `tool_request` only — legacy inline execution removed.
-        tool_results = Vec::new();
-
-        let assistant_tc_msg = openai_assistant_with_tool_calls_message(
-            &turn_result.tool_calls,
-            &turn_result.edge_tool_round,
-            &turn_result.reasoning_content,
-        );
-        messages.push(assistant_tc_msg);
-
-        enum RoundToolItem {
-            ServerTc(usize),
-            Synthetic(usize),
-        }
-        let indices: Vec<RoundToolItem> = if !turn_result.tool_calls.is_empty() {
-            (0..turn_result.tool_calls.len())
-                .map(RoundToolItem::ServerTc)
-                .collect()
-        } else {
-            (0..turn_result.edge_tool_round.len())
-                .map(RoundToolItem::Synthetic)
-                .collect()
-        };
-
-        let tool_count = indices.len().max(1);
-        let mut seen_calls: HashSet<String> = HashSet::new();
-        step_recorder.begin_act(tool_count);
-        let step_start_time = std::time::Instant::now();
-        let step_timeout_ms = step_recorder.scheduling().timeout_ms;
-        let mut consumed_edge = vec![false; turn_result.edge_tool_round.len()];
-        let by_sig: &HashMap<String, String> = &turn_result.edge_callback_outputs;
-
-        for item in &indices {
-            let step_elapsed_ms = step_start_time.elapsed().as_millis() as u64;
-            if step_elapsed_ms > step_timeout_ms {
-                let aborted_count = indices.len() - tool_results.len();
-                let aborted_tools: Vec<String> = indices[tool_results.len()..]
-                    .iter()
-                    .map(|it| match it {
-                        RoundToolItem::ServerTc(i) => turn_result.tool_calls[*i]
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        RoundToolItem::Synthetic(i) => turn_result.edge_tool_round[*i].tool.clone(),
-                    })
-                    .collect();
-                agent_warn!(
-                    "step",
-                    "Step timeout exceeded: {}ms > {}ms, aborting {} tools: {:?}",
-                    step_elapsed_ms,
-                    step_timeout_ms,
-                    aborted_count,
-                    aborted_tools
-                );
-                turn_guard.record_step_abort(&aborted_tools);
-                break;
-            }
-
-            let (id, name, args, from_synthetic) = match item {
-                RoundToolItem::ServerTc(i) => {
-                    let tc_event = &turn_result.tool_calls[*i];
-                    let id = tc_event
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let name = tc_event
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let args_raw = tc_event
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Object(Default::default()));
-                    let args = match args_raw {
-                        serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(&s)
-                            .unwrap_or_else(|_| serde_json::Value::Object(Default::default())),
-                        other => other,
-                    };
-                    (id, name, args, false)
-                }
-                RoundToolItem::Synthetic(i) => {
-                    let e = &turn_result.edge_tool_round[*i];
-                    (
-                        format!("edge-{i}"),
-                        e.tool.clone(),
-                        e.args.clone(),
-                        true,
-                    )
-                }
-            };
-
-            let call_sig = tool_dedup_signature(&name, &args);
-            if !seen_calls.insert(call_sig.clone()) {
-                let dup = "(duplicate call — result same as previous identical call this turn)";
-                let (tool_msg, tr) = openai_tool_roundtrip_values(&id, &name, dup);
-                messages.push(tool_msg);
-                tool_results.push(tr);
-                tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
-                    name: name.clone(),
-                    ok: true,
-                    ms: 0,
-                    error: Some("duplicate_within_turn".to_string()),
-                    input_bytes: None,
-                    output_bytes: None,
-                    args_preview: make_args_preview(&name, &args),
-                });
-                continue;
-            }
-
-            let idem_key = IdempotencyKey::semantic(&name, &args);
-            if CACHEABLE_TOOLS.contains(&name.as_str())
-                && let Some(cached) = idempotency_cache.check(&idem_key)
-            {
-                let cached_note = format!(
-                    "(cached from earlier turn — identical call)\n{}",
-                    cached.output
-                );
-                if !quiet {
-                    eprintln!("{}", format!("  ↻ {name} (cached)").dim());
-                }
-                let (tool_msg, tr) = openai_tool_roundtrip_values(&id, &name, &cached_note);
-                messages.push(tool_msg);
-                tool_results.push(tr);
-                let cache_key = idem_key.cache_key();
-                step_recorder.begin_tool_with_key(&name, &id, Some(&cache_key));
-                step_recorder.record_cache_hit(&name, cached.clone());
-                turn_guard.record_cache_hit(&name);
-                tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
-                    name: name.clone(),
-                    ok: true,
-                    ms: 0,
-                    error: Some("cached_cross_turn".to_string()),
-                    input_bytes: None,
-                    output_bytes: Some(cached.output.len() as u32),
-                    args_preview: make_args_preview(&name, &args),
-                });
-                continue;
-            }
-
-            let mut result_str = if from_synthetic {
-                match item {
-                    RoundToolItem::Synthetic(i) => turn_result.edge_tool_round[*i].output.clone(),
-                    _ => unreachable!(),
-                }
-            } else {
-                take_edge_output_for_tool_call(
-                    &name,
-                    &args,
-                    &turn_result.edge_tool_round,
-                    &mut consumed_edge,
-                    by_sig,
-                )
-            };
-
-            if !valid_tool_names.contains(&name) {
-                let err_msg = format!(
-                    "Unknown tool '{}'. Available: {}",
-                    name,
-                    valid_tool_names
-                        .iter()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                if !quiet {
-                    eprintln!("{}", format!("  ✗ {name}").red());
-                }
-                if !quiet {
-                    eprintln!("  {}", format!("└ {err_msg}").dim());
-                }
-                let (tool_msg, err_tr) = openai_tool_roundtrip_values(&id, &name, &err_msg);
-                messages.push(tool_msg);
-                tool_results.push(err_tr);
-                tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
-                    name: name.clone(),
-                    ok: false,
-                    ms: 0,
-                    error: Some(format!("unknown_tool: {name}")),
-                    input_bytes: None,
-                    output_bytes: None,
-                    args_preview: None,
-                });
-                continue;
-            }
-
-            result_str = hydrate_reflect_placeholder_if_needed(
-                api,
-                token,
-                current_session_id.as_ref(),
-                &name,
-                &args,
-                result_str,
-            )
-            .await;
-
-            let tool_start = Instant::now();
-            let tool_idem_key = if CACHEABLE_TOOLS.contains(&name.as_str()) {
-                Some(idem_key.cache_key())
-            } else {
-                None
-            };
-            step_recorder.begin_tool_with_key(&name, &id, tool_idem_key.as_deref());
-
-            let mut is_err = is_tool_error(&result_str);
-            let tool_already_restricted = restricted_tools.contains(&name);
-            let mut resource_limit_recorded = false;
-
-            if is_err && !tool_already_restricted {
-                use mo_agent_runtime::turn::error_recovery::{
-                    build_recovery_message, classify_error,
-                };
-                let category = classify_error(&result_str);
-
-                if matches!(
-                    category,
-                    mo_agent_runtime::turn::error_recovery::ErrorCategory::ResourceLimit
-                ) {
-                    turn_guard.health.record_resource_limit_failure(&name);
-                    turn_guard.errors.record_error(category);
-                    restricted_tools.insert(name.clone());
-                    resource_limit_recorded = true;
-                    if !quiet {
-                        eprintln!(
-                            "{}",
-                            format!("  ⚠ {name} blocked: system resource limit reached").yellow()
-                        );
-                    }
-                }
-
-                if matches!(
-                    category,
-                    mo_agent_runtime::turn::error_recovery::ErrorCategory::Transient
-                ) {
-                    turn_guard.errors.record_retry(false);
-                }
-
-                let deprioritized = turn_guard.health.deprioritized_tools();
-                let recovery_msg =
-                    build_recovery_message(&name, &result_str, category, &deprioritized);
-                result_str.push_str(&format!("\n{recovery_msg}"));
-            }
-
-            if !is_err && !tool_already_restricted && is_resource_limit_output(&result_str) {
-                turn_guard.health.record_resource_limit_failure(&name);
-                turn_guard.errors.record_error(
-                    mo_agent_runtime::turn::error_recovery::ErrorCategory::ResourceLimit,
-                );
-                restricted_tools.insert(name.clone());
-                is_err = true;
-                resource_limit_recorded = true;
-                if !quiet {
-                    eprintln!(
-                        "{}",
-                        format!("  ⚠ {name}: resource limit detected in output — tool blocked").dim()
-                    );
-                }
-            }
-
-            let result_quality = if resource_limit_recorded {
-                mo_agent_runtime::turn::result_quality::ResultQuality::Error
-            } else {
-                turn_guard.record_tool_result(&name, &result_str)
-            };
-
-            if let Some(feedback) = turn_guard.result_feedback(&name, result_quality) {
-                result_str.push_str(&format!("\n{feedback}"));
-            }
-
-            let args_size = serde_json::to_string(&args)
-                .map(|s| s.len() as u32)
-                .unwrap_or(0);
-            let result_size = result_str.len() as u32;
-            let args_preview = make_args_preview(&name, &args);
-            let tool_elapsed = tool_start.elapsed();
-            tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
-                name: name.clone(),
-                ok: !is_err,
-                ms: tool_elapsed.as_millis() as u64,
-                error: if is_err {
-                    result_str
-                        .lines()
-                        .next()
-                        .map(|l| l.chars().take(200).collect())
-                } else {
-                    None
-                },
-                input_bytes: Some(args_size),
-                output_bytes: Some(result_size),
-                args_preview,
-            });
-            step_recorder.complete_tool_with_result(
-                &name,
-                is_err,
-                tool_elapsed.as_millis() as u64,
-                false,
-                &result_str,
-            );
-
-            if let Some(ref sid) = current_session_id
-                && let Some(light) = step_recorder.build_light_checkpoint()
-            {
-                let cp = mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Light(light);
-                let _ = mo_agent_runtime::pipeline::step_checkpoint::write_step_checkpoint(
-                    sid,
-                    step_recorder.summary().checkpoints,
-                    &cp,
-                );
-            }
-
-            if !is_err && CACHEABLE_TOOLS.contains(&name.as_str()) {
-                let cached_result = CachedToolResult {
-                    tool_name: name.clone(),
-                    output: result_str.clone(),
-                    is_error: false,
-                    cached_at: mo_agent_runtime::pipeline::step_protocol::epoch_ms(),
-                };
-                step_recorder.attach_cached_result(cached_result.clone());
-                idempotency_cache.record(&idem_key, cached_result);
-                if let Some((prev_turn, reason)) =
-                    semantic_dedup.check_and_record(&name, &args, &result_str, _turn)
-                {
-                    let hint = format!(
-                        "\n⚠ Note: this result is similar to a previous {} call (turn {}, {}). \
-                         Avoid re-fetching the same information.",
-                        name,
-                        prev_turn + 1,
-                        reason
-                    );
-                    result_str.push_str(&hint);
-                }
-            }
-
-            if !quiet {
-                let duration_str = if tool_elapsed.as_secs_f64() >= 1.0 {
-                    format!("{:.1}s", tool_elapsed.as_secs_f64())
-                } else {
-                    format!("{}ms", tool_elapsed.as_millis())
-                };
-                let detail = tool_call_detail(&name, &args);
-                let summary = if !is_err {
-                    tool_result_summary(&name, &result_str)
-                } else {
-                    None
-                };
-                if is_err {
-                    eprintln!("{}", format!("  ✗ {name} ({duration_str})").red());
-                    if let Some(first_line) = result_str.lines().next() {
-                        let preview = if first_line.len() > 100 {
-                            format!("{}…", &first_line[..100])
-                        } else {
-                            first_line.to_string()
-                        };
-                        eprintln!("  {}", format!("└ Error: {preview}").dim());
-                    }
-                } else {
-                    eprintln!("{}", format!("  ✓ {name} ({duration_str})").green());
-                    match (&detail, &summary) {
-                        (Some(d), Some(s)) => {
-                            eprintln!("  {}", format!("└ {d}  →  {s}").dim());
-                        }
-                        (Some(d), None) => {
-                            eprintln!("  {}", format!("└ {d}").dim());
-                        }
-                        (None, Some(s)) => {
-                            eprintln!("  {}", format!("└ {s}").dim());
-                        }
-                        (None, None) => {}
-                    }
-                }
-            }
-
-            let (tool_msg, tr) = openai_tool_roundtrip_values(&id, &name, &result_str);
-            messages.push(tool_msg);
-            tool_results.push(tr);
-        }
+        run_headless_tool_round(HeadlessToolRoundRequest {
+            turn_index: _turn,
+            quiet,
+            api,
+            token,
+            current_session_id: current_session_id.as_ref(),
+            turn_result: &turn_result,
+            messages: &mut messages,
+            tool_results: &mut tool_results,
+            valid_tool_names: &valid_tool_names,
+            restricted_tools: &mut restricted_tools,
+            turn_guard: &mut turn_guard,
+            step_recorder: &mut step_recorder,
+            idempotency_cache: &mut idempotency_cache,
+            semantic_dedup: &mut semantic_dedup,
+            tool_call_records: &mut tool_call_records,
+        })
+        .await;
+        explain_turns.extend(turn_result.explain_turns);
         // ── Intent drift detection ──
         // Track per-turn tool names + args, detect when agent drifts from user's query
         {
