@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use serde_json::Value;
 
@@ -84,6 +84,48 @@ pub fn detect_server_stall(tool_sigs: &[BTreeSet<String>], window: usize) -> boo
 
     let recent = &tool_sigs[tool_sigs.len() - window..];
     recent.iter().all(|sig| sig == &recent[window - 1])
+}
+
+// ─── CLI stream_chat_sse agentic loop (mo-agent) ──────────────────────────────
+
+/// Subtract this many "remaining inner-loop turns" when TurnGuard reports **critical** during the
+/// CLI `/chat/turn` agentic loop (`apply_post_tool_turn_policy`).
+pub const CLI_AGENTIC_VERDICT_REMAINING_PENALTY_CRITICAL: usize = 5;
+/// Same for **warning** severity.
+pub const CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING: usize = 2;
+
+/// Per-round signature set and tool-name set for mo-agent flat `tool_calls` rows (`name` + `arguments` JSON).
+pub fn round_tool_call_sig_and_names(tool_calls: &[Value]) -> (BTreeSet<String>, HashSet<String>) {
+    let sig_set: BTreeSet<String> = tool_calls
+        .iter()
+        .map(|tc| {
+            let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let args = tc.get("arguments").cloned().unwrap_or_default();
+            format!(
+                "{}:{}",
+                name,
+                serde_json::to_string(&args).unwrap_or_default()
+            )
+        })
+        .collect();
+    let name_set: HashSet<String> = tool_calls
+        .iter()
+        .map(|tc| {
+            tc.get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    (sig_set, name_set)
+}
+
+/// True when the last `window` rounds have **identical** tool-name sets (name-only stall in CLI loop).
+pub fn detect_cli_tool_name_stall(turn_tool_names: &[HashSet<String>], window: usize) -> bool {
+    turn_tool_names.len() >= window
+        && turn_tool_names[turn_tool_names.len() - window..]
+            .windows(2)
+            .all(|w| w[0] == w[1])
 }
 
 // ─── Divergence detection ───────────────────────────────────────────────────
@@ -457,6 +499,37 @@ mod tests {
     fn stall_not_detected_different_tools() {
         let sigs = make_sigs(&[&["bash"], &["read_file"], &["bash"]]);
         assert!(!detect_server_stall(&sigs, 3));
+    }
+
+    // ── CLI agentic: sig/name helpers + name-only stall ──
+
+    #[test]
+    fn round_tool_call_sig_and_names_flat_shape() {
+        let calls = vec![serde_json::json!({
+            "name": "read_file",
+            "arguments": {"path": "a.rs"}
+        })];
+        let (sigs, names) = round_tool_call_sig_and_names(&calls);
+        assert!(
+            sigs.iter()
+                .any(|s| s.contains("read_file") && s.contains("a.rs"))
+        );
+        assert!(names.contains("read_file"));
+    }
+
+    #[test]
+    fn cli_tool_name_stall_three_identical_name_rounds() {
+        let one: HashSet<String> = HashSet::from_iter([String::from("read_file")]);
+        let v = vec![one.clone(), one.clone(), one];
+        assert!(detect_cli_tool_name_stall(&v, SERVER_STALL_WINDOW));
+    }
+
+    #[test]
+    fn cli_tool_name_stall_not_triggered_when_middle_round_differs() {
+        let rf: HashSet<String> = HashSet::from_iter([String::from("read_file")]);
+        let bash: HashSet<String> = HashSet::from_iter([String::from("bash")]);
+        let v = vec![rf.clone(), bash, rf];
+        assert!(!detect_cli_tool_name_stall(&v, SERVER_STALL_WINDOW));
     }
 
     // ── Divergence detection ──

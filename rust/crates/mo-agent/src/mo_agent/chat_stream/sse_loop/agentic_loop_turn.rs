@@ -36,7 +36,11 @@ use mo_agent_runtime::{
         take_edge_output_for_tool_call, tool_calls_for_stall_guard,
     },
     turn::response_guard::apply_response_guards,
-    turn::stall::{IntentDrift, detect_intent_drift},
+    turn::stall::{
+        CLI_AGENTIC_VERDICT_REMAINING_PENALTY_CRITICAL,
+        CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING, IntentDrift, SERVER_STALL_WINDOW,
+        detect_cli_tool_name_stall, detect_intent_drift, round_tool_call_sig_and_names,
+    },
     turn::tool_result_semantics::{is_resource_limit_output, is_tool_error, tool_dedup_signature},
     turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, pin_invoked_tool_schemas},
     turn::turn_guard::{TurnGuard, VerdictSeverity},
@@ -634,8 +638,6 @@ fn ingest_turn_sse_result(ctx: TurnResultIngestRequest<'_>) -> TurnIngestOutcome
 
 // ─── Stall preflight (signatures + name-stall) ────────────────────────────────
 
-const TOOL_NAME_STALL_WINDOW: usize = 3;
-
 struct StallPreflightRequest<'a> {
     turn_index: u32,
     tool_calls_for_guard: &'a [Value],
@@ -655,36 +657,13 @@ fn apply_stall_preflight(ctx: StallPreflightRequest<'_>) {
         turn_guard,
     } = ctx;
 
-    let sig_set: BTreeSet<String> = tool_calls_for_guard
-        .iter()
-        .map(|tc| {
-            let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let args = tc.get("arguments").cloned().unwrap_or_default();
-            format!(
-                "{}:{}",
-                name,
-                serde_json::to_string(&args).unwrap_or_default()
-            )
-        })
-        .collect();
-    let name_set: HashSet<String> = tool_calls_for_guard
-        .iter()
-        .map(|tc| {
-            tc.get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        })
-        .collect();
+    let (sig_set, name_set) = round_tool_call_sig_and_names(tool_calls_for_guard);
     turn_sigs.push(sig_set);
-    turn_tool_names.push(name_set.clone());
+    turn_tool_names.push(name_set);
 
     turn_guard.record_tool_calls(tool_calls_for_guard);
 
-    let name_stall = turn_tool_names.len() >= TOOL_NAME_STALL_WINDOW
-        && turn_tool_names[turn_tool_names.len() - TOOL_NAME_STALL_WINDOW..]
-            .windows(2)
-            .all(|w| w[0] == w[1]);
+    let name_stall = detect_cli_tool_name_stall(turn_tool_names, SERVER_STALL_WINDOW);
 
     if name_stall {
         stall_events.push(("name_stall".to_string(), turn_index));
@@ -795,10 +774,12 @@ fn apply_post_tool_turn_policy(ctx: PostToolTurnRequest<'_>) -> PostToolTurnOutc
 
         match verdict.severity {
             VerdictSeverity::Critical => {
-                *remaining_turns = remaining_turns.saturating_sub(5);
+                *remaining_turns =
+                    remaining_turns.saturating_sub(CLI_AGENTIC_VERDICT_REMAINING_PENALTY_CRITICAL);
             }
             VerdictSeverity::Warning => {
-                *remaining_turns = remaining_turns.saturating_sub(2);
+                *remaining_turns =
+                    remaining_turns.saturating_sub(CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING);
             }
             _ => {}
         }
