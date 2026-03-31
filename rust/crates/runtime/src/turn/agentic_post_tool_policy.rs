@@ -43,6 +43,29 @@ pub enum AgenticPostToolPolicyOutcome {
     Abort(String),
 }
 
+/// Maps [`AgenticPostToolPolicyOutcome`] for host loop control (CLI maps to `AgenticLoopTurnExit`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum AgenticPostToolIterationControl {
+    ProceedEndTurn,
+    RetryLlmClearToolResults,
+    Abort(String),
+}
+
+#[must_use]
+pub fn map_post_tool_policy_outcome(
+    outcome: AgenticPostToolPolicyOutcome,
+) -> AgenticPostToolIterationControl {
+    match outcome {
+        AgenticPostToolPolicyOutcome::Abort(s) => AgenticPostToolIterationControl::Abort(s),
+        AgenticPostToolPolicyOutcome::RetryLlmClearToolResults => {
+            AgenticPostToolIterationControl::RetryLlmClearToolResults
+        }
+        AgenticPostToolPolicyOutcome::ProceedEndTurn => {
+            AgenticPostToolIterationControl::ProceedEndTurn
+        }
+    }
+}
+
 pub fn apply_agentic_post_tool_policy(
     ctx: AgenticPostToolPolicyRequest<'_>,
 ) -> AgenticPostToolPolicyOutcome {
@@ -223,5 +246,21 @@ mod tests {
 
         assert_eq!(out, AgenticPostToolPolicyOutcome::ProceedEndTurn);
         assert_eq!(intent_tool_turns.len(), 1);
+    }
+
+    #[test]
+    fn map_post_tool_outcome_round_trip_variants() {
+        assert_eq!(
+            map_post_tool_policy_outcome(AgenticPostToolPolicyOutcome::ProceedEndTurn),
+            AgenticPostToolIterationControl::ProceedEndTurn
+        );
+        assert_eq!(
+            map_post_tool_policy_outcome(AgenticPostToolPolicyOutcome::RetryLlmClearToolResults),
+            AgenticPostToolIterationControl::RetryLlmClearToolResults
+        );
+        assert_eq!(
+            map_post_tool_policy_outcome(AgenticPostToolPolicyOutcome::Abort("x".into())),
+            AgenticPostToolIterationControl::Abort("x".into())
+        );
     }
 }

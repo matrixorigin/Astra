@@ -1,5 +1,8 @@
 //! User-visible strings for failed cloud `/chat` HTTP calls.
 
+/// Default retry count for `POST /chat/turn` when the thin client backs off on HTTP 429.
+pub const CHAT_TURN_POST_MAX_RETRIES: u32 = 3;
+
 /// Same shape as the CLI `API Error (status): body` line.
 #[must_use]
 pub fn chat_turn_http_error_user_message(status_code: u16, response_body_for_user: &str) -> String {

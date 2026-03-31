@@ -14,8 +14,10 @@ use mo_agent_runtime::{
     tool_registry::{self, ToolRegistry},
     tool_selector::{self, ToolSelector},
     turn::agentic_post_tool_policy::{
-        AgenticPostToolPolicyOutcome, AgenticPostToolPolicyRequest, apply_agentic_post_tool_policy,
+        AgenticPostToolIterationControl, AgenticPostToolPolicyRequest,
+        apply_agentic_post_tool_policy, map_post_tool_policy_outcome,
     },
+    turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools,
     turn::agentic_stall_preflight::{
         CliAgenticStallPreflightRequest, apply_cli_agentic_stall_preflight,
     },
@@ -30,7 +32,7 @@ use mo_agent_runtime::{
     },
     turn::boost_domain_hints::{domain_hints_debug_strings, domain_hints_from_boost_terms},
     turn::chat_history_openai::merge_skill_names_track,
-    turn::chat_turn_api_error::chat_turn_http_error_user_message,
+    turn::chat_turn_api_error::{CHAT_TURN_POST_MAX_RETRIES, chat_turn_http_error_user_message},
     turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn,
     turn::chat_turn_edge_profile::{
         detect_active_system_skills_in_message, read_git_branch_abbrev,
@@ -38,9 +40,8 @@ use mo_agent_runtime::{
     turn::chat_turn_explain_wire::AgenticChatExplainFlags,
     turn::chat_turn_heuristics::extract_repos_from_memory,
     turn::chat_turn_payload::{
-        ChatTurnBasePayloadInput, attach_filtered_edge_tools, chat_turn_base_payload,
-        merge_active_skills_into_edge_profile, merge_skill_instructions_into_edge_profile,
-        set_payload_tool_results_if_non_empty,
+        ChatTurnBasePayloadInput, chat_turn_base_payload, merge_active_skills_into_edge_profile,
+        merge_skill_instructions_into_edge_profile, set_payload_tool_results_if_non_empty,
     },
     turn::chat_turn_selection_context::build_agentic_tool_selection_context,
     turn::chat_turn_step_plan::record_agentic_step_plan_after_payload_prep,
@@ -307,14 +308,15 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     );
     ctx.executor.set_budget_pressure(budget_pressure);
 
-    tool_registry::apply_selector_hints_to_edge_profile(
-        &mut payload["edge_profile"],
+    apply_selector_hints_then_attach_filtered_edge_tools(
+        &mut payload,
+        turn_schemas,
+        ctx.restricted_tools,
         ctx.telem.first_selection_report.as_ref(),
         selection_confidence,
-        &learned_context_hint,
+        learned_context_hint.as_str(),
         learned_task_type.as_deref(),
     );
-    attach_filtered_edge_tools(&mut payload, turn_schemas, ctx.restricted_tools);
     if ctx.explain.explain_stderr {
         let (restricted_line, guidance_line) =
             explain_stderr_payload_line_pair(ctx.restricted_tools, &payload, selection_confidence);
@@ -464,7 +466,7 @@ async fn fetch_chat_turn_sse(ctx: ChatTurnSseFetchRequest<'_>) -> Result<TurnRes
     .await;
 
     let resp = api
-        .post_chat_turn_retry_429(token, &payload, 3, quiet)
+        .post_chat_turn_retry_429(token, &payload, CHAT_TURN_POST_MAX_RETRIES, quiet)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -972,30 +974,32 @@ pub(crate) async fn run_agentic_loop_iteration(
     .await;
     explain_turns.extend(turn_result.explain_turns.iter().cloned());
 
-    match apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
-        turn_index: turn_index as u32,
-        message,
-        tool_calls_for_guard: &tool_calls_for_guard,
-        intent_tool_turns,
-        messages,
-        stall_events,
-        turn_guard,
-        verdict_events,
-        restricted_tools,
-        remaining_turns,
-        step_recorder,
-        current_session_id: current_session_id.as_ref(),
-        max_turns,
-        loop_turn: turn_index,
-        recent_tools,
-        last_heavy_checkpoint,
-    }) {
-        AgenticPostToolPolicyOutcome::Abort(e) => Err(e),
-        AgenticPostToolPolicyOutcome::RetryLlmClearToolResults => {
+    match map_post_tool_policy_outcome(apply_agentic_post_tool_policy(
+        AgenticPostToolPolicyRequest {
+            turn_index: turn_index as u32,
+            message,
+            tool_calls_for_guard: &tool_calls_for_guard,
+            intent_tool_turns,
+            messages,
+            stall_events,
+            turn_guard,
+            verdict_events,
+            restricted_tools,
+            remaining_turns,
+            step_recorder,
+            current_session_id: current_session_id.as_ref(),
+            max_turns,
+            loop_turn: turn_index,
+            recent_tools,
+            last_heavy_checkpoint,
+        },
+    )) {
+        AgenticPostToolIterationControl::Abort(e) => Err(e),
+        AgenticPostToolIterationControl::RetryLlmClearToolResults => {
             tool_results.clear();
             Ok(AgenticLoopTurnExit::ContinueIterating)
         }
-        AgenticPostToolPolicyOutcome::ProceedEndTurn => {
+        AgenticPostToolIterationControl::ProceedEndTurn => {
             step_recorder.end_turn(false);
             Ok(AgenticLoopTurnExit::ContinueIterating)
         }
