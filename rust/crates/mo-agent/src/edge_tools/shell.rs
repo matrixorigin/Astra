@@ -4,6 +4,99 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+// ---------------------------------------------------------------------------
+// Command semantics — interpret exit codes per-command (inspired by Claude
+// Code's commandSemantics.ts). Many commands use non-zero exit codes to convey
+// information, not errors. Without this, the model treats grep exit 1 as a
+// failure and wastes turns retrying.
+// ---------------------------------------------------------------------------
+
+/// Semantic interpretation of a command's exit code.
+struct CommandResult {
+    is_error: bool,
+    /// Optional human-readable note (e.g. "No matches found").
+    note: Option<&'static str>,
+}
+
+/// Interpret exit code based on the command that produced it.
+/// Extracts the *last* command in a pipeline (that's what determines the exit code).
+fn interpret_exit_code(command: &str, code: i32) -> CommandResult {
+    let base = last_pipeline_command(command);
+    match base {
+        // grep/rg: 0=matches, 1=no matches, 2+=error
+        "grep" | "rg" | "ag" | "ack" => match code {
+            0 => CommandResult { is_error: false, note: None },
+            1 => CommandResult { is_error: false, note: Some("No matches found") },
+            _ => CommandResult { is_error: true, note: None },
+        },
+        // diff: 0=identical, 1=differences, 2+=error
+        "diff" => match code {
+            0 | 1 => CommandResult { is_error: false, note: None },
+            _ => CommandResult { is_error: true, note: None },
+        },
+        // test/[: 0=true, 1=false, 2+=error
+        "test" | "[" => match code {
+            0 | 1 => CommandResult { is_error: false, note: None },
+            _ => CommandResult { is_error: true, note: None },
+        },
+        // find: 0=ok, 1=partial (some dirs inaccessible), 2+=error
+        "find" | "fd" => match code {
+            0 | 1 => CommandResult { is_error: false, note: None },
+            _ => CommandResult { is_error: true, note: None },
+        },
+        // Default: only 0 is success
+        _ => CommandResult {
+            is_error: code != 0,
+            note: None,
+        },
+    }
+}
+
+/// Extract the base command name from the last segment of a pipeline.
+fn last_pipeline_command(command: &str) -> &str {
+    let last = command.rsplit('|').next().unwrap_or(command);
+    last.trim().split_whitespace().next().unwrap_or("")
+}
+
+// ---------------------------------------------------------------------------
+// Destructive command detection — warn before dangerous operations.
+// Inspired by Claude Code's destructiveCommandWarning.ts.
+// ---------------------------------------------------------------------------
+
+/// Check if a command is potentially destructive and return a warning.
+fn destructive_command_warning(command: &str) -> Option<&'static str> {
+    // Static patterns checked in order; first match wins.
+    static PATTERNS: &[(&str, &str)] = &[
+        // Git — data loss
+        ("git reset --hard", "⚠️ Warning: may discard uncommitted changes"),
+        ("git push --force", "⚠️ Warning: may overwrite remote history"),
+        ("git push -f", "⚠️ Warning: may overwrite remote history"),
+        ("git clean -f", "⚠️ Warning: may permanently delete untracked files"),
+        ("git checkout -- .", "⚠️ Warning: may discard all working tree changes"),
+        ("git restore -- .", "⚠️ Warning: may discard all working tree changes"),
+        ("git stash drop", "⚠️ Warning: may permanently remove stashed changes"),
+        ("git stash clear", "⚠️ Warning: may permanently remove all stashed changes"),
+        ("git branch -D", "⚠️ Warning: may force-delete a branch"),
+        // Git — safety bypass
+        ("--no-verify", "⚠️ Warning: skipping safety hooks"),
+        // File deletion
+        ("rm -rf /", "⚠️ Warning: recursive force-remove from root — extremely dangerous"),
+        // Database
+        ("DROP TABLE", "⚠️ Warning: may drop database table"),
+        ("DROP DATABASE", "⚠️ Warning: may drop entire database"),
+        ("TRUNCATE TABLE", "⚠️ Warning: may truncate database table"),
+        // Infrastructure
+        ("terraform destroy", "⚠️ Warning: may destroy infrastructure"),
+        ("kubectl delete", "⚠️ Warning: may delete Kubernetes resources"),
+    ];
+    for &(pattern, warning) in PATTERNS {
+        if command.contains(pattern) {
+            return Some(warning);
+        }
+    }
+    None
+}
+
 /// Execute a command with process group isolation and timeout.
 ///
 /// This ensures child processes are properly cleaned up even if:
@@ -270,6 +363,13 @@ impl ToolExecutor {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let mut result = String::new();
+
+                // Prepend destructive command warning if applicable
+                if let Some(warning) = destructive_command_warning(command) {
+                    result.push_str(warning);
+                    result.push('\n');
+                }
+
                 if !stdout.is_empty() {
                     result.push_str(&stdout);
                 }
@@ -279,46 +379,73 @@ impl ToolExecutor {
                     }
                     result.push_str(&stderr);
                 }
-                if result.is_empty() {
-                    if out.status.success() {
+
+                let exit_code = out.status.code().unwrap_or(-1);
+
+                if result.is_empty() || (result.trim().is_empty() && !result.contains("⚠️")) {
+                    return if out.status.success() {
                         "(no output)".to_string()
                     } else {
-                        format!("(exit code {})", out.status.code().unwrap_or(-1))
-                    }
-                } else {
-                    // Truncate long output
-                    if result.len() > 20_000 {
-                        result.truncate(20_000);
-                        result.push_str("\n[truncated]");
-                    }
-
-                    // For build/test commands, provide structured output with iteration tracking
-                    if super::build_test::is_build_test_command(command) {
-                        let mut parsed =
-                            super::build_test::parse_build_test_output(&result, out.status.code());
-                        if !parsed.error_locations.is_empty() {
-                            parsed.enrich_with_scope(&self.project_root);
+                        // Use command semantics to interpret exit code
+                        let sem = interpret_exit_code(command, exit_code);
+                        if let Some(note) = sem.note {
+                            note.to_string()
+                        } else if sem.is_error {
+                            format!("Error: command failed (exit code {exit_code})")
+                        } else {
+                            format!("(exit code {exit_code})")
                         }
-                        let delta = {
-                            let mut tracker = self.build_test_tracker.lock().unwrap();
-                            if tracker.command_changed(command) {
-                                tracker.reset();
-                            }
-                            tracker.record(&parsed, command)
-                        };
-                        let delta_summary = delta.to_summary();
-                        if delta_summary.is_empty() {
-                            return parsed.to_enhanced_output(&result);
-                        }
-                        return format!(
-                            "{}\n\n{}",
-                            delta_summary,
-                            parsed.to_enhanced_output(&result)
-                        );
-                    }
-
-                    result
+                    };
                 }
+
+                // Budget-pressure-aware truncation (was hardcoded 20KB)
+                let limit = self.scaled_output_limit();
+                if result.len() > limit {
+                    // Prefer cutting at newline boundary
+                    let end = result.floor_char_boundary(limit);
+                    let cut = result[..end]
+                        .rfind('\n')
+                        .filter(|&pos| pos > end / 2)
+                        .map(|pos| pos + 1)
+                        .unwrap_or(end);
+                    result.truncate(cut);
+                    result.push_str("\n[truncated]");
+                }
+
+                // For build/test commands, provide structured output with iteration tracking
+                if super::build_test::is_build_test_command(command) {
+                    let mut parsed =
+                        super::build_test::parse_build_test_output(&result, out.status.code());
+                    if !parsed.error_locations.is_empty() {
+                        parsed.enrich_with_scope(&self.project_root);
+                    }
+                    let delta = {
+                        let mut tracker = self.build_test_tracker.lock().unwrap();
+                        if tracker.command_changed(command) {
+                            tracker.reset();
+                        }
+                        tracker.record(&parsed, command)
+                    };
+                    let delta_summary = delta.to_summary();
+                    if delta_summary.is_empty() {
+                        return parsed.to_enhanced_output(&result);
+                    }
+                    return format!(
+                        "{}\n\n{}",
+                        delta_summary,
+                        parsed.to_enhanced_output(&result)
+                    );
+                }
+
+                // Append exit code context for non-zero, non-build commands
+                if !out.status.success() {
+                    let sem = interpret_exit_code(command, exit_code);
+                    if sem.is_error {
+                        result.push_str(&format!("\n(exit code {exit_code})"));
+                    }
+                }
+
+                result
             }
         }
     }
@@ -439,9 +566,11 @@ impl ToolExecutor {
             );
         }
 
+        // Use fd if available (faster, respects .gitignore), fall back to find
         let shell_cmd = format!(
-            "cd {} && find . {} -o -name {} -print | sed 's|^./||' | head -200",
+            "cd {} && {{ fd --type f --glob {} 2>/dev/null || find . {} -o -name {} -print | sed 's|^./||'; }} | head -200",
             shell_escape(base.to_string_lossy().as_ref()),
+            shell_escape(pattern),
             default_find_prune_clause(),
             shell_escape(pattern.split('/').next_back().unwrap_or(pattern))
         );
@@ -454,7 +583,23 @@ impl ToolExecutor {
                 if text.trim().is_empty() {
                     "No files found".to_string()
                 } else {
-                    text.to_string()
+                    // Apply budget-pressure-aware truncation
+                    let limit = self.scaled_output_limit();
+                    let line_count = text.lines().count();
+                    if text.len() > limit {
+                        let end = text.floor_char_boundary(limit);
+                        let cut = text[..end]
+                            .rfind('\n')
+                            .map(|pos| pos + 1)
+                            .unwrap_or(end);
+                        let shown = text[..cut].lines().count();
+                        format!(
+                            "{}\n[showing {shown} of {line_count} files, truncated]",
+                            &text[..cut]
+                        )
+                    } else {
+                        format!("{text}\n({line_count} files)")
+                    }
                 }
             }
             Err(e) => e,
@@ -1520,6 +1665,117 @@ mod tests {
         assert!(
             result.contains("// in "),
             "should have scope context annotation: {result}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Command semantics tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn interpret_grep_exit_1_is_not_error() {
+        let r = interpret_exit_code("grep -r foo .", 1);
+        assert!(!r.is_error);
+        assert_eq!(r.note, Some("No matches found"));
+    }
+
+    #[test]
+    fn interpret_grep_exit_2_is_error() {
+        let r = interpret_exit_code("grep -r foo .", 2);
+        assert!(r.is_error);
+    }
+
+    #[test]
+    fn interpret_diff_exit_1_is_not_error() {
+        let r = interpret_exit_code("diff a b", 1);
+        assert!(!r.is_error);
+    }
+
+    #[test]
+    fn interpret_test_exit_1_is_not_error() {
+        let r = interpret_exit_code("test -f /tmp/x", 1);
+        assert!(!r.is_error);
+    }
+
+    #[test]
+    fn interpret_pipeline_uses_last_command() {
+        // `cat file | grep pattern` — grep is the last command
+        let r = interpret_exit_code("cat file | grep pattern", 1);
+        assert!(!r.is_error);
+        assert_eq!(r.note, Some("No matches found"));
+    }
+
+    #[test]
+    fn interpret_unknown_command_exit_1_is_error() {
+        let r = interpret_exit_code("cargo build", 1);
+        assert!(r.is_error);
+    }
+
+    // -----------------------------------------------------------------------
+    // Destructive command warning tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn destructive_warning_git_reset_hard() {
+        assert!(destructive_command_warning("git reset --hard HEAD~1").is_some());
+    }
+
+    #[test]
+    fn destructive_warning_git_push_force() {
+        assert!(destructive_command_warning("git push --force origin main").is_some());
+        assert!(destructive_command_warning("git push -f origin main").is_some());
+    }
+
+    #[test]
+    fn destructive_warning_safe_commands() {
+        assert!(destructive_command_warning("git status").is_none());
+        assert!(destructive_command_warning("ls -la").is_none());
+        assert!(destructive_command_warning("cargo test").is_none());
+    }
+
+    #[test]
+    fn destructive_warning_no_verify() {
+        assert!(destructive_command_warning("git commit --no-verify -m 'x'").is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Bash integration: command semantics in output
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bash_grep_no_match_not_error() {
+        let executor = test_executor();
+        let result = executor.bash(
+            &serde_json::json!({"command": "grep -r 'ZZZZZ_IMPOSSIBLE_PATTERN_99999' /dev/null"}),
+        );
+        // Should NOT start with "Error" — grep exit 1 is semantic, not an error
+        assert!(
+            !result.to_lowercase().starts_with("error"),
+            "grep no-match should not be an error: {result}"
+        );
+    }
+
+    #[test]
+    fn bash_false_command_is_error() {
+        let executor = test_executor();
+        let result = executor.bash(&serde_json::json!({"command": "false"}));
+        assert!(
+            result.contains("exit code") || result.to_lowercase().contains("error"),
+            "false should indicate failure: {result}"
+        );
+    }
+
+    #[test]
+    fn bash_destructive_warning_prepended() {
+        // Verify the warning function itself works — no need to run actual destructive commands
+        let executor = test_executor();
+        // Use a command that contains the destructive pattern but is harmless
+        let result = executor.bash(
+            &serde_json::json!({"command": "echo 'git push --force would be dangerous'"}),
+        );
+        assert!(
+            result.contains("⚠️"),
+            "command containing destructive pattern should have warning: {result}"
         );
     }
 }

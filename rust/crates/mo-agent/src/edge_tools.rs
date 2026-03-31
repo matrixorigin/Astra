@@ -904,6 +904,11 @@ fn tool_output_limit() -> usize {
     mo_agent_core::RuntimeLimits::global().tool_output_limit
 }
 
+/// Per-turn aggregate output budget (bytes). When cumulative tool output
+/// exceeds this, subsequent tools get tighter limits. Inspired by Claude
+/// Code's `MAX_TOOL_RESULTS_PER_MESSAGE_CHARS` (200K).
+const AGGREGATE_OUTPUT_BUDGET: usize = 200_000;
+
 /// Truncate tool output to `max_bytes`, cutting at a newline boundary when
 /// possible (avoids mid-line cuts that confuse the LLM). Inspired by Claude
 /// Code's `generatePreview` pattern.
@@ -1084,6 +1089,11 @@ pub struct ToolExecutor {
     /// Used for staleness detection (prevent overwriting user edits)
     /// and dedup (skip re-reading unchanged files).
     file_state: std::sync::Mutex<HashMap<PathBuf, FileState>>,
+    /// Per-turn aggregate tool output size (bytes). When this exceeds
+    /// `AGGREGATE_OUTPUT_BUDGET`, subsequent tool outputs are truncated
+    /// more aggressively. Inspired by Claude Code's
+    /// `MAX_TOOL_RESULTS_PER_MESSAGE_CHARS` (200K).
+    aggregate_output_bytes: std::sync::atomic::AtomicUsize,
 }
 
 /// Extract owner/repo from git remote URLs in the given directory.
@@ -1156,6 +1166,7 @@ impl ToolExecutor {
             build_test_tracker: std::sync::Mutex::new(build_test::BuildTestTracker::new()),
             memoria_fail_count: std::sync::atomic::AtomicU32::new(0),
             file_state: std::sync::Mutex::new(HashMap::new()),
+            aggregate_output_bytes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1304,11 +1315,27 @@ impl ToolExecutor {
 
     /// Output limit scaled by budget pressure.
     /// At 0.0 pressure → full limit. At 0.9 → 25% of limit.
+    /// Also applies aggregate output pressure: when cumulative tool output
+    /// exceeds AGGREGATE_OUTPUT_BUDGET, further outputs are halved.
     fn scaled_output_limit(&self) -> usize {
         let base = tool_output_limit();
         let pressure = self.get_budget_pressure();
         let scale = 1.0 - (pressure * 0.75); // 0.0→1.0, 0.6→0.55, 0.9→0.325
-        (base as f64 * scale.max(0.25)) as usize
+        let mut limit = (base as f64 * scale.max(0.25)) as usize;
+        // Aggregate pressure: halve limit when cumulative output is high
+        let agg = self
+            .aggregate_output_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if agg > AGGREGATE_OUTPUT_BUDGET {
+            limit /= 2;
+        }
+        limit.max(1024) // never go below 1KB
+    }
+
+    /// Record tool output size for aggregate tracking.
+    fn record_output_size(&self, size: usize) {
+        self.aggregate_output_bytes
+            .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Clear all file state (call after compaction to avoid stale dedup).
@@ -1480,7 +1507,9 @@ impl ToolExecutor {
         };
         // Normalize empty output, then apply global safety net
         let output = normalize_empty_output(output, name);
-        truncate_output(output, global_output_limit())
+        let output = truncate_output(output, global_output_limit());
+        self.record_output_size(output.len());
+        output
     }
 
     /// Extract code symbols (functions, classes, structs) from a file using Tree-sitter.
