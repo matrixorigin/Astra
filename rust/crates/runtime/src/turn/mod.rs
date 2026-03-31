@@ -13,6 +13,7 @@ pub mod boost_domain_hints;
 pub mod bridge_e2e_hooks;
 pub mod bridge_inprocess;
 pub(crate) mod llm_client;
+pub mod loop_dispatcher;
 pub mod cache;
 pub mod chat_history_openai;
 pub mod chat_turn_api_error;

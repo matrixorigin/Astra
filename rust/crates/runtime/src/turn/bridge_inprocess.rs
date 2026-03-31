@@ -1,6 +1,21 @@
 /// In-process ChatTurnBridge — calls LLM directly without an external bridge service.
 ///
-/// Architecture:
+/// # Legacy Status
+///
+/// This module implements the **old-style cloud tool loop** (its own `for round_ix..`
+/// loop inside `stream!`). It does NOT use [`run_agentic_loop_with_host`], meaning
+/// stall detection, post-tool policy, semantic dedup, and step recording are **absent**
+/// from this path.
+///
+/// **Preferred replacement**: Use [`super::loop_dispatcher::LoopDispatcher`] with
+/// [`ServerAgenticLoopHost`](crate::server::server_loop_host::ServerAgenticLoopHost)
+/// which runs the full unified cognitive loop including all runtime policies.
+///
+/// This bridge remains wired for backward compatibility with existing `/chat/turn`
+/// and `/chat/stream` HTTP endpoints. New features should target the unified loop.
+///
+/// # Architecture (legacy)
+///
 ///   Rust API (dispatch_chat_turn_bridge) injects context into headers:
 ///     x-mo-user-id, x-mo-session-id, x-mo-turn-chain-id, x-mo-user-query-event-id, ...
 ///   This bridge reads those headers, calls the LLM, streams SSE back, persists events, and

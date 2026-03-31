@@ -1,18 +1,51 @@
 //! Runtime-portable agentic multi-turn loop.
 //!
+//! # Overview
+//!
 //! [`AgenticLoopHost`] abstracts all host-specific behavior (payload preparation,
 //! HTTP posting, SSE consumption, terminal rendering) so the multi-turn loop
 //! can run identically in CLI and headless cloud contexts.
 //!
+//! # Host Implementations
+//!
+//! | Host | Crate | Context | Tool execution |
+//! |------|-------|---------|----------------|
+//! | `CliAgenticLoopHost` | mo-agent-cli | Interactive terminal | Local via `ToolExecutor` |
+//! | `ServerAgenticLoopHost` | runtime/server | Headless cloud/API | Via edge callback ledger |
+//! | `MockHost` (tests) | runtime (tests) | Unit tests | Scripted responses |
+//!
+//! # Execution Flow
+//!
 //! ```text
 //! run_agentic_loop_with_host(host, state)
 //!   for turn in 0..max_turns:
-//!     host.execute_turn(&mut state) → HostTurnResult    ← CLI: payload + HTTP + SSE
+//!     ── cancel check ──────────────── cooperative, via cancel_flag
+//!     host.execute_turn(&mut state) → HostTurnResult    ← host-specific
 //!     ingest_agentic_turn_stream(...)                    ← runtime
 //!     agentic_round_stall_preflight_with_tool_calls(...) ← runtime
 //!     run_agentic_headless_tool_round(...)               ← runtime
 //!     apply_agentic_post_tool_policy(...)                ← runtime
 //! ```
+//!
+//! # Host Contract (pre-conditions)
+//!
+//! Before calling [`run_agentic_loop_with_host`]:
+//! - `state.messages` must contain at least one user message
+//! - `state.max_turns` and `state.remaining_turns` must be > 0
+//! - `state.message` must match the current user query text
+//!
+//! # Host Contract (invariants during loop)
+//!
+//! The runtime guarantees:
+//! - `execute_turn` is called at most `max_turns` times
+//! - Cancel flag is checked cooperatively between turns (not mid-turn)
+//! - Stall detection runs after every turn with tool calls
+//! - Post-tool policy may restrict tools or abort the loop
+//!
+//! # Dispatch
+//!
+//! For a higher-level entry point, use [`super::loop_dispatcher::LoopDispatcher`]
+//! which wraps this loop with consistent outcome mapping.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -178,6 +211,9 @@ pub enum AgenticLoopOutcome {
     Error(String),
     /// Loop was cancelled externally via cancel_flag.
     Cancelled,
+    /// Loop is waiting for external input (tool approval, user resume, webhook).
+    /// The caller should provide the requested input and re-invoke the loop.
+    Waiting(String),
 }
 
 // ─── Runtime loop ────────────────────────────────────────────────────────────
@@ -950,5 +986,29 @@ mod tests {
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(matches!(outcome, Ok(AgenticLoopOutcome::Cancelled)));
+    }
+
+    #[test]
+    fn waiting_variant_carries_reason() {
+        let outcome = AgenticLoopOutcome::Waiting("tool_approval".to_string());
+        match outcome {
+            AgenticLoopOutcome::Waiting(reason) => assert_eq!(reason, "tool_approval"),
+            other => panic!("expected Waiting, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outcome_debug_format() {
+        // Ensure all variants have Debug
+        let variants: Vec<AgenticLoopOutcome> = vec![
+            AgenticLoopOutcome::Completed,
+            AgenticLoopOutcome::Error("fail".into()),
+            AgenticLoopOutcome::Cancelled,
+            AgenticLoopOutcome::Waiting("resume".into()),
+        ];
+        for v in &variants {
+            let _ = format!("{v:?}");
+        }
+        assert_eq!(variants.len(), 4);
     }
 }
