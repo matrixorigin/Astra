@@ -48,12 +48,28 @@ impl ToolExecutor {
             Ok(safe) => safe,
             Err(e) => return e,
         };
+
+        // Binary file guard — refuse to read known binary extensions
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            const BINARY_EXTS: &[&str] = &[
+                "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "svg",
+                "pdf", "zip", "gz", "tar", "bz2", "xz", "7z", "rar",
+                "exe", "dll", "so", "dylib", "o", "a", "lib",
+                "wasm", "class", "pyc", "pyo",
+                "mp3", "mp4", "avi", "mov", "wav", "flac", "ogg",
+                "ttf", "otf", "woff", "woff2", "eot",
+                "sqlite", "db", "mdb",
+            ];
+            if BINARY_EXTS.contains(&ext.to_lowercase().as_str()) {
+                return format!("Error: refusing to read binary file (.{ext}). Use bash with appropriate tools (e.g. file, xxd, strings) for binary analysis.");
+            }
+        }
+
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
                 let msg = format!("Error: {e}");
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    // Try to find similar files
                     let suggestions = self.find_similar_files(path_str);
                     let hint = if !suggestions.is_empty() {
                         format!("\nDid you mean: {}?", suggestions.join(", "))
@@ -72,8 +88,6 @@ impl ToolExecutor {
         };
 
         // Outline mode: return only definition signatures with line numbers
-        // Uses tree-sitter for supported languages (Rust, Python, TypeScript, Go)
-        // Falls back to regex-based detection for others
         if args
             .get("outline")
             .and_then(Value::as_bool)
@@ -81,6 +95,9 @@ impl ToolExecutor {
         {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let total_lines = content.lines().count();
+
+            // Record as partial read (outline)
+            self.record_read(&path, true);
 
             // Try tree-sitter first for accurate AST-based extraction
             if let Some(ts_lang) = super::code_intel::detect_language(&path) {
@@ -119,7 +136,21 @@ impl ToolExecutor {
             .get("end_line")
             .and_then(Value::as_u64)
             .map(|n| n as usize);
-        if start.is_none() && end.is_none() {
+
+        let is_ranged = start.is_some() || end.is_some();
+
+        // Dedup: if same file, same range, unchanged mtime → skip re-sending
+        if !is_ranged && self.can_dedup_read(&path) {
+            return format!(
+                "[File unchanged since last read — refer to the earlier read_file result for {}]",
+                path_str
+            );
+        }
+
+        // Record the read state
+        self.record_read(&path, is_ranged);
+
+        if !is_ranged {
             let total_lines = content.lines().count();
             if content.len() > 50_000 {
                 let mut out = content[..50_000].to_string();
@@ -151,6 +182,21 @@ impl ToolExecutor {
             Some(c) => c,
             None => return json!({ "success": false, "error": "missing 'content'" }).to_string(),
         };
+
+        // Staleness check: if file exists, it must have been read first and not modified since
+        if path.exists() {
+            if let Err(e) = self.check_staleness(&path) {
+                return json!({ "success": false, "error": e }).to_string();
+            }
+            // Require full read (not outline/partial) before overwriting
+            if !self.was_fully_read(&path) {
+                return json!({
+                    "success": false,
+                    "error": "File was only partially read (outline or line range). Read the full file before overwriting."
+                }).to_string();
+            }
+        }
+
         if let Some(parent) = path.parent()
             && let Err(e) = fs::create_dir_all(parent)
         {
@@ -161,12 +207,16 @@ impl ToolExecutor {
             .to_string();
         }
         match fs::write(&path, content) {
-            Ok(_) => json!({
-                "success": true,
-                "bytes_written": content.len(),
-                "path": path.to_string_lossy().to_string()
-            })
-            .to_string(),
+            Ok(_) => {
+                // Record write state so subsequent reads/edits know the mtime
+                self.record_write(&path);
+                json!({
+                    "success": true,
+                    "bytes_written": content.len(),
+                    "path": path.to_string_lossy().to_string()
+                })
+                .to_string()
+            }
             Err(e) => json!({ "success": false, "error": e.to_string() }).to_string(),
         }
     }
@@ -192,6 +242,11 @@ impl ToolExecutor {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
+        // Staleness check
+        if let Err(e) = self.check_staleness(&path) {
+            return format!("Error: {e}");
+        }
+
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => return format!("Error reading file: {e}"),
@@ -213,8 +268,15 @@ impl ToolExecutor {
 
         match fs::write(&path, &new_content) {
             Ok(_) => {
+                // Record write state for staleness tracking
+                self.record_write(&path);
+
                 // Auto-format if formatter is available
                 let format_result = auto_format_file(&path, &self.project_root);
+                // Re-record after format (mtime may have changed)
+                if format_result.is_some() {
+                    self.record_write(&path);
+                }
 
                 // Build a compact diff preview for the LLM and user
                 let old_lines: Vec<&str> = old_str.lines().collect();
@@ -309,6 +371,11 @@ impl ToolExecutor {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
+        // Staleness check
+        if let Err(e) = self.check_staleness(&path) {
+            return format!("Error: {e}");
+        }
+
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => return format!("Error reading file: {e}"),
@@ -349,7 +416,11 @@ impl ToolExecutor {
         // Apply
         match fs::write(&path, &working) {
             Ok(_) => {
+                self.record_write(&path);
                 let format_result = auto_format_file(&path, &self.project_root);
+                if format_result.is_some() {
+                    self.record_write(&path);
+                }
                 let mut result = format!("Applied {} edit(s) successfully", edits.len());
                 if let Some(fmt_note) = format_result {
                     result.push_str(&format!("\n{fmt_note}"));
@@ -1356,6 +1427,7 @@ type Handler interface {
         std::fs::write(&file_path, "  fn hello() {\n    println!(\"hi\");\n  }\n").unwrap();
 
         let executor = test_executor_in(dir.path());
+        executor.read_file(&serde_json::json!({"path": "code.rs"}));
         let result = executor.str_replace(&serde_json::json!({
             "path": "code.rs",
             "old_str": "fn hello() {\n  println!(\"hi\");\n}",
@@ -1373,6 +1445,7 @@ type Handler interface {
         std::fs::write(&file_path, "let x = 1;\nlet y = 2;\nlet x = 1;\n").unwrap();
 
         let executor = test_executor_in(dir.path());
+        executor.read_file(&serde_json::json!({"path": "dup.rs"}));
         let result = executor.str_replace(&serde_json::json!({
             "path": "dup.rs",
             "old_str": "let x = 1;",
@@ -1615,6 +1688,7 @@ type Handler interface {
         let file = tmpdir.path().join("test.txt");
         std::fs::write(&file, "line1\nline2\nline3\n").unwrap();
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&serde_json::json!({"path": "test.txt"}));
         let result = exe.str_replace(&json!({
             "path": "test.txt",
             "old_str": "line2",
@@ -1644,6 +1718,7 @@ type Handler interface {
         let file = tmpdir.path().join("test.txt");
         std::fs::write(&file, "hello world").unwrap();
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&serde_json::json!({"path": "test.txt"}));
         let result = exe.str_replace(&json!({
             "path": "test.txt",
             "old_str": "hello",
@@ -1710,6 +1785,7 @@ type Handler interface {
         let file = tmpdir.path().join("code.rs");
         std::fs::write(&file, "fn foo() {}\nfn bar() {}\nfn baz() {}\n").unwrap();
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&serde_json::json!({"path": "code.rs"}));
         let result = exe.multi_edit(&json!({
             "path": "code.rs",
             "edits": [
@@ -1730,6 +1806,7 @@ type Handler interface {
         let file = tmpdir.path().join("code.rs");
         std::fs::write(&file, "fn foo() {}\nfn bar() {}\n").unwrap();
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&serde_json::json!({"path": "code.rs"}));
         let result = exe.multi_edit(&json!({
             "path": "code.rs",
             "edits": [
@@ -1756,6 +1833,7 @@ type Handler interface {
         let file = tmpdir.path().join("code.rs");
         std::fs::write(&file, "aaa\naaa\nbbb\n").unwrap();
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&serde_json::json!({"path": "code.rs"}));
         let result = exe.multi_edit(&json!({
             "path": "code.rs",
             "edits": [
@@ -1775,6 +1853,7 @@ type Handler interface {
         let file = tmpdir.path().join("code.rs");
         std::fs::write(&file, "fn foo() {}\nfn bar() {}\n").unwrap();
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&serde_json::json!({"path": "code.rs"}));
         let result = exe.multi_edit(&json!({
             "path": "code.rs",
             "edits": [
@@ -1814,6 +1893,7 @@ type Handler interface {
         let file = tmpdir.path().join("chain.txt");
         std::fs::write(&file, "alpha beta gamma").unwrap();
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&serde_json::json!({"path": "chain.txt"}));
         let result = exe.multi_edit(&json!({
             "path": "chain.txt",
             "edits": [
@@ -1861,6 +1941,7 @@ type Handler interface {
         )
         .unwrap();
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&serde_json::json!({"path": "lib.rs"}));
         let result = exe.str_replace(&json!({
             "path": "lib.rs",
             "old_str": "self.x + 1",
@@ -1880,6 +1961,7 @@ type Handler interface {
         let file = tmpdir.path().join("config.toml");
         std::fs::write(&file, "[package]\nname = \"old\"\n").unwrap();
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&serde_json::json!({"path": "config.toml"}));
         let result = exe.str_replace(&json!({
             "path": "config.toml",
             "old_str": "\"old\"",
@@ -1902,6 +1984,7 @@ type Handler interface {
         )
         .unwrap();
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&serde_json::json!({"path": "app.py"}));
         let result = exe.str_replace(&json!({
             "path": "app.py",
             "old_str": "data.strip()",
@@ -1920,6 +2003,7 @@ type Handler interface {
         let file = tmpdir.path().join("main.rs");
         std::fs::write(&file, "fn main() {\n    let x = 1;\n    let y = 2;\n}\n").unwrap();
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&serde_json::json!({"path": "main.rs"}));
         let result = exe.multi_edit(&json!({
             "path": "main.rs",
             "edits": [

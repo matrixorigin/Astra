@@ -461,6 +461,7 @@ impl ToolExecutor {
     }
 
     /// Fetch a URL and return its content (text or HTML→text).
+    /// Reports HTTP status, content type, and size for transparency.
     pub(crate) fn web_fetch(&self, args: &Value) -> String {
         let url = match args.get("url").and_then(Value::as_str) {
             Some(u) => u,
@@ -480,6 +481,7 @@ impl ToolExecutor {
             .unwrap_or(10_000) as usize;
         let timeout_secs = args.get("timeout").and_then(Value::as_u64).unwrap_or(10);
 
+        // Use -w to capture HTTP status code and content type for structured reporting
         let mut cmd = Command::new("curl");
         cmd.args([
             "-sS",
@@ -487,9 +489,11 @@ impl ToolExecutor {
             "--max-time",
             &timeout_secs.to_string(),
             "--max-filesize",
-            &(max_bytes * 2).to_string(), // allow 2x for pre-truncation
+            &(max_bytes * 2).to_string(),
             "-H",
             "User-Agent: mo-agent/0.1",
+            "-w",
+            "\n__CURL_META__%{http_code} %{content_type} %{size_download} %{url_effective}",
             url,
         ])
         .current_dir(&self.project_root);
@@ -506,12 +510,58 @@ impl ToolExecutor {
         match run_command_with_cleanup(&mut cmd, timeout_secs as f64 + 5.0) {
             Ok(out) => {
                 let status = out.status;
-                let stdout = String::from_utf8_lossy(&out.stdout);
+                let raw = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                if !status.success() && stdout.is_empty() {
+                if !status.success() && raw.is_empty() {
                     return format!("Error: {stderr}");
                 }
-                let mut result = stdout.to_string();
+
+                // Parse metadata from -w output
+                let (body, meta_line) = if let Some(idx) = raw.rfind("\n__CURL_META__") {
+                    (&raw[..idx], Some(&raw[idx + "\n__CURL_META__".len()..]))
+                } else {
+                    (raw.as_ref(), None)
+                };
+
+                let (http_code, _content_type, final_url) = if let Some(meta) = meta_line {
+                    let parts: Vec<&str> = meta.splitn(4, ' ').collect();
+                    (
+                        parts.first().copied().unwrap_or("?"),
+                        parts.get(1).copied().unwrap_or("?"),
+                        parts.get(3).copied().unwrap_or(""),
+                    )
+                } else {
+                    ("?", "?", "")
+                };
+
+                // Detect cross-host redirect
+                let redirected = if !final_url.is_empty() && final_url != url {
+                    // Check if host changed
+                    let orig_host = url.split('/').nth(2).unwrap_or("");
+                    let final_host = final_url.split('/').nth(2).unwrap_or("");
+                    if orig_host != final_host {
+                        Some(final_url)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // HTTP error codes
+                if let Ok(code) = http_code.parse::<u16>() {
+                    if code >= 400 {
+                        let reason = match code {
+                            401 | 403 => " (authentication required — look for an MCP tool with authenticated access)",
+                            404 => " (page not found)",
+                            429 => " (rate limited — try again later)",
+                            _ => "",
+                        };
+                        return format!("Error: HTTP {code}{reason}\nURL: {url}");
+                    }
+                }
+
+                let mut result = body.to_string();
 
                 // Convert HTML to plain text for LLM consumption
                 if looks_like_html(&result) {
@@ -522,6 +572,16 @@ impl ToolExecutor {
                     result.truncate(max_bytes);
                     result.push_str("\n[truncated]");
                 }
+
+                // Append metadata footer
+                let mut footer = String::new();
+                if let Some(redir) = redirected {
+                    footer.push_str(&format!("\n[Redirected to: {redir}]"));
+                }
+                if !footer.is_empty() {
+                    result.push_str(&footer);
+                }
+
                 result
             }
             Err(e) => {
@@ -959,6 +1019,7 @@ mod tests {
         )
         .unwrap();
 
+        executor.read_file(&serde_json::json!({"path": "code.rs"}));
         let result = executor.str_replace(&serde_json::json!({
             "path": "code.rs",
             "old_str": "println!(\"old\")",
@@ -981,6 +1042,7 @@ mod tests {
         let content = format!("header\n{old_block}footer\n");
         std::fs::write(dir.path().join("big.txt"), &content).unwrap();
 
+        executor.read_file(&serde_json::json!({"path": "big.txt"}));
         let result = executor.str_replace(&serde_json::json!({
             "path": "big.txt",
             "old_str": old_block.trim_end(),

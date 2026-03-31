@@ -7,6 +7,7 @@
 //!        mo_query, mo_snapshot, mo_branch
 
 use std::{
+    collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -39,6 +40,19 @@ mod mo_tools;
 mod shell;
 
 // ─── Tool schema ─────────────────────────────────────────────────────────────
+
+/// Tracks the last-read state of a file for staleness detection and dedup.
+/// Inspired by Claude Code's readFileState mechanism.
+#[derive(Debug, Clone)]
+struct FileState {
+    /// mtime (milliseconds) at the time of last read/write.
+    timestamp_ms: u128,
+    /// True if the last operation was a read (not a write/edit).
+    /// Dedup only fires when the previous op was a read.
+    from_read: bool,
+    /// True if the last read was a partial view (outline, line range).
+    is_partial: bool,
+}
 
 pub fn all_tool_schemas() -> Vec<Value> {
     vec![
@@ -1047,6 +1061,10 @@ pub struct ToolExecutor {
     build_test_tracker: std::sync::Mutex<build_test::BuildTestTracker>,
     /// Circuit breaker: skip Memoria calls after consecutive failures.
     memoria_fail_count: std::sync::atomic::AtomicU32,
+    /// File state tracker: records mtime after each read/write/edit.
+    /// Used for staleness detection (prevent overwriting user edits)
+    /// and dedup (skip re-reading unchanged files).
+    file_state: std::sync::Mutex<HashMap<PathBuf, FileState>>,
 }
 
 /// Extract owner/repo from git remote URLs in the given directory.
@@ -1118,6 +1136,7 @@ impl ToolExecutor {
             budget_pressure: std::sync::Mutex::new(0.0),
             build_test_tracker: std::sync::Mutex::new(build_test::BuildTestTracker::new()),
             memoria_fail_count: std::sync::atomic::AtomicU32::new(0),
+            file_state: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1172,6 +1191,96 @@ impl ToolExecutor {
                 poisoned.into_inner().clone()
             }
         }
+    }
+
+    // ─── File state helpers ──────────────────────────────────────────────────
+
+    /// Get the mtime of a file in milliseconds. Returns 0 on error.
+    fn file_mtime_ms(path: &Path) -> u128 {
+        fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    }
+
+    /// Record file state after a read.
+    fn record_read(&self, path: &Path, is_partial: bool) {
+        let ts = Self::file_mtime_ms(path);
+        if let Ok(mut state) = self.file_state.lock() {
+            state.insert(path.to_path_buf(), FileState {
+                timestamp_ms: ts,
+                from_read: true,
+                is_partial,
+            });
+        }
+    }
+
+    /// Record file state after a write/edit (full content known).
+    /// Uses from_read=false to distinguish from reads — dedup won't fire after writes.
+    fn record_write(&self, path: &Path) {
+        let ts = Self::file_mtime_ms(path);
+        if let Ok(mut state) = self.file_state.lock() {
+            state.insert(path.to_path_buf(), FileState {
+                timestamp_ms: ts,
+                from_read: false,
+                is_partial: false,
+            });
+        }
+    }
+
+    /// Check if a file has been modified since we last read/wrote it.
+    /// Returns Err(message) if stale, Ok(()) if fresh or unknown.
+    fn check_staleness(&self, path: &Path) -> Result<(), String> {
+        let current_ts = Self::file_mtime_ms(path);
+        if current_ts == 0 {
+            return Ok(()); // file doesn't exist yet — ok for write_file
+        }
+        if let Ok(state) = self.file_state.lock() {
+            if let Some(fs) = state.get(path) {
+                if current_ts > fs.timestamp_ms {
+                    return Err(
+                        "File has been modified since last read (by user or linter). \
+                         Read it again before editing."
+                            .to_string(),
+                    );
+                }
+            } else {
+                // Never read — require read first for existing files
+                return Err(
+                    "File exists but has not been read yet. Read it first before writing/editing."
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Check if a file was read as a full view (not partial/outline).
+    fn was_fully_read(&self, path: &Path) -> bool {
+        self.file_state
+            .lock()
+            .ok()
+            .and_then(|s| s.get(path).map(|fs| !fs.is_partial))
+            .unwrap_or(false)
+    }
+
+    /// Check if we can dedup a read (previous op was a full read, unchanged mtime).
+    fn can_dedup_read(&self, path: &Path) -> bool {
+        let current_ts = Self::file_mtime_ms(path);
+        if current_ts == 0 {
+            return false;
+        }
+        self.file_state
+            .lock()
+            .ok()
+            .and_then(|s| {
+                s.get(path).map(|fs| {
+                    fs.from_read && !fs.is_partial && fs.timestamp_ms == current_ts
+                })
+            })
+            .unwrap_or(false)
     }
 
     /// Configure security sandbox for tool execution.
